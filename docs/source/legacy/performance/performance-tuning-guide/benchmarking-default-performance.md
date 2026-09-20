@@ -73,10 +73,10 @@ if __name__ == '__main__':
 
 TensorRT-LLM also has a command line interface for building and saving engines. This workflow consists of two steps
 
-1. Convert model checkpoint (HuggingFace, Nemo) to TensorRT-LLM checkpoint via `convert_checkpoint.py`. Each supported model has a `convert_checkpoint.py` associated it with it and can be found in the examples folder. For example, the `convert_checkpoint.py` script for Llama models can be found [here](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/llama/convert_checkpoint.py)
+1. Convert model checkpoint (HuggingFace, Nemo) to TensorRT-LLM checkpoint via `convert_checkpoint.py`. Each supported model has a `convert_checkpoint.py` associated it with it and can be found in the examples folder. For example, the `convert_checkpoint.py` script for Llama models can be found [here](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.0/examples/models/core/llama/convert_checkpoint.py)
 2. Build engine by passing TensorRT-LLM checkpoint to `trtllm-build` command. The `trtllm-build` command is installed automatically when the `tensorrt_llm` package is installed.
 
-The README in the examples folder for supported models walks through building engines using this flow for a wide variety of situations. The examples folder for Llama models can be found at [https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/llama](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/llama).
+The README in the examples folder for supported models walks through building engines using this flow for a wide variety of situations. The examples folder for Llama models can be found at [https://github.com/NVIDIA/TensorRT-LLM/tree/v1.2.0/examples/models/core/llama](https://github.com/NVIDIA/TensorRT-LLM/tree/v1.2.0/examples/models/core/llama).
 
 ## Benchmarking with `trtllm-bench`
 
@@ -86,7 +86,7 @@ The README in the examples folder for supported models walks through building en
 
 `trtllm-bench` expects to be passed in a dataset of requests to run through the model. This guide creates a dummy dataset of 1000 requests with every request having input and output sequence length of 2048.  TensorRT-LLM provides the `prepare_dataset.py` script to produce the dataset. To use it clone the TensorRT-LLM Repo and run the following command:
 
-`python benchmarks/cpp/prepare_dataset.py --stdout --tokenizer /path/to/hf/Llama-3.3-70B-Instruct/ token-norm-dist --input-mean 2048 --output-mean 2048 --input-stdev 0 --output-stdev 0 --num-requests 1000 > synthetic_2048_2048.txt`
+`python benchmarks/prepare_dataset.py --stdout --tokenizer /path/to/hf/Llama-3.3-70B-Instruct/ token-norm-dist --input-mean 2048 --output-mean 2048 --input-stdev 0 --output-stdev 0 --num-requests 1000 > synthetic_2048_2048.txt`
 
 `trtllm-bench` can also take in real data, see [`trtllm-bench` documentation](../perf-benchmarking.md) for more details on the required format.
 

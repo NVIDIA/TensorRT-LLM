@@ -92,6 +92,8 @@ _EMIT = {
     "ad.reduce_mean": lambda a, ncols: f"(tl.sum({a}, 0) * (1.0 / {ncols}))",
     "ad.splat": None,  # handled specially — just inline the scalar value
     "ad.cast": lambda a, dt: f"{a}.to({dt})",
+    "ad.floordiv": None,  # handled specially — scalar divisor from attribute
+    "ad.eq": None,  # handled specially — scalar comparand from attribute
 }
 
 # Triton dtype name for MLIR element types
@@ -100,6 +102,11 @@ _TRITON_DTYPE_MAP = {
     "f32": "tl.float32",
     "bf16": "tl.bfloat16",
     "f64": "tl.float64",
+    "i1": "tl.int1",
+    "i8": "tl.int8",
+    "i16": "tl.int16",
+    "i32": "tl.int32",
+    "i64": "tl.int64",
 }
 
 # torch dtype string for MLIR element types (used in codegen source strings)
@@ -108,7 +115,18 @@ _TORCH_DTYPE_STR_MAP = {
     "f32": "torch.float32",
     "bf16": "torch.bfloat16",
     "f64": "torch.float64",
+    "i1": "torch.bool",
+    "i8": "torch.int8",
+    "i16": "torch.int16",
+    "i32": "torch.int32",
+    "i64": "torch.int64",
 }
+
+
+def _is_integer_type(tensor_type: TensorType) -> bool:
+    """Return True if the element type is integer or boolean (i1/i8/i16/i32/i64)."""
+    elem_str = str(tensor_type.element_type)
+    return elem_str.startswith("i")
 
 
 def _mlir_elem_to_triton_str(tensor_type: TensorType) -> str:
@@ -277,34 +295,41 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
             narrow_flags.append(False)
 
     # Build kernel body lines.
-    # All computation is done in f32 for numerical stability (matching hand-written
+    # Float computation is done in f32 for numerical stability (matching hand-written
     # kernels). Loads upcast to f32; stores downcast to the original dtype.
+    # Integer/bool inputs are kept in their native dtype (no f32 upcast).
     body_lines = []
 
-    # Load all subgraph inputs and upcast to f32.
+    # Detect integer inputs so we can skip the f32 upcast for them.
+    int_input_flags = [
+        isinstance(inp.type, TensorType) and _is_integer_type(inp.type) for inp in subgraph.inputs
+    ]
+
+    # Load all subgraph inputs.
     # In grouped mode, full-row inputs are offset by both row and group:
     #   ptr + pid_row * row_stride + pid_group * N_COLS + offs
     # Broadcast (1D) inputs (e.g. weights) are offset by group only:
     #   ptr + pid_group * N_COLS + offs
     for i, inp in enumerate(subgraph.inputs):
+        upcast = "" if int_input_flags[i] else ".to(tl.float32)"
+        other = "0" if int_input_flags[i] else "0.0"
         if scalar_flags[i]:
-            # Rank-0 (scalar) tensor: load single element, Triton broadcasts automatically.
-            body_lines.append(f"    v{i} = tl.load(in{i}_ptr).to(tl.float32)")
+            body_lines.append(f"    v{i} = tl.load(in{i}_ptr){upcast}")
         elif broadcast_flags[i]:
             if grouped_mode:
                 body_lines.append(
-                    f"    v{i} = tl.load(in{i}_ptr + group_off + offs, mask=mask).to(tl.float32)"
+                    f"    v{i} = tl.load(in{i}_ptr + group_off + offs, mask=mask, other={other}){upcast}"
                 )
             else:
-                body_lines.append(f"    v{i} = tl.load(in{i}_ptr + offs, mask=mask).to(tl.float32)")
+                body_lines.append(
+                    f"    v{i} = tl.load(in{i}_ptr + offs, mask=mask, other={other}){upcast}"
+                )
         elif narrow_flags[i]:
             inp_last_dim = inp.type.get_shape()[-1]
-            body_lines.append(
-                f"    v{i} = tl.load(in{i}_ptr + pid * {inp_last_dim}).to(tl.float32)"
-            )
+            body_lines.append(f"    v{i} = tl.load(in{i}_ptr + pid * {inp_last_dim}){upcast}")
         else:
             body_lines.append(
-                f"    v{i} = tl.load(in{i}_ptr + row_off + offs, mask=mask).to(tl.float32)"
+                f"    v{i} = tl.load(in{i}_ptr + row_off + offs, mask=mask, other={other}){upcast}"
             )
 
     # Process ops in topological order
@@ -381,6 +406,26 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
             for r in op.results:
                 val_names[id(r)] = result_name
 
+        elif op_name == "ad.floordiv":
+            input_val = op.operands[0]
+            input_name = val_names[id(input_val)]
+            divisor = op.attributes["divisor"].value.data
+            result_name = f"t{temp_counter}"
+            body_lines.append(f"    {result_name} = {input_name} // {divisor}")
+            temp_counter += 1
+            for r in op.results:
+                val_names[id(r)] = result_name
+
+        elif op_name == "ad.eq":
+            input_val = op.operands[0]
+            input_name = val_names[id(input_val)]
+            cmp_val = op.attributes["value"].value.data
+            result_name = f"t{temp_counter}"
+            body_lines.append(f"    {result_name} = ({input_name} == {cmp_val})")
+            temp_counter += 1
+            for r in op.results:
+                val_names[id(r)] = result_name
+
         elif emitter is not None:
             # Standard elementwise op
             operand_names = [val_names[id(v)] for v in op.operands]
@@ -403,14 +448,42 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
         # Determine original output dtype for downcast from f32
         if isinstance(out.type, TensorType):
             out_dt = _mlir_elem_to_triton_str(out.type)
+            is_int_out = _is_integer_type(out.type)
         else:
             out_dt = "tl.bfloat16"
-        cast = f".to({out_dt})" if out_dt != "tl.float32" else ""
+            is_int_out = False
+        if is_int_out:
+            # Integer/bool outputs: no sanitization or cast needed
+            safe_name = out_name
+            cast = ""
+        elif out_dt in ("tl.bfloat16", "tl.float16"):
+            # NaN/inf sanitization before bf16/f16 downcast (IEEE 754: x != x is true only for NaN).
+            # Clamp bound must match the output dtype's max-finite value — using fp16's 65504
+            # for a bf16 store would silently truncate legitimate values in [65504, 3.39e38]
+            # that bf16 can represent. This only masks the overflow symptom; the NaN root cause
+            # (e.g. rsqrt of a near-zero value) should be fixed upstream when possible.
+            if out_dt == "tl.float16":
+                # fp16 max-finite: (1 + 1023/1024) * 2^15 = 65504
+                clamp_bound = 65504.0
+            else:
+                # bf16 max-finite: (1 + 127/128) * 2^127 ≈ 3.389531389251535e+38
+                clamp_bound = 3.3895313892515355e38
+            safe_name = f"_safe{i}"
+            body_lines.append(
+                f"    {safe_name} = tl.where({out_name} != {out_name}, 0.0, {out_name})"
+            )
+            body_lines.append(
+                f"    {safe_name} = tl.clamp({safe_name}, {-clamp_bound}, {clamp_bound})"
+            )
+            cast = f".to({out_dt})"
+        else:
+            safe_name = out_name
+            cast = f".to({out_dt})" if out_dt != "tl.float32" else ""
         if out_rank < max_rank:
-            body_lines.append(f"    tl.store(out{i}_ptr + pid, {out_name}{cast})")
+            body_lines.append(f"    tl.store(out{i}_ptr + pid, {safe_name}{cast})")
         else:
             body_lines.append(
-                f"    tl.store(out{i}_ptr + out_row_off + offs, {out_name}{cast}, mask=mask)"
+                f"    tl.store(out{i}_ptr + out_row_off + offs, {safe_name}{cast}, mask=mask)"
             )
 
     # Build parameter lists

@@ -20,6 +20,7 @@
 
 #include <cutlass/numeric_conversion.h>
 #include "CutlassBarrier.h"
+#include "WsproReduce.h"
 
 namespace trtllm {
 namespace dev {
@@ -226,21 +227,10 @@ inline __device__ void reduceColMax(float (&regsMax)[NumColsPerThread],
                                     int numWarpGrpThreads,
                                     int warpGrpThreadIdx,
                                     int namedBarId) {
-
-  // The number of threads per row.
   int constexpr NumThreadsPerRow{4};
-  // The number of threads participating in atomicMax. It's an optim between SHFL and ATOMS.
-  int constexpr NumThreadsPerAtomicMax{8};
+  int constexpr NumThreadsPerCol{8};
 
-  // Then, reduce maximum values among the threads in the warp.
-  for (int col = 0; col < NumColsPerThread; ++col) {
-    for (int laneMask = 16; laneMask >= NumThreadsPerAtomicMax; laneMask /= 2) {
-      regsMax[col] =
-        fmaxf(__shfl_xor_sync(uint32_t{0xffffffff}, regsMax[col], laneMask), regsMax[col]);
-    }
-  }
-
-  // The lane inside the warp-group.
+  // The lane inside the warp.
   int const laneIdx{warpGrpThreadIdx % 32};
   // The column inside the warp-group.
   int const colIdx{warpGrpThreadIdx % NumThreadsPerRow};
@@ -248,10 +238,60 @@ inline __device__ void reduceColMax(float (&regsMax)[NumColsPerThread],
   // The shared memory location where to perform the atomic max.
   float* smemMax = &smemMaxPtr[colIdx * NumColsPerThread];
 
-  // Compute the warp-group maxes using atomics in shared memory.
-  for (int col = 0; col < NumColsPerThread; ++col) {
-    if (laneIdx < NumThreadsPerAtomicMax) {
-      atomicMaxFloat(&smemMax[col], regsMax[col]);
+  // We don't see a speedup with WSPRO when the number of reductions per thread is too small.
+  constexpr bool useWspro = (NumColsPerThread > 2);
+
+  if constexpr (useWspro) {
+    // Number of partial results per column that survive the WSPRO reduction and participate in
+    // atomicMax. ReduceGroupSize = NumThreadsPerCol / NumAtomThreadsPerGroup consecutive rows are
+    // fully reduced via WSPRO, then the remaining NumAtomThreadsPerGroup groups combine via
+    // atomicMax (2 atomics per column per warp).
+    int constexpr NumAtomThreadsPerGroup{2};
+    int constexpr ReduceGroupSize{NumThreadsPerCol / NumAtomThreadsPerGroup};
+
+    // The row inside the warp.
+    int const rowIdx{laneIdx / NumThreadsPerRow};
+    // The position within the reduction group (0..ReduceGroupSize-1).
+    int const localRowIdx{rowIdx % ReduceGroupSize};
+
+    // Reduce maximum values among the threads in the warp using WSPRO within each group of
+    // ReduceGroupSize rows. The two independent groups ({rows 0-3} and {rows 4-7}) reduce in
+    // parallel via SHFL masks 8 and 4 (= {2,1} * group_stride), which stay within each group.
+    // Reduced values are distributed across group threads: thread with localRowIdx=r holds results
+    // for columns {r, r+ReduceGroupSize, r+2*ReduceGroupSize, ...}.
+    WsproReduce<NumColsPerThread, ReduceGroupSize> reducer(localRowIdx,
+                                                           0xffffffffu,
+                                                           NumThreadsPerRow);
+
+    constexpr int NumIters = WsproReduce<NumColsPerThread, ReduceGroupSize>::max_out_per_thread;
+    float reduced[NumIters];
+    reducer.Max(regsMax, reduced);
+
+    // Both groups atomicMax their partial results to the same smem locations.
+    if (NumColsPerThread >= ReduceGroupSize || localRowIdx < NumColsPerThread) {
+#pragma unroll
+      for (int ii = 0; ii < NumIters; ii++) {
+        atomicMaxFloat(&smemMax[localRowIdx + ii * ReduceGroupSize], reduced[ii]);
+      }
+    }
+
+  } else {
+    // The number of threads participating in atomicMax. It's an optim between SHFL and ATOMS.
+    int constexpr NumThreadsPerAtomicMax{8};
+
+    // Reduce maximum values among the threads in the warp.
+    for (int col = 0; col < NumColsPerThread; ++col) {
+      for (int laneMask = 16; laneMask >= NumThreadsPerAtomicMax; laneMask /= 2) {
+        regsMax[col] =
+          fmaxf(__shfl_xor_sync(uint32_t{0xffffffff}, regsMax[col], laneMask), regsMax[col]);
+      }
+    }
+
+    // Compute the warp-group maxes using atomics in shared memory.
+    for (int col = 0; col < NumColsPerThread; ++col) {
+      if (laneIdx < NumThreadsPerAtomicMax) {
+        atomicMaxFloat(&smemMax[col], regsMax[col]);
+      }
     }
   }
 

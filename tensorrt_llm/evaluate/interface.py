@@ -49,6 +49,23 @@ def get_chat_template_kwargs(
     return effective_kwargs
 
 
+def get_model_context(llm: Any) -> tuple[str, str]:
+    """Return the HF model directory and model type for an LLM object."""
+    model_dir = getattr(llm, "_hf_model_dir", None) or getattr(
+        llm, "model", None)
+    if model_dir is None:
+        raise ValueError("The LLM object does not expose a model directory.")
+
+    config_path = os.path.join(str(model_dir), "config.json")
+    with open(config_path, "r", encoding="utf-8") as config_file:
+        config = json.load(config_file)
+
+    model_type = config.get("model_type")
+    if model_type is None:
+        raise KeyError(f"'model_type' is missing from {config_path}.")
+    return str(model_dir), str(model_type)
+
+
 class Evaluator(ABC):
 
     def __init__(self,

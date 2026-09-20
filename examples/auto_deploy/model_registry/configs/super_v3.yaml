@@ -42,7 +42,7 @@ transforms:
         "fc2_latent_proj": "gather"
   multi_stream_moe:
     stage: compile
-    enabled: true
+    enabled: false # https://github.com/NVIDIA/TensorRT-LLM/issues/13121
   gather_logits_before_lm_head:
     # TODO: fix https://github.com/NVIDIA/TensorRT-LLM/issues/9878 to enable by default
     enabled: true
@@ -53,5 +53,6 @@ transforms:
     backend: flashinfer_ssm
   fuse_nvfp4_moe:
     backend: trtllm_gen
+    enable_trtllm_gen_internal_routing: true
   fuse_fp8_moe:
     allow_different_input_scales: true

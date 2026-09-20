@@ -85,6 +85,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Optional
 
 import click
 import torch
@@ -92,6 +93,8 @@ import torch
 from tensorrt_llm import LLM, SamplingParams, logger
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
     KvCacheConnectorScheduler, KvCacheConnectorWorker, SchedulerOutput)
+from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import \
+    valid_page_slots
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
 from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig, TorchLlmArgs
 
@@ -112,6 +115,11 @@ class PersistentKvCacheConnectorWorker(KvCacheConnectorWorker):
         self.kv_cache_tensor = None
 
     def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
+        # This is the only registration hook this connector needs. A cache that
+        # describes itself as a layout instead still arrives here, through
+        # `register_kv_cache_layout`'s default, as long as one tensor can
+        # describe it. See llm_kv_cache_connector_vswa.py for the case where it
+        # cannot -- one attention window size per layer group.
         assert self.kv_cache_tensor is None, "KV cache tensor already registered"
         self.kv_cache_tensor = kv_cache_tensor
 
@@ -179,9 +187,18 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
 
             pending_load = self.pending_loads[req.request_id]
 
+            # Ordinal -> page slot for the blocks that have a page. Blocks with
+            # none keep their ordinal in `block_ids` so that entry `i` always
+            # describes the same token range; they are dropped here so no
+            # transfer can be built against one.
+            slots = dict(valid_page_slots(block_ids))
+
             for file_path, block_pos in zip(
                     pending_load, range(num_computed_blocks, len(block_ids))):
-                metadata.load.append((file_path, block_ids[block_pos]))
+                slot = slots.get(block_pos)
+                if slot is None:
+                    continue
+                metadata.load.append((file_path, slot))
 
             # Break up the remainder of the token sequence into chunks.
             chunks = self._chunk_tokens(req.new_tokens)
@@ -189,19 +206,25 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
             # For each chunk that isn't already on device, and isn't in our connector cache, we need to save it.
             for block_pos in range(num_computed_blocks + len(pending_load),
                                    len(block_ids)):
+                slot = slots.get(block_pos)
+                if slot is None:
+                    continue
                 if len(chunks[block_pos]) == self.block_size:
-                    hashed_tokens = self._hash_tokens(chunks[block_pos])
+                    hashed_tokens = self._hash_tokens(chunks[block_pos],
+                                                      req.cache_salt)
 
                     file_path = self._file_path(hashed_tokens)
 
-                    metadata.save.append((file_path, block_ids[block_pos]))
+                    metadata.save.append((file_path, slot))
 
         self.pending_loads = {}
 
         return metadata
 
-    def _hash_tokens(self, tokens: list[int]) -> int:
-        return abs(hash(tuple(tokens)))
+    def _hash_tokens(self, tokens: list[int], cache_salt: Optional[str]) -> int:
+        # cache_salt must participate in the hash so that requests carrying
+        # different salts (or no salt) cannot collide on the same cache file.
+        return abs(hash((cache_salt, tuple(tokens))))
 
     def _file_path(self, hash_value: int) -> Path:
         return Path(self.cache_folder) / f"{hash_value}.pt"
@@ -233,7 +256,7 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
         for chunk in remaining_chunks:
             # Only do full blocks.
             if len(chunk) == self.block_size:
-                hashed_tokens = self._hash_tokens(chunk)
+                hashed_tokens = self._hash_tokens(chunk, request.cache_salt)
 
                 file_path = self._file_path(hashed_tokens)
 

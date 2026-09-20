@@ -47,10 +47,18 @@ public:
 
 public:
   // Get the mmaOpsPerClk.
-  static int32_t getMmaOpsPerClk(FmhaOptions const& options);
+  static int32_t getMmaOpsPerClk(FmhaOptions const& options,
+                                 KernelTraits const& kernelTraits,
+                                 bool isBmm1 = true);
 
   // Select the GQA generation kernel.
   void selectGqaGenerationKernel();
+
+  // Select the kernel for tree-based custom speculative decoding (Eagle3 dynamic tree, MTP tree).
+  // Triggered by isCustomSpecDecodingGen with specDecodingTargetMaxGenLen > 0.
+  // Uses numTokensHeadsQ = numHeadsQPerKv * specDecodingTargetMaxGenLen as a config-time
+  // deterministic heuristic to choose tileSizeQ + kernelType.
+  void selectSpecDecTreeKernel();
 
   // Select the kernel and update the options.
   std::tuple<FmhaOptions, FmhaOptionsFromArgs, int32_t> selectKernel();
@@ -58,7 +66,15 @@ public:
   // Select the MLA generation kernel.
   void selectMlaGenerationKernel();
 
+  // Select the grouped Q64 MLA generation kernel when the capability predicate matches.
+  void selectGroupedMlaGenerationKernel();
+
 private:
+  // computeNumCtas uses the same cluster occupancy helper as enableCgaReduction.
+  friend std::tuple<int32_t, int32_t, int32_t> computeNumCtas(FmhaOptions& options,
+                                                              int32_t multiProcessorCount,
+                                                              bool enablesLogging);
+
   // Enables the cgaReduction if all clusters can be launched in one wave.
   void enableCgaReduction(int32_t numCtasX, int32_t numCtasY, int32_t numCtasZ);
 
@@ -70,7 +86,7 @@ private:
 
   // Get the maximum number of active clusters for a given cluster size which considers the
   // floorsweeping configurations.
-  int32_t getMaxNumActiveClusters(int32_t clusterSize);
+  static int32_t getMaxNumActiveClusters(int32_t clusterSize);
 
   // Selects the tileSizeQ for GQA generation kernels.
   void selectTileSizeQForGqaGeneration();
@@ -84,6 +100,9 @@ private:
   // Sets the kernel type and tileSizeQ for GQA generation kernels.
   void setGqaKernelTypeAndTileSizeQ();
 
+  // Set headDimPerCtaV for context and GQA generation kernels. MLA sets separately.
+  void setHeadDimPerCtaV(FmhaOptions& options);
+
   // Set the numInstsQ and numInstsKv.
   void setNumInstsQAndKv(FmhaOptions& options, bool forceSet = false, bool updateSetFlags = true);
 
@@ -92,6 +111,9 @@ private:
 
   // Set MMA order, interleavesMufuAndSums, and usesOrderedSequence.
   void setMmaOrder();
+
+  // Select the sparse MLA generation kernel.
+  void selectSparseMlaGenerationKernel();
 
   // Set softmax configs.
   void setSoftmaxConfigs();

@@ -36,7 +36,7 @@ This leads to the key design question behind DWDP: can we remove collective sync
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog19_sync_overhead_in_dep.png" alt="Synchronization overhead caused by workload imbalance in DEP" width="600">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog19_sync_overhead_in_dep.png" alt="Synchronization overhead caused by workload imbalance in DEP" width="600">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1. Synchronization overhead caused by workload imbalance in DEP for DeepSeek-R1 on GB200 with <code>ISL/OSL = 8K/1</code> and input ratio <code>0.8</code>.</em></sub></p>
@@ -57,7 +57,7 @@ DWDP also provides greater flexibility in expert placement. Because each rank on
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog19_dwdp_overview.png" alt="Overview of DWDP with DWDP group size 4" width="650">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog19_dwdp_overview.png" alt="Overview of DWDP with DWDP group size 4" width="650">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2. Overview of DWDP with DWDP group size 4.</em></sub></p>
@@ -139,7 +139,7 @@ Each DWDP-enabled MoE layer registers a `DwdpLayerHandleCollector`. During model
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog19_dwdp_runtime_flow.png" alt="DWDP runtime flow" width="700">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog19_dwdp_runtime_flow.png" alt="DWDP runtime flow" width="700">
 </figure>
 </div>
 
@@ -205,7 +205,7 @@ One mitigation is to split each remote-weight transfer into fixed-size slices an
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog19_async_comm_contention.png" alt="Nsight Systems trace showing many-to-one source-side communication contention in DWDP" width="1000">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog19_async_comm_contention.png" alt="Nsight Systems trace showing many-to-one source-side communication contention in DWDP" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3. Nsight Systems trace showing many-to-one source-side communication contention in DWDP under a short compute-window setting.</em></sub></p>
@@ -260,7 +260,7 @@ The end-to-end study uses the SemiAnalysis dataset with ISL=`8K`, OSL=`1K`, and 
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog19_e2e_pareto_frontier.png" alt="End-to-end Pareto frontier comparison between baseline and DWDP" width="700">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog19_e2e_pareto_frontier.png" alt="End-to-end Pareto frontier comparison between baseline and DWDP" width="700">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4. End-to-end Pareto frontier comparison between baseline and DWDP.</em></sub></p>

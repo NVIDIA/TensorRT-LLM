@@ -6,7 +6,7 @@ import torch
 from transformers.configuration_utils import PretrainedConfig
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints import HfCheckpointLoader
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import \
@@ -135,6 +135,7 @@ class DummyConfigLoader(BaseConfigLoader):
         return ModelConfig(pretrained_config=DummyConfig())
 
 
+@pytest.mark.cpu_only
 @pytest.mark.gpu1
 def test_additional_model_outputs_sampling_params():
     """Test that additional_model_outputs can be configured in SamplingParams."""
@@ -153,6 +154,7 @@ def test_additional_model_outputs_sampling_params():
     assert sampling_params.additional_model_outputs[1] == "generation_output"
 
 
+@pytest.mark.cpu_only
 @pytest.mark.gpu1
 def test_additional_model_outputs_no_outputs():
     """Test that no additional outputs are returned when not requested."""

@@ -7,16 +7,16 @@ from transformers import Qwen2MoeConfig
 
 from tensorrt_llm.functional import PositionEmbeddingType
 
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import DefaultMoeRoutingMethod, create_moe
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import DefaultMoeRoutingMethod, create_moe
 from ..utils import AuxStreamType
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
@@ -92,7 +92,8 @@ class QwenMoE(nn.Module):
             hidden_states,
             router_logits,
             all_rank_num_tokens=all_rank_num_tokens,
-            use_dp_padding=False)
+            use_dp_padding=False,
+            lora_params=lora_params)
 
         shared_expert_output = self.shared_expert(
             hidden_states,
@@ -114,10 +115,13 @@ class QwenMoeAttention(Attention):
         layer_idx: Optional[int] = None,
     ):
         config = model_config.pretrained_config
-        if getattr(config, "rope_scaling", None) is not None:
+        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_type = None
+        if rope_scaling is not None:
+            rope_type = rope_scaling.get("type", rope_scaling.get("rope_type"))
+        if rope_type is not None and rope_type != "default":
             pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.from_string(
-                    config.rope_scaling["type"]),
+                type=PositionEmbeddingType.from_string(rope_type),
                 rope=RopeParams.from_config(config),
             )
         else:

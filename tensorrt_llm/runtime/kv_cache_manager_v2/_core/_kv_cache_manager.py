@@ -14,34 +14,47 @@
 # limitations under the License.
 
 import time
+import warnings
 from collections import defaultdict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Iterable, Iterator, cast
+from typing import TYPE_CHECKING, Iterator, cast
 
 from .. import rawref
-from .._block_radix_tree import BlockRadixTree
+from .._block_radix_tree import Block, BlockRadixTree, ReuseMatch, ReuseScope, RootBlock
 from .._common import (
     BAD_PAGE_INDEX,
     GPU_LEVEL,
+    NDEBUG,
     PRIORITY_DEFAULT,
     BlockOrdinal,
     CacheLevel,
     CacheTier,
     LayerId,
     MemAddress,
+    PageIndexMode,
     PageStatus,
     Priority,
     TokenIdExt,
 )
 from .._config import DataRole, KVCacheManagerConfig
+from .._exceptions import LogicError
 from .._life_cycle_registry import LayerGroupId, LifeCycle, LifeCycleId, LifeCycleRegistry
 from .._page import Page, _PageHolder
-from .._storage._config import BufferId, create_storage_config
+from .._stats import (
+    CountsByLevel,
+    KVCacheIterationStatsDelta,
+    KVCacheStatsDelta,
+    ReusedBlocksByLevel,
+    SsmSnapshotIterationStatsDelta,
+    add_counts_by_level,
+)
+from .._storage._config import BufferId, SlotDesc, create_storage_config
 from .._storage._core import PoolGroupIndex, PoolIndex, SlotId
-from .._storage_manager import StorageManager
+from .._storage_manager import StorageManager, StorageStatistics
 from .._utils import (
+    HalfOpenRange,
     HomoTuple,
     TypedIndexList,
     div_up,
@@ -56,17 +69,23 @@ from .._utils import (
 from ._kv_cache import _KVCache
 from ._moving_average import MovingAverage
 
-
-@dataclass(slots=True, frozen=True)
-class MemoryPoolDesc:
-    base: MemAddress
-    page_size: int
+if TYPE_CHECKING:
+    from .._event_manager import KVCacheEventManager
 
 
 @dataclass(slots=True, frozen=True)
-class MemoryPoolGroupDesc:
-    num_pages: int
-    pools: TypedIndexList[PoolIndex, MemoryPoolDesc]
+class PoolDesc:
+    pool_index: PoolIndex
+    base_address: MemAddress
+    slot_bytes: int
+
+
+@dataclass(slots=True, frozen=True)
+class PoolGroupDesc:
+    pool_group_index: PoolGroupIndex
+    num_slots: int
+    slot_desc: SlotDesc
+    pools: TypedIndexList[PoolIndex, PoolDesc]
 
 
 @dataclass(slots=True, frozen=True)
@@ -102,27 +121,93 @@ class AggregatedPageDesc:
 
 
 @dataclass(slots=True, frozen=True)
+class ScratchDesc:
+    """Scratch metadata for one layer group of one sequence.
+
+    Scratch blocks are blocks whose KV data is ephemeral (only needed during one
+    step's attention). Their pages are stored in shared coalesced slots rather than
+    per-block slots.
+    """
+
+    range: HalfOpenRange[BlockOrdinal]  # block ordinal range [beg, end)
+    slot_ids: Sequence[int]  # scratch slot IDs, length = ceil(num_scratch_blocks / scale)
+
+    def __bool__(self) -> bool:
+        return bool(self.range)
+
+
+@dataclass(slots=True, frozen=True)
 class PageIndexConverter:
     scale: int
     expansion: int
+    layer_offset: int  # sub-page offset within coalesced slot
+    scratch_pages_per_block: int = 1
 
-    def __call__(self, base_index: int) -> Iterator[int]:
+    def __call__(
+        self,
+        base_indices: Sequence[int],
+        index_mode: PageIndexMode | None = None,
+        scratch: "ScratchDesc | None" = None,
+    ) -> list[int]:
         """
-        Convert from base page indices to page indices expected by operators/kernels.
-        This is just an reference implementation. Users are encouraged to do it with a CUDA kernel.
+        Convert from base page indices to per-layer page indices expected by operators/kernels.
+        This is a reference implementation. Users are encouraged to do it with a CUDA kernel.
+
+        When index_mode is PageIndexMode.PER_LAYER, the converted indices include the layer's
+        position within the coalesced slot. The caller should use the pool group base address.
+
+        When index_mode is PageIndexMode.SHARED, the converted indices do not include any
+        layer offset — the caller's base pointer (from get_mem_pool_base_address) already
+        incorporates it.
+
+        Args:
+            base_indices: Per-block base page indices (slot IDs), from get_base_page_indices().
+            index_mode: Page index mode. None defaults to SHARED; must be explicit when
+                scratch is active (scratch requires PER_LAYER).
+            scratch: Optional scratch metadata from _KVCache.get_scratch_desc().
         """
-        valid = base_index != BAD_PAGE_INDEX
-        index = base_index * self.scale
+        if index_mode is None:
+            assert not scratch, "index_mode must be provided when scratch is active"
+            index_mode = PageIndexMode.SHARED
+
+        scale = self.scale
         expansion = self.expansion
-        return ((index * expansion + i if valid else BAD_PAGE_INDEX) for i in range(expansion))
+        applied_layer_offset = self.layer_offset if index_mode == PageIndexMode.PER_LAYER else 0
+        scratch_pages = self.scratch_pages_per_block
+        result = list[int]()
+
+        for ordinal, base_index in enumerate(base_indices):
+            index: int
+            if scratch and ordinal in scratch.range:
+                # Scratch block: slot IDs come from ScratchDesc, not base_indices
+                block_pos = ordinal - scratch.range.beg
+                total_offset = block_pos * scratch_pages
+                slot_idx = total_offset // scale
+                slot_id = scratch.slot_ids[slot_idx]
+                offset = total_offset % scale
+                index = slot_id * scale + (offset + applied_layer_offset) % scale
+            elif base_index == BAD_PAGE_INDEX:
+                index = BAD_PAGE_INDEX
+            else:
+                index = base_index * scale + applied_layer_offset
+            for i in range(expansion):
+                result.append(index * expansion + i if index != BAD_PAGE_INDEX else BAD_PAGE_INDEX)
+        return result
+
+
+@dataclass(slots=True, frozen=True)
+class PoolGroupPeakBlockStats:
+    available: int
+    unavailable: int
+    evictable: int
 
 
 class KVCacheManager:
     __slots__ = (
         "_init_config",
         "_life_cycles",
-        "_radix_tree",
         "_storage",
+        "_radix_tree",
         "_living_kv_caches",
         "_avg_reused_length",
         "_avg_sqr_capacity",
@@ -130,14 +215,27 @@ class KVCacheManager:
         "_target_ratio_list_gpu",
         "_target_ratio_list_other",
         "_num_created_kv_caches",
-        "_num_closed_kv_caches",
+        "_num_sampled_kv_caches",
         "_last_adjustment_time",
-        "_last_update_num_closed_requests",
+        "_last_update_num_sampled_kv_caches",
+        "_event_manager",
+        "_stats_enabled",
+        "_committed_stats",
+        "_iteration_stats_by_life_cycle",
+        "_ssm_snapshot_iteration_stats_by_life_cycle",
+        "_iteration_peak_num_blocks_by_cache_level",
+        "_dirty_stats_kv_cache_ids",
+        "_stats_excluded_kv_cache_ids",
+        "_iter_suspended_requests",
+        "_iter_resumed_requests",
+        "_iter_disk_prefetch_blocks",
+        "_iter_cached_tokens_by_level",
+        "_iter_reused_blocks_by_level",
     )
     _init_config: KVCacheManagerConfig
     _life_cycles: LifeCycleRegistry
-    _radix_tree: BlockRadixTree
     _storage: StorageManager
+    _radix_tree: BlockRadixTree
     _living_kv_caches: set[rawref.ref[_KVCache]]
     # Eventually we should let the eviction controller evict associated pages together, i.e.
     # when a page eviction makes other pages in the same cache level useless, it should also
@@ -152,25 +250,50 @@ class KVCacheManager:
     _target_ratio_list_gpu: TypedIndexList[PoolGroupIndex, float]
     _target_ratio_list_other: TypedIndexList[PoolGroupIndex, float]
     _num_created_kv_caches: int
-    _num_closed_kv_caches: int
+    _num_sampled_kv_caches: int
     _last_adjustment_time: float
-    _last_update_num_closed_requests: int
+    _last_update_num_sampled_kv_caches: int
+    _event_manager: "KVCacheEventManager | None"
+    _stats_enabled: bool
+    _committed_stats: KVCacheStatsDelta
+    _iteration_stats_by_life_cycle: dict[LifeCycleId, KVCacheIterationStatsDelta]
+    _ssm_snapshot_iteration_stats_by_life_cycle: dict[LifeCycleId, SsmSnapshotIterationStatsDelta]
+    _iteration_peak_num_blocks_by_cache_level: TypedIndexList[
+        CacheLevel, TypedIndexList[PoolGroupIndex, PoolGroupPeakBlockStats]
+    ]
+    _dirty_stats_kv_cache_ids: set[int]
+    _stats_excluded_kv_cache_ids: set[int]
+    _iter_suspended_requests: int
+    _iter_resumed_requests: int
 
-    def __init__(self, config: KVCacheManagerConfig) -> None:
+    def __init__(
+        self,
+        config: KVCacheManagerConfig,
+        event_manager: "KVCacheEventManager | None" = None,
+        cold_page_codec: object | None = None,
+    ) -> None:
+        if cold_page_codec is not None:
+            raise NotImplementedError("Cold-page codecs require the C++ KVCacheManagerV2 backend")
         init_cuda_once()
         config = deepcopy(config)
         self._init_config = config
+        self._living_kv_caches = set[rawref.ref[_KVCache]]()
         self._life_cycles = LifeCycleRegistry(config)
-        self._radix_tree = BlockRadixTree(self._life_cycles, config.tokens_per_block)
         storage_config = create_storage_config(config)
-        self._storage = StorageManager(
+        storage = StorageManager(
             self._life_cycles,
             storage_config,
             config.tokens_per_block,
+            config.swa_scratch_reuse,
             typical_batch=config.typical_step,
             constraints=config.constraints,
+            initial_pool_ratio=config.initial_pool_ratio,
+            event_manager=event_manager,
+            max_util_for_resume=config.max_util_for_resume,
         )
-        self._living_kv_caches = set[rawref.ref[_KVCache]]()
+        radix_tree = BlockRadixTree(self._life_cycles, config.tokens_per_block, event_manager)
+        self._storage = storage
+        self._radix_tree = radix_tree
         decay = 0.9999
         self._avg_reused_length = MovingAverage(decay)
         self._avg_sqr_capacity = MovingAverage(decay)
@@ -178,31 +301,81 @@ class KVCacheManager:
         self._target_ratio_list_gpu = self._current_gpu_ratio
         self._target_ratio_list_other = self._current_other_ratios
         self._num_created_kv_caches = 0
-        self._num_closed_kv_caches = 0
+        self._num_sampled_kv_caches = 0
         self._last_adjustment_time = time.monotonic()
-        self._last_update_num_closed_requests = 0
+        self._last_update_num_sampled_kv_caches = 0
+        self._event_manager = event_manager
+        self._stats_enabled = config.enable_stats
+        self._committed_stats = KVCacheStatsDelta()
+        self._iteration_stats_by_life_cycle = {}
+        self._ssm_snapshot_iteration_stats_by_life_cycle = {}
+        self._reset_iteration_peak_num_blocks()
+        self._dirty_stats_kv_cache_ids = set()
+        self._stats_excluded_kv_cache_ids = set()
+        self._iter_suspended_requests = 0
+        self._iter_resumed_requests = 0
+        self._iter_disk_prefetch_blocks = 0
+        self._iter_cached_tokens_by_level = []
+        self._iter_reused_blocks_by_level = {}
 
     def __del__(self) -> None:
-        self.shutdown()
+        try:
+            self.shutdown()
+        except LogicError as e:
+            warnings.warn(str(e))
+
+    def _check_no_living_kv_caches(self, api: str) -> None:
+        """Raise unless every KV cache has been closed.
+
+        `api` names the caller so the message points at the mistake rather than at
+        whatever breaks later. Entries are dropped by `_KVCache.close()`, so this counts
+        sequences that are still open, not merely un-collected objects.
+        """
+        if self._living_kv_caches:
+            raise LogicError(
+                f"{api} with {len(self._living_kv_caches)} KV cache(s) still open; "
+                "close them (or drain the engine) first"
+            )
 
     def shutdown(self) -> None:
-        self.clear_reusable_blocks()
-        self._storage.destroy()
+        self._check_no_living_kv_caches("shutdown()")
+        # A failed constructor may leave either owner unset. Release tree pages
+        # before destroying storage whenever the corresponding objects exist.
+        radix_tree = getattr(self, "_radix_tree", None)
+        if radix_tree is not None:
+            radix_tree.clear()
+        storage = getattr(self, "_storage", None)
+        if storage is not None:
+            storage.destroy()
 
     def clear_reusable_blocks(self) -> None:
-        for ref in self._radix_tree.clear():
-            assert unwrap_rawref(ref).status == PageStatus.DROPPABLE
-            self._storage.exclude_from_eviction(unwrap_rawref(ref))
-        for level in self._storage._levels:
-            for pg_idx in typed_range(level.storage.num_pool_groups):
-                assert level.controller.num_evictable_pages(pg_idx) == 0
+        self._check_no_living_kv_caches("clear_reusable_blocks()")
+        self._radix_tree.clear()
 
-    def get_mem_pool_base_address(self, layer_id: LayerId, data_role: DataRole) -> MemAddress:
+    def get_mem_pool_base_address(
+        self, layer_id: LayerId, data_role: DataRole, index_mode: PageIndexMode | None = None
+    ) -> MemAddress:
         """
         Get the base address of the memory pool holding pages for the given layer and data role.
-        It's guaranteed that for one layer, multiple buffers of the same size have the same base address.
+
+        When index_mode is PageIndexMode.PER_LAYER, returns the pool group base address
+        (without per-layer offset), since PageIndexConverter includes the layer offset in
+        the converted indices. Otherwise, returns the per-layer base address (with the
+        layer offset baked in).
         """
-        return self._storage.get_mem_pool_base_address(layer_id, data_role)
+        storage = self._storage
+        attr = storage.get_buffer_attr(layer_id, data_role)
+
+        if index_mode is None:
+            if self.enable_swa_scratch_reuse:
+                raise ValueError("index_mode must be provided when SWA scratch reuse is enabled")
+            index_mode = PageIndexMode.SHARED
+
+        pg_idx = storage.get_pool_group_index(attr.life_cycle_id)
+        addr = storage.get_mem_pool_base_address(pg_idx, attr.pool_index)
+        if index_mode == PageIndexMode.SHARED:
+            addr = MemAddress(addr + attr.offset)
+        return addr
 
     # Currently always equals to page size. In the future, that will change when kernels support page stride.
     def get_page_stride(self, layer_id: LayerId, data_role: DataRole) -> int:
@@ -245,29 +418,53 @@ class KVCacheManager:
         self, layer_id: LayerId, data_role: DataRole
     ) -> PageIndexConverter:
         """
-        Get the converter to convert from base page indices to page indices expected by operators/kernels.
+        Get the converter to convert from base page indices to per-layer page indices
+        expected by operators/kernels.
 
-        For layers in the same layer group and with the same tokens_per_block, users are encouraged to
-        share the computed page indices between buffers of these layers, if the page index scale for these
-        buffers are the same.
+        The returned converter is constant and usable by all kv cache instances.
         """
         storage = self._storage
         attr = storage.get_buffer_attr(layer_id, data_role)
+        layer_attr = storage.get_layer_attr(layer_id)
         scale = storage._slot_to_page_indices[attr.life_cycle_id][attr.pool_index]
-        return PageIndexConverter(scale, attr.expansion)
+        layer_offset = exact_div(attr.offset, attr.size)
+        return PageIndexConverter(
+            scale, attr.expansion, layer_offset, layer_attr.slot_util[attr.pool_index]
+        )
 
     def create_kv_cache(
         self,
-        lora_task_id: int | None = None,
+        reuse_scope: ReuseScope | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
         id: int | None = None,
         custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority] = lambda _,
         __: PRIORITY_DEFAULT,
+        expected_prompt_length: int | None = None,
+        text_only: bool | None = None,
+        enable_request_stats: bool = False,
     ) -> _KVCache:
         """
-        lora_task_id: match lora_task_id before matching any tokens.
-        custom_priority_callback: takes block index and layer sliding window size, returns priority.
-        If priority returned is higher than existing priority for reused blocks, the block priority is updated.
+        Args:
+            reuse_scope: Namespace to match before matching any tokens.
+            input_tokens: Optional initial tokens used for reuse matching.
+            id: Optional cache identifier.
+            custom_priority_callback: Takes a block index and layer sliding-window
+                size and returns a priority. Reused blocks are updated when the
+                returned priority is higher than their existing priority.
+            expected_prompt_length: Optional token count marking the
+                prefill-to-generation boundary. Once history length reaches it,
+                subsequent capacity growth is recorded as generation-phase
+                allocation statistics. Defaults to the length of ``input_tokens``
+                and does not affect allocation, reuse, or correctness.
+            text_only: Optional per-cache override for the manager setting. ``True``
+                enables digest-free fast paths and requires all tokens to be text
+                token IDs; ``False`` permits digest tokens but is invalid when the
+                manager is configured with ``text_only=True``; ``None`` inherits
+                the manager setting.
+            enable_request_stats: Whether to collect request-level allocation and
+                reuse counters for this cache. Manager-level global and iteration
+                statistics remain controlled by ``KVCacheManagerConfig.enable_stats``.
+
         Newly created KV cache is suspended. You need to call resume() with a cuda stream to make it active
         & ready in that stream.
         Returns None if suspended=False and we don't have enough resource.
@@ -275,7 +472,81 @@ class KVCacheManager:
         It's user responsibility to remove the last token from prompts if we need to re-compute the token
         generated by prefill.
         """
-        return _KVCache(self, lora_task_id, input_tokens, id, custom_priority_callback)
+        if reuse_scope is None:
+            reuse_scope = ReuseScope()
+        assert type(reuse_scope) is ReuseScope
+        reuse_match = (
+            self._match_reuse(reuse_scope, input_tokens) if input_tokens is not None else None
+        )
+        if expected_prompt_length is None and input_tokens is not None:
+            expected_prompt_length = len(input_tokens)
+        return _KVCache(
+            self,
+            reuse_scope,
+            reuse_match,
+            id,
+            custom_priority_callback,
+            expected_prompt_length,
+            text_only,
+            enable_request_stats,
+        )
+
+    def _match_reuse(
+        self, reuse_scope: ReuseScope, input_tokens: Sequence[TokenIdExt]
+    ) -> ReuseMatch:
+        return self._radix_tree.match(
+            reuse_scope,
+            input_tokens,
+            self.enable_partial_match,
+            self.init_config.reuse_match_backoff,
+        )
+
+    def probe_reuse(
+        self,
+        reuse_scope: ReuseScope | None = None,
+        input_tokens: Sequence[TokenIdExt] | None = None,
+    ) -> int:
+        """
+        Return the currently reusable prefix length without holding pages.
+
+        The returned length is advisory because no page ownership is acquired.
+        """
+        if reuse_scope is None:
+            reuse_scope = ReuseScope()
+        assert type(reuse_scope) is ReuseScope
+        if input_tokens is None:
+            input_tokens = ()
+        return self._match_reuse(reuse_scope, input_tokens).num_tokens
+
+    def probe_first_new_block_key(
+        self,
+        reuse_scope: ReuseScope | None = None,
+        input_tokens: Sequence[TokenIdExt] | None = None,
+    ) -> bytes | None:
+        """Return the first full block's key past the currently reusable prefix.
+
+        Read-only and advisory, like ``probe_reuse``. Reuse the preceding full
+        block's key from the same fresh match instead of rehashing the prefix.
+        """
+        if reuse_scope is None:
+            reuse_scope = ReuseScope()
+        assert type(reuse_scope) is ReuseScope
+        if input_tokens is None:
+            return None
+        match = self._match_reuse(reuse_scope, input_tokens)
+        block_index = match.num_tokens // self.tokens_per_block
+        begin = block_index * self.tokens_per_block
+        end = begin + self.tokens_per_block
+        if end > len(input_tokens):
+            return None
+        # Use the final, pruned match. Its last block can be partial and have a
+        # different suffix; only a full predecessor has the query's exact key.
+        previous_key = (
+            RootBlock.make_key(reuse_scope)
+            if block_index == 0
+            else match.blocks[block_index - 1].key
+        )
+        return Block.make_key(previous_key, input_tokens[begin:end])
 
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool:
         """
@@ -299,6 +570,268 @@ class KVCacheManager:
     def get_quota(self, cache_level: CacheLevel) -> int:
         return self._storage._levels[cache_level].storage.total_quota
 
+    def _current_block_stats_by_cache_level(
+        self,
+    ) -> TypedIndexList[CacheLevel, TypedIndexList[PoolGroupIndex, PoolGroupPeakBlockStats]]:
+        def collect(
+            cache_level: CacheLevel,
+        ) -> TypedIndexList[PoolGroupIndex, PoolGroupPeakBlockStats]:
+            stats_by_pool_group = self._storage.get_statistics(cache_level)
+            return make_typed(
+                lambda pool_group_index: PoolGroupPeakBlockStats(
+                    available=stats_by_pool_group[pool_group_index].available,
+                    unavailable=stats_by_pool_group[pool_group_index].unavailable,
+                    evictable=stats_by_pool_group[pool_group_index].evictable,
+                ),
+                self._storage.num_pool_groups,
+            )
+
+        return make_typed(collect, self._storage.num_cache_levels)
+
+    def _reset_iteration_peak_num_blocks(self, cache_level: CacheLevel | None = None) -> None:
+        if cache_level is None:
+            self._iteration_peak_num_blocks_by_cache_level = (
+                self._current_block_stats_by_cache_level()
+            )
+            return
+        stats_by_pool_group = self._storage.get_statistics(cache_level)
+        self._iteration_peak_num_blocks_by_cache_level[cache_level] = make_typed(
+            lambda pool_group_index: PoolGroupPeakBlockStats(
+                available=stats_by_pool_group[pool_group_index].available,
+                unavailable=stats_by_pool_group[pool_group_index].unavailable,
+                evictable=stats_by_pool_group[pool_group_index].evictable,
+            ),
+            self._storage.num_pool_groups,
+        )
+
+    def _update_iteration_peak_num_blocks(self) -> None:
+        current = self._current_block_stats_by_cache_level()
+        for cache_level in typed_range(self._storage.num_cache_levels):
+            peak = self._iteration_peak_num_blocks_by_cache_level[cache_level]
+            current_level = current[cache_level]
+            for pool_group_index in typed_range(self._storage.num_pool_groups):
+                peak_stats = peak[pool_group_index]
+                current_stats = current_level[pool_group_index]
+                peak[pool_group_index] = PoolGroupPeakBlockStats(
+                    available=max(peak_stats.available, current_stats.available),
+                    unavailable=max(peak_stats.unavailable, current_stats.unavailable),
+                    evictable=max(peak_stats.evictable, current_stats.evictable),
+                )
+
+    def commit_stats(
+        self,
+        stats: KVCacheStatsDelta,
+        iteration_stats_by_life_cycle: dict[LifeCycleId, KVCacheIterationStatsDelta] | None = None,
+    ) -> None:
+        if not self._stats_enabled:
+            return
+        self._update_iteration_peak_num_blocks()
+        self._committed_stats.add(stats)
+        if iteration_stats_by_life_cycle is None:
+            return
+        for life_cycle, iteration_stats in iteration_stats_by_life_cycle.items():
+            if iteration_stats.empty:
+                continue
+            destination = self._iteration_stats_by_life_cycle.setdefault(
+                life_cycle, KVCacheIterationStatsDelta()
+            )
+            destination.add(iteration_stats)
+
+    def get_committed_stats(self) -> KVCacheStatsDelta:
+        return self._committed_stats.copy()
+
+    def get_and_reset_iteration_stats(self) -> dict[LifeCycleId, KVCacheIterationStatsDelta]:
+        stats = {
+            life_cycle: delta.copy()
+            for life_cycle, delta in self._iteration_stats_by_life_cycle.items()
+            if not delta.empty
+        }
+        self._iteration_stats_by_life_cycle.clear()
+        return stats
+
+    def _commit_ssm_snapshot_iteration_stats(
+        self,
+        iteration_stats_by_life_cycle: dict[LifeCycleId, SsmSnapshotIterationStatsDelta],
+    ) -> None:
+        if not self._stats_enabled:
+            return
+        for life_cycle, iteration_stats in iteration_stats_by_life_cycle.items():
+            if iteration_stats.empty:
+                continue
+            destination = self._ssm_snapshot_iteration_stats_by_life_cycle.setdefault(
+                life_cycle, SsmSnapshotIterationStatsDelta()
+            )
+            destination.add(iteration_stats)
+
+    def get_and_reset_ssm_snapshot_iteration_stats(
+        self,
+    ) -> dict[LifeCycleId, SsmSnapshotIterationStatsDelta]:
+        stats = {
+            life_cycle: delta.copy()
+            for life_cycle, delta in self._ssm_snapshot_iteration_stats_by_life_cycle.items()
+            if not delta.empty
+        }
+        self._ssm_snapshot_iteration_stats_by_life_cycle.clear()
+        return stats
+
+    def _commit_reused_blocks_by_level(
+        self, by_life_cycle: dict[LifeCycleId, ReusedBlocksByLevel]
+    ) -> None:
+        """Commit the per-cache-level split of the reuse block counts.
+
+        Committed alongside the scalar iteration stats so both views cover exactly the same
+        requests: a cache whose pending stats are discarded contributes to neither.
+        """
+        if not self._stats_enabled:
+            return
+        for life_cycle, by_level in by_life_cycle.items():
+            if by_level.empty:
+                continue
+            self._iter_reused_blocks_by_level.setdefault(life_cycle, ReusedBlocksByLevel()).add(
+                by_level
+            )
+
+    def get_and_reset_iteration_reused_blocks_by_level(
+        self,
+    ) -> dict[LifeCycleId, ReusedBlocksByLevel]:
+        """Return and reset the per-cache-level reuse block counts for this iteration."""
+        by_life_cycle = self._iter_reused_blocks_by_level
+        self._iter_reused_blocks_by_level = {}
+        return by_life_cycle
+
+    def record_request_suspended(self) -> None:
+        """Count one ACTIVE->SUSPENDED transition for the current iteration window."""
+        if not self._stats_enabled:
+            return
+        self._iter_suspended_requests += 1
+
+    def record_request_resumed(self) -> None:
+        """Count one preemption recovery for the current iteration window.
+
+        Only a previously-ACTIVE cache that was suspended and then successfully
+        resumed counts. A freshly-created cache is activated by its first resume()
+        call, but that is an admission, not a recovery, and is not counted.
+        """
+        if not self._stats_enabled:
+            return
+        self._iter_resumed_requests += 1
+
+    def get_and_reset_iteration_suspend_resume_stats(self) -> tuple[int, int]:
+        """Return (suspended, resumed) request counts since the last drain and reset them.
+
+        Suspend/resume is a per-request, manager-level event (not per-pool-group), so it
+        is drained alongside get_and_reset_iteration_stats once per iteration-stats fetch.
+
+        Both counters track the same population, so they are directly comparable:
+        the running (suspended - resumed) total is the number of requests still
+        parked in the SUSPENDED state.
+        """
+        suspended = self._iter_suspended_requests
+        resumed = self._iter_resumed_requests
+        self._iter_suspended_requests = 0
+        self._iter_resumed_requests = 0
+        return suspended, resumed
+
+    def record_disk_prefetch_blocks(self, num_blocks: int) -> None:
+        """Count the blocks a prefetch call actually migrated from disk to host."""
+        assert num_blocks >= 0
+        if self._stats_enabled:
+            self._iter_disk_prefetch_blocks += num_blocks
+
+    def get_and_reset_iteration_disk_prefetch_blocks(self) -> int:
+        """Return and reset disk-to-host prefetch blocks for this iteration."""
+        num_blocks = self._iter_disk_prefetch_blocks
+        self._iter_disk_prefetch_blocks = 0
+        return num_blocks
+
+    def _commit_cached_tokens_by_level(self, counts: CountsByLevel) -> None:
+        """Accumulate a request's initial cached-token attribution, by cache level, into this
+        iteration. Committed alongside the scalar iteration stats so both views cover exactly the
+        same requests."""
+        assert NDEBUG or all(count >= 0 for count in counts)
+        if self._stats_enabled:
+            self._iter_cached_tokens_by_level = add_counts_by_level(
+                self._iter_cached_tokens_by_level, counts
+            )
+
+    def get_and_reset_iteration_cached_tokens_by_level(self) -> CountsByLevel:
+        """Return the per-cache-level cached-token counts since the last drain and reset them."""
+        counts = self._iter_cached_tokens_by_level
+        self._iter_cached_tokens_by_level = []
+        return counts
+
+    def get_storage_statistics(
+        self, cache_level: CacheLevel = GPU_LEVEL
+    ) -> list[StorageStatistics]:
+        """Return independent per-pool values; this backend requires serialized access."""
+        return deepcopy(list(self._storage.get_statistics(cache_level)))
+
+    def get_life_cycle_pool_group_indices(
+        self, cache_level: CacheLevel = GPU_LEVEL
+    ) -> list[PoolGroupIndex]:
+        """Return lifecycle-to-pool indices; this backend shares the hot grouping at all levels."""
+        return [
+            self._storage.get_pool_group_index(life_cycle)
+            for life_cycle in typed_range(self._storage.num_life_cycles)
+        ]
+
+    def get_and_reset_iteration_peak_block_stats(
+        self, cache_level: CacheLevel
+    ) -> TypedIndexList[PoolGroupIndex, PoolGroupPeakBlockStats]:
+        self._update_iteration_peak_num_blocks()
+        peak = make_typed(
+            lambda pool_group_index: PoolGroupPeakBlockStats(
+                available=self._iteration_peak_num_blocks_by_cache_level[cache_level][
+                    pool_group_index
+                ].available,
+                unavailable=self._iteration_peak_num_blocks_by_cache_level[cache_level][
+                    pool_group_index
+                ].unavailable,
+                evictable=self._iteration_peak_num_blocks_by_cache_level[cache_level][
+                    pool_group_index
+                ].evictable,
+            ),
+            self._storage.num_pool_groups,
+        )
+        self._reset_iteration_peak_num_blocks(cache_level)
+        return peak
+
+    def get_and_reset_iteration_peak_block_stats_by_level(
+        self,
+    ) -> TypedIndexList[CacheLevel, TypedIndexList[PoolGroupIndex, PoolGroupPeakBlockStats]]:
+        """Drain every level at once.
+
+        The peaks are already tracked as one per-level record, so a caller that wants all of them
+        should not take that record apart one level at a time.
+        """
+        self._update_iteration_peak_num_blocks()
+        peak = self._iteration_peak_num_blocks_by_cache_level
+        self._reset_iteration_peak_num_blocks()
+        return peak
+
+    def mark_stats_dirty(self, kv_cache_id: int | None) -> None:
+        if kv_cache_id is not None:
+            self._dirty_stats_kv_cache_ids.add(kv_cache_id)
+
+    def clear_stats_dirty(self, kv_cache_id: int | None) -> None:
+        if kv_cache_id is not None:
+            self._dirty_stats_kv_cache_ids.discard(kv_cache_id)
+
+    def get_dirty_stats_kv_cache_ids(self) -> set[int]:
+        return self._dirty_stats_kv_cache_ids.copy()
+
+    def mark_stats_excluded(self, kv_cache_id: int | None) -> None:
+        if kv_cache_id is not None:
+            self._stats_excluded_kv_cache_ids.add(kv_cache_id)
+            self.clear_stats_dirty(kv_cache_id)
+
+    def clear_stats_excluded(self, kv_cache_id: int | None) -> None:
+        if kv_cache_id is not None:
+            self._stats_excluded_kv_cache_ids.discard(kv_cache_id)
+
+    def is_stats_excluded(self, kv_cache_id: int | None) -> bool:
+        return kv_cache_id is not None and kv_cache_id in self._stats_excluded_kv_cache_ids
+
     # sorted by CacheLevel from warm to cold
     @property
     def cache_tier_list(self) -> HomoTuple[CacheTier]:
@@ -307,6 +840,10 @@ class KVCacheManager:
     @property
     def tokens_per_block(self) -> int:
         return self._radix_tree.tokens_per_block
+
+    @property
+    def event_manager(self) -> "KVCacheEventManager | None":
+        return self._event_manager
 
     @property
     def allow_seq_rebasing(self) -> bool:
@@ -322,8 +859,22 @@ class KVCacheManager:
         return self._init_config.enable_partial_reuse
 
     @property
-    def ssm_reuse_interval(self) -> int:
-        return self._init_config.ssm_reuse_interval
+    def enable_swa_scratch_reuse(self) -> bool:
+        return self._init_config.enable_swa_scratch_reuse
+
+    def supports_index_mode(self, mode: PageIndexMode) -> bool | None:
+        """Whether managed KV caches support the given page index mode.
+
+        Returns:
+            True  — the mode is supported by every KV cache.
+            False — the mode is not supported by any KV cache.
+            None  — support is per-instance; check _KVCache.supports_index_mode().
+        """
+        match mode:
+            case PageIndexMode.PER_LAYER:
+                return True
+            case PageIndexMode.SHARED:
+                return None if self.enable_swa_scratch_reuse else True
 
     @property
     def num_layers(self) -> int:
@@ -341,6 +892,11 @@ class KVCacheManager:
         """
         Layers are divided into multiple groups.
         Buffers in the same layer group for the same token block are always allocated/deallocated together.
+
+        NOTE: the iteration order of the layer lists (and of the groups) is NOT part of
+        the API contract and may differ across backends/runs. Do not rely on it for
+        buffer/pool memory order -- query ``pool_group_descs`` (PoolGroupDesc.pools[i]
+        .base_address + coalesced_buffers) for that.
         """
         layer_to_life_cycle_ids = self._storage._layer_to_life_cycle_ids
         num_life_cycles = self._life_cycles.size
@@ -364,53 +920,72 @@ class KVCacheManager:
         Returns:
             A iterator of aggregated buffers.
         """
-        # Group by (life_cycle, pool_index)
         groups = defaultdict[tuple[LifeCycleId, PoolIndex], list[tuple[Range, ExpandedBuffer]]](
             list[tuple[Range, ExpandedBuffer]]
         )
         buffer_attr_map = self._storage._buffer_attr
-        for b in buffers:
-            attr = buffer_attr_map[b]
-            size = attr.size
+        for buffer in buffers:
+            attr = buffer_attr_map[buffer]
             start = attr.offset
             key = (attr.life_cycle_id, attr.pool_index)
-            groups[key].append((Range(start, start + size), ExpandedBuffer(b, attr.expansion)))
+            groups[key].append(
+                (Range(start, start + attr.size), ExpandedBuffer(buffer, attr.expansion))
+            )
 
         storage = self._storage._levels[GPU_LEVEL].storage
         lc2pg = self._storage._life_cycle_grouping
         for (lc, pool_idx), group in groups.items():
             pg_idx = lc2pg[lc]
-            # Sort by start offset
-            group.sort(key=lambda x: x[0].start)
-            # Merge contiguous
+            group.sort(key=lambda item: item[0].start)
             current_start, current_end, current_buffers = (
                 group[0][0].start,
                 group[0][0].end,
                 [group[0][1]],
             )
-            # cache stride and pool_base for this group
             stride = storage.slot_size(pg_idx)[pool_idx]
             pool_base = int(cast(int, storage.slot_address(pg_idx, pool_idx, SlotId(0))))
-            for i in range(1, len(group)):
-                next_range, next_buf = group[i]
+            for next_range, next_buffer in group[1:]:
                 if next_range.start == current_end:
                     current_end = next_range.end
-                    current_buffers.append(next_buf)
-                else:
-                    base = MemAddress(pool_base + current_start)
-                    yield AggregatedPageDesc(
-                        base, current_end - current_start, stride, lc, tuple(current_buffers)
-                    )
-                    current_start, current_end, current_buffers = (
-                        next_range.start,
-                        next_range.end,
-                        [next_buf],
-                    )
-            # Flush last
+                    current_buffers.append(next_buffer)
+                    continue
+
+                base = MemAddress(pool_base + current_start)
+                yield AggregatedPageDesc(
+                    base, current_end - current_start, stride, lc, tuple(current_buffers)
+                )
+                current_start, current_end, current_buffers = (
+                    next_range.start,
+                    next_range.end,
+                    [next_buffer],
+                )
             base = MemAddress(pool_base + current_start)
             yield AggregatedPageDesc(
                 base, current_end - current_start, stride, lc, tuple(current_buffers)
             )
+
+    @property
+    def pool_group_descs(self) -> TypedIndexList[PoolGroupIndex, PoolGroupDesc]:
+        storage = self._storage
+
+        def get_pool_group_desc(pg_idx: PoolGroupIndex) -> PoolGroupDesc:
+            slot_size_list = storage.slot_size(pg_idx)
+            pools = make_typed(
+                lambda pool_idx: PoolDesc(
+                    pool_index=pool_idx,
+                    base_address=storage.get_mem_pool_base_address(pg_idx, pool_idx),
+                    slot_bytes=slot_size_list[pool_idx],
+                ),
+                storage.num_pools(pg_idx),
+            )
+            return PoolGroupDesc(
+                pool_group_index=pg_idx,
+                num_slots=storage.num_slots(pg_idx),
+                slot_desc=storage._slot_desc_list[pg_idx],
+                pools=pools,
+            )
+
+        return make_typed(get_pool_group_desc, storage.num_pool_groups)
 
     @property
     def _current_gpu_ratio(self) -> TypedIndexList[PoolGroupIndex, float]:
@@ -442,7 +1017,7 @@ class KVCacheManager:
             b: TypedIndexList[PoolGroupIndex, float],
             thres: float,
         ) -> bool:
-            return any(not (1 / thres < x / y < thres) for x, y in zip(a, b))
+            return any(not (1 / thres < x / y < thres) for x, y in zip(a, b, strict=True))
 
         if level == GPU_LEVEL:
             return check_mismatch(self._target_ratio_list_gpu, self._current_gpu_ratio, 1.25)
@@ -481,7 +1056,7 @@ class KVCacheManager:
 
     @property
     def need_adjustment(self) -> bool:
-        if self._num_closed_kv_caches < 2000:
+        if self._num_sampled_kv_caches < 2000:
             return False
         if time.monotonic() - self._last_adjustment_time < 120:
             return False
@@ -505,26 +1080,26 @@ class KVCacheManager:
         self._last_adjustment_time = time.monotonic()
 
     def _try_update_target_ratios(self) -> None:
-        if self._num_closed_kv_caches - self._last_update_num_closed_requests < 100:
+        if self._num_sampled_kv_caches - self._last_update_num_sampled_kv_caches < 100:
             return
-        self._last_update_num_closed_requests = self._num_closed_kv_caches
+        self._last_update_num_sampled_kv_caches = self._num_sampled_kv_caches
         tokens_per_block = self.tokens_per_block
         storage = self._storage
-
-        def ratio_from_length(
-            history_length: int, capacity: int
-        ) -> TypedIndexList[PoolGroupIndex, float]:
-            return storage.ratio_from_length(tokens_per_block, history_length, capacity)
 
         avg_reused_length: int = round(self._avg_reused_length.value)
         avg_capacity: int = round(self._avg_sqr_capacity.value**0.5)
         avg_history_length: int = round(self._avg_sqr_history_length.value**0.5)
         if avg_capacity > 0:
-            self._target_ratio_list_gpu = storage.constrain_ratio(
-                ratio_from_length(avg_history_length, avg_capacity)
+            life_cycle_ratio = storage.ratio_from_length(
+                tokens_per_block, avg_history_length, avg_capacity
             )
+            pool_group_ratio = storage.pool_group_ratio(life_cycle_ratio)
+            self._target_ratio_list_gpu = storage.constrain_pool_group_ratio(pool_group_ratio)
         if avg_reused_length > 0:
-            self._target_ratio_list_other = ratio_from_length(avg_reused_length, avg_reused_length)
+            life_cycle_ratio = storage.ratio_from_length(
+                tokens_per_block, avg_reused_length, avg_reused_length
+            )
+            self._target_ratio_list_other = storage.pool_group_ratio(life_cycle_ratio)
 
     # @TODO: need updating when dynamic resizing is supported.
     def clamp_max_seq_len_for_mem(self, batch_size: int, token_num_upper_bound: int) -> int:
@@ -552,15 +1127,19 @@ class KVCacheManager:
 
         for pg in typed_range(num_pool_groups):
             remaining_slots[pg] -= get_num_slots(1)[pg] * (batch_size - 1)
-            assert remaining_slots[pg] >= 0
+            if remaining_slots[pg] < 0:
+                return 0
 
         def is_enough(num_blocks: int) -> bool:
             return all(
                 cnt <= rem
-                for cnt, rem in zip(get_num_slots(num_blocks * tokens_per_block), remaining_slots)
+                for cnt, rem in zip(
+                    get_num_slots(num_blocks * tokens_per_block), remaining_slots, strict=True
+                )
             )
 
-        assert is_enough(1)
+        if not is_enough(1):
+            return 0
         lb = 1
         ub = div_up(token_num_upper_bound, tokens_per_block)
         if is_enough(ub):
@@ -572,3 +1151,15 @@ class KVCacheManager:
             else:
                 ub = mid
         return min(lb * tokens_per_block, token_num_upper_bound)
+
+    @property
+    def init_config(self) -> KVCacheManagerConfig:
+        return self._init_config
+
+    @property
+    def commit_min_snapshot(self) -> bool:
+        return self.init_config.commit_min_snapshot
+
+    @property
+    def text_only(self) -> bool:
+        return self.init_config.text_only

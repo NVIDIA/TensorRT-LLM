@@ -1,0 +1,1821 @@
+{
+  "TorchLlmArgs": [
+    {
+      "allowed_values": [
+        "AUTO",
+        "NCCL",
+        "UB",
+        "MINLATENCY",
+        "ONESHOT",
+        "TWOSHOT",
+        "LOWPRECISION",
+        "MNNVL",
+        "NCCL_SYMMETRIC"
+      ],
+      "capture_policy": "literal|none",
+      "kind": "categorical",
+      "path": "allreduce_strategy"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "attention_dp_config.batching_wait_iters"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "attention_dp_config.enable_balance"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "attention_dp_config.enable_kv_cache_aware_routing"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "attention_dp_config.kv_cache_routing_account_for_in_transfer"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "attention_dp_config.kv_cache_routing_cold_start_warmup"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "attention_dp_config.kv_cache_routing_conversation_affinity"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "attention_dp_config.kv_cache_routing_fair_share_multiplier"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "attention_dp_config.kv_cache_routing_load_balance_weight"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "attention_dp_config.kv_cache_routing_match_rate_threshold"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "attention_dp_config.kv_cache_routing_max_sessions"
+    },
+    {
+      "allowed_values": [
+        "round_robin",
+        "least_queued",
+        "least_tokens"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "attention_dp_config.kv_cache_routing_new_conv_placement"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "attention_dp_config.timeout_iters"
+    },
+    {
+      "allowed_values": [
+        "VANILLA",
+        "TRTLLM",
+        "FLASHINFER"
+      ],
+      "capture_policy": "allowlist",
+      "kind": "categorical",
+      "path": "attn_backend"
+    },
+    {
+      "allowed_values": [
+        "pytorch"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "backend"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "batch_wait_max_tokens_ratio"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "batch_wait_timeout_iters"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "batch_wait_timeout_ms"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "cache_transceiver_config.agent_bounce_buffer_enable"
+    },
+    {
+      "allowed_values": [
+        "DEFAULT",
+        "UCX",
+        "NIXL",
+        "MOONCAKE",
+        "MPI"
+      ],
+      "capture_policy": "literal|none",
+      "kind": "categorical",
+      "path": "cache_transceiver_config.backend"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "cache_transceiver_config.enable_pipelined_transfer"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "cache_transceiver_config.kv_cache_bounce_size_mb"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "cache_transceiver_config.kv_transfer_poll_interval_ms"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "cache_transceiver_config.kv_transfer_sender_future_timeout_ms"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "cache_transceiver_config.kv_transfer_timeout_ms"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "cache_transceiver_config.max_tokens_in_buffer"
+    },
+    {
+      "allowed_values": [
+        "CPP",
+        "PYTHON",
+        "auto"
+      ],
+      "capture_policy": "literal|none",
+      "kind": "categorical",
+      "path": "cache_transceiver_config.transceiver_runtime"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "native",
+        "rank_striped_read_ahead"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "checkpoint_io_policy"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "context_parallel_size"
+    },
+    {
+      "allowed_values": [
+        "ULYSSES",
+        "RING",
+        "HELIX"
+      ],
+      "capture_policy": "enum[CpType]",
+      "kind": "categorical",
+      "path": "cp_config.cp_type"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "cp_config.fifo_version"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "cp_config.tokens_per_block"
+    },
+    {
+      "capture_policy": "bool|none",
+      "kind": "value",
+      "path": "cp_config.use_nccl_for_alltoall"
+    },
+    {
+      "capture_policy": "list[int]|none",
+      "kind": "value",
+      "path": "cuda_graph_config.batch_sizes"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "cuda_graph_config.enable_padding"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "cuda_graph_config.max_batch_size"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "cuda_graph_config.max_num_token"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "cuda_graph_config.max_seq_len"
+    },
+    {
+      "allowed_values": [
+        "decode",
+        "encode"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "cuda_graph_config.mode"
+    },
+    {
+      "capture_policy": "list[int]|none",
+      "kind": "value",
+      "path": "cuda_graph_config.num_tokens"
+    },
+    {
+      "capture_policy": "list[int]|none",
+      "kind": "value",
+      "path": "cuda_graph_config.seq_lens"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "disable_mm_encoder"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "disable_overlap_scheduler"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float16",
+        "bfloat16",
+        "float32"
+      ],
+      "capture_policy": "allowlist",
+      "kind": "categorical",
+      "path": "dtype"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "dwdp_config.contention_opt"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "dwdp_config.dwdp_size"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "dwdp_config.num_experts_per_worker"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "dwdp_config.num_groups"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "dwdp_config.num_prefetch_experts"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "enable_attention_dp"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "enable_autotuner"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "enable_chunked_prefill"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "enable_early_first_token_response"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "enable_encoder_decoder_mixed_cuda_graph"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "enable_energy_metrics"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "enable_in_graph_sampling"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "enable_iter_perf_stats"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "enable_iter_req_stats"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "enable_layerwise_nvtx_marker"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "enable_lm_head_tp_in_adp"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "enable_lora"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "enable_low_latency_host_dispatch"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "enable_min_latency"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "enable_mla_skip_correction"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "enable_resource_governor"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "enable_speculative_beam_history_d2h"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "encode_only"
+    },
+    {
+      "capture_policy": "list[int]|none",
+      "kind": "value",
+      "path": "encoder_cuda_graph_config.batch_sizes"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "encoder_cuda_graph_config.enable_padding"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "encoder_cuda_graph_config.max_batch_size"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "encoder_cuda_graph_config.max_num_token"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "encoder_cuda_graph_config.max_seq_len"
+    },
+    {
+      "allowed_values": [
+        "encode"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "encoder_cuda_graph_config.mode"
+    },
+    {
+      "capture_policy": "list[int]|none",
+      "kind": "value",
+      "path": "encoder_cuda_graph_config.num_tokens"
+    },
+    {
+      "capture_policy": "list[int]|none",
+      "kind": "value",
+      "path": "encoder_cuda_graph_config.seq_lens"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "encoder_max_batch_size"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "encoder_max_num_tokens"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "force_dynamic_quantization"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "garbage_collection_gen0_threshold"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "gather_generation_logits"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "trtllm"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "generation_config"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "rw",
+        "ro"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "gms_config.mode"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "gpus_per_node"
+    },
+    {
+      "allowed_values": [
+        "xgrammar",
+        "llguidance"
+      ],
+      "capture_policy": "literal|none",
+      "kind": "categorical",
+      "path": "guided_decoding_backend"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "iter_stats_max_iterations"
+    },
+    {
+      "allowed_values": [
+        "quantization_for_cold_page",
+        "triattention"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.algorithm"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_compression_config.beta"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_compression_config.budget"
+    },
+    {
+      "allowed_values": [
+        "union",
+        "per_head",
+        "per_layer_perhead"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.eviction_mode"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_compression_config.normalize_scores"
+    },
+    {
+      "allowed_values": [
+        "nvfp4"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.quant"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.attention_dp_events_gather_period_ms"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "kv_cache_config.avg_seq_len"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.block_reuse_config.max_num_turns"
+    },
+    {
+      "allowed_values": [
+        "all_reusable",
+        "per_request",
+        "per_conversation"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "kv_cache_config.block_reuse_config.policy"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.copy_on_partial_reuse"
+    },
+    {
+      "capture_policy": "float|none",
+      "kind": "value",
+      "path": "kv_cache_config.cross_kv_cache_fraction"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "kv_cache_config.disk_cache_size"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.disk_prefetch_num_reqs"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float16",
+        "bfloat16",
+        "float32",
+        "fp8",
+        "fp8_ds_mla",
+        "nvfp4"
+      ],
+      "capture_policy": "allowlist",
+      "kind": "categorical",
+      "path": "kv_cache_config.dtype"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.enable_block_reuse"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.enable_kv_pool_rebalance"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.enable_partial_reuse"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.enable_swa_scratch_reuse"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.event_buffer_max_size"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "kv_cache_config.fp8_context_mla_kv_len_cap"
+    },
+    {
+      "capture_policy": "float|none",
+      "kind": "value",
+      "path": "kv_cache_config.free_gpu_memory_fraction"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "kv_cache_config.host_cache_size"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.iteration_stats_interval"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "v1_block_key",
+        "v2_sha256",
+        "v2_sha256_64"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "kv_cache_config.kv_cache_event_hash_algo"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.kv_events_config.buffer_steps"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.kv_events_config.enable_kv_cache_events"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.kv_events_config.hwm"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.kv_events_config.max_queue_size"
+    },
+    {
+      "allowed_values": [
+        "null",
+        "zmq"
+      ],
+      "capture_policy": "literal|none",
+      "kind": "categorical",
+      "path": "kv_cache_config.kv_events_config.publisher"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float16",
+        "bfloat16",
+        "float32"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "kv_cache_config.mamba_ssm_cache_dtype"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.mamba_ssm_philox_rounds"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.mamba_ssm_stochastic_rounding"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.mamba_state_config.enable_branch_snapshot"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.mamba_state_config.periodic_snapshot_interval"
+    },
+    {
+      "capture_policy": "list[int]|none",
+      "kind": "value",
+      "path": "kv_cache_config.max_attention_window"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.max_gpu_total_bytes"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "kv_cache_config.max_tokens"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_cache_config.max_util_for_resume"
+    },
+    {
+      "capture_policy": "list[float]|none",
+      "kind": "value",
+      "path": "kv_cache_config.pool_ratio"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "kv_cache_config.secondary_offload_min_priority"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "kv_cache_config.sink_token_length"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.tokens_per_block"
+    },
+    {
+      "allowed_values": [
+        "auto"
+      ],
+      "capture_policy": "bool|literal",
+      "kind": "categorical",
+      "path": "kv_cache_config.use_kv_cache_manager_v2"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.use_uvm"
+    },
+    {
+      "allowed_values": [
+        "lmcache",
+        "lmcache-mp",
+        "kvbm"
+      ],
+      "capture_policy": "allowlist|none",
+      "kind": "categorical",
+      "path": "kv_connector_config.connector"
+    },
+    {
+      "capture_policy": "list[int]|none",
+      "kind": "value",
+      "path": "layer_wise_benchmarks_config.calibration_layer_indices"
+    },
+    {
+      "allowed_values": [
+        "NONE",
+        "MARK",
+        "COLLECT"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "layer_wise_benchmarks_config.calibration_mode"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "dummy",
+        "vision_only",
+        "gms",
+        "AUTO",
+        "DUMMY",
+        "VISION_ONLY",
+        "GMS"
+      ],
+      "capture_policy": "allowlist|enum[LoadFormat]",
+      "kind": "categorical",
+      "path": "load_format"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "lora_config.cuda_graph_specialize_lora"
+    },
+    {
+      "allowed_values": [
+        "hf",
+        "nemo"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "lora_config.lora_ckpt_source"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "lora_config.max_cpu_loras"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "lora_config.max_lora_rank"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "lora_config.max_loras"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "lora_config.overlap_lora_and_base"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "lora_config.swap_gate_up_proj_lora_b_weight"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "max_batch_size"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "max_beam_width"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "max_input_len"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "max_num_tokens"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "max_seq_len"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "max_stats_len"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "mla_skip_correction_threshold"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "mm_encoder_only"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "moe_cluster_parallel_size"
+    },
+    {
+      "allowed_values": [
+        "AUTO",
+        "CUTLASS",
+        "CUTEDSL",
+        "CUTEDSL_FC12",
+        "TRTLLM",
+        "DEEPGEMM",
+        "DENSEGEMM",
+        "VANILLA",
+        "TRITON",
+        "MARLIN",
+        "MEGAMOE_DEEPGEMM",
+        "MEGAMOE_CUTEDSL"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "moe_config.backend"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "moe_config.disable_finalize_fusion"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "moe_config.max_num_tokens"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "moe_config.use_low_precision_moe_combine"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "moe_expert_parallel_size"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "moe_tensor_parallel_size"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "multimodal_config.encoder_cache_max_bytes"
+    },
+    {
+      "allowed_values": [
+        "DISABLED",
+        "DEFAULT",
+        "EAGER"
+      ],
+      "capture_policy": "enum[MultimodalEncoderSchedulingPolicy]",
+      "kind": "categorical",
+      "path": "multimodal_config.encoder_scheduling_policy"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "multimodal_config.encoder_side_stream_max_ahead"
+    },
+    {
+      "capture_policy": "float|none",
+      "kind": "value",
+      "path": "multimodal_config.video_pruning_rate"
+    },
+    {
+      "allowed_values": [
+        "per_module"
+      ],
+      "capture_policy": "allowlist",
+      "kind": "categorical",
+      "path": "mx_config.preshard_strategy"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "mx_config.server_query_timeout_s"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "num_postprocess_workers"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "num_serve_frontends"
+    },
+    {
+      "allowed_values": [
+        "cutlass",
+        "cublaslt",
+        "cutedsl",
+        "cuda_core",
+        "marlin"
+      ],
+      "capture_policy": "list[literal]",
+      "kind": "categorical",
+      "path": "nvfp4_gemm_config.allowed_backends"
+    },
+    {
+      "allowed_values": [
+        "rpc",
+        "ray"
+      ],
+      "capture_policy": "literal|none",
+      "kind": "categorical",
+      "path": "orchestrator_type"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "peft_cache_config.device_cache_percent"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "peft_cache_config.host_cache_size"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "peft_cache_config.max_adapter_size"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "peft_cache_config.max_pages_per_block_device"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "peft_cache_config.max_pages_per_block_host"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "peft_cache_config.num_copy_streams"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "peft_cache_config.num_device_module_layer"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "peft_cache_config.num_ensure_workers"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "peft_cache_config.num_host_module_layer"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "peft_cache_config.num_put_workers"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "peft_cache_config.optimal_adapter_size"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "perf_metrics_max_requests"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "pipeline_parallel_size"
+    },
+    {
+      "capture_policy": "list[int]|none",
+      "kind": "value",
+      "path": "pp_partition"
+    },
+    {
+      "capture_policy": "list[int]|none",
+      "kind": "value",
+      "path": "prefill_capture_num_tokens"
+    },
+    {
+      "allowed_values": [
+        "disabled",
+        "piecewise",
+        "breakable"
+      ],
+      "capture_policy": "enum[PrefillCudaGraphBackend]",
+      "kind": "categorical",
+      "path": "prefill_cuda_graph_backend"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "print_iter_log"
+    },
+    {
+      "capture_policy": "list[float]|none",
+      "kind": "value",
+      "path": "prometheus_metrics_config.e2e_request_latency_buckets"
+    },
+    {
+      "capture_policy": "list[float]|none",
+      "kind": "value",
+      "path": "prometheus_metrics_config.request_decode_time_buckets"
+    },
+    {
+      "capture_policy": "list[float]|none",
+      "kind": "value",
+      "path": "prometheus_metrics_config.request_inference_time_buckets"
+    },
+    {
+      "capture_policy": "list[float]|none",
+      "kind": "value",
+      "path": "prometheus_metrics_config.request_prefill_time_buckets"
+    },
+    {
+      "capture_policy": "list[float]|none",
+      "kind": "value",
+      "path": "prometheus_metrics_config.request_queue_time_buckets"
+    },
+    {
+      "capture_policy": "list[float]|none",
+      "kind": "value",
+      "path": "prometheus_metrics_config.time_per_output_token_buckets"
+    },
+    {
+      "capture_policy": "list[float]|none",
+      "kind": "value",
+      "path": "prometheus_metrics_config.time_to_first_token_buckets"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "ray_placement_config.defer_workers_init"
+    },
+    {
+      "capture_policy": "float|none",
+      "kind": "value",
+      "path": "ray_placement_config.per_worker_gpu_share"
+    },
+    {
+      "capture_policy": "list[list[int]]|none",
+      "kind": "value",
+      "path": "ray_placement_config.placement_bundle_indices"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "deepseek-r1",
+        "poolside_v1",
+        "laguna",
+        "qwen3",
+        "qwen3_5",
+        "minimax_m2",
+        "minimax_m2_append_think",
+        "nano-v3",
+        "gemma4",
+        "kimi_k2",
+        "kimi_k25"
+      ],
+      "capture_policy": "allowlist|none",
+      "kind": "categorical",
+      "path": "reasoning_parser"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "reorder_policy_config.policy_args.agent_inflight_seq_num"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "reorder_policy_config.policy_args.agent_percentage"
+    },
+    {
+      "allowed_values": [
+        "AgentTree"
+      ],
+      "capture_policy": "literal|none",
+      "kind": "categorical",
+      "path": "reorder_policy_config.policy_name"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "request_stats_max_iterations"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "return_perf_metrics"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sampler_force_async_worker"
+    },
+    {
+      "allowed_values": [
+        "MAX_UTILIZATION",
+        "GUARANTEED_NO_EVICT",
+        "STATIC_BATCH"
+      ],
+      "capture_policy": "enum[CapacitySchedulerPolicy]",
+      "kind": "categorical",
+      "path": "scheduler_config.capacity_scheduler_policy"
+    },
+    {
+      "allowed_values": [
+        "FIRST_COME_FIRST_SERVED",
+        "EQUAL_PROGRESS",
+        "FORCE_CHUNK"
+      ],
+      "capture_policy": "enum[ContextChunkingPolicy]|none",
+      "kind": "categorical",
+      "path": "scheduler_config.context_chunking_policy"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "scheduler_config.dynamic_batch_config.dynamic_batch_moving_average_window"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "scheduler_config.dynamic_batch_config.enable_batch_size_tuning"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "scheduler_config.dynamic_batch_config.enable_max_num_tokens_tuning"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "scheduler_config.enable_prefix_aware_scheduling"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "scheduler_config.use_python_scheduler"
+    },
+    {
+      "allowed_values": [
+        "fcfs",
+        "priority"
+      ],
+      "capture_policy": "enum[WaitingQueuePolicy]",
+      "kind": "categorical",
+      "path": "scheduler_config.waiting_queue_policy"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "skip_tokenizer_init"
+    },
+    {
+      "allowed_values": [
+        "dsa",
+        "deepseek_v4",
+        "minimax_m3",
+        "qsa",
+        "rocket",
+        "skip_softmax"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "sparse_attention_config.algorithm"
+    },
+    {
+      "capture_policy": "list[int]",
+      "kind": "value",
+      "path": "sparse_attention_config.compress_ratios"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.enable_heuristic_topk"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.fuse_qkv_index_projection"
+    },
+    {
+      "allowed_values": [
+        "triton",
+        "msa"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "sparse_attention_config.implementation"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "sparse_attention_config.index_head_dim"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "sparse_attention_config.index_n_heads"
+    },
+    {
+      "capture_policy": "bool|none",
+      "kind": "value",
+      "path": "sparse_attention_config.index_share_for_mtp_iteration"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "sparse_attention_config.index_topk"
+    },
+    {
+      "allowed_values": [
+        "fp8",
+        "fp4"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "sparse_attention_config.indexer_k_dtype"
+    },
+    {
+      "allowed_values": [
+        "bf16",
+        "fp8"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "sparse_attention_config.indexer_kv_dtype"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "sparse_attention_config.indexer_max_chunk_size"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.indexer_rope_interleave"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "sparse_attention_config.kernel_size"
+    },
+    {
+      "allowed_values": [
+        "bfloat16",
+        "float8_e5m2"
+      ],
+      "capture_policy": "allowlist|none",
+      "kind": "categorical",
+      "path": "sparse_attention_config.kt_cache_dtype"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "sparse_attention_config.num_attention_heads"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "sparse_attention_config.num_key_value_heads"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "sparse_attention_config.page_size"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "sparse_attention_config.prompt_budget"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "sparse_attention_config.q_split_threshold"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "sparse_attention_config.seq_len_threshold"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.skip_indexer_for_short_seqs"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "sparse_attention_config.sparse_block_size"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.sparse_disable_index_value"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "sparse_attention_config.sparse_index_dim"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "sparse_attention_config.sparse_init_blocks"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "sparse_attention_config.sparse_local_blocks"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "sparse_attention_config.sparse_num_index_heads"
+    },
+    {
+      "allowed_values": [
+        "max"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "sparse_attention_config.sparse_score_type"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "sparse_attention_config.sparse_topk_blocks"
+    },
+    {
+      "capture_policy": "float|none",
+      "kind": "value",
+      "path": "sparse_attention_config.target_sparsity"
+    },
+    {
+      "capture_policy": "float|none",
+      "kind": "value",
+      "path": "sparse_attention_config.threshold_scale_factor"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "sparse_attention_config.topk"
+    },
+    {
+      "capture_policy": "float|int|none",
+      "kind": "value",
+      "path": "sparse_attention_config.topr"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.use_cute_dsl_paged_mqa_logits"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.use_cute_dsl_topk"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.use_gvr_emission"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.use_self_sampling_topk"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "sparse_attention_config.window_size"
+    },
+    {
+      "capture_policy": "float|none",
+      "kind": "value",
+      "path": "speculative_config.acceptance_rate_threshold"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "speculative_config.acceptance_rate_window_size"
+    },
+    {
+      "allowed_values": [
+        "full",
+        "no_topk",
+        "no_topp",
+        "no_topk_no_topp"
+      ],
+      "capture_policy": "enum[AdvancedSamplingMode]",
+      "kind": "categorical",
+      "path": "speculative_config.advanced_sampling_mode"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "speculative_config.allow_advanced_sampling"
+    },
+    {
+      "allowed_values": [
+        "VANILLA",
+        "TRTLLM",
+        "FA4"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "speculative_config.attention_backend"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "speculative_config.begin_thinking_phase_token"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "speculative_config.block_size"
+    },
+    {
+      "allowed_values": [
+        "AUTO",
+        "DFlash",
+        "DSpark",
+        "Draft_Target",
+        "Eagle3",
+        "Eagle",
+        "MTP",
+        "NGram",
+        "PARD",
+        "SA",
+        "SaveState",
+        "User_Provided"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "speculative_config.decoding_type"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "speculative_config.dynamic_tree_max_topK"
+    },
+    {
+      "capture_policy": "none|set[int]",
+      "kind": "value",
+      "path": "speculative_config.eagle3_layers_to_capture"
+    },
+    {
+      "allowed_values": [
+        "llama3",
+        "mistral_large3"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "speculative_config.eagle3_model_arch"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "speculative_config.enable_global_pool"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "speculative_config.enable_penalty"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "speculative_config.end_thinking_phase_token"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "speculative_config.global_pool_size"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "speculative_config.is_keep_all"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "speculative_config.is_public_pool"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "speculative_config.is_use_oldest"
+    },
+    {
+      "allowed_values": [
+        "vanilla",
+        "gated",
+        "rnn"
+      ],
+      "capture_policy": "literal|none",
+      "kind": "categorical",
+      "path": "speculative_config.markov_head_type"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "speculative_config.markov_rank"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "speculative_config.mask_token_id"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "speculative_config.max_concurrency"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "speculative_config.max_draft_len"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "speculative_config.max_matching_ngram_size"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "speculative_config.max_non_leaves_per_layer"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "speculative_config.max_total_draft_tokens"
+    },
+    {
+      "allowed_values": [
+        "AUTO",
+        "CUTLASS",
+        "CUTEDSL",
+        "CUTEDSL_FC12",
+        "TRTLLM",
+        "DEEPGEMM",
+        "DENSEGEMM",
+        "VANILLA",
+        "TRITON",
+        "MARLIN",
+        "MEGAMOE_DEEPGEMM",
+        "MEGAMOE_CUTEDSL"
+      ],
+      "capture_policy": "literal|none",
+      "kind": "categorical",
+      "path": "speculative_config.moe_backend"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "speculative_config.num_eagle_layers"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "speculative_config.num_nextn_predict_layers"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "speculative_config.relaxed_delta"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "speculative_config.relaxed_topk"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "speculative_config.sa_config.enable_global_pool"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "speculative_config.sa_config.threshold"
+    },
+    {
+      "capture_policy": "list[int]|none",
+      "kind": "value",
+      "path": "speculative_config.target_layer_ids"
+    },
+    {
+      "capture_policy": "bool|none",
+      "kind": "value",
+      "path": "speculative_config.use_dynamic_tree"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "speculative_config.use_mtp_vanilla"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "speculative_config.use_rejection_sampling"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "speculative_config.use_relaxed_acceptance_for_thinking"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "speculative_config.write_interval"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "stream_interval"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "telemetry_config.disabled"
+    },
+    {
+      "allowed_values": [
+        "unknown",
+        "llm_class",
+        "cli_serve",
+        "cli_bench",
+        "cli_eval",
+        "disaggregated"
+      ],
+      "capture_policy": "enum[UsageContext]",
+      "kind": "categorical",
+      "path": "telemetry_config.usage_context"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "tensor_parallel_size"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "slow"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "tokenizer_mode"
+    },
+    {
+      "capture_policy": "list[int]|none",
+      "kind": "value",
+      "path": "torch_compile_config.capture_num_tokens"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "torch_compile_config.enable_fullgraph"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "torch_compile_config.enable_inductor"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "torch_compile_config.enable_piecewise_cuda_graph"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "torch_compile_config.enable_userbuffers"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "torch_compile_config.max_num_streams"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "trust_remote_code"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "use_cute_dsl_bf16_bmm"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "use_cute_dsl_bf16_gemm"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "use_cute_dsl_blockscaling_bmm"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "use_cute_dsl_blockscaling_mm"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "use_fine_grained_sync"
+    }
+  ]
+}

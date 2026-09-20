@@ -1,11 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Model loader for diffusion pipelines.
 
 Flow:
-1. Load config via DiffusionModelConfig.from_pretrained()
+1. Load config via DiffusionPipelineConfig.from_pretrained()
 2. Create pipeline via AutoPipeline.from_config() with MetaInit
 3. Load weights with on-the-fly quantization if dynamic_weight_quant=True
 4. Call pipeline.post_load_weights()
+5. Apply runtime LoRA adapters after all post-load hooks finish
 
 Dynamic Quantization:
 - If quant_config specifies FP8/NVFP4 and dynamic_weight_quant=True:
@@ -16,19 +32,23 @@ Dynamic Quantization:
 
 import os
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 import torch.distributed as dist
 
-from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
-from tensorrt_llm.llmapi.utils import download_hf_model
+from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.video_sparse_attention import (
+    CUTE_AVAILABLE,
+)
+from tensorrt_llm.llmapi.utils import download_hf_model, download_hf_partial
 from tensorrt_llm.logger import logger
+from tensorrt_llm.visual_gen.args import VisualGenArgs
 
-from .config import DiffusionModelConfig, VisualGenArgs
+from .config import DiffusionPipelineConfig
 from .mapping import VisualGenMapping
 from .models import AutoPipeline
+from .pipeline_registry import PIPELINE_REGISTRY, PipelineComponent
 
 if TYPE_CHECKING:
     from .models import BasePipeline
@@ -44,36 +64,38 @@ class PipelineLoader:
 
     Example:
         args = VisualGenArgs(
-            checkpoint_path="/path/to/model",
-            linear=LinearConfig(type="trtllm-fp8-blockwise"),
-            parallel=ParallelConfig(dit_tp_size=2),
+            model="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            parallel_config=ParallelConfig(ulysses_size=2),
         )
         pipeline = PipelineLoader(args).load()
     """
 
     def __init__(
         self,
-        args: Optional[VisualGenArgs] = None,
+        args: VisualGenArgs,
         *,
         device: str = "cuda",
-    ):
+    ) -> None:
         """
         Initialize model loader.
 
         Args:
-            args: VisualGenArgs containing all configuration (preferred)
-            device: Device to load model on (fallback if args is None)
+            args: VisualGenArgs containing all configuration.
+            device: CUDA device to load the model on (e.g., "cuda:0").
+                Per-rank device routing is the caller's responsibility;
+                the engine config itself is device-agnostic.
         """
         self.args = args
-        self.device = torch.device(args.device if args is not None else device)
+        self.device = torch.device(device)
 
     def _resolve_checkpoint_dir(self, checkpoint_dir: str) -> str:
         """Resolve checkpoint_dir to a local directory path.
 
         If checkpoint_dir is an existing local path, returns it unchanged.
         Otherwise, attempts to download from HuggingFace Hub using the
-        file-lock-protected ``download_hf_model`` utility (safe for
-        concurrent multi-process access).
+        file-lock-protected download utility. Pipelines may register an
+        allow-list so repositories with multiple checkpoint variants only
+        fetch the components supported by TRT-LLM.
 
         Args:
             checkpoint_dir: Local path or HuggingFace Hub model ID.
@@ -88,13 +110,28 @@ class PipelineLoader:
         if os.path.exists(checkpoint_dir):
             return checkpoint_dir
 
-        revision = self.args.revision if self.args else None
+        revision = self.args.revision
         logger.info(
             f"'{checkpoint_dir}' not found locally; "
             f"attempting HuggingFace Hub download (revision={revision})"
         )
         try:
-            local_dir = download_hf_model(checkpoint_dir, revision=revision)
+            entry = next(
+                (
+                    candidate
+                    for candidate in PIPELINE_REGISTRY.values()
+                    if checkpoint_dir in candidate.hf_ids
+                ),
+                None,
+            )
+            if entry is not None and entry.download_patterns:
+                local_dir = download_hf_partial(
+                    checkpoint_dir,
+                    allow_patterns=entry.download_patterns,
+                    revision=revision,
+                )
+            else:
+                local_dir = download_hf_model(checkpoint_dir, revision=revision)
         except Exception as e:
             raise ValueError(
                 f"Could not resolve '{checkpoint_dir}' as a local path or "
@@ -102,74 +139,137 @@ class PipelineLoader:
             ) from e
         return str(local_dir)
 
-    def _setup_visual_gen_mapping(self, config: DiffusionModelConfig) -> None:
-        if self.args is not None:
-            ws = dist.get_world_size() if dist.is_initialized() else 1
-            rk = dist.get_rank() if dist.is_initialized() else 0
-            vgm = VisualGenMapping(
-                ws,
-                rk,
-                cfg_size=self.args.parallel.dit_cfg_size,
-                tp_size=self.args.parallel.dit_tp_size,
-                ulysses_size=self.args.parallel.dit_ulysses_size,
-                ring_size=self.args.parallel.dit_ring_size,
-                order=self.args.parallel.dit_dim_order,
+    def _resolve_pipeline_config(self, checkpoint_dir: str) -> dict:
+        """Validate VisualGenArgs.pipeline_config against the registry and merge.
+
+        The user-facing dict on ``VisualGenArgs.pipeline_config`` is strict:
+        keys must appear in the resolved pipeline family's ``defaults``
+        (the schema-by-example carried on the registry entry). Unknown
+        keys raise immediately so typos surface at load time. The merged
+        dict is ``{**entry.defaults, **user_dict}`` — user-supplied values
+        win.
+        """
+        user_pipeline_config = dict(self.args.pipeline_config)
+
+        # Detect _class_name from the resolved checkpoint, look up the
+        # registry entry. If detection fails (or the class_name isn't
+        # registered) leave the validation to AutoPipeline.from_config
+        # so the user gets the existing "Unknown pipeline" error rather
+        # than a confusing pipeline_config validation error.
+        try:
+            class_name = AutoPipeline._detect_from_checkpoint(checkpoint_dir)
+        except ValueError:
+            return user_pipeline_config
+
+        entry = PIPELINE_REGISTRY.get(class_name)
+        if entry is None:
+            return user_pipeline_config
+
+        unknown = set(user_pipeline_config) - set(entry.defaults)
+        if unknown:
+            raise ValueError(
+                f"Unknown pipeline_config keys for {class_name} ({checkpoint_dir}): "
+                f"{sorted(unknown)}. Valid keys: {sorted(entry.defaults)}"
             )
-        else:
-            # Single-GPU fallback. no args = no parallelism.
-            vgm = VisualGenMapping(world_size=1, rank=0)
+        return {**entry.defaults, **user_pipeline_config}
+
+    def _setup_visual_gen_mapping(self, config: DiffusionPipelineConfig) -> None:
+        ws = dist.get_world_size() if dist.is_initialized() else 1
+        rk = dist.get_rank() if dist.is_initialized() else 0
+        attn2d_row, attn2d_col = self.args.parallel_config.attn2d_size
+        vgm = VisualGenMapping(
+            ws,
+            rk,
+            cfg_size=self.args.parallel_config.cfg_size,
+            ulysses_size=self.args.parallel_config.ulysses_size,
+            ring_size=self.args.parallel_config.ring_size,
+            attn2d_row_size=attn2d_row,
+            attn2d_col_size=attn2d_col,
+            tp_size=self.args.parallel_config.tp_size,
+            parallel_vae_size=self.args.parallel_config.parallel_vae_size,
+        )
+        llm_mapping = vgm.to_llm_mapping()
         config.visual_gen_mapping = vgm
-        config.mapping = vgm.to_llm_mapping()
+        config.mapping = llm_mapping
+        for model_config in config.model_configs.values():
+            model_config.visual_gen_mapping = vgm
+            model_config.mapping = llm_mapping
 
     def load(
         self,
         checkpoint_dir: Optional[str] = None,
         skip_warmup: bool = False,
+        skip_components: Optional[List[Union[str, PipelineComponent]]] = None,
     ) -> "BasePipeline":
         """
         Load a diffusion pipeline with optional dynamic quantization.
 
         Flow:
         1. Resolve checkpoint_dir (local path or HuggingFace Hub model ID)
-        2. Load config via DiffusionModelConfig.from_pretrained()
+        2. Load config via DiffusionPipelineConfig.from_pretrained()
         3. Create pipeline via AutoPipeline.from_config() with MetaInit
         4. Load transformer weights via pipeline.load_transformer_weights()
         5. Load auxiliary components (VAE, text_encoder)
         6. Call pipeline.post_load_weights()
+        7. Apply runtime LoRA adapters after all post-load hooks finish
 
         Args:
-            checkpoint_dir: Local path or HF Hub model ID (uses args.checkpoint_path if not provided)
+            checkpoint_dir: Local path or HF Hub model ID (uses ``args.model`` if not provided)
             skip_warmup: If True, skip warmup inference after loading (useful for testing)
+            skip_components: Optional internal escape hatch — list of
+                ``PipelineComponent`` values (or their string equivalents) to
+                skip loading. Intended for memory-constrained unit tests
+                that only exercise the transformer; not part of the public
+                ``VisualGenArgs`` surface.
 
         Returns:
             Loaded pipeline (WanPipeline, FluxPipeline, etc.) - type auto-detected
         """
-        # Resolve checkpoint_dir
-        checkpoint_dir = checkpoint_dir or (self.args.checkpoint_path if self.args else None)
+        checkpoint_dir = checkpoint_dir or self.args.model
         if not checkpoint_dir:
             raise ValueError("checkpoint_dir must be provided or set in VisualGenArgs")
         checkpoint_dir = self._resolve_checkpoint_dir(str(checkpoint_dir))
 
-        # Get loading options from args
-        skip_components = self.args.skip_components if self.args else []
+        # Strict pipeline_config validation: detect _class_name from the
+        # checkpoint, look up the registry entry, reject unknown keys.
+        resolved_pipeline_config = self._resolve_pipeline_config(checkpoint_dir)
 
         load_start = time.time()
-        text_encoder_path = self.args.text_encoder_path if self.args else ""
+        # text_encoder_path is an LTX-2 pipeline_config knob; it lives in
+        # the merged dict that _resolve_pipeline_config produced, not on
+        # VisualGenArgs directly.
+        text_encoder_path = resolved_pipeline_config.get("text_encoder_path", "")
 
         # =====================================================================
         # STEP 1: Load Config (includes quant config parsing)
         # Merge pretrained checkpoint config with user-provided VisualGenArgs
         # =====================================================================
         logger.info(f"Loading config from {checkpoint_dir}")
-        config = DiffusionModelConfig.from_pretrained(
+        config = DiffusionPipelineConfig.from_pretrained(
             checkpoint_dir,
             args=self.args,
+            pipeline_config=resolved_pipeline_config,
         )
 
         # Log quantization settings
         if config.quant_config and config.quant_config.quant_algo:
             logger.info(f"Quantization: {config.quant_config.quant_algo.name}")
             logger.info(f"Dynamic weight quant: {config.dynamic_weight_quant}")
+
+        _attn_backend = config.attention.backend
+        _sa_cfg = config.attention.sparse_attention_config
+        if (
+            _attn_backend == "CUTEDSL"
+            and _sa_cfg is not None
+            and getattr(_sa_cfg, "algorithm", None) == "vsa"
+        ):
+            kernel_path = "CuTe DSL block-sparse" if CUTE_AVAILABLE else "dense SDPA fallback"
+            logger.info(
+                f"Attention backend: CUTEDSL (algorithm=vsa, "
+                f"sparsity={_sa_cfg.vsa_sparsity}, fine-stage={kernel_path})"
+            )
+        else:
+            logger.info(f"Attention backend: {_attn_backend}")
 
         # =====================================================================
         # STEP 1b: Build VisualGenMapping (must precede model creation)
@@ -186,9 +286,10 @@ class PipelineLoader:
         with MetaInitMode():
             pipeline = AutoPipeline.from_config(config, checkpoint_dir)
 
-        # Convert meta tensors to CUDA tensors
-        self._materialize_meta_tensors(pipeline)
-        pipeline.to(self.device)
+        # Convert meta tensors to their runtime devices. Offloaded submodules
+        # stay on CPU until they are explicitly staged.
+        cpu_offload_modules = self._get_load_time_cpu_offload_modules(pipeline)
+        self._materialize_meta_tensors(pipeline, cpu_offload_modules)
 
         # =====================================================================
         # STEP 3: Load Transformer Weights
@@ -202,6 +303,7 @@ class PipelineLoader:
         # =====================================================================
         weights = pipeline.load_transformer_weights(checkpoint_dir)
         pipeline.load_weights(weights)
+        del weights
 
         # =====================================================================
         # STEP 4: Load Standard Components (VAE, TextEncoder, etc.)
@@ -213,7 +315,7 @@ class PipelineLoader:
         pipeline.load_standard_components(
             checkpoint_dir,
             self.device,
-            skip_components,
+            skip_components=skip_components,
             **extra_kwargs,
         )
         logger.info(f"Model loaded successfully in {time.time() - load_start:.2f}s")
@@ -223,32 +325,36 @@ class PipelineLoader:
         # =====================================================================
 
         t0 = time.time()
-        if config.enable_parallel_vae:
+        if config.parallel.parallel_vae_size > 1:
             pipeline.setup_parallel_vae()
 
         if hasattr(pipeline, "post_load_weights"):
             pipeline.post_load_weights()
+        pipeline._setup_runtime_lora()
+        pipeline.initialize_offload_pipeline()
 
-        if config.torch_compile.enable_torch_compile:
+        if config.torch_compile.enable:
             torch._dynamo.config.cache_size_limit = 128
             pipeline.torch_compile()
         else:
             logger.info("torch.compile disabled by config")
 
+        # Cache acceleration (TeaCache / Cache-DiT) is enabled AFTER torch.compile
+        # on purpose: Cache-DiT captures references to the transformer block
+        # modules at enable time, while torch_compile() replaces the block lists
+        # with compiled copies. If Cache-DiT were enabled first, it would keep
+        # running the stale eager blocks and torch.compile would contribute
+        # nothing.
+        if getattr(pipeline, "transformer", None) is not None:
+            pipeline._setup_cache_acceleration()
+
         if not skip_warmup:
-            if config.torch_compile.enable_autotune:
-                with autotune(
-                    cache_path=os.environ.get("TLLM_AUTOTUNER_CACHE_PATH"),
-                    skip_dynamic_tuning_buckets=True,
-                ):
-                    pipeline.warmup()
-            else:
-                pipeline.warmup()
+            pipeline.warmup()
             logger.info(f"Warmup completed in {time.time() - t0:.2f}s")
         else:
             logger.info("Warmup skipped (skip_warmup=True)")
 
-        if config.pipeline.enable_layerwise_nvtx_marker:
+        if config.enable_layerwise_nvtx_marker:
             from tensorrt_llm._torch.pyexecutor.layerwise_nvtx_marker import LayerwiseNvtxMarker
 
             marker = LayerwiseNvtxMarker()
@@ -263,20 +369,83 @@ class PipelineLoader:
         )
         return pipeline
 
-    def _materialize_meta_tensors(self, module: torch.nn.Module) -> None:
+    def _get_load_time_cpu_offload_modules(self, pipeline: "BasePipeline") -> list[torch.nn.Module]:
+        """Return offloaded modules that should materialize on CPU at load time.
+
+        The offload manager is initialized only after weights and quantization
+        hooks run, but MetaInit materialization happens before loading. This
+        helper mirrors the pipeline's configured stages so offloaded towers never
+        need to materialize on GPU first.
         """
-        Convert meta tensors to CUDA tensors.
+        available_components = pipeline.offload_pipeline_components()
+        modules: list[torch.nn.Module] = []
+        seen: set[int] = set()
+
+        for stage in pipeline.offloader.filter_available_stages(
+            pipeline.offloader.stages(), available_components
+        ):
+            for component in stage:
+                offload_module = available_components[component]
+                module_id = id(offload_module)
+                if module_id not in seen:
+                    modules.append(offload_module)
+                    seen.add(module_id)
+
+        return modules
+
+    def _materialize_meta_tensors(
+        self,
+        module: torch.nn.Module,
+        cpu_offload_modules: Optional[list[torch.nn.Module]] = None,
+    ) -> None:
+        """
+        Convert meta tensors to tensors on their runtime devices.
 
         Meta tensors are placeholders that don't allocate GPU memory.
         After model structure is defined, we materialize them to real tensors.
+        Submodules listed in ``cpu_offload_modules`` are materialized on CPU and
+        skipped by the final move to ``self.device`` so checkpoint loading never
+        needs the full offloaded tower resident on GPU.
         """
-        memo = {}
+        cpu_offload_modules = cpu_offload_modules or []
+        meta_device = torch.device("meta")
+
+        cpu_memo = {}
+
+        def init_cpu_tensor(t: torch.Tensor) -> torch.Tensor:
+            if t.device != meta_device:
+                return t.to("cpu")
+            if t not in cpu_memo:
+                cpu_memo[t] = torch.empty_like(t, device="cpu")
+            return cpu_memo[t]
+
+        for offload_module in cpu_offload_modules:
+            offload_module._apply(init_cpu_tensor)
+
+        cpu_tensor_ids = self._collect_module_tensor_ids(cpu_offload_modules)
+        target_memo = {}
 
         def init_meta_tensor(t: torch.Tensor) -> torch.Tensor:
-            if t.device != torch.device("meta"):
+            if id(t) in cpu_tensor_ids:
                 return t
-            if t not in memo:
-                memo[t] = torch.empty_like(t, device="cuda")
-            return memo[t]
+            if t.device != meta_device:
+                return t.to(self.device)
+            if t not in target_memo:
+                target_memo[t] = torch.empty_like(t, device=self.device)
+            return target_memo[t]
 
         module._apply(init_meta_tensor)
+
+    @staticmethod
+    def _collect_module_tensor_ids(modules: list[torch.nn.Module]) -> set[int]:
+        """Collect parameter and buffer object IDs owned by ``modules``."""
+        tensor_ids: set[int] = set()
+        for module in modules:
+            for child in module.modules():
+                for param in child._parameters.values():
+                    if param is not None:
+                        tensor_ids.add(id(param))
+                for buffer in child._buffers.values():
+                    if buffer is not None:
+                        tensor_ids.add(id(buffer))
+        return tensor_ids

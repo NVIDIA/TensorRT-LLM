@@ -1,0 +1,42 @@
+model: NVIDIA-Nemotron-3-Super-120B-A12B-FP8
+hostname: localhost
+backend: pytorch
+generation_servers:
+  num_instances: 1
+  tensor_parallel_size: 4
+  moe_expert_parallel_size: 4
+  enable_attention_dp: false
+  max_batch_size: 4
+  max_num_tokens: 9216
+  max_seq_len: 9216
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 32
+  print_iter_log: true
+  trust_remote_code: true
+  kv_cache_config:
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.5
+  cache_transceiver_config:
+    max_tokens_in_buffer: 9216
+    backend: NIXL
+    transceiver_runtime: PYTHON
+  stream_interval: 20
+  num_postprocess_workers: 4
+  moe_config:
+    backend: CUTLASS
+context_servers:
+  num_instances: 1
+  max_batch_size: 1
+  max_num_tokens: 9216
+  max_seq_len: 9216
+  tensor_parallel_size: 4
+  moe_expert_parallel_size: 4
+  enable_attention_dp: false
+  disable_overlap_scheduler: true
+  cache_transceiver_config:
+    max_tokens_in_buffer: 9216
+    backend: NIXL
+    transceiver_runtime: PYTHON
+  moe_config:
+    backend: CUTLASS

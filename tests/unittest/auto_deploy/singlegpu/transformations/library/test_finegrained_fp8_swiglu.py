@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 from _torch_test_utils import fp8_compatible, trtllm_ops_available
 from torch.export import Dim
+from utils.util import skip_pre_blackwell
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
@@ -204,6 +205,21 @@ def _has_no_fake_quant_finegrained_fp8(gm):
     return _count_ops(gm, torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear) == 0
 
 
+def _count_fused_swiglu_ops(gm):
+    """Count fused FineGrainedFP8 SwiGLU MLP ops across both fused targets.
+
+    Accepts either the generic (FP32 per-block scale) or the Blackwell DeepGEMM
+    (UE8M0 packed-int) variant. On SM100f the fuse_finegrained_fp8_swiglu
+    transform converts weights/scales to UE8M0 in-place and dispatches to the
+    deepgemm op.
+    """
+    n = _count_ops(gm, torch.ops.auto_deploy.fused_finegrained_fp8_swiglu_mlp.default)
+    deepgemm_op = getattr(torch.ops.auto_deploy, "fused_finegrained_fp8_deepgemm_swiglu_mlp", None)
+    if deepgemm_op is not None:
+        n += _count_ops(gm, deepgemm_op.default)
+    return n
+
+
 # -- Tests ---------------------------------------------------------------------
 
 
@@ -275,11 +291,9 @@ def test_finegrained_fp8_swiglu_full_fusion():
 
     gm_fused = gm_fused.to("cuda")
 
-    # Check the fused op is present
-    fused_count = _count_ops(
-        gm_fused, torch.ops.auto_deploy.fused_finegrained_fp8_swiglu_mlp.default
-    )
-    assert fused_count == 1, f"Expected 1 fused_finegrained_fp8_swiglu_mlp op, got {fused_count}"
+    # Check the fused op is present (either generic or deepgemm variant).
+    fused_count = _count_fused_swiglu_ops(gm_fused)
+    assert fused_count == 1, f"Expected 1 fused swiglu mlp op, got {fused_count}"
 
     # No intermediate or unfused ops should remain
     assert (
@@ -326,12 +340,10 @@ def test_finegrained_fp8_swiglu_fusion_multiple_layers(num_layers):
 
     gm_fused = gm_fused.to("cuda")
 
-    # Check that all layers are fused
-    fused_count = _count_ops(
-        gm_fused, torch.ops.auto_deploy.fused_finegrained_fp8_swiglu_mlp.default
-    )
+    # Check that all layers are fused (either generic or deepgemm variant).
+    fused_count = _count_fused_swiglu_ops(gm_fused)
     assert fused_count == num_layers, (
-        f"Expected {num_layers} fused_finegrained_fp8_swiglu_mlp ops, got {fused_count}"
+        f"Expected {num_layers} fused swiglu mlp ops, got {fused_count}"
     )
 
     # Verify numerical correctness
@@ -395,3 +407,89 @@ def test_finegrained_fp8_swiglu_does_not_match_non_swiglu():
     assert (
         _count_ops(gm_result, torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear) == 2
     ), "Original FP8 linear ops should be unchanged"
+
+
+def _simulate_post_load_hook(model):
+    """Simulate FineGrainedFP8LinearQuantization.post_load_hook on Blackwell.
+
+    Converts FP8 weights and float32 scales to UE8M0 format with TMA-aligned
+    column-major layout, matching what happens during real model loading.
+    """
+    from tensorrt_llm.quantization.utils.fp8_utils import (
+        resmooth_to_fp8_e8m0,
+        transform_sf_into_required_layout,
+    )
+
+    with torch.no_grad():
+        for proj in ("gate", "up", "down"):
+            weight = getattr(model, f"{proj}_weight")
+            scale = getattr(model, f"{proj}_weight_scale")
+
+            weight_new, scale_new = resmooth_to_fp8_e8m0(weight, scale.float())
+            N, K = weight_new.shape[-2], weight_new.shape[-1]
+            transformed_scale = transform_sf_into_required_layout(
+                scale_new, mn=N, k=K, recipe=(1, 128, 128), is_sfa=False
+            )
+
+            model.register_buffer(f"{proj}_weight", weight_new)
+            model.register_buffer(f"{proj}_weight_scale", transformed_scale)
+
+
+@pytest.mark.skipif(_skip_condition, reason=_skip_reason)
+@skip_pre_blackwell
+def test_finegrained_fp8_swiglu_deepgemm_scale_layout():
+    """On Blackwell, fused weight scales must be torch.int col-major for DeepGEMM."""
+    torch.manual_seed(0)
+    model = FineGrainedFP8SwiGLUTestModel().to("cuda")
+
+    # Reference output is computed BEFORE _simulate_post_load_hook because the
+    # hook mutates scales to UE8M0 packed-int, which the eager
+    # torch_fake_quant_finegrained_fp8_linear kernel cannot consume (it expects
+    # raw fp32 per-block scales).
+    x = torch.randn(2, 256, device="cuda", dtype=torch.bfloat16)
+    y_ref = model(x)
+
+    # Simulate post_load_hook: convert scales to UE8M0 col-major
+    _simulate_post_load_hook(model.mlp)
+
+    # Verify pre-fusion scale layout (individual scales should be col-major)
+    for proj in ("gate", "up", "down"):
+        scale = getattr(model.mlp, f"{proj}_weight_scale")
+        assert scale.dtype == torch.int, f"{proj}_weight_scale should be torch.int after hook"
+        assert scale.stride(-2) == 1, f"{proj}_weight_scale should be col-major after hook"
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True, dynamic_shapes=({0: Dim.DYNAMIC},))
+
+    # Apply pattern matching + fusion
+    gm_fused = InferenceOptimizer(
+        None,
+        {
+            "match_finegrained_fp8_swiglu_pattern": {
+                "stage": "pattern_matcher",
+            },
+            "fuse_finegrained_fp8_swiglu": {
+                "stage": "post_load_fusion",
+            },
+        },
+    )(None, gm)
+
+    gm_fused = gm_fused.to("cuda")
+
+    # Verify fused op is present (deepgemm variant expected on Blackwell).
+    fused_count = _count_fused_swiglu_ops(gm_fused)
+    assert fused_count == 1, f"Expected 1 fused swiglu mlp op, got {fused_count}"
+
+    # Verify fused gate+up scale has correct layout for DeepGEMM
+    for name, buf in gm_fused.named_buffers():
+        if "gate_up_weight_scale" in name:
+            assert buf.dtype == torch.int, (
+                f"Fused gate_up_weight_scale should be torch.int (UE8M0), got {buf.dtype}"
+            )
+            assert buf.stride(-2) == 1, (
+                f"Fused gate_up_weight_scale should be col-major (stride(-2)==1), "
+                f"got stride={buf.stride()}"
+            )
+
+    # Verify numerical correctness (DeepGEMM path) against the pre-hook reference.
+    y_fused = gm_fused(x)
+    torch.testing.assert_close(y_fused, y_ref, atol=0.15, rtol=0.05)

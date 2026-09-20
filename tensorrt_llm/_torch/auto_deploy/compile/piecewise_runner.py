@@ -55,8 +55,7 @@ import torch
 import torch.nn as nn
 from torch.utils._pytree import tree_flatten
 
-from tensorrt_llm._torch.utils import make_weak_ref
-
+from .._compat import make_weak_ref
 from ..utils.logger import ad_logger
 
 
@@ -178,9 +177,9 @@ class MetadataWrapper(nn.Module):
     exceed capture output by up to (max_batch_size - 1) due to extra logical
     chunks from misaligned sequence boundaries in multi-sequence batches.
     On replay we copy_() the real results into those stable buffers and return
-    the full padded tensors — same address and shape as capture time.
-    Downstream dynamic ops determine how much to read from batch metadata
-    (cu_seqlens, batch_info_host), so extra zeros are never accessed.
+    views of those stable buffers with the real result shapes.  The underlying
+    storage keeps a stable address for CUDA graphs, while eager dynamic kernels
+    still see the true metadata length instead of padded tail elements.
     """
 
     def __init__(self, submodule: nn.Module, max_batch_size: Optional[int] = None):
@@ -239,18 +238,34 @@ class MetadataWrapper(nn.Module):
     def _rebuild_result(original: Any, saved: Tuple[torch.Tensor, ...]) -> Any:
         """Return saved tensors in the same container type as the original.
 
-        The saved tensors are returned at their full (padded) shape — no
-        truncation.  Downstream static CUDA graph segments record this padded
-        shape at capture time and replay with the same shape.  Dynamic ops
-        (SSM kernels) determine how much to read from batch_info / cu_seqlens,
-        so extra zero-padded elements are never accessed.
+        Mamba metadata may be backed by padded stable storage, but downstream
+        eager kernels use tensor length to determine logical chunk count.  Return
+        a view with the real runtime shape so padded tail elements are invisible
+        while data_ptr() remains stable.
         """
+
+        def view_as_original(real: torch.Tensor, stable: torch.Tensor) -> torch.Tensor:
+            if stable.shape == real.shape or stable.ndim == 0:
+                return stable
+            slices = tuple(slice(0, dim) for dim in real.shape)
+            return stable[slices]
+
         if isinstance(original, torch.Tensor):
-            return saved[0]
+            return view_as_original(original, saved[0])
         if isinstance(original, tuple):
-            return tuple(saved)
+            return tuple(
+                view_as_original(real, stable)
+                if isinstance(real, torch.Tensor) and isinstance(stable, torch.Tensor)
+                else stable
+                for real, stable in zip(original, saved)
+            )
         if isinstance(original, list):
-            return list(saved)
+            return [
+                view_as_original(real, stable)
+                if isinstance(real, torch.Tensor) and isinstance(stable, torch.Tensor)
+                else stable
+                for real, stable in zip(original, saved)
+            ]
         return saved
 
 
@@ -313,6 +328,22 @@ class ADPiecewiseRunner(nn.Module):
             info: Output metadata (shape, dtype, device) discovered during warmup.
         """
         self._next_dynamic_out_infos[dynamic_submod_id] = info
+
+    def finalize_capture(self, num_tokens: int) -> None:
+        """Release strong dynamic output refs after downstream captures finish.
+
+        Dynamic output buffers are allocated inside the preceding static runner's
+        graph capture, but following static runners consume them as inputs during
+        the same split-graph capture.  Keep the real tensor objects live until
+        that whole bucket capture finishes so the shared graph pool cannot reuse
+        their addresses for downstream graph outputs.  Runtime only needs stable
+        addresses, so weak refs are enough after capture.
+        """
+        entry = self.entries.get(num_tokens)
+        if entry is None:
+            return
+        for submod_id, buf in list(entry.dynamic_out_bufs.items()):
+            entry.dynamic_out_bufs[submod_id] = make_weak_ref(buf)
 
     def get_dynamic_out_buf(
         self, num_tokens: int, dynamic_submod_id: int
@@ -384,7 +415,7 @@ class ADPiecewiseRunner(nn.Module):
             entry.cuda_graph = graph
             entry.static_output = make_weak_ref(output)
             for submod_id, buf in dynamic_out_bufs.items():
-                entry.dynamic_out_bufs[submod_id] = make_weak_ref(buf)
+                entry.dynamic_out_bufs[submod_id] = buf
 
             # Debug: record input addresses for assertion in replay
             flat_args, _ = tree_flatten((args, kwargs))

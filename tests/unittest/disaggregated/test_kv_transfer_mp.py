@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import os
 import random
 
@@ -7,11 +21,21 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+# Exclude IB (no fabric) and gdr_copy (UCX rcache SIGABRT at teardown).
+# Force a deterministic UCX config regardless of what the cluster/CI injects;
+# see test_kv_transfer.py for the full rationale.
+os.environ["UCX_TLS"] = "^ib,gdr_copy"
+# Limit NIXL busy-polling progress threads; see test_kv_transfer.py for the
+# full rationale (intermittent 120s timeouts on shared CI nodes,
+# https://nvbugs/6426834).
+os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
+
 import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus
+from tensorrt_llm._torch.disaggregation.base import CacheKind, Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -114,6 +138,8 @@ def worker_fn(
     os.environ["MASTER_PORT"] = str(master_port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
+    # Use 4 worker threads for KV transfer to exercise multi-thread code paths
+    os.environ["TRTLLM_KV_TRANSFER_NUM_THREADS"] = "4"
 
     # Initialize distributed (use gloo for single GPU compatibility)
     dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
@@ -148,8 +174,14 @@ def worker_fn(
     dtype = DataType.FLOAT
     request_len = 16
 
-    ctx_instance_name = "ctx_instance"
-    gen_instance_name = "gen_instance"
+    # NIXL agent names share one namespace per node, and this file and the multi-process one both
+    # used to name themselves the same thing. Two xdist workers then registered one name twice and
+    # the loser's transfer came back "remote agent was invalidated" -- a red that reads like a
+    # transport bug. The worker id is inherited by any process this test spawns, so every rank of
+    # one test agrees while two concurrent tests do not.
+    suffix = os.environ.get("PYTEST_XDIST_WORKER", "")
+    ctx_instance_name = f"ctx_instance{suffix}"
+    gen_instance_name = f"gen_instance{suffix}"
 
     if is_ctx:
         # Create ctx mapping
@@ -319,8 +351,8 @@ def worker_fn(
             ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
 
             # Add sequence to KVCacheManager
-            kv_cache_manager.impl.add_sequence(
-                ctx_request.py_request_id, ctx_request.prompt_len, 1, ctx_request
+            kv_cache_manager.impl.add_sequence_batch(
+                [(ctx_request.py_request_id, ctx_request.prompt_len, 1)], [ctx_request]
             )
 
             # Create sender session
@@ -331,12 +363,17 @@ def worker_fn(
                 kv_cache_manager.get_batch_cache_indices([ctx_request.py_request_id])[0],
                 dtype=np.int64,
             )
-            send_kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=[block_ids])
-            send_future = sender_session.send(send_kv_slice)
+            send_kv_slice = Chunk(
+                block_ids_per_layer_groups=[block_ids],
+                kind_per_layer_group=[CacheKind.PAGED],
+                token_range=TokenRange(start=0, end=ctx_request.prompt_len),
+                is_last=True,
+            )
+            sender_session.send(send_kv_slice)
 
             # Wait for send to complete
-            send_future.result()
-            assert sender_session.status == SessionStatus.KV_TRANSFERRED
+            sender_session.wait_complete()
+            assert sender_session.status == SessionStatus.TRANSFERRED
 
             # Get block data for verification
             block_data = kv_cache_manager.get_unique_primary_pool()[block_ids]
@@ -361,8 +398,8 @@ def worker_fn(
             )
 
             # Add sequence to KVCacheManager
-            kv_cache_manager.impl.add_sequence(
-                gen_request.py_request_id, gen_request.prompt_len, 1, gen_request
+            kv_cache_manager.impl.add_sequence_batch(
+                [(gen_request.py_request_id, gen_request.prompt_len, 1)], [gen_request]
             )
 
             # Create receiver session
@@ -373,12 +410,17 @@ def worker_fn(
                 kv_cache_manager.get_batch_cache_indices([gen_request.py_request_id])[0],
                 dtype=np.int64,
             )
-            recv_kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=[block_ids])
-            recv_future = receiver_session.receive(recv_kv_slice)
+            recv_kv_slice = Chunk(
+                block_ids_per_layer_groups=[block_ids],
+                kind_per_layer_group=[CacheKind.PAGED],
+                token_range=TokenRange(start=0, end=gen_request.prompt_len),
+                is_last=True,
+            )
+            receiver_session.receive(recv_kv_slice)
 
             # Wait for receive to complete
-            recv_future.result()
-            assert receiver_session.status == SessionStatus.KV_TRANSFERRED
+            receiver_session.wait_complete(blocking=True)
+            assert receiver_session.status == SessionStatus.TRANSFERRED
 
             # Get block data for verification
             block_data = kv_cache_manager.get_unique_primary_pool()[block_ids]

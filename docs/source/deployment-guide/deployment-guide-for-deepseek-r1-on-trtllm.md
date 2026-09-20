@@ -29,8 +29,8 @@ There are multiple MOE backends inside TensorRT LLM, not all of them supporting 
 | H100/H200 | FP8 | CUTLASS |
 | B200/GB200 EP<=8 | NVFP4 | CUTLASS, TRTLLM |
 | B200/GB200 EP<=8 | FP8 | DEEPGEMM |
-| GB200 NVL72 EP>8 | NVFP4 |  WIDEEP |
-| GB200 NVL72 EP>8 | FP8 | WIDEEP without EPLB |
+| GB200 NVL72 EP>8 | NVFP4 |  CUTEDSL |
+| GB200 NVL72 EP>8 | FP8 | DEEPGEMM |
 
 The default moe backend is `CUTLASS`, so for the combination which is not supported by `CUTLASS`, one must set the `moe_config.backend` explicitly to run the model.
 
@@ -58,7 +58,7 @@ Note:
 * The command also maps port `8000` from the container to your host so you can access the LLM API endpoint from your host
 * See the <https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags> for all the available containers. The containers published in the main branch weekly have `rcN` suffix, while the monthly release with QA tests has no `rcN` suffix. Use the `rc` release to get the latest model and feature support.
 
-If you want to use latest main branch, you can choose to build from source to install TensorRT LLM, the steps refer to [https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html](https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html)
+If you want to use latest main branch, you can choose to build from source to install TensorRT LLM, the steps refer to [https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source.html](https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source.html)
 
 ### Recommended Performance Settings
 
@@ -207,7 +207,7 @@ See the [`TorchLlmArgs` class](https://nvidia.github.io/TensorRT-LLM/llm-api/ref
 Add the following fields to the YAML configuration file `/tmp/config.yml` to enable wide EP:
 ```yaml
 moe_config:
-    backend: WIDEEP
+    backend: CUTEDSL
     max_num_tokens: 9216
     load_balancer:  # configure online EP balancer
       num_slots: 288

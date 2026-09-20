@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +21,8 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
+
+#include <optional>
 
 namespace tensorrt_llm::runtime::lora
 {
@@ -57,5 +59,5 @@ void loraValidateRequestTensorDims(std::optional<ITensor::SharedPtr> const& optR
 void loraValidateRequestTensors(std::optional<std::uint64_t> const& optTaskId,
     std::optional<ITensor::SharedPtr> const& optReqLoraWeights,
     std::optional<ITensor::SharedPtr> const& optReqLoraConfig, runtime::ModelConfig const& modelConfig,
-    runtime::WorldConfig const& worldConfig);
+    runtime::WorldConfig const& worldConfig, std::optional<tensorrt_llm::DataType> loraDataType = std::nullopt);
 } // namespace tensorrt_llm::runtime::lora

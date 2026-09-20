@@ -2,6 +2,7 @@ import asyncio
 import collections
 import ctypes
 import datetime
+import errno
 import hashlib
 import inspect
 import io
@@ -15,11 +16,12 @@ import time
 import traceback
 import warnings
 import weakref
+from contextlib import nullcontext
 from functools import wraps
 from pathlib import Path
-from queue import Queue
-from typing import (Any, Callable, Iterable, List, Optional, Tuple, Type,
-                    get_type_hints)
+from queue import Empty, Queue
+from typing import (Any, Callable, ContextManager, Iterable, List, Optional,
+                    Tuple, Type, get_type_hints)
 
 import filelock
 import huggingface_hub
@@ -148,7 +150,12 @@ def get_device_count() -> int:
     return torch.cuda.device_count() if torch.cuda.is_available() else 0
 
 
-def get_total_gpu_memory(device: int) -> float:
+def get_total_gpu_memory(device: int) -> int:
+    # Compat for no GPU environment, only for device=0.
+    # Otherwise, the caller should ensure there are that many GPUs.
+    if device == 0 and get_device_count() == 0:
+        return 0
+
     return torch.cuda.get_device_properties(device).total_memory
 
 
@@ -169,19 +176,6 @@ class GpuArch:
 
 def get_gpu_arch(device: int = 0) -> int:
     return torch.cuda.get_device_properties(device).major
-
-
-class ContextManager:
-    ''' A helper to create a context manager for a resource. '''
-
-    def __init__(self, resource):
-        self.resource = resource
-
-    def __enter__(self):
-        return self.resource.__enter__()
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        return self.resource.__exit__(exc_type, exc_value, traceback)
 
 
 def is_directory_empty(directory: Path) -> bool:
@@ -231,7 +225,8 @@ def get_file_lock(model_name: str,
 class DisabledTqdm(tqdm):
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs, disable=True)
+        kwargs["disable"] = True
+        super().__init__(*args, **kwargs)
 
 
 def download_hf_model(model: str, revision: Optional[str] = None) -> Path:
@@ -327,6 +322,7 @@ class ManagedThread(threading.Thread):
                  error_queue: Queue,
                  name: Optional[str] = None,
                  stop_event: Optional[threading.Event] = None,
+                 context: Optional[ContextManager[Any]] = None,
                  **kwargs):
         super().__init__(name=name)
         self.task = task
@@ -334,26 +330,27 @@ class ManagedThread(threading.Thread):
         self.kwargs = kwargs
         self.daemon = True
         self.stop_event = stop_event or threading.Event()
+        self.context = context or nullcontext()
 
     def run(self):
+        with self.context:
+            while not self.stop_event.is_set():
+                task = self.task
+                if isinstance(task, weakref.WeakMethod):
+                    task = task()
+                    if task is None:
+                        # Normally, this should not happen.
+                        logger.warning("WeakMethod is expired.")
+                        break
 
-        while not self.stop_event.is_set():
-            task = self.task
-            if isinstance(task, weakref.WeakMethod):
-                task = task()
-                if task is None:
-                    # Normally, this should not happen.
-                    logger.warning("WeakMethod is expired.")
-                    break
-
-            try:
-                if not task(**self.kwargs):
-                    break
-            except Exception as e:
-                logger.error(
-                    f"Error in thread {self.name}: {e}\n{traceback.format_exc()}"
-                )
-                self.error_queue.put(e)
+                try:
+                    if not task(**self.kwargs):
+                        break
+                except Exception as e:
+                    logger.error(
+                        f"Error in thread {self.name}: {e}\n{traceback.format_exc()}"
+                    )
+                    self.error_queue.put(e)
 
         logger.info(f"Thread {self.name} stopped.")
 
@@ -538,12 +535,20 @@ class _SyncQueue:
 
         # We can't call asyncio.run_coroutine_threadsafe(self._aq.get(), self.loop) and wait the returned Future,
         # since we are in the same event loop, and we can't yield the thread while waiting result.
-        deadline = None if timeout is None else time.time() + timeout
-        while deadline is None or time.time() < deadline:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
             try:
                 return self._aq.unsafe_get()
             except asyncio.QueueEmpty:
-                time.sleep(0.01)
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        # Match `queue.Queue.get()` semantics; a silent `None` return would be
+                        # mis-handled downstream as an unknown response type.
+                        raise Empty() from None
+                    time.sleep(min(0.01, remaining))
+                else:
+                    time.sleep(0.01)
 
 
 def get_numa_aware_cpu_affinity(device_id):
@@ -551,6 +556,9 @@ def get_numa_aware_cpu_affinity(device_id):
 
     Args:
         device_id: The CUDA device ID to query for optimal CPU affinity.
+                   This is the logical CUDA device index (after
+                   CUDA_VISIBLE_DEVICES remapping). The function will
+                   resolve it to the physical NVML device index.
 
     Returns:
         List of CPU IDs representing the optimal CPU affinity mask for the device.
@@ -572,6 +580,35 @@ def get_numa_aware_cpu_affinity(device_id):
         import pynvml
         pynvml.nvmlInit()
 
+        # Resolve the physical NVML device index from the logical CUDA
+        # device_id.  NVML always enumerates *all* GPUs on the system
+        # regardless of CUDA_VISIBLE_DEVICES, so when the user restricts
+        # visibility (e.g. CUDA_VISIBLE_DEVICES=3,4), logical device 0
+        # actually corresponds to physical GPU 3.
+        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if cuda_visible is not None and cuda_visible.strip():
+            visible_tokens = [
+                x.strip() for x in cuda_visible.split(",") if x.strip()
+            ]
+            if 0 <= device_id < len(visible_tokens):
+                token = visible_tokens[device_id]
+                if token.isdigit():
+                    nvml_device_id = int(token)
+                else:
+                    logger.warning(
+                        f"CUDA_VISIBLE_DEVICES token '{token}' is non-numeric; "
+                        f"falling back to device_id ({device_id}) as NVML index."
+                    )
+                    nvml_device_id = device_id
+            else:
+                logger.warning(
+                    f"device_id {device_id} exceeds CUDA_VISIBLE_DEVICES "
+                    f"list length ({len(visible_tokens)}), falling back to "
+                    f"device_id as NVML index.")
+                nvml_device_id = device_id
+        else:
+            nvml_device_id = device_id
+
         # Get the number of bits per ulong
         c_ulong_bits = ctypes.sizeof(ctypes.c_ulong) * 8
 
@@ -580,7 +617,7 @@ def get_numa_aware_cpu_affinity(device_id):
 
         # Get the optimal CPU affinity for this device according to the NUMA
         # topology
-        handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
+        handle = pynvml.nvmlDeviceGetHandleByIndex(nvml_device_id)
         affinity_masks = pynvml.nvmlDeviceGetCpuAffinity(handle, cpu_set_size)
 
         # Convert CPU masks to python list
@@ -597,6 +634,145 @@ def get_numa_aware_cpu_affinity(device_id):
             pass  # Ignore shutdown errors
 
     return cpu_affinity
+
+
+def _set_affinity_all_threads(cpus: list[int]) -> tuple[int, int]:
+    """Best-effort bind of this process's threads to `cpus`.
+
+    sched_setaffinity(pid) only binds the main thread, so threads created
+    earlier (MPI, communication and I/O helpers) would keep their old mask.
+    Binds each TID from one `/proc/self/task` snapshot: threads created
+    concurrently may be missed, later ones inherit their creator's mask.
+
+    Returns `(bound, attempted)`. Threads that exit during the walk count
+    towards neither, so `(0, 0)` means nothing was rebound.
+    """
+    if not cpus:
+        # An empty mask is EINVAL for every thread.
+        logger.warning("Refusing to apply an empty CPU affinity mask; the "
+                       "affinity of this process is left unchanged.")
+        return 0, 0
+
+    if not os.path.isdir("/proc/self/task"):
+        # No procfs to enumerate TIDs. psutil is process-wide on Windows and
+        # FreeBSD; on Linux it degrades to the main thread, as before.
+        psutil.Process().cpu_affinity(cpus)
+        return 1, 1
+
+    try:
+        tids = os.listdir("/proc/self/task")
+    except OSError as e:
+        # Affinity is a perf knob: degrade, do not fail worker startup.
+        logger.warning(f"Could not enumerate /proc/self/task ({e}). The CPU "
+                       f"affinity of this process is left unchanged.")
+        return 0, 0
+
+    bound = 0
+    attempted = 0
+    failures = collections.Counter()
+    for tid in tids:
+        try:
+            os.sched_setaffinity(int(tid), cpus)
+        except ProcessLookupError:
+            # Exited after the snapshot; expected and benign.
+            continue
+        except OSError as e:
+            attempted += 1
+            failures[errno.errorcode.get(e.errno, e.errno)] += 1
+        else:
+            attempted += 1
+            bound += 1
+
+    if failures:
+        logger.warning(
+            f"Could not set the CPU affinity of {attempted - bound} of "
+            f"{attempted} threads ({dict(failures)}). Those threads keep "
+            f"their previous affinity mask.")
+    return bound, attempted
+
+
+def _reapply_current_thread_affinity_to_all_threads() -> tuple[int, int]:
+    """Rebind existing threads to the calling thread's current CPU mask.
+
+    This refreshes the snapshot taken by configure_cpu_affinity after
+    model and KV-cache initialization may have created more threads. It does
+    not choose or change the affinity policy.
+    """
+    if not hasattr(os, "sched_getaffinity"):
+        return 0, 0
+    try:
+        cpus = list(os.sched_getaffinity(0))
+    except OSError as e:
+        logger.warning(
+            f"Could not read the calling thread's CPU affinity before "
+            f"starting executor threads: {e}.")
+        return 0, 0
+    return _set_affinity_all_threads(cpus)
+
+
+def configure_cpu_affinity(device_id: int) -> None:
+    """Probe and configure the CPU affinity of the calling process based on NUMA topology.
+
+    Args:
+        device_id: The CUDA device ID to determine optimal CPU affinity.
+
+    Note:
+        Applies to every thread observed, not just the main thread; see
+        `_set_affinity_all_threads`. In a process shared with caller code that
+        includes non-worker threads, and the mask is not restored at shutdown.
+        If the process already has constrained affinity, a warning is logged.
+        Configuration is handled as follows:
+            TLLM_NUMA_AWARE_WORKER_AFFINITY = <unset>
+                -> Affinity is automatically configured if it is unconstrained,
+                   and deleted if it is constrained externally by the user.
+            TLLM_NUMA_AWARE_WORKER_AFFINITY = 1
+                -> Affinity is unconditionally auto-configured.
+            TLLM_NUMA_AWARE_WORKER_AFFINITY = 0 or any other value
+                -> Affinity is unconditionally _not_ auto-configured.
+    """
+    pid = os.getpid()
+    process = psutil.Process(pid)
+    cpu_affinity = process.cpu_affinity()
+
+    all_cpus = list(range(psutil.cpu_count()))
+
+    constrained_affinity = (cpu_affinity != all_cpus)
+    numa_aware_affinity = os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY")
+
+    # If affinity is constrained but the user hasn't explicitly
+    # requested NUMA-aware affinity, remove the constraints.
+    if constrained_affinity:
+        logger.warning(
+            f"Worker process {pid} is affined to run on the following CPUs: "
+            f"{cpu_affinity} (subset of all logical CPUs). This may harm "
+            f"performance if set incorrectly.")
+        if numa_aware_affinity is None:
+            logger.warning(f"Worker process {pid} has constrained CPU affinity "
+                           f"but `TLLM_NUMA_AWARE_WORKER_AFFINITY` is not set. "
+                           f"Removing CPU affinity constraints.")
+            bound, attempted = _set_affinity_all_threads(all_cpus)
+            if bound < attempted:
+                logger.warning(
+                    f"Worker process {pid} could only remove the CPU affinity "
+                    f"constraints of {bound} of {attempted} threads.")
+
+    # If affinity is unconstrained and the user hasn't explicitly
+    # prohibited it or the user has explicitly requested it, choose the
+    # optimal affinity based upon the NUMA topology
+    if ((numa_aware_affinity is None and not constrained_affinity)
+            or (numa_aware_affinity == "1")):
+        bound, attempted = _set_affinity_all_threads(
+            get_numa_aware_cpu_affinity(device_id))
+        if bound == 0:
+            logger.warning(
+                f"Worker process {pid} could not set the NUMA-aware CPU "
+                f"affinity of any thread. It will run without NUMA pinning, "
+                f"which may impact performance.")
+        else:
+            logger.info(
+                f"Worker process {pid} CPU affinity set to "
+                f"{process.cpu_affinity()} for optimal NUMA-aware scheduling "
+                f"({bound}/{attempted} threads).")
 
 
 def generate_api_docs_as_docstring(model: Type[BaseModel],

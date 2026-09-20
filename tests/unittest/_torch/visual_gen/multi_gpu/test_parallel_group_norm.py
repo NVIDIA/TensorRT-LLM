@@ -19,13 +19,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 
-try:
-    from tensorrt_llm._torch.visual_gen.modules.vae import GroupNormParallel
-    from tensorrt_llm._utils import get_free_port
-
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
+from tensorrt_llm._torch.visual_gen.modules.vae import GroupNormParallel
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -60,12 +54,20 @@ def _distributed_worker(rank, world_size, test_fn, port):
 
 
 def _run(world_size: int, test_fn: Callable):
-    if not MODULES_AVAILABLE:
-        pytest.skip("Required modules not available")
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Need {world_size} GPUs, have {torch.cuda.device_count()}")
-    port = get_free_port()
-    mp.spawn(_distributed_worker, args=(world_size, test_fn, port), nprocs=world_size, join=True)
+    # Spawn distributed workers via a helper that retries with a fresh master
+    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
+    from ._visual_gen_dist_utils import spawn_with_retry
+
+    spawn_with_retry(
+        lambda port: mp.spawn(
+            _distributed_worker,
+            args=(world_size, test_fn, port),
+            nprocs=world_size,
+            join=True,
+        )
+    )
 
 
 # ===========================================================================

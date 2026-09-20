@@ -14,6 +14,7 @@
 # limitations under the License.
 """Utilities for Prometheus Metrics Collection."""
 
+import math
 import time
 from typing import Dict, List, Optional, Union
 
@@ -43,6 +44,14 @@ class MetricsCollector:
             trtllm_request_inference_time_seconds
             trtllm_prompt_tokens_total
             trtllm_generation_tokens_total
+            trtllm_prompt_cached_tokens_total
+            trtllm_prompt_cache_hit_tokens_total
+            trtllm_prompt_cached_tokens_per_request
+            trtllm_spec_decode_drafted_tokens_total
+            trtllm_spec_decode_accepted_tokens_total
+            trtllm_prefill_perplexity
+            trtllm_generation_perplexity
+            trtllm_request_error_total
 
         Iteration-level metrics:
             trtllm_kv_cache_hit_rate
@@ -58,6 +67,7 @@ class MetricsCollector:
             trtllm_kv_cache_gen_alloc_blocks_total
             trtllm_kv_cache_onboard_bytes_total
             trtllm_kv_cache_offload_bytes_total
+            trtllm_kv_cache_disk_prefetch_blocks_total
             trtllm_kv_cache_intra_device_copy_bytes_total
             trtllm_num_requests_running
             trtllm_num_requests_waiting
@@ -84,6 +94,8 @@ class MetricsCollector:
             trtllm_spec_decode_num_accepted_tokens_total
             trtllm_spec_decode_acceptance_length
             trtllm_spec_decode_draft_overhead
+            trtllm_prefill_batch_occupancy
+            trtllm_prefill_batch_tokens
 
         Config info metrics (logged once at startup via log_config_info):
             trtllm_model_config_info
@@ -92,6 +104,8 @@ class MetricsCollector:
             trtllm_kv_cache_config_info
     """
     labelname_finish_reason = "finished_reason"
+    labelname_cache_level = "cache_level"
+    labelname_cache_tier = "cache_tier"
 
     def __init__(
         self,
@@ -281,6 +295,13 @@ class MetricsCollector:
             name=self.metric_prefix + "kv_cache_offload_bytes_total",
             documentation="Total bytes transferred from GPU to host (offload)",
             labelnames=self.labels.keys())
+        self.kv_cache_disk_prefetch_blocks_total = Counter(
+            name=self.metric_prefix + "kv_cache_disk_prefetch_blocks_total",
+            documentation=(
+                "Process-lifetime total V2 KV-cache blocks migrated from disk "
+                "to host by the prefetch mechanism. "
+                "Resets only when the serving process restarts."),
+            labelnames=self.labels.keys())
         self.kv_cache_intra_device_copy_bytes_total = Counter(
             name=self.metric_prefix + "kv_cache_intra_device_copy_bytes_total",
             documentation=
@@ -402,6 +423,90 @@ class MetricsCollector:
             documentation="Draft overhead in speculative decoding",
             labelnames=self.labels.keys())
 
+        # Prompt cache hit tracking
+        self.counter_tokens_cached_prompt = Counter(
+            name=self.metric_prefix + "prompt_cached_tokens_total",
+            documentation=(
+                "Process-lifetime total prompt tokens served from KV cache. "
+                "Resets only when the serving process restarts, not when the "
+                "KV cache is flushed or evicted."),
+            labelnames=self.labels.keys())
+        self.counter_tokens_cached_prompt.labels(**self.labels)
+        self.labels_with_cache_level = {
+            **self.labels,
+            self.labelname_cache_level: "",
+            self.labelname_cache_tier: "",
+        }
+        self.counter_tokens_cached_prompt_by_tier = Counter(
+            name=self.metric_prefix + "prompt_cache_hit_tokens_total",
+            documentation=(
+                "Process-lifetime total prompt tokens served from each KV "
+                "cache level. Resets only when the serving process restarts, "
+                "not when the KV cache is flushed or evicted. cache_level is "
+                "the index into the configured tier list and cache_tier names "
+                "the memory backing it, so a deployment with a hot and a cold "
+                "GPU level reports them as two series sharing the gpu name. "
+                "Pages already prefetched from disk to host count as host."),
+            labelnames=self.labels_with_cache_level.keys())
+        # The configured levels are only known once stats arrive; children are created then so
+        # that zero-valued levels are still visible before their first cache hit.
+        self._registered_cache_levels = False
+        self.histogram_tokens_cached_prompt = Histogram(
+            name=self.metric_prefix + "prompt_cached_tokens_per_request",
+            documentation="Histogram of cached prompt tokens per request.",
+            buckets=[0, 64, 128, 256, 512, 1024, 2048, 4096, 8192],
+            labelnames=self.labels.keys())
+
+        # Per-position speculative decoding acceptance counters
+        self.labelname_token_pos = "token_position"  # nosec: B105
+        self.labels_with_token_pos = {
+            **self.labels, self.labelname_token_pos: ""
+        }
+        self.counter_tokens_drafted_per_position = Counter(
+            name=self.metric_prefix + "spec_decode_drafted_tokens_total",
+            documentation=
+            "Total drafted tokens per speculative decoding position.",
+            labelnames=self.labels_with_token_pos.keys())
+        self.counter_tokens_accepted_per_position = Counter(
+            name=self.metric_prefix + "spec_decode_accepted_tokens_total",
+            documentation=
+            "Total accepted tokens per speculative decoding position.",
+            labelnames=self.labels_with_token_pos.keys())
+
+        # Per-request perplexity histograms
+        self.histogram_prefill_perplexity = Histogram(
+            name=self.metric_prefix + "prefill_perplexity",
+            documentation="Histogram of prefill perplexity per request.",
+            buckets=[1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 500.0, 1000.0],
+            labelnames=self.labels.keys())
+        self.histogram_generation_perplexity = Histogram(
+            name=self.metric_prefix + "generation_perplexity",
+            documentation="Histogram of generation perplexity per request.",
+            buckets=[1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 500.0, 1000.0],
+            labelnames=self.labels.keys())
+
+        # Prefill batch occupancy / context token distribution
+        self.gauge_prefill_batch_occupancy = Gauge(
+            name=self.metric_prefix + "prefill_batch_occupancy",
+            documentation=
+            "Fraction of max active slots occupied by context requests.",
+            labelnames=self.labels.keys())
+        self.histogram_prefill_batch_tokens = Histogram(
+            name=self.metric_prefix + "prefill_batch_tokens",
+            documentation="Histogram of total context tokens per iteration.",
+            buckets=[64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768],
+            labelnames=self.labels.keys())
+
+        # HTTP error counter
+        self.labelname_http_code = "http_code"
+        self.labels_with_http_code = {
+            **self.labels, self.labelname_http_code: ""
+        }
+        self.counter_request_error = Counter(
+            name=self.metric_prefix + "request_error_total",
+            documentation="Total request errors, labeled by HTTP status code.",
+            labelnames=self.labels_with_http_code.keys())
+
     def log_config_info(
             self,
             model_config: Optional[Dict[str, str]] = None,
@@ -464,11 +569,41 @@ class MetricsCollector:
         # Convenience function for logging to histogram.
         histogram.labels(**self.labels).observe(data)
 
+    def _cache_level_labels(self, level: int,
+                            level_tiers: Optional[List[str]]) -> Dict[str, str]:
+        tier = level_tiers[level] if level_tiers and level < len(
+            level_tiers) else ""
+        return {
+            self.labelname_cache_level: str(level),
+            self.labelname_cache_tier: tier,
+        }
+
+    def _log_cached_tokens_by_level(self, counts: Optional[List[int]],
+                                    level_tiers: Optional[List[str]]) -> None:
+        """Log cached prompt tokens for each configured cache level.
+
+        The level count comes from the engine's tier list, so the series are created on the
+        first stats report rather than at construction time.
+        """
+        if not counts:
+            return
+        if not self._registered_cache_levels:
+            for level in range(len(counts)):
+                self.counter_tokens_cached_prompt_by_tier.labels(
+                    **self.labels,
+                    **self._cache_level_labels(level, level_tiers))
+            self._registered_cache_levels = True
+        for level, count in enumerate(counts):
+            if count > 0:
+                self._log_counter(self.counter_tokens_cached_prompt_by_tier,
+                                  self._cache_level_labels(level, level_tiers),
+                                  count)
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
 
-    def log_request_metrics_dict(self, metrics_dict: dict[str, float]) -> None:
+    def log_request_metrics_dict(self, metrics_dict: dict) -> None:
         """Log per-request metrics from TRTLLM engine responses.
 
         This method updates Prometheus metrics including:
@@ -482,6 +617,7 @@ class MetricsCollector:
         - histogram_inference_time_request
         - counter_prompt_tokens
         - counter_generation_tokens
+        - counter_tokens_cached_prompt
 
         Args:
             metrics_dict: A dictionary containing request metrics with the following expected keys:
@@ -496,6 +632,8 @@ class MetricsCollector:
                 - `MetricNames.INFERENCE_TIME` (float): Total inference duration in seconds.
                 - `MetricNames.PROMPT_TOKENS` (int): Number of input tokens.
                 - `MetricNames.GENERATION_TOKENS` (int): Number of output tokens.
+                - `MetricNames.PROMPT_CACHE_CACHED_TOKENS` (int): Number of prompt tokens served
+                  from KV cache.
 
         Returns:
             None: Metrics are logged to Prometheus; nothing is returned.
@@ -539,6 +677,45 @@ class MetricsCollector:
                     MetricNames.GENERATION_TOKENS, 0):
                 self._log_counter(self.counter_generation_tokens, {},
                                   generation_tokens)
+            if MetricNames.PROMPT_CACHE_CACHED_TOKENS in metrics_dict:
+                cached_tokens = metrics_dict[
+                    MetricNames.PROMPT_CACHE_CACHED_TOKENS]
+                if cached_tokens > 0:
+                    self._log_counter(self.counter_tokens_cached_prompt,
+                                      self.labels, cached_tokens)
+                self._log_histogram(self.histogram_tokens_cached_prompt,
+                                    cached_tokens)
+
+            per_pos_drafted = metrics_dict.get(
+                MetricNames.SPEC_DEC_DRAFTED_PER_POS)
+            per_pos_accepted = metrics_dict.get(
+                MetricNames.SPEC_DEC_ACCEPTED_PER_POS)
+            if per_pos_drafted is not None and per_pos_accepted is not None:
+                last_nonzero = -1
+                for i in range(len(per_pos_drafted) - 1, -1, -1):
+                    if per_pos_drafted[i] > 0:
+                        last_nonzero = i
+                        break
+                for pos in range(last_nonzero + 1):
+                    labels_with_pos = {
+                        **self.labels, self.labelname_token_pos: pos
+                    }
+                    if per_pos_drafted[pos] > 0:
+                        self.counter_tokens_drafted_per_position.labels(
+                            **labels_with_pos).inc(per_pos_drafted[pos])
+                    if per_pos_accepted[pos] > 0:
+                        self.counter_tokens_accepted_per_position.labels(
+                            **labels_with_pos).inc(per_pos_accepted[pos])
+
+            prefill_ppl = metrics_dict.get(MetricNames.PREFILL_PERPLEXITY)
+            if prefill_ppl is not None and math.isfinite(prefill_ppl):
+                self._log_histogram(self.histogram_prefill_perplexity,
+                                    prefill_ppl)
+            gen_ppl = metrics_dict.get(MetricNames.GENERATION_PERPLEXITY)
+            if gen_ppl is not None and math.isfinite(gen_ppl):
+                self._log_histogram(self.histogram_generation_perplexity,
+                                    gen_ppl)
+
             self.last_log_time = time.time()
 
     def log_iteration_stats(self, iteration_stats: dict) -> None:
@@ -651,11 +828,21 @@ class MetricsCollector:
                 self._log_gauge(self.num_scheduled_requests,
                                 ifb_stats["numScheduledRequests"])
             if "numCtxTokens" in ifb_stats:
-                self._log_gauge(self.total_context_tokens,
-                                ifb_stats["numCtxTokens"])
+                num_ctx_tokens = ifb_stats["numCtxTokens"]
+                self._log_gauge(self.total_context_tokens, num_ctx_tokens)
+                if num_ctx_tokens > 0:
+                    self._log_histogram(self.histogram_prefill_batch_tokens,
+                                        num_ctx_tokens)
             if "avgNumDecodedTokensPerIter" in ifb_stats:
                 self._log_gauge(self.avg_decoded_tokens_per_iter,
                                 ifb_stats["avgNumDecodedTokensPerIter"])
+
+            # Prefill batch occupancy: context_requests / max_active_requests
+            num_context = ifb_stats.get("numContextRequests", 0)
+            max_active = iteration_stats.get("maxNumActiveRequests", 0)
+            if max_active and max_active > 0:
+                self._log_gauge(self.gauge_prefill_batch_occupancy,
+                                num_context / max_active)
 
         # Speculative decoding stats
         if spec_stats := iteration_stats.get("specDecodingStats"):
@@ -677,9 +864,41 @@ class MetricsCollector:
                 self._log_gauge(self.spec_decode_draft_overhead,
                                 spec_stats["draftOverhead"])
 
-        # Per-iteration KV cache stats (aggregated across window sizes)
-        if kv_iter := iteration_stats.get("kvCacheIterationStats"):
-            # Aggregate across all window sizes
+        # Per-iteration KV cache stats. V2 reports reuse/miss by lifecycle and
+        # storage/transfer counters by pool group; legacy V1 uses window stats.
+        disk_prefetch_blocks = iteration_stats.get("iterDiskPrefetchBlocks", 0)
+        if disk_prefetch_blocks > 0:
+            self._log_counter(self.kv_cache_disk_prefetch_blocks_total, {},
+                              disk_prefetch_blocks)
+
+        self._log_cached_tokens_by_level(
+            iteration_stats.get("iterCachedTokensByLevel"),
+            iteration_stats.get("kvCacheLevelTiers"))
+
+        kv_iter = iteration_stats.get("kvCacheIterationStats")
+        kv_iter_by_lifecycle = iteration_stats.get(
+            "kvCacheIterationStatsByLifecycle")
+        kv_iter_by_pool_group = iteration_stats.get(
+            "kvCacheIterationStatsByPoolGroup")
+        kv_iter_by_cold_pool_group = iteration_stats.get(
+            "kvCacheIterationStatsByColdPoolGroup")
+        if (kv_iter or kv_iter_by_lifecycle or kv_iter_by_pool_group
+                or kv_iter_by_cold_pool_group):
+            # Prefer lifecycle-level attention stats when present. An SSM-only
+            # lifecycle report must not hide the legacy/window-level attention
+            # aggregate. Missing kind remains attention-compatible.
+            attention_lifecycle_stats = {
+                key: stats
+                for key, stats in (kv_iter_by_lifecycle or {}).items()
+                if stats.get("kind", "attention") == "attention"
+            }
+            reuse_stats = attention_lifecycle_stats or kv_iter or {}
+            pool_group_stats = kv_iter_by_pool_group or kv_iter or {}
+            # Host/disk blocks come from the cold pool-group view, the only V2 view that reports them:
+            # cold levels group lifecycles independently of the hot level, so a hot pool group cannot
+            # own a cold one, and this view accounts for every cold block exactly once. Legacy V1 has
+            # no such view and keeps its cold counters on the window stats, hence the fallback.
+            secondary_stats = kv_iter_by_cold_pool_group or pool_group_stats
             total_secondary_max = 0
             total_secondary_used = 0
             total_reused = 0
@@ -691,19 +910,23 @@ class MetricsCollector:
             total_offload_bytes = 0
             total_intra_device_copy_bytes = 0
 
-            for ws_stats in kv_iter.values():
-                total_secondary_max += ws_stats.get("secondaryMaxNumBlocks", 0)
-                total_secondary_used += ws_stats.get("secondaryUsedNumBlocks",
-                                                     0)
-                total_reused += ws_stats.get("iterReusedBlocks", 0)
-                total_full_reused += ws_stats.get("iterFullReusedBlocks", 0)
-                total_partial_reused += ws_stats.get("iterPartialReusedBlocks",
-                                                     0)
-                total_missed += ws_stats.get("iterMissedBlocks", 0)
-                total_gen_alloc += ws_stats.get("iterGenAllocBlocks", 0)
-                total_onboard_bytes += ws_stats.get("iterOnboardBytes", 0)
-                total_offload_bytes += ws_stats.get("iterOffloadBytes", 0)
-                total_intra_device_copy_bytes += ws_stats.get(
+            for stats in reuse_stats.values():
+                total_reused += stats.get("iterReusedBlocks", 0)
+                total_full_reused += stats.get("iterFullReusedBlocks", 0)
+                total_partial_reused += stats.get("iterPartialReusedBlocks", 0)
+                total_missed += stats.get("iterMissedBlocks", 0)
+
+            for stats in secondary_stats.values():
+                total_secondary_max += stats.get("secondaryMaxNumBlocks", 0)
+                total_secondary_used += stats.get("secondaryUsedNumBlocks", 0)
+
+            # The cold view deliberately omits the per-iteration delta fields, so these stay on the
+            # hot pool-group view where they are actually tracked.
+            for stats in pool_group_stats.values():
+                total_gen_alloc += stats.get("iterGenAllocBlocks", 0)
+                total_onboard_bytes += stats.get("iterOnboardBytes", 0)
+                total_offload_bytes += stats.get("iterOffloadBytes", 0)
+                total_intra_device_copy_bytes += stats.get(
                     "iterIntraDeviceCopyBytes", 0)
 
             # Gauges
@@ -740,3 +963,8 @@ class MetricsCollector:
             if total_intra_device_copy_bytes > 0:
                 self._log_counter(self.kv_cache_intra_device_copy_bytes_total,
                                   {}, total_intra_device_copy_bytes)
+
+    def log_request_error(self, http_code: Union[int, str] = "") -> None:
+        """Increment the error counter, labeled by HTTP status code."""
+        labels = {**self.labels, self.labelname_http_code: str(http_code)}
+        self.counter_request_error.labels(**labels).inc(1)

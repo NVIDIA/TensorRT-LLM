@@ -32,11 +32,22 @@ template <class ArchTag, class TileShape, class ClusterShape, bool DYNAMIC_CGA, 
 struct should_filter_tma_warp_specialized_gemm_problem_shape
 {
 #ifdef FAST_BUILD
-    using SupportedCtaShape = cute::Shape<cute::_128, cute::_128, decltype(cute::get<2>(TileShape{}))>;
-    using SupportedCgaShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+    // The launcher passes its MMA tile shape here, which is CTA_M *
+    // (Is2SM ? 2 : 1). So a CTA_M=128 with cluster_M=2 (2SM mode) lands as
+    // MmaTileShape M==256. We accept both M=128 (1SM) and M=256 (2SM) under
+    // FAST_BUILD so MXFP8xMXFP8 grouped MoE (which requires the Mxf8f6f4
+    // tensor-op's MMA M==256) is reachable. The 1SM variant is also kept
+    // for per-tensor FP8 / BF16 paths.
+    using SupportedCtaShape1Sm = cute::Shape<cute::_128, cute::_128, decltype(cute::get<2>(TileShape{}))>;
+    using SupportedCtaShape2Sm = cute::Shape<cute::_256, cute::_128, decltype(cute::get<2>(TileShape{}))>;
+    using SupportedCgaShape1Sm = cute::Shape<cute::_1, cute::_1, cute::_1>;
+    using SupportedCgaShape2Sm = cute::Shape<cute::_2, cute::_1, cute::_1>;
 
-    constexpr static bool value = !cute::is_same_v<SupportedCtaShape, TileShape>
-        || !cute::is_same_v<SupportedCgaShape, ClusterShape> || DYNAMIC_CGA;
+    constexpr static bool cta_ok
+        = cute::is_same_v<SupportedCtaShape1Sm, TileShape> || cute::is_same_v<SupportedCtaShape2Sm, TileShape>;
+    constexpr static bool cga_ok
+        = cute::is_same_v<SupportedCgaShape1Sm, ClusterShape> || cute::is_same_v<SupportedCgaShape2Sm, ClusterShape>;
+    constexpr static bool value = !cta_ok || !cga_ok || DYNAMIC_CGA;
 #else
     constexpr static bool value = false;
 #endif

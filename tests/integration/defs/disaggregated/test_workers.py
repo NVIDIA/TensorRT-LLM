@@ -1,8 +1,24 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import contextlib
 import copy
 import json
 import os
+import platform
+import secrets
 import tempfile
 from typing import List
 
@@ -10,20 +26,37 @@ import aiohttp
 import pytest
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
-from defs.conftest import skip_no_hopper
+from defs.conftest import get_sm_version, skip_no_hopper
 from disagg_test_utils import (HEARTBEAT_INTERVAL, INACTIVE_TIMEOUT,
-                               run_ctx_worker, run_disagg_server,
-                               run_gen_worker, terminate,
+                               get_registered_worker_urls, run_ctx_worker,
+                               run_disagg_server, run_gen_worker, terminate,
                                wait_for_disagg_server_ready)
 from transformers import AutoTokenizer
 
 from tensorrt_llm import logger
+from tensorrt_llm.serve.disagg_auth import build_internal_disagg_auth_headers
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient
 from tensorrt_llm.serve.openai_protocol import (CompletionRequest,
+                                                ConversationParams,
                                                 DisaggregatedParams)
-from tensorrt_llm.serve.router import (KvCacheAwareRouter,
+from tensorrt_llm.serve.router import (ConversationRouter, KvCacheAwareRouter,
                                        KvCacheAwareServerState, ServerRole,
                                        block_key_hasher)
+
+
+def get_ucx_tls():
+    """Get UCX_TLS value based on GPU architecture.
+
+    Pre-Hopper GPUs need cuda_ipc excluded from UCX transports.
+    On some gb300 cluster, we need to set `cuda_copy,cuda_ipc,sm,self,tcp`
+    for UCX_TLS.
+    """
+    sm = get_sm_version()
+    if sm == 103 and "aarch" in platform.machine().lower():
+        return "cuda_copy,cuda_ipc,sm,self,tcp"
+    if sm < 90:
+        return "^cuda_ipc,ib,gdr_copy"
+    return "^ib,gdr_copy"
 
 
 def build_worker_config(base_config, server_type_config, disagg_cluster):
@@ -109,11 +142,13 @@ class BasicWorkerTester:
                  ctx_servers: List[str],
                  gen_servers: List[str],
                  req_timeout_secs: int = DEFAULT_TIMEOUT_REQUEST,
-                 server_start_timeout_secs: int = DEFAULT_TIMEOUT_SERVER_START):
+                 server_start_timeout_secs: int = DEFAULT_TIMEOUT_SERVER_START,
+                 internal_request_auth_key: str | None = None):
         self.ctx_servers = ctx_servers
         self.gen_servers = gen_servers
         self.req_timeout_secs = req_timeout_secs
         self.server_start_timeout_secs = server_start_timeout_secs
+        self.internal_request_auth_key = internal_request_auth_key
 
     async def new_session(self):
         session = aiohttp.ClientSession(
@@ -124,11 +159,15 @@ class BasicWorkerTester:
                                            self.server_start_timeout_secs)
         return session
 
-    async def send_request(self, session: aiohttp.ClientSession, url: str,
-                           request: dict) -> dict:
+    async def send_request(self,
+                           session: aiohttp.ClientSession,
+                           url: str,
+                           request: dict,
+                           headers: dict | None = None) -> dict:
         # TODO: streaming support
         async with session.post(url + "/v1/completions",
-                                json=request) as response:
+                                json=request,
+                                headers=headers) as response:
             content_type = response.headers.get("Content-Type", "")
             if "text/event-stream" in content_type:
                 raise ValueError(
@@ -154,7 +193,11 @@ class BasicWorkerTester:
         gen_request["disaggregated_params"] = ctx_response["choices"][0][
             "disaggregated_params"]
         gen_request["disaggregated_params"]["request_type"] = "generation_only"
-        gen_response = await self.send_request(session, gen_url, gen_request)
+        headers = build_internal_disagg_auth_headers(
+            self.internal_request_auth_key,
+            CompletionRequest.model_validate(gen_request))
+        gen_response = await self.send_request(session, gen_url, gen_request,
+                                               headers)
         return gen_response
 
     async def query_kv_cache_events(self, session: aiohttp.ClientSession,
@@ -188,9 +231,10 @@ class ConditionalWorkerTester(BasicWorkerTester):
                  gen_servers: List[str],
                  req_timeout_secs: int = DEFAULT_TIMEOUT_REQUEST,
                  server_start_timeout_secs: int = DEFAULT_TIMEOUT_SERVER_START,
-                 model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"):
+                 model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                 internal_request_auth_key: str | None = None):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
-                         server_start_timeout_secs)
+                         server_start_timeout_secs, internal_request_auth_key)
         self.model_name = model_name
 
     async def multi_round_request(self, session: aiohttp.ClientSession,
@@ -241,9 +285,10 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
                  gen_servers: List[str],
                  req_timeout_secs: int = DEFAULT_TIMEOUT_REQUEST,
                  server_start_timeout_secs: int = DEFAULT_TIMEOUT_SERVER_START,
-                 model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"):
+                 model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                 internal_request_auth_key: str | None = None):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
-                         server_start_timeout_secs)
+                         server_start_timeout_secs, internal_request_auth_key)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model_name = model_name
         self.kv_cache_block_maps: dict[str, KvCacheAwareServerState] = {}
@@ -258,9 +303,12 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
                     gen_server)
                 self.kv_cache_event_maps[gen_server] = []
 
-    async def send_request(self, session: aiohttp.ClientSession, url: str,
-                           request: dict) -> dict:
-        response = await super().send_request(session, url, request)
+    async def send_request(self,
+                           session: aiohttp.ClientSession,
+                           url: str,
+                           request: dict,
+                           headers: dict | None = None) -> dict:
+        response = await super().send_request(session, url, request, headers)
         events = await self.query_kv_cache_events(session, url)
         async with self.kv_cache_block_maps[url]._lock:
             self.kv_cache_block_maps[url].update_with_events(events)
@@ -359,9 +407,10 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
                  req_timeout_secs: int = DEFAULT_TIMEOUT_REQUEST,
                  server_start_timeout_secs: int = DEFAULT_TIMEOUT_SERVER_START,
                  model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-                 tokens_per_block: int = 32):
+                 tokens_per_block: int = 32,
+                 internal_request_auth_key: str | None = None):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
-                         server_start_timeout_secs)
+                         server_start_timeout_secs, internal_request_auth_key)
         self.ctx_router = KvCacheAwareRouter(server_role=ServerRole.CONTEXT,
                                              servers=ctx_servers,
                                              tokens_per_block=tokens_per_block)
@@ -392,10 +441,10 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
                 prompt=request["prompt"],
                 disaggregated_params=DisaggregatedParams(
                     request_type="context_only"))
-            ctx_server, ctx_info = await self.ctx_router.get_next_server(
-                openai_request)
+            ctx_server, _ = await self.ctx_router.get_next_server(openai_request
+                                                                  )
             prompt_str = request["prompt"]
-            request["prompt"] = ctx_info["token_lists"][0]
+            request["prompt"] = openai_request.prompt
             openai_request.disaggregated_params.request_type = "generation_only"
             gen_server, _ = await self.gen_router.get_next_server(openai_request
                                                                   )
@@ -406,9 +455,8 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
             gen_server_prev = gen_server
             response = await self.send_disagg_request(session, ctx_server,
                                                       gen_server, request)
-            await asyncio.gather(
-                self.ctx_router.finish_request(openai_request, session),
-                self.gen_router.finish_request(openai_request, session))
+            await asyncio.gather(self.ctx_router.finish_request(openai_request),
+                                 self.gen_router.finish_request(openai_request))
             logger.info(
                 f"Received response {i}: {repr(response['choices'][0]['text'])}"
             )
@@ -423,18 +471,22 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
                                        init_prompts: List[str],
                                        max_rounds: int = 8,
                                        warm_up_rounds: int = 4):
-        async with await self.new_session() as session:
-            chat_threads = [
-                self.multi_round_request(session, prompt, warm_up_rounds, False)
-                for prompt in init_prompts
-            ]
-            prompts = await asyncio.gather(*chat_threads)
-            logger.info("Warm up done")
-            chat_threads = [
-                self.multi_round_request(session, prompt, max_rounds, True)
-                for prompt in prompts
-            ]
-            await asyncio.gather(*chat_threads)
+        try:
+            async with await self.new_session() as session:
+                chat_threads = [
+                    self.multi_round_request(session, prompt, warm_up_rounds,
+                                             False) for prompt in init_prompts
+                ]
+                prompts = await asyncio.gather(*chat_threads)
+                logger.info("Warm up done")
+                chat_threads = [
+                    self.multi_round_request(session, prompt, max_rounds, True)
+                    for prompt in prompts
+                ]
+                await asyncio.gather(*chat_threads)
+        finally:
+            await self.ctx_router.close()
+            await self.gen_router.close()
 
     async def test_eviction(self):
         async with await self.new_session() as session:
@@ -522,7 +574,8 @@ def load_default_prompts(disaggregated_example_root: str):
 def background_workers(llm_venv, config_file: str):
     cwd = llm_venv.get_working_directory()
     os.chdir(cwd)
-    env = llm_venv._new_env
+    env = llm_venv._new_env.copy()
+    env["UCX_TLS"] = get_ucx_tls()
 
     with open(config_file, 'r') as f:
         config = yaml.safe_load(f)
@@ -550,6 +603,9 @@ def background_workers(llm_venv, config_file: str):
                                             disagg_cluster)
     gen_worker_config = build_worker_config(config, gen_server_cfg,
                                             disagg_cluster)
+    internal_request_auth_key = secrets.token_hex(32)
+    ctx_worker_config["internal_request_auth_key"] = internal_request_auth_key
+    gen_worker_config["internal_request_auth_key"] = internal_request_auth_key
 
     gpus_per_ctx = (ctx_server_cfg.get("tensor_parallel_size", 1) *
                     ctx_server_cfg.get("pipeline_parallel_size", 1))
@@ -558,35 +614,35 @@ def background_workers(llm_venv, config_file: str):
 
     ctx_workers = []
     gen_workers = []
-    ctx_urls = []
-    gen_urls = []
     next_device = 0
 
     import torch
     num_gpus = torch.cuda.device_count()
 
+    # port=0 lets each worker bind an OS-assigned port in its own process and
+    # register it with the cluster, instead of pre-picking a port here and
+    # racing whoever takes it before the worker rebinds it. The real URLs are
+    # read back from the cluster registry once the server reports ready.
     for i in range(num_ctx):
-        port = get_free_port()
-        ctx_urls.append(f"http://localhost:{port}")
         ctx_workers.append(
             run_ctx_worker(model,
                            ctx_worker_config,
                            work_dir,
-                           port=port,
+                           port=0,
                            device=next_device % num_gpus,
-                           env=env))
+                           env=env,
+                           worker_index=i))
         next_device += gpus_per_ctx
 
     for i in range(num_gen):
-        port = get_free_port()
-        gen_urls.append(f"http://localhost:{port}")
         gen_workers.append(
             run_gen_worker(model,
                            gen_worker_config,
                            work_dir,
-                           port=port,
+                           port=0,
                            device=next_device % num_gpus,
-                           env=env))
+                           env=env,
+                           worker_index=i))
         next_device += gpus_per_gen
 
     server_config = {
@@ -599,6 +655,7 @@ def background_workers(llm_venv, config_file: str):
         "generation_servers": {
             "router": gen_server_cfg.get("router", {})
         },
+        "internal_request_auth_key": internal_request_auth_key,
     }
     disagg_server = run_disagg_server(server_config,
                                       work_dir,
@@ -607,7 +664,11 @@ def background_workers(llm_venv, config_file: str):
 
     try:
         asyncio.run(wait_for_disagg_server_ready(disagg_port))
-        yield ctx_urls, gen_urls
+        ctx_urls, gen_urls = get_registered_worker_urls(disagg_port)
+        assert len(ctx_urls) == num_ctx and len(gen_urls) == num_gen, (
+            f"Expected {num_ctx} ctx and {num_gen} gen workers registered, "
+            f"got {ctx_urls} and {gen_urls}")
+        yield ctx_urls, gen_urls, disagg_port, internal_request_auth_key
     except Exception:
         logger.error("-------- Service discovery workers error --------")
         raise
@@ -626,8 +687,12 @@ def test_workers_conditional_disaggregation(disaggregated_test_root,
     prepare_llama_model(llama_model_root, llm_venv)
 
     with background_workers(llm_venv,
-                            config_file) as (ctx_servers, gen_servers):
-        tester = ConditionalWorkerTester(ctx_servers, gen_servers)
+                            config_file) as (ctx_servers, gen_servers, _,
+                                             internal_request_auth_key):
+        tester = ConditionalWorkerTester(
+            ctx_servers,
+            gen_servers,
+            internal_request_auth_key=internal_request_auth_key)
         prompts = load_default_prompts(disaggregated_example_root)
         asyncio.run(tester.test_multi_round_request(prompts))
 
@@ -650,8 +715,12 @@ def test_workers_conditional_disaggregation_deepseek_v3_lite_bf16(
             os.symlink(src, dst, target_is_directory=True)
 
     with background_workers(llm_venv,
-                            config_file) as (ctx_servers, gen_servers):
-        tester = ConditionalWorkerTester(ctx_servers, gen_servers)
+                            config_file) as (ctx_servers, gen_servers, _,
+                                             internal_request_auth_key):
+        tester = ConditionalWorkerTester(
+            ctx_servers,
+            gen_servers,
+            internal_request_auth_key=internal_request_auth_key)
         prompts = load_default_prompts(disaggregated_example_root)
         asyncio.run(tester.test_multi_round_request(prompts))
 
@@ -666,8 +735,12 @@ def test_workers_kv_cache_events(disaggregated_test_root,
     prepare_llama_model(llama_model_root, llm_venv)
 
     with background_workers(llm_venv,
-                            config_file) as (ctx_servers, gen_servers):
-        tester = KvCacheEventWorkerTester(ctx_servers, gen_servers)
+                            config_file) as (ctx_servers, gen_servers, _,
+                                             internal_request_auth_key):
+        tester = KvCacheEventWorkerTester(
+            ctx_servers,
+            gen_servers,
+            internal_request_auth_key=internal_request_auth_key)
         prompts = load_default_prompts(disaggregated_example_root)
         asyncio.run(tester.test_multi_round_request(prompts, 6))
 
@@ -683,8 +756,12 @@ def test_workers_kv_cache_aware_router(disaggregated_test_root,
     prepare_llama_model(llama_model_root, llm_venv)
 
     with background_workers(llm_venv,
-                            config_file) as (ctx_servers, gen_servers):
-        tester = KvCacheAwareRouterTester(ctx_servers, gen_servers)
+                            config_file) as (ctx_servers, gen_servers, _,
+                                             internal_request_auth_key):
+        tester = KvCacheAwareRouterTester(
+            ctx_servers,
+            gen_servers,
+            internal_request_auth_key=internal_request_auth_key)
         prompts = load_default_prompts(disaggregated_example_root)
         asyncio.run(tester.test_multi_round_request(prompts, 16, 4))
 
@@ -708,11 +785,14 @@ def test_workers_kv_cache_aware_router_deepseek_v3_lite_bf16(
             os.symlink(src, dst, target_is_directory=True)
 
     with background_workers(llm_venv,
-                            config_file) as (ctx_servers, gen_servers):
-        tester = KvCacheAwareRouterTester(ctx_servers,
-                                          gen_servers,
-                                          model_name="DeepSeek-V3-Lite/bf16",
-                                          tokens_per_block=64)
+                            config_file) as (ctx_servers, gen_servers, _,
+                                             internal_request_auth_key):
+        tester = KvCacheAwareRouterTester(
+            ctx_servers,
+            gen_servers,
+            model_name="DeepSeek-V3-Lite/bf16",
+            tokens_per_block=64,
+            internal_request_auth_key=internal_request_auth_key)
         prompts = load_default_prompts(disaggregated_example_root)
         asyncio.run(tester.test_multi_round_request(prompts, 8, 4))
 
@@ -727,6 +807,226 @@ def test_workers_kv_cache_aware_router_eviction(disaggregated_test_root,
     prepare_llama_model(llama_model_root, llm_venv)
 
     with background_workers(llm_venv,
-                            config_file) as (ctx_servers, gen_servers):
-        tester = KvCacheAwareRouterTester(ctx_servers, gen_servers)
+                            config_file) as (ctx_servers, gen_servers, _,
+                                             internal_request_auth_key):
+        tester = KvCacheAwareRouterTester(
+            ctx_servers,
+            gen_servers,
+            internal_request_auth_key=internal_request_auth_key)
         asyncio.run(tester.test_eviction())
+
+
+class ConversationRouterTester(BasicWorkerTester):
+    """Tests conversation router routing via local router + worker servers."""
+
+    def __init__(self,
+                 disagg_url: str,
+                 ctx_servers: List[str],
+                 gen_servers: List[str],
+                 req_timeout_secs: int = DEFAULT_TIMEOUT_REQUEST,
+                 server_start_timeout_secs: int = DEFAULT_TIMEOUT_SERVER_START,
+                 model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                 internal_request_auth_key: str | None = None):
+        super().__init__(ctx_servers, gen_servers, req_timeout_secs,
+                         server_start_timeout_secs, internal_request_auth_key)
+        self.disagg_url = disagg_url
+        self.model_name = model_name
+        self.ctx_router = ConversationRouter(server_role=ServerRole.CONTEXT,
+                                             servers=ctx_servers,
+                                             match_threshold=0.5,
+                                             tokens_per_block=2,
+                                             hash_skip_count=8,
+                                             use_token_ids=True)
+
+    async def _send_via_disagg(self,
+                               session: aiohttp.ClientSession,
+                               request: dict,
+                               headers: dict = None) -> dict:
+        async with session.post(f"{self.disagg_url}/v1/completions",
+                                json=request,
+                                headers=headers) as response:
+            response_dict = await response.json()
+            if not response.ok:
+                logger.error(f"Received failed response {response_dict}")
+                response.raise_for_status()
+            return response_dict
+
+    @staticmethod
+    def _apply_conversation_id_transport(request: dict, conv_id: str,
+                                         use_body_params: bool) -> dict | None:
+        if use_body_params:
+            request["conversation_params"] = {"conversation_id": conv_id}
+            return None
+        return {"X-Correlation-ID": conv_id}
+
+    async def test_explicit_conversation_id(self):
+        """Same conversation_id sticky-routes; different ids load-balance."""
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(
+                    total=self.req_timeout_secs)) as session:
+                for transport_name, use_body_params in [
+                    ("header", False),
+                    ("body", True),
+                ]:
+                    # 1. Same conversation_id always routes to the same server
+                    conv_id = f"test-explicit-conv-id-{transport_name}"
+                    prompt = ("Hello, this is a test prompt for "
+                              "conversation routing with explicit id")
+                    first_server = None
+                    for i in range(6):
+                        req = CompletionRequest(
+                            model=self.model_name,
+                            prompt=prompt,
+                            conversation_params=ConversationParams(
+                                conversation_id=conv_id),
+                            disaggregated_params=DisaggregatedParams(
+                                request_type="context_only"))
+                        server, _ = await self.ctx_router.get_next_server(req)
+                        if first_server is None:
+                            first_server = server
+                        else:
+                            assert server == first_server, (
+                                f"{transport_name} round {i}: expected "
+                                f"{first_server}, got {server}")
+                        request = {
+                            "model": self.model_name,
+                            "prompt": prompt,
+                            "max_tokens": 32,
+                            "ignore_eos": True,
+                            "temperature": 0.0,
+                        }
+                        headers = self._apply_conversation_id_transport(
+                            request, conv_id, use_body_params)
+                        response = await self._send_via_disagg(
+                            session, request, headers)
+                        assert len(response["choices"]) > 0
+                        await self.ctx_router.finish_request(req)
+                        prompt = prompt + response["choices"][0]["text"]
+                    logger.info(f"{transport_name} sticky routing passed: "
+                                f"all 6 rounds -> {first_server}")
+
+                    # 2. Different conversation_ids are load-balanced across
+                    #    servers (not all pinned to a single one).
+                    servers_seen = set()
+                    for i in range(len(self.ctx_servers) * 2):
+                        cid = f"test-diff-conv-{transport_name}-{i}"
+                        req = CompletionRequest(
+                            model=self.model_name,
+                            prompt=
+                            f"Unique prompt number {i} for load balancing",
+                            conversation_params=ConversationParams(
+                                conversation_id=cid),
+                            disaggregated_params=DisaggregatedParams(
+                                request_type="context_only"))
+                        server, _ = await self.ctx_router.get_next_server(req)
+                        servers_seen.add(server)
+                        request = {
+                            "model": self.model_name,
+                            "prompt": f"Unique prompt number {i}",
+                            "max_tokens": 1,
+                            "temperature": 0.0,
+                        }
+                        headers = self._apply_conversation_id_transport(
+                            request, cid, use_body_params)
+                        response = await self._send_via_disagg(
+                            session, request, headers)
+                        assert len(response["choices"]) > 0
+                        await self.ctx_router.finish_request(req)
+                    assert len(servers_seen) > 1, (
+                        f"{transport_name} different conv_ids all routed to "
+                        f"same server: {servers_seen}")
+                    logger.info(f"{transport_name} load balancing passed: "
+                                f"{len(servers_seen)} servers used")
+        finally:
+            await self.ctx_router.close()
+
+    async def test_implicit_conversation_matching(self):
+        """Requests sharing a common prefix implicitly route to same server."""
+        try:
+            async with await self.new_session() as session:
+                system_prompt = ("You are a helpful assistant. "
+                                 "Please answer the following question. ")
+                prompt = system_prompt + "What is the capital of France?"
+                req = CompletionRequest(
+                    model=self.model_name,
+                    prompt=prompt,
+                    disaggregated_params=DisaggregatedParams(
+                        request_type="context_only"))
+                first_server, _ = await self.ctx_router.get_next_server(req)
+                response = await self.send_request(
+                    session, first_server, {
+                        "model": self.model_name,
+                        "prompt": prompt,
+                        "max_tokens": 32,
+                        "ignore_eos": True,
+                        "temperature": 0.0,
+                        "disaggregated_params": {
+                            "request_type": "context_only"
+                        },
+                    })
+                await self.ctx_router.finish_request(req)
+                prompt = prompt + response["choices"][0]["text"]
+
+                match_count = 0
+                rounds = 6
+                for i in range(rounds):
+                    prompt = prompt + " Tell me more."
+                    req = CompletionRequest(
+                        model=self.model_name,
+                        prompt=prompt,
+                        disaggregated_params=DisaggregatedParams(
+                            request_type="context_only"))
+                    server, _ = await self.ctx_router.get_next_server(req)
+                    match_count += int(server == first_server)
+                    response = await self.send_request(
+                        session, server, {
+                            "model": self.model_name,
+                            "prompt": prompt,
+                            "max_tokens": 32,
+                            "ignore_eos": True,
+                            "temperature": 0.0,
+                            "disaggregated_params": {
+                                "request_type": "context_only"
+                            },
+                        })
+                    await self.ctx_router.finish_request(req)
+                    prompt = prompt + response["choices"][0]["text"]
+
+                assert match_count > rounds // 2, (
+                    f"Implicit match failed: only {match_count}/{rounds} "
+                    f"rounds matched server {first_server}")
+                logger.info(f"Implicit conversation matching test passed: "
+                            f"{match_count}/{rounds} matched")
+        finally:
+            await self.ctx_router.close()
+
+
+@skip_no_hopper
+@pytest.mark.skip_less_device(3)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_workers_conversation_router(disaggregated_test_root,
+                                     disaggregated_example_root, llm_venv,
+                                     llama_model_root):
+    config_file = os.path.join(
+        disaggregated_test_root,
+        'test_configs/disagg_config_conversation_workers.yaml')
+    prepare_llama_model(llama_model_root, llm_venv)
+
+    with background_workers(llm_venv,
+                            config_file) as (ctx_servers, gen_servers,
+                                             disagg_port,
+                                             internal_request_auth_key):
+        disagg_url = f"http://localhost:{disagg_port}"
+        tester = ConversationRouterTester(
+            disagg_url,
+            ctx_servers,
+            gen_servers,
+            internal_request_auth_key=internal_request_auth_key)
+        asyncio.run(tester.test_explicit_conversation_id())
+        tester = ConversationRouterTester(
+            disagg_url,
+            ctx_servers,
+            gen_servers,
+            internal_request_auth_key=internal_request_auth_key)
+        asyncio.run(tester.test_implicit_conversation_matching())

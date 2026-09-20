@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Stress test script for inference of model using TensorRT LLM with PyTorch/TRT backend.
+Stress test script for model inference using the TensorRT LLM PyTorch backend.
 This script is used for stress testing inference performance using trtllm-serve and aiperf.
 
 The script supports three test modes:
@@ -72,6 +72,12 @@ from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_info,
 # Define a constant for process termination timeouts
 GRACEFUL_TERMINATION_TIMEOUT = 300  # seconds - set longer when stress large model
 
+# Single source of truth for aiperf artifact location.
+# Passed to aiperf via --output-artifact-dir so writes and reads stay aligned
+# regardless of the pytest cwd.
+ARTIFACTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "artifacts")
+
 
 def _get_default_port() -> int:
     """Get a default port using CI allocation if available, otherwise use 8000."""
@@ -109,12 +115,10 @@ class ModelConfig:
     model_dir: str
     tp_size: int
     memory_requirement: int
-    backend: Optional[str] = None
 
     def __str__(self) -> str:
         model_name = os.path.basename(self.model_dir)
-        backend_str = f"_{self.backend}" if self.backend else ""
-        return f"{model_name}_tp{self.tp_size}{backend_str}"
+        return f"{model_name}_tp{self.tp_size}"
 
     @property
     def model_name(self) -> str:
@@ -167,14 +171,14 @@ class StressTestConfig:
 @dataclass(frozen=True)
 class PerformanceParams:
     """Dataclass to store test parameters for aiperf"""
-    input_len_mean: int = 64  # customized for tinyllama and llama-v3-8b-instruct-hf
+    input_len_mean: int = 64  # Customized for TinyLlama and Qwen3.5-4B.
     input_len_std: int = 16
-    output_len_mean: int = 128  # customized for tinyllama and llama-v3-8b-instruct-hf
+    output_len_mean: int = 128  # Customized for TinyLlama and Qwen3.5-4B.
     output_len_std: int = 32
     # test_timeout:
     # Maximum time allowed for the entire performance test to complete
     # Ensure indefinite runs specially for different concurrency values
-    test_timeout: int = 3600  # 1 hours for tinyllama and llama-v3-8b-instruct-hf
+    test_timeout: int = 3600  # One hour for TinyLlama and Qwen3.5-4B.
     concurrency_list: List[int] = field(
         default_factory=lambda: [8, 16, 32, 64, 128, 256])
 
@@ -413,7 +417,6 @@ def is_port_available(port: int,
     "test_mode",
     ["stress-test", "stress-stage-alone", "stress-test-with-accuracy"],
     ids=lambda x: x)
-@pytest.mark.parametrize("backend", ["trt", "pytorch"], ids=lambda x: x)
 @pytest.mark.parametrize("capacity_scheduler_policy",
                          ["GUARANTEED_NO_EVICT", "MAX_UTILIZATION"],
                          ids=lambda x: x)
@@ -428,10 +431,9 @@ def is_port_available(port: int,
         ModelConfig(model_dir="llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
                     tp_size=1,
                     memory_requirement=12288),
-        # Configuration for Llama-v3 model
+        # Configuration for Qwen3.5-4B
         # memory_requirement is in MiB (12 GB = 12288 MiB)
-        ModelConfig(model_dir="llama-models-v3/llama-v3-8b-instruct-hf",
-                    tp_size=1,
+        ModelConfig(model_dir="Qwen3.5-4B", tp_size=1,
                     memory_requirement=12288),
         # Configuration for DeepSeek-V3 model
         # memory_requirement is in MiB (96 GB = 98304 MiB)
@@ -459,9 +461,9 @@ def is_port_available(port: int,
                     memory_requirement=172032),
     ],
     ids=lambda x: f"{os.path.basename(x.model_dir)}_tp{x.tp_size}")
-def test_run_stress_test(config, stress_time_timeout, backend,
-                         capacity_scheduler_policy, test_mode):
-    """Run the stress test with the provided configuration, backend, and test mode.
+def test_run_stress_test(config, stress_time_timeout, capacity_scheduler_policy,
+                         test_mode):
+    """Run the stress test with the provided configuration and test mode.
 
     This test function calls the stress_test function with the given parameters.
     The function should start with test_ prefix to be recognized as a test function by pytest.
@@ -469,18 +471,9 @@ def test_run_stress_test(config, stress_time_timeout, backend,
     Args:
         config: Model configuration for the test (injected by pytest.mark.parametrize)
         stress_time_timeout: Tuple of (stress_time, stress_timeout) in seconds
-        backend: Backend to use ("trt" or "pytorch")
         capacity_scheduler_policy: Scheduler policy ("GUARANTEED_NO_EVICT", "MAX_UTILIZATION")
         test_mode: Test mode ("stress-test" or "stress-stage-alone")
     """
-    # Create a new ModelConfig with the backend parameter
-    # Convert 'trt' to None as expected by the ModelConfig
-
-    new_config = ModelConfig(model_dir=config.model_dir,
-                             tp_size=config.tp_size,
-                             memory_requirement=config.memory_requirement,
-                             backend=backend)
-
     # Extract stress_time and stress_timeout from the tuple
     stress_time, stress_timeout = stress_time_timeout
 
@@ -488,9 +481,8 @@ def test_run_stress_test(config, stress_time_timeout, backend,
     server_config = ServerConfig(
         capacity_scheduler_policy=capacity_scheduler_policy)
 
-    # Call the existing stress_test function with the new config and test mode
-    stress_test(new_config, test_mode, server_config, stress_time,
-                stress_timeout)
+    # Call the existing stress_test function with the config and test mode
+    stress_test(config, test_mode, server_config, stress_time, stress_timeout)
 
 
 def stress_test(config,
@@ -571,6 +563,9 @@ def stress_test(config,
 
     # For DeepSeek-V3 or DeepSeek-R1 specific server parameters
     if "DeepSeek-V3" in config.model_dir or "DeepSeek-R1" in config.model_dir:
+        # Reduce CUDA allocator fragmentation so transient MoE workspace
+        # allocations don't OOM when KV cache reservation is large.
+        os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
         test_server_config = ServerConfig(
             port=test_server_config.port,
             host=test_server_config.host,
@@ -582,7 +577,7 @@ def stress_test(config,
             max_num_tokens=
             8192,  # DeepSeek-V3 or DeepSeek-R1 specific max_num_tokens
             kv_cache_free_gpu_memory_fraction=
-            0.85,  # DeepSeek-V3 or DeepSeek-R1 specific kv_cache fraction
+            0.75,  # DeepSeek-V3 or DeepSeek-R1 specific kv_cache fraction
             capacity_scheduler_policy=test_server_config.
             capacity_scheduler_policy,
             wait_interval=test_server_config.wait_interval,
@@ -676,14 +671,13 @@ def stress_test(config,
             print_warning(f"Failed to detect GPU architecture: {e}. "
                           "Using default MOE backend (CUTLASS).")
 
-        if config.backend == "pytorch":
-            extra_llm_options.update({
-                "cuda_graph_config": {
-                    "enable_padding": True,
-                    "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
-                },
-                "print_iter_log": True,
-            })
+        extra_llm_options.update({
+            "cuda_graph_config": {
+                "enable_padding": True,
+                "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+            },
+            "print_iter_log": True,
+        })
 
     with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml',
                                      delete=False) as temp_file:
@@ -703,7 +697,7 @@ def stress_test(config,
         "--pp_size",
         str(test_server_config.pp_size),
         "--backend",
-        config.backend,
+        "pytorch",
     ]
 
     # Only add ep_size parameter if it's not None
@@ -923,6 +917,11 @@ def create_aiperf_command(model_name,
     Returns:
         List of command-line arguments for aiperf
     """
+    # --no-server-metrics: trtllm-serve exposes /metrics as a JSON
+    # iteration-stats endpoint (see openai_server.get_iteration_stats),
+    # not a Prometheus exposition. aiperf's ServerMetricsManager hangs
+    # scraping it, causing PROFILE_START to exceed the 60s
+    # AIPERF_SERVICE_PROFILE_START_TIMEOUT and the benchmark to abort.
     return [
         "aiperf",
         "profile",
@@ -934,6 +933,7 @@ def create_aiperf_command(model_name,
         "completions",
         "-u",
         server_url,
+        "--no-server-metrics",
         "--random-seed",
         "123",
         "--synthetic-input-tokens-mean",
@@ -948,6 +948,10 @@ def create_aiperf_command(model_name,
         str(request_count),
         "--concurrency",
         str(concurrency),
+        "--output-artifact-dir",
+        os.path.join(
+            ARTIFACTS_DIR,
+            f"{model_name}-openai-completions-concurrency{concurrency}"),
         # "--verbose",
     ]
 
@@ -1359,8 +1363,7 @@ def extract_stress_test_metrics(artifacts_dir=None, current_model=None):
     # For local testing, the artifacts are at
     # artifacts_dir = os.path.join(script_dir, "artifacts")
     if artifacts_dir is None:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        artifacts_dir = os.path.join(script_dir, "..", "artifacts")
+        artifacts_dir = ARTIFACTS_DIR
 
     # Find all profile_export_aiperf.json files in the artifacts directory
     json_files = glob(os.path.join(artifacts_dir,

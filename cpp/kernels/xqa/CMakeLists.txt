@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -88,6 +88,13 @@ add_custom_command(
 add_custom_target(xqa_sources_h DEPENDS ${XQA_SOURCES_H})
 
 if(BUILD_XQA_TESTS)
+  if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+    get_filename_component(TRT_LLM_ROOT_DIR
+                           "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
+    add_subdirectory("${TRT_LLM_ROOT_DIR}/3rdparty"
+                     "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
+  endif()
+
   # Try to find system installed GTest first
   find_package(GTest QUIET)
   if(NOT GTest_FOUND)

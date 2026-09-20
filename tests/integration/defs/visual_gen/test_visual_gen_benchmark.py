@@ -31,8 +31,8 @@ from typing import List, Optional
 import pytest
 import requests
 import yaml
+from test_common.llm_data import get_checkpoint
 
-from defs import conftest
 from tensorrt_llm._utils import get_free_port
 
 # ---------------------------------------------------------------------------
@@ -42,16 +42,9 @@ from tensorrt_llm._utils import get_free_port
 _WAN_T2V_MODEL = "Wan2.1-T2V-1.3B-Diffusers"
 
 
-def _wan_t2v_path() -> Path:
-    """Resolve the Wan T2V model path, or call pytest.skip if unavailable."""
-    root = Path(conftest.llm_models_root())
-    model_path = root / _WAN_T2V_MODEL
-    if not model_path.is_dir():
-        pytest.skip(
-            f"Wan T2V model not found: {model_path} "
-            f"(set LLM_MODELS_ROOT or place {_WAN_T2V_MODEL} under scratch)"
-        )
-    return model_path
+def _wan_t2v_path() -> str:
+    """Resolve the Wan T2V model path, failing loudly if it is not staged."""
+    return get_checkpoint(_WAN_T2V_MODEL)
 
 
 # Common small-scale generation params for fast CI
@@ -62,12 +55,13 @@ _SMALL_GEN_PARAMS = {
     "num_inference_steps": "4",
     "seed": "42",
 }
+_BENCHMARK_TIMEOUT_S = 1800
 
 
 def _make_visual_gen_options(**extra) -> dict:
     """Build a minimal VisualGen YAML config dict."""
     config = {
-        "parallel": {"dit_cfg_size": 1, "dit_ulysses_size": 1},
+        "parallel_config": {"cfg_size": 1, "ulysses_size": 1},
     }
     config.update(extra)
     return config
@@ -92,7 +86,7 @@ class RemoteVisualGenServer:
     def __init__(
         self,
         model: str,
-        extra_visual_gen_options: Optional[dict] = None,
+        visual_gen_args: Optional[dict] = None,
         cli_args: Optional[List[str]] = None,
         host: str = "localhost",
         port: Optional[int] = None,
@@ -106,11 +100,11 @@ class RemoteVisualGenServer:
         if cli_args:
             args += cli_args
 
-        if extra_visual_gen_options:
+        if visual_gen_args is not None:
             fd, self._config_file = tempfile.mkstemp(suffix=".yml", prefix="vg_bench_cfg_")
             with os.fdopen(fd, "w") as f:
-                yaml.dump(extra_visual_gen_options, f)
-            args += ["--extra_visual_gen_options", self._config_file]
+                yaml.dump(visual_gen_args, f)
+            args += ["--visual_gen_args", self._config_file]
 
         launch_cmd = ["trtllm-serve", model] + args
         self.proc = subprocess.Popen(
@@ -171,7 +165,7 @@ def server():
     model_path = _wan_t2v_path()
     with RemoteVisualGenServer(
         model=str(model_path),
-        extra_visual_gen_options=_make_visual_gen_options(),
+        visual_gen_args=_make_visual_gen_options(),
     ) as srv:
         yield srv
 
@@ -204,6 +198,23 @@ def test_online_benchmark(
 ):
     """Run benchmark_visual_gen.py and validate output and saved results."""
     result_dir = str(tmp_path / "results")
+    width, _, height = _SMALL_GEN_PARAMS["size"].partition("x")
+    requests_path = tmp_path / "requests.yaml"
+    requests_path.write_text(
+        yaml.safe_dump(
+            {
+                "common_params": {
+                    "width": int(width),
+                    "height": int(height),
+                    "num_frames": int(_SMALL_GEN_PARAMS["num_frames"]),
+                    "frame_rate": float(_SMALL_GEN_PARAMS["fps"]),
+                    "num_inference_steps": int(_SMALL_GEN_PARAMS["num_inference_steps"]),
+                    "seed": int(_SMALL_GEN_PARAMS["seed"]),
+                },
+                "requests": [{"prompt": "A bird flying over the ocean"}],
+            }
+        )
+    )
     cmd = [
         sys.executable,
         benchmark_script,
@@ -215,20 +226,8 @@ def test_online_benchmark(
         server.host,
         "--port",
         str(server.port),
-        "--prompt",
-        "A bird flying over the ocean",
-        "--num-prompts",
-        "1",
-        "--size",
-        _SMALL_GEN_PARAMS["size"],
-        "--num-frames",
-        _SMALL_GEN_PARAMS["num_frames"],
-        "--fps",
-        _SMALL_GEN_PARAMS["fps"],
-        "--num-inference-steps",
-        _SMALL_GEN_PARAMS["num_inference_steps"],
-        "--seed",
-        _SMALL_GEN_PARAMS["seed"],
+        "--workload",
+        str(requests_path),
         "--max-concurrency",
         "1",
         "--save-result",
@@ -243,6 +242,7 @@ def test_online_benchmark(
         stderr=subprocess.PIPE,
         text=True,
         check=True,
+        timeout=_BENCHMARK_TIMEOUT_S,
     )
 
     assert result.returncode == 0
@@ -255,7 +255,10 @@ def test_online_benchmark(
         data = json.load(f)
     assert "completed" in data
     assert data["completed"] >= 1
-    assert "mean_e2e_latency_ms" in data
+    assert data["e2e_latency"]["mean"] > 0
+    # The video route stamps gen_latency at the postprocessing transition, so it
+    # ends before the encode and the /content fetch that e2e_latency includes.
+    assert 0 < data["gen_latency"]["mean"] < data["e2e_latency"]["mean"]
 
 
 # ===========================================================================
@@ -276,7 +279,7 @@ def test_offline_benchmark(tmp_path):
         "--model_path",
         str(model_path),
         "visual-gen",
-        "--extra_visual_gen_options",
+        "--visual_gen_args",
         config_file,
         "--prompt",
         "A bird flying over the ocean",
@@ -307,6 +310,7 @@ def test_offline_benchmark(tmp_path):
         stderr=subprocess.PIPE,
         text=True,
         check=True,
+        timeout=_BENCHMARK_TIMEOUT_S,
     )
 
     assert result.returncode == 0
@@ -319,4 +323,5 @@ def test_offline_benchmark(tmp_path):
         data = json.load(f)
     assert "completed" in data
     assert data["completed"] >= 1
-    assert "mean_e2e_latency_ms" in data
+    assert data["mean_latency"] > 0
+    assert data["mean_generation"] > 0

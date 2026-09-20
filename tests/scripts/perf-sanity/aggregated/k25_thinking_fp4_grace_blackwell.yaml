@@ -26,16 +26,16 @@ server_configs:
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.6
     client_configs:
-      - name: "con2_iter10_8k1k"
+      - name: "con2_iter5_8k1k"
         concurrency: 2
-        iterations: 10
+        iterations: 5
         isl: 8192
         osl: 1024
         backend: "openai"
         trust_remote_code: true
         dataset_file: <dataset_file>
 
-  # 8k1k configs - DEP4 with CUTLASS
+  # 8k1k configs - DEP4 with CUTEDSL
   - name: "k25_thinking_fp4_dep4_8k1k"
     model_name: "k25_thinking_fp4"
     tensor_parallel_size: 4
@@ -51,7 +51,7 @@ server_configs:
       enable_balance: true
       timeout_iters: 60
     moe_config:
-      backend: 'CUTLASS'
+      backend: 'CUTEDSL'
       use_low_precision_moe_combine: true
     cuda_graph_config:
       enable_padding: true
@@ -61,9 +61,9 @@ server_configs:
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.6
     client_configs:
-      - name: "con256_iter10_8k1k"
+      - name: "con256_iter5_8k1k"
         concurrency: 256
-        iterations: 10
+        iterations: 5
         isl: 8192
         osl: 1024
         backend: "openai"

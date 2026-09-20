@@ -57,14 +57,27 @@ class NativePhysMemAllocator:
         prop.type = drv.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
         prop.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
         prop.location.id = self._device_id
-        prop.allocFlags.gpuDirectRDMACapable = 1
-        prop.requestedHandleTypes = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-        if not _is_prop_supported(prop):
-            prop.requestedHandleTypes = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_NONE
-            if not _is_prop_supported(prop):
-                prop.allocFlags.gpuDirectRDMACapable = 0
-                if not _is_prop_supported(prop):
-                    raise ValueError("Failed to create physical memory allocation property")
+        # Prefer shareable handle types so UCX cuda_ipc can export the memory
+        # for intra-node zero-copy transfers:
+        # FABRIC (MNNVL) > POSIX_FILE_DESCRIPTOR (pidfd-based, UCX >= 1.22) > NONE,
+        # and within each handle type prefer gpuDirectRDMACapable over not.
+        handle_type_preference = (
+            drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC,
+            drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+            drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_NONE,
+        )
+        supported = False
+        for handle_type in handle_type_preference:
+            for rdma_capable in (1, 0):
+                prop.requestedHandleTypes = handle_type
+                prop.allocFlags.gpuDirectRDMACapable = rdma_capable
+                if _is_prop_supported(prop):
+                    supported = True
+                    break
+            if supported:
+                break
+        if not supported:
+            raise ValueError("Failed to create physical memory allocation property")
         self._prop = prop
         self._outstanding_handles = set()
 
@@ -132,9 +145,7 @@ class VirtMem:
         assert vm_size % phys_mem_allocator.phys_mem_size == 0
         self._allocator = phys_mem_allocator
         device_id = phys_mem_allocator.device_id
-        self._address = _unwrap(
-            drv.cuMemAddressReserve(vm_size, phys_mem_allocator.phys_mem_size, 0, 0)
-        )
+        self._address = _unwrap(drv.cuMemAddressReserve(vm_size, 0, 0, 0))
         self._vm_size = vm_size
         self._pm_stack = []
         self._access_desc = drv.CUmemAccessDesc()

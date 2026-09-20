@@ -21,16 +21,16 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
     "USE_G": lambda args: args["g"] is not None,
     "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
 })
-# @triton.autotune(
-#     configs=[
-#         triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-#         for BK in BKV_LIST
-#         for BV in BKV_LIST
-#         for num_warps in NUM_WARPS
-#         for num_stages in [2, 3, 4]
-#     ],
-#     key=["H", "K", "V", "BT"],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({
+            "BK": BK,
+            "BV": BV
+        }, num_warps=nw, num_stages=ns) for BK in BKV_LIST for BV in BKV_LIST
+        for nw in NUM_WARPS for ns in [2, 3, 4]
+    ],
+    key=["H", "K", "V", "BT"],
+)
 @triton.jit(do_not_specialize=["T"])
 def chunk_fwd_kernel_o(
     q,
@@ -130,6 +130,7 @@ def chunk_fwd_o(
     scale: Optional[float] = None,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_size: int = 64,
+    output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
@@ -140,7 +141,7 @@ def chunk_fwd_o(
     if scale is None:
         scale = k.shape[-1]**-0.5
 
-    o = torch.empty_like(v)
+    o = output if output is not None else torch.empty_like(v)
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
@@ -161,9 +162,5 @@ def chunk_fwd_o(
         K=K,
         V=V,
         BT=BT,
-        BK=128,
-        BV=64,
-        num_warps=4,
-        num_stages=2,
     )
     return o

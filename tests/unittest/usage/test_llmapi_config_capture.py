@@ -1,0 +1,889 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+from enum import Enum
+from pathlib import Path
+from typing import Any, Literal, Optional, Union
+
+import pytest
+
+from tensorrt_llm.llmapi.llm_args import (
+    CudaGraphConfig,
+    Field,
+    KvCacheConfig,
+    TorchCompileConfig,
+    TorchLlmArgs,
+)
+from tensorrt_llm.llmapi.utils import StrictBaseModel
+from tensorrt_llm.usage import usage_lib
+from tensorrt_llm.usage.config import TelemetryField
+from tensorrt_llm.usage.llmapi_config import collect_llm_api_config_payloads
+
+pytestmark = pytest.mark.cpu_only
+
+
+class _NestedConfig(StrictBaseModel):
+    safe_plain_int: int = 7
+    safe_field_int: int = Field(default=11)
+
+
+class _ExampleConfig(StrictBaseModel):
+    safe_plain_int: int = 3
+    safe_field_int: int = Field(default=5)
+    private_path: str = "/customer/private/model"
+    mode: Literal["auto", "slow"] = "auto"
+    nested: _NestedConfig = Field(default_factory=_NestedConfig)
+    unsafe_union: Optional[Union[str, Path]] = "/customer/tokenizer"
+
+
+def _loads_payloads(args) -> tuple[dict, dict]:
+    config_json, meta_json = collect_llm_api_config_payloads(args)
+    return json.loads(config_json), json.loads(meta_json)
+
+
+def test_collect_llm_api_config_uses_type_driven_autoenroll_and_safety_vetoes():
+    """Safe annotations auto-enroll while bare strings and paths stay excluded."""
+    config, meta = _loads_payloads(_ExampleConfig())
+
+    assert config == {
+        "mode": "auto",
+        "nested.safe_field_int": 11,
+        "nested.safe_plain_int": 7,
+        "safe_field_int": 5,
+        "safe_plain_int": 3,
+    }
+    assert "private_path" not in config  # bare str, no allowlist -> not capturable
+    assert "unsafe_union" not in config  # Union[str,Path], no allowlist -> not capturable
+    assert meta["source"] == "effective_validated_llm_args"
+    assert meta["args_class"] == "_ExampleConfig"
+    assert meta["capturable_field_count"] == 5
+    assert meta["captured_field_count"] == 5
+    assert meta["excluded_field_count"] == 0
+    assert meta["unsafe_excluded"] is False
+    assert meta["payload_truncated"] is False
+
+
+def test_collect_llm_api_config_allows_only_explicit_categorical_values():
+    """Explicit strings capture while arbitrary strings and Path values fail closed."""
+
+    class _StringConfig(StrictBaseModel):
+        backend: Optional[str] = Field(
+            default="pytorch",
+            telemetry=TelemetryField.categorical("pytorch", "tensorrt"),
+        )
+        unsafe_backend: Optional[str] = Field(
+            default="file:///customer/private",
+            telemetry=TelemetryField.categorical("pytorch", "tensorrt"),
+        )
+        unconverted: Optional[str] = Field(
+            default="arbitrary-user-string", telemetry={"kind": "categorical"}
+        )
+        union_backend: Union[str, Path] = Field(
+            default="tensorrt",
+            telemetry=TelemetryField.categorical("pytorch", "tensorrt"),
+        )
+        union_path: Union[str, Path] = Field(
+            default=Path("/customer/private"),
+            telemetry=TelemetryField.categorical("pytorch", "tensorrt"),
+        )
+
+    config, meta = _loads_payloads(_StringConfig())
+
+    assert config == {"backend": "pytorch", "union_backend": "tensorrt"}
+    assert meta["captured_field_count"] == 2
+    # unconverted has no allowed values and is not capturable; unsafe_backend and
+    # union_path resolve but fail the explicit-value policy.
+    assert meta["capturable_field_count"] == 4
+    assert meta["excluded_field_count"] == 2
+    assert meta["unsafe_excluded"] is True
+
+
+def test_non_scalar_allowed_value_fails_manifest_build_loudly():
+    """Explicit domains accept only finite JSON scalars."""
+    from tensorrt_llm.usage.llmapi_config import build_capture_manifest
+
+    secret = Path("/customer/secret")
+
+    class _InvalidDomainConfig(StrictBaseModel):
+        value: Any = Field(default=secret, telemetry=TelemetryField.categorical(secret))
+
+    with pytest.raises(ValueError, match="finite JSON scalars"):
+        build_capture_manifest(_InvalidDomainConfig)
+
+
+def test_collect_llm_api_config_walks_only_declared_pydantic_fields():
+    class _DeclaredFieldsOnlyConfig(StrictBaseModel):
+        safe_value: int = 3
+
+        @property
+        def leaked_value(self):
+            raise AssertionError("collector must not inspect arbitrary attributes")
+
+    config, meta = _loads_payloads(_DeclaredFieldsOnlyConfig())
+
+    assert config == {"safe_value": 3}
+    assert meta["capturable_field_count"] == 1
+    assert meta["excluded_field_count"] == 0
+
+
+def test_collect_llm_api_config_rejects_unsafe_annotations_even_for_safe_values():
+    class _UnsafeAnnotationConfig(StrictBaseModel):
+        safe_value: int = 3
+        raw_any: Any = 11
+        object_like: object = True
+        raw_dict: dict[str, Any] = Field(default_factory=dict)
+        converted_any: Any = Field(
+            default="known",
+            telemetry=TelemetryField.categorical("known"),
+        )
+
+    config, meta = _loads_payloads(_UnsafeAnnotationConfig())
+
+    assert config == {"converted_any": "known", "safe_value": 3}
+    # raw_any/object_like/raw_dict have unsafe annotations -> excluded at the
+    # MANIFEST level (never selected), so the sanitizer never sees them.
+    assert "raw_any" not in config
+    assert "object_like" not in config
+    assert "raw_dict" not in config
+    assert meta["capturable_field_count"] == 2
+    assert meta["captured_field_count"] == 2
+    assert meta["excluded_field_count"] == 0
+    assert meta["unsafe_excluded"] is False
+
+
+def test_collect_llm_api_config_is_deterministic_for_effective_torch_args():
+    args = TorchLlmArgs(
+        model="/customer/private/Llama",
+        tokenizer="/customer/private/tokenizer",
+        skip_tokenizer_init=True,
+        tensor_parallel_size=2,
+        pipeline_parallel_size=1,
+        context_parallel_size=1,
+        dtype="float16",
+        load_format="dummy",
+        enable_chunked_prefill=True,
+        max_num_tokens=4096,
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=False,
+            free_gpu_memory_fraction=0.5,
+            dtype="bfloat16",
+            tokens_per_block=64,
+        ),
+        cuda_graph_config=CudaGraphConfig(batch_sizes=[4, 1], max_batch_size=4),
+        torch_compile_config=TorchCompileConfig(
+            enable_inductor=True,
+            enable_piecewise_cuda_graph=True,
+            capture_num_tokens=[128, 64],
+        ),
+    )
+
+    first_config_json, first_meta_json = collect_llm_api_config_payloads(args)
+    second_config_json, second_meta_json = collect_llm_api_config_payloads(args)
+    config = json.loads(first_config_json)
+    meta = json.loads(first_meta_json)
+
+    assert first_config_json == second_config_json
+    assert first_meta_json == second_meta_json
+    assert config["tensor_parallel_size"] == 2
+    assert config["dtype"] == "float16"
+    assert config["load_format"] == "dummy"
+    assert config["enable_chunked_prefill"] is True
+    assert config["max_num_tokens"] == 4096
+    assert config["kv_cache_config.enable_block_reuse"] is False
+    assert config["kv_cache_config.free_gpu_memory_fraction"] == 0.5
+    assert config["kv_cache_config.dtype"] == "bfloat16"
+    assert config["kv_cache_config.tokens_per_block"] == 64
+    assert config["cuda_graph_config.batch_sizes"] == [1, 4]
+    assert config["cuda_graph_config.max_batch_size"] == 4
+    assert config["torch_compile_config.enable_inductor"] is True
+    assert config["torch_compile_config.capture_num_tokens"] == [128, 64]
+    assert "model" not in config
+    assert "tokenizer" not in config
+    assert meta["capture_succeeded"] is True
+    assert meta["args_class"] == "TorchLlmArgs"
+    assert meta["schema_digest"]
+    assert meta["capture_manifest_digest"]
+
+
+def test_collect_llm_api_config_captures_nvfp4_kv_cache_dtype():
+    args = TorchLlmArgs(
+        model="/customer/private/Llama",
+        skip_tokenizer_init=True,
+        kv_cache_config=KvCacheConfig(dtype="nvfp4"),
+    )
+
+    config, meta = _loads_payloads(args)
+
+    assert config["kv_cache_config.dtype"] == "nvfp4"
+    assert meta["capture_succeeded"] is True
+
+
+def test_collect_llm_api_config_captures_int_enum_name():
+    class _LoadMode(Enum):
+        AUTO = 0
+
+    class _PrecisionMode(Enum):
+        FP8 = "fp8"
+
+    class _EnumConfig(StrictBaseModel):
+        mode: _LoadMode = _LoadMode.AUTO
+        precision: _PrecisionMode = _PrecisionMode.FP8
+
+    config, meta = _loads_payloads(_EnumConfig())
+
+    assert config == {"mode": "AUTO", "precision": "fp8"}
+    assert meta["unsafe_excluded"] is False
+
+
+def test_collect_llm_api_config_keeps_bool_values_boolean():
+    class _BoolConfig(StrictBaseModel):
+        enabled: bool = True
+
+    config, _ = _loads_payloads(_BoolConfig())
+
+    assert config["enabled"] is True
+    assert type(config["enabled"]) is bool
+
+
+def test_float_policy_normalizes_integer_defaults_but_rejects_bool():
+    class _FloatConfig(StrictBaseModel):
+        value: float = 0
+
+    config, meta = _loads_payloads(_FloatConfig())
+    assert config == {"value": 0.0}
+    assert type(config["value"]) is float
+    assert meta["unsafe_excluded"] is False
+
+    invalid = _FloatConfig.model_construct(value=True)
+    config, meta = _loads_payloads(invalid)
+    assert config == {}
+    assert meta["unsafe_excluded"] is True
+
+
+def test_bool_literal_union_composes_branches_without_filtering_bool():
+    from tensorrt_llm.usage.llmapi_config import build_capture_manifest
+
+    for value in (True, False, "auto"):
+        config, meta = _loads_payloads(KvCacheConfig(use_kv_cache_manager_v2=value))
+        assert config["use_kv_cache_manager_v2"] == value
+        assert meta["unsafe_excluded"] is False
+
+    invalid = KvCacheConfig()
+    invalid.use_kv_cache_manager_v2 = "private-value"
+    config, meta = _loads_payloads(invalid)
+    assert "use_kv_cache_manager_v2" not in config
+    assert meta["unsafe_excluded"] is True
+
+    entry = next(
+        item
+        for item in build_capture_manifest(KvCacheConfig)
+        if item.path == "use_kv_cache_manager_v2"
+    )
+    assert entry.kind == "categorical"
+    assert entry.capture_types == ("bool", "literal")
+    assert entry.allowed_values == ("auto",)
+
+
+def test_int_literal_union_preserves_typed_branch_distinctions():
+    class _IntOrAutoConfig(StrictBaseModel):
+        value: int | Literal["auto"] = "auto"
+
+    for value in (128, "auto"):
+        config, meta = _loads_payloads(_IntOrAutoConfig(value=value))
+        assert config["value"] == value
+        assert meta["unsafe_excluded"] is False
+
+    for value in ("private-value", True):
+        invalid = _IntOrAutoConfig.model_construct(value=value)
+        config, meta = _loads_payloads(invalid)
+        assert "value" not in config
+        assert meta["unsafe_excluded"] is True
+
+
+def test_equal_valued_literal_union_branches_preserve_python_types():
+    from tensorrt_llm.usage.llmapi_config import build_capture_manifest
+
+    class _TypedLiteralConfig(StrictBaseModel):
+        value: Literal[1] | Literal[True] = 1
+        values: list[Literal[0] | Literal[False]] = Field(default_factory=lambda: [0, False])
+
+    entry = next(
+        item for item in build_capture_manifest(_TypedLiteralConfig) if item.path == "value"
+    )
+    assert [type(value) for value in entry.allowed_values] == [int, bool]
+
+    for value in (1, True):
+        config, meta = _loads_payloads(_TypedLiteralConfig.model_construct(value=value))
+        assert type(config["value"]) is type(value)
+        assert meta["unsafe_excluded"] is False
+
+    config, meta = _loads_payloads(_TypedLiteralConfig())
+    assert [type(value) for value in config["values"]] == [int, bool]
+    assert meta["unsafe_excluded"] is False
+
+
+def test_literal_mamba_cache_dtype_needs_no_explicit_allowlist():
+    allowed = ("auto", "float16", "bfloat16", "float32")
+    for value in allowed:
+        config, meta = _loads_payloads(KvCacheConfig(mamba_ssm_cache_dtype=value))
+        assert config["mamba_ssm_cache_dtype"] == value
+        assert meta["unsafe_excluded"] is False
+
+    invalid = KvCacheConfig()
+    invalid.mamba_ssm_cache_dtype = "private-value"
+    config, meta = _loads_payloads(invalid)
+    assert "mamba_ssm_cache_dtype" not in config
+    assert meta["unsafe_excluded"] is True
+
+
+def test_explicit_allowlist_applies_only_to_unsafe_union_branch():
+    class _MixedConfig(StrictBaseModel):
+        value: int | str = Field(
+            default="auto",
+            telemetry=TelemetryField.categorical("auto"),
+        )
+
+    for value in (128, "auto"):
+        config, meta = _loads_payloads(_MixedConfig(value=value))
+        assert config["value"] == value
+        assert meta["unsafe_excluded"] is False
+
+    for value in ("private-value", True):
+        invalid = _MixedConfig.model_construct(value=value)
+        config, meta = _loads_payloads(invalid)
+        assert "value" not in config
+        assert meta["unsafe_excluded"] is True
+
+
+def test_explicit_allowlist_membership_is_type_exact():
+    class _NumericDomainConfig(StrictBaseModel):
+        value: Any = Field(default=1, telemetry=TelemetryField.categorical(1))
+
+    config, _ = _loads_payloads(_NumericDomainConfig())
+    assert config == {"value": 1}
+
+    invalid = _NumericDomainConfig(value=True)
+    config, meta = _loads_payloads(invalid)
+    assert config == {}
+    assert meta["unsafe_excluded"] is True
+
+
+def test_explicit_allowlist_cannot_broaden_a_safe_annotation():
+    from tensorrt_llm.usage.llmapi_config import build_capture_manifest
+
+    class _LiteralConfig(StrictBaseModel):
+        value: Literal["auto"] = Field(
+            default="auto",
+            telemetry=TelemetryField.categorical("private-value"),
+        )
+
+    with pytest.raises(ValueError, match="unsafe scalar annotation branch"):
+        build_capture_manifest(_LiteralConfig)
+
+
+def test_nested_union_sequence_is_sanitized_branch_by_branch():
+    class _NestedUnionConfig(StrictBaseModel):
+        values: Optional[list[int | Literal["auto"]]] = None
+
+    config, meta = _loads_payloads(_NestedUnionConfig(values=[128, "auto"]))
+    assert config == {"values": [128, "auto"]}
+    assert meta["unsafe_excluded"] is False
+
+    invalid = _NestedUnionConfig.model_construct(values=[True])
+    config, meta = _loads_payloads(invalid)
+    assert config == {}
+    assert meta["unsafe_excluded"] is True
+
+
+def test_homogeneous_tuple_and_set_sequences_remain_capturable():
+    class _SequenceConfig(StrictBaseModel):
+        sizes: tuple[int, ...] = (3, 1)
+        fixed_sizes: tuple[int, int] = (5, 2)
+        fixed_modes: tuple[Literal["auto"], Literal["auto"]] = ("auto", "auto")
+        modes: set[Literal["auto", "manual"]] = {"manual", "auto"}
+
+    config, meta = _loads_payloads(_SequenceConfig())
+    assert config == {
+        "fixed_modes": ["auto", "auto"],
+        "fixed_sizes": [5, 2],
+        "modes": ["auto", "manual"],
+        "sizes": [3, 1],
+    }
+    assert meta["unsafe_excluded"] is False
+
+
+def test_collect_llm_api_config_rejects_non_finite_floats():
+    """Non-finite floats are excluded while finite floats are captured."""
+
+    class _FloatConfig(StrictBaseModel):
+        finite: float = 0.5
+        infinite: float = float("inf")
+        not_a_number: float = float("nan")
+
+    config, meta = _loads_payloads(_FloatConfig())
+
+    assert config == {"finite": 0.5}
+    assert "infinite" not in config
+    assert "not_a_number" not in config
+    assert meta["excluded_field_count"] == 2
+    assert meta["unsafe_excluded"] is True
+
+
+def test_collect_llm_api_config_rejects_non_finite_floats_in_sequence():
+    """One non-finite item excludes the entire sequence."""
+
+    class _FloatSeqConfig(StrictBaseModel):
+        finite_buckets: list[float] = Field(default_factory=lambda: [0.1, 0.5, 1.0])
+        poisoned_buckets: list[float] = Field(default_factory=lambda: [0.1, float("inf"), 1.0])
+
+    config, meta = _loads_payloads(_FloatSeqConfig())
+
+    assert config == {"finite_buckets": [0.1, 0.5, 1.0]}
+    assert "poisoned_buckets" not in config
+    assert meta["unsafe_excluded"] is True
+
+
+def test_collect_llm_api_config_caps_sequences_recursively_and_flags_truncation():
+    from tensorrt_llm.usage import llmapi_config
+
+    cap = llmapi_config.MAX_SEQ_ITEMS
+
+    class _SequenceConfig(StrictBaseModel):
+        flat: list[int]
+        inner: list[list[int]]
+        outer: list[list[int]]
+
+    config, meta = _loads_payloads(
+        _SequenceConfig(
+            flat=list(range(cap + 50)),
+            inner=[list(range(cap + 10)), list(range(cap + 20))],
+            outer=[[0, 1] for _ in range(cap + 30)],
+        )
+    )
+    assert config["flat"] == list(range(cap))
+    assert len(config["inner"]) == 2
+    assert all(row == list(range(cap)) for row in config["inner"])
+    assert len(config["outer"]) == cap
+    assert meta["sequence_truncated"] is True
+
+    exact = list(range(cap))
+    exact_outer = [[0, 1] for _ in range(cap)]
+    config, meta = _loads_payloads(_SequenceConfig(flat=exact, inner=[exact], outer=exact_outer))
+    assert config == {"flat": exact, "inner": [exact], "outer": exact_outer}
+    assert meta["sequence_truncated"] is False
+
+    config, meta = _loads_payloads(
+        _SequenceConfig(flat=[1, 2, 3], inner=[[1], [2]], outer=[[0, 1]])
+    )
+    assert config["flat"] == [1, 2, 3]
+    assert config["inner"] == [[1], [2]]
+    assert config["outer"] == [[0, 1]]
+    assert meta["sequence_truncated"] is False
+
+
+def test_failure_meta_uses_new_contract_keys_and_versions():
+    from tensorrt_llm.usage import llmapi_config as rc
+
+    meta = rc._failure_meta(args_class="X")
+    assert meta["capture_version"] == "2"
+    assert meta["api_contract_version"] == "0.2.0"
+    assert meta["field_policy_version"] == "3"
+    assert meta["excluded_field_count"] == 0  # renamed from the old marked-count key
+    assert meta["payload_truncated"] is False
+    assert meta["sequence_truncated"] is False
+    # The pre-migration keys must be gone from the new contract; assert by literal
+    # so a regression that reintroduces them fails loudly.
+    assert "excluded_marked_field_count" not in meta
+    assert "included_field_count" not in meta
+
+
+def test_collect_llm_api_config_rejects_heterogeneous_tuples():
+    class _TupleConfig(StrictBaseModel):
+        pair: tuple[int, Literal["safe"]] = (1, "safe")
+        typed_pair: tuple[Literal[1], Literal[True]] = (1, True)
+
+    config, meta = _loads_payloads(_TupleConfig())
+
+    assert config == {}
+    assert meta["capturable_field_count"] == 0
+    assert meta["excluded_field_count"] == 0
+    assert meta["unsafe_excluded"] is False
+
+
+def test_collect_llm_api_config_derives_manifest_kind_from_annotation():
+    """Stored kind metadata cannot override the kind derived from compiled policies."""
+
+    class _Mode(Enum):
+        AUTO = "auto"
+
+    class _KindConfig(StrictBaseModel):
+        # Literal but deliberately registered with the wrong kind -> categorical.
+        literal_field: Literal["a", "b"] = Field(default="a", telemetry={"kind": "value"})
+        # Enum -> categorical.
+        enum_field: _Mode = Field(default=_Mode.AUTO, telemetry=True)
+        # Bare str + allowlist -> categorical.
+        allowlist_field: str = Field(
+            default="x",
+            telemetry={
+                "kind": "value",
+                "allowed_values": ["x", "y"],
+            },
+        )
+        # Plain int -> value.
+        int_field: int = Field(default=3, telemetry={"kind": "categorical"})
+
+    from tensorrt_llm.usage.llmapi_config import build_capture_manifest
+
+    by_path = {e.path: e for e in build_capture_manifest(_KindConfig)}
+    assert by_path["literal_field"].kind == "categorical"
+    assert by_path["enum_field"].kind == "categorical"
+    assert by_path["allowlist_field"].kind == "categorical"
+    assert by_path["int_field"].kind == "value"
+
+
+def test_collect_llm_api_config_swallows_expected_capture_errors(monkeypatch):
+    """The inner net stays fail-silent for the expected sanitizer error family."""
+    from tensorrt_llm.usage import llmapi_config
+
+    def raise_value_error(*_args, **_kwargs):
+        raise ValueError("synthetic sanitizer error")
+
+    monkeypatch.setattr(llmapi_config, "build_capture_manifest", raise_value_error)
+
+    config, meta = _loads_payloads(_ExampleConfig())
+
+    assert config == {}
+    assert meta["capture_succeeded"] is False
+    assert meta["args_class"] == "_ExampleConfig"
+
+
+def test_collect_llm_api_config_propagates_unexpected_errors(monkeypatch):
+    """Unexpected errors must propagate, not get swallowed by the inner net."""
+    import pytest
+
+    from tensorrt_llm.usage import llmapi_config
+
+    def raise_runtime_error(*_args, **_kwargs):
+        raise RuntimeError("unexpected collector bug")
+
+    monkeypatch.setattr(llmapi_config, "build_capture_manifest", raise_runtime_error)
+
+    with pytest.raises(RuntimeError, match="unexpected collector bug"):
+        collect_llm_api_config_payloads(_ExampleConfig())
+
+
+@pytest.mark.parametrize(
+    "metadata", ({"status": "beta"}, {"telemetry": True}, {"telemetry": False})
+)
+def test_field_wrapper_rejects_callable_json_schema_extra_with_metadata(metadata):
+    with pytest.raises(TypeError, match="json_schema_extra must be a dict"):
+        Field(default=1, json_schema_extra=lambda schema: None, **metadata)
+
+
+def test_field_wrapper_preserves_callable_json_schema_extra_without_metadata():
+    class _Config(StrictBaseModel):
+        value: int = Field(default=1, json_schema_extra=lambda schema: schema.update(marker=True))
+
+    assert _Config.model_json_schema()["properties"]["value"]["marker"] is True
+
+
+def test_collect_llm_api_config_captures_none_on_optional_allowlist_field():
+    """None is captured through the independent policy on Optional fields."""
+
+    class _C(StrictBaseModel):
+        backend: Optional[str] = Field(
+            default=None,
+            telemetry=TelemetryField.categorical("pytorch", "tensorrt"),
+        )
+
+    config, meta = _loads_payloads(_C())
+    assert config == {"backend": None}
+    assert meta["captured_field_count"] == 1
+    assert meta["excluded_field_count"] == 0
+    assert meta["unsafe_excluded"] is False
+
+
+def test_collect_llm_api_config_captures_transceiver_runtime_categorical():
+    """Every Optional transceiver-runtime Literal value is captured."""
+    from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+
+    for runtime in ("CPP", "PYTHON", "auto", None):
+        args = TorchLlmArgs(
+            model="/customer/private/Llama",
+            skip_tokenizer_init=True,
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend="NIXL", transceiver_runtime=runtime
+            ),
+        )
+
+        config, meta = _loads_payloads(args)
+
+        assert config["cache_transceiver_config.transceiver_runtime"] == runtime
+        assert meta["capture_succeeded"] is True
+
+
+def test_collect_llm_api_config_redacts_out_of_allowlist_categorical_str():
+    """The reasoning-parser allowlist rejects arbitrary strings."""
+    args = TorchLlmArgs(
+        model="/customer/private/Llama",
+        skip_tokenizer_init=True,
+        reasoning_parser="not-a-real-parser-/customer/secret",
+    )
+
+    config, meta = _loads_payloads(args)
+
+    assert "reasoning_parser" not in config
+    assert meta["unsafe_excluded"] is True
+    # An in-allowlist value is captured.
+    args_ok = TorchLlmArgs(
+        model="/customer/private/Llama",
+        skip_tokenizer_init=True,
+        reasoning_parser="deepseek-r1",
+    )
+    config_ok, _ = _loads_payloads(args_ok)
+    assert config_ok["reasoning_parser"] == "deepseek-r1"
+
+
+def test_collect_llm_api_config_captures_gms_load_format():
+    """The explicit load-format policy captures GMS as ``gms``."""
+    args = TorchLlmArgs(
+        model="/customer/private/Llama",
+        skip_tokenizer_init=True,
+        load_format="gms",
+    )
+
+    config, meta = _loads_payloads(args)
+
+    assert config["load_format"] == "gms"
+    assert meta["capture_succeeded"] is True
+
+
+def test_collect_llm_api_config_captures_checkpoint_io_policy() -> None:
+    for policy in ("auto", "rank_striped_read_ahead"):
+        args = TorchLlmArgs(
+            model="/customer/private/Llama",
+            skip_tokenizer_init=True,
+            checkpoint_io_policy=policy,
+        )
+
+        config, meta = _loads_payloads(args)
+
+        assert config["checkpoint_io_policy"] == policy
+        assert meta["capture_succeeded"] is True
+
+
+def _walk_captured_keys(model) -> set[str]:
+    """Capture a single nested config model and return its captured keys."""
+    config, _ = _loads_payloads(model)
+    return set(config)
+
+
+def test_collect_llm_api_config_captures_decoding_type_for_every_arm():
+    """Every reachable decoding_type Literal is captured from its active model arm."""
+    from tensorrt_llm.llmapi.llm_args import (
+        AutoDecodingConfig,
+        MTPDecodingConfig,
+        NGramDecodingConfig,
+    )
+
+    mtp = MTPDecodingConfig(num_nextn_predict_layers=1)
+    assert _walk_captured_keys(mtp) >= {"decoding_type"}
+
+    ngram = NGramDecodingConfig(max_draft_len=1, max_matching_ngram_size=2)
+    assert _walk_captured_keys(ngram) >= {"decoding_type"}
+
+    auto = AutoDecodingConfig()
+    assert _walk_captured_keys(auto) >= {"decoding_type"}
+
+
+def test_collect_llm_api_config_captures_max_total_draft_tokens_for_every_arm():
+    """Inherited safe fields remain capturable on concrete model arms."""
+    from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+
+    mtp = MTPDecodingConfig(num_nextn_predict_layers=1)
+    assert "max_total_draft_tokens" in _walk_captured_keys(mtp)
+
+
+def test_collect_llm_api_config_captures_sparse_algorithm_for_every_arm():
+    """Every reachable sparse algorithm Literal is captured from its active model arm."""
+    from tensorrt_llm.llmapi.llm_args import (
+        DeepSeekSparseAttentionConfig,
+        DeepSeekV4SparseAttentionConfig,
+        MiniMaxM3SparseAttentionConfig,
+        QSASparseAttentionConfig,
+        RocketSparseAttentionConfig,
+        SkipSoftmaxAttentionConfig,
+    )
+    from tensorrt_llm.usage.llmapi_config import build_capture_manifest
+
+    configs = (
+        QSASparseAttentionConfig(),
+        DeepSeekSparseAttentionConfig(),
+        DeepSeekV4SparseAttentionConfig(),
+        RocketSparseAttentionConfig(),
+        SkipSoftmaxAttentionConfig(),
+        MiniMaxM3SparseAttentionConfig(),
+    )
+    expected = {config.algorithm for config in configs}
+    entry = next(
+        item
+        for item in build_capture_manifest(TorchLlmArgs)
+        if item.path == "sparse_attention_config.algorithm"
+    )
+    assert set(entry.allowed_values) == expected
+    assert entry.capture_types == ("literal",)
+
+    for sparse_config in configs:
+        args = TorchLlmArgs(
+            model="/customer/private/Llama",
+            skip_tokenizer_init=True,
+            sparse_attention_config=sparse_config,
+        )
+        captured, meta = _loads_payloads(args)
+        assert captured["sparse_attention_config.algorithm"] == sparse_config.algorithm
+        assert meta["unsafe_excluded"] is False
+
+
+@pytest.mark.parametrize("field_name", ["target_sparsity", "threshold_scale_factor"])
+def test_sparse_scalar_union_branches_capture_float_but_not_mapping(field_name):
+    from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
+    def capture(value):
+        sparse_config = SkipSoftmaxAttentionConfig(**{field_name: value})
+        args = TorchLlmArgs(
+            model="/customer/private/Llama",
+            skip_tokenizer_init=True,
+            sparse_attention_config=sparse_config,
+        )
+        return _loads_payloads(args)
+
+    path = f"sparse_attention_config.{field_name}"
+    config, meta = capture(0.5)
+    assert config[path] == 0.5
+    assert type(config[path]) is float
+    assert meta["unsafe_excluded"] is False
+
+    config, meta = capture({"decode": 0.5})
+    assert path not in config
+    assert meta["unsafe_excluded"] is True
+
+
+def test_background_reporter_keeps_initial_report_when_config_capture_fails(
+    monkeypatch, enable_telemetry
+):
+    sent_payloads = []
+
+    assert usage_lib.apply_usage_session_config()
+
+    monkeypatch.setattr(usage_lib, "_MAX_HEARTBEATS", 0)
+    monkeypatch.setattr(usage_lib, "_get_trtllm_version", lambda: "0.0.0-test")
+    monkeypatch.setattr(
+        usage_lib,
+        "_collect_system_info",
+        lambda: {
+            "platform": "linux",
+            "python_version": "3",
+            "cpu_architecture": "x86",
+            "cpu_count": 1,
+        },
+    )
+    monkeypatch.setattr(
+        usage_lib,
+        "_collect_gpu_info",
+        lambda: {"gpu_count": 0, "gpu_name": "", "gpu_memory_mb": 0, "cuda_version": ""},
+    )
+    monkeypatch.setattr(usage_lib, "_send_to_gxt", sent_payloads.append)
+
+    def raise_capture_error(_):
+        raise RuntimeError("capture failed")
+
+    monkeypatch.setattr(usage_lib, "_collect_llm_api_config_payloads", raise_capture_error)
+
+    usage_lib._background_reporter(
+        llm_args=object(), pretrained_config=None, usage_context="llm_class"
+    )
+
+    params = sent_payloads[0]["events"][0]["parameters"]
+    assert json.loads(params["llmApiConfigJson"]) == {}
+    meta = json.loads(params["llmApiConfigMetaJson"])
+    assert meta["capture_succeeded"] is False
+    assert meta["args_class"] == "object"
+    assert params["featuresJson"]
+
+
+def test_collect_llm_api_config_honors_explicit_exclude_sentinel():
+    class _ExcludeConfig(StrictBaseModel):
+        kept: int = Field(default=1)
+        secret_seed: int = Field(default=42, telemetry=False)
+
+    config, meta = _loads_payloads(_ExcludeConfig())
+    assert config == {"kept": 1}
+    assert "secret_seed" not in config
+    assert meta["capturable_field_count"] == 1
+
+
+def test_unknown_subclass_cannot_inherit_a_base_capture_policy():
+    class _BaseArm(StrictBaseModel):
+        sensitive: int = 1
+
+    class _ChildArm(_BaseArm):
+        sensitive: int = Field(default=2, telemetry=False)
+
+    class _Root(StrictBaseModel):
+        arm: _BaseArm
+
+    config, meta = _loads_payloads(_Root(arm=_ChildArm()))
+    assert "arm.sensitive" not in config
+    assert meta["capturable_field_count"] == 1
+
+
+def test_collect_llm_api_config_honors_raw_json_schema_extra_exclude():
+    # Cross-module models use bare pydantic Field with json_schema_extra={"telemetry": ...}.
+    # A raw {"telemetry": False} must be honored as an exclude, like the wrapper telemetry=False.
+    from pydantic import Field as PydField
+
+    class _RawExcludeConfig(StrictBaseModel):
+        kept: int = 1
+        secret: int = PydField(default=2, json_schema_extra={"telemetry": False})
+
+    config, meta = _loads_payloads(_RawExcludeConfig())
+    assert "secret" not in config
+    assert config == {"kept": 1}
+
+
+def test_manifest_excludes_loosely_typed_model_children():
+    # B-1 regression: moe_config.load_balancer is Optional[Union[object, str]];
+    # a validator coerces it into a MoeLoadBalancerConfig at runtime, but the
+    # annotation names no BaseModel, so its children must NOT be capturable.
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+    from tensorrt_llm.usage.llmapi_config import build_capture_manifest
+
+    paths = {e.path for e in build_capture_manifest(TorchLlmArgs)}
+    assert not any(p.startswith("moe_config.load_balancer.") for p in paths)
+
+
+def test_collect_llm_api_config_caps_total_payload_size(monkeypatch):
+    from tensorrt_llm.usage import llmapi_config as rc
+
+    class _BigConfig(StrictBaseModel):
+        a: int = 11111111
+        b: int = 22222222
+        c: int = 33333333
+
+    monkeypatch.setattr(rc, "MAX_CONFIG_BYTES", 20)  # force truncation
+    config, meta = _loads_payloads(_BigConfig())
+    assert meta["payload_truncated"] is True
+    assert len(rc._canonical_json(config).encode("utf-8")) <= 20

@@ -16,7 +16,6 @@
  */
 
 #include "bindings.h"
-#include "executor.h"
 #include "executorConfig.h"
 #include "request.h"
 #include "tensorrt_llm/executor/executor.h"
@@ -131,7 +130,14 @@ void initBindings(nb::module_& m)
         .def_rw("num_paused_requests", &tle::InflightBatchingStats::numPausedRequests)
         .def_rw("num_ctx_tokens", &tle::InflightBatchingStats::numCtxTokens)
         .def_rw("micro_batch_id", &tle::InflightBatchingStats::microBatchId)
-        .def_rw("avg_num_decoded_tokens_per_iter", &tle::InflightBatchingStats::avgNumDecodedTokensPerIter);
+        .def_rw("avg_num_decoded_tokens_per_iter", &tle::InflightBatchingStats::avgNumDecodedTokensPerIter)
+        .def_rw("num_ctx_kv_tokens", &tle::InflightBatchingStats::numCtxKvTokens)
+        .def_rw("num_gen_kv_tokens", &tle::InflightBatchingStats::numGenKvTokens)
+        .def_rw("num_queued_context_requests", &tle::InflightBatchingStats::numQueuedContextRequests)
+        .def_rw("num_queued_ctx_tokens", &tle::InflightBatchingStats::numQueuedCtxTokens)
+        .def_rw("num_queued_gen_requests", &tle::InflightBatchingStats::numQueuedGenRequests)
+        .def_rw("num_queued_gen_kv_tokens", &tle::InflightBatchingStats::numQueuedGenKvTokens)
+        .def_rw("num_paused_kv_tokens", &tle::InflightBatchingStats::numPausedKvTokens);
 
     nb::class_<tle::SpecDecodingStats>(m, "SpecDecodingStats")
         .def(nb::init<>())
@@ -223,6 +229,7 @@ void initBindings(nb::module_& m)
         .def_ro("lora_id", &tle::KVCacheStoredBlockData::loraId)
         .def_ro("cache_level", &tle::KVCacheStoredBlockData::cacheLevel)
         .def_ro("priority", &tle::KVCacheStoredBlockData::priority)
+        .def_ro("cache_salt", &tle::KVCacheStoredBlockData::cacheSalt)
         .def_prop_ro("mm_keys",
             [](tle::KVCacheStoredBlockData const& self)
             {
@@ -279,7 +286,6 @@ void initBindings(nb::module_& m)
 
     tensorrt_llm::nanobind::executor::initRequestBindings(m);
     tensorrt_llm::nanobind::executor::initConfigBindings(m);
-    tensorrt_llm::nanobind::executor::Executor::initBindings(m);
 }
 
 } // namespace tensorrt_llm::nanobind::executor

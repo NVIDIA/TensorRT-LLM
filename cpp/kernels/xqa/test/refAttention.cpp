@@ -180,7 +180,8 @@ template <typename MathElem, bool isPaged, bool useBeamSearch>
 #if SPEC_DEC
 Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttention(IOHead const* q,
     CacheSeq<isPaged, useBeamSearch> const& k, CacheSeq<isPaged, useBeamSearch> const& v, uint32_t seqLen, float qScale,
-    float kvScale, float xScale, uint32_t slidingWinSize, bool* hostMask, const uint32_t qSeqLen, const uint32_t q_len)
+    float kvScale, float xScale, uint32_t slidingWinSize, float* attentionSinks, bool* hostMask, const uint32_t qSeqLen,
+    const uint32_t q_len)
 {
 #else
 Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttention(IOHead const* q,
@@ -244,7 +245,6 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttenti
     }
 
     // Add the attention sinks.
-#if !SPEC_DEC
     if (attentionSinks != nullptr)
     {
         for (uint32_t i = 0; i < headGrpSize; i++)
@@ -252,7 +252,6 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttenti
             rowSum[i] += expf(attentionSinks[i] - rowMax[i]);
         }
     }
-#endif
 
     Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> out
         = gemm1Acc.array().colwise() * (xScale * kvScale / rowSum.array());
@@ -265,7 +264,7 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttenti
     template Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor>                                     \
     refAttention<prec, isPaged, useBeamSearch>(IOHead const* q, CacheSeq<isPaged, useBeamSearch> const& k,             \
         CacheSeq<isPaged, useBeamSearch> const& v, uint32_t seqLen, float qScale, float kvScale, float xScale,         \
-        uint32_t slidingWinSize, bool* hostMask, const uint32_t qSeqLen, const uint32_t q_len)
+        uint32_t slidingWinSize, float* attentionSinks, bool* hostMask, const uint32_t qSeqLen, const uint32_t q_len)
 #else
 #define INSTANTIATE_refAttention(prec, isPaged, useBeamSearch)                                                         \
     template Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor>                                     \

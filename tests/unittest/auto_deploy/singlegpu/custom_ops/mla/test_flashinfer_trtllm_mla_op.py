@@ -1,15 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from unittest.mock import patch
 
 import pytest
 import torch
-
-import tensorrt_llm._torch.auto_deploy  # noqa: F401
-from tensorrt_llm._torch.auto_deploy.custom_ops.mla import flashinfer_trtllm_mla as trtllm_mla_mod
-from tests.unittest.auto_deploy.singlegpu.custom_ops.mla.test_flashinfer_mla_op import (
+from auto_deploy.singlegpu.custom_ops.mla.test_flashinfer_mla_op import (
     _create_mla_inputs,
     _create_paged_cache_and_metadata,
     _create_unpaged_cache_and_metadata,
 )
+
+import tensorrt_llm._torch.auto_deploy  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.mla import flashinfer_trtllm_mla as trtllm_mla_mod
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),

@@ -1,139 +1,397 @@
 # Sparse Attention
 
-- [Background and Motivation](#background-and-motivation)
-- [Algorithm Overview](#algorithm-overview)
-- [Quick Start](#quick-start)
-  - [Python API](#python-api)
-  - [Configure via YAML file](#configure-via-yaml-file)
-- [Sparse Attention Implementation](#sparse-attention-implementation)
-  - [Framework-Level Sparse Attention](#framework-level-sparse-attention)
-    - [Overview](#overview)
-    - [Architecture](#architecture)
-    - [Framework Implementation](#framework-implementation)
-    - [Implementing a New Algorithm](#implementing-a-new-algorithm)
-      - [1. Configuration Class](#1-configuration-class)
-      - [2. Implement the prediction module in Attention Backend](#2-implement-the-prediction-module-in-attention-backend)
-      - [3. Manage Auxiliary Memory Pool](#3-manage-auxiliary-memory-pool)
-      - [4. Registration and Dispatch](#4-registration-and-dispatch)
-      - [Future Work](#future-work)
-  - [Kernel-Level Sparse Attention](#kernel-level-sparse-attention)
-  - [Summary](#summary)
+- [Overview](#overview)
+- [Supported Sparse Attentions](#supported-sparse-attentions)
+  - [Sparse MLA](#sparse-mla)
+  - [Sparse MQA/GQA](#sparse-mqagqa)
+  - [Sparse MHA](#sparse-mha)
+- [Supported Algorithms](#supported-algorithms)
+  - [Capability Comparison](#capability-comparison)
+  - [Algorithm Details](#algorithm-details)
+- [Usage with trtllm-bench and trtllm-serve](#usage-with-trtllm-bench-and-trtllm-serve)
+- [Further Reading](#further-reading)
 
-## Background and Motivation
+## Overview
 
-As Large Language Models (LLMs) are applied to increasingly complex tasks such as long-document summarization, code generation, and autonomous agents, the demand for processing long contexts and extended generation has surged. In Transformer-based models, the attention mechanism's computational complexity and memory usage grow quadratically and linearly with sequence length, respectively. This creates significant bottlenecks in both the **Context (Prefill)** and **Generation (Decode)** phases:
+Sparse attention reduces long-context inference cost by avoiding attention work on
+KV entries that an algorithm considers unimportant. TensorRT LLM separates two
+parts of that process:
 
-*   **Context Phase**: Processing long prompts requires substantial memory bandwidth and computation, affecting time-to-first-token (TTFT). Since the context phase is typically compute-bound, reducing the computational load here is critical.
-*   **Generation Phase**: The Key-Value (KV) cache grows with every generated token, consuming vast amounts of GPU memory and bandwidth. Since the generation phase is usually memory-bound, reducing the memory footprint directly alleviates memory pressure, improves token-to-token latency (TPOT), and allows for larger batch sizes.
+1. An algorithm selects tokens or blocks, or decides which kernel tiles can be
+   skipped.
+2. An attention implementation consumes that sparse pattern and computes the
+   output.
 
-Sparse attention methods aim to exploit structured sparsity in attention. Especially, exploiting the token sparsity in the sequence dimension to concentrate on the most important query-key pairs is very common. The goal of sparse attention is accelerating long-context inference, while balancing performance gains with acceptable approximation error and system complexity.
+This distinction matters for support. A kernel that can compute sparse MQA/GQA
+does not by itself define how a model selects tokens, and therefore is not a
+standalone user-facing algorithm.
 
-## Algorithm Overview
-The design space of sparse attention is quite large, so we cannot assume there is a single implementation strategy that covers all variants. TensorRT LLM uses `sparse_attention_config` in the `LLM` API as a unified interface for **describing and enabling** different sparse attention algorithms, while allowing each technique to choose the most suitable implementation path. Each *algorithm* has its own configuration class inheriting from `BaseSparseAttentionConfig`.
+The user-facing `sparse_attention_config` API is currently prototype and is
+supported by the PyTorch execution backend. Each public algorithm has a config
+class selected by its `algorithm` field. Model-native algorithms usually read
+their geometry from the checkpoint; avoid overriding those values unless the
+model-specific guide says they are tunable.
 
-TensorRT LLM currently exposes the following algorithms differentiated by `sparse_attention_config.algorithm`:
+## Supported Sparse Attentions
 
-- **RocketKV** (`algorithm: rocket`, `RocketSparseAttentionConfig`, [ref](https://arxiv.org/pdf/2502.14051)): A two-stage algorithm, where the first stage performs permanent KV cache eviction and the second stage performs dynamic token selection.
-- **DeepSeek Sparse Attention (DSA)** (`algorithm: dsa`, `DeepSeekSparseAttentionConfig`, [ref](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/DeepSeek_V3_2.pdf)): DeepSeek's model-native sparse attention solution, introduced in DeepSeek V3.2.
-- **Skip Softmax Attention (BLASST)** (`algorithm: skip_softmax`, `SkipSoftmaxAttentionConfig`, [ref](https://arxiv.org/pdf/2512.12087)): A drop-in method that dynamically skips Softmax and BMM2 work for unimportant KV blocks, which could be fully implemented inside the attention kernels.
+TensorRT LLM supports sparse computation for MLA, MQA/GQA, and MHA. This
+section describes the attention and kernel contracts independently of the
+algorithm that produces the sparse pattern. The public algorithms that connect
+selectors, cache management, and these attention implementations are listed in
+[Supported Algorithms](#supported-algorithms).
 
-## Quick Start
+### Sparse MLA
 
-This section shows how to enable sparse attention through the `LLM` API or YAML config. 
+Sparse MLA consumes token-level selections against a model-specific shared KV
+representation. DeepSeek Sparse Attention selects entries from a low-rank
+latent KV cache, while DeepSeek-V4 combines compressed full-head non-RoPE K
+with its corresponding RoPE K. Both prefill and generation are supported,
+including mixed batches.
 
-### Python API
+| Parameter | Support |
+|---|---|
+| GPU architecture | SM90, SM100, SM103, SM120, and SM121 |
+| Compute phase | Packed prefill and generation, including mixed batches |
+| Attention type | MLA |
+| Head counts | Checkpoint-defined |
+| Q heads per KV head | Not applicable; the model uses a shared KV representation |
+| Head dimensions | DeepSeek-V3.2: QK `192`, V `128`; DeepSeek-V4: QK/V `512` |
+| Input dtype | BF16 |
+| Input layout | Model-native MLA inputs |
+| Output dtype | BF16 |
+| KV-cache dtype | BF16 or model- and architecture-specific FP8 |
+| KV-cache layout | Paged, model-specific shared KV representation |
+| Sparse granularity | Token |
+| Attention semantics | Causal self-attention |
 
-To use sparse attention, configure a `BaseSparseAttentionConfig` subclass and pass it to the `LLM` constructor. Each algorithm has its own configuration class inheriting from `BaseSparseAttentionConfig`. To learn about the meaning of specific parameters, please refer to the docstring of the corresponding configuration class.
+`Input dtype` refers to model-native MLA inputs, which remain BF16. The FP8
+KV-cache entry and any internal FP8 staging do not indicate raw FP8 model-input
+support.
+
+See
+[`test_sparse_mla_forward.py`](../../../tests/unittest/_torch/attention/sparse/test_sparse_mla_forward.py)
+for executable sparse MLA examples.
+
+### Sparse MQA/GQA
+
+The table below compares token-sparse and 128-token block-sparse MQA/GQA. The
+token-sparse path accepts a precomputed token list for each KV head and query
+token; query heads in the same KV group share that list. The block-sparse path
+accepts request-local KV-block selections from a paged HND cache. The shared
+page-sparse generation path described under [Sparse MHA](#sparse-mha) also
+supports MQA and GQA.
+
+These are attention capabilities, not standalone public
+`SparseAttentionConfig` algorithms. A user-facing algorithm must also provide
+the selector, metadata, cache management, and backend integration.
+
+| Parameter | Token-sparse | Block-sparse |
+|---|---|---|
+| GPU architecture | SM100 and SM103 | SM100 and SM103 |
+| Compute phase | Packed prefill and generation, including linear draft tokens | Packed prefill and generation, including linear multi-query and mixed batches |
+| Attention type | MQA and GQA | MQA and GQA |
+| Head counts | Q heads must be divisible by KV heads; no other discrete limit | Q heads must be divisible by KV heads; no other discrete limit |
+| Q heads per KV head | At most 32 | `2`, `4`, `8`, or `16` |
+| Head dimensions | Q/K/V: `64`, `80`, `128`, or `256` | Q/K/V: `128` |
+| Input dtype | BF16 or FP16 | BF16 or E4M3 FP8 |
+| Input layout | Fused QKV | Q `[tokens, q_heads, 128]`; paged K/V `[pages, kv_heads, 128, 128]` |
+| Output dtype | BF16 or FP16 for every supported head dimension; E4M3 FP8 for head dimensions `64`, `128`, and `256` | BF16 |
+| KV-cache dtype | BF16 or FP16 for every supported head dimension; E4M3 FP8 for head dimensions `64`, `128`, and `256` | BF16 or E4M3 FP8 |
+| KV-cache layout | Paged cache; page size is a power of two and at least 8 tokens | Paged HND cache with page size `128`; supports shuffled physical pages and strided outer-page storage |
+| Sparse granularity | Token | Block (`128` tokens) |
+| Attention semantics | Causal self-attention | Causal self-attention with bottom-right or explicit per-request query offsets |
+
+The token-sparse path is JIT-compiled with NVRTC. During linear draft-token
+generation, each query has its own causal sparse list, including K/V written
+earlier in the same speculative forward.
+
+For an FP8 KV cache, token-sparse Q is quantized to E4M3 during QKV
+preprocessing while the model input remains BF16 or FP16. The path supports
+both BF16 output with an FP8 KV cache and E4M3 FP8 output.
+
+This is distinct from the block-sparse column: its E4M3 input row is a raw Q/K/V
+contract of that dedicated backend. Raw E4M3 fused QKV is not a token-sparse
+MQA/GQA input contract.
+
+Backend developers can use
+[`test_sparse_mqa_gqa.py`](../../../tests/unittest/_torch/attention/sparse/test_sparse_mqa_gqa.py)
+as an executable integration example.
+
+### Sparse MHA
+
+The shared page-sparse MHA path consumes block indices and per-request offsets
+produced by a sparse selector. Sparse MHA computation starts during generation;
+prefill attention computation remains dense. An algorithm can still compact
+the retained KV cache after prefill to reduce cache size and later decode work.
+
+| Parameter | Support |
+|---|---|
+| GPU architecture | SM100 and SM103 |
+| Compute phase | Generation, including single-token and linear draft-token inputs |
+| Attention type | MHA |
+| Head counts | Positive and `num_q_heads == num_kv_heads`; no other discrete limit |
+| Q heads per KV head | `1` |
+| Head dimensions | Q/K/V: `64`, `80`, `128`, or `256` |
+| Input dtype | BF16 or FP16 |
+| Input layout | Fused QKV |
+| Output dtype | Model dtype for head dimensions `64`, `80`, `128`, and `256`; E4M3 FP8 for head dimensions `64`, `128`, and `256` with an FP8 KV cache |
+| KV-cache dtype | Model dtype for head dimensions `64`, `80`, `128`, and `256`; E4M3 FP8 for head dimensions `64`, `128`, and `256` |
+| KV-cache layout | Paged KV cache; page size is a power of two and at least 8 tokens |
+| Sparse granularity | Positive-size blocks expanded to KV-cache pages |
+| Attention semantics | Causal self-attention |
+
+The E4M3 entries above describe FP8 KV-cache and output paths. The fused model
+QKV input remains BF16 or FP16; raw E4M3 fused QKV is not supported by the
+page-sparse MHA path.
+
+Backend developers can use
+[`test_sparse_mha.py`](../../../tests/unittest/_torch/attention/sparse/test_sparse_mha.py)
+as an executable integration example.
+
+<a id="block-sparse-mha-mqa-gqa"></a>
+
+### Block-sparse MHA/MQA/GQA
+
+The generic block-sparse path executes attention over KV blocks that a sparse
+algorithm selects for each KV head. The algorithm hands its routes to the core
+forward through the `block_sparse_attn_predict` hook as
+`BlockSparseForwardInputs`: canonical BSR (`block_indptr` plus `block_indices`)
+or a packed block bitmask, optionally with K/V block summaries so unselected
+blocks contribute a proxy instead of being dropped. Only the block-sparse FMHA
+library declares `supports_block_sparse_inputs`, so a request that carries
+routes is never served by a dense kernel. Both the contiguous prefill path,
+used by diffusion models that keep no KV cache, and the paged generation path
+are provided by the vendored PrimTS kernels.
+
+This is an attention capability, not a standalone public
+`SparseAttentionConfig` algorithm. A user-facing algorithm must also provide
+the selector, metadata, and backend integration.
+
+| Parameter | Contiguous prefill | Paged generation |
+|---|---|---|
+| GPU architecture | SM100 and SM103 | SM100 and SM103 |
+| Compute phase | Prefill with separate Q/K/V and no KV cache | Generation with a fixed per-request query length |
+| Attention type | MHA, MQA, and GQA | MHA, MQA, and GQA |
+| Head counts | Q heads must be divisible by KV heads; no other discrete limit | Q heads must be divisible by KV heads; no other discrete limit |
+| Q heads per KV head | Any divisor of the Q head count | Any divisor of the Q head count |
+| Head dimensions | Q/K/V: `128` | Q/K/V: `128` |
+| Input dtype | BF16 or FP16 | BF16 or FP16 |
+| Input layout | Separate Q `[tokens, q_heads, 128]` and K/V `[tokens, kv_heads, 128]` | Fused QKV |
+| Output dtype | Model dtype | Model dtype |
+| KV-cache dtype | No KV cache | Model dtype |
+| KV-cache layout | No KV cache | Paged HND cache; page size `64` or `128` |
+| Sparse granularity | Q blocks of `q_block_size` tokens by KV blocks of `8`, `16`, `32`, or a positive multiple of `64` tokens, selected per KV head | KV blocks of a positive multiple of `64` tokens, selected per KV head |
+| Sparse routes | BSR or packed bitmask; optional K/V block summaries (proxy routes); optional packed `kv_valid_bits` for ragged KV tails | BSR; live per-request KV lengths and page tables |
+| Attention semantics | Dense or causal self-attention; proxy routes require dense | Causal self-attention |
+
+Routes are validated against the kernel's static profile on every call, and an
+unsupported request raises instead of degrading to dense attention. A paged
+request needs a page that holds at least one 64-token route fragment, which is
+why page sizes below `64` are rejected.
+
+Backend developers can use
+[`test_prims_ts_block_sparse.py`](../../../tests/unittest/_torch/attention/sparse/test_prims_ts_block_sparse.py)
+as an executable integration example; it covers MHA, GQA, and MQA head
+topologies, both model dtypes, KV block sizes `64` and `128`, page sizes `64`
+and `128`, proxy routes, token-validity masks, and CUDA Graph replay.
+
+<a id="framework-level-sparse-attention"></a>
+
+## Supported Algorithms
+
+The public `sparse_attention_config` API connects a sparse algorithm to its
+selector, runtime metadata, cache management, and attention implementation.
+
+| `algorithm` | Config class | Sparse mechanism | Attention implementation | Typical use |
+|---|---|---|---|---|
+| `rocket` | `RocketSparseAttentionConfig` | Prompt KV eviction, then page-level Top-K selection during decode | TRTLLM or Vanilla | Training-free sparsity for MHA/MQA/GQA models |
+| `dsa` | `DeepSeekSparseAttentionConfig` | Learned token-level indexer followed by sparse MLA | TRTLLM | DeepSeek-V3.2 and compatible model-native DSA architectures |
+| `deepseek_v4` | `DeepSeekV4SparseAttentionConfig` | Sliding-window attention plus compressed sparse or compressed dense history | TRTLLM | DeepSeek-V4 hybrid attention |
+| `minimax_m3` | `MiniMaxM3SparseAttentionConfig` | Learned block selection followed by sparse GQA | Dedicated Triton or packaged block-sparse implementation | MiniMax-M3 sparse layers |
+| `skip_softmax` | `SkipSoftmaxAttentionConfig` | Dynamically skips eligible softmax work inside the FMHA kernel | TRTLLM | Existing full-attention models with calibrated or direct thresholds |
+
+All five configs are supported only by the PyTorch execution backend. The
+"attention implementation" column refers to the attention kernel/backend used
+inside that execution backend.
+
+### Capability Comparison
+
+| Capability | RocketKV | DSA | DeepSeek-V4 | MiniMax-M3 | Skip Softmax |
+|---|---:|---:|---:|---:|---:|
+| Sparse prefill computation | No | Yes | Yes | Yes | Yes |
+| Sparse decode computation | Yes | Yes | Yes | Yes | Yes |
+| Reduces retained main KV history | Yes | No | Yes, through model-native compression | No | No |
+| Requires a model-trained selector | No | Yes | Yes | Yes | No |
+| Selection granularity | Token eviction and pages | Tokens | Compressed entries | Blocks | Kernel tiles |
+
+"No" for RocketKV prefill means that prompt attention is still computed
+densely. RocketKV selects which prompt KV entries to retain, so it reduces cache
+size and later decode work.
+
+### Algorithm Details
 
 #### RocketKV
 
+[RocketKV](https://arxiv.org/pdf/2502.14051) is a training-free, two-stage
+algorithm for MHA, MQA, and GQA architectures. During prefill, it computes dense
+attention and permanently evicts prompt KV entries beyond a prompt budget.
+During decode, it scores retained pages and attends to the selected Top-K
+pages.
+
+RocketKV currently requires CUDA compute capability 10.0 or newer. KV-cache
+block reuse and chunked prefill must be disabled, and disaggregated serving is
+not supported.
+
 ```python
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import RocketSparseAttentionConfig, KvCacheConfig
-
-# 1. Configure sparse attention (RocketKV)
-sparse_attention_config = RocketSparseAttentionConfig(
-    prompt_budget=2048,
-    kt_cache_dtype='float8_e5m2'
-)
-
-# 2. Configure KV cache
-# Note: some framework-based algorithms may require disabling block reuse.
-kv_config = KvCacheConfig(enable_block_reuse=False)
-
-# 3. Initialize LLM
-llm = LLM(
-    model="<path_or_hf_id>",
-    sparse_attention_config=sparse_attention_config,
-    kv_cache_config=kv_config,
-)
-
-# 4. Generate
-prompts = ["To be or not to be..."]
-outputs = llm.generate(prompts, SamplingParams(max_tokens=128))
-```
-
-#### DSA
-
-```python
-from tensorrt_llm import LLM
-from tensorrt_llm.llmapi import DeepSeekSparseAttentionConfig
-
-# Example: DSA configuration (exact values depend on model + use case)
-sparse_attention_config = DeepSeekSparseAttentionConfig(
-    index_topk=64,
-)
+from tensorrt_llm.llmapi import KvCacheConfig, RocketSparseAttentionConfig
 
 llm = LLM(
     model="<path_or_hf_id>",
-    sparse_attention_config=sparse_attention_config,
+    sparse_attention_config=RocketSparseAttentionConfig(
+        prompt_budget=2048,
+        kt_cache_dtype="float8_e5m2",
+    ),
+    kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+    enable_chunked_prefill=False,
+)
+outputs = llm.generate(
+    ["To be or not to be..."],
+    SamplingParams(max_tokens=128),
 )
 ```
 
-#### Skip Softmax Attention
-
-```python
-from tensorrt_llm import LLM
-from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
-
-# One value for both phases:
-sparse_attention_config = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0)
-
-# Or configure prefill/decode separately:
-sparse_attention_config = SkipSoftmaxAttentionConfig(
-    threshold_scale_factor={"prefill": 1000.0, "decode": 500.0}
-)
-
-llm = LLM(
-    model="<path_or_hf_id>",
-    sparse_attention_config=sparse_attention_config,
-)
-```
-
-### Configure via YAML file
-Besides Python API, you can also configure sparse attention via YAML file. This is typically more convenient in bash commands, such as `trtllm-serve` and `trtllm-eval`.
-
-**Rocket KV**
 ```yaml
 sparse_attention_config:
   algorithm: rocket
-  kt_cache_dtype: float8_e5m2
   prompt_budget: 2048
+  kt_cache_dtype: float8_e5m2
 kv_cache_config:
   enable_block_reuse: false
 enable_chunked_prefill: false
 ```
 
-**DSA**
+The TRTLLM and Vanilla attention implementations support RocketKV. The
+Vanilla implementation requires a BF16 KT cache.
+
+#### DeepSeek Sparse Attention
+
+DeepSeek Sparse Attention (DSA) is a model-native mechanism introduced by
+DeepSeek V3.2. A learned MQA indexer scores the KV history, Top-K selects token
+indices, and sparse MLA consumes them. Checkpoint fields define the indexer
+head count, index head dimension, and Top-K; the safest configuration is to let
+TensorRT LLM load them from the model.
+
+```python
+from tensorrt_llm import LLM
+from tensorrt_llm.llmapi import DeepSeekSparseAttentionConfig
+
+llm = LLM(
+    model="deepseek-ai/DeepSeek-V3.2",
+    sparse_attention_config=DeepSeekSparseAttentionConfig(),
+)
+```
+
+On supported Blackwell configurations, Guess-Verify-Refine (GVR) can replace
+the regular decode Top-K dispatcher. The current implementation accepts
+`index_topk` values `512`, `1024`, and `2048`, and indexer compression ratios
+`1` and `4`. Unsupported combinations fall back to the production
+insertion/radix Top-K path.
+
 ```yaml
 sparse_attention_config:
   algorithm: dsa
-  index_topk: 64
+  index_topk: 2048
+  enable_heuristic_topk: true
 ```
 
-**Skip Softmax Attention**
+See the
+[DeepSeek V3/V3.2 example](source:examples/models/core/deepseek_v3/README.md)
+for model precision, hardware, parallelism, MTP, chunked-prefill, cache-reuse,
+and disaggregated-serving support.
+
+#### DeepSeek-V4 Hybrid Sparse Attention
+
+DeepSeek-V4 interleaves three model-native attention modes:
+
+- sliding-window attention over recent raw tokens;
+- compressed sparse attention over 4x-compressed history selected by an
+  indexer;
+- compressed dense attention over 128x-compressed history.
+
+TensorRT LLM normally constructs `DeepSeekV4SparseAttentionConfig` from the
+checkpoint. An explicit config overrides matching fields; it must preserve the
+model's attention layout. The current implementation requires
+`window_size=128`, compression ratios from `{1, 4, 128}`, Hopper (`SM90`) or
+Blackwell (`SM100+`) GPUs, KV-cache blocks of `128` or `256` tokens, and beam
+width `1`. Hopper requires `kv_cache_config.dtype=fp8_ds_mla`; on SM120 and
+SM121, that cache layout requires 256-token blocks.
+
 ```yaml
-attn_backend: TRTLLM
+sparse_attention_config:
+  algorithm: deepseek_v4
+  window_size: 128
+  index_topk: 512
+```
+
+See the
+[DeepSeek-V4 example](source:examples/models/core/deepseek_v4/README.md) for
+checkpoint-derived configuration and deployment constraints.
+
+#### MiniMax-M3 Block-Sparse GQA
+
+MiniMax-M3 uses model-native block-sparse GQA in its sparse layers. An index
+branch scores main KV-cache blocks, forces configured initial/local blocks into
+the selection, and chooses the remaining Top-K blocks before sparse GQA.
+Defaults such as four index heads, index dimension `128`, block size `128`, and
+16 selected blocks come from the checkpoint-compatible config.
+
+```yaml
+sparse_attention_config:
+  algorithm: minimax_m3
+```
+
+Two implementations are available:
+
+- `triton` is the default reference implementation.
+- `msa` uses `fmha_sm100` kernels and requires an SM100-family GPU (SM100 or
+  SM103), the `fmha_sm100` package, and `sparse_block_size=128`.
+
+```yaml
+sparse_attention_config:
+  algorithm: minimax_m3
+  implementation: msa
+```
+
+The sparse path currently has no dense fallback and does not support KV-cache
+reuse or MTP. See the
+[MiniMax-M3 deployment guide](../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.md)
+for supported checkpoints and parallel deployment settings.
+
+<a id="kernel-level-sparse-attention"></a>
+
+#### Skip Softmax Attention
+
+Skip Softmax Attention, also known as BLASST, dynamically skips eligible work
+inside a FlashAttention-style kernel. It does not select tokens, alter the
+model architecture, or reduce KV-cache storage.
+
+The kernel consumes `threshold_scale_factor` and combines it with sequence
+length at runtime. You can provide that value directly:
+
+```python
+from tensorrt_llm import LLM
+from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
+
+llm = LLM(
+    model="<path_or_hf_id>",
+    sparse_attention_config=SkipSoftmaxAttentionConfig(
+        threshold_scale_factor={"prefill": 1000.0, "decode": 500.0},
+    ),
+)
+```
+
+```yaml
 sparse_attention_config:
   algorithm: skip_softmax
   threshold_scale_factor:
@@ -141,204 +399,122 @@ sparse_attention_config:
     decode: 500.0
 ```
 
-Run the command with the config file:
+Alternatively, provide `target_sparsity`. This path requires the checkpoint to
+contain a calibration formula that maps the requested target to the kernel's
+threshold scale factor. `target_sparsity` is calibration guidance rather than a
+runtime guarantee; the achieved sparsity depends on the model inputs and
+workload.
+
+```yaml
+sparse_attention_config:
+  algorithm: skip_softmax
+  target_sparsity:
+    prefill: 0.5
+    decode: 0.3
+```
+
+Both fields accept a scalar for both phases or a dictionary with `prefill` and
+`decode` values. If both are present, `threshold_scale_factor` takes
+precedence. User-provided `target_sparsity` overrides a checkpoint default.
+
+Model Optimizer can store calibration metadata in the checkpoint's
+`config.json`:
+
+```json
+{
+  "sparse_attention_config": {
+    "config_groups": {
+      "group_0": {
+        "algorithm": "skip_softmax",
+        "threshold_scale_factor": {
+          "formula": "a * exp(b * target_sparsity)",
+          "prefill": {"a": 100.0, "b": 5.0},
+          "decode": {"a": 0.05, "b": 10.0}
+        },
+        "target_sparsity": {"prefill": 0.5, "decode": 0.3},
+        "ignore": ["model.layers.0.self_attn"]
+      }
+    }
+  }
+}
+```
+
+The formula is a [numexpr](https://numexpr.readthedocs.io/) expression over
+`target_sparsity` and named coefficients. The optional `ignore` list uses
+fnmatch layer patterns. At most one checkpoint config group may use the
+`skip_softmax` algorithm.
+
+TRT-LLM imports NumExpr only when it needs to consume a checkpoint formula.
+During package bootstrap, TRT-LLM defaults `NUMEXPR_NUM_THREADS` to `1` without
+overriding an explicit environment setting. This evaluates the scalar formulas
+without creating a NumExpr worker pool while allowing applications with
+substantial NumExpr work to opt into parallel evaluation. This setting controls
+only NumExpr and does not replace workload-specific OpenMP tuning. Applications
+that import NumExpr before TRT-LLM must configure it before process startup.
+
+Skip Softmax Attention requires the TRTLLM attention backend. Other attention
+backends do not apply it.
+
+## Usage with trtllm-bench and trtllm-serve
+
+Sparse attention is configured through `sparse_attention_config` on the
+PyTorch backend. DeepSeek-V3.2 provides a mature end-to-end example: its
+checkpoint defines the DSA indexer geometry and Top-K, so the minimal YAML only
+needs to select the `dsa` algorithm.
+
+```yaml
+# config.yml
+sparse_attention_config:
+  algorithm: dsa
+```
+
+Start an OpenAI-compatible server with the same config file used for other
+PyTorch backend options:
+
 ```bash
-trtllm-bench/trtllm-serve --model <model_path> --config extra_config.yaml ...
+trtllm-serve deepseek-ai/DeepSeek-V3.2 \
+  --backend pytorch \
+  --tp_size 8 \
+  --ep_size 8 \
+  --custom_tokenizer deepseek_v32 \
+  --config ./config.yml
 ```
 
-For example, users can evaluate a model with trtllm-eval on LongBenchV2 task like this:
+For a throughput benchmark, first prepare or supply a tokenized dataset, then
+pass the same config to `trtllm-bench`:
 
 ```bash
-trtllm-eval --model <path_to_model> --config extra_config.yaml longbench_v2 --max_output_length 1024 ...
+trtllm-bench --model deepseek-ai/DeepSeek-V3.2 \
+  prepare-dataset \
+  --output ./deepseek-v3.2-dataset.json \
+  token-norm-dist \
+  --input-mean 4096 \
+  --output-mean 512 \
+  --input-stdev 0 \
+  --output-stdev 0 \
+  --num-requests 16
+
+trtllm-bench --model deepseek-ai/DeepSeek-V3.2 throughput \
+  --backend pytorch \
+  --tp 8 \
+  --ep 8 \
+  --dataset ./deepseek-v3.2-dataset.json \
+  --max_batch_size 16 \
+  --max_num_tokens 8192 \
+  --config ./config.yml
 ```
 
-## Sparse Attention Implementation
+Use a local checkpoint path in place of the Hugging Face model ID when needed.
+Other sparse algorithms use the same YAML entry point with their own
+`algorithm` discriminator and settings. See the
+[DeepSeek V3/V3.2 example](source:examples/models/core/deepseek_v3/README.md)
+for model precision, hardware, parallelism, MTP, chunked-prefill, cache-reuse,
+and disaggregated-serving configurations.
 
-This section provides deeper technical details on how each algorithm of sparse attention is implemented in TensorRT LLM. If you just want to enable sparse attention, see [Quick Start](#quick-start) above.
+## Further Reading
 
-Ideologically, the current available sparse attention algorithms can be categorized into two types:
-
-- **Framework-level sparse attention**: uses TensorRT LLM's sparse-attention framework (prediction hooks + metadata) to drive sparse computation and/or KV-cache behavior. Examples: **RocketKV**, **DSA**.
-- **Kernel-level sparse attention**: implemented directly inside the attention kernels, with no extra modification on the runtime logic. Example: **Skip Softmax Attention**.
-
-### Framework-Level Sparse Attention
-
-Framework-level sparse attention refers to methods that use TensorRT LLM's extensible sparse-attention framework—a set of prediction hooks and metadata interfaces that drive sparse computation and/or KV-cache behavior. Currently, **RocketKV** and **DSA** are the supported framework-level sparse attention algorithms in TensorRT LLM.
-
-#### Overview
-
-Attention scores often exhibit strong structure and sparsity: for many queries, only a small fraction of the historical tokens meaningfully contribute to the output. To exploit this, a wide range of approximate sparse-attention methods have been proposed. These methods can introduce sparsity along different dimensions (e.g., sequence, head, hidden). TensorRT LLM’s **framework-level** support for sparse attention primarily targets approaches that leverage **token/sequence sparsity** into a GPU-friendly, structured way.
-
-#### Architecture
-
-This section describes the framework architecture and guides developers on how to implement new framework-level sparse attention algorithms in TensorRT LLM.
-
-<div align="center">
-<figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/media/sparse_attention_framework.png" width="800">
-</figure>
-</div>
-<p align="center"><sub><em>Figure 1: The framework support for sparse attention in TensorRT LLM.</em></sub></p>
-
-Our goal is to design a general, extensible, and flexible sparse attention framework. In this framework, the attention operator provides the unified APIs to support both **sparse computation** and **sparse KV cache** that leverage token sparsity, while the users/developers can only focus on the algorithm of sparse attentions, i.e. how to accurately identify important query-key pairs.
-
-For the generality, TensorRT LLM abstracts sparse attention into a prediction-based workflow: *a prediction module first identifies the sparse indices (tokens/blocks to keep or attend to), which are then used by the subsequent attention operator*. Currently, for standard attention (MQA/GQA), TensorRT LLM supports **sparse KV cache** in the context phase and **sparse computation** in the generation phase. Different KV heads are allowed to use different sparse indices, while Q heads that map to the same KV head share the same sparse pattern. It does **not** yet support sparse computation in the context phase or sparse KV cache in the generation phase.
-
-For the scalability, Figure 1 illustrates the overall design. The architecture is built by inheriting from the existing `AttentionBackend` to define algorithm-specific sparse attention backends. Within these backends, `prediction` methods are implemented to generate the corresponding sparse indices. These indices are then passed as arguments to the `AttentionOp` to perform the sparse attention computation. This approach balances system flexibility with extensibility, allowing new algorithms to be integrated by simply defining their prediction logic **without** modifying the core attention kernels.
-
-TensorRT LLM currently supports the following features in the framework:
-
-1.  **Context Phase**:
-    *   **sparse computation**: MLA
-    *   **sparse KV cache**: MQA/GQA
-
-2.  **Generation Phase**:
-    *   **sparse computation**: MLA/MQA/GQA
-    *   **sparse KV cache**: no support yet
-
-#### Framework Implementation
-
-To hide the complexity of sparse algorithms, the main prediction logic is encapsulated within the `tensorrt_llm._torch.attention_backend` module.
-
-We have extended the existing `AttentionBackend` to include a prediction step that retrieves sparse indices before the attention operation. These indices are generated using two prediction methods:
-
-```python
-# Predict indices for sparse KV Cache
-sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(
-    q, k, metadata, **kwargs)
-
-# Predict indices for sparse computation
-sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(
-    q, k, metadata, **kwargs)
-```
-
-The specific prediction logic is hidden in the subclasses, where developers implement `sparse_kv_predict` and `sparse_attn_predict`.
-
-The key files located in `tensorrt_llm/_torch/attention_backend/sparse/` are:
-
-*   `rocket.py`, `dsa.py`: Implementations of specific algorithms (e.g., RocketKV, DSA).
-*   `kernel.py`: Custom Triton kernels for importance scoring or selection.
-*   `utils.py`: Dispatch related logic.
-
-<div align="center">
-<figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/media/sparse_attention_op.png" width="800">
-</figure>
-</div>
-<p align="center"><sub><em>Figure 2: Sparse attention operator workflow in TensorRT LLM.</em></sub></p>
-
-In `AttentionOp`, currently, the MQA/GQA sparse attention only supports sparse computation at block granularity in the generation phase, where the block size equals to the page size of the KV cache. It means that we can skip the attention computation of those unimportant pages. In addition, we provide a sparse MLA kernel that supports token-level sparse computation in both the context and generation phases.
-
-To support those features, as illustrated in Figure 2, we have implemented two kernels for the MQA/GQA path, `updateSparseKvCacheAfterFmha` and `gatherKvPageOffsetsKernel`, applied in the context and generation phases respectively:
-
-*   **`updateSparseKvCacheAfterFmha`**: Invoked in the post-processing stage after the context attention computation. It selects the important KV tokens and write those K/V vectors to the KV cache to reduce the KV cache size.
-
-*   **`gatherKvPageOffsetsKernel`**: Executed before the attention computation in the generation phase. It converts the input sparse indices (which can be of arbitrary granularity) into page-aligned indices. This means that if a single token is selected, the entire page is included in the attention computation. After this conversion, we will get a new `kv_page_offsets` and also an updated `kv_len` that is the number of those selected KV tokens. Then these new metadata are fed into the subsequent attention kernel for computation.
-
-For sparse MLA, the kernel supports token sparsity directly, eliminating the need for `gatherKvPageOffsetsKernel`. However, please note that sparse KV cache support is not yet available.
-
-Many sparse attention algorithms also require additional auxiliary memory. In the current system, there are two paths to support this feature:
-
-*   Implement a simple, custom CacheManager at the Python level, inheriting from `KVCacheManager`.
-
-*   Use `KVCacheManagerCpp` to simultaneously manage both the KV Cache and auxiliary memory.
-
-Each option has its own advantages and disadvantages, please refer to the [Manage Auxiliary Memory Pool](#3-manage-auxiliary-memory-pool) for more details.
-
-#### Implementing a New Algorithm Inside the Sparse Attention Framework
-
-#### 1. Configuration Class
-
-Define a configuration class in `tensorrt_llm/llmapi/llm_args.py` inheriting from `BaseSparseAttentionConfig`. This class should hold user-tunable parameters for your algorithm.
-
-```python
-@dataclass
-class MySparseAttentionConfig(BaseSparseAttentionConfig):
-    topk: int = 64
-    # ... other parameters
-```
-
-#### 2. Implement the prediction module in Attention Backend
-
-Create a new class inheriting from `TrtllmAttention` (in `tensorrt_llm/_torch/attention_backend/trtllm.py`). You typically need to override two main prediction methods:
-
-**`sparse_kv_predict(self, q, k, metadata, **kwargs)`**
-*   **Behavior**: This function performs prediction to return the indices of tokens to be preserved in the KV cache.
-*   **Output**: 
-    - `sparse_kv_indices`: The token indices of the important tokens on sequence dimension, shape `(nHeads, nTokens)`, where `nHeads` is the number of KV heads and `nTokens` is the total number of selected tokens across all samples in the batch.
-    - `sparse_kv_offsets`: The offset for the `sparse_kv_indices`, shape `(nBatch + 1)`, where `nBatch` is the number of the batch size. The index for head `h` and sample `n` can be obtained via `sparse_kv_indices[h, sparse_kv_offsets[n]]`.
-*   **Constraint**: Returned indices must be **sorted** to ensure safe in-place gathering in memory. Note that this post-processing "gather" step introduces some overhead, but significantly improves flexibility, allowing compatibility with features in context like chunked prefill.
-
-**`sparse_attn_predict(self, q, k, metadata, **kwargs)`**
-*   **Behavior**: For the current query tokens, predict and return the sparse indices for sparse computation.
-*   **Output**: 
-    - `sparse_attn_indices`: The block indices of the block sparse attention on the KV sequence dimension, shape `(nHeads, nBlocks)`, where `nHeads` is the number of KV heads and `nBlocks` is the total number of selected blocks across all samples in the batch. For block sparse attention, the block size is defined by `sparse_attn_indices_block_size`, which supports arbitrary values.
-    - `sparse_attn_offsets`: The offset for the `sparse_attn_indices`, shape `(nBatch + 1)`, where `nBatch` is the number of the batch size. The index for head `h` and sample `n` can be obtained via `sparse_attn_indices[h, sparse_attn_offsets[n]]`.
-*   **Constraint**: The generation phase sparse computation is supported for NVIDIA Blackwell GPUs and newer (SM 100+) using TRTLLM-GEN kernels. However, it is flexible enough to extend to different architectures. Currently, only KV cache's **page-level** granularity is supported for sparse computation.
-
-**Note**: The prediction process can be time-consuming, especially in low-latency scenarios where it might account for a significant portion of the attention time. It is highly recommended to optimize this step using custom kernels.
-
-#### 3. Manage Auxiliary Memory Pool
-
-Many sparse algorithms (like RocketKV or DSA) require auxiliary structures (e.g., a "KT cache" in RocketKV) to select relevant tokens. There are two primary ways to manage this memory in TensorRT LLM:
-
-**Option A: Python-level Custom Manager**
-
-You can implement a custom manager in Python.
-*   **Use Case**: Algorithms like RocketKV use this approach to store the KT cache (e.g., `RocketKVCacheManager` in `rocket.py`).
-*   **Implementation**: Create a Python level cache manager that handles the allocation and lifecycle of the auxiliary tensors. It is recommended to use the existing `BlockManager` to manage the auxiliary pools if possible. This allows the auxiliary pool to share block manager logics, reducing implementation overhead.
-*   **Key Methods to Override**:
-    *   `get_cache_size_per_token` / `get_cache_bytes_per_token`: Update `kv_factor` correctly to include the size of the auxiliary structures so TensorRT LLM allocates sufficient GPU memory.
-    *   `add_dummy_requests` / `prepare_resources`: Ensure the auxiliary pool allocates correct resources/tokens for new requests.
-*   **Pros**: The custom cache manager is more flexible and easier to implement because it can share the same blocks managed by the `KVCacheManager`.
-*   **Cons**: This approach operates at the Python level, making it difficult to share features of the KV cache managed at the C++ level (e.g., advanced transmission or kvcache reuse features tied to the C++ manager).
-
-**Option B: C++ Integrated Manager**
-
-For tighter integration, you can manage the auxiliary memory within the C++ `KVCacheManager`.
-*   **Use Case**: Algorithms like DSA use this approach to store the indexer Kcache.
-*   **Pros**: Enables compatibility with advanced features such as KV cache reuse and disagg-serving. For example, DSA's low-rank indexer Kcache can be reused or transmitted between context and generation engines.
-*   **Cons**: Higher implementation complexity. The current C++ `KVCacheManager` is optimized for the standard KV cache pool. Adding custom pools often requires significant modifications or manual implementation of the pool management logic within the C++ level.
-
-**Note**: If your algorithm involves sparse KV cache, standard KV cache block reuse is generally incompatible because eviction modifies the block content uniquely for each request. However, algorithms like DSA that use low-rank approximation without eviction can support block reuse.
-
-#### 4. Registration and Dispatch
-
-*   Register your config and backend in `tensorrt_llm/_torch/attention_backend/sparse/utils.py` and `tensorrt_llm/_torch/pyexecutor/_util.py` to ensure the system routes the request to your new backend when the config is present.
-*   Add initialization logic in `cpp/tensorrt_llm/thop/attentionOp.cpp` and `cpp/tensorrt_llm/kernels/sparseAttentionKernels.h` if new C++ level parameters are required.
-
-#### Future Work
-
-*   **Sparse Computation in Context Phase**: We plan to introduce sparse computation support for the context phase for MQA/GQA, allowing the framework to cover more scenarios.
-*   **Dynamic Eviction in Generation Phase**: Dynamically evicting KV cache blocks during the generation phase poses significant challenges to KV cache flexibility. Block-level eviction appears to be a promising compromise and is under exploration.
-*   **Unified Auxiliary Memory Management**: We are exploring a unified mechanism to manage auxiliary memory pools, allowing custom auxiliary spaces to automatically inherit advanced features from the KV cache (e.g., reuse, offloading).
-*   **Code Refactoring**: As more sparse attention algorithms are integrated, the framework will undergo refactoring to unify code and improve maintainability.
-
-### Kernel-Level Sparse Attention
-
-Unlike framework-level methods, **kernel-level sparse attention** is implemented directly inside the attention kernels. There is no external prediction/gather workflow—the kernel itself decides what to skip based on runtime criteria.
-
-**Skip Softmax Attention (BLASST)** is TensorRT LLM's kernel-level sparse attention method, supported on both **Hopper** and **Blackwell** GPUs for MHA/GQA/MLA, in both prefill and decode phases. It dynamically skips Softmax and BMM2 computation for KV blocks whose contribution falls below a threshold. Because the logic lives entirely inside the kernel, it requires no auxiliary data structures or framework hooks—just set `threshold_scale_factor` in the config. As a result, the runtime overhead is zero and the attention kernel performance improvement could be directly reflected in the end-to-end speedup.
-
-For algorithm details and end-to-end results, please refer to the following resources:
-- **Paper**: [BLASST: Dynamic Blocked Attention Sparsity via Softmax Thresholding](https://arxiv.org/pdf/2512.12087)
-- **NVIDIA developer blog**: [Accelerating Long-Context Inference with Skip Softmax Attention](https://developer.nvidia.com/blog/accelerating-long-context-inference-with-skip-softmax-in-nvidia-tensorrt-llm/)
-- **Tech blog**: [Accelerating Long-Context Inference with Skip Softmax Attention](../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.md)
-
-Skip Softmax Attention is supported only with the **trtllm** attention backend, implemented inside TensorRT-LLM's high-performance attention kernels:
-- **Hopper prefill**: [fmha_v2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/kernels/fmha_v2)
-- **Hopper decode**: [XQA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/kernels/xqa)
-- **Blackwell**: [trtllm-gen](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/kernels/trtllmGenKernels)
-
-
-### Summary
-
-The following table compares the three sparse attention algorithms available in TensorRT LLM:
-
-| Aspect | RocketKV | DSA | Skip Softmax |
-|--------|----------|-----|--------------|
-| Prefill Acceleration | No | Yes | Yes |
-| Decode Acceleration | Yes | Yes | Yes |
-| KV Cache Reduction | Yes | No | No |
-| Framework-Level Support Required | Yes | Yes | No |
-| Model Native | No | Yes | No |
+- [KV Cache Compression](kv-cache-compression.md) — methods that reduce the
+  stored KV representation or retained KV set outside the Attention kernel.
+- [Blog 17: Sparse Attention in TensorRT-LLM](../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.md) — framework design, per-algorithm implementation details, evaluation results.
+- [Blog 16: Accelerating Long Context Inference with Skip Softmax Attention](../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.md) — algorithm details, kernel internals, end-to-end benchmarks.
+- [Sparse Attention Development Guide](../developer-guide/sparse-attention-development-guide.md) — how to add a new sparse attention algorithm, including config classes, prediction modules, auxiliary memory, and registration.

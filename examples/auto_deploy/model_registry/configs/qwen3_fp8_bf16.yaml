@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Qwen3 dense FP8 checkpoints run through the BF16-weight path here.
+model_kwargs:
+  torch_dtype: bfloat16

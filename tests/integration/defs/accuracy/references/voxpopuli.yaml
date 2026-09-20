@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8:
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    wer: 6.2
+    num_samples: 1842
+nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4:
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    wer: 6.2
+    num_samples: 1842

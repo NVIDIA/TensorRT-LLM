@@ -1,0 +1,18 @@
+version: 0.0.1
+l0_dgx_h200_perf_sanity:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+        lte: 8
+    wildcards:
+      gpu:
+      - '*h200*'
+      linux_distribution_name: ubuntu*
+      cpu: x86_64
+    terms:
+      stage: post_merge
+      backend: pytorch
+  tests:
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-dynamo_qwen3_235b_a22b_fp8_hopper-qwen3_235b_a22b_fp8_tp4_ep4_cutlass_8k1k]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-dynamo_qwen3_32b_fp8_hopper-qwen3_32b_fp8_tp2_6k1k]

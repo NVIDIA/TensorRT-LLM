@@ -84,12 +84,16 @@ static inline void set_alpha(uint32_t& alpha, float norm, Data_type dtype)
 FusedMHARunnerV2::FusedMHARunnerV2(MHARunnerFixedParams fixedParams)
     : mFixedParams(fixedParams)
 {
-    TLLM_CHECK_WITH_INFO((mSM == kSM_80 || mSM == kSM_86 || mSM == kSM_89 || mSM == kSM_90 || mSM == kSM_100
-                             || mSM == kSM_103 || mSM == kSM_120 || mSM == kSM_121),
+    TLLM_CHECK_WITH_INFO((mSM == kSM_80 || mSM == kSM_86 || mSM == kSM_89 || mSM == kSM_90
+                             || tensorrt_llm::common::isSM100Family(mSM) || mSM == kSM_120 || mSM == kSM_121),
         "Unsupported architecture");
     TLLM_CHECK_WITH_INFO((mFixedParams.dataType == DATA_TYPE_FP16 || mFixedParams.dataType == DATA_TYPE_BF16
                              || mFixedParams.dataType == DATA_TYPE_E4M3),
         "Unsupported data type");
+    if (tensorrt_llm::common::isSM100Family(mSM))
+    {
+        mSM = kSM_100;
+    }
     xmmaKernel = getXMMAKernelsV2(mFixedParams.dataType, mFixedParams.dataTypeOut, mSM);
 
     if (mFixedParams.headSizeV == 0)
@@ -190,7 +194,12 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
             // Tensor K is contiguous.
             mKernelParams.k_stride_in_bytes
                 = get_size_in_bytes(mFixedParams.numKvHeads * mFixedParams.headSize, mFixedParams.dataType);
-            if (mFixedParams.headSizeQkNope > 0 && mFixedParams.dataType != DATA_TYPE_E4M3)
+            if (runnerParams.vStrideInBytes > 0)
+            {
+                // Caller provided the actual V stride (supports both contiguous and non-contiguous V).
+                mKernelParams.v_stride_in_bytes = runnerParams.vStrideInBytes;
+            }
+            else if (mFixedParams.headSizeQkNope > 0 && mFixedParams.dataType != DATA_TYPE_E4M3)
             {
                 // Non-FP8 context MLA: tensor V is not contiguous. The token stride is numKvHeads * (headSizeQkNope +
                 // headSizeV).
@@ -353,7 +362,7 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     bool const isSm8x = (mSM == kSM_86 || mSM == kSM_89);
     bool const isSm80 = (mSM == kSM_80);
     bool const isSm89 = (mSM == kSM_89);
-    bool const isSm100f = (mSM == kSM_100 || mSM == kSM_103);
+    bool const isSm100f = tensorrt_llm::common::isSM100Family(mSM);
     bool const isSm120f = (mSM == kSM_120 || mSM == kSM_121);
 
     // Sliding_or_chunked_causal mask.
@@ -493,17 +502,16 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
                     && (mLaunchParams.attention_input_layout == AttentionInputLayout::SEPARATE_Q_K_V))));
     }
 
-    // Setup launch params for skip softmax attention
-    mLaunchParams.enableSkipSoftmax = false;
-    if (runnerParams.skipSoftmaxThresholdScaleFactor > 0)
-    {
-        if (!isSm90 || !mLaunchParams.warp_specialization || !mLaunchParams.flash_attention)
-        {
-            TLLM_CHECK_WITH_INFO(false,
-                "Skip softmax attention is only supported on Hopper with warp specialization and flash attention.");
-        }
-        mLaunchParams.enableSkipSoftmax = true;
-    }
+    // Skip-softmax is driven by the threshold alone -- there is no separate enable
+    // flag. It is realized by two kernels: the Hopper warp-specialized FMHA, which
+    // is selected through the enableSkipSoftmax cubin-hash bit, and the sm_120 /
+    // sm_121 warp-specialized context FMHA, which reads the threshold directly and
+    // therefore does not need the cubin-hash bit (enableSkipSoftmax stays false
+    // there -- see fused_multihead_attention_v2.cpp). If no skip-capable kernel
+    // matches the config, skipping is simply not enabled and the request runs full
+    // softmax.
+    mLaunchParams.enableSkipSoftmax = runnerParams.skipSoftmaxThresholdScaleFactor > 0 && isSm90
+        && mLaunchParams.warp_specialization && mLaunchParams.flash_attention;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

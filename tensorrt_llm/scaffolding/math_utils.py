@@ -79,7 +79,11 @@ def get_majority_result(
 def get_digit_majority_vote_result(results: List[str]) -> str:
 
     def is_digit(result: str):
-        return result.isdigit()
+        try:
+            int(result)
+            return True
+        except (ValueError, TypeError):
+            return False
 
     index, extract_answer = get_majority_result(
         results,

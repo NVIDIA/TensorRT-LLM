@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import array
+import concurrent.futures
 import ctypes
 import errno
 import functools
@@ -122,11 +123,22 @@ class HalfOpenRange(tuple[Idx, Idx], Generic[Idx]):
     def end(self) -> Idx:
         return self[1]
 
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, HalfOpenRange):
+            return NotImplemented
+        return (not self and not other) or tuple.__eq__(self, other)
+
+    def __hash__(self) -> int:
+        return hash((0, 0)) if not self else tuple.__hash__(self)
+
     def __bool__(self) -> bool:
         return self[0] < self[1]
 
     def __len__(self) -> int:
         return max(0, self[1] - self[0])
+
+    def __contains__(self, item: Any) -> bool:
+        return self[0] <= item < self[1]
 
 
 def intersect(a: HalfOpenRange[Idx], b: HalfOpenRange[Idx]) -> HalfOpenRange[Idx]:
@@ -266,7 +278,7 @@ class TypedIndexList(Protocol[Index, T]):
 
 
 # @TODO: use this where applicable.
-def to_typed(index_type: Type[Index], lst: list[T]) -> TypedIndexList[Index, T]:
+def to_typed(index_type: Callable[[Any], Index], lst: list[T]) -> TypedIndexList[Index, T]:
     """
     Casts a standard list to a TypedIndexList with a strongly typed integer index.
 
@@ -391,6 +403,21 @@ _libc.posix_fallocate.restype = ctypes.c_int
 _libc.posix_fallocate.argtypes = [ctypes.c_int, ctypes.c_longlong, ctypes.c_longlong]
 
 MADV_HUGEPAGE: Final[int] = 14
+MADV_NOHUGEPAGE: Final[int] = 15
+MADV_POPULATE_WRITE: Final[int] = 23
+
+# TLLM_KV_CACHE_MANAGER_V2_THP=0 backs host pools with regular 4KB pages
+# (MADV_NOHUGEPAGE). On nodes with fragmented physical memory and THP
+# defrag=madvise, every 2MB THP fault stalls in direct compaction that
+# rarely succeeds, slowing pool population from GB/s to GB/min.
+USE_THP: Final[bool] = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_THP", "1") == "1"
+# TLLM_KV_CACHE_MANAGER_V2_PREFAULT_THREADS=0 disables prefaulting; pages are
+# then faulted in lazily, single-threaded, inside cuMemHostRegister.
+PREFAULT_THREADS: Final[int] = int(
+    os.environ.get(
+        "TLLM_KV_CACHE_MANAGER_V2_PREFAULT_THREADS", str(min(64, (os.cpu_count() or 32) // 2))
+    )
+)
 
 
 def _madvise(ptr: int, size: int, advice: int) -> None:
@@ -505,8 +532,10 @@ class HostMem:
 
         # Opportunistically advise huge pages for the whole range.
         # The kernel will use huge pages for aligned 2MB chunks within this range.
-        _madvise(self._address, self._size, MADV_HUGEPAGE)
+        _madvise(self._address, self._size, MADV_HUGEPAGE if USE_THP else MADV_NOHUGEPAGE)
 
+        if PREFAULT_THREADS > 0:
+            self._parallel_prefault(PREFAULT_THREADS)
         self._register_to_cuda()
 
     def resize(self, new_size: int) -> None:
@@ -516,8 +545,8 @@ class HostMem:
             assert self._address % self.ALIGNMENT == 0
             self._size = new_size
 
-            # Re-advise HUGEPAGE for the new range
-            _madvise(self._address, self._size, MADV_HUGEPAGE)
+            # Re-advise the configured page mode for the new range.
+            _madvise(self._address, self._size, MADV_HUGEPAGE if USE_THP else MADV_NOHUGEPAGE)
         finally:
             self._register_to_cuda()
 
@@ -531,6 +560,50 @@ class HostMem:
 
     def __del__(self) -> None:
         self.destroy()
+
+    def _parallel_prefault(self, nthreads: int) -> None:
+        """Fault in all pages with parallel threads before cuMemHostRegister,
+        so registration only pins pages (never allocates them).
+
+        Lazy faulting inside cuMemHostRegister is single-threaded and, under
+        memory pressure or THP compaction stalls, can take minutes for
+        multi-hundred-GiB pools. MADV_POPULATE_WRITE populates in bulk; small
+        chunks keep mmap_lock hold times short (one giant madvise per thread
+        serializes every other thread behind it) and let threads
+        load-balance.
+        """
+        chunk = 512 << 20
+
+        def populate(off: int) -> None:
+            ln = min(chunk, self._size - off)
+            if ln <= 0:
+                return
+            ret = _libc.madvise(
+                ctypes.c_void_p(self._address + off),
+                ctypes.c_size_t(ln),
+                ctypes.c_int(MADV_POPULATE_WRITE),
+            )
+            if ret != 0:
+                error_code = ctypes.get_errno()
+                if error_code in (errno.EINVAL, getattr(errno, "ENOSYS", -1)):
+                    # MADV_POPULATE_WRITE requires Linux >= 5.14; on older
+                    # kernels fall back to touching every page.
+                    ctypes.memset(self._address + off, 0, ln)
+                    return
+                error_name = errno.errorcode.get(error_code, "Unknown error")
+                if error_code == errno.ENOMEM:
+                    # Surface real allocation failures instead of masking them
+                    # with a memset that would trigger a system OOM kill.
+                    raise HostOOMError(
+                        f"madvise(MADV_POPULATE_WRITE) failed with errno {error_code}: {error_name}"
+                    )
+                raise OSError(
+                    error_code,
+                    f"madvise(MADV_POPULATE_WRITE) failed: {error_name}",
+                )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=nthreads) as executor:
+            list(executor.map(populate, range(0, self._size, chunk)))
 
     def _register_to_cuda(self) -> None:
         assert self._num_registered_chunks == 0
@@ -600,13 +673,28 @@ class DynamicBitset:
         return self._num_set_bits
 
     def resize(self, new_capacity: int) -> None:
-        extra_elems = div_up(new_capacity, 64) - len(self._bits)
-        if extra_elems > 0:
-            self._bits.extend(array.array(self.TYPE_CODE, [0] * extra_elems))
-        elif extra_elems < 0:
-            self._bits = self._bits[:extra_elems]
-            if new_capacity % 64 != 0:
-                self._bits[-1] &= self.ALL_SET_MASK >> (64 - (new_capacity % 64))
+        old_elems = len(self._bits)
+        new_elems = div_up(new_capacity, 64)
+
+        # When the capacity shrinks, every set bit at or above new_capacity is
+        # dropped. Account for those bits so num_set_bits stays accurate, and
+        # mask the retained partial word so any_set() cannot observe stale bits.
+        # This covers both fewer-words and same-word-count (new_elems ==
+        # old_elems with a smaller new_capacity) shrinks.
+        if new_elems <= old_elems:
+            for w in range(new_elems, old_elems):
+                self._num_set_bits -= bin(self._bits[w]).count("1")
+            if new_elems >= 1 and new_capacity % 64 != 0:
+                keep_mask = self.ALL_SET_MASK >> (64 - (new_capacity % 64))
+                word = self._bits[new_elems - 1]
+                dropped = word & ~keep_mask & self.ALL_SET_MASK
+                self._num_set_bits -= bin(dropped).count("1")
+                self._bits[new_elems - 1] = word & keep_mask
+
+        if new_elems > old_elems:
+            self._bits.extend(array.array(self.TYPE_CODE, [0] * (new_elems - old_elems)))
+        elif new_elems < old_elems:
+            self._bits = self._bits[:new_elems]
 
     # check if any bit in the range [start, end) is set
     def any_set(self, start: int, end: int) -> bool:

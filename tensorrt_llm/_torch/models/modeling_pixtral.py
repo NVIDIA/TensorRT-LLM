@@ -1,15 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import List
 
 import torch
 import transformers
 
 from tensorrt_llm._torch import model_config as model_config_lib
-from tensorrt_llm._torch.attention_backend import interface as attention_interface
-from tensorrt_llm._torch.attention_backend import utils as attention_utils
+from tensorrt_llm._torch.attention import attention as trtllm_attention
+from tensorrt_llm._torch.attention.backends import interface as attention_interface
+from tensorrt_llm._torch.attention.backends import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_utils
-from tensorrt_llm._torch.modules import attention as trtllm_attention
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm._torch.modules import gated_mlp as trtllm_gated_mlp
 from tensorrt_llm._torch.modules import rms_norm as trtllm_rmsnorm
+from tensorrt_llm._utils import prefer_pinned
 
 
 class PixtralAttention(trtllm_attention.Attention):
@@ -167,7 +172,7 @@ class PixtralTransformer(torch.nn.Module):
 # Original implementation:
 # https://github.com/huggingface/transformers/blob/v4.51.3/src/transformers/models/pixtral/modeling_pixtral.py#L440
 @modeling_utils.register_auto_model("PixtralVisionModel")
-class PixtralVisionModel(torch.nn.Module):
+class PixtralVisionModel(torch.nn.Module, MultimodalEncoderMixin):
     def __init__(
         self, model_config: model_config_lib.ModelConfig[transformers.PixtralVisionConfig]
     ):
@@ -189,13 +194,27 @@ class PixtralVisionModel(torch.nn.Module):
             dtype=self.config.torch_dtype,
         )
         self.transformer = PixtralTransformer(model_config)
+        if getattr(self.config, "rope_parameters", None) is None:
+            rope_theta = getattr(self.config, "rope_theta", 10000.0)
+            self.config.rope_parameters = {
+                "rope_type": "default",
+                "rope_theta": rope_theta,
+            }
         self._patch_positional_embedding = (
             transformers.models.pixtral.modeling_pixtral.PixtralRotaryEmbedding(self.config)
         )
 
-        self._metadata_cls = attention_utils.get_attention_backend(
+        self.metadata_cls = attention_utils.get_attention_backend(
             model_config.attn_backend
         ).Metadata
+
+    def get_encoder_attention_metadata_capacity(self, max_num_tokens: int) -> dict[str, int]:
+        """Conservatively map each item to one Pixtral attention context.
+
+        Mistral3's processor normally injects the tighter merge-tile-aware
+        token bound into :meth:`setup_attn_metadata`.
+        """
+        return {"attention": max(1, max_num_tokens)}
 
     @torch.inference_mode()
     def forward(
@@ -242,18 +261,15 @@ class PixtralVisionModel(torch.nn.Module):
 
     def _prepare_attn_metadata(self, batch_size: int, seq_lengths: List[int]):
         request_ids = list(range(1, batch_size + 1))
-        attn_metadata = self._metadata_cls(
-            seq_lens=torch.tensor(seq_lengths, dtype=torch.int),
-            num_contexts=batch_size,
-            max_num_requests=batch_size,
-            max_num_tokens=sum(seq_lengths),
-            kv_cache_manager=None,
-            request_ids=request_ids,
-            prompt_lens=seq_lengths,
-        )
-        attn_metadata.max_seq_len = max(seq_lengths)
-        attn_metadata.prepare()
-        return attn_metadata
+        seq_lens = torch.tensor(seq_lengths, dtype=torch.int, pin_memory=prefer_pinned())
+
+        self.attn_metadata.num_contexts = batch_size
+        self.attn_metadata.request_ids = request_ids
+        self.attn_metadata.prompt_lens = seq_lengths
+        self.attn_metadata.seq_lens = seq_lens
+        self.attn_metadata.max_seq_len = max(seq_lengths)
+        self.attn_metadata.prepare()
+        return self.attn_metadata
 
 
 class _RopeFunction:
@@ -272,7 +288,7 @@ class _RopeFunction:
         self._cos, self._sin = position_embeddings
 
     # This signature matches that of
-    # `tensorrt_llm/_torch/modules/rotary_embedding.py::RotaryEmbedding.forward` so that we are
+    # `tensorrt_llm/_torch/attention/rotary_embedding.py::RotaryEmbedding.forward` so that we are
     # able to override the `PixtralAttentionLayer.rotary_embed` attribute.
     @torch.no_grad()
     def __call__(

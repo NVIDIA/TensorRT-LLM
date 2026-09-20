@@ -31,8 +31,8 @@ l0_e2e:
           - '*h100*'
         linux_distribution_name: ubuntu*
     tests:
-      - examples/test_llama.py::test_llm_llama_v3_1_1node_multi_gpus[llama-3.1-8b-enable_fp8]
-      - examples/test_llama.py::test_llm_llama_v3_1_1node_multi_gpus[llama-3.1-70b-enable_fp8]
+      - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[pp4-mtp_nextn=0-fp8kv=False-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-sampler_async_worker=False]
+      - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp4-mtp_nextn=0-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-sampler_async_worker=False]
 ```
 
 ## Generating Test Lists

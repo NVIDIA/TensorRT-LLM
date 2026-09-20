@@ -1,0 +1,301 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "kv_cache_manager_v2/utils/poison.h"
+#include "kv_cache_manager_v2/utils/sharedPtr.h"
+
+#include "tensorrt_llm/common/assert.h"
+
+#include <cuda.h>
+#include <exception>
+#include <stdexcept>
+#include <string>
+#include <utility>
+
+namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
+{
+
+// Runs cleanup that must not throw, and poisons KVCM2 if it does.
+//
+// The early return is what makes poisoning safe: once the cache is known to be inconsistent, the
+// cleanup here would act on structures whose invariants no longer hold — releasing a slot that
+// may already be released, unlinking a block from a tree that is no longer intact. Skipping leaks
+// instead, which is the direction that cannot corrupt anything. It also suppresses the cascade of
+// secondary check failures that a poisoned teardown would otherwise produce, leaving the first
+// violation as the reported one.
+template <typename F>
+void poisonOnExcept(char const* context, F&& func) noexcept
+{
+    if (TLLM_UNLIKELY(Poison::poisoned()))
+    {
+        return;
+    }
+    try
+    {
+        std::forward<F>(func)();
+    }
+    catch (std::exception const& error)
+    {
+        Poison::set(context, error.what());
+    }
+    catch (...)
+    {
+        Poison::set(context, "unknown error");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Exception hierarchy (mirrors _exceptions.py)
+// ---------------------------------------------------------------------------
+
+class OutOfMemoryError : public std::runtime_error
+{
+public:
+    explicit OutOfMemoryError(std::string const& msg = "Out of memory")
+        : std::runtime_error(msg)
+    {
+    }
+};
+
+class HostOOMError : public OutOfMemoryError
+{
+public:
+    explicit HostOOMError(std::string const& msg = "Host out of memory")
+        : OutOfMemoryError(msg)
+    {
+    }
+};
+
+class DiskOOMError : public OutOfMemoryError
+{
+public:
+    explicit DiskOOMError(std::string const& msg = "Disk out of memory")
+        : OutOfMemoryError(msg)
+    {
+    }
+};
+
+class CuOOMError : public OutOfMemoryError
+{
+public:
+    explicit CuOOMError(std::string const& msg = "CUDA out of memory")
+        : OutOfMemoryError(msg)
+    {
+    }
+};
+
+// Indicates a bug in the KV cache manager code.
+class LogicError : public std::logic_error
+{
+public:
+    explicit LogicError(std::string const& msg)
+        : std::logic_error(msg)
+    {
+    }
+};
+
+// Mirrors a Python `assert` failure: the binding layer translates this to a
+// Python AssertionError so shared tests observe the same exception type as the
+// pure-Python backend.
+class AssertionError : public std::logic_error
+{
+public:
+    explicit AssertionError(std::string const& msg)
+        : std::logic_error(msg)
+    {
+    }
+};
+
+// Wraps a CUDA driver API error (CUresult).
+class CuError : public std::runtime_error
+{
+public:
+    CUresult errorCode;
+
+    explicit CuError(CUresult result)
+        : std::runtime_error(makeMessage(result))
+        , errorCode(result)
+    {
+    }
+
+private:
+    static std::string makeMessage(CUresult result)
+    {
+        char const* errStr = nullptr;
+        if (cuGetErrorString(result, &errStr) != CUDA_SUCCESS || errStr == nullptr)
+        {
+            errStr = "<Failed to get error string with cuGetErrorString>";
+        }
+        return "CUDA driver error: " + std::to_string(static_cast<int>(result)) + " (" + errStr + ")";
+    }
+};
+
+// KVCM2 detected a broken invariant and is refusing to do further work. The cache cannot be
+// recovered; the message names the original violation, not this call.
+class CorruptedError : public std::runtime_error
+{
+public:
+    explicit CorruptedError(std::string const& msg)
+        : std::runtime_error(msg)
+    {
+    }
+};
+
+// Throws CorruptedError if KVCM2 has been poisoned. Called on entry to and exit from public API
+// methods: on entry so a poisoned cache is never used, and on exit so the call that caused the
+// poisoning is the one that reports it rather than some later, unrelated call.
+inline void rejectIfPoisoned(char const* context)
+{
+    if (TLLM_UNLIKELY(Poison::poisoned()))
+    {
+        throw CorruptedError(std::string(context) + ": KV cache manager is unusable. "
+            + Poison::reason().value_or("<no reason recorded>"));
+    }
+}
+
+// Checks for poisoning again when a public API call returns, so the call that caused the damage is
+// the one that reports it rather than some later, unrelated call.
+//
+// The destructor throws, hence noexcept(false), but only on the success path: if the scope is
+// being unwound by another exception, that exception is the more informative one and is left to
+// propagate. Only ever use this as a local in a function that is not noexcept.
+class PoisonExitCheck
+{
+public:
+    explicit PoisonExitCheck(char const* context) noexcept
+        : mContext(context)
+        , mUncaught(std::uncaught_exceptions())
+    {
+    }
+
+    PoisonExitCheck(PoisonExitCheck const&) = delete;
+    PoisonExitCheck& operator=(PoisonExitCheck const&) = delete;
+
+    ~PoisonExitCheck() noexcept(false)
+    {
+        if (std::uncaught_exceptions() == mUncaught)
+        {
+            rejectIfPoisoned(mContext);
+        }
+    }
+
+private:
+    char const* mContext;
+    int mUncaught;
+};
+
+// A resource (e.g., a page lock) is still in use.
+class ResourceBusyError : public std::runtime_error
+{
+public:
+    explicit ResourceBusyError(std::string const& msg = "Resource is busy")
+        : std::runtime_error(msg)
+    {
+    }
+};
+
+// Not enough free pages to satisfy an allocation request.
+class OutOfPagesError : public std::runtime_error
+{
+public:
+    explicit OutOfPagesError(std::string const& msg = "Out of pages")
+        : std::runtime_error(msg)
+    {
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Helper: unwrap a weak_ptr, throw LogicError on dangling reference.
+// Mirrors Python's unwrap_rawref(_utils.py:163).
+// ---------------------------------------------------------------------------
+template <typename T>
+SharedPtr<T> unwrap(WeakPtr<T> const& ref)
+{
+    auto ptr = ref.lock();
+    if (!ptr)
+        throw LogicError("Dereferencing a dangling weak_ptr");
+    return ptr;
+}
+
+// ---------------------------------------------------------------------------
+// Helper: unwrap CUresult, throw CuError/CuOOMError on failure.
+// ---------------------------------------------------------------------------
+inline void cuCheck(CUresult result)
+{
+    if (result == CUDA_SUCCESS)
+    {
+        return;
+    }
+    if (result == CUDA_ERROR_OUT_OF_MEMORY)
+    {
+        throw CuOOMError();
+    }
+    throw CuError(result);
+}
+
+} // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
+
+// Rejects the call if KVCM2 has been poisoned. For public API entry points.
+#define KVCM2_REJECT_IF_POISONED()                                                                                     \
+    ::tensorrt_llm::batch_manager::kv_cache_manager_v2::rejectIfPoisoned(__PRETTY_FUNCTION__)
+
+// As above, and checks again when the call returns normally. For the entry points that do enough
+// work to poison the cache themselves.
+#define KVCM2_API_GUARD()                                                                                              \
+    KVCM2_REJECT_IF_POISONED();                                                                                        \
+    ::tensorrt_llm::batch_manager::kv_cache_manager_v2::PoisonExitCheck kvcm2PoisonExitCheck_                          \
+    {                                                                                                                  \
+        __PRETTY_FUNCTION__                                                                                            \
+    }
+
+// Runs cleanup that must not throw. On failure, or if KVCM2 is already poisoned, the callable is
+// abandoned and the cache is marked unusable. Variadic so the callable may contain commas.
+#define KVCM2_POISON_ON_EXCEPT(...)                                                                                    \
+    ::tensorrt_llm::batch_manager::kv_cache_manager_v2::poisonOnExcept(__PRETTY_FUNCTION__, __VA_ARGS__)
+
+// Check variants for noexcept contexts such as destructors: on failure they record the assertion
+// message, source location and backtrace captured by TLLM_CHECK, prefixed with the enclosing
+// function, and poison KVCM2. Once poisoned they evaluate nothing, so a single root violation is
+// reported rather than every consequence of it.
+#define KVCM2_CHECK_FATAL(cond)                                                                                        \
+    ::tensorrt_llm::batch_manager::kv_cache_manager_v2::poisonOnExcept(__PRETTY_FUNCTION__, [&]() { TLLM_CHECK(cond); })
+
+#define KVCM2_CHECK_FATAL_WITH_INFO(cond, info, ...)                                                                   \
+    ::tensorrt_llm::batch_manager::kv_cache_manager_v2::poisonOnExcept(                                                \
+        __PRETTY_FUNCTION__, [&]() { TLLM_CHECK_WITH_INFO(cond, info, ##__VA_ARGS__); })
+
+// As above, but only evaluated when debug checks are enabled. The gDebug test comes first so
+// nothing is built when checks are off.
+#define KVCM2_CHECK_FATAL_DEBUG(cond)                                                                                  \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        if (TLLM_UNLIKELY(::tensorrt_llm::batch_manager::kv_cache_manager_v2::gDebug))                                 \
+        {                                                                                                              \
+            KVCM2_CHECK_FATAL(cond);                                                                                   \
+        }                                                                                                              \
+    } while (0)
+
+#define KVCM2_CHECK_FATAL_DEBUG_WITH_INFO(cond, info, ...)                                                             \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        if (TLLM_UNLIKELY(::tensorrt_llm::batch_manager::kv_cache_manager_v2::gDebug))                                 \
+        {                                                                                                              \
+            KVCM2_CHECK_FATAL_WITH_INFO(cond, info, ##__VA_ARGS__);                                                    \
+        }                                                                                                              \
+    } while (0)

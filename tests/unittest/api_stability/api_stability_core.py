@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # autoflake: skip_file
 import copy
 import inspect
@@ -7,8 +10,8 @@ from collections.abc import Mapping
 from dataclasses import _HAS_DEFAULT_FACTORY_CLASS, dataclass, fields
 from pprint import pprint
 from types import MethodType, NoneType
-from typing import (Any, Callable, ClassVar, Dict, List, Literal, Optional,
-                    Sequence, Tuple, Union, _type_repr)
+from typing import (Annotated, Any, Callable, ClassVar, Dict, List, Literal,
+                    Optional, Sequence, Tuple, Union, _type_repr)
 
 import docstring_parser
 import pydantic.main
@@ -16,6 +19,7 @@ import pytest
 import torch
 import transformers
 import yaml
+from annotated_types import Gt
 from pydantic import BaseModel
 
 import tensorrt_llm
@@ -24,11 +28,11 @@ from tensorrt_llm import LLM, DisaggregatedParams
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
     BaseCheckpointLoader
 from tensorrt_llm.executor import GenerationResult
-from tensorrt_llm.executor.result import TokenLogprobs
+from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
 from tensorrt_llm.llmapi import (CalibConfig, CompletionOutput,
                                  GuidedDecodingParams, QuantConfig,
                                  RequestOutput, SamplingParams)
-from tensorrt_llm.llmapi.llm_args import SamplerType
+from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 from tensorrt_llm.llmapi.llm_utils import LlmArgs
 from tensorrt_llm.logger import Singleton
 from tensorrt_llm.sampling_params import LogprobMode
@@ -157,8 +161,17 @@ class MethodSnapshot:
         return cls(parameters, return_annotation)
 
     @classmethod
+    def _strip_api_status_tag(cls, docstring: str) -> str:
+        """Strip the :tag:`...` prefix added by @set_api_status decorator."""
+        if docstring and docstring.startswith(":tag:"):
+            import re
+            docstring = re.sub(r'^:tag:`[^`]*`\s*', '', docstring)
+        return docstring
+
+    @classmethod
     def from_docstring(cls, method: MethodType):
-        doc = docstring_parser.parse(method.__doc__)
+        docstring = cls._strip_api_status_tag(method.__doc__)
+        doc = docstring_parser.parse(docstring)
         parameters = {}
         for param in doc.params:
             if param.args[0] == 'param':

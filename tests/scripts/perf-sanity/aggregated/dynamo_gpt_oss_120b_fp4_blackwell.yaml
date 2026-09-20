@@ -1,0 +1,67 @@
+# Dynamo-replica: agg GPT-OSS-120B FP4 TRT-LLM deployment.
+#
+# Source (upstream Dynamo recipe):
+#   https://github.com/ai-dynamo/dynamo/tree/main/recipes/gpt-oss-120b/trtllm/agg
+
+metadata:
+  model_name: gpt_oss_120b_fp4
+  supported_gpus:
+  - GB200
+hardware:
+  gpus_per_node: 4
+server_configs:
+  - name: "gpt_oss_fp4_tep4_adp_cutlass_1k1k"
+    model_name: "gpt_oss_120b_fp4"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    pipeline_parallel_size: 1
+    max_batch_size: 800
+    max_num_tokens: 20000
+    attn_backend: "TRTLLM"
+    enable_attention_dp: true
+    stream_interval: 20
+    moe_config:
+      backend: 'CUTLASS'
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 800
+    kv_cache_config:
+      dtype: 'fp8'
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.9
+    client_configs:
+      - name: "con128_iter10_1k1k"
+        concurrency: 128
+        iterations: 10
+        isl: 1024
+        osl: 1024
+        backend: "openai"
+        dataset_file: <dataset_file>
+
+  - name: "gpt_oss_fp4_tep4_adp_cutlass_8k1k"
+    model_name: "gpt_oss_120b_fp4"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    pipeline_parallel_size: 1
+    max_batch_size: 800
+    max_num_tokens: 20000
+    attn_backend: "TRTLLM"
+    enable_attention_dp: true
+    stream_interval: 20
+    moe_config:
+      backend: 'CUTLASS'
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 800
+    kv_cache_config:
+      dtype: 'fp8'
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.9
+    client_configs:
+      - name: "con128_iter10_8k1k"
+        concurrency: 128
+        iterations: 10
+        isl: 8192
+        osl: 1024
+        backend: "openai"
+        dataset_file: <dataset_file>

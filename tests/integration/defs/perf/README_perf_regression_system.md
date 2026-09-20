@@ -20,7 +20,7 @@ The lowest layer. It knows only how to talk to OpenSearch and nothing about regr
 | Function | Purpose |
 |----------|---------|
 | `add_id(data)` | Generates a unique `_id` for a data dict |
-| `get_history_data(new_data_dict, match_keys, common_values_dict)` | Queries OpenSearch for the last 90 days of valid post-merge data, matches each history record to the correct `cmd_idx` based on `match_keys`. Returns `latest_history_data_dict` (most recent per cmd_idx) and `history_data_dict` (all entries per cmd_idx) |
+| `get_history_data(new_data_dict, match_keys, common_values_dict)` | Queries OpenSearch for the last 90 days of valid post-merge data, matches each history record to the correct `cmd_idx` based on `match_keys`. Returns a 3-tuple: `latest_history_data_dict` (most recent entry per cmd_idx), `latest_baseline_threshold_dict` (baseline/threshold fields from the most recent entry that has them, per cmd_idx), and `history_data_dict` (all entries per cmd_idx) |
 | `post_new_perf_data(new_data_dict)` | Posts all entries to OpenSearch |
 
 ### Layer 2: `perf_regression_utils.py` — Generic Regression Pipeline
@@ -35,10 +35,23 @@ The main entry point is `process_and_upload_test_results()`, which orchestrates 
 | 2 | Enrich data | Merges `job_config` and `extra_fields` into each entry, then calls `add_id()` |
 | 3 | `get_common_values()` | Scans all entries to find match_keys where every entry has the same value (e.g., all share `s_gpu_type=H100`). These become additional query filters |
 | 4 | `get_history_data()` | Queries OpenSearch with the narrowed filters, matches results back to `cmd_idx` |
-| 5 | `prepare_regressive_test_cases()` | Compares each metric's new value against baseline. Baseline comes from the latest history entry's embedded `d_baseline_*` field; if missing, falls back to `calculate_baseline_metrics()`. Sets `b_is_regression=True` if any regression metric exceeds the threshold |
-| 6 | `add_baseline_fields_to_post_merge_data()` | Post-merge only: embeds `d_baseline_*` and `d_threshold_*` fields into new data so future runs can use them directly |
+| 5 | `prepare_regressive_test_cases()` | Compares each metric's new value against baseline. Baseline comes from `latest_baseline_threshold_dict` (the most recent entry with baseline fields); if missing, falls back to `calculate_baseline_metrics()`. Threshold also comes from `latest_baseline_threshold_dict`; if missing, uses defaults. Sets `b_is_regression=True` if any regression metric exceeds the threshold. Returns the set of pre-merge `cmd_idx` exempt from gating (empty when the history query failed) |
+| 6 | `add_baseline_fields_to_post_merge_data()` | Post-merge only: embeds `d_baseline_*` and `d_threshold_*` fields into new data from `latest_baseline_threshold_dict`. Only sets fields when inherited values exist and are > 0; skips otherwise |
 | 7 | `post_new_perf_data()` | Uploads to OpenSearch |
-| 8 | `check_perf_regression()` | Prints regression details. For pre-merge, raises `RuntimeError` if `fail_on_regression=True` (default for pre-merge, auto-detected) |
+| 8 | `check_perf_regression()` | Prints regression details. For pre-merge, raises `RuntimeError` if `fail_on_regression=True` (default for pre-merge, auto-detected) and at least one regressive case is **not** exempt. Exempt cases are still printed as warnings |
+
+`s_branch` comes from `globalVars["build_branch"]`, which the pipeline resolves
+once in `resolveBuildBranch()` (`jenkins/L0_MergeRequest.groovy`) and also writes
+into the build's `build_info.txt`, so the two always agree. It is
+`github-pr-<N>` for GitHub PR builds (the only builds that carry
+`github_pr_api_url`), and otherwise `env.gitlabBranch` — the pushed branch
+(`main`, `release/1.3.0rcXX`, ...) for post-merge builds, the source branch for
+GitLab MR builds — falling back to `main` when that is unset. A value the
+pipeline did not publish as a string becomes `""`, because an empty branch is
+recoverable and a wrong one is not. Do **not** try to recover it from
+`s_job_url`: the `/job/LLM/job/<folder>/` segment there names the Jenkins folder
+the job definition lives in, which is `main` even for release-branch post-merge
+builds.
 
 **Baseline calculation** (`calculate_baseline_metrics`):
 1. Group all data points by day, average within each day
@@ -48,6 +61,48 @@ The main entry point is `process_and_upload_test_results()`, which orchestrates 
 **Regression detection** (`prepare_regressive_test_cases`):
 - A metric is regressive if the new value breaches `baseline * (1 +/- threshold)`
 - Default thresholds: **5%** for post-merge, **10%** for pre-merge (can be overridden per-metric via embedded `d_threshold_*` fields from history)
+
+**Pre-merge exemption when `main` has already regressed**
+
+Both pipelines compare against the same baseline, so a regression that lands on
+`main` makes every subsequent PR measure the same regressed value and fail a
+test it did not break — blocking all PRs until a fix merges and everyone
+rebases. To prevent that, a pre-merge case does not fail the stage when the
+latest post-merge record for the same case would itself miss the pre-merge gate:
+
+- The latest post-merge **value** is re-evaluated here, against the same baseline
+  and the same **pre-merge** threshold (10%) used for the pre-merge verdict. The
+  `b_is_regression` recorded by the post-merge run is *not* consulted, because it
+  was computed at the tighter post-merge threshold (5%).
+- That makes the exemption exactly as wide as the failure it prevents. If `main`
+  sits within the pre-merge threshold, a PR reproducing `main`'s value does not
+  fail the gate, so there is nothing to exempt and the gate stays armed.
+- Granularity is the whole test case (per `cmd_idx`), not per metric.
+- Anything unusable in that record — metric absent, null, non-numeric, or
+  non-positive — does **not** exempt, so a broken post-merge document leaves the
+  gate armed rather than silently disarming it.
+- The pre-merge document still uploads `b_is_regression` exactly as measured and
+  keeps the full metric detail in `s_regression_info`; only the `RuntimeError` is
+  suppressed, and an explanatory line is appended. No new field is written.
+- `latest_history_data_dict` already supplies this record, so no extra
+  OpenSearch query is issued.
+
+Consequences worth knowing:
+
+- Within the exempt band the case is **fully** exempt: once `main` is more than
+  10% off baseline, a PR that makes the same case worse still passes. This is
+  inherent to exempting a whole case rather than diffing against `main`'s value.
+- It **self-clears**, which also hides the regression. Nothing seeds
+  `d_baseline_*` automatically, so the effective baseline is the rolling
+  P95/P5 window; within a few days it drifts down to the regressed level, the
+  latest post-merge value comes back inside the threshold, and the gate re-arms
+  against the *lowered* bar — with no fix ever landing.
+- A single flaky post-merge data point disarms the gate until the next
+  post-merge run: "latest" is one record, not a smoothed trend.
+- To force gating back on, mark the offending post-merge document
+  `b_is_valid: false` in OpenSearch, which drops it from the history query.
+- Match keys do not include `s_stage_name`, so the exempting record is whichever
+  stage most recently measured that case.
 
 ### Layer 3: Test-Specific Data Assembly
 
@@ -139,7 +194,7 @@ process_and_upload_test_results(
 | `match_keys` | `List[str]` | Fields that uniquely identify a test case |
 | `maximize_metrics` | `List[str]` | Metrics where larger is better (baseline = P95) |
 | `minimize_metrics` | `List[str]` | Metrics where smaller is better (baseline = P5) |
-| `regression_metrics` | `List[str]` | Subset checked for pass/fail regression |
+| `regression_metrics` | `List[str]` | Subset of `maximize_metrics + minimize_metrics` checked for pass/fail regression. Raises `ValueError` if any entry is not in those lists |
 | `extra_fields` | `dict` or `None` | Additional fields merged into every entry |
 | `upload_to_db` | `bool` | Whether to actually post to OpenSearch |
 | `fail_on_regression` | `bool` or `None` | `None` = auto (fail pre-merge, warn post-merge) |

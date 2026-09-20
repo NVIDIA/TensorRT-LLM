@@ -232,8 +232,11 @@ class SinglePassMultiCTARadixTopKClusterKernel(SinglePassMultiCTARadixTopKKernel
             tidx,
         )
 
-        # 2. Cluster barrier: publish all local histograms
-        cute.arch.cluster_arrive_relaxed()
+        # 2. Cluster barrier: publish all local histograms. Non-relaxed arrive
+        # (release fence) so the local_histogram stores are visible to the peer
+        # ld.shared::cluster acquire in merge_histogram_dsmem below; relaxed
+        # would risk stale peer reads (cf. filtered_top_k_varlen_util fix).
+        cute.arch.cluster_arrive()
         cute.arch.cluster_wait()
 
         # 3. Merge histograms via DSMEM (local_histogram -> prefix_buf)

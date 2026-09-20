@@ -166,6 +166,12 @@ class MLIRElementwiseFusion(BaseTransform):
         back_converter = MLIRToFXConverter(gm)
         new_gm = back_converter.convert(mlir_module, converter.metadata)
 
+        # Step 6: Defer graph cleanup and shape-prop to the framework. Running
+        # fake-tensor shape-prop here is unsafe at post_load_fusion: the graph
+        # may be in a deliberately invalid intermediate state (e.g.
+        # fuse_rope_into_trtllm_attention rewires Q/K/V to a fused-QKV tensor
+        # whose rank does not match torch_attention.register_fake; the op swap
+        # happens later at cache_init).
         return new_gm, TransformInfo(
             skipped=False,
             num_matches=num_replaced,

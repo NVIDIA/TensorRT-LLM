@@ -1,6 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import subprocess
-import sys
 import tempfile
 
 import pytest
@@ -8,7 +22,7 @@ import yaml
 
 from .openai_server import RemoteOpenAIServer
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+__extra_import_path__ = [".."]
 from test_llm import get_model_path
 
 
@@ -22,8 +36,10 @@ def temp_extra_llm_api_options_file():
     temp_dir = tempfile.gettempdir()
     temp_file_path = os.path.join(temp_dir, "extra_llm_api_options.yaml")
     try:
+        # YAML attempts to override tensor_parallel_size; the CLI's --tp_size 1
+        # must win. max_num_tokens is YAML-only and should still be applied.
         extra_llm_api_options_dict = {
-            "tensor_parallel_size": 1,
+            "tensor_parallel_size": 99,
             "max_num_tokens": 16384,
         }
 
@@ -45,8 +61,10 @@ def example_root():
 @pytest.fixture(scope="module")
 def server(model_name: str, temp_extra_llm_api_options_file: str):
     model_path = get_model_path(model_name)
+    # If YAML's tensor_parallel_size: 99 won over the CLI, the server would
+    # fail to start; the server starting at TP=1 is the assertion.
     args = [
-        "--tp_size", "99", "--extra_llm_api_options",
+        "--tp_size", "1", "--extra_llm_api_options",
         temp_extra_llm_api_options_file
     ]
     with RemoteOpenAIServer(model_path, port=8000,
@@ -67,4 +85,5 @@ def test_trtllm_serve_duplicated_args(exe: str, script: str,
                    stdout=subprocess.PIPE,
                    stderr=subprocess.PIPE,
                    text=True,
-                   check=True)
+                   check=True,
+                   timeout=600)

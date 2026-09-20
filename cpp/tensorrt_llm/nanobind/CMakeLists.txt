@@ -6,30 +6,39 @@ set(TRTLLM_NB_MODULE
 set(SRCS
     batch_manager/algorithms.cpp
     batch_manager/bindings.cpp
-    batch_manager/buffers.cpp
     batch_manager/cacheTransceiver.cpp
     batch_manager/kvCacheConnector.cpp
     batch_manager/kvCacheManager.cpp
     batch_manager/kvCacheManagerV2Utils.cpp
+    batch_manager/kvCacheManagerV2.cpp
     batch_manager/llmRequest.cpp
     common/tllmExceptions.cpp
     executor/bindings.cpp
-    executor/executor.cpp
     executor/executorConfig.cpp
     executor/request.cpp
+    kvCacheCompression/bindings.cpp
     process_group/bindings.cpp
     runtime/bindings.cpp
     runtime/hostfunc.cpp
     runtime/moeBindings.cpp
     suffixAutomaton/bindings.cpp
     testing/kvCacheManagerTestUtilBinding.cpp
-    testing/modelSpecBinding.cpp
     userbuffers/bindings.cpp
     thop/bindings.cpp
+    visual_gen/coordinatorWatchdog.cpp
     ../runtime/ipcNvlsMemory.cu
     bindings.cpp)
 
 include_directories(${PROJECT_SOURCE_DIR}/include)
+
+# KV Cache Manager V2 include directory (global, needed during compilation of
+# SRCS) NOTE: PROJECT_SOURCE_DIR = cpp/ (build_wheel.py passes cpp/ as -S), so
+# batch_manager is one level down and the vendored SHA-256 is at
+# tensorrt_llm/common/sha256.
+set(KV_CACHE_MANAGER_V2_INCLUDE
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
+include_directories(${KV_CACHE_MANAGER_V2_INCLUDE}
+                    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
 
 # NOSTRIP: Disable stripping for BOLT compatibility (requires --emit-relocs)
 if(ENABLE_BOLT_COMPATIBLE)
@@ -37,6 +46,12 @@ if(ENABLE_BOLT_COMPATIBLE)
 else()
   nanobind_add_module(${TRTLLM_NB_MODULE} ${SRCS})
 endif()
+
+# SHA-256 symbols are provided by tensorrt_llm_batch_manager_static (via the
+# shared lib). Only add the include directory so headers resolve during
+# compilation of kvCacheManagerV2.cpp.
+target_include_directories(
+  ${TRTLLM_NB_MODULE} PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
 
 set_property(TARGET ${TRTLLM_NB_MODULE} PROPERTY POSITION_INDEPENDENT_CODE ON)
 
@@ -53,6 +68,7 @@ target_link_libraries(
   PUBLIC ${SHARED_TARGET}
          ${Python3_LIBRARIES}
          ${TORCH_LIBRARIES}
+         Threads::Threads
          torch_python
          ${CUDA_DRV_LIB}
          th_common

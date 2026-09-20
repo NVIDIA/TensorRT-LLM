@@ -48,6 +48,11 @@ class ZeroMqQueue:
             use_hmac_encryption (bool): Whether to use HMAC encryption for pickled data. Defaults to True.
         '''
 
+        if not use_hmac_encryption:
+            raise RuntimeError(
+                "use_hmac_encryption HMAC encryption is always required. Turning off HMAC encryption risks security vulnerability of unauthorized data serialization and deserialization. "
+            )
+
         self.socket_type = socket_type
         self.address_endpoint = address[
             0] if address is not None else "tcp://127.0.0.1:*"
@@ -191,6 +196,21 @@ class ZeroMqQueue:
                 # Standard socket without encryption - use pyobj directly
                 self.socket.send_pyobj(obj)
 
+    def put_nowait(self, obj: Any, routing_id: Optional[bytes] = None):
+        """Send an object without waiting for a writable peer.
+
+        Raises:
+            zmq.Again: If the socket cannot accept the message immediately.
+        """
+        self.setup_lazily()
+        self._check_thread_safety()
+        with nvtx_range_debug("send", color="blue", category="IPC"):
+            if self.use_hmac_encryption or self.socket_type == zmq.ROUTER:
+                data = self._prepare_data(obj)
+                self._send_data(data, flags=zmq.NOBLOCK, routing_id=routing_id)
+            else:
+                self.socket.send_pyobj(obj, flags=zmq.NOBLOCK)
+
     def put_noblock(self,
                     obj: Any,
                     *,
@@ -258,10 +278,33 @@ class ZeroMqQueue:
             logger.error(traceback.format_exc())
             raise e
 
-    def get(self) -> Any:
+    def get(self, timeout: Optional[float] = None) -> Any:
+        """Receive an object from the queue.
+
+        Args:
+            timeout: If ``None`` (default), block until a message arrives.
+                If a non-negative float, wait up to that many seconds and
+                raise ``queue.Empty`` if nothing arrives in time.
+        """
         self.setup_lazily()
         self._check_thread_safety()
+        if timeout is not None:
+            # ``zmq.Socket.poll`` takes timeout in milliseconds; convert
+            # from seconds. ``poll`` returns 0 when the timeout fires
+            # without any event on the socket.
+            if not self.socket.poll(timeout=int(timeout * 1000)):
+                from queue import Empty
+                raise Empty()
         return self._recv_data()
+
+    def drain(self) -> list[Any]:
+        """Non-blocking drain: return all currently available messages without waiting."""
+        self.setup_lazily()
+        self._check_thread_safety()
+        results = []
+        while self.socket.poll(timeout=0):
+            results.append(self._recv_data())
+        return results
 
     async def get_async(self) -> Any:
         self.setup_lazily()

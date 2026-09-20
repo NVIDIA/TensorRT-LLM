@@ -1,7 +1,7 @@
 regex
 fire
 tritonclient[all]
-transformers==4.57.3
+transformers==5.5.4
 pandas
 tabulate
 flash_attn

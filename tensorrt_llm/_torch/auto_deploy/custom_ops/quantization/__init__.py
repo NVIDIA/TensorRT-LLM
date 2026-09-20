@@ -18,9 +18,11 @@
 This module provides quantization utilities and operations:
 - quant: Quantization operations (FP8, FP4, INT4, INT8)
 - torch_quant: PyTorch-based quantization implementations
+- trtllm_quant: TRT-LLM-backed quantized linear ops
 """
 
 __all__ = [
     "quant",
     "torch_quant",
+    "trtllm_quant",
 ]

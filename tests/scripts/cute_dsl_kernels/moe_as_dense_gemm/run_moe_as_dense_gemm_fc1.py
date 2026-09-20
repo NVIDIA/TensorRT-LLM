@@ -736,7 +736,7 @@ def run(
             torch.testing.assert_close(c_ref, ref, atol=tolerance, rtol=1e-02)
         elif c_dtype is cutlass.Float4E2M1FN:
             # FP4 quantization with SFC (Scale Factor C) verification
-            # Reference: run_blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py
+            # Reference: run_blockscaled_contiguous_gather_grouped_gemm_act_fusion.py
 
             # ============================================================
             # Step 1: Compute reference scale factor (SFC) from SwiGLU output

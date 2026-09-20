@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -49,10 +49,9 @@ configure_file(
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 
-filter_source_cuda_architectures(
-  SOURCE_LIST SRC_CPP
-  ARCHS 100 103 100f
-  TARGET trtllm_gen_fmha_interface)
+filter_source_cuda_architectures(SOURCE_LIST SRC_CPP ARCHS 100 103 107 100f)
+
+add_library(trtllm_gen_fmha_interface INTERFACE)
 target_include_directories(
   trtllm_gen_fmha_interface
   INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/trtllmGen_fmha_export)
@@ -63,14 +62,19 @@ set_property(TARGET trtllm_gen_fmha PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_link_libraries(trtllm_gen_fmha PUBLIC trtllm_gen_fmha_interface)
 target_include_directories(
   trtllm_gen_fmha PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/trtllmGen_fmha_export)
+
+include(tllm_cubin_archive)
+tllm_add_cubin_archive_sources(
+  trtllm_gen_fmha "${CMAKE_CURRENT_SOURCE_DIR}/cubin" ARCHS 100 103 107 100f)
 set(TRTLLM_FMHA_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}")
 target_compile_definitions(
   trtllm_gen_fmha
-  PRIVATE TRTLLM_FMHA_BUILD_DIR="${TRTLLM_FMHA_BUILD_DIR}" TLLM_PUBLIC_RELEASE
+  PRIVATE TRTLLM_FMHA_BUILD_DIR="${TRTLLM_FMHA_BUILD_DIR}" TLLM_RUBIN_FEATURES
           TLLM_GEN_EXPORT_INTERFACE TLLM_FMHA_TRTLLM_COMPAT)
 target_compile_definitions(
-  trtllm_gen_fmha_interface INTERFACE TLLM_GEN_EXPORT_INTERFACE
-                                      TLLM_FMHA_TRTLLM_COMPAT)
+  trtllm_gen_fmha_interface
+  INTERFACE TLLM_GEN_EXPORT_INTERFACE TLLM_FMHA_TRTLLM_COMPAT
+            TLLM_RUBIN_FEATURES)
 
 # Link the TrtLlmGen FMHA static library
 set(TRTLLM_GEN_FMHA_LIB

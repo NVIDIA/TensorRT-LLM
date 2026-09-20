@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -25,11 +25,7 @@ set(SRCS
     cache_transmission/cacheSplitConcat.cu
     cache_transmission/rnnCacheSplitConcat.cu
     contextPhaseParams.cpp
-    debugConfig.cpp
     decodingConfig.cpp
-    executor.cpp
-    executorConfig.cpp
-    executorImpl.cpp
     executorKVCacheEventManager.cpp
     extendedRuntimePerfKnobConfig.cpp
     guidedDecodingConfig.cpp
@@ -37,11 +33,8 @@ set(SRCS
     jsonSerialization.cpp
     kvCacheConfig.cpp
     kvCacheRetentionConfig.cpp
-    logitsPostProcessorConfig.cpp
     loraConfig.cpp
-    orchestratorConfig.cpp
     outputConfig.cpp
-    parallelConfig.cpp
     peftCacheConfig.cpp
     promptTuningConfig.cpp
     mropeConfig.cpp
@@ -52,15 +45,12 @@ set(SRCS
     response.cpp
     samplingConfig.cpp
     dynamicBatchConfig.cpp
-    dynamicBatchTuner.cpp
     schedulerConfig.cpp
     serialization.cpp
-    speculativeDecodingConfig.cpp
     tensor.cpp
     types.cpp
     requestUtils.cpp
     contextPhaseParams.cpp
-    disaggServerUtil.cpp
     cacheTransceiverConfig.cpp)
 
 if(NOT WIN32)

@@ -39,8 +39,7 @@ from typing import List, Optional
 import pytest
 import requests
 import yaml
-
-from tensorrt_llm._utils import get_free_port
+from utils.util import skip_pre_blackwell
 
 # ---------------------------------------------------------------------------
 # Model paths
@@ -69,6 +68,12 @@ _FLUX2_PATH = Path(_llm_models_root()) / "FLUX.2-dev"
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]  # repo root
 _REF_IMAGE_PATH = _PROJECT_ROOT / "examples" / "visual_gen" / "cat_piano.png"
 
+# Use the CI-aware port allocator from tests/integration/defs/common.py so
+# parallel pytest sessions on the same OCI node fall into disjoint port
+# sections (CONTAINER_PORT_START / CONTAINER_PORT_NUM). It transparently falls
+# back to the plain free-port scan when those env vars are not set.
+__extra_import_path__ = ["~/tests/integration"]
+from defs.common import get_free_port_in_ci  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Remote server helper (follows RemoteOpenAIServer pattern)
@@ -87,14 +92,14 @@ class RemoteVisualGenServer:
     def __init__(
         self,
         model: str,
-        extra_visual_gen_options: Optional[dict] = None,
+        visual_gen_args: Optional[dict] = None,
         cli_args: Optional[List[str]] = None,
         host: str = "localhost",
         port: Optional[int] = None,
         env: Optional[dict] = None,
     ) -> None:
         self.host = host
-        self.port = port if port is not None else get_free_port()
+        self.port = port if port is not None else get_free_port_in_ci()
         self._config_file: Optional[str] = None
         self.proc: Optional[subprocess.Popen] = None
 
@@ -103,11 +108,11 @@ class RemoteVisualGenServer:
             args += cli_args
 
         # Write the visual-gen YAML config to a temp file
-        if extra_visual_gen_options:
+        if visual_gen_args:
             fd, self._config_file = tempfile.mkstemp(suffix=".yml", prefix="vg_cfg_")
             with os.fdopen(fd, "w") as f:
-                yaml.dump(extra_visual_gen_options, f)
-            args += ["--extra_visual_gen_options", self._config_file]
+                yaml.dump(visual_gen_args, f)
+            args += ["--visual_gen_args", self._config_file]
 
         launch_cmd = ["trtllm-serve", model] + args
 
@@ -198,9 +203,9 @@ def _assert_b64_image_response(data: dict) -> None:
 
 
 def _make_visual_gen_options(**extra) -> dict:
-    """Build the YAML dict passed via ``--extra_visual_gen_options``."""
+    """Build the YAML dict passed via ``--visual_gen_args``."""
     config = {
-        "parallel": {"dit_cfg_size": 1, "dit_ulysses_size": 1},
+        "parallel_config": {"cfg_size": 1, "ulysses_size": 1},
     }
     config.update(extra)
     return config
@@ -218,7 +223,7 @@ class TestWanTextToVideo:
     def server(self):
         with RemoteVisualGenServer(
             model=str(_WAN_T2V_PATH),
-            extra_visual_gen_options=_make_visual_gen_options(),
+            visual_gen_args=_make_visual_gen_options(),
         ) as srv:
             yield srv
 
@@ -229,7 +234,7 @@ class TestWanTextToVideo:
         assert resp.status_code == 200
 
     @pytest.mark.parametrize(
-        "output_format,expected_content_type",
+        "format_,expected_content_type",
         [
             pytest.param("avi", "video/x-msvideo", id="avi"),
             pytest.param(
@@ -240,10 +245,10 @@ class TestWanTextToVideo:
             ),
         ],
     )
-    def test_t2v_sync(self, server, output_format, expected_content_type):
-        """Synchronous text-to-video via POST /v1/videos/generations."""
+    def test_t2v_sync(self, server, format_, expected_content_type):
+        """Synchronous text-to-video via POST /v1/videos/sync."""
         resp = requests.post(
-            server.url_for("v1", "videos", "generations"),
+            server.url_for("v1", "videos", "sync"),
             json={
                 "prompt": "A cute cat playing piano",
                 "size": "480x320",
@@ -251,7 +256,7 @@ class TestWanTextToVideo:
                 "fps": 8,
                 "num_inference_steps": 4,
                 "seed": 42,
-                "output_format": output_format,
+                "format": format_,
             },
         )
         assert resp.status_code == 200, resp.text
@@ -259,7 +264,7 @@ class TestWanTextToVideo:
         assert len(resp.content) > 1000, "Video file too small"
 
     @pytest.mark.parametrize(
-        "output_format,expected_content_type",
+        "format_,expected_content_type",
         [
             pytest.param("avi", "video/x-msvideo", id="avi"),
             pytest.param(
@@ -270,7 +275,7 @@ class TestWanTextToVideo:
             ),
         ],
     )
-    def test_t2v_async_lifecycle(self, server, output_format, expected_content_type):
+    def test_t2v_async_lifecycle(self, server, format_, expected_content_type):
         """Async video generation: create job → poll → download → delete."""
         base = server.url_for("v1", "videos")
 
@@ -284,7 +289,7 @@ class TestWanTextToVideo:
                 "fps": 8,
                 "num_inference_steps": 4,
                 "seed": 42,
-                "output_format": output_format,
+                "format": format_,
             },
         )
         assert create_resp.status_code == 202, create_resp.text
@@ -338,7 +343,7 @@ class TestWanImageToVideo:
     def server(self):
         with RemoteVisualGenServer(
             model=str(_WAN_I2V_PATH),
-            extra_visual_gen_options=_make_visual_gen_options(),
+            visual_gen_args=_make_visual_gen_options(),
         ) as srv:
             yield srv
 
@@ -349,7 +354,7 @@ class TestWanImageToVideo:
         assert resp.status_code == 200
 
     @pytest.mark.parametrize(
-        "output_format,expected_content_type",
+        "format_,expected_content_type",
         [
             pytest.param("avi", "video/x-msvideo", id="avi"),
             pytest.param(
@@ -360,11 +365,12 @@ class TestWanImageToVideo:
             ),
         ],
     )
-    def test_ti2v_sync(self, server, output_format, expected_content_type):
-        """Synchronous image-to-video via multipart POST /v1/videos/generations."""
+    @skip_pre_blackwell
+    def test_ti2v_sync(self, server, format_, expected_content_type):
+        """Synchronous image-to-video via multipart POST /v1/videos/sync."""
         with open(_REF_IMAGE_PATH, "rb") as f:
             resp = requests.post(
-                server.url_for("v1", "videos", "generations"),
+                server.url_for("v1", "videos", "sync"),
                 data={
                     "prompt": "The cat starts playing piano, keys moving",
                     "size": "480x320",
@@ -372,10 +378,10 @@ class TestWanImageToVideo:
                     "fps": "8",
                     "num_inference_steps": "4",
                     "seed": "42",
-                    "output_format": output_format,
+                    "format": format_,
                 },
                 files={
-                    "input_reference": ("cat_piano.png", f, "image/png"),
+                    "image_reference": ("cat_piano.png", f, "image/png"),
                 },
             )
         assert resp.status_code == 200, resp.text
@@ -383,7 +389,7 @@ class TestWanImageToVideo:
         assert len(resp.content) > 1000, "Video file too small"
 
     @pytest.mark.parametrize(
-        "output_format,expected_content_type",
+        "format_,expected_content_type",
         [
             pytest.param("avi", "video/x-msvideo", id="avi"),
             pytest.param(
@@ -394,7 +400,8 @@ class TestWanImageToVideo:
             ),
         ],
     )
-    def test_ti2v_async_lifecycle(self, server, output_format, expected_content_type):
+    @skip_pre_blackwell
+    def test_ti2v_async_lifecycle(self, server, format_, expected_content_type):
         """Async i2v: create job with image → poll → download → delete."""
         base = server.url_for("v1", "videos")
 
@@ -409,10 +416,10 @@ class TestWanImageToVideo:
                     "fps": "8",
                     "num_inference_steps": "4",
                     "seed": "42",
-                    "output_format": output_format,
+                    "format": format_,
                 },
                 files={
-                    "input_reference": ("cat_piano.png", f, "image/png"),
+                    "image_reference": ("cat_piano.png", f, "image/png"),
                 },
             )
         assert create_resp.status_code == 202, create_resp.text
@@ -459,7 +466,7 @@ class TestFlux1TextToImage:
     def server(self):
         with RemoteVisualGenServer(
             model=str(_FLUX1_PATH),
-            extra_visual_gen_options=_make_visual_gen_options(),
+            visual_gen_args=_make_visual_gen_options(),
         ) as srv:
             yield srv
 
@@ -517,7 +524,7 @@ class TestFlux2TextToImage:
     def server(self):
         with RemoteVisualGenServer(
             model=str(_FLUX2_PATH),
-            extra_visual_gen_options=_make_visual_gen_options(),
+            visual_gen_args=_make_visual_gen_options(),
         ) as srv:
             yield srv
 

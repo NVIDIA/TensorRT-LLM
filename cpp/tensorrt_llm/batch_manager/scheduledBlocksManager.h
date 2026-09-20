@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <map>
 #include <optional>
+#include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
@@ -37,28 +38,40 @@ public:
     {
     }
 
-    void decrementReservedBlocks(LlmRequest const& req)
+    /// @brief  Check whether enough blocks are available for the request.
+    /// Caches the per-window block counts for a subsequent commitBlocks() call.
+    bool enoughAvailableBlocks(
+        LlmRequest const& req, std::optional<PrefixReuseSummary> const& cachedSummary = std::nullopt)
     {
-        for (auto& [windowSize, availableBlocks] : mAvailableBlocks)
+        mCachedNeededBlocks.clear();
+        bool enough = true;
+        for (auto const& [windowSize, availableBlocks] : mAvailableBlocks)
         {
-            availableBlocks -= mKvCacheManager.getRemainingBlocksToCompletion(req, windowSize);
+            auto const needed = mKvCacheManager.getRemainingBlocksToCompletion(req, windowSize, cachedSummary);
+            mCachedNeededBlocks.emplace_back(windowSize, needed);
+            if (needed > availableBlocks)
+            {
+                enough = false;
+            }
         }
+        return enough;
     }
 
-    bool enoughAvailableBlocks(LlmRequest const& req)
+    /// @brief  Subtract the block counts cached by the last enoughAvailableBlocks() call.
+    void commitBlocks()
     {
-        return std::all_of(mAvailableBlocks.cbegin(), mAvailableBlocks.cend(),
-            [this, &req](auto const& pair)
-            {
-                auto const& [windowSize, availableBlocks] = pair;
-                auto const neededBlocks = mKvCacheManager.getRemainingBlocksToCompletion(req, windowSize);
-                return neededBlocks <= availableBlocks;
-            });
+        for (auto const& [windowSize, needed] : mCachedNeededBlocks)
+        {
+            mAvailableBlocks[windowSize] -= needed;
+        }
+        mCachedNeededBlocks.clear();
     }
 
 private:
     BaseKVCacheManager const& mKvCacheManager;
     std::map<SizeType32, SizeType32> mAvailableBlocks;
+    // Cache from last enoughAvailableBlocks call, consumed by commitBlocks
+    std::vector<std::pair<SizeType32, SizeType32>> mCachedNeededBlocks;
 };
 
 class MaxUtilizationScheduledBlocksManager
@@ -77,12 +90,14 @@ public:
         }
     }
 
-    std::optional<std::map<SizeType32, SizeType32>> prepareNewNumberOfBlocksIfWeEndUpScheduling(LlmRequest const& req)
+    std::optional<std::map<SizeType32, SizeType32>> prepareNewNumberOfBlocksIfWeEndUpScheduling(
+        LlmRequest const& req, std::optional<PrefixReuseSummary> const& cachedSummary = std::nullopt)
     {
         std::map<SizeType32, SizeType32> blocksIfScheduled;
         for (auto const& [windowSize, numScheduled] : mNumScheduledBlocks)
         {
-            auto const required = mKvCacheManager.getNeededBlocksOneStep(req, mTwoStepsLookAhead, windowSize);
+            auto const required
+                = mKvCacheManager.getNeededBlocksOneStep(req, mTwoStepsLookAhead, windowSize, cachedSummary);
 
             TLLM_LOG_DEBUG("MaxUtilizationScheduler: request ID %lu required blocks %i for %i window size",
                 req.mRequestId, required, windowSize);

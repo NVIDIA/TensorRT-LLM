@@ -1,0 +1,4 @@
+# HunyuanVideo 1.5 text-to-video (single GPU).
+parallel_config:
+  cfg_size: 1
+  ulysses_size: 1

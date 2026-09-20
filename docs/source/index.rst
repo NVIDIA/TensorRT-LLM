@@ -1,3 +1,6 @@
+.. SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+.. SPDX-License-Identifier: Apache-2.0
+
 .. TensorRT LLM documentation master file, created by
    sphinx-quickstart on Wed Sep 20 08:35:21 2023.
    You can adapt this file completely to your liking, but it should at least
@@ -23,6 +26,7 @@ Welcome to TensorRT LLM's Documentation!
    :name: Deployment Guide
 
    examples/llm_api_examples.rst
+   examples/visual_gen_examples.rst
    examples/trtllm_serve_examples
    examples/dynamo_k8s_example.rst
    deployment-guide/index.rst
@@ -64,7 +68,10 @@ Welcome to TensorRT LLM's Documentation!
    features/feature-combination-matrix.md
    features/attention.md
    features/disagg-serving.md
+   features/subagent-routing.md
+   features/embeddings.md
    features/kvcache.md
+   features/kv-cache-compression.md
    features/long-sequence.md
    features/lora.md
    features/multi-modality.md
@@ -74,15 +81,19 @@ Welcome to TensorRT LLM's Documentation!
    features/quantization.md
    features/sampling.md
    features/additional-outputs.md
+   features/post-processor-hook.md
    features/guided-decoding.md
    features/speculative-decoding.md
    features/checkpoint-loading.md
+   features/model-express.md
    features/auto_deploy/auto-deploy.md
+   features/auto_deploy/transforms.rst
    features/ray-orchestrator.md
    features/torch_compile_and_piecewise_cuda_graph.md
    features/helix.md
    features/kv-cache-connector.md
    features/sparse-attention.md
+   features/visual-generation.md
 
 
 .. toctree::
@@ -96,6 +107,10 @@ Welcome to TensorRT LLM's Documentation!
    developer-guide/dev-containers.md
    developer-guide/api-change.md
    developer-guide/kv-transfer.md
+   developer-guide/kv-cache-cold-page-codec.md
+   developer-guide/kv-cache-compression-development.md
+   developer-guide/sparse-attention-development-guide.md
+   developer-guide/telemetry.md
 
 
 .. toctree::
@@ -123,10 +138,9 @@ Welcome to TensorRT LLM's Documentation!
 
 .. toctree::
    :maxdepth: 2
-   :caption: Use TensorRT Engine
-   :hidden:
+   :caption: Migration
 
-   legacy/tensorrt_quickstart.md
+   legacy/tensorrt-backend-removal.md
 
 Indices and tables
 ==================

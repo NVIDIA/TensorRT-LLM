@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 (gpt-attention)=
 
 # Multi-Head, Multi-Query, and Group-Query Attention
@@ -21,7 +25,7 @@ future***.
 In TensorRT-LLM, the GPT attention operator supports two different types
 of QKV inputs: Padded and packed (i.e. non padded) inputs. The mode is
 determined by the global configuration parameter `remove_input_padding` defined
-in [`tensorrt_llm.plugin`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/plugin/plugin.py).
+in [`tensorrt_llm.plugin`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.0/tensorrt_llm/plugin/plugin.py).
 
 When padding is enabled (that is, `remove_input_padding` is `False`), the sequences
 that are shorter than the `max_sequence_length` are padded to that maximum
@@ -43,7 +47,7 @@ context and generation phases in auto-regressive models like GPT.
 ### Context Phase
 
 If the `context_fmha_type` is set to `disabled` (refer to
-[`tensorrt_llm.plugin`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/plugin/plugin.py)),
+[`tensorrt_llm.plugin`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.0/tensorrt_llm/plugin/plugin.py)),
 the implementation maps to a sequence of GPU kernels that will store the
 intermediate `Q*K^T` tensor in memory before calling the softmax operator. It
 is the slowest method and the memory footprint is significant (quadratically
@@ -118,14 +122,11 @@ Support matrix of the XQA optimization:
  - FP16 / BF16 / FP8 / INT8 KV cache data type.
  - Paged KV cache (8 / 16 / 32 / 64 / 128 tokens per block).
 
-This is default enabled. To disable this, you need to use the
-flag `--disable_xqa` when building the engines. Note that a heuristic algorithm
+By default, this is enabled. Note that a heuristic algorithm
 is also used to decide whether to use XQA kernel or masked MHA kernel to get
-better performance. That means even `--disable_xqa` is not set, XQA kernels
-may not also be used. If you want to always use that kernel when possible,
-`TRTLLM_FORCE_XQA=1` can be set to force use XQA kernels when the model config
-is supported. Detailed supported configuration can be found function `shouldUse`
-of class `DecoderXQARunner` in
+better performance.
+If you want to use that kernel whenever possible, set `TRTLLM_FORCE_XQA=1` to force use of the XQA kernel when the model config is supported.
+Supported configurations can be found using the `shouldUse` function of the `DecoderXQARunner` class in
 `cpp/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h`.
 
 

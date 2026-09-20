@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,97 +27,13 @@ using ::testing::Invoke;
 using namespace tensorrt_llm::executor;
 using namespace tensorrt_llm::common;
 
-TEST(ExecutorConfigTest, ctorValidInputs)
+TEST(CacheTransceiverConfigTest, validatesKvTransferPollInterval)
 {
-    SchedulerConfig schedulerConfig;
-    KvCacheConfig kvCacheConfig;
-    {
-        auto executorConfig = ExecutorConfig(1);
-    }
-    {
-        auto executorConfig = ExecutorConfig(1, schedulerConfig, kvCacheConfig, true, true, 0);
-    }
-    {
-        auto executorConfig = ExecutorConfig(1, schedulerConfig, kvCacheConfig, true, true, 1000);
-    }
-}
+    auto makeConfig = [](std::optional<int> pollIntervalMs)
+    { return CacheTransceiverConfig(std::nullopt, std::nullopt, std::nullopt, std::nullopt, pollIntervalMs); };
 
-void testInvalid(SizeType32 maxBeamWidth = 1, SchedulerConfig schedulerConfig = SchedulerConfig(),
-    KvCacheConfig kvCacheConfig = KvCacheConfig(), bool enableChunkedContext = false, bool normalizeLogProbs = true,
-    SizeType32 iterStatsMaxIterations = 1000, BatchingType batchingType = BatchingType::kINFLIGHT,
-    std::optional<ParallelConfig> parallelConfig = std::nullopt)
-{
-    try
-    {
-        auto executorConfig = ExecutorConfig(maxBeamWidth, schedulerConfig, kvCacheConfig, enableChunkedContext,
-            normalizeLogProbs, iterStatsMaxIterations);
-        FAIL() << "Expected TllmException";
-    }
-    catch (TllmException& e)
-    {
-        EXPECT_THAT(e.what(), testing::HasSubstr("Assertion failed"));
-    }
-    catch (std::exception const& e)
-    {
-        FAIL() << "Expected TllmException";
-    }
-}
-
-TEST(ExecutorConfigTest, ctorInvalidInputs)
-{
-    testInvalid(0);
-    testInvalid(-1);
-
-    SchedulerConfig schedulerConfig;
-    KvCacheConfig kvCacheConfig;
-
-    // Empty device ids
-    try
-    {
-        ParallelConfig parallelConfigInvalid;
-        parallelConfigInvalid.setDeviceIds({});
-        FAIL() << "Expected TllmException";
-    }
-    catch (TllmException& e)
-    {
-        EXPECT_THAT(e.what(), testing::HasSubstr("Assertion failed"));
-    }
-    catch (std::exception const& e)
-    {
-        FAIL() << "Expected TllmException";
-    }
-
-    // iter stats negative
-    ParallelConfig parallelConfigValid;
-    testInvalid(1, schedulerConfig, kvCacheConfig, true, true, -1, BatchingType::kINFLIGHT, parallelConfigValid);
-}
-
-TEST(ExecutorConfigTest, extendedRuntimePerfKnobConfigTest)
-{
-    ExtendedRuntimePerfKnobConfig extendedRuntimePerfKnobConfig;
-    {
-        auto executorConfig = ExecutorConfig(1);
-        executorConfig.setExtendedRuntimePerfKnobConfig(extendedRuntimePerfKnobConfig);
-    }
-    {
-        auto executorConfig = ExecutorConfig(1);
-        extendedRuntimePerfKnobConfig.setMultiBlockMode(true);
-        extendedRuntimePerfKnobConfig.setEnableContextFMHAFP32Acc(true);
-        executorConfig.setExtendedRuntimePerfKnobConfig(extendedRuntimePerfKnobConfig);
-    }
-    {
-        auto executorConfig = ExecutorConfig(1);
-        extendedRuntimePerfKnobConfig.setMultiBlockMode(true);
-        extendedRuntimePerfKnobConfig.setMultiBlockMode(false);
-        extendedRuntimePerfKnobConfig.setEnableContextFMHAFP32Acc(true);
-        extendedRuntimePerfKnobConfig.setEnableContextFMHAFP32Acc(false);
-        executorConfig.setExtendedRuntimePerfKnobConfig(extendedRuntimePerfKnobConfig);
-    }
-    {
-        ExtendedRuntimePerfKnobConfig newExtendedRuntimePerfKnobConfig(false, false);
-        auto executorConfig = ExecutorConfig(1);
-        newExtendedRuntimePerfKnobConfig.setMultiBlockMode(true);
-        newExtendedRuntimePerfKnobConfig.setEnableContextFMHAFP32Acc(true);
-        executorConfig.setExtendedRuntimePerfKnobConfig(newExtendedRuntimePerfKnobConfig);
-    }
+    EXPECT_EQ(makeConfig(std::nullopt).getKvTransferPollIntervalMs(), std::nullopt);
+    EXPECT_EQ(makeConfig(1).getKvTransferPollIntervalMs(), 1);
+    EXPECT_THROW(makeConfig(0), TllmException);
+    EXPECT_THROW(makeConfig(-1), TllmException);
 }

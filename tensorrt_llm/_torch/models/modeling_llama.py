@@ -1,25 +1,40 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import copy
 import os
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 from PIL.Image import Image
 from torch import nn
 from transformers import (AutoProcessor, AutoTokenizer, Llama4Config,
                           Llama4VisionModel, LlamaConfig, PretrainedConfig)
-from transformers.modeling_utils import load_sharded_checkpoint
 from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
+from transformers.utils import (SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME,
+                                WEIGHTS_INDEX_NAME, WEIGHTS_NAME)
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, MoEAllReduce)
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
+from tensorrt_llm._torch.peft.lora.loaders import HfLoraLoader
 from tensorrt_llm._utils import get_sm_version, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -28,19 +43,19 @@ from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...sampling_params import SamplingParams
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import (PositionalEmbeddingParams,
-                                           PredefinedAttentionMask, RopeParams)
+from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import (PositionalEmbeddingParams,
+                                            PredefinedAttentionMask, RopeParams)
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (Llama4RenormalizeMoeRoutingMethod,
-                                 MoEWeightLoadingMode, create_moe)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import (Llama4RenormalizeMoeRoutingMethod,
+                             MoEWeightLoadingMode, create_moe)
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_multimodal_utils import fuse_input_embeds
@@ -49,6 +64,26 @@ from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, register_auto_model)
 
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
+
+try:
+    # Available in transformers<5
+    from transformers.modeling_utils import load_sharded_checkpoint
+except ImportError:
+    # Removed in transformers>=5; provide a minimal shim
+    def load_sharded_checkpoint(model, folder, strict=True):
+        import json
+
+        from safetensors.torch import load_file
+        index_file = os.path.join(folder, "model.safetensors.index.json")
+        if os.path.exists(index_file):
+            with open(index_file) as f:
+                shard_files = set(json.load(f)["weight_map"].values())
+            state_dict = {}
+            for sf in shard_files:
+                state_dict.update(load_file(os.path.join(folder, sf)))
+        else:
+            state_dict = load_file(os.path.join(folder, "model.safetensors"))
+        model.load_state_dict(state_dict, strict=strict)
 
 
 class Llama4Attention(Attention):
@@ -349,11 +384,20 @@ class Llama4MoE(nn.Module):
 
         assert shared_output.size() == routed_output.size(
         ), f'unmatched tensor shape'
-        final_hidden_states = shared_output + routed_output
         if not self.enable_attention_dp and self.mapping.has_tp():
+            if isinstance(shared_output, torch.Tensor):
+                output_tensor, _ = torch.ops.trtllm.allocate_output(
+                    shared_output, self.all_reduce.output_buffer_kind,
+                    self.mapping.tp_group)
+                final_hidden_states = torch.add(shared_output,
+                                                routed_output,
+                                                out=output_tensor)
+            else:
+                final_hidden_states = shared_output + routed_output
             final_hidden_states = self.all_reduce(
                 final_hidden_states, all_reduce_params=final_all_reduce_params)
-
+        else:
+            final_hidden_states = shared_output + routed_output
         return final_hidden_states
 
 
@@ -454,7 +498,7 @@ class Llama4DecoderLayer(DecoderLayer):
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
                                        dtype=config.torch_dtype)
-        # When post_load_weights() chains layernorms across layers,
+        # When setup_aliases() chains layernorms across layers,
         # this flag is set to True to skip the input layernorm in
         # forward() since it is handled by the previous layer.
         self.skip_input_layernorm = False
@@ -679,7 +723,7 @@ class LlamaDecoderLayer(DecoderLayer):
             quantize_type="nvfp4"
             if not self.disable_nvfp4_layernorm_fusion and self.is_nvfp4
             and not (differ_pp_stage_with_previous_layer) else None)
-        # When post_load_weights() chains layernorms across layers,
+        # When setup_aliases() chains layernorms across layers,
         # this flag is set to True to skip the input layernorm in
         # forward() since it is handled by the previous layer.
         self.skip_input_layernorm = False
@@ -953,7 +997,7 @@ class Llama4Model(DecoderModel):
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
-        # When post_load_weights() chains the final norm into the
+        # When setup_aliases() chains the final norm into the
         # last decoder layer, this flag is set to True to skip
         # applying it again in forward().
         self.skip_norm = False
@@ -1058,7 +1102,7 @@ class LlamaModel(DecoderModel):
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
-        # When post_load_weights() chains the final norm into the
+        # When setup_aliases() chains the final norm into the
         # last decoder layer, this flag is set to True to skip
         # applying it again in forward().
         self.skip_norm = False
@@ -1104,13 +1148,28 @@ class LlamaModel(DecoderModel):
 @register_auto_model("LlamaForCausalLM")
 class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
 
+    @classmethod
+    def get_preferred_kv_cache_manager_version(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for Llama."""
+        return "V2"
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        return "PYTHON"
+
     def __init__(
         self,
         model_config: ModelConfig[LlamaConfig],
     ):
         super().__init__(LlamaModel(model_config), model_config)
 
-    def post_load_weights(self):
+    def setup_aliases(self) -> None:
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
@@ -1121,6 +1180,56 @@ class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
                     idx + 1].input_layernorm
                 self.model.layers[idx + 1].skip_input_layernorm = True
                 layer.next_attn = self.model.layers[idx + 1].self_attn
+
+
+def _load_checkpoint_into_module(module: nn.Module,
+                                 folder: str,
+                                 strict: bool = True) -> None:
+    """Load a sharded HuggingFace checkpoint into a module.
+
+    This replaces the removed ``transformers.modeling_utils.load_sharded_checkpoint``
+    function. It supports both safetensors and PyTorch checkpoint formats.
+    """
+    folder = str(folder)
+
+    # Determine checkpoint format and collect shard files
+    index_file = os.path.join(folder, SAFE_WEIGHTS_INDEX_NAME)
+    if os.path.isfile(index_file):
+        import json
+        with open(index_file) as f:
+            shard_files = sorted(set(json.load(f)["weight_map"].values()))
+        shard_paths = [os.path.join(folder, s) for s in shard_files]
+        use_safetensors = True
+    elif os.path.isfile(os.path.join(folder, WEIGHTS_INDEX_NAME)):
+        import json
+        with open(os.path.join(folder, WEIGHTS_INDEX_NAME)) as f:
+            shard_files = sorted(set(json.load(f)["weight_map"].values()))
+        shard_paths = [os.path.join(folder, s) for s in shard_files]
+        use_safetensors = False
+    elif os.path.isfile(os.path.join(folder, SAFE_WEIGHTS_NAME)):
+        shard_paths = [os.path.join(folder, SAFE_WEIGHTS_NAME)]
+        use_safetensors = True
+    elif os.path.isfile(os.path.join(folder, WEIGHTS_NAME)):
+        shard_paths = [os.path.join(folder, WEIGHTS_NAME)]
+        use_safetensors = False
+    else:
+        raise FileNotFoundError(
+            f"No checkpoint found in {folder}. Expected "
+            f"{SAFE_WEIGHTS_INDEX_NAME}, {WEIGHTS_INDEX_NAME}, "
+            f"{SAFE_WEIGHTS_NAME}, or {WEIGHTS_NAME}.")
+
+    # Load state dict from all shards and merge
+    full_state_dict: Dict[str, torch.Tensor] = {}
+    if use_safetensors:
+        from safetensors.torch import load_file
+        for path in shard_paths:
+            full_state_dict.update(load_file(path))
+    else:
+        for path in shard_paths:
+            full_state_dict.update(
+                torch.load(path, map_location="cpu", weights_only=True))
+
+    module.load_state_dict(full_state_dict, strict=strict)
 
 
 class Llama4VisionEncoder(nn.Module):
@@ -1153,9 +1262,9 @@ class Llama4VisionEncoder(nn.Module):
 
         # Otherwise, load the weights from the checkpoint.
         else:
-            load_sharded_checkpoint(module_dict,
-                                    self.pretrained_config._name_or_path,
-                                    strict=False)
+            _load_checkpoint_into_module(module_dict,
+                                         self.pretrained_config._name_or_path,
+                                         strict=False)
 
         self.vision_model = module_dict["vision_model"].to(self.device)
         self.mm_projector = module_dict["multi_modal_projector"].to(self.device)
@@ -1213,6 +1322,15 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
     def tokenizer(self) -> AutoTokenizer:
         return self._tokenizer
 
+    def get_mm_token_ids(self) -> Optional[torch.Tensor]:
+        """Surface the in-vocab image placeholder so
+        ``maybe_compute_mm_embed_cumsum`` builds ``embed_mask_cumsum`` via
+        ``torch.isin(input_ids, mm_token_ids)`` instead of the OOV
+        ``>= vocab_size`` fallback (which would miss all positions now that
+        the OOV remap in __call__/load_tokenizer is gone).
+        """
+        return torch.tensor([self.image_token_index], dtype=torch.int32)
+
     @property
     def model_path(self) -> str:
         return self._model_path
@@ -1225,7 +1343,7 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
     def dtype(self) -> torch.dtype:
         return self._dtype
 
-    def attach_multimodal_embeddings(
+    def _attach_multimodal_embeddings_impl(
         self, inputs: TextPrompt, multimodal_embedding: Dict[str,
                                                              List[Dict[str,
                                                                        Any]]],
@@ -1345,8 +1463,9 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
             **kwargs)
         token_ids = text_inputs.input_ids.squeeze()
 
-        # Replace image token indices with out-of-vocabulary tokens
-        token_ids[token_ids == self.image_token_index] = self.vocab_size + 1
+        # Keep image_token_index in-vocab so the model engine can locate mm
+        # positions via ``torch.isin(input_ids, mm_token_ids)`` without the
+        # legacy ``vocab_size + 1`` remap.
         # Concatenate all multimodal embeddings
         multimodal_data = {}
         multimodal_data["multimodal_embedding"] = torch.cat(mm_embeddings,
@@ -1354,7 +1473,7 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
         return token_ids.tolist(), {"multimodal_data": multimodal_data}
 
     @torch.inference_mode()
-    def __call__(
+    def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         text_prompt, mm_data = inputs.get("prompt"), inputs.get(
@@ -1384,8 +1503,8 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
             **truncate_kwargs)
         if images:
             token_ids = processed["input_ids"].squeeze()
-            # for fuse_input_embeds
-            token_ids[token_ids == self.image_token_index] = self.vocab_size + 1
+            # Keep image_token_index in-vocab; mm positions are located by
+            # the model engine via ``torch.isin(input_ids, mm_token_ids)``.
 
             multimodal_data = {}
             multimodal_data["image"] = {
@@ -1408,6 +1527,22 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
 class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                                                                  Llama4Config]):
 
+    @classmethod
+    def get_preferred_kv_cache_manager_version(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for Llama4."""
+        return "V2"
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        """Prefer the Python transceiver for Llama4 NIXL disaggregated serving."""
+        return "PYTHON"
+
     def __init__(
         self,
         model_config: ModelConfig[Llama4Config],
@@ -1425,6 +1560,20 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
 
         if not DISAGG:
             self.mm_encoder = Llama4VisionEncoder(full_model_config)
+
+        # Surface the in-vocab image placeholder to the model engine's
+        # ``runners.prepare_multimodal_indices`` so it selects the ``torch.isin``
+        # predicate. Read from ``full_model_config`` (the top-level Llama4Config
+        # holds ``image_token_index``; the text-only swapped config above does
+        # not).
+        self._mm_token_ids = torch.tensor(
+            [full_model_config.pretrained_config.image_token_index],
+            dtype=torch.int32,
+        )
+
+    @property
+    def mm_token_ids(self) -> torch.Tensor:
+        return self._mm_token_ids
 
     def forward(
         self,
@@ -1448,9 +1597,14 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                     for multimodal_param in multimodal_params
                 ]
 
-        input_ids, inputs_embeds = fuse_input_embeds(self.model.embed_tokens,
-                                                     input_ids, mm_embeds,
-                                                     **kwargs)
+        input_ids, inputs_embeds = fuse_input_embeds(
+            self.model.embed_tokens,
+            input_ids,
+            mm_embeds,
+            mm_token_ids=self.mm_token_ids,
+            mm_token_indices=kwargs.get("mm_token_indices"),
+            text_token_indices=kwargs.get("text_token_indices"),
+        )
         return super().forward(attn_metadata,
                                input_ids,
                                position_ids,
@@ -1484,7 +1638,7 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
             if had_mm_encoder:
                 self.mm_encoder = saved_mm_encoder
 
-    def post_load_weights(self):
+    def setup_aliases(self) -> None:
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
@@ -1497,7 +1651,11 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                 layer.next_attn = self.model.layers[idx + 1].self_attn
 
 
-@register_auto_model("MistralForCausalLM")
+# NOTE: deliberately NOT decorated with @register_auto_model: the
+# "MistralForCausalLM" architecture is owned by modeling_mistral (which, under
+# the previous eager import order, always overwrote this legacy registration).
+# With the model zoo imported lazily, a duplicate registration here would make
+# the resolved class depend on import order.
 class MistralForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
 
     def __init__(

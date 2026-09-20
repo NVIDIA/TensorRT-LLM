@@ -16,9 +16,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.config import (
+    DiffusionModelConfig,
+    create_attention_metadata_state,
+)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig
 
 
 def _create_config(backend: str = "VANILLA") -> DiffusionModelConfig:
@@ -46,6 +50,27 @@ def _init_weights(module: torch.nn.Module, std: float = 0.02):
                 p.fill_(1.0)
             else:
                 torch.nn.init.normal_(p, mean=0.0, std=std)
+
+
+def _make_pe(
+    batch_size: int,
+    seq_len: int,
+    heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    device: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build an identity-rotation (cos=1, sin=0) RoPE tuple for self-attn tests.
+
+    LTX-2 self-attn forward (fuse_qk_norm_rope=True, head_dim ∈ {64, 128}) requires
+    ``pe`` to be a non-None ``(cos, sin)`` tuple in token-major [B, T, H, D] layout —
+    the same shape ``_split_freqs_cis`` produces in production. cos=1, sin=0 makes
+    the RoPE step an identity, so shape-only sanity checks remain meaningful while
+    still exercising the fused norm+RoPE kernel.
+    """
+    cos = torch.ones(batch_size, seq_len, heads, head_dim, device=device, dtype=dtype)
+    sin = torch.zeros(batch_size, seq_len, heads, head_dim, device=device, dtype=dtype)
+    return cos, sin
 
 
 class TestLTX2SelfAttention(unittest.TestCase):
@@ -82,9 +107,10 @@ class TestLTX2SelfAttention(unittest.TestCase):
         )
 
         x = torch.randn(batch_size, seq_len, query_dim, device=self.DEVICE, dtype=dtype) * 0.02
+        pe = _make_pe(batch_size, seq_len, heads, head_dim, dtype, self.DEVICE)
 
         with torch.no_grad():
-            output = attn(x, context=None, pe=None)
+            output = attn(x, context=None, pe=pe)
 
         self.assertEqual(output.shape, (batch_size, seq_len, query_dim))
 
@@ -102,6 +128,7 @@ class TestLTX2SelfAttention(unittest.TestCase):
 
         torch.manual_seed(42)
         config = _create_config("TRTLLM")
+        config.attention_metadata_state = create_attention_metadata_state()
 
         attn = (
             LTX2Attention(
@@ -117,9 +144,10 @@ class TestLTX2SelfAttention(unittest.TestCase):
         )
 
         x = torch.randn(batch_size, seq_len, query_dim, device=self.DEVICE, dtype=dtype) * 0.02
+        pe = _make_pe(batch_size, seq_len, heads, head_dim, dtype, self.DEVICE)
 
         with torch.no_grad():
-            output = attn(x, context=None, pe=None)
+            output = attn(x, context=None, pe=pe)
 
         self.assertEqual(output.shape, (batch_size, seq_len, query_dim))
 
@@ -162,8 +190,12 @@ class TestLTX2CrossAttention(unittest.TestCase):
         x = torch.randn(batch_size, q_seq, query_dim, device=self.DEVICE, dtype=dtype) * 0.02
         ctx = torch.randn(batch_size, kv_seq, context_dim, device=self.DEVICE, dtype=dtype) * 0.02
 
+        # Cross-attn must use the cached pattern: project K/V upstream, then
+        # call forward with pre_projected_kv (production text cross-attn does
+        # this via prepare_text_cache; AV cross-attn does it inline).
         with torch.no_grad():
-            output = attn(x, context=ctx, pe=None)
+            k, v = attn.project_kv(ctx, pe=None)
+            output = attn(x, pre_projected_kv=(k, v), pe=None)
 
         self.assertEqual(output.shape, (batch_size, q_seq, query_dim))
 
@@ -201,7 +233,8 @@ class TestLTX2CrossAttention(unittest.TestCase):
         ctx = torch.randn(batch_size, kv_seq, context_dim, device=self.DEVICE, dtype=dtype) * 0.02
 
         with torch.no_grad():
-            output = attn(x, context=ctx, pe=None)
+            k, v = attn.project_kv(ctx, pe=None)
+            output = attn(x, pre_projected_kv=(k, v), pe=None)
 
         self.assertEqual(output.shape, (batch_size, q_seq, query_dim))
 
@@ -243,9 +276,10 @@ class TestLTX2GatedAttention(unittest.TestCase):
         self.assertIsNotNone(attn.to_gate_logits, "Gated attention should create to_gate_logits")
 
         x = torch.randn(batch_size, seq_len, query_dim, device=self.DEVICE, dtype=dtype) * 0.02
+        pe = _make_pe(batch_size, seq_len, heads, head_dim, dtype, self.DEVICE)
 
         with torch.no_grad():
-            output = attn(x, context=None, pe=None)
+            output = attn(x, context=None, pe=pe)
 
         self.assertEqual(output.shape, (batch_size, seq_len, query_dim))
 
@@ -287,6 +321,7 @@ class TestLTX2BackendEquivalence(unittest.TestCase):
 
         # Create TRTLLM attention and copy weights
         config_trtllm = _create_config("TRTLLM")
+        config_trtllm.attention_metadata_state = create_attention_metadata_state()
         trtllm_attn = (
             LTX2Attention(
                 query_dim=query_dim,
@@ -302,10 +337,11 @@ class TestLTX2BackendEquivalence(unittest.TestCase):
         trtllm_attn.load_state_dict(vanilla_attn.state_dict())
 
         x = torch.randn(batch_size, seq_len, query_dim, device=self.DEVICE, dtype=dtype) * 0.02
+        pe = _make_pe(batch_size, seq_len, heads, head_dim, dtype, self.DEVICE)
 
         with torch.no_grad():
-            out_vanilla = vanilla_attn(x.clone(), context=None, pe=None)
-            out_trtllm = trtllm_attn(x.clone(), context=None, pe=None)
+            out_vanilla = vanilla_attn(x.clone(), context=None, pe=pe)
+            out_trtllm = trtllm_attn(x.clone(), context=None, pe=pe)
 
         # Skip comparison if either has NaN/Inf (can happen with random weights)
         has_nan = torch.isnan(out_vanilla).any() or torch.isnan(out_trtllm).any()

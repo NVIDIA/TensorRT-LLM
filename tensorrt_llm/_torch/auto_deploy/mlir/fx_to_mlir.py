@@ -39,7 +39,9 @@ from xdsl.ir import Block, Region, SSAValue
 from ..utils.node_utils import is_op
 from .dialect import (
     AdAdd,
+    AdEq,
     AdExp,
+    AdFloorDiv,
     AdGatedRMSNorm,
     AdGelu,
     AdGraphInput,
@@ -179,7 +181,8 @@ class FXToMLIRConverter:
         elif node.op == "get_attr":
             # Parameters/buffers — treat as graph inputs for MLIR purposes
             self._convert_get_attr(node, block)
-        # call_module and call_method are rare in exported graphs; skip for prototype
+        elif node.op in ("call_module", "call_method"):
+            self._convert_opaque(node, block)
 
     def _convert_placeholder(self, node: Node, block: Block) -> None:
         """Convert FX placeholder → ``ad.graph_input``."""
@@ -257,6 +260,10 @@ class FXToMLIRConverter:
             self._convert_gated_rmsnorm(node, block)
         elif is_op(node, torch.ops.aten.to.dtype):
             self._convert_to_dtype(node, block)
+        elif node.target is op_module.floordiv:
+            self._convert_floordiv(node, block)
+        elif node.target is op_module.eq or getattr(node.target, "__name__", "") == "eq":
+            self._convert_eq(node, block)
         elif node.target is op_module.getitem:
             self._convert_getitem(node, block)
         else:
@@ -296,6 +303,36 @@ class FXToMLIRConverter:
         op = AdPow.build(
             operands=[base_val],
             attributes={"exponent": FloatAttr(exponent, Float64Type())},
+            result_types=[result_type],
+        )
+        block.add_op(op)
+        self._value_map[node.name] = op.output
+        self._store_meta(node)
+        self.metadata[node.name]["_fx_node_name"] = node.name
+
+    def _convert_floordiv(self, node: Node, block: Block) -> None:
+        """``operator.floordiv(tensor, scalar)`` → ``ad.floordiv``."""
+        input_val = self._resolve_operand(node.args[0])
+        divisor = int(node.args[1])
+        result_type = _result_type_for_node(node)
+        op = AdFloorDiv.build(
+            operands=[input_val],
+            attributes={"divisor": IntegerAttr(divisor, IntegerType(64))},
+            result_types=[result_type],
+        )
+        block.add_op(op)
+        self._value_map[node.name] = op.output
+        self._store_meta(node)
+        self.metadata[node.name]["_fx_node_name"] = node.name
+
+    def _convert_eq(self, node: Node, block: Block) -> None:
+        """``operator.eq(tensor, scalar)`` → ``ad.eq``."""
+        input_val = self._resolve_operand(node.args[0])
+        value = int(node.args[1])
+        result_type = _result_type_for_node(node)
+        op = AdEq.build(
+            operands=[input_val],
+            attributes={"value": IntegerAttr(value, IntegerType(64))},
             result_types=[result_type],
         )
         block.add_op(op)
@@ -461,6 +498,8 @@ class FXToMLIRConverter:
                 idx = operand_idx[0]
                 operand_idx[0] += 1
                 return ("__mlir_operand__", idx)
+            elif isinstance(arg, Node):
+                return ("__fx_node_ref__", arg.name)
             elif isinstance(arg, (tuple, list)):
                 return type(arg)(_build_template(a) for a in arg)
             else:
@@ -517,6 +556,8 @@ class FXToMLIRConverter:
         self.metadata[node.name]["_original_target"] = node.target
         self.metadata[node.name]["_args_template"] = args_template
         self.metadata[node.name]["_kwargs_template"] = kwargs_template
+        if node.op != "call_function":
+            self.metadata[node.name]["_fx_op"] = node.op
 
     # ------------------------------------------------------------------
     # Helpers

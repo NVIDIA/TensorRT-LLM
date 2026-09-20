@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Test script for synchronous video generation endpoint.
 
-Tests POST /v1/videos/generations endpoint which waits for completion and returns video data.
+Tests POST /v1/videos/sync endpoint which waits for completion and returns video data.
 The video is generated synchronously and the response contains the video file.
 
 Supports two modes:
@@ -27,11 +27,12 @@ def test_sync_video_generation(
     base_url: str = "http://localhost:8000/v1",
     model: str = "wan",
     prompt: str = "A video of a cute cat playing with a ball in the park",
-    input_reference: str = None,
+    image_reference: str = None,
     duration: float = 4.0,
     fps: int = 24,
     size: str = "256x256",
     output_file: str = "output_sync.mp4",
+    format: str = "auto",
 ):
     """Test synchronous video generation with direct HTTP requests.
 
@@ -39,7 +40,7 @@ def test_sync_video_generation(
         base_url: Base URL of the API server
         model: Model name to use
         prompt: Text prompt for generation
-        input_reference: Path to reference image (optional, for TI2V mode)
+        image_reference: Path to reference image (optional, for TI2V mode)
         duration: Video duration in seconds
         fps: Frames per second
         size: Video resolution (WxH format)
@@ -49,7 +50,7 @@ def test_sync_video_generation(
         The server may return either MP4 (H.264) or AVI (MJPEG) format depending on
         the available encoder. The output filename extension will be adjusted to match.
     """
-    mode = "TI2V" if input_reference else "T2V"
+    mode = "TI2V" if image_reference else "T2V"
     print("=" * 80)
     print(f"Testing Sync Video Generation API - {mode} Mode")
     print("=" * 80)
@@ -57,19 +58,19 @@ def test_sync_video_generation(
     print("\n1. Generating video (waiting for completion)...")
     print(f"   Mode: {mode}")
     print(f"   Prompt: {prompt}")
-    if input_reference:
-        print(f"   Input Reference: {input_reference}")
+    if image_reference:
+        print(f"   Input Reference: {image_reference}")
     print(f"   Duration: {duration}s")
     print(f"   FPS: {fps}")
     print(f"   Size: {size}")
 
     try:
-        endpoint = f"{base_url}/videos/generations"
+        endpoint = f"{base_url}/videos/sync"
 
-        if input_reference:
+        if image_reference:
             # TI2V mode - Use multipart/form-data with file upload
-            if not Path(input_reference).exists():
-                print(f"\n❌ Error: Input reference image not found: {input_reference}")
+            if not Path(image_reference).exists():
+                print(f"\n❌ Error: Input reference image not found: {image_reference}")
                 return False
 
             # Prepare form data (all values as strings for multipart)
@@ -79,20 +80,22 @@ def test_sync_video_generation(
                 "size": size,
                 "seconds": str(duration),
                 "fps": str(fps),
+                "format": format,
             }
 
-            # Add the file
+            # Add the file. Keep the request inside the file's context so the
+            # handle closes once the upload completes.
             ## Note: The content-type must be multipart/form-data.
-            files = {
-                "input_reference": (
-                    Path(input_reference).name,
-                    open(input_reference, "rb"),
-                    "multipart/form-data",
-                )
-            }
-
-            print("\n   Uploading reference image and generating video...")
-            response_video = requests.post(endpoint, data=form_data, files=files)
+            with open(image_reference, "rb") as ref_file:
+                files = {
+                    "image_reference": (
+                        Path(image_reference).name,
+                        ref_file,
+                        "multipart/form-data",
+                    )
+                }
+                print("\n   Uploading reference image and generating video...")
+                response_video = requests.post(endpoint, data=form_data, files=files)
         else:
             # T2V mode - Use JSON
             response_video = requests.post(
@@ -103,18 +106,25 @@ def test_sync_video_generation(
                     "size": size,
                     "seconds": duration,
                     "fps": fps,
+                    "format": format,
                 },
             )
 
         print(f"\nStatus code: {response_video.status_code}")
 
         if response_video.status_code == 200:
-            # Determine actual file extension from Content-Type header
-            content_type = response_video.headers.get("content-type", "video/mp4")
-            if "x-msvideo" in content_type or "avi" in content_type:
-                actual_ext = ".avi"
+            # Determine the on-disk extension. Tensor formats are
+            # selected by the request and the server returns
+            # ``application/octet-stream``; encoder formats can be
+            # disambiguated from Content-Type (mp4 vs avi).
+            if format in ("safetensors", "pt"):
+                actual_ext = f".{format}"
             else:
-                actual_ext = ".mp4"
+                content_type = response_video.headers.get("content-type", "video/mp4")
+                if "x-msvideo" in content_type or "avi" in content_type:
+                    actual_ext = ".avi"
+                else:
+                    actual_ext = ".mp4"
 
             # Adjust output filename if extension doesn't match
             output_path = Path(output_file)
@@ -214,6 +224,17 @@ Examples:
         default="output_sync.mp4",
         help="Output video file path (extension may change based on server encoder: .mp4 or .avi)",
     )
+    parser.add_argument(
+        "--format",
+        type=str,
+        default="auto",
+        choices=["mp4", "avi", "auto", "safetensors", "pt"],
+        help=(
+            "Generation content encoding format. Video encoders: mp4 / "
+            "avi / auto. Tensor payloads: safetensors / pt carry video + "
+            "audio + scalar metadata in a single file."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -234,11 +255,12 @@ Examples:
         base_url=args.base_url,
         model=args.model,
         prompt=args.prompt,
-        input_reference=args.image,
+        image_reference=args.image,
         duration=args.duration,
         fps=args.fps,
         size=args.size,
         output_file=args.output,
+        format=args.format,
     )
 
     sys.exit(0 if success else 1)

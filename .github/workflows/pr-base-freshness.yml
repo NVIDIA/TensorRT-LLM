@@ -1,0 +1,114 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: PR Base Freshness
+
+on:
+  pull_request:
+    # auto_merge_enabled is important: a PR that was fresh when opened can
+    # sit in review long enough for main to fly ahead. Clicking "Enable
+    # auto-merge" would otherwise trust a stale cached check result.
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - auto_merge_enabled
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  base-freshness:
+    name: PR Base Freshness
+    runs-on: ubuntu-latest
+    # Skip draft PRs — they are still being iterated on. Real merges happen
+    # after ready_for_review (which is in the trigger list), so the check will
+    # run then.
+    if: github.event.pull_request.draft == false
+    steps:
+      # We only need the check script and enough git metadata to compute
+      # merge-base + commit dates. Everything below keeps the checkout as
+      # cheap as possible on a large repo:
+      #   - fetch-depth: 500 covers the vast majority of real PRs; the
+      #     next step deepens progressively if a deeper merge-base is
+      #     needed.
+      #   - sparse-checkout materializes only the script we execute.
+      #   - lfs / submodules / tags are disabled — none are needed.
+      # The script is only ever read, never executed against PR code.
+      - name: Checkout target branch (shallow, script only)
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 500
+          fetch-tags: false
+          lfs: false
+          submodules: false
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+
+      # Fetch the PR head commit via refs/pull/N/head (works for both
+      # same-repo and fork PRs). Deepen progressively if merge-base is
+      # not yet visible — an "always stale" PR may need more history.
+      - name: Fetch PR head and ensure merge-base is reachable
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          TARGET_BRANCH: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -e
+          git fetch --depth=500 --no-tags origin \
+            "+refs/pull/${PR_NUMBER}/head:refs/remotes/origin/pr-head"
+          for round in 1 2 3 4; do
+            if git merge-base origin/pr-head "origin/${TARGET_BRANCH}" >/dev/null 2>&1; then
+              break
+            fi
+            echo "merge-base not visible yet, deepening by 2000 commits (round ${round})"
+            git fetch --deepen=2000 --no-tags origin \
+              "${TARGET_BRANCH}" "+refs/pull/${PR_NUMBER}/head:refs/remotes/origin/pr-head"
+          done
+          if ! git merge-base origin/pr-head "origin/${TARGET_BRANCH}" >/dev/null 2>&1; then
+            echo "::error::Could not find merge-base between PR head and ${TARGET_BRANCH} after deepening to ~8500 commits."
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Check PR base freshness
+        # Thresholds and enforcement are driven by repo-level Actions
+        # variables so they can be tuned via Settings -> Secrets and
+        # variables -> Actions -> Variables, without editing this file.
+        # Fallback literals below are the phase 1 (warn-only) starting
+        # values and take effect when a variable is not set.
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          TARGET_REF: origin/${{ github.event.pull_request.base.ref }}
+          COMMITS_BEHIND_LIMIT: ${{ vars.PR_BASE_FRESHNESS_COMMITS_LIMIT || '150' }}
+          BASE_AGE_LIMIT_DAYS: ${{ vars.PR_BASE_FRESHNESS_AGE_LIMIT_DAYS || '10' }}
+          # Set repo variable PR_BASE_FRESHNESS_ENFORCE='true' to turn this
+          # from warn-only into a blocking required check.
+          ENFORCE: ${{ vars.PR_BASE_FRESHNESS_ENFORCE || 'false' }}
+        run: |
+          # Bootstrap-safe: on the PR that first introduces this workflow,
+          # the script does not yet exist on the target branch, so the
+          # sparse checkout yields an empty .github/scripts directory.
+          # Treat that as a clean skip rather than a failure.
+          if [ ! -f .github/scripts/pr_base_freshness_check.py ]; then
+            echo "::notice::Freshness check script not yet available on the target branch; skipping. This is expected on the PR that introduces the workflow."
+            exit 0
+          fi
+          python3 .github/scripts/pr_base_freshness_check.py

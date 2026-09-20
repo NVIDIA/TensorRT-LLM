@@ -1,4 +1,5 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """Shared MLA RoPE utilities for auto_deploy custom models.
 
@@ -10,10 +11,7 @@ from typing import Dict
 
 import torch
 
-from tensorrt_llm.quantization.utils.fp8_matrix_weight_dequant import (
-    dequant_fp8_nk_weight_auto_scale_layout,
-)
-
+from ...utils.fp8_dequant import dequant_fp8_nk_weight_auto_scale_layout
 from ...utils.quantization_utils import FLOAT8_DTYPES
 
 
@@ -63,21 +61,27 @@ def _rope_deinterleave_load_hook(
         q_key = layer_prefix + "q_b_proj.weight"
         if q_key in state_dict:
             w = state_dict[q_key]
+            orig_dtype = w.dtype
+            if not w.is_floating_point() or w.dtype == torch.float8_e4m3fn:
+                w = w.to(torch.bfloat16)
             w = w.view(num_heads, qk_head_dim, -1)
             w_nope = w[:, :qk_nope_head_dim, :]
             w_rope = w[:, qk_nope_head_dim:, :]
             w_rope = _index_select_with_float8_cpu_workaround(w_rope, 1, perm)
             w = torch.cat([w_nope, w_rope], dim=1)
-            state_dict[q_key] = w.view(-1, w.shape[-1])
+            state_dict[q_key] = w.view(-1, w.shape[-1]).to(orig_dtype)
 
         # --- kv_a_proj_with_mqa.weight ---
         kv_key = layer_prefix + "kv_a_proj_with_mqa.weight"
         if kv_key in state_dict:
             w = state_dict[kv_key]
+            orig_dtype = w.dtype
+            if not w.is_floating_point() or w.dtype == torch.float8_e4m3fn:
+                w = w.to(torch.bfloat16)
             w_kv = w[:kv_lora_rank, :]
             w_pe = w[kv_lora_rank:, :]
             w_pe = _index_select_with_float8_cpu_workaround(w_pe, 0, perm)
-            state_dict[kv_key] = torch.cat([w_kv, w_pe], dim=0)
+            state_dict[kv_key] = torch.cat([w_kv, w_pe], dim=0).to(orig_dtype)
 
         # --- kv_a_proj_with_mqa.bias (if present) ---
         kv_bias_key = layer_prefix + "kv_a_proj_with_mqa.bias"
@@ -136,3 +140,25 @@ def _kv_b_proj_dequant_load_hook(
 
         # Remove scale from state_dict so it is not loaded into a non-existent buffer.
         del state_dict[scale_key]
+
+
+# Model types whose MLA modeling skips _rope_deinterleave_load_hook and keeps
+# RoPE weights in native GPTJ layout end-to-end.  For these, the round-trip
+# (load-time de-interleave + fusion-time undo) is omitted, so
+# fuse_rope_into_trtllm_mla must NOT run _undo_rope_deinterleave.
+_GPTJ_LAYOUT_MODEL_TYPES: frozenset = frozenset({"deepseek_v3"})
+
+
+def is_gptj_layout(model_config) -> bool:
+    """Return True if MLA RoPE weights stay in native GPTJ layout (no de-interleave).
+
+    Models in _GPTJ_LAYOUT_MODEL_TYPES omit ``_rope_deinterleave_load_hook``;
+    their weights are never permuted, so ``fuse_rope_into_trtllm_mla`` skips the
+    undo.  Other MLA models apply the hook (GPTJ→NeoX) and need the undo.
+
+    NOTE: detection is by model_type, NOT by graph op.  The interleaving-aware
+    eager op (torch_rope_with_qk_interleaving) mis-pairs with the fused kernel's
+    is_neox=True rotation (~0.7 GSM8K loss), so these models use
+    torch_rope_with_explicit_cos_sin and cannot be distinguished by graph op.
+    """
+    return getattr(model_config, "model_type", "") in _GPTJ_LAYOUT_MODEL_TYPES

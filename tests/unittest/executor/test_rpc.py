@@ -9,6 +9,8 @@ from tensorrt_llm.executor.rpc import (RPCCancelled, RPCClient, RPCError,
                                        RPCServer, RPCStreamingError, RPCTimeout)
 from tensorrt_llm.executor.rpc.rpc_common import get_unique_ipc_addr
 
+pytestmark = pytest.mark.cpu_only
+
 
 class RpcServerWrapper(RPCServer):
     """ A helper class to wrap the RPCServer and manage its lifecycle. """
@@ -48,7 +50,7 @@ class TestRpcBasics:
                 return "world"
 
         with RpcServerWrapper(App()) as server:
-            with RPCClient(server.addr) as client:
+            with RPCClient(server.addr, hmac_key=server.hmac_key) as client:
                 ret = client.hello().remote()  # sync call
                 assert ret == "world"
 
@@ -61,7 +63,7 @@ class TestRpcBasics:
                 return f"hello {name} from {location}"
 
         with RpcServerWrapper(App()) as server:
-            with RPCClient(server.addr) as client:
+            with RPCClient(server.addr, hmac_key=server.hmac_key) as client:
                 ret = client.hello("app", "Marvel").remote()
                 assert ret == "hello app from Marvel"
 
@@ -74,7 +76,7 @@ class TestRpcBasics:
                 return f"hello {name} from {location}"
 
         with RpcServerWrapper(App()) as server:
-            with RPCClient(server.addr) as client:
+            with RPCClient(server.addr, hmac_key=server.hmac_key) as client:
                 ret = client.hello(name="app", location="Marvel").remote()
                 assert ret == "hello app from Marvel"
 
@@ -87,7 +89,7 @@ class TestRpcBasics:
                 return f"hello {name} from {location}"
 
         with RpcServerWrapper(App()) as server:
-            with RPCClient(server.addr) as client:
+            with RPCClient(server.addr, hmac_key=server.hmac_key) as client:
                 ret = client.hello(name="app", location="Marvel").remote()
                 assert ret == "hello app from Marvel"
 
@@ -107,7 +109,7 @@ class TestRpcBasics:
                 raise ValueError("hello")
 
         with RpcServerWrapper(App()) as server:
-            with RPCClient(server.addr) as client:
+            with RPCClient(server.addr, hmac_key=server.hmac_key) as client:
                 with pytest.raises(RPCError):
                     client.hello().remote()
 
@@ -128,7 +130,7 @@ class TestRpcBasics:
                 return self.task_submitted
 
         with RpcServerWrapper(App()) as server:
-            with RPCClient(server.addr) as client:
+            with RPCClient(server.addr, hmac_key=server.hmac_key) as client:
                 client.send_task().remote(need_response=False)
                 time.sleep(
                     0.1
@@ -153,7 +155,7 @@ class TestRpcCorrectness:
 
     def test_incremental_task(self, num_tasks: int = 10000):
         with RpcServerWrapper(TestRpcCorrectness.App()) as server:
-            with RPCClient(server.addr) as client:
+            with RPCClient(server.addr, hmac_key=server.hmac_key) as client:
                 for i in range(num_tasks):  # a large number of tasks
                     result = client.incremental_task(i).remote()
                     if i % 1000 == 0:
@@ -162,7 +164,7 @@ class TestRpcCorrectness:
 
     def test_incremental_task_async(self, num_tasks: int = 10000):
         with RpcServerWrapper(TestRpcCorrectness.App()) as server:
-            with RPCClient(server.addr) as client:
+            with RPCClient(server.addr, hmac_key=server.hmac_key) as client:
 
                 async def test_incremental_task_async():
                     for i in range(num_tasks):  # a large number of tasks
@@ -178,7 +180,9 @@ class TestRpcCorrectness:
     def test_incremental_task_future(self):
         with RpcServerWrapper(TestRpcCorrectness.App()) as server:
             # Create client with more workers to handle concurrent futures
-            with RPCClient(server.addr, num_workers=16) as client:
+            with RPCClient(server.addr,
+                           hmac_key=server.hmac_key,
+                           num_workers=16) as client:
                 # Process in smaller batches to avoid overwhelming the system
                 batch_size = 50
                 total_tasks = 1000  # Reduced from 10000 for stability
@@ -204,7 +208,7 @@ class TestRpcCorrectness:
         with RpcServerWrapper(TestRpcCorrectness.App(),
                               async_run_task=True) as server:
 
-            with RPCClient(server.addr) as client:
+            with RPCClient(server.addr, hmac_key=server.hmac_key) as client:
 
                 async def test_streaming_task():
                     results = []
@@ -232,7 +236,10 @@ class TestRpcCorrectness:
         with RpcServerWrapper(App()) as server:
             # Create multiple clients
             num_clients = 10
-            clients = [RPCClient(server.addr) for _ in range(num_clients)]
+            clients = [
+                RPCClient(server.addr, hmac_key=server.hmac_key)
+                for _ in range(num_clients)
+            ]
 
             try:
                 # Perform requests from all clients
@@ -270,7 +277,7 @@ class TestRpcError:
             server.bind(addr)
             server.start()
             time.sleep(0.1)
-            with RPCClient(addr) as client:
+            with RPCClient(addr, hmac_key=server.hmac_key) as client:
                 # Test ValueError handling
                 with pytest.raises(RPCError) as exc_info:
                     client.hello().remote()
@@ -320,7 +327,7 @@ class TestRpcError:
         server.start()
         time.sleep(0.1)
 
-        client = RPCClient(addr)
+        client = RPCClient(addr, hmac_key=server.hmac_key)
         try:
             client.shutdown_server()
             pending_futures = [client.task().remote_future() for _ in range(10)]
@@ -349,7 +356,8 @@ class TestRpcError:
             time.sleep(0.1)
 
             # Create client with short timeout
-            with RPCClient(server.addr, timeout=0.5) as client:
+            with RPCClient(server.addr, hmac_key=server.hmac_key,
+                           timeout=0.5) as client:
                 with pytest.raises(RPCError) as exc_info:
                     client.slow_method().remote(timeout=0.5)
 
@@ -369,7 +377,7 @@ class TestRpcError:
         with RpcServerWrapper(App()) as server:
             time.sleep(0.1)
 
-            with RPCClient(server.addr) as client:
+            with RPCClient(server.addr, hmac_key=server.hmac_key) as client:
                 with pytest.raises(RPCError) as exc_info:
                     client.non_existent_method().remote()
 
@@ -392,7 +400,7 @@ def test_rpc_shutdown_server():
     server.start()
     time.sleep(0.1)
     try:
-        with RPCClient(addr) as client:
+        with RPCClient(addr, hmac_key=server.hmac_key) as client:
             ret = client.hello().remote()
             assert ret == "world"
 
@@ -421,7 +429,7 @@ def test_rpc_without_response_performance():
         server.bind(addr)
         server.start()
         time.sleep(0.1)
-        with RPCClient(addr) as client:
+        with RPCClient(addr, hmac_key=server.hmac_key) as client:
             time_start = time.time()
             for i in range(100):
                 client.send_task().remote(need_response=False)
@@ -454,7 +462,7 @@ def test_rpc_benchmark(async_run_task: bool, use_ipc_addr: bool):
         server.start()
         time.sleep(0.1)
 
-        with RPCClient(server.address) as client:
+        with RPCClient(server.address, hmac_key=server.hmac_key) as client:
 
             time_start = time.time()
             for i in range(100):
@@ -484,7 +492,7 @@ class TestRpcTimeout:
         self.server.bind(self.address)
         self.server.start()
         time.sleep(0.1)
-        self.client = RPCClient(self.address)
+        self.client = RPCClient(self.address, hmac_key=self.server.hmac_key)
 
     def teardown_method(self):
         """Shutdown server and close client."""
@@ -552,7 +560,7 @@ class TestRpcShutdown:
 
         with RpcServerWrapper(App()) as server:
             time.sleep(0.1)
-            with RPCClient(server.addr) as client:
+            with RPCClient(server.addr, hmac_key=server.hmac_key) as client:
                 client.quick_task(1).remote()
 
                 # repeated shutdown should not raise an error
@@ -574,7 +582,7 @@ class TestRpcShutdown:
         server.start()
 
         time.sleep(0.1)
-        with RPCClient(addr) as client:
+        with RPCClient(addr, hmac_key=server.hmac_key) as client:
             # This task should be cancelled when server shuts down
             res = client.foo(10).remote_future(timeout=12)
 
@@ -635,7 +643,7 @@ async def test_streaming_task_cancelled():
     # This emulates the RpcWorker.fetch_responses_loop_async behavior
     app = TestApp()
     with RpcServerWrapper(app, num_workers=2, async_run_task=True) as server:
-        with RPCClient(server.address) as client:
+        with RPCClient(server.address, hmac_key=server.hmac_key) as client:
             iter = client.streaming_forever().remote_streaming()
             # Only get the first 3 values
             for i in range(3):
@@ -655,7 +663,7 @@ class TestRpcAsync:
         self.server.start()
         # Get actual address after binding
         address = f"tcp://127.0.0.1:{self.server.address.split(':')[-1]}"
-        self.client = RPCClient(address)
+        self.client = RPCClient(address, hmac_key=self.server.hmac_key)
 
     def teardown_method(self):
         self.server.shutdown()
@@ -787,7 +795,7 @@ class TestResponsePickleError:
 
     def test_unpickleable_error(self):
         with RpcServerWrapper(self.App()) as server:
-            with RPCClient(server.addr) as client:
+            with RPCClient(server.addr, hmac_key=server.hmac_key) as client:
                 with pytest.raises(RPCError) as exc_info:
                     client.unpickleable_return().remote()
 
@@ -796,7 +804,7 @@ class TestResponsePickleError:
     @pytest.mark.asyncio
     async def test_unpickleable_streaming_error(self):
         with RpcServerWrapper(self.App(), async_run_task=True) as server:
-            with RPCClient(server.addr) as client:
+            with RPCClient(server.addr, hmac_key=server.hmac_key) as client:
                 with pytest.raises(RPCStreamingError) as exc_info:
                     async for _ in client.unpickleable_streaming_return(
                     ).remote_streaming():
@@ -823,7 +831,7 @@ class TestRpcRobustness:
 
     def test_remote_with_large_response(self):
         with RpcServerWrapper(self.App()) as server:
-            with RPCClient(server.addr) as client:
+            with RPCClient(server.addr, hmac_key=server.hmac_key) as client:
                 for i in range(100):
                     result = client.remote_with_large_response().remote()
                     assert result == b"a" * self.App.LARGE_RESPONSE_SIZE
@@ -831,7 +839,7 @@ class TestRpcRobustness:
     @pytest.mark.asyncio
     async def test_streaming_with_large_response(self):
         with RpcServerWrapper(self.App()) as server:
-            with RPCClient(server.addr) as client:
+            with RPCClient(server.addr, hmac_key=server.hmac_key) as client:
                 async for result in client.streaming_with_large_response(
                 ).remote_streaming():
                     assert result == b"a" * self.App.LARGE_RESPONSE_SIZE
@@ -861,7 +869,8 @@ class TestRpcRobustness:
                 print(f"Thread {thread_id} started")
                 try:
                     # Each thread creates its own client connection
-                    with RPCClient(server.addr) as client:
+                    with RPCClient(server.addr,
+                                   hmac_key=server.hmac_key) as client:
                         collected = []
 
                         async def consume_stream():
@@ -933,7 +942,7 @@ class TestRpcRobustness:
             errors = []
             results = [None] * num_threads
 
-            client = RPCClient(server.addr)
+            client = RPCClient(server.addr, hmac_key=server.hmac_key)
 
             def remote_caller(thread_id: int):
                 """Function to be executed in each thread."""
@@ -1017,7 +1026,7 @@ class TestRpcRobustness:
             app = TestApp()
 
             with RpcServerWrapper(app) as server:
-                with RPCClient(server.addr) as client:
+                with RPCClient(server.addr, hmac_key=server.hmac_key) as client:
                     # Perform a few remote calls to verify functionality
                     result1 = client.increment(10).remote()
                     assert result1 == 11, f"Iteration {i}: Expected 11, got {result1}"
@@ -1054,7 +1063,8 @@ class TestRpcRobustness:
 
             def run_client_session(client_id):
                 try:
-                    with RPCClient(server.addr) as client:
+                    with RPCClient(server.addr,
+                                   hmac_key=server.hmac_key) as client:
                         for i in range(requests_per_client):
                             msg = f"c{client_id}-req{i}"
                             ret = client.echo(msg).remote()
@@ -1100,7 +1110,8 @@ class TestRpcRobustness:
             def run_client_session(client_id):
                 try:
                     # Client creation and usage happens strictly within this thread
-                    with RPCClient(server.addr) as client:
+                    with RPCClient(server.addr,
+                                   hmac_key=server.hmac_key) as client:
                         for i in range(requests_per_client):
                             msg = f"c{client_id}-req{i}"
                             ret = client.echo(msg).remote()

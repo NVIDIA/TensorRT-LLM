@@ -24,6 +24,7 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
+from tensorrt_llm._utils import get_sm_version
 
 from .softplus import softplus
 
@@ -332,7 +333,12 @@ def selective_state_update(
         launch_with_pdl: If True, launch with Programmatic Dependent Launch.
             Requires all inputs other than x, B, and C to already be available.
             Allows addressing math and state loading to overlap with the prior kernel.
+            Ignored on hardware that doesn't support PDL (sm < 90).
     """
+    # PDL needs sm >= 90.
+    if get_sm_version() < 90:
+        launch_with_pdl = False
+
     if state.dim() == 3:
         state = state.unsqueeze(1)
     if x.dim() == 2:
@@ -526,8 +532,14 @@ def selective_state_update_mtp_ssm_cache_trtllm(
         retrieve_parent_token: (batch, cache_steps) int32 optional
         intermediate_state_indices: (batch,) int32 optional
     """
+    # The CUDA op hardcodes the SSM state's batch stride to nheads*head_dim*ssm_dim,
+    # so it requires `state` to be 4D contiguous. The unified hybrid KV pool
+    # (CppMambaHybridCacheManager) packs SSM + conv state into each block, giving
+    # `ssm_states` a non-contiguous batch stride. Stage through a contiguous copy
+    # and write the updated slots back when the kernel mutates the state.
+    state_in = state.contiguous()
     torch.ops.trtllm.mamba2_mtp_ssm_cache_update(
-        state,
+        state_in,
         x,
         dt,
         A,
@@ -546,4 +558,6 @@ def selective_state_update_mtp_ssm_cache_trtllm(
         pad_slot_id,
         disable_state_update,
     )
+    if state_in is not state and not disable_state_update:
+        state.copy_(state_in)
     return out, intermediate_states_buffer

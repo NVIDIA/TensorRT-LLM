@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,31 +29,48 @@ namespace kernels
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-TllmGenFmhaRunner::TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut)
+TllmGenFmhaRunner::TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeK, Data_type dtypeV, Data_type dtypeOut,
+    int numEltsPerSageAttnBlkQ, int numEltsPerSageAttnBlkK, int numEltsPerSageAttnBlkP, int numEltsPerSageAttnBlkV,
+    bool fusesDsv4InvRopeFp8Quant)
     : mSM(tensorrt_llm::common::getSMVersion())
     , mDtypeQ(dtypeQ)
-    , mDtypeKv(dtypeKv)
+    , mDtypeK(dtypeK)
+    , mDtypeV(dtypeV)
     , mDtypeOut(dtypeOut)
+    , mNumEltsPerSageAttnBlkQ(numEltsPerSageAttnBlkQ)
+    , mNumEltsPerSageAttnBlkK(numEltsPerSageAttnBlkK)
+    , mNumEltsPerSageAttnBlkP(numEltsPerSageAttnBlkP)
+    , mNumEltsPerSageAttnBlkV(numEltsPerSageAttnBlkV)
+    , mFusesDsv4InvRopeFp8Quant(fusesDsv4InvRopeFp8Quant)
 {
-    TLLM_CHECK_WITH_INFO(mSM == kSM_100 || mSM == kSM_103, "Unsupported architecture");
-    TLLM_CHECK_WITH_INFO(
-        mDtypeQ == DATA_TYPE_E4M3 || mDtypeQ == DATA_TYPE_FP16 || mDtypeQ == DATA_TYPE_BF16, "Unsupported Q data type");
-    TLLM_CHECK_WITH_INFO(mDtypeKv == DATA_TYPE_E2M1 || mDtypeKv == DATA_TYPE_E4M3 || mDtypeKv == DATA_TYPE_FP16
-            || mDtypeKv == DATA_TYPE_BF16,
-        "Unsupported Kv data type");
+    TLLM_CHECK_WITH_INFO(tensorrt_llm::common::isSM100Family(mSM), "Unsupported architecture");
+    TLLM_CHECK_WITH_INFO(mDtypeQ == DATA_TYPE_E4M3 || mDtypeQ == DATA_TYPE_FP16 || mDtypeQ == DATA_TYPE_BF16
+            || mDtypeQ == DATA_TYPE_INT8,
+        "Unsupported Q data type");
+    TLLM_CHECK_WITH_INFO(mDtypeK == DATA_TYPE_E2M1 || mDtypeK == DATA_TYPE_E4M3 || mDtypeK == DATA_TYPE_FP16
+            || mDtypeK == DATA_TYPE_BF16 || mDtypeK == DATA_TYPE_INT8,
+        "Unsupported K data type");
+    TLLM_CHECK_WITH_INFO(mDtypeV == DATA_TYPE_E2M1 || mDtypeV == DATA_TYPE_E4M3 || mDtypeV == DATA_TYPE_FP16
+            || mDtypeV == DATA_TYPE_BF16,
+        "Unsupported V data type");
     TLLM_CHECK_WITH_INFO(mDtypeOut == DATA_TYPE_E2M1 || mDtypeOut == DATA_TYPE_E4M3 || mDtypeOut == DATA_TYPE_FP16
             || mDtypeOut == DATA_TYPE_BF16,
         "Unsupported Output data type");
     auto const [freeMemory, totalMemory] = tensorrt_llm::common::getDeviceMemoryInfo(false);
     mTotalDeviceMemory = totalMemory;
     TLLM_CHECK_WITH_INFO(mTotalDeviceMemory > 0, "Total device memory is invalid");
-    mKernel = getTllmFmhaKernels(mDtypeQ, mDtypeKv, mDtypeOut, mSM);
+    mKernel = getTllmFmhaKernels(mDtypeQ, mDtypeK, mDtypeV, mDtypeOut, mSM, numEltsPerSageAttnBlkQ,
+        numEltsPerSageAttnBlkK, numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV, mFusesDsv4InvRopeFp8Quant);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void TllmGenFmhaRunner::run(TllmGenFmhaRunnerParams const& runnerParams)
 {
+    if (mKernel == nullptr)
+    {
+        TLLM_THROW("TRTLLM-GEN: mKernel is null. Cannot run FMHA kernel.");
+    }
     mKernel->run(runnerParams);
 }
 
@@ -61,6 +78,14 @@ void TllmGenFmhaRunner::run(TllmGenFmhaRunnerParams const& runnerParams)
 
 bool TllmGenFmhaRunner::isSupported(TllmGenFmhaRunnerParams const& runnerParams) const
 {
+    if (mKernel == nullptr)
+    {
+        TLLM_LOG_WARNING(
+            "TRTLLM-GEN: mKernel is null. No kernels available for dtypeQ=%d, dtypeK=%d, dtypeV=%d, dtypeOut=%d, SM=%d",
+            static_cast<int>(mDtypeQ), static_cast<int>(mDtypeK), static_cast<int>(mDtypeV),
+            static_cast<int>(mDtypeOut), mSM);
+        return false;
+    }
     return mKernel->checkIfKernelExist(runnerParams).first;
 }
 
@@ -68,6 +93,14 @@ bool TllmGenFmhaRunner::isSupported(TllmGenFmhaRunnerParams const& runnerParams)
 
 std::pair<bool, std::string> TllmGenFmhaRunner::isSupportedWithInfo(TllmGenFmhaRunnerParams const& runnerParams) const
 {
+    if (mKernel == nullptr)
+    {
+        std::string errorMsg = "TRTLLM-GEN: mKernel is null. No kernels available for dtypeQ="
+            + std::to_string(static_cast<int>(mDtypeQ)) + ", dtypeK=" + std::to_string(static_cast<int>(mDtypeK))
+            + ", dtypeV=" + std::to_string(static_cast<int>(mDtypeV))
+            + ", dtypeOut=" + std::to_string(static_cast<int>(mDtypeOut)) + ", SM=" + std::to_string(mSM);
+        return std::make_pair(false, errorMsg);
+    }
     return mKernel->checkIfKernelExist(runnerParams);
 }
 

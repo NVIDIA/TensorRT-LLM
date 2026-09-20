@@ -1,5 +1,3 @@
-import os
-import sys
 import time
 
 import pytest
@@ -9,13 +7,13 @@ from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
 from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 
 # isort: off
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from utils.llm_data import llm_models_root
 from utils.util import skip_single_gpu
 # isort: on
 
 from tensorrt_llm.executor.base_worker import BaseWorker
-from tensorrt_llm.executor.request import GenerationRequest
+from tensorrt_llm.executor.request import GenerationRequest, LoRARequest
+from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -23,15 +21,50 @@ default_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 model_path = llm_models_root() / default_model_name
 
 
-def create_fake_executor_config(engine_path, tp_size: int = 1):
-    """Create TorchLlmArgs and executor_config for testing.
+@pytest.mark.cpu_only
+def test_enqueue_request_wraps_lora_load_error():
+
+    class LoraManager:
+
+        def is_adapter_in_cpu_cache(self, adapter_id):
+            return False
+
+    def raise_load_error(lora_request):
+        raise RuntimeError("bad adapter")
+
+    worker = object.__new__(BaseWorker)
+    # GC-time __del__ -> shutdown() reads this; __init__ is bypassed here, so
+    # seed it to keep teardown a clean no-op.
+    worker.doing_shutdown = False
+    worker._lora_manager = LoraManager()
+    worker._load_lora_adapter = raise_load_error
+    request = type(
+        "Request", (), {
+            "id": 1,
+            "lora_request": type("LoraRequest", (), {"adapter_id": 999})(),
+        })()
+
+    with pytest.raises(RequestError, match="Failed to load LoRA adapter"):
+        worker._enqueue_request(request)
+
+
+def test_lora_request_does_not_probe_filesystem_on_init(tmp_path):
+    missing_path = str(tmp_path / "private-lora-path")
+
+    request = LoRARequest("missing", 1, missing_path)
+
+    assert request.path == missing_path
+
+
+def create_fake_llm_args(engine_path, tp_size: int = 1):
+    """Create TorchLlmArgs for testing.
 
     Args:
         engine_path: Path to the model
         tp_size: Tensor parallel size
 
     Returns:
-        Tuple of (llm_args, executor_config)
+        TorchLlmArgs
     """
     llm_args = TorchLlmArgs(
         model=engine_path,
@@ -42,9 +75,7 @@ def create_fake_executor_config(engine_path, tp_size: int = 1):
         max_batch_size=8,  # Set reasonable batch size for tests
         max_num_tokens=2048,  # Set reasonable max tokens
     )
-    # executor_config is not needed for PyTorch backend
-    executor_config = None
-    return llm_args, executor_config
+    return llm_args
 
 
 class FakeWorker(BaseWorker):
@@ -152,7 +183,9 @@ class TestRpcWorkerBaseTP2:
         self.session = self.create_worker_session()
 
     def create_worker_session(self):
-        session = MpiPoolSession(n_workers=2)
+        # wait_shutdown: block shutdown until the workers exited, so a test
+        # handed a live pool right after this one cannot race the GPU release.
+        session = MpiPoolSession(n_workers=2, wait_shutdown=True)
         return session
 
     @pytest.mark.gpu2

@@ -41,6 +41,14 @@ class LogicError(Exception):
         super().__init__(message)
 
 
+class CorruptedError(Exception):
+    """A broken invariant was detected; this process refuses further KV cache work.
+
+    Only the C++ backend has the poison latch that raises this, so the pure-Python backend
+    never does. It is defined here so that callers can catch it under either backend.
+    """
+
+
 class CuError(Exception):
     error_code: drv.CUresult
 
@@ -50,6 +58,9 @@ class CuError(Exception):
         if err != drv.CUresult.CUDA_SUCCESS:
             err_str = "<Failed to get error string with cuGetErrorString>"
         super().__init__(f"CUDA driver error: {error_code} ({err_str})")
+
+    def __reduce__(self) -> tuple[type["CuError"], tuple[drv.CUresult]]:
+        return (self.__class__, (self.error_code,))
 
 
 class ResourceBusyError(Exception):

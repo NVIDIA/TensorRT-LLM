@@ -76,6 +76,27 @@ inline const AlgoListType spark_bf16_algo_list = {
     // [-algo21 -m_tile20 -m_stages15 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom0 -m_mma0 -m_cga0 -m_scheduling1]
     {{4096, 4096, 2880}, {21, 20, 15, 1, 0, 0, 0, 0}},
 
+    // nemotron super v3
+    // [-algo67 -m_tile6 -m_stages37 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom16 -m_mma0 -m_cga0 -m_scheduling1]
+    {{8, 1024, 4096}, {67, 6, 37, 1, 0, 0, 16, 0}},
+    // [-algo67 -m_tile6 -m_stages37 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom93 -m_mma0 -m_cga0 -m_scheduling1]
+    {{8, 4096, 512}, {67, 6, 37, 1, 0, 0, 93, 0}},
+    // [-algo67 -m_tile10 -m_stages37 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom142 -m_mma0 -m_cga0 -m_scheduling1]
+    {{8, 4096, 1024}, {67, 10, 37, 1, 0, 0, 142, 0}},
+    // [-algo13 -m_tile0 -m_stages0 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom83 -m_mma0 -m_cga0 -m_scheduling1]
+    {{8, 4096, 4096}, {13, 0, 0, 1, 0, 0, 83, 0}},
+    // [-algo13 -m_tile0 -m_stages0 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom83 -m_mma0 -m_cga0 -m_scheduling1]
+    {{8, 4096, 4608}, {13, 0, 0, 1, 0, 0, 83, 0}},
+    // [-algo13 -m_tile0 -m_stages0 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom83 -m_mma0 -m_cga0 -m_scheduling1]
+    {{8, 4096, 5376}, {13, 0, 0, 1, 0, 0, 83, 0}},
+    // [-algo13 -m_tile0 -m_stages0 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom75 -m_mma0 -m_cga0 -m_scheduling1]
+    {{8, 4096, 18560}, {13, 0, 0, 1, 0, 0, 75, 0}},
+    // [-algo13 -m_tile0 -m_stages0 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom83 -m_mma0 -m_cga0 -m_scheduling1]
+    {{8, 4096, 131072}, {13, 0, 0, 1, 0, 0, 83, 0}},
+    // [-algo67 -m_tile3 -m_stages37 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom76 -m_mma0 -m_cga0 -m_scheduling1]
+    {{8, 5376, 4096}, {67, 3, 37, 1, 0, 0, 76, 0}},
+    // [-algo67 -m_tile3 -m_stages38 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom0 -m_mma0 -m_cga0 -m_scheduling1]
+    {{8, 8192, 4096}, {67, 3, 38, 1, 0, 0, 0, 0}},
 };
 
 // bf16*bf16->fp32->bf16

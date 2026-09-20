@@ -6,7 +6,7 @@ context_servers:
   tensor_parallel_size: 2
   pipeline_parallel_size: 1
   moe_expert_parallel_size: 2
-  enable_attention_dp: false
+  enable_attention_dp: true
   max_num_tokens: 16640
   max_seq_len: 8232
   max_batch_size: 128
@@ -22,14 +22,15 @@ context_servers:
   cuda_graph_config: null
   print_iter_log: true
   cache_transceiver_config:
-    backend: DEFAULT
+    backend: NIXL
+    transceiver_runtime: PYTHON
     max_tokens_in_buffer: 16384
 generation_servers:
   num_instances: 1
   tensor_parallel_size: 2
   pipeline_parallel_size: 1
   moe_expert_parallel_size: 2
-  enable_attention_dp: false
+  enable_attention_dp: true
   max_num_tokens: 10240
   max_seq_len: 10240
   max_batch_size: 128
@@ -59,5 +60,6 @@ generation_servers:
     - 1024
   print_iter_log: true
   cache_transceiver_config:
-    backend: DEFAULT
+    backend: NIXL
+    transceiver_runtime: PYTHON
     max_tokens_in_buffer: 16384

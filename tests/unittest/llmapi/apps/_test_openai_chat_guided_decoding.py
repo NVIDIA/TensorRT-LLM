@@ -47,9 +47,6 @@ def temp_extra_llm_api_options_file(model_name: str):
                 "speculative_model_dir":
                 get_model_path("gpt_oss/gpt-oss-120b-Eagle3"),
             }
-        elif model_name == "zai-org/GLM-5-FP8":
-            extra_llm_api_options_dict["custom_tokenizer"] = "glm_moe_dsa"
-
         with open(temp_file_path, 'w') as f:
             yaml.dump(extra_llm_api_options_dict, f)
 

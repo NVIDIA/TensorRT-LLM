@@ -1,8 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
+
+pytestmark = pytest.mark.cpu_only
 
 
 def test_disaggregated_params_ctx_dp_rank():
@@ -19,6 +36,21 @@ def test_disaggregated_params_ctx_info_endpoint():
 
     params = DisaggregatedParams(ctx_info_endpoint=["tcp://10.0.0.1:5000", "tcp://10.0.0.2:5000"])
     assert params.ctx_info_endpoint == ["tcp://10.0.0.1:5000", "tcp://10.0.0.2:5000"]
+
+
+def test_receiver_ctx_info_endpoint_required():
+    from tensorrt_llm._torch.disaggregation.native.transfer import Receiver
+
+    with pytest.raises(ValueError, match="ctx_info_endpoint is required"):
+        Receiver._extract_info_endpoint(DisaggregatedParams())
+    with pytest.raises(ValueError, match="ctx_info_endpoint is required"):
+        Receiver._extract_info_endpoint(DisaggregatedParams(ctx_info_endpoint=[]))
+    assert (
+        Receiver._extract_info_endpoint(
+            DisaggregatedParams(ctx_info_endpoint="tcp://10.0.0.1:5000")
+        )
+        == "tcp://10.0.0.1:5000"
+    )
 
 
 @patch("tensorrt_llm.disaggregated_params.tllme")
@@ -56,29 +88,66 @@ def test_to_disaggregated_params():
         first_gen_tokens=[1, 2],
         ctx_dp_rank=5,
         ctx_info_endpoint="tcp://10.0.0.1:5000",
+        ctx_usage={
+            "prompt_tokens": 10,
+            "completion_tokens": 0,
+            "total_tokens": 10,
+            "prompt_tokens_details": {
+                "cached_tokens": 4,
+            },
+        },
     )
     openai_params = to_disaggregated_params(llm_params)
 
+    print(f"[usage_check] to_disaggregated_params: ctx_usage={openai_params.ctx_usage}")
     assert openai_params.request_type == "context_only"
     assert openai_params.first_gen_tokens == [1, 2]
     assert openai_params.ctx_dp_rank == 5
     assert openai_params.ctx_info_endpoint == "tcp://10.0.0.1:5000"
+    assert openai_params.ctx_usage.prompt_tokens == 10
+    assert openai_params.ctx_usage.prompt_tokens_details.cached_tokens == 4
 
 
 def test_to_llm_disaggregated_params():
     from tensorrt_llm.serve.openai_protocol import DisaggregatedParams as OpenAIDisaggregatedParams
-    from tensorrt_llm.serve.openai_protocol import to_llm_disaggregated_params
+    from tensorrt_llm.serve.openai_protocol import (
+        PromptTokensDetails,
+        UsageInfo,
+        to_llm_disaggregated_params,
+    )
 
     openai_params = OpenAIDisaggregatedParams(
         request_type="generation_only",
         ctx_dp_rank=2,
         ctx_info_endpoint="tcp://10.0.0.1:5000",
+        ctx_usage=UsageInfo(
+            prompt_tokens=10,
+            completion_tokens=0,
+            total_tokens=10,
+            prompt_tokens_details=PromptTokensDetails(cached_tokens=4),
+        ),
     )
     llm_params = to_llm_disaggregated_params(openai_params)
 
+    print(f"[usage_check] to_llm_disaggregated_params: ctx_usage={llm_params.ctx_usage}")
     assert llm_params.request_type == "generation_only"
     assert llm_params.ctx_dp_rank == 2
     assert llm_params.ctx_info_endpoint == "tcp://10.0.0.1:5000"
+    assert llm_params.ctx_usage["prompt_tokens"] == 10
+    assert llm_params.ctx_usage["prompt_tokens_details"]["cached_tokens"] == 4
+
+
+def test_opaque_state_round_trips_through_openai_protocol():
+    from tensorrt_llm.serve.openai_protocol import (
+        to_disaggregated_params,
+        to_llm_disaggregated_params,
+    )
+
+    openai_params = to_disaggregated_params(
+        DisaggregatedParams(request_type="context_only", opaque_state=b"opaque")
+    )
+    assert openai_params.encoded_opaque_state == "b3BhcXVl"
+    assert to_llm_disaggregated_params(openai_params).opaque_state == b"opaque"
 
 
 @patch("tensorrt_llm.disaggregated_params.tllme")

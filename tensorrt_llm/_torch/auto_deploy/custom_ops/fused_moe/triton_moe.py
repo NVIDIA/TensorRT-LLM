@@ -1,3 +1,11 @@
+# Copyright contributors to the vLLM project
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/vllm-project/vllm
+#
+# Copyright contributors to the SGLang project
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/sgl-project/sglang
+#
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -29,8 +37,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.utils import ActivationType  # noqa: F401
-
+from ..._compat import ActivationType  # noqa: F401
 from ...utils.logger import ad_logger
 
 

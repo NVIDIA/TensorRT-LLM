@@ -89,17 +89,13 @@ cpp_file_prefix_text = R"""/*
 
 #include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm
-{
-namespace kernels
-{
+namespace tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels {
 // clang-format off
 """
 
 cpp_file_suffex_text = R"""
 // clang-format on
-} // namespace kernels
-}
+} // namespace tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels
 """
 
 cubin_meta_info_struct_prefix_text = R"""
@@ -115,7 +111,7 @@ static const struct XQAKernelMetaInfo
     bool mPagedKVCache;
     bool mMultiQueryTokens;
     unsigned int mSM;
-    const unsigned long long* mCubin;
+    const unsigned char* mCubin;
     unsigned int mCubinSize;
     const char* mFuncName;
 } sXqaKernelMetaInfo[] = {
@@ -250,7 +246,13 @@ def build_commands(
     arch: int,
     input_filename: str,
     compile_macros: List[CompileMacro],
-) -> Tuple[str, str, str]:
+) -> Tuple[str, str]:
+    """Returns (nvcc_command, cubin_file_path).
+
+    The cubin is written to `cubin/<function_name>.cubin` and is later
+    wrapped in a per-cubin `.cubin.tar.zst` tarball for git-LFS commit
+    (see archive_cubin).
+    """
     arch_str = str(arch) + 'a' if arch in (90, ) else str(arch)
     arch_option = f"-arch=compute_{arch_str} -code=sm_{arch_str}"
     name_info = build_name_info(compile_macros)
@@ -273,62 +275,59 @@ def build_commands(
     function_name = construct_name(func_name_prefix, arch, name_info)
     macro_options.append(f"-DKERNEL_FUNC_NAME={function_name}")
     all_macro_option = ' '.join(macro_options)
-    cubin_file_name = construct_name(func_name_prefix, arch, name_info,
-                                     ".cubin")
+    # Output goes under cubin_dir so the tarball-archive step finds it without
+    # having to chase relative paths. The base name is used both as the
+    # on-disk file (`<function_name>.cubin`) and as the C++ symbol stem
+    # (`<function_name>_cubin` after the build-time INCBIN aggregation).
+    cubin_file_name = os.path.join(cubin_dir, function_name + '.cubin')
     output_option = " ".join(["-o", cubin_file_name])
     nvcc_command = " ".join([
         nvcc_bin, nvcc_flags, arch_option, output_option, all_macro_option,
         input_filename
     ])
-    xxd_command = " ".join(["xxd -i", cubin_file_name])
-    return nvcc_command, xxd_command, cubin_file_name
+    return nvcc_command, cubin_file_name
 
 
-def save_cubin_cpp_file(xxd_output, func_name_prefix, arch, compile_macros):
-    name_info = build_name_info(compile_macros)
-    cubin_cpp_file_name = construct_name(func_name_prefix, arch, name_info,
-                                         ".cubin.cpp")
-    with open(cubin_cpp_file_name, "w") as f:
-        f.write(''.join(
-            [cpp_file_prefix_text, xxd_output, cpp_file_suffex_text]))
+def archive_cubin(cubin_file_name: str) -> None:
+    """Archive a freshly compiled `<dir>/<stem>.cubin` into `.tar.zst`.
 
+    Use `cmake -E tar`. The build-time helper
+    `tllm_add_cubin_archive_sources` extracts the same archive back to a
+    `<stem>.cubin` file and pulls it in via INCBIN.
 
-def convert_cubin_cpp_xxd(xxd_command: str, cubin_file_name: str):
-    result = subprocess.run(xxd_command.split(' '),
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True,
-                            check=True,
-                            shell=False)
-    cubin_cpp_str = result.stdout
-    cubin_size = os.path.getsize(cubin_file_name)
-    return cubin_cpp_str, cubin_size
-
-
-def convert_cubin_cpp_np(cubin_file_name: str):
-    import numpy as np
-    cubin_size = os.path.getsize(cubin_file_name)
-    with open(cubin_file_name, 'rb') as f:
-        cubin_bin_data = f.read()
-    remainder = len(cubin_bin_data) % 8
-    if remainder != 0:
-        padding = b'\x00' * (8 - remainder)
-        cubin_bin_data += padding
-    array = np.frombuffer(cubin_bin_data, dtype=np.uint64)
-    array_name = cubin_file_name.replace('.', '_')
-    elements_per_line = 4
-    cpp_array_content = ',\n'.join(
-        ', '.join(
-            '0x{:016x}ULL'.format(array[i])
-            for i in range(start, min(start + elements_per_line, len(array))))
-        for start in range(0, len(array), elements_per_line))
-    cpp_array = 'unsigned long long ' + array_name + '[] = {\n' + cpp_array_content + '\n};\n' + 'unsigned int ' \
-                + array_name + '_len = ' + str(cubin_size) + ';\n'
-    return cpp_array, cubin_size
+    `--mtime="1970-01-01UTC"` pins the entry mtime so two runs over the same
+    cubin bytes produce a byte-identical tarball -- git/LFS see no diff,
+    which keeps the LFS object store from churning on every regeneration.
+    The consumer side compensates for the frozen entry mtime by copying the
+    tarball file's filesystem mtime onto the extracted cubin (see
+    cpp/cmake/modules/tllm_cubin_archive.cmake), so ninja's incremental
+    rebuild detection remains correct.
+    """
+    cubin_path = os.path.abspath(cubin_file_name)
+    cubin_dirname = os.path.dirname(cubin_path)
+    cubin_basename = os.path.basename(cubin_path)
+    archive_basename = cubin_basename + '.tar.zst'
+    subprocess.run(
+        [
+            'cmake',
+            '-E',
+            'tar',
+            'cf',
+            archive_basename,
+            '--zstd',
+            '--mtime=1970-01-01UTC',
+            '--',
+            cubin_basename,
+        ],
+        cwd=cubin_dirname,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
 
 
 def run_cubin_gen(arch_micro_file_list: CompileArchMacrosAndFile):
-    nvcc_command, xxd_command, cubin_file_name = build_commands(
+    nvcc_command, cubin_file_name = build_commands(
         build_func_name_prefix, arch_micro_file_list.arch,
         arch_micro_file_list.input_file_name, arch_micro_file_list.macro_list)
     function_name = construct_name(
@@ -337,17 +336,14 @@ def run_cubin_gen(arch_micro_file_list: CompileArchMacrosAndFile):
     print(f'generating for {function_name}... command: {nvcc_command}')
     cubin_size = None
     try:
-        result = subprocess.run(nvcc_command.split(' '),
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                text=True,
-                                check=True,
-                                shell=False)
-        # cubin_cpp_str, cubin_size = convert_cubin_cpp_xxd(xxd_command, cubin_file_name)
-        cubin_cpp_str, cubin_size = convert_cubin_cpp_np(cubin_file_name)
-        save_cubin_cpp_file(cubin_cpp_str, cubin_dir + build_func_name_prefix,
-                            arch_micro_file_list.arch,
-                            arch_micro_file_list.macro_list)
+        subprocess.run(nvcc_command.split(' '),
+                       stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE,
+                       text=True,
+                       check=True,
+                       shell=False)
+        cubin_size = os.path.getsize(cubin_file_name)
+        archive_cubin(cubin_file_name)
         if clean_cubin:
             os.remove(cubin_file_name)
     except subprocess.CalledProcessError as e:
@@ -406,10 +402,21 @@ def generate_header_file_contents(
         #function_name = construct_name(build_func_name_prefix, arch, build_name_info(macros))
         function_name, cubin_size = name_size
         cubin_variable_name = f"{function_name}_cubin"
+        # No `extern "C"`: the build-time INCBIN aggregator
+        # (cpp/cmake/modules/tllm_cubin_archive.cmake +
+        # cpp/include/tensorrt_llm/common/cubinIncbin.h) emits these symbols
+        # under their C++-mangled names so they're scoped to the surrounding
+        # `tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels` namespace, avoiding
+        # multi-definition collisions with other packages or other TRT-LLM
+        # ABI versions in the same final link.
+        # Match the definition site emitted by TLLM_INCBIN_NS in
+        # cpp/include/tensorrt_llm/common/cubinIncbin.h:
+        #   extern unsigned char const SYMBOL[];
+        #   extern unsigned int  const SYMBOL_len;
         cubin_data_array.append(
-            f"extern unsigned long long {cubin_variable_name}[];\n")
+            f'extern unsigned char const {cubin_variable_name}[];\n')
         cubin_length_array.append(
-            f"extern uint32_t {cubin_variable_name}_len;\n")
+            f'extern unsigned int const {cubin_variable_name}_len;\n')
         meta_line_array.append(
             generate_cubin_meta_info_line(arch, macros, function_name,
                                           cubin_size,

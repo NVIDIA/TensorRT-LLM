@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,9 +18,11 @@
 
 #include "common.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/batch_manager/reorderPolicy.h"
 #include "tensorrt_llm/common/algorithm.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/runtime/common.h"
+#include <memory>
 #include <variant>
 
 namespace tensorrt_llm::batch_manager
@@ -30,6 +32,7 @@ namespace kv_cache_manager
 class BaseKVCacheManager;
 }
 class BasePeftCacheManager;
+
 } // namespace tensorrt_llm::batch_manager
 
 namespace tensorrt_llm::batch_manager
@@ -84,31 +87,44 @@ private:
 
 /// @brief   Schedule requests using the MAX_UTILIZATION policy
 /// @details Try reserving resources to advance requests by one step,
-///          may pause previously started requests.
+///          may pause previously started requests.  When a
+///          ``crossKvCacheManager`` is supplied, requests in the
+///          ``ENCODER_INIT`` state may be admitted for encoder compute
+///          without consuming self- or cross-KV blocks; the later
+///          ``CONTEXT_INIT`` decoder admission owns cross-pool budgeting.
 class MaxUtilizationScheduler : public BaseCapacityScheduler
 {
 public:
     MaxUtilizationScheduler(SizeType32 maxNumRequests, bool twoStepsLookAhead,
         LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
-        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
+        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE,
+        bool enablePrefixAwareScheduling = true);
 
     [[nodiscard]] std::tuple<RequestVector, RequestVector> operator()(
-        kv_cache_manager::BaseKVCacheManager& kvCacheManager, OptionalRef<BasePeftCacheManager const> peftCacheManager,
-        RequestList const& activeRequests) const;
+        kv_cache_manager::BaseKVCacheManager& kvCacheManager,
+        OptionalRef<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager,
+        OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const;
 
 private:
     SizeType32 mMaxNumRequests;
     /// @brief Boolean that indicates if two step lookahead is enabled
     bool mTwoStepsLookAhead;
+    /// @brief Whether to use KV prefix-reuse estimates in scheduling decisions.
+    bool mEnablePrefixAwareScheduling;
 };
 
 /// @brief Schedule requests using the GUARANTEED_NO_EVICT policy
+/// @details When a ``crossKvCacheManager`` is supplied, requests in the
+///          ``ENCODER_INIT`` state may be admitted for encoder compute
+///          without consuming self- or cross-KV blocks.  The later
+///          ``CONTEXT_INIT`` decoder admission owns cross-pool budgeting.
 class GuaranteedNoEvictScheduler : public BaseCapacityScheduler
 {
 public:
     GuaranteedNoEvictScheduler(SizeType32 maxNumRequests,
         LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
-        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
+        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE,
+        bool enablePrefixAwareScheduling = true);
 
     [[nodiscard]] std::tuple<RequestVector, RequestVector> operator()(
         kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
@@ -124,6 +140,8 @@ protected:
 
 private:
     SizeType32 mMaxNumRequests;
+    /// @brief Whether to use KV prefix-reuse estimates in scheduling decisions.
+    bool mEnablePrefixAwareScheduling;
 };
 
 /// @brief Schedule requests using the STATIC_BATCH policy
@@ -132,7 +150,8 @@ class StaticBatchScheduler : public GuaranteedNoEvictScheduler
 public:
     StaticBatchScheduler(SizeType32 maxNumRequests,
         LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
-        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
+        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE,
+        bool enablePrefixAwareScheduling = true);
 
     [[nodiscard]] std::tuple<RequestVector, RequestVector> operator()(
         kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
@@ -148,14 +167,19 @@ public:
     explicit CapacityScheduler(SizeType32 maxNumRequests, executor::CapacitySchedulerPolicy capacitySchedulerPolicy,
         bool hasKvCacheManager, bool twoStepsLookAhead = false,
         LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
-        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
+        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE,
+        bool enablePrefixAwareScheduling = true);
 
     /**
      * @brief Schedules requests following the selected policy.
      *
      * @param kvCacheManager Required in MaxUtilizationScheduler (as a ref) and in GuaranteedNoEvictScheduler and
      * StaticBatchScheduler (as a const ref).
-     * @param crossKvCacheManager Optional used in GuaranteedNoEvictScheduler and StaticBatchScheduler.
+     * @param crossKvCacheManager Optional cross-attention KV cache manager.  Used by
+     * MaxUtilizationScheduler (mutates: ``startScheduling`` / ``schedulingRemoveSequence``)
+     * and GuaranteedNoEvictScheduler / StaticBatchScheduler (read-only).  Required for
+     * encoder-decoder admission. Encoder-init requests only require this pool
+     * to be configured; decoder context admission budgets blocks from it.
      * @param peftCacheManager Optional used in MaxUtilizationScheduler, GuaranteedNoEvictScheduler and
      * StaticBatchScheduler.
      * @param activeRequests
@@ -165,12 +189,22 @@ public:
     [[nodiscard]] std::tuple<RequestVector, RequestVector, RequestVector> operator()(RequestList const& activeRequests,
         OptionalRef<kv_cache_manager::BaseKVCacheManager> kvCacheManager = std::nullopt,
         OptionalRef<BasePeftCacheManager const> peftCacheManager = std::nullopt,
-        OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager = std::nullopt) const;
+        OptionalRef<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager = std::nullopt) const;
+
+    /// @brief Sets the reorder policy to use AgentTreePolicy with the given configuration.
+    /// @param agentPercentage The ratio of agent requests to schedule (0.0-1.0, -1.0 for random).
+    /// @param agentTypes The list of agent types to schedule.
+    /// @param agentInflightSeqNum The maximum number of inflight sequences for agent requests.
+    void setAgentTreeReorderPolicy(
+        float agentPercentage, std::optional<std::vector<std::string>> agentTypes, SizeType32 agentInflightSeqNum);
 
 private:
     std::variant<std::monostate, MaxRequestsScheduler, MaxUtilizationScheduler, GuaranteedNoEvictScheduler,
         StaticBatchScheduler>
         mScheduler;
+
+    /// Optional reorder policy for reordering requests before scheduling.
+    std::unique_ptr<ReorderPolicy> mReorderPolicy;
 };
 
 } // namespace tensorrt_llm::batch_manager

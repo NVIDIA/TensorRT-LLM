@@ -6,12 +6,20 @@ from ..bindings.internal import runtime as bindings
 
 HOSTFUNC_USER_DATA_HANDLES = set()
 
+_low_latency_dispatch: bool = False
+
+
+def set_low_latency_dispatch(enabled: bool) -> None:
+    global _low_latency_dispatch
+    _low_latency_dispatch = enabled
+
 
 def launch_hostfunc(hostfunc, *args, **kwargs):
     stream = torch.cuda.current_stream()
     is_capturing = torch.cuda.is_current_stream_capturing()
     handle = bindings.launch_hostfunc(stream.cuda_stream, not is_capturing,
-                                      hostfunc, *args, **kwargs)
+                                      _low_latency_dispatch, hostfunc, *args,
+                                      **kwargs)
     if is_capturing:
         HOSTFUNC_USER_DATA_HANDLES.add(handle)
     else:

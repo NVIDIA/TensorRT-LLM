@@ -9,7 +9,7 @@ The kernel performs: C = alpha_post * SwiGLU(alpha * (A @ B.T))
 import pytest
 import torch
 
-from tensorrt_llm._torch.modules.fused_moe.quantization import interleave_linear_and_gate
+from tensorrt_llm._torch.moe.fused_moe.quantization import interleave_linear_and_gate
 from tensorrt_llm._torch.utils import swizzle_sf, unswizzle_sf
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.math_utils import pad_up
@@ -179,7 +179,7 @@ def test_nvfp4_dense_gemm_swiglu_blackwell(
     )
 
     # Call the kernel with fp4 output
-    c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_blackwell(
+    c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_moe_blackwell(
         a,
         b_interleaved,
         a_sf,

@@ -61,8 +61,12 @@ struct XqaFixedParams
     bool isPagedKv;
     // Is speculative decoding enabled.
     bool isSpecDecoding;
+    // Spec-dec tree bound for FMHA kernel selection.
+    int specDecodingTargetMaxGenLen = 0;
     // Do we apply alibi ?
     bool hasAlibi;
+    // Use trtllm-gen sparse attention kernel.
+    bool useTllmGenSparseAttention;
 };
 
 class XqaDispatcher

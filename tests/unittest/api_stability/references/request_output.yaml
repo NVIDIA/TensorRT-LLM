@@ -32,4 +32,7 @@ methods:
         annotation: Optional[dict[str, float]]
         default: None
     return_annotation: None
-properties: {}
+properties:
+  error:
+    annotation: Optional[str]
+    default: inspect._empty

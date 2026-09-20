@@ -13,50 +13,47 @@ Tests cover:
 - Multi-GPU parallelism (Ulysses sequence parallelism, 2+ GPUs)
 """
 
+import functools
 import gc
 import os
-from pathlib import Path
 
 import numpy as np
+import PIL.Image
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
+from utils.llm_data import get_checkpoint
 
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.visual_gen.config import (
-    AttentionConfig,
-    PipelineConfig,
-    TorchCompileConfig,
-    VisualGenArgs,
-)
-from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent, PipelineLoader
+from tensorrt_llm._utils import get_free_port
+from tensorrt_llm.visual_gen.args import AttentionConfig, TorchCompileConfig, VisualGenArgs
+
+# Skip non-transformer components (text encoders, VAE, tokenizers, scheduler) so
+# FLUX unit tests focus on the transformer; matches the SKIP_COMPONENTS list
+# used on main before the public-config refactor.
+SKIP_COMPONENTS = [
+    PipelineComponent.TEXT_ENCODER,
+    PipelineComponent.TEXT_ENCODER_2,
+    PipelineComponent.VAE,
+    PipelineComponent.TOKENIZER,
+    PipelineComponent.TOKENIZER_2,
+    PipelineComponent.SCHEDULER,
+]
 
 
-def _llm_models_root() -> str:
-    """Return LLM_MODELS_ROOT path if it is set in env, assert when it's set but not a valid path."""
-    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
-    if "LLM_MODELS_ROOT" in os.environ:
-        root = Path(os.environ["LLM_MODELS_ROOT"])
-    if not root.exists():
-        root = Path("/scratch.trt_llm_data/llm-models/")
-    assert root.exists(), (
-        "You shall set LLM_MODELS_ROOT env or be able to access scratch.trt_llm_data to run this test"
-    )
-    return str(root)
+# Checkpoint paths for integration tests, resolved lazily on first test access so
+# a missing checkpoint fails the tests that need it rather than whole-file collection.
+@functools.lru_cache
+def _flux1_path() -> str:
+    return get_checkpoint("FLUX.1-dev")
 
 
-# Checkpoint paths for integration tests
-FLUX1_CHECKPOINT_PATH = os.environ.get(
-    "FLUX1_MODEL_PATH",
-    os.path.join(_llm_models_root(), "FLUX.1-dev"),
-)
-FLUX2_CHECKPOINT_PATH = os.environ.get(
-    "FLUX2_MODEL_PATH",
-    os.path.join(_llm_models_root(), "FLUX.2-dev"),
-)
-SKIP_COMPONENTS = ["text_encoder", "text_encoder_2", "vae", "tokenizer", "tokenizer_2", "scheduler"]
+@functools.lru_cache
+def _flux2_path() -> str:
+    return get_checkpoint("FLUX.2-dev")
 
 
 def _get_flux_transformer_inputs(transformer, device="cuda", dtype=torch.bfloat16):
@@ -127,28 +124,6 @@ def _find_first_quantizable_linear(transformer):
     return None, None
 
 
-@pytest.fixture
-def flux1_checkpoint_exists():
-    """Check if FLUX.1 checkpoint is available locally."""
-    if not FLUX1_CHECKPOINT_PATH or not os.path.exists(FLUX1_CHECKPOINT_PATH):
-        pytest.skip(
-            f"FLUX.1 checkpoint not found at {FLUX1_CHECKPOINT_PATH}. "
-            "Set FLUX1_MODEL_PATH or stage checkpoint under LLM_MODELS_ROOT."
-        )
-    return True
-
-
-@pytest.fixture
-def flux2_checkpoint_exists():
-    """Check if FLUX.2 checkpoint is available locally."""
-    if not FLUX2_CHECKPOINT_PATH or not os.path.exists(FLUX2_CHECKPOINT_PATH):
-        pytest.skip(
-            f"FLUX.2 checkpoint not found at {FLUX2_CHECKPOINT_PATH}. "
-            "Set FLUX2_MODEL_PATH or stage checkpoint under LLM_MODELS_ROOT."
-        )
-    return True
-
-
 # =============================================================================
 # Pipeline Loading Tests
 # =============================================================================
@@ -158,37 +133,31 @@ class TestFluxPipelineLoading:
     """Integration tests for FLUX pipeline loading."""
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_load_flux1_pipeline_basic(self, flux1_checkpoint_exists):
+    def test_load_flux1_pipeline_basic(self):
         """Test loading FLUX.1 pipeline."""
         args = VisualGenArgs(
-            checkpoint_path=FLUX1_CHECKPOINT_PATH,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
+            model=_flux1_path(),
         )
 
-        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
 
         assert pipeline is not None
         assert hasattr(pipeline, "transformer")
         assert pipeline.transformer is not None
-        assert pipeline.model_config.attention.backend == "VANILLA"
+        assert pipeline.pipeline_config.attention.backend == "VANILLA"
 
         del pipeline
         gc.collect()
         torch.cuda.empty_cache()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_load_flux2_pipeline_basic(self, flux2_checkpoint_exists):
+    def test_load_flux2_pipeline_basic(self):
         """Test loading FLUX.2 pipeline."""
         args = VisualGenArgs(
-            checkpoint_path=FLUX2_CHECKPOINT_PATH,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
+            model=_flux2_path(),
         )
 
-        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
 
         assert pipeline is not None
         assert hasattr(pipeline, "transformer")
@@ -200,19 +169,16 @@ class TestFluxPipelineLoading:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM"])
-    def test_load_flux1_with_attention_backend(self, flux1_checkpoint_exists, backend: str):
+    def test_load_flux1_with_attention_backend(self, backend: str):
         """Test loading FLUX.1 with different attention backends."""
         args = VisualGenArgs(
-            checkpoint_path=FLUX1_CHECKPOINT_PATH,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
-            attention=AttentionConfig(backend=backend),
+            model=_flux1_path(),
+            attention_config=AttentionConfig(backend=backend),
         )
 
-        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
 
-        assert pipeline.model_config.attention.backend == backend
+        assert pipeline.pipeline_config.attention.backend == backend
 
         del pipeline
         gc.collect()
@@ -228,20 +194,17 @@ class TestFluxQuantization:
     """Test FLUX quantization loading and FP8 weight verification."""
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES"])
-    def test_load_flux1_with_quantization(self, flux1_checkpoint_exists, quant_algo: str):
+    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES", "FP8_PER_CHANNEL_PER_TOKEN"])
+    def test_load_flux1_with_quantization(self, quant_algo: str):
         """Test loading FLUX.1 with FP8 quantization and verify FP8 weights."""
         args = VisualGenArgs(
-            checkpoint_path=FLUX1_CHECKPOINT_PATH,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
+            model=_flux1_path(),
             quant_config={"quant_algo": quant_algo, "dynamic": True},
         )
 
-        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
 
-        assert pipeline.model_config.quant_config.quant_algo is not None
+        assert pipeline.pipeline_config.quant_config.quant_algo is not None
 
         # Count quantized Linear layers and verify FP8 weights
         quant_count = 0
@@ -258,6 +221,14 @@ class TestFluxQuantization:
                             assert hasattr(module, "weight_scale"), (
                                 f"Linear {name} missing weight_scale"
                             )
+                            if quant_algo == "FP8_PER_CHANNEL_PER_TOKEN":
+                                assert module.weight_scale.dim() == 1, (
+                                    f"Linear {name} rowwise weight_scale should be 1-D, "
+                                    f"got shape {tuple(module.weight_scale.shape)}"
+                                )
+                                assert module.weight_scale.shape[0] == module.weight.shape[0], (
+                                    f"Linear {name} weight_scale length mismatch"
+                                )
                             found_fp8 = True
                             print(
                                 f"\n[{quant_algo}] FP8 layer {name}: weight {module.weight.shape}"
@@ -272,20 +243,17 @@ class TestFluxQuantization:
         torch.cuda.empty_cache()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES"])
-    def test_load_flux2_with_quantization(self, flux2_checkpoint_exists, quant_algo: str):
+    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES", "FP8_PER_CHANNEL_PER_TOKEN"])
+    def test_load_flux2_with_quantization(self, quant_algo: str):
         """Test loading FLUX.2 with FP8 quantization and verify FP8 weights."""
         args = VisualGenArgs(
-            checkpoint_path=FLUX2_CHECKPOINT_PATH,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
+            model=_flux2_path(),
             quant_config={"quant_algo": quant_algo, "dynamic": True},
         )
 
-        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
 
-        assert pipeline.model_config.quant_config.quant_algo is not None
+        assert pipeline.pipeline_config.quant_config.quant_algo is not None
 
         quant_count = 0
         found_fp8 = False
@@ -301,6 +269,14 @@ class TestFluxQuantization:
                             assert hasattr(module, "weight_scale"), (
                                 f"Linear {name} missing weight_scale"
                             )
+                            if quant_algo == "FP8_PER_CHANNEL_PER_TOKEN":
+                                assert module.weight_scale.dim() == 1, (
+                                    f"Linear {name} rowwise weight_scale should be 1-D, "
+                                    f"got shape {tuple(module.weight_scale.shape)}"
+                                )
+                                assert module.weight_scale.shape[0] == module.weight.shape[0], (
+                                    f"Linear {name} weight_scale length mismatch"
+                                )
                             found_fp8 = True
                             print(
                                 f"\n[{quant_algo}] FP8 layer {name}: weight {module.weight.shape}"
@@ -324,8 +300,8 @@ class TestFluxFP8NumericalCorrectness:
     """Test FP8 vs BF16 numerical accuracy at single-layer and full-transformer levels."""
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES"])
-    def test_fp8_vs_bf16_single_layer(self, flux1_checkpoint_exists, quant_algo: str):
+    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES", "FP8_PER_CHANNEL_PER_TOKEN"])
+    def test_fp8_vs_bf16_single_layer(self, quant_algo: str):
         """Test FP8 vs BF16 numerical accuracy on a single Linear layer.
 
         Pattern (matching Wan test_fp8_vs_bf16_numerical_correctness):
@@ -337,23 +313,21 @@ class TestFluxFP8NumericalCorrectness:
         # Load BF16 pipeline (reference)
         print(f"\n[Compare {quant_algo}] Loading BF16 pipeline...")
         args_bf16 = VisualGenArgs(
-            checkpoint_path=FLUX1_CHECKPOINT_PATH,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
+            model=_flux1_path(),
         )
-        pipeline_bf16 = PipelineLoader(args_bf16).load(skip_warmup=True)
+        pipeline_bf16 = PipelineLoader(args_bf16).load(
+            skip_warmup=True, skip_components=SKIP_COMPONENTS
+        )
 
         # Load FP8 pipeline
         print(f"[Compare {quant_algo}] Loading {quant_algo} pipeline...")
         args_fp8 = VisualGenArgs(
-            checkpoint_path=FLUX1_CHECKPOINT_PATH,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
+            model=_flux1_path(),
             quant_config={"quant_algo": quant_algo, "dynamic": True},
         )
-        pipeline_fp8 = PipelineLoader(args_fp8).load(skip_warmup=True)
+        pipeline_fp8 = PipelineLoader(args_fp8).load(
+            skip_warmup=True, skip_components=SKIP_COMPONENTS
+        )
 
         # Get matching Linear layers from both pipelines
         linear_bf16, layer_name = _find_first_quantizable_linear(pipeline_bf16.transformer)
@@ -409,8 +383,8 @@ class TestFluxFP8NumericalCorrectness:
         torch.cuda.empty_cache()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES"])
-    def test_fp8_vs_bf16_full_transformer_e2e(self, flux1_checkpoint_exists, quant_algo: str):
+    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES", "FP8_PER_CHANNEL_PER_TOKEN"])
+    def test_fp8_vs_bf16_full_transformer_e2e(self, quant_algo: str):
         """End-to-end test: Compare full FLUX.1 transformer FP8 vs BF16 output.
 
         Runs the entire transformer (19 dual + 38 single blocks) and compares outputs.
@@ -419,24 +393,22 @@ class TestFluxFP8NumericalCorrectness:
         # Load BF16 transformer (reference)
         print("\n[E2E] Loading BF16 transformer...")
         args_bf16 = VisualGenArgs(
-            checkpoint_path=FLUX1_CHECKPOINT_PATH,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
+            model=_flux1_path(),
         )
-        pipeline_bf16 = PipelineLoader(args_bf16).load(skip_warmup=True)
+        pipeline_bf16 = PipelineLoader(args_bf16).load(
+            skip_warmup=True, skip_components=SKIP_COMPONENTS
+        )
         transformer_bf16 = pipeline_bf16.transformer
 
         # Load FP8 transformer
         print(f"[E2E] Loading {quant_algo} transformer...")
         args_fp8 = VisualGenArgs(
-            checkpoint_path=FLUX1_CHECKPOINT_PATH,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
+            model=_flux1_path(),
             quant_config={"quant_algo": quant_algo, "dynamic": True},
         )
-        pipeline_fp8 = PipelineLoader(args_fp8).load(skip_warmup=True)
+        pipeline_fp8 = PipelineLoader(args_fp8).load(
+            skip_warmup=True, skip_components=SKIP_COMPONENTS
+        )
         transformer_fp8 = pipeline_fp8.transformer
 
         # Create test inputs
@@ -523,7 +495,7 @@ class TestFluxFP8Memory:
     """Test FP8 memory reduction for FLUX models."""
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_fp8_vs_bf16_memory_comparison(self, flux1_checkpoint_exists):
+    def test_fp8_vs_bf16_memory_comparison(self):
         """Test FP8 uses ~2x less memory than BF16 (matching Wan test)."""
 
         def get_module_memory_gb(module):
@@ -534,12 +506,11 @@ class TestFluxFP8Memory:
         torch.cuda.reset_peak_memory_stats()
 
         args_bf16 = VisualGenArgs(
-            checkpoint_path=FLUX1_CHECKPOINT_PATH,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
+            model=_flux1_path(),
         )
-        pipeline_bf16 = PipelineLoader(args_bf16).load(skip_warmup=True)
+        pipeline_bf16 = PipelineLoader(args_bf16).load(
+            skip_warmup=True, skip_components=SKIP_COMPONENTS
+        )
 
         bf16_model_mem = get_module_memory_gb(pipeline_bf16.transformer)
         bf16_peak_mem = torch.cuda.max_memory_allocated() / 1024**3
@@ -554,13 +525,12 @@ class TestFluxFP8Memory:
         torch.cuda.reset_peak_memory_stats()
 
         args_fp8 = VisualGenArgs(
-            checkpoint_path=FLUX1_CHECKPOINT_PATH,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
+            model=_flux1_path(),
             quant_config={"quant_algo": "FP8", "dynamic": True},
         )
-        pipeline_fp8 = PipelineLoader(args_fp8).load(skip_warmup=True)
+        pipeline_fp8 = PipelineLoader(args_fp8).load(
+            skip_warmup=True, skip_components=SKIP_COMPONENTS
+        )
 
         fp8_model_mem = get_module_memory_gb(pipeline_fp8.transformer)
         fp8_peak_mem = torch.cuda.max_memory_allocated() / 1024**3
@@ -591,7 +561,7 @@ class TestFluxAttentionBackend:
     """Test VANILLA vs TRTLLM attention backend numerical correctness."""
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_attention_backend_comparison(self, flux1_checkpoint_exists):
+    def test_attention_backend_comparison(self):
         """Test that VANILLA and TRTLLM backends produce similar outputs.
 
         FLUX uses joint self-attention (same seq_len for Q and KV), so both
@@ -602,13 +572,12 @@ class TestFluxAttentionBackend:
         # (two full transformers don't fit in GPU memory simultaneously)
         print("\n[Attention Backend Test] Loading baseline transformer (VANILLA)...")
         args_baseline = VisualGenArgs(
-            checkpoint_path=FLUX1_CHECKPOINT_PATH,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
-            attention=AttentionConfig(backend="VANILLA"),
+            model=_flux1_path(),
+            attention_config=AttentionConfig(backend="VANILLA"),
         )
-        pipeline_baseline = PipelineLoader(args_baseline).load(skip_warmup=True)
+        pipeline_baseline = PipelineLoader(args_baseline).load(
+            skip_warmup=True, skip_components=SKIP_COMPONENTS
+        )
         transformer_baseline = pipeline_baseline.transformer
 
         inputs = _get_flux_transformer_inputs(transformer_baseline)
@@ -625,13 +594,12 @@ class TestFluxAttentionBackend:
         # Load and run TRTLLM backend
         print("[Attention Backend Test] Loading TRTLLM transformer...")
         args_trtllm = VisualGenArgs(
-            checkpoint_path=FLUX1_CHECKPOINT_PATH,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
-            attention=AttentionConfig(backend="TRTLLM"),
+            model=_flux1_path(),
+            attention_config=AttentionConfig(backend="TRTLLM"),
         )
-        pipeline_trtllm = PipelineLoader(args_trtllm).load(skip_warmup=True)
+        pipeline_trtllm = PipelineLoader(args_trtllm).load(
+            skip_warmup=True, skip_components=SKIP_COMPONENTS
+        )
         transformer_trtllm = pipeline_trtllm.transformer
 
         print("[Attention Backend Test] Running TRTLLM transformer forward...")
@@ -688,14 +656,14 @@ class TestFluxE2E:
     """End-to-end pipeline tests: full generation compared to HuggingFace reference."""
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_flux1_e2e_vs_hf(self, flux1_checkpoint_exists):
+    def test_flux1_e2e_vs_hf(self):
         """Full FLUX.1 pipeline (all components) generates image matching HF reference."""
         from diffusers import FluxPipeline as HFFluxPipeline
 
         # 1. Generate HF reference image
-        hf_pipe = HFFluxPipeline.from_pretrained(
-            FLUX1_CHECKPOINT_PATH, torch_dtype=torch.bfloat16
-        ).to("cuda")
+        hf_pipe = HFFluxPipeline.from_pretrained(_flux1_path(), torch_dtype=torch.bfloat16).to(
+            "cuda"
+        )
         hf_result = hf_pipe(
             prompt="a tiny astronaut hatching from an egg on the moon",
             height=256,
@@ -711,10 +679,7 @@ class TestFluxE2E:
 
         # 2. Load TRT-LLM pipeline
         args = VisualGenArgs(
-            checkpoint_path=FLUX1_CHECKPOINT_PATH,
-            device="cuda",
-            dtype="bfloat16",
-            pipeline=PipelineConfig(),
+            model=_flux1_path(),
         )
         pipeline = PipelineLoader(args).load()
 
@@ -741,14 +706,14 @@ class TestFluxE2E:
         torch.cuda.empty_cache()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_flux2_e2e_vs_hf(self, flux2_checkpoint_exists):
+    def test_flux2_e2e_vs_hf(self):
         """Full FLUX.2 pipeline (all components) generates image matching HF reference."""
         from diffusers import Flux2Pipeline as HFFlux2Pipeline
 
         # 1. Generate HF reference image
-        hf_pipe = HFFlux2Pipeline.from_pretrained(
-            FLUX2_CHECKPOINT_PATH, torch_dtype=torch.bfloat16
-        ).to("cuda")
+        hf_pipe = HFFlux2Pipeline.from_pretrained(_flux2_path(), torch_dtype=torch.bfloat16).to(
+            "cuda"
+        )
         hf_result = hf_pipe(
             prompt="a tiny astronaut hatching from an egg on the moon",
             height=256,
@@ -764,10 +729,7 @@ class TestFluxE2E:
 
         # 2. Load TRT-LLM pipeline
         args = VisualGenArgs(
-            checkpoint_path=FLUX2_CHECKPOINT_PATH,
-            device="cuda",
-            dtype="bfloat16",
-            pipeline=PipelineConfig(),
+            model=_flux2_path(),
         )
         pipeline = PipelineLoader(args).load()
 
@@ -794,6 +756,76 @@ class TestFluxE2E:
         gc.collect()
         torch.cuda.empty_cache()
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_flux2_reference_image_e2e_vs_hf(self):
+        """FLUX.2 reference-image generation matches the diffusers pipeline."""
+        from diffusers import Flux2Pipeline as HFFlux2Pipeline
+
+        reference_array = np.zeros((256, 256, 3), dtype=np.uint8)
+        reference_array[..., 0] = np.arange(256, dtype=np.uint8)[None, :]
+        reference_array[..., 1] = np.arange(256, dtype=np.uint8)[:, None]
+        reference_array[..., 2] = 127
+        reference_image = PIL.Image.fromarray(reference_array)
+        cases = [
+            {
+                "image": reference_image,
+                "prompt": "turn the reference into a detailed watercolor painting",
+                "height": 256,
+                "width": 256,
+                "num_images_per_prompt": 1,
+            },
+            {
+                "image": [
+                    reference_image.resize((160, 128)),
+                    PIL.Image.new("RGB", (112, 96), color=(30, 90, 180)),
+                    PIL.Image.new("RGB", (80, 64), color=(180, 90, 30)),
+                ],
+                "prompt": [
+                    "combine the references into a watercolor scene",
+                    "combine the references into a pencil illustration",
+                ],
+                "height": None,
+                "width": None,
+                "num_images_per_prompt": 2,
+            },
+        ]
+
+        hf_pipe = HFFlux2Pipeline.from_pretrained(_flux2_path(), torch_dtype=torch.bfloat16).to(
+            "cuda"
+        )
+        hf_images = []
+        for case in cases:
+            hf_result = hf_pipe(
+                **case,
+                num_inference_steps=4,
+                guidance_scale=4.0,
+                generator=torch.Generator("cuda").manual_seed(42),
+            )
+            hf_images.append(np.stack([np.array(image) for image in hf_result.images]))
+        del hf_pipe
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        pipeline = PipelineLoader(VisualGenArgs(model=_flux2_path())).load()
+        for case, hf_image_batch in zip(cases, hf_images):
+            result = pipeline.forward(
+                **case,
+                num_inference_steps=4,
+                guidance_scale=4.0,
+                seed=42,
+            )
+            native_image_batch = result.image.cpu().numpy()
+
+            assert native_image_batch.shape == hf_image_batch.shape
+            for hf_image, native_image in zip(hf_image_batch, native_image_batch):
+                mse = ((hf_image.astype(float) - native_image.astype(float)) ** 2).mean()
+                psnr = 10 * np.log10(255**2 / mse) if mse > 0 else float("inf")
+                assert psnr > 20.0, f"PSNR too low: {psnr:.2f} dB (expected >20 dB)"
+
+        del pipeline
+        gc.collect()
+        torch.cuda.empty_cache()
+
 
 class TestFluxBatchGeneration:
     """Batch generation tests for FLUX pipelines.
@@ -806,17 +838,9 @@ class TestFluxBatchGeneration:
     @pytest.fixture(scope="class")
     def flux1_pipeline(self):
         """Load FLUX.1 TRT-LLM pipeline once for all FLUX.1 batch tests."""
-        if not FLUX1_CHECKPOINT_PATH or not os.path.exists(FLUX1_CHECKPOINT_PATH):
-            pytest.skip(
-                f"FLUX.1 checkpoint not found at {FLUX1_CHECKPOINT_PATH}. "
-                "Set FLUX1_MODEL_PATH or LLM_MODELS_ROOT."
-            )
         args = VisualGenArgs(
-            checkpoint_path=FLUX1_CHECKPOINT_PATH,
-            device="cuda",
-            dtype="bfloat16",
-            torch_compile=TorchCompileConfig(enable_torch_compile=False),
-            pipeline=PipelineConfig(),
+            model=_flux1_path(),
+            torch_compile_config=TorchCompileConfig(enable=False),
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
         yield pipeline
@@ -827,17 +851,9 @@ class TestFluxBatchGeneration:
     @pytest.fixture(scope="class")
     def flux2_pipeline(self):
         """Load FLUX.2 TRT-LLM pipeline once for all FLUX.2 batch tests."""
-        if not FLUX2_CHECKPOINT_PATH or not os.path.exists(FLUX2_CHECKPOINT_PATH):
-            pytest.skip(
-                f"FLUX.2 checkpoint not found at {FLUX2_CHECKPOINT_PATH}. "
-                "Set FLUX2_MODEL_PATH or LLM_MODELS_ROOT."
-            )
         args = VisualGenArgs(
-            checkpoint_path=FLUX2_CHECKPOINT_PATH,
-            device="cuda",
-            dtype="bfloat16",
-            torch_compile=TorchCompileConfig(enable_torch_compile=False),
-            pipeline=PipelineConfig(),
+            model=_flux2_path(),
+            torch_compile_config=TorchCompileConfig(enable=False),
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
         yield pipeline
@@ -893,17 +909,106 @@ class TestFluxBatchGeneration:
         assert mse > 100, f"Batch images are too similar (MSE={mse:.1f}), seeding may be broken"
         print(f"\n[Batch FLUX.2] Inter-image MSE = {mse:.1f} (images differ as expected)")
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_flux1_num_images_per_prompt(self, flux1_pipeline):
+        """FLUX.1 num_images_per_prompt: single prompt with N>1 produces N images."""
+        prompt = "a sunset over mountains"
+        num_images = 3
+
+        result = flux1_pipeline.forward(
+            prompt=prompt,
+            height=256,
+            width=256,
+            num_inference_steps=4,
+            seed=42,
+            num_images_per_prompt=num_images,
+        )
+        assert result.image.dim() == 4, f"Expected 4D, got {result.image.shape}"
+        assert result.image.shape[0] == num_images, (
+            f"Expected {num_images} images, got {result.image.shape[0]}"
+        )
+        assert result.image.shape[1:] == (256, 256, 3)
+
+        # Images should differ (independent noise samples)
+        mse_01 = ((result.image[0].float() - result.image[1].float()) ** 2).mean().item()
+        mse_02 = ((result.image[0].float() - result.image[2].float()) ** 2).mean().item()
+        assert mse_01 > 100, f"Images 0,1 too similar (MSE={mse_01:.1f})"
+        assert mse_02 > 100, f"Images 0,2 too similar (MSE={mse_02:.1f})"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_flux2_num_images_per_prompt(self, flux2_pipeline):
+        """FLUX.2 num_images_per_prompt: single prompt with N>1 produces N images."""
+        prompt = "a cat on a roof"
+        num_images = 2
+
+        result = flux2_pipeline.forward(
+            prompt=prompt,
+            height=256,
+            width=256,
+            num_inference_steps=4,
+            seed=42,
+            num_images_per_prompt=num_images,
+        )
+        assert result.image.dim() == 4, f"Expected 4D, got {result.image.shape}"
+        assert result.image.shape == (num_images, 256, 256, 3), (
+            f"Unexpected shape: {result.image.shape}"
+        )
+
+        # Images should differ (independent noise samples)
+        mse = ((result.image[0].float() - result.image[1].float()) ** 2).mean().item()
+        assert mse > 100, f"Images too similar (MSE={mse:.1f}), seeding may be broken"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_flux1_num_images_per_prompt_batch(self, flux1_pipeline):
+        """FLUX.1 num_images_per_prompt with batch: 2 prompts * 2 images = 4 outputs."""
+        prompts = ["a sunset over mountains", "a cat on a roof"]
+        num_images = 2
+
+        result = flux1_pipeline.forward(
+            prompt=prompts,
+            height=256,
+            width=256,
+            num_inference_steps=4,
+            seed=42,
+            num_images_per_prompt=num_images,
+        )
+        expected_batch = len(prompts) * num_images
+        assert result.image.shape[0] == expected_batch, (
+            f"Expected {expected_batch} images, got {result.image.shape[0]}"
+        )
+        assert result.image.shape[1:] == (256, 256, 3)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_flux2_num_images_per_prompt_batch(self, flux2_pipeline):
+        """FLUX.2 num_images_per_prompt with batch: 2 prompts * 2 images = 4 outputs."""
+        prompts = ["a sunset over mountains", "a cat on a roof"]
+        num_images = 2
+
+        result = flux2_pipeline.forward(
+            prompt=prompts,
+            height=256,
+            width=256,
+            num_inference_steps=4,
+            seed=42,
+            num_images_per_prompt=num_images,
+        )
+        expected_batch = len(prompts) * num_images
+        assert result.image.shape[0] == expected_batch, (
+            f"Expected {expected_batch} images, got {result.image.shape[0]}"
+        )
+        assert result.image.shape[1:] == (256, 256, 3)
+
 
 # =============================================================================
 # Multi-GPU Parallelism Tests (Ulysses sequence parallelism)
 # =============================================================================
 
 
-def _setup_distributed(rank, world_size, backend="nccl"):
+def _setup_distributed(rank, world_size, master_port, backend="nccl"):
     """Initialize distributed process group for multi-GPU tests."""
     os.environ["TLLM_DISABLE_MPI"] = "1"
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12355"
+    os.environ["MASTER_PORT"] = str(master_port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
 
@@ -917,26 +1022,25 @@ def _cleanup_distributed():
         dist.destroy_process_group()
 
 
-def _run_ulysses_worker(rank, world_size, checkpoint_path, inputs_cpu, return_dict):
+def _run_ulysses_worker(rank, world_size, master_port, checkpoint_path, inputs_cpu, return_dict):
     """Worker function for Ulysses multi-GPU test.
 
     Must be module-level for multiprocessing.spawn() pickling.
     """
     try:
-        _setup_distributed(rank, world_size)
+        _setup_distributed(rank, world_size, master_port)
 
-        from tensorrt_llm._torch.visual_gen.config import ParallelConfig, VisualGenArgs
         from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+        from tensorrt_llm.visual_gen.args import ParallelConfig, VisualGenArgs
 
         # Load pipeline with Ulysses parallelism
         args = VisualGenArgs(
-            checkpoint_path=checkpoint_path,
-            device=f"cuda:{rank}",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
-            parallel=ParallelConfig(dit_ulysses_size=world_size),
+            model=checkpoint_path,
+            parallel_config=ParallelConfig(ulysses_size=world_size),
         )
-        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        pipeline = PipelineLoader(args, device=f"cuda:{rank}").load(
+            skip_warmup=True, skip_components=SKIP_COMPONENTS
+        )
 
         # Load inputs on this GPU
         inputs = {k: v.to(f"cuda:{rank}") for k, v in inputs_cpu.items()}
@@ -970,7 +1074,7 @@ class TestFluxParallelism:
         torch.cuda.is_available() and torch.cuda.device_count() < 2,
         reason="Ulysses parallel test requires at least 2 GPUs",
     )
-    def test_ulysses_2gpu_correctness(self, flux1_checkpoint_exists):
+    def test_ulysses_2gpu_correctness(self):
         """Test Ulysses (ulysses_size=2) correctness against single-GPU baseline.
 
         Similar pattern to WAN's test_cfg_2gpu_correctness:
@@ -990,12 +1094,11 @@ class TestFluxParallelism:
         # Load single-GPU reference
         print("\n[1/3] Loading single-GPU reference (ulysses_size=1) on GPU 0...")
         args_baseline = VisualGenArgs(
-            checkpoint_path=FLUX1_CHECKPOINT_PATH,
-            device="cuda:0",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
+            model=_flux1_path(),
         )
-        pipeline_baseline = PipelineLoader(args_baseline).load(skip_warmup=True)
+        pipeline_baseline = PipelineLoader(args_baseline, device="cuda:0").load(
+            skip_warmup=True, skip_components=SKIP_COMPONENTS
+        )
 
         # Create test inputs (seq_len must be divisible by 2 for Ulysses)
         print("\n[2/3] Creating test inputs...")
@@ -1024,9 +1127,10 @@ class TestFluxParallelism:
         manager = mp.Manager()
         return_dict = manager.dict()
 
+        master_port = get_free_port()
         mp.spawn(
             _run_ulysses_worker,
-            args=(2, FLUX1_CHECKPOINT_PATH, inputs_cpu, return_dict),
+            args=(2, master_port, _flux1_path(), inputs_cpu, return_dict),
             nprocs=2,
             join=True,
         )
@@ -1061,47 +1165,50 @@ class TestFluxParallelism:
         torch.cuda.empty_cache()
 
 
-def _run_all_optimizations_worker(rank, world_size, checkpoint_path, inputs_cpu, return_dict):
+def _run_all_optimizations_worker(
+    rank, world_size, master_port, checkpoint_path, inputs_cpu, return_dict
+):
     """Worker for combined optimizations test (FP8 + TeaCache + TRTLLM + Ulysses).
 
     Must be module-level for multiprocessing.spawn() pickling.
     """
     try:
-        _setup_distributed(rank, world_size)
+        _setup_distributed(rank, world_size, master_port)
 
-        from tensorrt_llm._torch.visual_gen.config import (
+        from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+        from tensorrt_llm.quantization.mode import QuantAlgo
+        from tensorrt_llm.visual_gen.args import (
             AttentionConfig,
             ParallelConfig,
             TeaCacheConfig,
             VisualGenArgs,
         )
-        from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-        from tensorrt_llm.quantization.mode import QuantAlgo
 
         # Load pipeline with ALL optimizations
         args = VisualGenArgs(
-            checkpoint_path=checkpoint_path,
-            device=f"cuda:{rank}",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
+            model=checkpoint_path,
             quant_config={"quant_algo": "FP8", "dynamic": True},
-            teacache=TeaCacheConfig(
-                enable_teacache=True,
+            cache_config=TeaCacheConfig(
                 teacache_thresh=0.2,
                 use_ret_steps=True,
             ),
-            attention=AttentionConfig(backend="TRTLLM"),
-            parallel=ParallelConfig(dit_ulysses_size=world_size),
+            attention_config=AttentionConfig(backend="TRTLLM"),
+            parallel_config=ParallelConfig(ulysses_size=world_size),
         )
-        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        pipeline = PipelineLoader(args, device=f"cuda:{rank}").load(
+            skip_warmup=True, skip_components=SKIP_COMPONENTS
+        )
         transformer = pipeline.transformer.eval()
 
         # Verify all optimizations are enabled
-        assert pipeline.model_config.visual_gen_mapping.ulysses_size == world_size, (
+        assert pipeline.pipeline_config.visual_gen_mapping.ulysses_size == world_size, (
             "Ulysses parallel not enabled"
         )
         assert transformer.model_config.quant_config.quant_algo == QuantAlgo.FP8, "FP8 not enabled"
-        assert hasattr(pipeline, "cache_backend"), "TeaCache not enabled"
+        assert (
+            getattr(pipeline, "cache_accelerator", None) is not None
+            and pipeline.cache_accelerator.is_enabled()
+        ), "TeaCache not enabled"
         assert transformer.transformer_blocks[0].attn.attn_backend == "TRTLLM", "TRTLLM not enabled"
 
         if rank == 0:
@@ -1112,8 +1219,8 @@ def _run_all_optimizations_worker(rank, world_size, checkpoint_path, inputs_cpu,
             print(f"    - Ulysses: ulysses_size={world_size}")
 
         # Initialize TeaCache for single-step inference
-        if hasattr(pipeline, "cache_backend") and pipeline.cache_backend:
-            pipeline.cache_backend.refresh(num_inference_steps=1)
+        if getattr(pipeline, "cache_accelerator", None) and pipeline.cache_accelerator.is_enabled():
+            pipeline.cache_accelerator.refresh(num_inference_steps=1)
 
         # Load inputs on this GPU
         inputs = {k: v.to(f"cuda:{rank}") for k, v in inputs_cpu.items()}
@@ -1148,7 +1255,7 @@ class TestFluxCombinedOptimizations:
         torch.cuda.is_available() and torch.cuda.device_count() < 2,
         reason="Combined optimization test requires at least 2 GPUs",
     )
-    def test_all_optimizations_combined(self, flux1_checkpoint_exists):
+    def test_all_optimizations_combined(self):
         """Test FP8 + TeaCache + TRTLLM attention + Ulysses=2 combined correctness.
 
         Validates that all optimizations work together correctly.
@@ -1167,12 +1274,11 @@ class TestFluxCombinedOptimizations:
         # Load baseline on GPU 0 (no optimizations)
         print("\n[1/3] Loading baseline on GPU 0 (BF16, no optimizations)...")
         args_baseline = VisualGenArgs(
-            checkpoint_path=FLUX1_CHECKPOINT_PATH,
-            device="cuda:0",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
+            model=_flux1_path(),
         )
-        pipeline_baseline = PipelineLoader(args_baseline).load(skip_warmup=True)
+        pipeline_baseline = PipelineLoader(args_baseline, device="cuda:0").load(
+            skip_warmup=True, skip_components=SKIP_COMPONENTS
+        )
 
         # Reset torch compile state
         torch._dynamo.reset()
@@ -1203,9 +1309,10 @@ class TestFluxCombinedOptimizations:
         manager = mp.Manager()
         return_dict = manager.dict()
 
+        master_port = get_free_port()
         mp.spawn(
             _run_all_optimizations_worker,
-            args=(2, FLUX1_CHECKPOINT_PATH, inputs_cpu, return_dict),
+            args=(2, master_port, _flux1_path(), inputs_cpu, return_dict),
             nprocs=2,
             join=True,
         )

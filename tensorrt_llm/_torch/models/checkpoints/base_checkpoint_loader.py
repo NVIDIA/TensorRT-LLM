@@ -1,4 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 from torch import nn
@@ -12,6 +17,8 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
     BaseWeightLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
+from tensorrt_llm._torch.models.checkpoints.checkpoint_catalog import \
+    CheckpointCatalog
 from tensorrt_llm._torch.models.modeling_utils import \
     CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING
 from tensorrt_llm.logger import logger
@@ -64,6 +71,44 @@ class BaseCheckpointLoader(ABC):
         return self.weight_loader.load_weights(checkpoint_dir,
                                                mapping=mapping,
                                                **kwargs)
+
+    @contextmanager
+    def open_weight_session(self, checkpoint_dir: str, mapping: Mapping,
+                            **kwargs) -> Iterator[dict[str, Any]]:
+        """Keep loader-specific work alive while weights are materialized."""
+        yield self.load_weights(checkpoint_dir, mapping=mapping, **kwargs)
+
+    def is_weights_preloaded(self) -> bool:
+        """Whether the last load wrote weights directly into the model."""
+        return False
+
+    def is_post_transform_weights_preloaded(self) -> bool:
+        """Whether the last direct preload delivered post-transform weights.
+
+        This is narrower than :meth:`is_weights_preloaded`: a loader may write
+        bytes directly into the model while those bytes still use the raw
+        checkpoint layout. Return True only when the source identity was
+        verified and the incoming bytes can safely skip module transform hooks.
+        """
+        return False
+
+    def build_checkpoint_catalog(self, checkpoint_dir: str,
+                                 **kwargs) -> CheckpointCatalog | None:
+        """Return source metadata for shadow planning when available."""
+        return None
+
+    def post_load_apply(self,
+                        model: nn.Module,
+                        *,
+                        weights_preloaded: bool = False) -> None:
+        """Apply format-specific state after weights have been loaded."""
+
+    def post_load_publish(self,
+                          model: nn.Module,
+                          *,
+                          checkpoint_dir: str,
+                          weights_preloaded: bool = False) -> None:
+        """Publish format-specific loaded weights after the load path."""
 
     @classmethod
     def get(cls, checkpoint_format: str, **kwargs) -> "BaseCheckpointLoader":

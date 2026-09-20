@@ -17,9 +17,9 @@
 
 import asyncio
 import os
+import secrets
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 import traceback
@@ -85,7 +85,15 @@ def periodic_check(timeout=300, interval=3):
 
 
 def _run_worker(
-    model_name, worker_config, role, port, work_dir, device=-1, save_log=False, env=None
+    model_name,
+    worker_config,
+    role,
+    port,
+    work_dir,
+    device=-1,
+    save_log=False,
+    env=None,
+    worker_index=0,
 ):
     """Run a worker process (context or generation).
 
@@ -98,11 +106,13 @@ def _run_worker(
         device: CUDA device ID (-1 for default)
         save_log: Whether to save logs to file
         env: Environment variables for the subprocess
+        worker_index: Index used for log/config filenames (avoids collisions when
+            multiple workers share port=0)
 
     Returns:
         ProcessWrapper: Wrapped subprocess
     """
-    worker_config_path = os.path.join(work_dir, f"{role}_{port}_config.yaml")
+    worker_config_path = os.path.join(work_dir, f"{role}_{worker_index}_config.yaml")
     with open(worker_config_path, "w+") as f:
         yaml.dump(worker_config, f)
         f.flush()
@@ -125,17 +135,18 @@ def _run_worker(
             env = env.copy()
         log_file = None
         log_path = None
+        # WAR for QA env (pytest --capture=tee-sys): sys.stdout/sys.stderr lack
+        # fileno() and break Popen. Leaving stdout/stderr as None makes the
+        # child inherit the parent's real fds. See nvbugs/5821433, PR #11214.
+        stdout = None
+        stderr = None
         if save_log:
-            log_path = os.path.join(work_dir, f"worker_{role}_{port}.log")
+            log_path = os.path.join(work_dir, f"worker_{role}_{worker_index}.log")
             log_file = open(log_path, "w+")
             stdout = log_file
             stderr = log_file
-        else:
-            stdout = sys.stdout
-            stderr = sys.stderr
         if device != -1:
             env["CUDA_VISIBLE_DEVICES"] = str(device)
-        print(f"Running {role} on port {port}")
         return ProcessWrapper(
             subprocess.Popen(cmd, env=env, stdout=stdout, stderr=stderr),
             log_file=log_file,
@@ -144,20 +155,58 @@ def _run_worker(
         )
 
 
-def run_ctx_worker(model_name, ctx_worker_config, work_dir, port=0, device=0, env=None):
+def run_ctx_worker(
+    model_name,
+    ctx_worker_config,
+    work_dir,
+    port=0,
+    device=0,
+    env=None,
+    save_log=False,
+    worker_index=0,
+):
     """Launch a context worker with service discovery.
 
     Use port=0 to let the worker choose a free port.
     """
-    return _run_worker(model_name, ctx_worker_config, "ctx", port, work_dir, device, env=env)
+    return _run_worker(
+        model_name,
+        ctx_worker_config,
+        "ctx",
+        port,
+        work_dir,
+        device,
+        save_log=save_log,
+        env=env,
+        worker_index=worker_index,
+    )
 
 
-def run_gen_worker(model_name, gen_worker_config, work_dir, port=0, device=1, env=None):
+def run_gen_worker(
+    model_name,
+    gen_worker_config,
+    work_dir,
+    port=0,
+    device=1,
+    env=None,
+    save_log=False,
+    worker_index=0,
+):
     """Launch a generation worker with service discovery.
 
     Use port=0 to let the worker choose a free port.
     """
-    return _run_worker(model_name, gen_worker_config, "gen", port, work_dir, device, env=env)
+    return _run_worker(
+        model_name,
+        gen_worker_config,
+        "gen",
+        port,
+        work_dir,
+        device,
+        save_log=save_log,
+        env=env,
+        worker_index=worker_index,
+    )
 
 
 def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False, env=None, cwd=None):
@@ -180,14 +229,14 @@ def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False, e
     cmds = ["trtllm-serve", "disaggregated", "-c", disagg_server_config_path]
     log_file = None
     log_path = None
+    # See WAR rationale in _run_worker above (nvbugs/5821433).
+    stdout = None
+    stderr = None
     if save_log:
         log_path = os.path.join(work_dir, "disagg_server.log")
         log_file = open(log_path, "w+")
         stdout = log_file
         stderr = log_file
-    else:
-        stdout = sys.stdout
-        stderr = sys.stderr
     p = subprocess.Popen(cmds, env=env, stdout=stdout, stderr=stderr, cwd=cwd)
     return ProcessWrapper(p, log_file=log_file, log_path=log_path, port=port)
 
@@ -272,6 +321,32 @@ async def wait_for_port_released(port):
             return True
     except OSError:
         return False
+
+
+def get_registered_worker_urls(port: int) -> tuple[list[str], list[str]]:
+    """Return ``(ctx_urls, gen_urls)`` as registered with the disagg server.
+
+    Workers launched with ``port=0`` pick their listening port inside the child
+    process, so the cluster registry is the only authoritative source for their
+    addresses. Call this once the server reports ready, i.e. once every worker
+    the test expects has registered.
+
+    Args:
+        port: Disagg server port
+
+    Returns:
+        tuple[list[str], list[str]]: Context and generation worker URLs, each
+        sorted so the ordering is stable across calls.
+    """
+    assert port > 0, "port must be positive"
+    info_resp = requests.get(f"http://localhost:{port}/cluster_info", timeout=5)
+    assert info_resp.status_code == 200, f"cluster_info returned {info_resp.status_code}"
+    workers = info_resp.json().get("current_workers", {})
+
+    def _urls(role_key: str) -> list[str]:
+        return sorted(f"http://{w['host']}:{w['port']}" for w in workers.get(role_key, []))
+
+    return _urls("context_servers"), _urls("generation_servers")
 
 
 def verify_cluster_info(ready, ctx_workers=-1, gen_workers=-1, port=0, expected_code=200):
@@ -429,7 +504,13 @@ def disagg_cluster_config(service_discovery):
 
 
 @pytest.fixture
-def disagg_server_config(disagg_cluster_config, router, disagg_port):
+def internal_request_auth_key():
+    """Create one internal auth key shared by proxy and workers."""
+    return secrets.token_hex(32)
+
+
+@pytest.fixture
+def disagg_server_config(disagg_cluster_config, router, disagg_port, internal_request_auth_key):
     """Create disaggregated server configuration."""
     return {
         "hostname": "localhost",
@@ -437,14 +518,16 @@ def disagg_server_config(disagg_cluster_config, router, disagg_port):
         "disagg_cluster": disagg_cluster_config,
         "context_servers": {"router": {"type": router}},
         "generation_servers": {"router": {"type": router}},
+        "internal_request_auth_key": internal_request_auth_key,
     }
 
 
 @pytest.fixture
-def worker_config(disagg_cluster_config):
+def worker_config(disagg_cluster_config, internal_request_auth_key):
     """Create worker configuration."""
     return {
         "disagg_cluster": disagg_cluster_config,
+        "internal_request_auth_key": internal_request_auth_key,
         "disable_overlap_scheduler": True,
         "cache_transceiver_config": {"backend": "DEFAULT"},
         "kv_cache_config": {

@@ -8,7 +8,7 @@ import torch
 try:
     import ray
 except ModuleNotFoundError:
-    from tensorrt_llm import ray_stub as ray
+    from tensorrt_llm.executor.ray import stub as ray
 
 from tensorrt_llm._torch.distributed.communicator import TorchDist
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
@@ -25,7 +25,7 @@ class PgOpTest:
 
         assert len(ray.get_gpu_ids()) == 1
         self.gpu = int(ray.get_gpu_ids()[0])
-        from tensorrt_llm.executor.ray_gpu_worker import RayWorkerWrapper
+        from tensorrt_llm.executor.ray.gpu_worker import RayWorkerWrapper
         local_gpu = RayWorkerWrapper.physical_to_local_id(self.gpu)
         torch.cuda.set_device(local_gpu)
 
@@ -86,7 +86,7 @@ class PgOpTest:
         return True
 
 
-@pytest.mark.gpu2
+@pytest.mark.part0
 @pytest.mark.parametrize("hidden_size", [128, 1024],
                          ids=lambda x: f"hidden:{x}")
 @pytest.mark.parametrize("seq_len", [16, 64], ids=lambda x: f"seqlen:{x}")
@@ -148,7 +148,7 @@ def test_allgather_pg_op(setup_ray_cluster, seq_len, hidden_size, var_len):
         assert r is True
 
 
-@pytest.mark.gpu2
+@pytest.mark.part1
 @pytest.mark.parametrize("hidden_size", [128, 1024],
                          ids=lambda x: f"hidden:{x}")
 @pytest.mark.parametrize("seq_len", [16, 64], ids=lambda x: f"seqlen:{x}")
@@ -208,7 +208,7 @@ def test_reducescatter_pg_op(setup_ray_cluster, seq_len, hidden_size, var_len):
         assert r is True
 
 
-@pytest.mark.gpu2
+@pytest.mark.part2
 @pytest.mark.parametrize("hidden_size", [128, 1024],
                          ids=lambda x: f"hidden:{x}")
 @pytest.mark.parametrize("seq_len", [16, 64], ids=lambda x: f"seqlen:{x}")
@@ -273,7 +273,7 @@ class CpBroadcastTest:
 
         assert len(ray.get_gpu_ids()) == 1
         self.gpu = int(ray.get_gpu_ids()[0])
-        from tensorrt_llm.executor.ray_gpu_worker import RayWorkerWrapper
+        from tensorrt_llm.executor.ray.gpu_worker import RayWorkerWrapper
         local_gpu = RayWorkerWrapper.physical_to_local_id(self.gpu)
         torch.cuda.set_device(local_gpu)
 
@@ -353,7 +353,7 @@ class CpBroadcastTest:
         return result == root_obj
 
 
-@pytest.mark.gpu2
+@pytest.mark.part3
 @pytest.mark.parametrize("hidden_size", [128, 512], ids=lambda x: f"hidden:{x}")
 @pytest.mark.parametrize("seq_len", [16, 32], ids=lambda x: f"seqlen:{x}")
 def test_cp_broadcast_tensor(setup_ray_cluster, seq_len, hidden_size):
@@ -394,7 +394,7 @@ def test_cp_broadcast_tensor(setup_ray_cluster, seq_len, hidden_size):
         assert r is True, "Tensor broadcast from root=0 failed"
 
 
-@pytest.mark.gpu2
+@pytest.mark.part4
 @pytest.mark.parametrize("test_object", [
     {
         "key1": "value1",

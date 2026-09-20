@@ -1,6 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
-import json
 import os
 from collections import defaultdict
 from typing import Any, Dict, List, NamedTuple, Optional
@@ -85,7 +98,60 @@ class StatsKeeper:
         """Set the total energy for the benchmark."""
         self.total_energy = energy
 
-    def generate_statistics_summary(self, max_draft_tokens: int) -> None:
+    @staticmethod
+    def _compute_batch_full_output_throughput(
+            requests: List[RequestRecord], batch_size: int) -> Optional[float]:
+        """Estimate output token throughput while active requests fill a batch.
+
+        Request records do not carry per-token timestamps, so output tokens are
+        prorated uniformly over each request's start/end interval.  This keeps
+        the existing end-to-end throughput while adding a steady-state view that
+        excludes the final drain phase when active requests drop below
+        ``batch_size``.
+        """
+        if batch_size <= 0:
+            return None
+
+        events: Dict[int, tuple[int, float]] = {}
+        for request in requests:
+            start = request.start_timestamp
+            end = request.end_timestamp
+            if end <= start:
+                continue
+            token_rate = request.num_total_output_tokens / (end - start)
+            start_request_delta, start_rate_delta = events.get(start, (0, 0.0))
+            events[start] = (start_request_delta + 1,
+                             start_rate_delta + token_rate)
+            end_request_delta, end_rate_delta = events.get(end, (0, 0.0))
+            events[end] = (end_request_delta - 1, end_rate_delta - token_rate)
+
+        if not events:
+            return None
+
+        active_requests = 0
+        active_token_rate = 0.0
+        batch_full_duration_ns = 0
+        batch_full_output_tokens = 0.0
+        last_timestamp = None
+        for timestamp in sorted(events):
+            if (last_timestamp is not None and timestamp > last_timestamp
+                    and active_requests >= batch_size):
+                duration_ns = timestamp - last_timestamp
+                batch_full_duration_ns += duration_ns
+                batch_full_output_tokens += active_token_rate * duration_ns
+
+            request_delta, rate_delta = events[timestamp]
+            active_requests += request_delta
+            active_token_rate += rate_delta
+            last_timestamp = timestamp
+
+        if batch_full_duration_ns <= 0:
+            return None
+
+        return batch_full_output_tokens / batch_full_duration_ns
+
+    def generate_statistics_summary(self, max_draft_tokens: int,
+                                    batch_size: int) -> BenchmarkStatistics:
         """Generate summary statistics from internally stored statistics.
 
         Returns:
@@ -112,6 +178,7 @@ class StatsKeeper:
         num_accepted_draft_tokens = []
         draft_acceptance_rate = []
         acceptance_length = []
+        decoding_iterations = []
 
         for entry in self.requests.values():
             start_time = min(entry.start_timestamp, start_time)
@@ -140,6 +207,7 @@ class StatsKeeper:
                     float(num_draft_tokens[-1]))
                 acceptance_length.append(entry.num_total_output_tokens /
                                          (entry.decode_iteration + 1))
+                decoding_iterations.append(entry.decode_iteration + 1)
 
         global_acceptance_length = sum(
             output_tokens) / total_decoding_iterations
@@ -149,16 +217,31 @@ class StatsKeeper:
             num_draft_tokens) if num_draft_tokens else None
         num_accepted_draft_tokens_percentiles = PercentileStats.from_iterable(
             num_accepted_draft_tokens) if num_accepted_draft_tokens else None
+        # Weight the per-request acceptance rate (AR) and acceptance length
+        # (AL) averages by the number of decoding iterations the request ran.
+        # An equally-weighted mean would bias the result toward short requests,
+        # which run fewer decoding iterations; iteration weighting makes the
+        # .average a token-level mean so longer requests contribute
+        # proportionally. This also makes acceptance_length_percentiles.average
+        # equal the globally-computed acceptance_length
+        # (sum(output_tokens) / total_decoding_iterations), since AL_i =
+        # output_tokens_i / iterations_i and the weights cancel the per-request
+        # iterations. Percentiles are unaffected.
         draft_acceptance_rate_percentiles = PercentileStats.from_iterable(
-            draft_acceptance_rate) if draft_acceptance_rate else None
+            draft_acceptance_rate,
+            weights=decoding_iterations) if draft_acceptance_rate else None
         acceptance_length_percentiles = PercentileStats.from_iterable(
-            acceptance_length) if acceptance_length else None
+            acceptance_length,
+            weights=decoding_iterations) if acceptance_length else None
 
+        requests = list(self.requests.values())
         stats = BenchmarkStatistics(
             num_requests=num_requests,
             total_latency_ns=end_time - start_time,
             total_output_tokens=sum(output_tokens),
             total_input_tokens=total_input_tokens,
+            batch_full_output_throughput_tok_ns=self.
+            _compute_batch_full_output_throughput(requests, batch_size),
             total_energy=self.total_energy,
             request_latency_percentiles=PercentileStats.from_iterable(
                 request_latencies),
@@ -187,13 +270,40 @@ class StatsKeeper:
 class ReportUtility:
     """A utility for reporting statistics."""
 
+    @staticmethod
+    def _format_startup_metrics(
+            startup_metrics: Optional[Dict[str, Any]]) -> str:
+        """Format startup metrics for terminal output."""
+        if not startup_metrics:
+            return ""
+
+        def format_metrics(metrics: Dict[str, Any], prefix: str = "") -> str:
+            lines = []
+            for name, value in metrics.items():
+                metric_name = f"{prefix}.{name}" if prefix else name
+                if isinstance(value, dict):
+                    lines.append(format_metrics(value, metric_name))
+                elif isinstance(value,
+                                (int, float)) and not isinstance(value, bool):
+                    lines.append(f"{metric_name}: {value:.4f}\n")
+                else:
+                    lines.append(f"{metric_name}: {value}\n")
+            return "".join(lines)
+
+        metric_lines = format_metrics(startup_metrics)
+        return ("===========================================================\n"
+                "= STARTUP METRICS\n"
+                "===========================================================\n"
+                f"{metric_lines}\n")
+
     def __init__(self,
                  statistics: StatsKeeper,
                  dataset_metadata: DatasetMetadata,
                  rt_cfg: RuntimeConfig,
                  logger: Logger,
                  kwargs: Dict[str, Any],
-                 streaming: bool = False) -> None:
+                 streaming: bool = False,
+                 startup_metrics: Optional[Dict[str, Any]] = None) -> None:
         """Initialize the ReportingController.
 
         Args:
@@ -202,6 +312,8 @@ class ReportUtility:
             rt_cfg (RuntimeConfig): Configuration for the run.
             logger (Logger): A logger for logging.
             streaming (bool, optional): Streaming benchmark used. Defaults to False.
+            startup_metrics (Dict[str, Any], optional): Metrics captured while
+                initializing the model.
         """
         self.dataset_metadata = dataset_metadata
         self.rt_cfg = rt_cfg
@@ -209,8 +321,10 @@ class ReportUtility:
         self.kwargs = kwargs
         self.raw_statistics = statistics
         self.statistics = statistics.generate_statistics_summary(
-            self.get_max_draft_len())
+            self.get_max_draft_len(),
+            self.rt_cfg.settings_config.max_batch_size)
         self.streaming = streaming
+        self.startup_metrics = startup_metrics
 
     def _query_gpu_info(self) -> Dict[str, Any]:
         """Query first GPU info (all GPUs must be identical for TRT-LLM)."""
@@ -275,6 +389,13 @@ class ReportUtility:
         return self.convert_rate_to_s(self.statistics.output_throughput_tok_ns)
 
     @property
+    def batch_full_output_throughput_tok_s(self) -> Optional[float]:
+        """Estimated output throughput while active requests fill a batch."""
+        throughput = self.statistics.batch_full_output_throughput_tok_ns
+        return self.convert_rate_to_s(
+            throughput) if throughput is not None else None
+
+    @property
     def total_token_throughput_tok_s(self) -> float:
         """Total token throughput in tokens per second."""
         return self.convert_rate_to_s(
@@ -319,11 +440,12 @@ class ReportUtility:
             "engine": {
                 "model": self.rt_cfg.model,
                 "model_path": str(self.rt_cfg.model_path),
-                "engine_dir": str(self.rt_cfg.engine_dir),
                 "revision": self.rt_cfg.revision,
                 "version": self.rt_cfg.sw_version,
             },
         }
+        if self.startup_metrics:
+            stats_dict["startup_metrics"] = self.startup_metrics
 
         # Machine / GPU details - query only first GPU (all GPUs must be identical)
         stats_dict["machine"] = self._query_gpu_info()
@@ -345,49 +467,27 @@ class ReportUtility:
             if kv_cache_mem_percent is not None else None
 
         # Engine/Backend details
-        if self.rt_cfg.backend not in ('pytorch', '_autodeploy'):
-            config_path = self.rt_cfg.engine_dir / "config.json"
-            with open(config_path, "r") as config:
-                engine_config = json.load(config)
-            build_cfg = engine_config["build_config"]
-            pretrain_cfg = engine_config["pretrained_config"]
+        from tensorrt_llm._torch.model_config import ModelConfig
+        from tensorrt_llm._utils import torch_dtype_to_str
 
-            stats_dict["engine"] |= {
-                "backend":
-                "TRT",
-                "dtype":
-                pretrain_cfg["dtype"],
-                "kv_cache_dtype":
-                pretrain_cfg["quantization"]["kv_cache_quant_algo"],
-                "quantization":
-                pretrain_cfg["quantization"]["quant_algo"],
-                "max_input_length":
-                build_cfg["max_input_len"],
-                "max_sequence_length":
-                build_cfg["max_seq_len"]
-            }
-        else:
-            from tensorrt_llm._torch.model_config import ModelConfig
-            from tensorrt_llm._utils import torch_dtype_to_str
+        model = self.rt_cfg.model_path or self.rt_cfg.model
+        model_config = ModelConfig.from_pretrained(model,
+                                                   trust_remote_code=True)
 
-            model = self.rt_cfg.model_path or self.rt_cfg.model
-            model_config = ModelConfig.from_pretrained(model,
-                                                       trust_remote_code=True)
+        validate_and_set_kv_cache_quant(model_config, kv_cache_dtype)
 
-            validate_and_set_kv_cache_quant(model_config, kv_cache_dtype)
-
-            stats_dict["engine"] |= {
-                "backend":
-                "Pytorch",
-                "dtype":
-                torch_dtype_to_str(model_config.torch_dtype
-                                   or model_config.pretrained_config.
-                                   get_text_config().torch_dtype),
-                "kv_cache_dtype":
-                model_config.quant_config.kv_cache_quant_algo,
-                "quantization":
-                model_config.quant_config.quant_algo
-            }
+        stats_dict["engine"] |= {
+            "backend":
+            "Pytorch",
+            "dtype":
+            torch_dtype_to_str(
+                model_config.torch_dtype or
+                model_config.pretrained_config.get_text_config().torch_dtype),
+            "kv_cache_dtype":
+            model_config.quant_config.kv_cache_quant_algo,
+            "quantization":
+            model_config.quant_config.quant_algo
+        }
 
         # World and runtime info
         stats_dict["world_info"] = {
@@ -428,6 +528,9 @@ class ReportUtility:
             # Output throughput (total output (OSL) tokens / end-to-end latency)
             "system_output_throughput_tok_s":
             self.output_throughput_tok_s,
+            # Estimated output throughput while active requests fill a batch.
+            "batch_full_output_throughput_tok_s":
+            self.batch_full_output_throughput_tok_s,
             # Output throughput per user (average per request output throughput)
             "system_total_throughput_tok_s":
             self.total_token_throughput_tok_s,
@@ -555,46 +658,21 @@ class ReportUtility:
         perf = stats_dict["performance"]
         streaming = stats_dict.get("streaming_metrics")
         decoding = stats_dict.get("decoding_stats", None)
+        startup_metrics_info = self._format_startup_metrics(
+            stats_dict.get("startup_metrics"))
 
-        backend_info = ""
-        if self.rt_cfg.backend not in ('pytorch', '_autodeploy'):
-            config_path = self.rt_cfg.engine_dir / "config.json"
-            with open(config_path, "r") as config:
-                engine_config = json.load(config)
-            build_cfg = engine_config["build_config"]
-            pretrain_cfg = engine_config["pretrained_config"]
-
-            backend_info = (
-                "\n\n===========================================================\n"
-                "= ENGINE DETAILS\n"
-                "===========================================================\n"
-                f"Model:\t\t\t{engine['model']}\n"
-                f"Model Path:\t\t{engine['model_path']}\n"
-                f"Revision:\t\t{engine['revision'] or 'N/A'}\n"
-                f"Engine Directory:\t{engine['engine_dir']}\n"
-                f"TensorRT LLM Version:\t{engine['version']}\n"
-                f"Dtype:\t\t\t{pretrain_cfg['dtype']}\n"
-                f"KV Cache Dtype:\t\t{pretrain_cfg['quantization']['kv_cache_quant_algo']}\n"
-                f"Quantization:\t\t{pretrain_cfg['quantization']['quant_algo']}\n"
-                f"Max Input Length:\t{build_cfg['max_input_len']}\n"
-                f"Max Sequence Length:\t{build_cfg['max_seq_len']}\n"
-                f"\n")
-        else:
-            backend_info = (
-                "\n\n===========================================================\n"
-                f"= {self.rt_cfg.backend.upper()} BACKEND\n"
-                "===========================================================\n"
-                f"Model:\t\t\t{engine['model']}\n"
-                f"Model Path:\t\t{engine['model_path']}\n"
-                f"Revision:\t\t{engine['revision'] or 'N/A'}\n"
-                f"TensorRT LLM Version:\t{engine['version']}\n"
-                f"Dtype:\t\t\t{engine['dtype']}\n"
-                f"KV Cache Dtype:\t\t{engine['kv_cache_dtype']}\n"
-                f"Quantization:\t\t{engine['quantization']}\n"
-                # TODO
-                # f"Max Input Length:\t{build_cfg['max_input_len']}\n"
-                # f"Max Sequence Length:\t{build_cfg['max_seq_len']}\n"
-                f"\n")
+        backend_info = (
+            "\n\n===========================================================\n"
+            f"= {self.rt_cfg.backend.upper()} BACKEND\n"
+            "===========================================================\n"
+            f"Model:\t\t\t{engine['model']}\n"
+            f"Model Path:\t\t{engine['model_path']}\n"
+            f"Revision:\t\t{engine['revision'] or 'N/A'}\n"
+            f"TensorRT LLM Version:\t{engine['version']}\n"
+            f"Dtype:\t\t\t{engine['dtype']}\n"
+            f"KV Cache Dtype:\t\t{engine['kv_cache_dtype']}\n"
+            f"Quantization:\t\t{engine['quantization']}\n"
+            f"\n")
 
         kv_cache_percentage = world_info.get("kv_cache_percentage", None)
         if kv_cache_percentage is not None:
@@ -647,9 +725,15 @@ class ReportUtility:
             "= PERFORMANCE OVERVIEW \n"
             "===========================================================\n")
 
+        batch_full_output_throughput = perf[
+            "batch_full_output_throughput_tok_s"]
+        batch_full_output_throughput_text = (
+            f"{batch_full_output_throughput:.4f}"
+            if batch_full_output_throughput is not None else "N/A")
         perf_stats = (
             f"Request Throughput (req/sec):                     {perf['request_throughput_req_s']:.4f}\n"
             f"Total Output Throughput (tokens/sec):             {perf['system_output_throughput_tok_s']:.4f}\n"
+            f"Batch-Full Output Throughput (tokens/sec):        {batch_full_output_throughput_text}\n"
             f"Total Token Throughput (tokens/sec):              {perf['system_total_throughput_tok_s']:.4f}\n"
             f"Total Latency (ms):                               {perf['total_latency_ms']:.4f}\n"
             f"Average request latency (ms):                     {perf['avg_request_latency_ms']:.4f}\n"
@@ -760,6 +844,7 @@ class ReportUtility:
                 )
 
         logging_info = (f"{backend_info}"
+                        f"{startup_metrics_info}"
                         f"{machine_info}"
                         f"{request_info}"
                         f"{world_info}"
@@ -778,8 +863,7 @@ class ReportUtility:
             spec_config = self.kwargs["speculative_config"]
             # Handle both dict (from YAML) and object types
             if isinstance(spec_config, dict):
-                draft_len = (spec_config.get("max_draft_len")
-                             or spec_config.get("num_nextn_predict_layers"))
+                draft_len = spec_config.get("max_draft_len")
                 return draft_len or 0
             return spec_config.max_draft_len or 0
 

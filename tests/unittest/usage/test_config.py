@@ -16,21 +16,11 @@
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
 
 class TestTelemetryConfigLocation:
     """Verify TelemetryConfig and UsageContext live in tensorrt_llm.usage.config."""
-
-    def test_import_telemetry_config_from_usage_config(self):
-        """TelemetryConfig must be importable from tensorrt_llm.usage.config."""
-        from tensorrt_llm.usage import config
-
-        assert hasattr(config, "TelemetryConfig")
-
-    def test_import_usage_context_from_usage_config(self):
-        """UsageContext must be importable from tensorrt_llm.usage.config."""
-        from tensorrt_llm.usage import config
-
-        assert hasattr(config, "UsageContext")
 
     def test_telemetry_config_defaults(self):
         """TelemetryConfig defaults: disabled=False, usage_context=UNKNOWN."""
@@ -44,7 +34,14 @@ class TestTelemetryConfigLocation:
         """UsageContext enum has all expected members."""
         from tensorrt_llm.usage import config
 
-        expected = {"UNKNOWN", "LLM_CLASS", "CLI_SERVE", "CLI_BENCH", "CLI_EVAL"}
+        expected = {
+            "UNKNOWN",
+            "LLM_CLASS",
+            "CLI_SERVE",
+            "CLI_BENCH",
+            "CLI_EVAL",
+            "DISAGGREGATED",
+        }
         actual = {e.name for e in config.UsageContext}
         assert expected == actual
 
@@ -57,6 +54,7 @@ class TestTelemetryConfigLocation:
         assert config.UsageContext.CLI_SERVE.value == "cli_serve"
         assert config.UsageContext.CLI_BENCH.value == "cli_bench"
         assert config.UsageContext.CLI_EVAL.value == "cli_eval"
+        assert config.UsageContext.DISAGGREGATED.value == "disaggregated"
 
     def test_telemetry_config_disabled_flag(self):
         """TelemetryConfig(disabled=True) sets the flag."""
@@ -85,22 +83,46 @@ class TestTelemetryConfigLocation:
 class TestBackwardCompatibility:
     """Verify types are still importable from llm_args for backward compat."""
 
-    def test_telemetry_config_importable_from_llm_args(self):
-        """TelemetryConfig must still be importable from llm_args."""
+    def test_telemetry_types_preserve_legacy_imports(self) -> None:
+        from tensorrt_llm.llmapi.llm_args import TelemetryConfig as LegacyTelemetryConfig
+        from tensorrt_llm.llmapi.llm_args import UsageContext as LegacyUsageContext
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+
+        assert LegacyTelemetryConfig is TelemetryConfig
+        assert LegacyUsageContext is UsageContext
+
+
+class TestFieldTelemetryMetadata:
+    """Verify llm_args.Field telemetry metadata handling."""
+
+    def test_telemetry_false_records_exclude_marker(self):
+        """Field(telemetry=False) records the explicit exclude sentinel."""
         from tensorrt_llm.llmapi import llm_args
 
-        assert hasattr(llm_args, "TelemetryConfig")
+        field = llm_args.Field(default=0, telemetry=False)
 
-    def test_usage_context_importable_from_llm_args(self):
-        """UsageContext must still be importable from llm_args."""
+        assert field.json_schema_extra == {"telemetry": {"exclude": True}}
+
+    def test_telemetry_false_preserves_status_and_records_exclude_marker(self):
+        """Field(telemetry=False) preserves unrelated json schema metadata."""
         from tensorrt_llm.llmapi import llm_args
 
-        assert hasattr(llm_args, "UsageContext")
+        field = llm_args.Field(default=0, status="beta", telemetry=False)
 
-    def test_same_types_both_locations(self):
-        """Types from both locations must be the same class."""
-        from tensorrt_llm.llmapi import llm_args
-        from tensorrt_llm.usage import config
+        assert field.json_schema_extra == {
+            "status": "beta",
+            "telemetry": {"exclude": True},
+        }
 
-        assert config.TelemetryConfig is llm_args.TelemetryConfig
-        assert config.UsageContext is llm_args.UsageContext
+
+class TestTelemetryFieldCategorical:
+    """Verify TelemetryField.categorical(*values) allowlist shorthand."""
+
+    def test_categorical_builds_allowlist_metadata(self):
+        from tensorrt_llm.usage.config import TelemetryField
+
+        field = TelemetryField.categorical("a", "b")
+
+        assert field.as_json_schema_extra() == {
+            "allowed_values": ["a", "b"],
+        }

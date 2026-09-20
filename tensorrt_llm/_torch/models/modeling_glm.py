@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import inspect
 import math
 import os
@@ -11,12 +14,15 @@ from transformers import PretrainedConfig
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
+from ..attention.qk_norm_attention import QKNormRoPEAttention
 from ..distributed import (
     AllReduce,
     AllReduceFusionOp,
@@ -25,15 +31,13 @@ from ..distributed import (
     MoEAllReduceParams,
 )
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import MoE, MoEWeightLoadingMode, create_moe
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
-from ..modules.qk_norm_attention import QKNormRoPEAttention
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import MoEWeightLoadingMode, create_moe, is_moe_weight_owner
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .modeling_deepseekv3 import DeepseekV3Gate, DeepseekV3MTPHead, moe_reduce_add_shared_output
@@ -140,7 +144,7 @@ class Glm4WeightLoader:
                     # Mark consumed experts weights
                     if can_mark_consumed:
                         weights.mark_consumed(name)
-                elif names[-1] == "backend" and isinstance(module, MoE):
+                elif names[-1] == "backend" and is_moe_weight_owner(module):
                     # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
                     # Currently saved MoE weights don't include 'backend' in their names.
                     # After MoE refactoring, ConfigurableMoE now has a backend submodule,
@@ -315,6 +319,8 @@ class Glm4MoE(nn.Module):
             config=model_config,
             overridden_tp_size=shared_tp_size,
             reduce_output=False,
+            layer_idx=layer_idx,
+            is_shared_expert=True,
         )
 
         self.allreduce = AllReduce(
@@ -374,7 +380,12 @@ class Glm4MoE(nn.Module):
         )
 
     def compute_routed_output(
-        self, hidden_states, hidden_states_fp4, all_rank_num_tokens, do_finalize
+        self,
+        hidden_states,
+        hidden_states_fp4,
+        all_rank_num_tokens,
+        do_finalize,
+        lora_params,
     ):
         # max-throughput
         use_dp_padding = False
@@ -395,6 +406,7 @@ class Glm4MoE(nn.Module):
             output_dtype=hidden_states.dtype,
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
+            lora_params=lora_params,
         )
 
         return routed_output
@@ -406,13 +418,15 @@ class Glm4MoE(nn.Module):
         all_rank_num_tokens: Optional[list[int]] = None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         do_finalize: Optional[bool] = True,
+        lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         if not do_finalize:
             assert not self.use_dp
 
         def _compute_shared_output():
             shared_output = self.shared_experts(
-                hidden_states_fp4 if hidden_states_fp4 is not None else hidden_states
+                hidden_states_fp4 if hidden_states_fp4 is not None else hidden_states,
+                lora_params=lora_params,
             )
             if self.shared_output_scale is not None:
                 shared_output *= self.shared_output_scale
@@ -420,7 +434,11 @@ class Glm4MoE(nn.Module):
 
         def _compute_routed_output():
             routed_output = self.compute_routed_output(
-                hidden_states, hidden_states_fp4, all_rank_num_tokens, do_finalize
+                hidden_states,
+                hidden_states_fp4,
+                all_rank_num_tokens,
+                do_finalize,
+                lora_params,
             )
             return routed_output
 
@@ -438,14 +456,34 @@ class Glm4MoE(nn.Module):
         if not do_finalize:
             return [shared_output, *routed_output]
         else:
+            if not isinstance(shared_output, torch.Tensor):
+                final_hidden_states = shared_output + routed_output
+                if not self.use_dp and self.mapping.tp_size > 1:
+                    final_hidden_states = self.allreduce(
+                        final_hidden_states, all_reduce_params=final_all_reduce_params
+                    )
+                return final_hidden_states
+            output_tensor = None
+            if not self.use_dp and self.mapping.tp_size > 1:
+                w, actual_kind = torch.ops.trtllm.allocate_output(
+                    shared_output, self.allreduce.output_buffer_kind, self.mapping.tp_group
+                )
+                if actual_kind == int(BufferKind.NCCL_WINDOW):
+                    output_tensor = w
             if routed_output.dim() == 3:
                 assert shared_output.numel() * self.top_k == routed_output.numel(), (
                     "unmatched tensor shape"
                 )
-                final_hidden_states = moe_reduce_add_shared_output(routed_output, shared_output)
+                final_hidden_states = moe_reduce_add_shared_output(
+                    routed_output, shared_output, out=output_tensor
+                )
             else:
                 assert shared_output.size() == routed_output.size(), "unmatched tensor shape"
-                final_hidden_states = shared_output + routed_output
+                if output_tensor is not None:
+                    final_hidden_states = torch.add(shared_output, routed_output, out=output_tensor)
+                else:
+                    # In-place add to avoid allocating a temporary tensor, reducing peak memory
+                    final_hidden_states = shared_output.add_(routed_output)
 
             if not self.use_dp and self.mapping.tp_size > 1:
                 final_hidden_states = self.allreduce(
@@ -544,6 +582,7 @@ class Glm4DecoderLayer(DecoderLayer):
                 config=model_config,
                 overridden_tp_size=self.mlp_tp_size,
                 reduce_output=True,
+                layer_idx=layer_idx,
             )
 
         self.input_layernorm = RMSNorm(
@@ -624,6 +663,7 @@ class Glm4DecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
@@ -635,6 +675,7 @@ class Glm4DecoderLayer(DecoderLayer):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(enable_allreduce=not (self.disable_attn_allreduce)),
+            lora_params=lora_params,
             **kwargs,
         )
         if isinstance(self.mlp, Glm4MoE):
@@ -645,6 +686,7 @@ class Glm4DecoderLayer(DecoderLayer):
                 attn_metadata=attn_metadata,
                 residual=residual,
                 spec_metadata=spec_metadata,
+                lora_params=lora_params,
             )
         else:
             if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
@@ -654,6 +696,7 @@ class Glm4DecoderLayer(DecoderLayer):
                 hidden_states=hidden_states,
                 residual=residual,
                 spec_metadata=spec_metadata,
+                lora_params=lora_params,
             )
 
     def forward_MoE(
@@ -662,6 +705,7 @@ class Glm4DecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         def _run_MoE(hidden_states, hidden_states_fp4, do_finalize):
             return self.mlp(
@@ -674,6 +718,7 @@ class Glm4DecoderLayer(DecoderLayer):
                     )
                 ),
                 do_finalize=do_finalize,
+                lora_params=lora_params,
             )
 
         if self.fusion_config.PRE_MOE_FUSION:
@@ -751,6 +796,7 @@ class Glm4DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.fusion_config.PRE_MLP_FUSION:
             act_fp4, act_sf, residual = self.allreduce(
@@ -774,6 +820,7 @@ class Glm4DecoderLayer(DecoderLayer):
             final_all_reduce_params=AllReduceParams(
                 enable_allreduce=not (self.fusion_config.POST_MLP_FUSION or self.mlp_tp_size == 1)
             ),
+            lora_params=lora_params,
         )
 
         if self.fusion_config.POST_MLP_FUSION:
@@ -851,6 +898,7 @@ class Glm4MTP(Glm4DecoderLayer):
         embed_tokens: Embedding,
         attn_metadata: AttentionMetadata,
         all_rank_num_tokens: Optional[List[int]] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         def norm_embeds():
@@ -886,6 +934,7 @@ class Glm4MTP(Glm4DecoderLayer):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(enable_allreduce=not (self.disable_attn_allreduce)),
+            lora_params=lora_params,
             **kwargs,
         )
 
@@ -912,6 +961,7 @@ class Glm4MTP(Glm4DecoderLayer):
                     self.fusion_config.POST_MOE_FUSION or self.mapping.tp_size == 1
                 )
             ),
+            lora_params=lora_params,
         )
 
         if self.fusion_config.POST_MOE_FUSION:
@@ -988,6 +1038,7 @@ class Glm4Model(DecoderModel):
                 attn_metadata=attn_metadata,
                 residual=residual,
                 spec_metadata=spec_metadata,
+                **kwargs,
             )
 
         return hidden_states
@@ -1003,7 +1054,7 @@ class Glm4MoeForCausalLM(SpecDecOneEngineForCausalLM[Glm4Model, PretrainedConfig
             model_config.spec_config is not None
             and model_config.spec_config.spec_dec_mode.is_mtp_one_model()
         ):
-            model_nextn = model_config.spec_config.num_nextn_predict_layers
+            model_nextn = self.config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
             assert ckpt_nextn > 0, "There is not MTP modules in the checkpoint."
@@ -1053,7 +1104,7 @@ class Glm4MoeForCausalLM(SpecDecOneEngineForCausalLM[Glm4Model, PretrainedConfig
         weight_loader = Glm4WeightLoader(self)
         weight_loader.load_weights(weights, allow_partial_loading=allow_partial_loading)
 
-    def post_load_weights(self):
+    def setup_aliases(self) -> None:
         for idx, layer in enumerate(self.model.layers[: self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm

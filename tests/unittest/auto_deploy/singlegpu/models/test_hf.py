@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import copy
 from unittest.mock import MagicMock, patch
 
@@ -79,6 +93,7 @@ def mock_factory():
         yield factory
 
 
+@pytest.mark.cpu_only
 def test_recursive_update_config(mock_factory):
     """Test that _recursive_update_config correctly updates a config object recursively."""
     # Get the mocked factory instance
@@ -88,8 +103,10 @@ def test_recursive_update_config(mock_factory):
     config = Llama4Config()
 
     # Create an update dictionary with both simple and nested values
+    # NOTE: In transformers 5.x, bos_token_id moved into text_config for
+    # Llama4Config, so use boi_token_index (a root-level attribute) instead.
     update_dict = {
-        "bos_token_id": 42,  # Simple value at root level
+        "boi_token_index": 42,  # Simple value at root level
         "text_config": {  # Nested config update
             "hidden_size": 4096,
             "num_attention_heads": 32,
@@ -108,7 +125,7 @@ def test_recursive_update_config(mock_factory):
     assert updated_config is config
 
     # Check root level updates
-    assert config.bos_token_id == 42
+    assert config.boi_token_index == 42
 
     # Check nested updates in text_config
     assert config.text_config.hidden_size == 4096
@@ -134,6 +151,7 @@ def test_recursive_update_config(mock_factory):
     assert config.text_config.rope_scaling["type"] == "linear"
 
 
+@pytest.mark.cpu_only
 def test_register_custom_model_cls():
     config_cls_name = "FooConfig"
     custom_model_cls = MagicMock(spec=AutoModelForCausalLM)
@@ -153,6 +171,7 @@ class FooConfig:
     pass
 
 
+@pytest.mark.cpu_only
 def test_build_model_raises_when_custom_model_cls_does_not_have_from_config(mock_factory):
     custom_model_cls = MagicMock(spec=AutoModelForCausalLM, __name__="FooModel")
     AutoModelForCausalLMFactory.register_custom_model_cls(
@@ -170,6 +189,7 @@ def test_build_model_raises_when_custom_model_cls_does_not_have_from_config(mock
         mock_factory.build_model(device="meta")
 
 
+@pytest.mark.cpu_only
 def test_build_model_uses_custom_model_cls_from_config(mock_factory):
     custom_model_cls = MagicMock(spec=AutoModelForCausalLM)
     custom_model_cls.configure_mock(_from_config=MagicMock(side_effect=MyError))
@@ -188,6 +208,7 @@ def test_build_model_uses_custom_model_cls_from_config(mock_factory):
         mock_factory.build_model(device="meta")
 
 
+@pytest.mark.cpu_only
 def test_custom_model_mapping_in_parent_does_not_affect_children():
     class Child(AutoModelForCausalLMFactory):
         pass
@@ -201,6 +222,7 @@ def test_custom_model_mapping_in_parent_does_not_affect_children():
     assert Child._custom_model_mapping == {}
 
 
+@pytest.mark.cpu_only
 def test_custom_model_mapping_in_parent_does_not_affect_parent():
     class Child(AutoModelForCausalLMFactory):
         pass

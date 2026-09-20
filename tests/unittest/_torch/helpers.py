@@ -1,4 +1,4 @@
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -236,7 +236,9 @@ def reference_block_scale_moe_torch(
     return results.view_as(x)
 
 
-def create_mock_cuda_graph_runner(batch_size: int, use_mrope: bool = False):
+def create_mock_cuda_graph_runner(batch_size: int,
+                                  use_mrope: bool = False,
+                                  max_num_tokens: int = 1):
     config = CUDAGraphRunnerConfig(
         use_cuda_graph=True,
         cuda_graph_padding_enabled=False,
@@ -244,7 +246,7 @@ def create_mock_cuda_graph_runner(batch_size: int, use_mrope: bool = False):
         max_cuda_graph_batch_size=batch_size,
         batch_size=batch_size,
         max_beam_width=1,
-        max_num_tokens=1,
+        max_num_tokens=max_num_tokens,
         use_mrope=use_mrope,
         spec_config=None,
         cuda_graph_mem_pool=None,
@@ -252,7 +254,27 @@ def create_mock_cuda_graph_runner(batch_size: int, use_mrope: bool = False):
         original_max_draft_len=0,
         original_max_total_draft_tokens=0,
         is_draft_model=False,
+        is_encoder_decoder=False,
         mapping=Mapping(),
         dist=None,
         kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER)
     return CUDAGraphRunner(config)
+
+
+def make_hf_hybrid_cache_for_tests(
+    config,
+    *,
+    max_cache_len: int,
+    max_batch_size: Optional[int] = None,
+    device=None,
+    dtype=None,
+):
+    """Build Hugging Face ``past_key_values`` for hybrid / sliding-window models in tests.
+
+    Transformers v5 removed ``HybridCache`` in favor of ``StaticCache`` for fixed-length
+    pre-allocated KV.
+    """
+    del max_batch_size, device, dtype  # StaticCache doesn't accept these kwargs.
+    from transformers.cache_utils import StaticCache
+
+    return StaticCache(config=config, max_cache_len=max_cache_len)

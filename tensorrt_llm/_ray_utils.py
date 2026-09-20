@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,32 +12,29 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import functools
-from contextlib import contextmanager
-from typing import Callable
+"""Compatibility shim for ``tensorrt_llm._ray_utils``.
 
-try:
-    import ray
-except ImportError:
-    import tensorrt_llm.ray_stub as ray
+Will be removed once all usages are migrated to
+``tensorrt_llm.executor.ray.utils``.
 
+DO NOT ADD ANYTHING TO THIS FILE.
+"""
 
-@contextmanager
-def unwrap_ray_errors():
-    try:
-        yield
-    except ray.exceptions.RayTaskError as e:
-        raise e.as_instanceof_cause() from e
+import warnings
 
+from tensorrt_llm.executor.ray.utils import (  # noqa: F401
+    control_action_decorator,
+    unwrap_ray_errors,
+)
 
-def control_action_decorator(func: Callable) -> Callable:
-    """
-    Decorator that wraps a method to use control_action context manager.
-    """
+warnings.warn(
+    "tensorrt_llm._ray_utils has moved to tensorrt_llm.executor.ray.utils "
+    "and will be removed in a future release.",
+    FutureWarning,
+    stacklevel=2,
+)
 
-    @functools.wraps(func)
-    def wrapper(self, *args, **kwargs):
-        with self.engine.control_action():
-            return func(self, *args, **kwargs)
-
-    return wrapper
+__all__ = [
+    "control_action_decorator",
+    "unwrap_ray_errors",
+]

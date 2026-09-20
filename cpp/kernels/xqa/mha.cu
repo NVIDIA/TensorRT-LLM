@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -378,6 +378,8 @@ struct alignas(128) SharedMem
     using Barrier = CtaBarrier;
 
     Barrier qBarrier[ctaShapeInWarps.y];
+    // Handoff from GEMM0 warps to GEMM1 before reusing shared-memory for post-processing and multi-block reduction.
+    Barrier gemm0ToPostProcBarrier;
     // Beside X buffers, also protects warpRowMax and warpRowSum. For CTA_ROW_MAX_BACKWARD_METHOD==1 or 2, also
     // ctaRowMax.
     CtaBarrierPair xBarriers[ctaShapeInWarps.y][ctaShapeInWarps.x];
@@ -1475,10 +1477,19 @@ __device__ inline void addAttentionSinks(
 {
     for (uint32_t i = 0; i < globalRowSum.size; i++)
     {
-        uint32_t srcOffset = warp_size * i + laneId();
-        if (srcOffset < headGrpSize)
+        uint32_t const rowOffset = warp_size * i + laneId();
+        if constexpr (SPEC_DEC)
         {
-            globalRowSum[i] += expf(attentionSinks[srcOffset] - globalRowMax[i]);
+            // Spec-dec rows flatten [query token, head], so repeat the sink indices for every token.
+            if (rowOffset < warpTile.y)
+            {
+                uint32_t const srcOffset = rowOffset % headGrpSize;
+                globalRowSum[i] += expf(attentionSinks[srcOffset] - globalRowMax[i]);
+            }
+        }
+        else if (rowOffset < headGrpSize)
+        {
+            globalRowSum[i] += expf(attentionSinks[rowOffset] - globalRowMax[i]);
         }
     }
 }
@@ -1580,6 +1591,10 @@ CUBIN_EXPORT __global__
     if (ctaThrdId < ctaShapeInWarps.y)
     {
         init(&smem.qBarrier[ctaThrdId], warp_size * ctaShapeInWarps.x); // be sure to use .noinc
+    }
+    if (ctaThrdId == 0)
+    {
+        init(&smem.gemm0ToPostProcBarrier, warp_size * ctaShapeInWarps.x * ctaShapeInWarps.y);
     }
     constexpr uint32_t cacheVTileSeqStride = cacheVTileSeqLen * gemm1NbWarpGrps;
     constexpr uint32_t nbXTilesPerXIter
@@ -1698,7 +1713,7 @@ CUBIN_EXPORT __global__
 
     uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
 #if SLIDING_WINDOW && SPEC_DEC && !IS_SPEC_DEC_TREE
-    uint32_t const tok0SeqLen = cacheSeqLen - actualQSeqLen + 1 + idxHeadTokenInGrp; // ctaTokOffset;
+    uint32_t const tok0SeqLen = cacheSeqLen - actualQSeqLen + 1;
     int32_t const tok0WinBeg = int32_t(tok0SeqLen) - int32_t(slidingWinSize);
     uint32_t const nbTotalSkipTokens = mha::max(0, tok0WinBeg);
     bool const rtIsReallySliding = (cacheSeqLen + actualQSeqLen > slidingWinSize);
@@ -1709,6 +1724,9 @@ CUBIN_EXPORT __global__
 #else
     constexpr bool rtIsReallySliding = false;
     constexpr uint32_t nbTotalSkipTokens = 0;
+#endif
+#if USE_PAGED_KV_CACHE
+    uint32_t const nbSkipLeadingPages = nbTotalSkipTokens / tokensPerPage;
 #endif
     uint32_t const nbSkipLeadingTiles = nbTotalSkipTokens / ctaTile.x;
     uint32_t const tile0NbSkipTokens = nbTotalSkipTokens % ctaTile.x;
@@ -1763,10 +1781,11 @@ CUBIN_EXPORT __global__
         {
 #if BEAM_WIDTH == 1
             uint32_t const idxBeam = 0;
-            pageIdx = getPage<KCachePageIndices::size>(cacheList, true, idxReq, idxBeam, idxPage, nbPages);
+            pageIdx = getPage<KCachePageIndices::size>(
+                cacheList, true, idxReq, idxBeam, idxPage, nbPages, nbSkipLeadingPages);
 #else
             auto& dst = smem.kCachePages[warpIdx.x];
-            loadPagesForBeamSearchAsync<1>(0U, dst, cacheList, true, idxReq, idxPage, nbPages);
+            loadPagesForBeamSearchAsync<1>(0U, dst, cacheList, true, idxReq, idxPage, nbPages, nbSkipLeadingPages);
 #endif
         };
         uint32_t idxPageBeg = nbPagesPerCtaTile * seqIterInit + warpIdx.x * warpTile.x / tokensPerPage;
@@ -1945,6 +1964,7 @@ CUBIN_EXPORT __global__
                     {
                         // synchronize k
                         ldgsts::waitGroup<1>();
+                        __syncwarp();
                     }
                     SharedMem::QSmemBuffer const& smemQ = smem.q[warpIdx.y][0];
                     constexpr uint32_t qOffsetPerPart = exactDiv(elemsPerKHeadPart, inputElemsPerGrain);
@@ -2055,6 +2075,12 @@ CUBIN_EXPORT __global__
             smem.warpRowSum[warpIdx.y][warpIdx.x].storeFromReg<false>(warp, regRowSum);
             unused(xBar.produced.arrive());
         }
+        // The initial K prefetch is issued even for an empty multi-block subsequence, where the loop above is skipped.
+        // Drain it (and the final look-ahead prefetch for non-empty subsequences) before publishing GEMM0 completion;
+        // GEMM1 reuses the same shared-memory allocation for output reduction after waiting on this barrier.
+        ldgsts::waitGroup<0>();
+        // Publish completion of GEMM0 warps. GEMM1 waits on this barrier before reusing the K/Q/X storage.
+        unused(smem.gemm0ToPostProcBarrier.arrive());
     }
     else
     {
@@ -2090,11 +2116,12 @@ CUBIN_EXPORT __global__
         {
 #if BEAM_WIDTH == 1
             uint32_t const idxBeam = 0;
-            pageIdx = getPage<VCachePageIndices::size>(cacheList, false, idxReq, idxBeam, idxPageBeg, nbPages);
+            pageIdx = getPage<VCachePageIndices::size>(
+                cacheList, false, idxReq, idxBeam, idxPageBeg, nbPages, nbSkipLeadingPages);
 #else
             auto& dst = smem.vCachePages[grpLoadV ? warpGrpIdx : warpIdx.x];
             loadPagesForBeamSearchAsync<grpLoadV ? gemm1WarpsPerGrp : 1U>(
-                grpLoadV ? warpIdxInGrp : 0U, dst, cacheList, false, idxReq, idxPageBeg, nbPages);
+                grpLoadV ? warpIdxInGrp : 0U, dst, cacheList, false, idxReq, idxPageBeg, nbPages, nbSkipLeadingPages);
 #endif
         };
         uint32_t idxPageBeg = nbPagesPerCtaTile * seqIterInit + cacheVTileSeqLen * warpGrpIdx / tokensPerPage;
@@ -2213,15 +2240,16 @@ CUBIN_EXPORT __global__
                   wait_parity<grpLoadV>(pWarpGrpBar, getAndFlip<grpLoadV>(warpGrpBarParityNext));
 #endif
 #if USE_PAGED_KV_CACHE
-                  constexpr uint32_t xIterSeqStride = cacheVTileSeqStride * nbVItersPerXIter;
-                  if constexpr (xIterSeqStride <= tokensPerPage)
+                  // Consecutive V tiles of a warp group are cacheVTileSeqStride tokens apart,
+                  // so the page cursor must step per V tile.
+                  uint32_t const idxVTileInCtaTile = xIter * nbVItersPerXIter + vIter;
+                  bool const isLastBeam = (idxBeam == beamWidth - 1 || isConvergedTile(seqIter));
+                  if constexpr (cacheVTileSeqStride <= tokensPerPage)
                   {
-                      uint32_t const nbXItersPerPage = exactDiv(tokensPerPage, xIterSeqStride);
-                      assert(nbXItersPerPage <= nbXItersPerCtaTile);
-                      if (xIter % nbXItersPerPage == nbXItersPerPage - 1 && vIter == nbVItersPerXIter - 1
-                          && (idxBeam == beamWidth - 1 || isConvergedTile(seqIter)))
+                      constexpr uint32_t nbVTilesPerPage = exactDiv(tokensPerPage, cacheVTileSeqStride);
+                      if (idxVTileInCtaTile % nbVTilesPerPage == nbVTilesPerPage - 1 && isLastBeam)
                       {
-                          auto const step = 1; // cacheVTileSeqLen * gemm1NbWarpGrps / tokensPerPage;
+                          constexpr uint32_t step = 1;
                           idxPageBeg += (idxPageBeg % nbPagesPerCtaTile == nbPagesPerCtaTile - 1
                                   ? nbPagesPerCtaTile * (nbSubSeqPerSeq - 1) + step
                                   : step);
@@ -2233,10 +2261,9 @@ CUBIN_EXPORT __global__
                   }
                   else
                   {
-                      assert(nbVItersPerXIter == 1);
-                      if ((idxBeam == beamWidth - 1 || isConvergedTile(seqIter)) && vIter == nbVItersPerXIter - 1)
+                      if (isLastBeam)
                       {
-                          auto const step = exactDiv(xIterSeqStride, tokensPerPage);
+                          constexpr uint32_t step = exactDiv(cacheVTileSeqStride, tokensPerPage);
                           idxPageBeg += (idxPageBeg % nbPagesPerCtaTile + step >= nbPagesPerCtaTile
                                   ? nbPagesPerCtaTile * (nbSubSeqPerSeq - 1) + step
                                   : step);
@@ -2271,6 +2298,8 @@ CUBIN_EXPORT __global__
 #else
             assert(!alreadyComplete);
             ldgsts::waitGroup<nbVBuffers - 1>();
+            // Each lane waits only for its own async-copy groups; synchronize the warp before consuming the V tile.
+            __syncwarp();
 #endif
         };
         auto testVTileLoad = [&](uint32_t idxVBar, ParityOrNone<grpLoadV> parity)
@@ -2466,11 +2495,16 @@ CUBIN_EXPORT __global__
 
         auto const fullRescaleMask = UniformRescaleMask::filled(~0U);
 
+        // Drain speculative V prefetches and wait for GEMM0 warps before reusing shared memory for
+        // global-row merging and output post-processing.
+        ldgsts::waitGroup<0>();
+        smem.gemm0ToPostProcBarrier.wait_parity(false);
+        __syncthreads();
+
         constexpr bool needMergeGlobal = (gemm1NbWarpGrps > 1 && nbXTilesPerXIter > 1);
         if constexpr (needMergeGlobal)
         {
             assert(gemm1NbWarpGrps != 1);
-            __syncthreads();
             smem.warpRowMax[warpIdx.y][warpIdx.x].template storeFromReg<false>(warp, globalRowMax);
             smem.warpRowSum[warpIdx.y][warpIdx.x].template storeFromReg<false>(warp, globalRowSum);
             __syncthreads();
@@ -2495,8 +2529,8 @@ CUBIN_EXPORT __global__
         float voScale = (isKVCacheQuantized ? kvCacheScale[0] : 1.F);
         if (seqIterInit < nbSeqIters)
         { // otherwise rcpRowSum will be NAN.
-            // The attention sinks are moved to the multi-block reduction part if the multi-block is enabled.
-            if (!isMultiBlock && attentionSinks != nullptr)
+            // In multi-block mode, assign the virtual sink token to exactly one partial CTA.
+            if ((!isMultiBlock || idxSubSeqInSeq == 0) && attentionSinks != nullptr)
             {
                 // Attention sinks are per head.
                 addAttentionSinks(globalRowSum, globalRowMax, attentionSinks + headGrpSize * idxHeadGrp);
@@ -2538,6 +2572,9 @@ CUBIN_EXPORT __global__
 
         // merge results from different warp groups
         SharedMem::XSmemBuffer* smemOutTile = mergeAndSaveOutTile(outTile, inputElemSize == 2 && cacheElemSize == 1);
+        // Only the CTA that performs the multi-block merge may write the output; a non-last CTA
+        // writing its unmerged partial would race with the merged result.
+        bool writesOutput = true;
         if (isMultiBlock)
         {
             static_assert(ctaShapeInWarps.y == 1, "not implemented");
@@ -2610,6 +2647,9 @@ CUBIN_EXPORT __global__
 
             // merge if we are the last CTA.
             bool const isLastCta = mbsmem.isLastCta;
+            writesOutput = isLastCta;
+            // All threads must finish reading the flag before the same shared-memory storage is reused by smemRowMax.
+            __syncthreads();
             if (isLastCta)
             {
                 MultiBlockSMem::MBBuf& mbbuf = mbsmem.storage[warpIdx.y];
@@ -2654,6 +2694,8 @@ CUBIN_EXPORT __global__
                     }
                     ldgsts::commitGroup();
                     ldgsts::waitGroup<1>();
+                    // Each lane waits only for its own async-copy groups; synchronize before consuming the merge tile.
+                    __syncwarp();
                     uint32_t const d = n / gemm1NbWarpGrps % nbTileBuffers;
                     WarpAcc tile = toWarpAcc(loadGemmOutTile(warp, mbbuf.tiles[warpGrpIdx][warpIdxInGrp][d]));
                     ThrdRegRowMax const tileRowMax = getTileBuf(mbbuf.tileRowMax, d).loadToReg<false>(warp);
@@ -2664,6 +2706,9 @@ CUBIN_EXPORT __global__
                     assert(std::isfinite(partialMergedRowSum[0]));
                     rescaleAcc(warp, tile, fullRescaleMask, scaledTileRowSum);
                     sumAcc = sumAcc + tile;
+                    // The merge tiles form a two-stage circular buffer.  Make every lane finish the current
+                    // ldmatrix/row-stat reads before any lane advances far enough to overwrite this slot.
+                    __syncwarp();
                 }
 
                 ThrdRegRowMax mergedRowSum{};
@@ -2689,18 +2734,13 @@ CUBIN_EXPORT __global__
                         assert(std::isfinite(mergedRowSum[0]));
                     }
                 }
-                if (attentionSinks != nullptr)
-                {
-                    // Attention sinks are per head.
-                    addAttentionSinks(mergedRowSum, mergedRowMax, attentionSinks + headGrpSize * idxHeadGrp);
-                }
                 __syncthreads();
                 rescaleAcc(warp, sumAcc, fullRescaleMask, __frcp_rn(mergedRowSum));
                 GemmOutRegTile const mergedOutTile = toFp16(sumAcc);
                 smemOutTile = mergeAndSaveOutTile(mergedOutTile, false);
             }
         }
-        if (warpGrpIdx == 0)
+        if (writesOutput && warpGrpIdx == 0)
         {
 #if SPEC_DEC
             copyOutputToGlobalMem(warp, &output[reqSeqOffset * nbQHeads], nbQHeads, headGrpSize,

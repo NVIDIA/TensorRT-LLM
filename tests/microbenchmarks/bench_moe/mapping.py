@@ -1,0 +1,304 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Construction of TRT-LLM Mapping / ModelConfig / RoutingMethod objects.
+
+The benchmark plumbs three TRT-LLM-internal config objects into
+``create_moe``:
+
+* :class:`Mapping`  — TP / EP / attention-DP topology derived from the
+  :class:`ConfigSpec` parallel-mode shortcut (``DEP`` / ``TEP`` / ``DTP``
+  / ``TTP``, a hybrid ``(D|T)TP<k>EP<m>`` name such as ``DTP2EP2``, or
+  ``CUSTOM``).
+* :class:`ModelConfig` — ``Mapping`` + quant config + per-run knobs
+  (CUDA graph, max num tokens, low-precision combine).
+* A concrete routing-method instance — picked by the registry value
+  recorded on :class:`ModelSpec`.
+
+Centralising this construction in one module makes the per-case execution
+path easier to follow and keeps the ``ConfigurableMoE`` glue out of
+the worker and CLI layers.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
+import torch
+from transformers.configuration_utils import PretrainedConfig
+
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.moe.fused_moe.routing import (
+    DeepSeekV3MoeRoutingMethod,
+    DefaultMoeRoutingMethod,
+    Llama4RenormalizeMoeRoutingMethod,
+    MiniMaxM2MoeRoutingMethod,
+    RenormalizeMoeRoutingMethod,
+    RenormalizeNaiveMoeRoutingMethod,
+    SigmoidRenormMoeRoutingMethod,
+)
+from tensorrt_llm._utils import mpi_rank
+from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+
+from .backend import MoeModelConfig, resolve_deepseek_group_config
+from .specs import ConfigSpec, ModelSpec
+
+_PARALLEL_MODE_LAYOUTS: Dict[str, Dict[str, Any]] = {
+    "DEP": {"moe_ep_size": "world", "moe_tp_size": 1, "enable_attention_dp": True},
+    "TEP": {"moe_ep_size": "world", "moe_tp_size": 1, "enable_attention_dp": False},
+    "DTP": {"moe_ep_size": 1, "moe_tp_size": "world", "enable_attention_dp": True},
+    "TTP": {"moe_ep_size": 1, "moe_tp_size": "world", "enable_attention_dp": False},
+}
+
+# Hybrid TP x EP parallel modes, e.g. "DTP2EP2" / "TTP2EP4".
+#
+# The leading letter keeps the meaning it has in the table above -- ``D`` selects
+# attention data parallelism, ``T`` selects attention tensor parallelism -- while
+# ``TP<k>EP<m>`` spells out the MoE grid explicitly: ``moe_tp_size=k`` and
+# ``moe_ep_size=m``. As for every other mode, ``k * m`` must equal ``world_size``.
+#
+# The four legacy names are looked up in the table first, so ``DTP`` (no digits)
+# can never be captured here.
+_HYBRID_MODE_RE = re.compile(r"^(?P<attn>[DT])TP(?P<tp>\d+)EP(?P<ep>\d+)$")
+
+# Grammar shown in user-facing error messages.
+PARALLEL_MODE_SYNTAX_HINT = (
+    "expected one of DEP/TEP/DTP/TTP, a hybrid (D|T)TP<k>EP<m> name "
+    "(e.g. DTP2EP2, TTP2EP4; k=moe_tp_size, m=moe_ep_size, k*m must equal "
+    "world_size), or CUSTOM"
+)
+
+
+def resolve_named_layout(mode: str, world_size: int) -> Optional[Tuple[int, int, bool]]:
+    """Resolve a named parallel mode to ``(moe_ep_size, moe_tp_size, enable_attention_dp)``.
+
+    Handles both the four legacy table entries and the hybrid
+    ``(D|T)TP<k>EP<m>`` grammar. Returns ``None`` for names that carry no
+    layout of their own (``CUSTOM``) and for unknown names -- the caller
+    decides how to report that.
+    """
+    name = str(mode).upper()
+    layout = _PARALLEL_MODE_LAYOUTS.get(name)
+    if layout is not None:
+        moe_ep = world_size if layout["moe_ep_size"] == "world" else int(layout["moe_ep_size"])
+        moe_tp = world_size if layout["moe_tp_size"] == "world" else int(layout["moe_tp_size"])
+        return moe_ep, moe_tp, bool(layout["enable_attention_dp"])
+
+    match = _HYBRID_MODE_RE.match(name)
+    if match is None:
+        return None
+    return (
+        int(match.group("ep")),
+        int(match.group("tp")),
+        match.group("attn") == "D",
+    )
+
+
+def parallel_mode_enable_attention_dp(mode: str) -> Optional[bool]:
+    """Return the attention-DP flag implied by a named mode, without a world size.
+
+    Returns ``None`` when the mode carries no implied flag (``CUSTOM``, or an
+    unknown name), so callers can fall back to their own handling.
+    """
+    name = str(mode).upper()
+    layout = _PARALLEL_MODE_LAYOUTS.get(name)
+    if layout is not None:
+        return bool(layout["enable_attention_dp"])
+    match = _HYBRID_MODE_RE.match(name)
+    if match is None:
+        return None
+    return match.group("attn") == "D"
+
+
+def is_named_parallel_mode(mode: str) -> bool:
+    """Whether ``mode`` is a self-describing layout name (i.e. not ``CUSTOM``)."""
+    return parallel_mode_enable_attention_dp(mode) is not None
+
+
+def default_hybrid_parallel_modes(world_size: int) -> Tuple[str, ...]:
+    """Hybrid mode names that split ``world_size`` as evenly as possible.
+
+    When ``world_size`` is a perfect square there is a single even split
+    (``k == m == sqrt(world_size)``). Otherwise the split is ambiguous, so both
+    neighbours are offered: the grid rounded down on the MoE-TP axis
+    (``k <= sqrt(world_size)``, favouring EP) and the one rounded up
+    (``k >= sqrt(world_size)``, favouring TP). Both attention flavours are
+    emitted for every grid, keeping the axis symmetric with the four presets.
+
+    Grids that degenerate to an existing preset (``k == 1`` is DEP/TEP,
+    ``m == 1`` is DTP/TTP) are dropped, so ``world_size < 4`` adds nothing.
+    """
+    size = int(world_size)
+    if size < 4:
+        return ()
+    divisors = [d for d in range(1, size + 1) if size % d == 0]
+    grids: List[Tuple[int, int]] = []
+    for moe_tp in (
+        max((d for d in divisors if d * d <= size), default=None),
+        min((d for d in divisors if d * d >= size), default=None),
+    ):
+        if moe_tp is None:
+            continue
+        moe_ep = size // moe_tp
+        if moe_tp == 1 or moe_ep == 1 or (moe_tp, moe_ep) in grids:
+            continue
+        grids.append((moe_tp, moe_ep))
+    grids.sort()
+    return tuple(f"{attn}TP{tp}EP{ep}" for tp, ep in grids for attn in ("D", "T"))
+
+
+def _resolve_mapping_layout(config: ConfigSpec, world_size: int) -> Tuple[int, int, bool]:
+    """Resolve ``(moe_ep_size, moe_tp_size, enable_attention_dp)`` for a ConfigSpec."""
+    if config.parallel_mode == "CUSTOM":
+        if config.moe_ep_size is None or config.moe_tp_size is None:
+            raise ValueError("parallel_mode=CUSTOM requires explicit moe_ep_size and moe_tp_size")
+        moe_ep = int(config.moe_ep_size)
+        moe_tp = int(config.moe_tp_size)
+        enable_dp = (
+            bool(config.enable_attention_dp) if config.enable_attention_dp is not None else False
+        )
+    else:
+        resolved = resolve_named_layout(config.parallel_mode, world_size)
+        if resolved is None:
+            raise ValueError(
+                f"Unknown parallel_mode={config.parallel_mode!r}; {PARALLEL_MODE_SYNTAX_HINT}"
+            )
+        moe_ep, moe_tp, enable_dp = resolved
+    if moe_ep * moe_tp != world_size:
+        raise ValueError(
+            f"parallel_mode={config.parallel_mode}: moe_ep_size * moe_tp_size = "
+            f"{moe_ep} * {moe_tp} = {moe_ep * moe_tp} must equal world_size={world_size}"
+        )
+    return moe_ep, moe_tp, enable_dp
+
+
+def _build_mapping_from_config(config: ConfigSpec, world_size: int) -> Mapping:
+    """Build ``Mapping`` from a ``ConfigSpec`` + world size; sets ``rank=mpi_rank()``."""
+    moe_ep, moe_tp, enable_dp = _resolve_mapping_layout(config, world_size)
+    # gpus_per_node must match actual visible GPUs per node so that
+    # mapping.local_rank (= rank % gpus_per_node) gives the correct device index.
+    # The Mapping default (8) is wrong for multi-node runs with fewer GPUs per node.
+    gpus_per_node = torch.cuda.device_count()
+    mapping = Mapping(
+        world_size=world_size,
+        tp_size=world_size,
+        moe_ep_size=moe_ep,
+        moe_tp_size=moe_tp,
+        enable_attention_dp=enable_dp,
+        gpus_per_node=gpus_per_node,
+    )
+    mapping.rank = mpi_rank()
+    return mapping
+
+
+def _create_routing_method(
+    routing_method_cls,
+    top_k: int,
+    num_experts: int,
+    bias_dtype: torch.dtype,
+    profile_model_config: MoeModelConfig,
+):
+    """Create a routing-method instance mirroring ``test_moe_module._create_routing_method``."""
+    if routing_method_cls in (RenormalizeMoeRoutingMethod, DefaultMoeRoutingMethod):
+        return routing_method_cls(top_k=top_k, force_enable_pytorch_op=True)
+
+    if routing_method_cls in (RenormalizeNaiveMoeRoutingMethod, Llama4RenormalizeMoeRoutingMethod):
+        return routing_method_cls(top_k=top_k)
+
+    if routing_method_cls is DeepSeekV3MoeRoutingMethod:
+        n_group, topk_group = resolve_deepseek_group_config(profile_model_config)
+        e_score_correction_bias = torch.zeros(num_experts, dtype=bias_dtype, device="cuda")
+        return routing_method_cls(
+            top_k=top_k,
+            n_group=n_group,
+            topk_group=topk_group,
+            routed_scaling_factor=1.0,
+            callable_e_score_correction_bias=lambda: e_score_correction_bias,
+            is_fused=True,
+        )
+
+    if routing_method_cls is MiniMaxM2MoeRoutingMethod:
+        e_score_correction_bias = torch.zeros(num_experts, dtype=bias_dtype, device="cuda")
+        return routing_method_cls(
+            top_k=top_k,
+            num_experts=num_experts,
+            callable_e_score_correction_bias=lambda: e_score_correction_bias,
+        )
+
+    if routing_method_cls is SigmoidRenormMoeRoutingMethod:
+        return routing_method_cls(top_k=top_k, num_experts=num_experts)
+
+    return routing_method_cls(top_k=top_k)
+
+
+def _build_pretrained_config(
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    dtype: torch.dtype,
+    n_shared_experts: int = 0,
+) -> PretrainedConfig:
+    """Construct a HF-style ``PretrainedConfig`` for ``ConfigurableMoE``."""
+    pc = PretrainedConfig()
+    pc.num_experts = num_experts
+    pc.hidden_size = hidden_size
+    pc.intermediate_size = intermediate_size
+    pc.torch_dtype = dtype
+    # TRTLLMGenFusedMoE reads ``n_shared_experts`` off the pretrained config to
+    # decide num_fused_shared_expert (shared-expert fusion). Keep it at 0 unless
+    # explicitly requested so non-fusion cases are unaffected.
+    pc.n_shared_experts = n_shared_experts
+    return pc
+
+
+def _build_model_config(
+    *,
+    model: ModelSpec,
+    mapping: Mapping,
+    moe_backend: str,
+    use_cuda_graph: bool,
+    max_num_tokens: int,
+    use_low_precision_moe_combine: bool,
+    dtype: torch.dtype,
+) -> ModelConfig:
+    """Build ``ModelConfig`` plumbed into ``create_moe``."""
+    # In "unfused" mode the routed MoE must NOT fuse the shared experts (a separate
+    # GatedMLP is built and summed in build.py instead), so the fused count is 0.
+    fused_n_shared = model.n_shared_experts if model.shared_expert_mode != "unfused" else 0
+    pretrained_config = _build_pretrained_config(
+        model.num_experts,
+        model.hidden_size,
+        model.intermediate_size,
+        dtype,
+        n_shared_experts=fused_n_shared,
+    )
+
+    quant_algo = model.quant_algo_enum
+    quant_config = (
+        QuantConfig(quant_algo=None) if quant_algo is None else QuantConfig(quant_algo=quant_algo)
+    )
+
+    return ModelConfig(
+        pretrained_config=pretrained_config,
+        mapping=mapping,
+        quant_config=quant_config,
+        moe_backend=moe_backend,
+        moe_disable_finalize_fusion=False,
+        max_num_tokens=max(int(max_num_tokens), 1),
+        use_cuda_graph=use_cuda_graph,
+        use_low_precision_moe_combine=use_low_precision_moe_combine,
+    )

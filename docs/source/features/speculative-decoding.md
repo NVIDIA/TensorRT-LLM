@@ -28,7 +28,7 @@ llm = LLM("/path/to/target_model", speculative_config=speculative_config, disabl
 ### EAGLE 3
 
 The EAGLE 3 algorithm is described in the paper [EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test](https://arxiv.org/pdf/2503.01840).
-TRT-LLM supports a modified version of the algorithm presented in the paper: tree structures for draft sequences are not supported. Instead, each request uses a single sequence of draft tokens with length `max_draft_len`.
+By default, each request uses a single sequence (linear chain) of draft tokens with length `max_draft_len`. Optionally, dynamic tree draft generation can be enabled to improve acceptance rates — see [Dynamic Tree Mode](#dynamic-tree-mode) below.
 
 The following draft model checkpoints can be used for EAGLE 3:
 * Llama 3 variants: [use the checkpoints from the authors of the original EAGLE 3 paper](https://huggingface.co/yuhuili).
@@ -49,6 +49,36 @@ llm = LLM(model, speculative_config=speculative_config)
 ```
 
 EAGLE 3 can be combined with the [Suffix Automaton enhancement](#suffix-automaton-sa-enhancement) for improved acceptance rates on repetitive content. See the SA section below for details.
+
+#### Dynamic Tree Mode
+
+Dynamic tree mode enables tree-structured draft generation for EAGLE 3, where the drafter expands multiple candidate tokens at each layer instead of a single token. This can improve acceptance rates compared to linear drafting at the cost of additional compute per generation step.
+
+To enable dynamic tree mode, set `use_dynamic_tree=True` on the `Eagle3DecodingConfig` and provide the following parameters:
+
+* `use_dynamic_tree` (`bool`): Enables dynamic tree draft generation.
+* `dynamic_tree_max_topK` (`int`): Maximum number of tokens to expand per node at each draft layer.
+* `max_total_draft_tokens` (`int`, optional): Total draft token budget for the tree. Must satisfy `max_draft_len <= max_total_draft_tokens <= dynamic_tree_max_topK * max_draft_len`. Defaults to `dynamic_tree_max_topK * max_draft_len` if not set.
+
+When `use_dynamic_tree=True`, the dynamic tree CUDA buffers are pre-allocated based on the `LLM`'s `max_batch_size`, which is propagated internally and must not be passed directly to `Eagle3DecodingConfig`.
+
+```python
+from tensorrt_llm.llmapi import Eagle3DecodingConfig
+
+speculative_config = Eagle3DecodingConfig(
+    max_draft_len=6,
+    speculative_model="yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
+    use_dynamic_tree=True,
+    dynamic_tree_max_topK=10,
+    max_total_draft_tokens=60,
+)
+
+llm = LLM("/path/to/target_model", speculative_config=speculative_config)
+```
+
+```{note}
+Dynamic tree mode is currently **not supported** for models that use sliding window attention or MLA (Multi-Latent Attention), such as DeepSeek and gpt-oss models.
+```
 
 ### NGram
 
@@ -73,7 +103,7 @@ llm = LLM("/path/to/target_model", speculative_config=speculative_config, disabl
 
 ### MTP
 
-MTP is currently only supported by Deepseek. MTP can be tuned with the following configuration options:
+MTP is supported by DeepSeek models and other architectures that ship native MTP modules, including Qwen3.8 MoE, Qwen3.5 MoE, and Step-3.x. MTP can be tuned with the following configuration options:
 
 * `max_draft_len`: Maximum draft candidate length.
 * `num_nextn_predict_layers`: Number of MTP modules to use. Currently must match `max_draft_len`.
@@ -84,8 +114,7 @@ MTP is currently only supported by Deepseek. MTP can be tuned with the following
 ```python
 from tensorrt_llm.llmapi import MTPDecodingConfig
 
-speculative_config = MTPDecodingConfig(
-    max_draft_len=3, num_nextn_predict_layers=3)
+speculative_config = MTPDecodingConfig(max_draft_len=3)
 
 llm = LLM("/path/to/deepseek_model", speculative_config=speculative_config)
 ```
@@ -113,11 +142,37 @@ llm = LLM("/path/to/target_model", speculative_config=speculative_config)
 
 PARD can be combined with the [Suffix Automaton enhancement](#suffix-automaton-sa-enhancement) for improved acceptance rates on repetitive content. See the SA section below for details.
 
+### DFlash
+
+DFlash is a target-dependent speculative decoding method that uses hidden states from specific target model layers as cross-attention context in the draft model to predict multiple draft tokens in parallel.
+
+Reference: [DFlash: Distilled Flash Speculative Decoding](https://arxiv.org/pdf/2602.06036)
+
+* `max_draft_len`: Maximum draft candidate length.
+* `speculative_model`: Path or HuggingFace model ID for the DFlash draft model.
+* `mask_token_id`: Token ID used as the mask token for parallel prediction. If not set, it is read from the draft model config.
+* `target_layer_ids`: List of target model layer indices whose hidden states are captured for cross-attention in the draft model. If not set, read from the draft model config.
+* `attention_backend`: Cross-attention backend for the draft model, independent of the drafter's standard attention modules. `"VANILLA"` (the default) uses FlashAttention with a contiguous context K/V cache and runs anywhere. `"TRTLLM"` uses TRTLLM-Gen FMHA (via FlashInfer) over a private paged context K/V cache and supports SM100/SM103 only. `"FA4"` uses the flash-attn CuTe DSL kernels on the same paged cache and supports SM90 only.
+
+```python
+from tensorrt_llm.llmapi import DFlashDecodingConfig
+
+speculative_config = DFlashDecodingConfig(
+    max_draft_len=4,
+    speculative_model="/path/to/dflash_model",
+    attention_backend="TRTLLM",
+)
+
+llm = LLM("/path/to/target_model", speculative_config=speculative_config)
+```
+
+[DFlash 2](https://inco.ai/blog/dflash2/) is also supported. The same `DFlashDecodingConfig` can be used for DFlash 2; no extra arguments are required.
+
 ### User-provided drafting
 A completely user-defined drafting method can be supplied with a `UserProvidedDecodingConfig` that includes
 * `max_draft_len`: Maximum draft candidate length.
-* `drafter`: An object of type `Drafter` that implements the `prepare_draft_tokens` method (see [Developer Guide](speculative-decoding.md#developer-guide) 7.)
-* `resource_manager`: An optional `ResourceManager` object (see [Developer Guide](speculative-decoding.md#developer-guide) 4.)
+* `drafter`: An object of type `Drafter` that implements the `prepare_draft_tokens` method (see [User-provided drafting](speculative-decoding.md#user-provided-drafting) 7.)
+* `resource_manager`: An optional `ResourceManager` object (see [User-provided drafting](speculative-decoding.md#user-provided-drafting) 4.)
 
 ```python
 from tensorrt_llm.llmapi import UserProvidedDecodingConfig
@@ -177,6 +232,7 @@ Speculative decoding options must be specified via `--config config.yaml` for bo
 * `NGram`
 * `DraftTarget`
 * `PARD`
+* `DFlash`
 * `SA`
 
 > Note: The PyTorch backend supports only `Eagle3`. `decoding_type: Eagle` is accepted as a backward-compatible alias for `Eagle3`, but EAGLE (v1/v2) draft checkpoints are incompatible.
@@ -197,6 +253,18 @@ speculative_config:
   decoding_type: Eagle3
   max_draft_len: 4
   speculative_model: /path/to/draft/model
+```
+
+```yaml
+# Dynamic tree mode
+speculative_config:
+  decoding_type: Eagle3
+  max_draft_len: 6
+  speculative_model: /path/to/eagle3_model
+  use_dynamic_tree: true
+  dynamic_tree_max_topK: 10
+  max_total_draft_tokens: 60
+  max_batch_size: 4
 ```
 
 ```yaml

@@ -190,17 +190,13 @@ generate_cu_trtllm = os.environ.get('GENERATE_CU_TRTLLM',
                                     'False').lower() == 'true'
 
 ns_open = r"""
-namespace tensorrt_llm
-{
-namespace kernels
-{
+namespace tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels {
 // clang-format off
 """ if generate_cu_trtllm else ""
 
 ns_close = r"""
 // clang-format on
-} // namespace kernels
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels
 """ if generate_cu_trtllm else ""
 
 copyright = '''\
@@ -1937,7 +1933,7 @@ void {launcher_name}(
         size_t m_steps = size_t((params.s + {loop_step} * NUM_COMPUTE_GROUPS - 1) / ({loop_step} * NUM_COMPUTE_GROUPS));
 
         // 2 * {bytes_per_elt} stands for kv cache and {bytes_per_elt} bytes per element.
-        size_t size_in_bytes = block_size.y * params.s * params.d * 2 * {bytes_per_elt};
+        size_t size_in_bytes = static_cast<size_t>(block_size.y) * params.s * params.d * 2 * {bytes_per_elt};
         if( size_in_bytes <= launch_params.device_l2_cache_size ) {{
             // strategy 1: limit to only 1 wave
             block_size.x = std::min(m_steps, sms_per_head);
@@ -1954,7 +1950,7 @@ void {launcher_name}(
         params.num_tiles = static_cast<uint32_t>(m_steps * params.b * params.h);
         if (launch_params.attention_mask_type == Attention_mask_type::CAUSAL) {{
             // 2 * {bytes_per_elt} stands for kv cache and {bytes_per_elt} bytes per element.
-            size_t size_in_bytes = params.b * params.h * params.s * params.d * 2 * {bytes_per_elt};
+            size_t size_in_bytes = static_cast<size_t>(params.b) * params.h * params.s * params.d * 2 * {bytes_per_elt};
             params.use_balanced_scheduling = (size_in_bytes <= launch_params.device_l2_cache_size);
         }}
 
@@ -2092,7 +2088,7 @@ def encode_name(kernel_spec):
     # Produce file, launch function and kernel names.
     fname = name_base.replace('__placeholder__', '')
     if seqlen >= 1024 and not kernel_spec.flash_attention:
-        fname += '.no_i2f_f2i'
+        fname += '_no_i2f_f2i'
     fname += '.cu'
     lname = ('run_' + name_base).replace('__placeholder__', '')
     kname = name_base + '_kernel'
@@ -2398,7 +2394,10 @@ def get_kernel_code(kspec, kname, lname):
     params_str = 'reinterpret_cast<bert::Fused_multihead_attention_params_v2 &>(params)' if generate_cu_trtllm else 'params'
     attn_mask_type_str = 'using Attention_mask_type = ContextAttentionMaskType;' if generate_cu_trtllm else 'using Attention_mask_type = fmha::Attention_mask_type;'
     bert_launch_params = '' if generate_cu_trtllm else 'using Launch_params = bert::Fused_multihead_attention_launch_params;'
-    include_str = '#include "../fused_multihead_attention_common.h"\n' if generate_cu_trtllm else ''
+    # No "../" prefix: the generated .cu may live outside the source tree
+    # (TRTLLM_FMHA_GEN_DIR); the consuming CMake target puts the
+    # contextFusedMultiHeadAttention directory on the include path.
+    include_str = '#include "fused_multihead_attention_common.h"\n' if generate_cu_trtllm else ''
     include_str += '#include "tensorrt_llm/common/config.h"' if generate_cu_trtllm else ''
     num_compute_groups_str = '' if generate_cu_trtllm else 'static constexpr int NUM_COMPUTE_GROUPS = 2;'
     fused_multihead_attention_params_v2_str = 'Fused_multihead_attention_params_v2' if generate_cu_trtllm else f'{params_type}'
@@ -3359,8 +3358,21 @@ def get_cubin_header(kernel_traits, specs_names):
                 kspec.enable_skip_softmax, mask_type):
             continue
         name = fname.replace('.', '_')
-        data = 'extern unsigned char cubin_{name}_cubin[];'.format(name=name)
-        size = 'extern uint32_t cubin_{name}_cubin_len;'.format(name=name)
+        # No `extern "C"` -- the build-time INCBIN aggregator
+        # (cpp/cmake/modules/tllm_cubin_archive.cmake +
+        # cpp/include/tensorrt_llm/common/cubinIncbin.h) emits these symbols
+        # under their C++-mangled names so they're scoped to the surrounding
+        # `tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels` namespace. That
+        # protects against multi-definition errors when two packages or two
+        # TRT-LLM ABI versions ship the same kernel set.
+        # Match the definition site emitted by TLLM_INCBIN_NS in
+        # cpp/include/tensorrt_llm/common/cubinIncbin.h:
+        #   extern unsigned char const SYMBOL[];
+        #   extern unsigned int  const SYMBOL_len;
+        data = 'extern unsigned char const cubin_{name}_cubin[];'.format(
+            name=name)
+        size = 'extern unsigned int const cubin_{name}_cubin_len;'.format(
+            name=name)
         if kspec.sm in cubins_dict:
             cubins_dict[kspec.sm].append(data)
             cubin_lens_dict[kspec.sm].append(size)
@@ -3583,12 +3595,17 @@ def get_cubin_header(kernel_traits, specs_names):
         else:
             assert False, 'Something terrible happened'
 
+    def render_sm(sm):
+        if int(sm) >= 100:
+            return f"{sm}F"
+        return sm
+
     metadata_v1 = ',\n'.join(metadata_v1)
     # Add macros to only include needed cubins during compilation.
     if bool(metadata_v2_dict):
         metadata_v2 = ''
         for sm in metadata_v2_dict.keys():
-            macro_begin = f"#ifndef EXCLUDE_SM_{sm}"
+            macro_begin = f"#ifndef EXCLUDE_SM_{render_sm(sm)}"
             macro_end = f"#endif\n\n"
             metadata_v2 += macro_begin + '\n' + (',\n'.join(
                 metadata_v2_dict[sm]))
@@ -3604,7 +3621,7 @@ def get_cubin_header(kernel_traits, specs_names):
             list(launchers_dict.keys())))
 
     for sm in all_sms:
-        macro_begin = f"#ifndef EXCLUDE_SM_{sm}"
+        macro_begin = f"#ifndef EXCLUDE_SM_{render_sm(sm)}"
         macro_end = f"#endif\n"
 
         # Add cubin array declarations
@@ -3806,7 +3823,7 @@ TRTLLM_NAMESPACE_END
 
 {local_ns_close}
 
-using namespace tensorrt_llm::kernels;
+using namespace tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels;
 
 namespace tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels {{
 
@@ -3909,12 +3926,12 @@ def modify_cubin_header(cubin_header):
     target = "#ifndef EXCLUDE_SM_80"
     addition_cubin_array = """
 #ifndef EXCLUDE_SM_80
-extern unsigned char cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin[];
+extern unsigned char const cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin[];
 #endif
 """
     addition_cubin_length = """
 #ifndef EXCLUDE_SM_80
-extern uint32_t cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin_len;
+extern unsigned int const cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin_len;
 #endif
 """
     # Add cubin array and length into there corresponding sections.
@@ -6796,7 +6813,7 @@ def enumerate_kernels():
         enumerate_qmma_flash_kernels(specs,
                                      sm=120,
                                      dtype='e4m3_fp32',
-                                     head_sizes=[128, 192, 576],
+                                     head_sizes=[64, 128, 192, 256, 576],
                                      output_dtype="bf16")
 
     if 'ENABLE_HMMA_FP32' in os.environ:

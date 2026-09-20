@@ -22,11 +22,19 @@ vice versa.
 Imported by tensorrt_llm.llmapi.llm_args for use in BaseLlmArgs.
 """
 
+from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
-from pydantic import Field
+from pydantic import BaseModel, ConfigDict, Field
 
-from tensorrt_llm.llmapi.utils import StrictBaseModel
+
+class _StrictUsageBaseModel(BaseModel):
+    """Strict usage-local base. Same extra=forbid contract as llmapi StrictBaseModel."""
+
+    # Keep usage import light. Do not import llmapi.utils here: it pulls torch
+    # and HF deps. Needed contract stays same: extra fields forbidden.
+    model_config = ConfigDict(extra="forbid")
 
 
 class UsageContext(str, Enum):
@@ -37,9 +45,25 @@ class UsageContext(str, Enum):
     CLI_SERVE = "cli_serve"
     CLI_BENCH = "cli_bench"
     CLI_EVAL = "cli_eval"
+    DISAGGREGATED = "disaggregated"
 
 
-class TelemetryConfig(StrictBaseModel):
+@dataclass(frozen=True)
+class TelemetryField:
+    """Field-local opt-in metadata for LLM API config telemetry capture."""
+
+    allowed_values: tuple[Any, ...]
+
+    @classmethod
+    def categorical(cls, *allowed_values: Any) -> "TelemetryField":
+        """Allow capture only for the specified values and their exact types."""
+        return cls(allowed_values=allowed_values)
+
+    def as_json_schema_extra(self) -> dict[str, Any]:
+        return {"allowed_values": list(self.allowed_values)}
+
+
+class TelemetryConfig(_StrictUsageBaseModel):
     """Telemetry configuration for usage data collection.
 
     Controls opt-out behavior and tracks which entry point invoked TRT-LLM.

@@ -15,6 +15,7 @@
 
 add_gtest(cudaProfilerUtilsTest cudaProfilerUtilsTest.cpp)
 add_gtest(cudaUtilsTest cudaUtilsTest.cpp)
+add_gtest(attentionWorkspaceTest attentionWorkspaceTest.cpp)
 add_gtest(memoryUtilsTest memoryUtilsTest.cu)
 add_gtest(optionalRefTest optionalRefTest.cpp)
 add_gtest(quantizationTest quantizationTest.cpp)
@@ -23,3 +24,4 @@ add_gtest(stringUtilsTest stringUtilsTest.cpp)
 add_gtest(timestampUtilsTest timestampUtilsTest.cpp)
 add_gtest(tllmExceptionTest tllmExceptionTest.cpp)
 add_gtest(cudaDriverWrapperTest cudaDriverWrapperTest.cpp)
+add_gtest(loggerTest loggerTest.cpp)

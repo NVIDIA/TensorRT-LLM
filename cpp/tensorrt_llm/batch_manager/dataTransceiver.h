@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,15 +19,18 @@
 #include <fstream>
 #include <future>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include "tensorrt_llm/batch_manager/baseTransBuffer.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/cacheTransferLayer.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/cacheCommunicator.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
@@ -119,7 +122,7 @@ public:
 
     void recv(size_t idx, void* data, size_t size);
 
-    [[nodiscard]] LlmRequest const& getLlmRequest() const;
+    [[nodiscard]] std::optional<LlmRequest const*> getLlmRequest() const;
 
     // in CacheSender, the LlmRequest is not available until the sendSync is called
     void setLlmRequest(LlmRequest const& llmRequest);
@@ -127,6 +130,20 @@ public:
     void setTime(TimeNames name);
 
     void appendMeasure(LlmRequest::TimePoint start, LlmRequest::TimePoint end, size_t size);
+
+    /// @brief Transfer ownership of pre-assigned receive buffers to this session.
+    void setReservedRecvBuffers(std::vector<BufferIndexHolder> holders);
+
+    [[nodiscard]] bool hasReservedRecvBuffer(BaseTransBufferManager const& manager) const noexcept;
+
+    /// @brief Release one formatter's pre-assigned buffer after its receive and postprocessing complete.
+    bool releaseReservedRecvBuffer(BaseTransBufferManager const& manager) noexcept;
+
+    /// @brief Release all pre-assigned receive buffers after the full receive pipeline completes.
+    void releaseReservedRecvBuffers() noexcept;
+
+    /// @brief Fail closed when receive-buffer quiescence cannot be established.
+    void poisonReservedRecvBuffers() noexcept;
 
     // TODO: 1. use global id instead of context request id; 2. export to llm metrics instead of file
     void exportMeasure(std::ofstream& outFile, bool isContext) const;
@@ -160,6 +177,7 @@ private:
     runtime::BufferManager const* mBufferManager;
     LlmRequest const* mRequest;
     std::unique_ptr<KVCacheTimes> mTimes;
+    std::vector<BufferIndexHolder> mReservedRecvBuffers;
     int32_t mIndexFromEnd{0};
     BlockKey mLastBlockKey{};
 };
@@ -217,6 +235,17 @@ public:
         return mLastBlockKey;
     }
 
+    /// @brief Arbitrary (llmRequest-agnostic) transfer served from the sender's reuse tree.
+    [[nodiscard]] bool isArbitraryTransfer() const noexcept
+    {
+        return mIsArbitraryTransfer;
+    }
+
+    void setIsArbitraryTransfer(bool isArbitraryTransfer) noexcept
+    {
+        mIsArbitraryTransfer = isArbitraryTransfer;
+    }
+
     /// @brief Serialization.
     /// @param requestInfo Request information to be serialized.
     /// @param os The output stream to which the serialization result points.
@@ -240,6 +269,9 @@ private:
     // Last block key, used to derive other block keys on receiver
     BlockKey mLastBlockKey{};
 
+    // True for arbitrary (llmRequest-agnostic) transfers served from the sender's reuse tree.
+    bool mIsArbitraryTransfer{false};
+
     // The state of the data transceiver.
     executor::DataTransceiverState mTransState;
 };
@@ -251,15 +283,16 @@ public:
     /// @param manager The connection manager.
     /// @param selfIndex The sequential index of the current executor process.
     /// @param cacheLayer The cache layer bundling all cache states and formatters.
-    CacheSender(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer);
+    CacheSender(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer,
+        std::string instanceId = "");
 
     CacheSender() = default;
 
     /// @brief Asynchronously respond to the request and send data.
-    /// @param llmRequest Request object. Its data should be ready when called, and the data for this request
-    /// should remain valid until future synchronization.
+    /// @param llmRequest Request object. Its data should be ready when called. shared_ptr so the async send
+    /// worker can extend the request's lifetime past the caller's reference.
     /// @return Once the data is fully sent, the future object will become valid.
-    [[nodiscard]] virtual std::future<void> sendAsync(LlmRequest& llmRequest) const;
+    [[nodiscard]] virtual std::future<void> sendAsync(std::shared_ptr<LlmRequest> const& llmRequest) const;
 
     /// @brief Return the internal communicator status.
     /// @return The communicator status.
@@ -287,6 +320,12 @@ public:
     /// @param isReady Whether the request is ready to be received.
     virtual void sendReadySignal(LlmRequest::RequestIdType requestId, bool isReady);
 
+    /// @brief Update the RNN config on the internal CacheState copies.
+    /// Used by CppMambaHybridCacheManager path where RNN config is set after construction.
+    void setRnnConfig(executor::kv_cache::CacheState::RnnModelConfig rnnModelConfig,
+        std::vector<SizeType32> rnnLayerNumPerPP, tensorrt_llm::DataType convStateDataType,
+        tensorrt_llm::DataType ssmStateDataType);
+
     /// @brief Destructor.
     virtual ~CacheSender();
 
@@ -308,15 +347,16 @@ public:
     /// @param manager The connection manager.
     /// @param selfIndex The sequential index of the current executor process.
     /// @param cacheLayer The cache layer bundling all cache states and formatters.
-    CacheReceiver(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer);
+    CacheReceiver(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer,
+        std::string instanceId = "");
 
     CacheReceiver() = default;
 
     /// @brief Asynchronously send a request to receive data.
-    /// @param llmRequest Request object. Its data should be in an allocated but unwritten state when called, and the
-    /// data for this request should remain intact only after future synchronization.
+    /// @param llmRequest Request object. Its data should be in an allocated but unwritten state when called.
+    /// shared_ptr so the async receive worker can extend the request's lifetime past the caller's reference.
     /// @return Once the data is fully received, the future object will become valid.
-    [[nodiscard]] virtual std::future<void> receiveAsync(LlmRequest& llmRequest) const;
+    [[nodiscard]] virtual std::future<void> receiveAsync(std::shared_ptr<LlmRequest> const& llmRequest) const;
 
     virtual TransferSession sendRequestInfo(LlmRequest const& llmRequest);
 
@@ -331,6 +371,12 @@ public:
     /// @param session The session object.
     /// @return Whether the request is ready to be received.
     virtual bool receiveReadySignal(TransferSession& session);
+
+    /// @brief Update the RNN config on the internal CacheState copies.
+    /// Used by CppMambaHybridCacheManager path where RNN config is set after construction.
+    void setRnnConfig(executor::kv_cache::CacheState::RnnModelConfig rnnModelConfig,
+        std::vector<SizeType32> rnnLayerNumPerPP, tensorrt_llm::DataType convStateDataType,
+        tensorrt_llm::DataType ssmStateDataType);
 
     /// @brief Destructor.
     virtual ~CacheReceiver();
