@@ -54,13 +54,11 @@ add_library(
   asyncUlyssesOp.cpp
   attentionOp.cpp
   causalConv1dOp.cpp
-  moe/cuteDsl/cuteDslMoeUtilsOp.cpp
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
   cublasFp4ScaledMM.cpp
   cudaNvfp4MM.cpp
   marlinNvfp4MM.cpp
-  moe/marlin/marlinNvfp4MoeMM.cpp
   marlinRepack.cpp
   cudaScaledMM.cpp
   fmhaPackMaskOp.cpp
@@ -100,20 +98,8 @@ add_library(
   llama4MinLatency.cpp
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
-  moe/cutlass/moeOp.cpp
-  moe/utils/moeUtilOp.cpp
-  moe/routing/moeGateOp.cpp
-  moe/communication/moeCommOp.cpp
-  moe/communication/moeAlltoAllOp.cpp
-  moe/loadBalance/moeLoadBalanceOp.cpp
-  moe/utils/moeAlignOp.cpp
-  moe/communication/megaMoePrepareOp.cpp
-  moe/trtllmGen/mxFp4BlockScaleMoe.cpp
   mxFp8Quantize.cpp
   mxfp8Gemm.cpp
-  moe/trtllmGen/fp8BlockScaleMoe.cpp
-  moe/trtllmGen/fp8PerTensorScaleMoe.cpp
-  moe/trtllmGen/fp4BlockScaleMoe.cpp
   noAuxTcOp.cpp
   fusedCatFp4Op.cpp
   fusedCatFp8Op.cpp
@@ -130,7 +116,6 @@ add_library(
   reducescatterOp.cpp
   relativeAttentionBiasOp.cpp
   dsv3RouterGemmOp.cpp
-  moe/routing/customMoeRoutingOp.cpp
   localityDomainAllocator.cpp
   mamba2MTPSSMCacheOp.cpp
   selectiveScanOp.cpp
@@ -153,6 +138,10 @@ add_library(
   inplaceSliceCopyOp.cpp
   mhcOp.cpp
   compressorOp.cpp)
+
+# MoE torch ops live in moe/<backend|role>/; that directory adds them to
+# th_common with target_sources() so the list stays next to the files.
+add_subdirectory(moe)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_target_properties(th_common PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
                                                            ON)
