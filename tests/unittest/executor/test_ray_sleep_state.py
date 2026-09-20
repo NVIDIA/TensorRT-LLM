@@ -65,8 +65,10 @@ def test_ray_worker_publishes_persistent_admission_transition(method, operation)
     getattr(worker.engine, f"begin_{method}_transition").assert_called_once()
     getattr(worker.engine, f"complete_{method}_transition").assert_called_once_with()
     if method == "sleep":
+        worker.engine.validate_sleep_tags.assert_called_once()
         worker.engine.invalidate_v1_prefix_cache_for_sleep.assert_called_once()
     else:
+        worker.engine.validate_sleep_tags.assert_not_called()
         worker.engine.invalidate_v1_prefix_cache_for_sleep.assert_not_called()
 
 

@@ -625,6 +625,11 @@ class BaseWorker(GenerationExecutor):
                 "Sleep feature is not enabled, please set sleep_config in "
                 "the LLM arguments.")
 
+    def _validate_sleep_tags(self, tags: list[ExecutorMemoryType]) -> None:
+        validator = getattr(self.engine, "validate_sleep_tags", None)
+        if validator is not None:
+            validator(tags)
+
     def _invalidate_v1_prefix_cache_for_sleep(
             self, tags: list[ExecutorMemoryType]) -> None:
         invalidator = getattr(self.engine,
@@ -1012,6 +1017,7 @@ class BaseWorker(GenerationExecutor):
         tags = self._prepare_sleep_tags(tags)
         if not tags:
             return
+        self._validate_sleep_tags(tags)
         logger.info(f"Sleep: {tags}")
         self.engine.begin_sleep_transition(tags)
         local_mutation_started = False

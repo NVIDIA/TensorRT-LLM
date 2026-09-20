@@ -8395,6 +8395,13 @@ class PyExecutor:
         if self.enable_joint_kv_cache_reuse:
             self.draft_kv_cache_manager.reset_reuse_state()
 
+    def validate_sleep_tags(self, tags: List[ExecutorMemoryType]) -> None:
+        """Reject runtime-memory tags unsupported by the active KV manager."""
+        if (self._is_kv_manager_v2 and ExecutorMemoryType.KV_CACHE in tags):
+            raise ValueError(
+                "KV_CACHE sleep is not supported with KVCacheManagerV2 because "
+                "its main pools are not managed by tagged virtual memory.")
+
     def invalidate_v1_prefix_cache_for_sleep(
             self, tags: List[ExecutorMemoryType]) -> None:
         """Invalidate V1 reuse metadata before destructive KV-cache sleep."""
