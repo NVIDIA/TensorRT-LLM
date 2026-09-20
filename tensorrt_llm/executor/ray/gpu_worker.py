@@ -326,6 +326,7 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         try:
             torch.cuda.synchronize()
             mutation_started = True
+            self._invalidate_v1_prefix_cache_for_sleep(tags)
             release_with_tag(*tags)
             torch.cuda.synchronize()
             gc.collect()
