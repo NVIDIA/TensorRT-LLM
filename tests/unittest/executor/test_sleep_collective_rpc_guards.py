@@ -58,8 +58,38 @@ def _make_worker(backend="pytorch", world_size=1, sleep_config=_SLEEP_CONFIG_DEF
         complete_wakeup_transition=MagicMock(),
         abort_wakeup_transition=MagicMock(),
         fail_sleep_wakeup_transition=MagicMock(),
+        invalidate_v1_prefix_cache_for_sleep=MagicMock(),
     )
     return w
+
+
+class TestV1PrefixCacheInvalidation:
+    @pytest.mark.parametrize(
+        "use_v2,enable_reuse,tags,restore_mode,should_reset",
+        [
+            (False, True, ["kv_cache"], "NONE", True),
+            (False, True, ["kv_cache"], "MEMSET", True),
+            (False, True, ["kv_cache"], "CPU", False),
+            (False, True, ["model"], "NONE", False),
+            (True, True, ["kv_cache"], "NONE", False),
+            (False, False, ["kv_cache"], "NONE", False),
+        ],
+    )
+    def test_invalidation_conditions(self, use_v2, enable_reuse, tags, restore_mode, should_reset):
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
+
+        executor = object.__new__(PyExecutor)
+        executor._is_kv_manager_v2 = use_v2
+        executor.enable_kv_cache_reuse = enable_reuse
+        executor.llm_args = SimpleNamespace(
+            sleep_config=SleepConfig(restore_modes={ExecutorMemoryType.KV_CACHE: restore_mode})
+        )
+        executor.reset_prefix_cache = MagicMock()
+
+        executor.invalidate_v1_prefix_cache_for_sleep([ExecutorMemoryType(tag) for tag in tags])
+
+        assert executor.reset_prefix_cache.called is should_reset
 
 
 def _make_proxy(cls_name, model_world_size=1, rpc_client=None):
@@ -1223,6 +1253,8 @@ class TestListenerUncaughtExceptionSendsErrorAck:
         executor.control_request_barrier.set()
         executor.control_action_done = threading.Event()
         executor._active_control_id = None
+        executor._is_kv_manager_v2 = False
+        executor.enable_kv_cache_reuse = False
 
         with (
             patch("torch.cuda.set_device"),
@@ -1638,6 +1670,7 @@ class TestSingleRankLockAcquired:
             complete_wakeup_transition=MagicMock(),
             abort_wakeup_transition=MagicMock(),
             fail_sleep_wakeup_transition=MagicMock(),
+            invalidate_v1_prefix_cache_for_sleep=MagicMock(),
         )
 
         with (
@@ -1650,6 +1683,10 @@ class TestSingleRankLockAcquired:
             getattr(w, method)(["kv_cache"])
 
         assert lock_entered, f"{method}() with world_size=1 did not acquire _sleep_wakeup_lock"
+        if method == "sleep":
+            w.engine.invalidate_v1_prefix_cache_for_sleep.assert_called_once()
+        else:
+            w.engine.invalidate_v1_prefix_cache_for_sleep.assert_not_called()
 
     @pytest.mark.parametrize(
         ("method", "mutation"),
