@@ -19,8 +19,6 @@ import pytest
 
 from tensorrt_llm.executor.ray.gpu_worker import RayGPUWorker
 
-pytestmark = pytest.mark.cpu_only
-
 
 class _Args:
     sleep_config = object()
