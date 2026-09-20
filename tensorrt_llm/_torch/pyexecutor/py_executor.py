@@ -2907,6 +2907,19 @@ class PyExecutor:
                                 batch_outputs = self._forward_step(
                                     scheduled_batch)
 
+                            if batch_outputs is None:
+                                # _forward_step hit an exception; _handle_errors
+                                # already responded to the affected requests.
+                                # Under pipeline parallelism the peer ranks are
+                                # inside inter-PP communication for this
+                                # microbatch and cannot skip it in lockstep, so
+                                # the iteration is not survivable here; raise an
+                                # explicit fatal instead of the opaque TypeError
+                                # from dereferencing batch_outputs['logits'].
+                                raise RuntimeError(
+                                    "model forward failed on the last PP rank; "
+                                    "see the preceding forward error")
+
                             guided_decoder_failed_requests = None
                             if self.guided_decoder is not None:
                                 self.guided_decoder.add_batch(scheduled_batch)
@@ -4413,75 +4426,86 @@ class PyExecutor:
                                 self.dwdp_manager.prefetch_first_layers()
                             batch_outputs = self._forward_step(scheduled_batch)
 
-                        self._maybe_prefetch_next_iter_mm_encoders(
-                            scheduled_batch)
+                        # A None means _forward_step hit an exception and
+                        # _handle_errors already failed the affected requests
+                        # and enqueued (or buffered, under attention DP) their
+                        # error responses. A non-fatal forward error is meant
+                        # to be survivable, so skip this iteration's sampling
+                        # and bookkeeping instead of dereferencing
+                        # batch_outputs['logits'] and taking down every rank.
+                        if batch_outputs is not None:
+                            self._maybe_prefetch_next_iter_mm_encoders(
+                                scheduled_batch)
 
-                        guided_decoder_failed_requests = None
-                        if self.guided_decoder is not None:
-                            guided_decoder_failed_requests = self.guided_decoder.execute(
-                                batch_outputs['logits'])
+                            guided_decoder_failed_requests = None
+                            if self.guided_decoder is not None:
+                                guided_decoder_failed_requests = self.guided_decoder.execute(
+                                    batch_outputs['logits'])
 
-                        with self.perf_manager.record_perf_events(
-                                None, gpu_sample_end) as sample_timing:
-                            sample_state = self._sample_async(
-                                scheduled_batch, batch_outputs)
+                            with self.perf_manager.record_perf_events(
+                                    None, gpu_sample_end) as sample_timing:
+                                sample_state = self._sample_async(
+                                    scheduled_batch, batch_outputs)
 
-                    if self.perf_manager.enabled:
-                        self.perf_manager.save_timing_to_requests(
-                            scheduled_batch.all_requests(), gpu_forward_start,
-                            gpu_forward_end, gpu_sample_end,
-                            fwd_timing.start_time, fwd_timing.end_time,
-                            sample_timing.start_time, sample_timing.end_time)
+                    if batch_outputs is not None:
+                        if self.perf_manager.enabled:
+                            self.perf_manager.save_timing_to_requests(
+                                scheduled_batch.all_requests(),
+                                gpu_forward_start, gpu_forward_end,
+                                gpu_sample_end, fwd_timing.start_time,
+                                fwd_timing.end_time, sample_timing.start_time,
+                                sample_timing.end_time)
 
-                    # Handle guided decoder errors after _sample_async to avoid state conflicts.
-                    # If called before, failed requests would be marked as GENERATION_COMPLETE,
-                    # causing _sample_async to fail when accessing context_chunk_size property.
-                    self._handle_guided_decoder_errors(
-                        scheduled_batch, guided_decoder_failed_requests)
+                        # Handle guided decoder errors after _sample_async to avoid state conflicts.
+                        # If called before, failed requests would be marked as GENERATION_COMPLETE,
+                        # causing _sample_async to fail when accessing context_chunk_size property.
+                        self._handle_guided_decoder_errors(
+                            scheduled_batch, guided_decoder_failed_requests)
 
-                    # Handle SaveHiddenStates mode - save hidden states after forward
-                    if not self.is_warmup:
-                        spec_resource_mgr = self.resource_manager.resource_managers.get(
-                            ResourceManagerType.SPEC_RESOURCE_MANAGER)
-                        if spec_resource_mgr is not None and hasattr(
-                                spec_resource_mgr, 'process_and_save'):
-                            spec_metadata = getattr(self.model_engine,
-                                                    'spec_metadata', None)
-                            spec_resource_mgr.process_and_save(
-                                scheduled_batch, spec_metadata)
+                        # Handle SaveHiddenStates mode - save hidden states after forward
+                        if not self.is_warmup:
+                            spec_resource_mgr = self.resource_manager.resource_managers.get(
+                                ResourceManagerType.SPEC_RESOURCE_MANAGER)
+                            if spec_resource_mgr is not None and hasattr(
+                                    spec_resource_mgr, 'process_and_save'):
+                                spec_metadata = getattr(self.model_engine,
+                                                        'spec_metadata', None)
+                                spec_resource_mgr.process_and_save(
+                                    scheduled_batch, spec_metadata)
 
-                    self._update_request_states(scheduled_batch)
-                    self._update_requests(sample_state, self.resource_manager)
-                    if self.speculation_gate is not None:
-                        self._update_batch_acceptance_rate(
-                            scheduled_batch,
-                            sample_state,
-                            iteration_id=self.iter_counter)
+                        self._update_request_states(scheduled_batch)
+                        self._update_requests(sample_state,
+                                              self.resource_manager)
+                        if self.speculation_gate is not None:
+                            self._update_batch_acceptance_rate(
+                                scheduled_batch,
+                                sample_state,
+                                iteration_id=self.iter_counter)
 
-                    if self._is_kv_manager_v2:
-                        # Finalize V2 context KV before disagg transfer/response
-                        # handling can terminate the request.
-                        self._update_v2_context_resources(scheduled_batch)
-                    self._send_kv_async(scheduled_batch.all_requests())
+                        if self._is_kv_manager_v2:
+                            # Finalize V2 context KV before disagg transfer/response
+                            # handling can terminate the request.
+                            self._update_v2_context_resources(scheduled_batch)
+                        self._send_kv_async(scheduled_batch.all_requests())
 
-                    self._handle_canceled_requests()
-                    finished_requests = self._handle_responses()
-                    # Complete ctx send sessions AFTER responses are created so
-                    # _handle_responses sees the request before it is terminated.
-                    self.disagg.reap_context_sends(0)
-                    # Compute GPU times after _handle_responses creates metric entries
-                    # (safe in non-overlap mode: no next iteration to overwrite events)
-                    self.perf_manager.compute_batch_gpu_times(
-                        scheduled_batch.all_requests())
-                    attn_metadata = getattr(self.model_engine, 'attn_metadata',
-                                            None)
-                    kv_cache_dtype_byte_size = getattr(
-                        self.model_engine, 'kv_cache_dtype_byte_size', None)
-                    self.resource_manager.update_resources(
-                        scheduled_batch, attn_metadata,
-                        kv_cache_dtype_byte_size)
-                    if self.enable_kv_cache_events:
-                        self._add_kv_cache_events()
+                        self._handle_canceled_requests()
+                        finished_requests = self._handle_responses()
+                        # Complete ctx send sessions AFTER responses are created so
+                        # _handle_responses sees the request before it is terminated.
+                        self.disagg.reap_context_sends(0)
+                        # Compute GPU times after _handle_responses creates metric entries
+                        # (safe in non-overlap mode: no next iteration to overwrite events)
+                        self.perf_manager.compute_batch_gpu_times(
+                            scheduled_batch.all_requests())
+                        attn_metadata = getattr(self.model_engine,
+                                                'attn_metadata', None)
+                        kv_cache_dtype_byte_size = getattr(
+                            self.model_engine, 'kv_cache_dtype_byte_size', None)
+                        self.resource_manager.update_resources(
+                            scheduled_batch, attn_metadata,
+                            kv_cache_dtype_byte_size)
+                        if self.enable_kv_cache_events:
+                            self._add_kv_cache_events()
 
                 # Drain timeout buffer outside ``if can_queue`` so the synced
                 # collective fires every iter regardless of future restructuring.
@@ -5282,7 +5306,31 @@ class PyExecutor:
                                 scheduled_batch, previous_tensors_device,
                                 num_accepted_tokens_device)
 
-                    self._maybe_prefetch_next_iter_mm_encoders(scheduled_batch)
+                    if batch_outputs is None:
+                        # _forward_step hit an exception and _handle_errors has
+                        # already failed the affected requests and enqueued (or
+                        # buffered, under attention DP) their error responses.
+                        # A non-fatal forward error is meant to be survivable,
+                        # so fall back to the empty-batch bookkeeping for the
+                        # rest of this iteration instead of dereferencing
+                        # batch_outputs['logits'] and taking down every rank.
+                        # The previous batch's requests were failed with the
+                        # rest of active_requests, so drop it rather than
+                        # updating terminated requests.
+                        can_queue = False
+                        can_queue_this_rank = False
+                        should_process_previous_batch = False
+                        self.previous_batch = None
+                        self.has_previous_draft_tokens = False
+                        target_inputs = None
+                        previous_tensors_device = None
+                        if gpu_forward_events_from_perf_pool:
+                            self.perf_manager.release_forward_timing_events(
+                                gpu_forward_start, gpu_forward_end)
+                            gpu_forward_events_from_perf_pool = False
+                    else:
+                        self._maybe_prefetch_next_iter_mm_encoders(
+                            scheduled_batch)
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._update_requests(self.previous_batch.sample_state)
@@ -5715,6 +5763,18 @@ class PyExecutor:
 
         # Check if request has enough budget
         self._validate_request_budget(request)
+
+        # Model-specific multimodal admission checks (e.g. an image whose
+        # vision-attention segment exceeds the encoder budget). The same
+        # condition raised inside the model forward is handled batch-wide and
+        # fails every request scheduled alongside the bad one; rejecting here
+        # fails only this request.
+        mm_data = getattr(request, 'py_multimodal_data', None)
+        if mm_data:
+            validate_mm = getattr(self.model_engine.model,
+                                  'validate_multimodal_request_data', None)
+            if validate_mm is not None:
+                validate_mm(mm_data)
 
     def _fetch_and_enqueue_requests(self, waiting_queue: WaitingQueue,
                                     total_num_live_requests: int) -> None:
