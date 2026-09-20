@@ -2315,6 +2315,28 @@ class OpenAIServer(_VideoRoutesMixin):
             if request.mm_processor_kwargs:
                 prompt["mm_processor_kwargs"] = request.mm_processor_kwargs
 
+            if mm_data:
+                try:
+                    from tensorrt_llm.inputs.multimodal import \
+                        find_mm_token_lengths
+                    proc = self.processor or getattr(self.generator,
+                                                     "input_processor", None)
+                    if proc is not None:
+                        mm_token_lengths = find_mm_token_lengths(mm_data, proc)
+                        if mm_token_lengths:
+                            if "image" in mm_token_lengths:
+                                postproc_args.image_tokens = sum(
+                                    mm_token_lengths["image"])
+                            if "video" in mm_token_lengths:
+                                postproc_args.video_tokens = sum(
+                                    mm_token_lengths["video"])
+                            if "audio" in mm_token_lengths:
+                                postproc_args.audio_tokens = sum(
+                                    mm_token_lengths["audio"])
+                except Exception as e:
+                    logger.debug(
+                        f"Failed to calculate multimodal token counts: {e}")
+
             postproc_args.reasoning_parser = self.generator.args.reasoning_parser
             # Templates that prefill <think>/</think> leave the marker in the
             # prompt, so the request kwargs alone cannot tell the parser which
@@ -2836,6 +2858,60 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
 
+    @staticmethod
+    def merge_completion_responses(responses: List[CompletionResponse],
+                                   model: str = "") -> CompletionResponse:
+        all_choices: List[CompletionResponseChoice] = []
+        all_prompt_token_ids: List[List[int]] = []
+        num_prompt_tokens = num_gen_tokens = num_cached_tokens = 0
+        for rsp in responses:
+            choices, usage = rsp.choices, rsp.usage
+            all_choices.extend(choices)
+            num_prompt_tokens += usage.prompt_tokens
+            num_gen_tokens += usage.completion_tokens
+            if usage.prompt_tokens_details is not None:
+                num_cached_tokens += usage.prompt_tokens_details.cached_tokens or 0
+            # Aggregate prompt token ids for context-only requests
+            if rsp.prompt_token_ids is not None:
+                all_prompt_token_ids.append(rsp.prompt_token_ids)
+
+        def _aggregate_modality(modality: str) -> Optional[int]:
+            if not responses:
+                return None
+            counts = []
+            for rsp in responses:
+                if rsp.usage is None or rsp.usage.prompt_tokens_details is None:
+                    return None
+                count = getattr(rsp.usage.prompt_tokens_details,
+                                f"{modality}_tokens", None)
+                if count is None:
+                    return None
+                counts.append(count)
+            return sum(counts)
+
+        num_image_tokens = _aggregate_modality("image")
+        num_video_tokens = _aggregate_modality("video")
+        num_audio_tokens = _aggregate_modality("audio")
+
+        usage_info = UsageInfo(
+            prompt_tokens=num_prompt_tokens,
+            completion_tokens=num_gen_tokens,
+            total_tokens=num_gen_tokens + num_prompt_tokens,
+            prompt_tokens_details=PromptTokensDetails(
+                cached_tokens=num_cached_tokens,
+                image_tokens=num_image_tokens,
+                video_tokens=num_video_tokens,
+                audio_tokens=num_audio_tokens,
+            ),
+        )
+        merged_rsp = CompletionResponse(
+            model=model,
+            choices=all_choices,
+            usage=usage_info,
+            prompt_token_ids=all_prompt_token_ids,
+        )
+        return merged_rsp
+
     async def openai_completion(self, request: CompletionRequest,
                                 raw_request: Request) -> Response:
 
@@ -2856,36 +2932,6 @@ class OpenAIServer(_VideoRoutesMixin):
                 pp_result.prompt_token_ids = response.prompt_token_ids
             await self._extract_metrics(response, raw_request)
             return pp_result
-
-        def merge_completion_responses(
-                responses: List[CompletionResponse]) -> CompletionResponse:
-            all_choices: List[CompletionResponseChoice] = []
-            all_prompt_token_ids: List[List[int]] = []
-            num_prompt_tokens = num_gen_tokens = num_cached_tokens = 0
-            for rsp in responses:
-                choices, usage = rsp.choices, rsp.usage
-                all_choices.extend(choices)
-                num_prompt_tokens += usage.prompt_tokens
-                num_gen_tokens += usage.completion_tokens
-                num_cached_tokens += usage.prompt_tokens_details.cached_tokens
-                # Aggregate prompt token ids for context-only requests
-                if rsp.prompt_token_ids is not None:
-                    all_prompt_token_ids.append(rsp.prompt_token_ids)
-
-            usage_info = UsageInfo(
-                prompt_tokens=num_prompt_tokens,
-                completion_tokens=num_gen_tokens,
-                total_tokens=num_gen_tokens + num_prompt_tokens,
-                prompt_tokens_details=PromptTokensDetails(
-                    cached_tokens=num_cached_tokens, ),
-            )
-            merged_rsp = CompletionResponse(
-                model=self.model,
-                choices=all_choices,
-                usage=usage_info,
-                prompt_token_ids=all_prompt_token_ids,
-            )
-            return merged_rsp
 
         async def completion_generator(promise: RequestOutput,
                                        params: Optional[PostprocParams]):
@@ -3047,8 +3093,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     completion_response(promise, params) for promise, params in
                     zip(promises, postproc_params_collection)
                 ])
-                response = merge_completion_responses(rsps) if len(
-                    rsps) > 1 else rsps[0]
+                response = self.merge_completion_responses(
+                    rsps, self.model) if len(rsps) > 1 else rsps[0]
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
             logger.error(traceback.format_exc())

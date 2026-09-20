@@ -350,7 +350,11 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                 total_tokens=num_tokens,
                 completion_tokens=0,
                 prompt_tokens_details=PromptTokensDetails(
-                    cached_tokens=rsp.cached_tokens),
+                    cached_tokens=rsp.cached_tokens,
+                    image_tokens=args.image_tokens,
+                    video_tokens=args.video_tokens,
+                    audio_tokens=args.audio_tokens,
+                ),
             )
             rewrite_usage_info_from_ctx(chunk.usage, ctx_usage)
         data = chunk.model_dump_json(exclude_none=True)
@@ -545,7 +549,11 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                                     completion_tokens=output.length,
                                     total_tokens=output.length + prompt_tokens,
                                     prompt_tokens_details=PromptTokensDetails(
-                                        cached_tokens=rsp.cached_tokens))
+                                        cached_tokens=rsp.cached_tokens,
+                                        image_tokens=args.image_tokens,
+                                        video_tokens=args.video_tokens,
+                                        audio_tokens=args.audio_tokens,
+                                    ))
             rewrite_usage_info_from_ctx(chunk.usage, ctx_usage)
         data = chunk.model_dump_json(exclude_none=True)
         res.append(f"data: {data}\n\n")
@@ -557,7 +565,11 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
             prompt_tokens_details=PromptTokensDetails(
-                cached_tokens=rsp.cached_tokens),
+                cached_tokens=rsp.cached_tokens,
+                image_tokens=args.image_tokens,
+                video_tokens=args.video_tokens,
+                audio_tokens=args.audio_tokens,
+            ),
         )
         rewrite_usage_info_from_ctx(final_usage, ctx_usage)
 
@@ -566,7 +578,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                                                          usage=final_usage,
                                                          id=stream_response_id,
                                                          created=stream_created)
-        final_usage_data = final_usage_chunk.model_dump_json()
+        final_usage_data = final_usage_chunk.model_dump_json(exclude_none=True)
         res.append(f"data: {final_usage_data}\n\n")
     return res
 
@@ -711,7 +723,11 @@ def chat_response_post_processor(
         completion_tokens=num_generated_tokens,
         total_tokens=num_prompt_tokens + num_generated_tokens,
         prompt_tokens_details=PromptTokensDetails(
-            cached_tokens=rsp.cached_tokens),
+            cached_tokens=rsp.cached_tokens,
+            image_tokens=args.image_tokens,
+            video_tokens=args.video_tokens,
+            audio_tokens=args.audio_tokens,
+        ),
     )
     ctx_usage = _ctx_usage_for_postproc(args, rsp.outputs)
     response = ChatCompletionResponse(
@@ -830,7 +846,11 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
                                     completion_tokens=output.length,
                                     total_tokens=output.length + prompt_tokens,
                                     prompt_tokens_details=PromptTokensDetails(
-                                        cached_tokens=rsp.cached_tokens))
+                                        cached_tokens=rsp.cached_tokens,
+                                        image_tokens=args.image_tokens,
+                                        video_tokens=args.video_tokens,
+                                        audio_tokens=args.audio_tokens,
+                                    ))
             rewrite_usage_info_from_ctx(chunk.usage, ctx_usage)
         data = chunk.model_dump_json(exclude_unset=False)
         res.append(f"data: {data}\n\n")
@@ -842,7 +862,11 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
             prompt_tokens_details=PromptTokensDetails(
-                cached_tokens=rsp.cached_tokens),
+                cached_tokens=rsp.cached_tokens,
+                image_tokens=args.image_tokens,
+                video_tokens=args.video_tokens,
+                audio_tokens=args.audio_tokens,
+            ),
         )
         rewrite_usage_info_from_ctx(final_usage, ctx_usage)
 
@@ -896,7 +920,11 @@ def completion_response_post_processor(
                       completion_tokens=completion_tokens,
                       total_tokens=completion_tokens + prompt_tokens,
                       prompt_tokens_details=PromptTokensDetails(
-                          cached_tokens=rsp.cached_tokens))
+                          cached_tokens=rsp.cached_tokens,
+                          image_tokens=args.image_tokens,
+                          video_tokens=args.video_tokens,
+                          audio_tokens=args.audio_tokens,
+                      ))
     response = CompletionResponse(choices=choices,
                                   model=args.model,
                                   usage=usage)
@@ -942,6 +970,9 @@ def chat_harmony_post_processor(
         model=args.model,
         num_prompt_tokens=args.num_prompt_tokens,
         cached_tokens=rsp.cached_tokens,
+        image_tokens=args.image_tokens,
+        video_tokens=args.video_tokens,
+        audio_tokens=args.audio_tokens,
     )
     ctx_usage = _ctx_usage_for_postproc(args, rsp.outputs)
     rewrite_usage_response_from_ctx(response, ctx_usage)
@@ -978,6 +1009,9 @@ def chat_harmony_streaming_post_processor(
         cached_tokens=cached_tokens,
         stream_response_id=stream_response_id,
         stream_created=stream_created,
+        image_tokens=args.image_tokens,
+        video_tokens=args.video_tokens,
+        audio_tokens=args.audio_tokens,
     )
     args.first_iteration = False
     return response
