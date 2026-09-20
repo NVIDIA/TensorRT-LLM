@@ -166,7 +166,8 @@ def test_trtllm_attention_layers_share_block_sparse_plan_cache(monkeypatch):
         )
 
     def _base_init(self, **kwargs):
-        del kwargs
+        fmha_state = kwargs.get("fmha_state")
+        self.fmha_state = {} if fmha_state is None else fmha_state
         self.is_mla_enable = False
         self.kv_lora_rank = None
         self.v_head_dim = None
@@ -180,7 +181,7 @@ def test_trtllm_attention_layers_share_block_sparse_plan_cache(monkeypatch):
     )
     monkeypatch.setattr(visual_trtllm.BaseTrtllmAttention, "__init__", _base_init)
     attention_metadata_state = create_attention_metadata_state()
-    assert "block_sparse_fmha_cache" not in attention_metadata_state
+    assert "fmha_caches" not in attention_metadata_state
 
     first = visual_trtllm.TrtllmAttention(
         attention_metadata_state=attention_metadata_state,
@@ -189,8 +190,9 @@ def test_trtllm_attention_layers_share_block_sparse_plan_cache(monkeypatch):
         attention_metadata_state=attention_metadata_state,
     )
 
-    assert not hasattr(first, "_block_sparse_fmha_cache_state")
-    assert not hasattr(second, "_block_sparse_fmha_cache_state")
+    assert first.fmha_state is attention_metadata_state["fmha_caches"]
+    assert second.fmha_state is first.fmha_state
+    assert "update_quant_config" not in visual_trtllm.TrtllmAttention.__dict__
     first_fmha = first._fmha_manager.fmha_libs[0]
     second_fmha = second._fmha_manager.fmha_libs[0]
     assert first_fmha._contiguous_wrappers is second_fmha._contiguous_wrappers

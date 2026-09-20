@@ -78,12 +78,6 @@ class TrtllmAttentionMetadata:
         self._cached_seq_lens: Optional[torch.Tensor] = None
         self._prepared = False
 
-    def get_fmha_cache_state(self, name: str) -> dict[str, object]:
-        """Return one model-scoped cache owned by this metadata adapter."""
-
-        fmha_caches = self._metadata_state.setdefault("fmha_caches", {})
-        return fmha_caches.setdefault(name, {})
-
     def _needs_prepare(self, batch_size: int, seq_lens: torch.Tensor) -> bool:
         """Check if we need to call prepare() (current request seq_lens or shared metadata object seq_lens changed).
 
@@ -219,9 +213,6 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 "TRTLLM attention requires `attention_metadata_state` to be provided "
                 "by visual-gen config for model-scoped metadata and plan sharing."
             )
-        self.metadata = TrtllmAttentionMetadata(
-            attention_metadata_state=attention_metadata_state,
-        )
 
         super().__init__(
             layer_idx=layer_idx,
@@ -231,25 +222,20 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             quant_config=quant_config,
             sparse_params=sparse_params,
             dtype=dtype,
+            # Every layer of one model component shares its FMHA plan caches.
+            fmha_state=attention_metadata_state.setdefault("fmha_caches", {}),
         )
 
         # TRTLLM expects flat [B*S, H*D] format
         self._preferred_layout = AttentionTensorLayout.NHD
 
+        self.metadata = TrtllmAttentionMetadata(
+            attention_metadata_state=attention_metadata_state,
+        )
+
         self.quant_attention_config = quant_attention_config
         self._prepared_timestep: Optional[float] = None
         self._timestep_prepared = False
-
-    def update_quant_config(self, new_quant_config: Optional[QuantConfig]) -> None:
-        """Rebuild FMHA libraries and bind VisualGen-owned shared plan caches."""
-
-        super().update_quant_config(new_quant_config)
-        from ...attention.backends.fmha.prims_ts_block_sparse import PrimsTSBlockSparseFmha
-
-        cache_state = self.metadata.get_fmha_cache_state("prims_ts_block_sparse")
-        for fmha in self._fmha_manager.fmha_libs:
-            if isinstance(fmha, PrimsTSBlockSparseFmha):
-                fmha.bind_plan_cache(cache_state)
 
     @property
     def timestep_cutoff(self) -> Optional[float]:
