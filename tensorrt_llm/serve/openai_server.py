@@ -128,8 +128,8 @@ from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
 from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
 from tensorrt_llm.serve.rl_control_auth import validate_rl_control_request
-from tensorrt_llm.serve.runtime_control_auth import \
-    validate_runtime_control_request
+from tensorrt_llm.serve.runtime_control_auth import (
+    RuntimeControlReplayCache, validate_runtime_control_request)
 from tensorrt_llm.serve.serving_extensions import apply_model_chat_extensions
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import (
@@ -619,6 +619,7 @@ class OpenAIServer(_VideoRoutesMixin):
         self._rl_control_api_key = rl_control_api_key
         self._enable_runtime_control_endpoints = enable_runtime_control_endpoints
         self._runtime_control_api_key = runtime_control_api_key
+        self._runtime_control_replay_cache = RuntimeControlReplayCache()
         self.server_role = server_role
         # Will be set in __call__
         self.binding_addr = None
@@ -1398,6 +1399,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 route_path,
                 body,
                 raw_request.headers,
+                self._runtime_control_replay_cache,
             )
         except ValueError as error:
             raise HTTPException(

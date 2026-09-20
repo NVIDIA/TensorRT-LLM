@@ -19,15 +19,49 @@ import hashlib
 import hmac
 import re
 import secrets
+import threading
 import time
 from typing import Mapping, Optional
 
 RUNTIME_CONTROL_AUTH_HEADER = "x-trtllm-runtime-control-auth"
 RUNTIME_CONTROL_NONCE_HEADER = "x-trtllm-runtime-control-nonce"
 RUNTIME_CONTROL_TIMESTAMP_HEADER = "x-trtllm-runtime-control-timestamp"
+RUNTIME_CONTROL_VALIDITY_WINDOW_SECONDS = 300
+DEFAULT_RUNTIME_CONTROL_REPLAY_CACHE_CAPACITY = 4096
 _SIGNATURE_PREFIX = "sha256="
 _SIGNATURE_DOMAIN = b"trtllm-runtime-control-v1\n"
 _NONCE_PATTERN = re.compile(r"[0-9a-f]{32}")
+
+
+class RuntimeControlReplayCache:
+    """Atomically retain accepted nonces for their full validity period."""
+
+    def __init__(
+        self,
+        max_entries: int = DEFAULT_RUNTIME_CONTROL_REPLAY_CACHE_CAPACITY,
+    ) -> None:
+        if max_entries <= 0:
+            raise ValueError("Runtime control replay cache capacity must be positive.")
+        self._max_entries = max_entries
+        self._expires_at_by_nonce: dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def claim(self, nonce: str, expires_at: int, current_time: int) -> None:
+        """Claim a nonce or reject a duplicate without evicting live entries."""
+        with self._lock:
+            expired = [
+                cached_nonce
+                for cached_nonce, cached_expiry in self._expires_at_by_nonce.items()
+                if cached_expiry < current_time
+            ]
+            for cached_nonce in expired:
+                del self._expires_at_by_nonce[cached_nonce]
+
+            if nonce in self._expires_at_by_nonce:
+                raise ValueError("Runtime control request nonce has already been used.")
+            if len(self._expires_at_by_nonce) >= self._max_entries:
+                raise ValueError("Runtime control replay cache capacity exceeded.")
+            self._expires_at_by_nonce[nonce] = expires_at
 
 
 def _canonical_request(
@@ -117,8 +151,11 @@ def validate_runtime_control_request(
     path: str,
     body: bytes,
     headers: Optional[Mapping[str, str]],
+    replay_cache: RuntimeControlReplayCache,
+    *,
+    current_time: int | None = None,
 ) -> None:
-    """Validate an HMAC signature over the canonical HTTP request."""
+    """Validate and atomically claim a signed runtime-control request."""
     if not runtime_control_api_key:
         raise ValueError("Runtime control endpoints are enabled but no API key is configured.")
 
@@ -138,3 +175,17 @@ def validate_runtime_control_request(
     )
     if not hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8")):
         raise ValueError("Invalid runtime control request authentication.")
+
+    now = int(time.time()) if current_time is None else current_time
+    try:
+        request_time = int(timestamp)
+    except ValueError as error:
+        raise ValueError("Invalid runtime control request timestamp.") from error
+    if abs(now - request_time) > RUNTIME_CONTROL_VALIDITY_WINDOW_SECONDS:
+        raise ValueError("Runtime control request timestamp is outside the validity window.")
+
+    replay_cache.claim(
+        nonce,
+        request_time + RUNTIME_CONTROL_VALIDITY_WINDOW_SECONDS,
+        now,
+    )
