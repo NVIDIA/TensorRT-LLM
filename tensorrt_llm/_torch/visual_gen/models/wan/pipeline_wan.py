@@ -115,7 +115,6 @@ _WAN_TWO_TRANSFORMER_OFFLOAD_STAGES = (
     hf_ids=[
         "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
         "Wan-AI/Wan2.1-T2V-14B-Diffusers",
-        "FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers",
         "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
         "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
         "nvidia/Wan2.2-T2V-A14B-Diffusers-FP8",

@@ -75,9 +75,9 @@ except (ImportError, OSError) as e:
 def _cute_dense_available() -> bool:
     """Whether `cute_dsl_fmha_fwd` can run on the current device.
 
-    Checked once at construction. Sol-Attn and the dense CuTe DSL kernel now
+    Checked once at construction. SOL and the dense CuTe DSL kernel now
     cover the same set (sm_100a/sm_103a), so in practice this is always true
-    wherever Sol-Attn runs; the negative branch exists so an unsupported device
+    wherever SOL runs; the negative branch exists so an unsupported device
     degrades to SDPA instead of raising.
     """
     try:
@@ -128,7 +128,7 @@ class SOLCuTeDSLAttention(AttentionBackend):
             # would then see unequal Q/K shapes and quietly take its dense
             # fallback instead of rejecting an unsupported configuration.
             raise ValueError(
-                f"Sol-Attn is MHA-only (num_kv_heads == num_heads), got "
+                f"SOL is MHA-only (num_kv_heads == num_heads), got "
                 f"num_kv_heads={self.num_kv_heads}, num_heads={self.num_heads}. "
                 f"GQA/MQA is not supported."
             )
@@ -196,7 +196,7 @@ class SOLCuTeDSLAttention(AttentionBackend):
             logger.warning_once(
                 "SolAttentionConfig.disabled_until_timestep="
                 f"{self.disabled_until_timestep} is set, but no `timestep` reached "
-                "the Sol-Attn forward call. The dense prefix it requests will not "
+                "the SOL forward call. The dense prefix it requests will not "
                 "be applied. Ensure the pipeline passes a normalized timestep, or "
                 "unset disabled_until_timestep.",
                 key="sol_attn_missing_timestep",
@@ -257,14 +257,14 @@ class SOLCuTeDSLAttention(AttentionBackend):
 
         Everything false here is delegated (see ``_delegate``). Deciding it from the
         tensors, per call, is deliberate, and it is why ``modules/attention.py``
-        has no ``SEPARATE_QKV`` rule for Sol-Attn: ``qkv_mode`` describes how
+        has no ``SEPARATE_QKV`` rule for SOL: ``qkv_mode`` describes how
         Q/K/V are *projected*, not whether K/V come from another sequence, so a
         construction-time rule keyed on it mistakes self-attention for
         cross-attention wherever that mode is chosen for other reasons --
         Qwen-Image always, and WAN's ``attn1`` under async Ulysses -- silently
         costing those modules their configured backend.
         """
-        # Cross-attention: K/V come from another sequence, and Sol-Attn's
+        # Cross-attention: K/V come from another sequence, and SOL's
         # routing assumes one self-attending sequence. Unequal Q/K lengths are
         # a heuristic for that, not a definition: a cross-attention call whose
         # context happens to match the query length is not caught here. The

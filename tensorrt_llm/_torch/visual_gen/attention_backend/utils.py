@@ -131,10 +131,10 @@ def create_attention(
     Returns:
         AttentionBackend instance
     """
-    sparse_attention_config = (
+    sparse_config = (
         attention_config.sparse_attention_config if attention_config is not None else None
     )
-    sparse_algorithm = getattr(sparse_attention_config, "algorithm", None)
+    sparse_algorithm = getattr(sparse_config, "algorithm", None)
     is_vsa = sparse_algorithm == "vsa"
     is_sol = sparse_algorithm == "sol_attn"
 
@@ -165,7 +165,7 @@ def create_attention(
     elif is_sol and kwargs.get("sparse_params") is None:
         # The attention module lowers the config once per layer; callers that
         # construct a backend directly get the same lowering here.
-        kwargs["sparse_params"] = sparse_attention_config.to_sparse_params()
+        kwargs["sparse_params"] = sparse_config.to_sparse_params()
 
     # Forward the validated quantization recipe to TRTLLM, cuDNN, FlashInfer, or the dense CuTe DSL
     # FMHA backend.

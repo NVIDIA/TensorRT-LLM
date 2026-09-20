@@ -111,10 +111,10 @@ class Attention(nn.Module):
         ulysses_size = vgm.ulysses_size if vgm else 1
         cp_size = vgm.cp_size if vgm else 1
         base_backend = config.attention.backend
-        _sa_cfg = config.attention.sparse_attention_config
-        _sa_algo = getattr(_sa_cfg, "algorithm", None) if _sa_cfg is not None else None
-        is_vsa = _sa_algo == "vsa"
-        is_sol = _sa_algo == "sol_attn"
+        sparse_config = config.attention.sparse_attention_config
+        sparse_algorithm = getattr(sparse_config, "algorithm", None)
+        is_vsa = sparse_algorithm == "vsa"
+        is_sol = sparse_algorithm == "sol_attn"
         is_separate_qkv_cross_attention = (
             self.qkv_mode == QKVMode.SEPARATE_QKV and not separate_qkv_is_self_attention
         )
@@ -144,15 +144,9 @@ class Attention(nn.Module):
         # Every sparse algorithm here routes over the whole token sequence, so
         # none of them can be split across context-parallel ranks.
         if (is_vsa or is_sol) and cp_size > 1:
-            _algo_name = "VSA" if is_vsa else "SOL"
+            algorithm_name = "VSA" if is_vsa else "SOL"
             raise ValueError(
-                f"{_algo_name} needs the full token sequence per rank, so it is incompatible "
-                f"with context parallelism (Attention2D/Ring, cp_size={cp_size}). Use "
-                f"ulysses or cfg parallelism instead."
-            )
-        if is_sol and cp_size > 1:
-            raise ValueError(
-                f"SOL needs the full token sequence per rank, so it is incompatible "
+                f"{algorithm_name} needs the full token sequence per rank, so it is incompatible "
                 f"with context parallelism (Attention2D/Ring, cp_size={cp_size}). Use "
                 f"ulysses or cfg parallelism instead."
             )
@@ -253,20 +247,22 @@ class Attention(nn.Module):
             backend_num_heads = self.local_num_attention_heads
             backend_num_kv_heads = self.local_num_key_value_heads
 
-        # Lower the shared SkipSoftmax user/checkpoint config for each backend
-        # whose kernel consumes SkipSoftmaxParams.
+        # Lower the user/checkpoint sparse config for each backend whose kernel
+        # consumes the lowered SparseParams.
         sparse_params = None
-        ss_cfg = config.attention.sparse_attention_config
-        if isinstance(ss_cfg, SkipSoftmaxAttentionConfig) and backend_name in (
+        if isinstance(sparse_config, SkipSoftmaxAttentionConfig) and backend_name in (
             "TRTLLM",
             "CUTEDSL",
         ):
-            sparse_params = ss_cfg.to_sparse_params(
+            sparse_params = sparse_config.to_sparse_params(
                 module_name=self.module_name,
                 pretrained_config=config.pretrained_config,
             )
-        elif isinstance(ss_cfg, SolAttentionConfig) and backend_name in ("TRTLLM", "CUTEDSL"):
-            sparse_params = ss_cfg.to_sparse_params()
+        elif isinstance(sparse_config, SolAttentionConfig) and backend_name in (
+            "TRTLLM",
+            "CUTEDSL",
+        ):
+            sparse_params = sparse_config.to_sparse_params()
         self.sparse_params = sparse_params
 
         # Create compute backend
