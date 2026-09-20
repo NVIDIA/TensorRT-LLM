@@ -1699,19 +1699,30 @@ class TestProxyCollectiveRpcGuards:
     def test_multirank_allowed_for_runtime_memory_control(self, cls):
         """Runtime-memory methods may be called with model_world_size > 1.
 
-        Both are in _MULTI_RANK_ALLOWED_METHODS; the guard must not raise
-        and the call must be forwarded to rpc_client.
+        All three are in _MULTI_RANK_ALLOWED_METHODS; the guard must not raise,
+        and each call must be forwarded with the worker method's real signature.
         """
         from unittest.mock import MagicMock as _MM
 
-        for method_name in ("get_memory_status", "sleep", "wakeup"):
+        method_args = (
+            ("get_memory_status", ()),
+            ("sleep", (["kv_cache"],)),
+            ("wakeup", (["kv_cache"],)),
+        )
+        for method_name, args in method_args:
             mock_call = _MM()
             mock_call.remote.return_value = "ok"
             mock_client = _MM()
-            getattr(mock_client, method_name).return_value = mock_call
+            mock_method = getattr(mock_client, method_name)
+            mock_method.return_value = mock_call
             p = _make_proxy(cls, model_world_size=2, rpc_client=mock_client)
-            result = p.collective_rpc(method_name, args=(["kv_cache"],))
+            result = p.collective_rpc(method_name, args=args)
+
             assert result == ["ok"]
+            mock_method.assert_called_once_with(*args)
+            if cls == "ipc":
+                p.workers_started = False
+            mock_call.remote.assert_called_once_with()
 
     def test_multirank_raises_for_non_allowlisted_method(self, cls):
         """Non-allowlisted methods still raise NotImplementedError for world_size > 1."""
