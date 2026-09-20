@@ -23,7 +23,7 @@ def _supported_arch() -> bool:
 
 skip_unsupported = pytest.mark.skipif(
     not _supported_arch(),
-    reason="FlashInfer GDN prefill requires SM90 (Hopper) or SM100/SM103/SM120 (Blackwell)",
+    reason="FlashInfer GDN prefill requires SM90 (Hopper) or SM100/SM103/SM120/SM121 (Blackwell)",
 )
 
 # Reuse the wrapper's own predicate so the gate cannot drift from the dispatch
@@ -45,14 +45,13 @@ skip_unless_indexed_pool_io = pytest.mark.skipif(
         (100, True),  # datacenter Blackwell (B200)
         (103, True),  # datacenter Blackwell (B300/GB200)
         (120, True),  # consumer Blackwell (RTX 5090 / PRO 6000)
-        (121, False),  # other consumer Blackwell -> Triton
+        (121, True),  # consumer Blackwell (GB10 / DGX Spark)
         (89, False),  # Ada
         (80, False),  # Ampere
     ],
 )
 def test_is_flashinfer_gdn_prefill_supported_arch(sm_version, expected):
-    """FlashInfer ships the GDN chunk-prefill kernel for SM90/SM100/SM103/SM120
-    every other arch must fall back to Triton. Pure predicate, no GPU required."""
+    """Pure predicate, no GPU required."""
     from tensorrt_llm._utils import is_flashinfer_gdn_prefill_supported_arch
 
     assert is_flashinfer_gdn_prefill_supported_arch(sm_version) is expected
@@ -65,15 +64,15 @@ def test_is_flashinfer_gdn_prefill_supported_arch(sm_version, expected):
         (100, True),  # datacenter Blackwell (B200)
         (103, True),  # datacenter Blackwell (B300/GB200)
         (120, False),  # consumer Blackwell: prefill kernel exists, decode does not
-        (121, False),  # other consumer Blackwell -> Triton
+        (121, False),  # consumer Blackwell: prefill kernel exists, decode does not
         (89, False),  # Ada
         (80, False),  # Ampere
     ],
 )
 def test_is_flashinfer_gdn_decode_supported_arch(sm_version, expected):
     """The bf16-state decode / MTP-verify kernels are SM90/SM100/SM103 only --
-    narrower than the prefill set, which also covers SM120. Pure predicate, no
-    GPU required."""
+    narrower than the prefill set, which also covers SM120/SM121. Pure predicate,
+    no GPU required."""
     from tensorrt_llm._utils import is_flashinfer_gdn_decode_supported_arch
 
     assert is_flashinfer_gdn_decode_supported_arch(sm_version) is expected
@@ -781,8 +780,8 @@ def test_indexed_state_pool_fast_path_bf16_matches_triton(monkeypatch, cache_ind
 def test_gdn_mixer_resolve_chunk_gated_delta_rule(monkeypatch):
     """gdn_mixer resolves its prefill kernel lazily (``_resolve_chunk_gated_delta_rule``):
     the FlashInfer wrapper when the env opt-in is set (default) *and* the arch is
-    supported (SM90/SM100/SM103/SM120), otherwise the vendored Triton kernel (env
-    opt-out, or an unsupported arch such as SM121).
+    supported (SM90/SM100/SM103/SM120/SM121), otherwise the vendored Triton kernel
+    (env opt-out, or an unsupported arch such as SM89).
 
     The arch predicate is monkeypatched so the routing is checked independent of
     the actual GPU; only dispatch wiring is exercised (no kernel launch).
@@ -810,7 +809,7 @@ def test_gdn_mixer_resolve_chunk_gated_delta_rule(monkeypatch):
     assert resolve("1", True) is flashinfer_fn
     # Opt-out env -> Triton even on a supported arch.
     assert resolve("0", True) is triton_fn
-    # Unsupported arch (e.g. SM121) -> Triton even with the default opt-in.
+    # Unsupported arch (e.g. SM89) -> Triton even with the default opt-in.
     assert resolve(None, False) is triton_fn
 
     # Clear the cached resolution so later tests re-resolve against the real

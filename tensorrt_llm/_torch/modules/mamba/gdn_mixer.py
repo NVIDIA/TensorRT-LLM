@@ -53,8 +53,8 @@ from .recurrent_state_cache import reset_recurrent_state_rows
 # FlashInfer GDN prefill is ON by default; set TLLM_USE_FLASHINFER_GDN_PREFILL=0
 # to force the vendored Triton chunk_gated_delta_rule everywhere. FlashInfer
 # ships the GDN prefill kernel for Hopper (SM90), datacenter Blackwell
-# (SM100/SM103) and consumer Blackwell (SM120); on other archs it aborts at
-# launch, so we fall back to Triton there. Resolution is deferred to first call
+# (SM100/SM103) and consumer Blackwell (SM120/SM121); on other archs it aborts
+# at launch, so we fall back to Triton there. Resolution is deferred to first call
 # (and cached) so importing this module never initializes CUDA.
 def _use_flashinfer_gdn_prefill() -> bool:
     """Check the prefill backend setting and supported GPU architecture."""
