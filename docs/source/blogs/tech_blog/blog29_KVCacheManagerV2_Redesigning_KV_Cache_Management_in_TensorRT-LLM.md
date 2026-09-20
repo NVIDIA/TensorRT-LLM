@@ -33,7 +33,7 @@ TensorRT LLM's original KV cache manager, which we will call V1 throughout this 
 
 KVCacheManagerV2 (KVCM2) is a ground-up redesign built around a single question: *which buffers, across which layers, live and die together?* Answering that question explicitly — instead of assuming the answer is "all of them" — is what lets one manager serve full attention, sliding-window attention, and recurrent state with a single prefix-reuse tree, a narrow public API, and first-class GPU/host/disk storage.
 
-This post describes that design. A companion post, [From Python to C++: Rewriting KVCacheManagerV2 in the Age of Coding Agents](./blog29_From_Python_to_Cpp_Rewriting_KVCacheManagerV2_with_Coding_Agents.md), covers how KVCM2 was built: why we deliberately wrote it in Python first, and what changed to make us translate it to C++.
+This post describes that design. A companion post, [From Python to C++: Rewriting KVCacheManagerV2 in the Age of Coding Agents](./blog30_From_Python_to_Cpp_Rewriting_KVCacheManagerV2_with_Coding_Agents.md), covers how KVCM2 was built: why we deliberately wrote it in Python first, and what changed to make us translate it to C++.
 
 ## Why a Second KV Cache Manager
 
@@ -89,7 +89,7 @@ The storage tier count is encoded in the sign bit of the 32-bit block index that
 
 <div align="center">
 <figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog28_v1_vs_v2_architecture.png" width="900">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog29_v1_vs_v2_architecture.png" width="900">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1: V1 and V2 KV cache manager architectures.</em></sub></p>
@@ -167,7 +167,7 @@ It is worth being precise about how this differs from V1, because V1 coalesces a
 
 <div align="center">
 <figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog28_lifecycle_coalescing.png" width="900">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog29_lifecycle_coalescing.png" width="900">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2: Lifecycles group buffers into big pages, and why the grouping must be by lifecycle.</em></sub></p>
@@ -195,7 +195,7 @@ That last clause is why sliding-window prefix reuse works at all. A sliding-wind
 
 <div align="center">
 <figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog28_one_tree_many_lifecycles.png" width="800">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog29_one_tree_many_lifecycles.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3: A radix-tree block holds one page slot per lifecycle.</em></sub></p>
@@ -219,7 +219,7 @@ A page also need not keep the same representation on every tier. A **cold-page c
 
 <div align="center">
 <figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog28_page_states_and_tiers.png" width="800">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog29_page_states_and_tiers.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4: Page status and tier migration.</em></sub></p>
@@ -254,7 +254,7 @@ So each GPU pool reserves a virtual address range once and maps physical chunks 
 
 <div align="center">
 <figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog28_elastic_pools_vmm.png" width="800">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog29_elastic_pools_vmm.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 5: Elastic pools over CUDA virtual memory.</em></sub></p>
@@ -343,15 +343,14 @@ Gemma4 hybrid attention and sparse-attention models route to V2 unconditionally,
 | Block-key hash | 64-bit, non-cryptographic | Chained SHA-256, per-scope roots |
 | Stats and events granularity | Per window size | Per lifecycle (layer group) |
 | Beam search | Supported | Not yet |
-| KV connector API | Supported | Not yet |
 
 </div>
 
-V1 remains the default everywhere else, and it is not a legacy path. It is a mature, heavily tested implementation that still supports three things V2 does not: the KV connector API, beam search, and STAR context parallelism combined with DSA sparse attention. The routing logic reflects this honestly — for models where V2 is structurally required, requesting an unsupported combination raises rather than silently downgrading; elsewhere it warns and falls back.
+V1 remains the default everywhere else, and it is not a legacy path. It is a mature, heavily tested implementation, and one runtime feature still keeps a model on it: beam search. `max_beam_width > 1` is the sole entry on V2's incompatible-feature list; everything else that once forced a fallback, including the KV connector, is now served on V2. The routing logic reflects the distinction honestly — for models where V2 is structurally required, requesting beam search raises rather than silently downgrading; for a plain model it warns and falls back to V1.
 
 <div align="center">
 <figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog28_e2e_throughput.png" width="900">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog29_e2e_throughput.png" width="900">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 6: End-to-end serving impact on models where V2 is the default.</em></sub></p>
@@ -367,7 +366,7 @@ option — vs V2 with prefix reuse enabled, on a multi-turn or agentic trace whe
 - **KV cache compression**: The cold-page codec interface is complete and a custom codec already works against it. Because encode and decode are stream-ordered GPU work, compression costs a little GPU time on the migration path rather than host time, and buys substantially more effective host- and disk-tier capacity. It is the next thing to reach users.
 - **Smarter rebalancing**: The ratio-driven quota adjustment currently samples the live batch. Feeding it workload-level signals such as conversation structure and expected reuse should let it converge faster and overshoot less.
 - **Beam search**: Multi-beam support is designed for throughout — the data structures are beam-indexed — but the commit path is not yet complete.
-- **KV connector support**: Bringing the connector API to V2 is required before V2 can become the default for models that rely on it.
+- **Retiring V1**: With the key models already on V2, the remaining families are being migrated one at a time, each behind accuracy and performance validation. Once that finishes, V1 goes away and the adapter stops needing to speak two dialects.
 - **Broader default rollout**: Each model family moved to V2 by default is preceded by accuracy and performance validation, and the list will keep growing.
 
 ## Acknowledgment

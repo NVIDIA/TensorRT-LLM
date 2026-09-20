@@ -21,7 +21,7 @@ By NVIDIA TensorRT LLM Team
 
 ## Introduction
 
-KVCacheManagerV2 (KVCM2) is TensorRT LLM's redesigned KV cache manager. The companion post, [KVCacheManagerV2: Redesigning KV Cache Management in TensorRT LLM](./blog28_KVCacheManagerV2_Redesigning_KV_Cache_Management_in_TensorRT-LLM.md), describes what it does and why the previous design needed replacing. This post is about something narrower and, we think, more broadly applicable: how it was built, and what we learned when the reasoning behind one of our biggest decisions quietly stopped being true.
+KVCacheManagerV2 (KVCM2) is TensorRT LLM's redesigned KV cache manager. The companion post, [KVCacheManagerV2: Redesigning KV Cache Management in TensorRT LLM](./blog29_KVCacheManagerV2_Redesigning_KV_Cache_Management_in_TensorRT-LLM.md), describes what it does and why the previous design needed replacing. This post is about something narrower and, we think, more broadly applicable: how it was built, and what we learned when the reasoning behind one of our biggest decisions quietly stopped being true.
 
 We deliberately wrote KVCM2 in **Python**, accepting a known performance penalty, because we believed a Python KV cache manager would be far more approachable for community contributors. We spent months defending that choice — micro-optimizing, compiling with mypyc, writing a custom C extension to work around mypyc's limitations, even taking the workload's execution characteristics to NVIDIA's CPU architecture teams. And then, over roughly a year, the premise underneath the decision dissolved. Coding agents got good enough that the language a contributor already knows stopped being the binding constraint. So we translated about 12,000 lines of Python into roughly 17,000 lines of C++, with agents doing most of the typing, and made C++ the default backend.
 
@@ -29,7 +29,7 @@ Both halves of that story are worth telling honestly, including the parts where 
 
 <div align="center">
 <figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog29_project_timeline.png" width="900">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog30_project_timeline.png" width="900">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1: KVCacheManagerV2 project timeline.</em></sub></p>
@@ -64,7 +64,7 @@ The hypothesis was right for large-chunk prefill and wrong for high-throughput d
 
 <div align="center">
 <figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog29_backend_throughput.png" width="800">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog30_backend_throughput.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2: Manager throughput against per-step token interval, by backend.</em></sub></p>
