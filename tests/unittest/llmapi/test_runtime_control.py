@@ -48,15 +48,15 @@ def _make_server(*, asynchronous: bool = False) -> OpenAIServer:
     return server
 
 
-def _signed_headers(body: bytes, key: str = "secret") -> dict[str, str]:
+def _signed_headers(method: str, path: str, body: bytes, key: str = "secret") -> dict[str, str]:
     headers = {"Content-Type": "application/json"}
-    headers.update(build_runtime_control_auth_headers(key, body))
+    headers.update(build_runtime_control_auth_headers(key, method, path, body))
     return headers
 
 
 def _post(client: TestClient, path: str, payload=None):
     body = b"" if payload is None else json.dumps(payload).encode("utf-8")
-    return client.post(path, content=body, headers=_signed_headers(body))
+    return client.post(path, content=body, headers=_signed_headers("POST", path, body))
 
 
 def test_runtime_control_routes_are_authenticated():
@@ -78,7 +78,30 @@ def test_signature_covers_exact_body():
         response = client.post(
             "/release_memory",
             content=other_body,
-            headers=_signed_headers(signed_body),
+            headers=_signed_headers("POST", "/release_memory", signed_body),
+        )
+
+    assert response.status_code == 401
+    server.generator.release.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("signed_method", "signed_path"),
+    [
+        ("GET", "/release_memory"),
+        ("POST", "/resume_memory"),
+        ("GET", "/memory_status"),
+    ],
+)
+def test_signature_covers_http_method_and_route(signed_method, signed_path):
+    server = _make_server()
+    body = b""
+
+    with TestClient(server.app) as client:
+        response = client.post(
+            "/release_memory",
+            content=body,
+            headers=_signed_headers(signed_method, signed_path, body),
         )
 
     assert response.status_code == 401
@@ -118,7 +141,7 @@ async def test_async_generator_is_awaited_directly():
 
 def test_memory_status_signs_empty_body():
     server = _make_server()
-    headers = build_runtime_control_auth_headers("secret", b"")
+    headers = _signed_headers("GET", "/memory_status", b"")
 
     with TestClient(server.app) as client:
         response = client.get("/memory_status", headers=headers)
@@ -130,7 +153,7 @@ def test_memory_status_signs_empty_body():
 def test_invalid_worker_status_is_an_internal_error():
     server = _make_server()
     server.generator.get_memory_status.side_effect = ValueError("invalid worker status")
-    headers = build_runtime_control_auth_headers("secret", b"")
+    headers = _signed_headers("GET", "/memory_status", b"")
 
     with TestClient(server.app) as client:
         response = client.get("/memory_status", headers=headers)
