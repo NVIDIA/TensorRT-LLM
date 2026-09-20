@@ -86,19 +86,36 @@ Developer workflow for code contributions is as follows:
 
 ### PR Submission Policies
 
-The naming of the merge requests in TensorRT-LLM follows the [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/). If the PR includes an API change that might break user code/API usage, consider adding "BREAKING CHANGE" in the title so that reviewers know what to expect. Additionally, if the PR is not related to any bug and task, consider using "chore" or None as the placeholder.
+A PR title has to be `[ticket][type] Summary`. The `Check PR Title Format` job in
+`.github/workflows/pr-check.yml` rejects anything else, so a title that does not
+match blocks the PR until it is renamed.
+
+The ticket is one of:
+
+| ticket | when |
+|---|---|
+| `[TRTLLM-1234]`, `[FOOBAR-123]` | a JIRA ticket (**NVIDIAN only**) |
+| `[https://nvbugs/1234567]` | an NVBugs ID (**NVIDIAN only**) |
+| `[#1234]` | a GitHub issue |
+| `[None]` | no ticket, for example a chore |
+
+The type is lowercase and bracketed: `[fix]`, `[feat]`, `[doc]`, `[infra]`,
+`[chore]`, `[perf]`, `[refactor]`, `[test]`.
+
+If the PR includes an API change that might break user code or API usage,
+consider saying "BREAKING CHANGE" in the summary so that reviewers know what to
+expect.
 
 [!IMPORTANT]
 For NVIDIA developers, please include the JIRA number or NVBUG ID in the PR title whenever possible. Also, to identify the author of the PR, please ensure that your GitHub account either displays your full name or your NVIDIA account name in the `Name` field of your profile.
 
 Good PR Titles Examples:
-* feat: Add support for starcoder-v2 FP8 base + FP16/BF16 LoRA
-* BREAKING CHANGE: Set default max batch size to 2048
-* chore: Remove version from plugins .so
-* None: Stringized enums for better error msgs
-* fix https://github.com/NVIDIA/TensorRT-LLM/issues/700: a Memory leak issue in C++ runtime
-* [TRTLLM-5516] perf: replicate dummy request for cuda graph padding (**NVIDIAN only**)
-* [nvbug/5334370] fix: Fix one model EAGLE3 (**NVIDIAN only**)
+* `[TRTLLM-1234][feat] Add support for starcoder-v2 FP8 base + FP16/BF16 LoRA` (**NVIDIAN only**)
+* `[https://nvbugs/1234567][fix] Fix one model EAGLE3` (**NVIDIAN only**)
+* `[#1234][fix] Fix a memory leak in the C++ runtime`
+* `[#1234][doc] Update documentation`
+* `[None][chore] Remove version from plugins .so`
+* `[None][feat] BREAKING CHANGE: Set default max batch size to 2048`
 
 
 This is important for tracking and collecting what has been submitted to which release and makes it easier for others to track the bugs or tasks. It could also be helpful when collecting GitHub publish announcement.
