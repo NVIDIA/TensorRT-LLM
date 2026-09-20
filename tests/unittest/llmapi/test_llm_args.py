@@ -3679,7 +3679,7 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
     assert cold_config.model_dump() == {
         "algorithm": "quantization_for_cold_page",
         "quant": "nvfp4",
-        "keep_rope_precision": False,
+        "skip_rope_quantization": False,
         "scale_checkpoint_path": None,
     }
     assert not cold_config.changes_physical_kv_length
@@ -3696,20 +3696,20 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
     ).kv_cache_compression_config
     assert cold_config_with_scales.scale_checkpoint_path == "/tmp/nvfp4-kv-scales"
 
-    cold_config_keep_rope = TorchLlmArgs(
+    cold_config_skip_rope = TorchLlmArgs(
         model="/tmp/dummy_model",
         kv_cache_compression_config={
             "algorithm": "quantization_for_cold_page",
-            "keep_rope_precision": True,
+            "skip_rope_quantization": True,
         },
     ).kv_cache_compression_config
-    assert cold_config_keep_rope.keep_rope_precision is True
+    assert cold_config_skip_rope.skip_rope_quantization is True
     with pytest.raises(ValidationError):
         TorchLlmArgs(
             model="/tmp/dummy_model",
             kv_cache_compression_config={
                 "algorithm": "quantization_for_cold_page",
-                "keep_rope_precision": "maybe",
+                "skip_rope_quantization": "maybe",
             },
         )
 

@@ -3857,7 +3857,7 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
     quant: Literal["nvfp4"] = Field(
         default="nvfp4",
         description="Quantization format stored in the compressed cache tier.")
-    keep_rope_precision: bool = Field(
+    skip_rope_quantization: bool = Field(
         default=False,
         description=
         "Off (default): whole K and V vectors become NVFP4 in the compressed "

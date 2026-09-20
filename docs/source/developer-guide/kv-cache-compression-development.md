@@ -301,9 +301,9 @@ contiguous piece into NVFP4 (4-bit values plus one scale per 16 numbers) and
 copies everything before and after that piece unchanged. A compressed buffer
 records the piece as `quantized_range_start` and `quantized_range_elements`.
 
-- `keep_rope_precision` off: the piece is the whole vector, so every K and V
+- `skip_rope_quantization` off: the piece is the whole vector, so every K and V
   number becomes NVFP4.
-- `keep_rope_precision` on: the piece is the NoPE part of the K vector, so the
+- `skip_rope_quantization` on: the piece is the NoPE part of the K vector, so the
   RoPE numbers are copied unchanged into the cold page, right after that buffer's
   scales. The codec finds the RoPE part in the model config: the last
   `qk_rope_head_dim` numbers of the single 576-number vector an MLA layer stores
@@ -317,7 +317,7 @@ The codec refuses what the kernel cannot express: a K vector that is entirely
 RoPE (nothing left to quantize), RoPE in the middle of the vector (two pieces),
 or a piece whose start or length is not a multiple of 16 numbers (the scale
 group). The switch only takes effect for the model types in
-`_KEEP_ROPE_PRECISION_MODEL_TYPES`, whose RoPE layout and accuracy have been
+`_SKIP_ROPE_QUANTIZATION_MODEL_TYPES`, whose RoPE layout and accuracy have been
 checked; other models log a warning and quantize whole vectors. Draft-model KV
 caches always quantize whole vectors because the codec holds only the target
 model's config.

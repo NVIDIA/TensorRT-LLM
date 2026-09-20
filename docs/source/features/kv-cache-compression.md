@@ -207,7 +207,7 @@ NVFP4. See [Quantization](quantization.md) for active KV-cache quantization.
 For complete single-GPU and disaggregated-serving configurations, see the
 [NVFP4 cold-page compression example](source:examples/kv_cache_compression/nvfp4_cold_page.md).
 
-#### Keeping RoPE Precision
+#### Skipping RoPE Quantization
 
 For every token and KV head, the KV cache stores one K vector and one V vector
 of `head_dim` numbers. In some models only part of the K vector carries the
@@ -221,7 +221,7 @@ rest, so 4-bit rounding costs it more accuracy. Whether the rotation or the miss
 normalization is the cause is still being studied; the option names where the
 values sit, and its accuracy effect is checked per model.
 
-`keep_rope_precision` controls this:
+`skip_rope_quantization` controls this:
 
 - Off (default): the whole K vector and the whole V vector become NVFP4. This
   gives the highest compression ratio.
@@ -233,14 +233,14 @@ values sit, and its accuracy effect is checked per model.
 The option is validated for DeepSeek-V4, GLM-5 (`glm_moe_dsa`), and the Qwen3.5
 series. Any other model ignores it with a warning and quantizes whole vectors; to
 support a new model, check its accuracy and add its `model_type` to
-`_KEEP_ROPE_PRECISION_MODEL_TYPES` in `nvfp4_quantization.py`. The KV cache of a
+`_SKIP_ROPE_QUANTIZATION_MODEL_TYPES` in `nvfp4_quantization.py`. The KV cache of a
 draft model (speculative decoding) always quantizes whole vectors.
 
 ```yaml
 kv_cache_compression_config:
   algorithm: quantization_for_cold_page
   quant: nvfp4
-  keep_rope_precision: true
+  skip_rope_quantization: true
 ```
 
 ### TriAttention
@@ -288,7 +288,7 @@ structures. Both share the same general platform requirements.[^general-requirem
 | MLA Attention KV | Supported | Not supported |
 | GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly | Not supported |
 | DSA and other Attention side buffers | Preserved losslessly | Not supported |
-| DeepSeek-V4 CSA cache | Supported[^deepseek-v4]; the compressed KV rows are encoded as NVFP4 (their RoPE part is preserved losslessly when `keep_rope_precision` is on) and the indexer cache is preserved losslessly | Not supported |
+| DeepSeek-V4 CSA cache | Supported[^deepseek-v4]; the compressed KV rows are encoded as NVFP4 (their RoPE part is preserved losslessly when `skip_rope_quantization` is on) and the indexer cache is preserved losslessly | Not supported |
 | DeepSeek-V4 SWA, HCA, and compressor state | Preserved losslessly | Not supported |
 
 [^general-requirements]: Both methods currently require the PyTorch backend,

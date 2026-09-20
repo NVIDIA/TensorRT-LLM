@@ -49,8 +49,8 @@ _NVFP4_TRANSFORM = 0
 _LOSSLESS_TRANSFORM = 1
 
 # Models whose K vectors have a known position-free (NoPE) part and whose accuracy
-# with keep_rope_precision has been checked. Other models ignore the switch.
-_KEEP_ROPE_PRECISION_MODEL_TYPES = frozenset(
+# with skip_rope_quantization has been checked. Other models ignore the switch.
+_SKIP_ROPE_QUANTIZATION_MODEL_TYPES = frozenset(
     {"deepseek_v4", "glm_moe_dsa", "qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_5_moe_text"}
 )
 
@@ -205,28 +205,28 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
     ) -> None:
         super().__init__(config, pretrained_config=pretrained_config)
         self._model_scales = _load_modelopt_nvfp4_scales(config.scale_checkpoint_path)
-        self._keep_rope_precision = bool(config.keep_rope_precision)
+        self._skip_rope_quantization = bool(config.skip_rope_quantization)
         model_type = getattr(pretrained_config, "model_type", None)
-        if self._keep_rope_precision and model_type not in _KEEP_ROPE_PRECISION_MODEL_TYPES:
+        if self._skip_rope_quantization and model_type not in _SKIP_ROPE_QUANTIZATION_MODEL_TYPES:
             logger.warning(
-                "keep_rope_precision is validated for model types "
-                f"{sorted(_KEEP_ROPE_PRECISION_MODEL_TYPES)} only; ignoring it for "
+                "skip_rope_quantization is validated for model types "
+                f"{sorted(_SKIP_ROPE_QUANTIZATION_MODEL_TYPES)} only; ignoring it for "
                 f"{model_type!r} and turning whole K and V vectors into NVFP4."
             )
-            self._keep_rope_precision = False
+            self._skip_rope_quantization = False
 
     def _calculate_quantized_range(
         self,
         row_elements: int,
         *,
-        keep_rope: bool,
+        skip_rope: bool,
         rope: tuple[int, int] | None = None,
         key_only: bool = False,
         buffer_name: str,
     ) -> tuple[int, int]:
         """Return (start, count) of the numbers of each K or V vector that become NVFP4."""
 
-        if not keep_rope:
+        if not skip_rope:
             return 0, row_elements
         if rope is None:
             # The same RoPE width the attention layers use.
@@ -238,7 +238,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                     raise NotImplementedError(
                         f"{buffer_name}: head_dim {row_elements} is not kv_lora_rank + "
                         f"qk_rope_head_dim ({kv_lora_rank} + {rope_dim}) of an MLA latent vector, "
-                        "so its RoPE part cannot be located; keep_rope_precision is unsupported here"
+                        "so its RoPE part cannot be located; skip_rope_quantization is unsupported here"
                     )
                 rope = (kv_lora_rank, rope_dim)
             else:  # GQA head: the leading numbers carry RoPE.
@@ -254,8 +254,8 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             return 0, row_elements
         if rope_elements >= row_elements:
             raise ValueError(
-                f"{buffer_name}: every element is position-encoded, so keep_rope_precision would "
-                "leave nothing to quantize; this model cannot keep RoPE precision"
+                f"{buffer_name}: every element is position-encoded, so skip_rope_quantization would "
+                "leave nothing to quantize; the K vectors of this model are entirely RoPE"
             )
         if rope_start == 0:  # RoPE leads the row (partial-rotary GQA heads).
             start, elements = rope_elements, row_elements - rope_elements
@@ -281,7 +281,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         pp_layers: Sequence[int],
         runtime_type: int,
         is_draft: bool,
-        keep_rope: bool,
+        skip_rope: bool,
     ) -> dict[int, _Nvfp4LayerLayout | None]:
         """Build layouts for DeepSeek-V4 lifecycles; None selects lossless fallback."""
 
@@ -385,7 +385,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             # A compressed row is 448 NoPE elements followed by 64 RoPE elements.
             range_start, range_elements = self._calculate_quantized_range(
                 _DEEPSEEK_V4_ROW_STRIDE,
-                keep_rope=keep_rope,
+                skip_rope=skip_rope,
                 rope=(_DEEPSEEK_V4_NOPE_DIM, _DEEPSEEK_V4_ROW_STRIDE - _DEEPSEEK_V4_NOPE_DIM),
                 buffer_name=f"cold-page layer {layer_id} {_DEEPSEEK_V4_COMPRESS}",
             )
@@ -437,10 +437,12 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
 
         # The codec holds only the target model's config, so it cannot locate RoPE
         # in a draft model's K vectors: draft KVCMs always quantize whole vectors.
-        keep_rope = self._keep_rope_precision
-        if keep_rope and is_draft:
-            logger.warning("keep_rope_precision: draft-model K and V vectors become NVFP4 in full.")
-            keep_rope = False
+        skip_rope = self._skip_rope_quantization
+        if skip_rope and is_draft:
+            logger.warning(
+                "skip_rope_quantization: draft-model K and V vectors become NVFP4 in full."
+            )
+            skip_rope = False
 
         deepseek_v4_layouts = {}
         if self.pretrained_config.model_type == "deepseek_v4":
@@ -450,7 +452,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 pp_layers=pp_layers,
                 runtime_type=runtime_type if runtime_type is not None else 0,
                 is_draft=is_draft,
-                keep_rope=keep_rope,
+                skip_rope=skip_rope,
             )
 
         layer_layouts = []
@@ -488,7 +490,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 )
             key_range = self._calculate_quantized_range(
                 head_dim,
-                keep_rope=keep_rope,
+                skip_rope=skip_rope,
                 key_only=compressed_roles == ("key",),
                 buffer_name=f"cold-page layer {layer_id} key",
             )

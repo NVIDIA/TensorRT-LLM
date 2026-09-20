@@ -529,11 +529,6 @@
     {
       "capture_policy": "bool",
       "kind": "value",
-      "path": "kv_cache_compression_config.keep_rope_precision"
-    },
-    {
-      "capture_policy": "bool",
-      "kind": "value",
       "path": "kv_cache_compression_config.normalize_scores"
     },
     {
@@ -543,6 +538,11 @@
       "capture_policy": "literal",
       "kind": "categorical",
       "path": "kv_cache_compression_config.quant"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_compression_config.skip_rope_quantization"
     },
     {
       "capture_policy": "int",
