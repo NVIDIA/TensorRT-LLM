@@ -59,6 +59,8 @@ def _sole_piece(block_ids_per_layer_groups=None, *, tokens=0, is_last=True) -> C
 class _BounceProbe:
     """No-bounce probe that records physical-owner cleanup decisions."""
 
+    enabled = False
+
     def __init__(self) -> None:
         self.failed_writers: list[tuple[tuple[int, int], int]] = []
         self.orphaned: list[tuple[int, int]] = []
@@ -101,14 +103,24 @@ class _LateReservationBounce(_BounceProbe):
 class _PartialFanInBounce(_BounceProbe):
     """CPU model of one bounced fan-in reservation."""
 
+    enabled = True
+
     def __init__(self) -> None:
         super().__init__()
         self.context: TransferContext | None = None
         self.release_count = 0
         self.scatter_count = 0
 
-    def reserve(self, receiver_req, num_writers: int, *, extra_bytes: int = 0) -> bool:
-        del extra_bytes
+    def reserve(
+        self,
+        receiver_req,
+        num_writers: int,
+        *,
+        extra_bytes: int = 0,
+        frags_per_block: dict[int, int] | None = None,
+        writer_owns_replicated: list[bool] | None = None,
+    ) -> bool:
+        del extra_bytes, frags_per_block, writer_owns_replicated
         self.context = TransferContext(
             rid_slice=(receiver_req.unique_rid, receiver_req.slice_id),
             slot_id=0,
@@ -118,10 +130,12 @@ class _PartialFanInBounce(_BounceProbe):
         )
         return True
 
-    def writer_base(self, rid_slice: tuple[int, int], writer_index: int) -> int | None:
+    def writer_region(
+        self, rid_slice: tuple[int, int], writer_index: int
+    ) -> tuple[int | None, int | None]:
         if self.context is None or self.context.rid_slice != rid_slice:
-            return None
-        return self.context.writer_base(writer_index)
+            return None, None
+        return self.context.writer_base(writer_index), self.context.writer_bytes(writer_index)
 
     def is_bounced(self, rid_slice: tuple[int, int]) -> bool:
         return self.context is not None and self.context.rid_slice == rid_slice
@@ -699,6 +713,8 @@ def test_partial_bounced_publication_waits_for_queued_writer_success(
         get_peer_overlap=Mock(return_value=overlap),
         self_extractor=SimpleNamespace(page_table=None),
         self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0, cp_size=1),
+        frags_per_block_per_group=Mock(return_value={0: 1}),
+        fan_in_replicated_owners=Mock(return_value=[True, False]),
     )
     receiver._get_sender_info = Mock(
         return_value=SimpleNamespace(

@@ -209,19 +209,29 @@ def gather_contiguous(
     )
 
 
-def scatter_contiguous(
-    src_base: int,
-    dst_ptrs: np.ndarray,
-    sizes: np.ndarray,
-    offsets: np.ndarray,
-    *,
-    stream,
-) -> None:
-    """The inverse of gather: scatter each piece of the contiguous buffer back to its destination
-    fragment, asynchronously. The caller syncs before signaling completion."""
-    dst_addrs = np.asarray(dst_ptrs, dtype=np.int64)
-    src_addrs = np.int64(src_base) + np.asarray(offsets, dtype=np.int64)
-    sizes = np.asarray(sizes, dtype=np.int64)
+def scatter_contiguous_multi(regions, *, stream) -> None:
+    """The inverse of gather: scatter each region back to its fragments, asynchronously.
+
+    All regions go in ONE batched copy: the per-stream metadata buffers may only be refilled after
+    a sync, and the caller syncs once at the end. The caller syncs before signaling completion.
+    """
+    dst_parts, src_parts, size_parts = [], [], []
+    for src_base, dst_ptrs, sizes in regions:
+        sizes = np.asarray(sizes, dtype=np.int64)
+        if sizes.size == 0:
+            continue
+        offsets = np.empty(sizes.size, dtype=np.int64)
+        offsets[0] = 0
+        np.cumsum(sizes[:-1], out=offsets[1:])
+        dst_parts.append(np.asarray(dst_ptrs, dtype=np.int64))
+        src_parts.append(np.int64(src_base) + offsets)
+        size_parts.append(sizes)
+    if not size_parts:
+        return
+
+    dst_addrs = dst_parts[0] if len(dst_parts) == 1 else np.concatenate(dst_parts)
+    src_addrs = src_parts[0] if len(src_parts) == 1 else np.concatenate(src_parts)
+    sizes = size_parts[0] if len(size_parts) == 1 else np.concatenate(size_parts)
 
     if _launch_batched_copy(dst_addrs, src_addrs, sizes, stream):
         return

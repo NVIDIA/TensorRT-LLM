@@ -41,7 +41,7 @@ from tensorrt_llm._utils import CUASSERT
 from .buffer import SlotAllocator
 from .config import DEFAULT_MIN_BYTES, SizingContext, fit_within_free
 from .core import BounceTransport, Disposition, Settlement, TransferContext
-from .gather_scatter import Plan, gather_contiguous, scatter_contiguous
+from .gather_scatter import Plan, gather_contiguous, scatter_contiguous_multi
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
@@ -62,7 +62,12 @@ class VmmBounceTransport(BounceTransport):
 
     @classmethod
     def from_config(
-        cls, agent, cfg, *, device_id: int, block_bytes_per_group: list[int | None]
+        cls,
+        agent,
+        cfg,
+        *,
+        device_id: int,
+        block_bytes_per_group: tuple[list[int | None], list[int]],
     ) -> VmmBounceTransport | None:
         """Build a transport sized from the config and clamped to free memory, or None if not even one
         chunk fits."""
@@ -99,7 +104,7 @@ class VmmBounceTransport(BounceTransport):
         device_id: int,
         capacity_bytes: int,
         phys_chunk_size: int,
-        block_bytes_per_group: list[int | None],
+        block_bytes_per_group: tuple[list[int | None], list[int]],
         min_bytes: int = DEFAULT_MIN_BYTES,
         min_blocks: int = 96,
         quarantine_grace_s: float = _QUARANTINE_GRACE_S,
@@ -107,12 +112,13 @@ class VmmBounceTransport(BounceTransport):
     ):
         self._agent = agent
         self._device_id = device_id
-        # The byte size of one cache block, listed for each attention layer group.
-        self._block_bytes_per_group = list(block_bytes_per_group)
-        # Size gates below which bounce is skipped: coalescing only pays off once the transfer is
-        # large enough to beat the gather+scatter overhead (see config.DEFAULT_MIN_BYTES for the
-        # rationale). min_bytes applies to payloads carrying recurrent (mamba/KDA) state;
-        # min_blocks applies to plain-KV payloads (see the gate in reserve()).
+        # Bytes of one cache block per attention layer group, and the replicated part of that,
+        # which a fan-in sends once from an elected owner rather than splitting.
+        self._block_bytes_per_group, self._replicated_block_bytes_per_group = (
+            list(x) for x in block_bytes_per_group
+        )
+        # Skip bounce below this many fragments: coalescing pays off only once the per-fragment
+        # path would submit many descriptors.
         self._min_bytes = min_bytes
         self._min_blocks = min_blocks
         # how long an orphaned region is held out of reuse; must outlast the worst in-flight write
@@ -190,6 +196,16 @@ class VmmBounceTransport(BounceTransport):
         """Reserve a send slot and gather into it, or None on send-region backpressure. Eligibility
         was already decided by the receiver, so the sender only falls back under backpressure."""
         total = int(write_meta.sizes.sum())
+        limit = getattr(write_meta, "bounce_dst_bytes", None)
+        if limit is not None and total > int(limit):
+            # The two sides disagree about the coalesced size; fall back rather than overrun the
+            # neighbouring slot.
+            logger.warning_once(
+                f"[kv-bounce] in-place: gathered {total}B exceeds the {int(limit)}B the receiver "
+                "reserved; falling back to per-fragment (sender/receiver size mismatch)",
+                key="kv-bounce-dst-overrun",
+            )
+            return None
         res = self._send_alloc.reserve(total, timeout=timeout)
         if res is None:
             logger.warning_once(
@@ -235,10 +251,12 @@ class VmmBounceTransport(BounceTransport):
         *,
         timeout: Optional[float] = _RESERVE_TIMEOUT_S,
         extra_bytes: int = 0,
+        frags_per_block: dict[int, int] | None = None,
+        writer_owns_replicated: list[bool] | None = None,
     ) -> bool:
         """Reserve a region and create its state, recording the address for the senders. Returns
-        False to fall back to the per-fragment path. A fan-in splits the region evenly, so the total
-        must divide across the writers. ``extra_bytes`` is the non-paged payload the sender appends
+        False to fall back to the per-fragment path. Sharded bytes split evenly across fan-in
+        writers; replicated bytes go to their elected owner. ``extra_bytes`` is what the sender appends
         to the same coalesced write (mamba/KDA recurrent state, sized by the receiver via
         ``mamba_receiver_payload_bytes``); the region must cover it or the write would overrun into the
         neighboring slot."""
@@ -276,17 +294,10 @@ class VmmBounceTransport(BounceTransport):
             return self._skip_bounce(
                 f"computed transfer size {total} <= 0", warn_key="kv-bounce-nonpositive-size"
             )
-        # Which size gate applies depends on the payload. Payloads carrying recurrent (mamba/KDA)
-        # state gate on BYTES: the cost the gate guards (falling back to the slow per-fragment
-        # path) scales with bytes, and a block count is meaningless for the non-paged state (the
-        # Kimi-K3 regression: a 433 MiB transfer of 67 small blocks plus KDA state failed a
-        # 96-block gate and fell onto the ~0.4 GB/s host-staged path). Plain-KV payloads keep the
-        # original block-count gate so pre-existing bounce deployments (opted in via
-        # kv_cache_bounce_size_mb) see no change in which transfers use the arena.
-        # TODO(TRTLLM-15194): investigate whether the byte-only gate is
-        # safe (or better) for plain-KV payloads too, so this special case can be removed and
-        # both payload kinds share one gate.
+        # Recurrent-state payloads retain their byte gate; plain KV gates on descriptors.
         nblocks = sum(int(a.size) for a in recv_req.block_ids_per_layer_groups)
+        blocks = [int(a.size) for a in recv_req.block_ids_per_layer_groups]
+        nfrags = sum(n * (frags_per_block or {}).get(g, 1) for g, n in enumerate(blocks))
         if extra_bytes > 0:
             if total < self._min_bytes:
                 return self._skip_bounce(
@@ -294,27 +305,37 @@ class VmmBounceTransport(BounceTransport):
                     f"(too small; tune TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES)",
                     warn_key="kv-bounce-below-min-bytes",
                 )
-        elif nblocks < self._min_blocks:
+        elif nfrags < self._min_blocks:
             return self._skip_bounce(
-                f"{nblocks} blocks < min {self._min_blocks} (too small; tune "
+                f"{nblocks} blocks / {nfrags} fragments < min {self._min_blocks} (too small; tune "
                 f"TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS)",
                 warn_key="kv-bounce-below-min-blocks",
             )
-        if num_writers > 1 and total % num_writers != 0:
-            return self._skip_bounce(
-                f"fan-in {total}B across {num_writers} senders is not an even split "
-                f"({total % num_writers}B remainder); head-mismatch explosion NOT mitigated",
-                warn_key="kv-bounce-uneven-fanin",
-            )
+        writer_sizes: Optional[List[int]] = None
         if num_writers > 1:
-            # Fan-in gives each writer an equal share of the region, which only matches where it
-            # writes when all writers send the same bytes. Equal layer count guarantees that only
-            # when the per-block sizes match, so require that here, else fall back.
-            # Exclude None entries (STATE groups) — they are already guarded above.
+            # Replicated views go out once from an elected owner, so only the rest is divided.
+            repl_total = sum(n * r for n, r in zip(blocks, self._replicated_block_bytes_per_group))
+            shard_total = total - repl_total
+            if shard_total <= 0:
+                # Empty sub-regions all resolve to the same address; fall back, don't alias.
+                return self._skip_bounce(
+                    f"fan-in across {num_writers} senders leaves {shard_total}B to share after "
+                    f"{repl_total}B of replicated views; cannot give each writer its own region",
+                    warn_key="kv-bounce-no-sharded-bytes",
+                )
+            if shard_total % num_writers != 0:
+                return self._skip_bounce(
+                    f"fan-in {shard_total}B across {num_writers} senders is not an even split "
+                    f"({shard_total % num_writers}B remainder); head-mismatch explosion NOT mitigated",
+                    warn_key="kv-bounce-uneven-fanin",
+                )
+            # An equal share only lands where a writer writes when the per-block sizes match.
             present_slot_bytes = {
-                self._block_bytes_per_group[g]
-                for g, block_ids in enumerate(recv_req.block_ids_per_layer_groups)
-                if int(block_ids.size) > 0 and self._block_bytes_per_group[g]
+                b - r
+                for n, b, r in zip(
+                    blocks, self._block_bytes_per_group, self._replicated_block_bytes_per_group
+                )
+                if n > 0 and b is not None
             }
             if len(present_slot_bytes) > 1:
                 return self._skip_bounce(
@@ -322,6 +343,22 @@ class VmmBounceTransport(BounceTransport):
                     f"{sorted(present_slot_bytes)}; the equal split would overrun a sub-region",
                     warn_key="kv-bounce-heterogeneous-fanin",
                 )
+            even = shard_total // num_writers
+            if repl_total == 0:
+                writer_sizes = [even] * num_writers
+            else:
+                # One writer carries the replicated bytes, so its sub-region is the larger one;
+                # without a prediction naming exactly one owner, guessing would overrun.
+                owners = [i for i, owns in enumerate(writer_owns_replicated or ()) if owns]
+                if len(writer_owns_replicated or ()) != num_writers or len(owners) != 1:
+                    return self._skip_bounce(
+                        f"fan-in across {num_writers} senders carries {repl_total}B of replicated "
+                        f"pools but the elected owner is {owners or 'unknown'}; cannot size "
+                        "sub-regions",
+                        warn_key="kv-bounce-replicated-fanin",
+                    )
+                writer_sizes = [even] * num_writers
+                writer_sizes[owners[0]] += repl_total
         if total > self._recv_alloc.capacity:  # too big to ever fit, unlike transient backpressure
             return self._skip_bounce(
                 f"transfer {total // _MIB}MiB exceeds the {self._recv_alloc.capacity // _MIB}MiB bounce "
@@ -336,6 +373,7 @@ class VmmBounceTransport(BounceTransport):
             )
         slot_id, addr = res
         recv_req.bounce_dst_base = addr
+        recv_req.bounce_dst_bytes = writer_sizes[0] if writer_sizes else total
         with self._reserved_map_lock:
             ctx = TransferContext(
                 rid_slice=(recv_req.unique_rid, recv_req.slice_id),
@@ -343,23 +381,31 @@ class VmmBounceTransport(BounceTransport):
                 base_addr=addr,
                 per_writer_bytes=total // num_writers,
                 num_writers=num_writers,
+                writer_sizes=writer_sizes,
             )
             self._reserved_map[ctx.rid_slice] = ctx  # inactive until the first writer reports
         # Positive marker: all fall-back guards above passed, so this transfer provably takes the
         # coalesced-bounce WRITE path. Logged once (per process) so an e2e test can assert that
         # bounce actually engaged instead of silently falling back to the per-fragment path.
         logger.info_once(
-            f"[kv-bounce] coalesced {nblocks} blocks / {total // _MIB}MiB into one region "
+            f"[kv-bounce] coalesced {sum(blocks)} blocks / {total // _MIB}MiB into one region "
             f"across {num_writers} writer(s)",
             key="kv-bounce-coalesced",
         )
         return True
 
-    def writer_base(self, rid_slice: RidSlice, writer_index: int) -> Optional[int]:
-        """Where the given fan-in writer writes in the region."""
+    def writer_region(
+        self, rid_slice: RidSlice, writer_index: int
+    ) -> tuple[int | None, int | None]:
+        """Where a fan-in writer writes and how much it may write: (base, bytes).
+
+        Both under one lock: the size limit is what stops an oversized gather from overrunning a
+        neighbour, so a concurrent cancel must not be able to strip it from a base."""
         with self._reserved_map_lock:
             ctx = self._reserved_map.get(rid_slice)
-            return None if ctx is None else ctx.writer_base(writer_index)
+            if ctx is None:
+                return None, None
+            return ctx.writer_base(writer_index), int(ctx.writer_bytes(writer_index))
 
     def is_bounced(self, rid_slice: RidSlice) -> bool:
         with self._reserved_map_lock:
@@ -469,13 +515,10 @@ class VmmBounceTransport(BounceTransport):
             ctx, descs = item
             ok = True
             try:
-                # Scatter each writer's fragments from its own source, never one global offset, so a
-                # missing or fallback writer cannot shift where the others are read from.
-                for src_base, dst_ptrs, sizes in descs:
-                    p = Plan(dst_ptrs, dst_ptrs, sizes, int(sizes.sum()))
-                    scatter_contiguous(
-                        src_base, p.dst_ptrs, p.sizes, p.offsets, stream=self._scatter_stream
-                    )
+                # Each writer scatters from its own source, so a missing or fallback writer cannot
+                # shift where the others are read from; one batched copy for all of them, because
+                # the per-stream metadata buffers may only be refilled after the sync below.
+                scatter_contiguous_multi(descs, stream=self._scatter_stream)
                 CUASSERT(cudart.cudaStreamSynchronize(self._scatter_stream))
             except Exception as e:
                 # a scatter failure must not kill the worker nor be reported as success
@@ -519,11 +562,13 @@ class NoBounceTransport(BounceTransport):
         *,
         timeout: Optional[float] = _RESERVE_TIMEOUT_S,
         extra_bytes: int = 0,
+        frags_per_block: dict[int, int] | None = None,
+        writer_owns_replicated: list[bool] | None = None,
     ) -> bool:
         return False
 
-    def writer_base(self, rid_slice, writer_index: int):
-        return None
+    def writer_region(self, rid_slice: RidSlice, writer_index: int) -> tuple[None, None]:
+        return None, None
 
     def is_bounced(self, rid_slice) -> bool:
         return False
@@ -556,7 +601,10 @@ def create_bounce(agent, cfg, *, device_id: int, page_table) -> BounceTransport:
         return NoBounceTransport()
     try:
         transport = VmmBounceTransport.from_config(
-            agent, cfg, device_id=device_id, block_bytes_per_group=block_bytes_per_group(page_table)
+            agent,
+            cfg,
+            device_id=device_id,
+            block_bytes_per_group=block_bytes_per_group(page_table),
         )
         return transport if transport is not None else NoBounceTransport()
     except (
@@ -610,22 +658,24 @@ def decode_result_tail(message):
     return None, None, None
 
 
-def block_bytes_per_group(page_table: KVCachePageTable) -> list[int | None]:
-    """Return transferred bytes per cache block for each layer group.
+def block_bytes_per_group(page_table: KVCachePageTable) -> tuple[list[int | None], list[int]]:
+    """Return total and replicated bytes per cache block for each layer group.
 
     All distinct physical pools exposed by an attention group contribute to its
     transfer size. Multiple logical views of the same physical pool contribute
     only once. Non-attention groups retain a ``None`` placeholder so the result
     remains aligned with receive-request layer-group indices.
     """
-    from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
+    from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, MapperKind
     from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 
     assert page_table is not None
     out: list[int | None] = []
+    replicated: list[int] = []
     for lg_idx, lg in enumerate(page_table.layer_groups):
         if lg.kind != CacheKind.PAGED:
             out.append(None)
+            replicated.append(0)
             continue
         pool_indices = {pool_view.pool_idx for pool_view in lg.pool_views}
         out.append(
@@ -634,4 +684,12 @@ def block_bytes_per_group(page_table: KVCachePageTable) -> list[int | None]:
                 for pool_idx in pool_indices
             )
         )
-    return out
+        replicated.append(
+            sum(
+                int(entry["size"])
+                for view in lg.pool_views
+                if view.mapper_kind == MapperKind.REPLICATED
+                for entry in view.buffer_entries
+            )
+        )
+    return out, replicated
