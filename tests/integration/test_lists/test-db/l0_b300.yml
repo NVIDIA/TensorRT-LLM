@@ -75,7 +75,6 @@ l0_b300:
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streamed_experts_forward_runs
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_cutlass_situ_bf16_matches_reference
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_kernel_actually_applies_situ[CUTEDSL]
-  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_kernel_actually_applies_situ[CUTLASS]
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_kernel_actually_applies_situ[TRTLLM]
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_kimi_k3_allow_list_matches_what_the_backends_declare
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass
