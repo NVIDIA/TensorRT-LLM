@@ -3364,7 +3364,14 @@ class RuntimeMemoryStatus(StrictBaseModel):
     state: Literal["running", "parking", "parked", "waking", "failed"] = Field(
         description="Current runtime-memory admission state.")
     parked_tags: list[ExecutorMemoryType] = Field(
-        default_factory=list, description="Memory tags that remain released.")
+        default_factory=list,
+        description=
+        "Memory tags that remain released, sorted lexicographically by value.")
+
+    @field_validator("parked_tags")
+    @classmethod
+    def sort_parked_tags(cls, parked_tags):
+        return sorted(parked_tags, key=lambda tag: tag.value)
 
 
 @dataclass

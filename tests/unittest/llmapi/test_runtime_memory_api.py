@@ -68,7 +68,7 @@ async def test_async_resume_defaults_to_currently_parked_tags():
     assert result is None
     assert llm.collective_rpc.await_args_list == [
         call("get_memory_status"),
-        call("wakeup", args=(["model", "kv_cache"],)),
+        call("wakeup", args=(["kv_cache", "model"],)),
     ]
 
 
@@ -86,14 +86,19 @@ async def test_async_resume_is_noop_when_nothing_is_parked():
 @pytest.mark.asyncio
 async def test_async_get_memory_status_reconciles_worker_replies():
     llm = _make_async_llm()
-    reply = {"state": "parked", "parked_tags": ["model"]}
-    llm.collective_rpc.return_value = [reply, reply]
+    llm.collective_rpc.return_value = [
+        {"state": "parked", "parked_tags": ["model", "kv_cache"]},
+        {"state": "parked", "parked_tags": ["kv_cache", "model"]},
+    ]
 
     status = await llm.get_memory_status()
 
     assert status == RuntimeMemoryStatus(
         state="parked",
-        parked_tags=[ExecutorMemoryType.MODEL_ENGINE_MAIN],
+        parked_tags=[
+            ExecutorMemoryType.KV_CACHE,
+            ExecutorMemoryType.MODEL_ENGINE_MAIN,
+        ],
     )
     llm.collective_rpc.assert_awaited_once_with("get_memory_status")
 
@@ -186,7 +191,7 @@ def test_resume_defaults_to_currently_parked_tags():
 
     llm.resume()
 
-    llm._collective_rpc.assert_called_once_with("wakeup", (["model", "kv_cache"],))
+    llm._collective_rpc.assert_called_once_with("wakeup", (["kv_cache", "model"],))
 
 
 def test_resume_is_noop_when_nothing_is_parked():
@@ -201,6 +206,21 @@ def test_resume_is_noop_when_nothing_is_parked():
     llm.resume()
 
     llm._collective_rpc.assert_not_called()
+
+
+def test_runtime_memory_status_sorts_parked_tags():
+    status = RuntimeMemoryStatus(
+        state="parked",
+        parked_tags=[
+            ExecutorMemoryType.MODEL_ENGINE_MAIN,
+            ExecutorMemoryType.KV_CACHE,
+        ],
+    )
+
+    assert status.parked_tags == [
+        ExecutorMemoryType.KV_CACHE,
+        ExecutorMemoryType.MODEL_ENGINE_MAIN,
+    ]
 
 
 def test_get_memory_status_reconciles_worker_replies():

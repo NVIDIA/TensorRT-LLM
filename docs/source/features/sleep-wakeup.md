@@ -271,6 +271,8 @@ A status response has this shape:
 }
 ```
 
+The `parked_tags` list is sorted lexicographically by tag value.
+
 Successful POST requests return `{"status":"success"}`. Invalid tags return
 HTTP 400, conflicting transitions return 409, authentication failures return
 401, and unexpected worker failures return 500.
