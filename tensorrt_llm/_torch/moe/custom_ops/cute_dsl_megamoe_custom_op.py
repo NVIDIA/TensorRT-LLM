@@ -524,6 +524,7 @@ def _megamoe_problem_key(
     combine_format: str,
     swiglu_alpha: Optional[float] = None,
     swiglu_beta: Optional[float] = None,
+    skip_topk_reduce: bool = False,
 ) -> Tuple:
     return (
         int(sm_version),
@@ -543,6 +544,7 @@ def _megamoe_problem_key(
         str(combine_format),
         None if swiglu_alpha is None else float(swiglu_alpha),
         None if swiglu_beta is None else float(swiglu_beta),
+        bool(skip_topk_reduce),
     )
 
 
@@ -1828,6 +1830,78 @@ if IS_MEGAMOE_OP_AVAILABLE:
         _, shared_bytes = probe.get_workspace_sizes()
         return int(shared_bytes), isinstance(probe, RubinInferenceGenphaseMegaMoE)
 
+    def query_megamoe_combine_quant_region(
+        *,
+        world_size: int,
+        num_topk: int,
+        num_experts_per_rank: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        expand_intermediate_size_per_partition: int,
+        max_tokens_per_rank: int,
+        combine_format: str = "bf16",
+    ) -> Tuple[int, int]:
+        """Return ``(byte_offset, byte_size)`` of the ``combine_quant`` region
+        inside the kernel's shared workspace.
+
+        Deferred finalize (``skip_topk_reduce``) exposes this region to the
+        caller as a ``(max_tokens_per_rank, num_topk, hidden)`` torch view.
+        The shared-region layout is tactic-invariant (it depends only on
+        world_size / num_experts_per_rank / num_topk / max_tokens_per_rank /
+        hidden / combine_format -- see ``_build_shared_region_specs``), so a
+        default-tactic probe kernel yields the offsets of every launch.
+        Form-A only: form-B (``in_kernel_fc2_reduce``) has no such region.
+        """
+        if combine_format != "bf16":
+            raise ValueError(
+                f"deferred finalize exposes combine_quant undequantized and "
+                f"therefore requires the bf16 combine format; got "
+                f"{combine_format!r}."
+            )
+        tactic = default_megamoe_tactic(0)
+        (
+            mma_tiler,
+            cluster_shape,
+            group_hint,
+            load_balance_mode,
+            token_back_mode,
+            use_bulk_fc2_store,
+            flag_batch,
+            epi_flag_batch,
+        ) = _unpack_tactic(tactic)
+        mma_tiler = tuple(mma_tiler)
+        kernel_cls, CombineFormat = _import_megamoe_kernel()
+        probe = kernel_cls(
+            combine_format=CombineFormat.parse(combine_format),
+            mma_tiler_mnk=mma_tiler,
+            cluster_shape_mnk=tuple(cluster_shape),
+            use_2cta_instrs=bool(mma_tiler[0] == 256),
+            group_hint=int(group_hint),
+            token_padding_block=64,
+            sf_padding_block=SfPaddingBlock,
+            load_balance_mode=str(load_balance_mode),
+            static_expert_shape=(
+                num_experts_per_rank,
+                expand_intermediate_size_per_partition,
+                hidden_size,
+            ),
+            world_size=int(world_size),
+            num_topk=int(num_topk),
+            max_tokens_per_rank=int(max_tokens_per_rank),
+            hidden=int(hidden_size),
+            fc2_output_dtype=cutlass.BFloat16,
+            in_kernel_fc2_reduce=False,
+            skip_topk_reduce=True,
+            token_back_mode=str(token_back_mode),
+            non_ubulk_fc2_store=(not bool(use_bulk_fc2_store)),
+            flag_batch=int(flag_batch),
+            epi_flag_batch=tuple(epi_flag_batch),
+            **_LOCKED_KERNEL_KWARGS,
+        )
+        offset = int(probe._shared_offsets["combine_quant"])
+        nbytes = int(probe._shared_region_by_name["combine_quant"].nbytes)
+        return offset, nbytes
+
     def _megamoe_autotune_num_tokens(shapes: List[torch.Size]) -> int:
         """Shape-derivation rule: the activation token count (input[0] dim0)
         drives every other tensor's leading axis.
@@ -1879,6 +1953,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             situ_linear_beta: Optional[float] = None,
             in_kernel_fc2_reduce: bool = False,
             combine_format: str = "bf16",
+            skip_topk_reduce: bool = False,
             tactic_autotune: bool = False,
         ) -> None:
             super().__init__()
@@ -1928,6 +2003,11 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # combine wire format: bf16 / 32e4m3xe8m0 (fp8) / 16e2m1xbf16 (fp4);
             # quantized changes the shared_workspace size, so part of unique_id.
             self.combine_format = str(combine_format)
+            # Deferred finalize: skip the standalone TopkReduce and leave the
+            # per-(token, topk) combine_quant staging as the kernel's output.
+            # Codegen-time (changes the launch graph) -> part of unique_id, so
+            # deferred and default runs never share compiled kernels/tactics.
+            self.skip_topk_reduce = bool(skip_topk_reduce)
             # Tactic-autotune opt-in (default OFF). Does NOT change the
             # generated kernel, so deliberately EXCLUDED from unique_id /
             # _tactic_cache_key: opted-in and opted-out runs share caches.
@@ -1958,6 +2038,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 situ_linear_beta=self.situ_linear_beta,
                 in_kernel_fc2_reduce=self.in_kernel_fc2_reduce,
                 combine_format=self.combine_format,
+                skip_topk_reduce=self.skip_topk_reduce,
             )
 
         def get_valid_tactics(
@@ -2195,6 +2276,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 apply_topk_in_fc1=self.apply_topk_in_fc1,
                 swiglu_alpha=self.swiglu_alpha,
                 swiglu_beta=self.swiglu_beta,
+                skip_topk_reduce=self.skip_topk_reduce,
                 gate_up_clamp=self.gate_up_clamp,
                 situ_beta=self.situ_beta,
                 situ_linear_beta=self.situ_linear_beta,
@@ -2546,6 +2628,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         act_beta: Optional[float] = None,
         in_kernel_fc2_reduce: bool = False,
         combine_format: str = "bf16",
+        skip_topk_reduce: bool = False,
         tactic_autotune: bool = False,
         num_tokens: int = -1,
     ) -> None:
@@ -2570,6 +2653,12 @@ if IS_MEGAMOE_OP_AVAILABLE:
         accumulation order). Both write ``combine_output`` with shape
         ``(T, 1, hidden)``. Perf knobs come from the tactic, not op
         arguments.
+
+        ``skip_topk_reduce`` (deferred finalize, form-A + bf16 wire only)
+        drops the TopkReduce tail: ``combine_output`` is left untouched and
+        the caller consumes the per-(token, topk) ``combine_quant`` staging
+        inside ``shared_workspace`` directly (locate it with
+        :func:`query_megamoe_combine_quant_region`).
 
         ``act_alpha`` / ``act_beta`` select the activation: both None
         runs SwiGLU, both set runs SiTU with the gate-side and linear-side
@@ -2607,6 +2696,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             situ_linear_beta=act_beta,
             in_kernel_fc2_reduce=in_kernel_fc2_reduce,
             combine_format=combine_format,
+            skip_topk_reduce=skip_topk_reduce,
             tactic_autotune=tactic_autotune,
         )
         inputs = [
@@ -2723,6 +2813,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         act_beta: Optional[float] = None,
         in_kernel_fc2_reduce: bool = False,
         combine_format: str = "bf16",
+        skip_topk_reduce: bool = False,
         tactic_autotune: bool = False,
         num_tokens: int = -1,
     ) -> None:

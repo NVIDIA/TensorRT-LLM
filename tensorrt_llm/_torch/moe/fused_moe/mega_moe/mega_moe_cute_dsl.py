@@ -594,9 +594,26 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             )
         self.apply_router_weight_on_input = apply_router_weight_on_input
 
-        # Preserve V4's pre-quantization routing weights; other models apply them after FC2.
-        self.apply_topk_in_fc1 = "DeepseekV4ForCausalLM" in (
-            getattr(model_config.pretrained_config, "architectures", None) or ()
+        # Deferred finalize (opt-in, MEGAMOE_DEFERRED_FINALIZE=1): the fused
+        # kernel skips its TopkReduce tail and ``run_moe(do_finalize=False)``
+        # returns the unfinalized (gemm2_output, expert_weights,
+        # expanded_idx_to_permuted_idx) triple over the per-(token, topk)
+        # combine_quant staging, so a model-owned finalize (e.g. per-expert
+        # RMSNorm before the weighted sum) can run between the expert FC2 and
+        # the top-k reduction. Must be rank-identical (selects the compiled
+        # kernel on every EP rank). Default OFF: the default path is
+        # byte-identical to a build without this knob.
+        self.deferred_finalize = os.environ.get("MEGAMOE_DEFERRED_FINALIZE", "0") == "1"
+
+        # Preserve V4's pre-quantization routing weights; other models apply
+        # them after FC2. Deferred finalize MUST take the post-FC2 route
+        # regardless: a model finalize that is not scale-covariant (RMSNorm is
+        # scale-invariant) would erase a routing weight folded upstream, so the
+        # weight has to be applied after the model's per-expert transform.
+        self.apply_topk_in_fc1 = not self.deferred_finalize and (
+            "DeepseekV4ForCausalLM" in (
+                getattr(model_config.pretrained_config, "architectures", None) or ()
+            )
         )
         self._topk_idx_dtype = torch.int32 if get_sm_version() == 107 else torch.int64
 
@@ -611,6 +628,33 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 f"{sorted(self._SUPPORTED_COMBINE_FORMATS)}; got {combine_format!r}."
             )
         self.combine_format = combine_format
+        if self.deferred_finalize and combine_format != "bf16":
+            raise ValueError(
+                f"MEGAMOE_DEFERRED_FINALIZE=1 requires the bf16 combine wire "
+                f"format (the exposed combine_quant rows are consumed "
+                f"undequantized); got MEGAMOE_COMBINE_FORMAT={combine_format!r}."
+            )
+        # Deferred finalize returns COMPLETE per-token expert rows (the fused
+        # combine is transport: the token owner receives every top-k row), so
+        # the model-side TP all-reduce that sums TRTLLM-style rank-local
+        # partials would double-count. Attention TP without attention DP is
+        # therefore refused; pure DEP / ADP are the supported topologies.
+        if (
+            self.deferred_finalize
+            and self.mapping.tp_size > 1
+            and not self.mapping.enable_attention_dp
+        ):
+            raise ValueError(
+                "MEGAMOE_DEFERRED_FINALIZE=1 is not supported with attention "
+                "TP (tp_size > 1 without attention DP): the unfinalized "
+                "triple already holds complete per-token expert rows, and a "
+                "model-side TP all-reduce would double-count them."
+            )
+        # Per-bucket combine_quant (offset, nbytes) inside the shared
+        # workspace; filled lazily on the deferred-finalize path.
+        self._combine_quant_regions: Dict[int, Tuple[int, int]] = {}
+        # Per-(rows, device) cached identity index map for the triple.
+        self._deferred_idx_cache: Dict[Tuple[int, str], torch.Tensor] = {}
 
         # AutoTuner tactic-sweep opt-in via MEGAMOE_TACTIC_AUTOTUNE=1
         # (bench-only knob; default OFF so serving warmup never pays the
@@ -757,6 +801,12 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         and reset by the next ``_run_moe``.
         """
         self._active_launch_max_tokens = chunk_max_tokens
+
+    @property
+    def supports_deferred_finalize(self) -> bool:
+        """Scheduler gate: ``FusedCommMoEScheduler`` accepts
+        ``do_finalize=False`` only when the backend advertises this."""
+        return self.deferred_finalize
 
     def _supports_load_balancer(self) -> bool:
         # Both static and dynamic EPLB are supported: the four MegaMoE-
@@ -1225,6 +1275,13 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             output_dtype = self.dtype or torch.bfloat16
         if x_sf is None:
             raise ValueError("MegaMoECuteDsl requires x_sf from quantize_input")
+        deferred = not ctx.do_finalize
+        if deferred and not self.deferred_finalize:
+            raise NotImplementedError(
+                "MegaMoECuteDsl got do_finalize=False but deferred finalize "
+                "is not enabled; set MEGAMOE_DEFERRED_FINALIZE=1 (rank-"
+                "identically) to opt in."
+            )
 
         # Surface a missing multi-rank symm provider BEFORE the weights
         # guard so callers can distinguish "no provider" from "weights
@@ -1266,6 +1323,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             hidden=hidden,
             device=device,
             output_dtype=output_dtype,
+            deferred=deferred,
         )
 
     def _ensure_local_staging(self, *, top_k: int, hidden: int, device, output_dtype, max_T: int):
@@ -1480,6 +1538,64 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             bufs.topk_weights[num_tokens:max_T, :top_k].zero_()
         self._last_staged_T[max_T] = num_tokens
 
+    def _combine_quant_view(
+        self, shared_workspace: torch.Tensor, *, top_k: int, hidden: int, launch_max_T: int
+    ) -> torch.Tensor:
+        """(launch_max_T, top_k, hidden) bf16 torch view over the kernel's
+        internal ``combine_quant`` staging region inside ``shared_workspace``.
+
+        The region offset is tactic-invariant per bucket (see
+        ``query_megamoe_combine_quant_region``); cached per ``launch_max_T``.
+        Rebuilt per launch because each adaptive bucket has its own
+        shared workspace (and, multi-rank, its own symmetric provider).
+        """
+        region = self._combine_quant_regions.get(launch_max_T)
+        if region is None:
+            from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
+                query_megamoe_combine_quant_region,
+            )
+
+            region = query_megamoe_combine_quant_region(
+                world_size=self.ep_size,
+                num_topk=top_k,
+                num_experts_per_rank=int(self.expert_size_per_partition),
+                hidden_size=hidden,
+                intermediate_size_per_partition=int(self.intermediate_size_per_partition),
+                expand_intermediate_size_per_partition=int(
+                    self.expand_intermediate_size_per_partition
+                ),
+                max_tokens_per_rank=launch_max_T,
+                combine_format=self.combine_format,
+            )
+            self._combine_quant_regions[launch_max_T] = region
+        offset, nbytes = region
+        expected = launch_max_T * top_k * hidden * 2  # bf16
+        if nbytes != expected:
+            raise RuntimeError(
+                f"MegaMoECuteDsl combine_quant region size mismatch: probe "
+                f"reports {nbytes} bytes, expected {expected} "
+                f"(max_T={launch_max_T}, top_k={top_k}, hidden={hidden}, bf16)."
+            )
+        return (
+            shared_workspace[offset : offset + nbytes]
+            .view(torch.bfloat16)
+            .view(launch_max_T, top_k, hidden)
+        )
+
+    def _deferred_identity_idx(self, rows: int, device) -> torch.Tensor:
+        """Cached ``arange(rows, int32)`` index map for the unfinalized triple.
+
+        The fused combine lands every (token, k) cell densely in slot order
+        matching ``token_selected_experts`` (no -1 slots, no permutation), so
+        the expanded->permuted map is the identity.
+        """
+        key = (rows, str(device))
+        idx = self._deferred_idx_cache.get(key)
+        if idx is None:
+            idx = torch.arange(rows, dtype=torch.int32, device=device)
+            self._deferred_idx_cache[key] = idx
+        return idx
+
     def _launch_megamoe_kernel(
         self,
         *,
@@ -1498,8 +1614,15 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         num_tokens: int,
         output_dtype: torch.dtype,
         launch_max_T: int,
-    ) -> torch.Tensor:
+        deferred: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """Launch the fused MegaMoE CuteDSL kernel and return its reduced output.
+
+        ``deferred=True`` (deferred finalize) skips the in-op TopkReduce and
+        returns the unfinalized ``(gemm2_output, expert_weights,
+        expanded_idx_to_permuted_idx)`` triple instead: a live-rows view of the
+        internal ``combine_quant`` staging reshaped to ``(T * top_k, hidden)``,
+        the staged routing weights, and an identity int32 index map.
 
         Single-rank and multi-rank reach this point with identical kernel
         inputs; only the source of the staged buffers differs (decided
@@ -1594,6 +1717,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 act_beta=(self.act_beta if self.activation_type is ActivationType.SiTu else None),
                 in_kernel_fc2_reduce=in_kernel_fc2_reduce,
                 combine_format=self.combine_format,
+                skip_topk_reduce=bool(deferred),
                 tactic_autotune=bool(self.tactic_autotune),
                 num_tokens=num_tokens,
             )
@@ -1602,6 +1726,20 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             # global alive (its closure strongly references this module).
             set_active_megamoe_profiling_scratch(None)
             set_active_megamoe_profiling_scratch_factory(None)
+        if deferred:
+            # Unfinalized triple over the combine_quant staging. The live-row
+            # slice of the (max_T, top_k, hidden) view is contiguous, so the
+            # reshape stays a view (no copy); the model/scheduler finalize
+            # reads it before the next MoE layer's kernel can overwrite the
+            # region (stream-ordered: peers only write this rank's cells after
+            # its next dispatch, which launches after the finalize).
+            view = self._combine_quant_view(
+                shared_workspace, top_k=top_k, hidden=hidden, launch_max_T=launch_max_T
+            )
+            gemm2_output = view[:num_tokens].reshape(num_tokens * top_k, hidden)
+            expert_weights = topk_weights[:num_tokens]
+            idx = self._deferred_identity_idx(num_tokens * top_k, gemm2_output.device)
+            return gemm2_output, expert_weights, idx
         if num_tokens == 0:
             return torch.empty((0, hidden), dtype=output_dtype, device=combine_output.device)
         # The kernel already collapsed the top-k axis into the (T, 1, hidden)
@@ -1704,7 +1842,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         hidden: int,
         device,
         output_dtype: torch.dtype,
-    ) -> torch.Tensor:
+        deferred: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """Unified MegaMoE CuteDSL forward: acquire -> stage -> launch.
 
         The kernel is launched with ``T = launch_max_T`` -- the smallest
@@ -1736,6 +1875,12 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 f"lockstep chunk-max hint diverged from the staged tokens."
             )
         if num_tokens == 0 and self.ep_size == 1:
+            if deferred:
+                return (
+                    torch.empty((0, hidden), dtype=torch.bfloat16, device=device),
+                    torch.empty((0, top_k), dtype=torch.float32, device=device),
+                    torch.empty((0,), dtype=torch.int32, device=device),
+                )
             return torch.empty((0, hidden), dtype=output_dtype, device=device)
 
         if (
@@ -1812,6 +1957,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             num_tokens=num_tokens,
             output_dtype=output_dtype,
             launch_max_T=launch_max_T,
+            deferred=deferred,
         )
 
 

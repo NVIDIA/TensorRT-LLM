@@ -42,6 +42,7 @@ Default-on switches read as disabled for the values ``0``/``false``/``no``/
 """
 
 import contextlib
+import copy
 import os
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
@@ -1603,6 +1604,34 @@ class MuseSparkOpenMoE(nn.Module):
         aux_stream_dict = (
             {AuxStreamType.MoeChunkingOverlap: aux_stream} if aux_stream is not None else None
         )
+        # The checkpoint may quant-exclude whole layers ("model.layers.N." in
+        # exclude_modules), leaving their experts BF16. Backend resolution
+        # only sees the global quant config, so a MEGAMOE-family request
+        # builds an NVFP4-only backend for those layers, which then rejects
+        # the BF16 config when the post-init exclusion pass re-creates
+        # weights; the family's BF16 fallback (CutlassFusedMoE) ignores
+        # ``do_finalize=False``, and the per-expert norm needs the unfinalized
+        # triple on every layer. Excluded layers therefore request the TRTLLM
+        # family, whose construct-then-requant path serves them:
+        # TRTLLMGenFusedMoE is constructed against the global config, the
+        # exclusion pass re-creates its weights as BF16, and its BF16 path
+        # honors ``do_finalize=False``, so the layer keeps this module's
+        # finalize. Gated to MEGAMOE requests so other routes are untouched.
+        layer_model_config = model_config
+        global_quant_config = model_config.quant_config
+        if (
+            str(getattr(model_config, "moe_backend", "")).upper()
+            in ("MEGAMOE_CUTEDSL", "MEGAMOE_DEEPGEMM")
+            and global_quant_config is not None
+            and global_quant_config.exclude_modules
+            and global_quant_config.is_module_excluded_from_quantization(
+                f"model.layers.{layer_idx}"
+            )
+        ):
+            layer_model_config = copy.copy(model_config)
+            layer_model_config._frozen = False
+            layer_model_config.moe_backend = "TRTLLM"
+            layer_model_config._frozen = True
         self.experts = create_moe(
             routing_method=MuseSparkOpenRoutingMethod(
                 top_k=self.top_k,
@@ -1617,7 +1646,7 @@ class MuseSparkOpenMoE(nn.Module):
             # The per-expert post-norm has to run before the combine, so the
             # partial sums are reduced by this module, not inside the backend.
             reduce_results=False,
-            model_config=model_config,
+            model_config=layer_model_config,
             aux_stream_dict=aux_stream_dict,
             layer_idx=layer_idx,
         )

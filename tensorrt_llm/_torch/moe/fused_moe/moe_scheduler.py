@@ -1091,6 +1091,26 @@ class FusedCommMoEScheduler(MoEScheduler):
         num_chunks, x_chunks, rl_chunks, all_rank_chunk_size_list = self._compute_chunk_layout(
             x_real, rl_real, real_all_rank_num_tokens, ep_rank
         )
+        if not do_finalize:
+            # Deferred finalize: the backend hands back the unfinalized
+            # (gemm2_output, expert_weights, expanded_idx_to_permuted_idx)
+            # triple for a model-owned finalize. Only backends that opt in
+            # can (the fused kernel must expose its pre-reduce staging).
+            if not getattr(self.moe.backend, "supports_deferred_finalize", False):
+                raise NotImplementedError(
+                    f"do_finalize=False requires a fused-comm backend with "
+                    f"deferred-finalize support; "
+                    f"{type(self.moe.backend).__name__} does not advertise "
+                    f"supports_deferred_finalize."
+                )
+            if num_chunks > 1:
+                raise NotImplementedError(
+                    f"do_finalize=False is not supported with a chunked "
+                    f"fused-comm forward (num_chunks={num_chunks}): each "
+                    f"chunk's unfinalized triple aliases the same kernel "
+                    f"staging buffer, so the next chunk would overwrite it. "
+                    f"Raise moe_max_num_tokens above the per-rank chunk max."
+                )
         input_ids_chunks = []
         if input_ids_real is not None:
             chunk_size_list = all_rank_chunk_size_list[ep_rank]
@@ -1291,7 +1311,13 @@ class FusedCommMoEScheduler(MoEScheduler):
         assert not moe.apply_router_weight_on_input, (
             "Fused-comm MoE does not support apply_router_weight_on_input"
         )
-        assert do_finalize, "Fused-comm MoE always finalizes inside the fused kernel"
+        # do_finalize=False is legal only for backends advertising
+        # supports_deferred_finalize (gated in ``forward``); the backend then
+        # returns the unfinalized triple instead of a dense tensor.
+        assert do_finalize or getattr(moe.backend, "supports_deferred_finalize", False), (
+            "Fused-comm MoE finalizes inside the fused kernel unless the "
+            "backend supports deferred finalize"
+        )
 
         if isinstance(x, Fp4QuantizedTensor):
             raise NotImplementedError(
@@ -1399,6 +1425,7 @@ class FusedCommMoEScheduler(MoEScheduler):
                 x=moe_input,
                 x_sf=x_sf,
                 output_dtype=output_dtype,
+                do_finalize=do_finalize,
             )
         )
 
