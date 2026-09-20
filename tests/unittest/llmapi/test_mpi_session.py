@@ -523,6 +523,8 @@ def _wait_closer_thread_gone(timeout: float = 5.0) -> None:
                    for t in threading.enumerate()):
             return
         _time.sleep(0.02)
+    raise AssertionError("MpiCommExecutorCloser remained alive after "
+                         f"{timeout}s")
 
 
 @pytest.fixture
