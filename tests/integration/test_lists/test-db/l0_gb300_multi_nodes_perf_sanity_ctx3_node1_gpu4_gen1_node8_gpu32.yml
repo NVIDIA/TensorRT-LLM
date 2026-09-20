@@ -21,7 +21,8 @@ l0_gb300_multi_nodes_perf_sanity_ctx3_node1_gpu4_gen1_node8_gpu32:
   #   git show 9855bc8f368f146be27e946f13f02b2d0bb2aa7e:tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx3_node1_gpu4_gen1_node8_gpu32.yml
   # deepseek-v4-pro-fp4 8k1k con180
   - perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v4-pro-fp4_8k1k_con180_ctx3_dep4_gen1_dep32_eplb384_mtp3_ccb-NIXL] TIMEOUT (120)
-  # Verdict-logic unit test for the preflight this PR adds. Seconds of CPU time
-  # inside an allocation that is already up, so it costs nothing here and gives
-  # the new file a reported row on a stage we are triggering anyway.
-  - unittest/_torch/moe/test_mega_moe_symm_preflight.py
+  # NOTE: the preflight unit test deliberately does NOT live here.
+  # jenkins/scripts/perf/submit.py:336 requires each pytest-split group to
+  # select EXACTLY ONE test, so a second entry aborts the whole stage before
+  # it ever reaches SLURM. It is already covered on the CPU stage via the
+  # "unittest/_torch/moe" directory entry in l0_cpu.yml plus its cpu_only mark.
