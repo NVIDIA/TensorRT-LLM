@@ -17,7 +17,7 @@ all available backends (FMA, DeepGEMM split-K, DeepGEMM no-split) at warmup.
 Falls back to FMA when DeepGEMM is unavailable or autotuner cache misses.
 """
 
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Any, List
 
 import torch
@@ -211,28 +211,34 @@ def mhc_gemm_rms_fma_cuda(
 # ---------------------------------------------------------------------------
 
 
-def _mhc_gen_tuning_buckets(x: int):
-    """Generate M-dimension tuning buckets for MHC pre_mapping.
+_MHC_FINE_GRAINED_TUNING_LIMIT = 8192
+_MHC_COARSE_TUNING_STEP = 1024
 
-    Buckets: 1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 768, 1024, ...
-    Small M uses powers-of-2 for fine granularity; large M uses 128 steps.
-    """
+
+def _mhc_gen_tuning_buckets(x: int, *, large_m_step: int | None = None) -> tuple[int, ...]:
+    """Generate fine-grained buckets, optionally extending above 8192 with coarser steps."""
+    if large_m_step is not None:
+        # Cover the rounded-up runtime bucket even for non-aligned warmup sizes.
+        x = _mhc_map_to_tuning_bucket(x, large_m_step=large_m_step)
     buckets = (1, 2, 4, 8, 16, 32, 64, 128)
     if x >= 128:
-        x = min(x, 8192)
-        x = max(x, 1024)
-        buckets += tuple(range(256, x + 1, 128))
+        fine_upper = max(1024, min(x, _MHC_FINE_GRAINED_TUNING_LIMIT))
+        buckets += tuple(range(256, fine_upper + 1, 128))
+    if large_m_step is not None and x > _MHC_FINE_GRAINED_TUNING_LIMIT:
+        coarse_start = (_MHC_FINE_GRAINED_TUNING_LIMIT // large_m_step + 1) * large_m_step
+        buckets += tuple(range(coarse_start, x + 1, large_m_step))
     return buckets
 
 
-def _mhc_map_to_tuning_bucket(x: int) -> int:
+def _mhc_map_to_tuning_bucket(x: int, *, large_m_step: int | None = None) -> int:
     """Map an inference-time M to the nearest tuning bucket (round up)."""
     if x <= 128:
         v = 1
         while v < x:
             v *= 2
         return min(v, 128)
-    return ((x + 127) // 128) * 128
+    step = large_m_step if large_m_step is not None and x > _MHC_FINE_GRAINED_TUNING_LIMIT else 128
+    return ((x + step - 1) // step) * step
 
 
 _FMA_TILE_N_OPTIONS = (1, 2, 3, 4, 6, 8, 12, 24)
@@ -263,8 +269,12 @@ class MhcPreMappingRunner(TunableRunner):
             DynamicTensorSpec(
                 input_idx=0,
                 dim_idx=0,
-                gen_tuning_buckets=_mhc_gen_tuning_buckets,
-                map_to_tuning_buckets=_mhc_map_to_tuning_bucket,
+                gen_tuning_buckets=partial(
+                    _mhc_gen_tuning_buckets, large_m_step=_MHC_COARSE_TUNING_STEP
+                ),
+                map_to_tuning_buckets=partial(
+                    _mhc_map_to_tuning_bucket, large_m_step=_MHC_COARSE_TUNING_STEP
+                ),
             ),
         ),
         # residual (input[2]) dim 0 = M, same as x (input[0]) dim 0
