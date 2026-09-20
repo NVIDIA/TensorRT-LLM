@@ -46,9 +46,8 @@ _CUTEDSL_FC2_N_TILE_SIZE_ENV = "TRTLLM_CUTEDSL_FC2_N_TILE_SIZE"
 _CUTEDSL_FC2_N_TILE_SIZES = (128, 256)
 _CUTEDSL_FC2_DEFAULT_N_TILE_SIZE = 128
 
-# The torch.library schema needs a concrete float, so "unset" is a sentinel
-# rather than ``None``. SiTU betas are required to be positive, so any
-# non-positive value is unambiguously "not provided".
+# Legacy Rubin ops use a float sentinel for absent SiTU soft-caps.
+# The Blackwell act-fusion op accepts Optional[float] directly.
 SITU_BETA_DISABLED = -1.0
 
 
@@ -3652,12 +3651,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if self.use_expert_counts:
                 if self.top_k != 1:
                     raise ValueError("Expert-count scheduling requires top_k=1")
-            # Trace-time constants, so they are part of the kernel identity --
-            # see ``unique_id`` and the compile cache key below. Betas that are
-            # not keyed would let a layer silently reuse a kernel compiled for
-            # different soft-caps.
-            self.situ_beta = situ_beta
-            self.situ_linear_beta = situ_linear_beta
 
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(

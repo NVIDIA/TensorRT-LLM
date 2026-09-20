@@ -673,43 +673,63 @@ def test_kimi_k3_allow_list_matches_what_the_backends_declare():
     assert "CUTEDSL" in declares_situ
 
 
-def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass():
-    """An ineligible CUTEDSL request must raise, not silently pick CUTLASS.
+def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch):
+    """K3 must propagate strict backend selection through create_moe."""
+    from transformers.configuration_utils import PretrainedConfig
 
-    This is the failure this branch was built around: CUTEDSL declined every
-    K3 layer on all 16 ranks, CUTLASS took over, and the run produced correct
-    text and a zero exit while being attributed to CUTEDSL. K3 therefore
-    passes ``allow_backend_degradation=False`` for it; the assertion here is
-    that the resolver honours that rather than that K3 sets it.
+    from tensorrt_llm._torch.moe.fused_moe import CutlassFusedMoE
+    from tensorrt_llm._torch.moe.fused_moe.activation import SiTuActivation
+    from tensorrt_llm._torch.moe.fused_moe.interface import MoEEligibility, MoERejectReason
+    from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
+        BACKEND_FAMILY,
+        impl_class_for,
+        resolve_moe_impl,
+    )
+    from tensorrt_llm.models.modeling_utils import QuantConfig
 
-    The ``allow_degradation=True`` half is the control -- without it, a
-    resolver that had stopped substituting altogether would pass the first
-    half for the wrong reason.
-    """
-    from tensorrt_llm._torch.moe.fused_moe.moe_resolution import resolve_moe_impl
-
-    # SM90 has no NVFP4 CuteDSL path at all, so the request is declined for a
-    # reason that does not depend on this branch's activation work.
+    # Keep the real resolver and K3 caller; only make eligibility deterministic.
+    for backend_cls in BACKEND_FAMILY["CUTEDSL"]:
+        monkeypatch.setattr(
+            backend_cls,
+            "can_implement",
+            classmethod(
+                lambda cls, p, d: MoEEligibility.no(
+                    MoERejectReason.DEP_MISSING, "CuTe DSL unavailable for this test"
+                )
+            ),
+        )
+    monkeypatch.setattr(
+        CutlassFusedMoE, "can_implement", classmethod(lambda cls, p, d: MoEEligibility.ok())
+    )
+    quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+    pretrained_config = PretrainedConfig()
+    pretrained_config.torch_dtype = torch.bfloat16
     model_config = ModelConfig(
+        pretrained_config=pretrained_config,
         mapping=Mapping(world_size=1, rank=0, tp_size=1),
         moe_backend="CUTEDSL",
+        quant_config_dict={"layers.0.mlp.experts": quant_config},
     )
-    kwargs = dict(
-        num_experts=8,
-        hidden_size=512,
-        intermediate_size=512,
+    cfg = _K3Config(routed_expert_hidden_size=512, latent_moe_use_norm=True)
+    gate = KimiK3MoEGate(cfg)
+    report = resolve_moe_impl(
+        model_config,
+        override_quant_config=quant_config,
+        activation=SiTuActivation(gate_softcap=4.0, linear_softcap=25.0),
+        routing=gate.routing_method,
+        num_experts=cfg.num_experts,
+        hidden_size=cfg.routed_expert_hidden_size,
+        intermediate_size=cfg.moe_intermediate_size,
         dtype=torch.bfloat16,
+        allow_degradation=True,
     )
+    assert report.degraded
+    assert impl_class_for(report) is CutlassFusedMoE
 
-    degraded = resolve_moe_impl(model_config, allow_degradation=True, **kwargs)
-    if not degraded.degraded:
-        pytest.skip("CUTEDSL is eligible on this device; nothing to degrade from")
-
-    with pytest.raises(ValueError) as excinfo:
-        resolve_moe_impl(model_config, allow_degradation=False, **kwargs)
-    # The trail, not just the refusal: without it the caller cannot tell which
-    # gate declined and has to re-derive it.
-    assert "CUTEDSL" in str(excinfo.value)
+    # Removing CUTEDSL from K3's no-degradation list must fail this assertion.
+    with pytest.raises(ValueError, match="CUTEDSL.*degradation disallowed") as excinfo:
+        KimiK3MoERuntime(model_config, cfg, layer_idx=0, aux_stream_dict={})
+    assert "dep_missing" in str(excinfo.value)
 
 
 def test_kimi_k3_routed_config_rejects_backend_without_situ_support():
@@ -1372,10 +1392,9 @@ def _skip_if_backend_unavailable(moe_backend):
 
     if not IS_CUTLASS_DSL_AVAILABLE:
         pytest.skip("CuteDSL MoE requires the CuTe DSL wheel")
-    # nvfp4_moe_supported admits every SM >= 100, but only the Blackwell
-    # act-fusion kernel carries the SiTU epilogue. Elsewhere -- SM107 included
-    # -- can_implement() declines SiTu, so without this the case would fail in
-    # backend resolution on hardware it was never claimed to support.
+    # nvfp4_moe_supported admits every SM >= 100, but this integration enables
+    # SiTU only on Blackwell. Match can_implement() rather than exercising an
+    # end-to-end path that has not been enabled on SM107.
     if get_sm_version() not in (100, 103):
         pytest.skip(
             f"CuteDSL SiTU MoE needs the Blackwell act-fusion kernel "
@@ -2085,42 +2104,29 @@ def test_nvfp4_kernel_actually_applies_situ(moe_backend):
 
 
 @nvfp4_moe_supported
-def test_cutedsl_situ_betas_reach_the_kernel_cache_key():
-    """Two beta pairs, one process: the second must not reuse the first kernel.
+def test_cutedsl_situ_betas_reach_the_kernel_cache_key(monkeypatch):
+    """Each soft-cap must distinguish runner identities and compiled kernels.
 
-    The CuteDSL betas are trace-time ``const_expr``, folded into the compiled
-    epilogue rather than passed at launch, so a layer that changes them needs a
-    different kernel. ``unique_id()`` lists them for exactly that reason. If
-    they ever fall out of it the autotuner hands back the kernel it compiled
-    for the previous betas, and nothing raises -- the second layer simply
-    returns the first layer's soft-caps applied to its own inputs.
-
-    Both layers therefore run in one process, in cache order, and each output
-    is checked against the reference for ITS OWN betas. Asserting only that the
-    two outputs differ would pass if the second were wrong in some other way.
-
-    The betas are what varies, not the activation magnitude: measured from the
-    checkpoint, production g and u sit at sigma 0.10..0.23, so inflating the
-    activation would move the test away from inference rather than toward it.
-
-    (2.0, 10.0) is the second pair because the residual grows as the caps
-    tighten, and it is the last one the sqrt(3)*eps budget still covers --
-    measured rel_l2 against each pair's own reference, with the output norm
-    beside it:
-
-        (4.0, 25.0)  0.1644  0.999x floor  |out| 414
-        (2.0, 10.0)  0.1674  1.017x        |out| 323   <- used here
-        (0.5,  2.0)  0.1869  1.136x        |out|  90
-        (0.25, 1.0)  0.2185  1.328x        |out|  33
-
-    The growth is not explained. Sharper clipping does make the FC1->FC2
-    intermediate quantize slightly worse, but that accounts for ~3% of it, not
-    33%; below beta=1 the excess in absolute terms stops tracking the output
-    norm. Rather than assert an unexplained number, this picks a pair the
-    budget covers -- 27% apart from the production output, far outside
-    allclose, which is all the cache question needs.
+    Fix FC1 and outer tactics so beta changes cannot be hidden by another
+    tile's cache entry. Change each cap independently, then change both.
+    References use the same dequantized checkpoint weights as the kernel.
     """
     _skip_if_backend_unavailable("CUTEDSL")
+    from tensorrt_llm._torch.autotuner import AutoTuner
+
+    tuner = AutoTuner.get()
+    choose_one = tuner.choose_one
+    identities = set()
+
+    def fixed_tactic(custom_op, runners, tuning_config, inputs, **kwargs):
+        if custom_op == "CuteDslFusedMoE::run_moe_nvfp4":
+            return runners[0], -1
+        if custom_op == "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell":
+            identities.add(runners[0].unique_id())
+            return runners[0], -1
+        return choose_one(custom_op, runners, tuning_config, inputs, **kwargs)
+
+    monkeypatch.setattr(tuner, "choose_one", fixed_tactic)
     num_experts, hidden, inter = _TP_EXPERTS, _TP_HIDDEN, _TP_INTERMEDIATE
     gate = _make_test_gate(num_experts=num_experts)
 
@@ -2144,7 +2150,7 @@ def test_cutedsl_situ_betas_reach_the_kernel_cache_key():
     router_logits = gate.compute_logits(x)
 
     outputs = {}
-    for gate_softcap, linear_softcap in ((4.0, 25.0), (2.0, 10.0)):
+    for gate_softcap, linear_softcap in ((4.0, 25.0), (2.0, 25.0), (4.0, 10.0), (2.0, 10.0)):
         moe = _make_nvfp4_moe(
             gate,
             num_experts=num_experts,
@@ -2176,12 +2182,11 @@ def test_cutedsl_situ_betas_reach_the_kernel_cache_key():
         )
         outputs[(gate_softcap, linear_softcap)] = actual
 
-    first, second = outputs.values()
-    assert not torch.allclose(first, second), (
-        "beta pairs (4.0, 25.0) and (2.0, 10.0) produced identical output, so the "
-        "second layer ran the first layer's compiled epilogue: the soft-caps are "
-        "no longer part of the kernel cache key"
-    )
+    assert len(identities) == len(outputs), "each soft-cap must participate in runner.unique_id()"
+    first = outputs[(4.0, 25.0)]
+    for betas, output in outputs.items():
+        if betas != (4.0, 25.0):
+            assert not torch.allclose(first, output), f"soft-caps {betas} reused the first output"
 
 
 def test_fp8_block_scaled_dequantization():

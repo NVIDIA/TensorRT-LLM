@@ -690,16 +690,15 @@ class CuteDslFusedMoE(MoEImplBase):
     # There are two of them and ``run_moe_nvfp4`` picks between them by SM:
     #   cute_dsl_kernels/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py
     #   cute_dsl_kernels/rubin/moe/rubin_contiguous_gather_grouped_blockscaled_gemm_act_fusion.py
-    # They agreed until SiTu, which only the Blackwell one implements. This
-    # attribute is the union, because resolution reads it off the class and a
-    # class attribute cannot see which kernel an instance will dispatch to;
-    # ``can_implement`` narrows it back for the SM that lacks the epilogue.
+    # SiTU is enabled here only for the Blackwell path. The Rubin kernels
+    # also expose SiTU, but their end-to-end integration is outside this
+    # enablement; ``can_implement`` keeps that path gated by SM.
     #
     # The clamp is a kernel-cache-key scalar and the epilogue has no
     # "clamp absent" branch, so an absent clamp is +inf, not None.
     #
     # alpha/beta are declared here rather than narrowed per instance:
-    # ``moe_resolution._activation_rejection`` states the invariant -- an
+    # ``moe_resolution._reject_unsupported_activation`` states the invariant -- an
     # instance may narrow a shape, never admit one its class refuses.
     # Declaring UNSUPPORTED here and widening per instance made every K3 layer
     # resolve away to CUTLASS with "CuteDslFusedMoE kernels take no activation
@@ -834,16 +833,13 @@ class CuteDslFusedMoE(MoEImplBase):
                     MoERejectReason.DEP_MISSING,
                     "NVFP4 CuteDSL MoE on SM107 requires Rubin support in CuTe DSL"
                 )
-            # ``activation_support`` above is the union over the act-fusion
-            # kernels ``run_moe_nvfp4`` picks between; only one of them has a
-            # SiTU epilogue. Turn the layer down where the other one would be
-            # chosen, so it stays resolvable by another backend instead of
-            # raising inside the kernel at forward time.
+            # Keep SiTU enablement scoped to the Blackwell path. Rubin
+            # integration needs separate end-to-end validation.
             if p.activation == "SiTu" and sm_version == 107:
                 return _reject(
                     MoERejectReason.ACTIVATION_UNSUPPORTED,
-                    "this device's CuteDSL act-fusion kernel has no SiTU "
-                    "epilogue")
+                    "CuteDSL SiTU is enabled only on SM100/SM103; "
+                    "SM107 integration is not enabled")
             # process_weights_after_loading() unswizzles the FC1 block scales,
             # which asserts 128-row tiles; without this gate an unaligned shard
             # dies mid weight load with a bare swizzle error.
