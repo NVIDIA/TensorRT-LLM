@@ -502,8 +502,9 @@ def test_prefetch_fallback_identity_timeout_matches_mpi_default():
 class _FakeCommExecutor:
     """Stand-in for the entered MPICommExecutor context manager."""
 
-    def __init__(self, block: bool = False):
+    def __init__(self, block: bool = False, fail: bool = False):
         self.block = block
+        self.fail = fail
         self.release = threading.Event()
         self.exited = threading.Event()
 
@@ -513,6 +514,8 @@ class _FakeCommExecutor:
             # releases it (so the closer thread does not leak past the test).
             self.release.wait(30)
         self.exited.set()
+        if self.fail:
+            raise RuntimeError("simulated executor close failure")
 
 
 def _wait_closer_thread_gone(timeout: float = 5.0) -> None:
@@ -578,6 +581,29 @@ def test_server_close_escalates_to_abort_when_the_join_wedges(
     fake.release.set()
     fake.exited.wait(5)
     _wait_closer_thread_gone()
+
+
+def test_server_close_escalates_to_abort_when_exit_raises(
+        _global_executor_state):
+    """Escalate to abort when the executor's ``__exit__`` raises.
+
+    A raised ``__exit__`` means the executor did not cleanly release, so peers
+    can stay blocked; the global refs are already cleared, so nothing else will
+    close them -- escalate the same way a timeout does.
+    """
+    from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionServer
+
+    fake = _FakeCommExecutor(fail=True)
+    MPINodeState._global_comm_executor = fake
+    aborted = []
+
+    RemoteMpiCommSessionServer._close_global_comm_executor(
+        grace=5.0, abort=lambda: aborted.append(True))
+
+    assert fake.exited.is_set()
+    assert aborted == [True]
+    _wait_closer_thread_gone()
+    assert MPINodeState._global_comm_executor is None
 
 
 def test_server_close_is_a_noop_without_a_global_executor(

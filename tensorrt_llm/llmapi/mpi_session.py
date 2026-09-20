@@ -1003,13 +1003,14 @@ class RemoteMpiCommSessionServer():
             abort = lambda: mpi4py.MPI.COMM_WORLD.Abort(1)  # noqa: E731
 
         closed = threading.Event()
+        close_failed = threading.Event()
 
         def _close():
             try:
                 executor.__exit__(None, None, None)
             except Exception as e:  # noqa: BLE001 - teardown must not raise
-                logger.error(
-                    f"global MPICommExecutor close failed (ignored): {e!r}")
+                logger.error(f"global MPICommExecutor close failed: {e!r}")
+                close_failed.set()
             finally:
                 closed.set()
 
@@ -1021,6 +1022,15 @@ class RemoteMpiCommSessionServer():
             logger.critical(
                 f"global MPICommExecutor did not close within {grace}s; "
                 "calling MPI_Abort to free stuck ranks...")
+            abort()
+        elif close_failed.is_set():
+            # A raised __exit__ means the executor did not cleanly release, so
+            # peers can stay blocked in the task loop; the global refs are
+            # already cleared, so nothing else will close them. Escalate the
+            # same way a timeout does.
+            logger.critical(
+                "global MPICommExecutor close raised; calling MPI_Abort to "
+                "free stuck ranks...")
             abort()
 
     def mpi_async_error_callback(self, future):
