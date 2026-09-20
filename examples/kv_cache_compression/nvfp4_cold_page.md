@@ -377,10 +377,8 @@ Pages currently use identity global scales.
 Every token's K vector has a part that carries the token's position (RoPE) and,
 in some models, a part that does not (NoPE): the last 64 of the 576 numbers an
 MLA model stores per token, the first 64 of the 256 numbers of a Qwen3.5 head,
-the last 64 of the 512 numbers of a DeepSeek-V4 compressed entry. In MLA models and
-DeepSeek-V4 this part also skips the K normalization and has larger outliers, so it
-loses more accuracy at 4 bits. By default the cold page turns the whole K vector and
-the whole V vector into NVFP4. With
+the last 64 of the 512 numbers of a DeepSeek-V4 compressed entry. By default the cold
+page turns the whole K vector and the whole V vector into NVFP4. With
 `skip_rope_quantization: true`, only the NoPE part of the K vector becomes NVFP4 and
 the RoPE part is copied unchanged, keeping the hot cache's precision; the V
 vector still becomes NVFP4 in full. Accuracy improves a little and the

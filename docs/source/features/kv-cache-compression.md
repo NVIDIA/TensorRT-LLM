@@ -215,11 +215,8 @@ token's position (the RoPE part); the rest does not (the NoPE part). GLM-5 and
 other MLA models store one 576-number vector per token instead of separate K and
 V, and its last 64 numbers are RoPE; Qwen3.5 rotates the first 64 of its 256
 numbers; a DeepSeek-V4 compressed entry has 512 numbers of which the last 64 are
-RoPE. In MLA models and DeepSeek-V4 this part also skips the K normalization
-(`kv_a_layernorm` covers only the NoPE part), and it shows larger outliers than the
-rest, so 4-bit rounding costs it more accuracy. Whether the rotation or the missing
-normalization is the cause is still being studied; the option names where the
-values sit, and its accuracy effect is checked per model.
+RoPE. Quantizing this part costs more accuracy than the rest in the models
+checked so far; the option lets a deployment leave it out.
 
 `skip_rope_quantization` controls this:
 
