@@ -1065,6 +1065,12 @@ def minimax_m3_sparse_attn_decode(
     kv_nvfp4 = any(arg is not None for arg in nvfp4_args)
     scale_cols = head_dim // NVFP4_SF_VEC_SIZE
     if kv_nvfp4:
+        capability = torch.cuda.get_device_capability(q.device)
+        if capability not in _SM100F_CAPABILITIES:
+            raise NotImplementedError(
+                "MiniMax-M3 NVFP4 sparse decode requires SM100/SM103; "
+                f"got SM{capability[0] * 10 + capability[1]}."
+            )
         _check_nvfp4_inputs(k_paged, v_paged, nvfp4_args, head_dim=head_dim, scale_cols=scale_cols)
         # Two E2M1 elements per byte; Triton must see them unsigned so that the
         # high-nibble shift does not sign-extend.

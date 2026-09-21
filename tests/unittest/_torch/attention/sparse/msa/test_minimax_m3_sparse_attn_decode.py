@@ -40,7 +40,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 skip_not_sm100 = pytest.mark.skipif(
     get_sm_version() not in (100, 103),
-    reason="fmha_sm100 A/B comparison requires SM100/SM103.",
+    reason="MiniMax-M3 NVFP4 and fmha_sm100 require SM100/SM103.",
 )
 
 
@@ -564,6 +564,7 @@ def test_sparse_decode_matches_msa_kernel():
     torch.testing.assert_close(triton_out.float(), msa_out.float(), rtol=6e-2, atol=6e-2)
 
 
+@skip_not_sm100
 @pytest.mark.parametrize(
     ("num_kv_heads", "group", "decode_query_len"),
     [(1, 8, 1), (1, 8, 2), (2, 16, 1), (4, 4, 3)],
@@ -593,6 +594,7 @@ def test_nvfp4_sparse_decode_matches_reference(num_kv_heads, group, decode_query
     torch.testing.assert_close(out.float(), expected, rtol=3e-2, atol=3e-2)
 
 
+@skip_not_sm100
 @pytest.mark.parametrize("local_batch", [11, 12, 14])
 def test_nvfp4_sparse_decode_eagle_pair_matches_divergent_reference(local_batch):
     """The paired producer must remain exact when adjacent selections differ."""
@@ -621,6 +623,7 @@ def test_nvfp4_sparse_decode_eagle_pair_matches_divergent_reference(local_batch)
     torch.testing.assert_close(out.float(), expected, rtol=3e-2, atol=3e-2)
 
 
+@skip_not_sm100
 def test_nvfp4_sparse_decode_fp8_q_matches_reference():
     """Production FP8 q may use FP16 dot operands without changing the cache math."""
     case = _make_nvfp4_inputs([300, 1500, 4097], num_kv_heads=2, group=8, seed=67)
@@ -639,6 +642,7 @@ def test_nvfp4_sparse_decode_fp8_q_matches_reference():
     torch.testing.assert_close(out.float(), expected, rtol=3e-2, atol=3e-2)
 
 
+@skip_not_sm100
 def test_nvfp4_paged_scale_layouts_are_the_ones_the_kernel_reads():
     """Lock the two block-scale layouts and the nibble order.
 
@@ -671,6 +675,7 @@ def test_nvfp4_paged_scale_layouts_are_the_ones_the_kernel_reads():
         torch.testing.assert_close(decoded, expected, rtol=0, atol=0)
 
 
+@skip_not_sm100
 @pytest.mark.parametrize("num_topk_chunks", [1, 2, 4, 8, 16])
 def test_nvfp4_sparse_decode_split_k_invariant(num_topk_chunks):
     """Flash-decoding over an NVFP4 cache must merge to one answer.

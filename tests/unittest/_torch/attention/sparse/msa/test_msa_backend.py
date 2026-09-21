@@ -33,6 +33,9 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils 
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.paged_cache import (
     write_kv_slots,
 )
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.triton_sparse_decode import (
+    minimax_m3_sparse_attn_decode,
+)
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import (
     MiniMaxM3MsaSparseAttentionMetadata,
     MsaDecodeSpan,
@@ -191,6 +194,38 @@ def test_cache_manager_honors_executor_sparse_attention_config(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("capability", [(8, 0), (9, 0), (12, 0)])
+def test_nvfp4_sparse_decode_rejects_unsupported_device(
+    monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int]
+) -> None:
+    """Unsupported devices fail before NVFP4 quantization or Triton compilation."""
+    get_capability = Mock(spec_set=torch.cuda.get_device_capability, return_value=capability)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", get_capability)
+    q = torch.empty((1, 8, 128), dtype=torch.bfloat16)
+    kv = torch.empty((1, 1, 128, 64), dtype=torch.uint8)
+    block_scale = torch.empty((1, 1, 128, 8), dtype=torch.uint8)
+    global_scale = torch.ones(1)
+
+    with pytest.raises(NotImplementedError, match="NVFP4 sparse decode requires SM100/SM103"):
+        minimax_m3_sparse_attn_decode(
+            q,
+            kv,
+            kv,
+            torch.zeros((1, 1, 1), dtype=torch.int32),
+            torch.zeros((1, 1), dtype=torch.int32),
+            torch.ones(1, dtype=torch.int32),
+            sm_scale=128**-0.5,
+            output=torch.empty_like(q),
+            decode_query_len=1,
+            k_block_scale=block_scale,
+            v_block_scale=block_scale,
+            k_global_scale=global_scale,
+            v_global_scale=global_scale,
+        )
+    get_capability.assert_called_once_with(q.device)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("indexer_kv_dtype", ["bf16", "fp8"])
 @pytest.mark.parametrize("implementation", ["msa", "triton"])
 def test_index_k_views_are_fullgraph_safe(
@@ -202,6 +237,7 @@ def test_index_k_views_are_fullgraph_safe(
 
     def fake_base_init(self: KVCacheManagerV2, *args: object, **kwargs: object) -> None:
         self.is_disagg = False
+        self.dtype = DataType.BF16
         # Dense layer 0 and draft layer 60 have no INDEX_KEY; sparse layer 5
         # is non-local. Two local sparse layers share an interleaved pool.
         self.layer_offsets = {0: 0, 3: 1, 4: 2, 60: 3}
