@@ -3156,12 +3156,26 @@ class TestNemotron35SuperVLToolParserFactory:
     "qwen3_5",
     "qwen3_5_text",
     "qwen3_5_moe",
+])
+def test_auto_detect_qwen3_5_json_tool_parser(tmp_path, model_type):
+    """Shared Qwen3.5 types retain their established JSON parser default."""
+    from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+        resolve_auto_tool_parser
+    model_dir = tmp_path / model_type
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps({"model_type": model_type}))
+
+    assert resolve_auto_tool_parser(str(model_dir)) == "qwen3"
+
+
+@pytest.mark.parametrize("model_type", [
     "qwen3_5_moe_text",
     "qwen4_exp",
     "qwen4_exp_text",
 ])
-def test_auto_detect_qwen3_5_and_qwen3_8_tool_parser(tmp_path, model_type):
-    """Qwen3.5 and Qwen3.8 use the Qwen3-Coder XML tool-call format."""
+def test_auto_detect_qwen3_8_tool_parser(tmp_path, model_type):
+    """Qwen3.8-specific model types use the Qwen3-Coder XML parser."""
     from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
         resolve_auto_tool_parser
     model_dir = tmp_path / model_type
@@ -3170,6 +3184,84 @@ def test_auto_detect_qwen3_5_and_qwen3_8_tool_parser(tmp_path, model_type):
         json.dumps({"model_type": model_type}))
 
     assert resolve_auto_tool_parser(str(model_dir)) == "qwen3_coder"
+
+
+@pytest.mark.parametrize("chat_template", [
+    "<tool_call><function={{ name }}><parameter={{ key }}>",
+    [{
+        "name": "default",
+        "template": "<tool_call><function={{ name }}><parameter={{ key }}>",
+    }],
+])
+def test_auto_detect_qwen3_5_coder_format_from_chat_template(
+        tmp_path, chat_template):
+    """The tokenizer template disambiguates shared Qwen model types."""
+    from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+        resolve_auto_tool_parser
+    model_dir = tmp_path / "qwen3_5_moe"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5_moe"}))
+    (model_dir / "tokenizer_config.json").write_text(
+        json.dumps({"chat_template": chat_template}))
+
+    assert resolve_auto_tool_parser(str(model_dir)) == "qwen3_coder"
+
+
+def test_auto_detect_qwen3_5_json_format_from_chat_template(tmp_path):
+    """A JSON tool template must not opt a shared model into the XML parser."""
+    from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+        resolve_auto_tool_parser
+    model_dir = tmp_path / "qwen3_5"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(json.dumps({"model_type":
+                                                       "qwen3_5"}))
+    (model_dir / "tokenizer_config.json").write_text(
+        json.dumps({
+            "chat_template":
+            '<tool_call>{"name": {{ name }}, "arguments": {{ arguments }}}</tool_call>'
+        }))
+
+    assert resolve_auto_tool_parser(str(model_dir)) == "qwen3"
+
+
+@pytest.mark.parametrize("model_type,chat_template,output,expected_parser", [
+    (
+        "qwen3_5",
+        '<tool_call>{"name": {{ name }}, "arguments": {{ arguments }}}</tool_call>',
+        '{"name":"get_weather","arguments":{"location":"Paris"}}',
+        "qwen3",
+    ),
+    (
+        "qwen3_5_moe",
+        "<tool_call><function={{ name }}><parameter={{ key }}>",
+        ("<tool_call>\n<function=get_weather>\n<parameter=location>\nParis\n"
+         "</parameter>\n</function>\n</tool_call>"),
+        "qwen3_coder",
+    ),
+])
+def test_auto_detect_qwen_tool_parser_matches_output(tmp_path, sample_tools,
+                                                     model_type, chat_template,
+                                                     output, expected_parser):
+    """Auto-selection chooses a parser that can consume the emitted format."""
+    from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
+        ToolParserFactory, resolve_auto_tool_parser)
+    model_dir = tmp_path / model_type
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps({"model_type": model_type}))
+    (model_dir / "tokenizer_config.json").write_text(
+        json.dumps({"chat_template": chat_template}))
+
+    parser_name = resolve_auto_tool_parser(str(model_dir))
+    assert parser_name == expected_parser
+
+    result = ToolParserFactory.create_tool_parser(parser_name).detect_and_parse(
+        output, sample_tools)
+    assert result.normal_text == ""
+    assert len(result.calls) == 1
+    assert result.calls[0].name == "get_weather"
+    assert json.loads(result.calls[0].parameters) == {"location": "Paris"}
 
 
 # ============================================================================
