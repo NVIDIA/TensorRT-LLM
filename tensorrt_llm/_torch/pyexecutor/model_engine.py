@@ -697,7 +697,7 @@ class PyTorchModelEngine(ModelEngine):
                         fullgraph=torch_compile_fullgraph)
                     self._torch_compile_prefill_only = (
                         self._torch_compile_piecewise_cuda_graph
-                        and self.model.use_prefill_only_compile)
+                        and not self.model.use_fx_for_pcg_fallback)
                     self.model.model = (
                         _PrefillCompiledModel(eager_model, compiled_model)
                         if self._torch_compile_prefill_only else compiled_model)
@@ -2206,9 +2206,12 @@ class PyTorchModelEngine(ModelEngine):
                 quant_method.enable_flashinfer_auto()
                 quant_method.tune_decode_graph_backends = (
                     tune_with_cute_dsl and quant_method.uses_flashinfer)
+        # An explicit auto setting stays intact, but compiled auto dispatch
+        # uses native GEMM. Do not run or mark an unused FlashInfer tuning pass.
         flashinfer_mxfp8_methods = [
             method for method in mxfp8_methods
-            if method.needs_flashinfer_autotune
+            if method.needs_flashinfer_autotune and (
+                not compile_all_batches or method.backend == "flashinfer")
         ]
 
         # Every TP and PP rank must make the same backend decision before any

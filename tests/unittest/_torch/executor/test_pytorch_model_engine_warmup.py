@@ -51,7 +51,7 @@ from tensorrt_llm.mapping import Mapping
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("model_kind", ["default", "m3", "m3_vl", "gdn", "mamba"])
 @pytest.mark.parametrize("compile_enabled,piecewise", [(False, False), (True, False), (True, True)])
-def test_prefill_compile_initialization_is_model_opt_in(
+def test_pcg_fx_fallback_policy_is_model_specific(
     monkeypatch: pytest.MonkeyPatch,
     model_kind: str,
     compile_enabled: bool,
@@ -73,6 +73,7 @@ def test_prefill_compile_initialization_is_model_opt_in(
         "gdn": Qwen3NextForCausalLM,
         "mamba": NemotronHForCausalLM,
     }[model_kind]
+    assert model_cls.use_fx_for_pcg_fallback is (model_kind not in ("m3", "m3_vl"))
     model = model_cls.__new__(model_cls)
     torch.nn.Module.__init__(model)
     mapping = Mapping()
@@ -304,35 +305,54 @@ def test_prefill_compile_scopes_whole_model_forward(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("prefill_only", [False, True])
+@pytest.mark.parametrize("compile_mode", ["eager", "all_batches", "prefill_only"])
 @pytest.mark.parametrize("backend", [None, "auto", "flashinfer", "trtllm"])
 def test_compiled_mxfp8_warmup_backend_selection(
     monkeypatch: pytest.MonkeyPatch,
-    prefill_only: bool,
+    compile_mode: str,
     backend: str | None,
 ) -> None:
-    """PCG retains eager decode tuning; all-batch compile settles auto on native."""
+    """Tune only backends reached by real dispatch, preserving explicit choices."""
     import tensorrt_llm._torch.modules.linear as linear_module
 
+    compile_enabled = compile_mode != "eager"
+    prefill_only = compile_mode == "prefill_only"
+    inputs = torch.zeros(2, 4)
+    output = torch.zeros(2, 3)
+    layer = SimpleNamespace(
+        weight=torch.zeros(3, 4), weight_scale=torch.ones(4), dtype=torch.float32
+    )
+    native_gemm = Mock(return_value=output)
+    flashinfer_gemm = Mock(return_value=output)
     monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
     monkeypatch.delenv("TLLM_AUTOTUNER_CACHE_PATH", raising=False)
     if backend is not None:
         monkeypatch.setenv("TRTLLM_MXFP8_GEMM_BACKEND", backend)
     monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
-    monkeypatch.setattr(torch.ops.trtllm, "flashinfer_mm_mxfp8", Mock(), raising=False)
+    monkeypatch.setattr(torch.ops.trtllm, "flashinfer_mm_mxfp8", flashinfer_gemm, raising=False)
+    monkeypatch.setattr(
+        torch.ops.trtllm, "mxfp8_quantize", Mock(return_value=(inputs, inputs)), raising=False
+    )
+    for name in ("mxfp8_mxfp8_gemm", "mxfp8_mxfp8_gemm_autotuned"):
+        monkeypatch.setattr(torch.ops.trtllm, name, native_gemm, raising=False)
     flashinfer_tune = Mock(return_value=contextlib.nullcontext())
     monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(autotune=flashinfer_tune))
     method = MXFP8LinearMethod()
     engine = SimpleNamespace(
         llm_args=SimpleNamespace(enable_autotuner=True),
-        _torch_compile_enabled=True,
+        _torch_compile_enabled=compile_enabled,
         _torch_compile_prefill_only=prefill_only,
+        _torch_compile_backend=None,
+        _eager_workspace_reclaimer=None,
+        is_warmup=True,
         cuda_graph_runner=SimpleNamespace(enabled=True),
         model=SimpleNamespace(
             modules=lambda: [
                 SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
                 SimpleNamespace(quant_method=method),
-            ]
+            ],
+            model_config=SimpleNamespace(extra_attrs={}),
+            forward=lambda **kwargs: method.apply(layer, inputs, None),
         ),
         mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
         dist=object(),
@@ -345,8 +365,10 @@ def test_compiled_mxfp8_warmup_backend_selection(
         is_draft_model=False,
         guided_decoder=None,
         no_cuda_graph=lambda: contextlib.nullcontext(),
-        _create_warmup_request=Mock(return_value=object()),
-        _release_batch_context=lambda *args: contextlib.nullcontext(object()),
+        _create_warmup_request=lambda resources, num_tokens, num_gen_requests: Mock(
+            num_gen_requests=num_gen_requests
+        ),
+        _release_batch_context=lambda batch, resources: contextlib.nullcontext(batch),
         _should_run_warmup_batch=Mock(return_value=True),
         _release_megamoe_profiling_scratch=Mock(),
         forward=Mock(),
@@ -362,16 +384,41 @@ def test_compiled_mxfp8_warmup_backend_selection(
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(model_engine_module, "clear_memory_buffers", lambda: None)
+    monkeypatch.setattr(model_engine_module, "get_model_extra_attrs", lambda: {})
+    monkeypatch.setattr(model_engine_module, "is_trace_enabled", lambda name: False)
 
-    PyTorchModelEngine._run_autotuner_warmup(engine, resources)
+    def forward(batch: Mock, **kwargs: object) -> torch.Tensor:
+        # Stand in for input preparation, but use the real engine compile scope
+        # and linear dispatch for each prefill/generation warmup batch.
+        monkeypatch.setattr(
+            model_engine_module,
+            "get_per_request_prefill_cuda_graph_flag",
+            lambda: batch.num_gen_requests == 0,
+        )
+        return PyTorchModelEngine.model_forward(engine, attn_metadata=batch)
 
-    expected_backend = backend or ("auto" if prefill_only else "trtllm")
-    flashinfer_expected = expected_backend in ("auto", "flashinfer")
+    engine.forward.side_effect = forward
+    with torch_compiling(compile_enabled):
+        PyTorchModelEngine._run_autotuner_warmup(engine, resources)
+        assert is_torch_compiling() is compile_enabled
+
+    expected_backend = backend or ("trtllm" if compile_mode == "all_batches" else "auto")
+    flashinfer_expected = expected_backend == "flashinfer" or (
+        expected_backend == "auto" and compile_mode != "all_batches"
+    )
     assert method.backend == expected_backend
     assert method._native_autotuned
     assert method._flashinfer_autotuned == flashinfer_expected
     assert flashinfer_tune.call_count == int(flashinfer_expected)
     assert engine.forward.call_count == (4 if flashinfer_expected else 2)
+    expected_flashinfer_calls = (
+        (4 if expected_backend == "flashinfer" else (1 if prefill_only else 2))
+        if flashinfer_expected
+        else 0
+    )
+    assert flashinfer_gemm.call_count == expected_flashinfer_calls
+    assert native_gemm.call_count == engine.forward.call_count - expected_flashinfer_calls
+    assert os.environ.get("TRTLLM_MXFP8_GEMM_BACKEND") == backend
 
 
 @pytest.mark.parametrize("config_cls", [DraftTargetDecodingConfig, PARDDecodingConfig])

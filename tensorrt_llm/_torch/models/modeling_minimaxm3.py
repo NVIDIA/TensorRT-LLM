@@ -2690,7 +2690,7 @@ def _fold_gemma_boundary_norm_weights(weights):
 class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, PretrainedConfig]):
     """Text-only M3 model."""
 
-    use_prefill_only_compile = True
+    use_fx_for_pcg_fallback = False
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:

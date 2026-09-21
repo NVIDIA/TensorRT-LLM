@@ -388,8 +388,8 @@ class DecoderModelForCausalLM(nn.Module,
                               Generic[TModel, TConfig],
                               metaclass=PostInitCaller):
 
-    # Opt in to original eager execution outside capture-eligible PCG batches.
-    use_prefill_only_compile: ClassVar[bool] = False
+    # Keep FX optimizations for decode and prefill above the PCG capture ceiling.
+    use_fx_for_pcg_fallback: ClassVar[bool] = True
 
     @staticmethod
     def _checkpoint_has_lm_head_scale(config: ModelConfig[TConfig]) -> bool:
