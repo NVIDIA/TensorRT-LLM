@@ -2319,10 +2319,13 @@ class OpenAIServer(_VideoRoutesMixin):
                 try:
                     from tensorrt_llm.inputs.multimodal import \
                         find_mm_token_lengths
-                    proc = self.processor or getattr(self.generator,
-                                                     "input_processor", None)
+                    proc = getattr(self.generator, "input_processor",
+                                   None) or self.processor
                     if proc is not None:
-                        mm_token_lengths = find_mm_token_lengths(mm_data, proc)
+                        mm_token_lengths = find_mm_token_lengths(
+                            mm_data,
+                            proc,
+                            multimodal_data=prompt.get("multi_modal_data"))
                         if mm_token_lengths:
                             if "image" in mm_token_lengths:
                                 postproc_args.image_tokens = sum(
