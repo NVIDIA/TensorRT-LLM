@@ -4210,6 +4210,7 @@ def run(
         workspace,
         split_kv,
         cache_seqs,
+        None,  # kv_bounds: helix-only, not exercised here
         block_split_kvs,
         softmax_scale,
         output_scale,
@@ -4325,6 +4326,7 @@ def run(
             workspace,
             split_kv,
             cache_seqs,
+            None,  # kv_bounds: helix-only, not exercised here
             block_split_kvs,
             softmax_scale,
             output_scale,
@@ -4462,6 +4464,7 @@ def run(
             workspace,
             _split_kv,
             cache_seqs,
+            None,  # kv_bounds: helix-only, not exercised here
             block_split_kvs,
             softmax_scale,
             output_scale,
