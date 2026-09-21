@@ -221,7 +221,8 @@ def _kpool_score_kernel(
     for every row of the program. A group straddling two requests (only at
     request boundaries) gathers per row instead.
     """
-    r0 = tl.program_id(0) * ROWS
+    # The FP32 score matrix can exceed 2**31 elements during long-context prefill.
+    r0 = tl.program_id(0).to(tl.int64) * ROWS
     j0 = tl.program_id(1) * BP
     j = j0 + tl.arange(0, BP)
     d = tl.arange(0, HD)

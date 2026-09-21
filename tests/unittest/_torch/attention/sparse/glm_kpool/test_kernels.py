@@ -470,3 +470,106 @@ def test_native_sparse_decode_coalesced_rows_and_graph_replay(rows: int, width: 
         probabilities = torch.nan_to_num(logits.softmax(dim=-1))
         expected = torch.einsum("rhk,rkd->rhd", probabilities, selected).to(q.dtype)
         torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
+
+
+def test_pool_scores_offsets_beyond_int32() -> None:
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.kernels import _kpool_score_kernel
+
+    # A 1M-token capacity has 2**18 pools. Row 8192 starts at element 2**31.
+    # Only launch the first pool tile: exercise real pointer arithmetic without
+    # scoring every pool or touching the entire 8 GiB allocation.
+    rows, capacity, rows_per_program = 8208, 1 << 18, 16
+    required_bytes = rows * capacity * 4
+    if torch.cuda.mem_get_info()[0] < required_bytes + (1 << 30):
+        pytest.skip("large score-offset regression requires 9 GiB of free device memory")
+    out = torch.empty(rows, capacity, dtype=torch.float32, device="cuda")
+    q = torch.ones(rows, 1, HD, dtype=torch.bfloat16, device="cuda")
+    weights = torch.ones(rows, 1, dtype=torch.bfloat16, device="cuda")
+    pool = torch.ones(2, TPB, 3 * HD, dtype=torch.bfloat16, device="cuda")
+    pool[1].fill_(2)
+    tables = torch.tensor([[0], [1]], dtype=torch.int64, device="cuda")
+    lengths = torch.zeros(rows, dtype=torch.int64, device="cuda")
+    requests = torch.zeros(rows, dtype=torch.int32, device="cuda")
+
+    for branch in ("invisible", "shared", "request_boundary"):
+        if branch != "invisible":
+            lengths.fill_(KPOOL)
+        if branch == "request_boundary":
+            requests[-8:] = 1
+        _kpool_score_kernel[(rows // rows_per_program, 1)](
+            q,
+            weights,
+            pool,
+            tables,
+            lengths,
+            requests,
+            out,
+            rows,
+            weights.stride(0),
+            weights.stride(1),
+            pool.stride(0),
+            pool.stride(1),
+            tables.stride(0),
+            TPB,
+            capacity,
+            1.0 / HD,
+            1.0,
+            FP32_MIN,
+            HD=HD,
+            KPOOL=KPOOL,
+            H=1,
+            HP=16,
+            BP=64,
+            ROWS=rows_per_program,
+            PRECISION="tf32",
+            HAS_REQ=True,
+            num_warps=4,
+        )
+        expected = torch.full((32, 64), FP32_MIN, device="cuda")
+        if branch != "invisible":
+            expected[:, 0] = 1
+        if branch == "request_boundary":
+            expected[-8:, 0] = 2
+        torch.testing.assert_close(out[-32:, :64], expected, rtol=0, atol=0)
+
+
+def test_pool_topk_without_cute_dsl_replays_graph(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch import cute_dsl_utils
+    from tensorrt_llm._torch.models.modeling_glm5_next import Glm5NextIndexer
+
+    monkeypatch.setattr(cute_dsl_utils, "IS_CUTLASS_DSL_AVAILABLE", False)
+    config = SimpleNamespace(
+        hidden_size=256,
+        q_lora_rank=128,
+        index_n_heads=32,
+        index_head_dim=128,
+        index_topk=2048,
+        index_kpool=4,
+        index_kpool_always_select_tail=True,
+    )
+    with torch.device("meta"):
+        indexer = Glm5NextIndexer(config, layer_idx=0)
+    scores = torch.arange(520, dtype=torch.float32, device="cuda").repeat(3, 1)
+    lengths = torch.tensor([0, 3, 513], dtype=torch.int32, device="cuda")
+    selected = torch.empty(3, 512, dtype=torch.int32, device="cuda")
+
+    def select() -> torch.Tensor:
+        return indexer.pool_top_k(
+            scores, selected, is_prefill=False, sequence_lengths=lengths, scan_lengths=lengths
+        )
+
+    select()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        select()
+    for bounds in ([0, 3, 513], [520, 1, 0]):
+        lengths.copy_(torch.tensor(bounds, dtype=torch.int32, device="cuda"))
+        graph.replay()
+        for row, count in enumerate(bounds):
+            actual = selected[row].cpu()
+            valid = actual[actual >= 0].sort().values
+            expected = torch.arange(max(0, count - 512), count, dtype=torch.int32)
+            assert torch.equal(valid, expected)
+            assert int((actual == -1).sum()) == 512 - min(count, 512)

@@ -643,3 +643,25 @@ def test_packed_attention_splits_phases_and_reduces_once(generation_phase, reduc
     other.assert_not_called()
     if reduction is not None:
         reduction.assert_called_once()
+
+
+@pytest.mark.cpu_only
+def test_indexer_topk_without_cute_dsl(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm._torch import cute_dsl_utils
+    from tensorrt_llm._torch.models.modeling_glm5_next import Glm5NextIndexer
+
+    monkeypatch.setattr(cute_dsl_utils, "IS_CUTLASS_DSL_AVAILABLE", False)
+    with torch.device("meta"):
+        indexer = Glm5NextIndexer(_config().text_config, layer_idx=0)
+    scores = torch.arange(520, dtype=torch.float32).repeat(3, 1)
+    lengths = torch.tensor([0, 3, 513], dtype=torch.int32)
+    selected = torch.empty(3, indexer.select_k, dtype=torch.int32)
+    # GLM calls this entry for both packed prefill rows and generation rows.
+    indexer.pool_top_k(
+        scores, selected, is_prefill=False, sequence_lengths=lengths, scan_lengths=lengths
+    )
+    for row, count in enumerate(lengths.tolist()):
+        valid = selected[row][selected[row] >= 0].sort().values
+        expected = torch.arange(max(0, count - indexer.select_k), count, dtype=torch.int32)
+        assert torch.equal(valid, expected)
+        assert int((selected[row] == -1).sum()) == indexer.select_k - min(count, indexer.select_k)
