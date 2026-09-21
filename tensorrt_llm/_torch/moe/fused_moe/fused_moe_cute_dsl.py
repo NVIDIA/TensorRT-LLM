@@ -1308,9 +1308,6 @@ class CuteDslFusedMoE(MoEImplBase):
         if use_rubin:
             gather_act_kwargs["output_tensor"] = None
             gather_act_kwargs["output_sf_tensor"] = None
-        else:
-            gather_act_kwargs["activation_type"] = self.activation_type
-            gather_act_kwargs["swiglu_limit_scalar"] = self.act_clamp
         gather_act_kwargs["activation_type"] = self.activation_type
         # ``act_alpha`` / ``act_beta`` are where ``SiTuActivation.constants()``
         # lands: gate_softcap -> alpha, linear_softcap -> beta, both reduced to
@@ -1321,6 +1318,7 @@ class CuteDslFusedMoE(MoEImplBase):
         if self.activation_type == ActivationType.SiTu:
             gather_act_kwargs["situ_beta"] = self.act_alpha
             gather_act_kwargs["situ_linear_beta"] = self.act_beta
+        gather_act_kwargs["swiglu_limit_scalar"] = self.act_clamp
 
         x, x_sf = gather_act_op(**gather_act_kwargs)
 
@@ -1715,6 +1713,7 @@ class CuteDslFusedMoE(MoEImplBase):
             output_sf_tensor=fc1_out_sf,
             scaling_vector_size=self.scaling_vector_size,
             activation_type=self.activation_type,
+            swiglu_limit_scalar=self.act_clamp,
         )
 
         fc1_out_sf_merged = fc1_out_sf

@@ -24,6 +24,7 @@ from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile, Tunabl
 from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
     SITU_BETA_DISABLED,
+    SWIGLU_LIMIT_SCALAR_DISABLED,
     GroupedGemmInputsHelper,
     _get_sm107_nvfp4_default_mma_config,
 )
@@ -1390,6 +1391,7 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
     [ActivationType.Swiglu, ActivationType.Relu2],
     ids=["swiglu", "relu2"],
 )
+@pytest.mark.parametrize("swiglu_limit", [float("inf"), 1.0], ids=["nolimit", "limit1"])
 @pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize("ep_size", [1, 8, 32])
 @pytest.mark.parametrize("top_k", [1, 2, 8])
@@ -1400,6 +1402,7 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
     ep_size: int,
     tile_size: int,
     activation_type: ActivationType,
+    swiglu_limit: float,
 ):
     """Test gather-based grouped GEMM with fused activation on Rubin (SM107).
 
@@ -1409,6 +1412,8 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
     3. Applies the fused activation (SwiGLU for gated, Relu2 for non-gated)
     4. Quantizes output to FP4 with scale factor generation
     """
+    if swiglu_limit != float("inf") and activation_type != ActivationType.Swiglu:
+        pytest.skip("swiglu_limit applies to SwiGLU only")
     is_gated = is_gated_activation(activation_type)
     weight_n_multiplier = 2 if is_gated else 1
     sf_vec_size = 16
@@ -1524,7 +1529,7 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
         output_dtype=torch.bfloat16,
         scaling_vector_size=sf_vec_size,
     )
-    c_ref = apply_activation_ref(c_ref, activation_type)
+    c_ref = apply_activation_ref(c_ref, activation_type, swiglu_limit)
     global_sf = c_ref[:num_valid_permuted_tokens].abs().max().float() / (448 * 6)
     c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
 
@@ -1549,6 +1554,7 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
         output_sf_tensor=None,
         scaling_vector_size=sf_vec_size,
         activation_type=activation_type,
+        swiglu_limit_scalar=swiglu_limit,
     )
 
     # Verify output (only compare valid tokens, skip padding)
@@ -2893,6 +2899,7 @@ def _assert_rubin_moe_op_schema(
                 "activation_type",
                 "situ_beta",
                 "situ_linear_beta",
+                "swiglu_limit_scalar",
                 "precomputed_tactic",
             ),
             {
@@ -2901,6 +2908,7 @@ def _assert_rubin_moe_op_schema(
                 "activation_type": int(ActivationType.Swiglu),
                 "situ_beta": SITU_BETA_DISABLED,
                 "situ_linear_beta": SITU_BETA_DISABLED,
+                "swiglu_limit_scalar": SWIGLU_LIMIT_SCALAR_DISABLED,
                 "precomputed_tactic": None,
             },
             {"output_tensor", "output_sf_tensor"},
@@ -3169,12 +3177,14 @@ def test_rubin_bf16_moe_precomputed_tactic_fake_signatures():
                 "activation_type",
                 "situ_beta",
                 "situ_linear_beta",
+                "swiglu_limit_scalar",
             ),
             {
                 "scaling_vector_size": 16,
                 "activation_type": int(ActivationType.Swiglu),
                 "situ_beta": SITU_BETA_DISABLED,
                 "situ_linear_beta": SITU_BETA_DISABLED,
+                "swiglu_limit_scalar": SWIGLU_LIMIT_SCALAR_DISABLED,
             },
             {"output_tensor", "output_sf_tensor"},
             id="nvfp4_fc1",
@@ -3628,11 +3638,12 @@ def test_rubin_moe_locality_domain_composite_owns_concurrent_tuning(
     runner_args, runner_kwargs = runner_instances[0].init_call
     if quantized and is_fc1:
         assert runner_args == (1, 1, 1, 0, 128, 16)
-        # The disabled sentinel canonicalizes to None before the runner sees it.
+        # The disabled sentinels canonicalize (None / +inf) before the runner sees them.
         assert runner_kwargs == {
             "activation_type": ActivationType.Swiglu,
             "situ_beta": None,
             "situ_linear_beta": None,
+            "swiglu_limit_scalar": float("inf"),
         }
     elif quantized:
         assert runner_args == (1, 1, 1, 0, 128, torch.bfloat16, 16)
