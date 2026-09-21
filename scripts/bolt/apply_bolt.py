@@ -269,8 +269,10 @@ def bolt_standalone_wheel(
     # argument, so a failed apply would leave the caller's input half-written
     # with nothing to fall back on.
     if output.resolve() == wheel.resolve():
-        err("--output must differ from --wheel; the input is preserved so a "
-            "failed apply leaves it usable")
+        err(
+            "--output must differ from --wheel; the input is preserved so a "
+            "failed apply leaves it usable"
+        )
         return 2
 
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -470,9 +472,7 @@ def _apply(args: argparse.Namespace, workdir: Path) -> int:
 
     # 2) Wheel(s).
     for wheel in sorted(tree.rglob("tensorrt_llm-*.whl")):
-        total += process_wheel(
-            wheel, profiles_dir, DEFAULT_BOLT_FLAGS, args.strip, args.dry_run
-        )
+        total += process_wheel(wheel, profiles_dir, DEFAULT_BOLT_FLAGS, args.strip, args.dry_run)
 
     if total == 0:
         err("no ELFs matched a profile -- nothing bolted. Check --profiles names.")
