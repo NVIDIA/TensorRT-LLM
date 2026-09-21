@@ -108,6 +108,46 @@ def _kimi_k3_mxfp8_tuning_bucket(num_tokens: int) -> int:
     return next_positive_power_of_2(num_tokens)
 
 
+_DSA_LOGITS_FULL_QUERY = os.environ.get("TRTLLM_DSA_LOGITS_FULL_QUERY", "0") == "1"
+
+
+def fp8_full_query_weight_cache_limit(
+    next_n: int,
+    num_heads: int,
+    head_dim: int,
+    phys_block_kv: int,
+    q_dtype: torch.dtype,
+    num_epi_subtiles: int = 1,
+    epi_dtype: torch.dtype = torch.float32,
+    acc_dtype: torch.dtype = torch.float32,
+    output_dtype: torch.dtype = torch.float32,
+) -> int | None:
+    """Return the full-query register-cache policy, or preserve atom splitting.
+
+    The two MMA groups share 512 TMEM columns. Each needs Q*H columns,
+    with an eight-column MMA granularity. D=128 and three Q/KV stages
+    fit the shared-memory budget throughout this range. Physical pages
+    must divide the 128-token compute tile into at most four pieces.
+    Keep at most 96 FP32 weights per thread (16 for each Q6 position);
+    the existing shared-memory tail handles the remaining heads without
+    changing the FMA order. Q1--4 retain the existing wave-aware policy.
+    """
+    if not _DSA_LOGITS_FULL_QUERY:
+        return None
+    columns = next_n * num_heads
+    if (next_n <= 4 or head_dim != 128 or not 8 <= columns <= 256
+            or columns % 8 or phys_block_kv not in (32, 64, 128)
+            or num_epi_subtiles <= 0 or num_heads % num_epi_subtiles
+            or (num_heads // num_epi_subtiles) % 4
+            or q_dtype != torch.float8_e4m3fn
+            or epi_dtype != torch.float32 or acc_dtype != torch.float32
+            or output_dtype != torch.float32):
+        return None
+    limit = min(16, num_heads, (96 // next_n // 4) * 4)
+    return limit if limit >= 4 else None
+
+
+
 def _with_input_cuda_device(function):
     """Run a custom-op implementation under its input tensor's CUDA device."""
 
@@ -8943,11 +8983,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
         @classmethod
         def _compile(cls, compute_block_kv, phys_block_kv, num_heads, head_dim,
                      next_n, num_sms, num_epi_subtiles, epi_dtype, acc_dtype,
-                     output_dtype):
+                     output_dtype, weight_cache_limit=None):
             """Compile kernel using fake tensors + TVM FFI."""
             key = (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n,
                    num_sms, num_epi_subtiles, epi_dtype, acc_dtype,
                    output_dtype)
+            if weight_cache_limit is not None:
+                key += (weight_cache_limit, )
             if key in cls.kernel_cache:
                 return
 
@@ -9010,6 +9052,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 epi_dtype=to_cutlass[epi_dtype],
                 acc_dtype=to_cutlass[acc_dtype],
                 output_dtype=to_cutlass[output_dtype],
+                weight_cache_limit=weight_cache_limit,
             )
 
             compiled = cute.compile(
@@ -9099,12 +9142,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
             logits = logits[:, :max_context_len]
 
             # Compile if needed (fake tensors, no real data required)
+            weight_cache_limit = None
+            if _DSA_LOGITS_FULL_QUERY:
+                weight_cache_limit = fp8_full_query_weight_cache_limit(
+                    next_n, H, D, phys_block_kv, q.dtype, num_epi_subtiles,
+                    epi_dtype, acc_dtype, output_dtype)
             key = (compute_block_kv, phys_block_kv, H, D, next_n, num_sms,
                    num_epi_subtiles, epi_dtype, acc_dtype, output_dtype)
+            if weight_cache_limit is not None:
+                key += (weight_cache_limit, )
             if key not in cls.kernel_cache:
                 cls._compile(compute_block_kv, phys_block_kv, H, D, next_n,
                              num_sms, num_epi_subtiles, epi_dtype, acc_dtype,
-                             output_dtype)
+                             output_dtype, weight_cache_limit)
             compiled = cls.kernel_cache[key]
 
             # FP8 q needs uint8 view to match compile-time dtype

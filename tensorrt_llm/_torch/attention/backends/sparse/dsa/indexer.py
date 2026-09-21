@@ -650,6 +650,7 @@ class Indexer(nn.Module):
         self.compress_ratio = compress_ratio
 
         self.wq_b = self.wk = self.k_norm = self.weights_proj = self.rotary_emb = None
+        self._full_query_logits = os.environ.get("TRTLLM_DSA_LOGITS_FULL_QUERY", "0") == "1"
         self._fused_wk_wp_weight: Optional[torch.Tensor] = None
         self._indexer_bf16 = False
         if not projection_free:
@@ -1919,7 +1920,8 @@ class Indexer(nn.Module):
                         **gvr_emit_kwargs,
                     )
                 else:
-                    # FP8 DSL kernel natively supports next_n ∈ {1, 2, 3, 4}.
+                    # Default FP8 atoms are {1, 2, 3, 4}. Full-query mode
+                    # can reuse KV across a larger resource-bounded atom.
                     # Atom-split benefits small-batch / low-ntask configs by
                     # raising SM utilization at the cost of factorx KV HBM
                     # re-reads. Context lengths are indexer KV lengths, which
@@ -1928,7 +1930,16 @@ class Indexer(nn.Module):
                     fp8_ctx_lens = dsl_context_lens
                     fp8_block_table = block_table
                     fp8_schedule_meta = metadata.scheduler_metadata_buffer
-                    if dsl_atom_split:
+                    full_query = False
+                    if self._full_query_logits:
+                        from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+                            fp8_full_query_weight_cache_limit,
+                        )
+
+                        full_query = fp8_full_query_weight_cache_limit(
+                            next_n, self.n_heads, self.head_dim, k_cache.shape[1], q_decode.dtype
+                        ) is not None
+                    if dsl_atom_split and not full_query:
                         factor = metadata.dsl_expand_factor
                         atom = metadata.dsl_atom
                         exp_B = num_generations * factor
