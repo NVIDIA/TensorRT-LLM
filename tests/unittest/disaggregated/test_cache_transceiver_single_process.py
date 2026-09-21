@@ -23,6 +23,7 @@ TP/PP/DP/MLA/sliding-window configurations for both V1 and V2 cache managers.
 import gc
 import os
 import threading
+import time
 import uuid
 from types import SimpleNamespace
 
@@ -47,17 +48,19 @@ import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
+from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.utils import get_global_layer_ids
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
+from tensorrt_llm.bindings.internal.testing import simulate_prefill_completion_only_use_for_testing
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, CacheTransceiverConfig, KvCacheConfig
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
@@ -2004,6 +2007,265 @@ def test_python_nixl_cache_transceiver_uses_cpp_bounce(
         enable_indexer_k_cache=enable_indexer_k_cache,
         expect_cpp_bounce=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# V1 host offload: block IDs diverge from primary slots; the sender must use slots
+# ---------------------------------------------------------------------------
+_OFFLOAD_SEQ_LEN = TOKENS_PER_BLOCK * 4  # four-block context primary pool, one window
+_OFFLOAD_PROMPT_LEN = TOKENS_PER_BLOCK * 2
+
+
+def _offload_cycle_manager(
+    *, max_tokens: int, host_cache_size: int, enable_block_reuse: bool
+) -> KVCacheManager:
+    """V1 manager sized in tokens; ``host_cache_size > 0`` adds the secondary (host) pool."""
+    return KVCacheManager(
+        KvCacheConfig(
+            max_tokens=max_tokens,
+            free_gpu_memory_fraction=0.1,
+            max_attention_window=[_OFFLOAD_SEQ_LEN],
+            enable_block_reuse=enable_block_reuse,
+            enable_partial_reuse=enable_block_reuse,
+            copy_on_partial_reuse=False,
+            host_cache_size=host_cache_size,
+            secondary_offload_min_priority=0,
+        ),
+        CacheTypeCpp.SELF,
+        num_layers=NUM_LAYERS,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        tokens_per_block=TOKENS_PER_BLOCK,
+        max_seq_len=_OFFLOAD_SEQ_LEN,
+        max_batch_size=MAX_BATCH_SIZE,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.FLOAT,
+    )
+
+
+def _offload_request_pair(index: int, tokens: List[int], ctx_info_endpoint):
+    """Context/generation request pair for one prompt (ids ``2*index`` and ``2*index + 1``)."""
+    disagg_request_id = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+
+    def make(request_id, request_type):
+        return LlmRequest(
+            request_id=request_id,
+            max_new_tokens=1,
+            input_tokens=list(tokens),
+            sampling_config=tensorrt_llm.bindings.SamplingConfig(
+                SamplingParams()._get_sampling_config()
+            ),
+            is_streaming=False,
+            llm_request_type=request_type,
+        )
+
+    ctx = make(2 * index, LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+    ctx.py_disaggregated_params = DisaggregatedParams(disagg_request_id=disagg_request_id)
+    gen = make(2 * index + 1, LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY)
+    gen.py_disaggregated_params = DisaggregatedParams(
+        ctx_request_id=ctx.py_request_id,
+        ctx_dp_rank=0,
+        ctx_info_endpoint=ctx_info_endpoint,
+        disagg_request_id=disagg_request_id,
+    )
+    return ctx, gen
+
+
+def _v1_block_ids_and_slots(mgr: KVCacheManager, request_id: int):
+    block_ids = [int(b) for b in mgr.get_batch_cache_indices([request_id], layer_idx=0)[0]]
+    window = mgr.max_attention_window_vec[0]
+    slots = mgr.get_memory_pool_block_indices(block_ids, window_size=window)
+    return block_ids, [int(s) for s in slots]
+
+
+def _v1_blocks_at(mgr: KVCacheManager, slots: List[int]) -> List[torch.Tensor]:
+    """Per-layer copies of the primary-pool blocks at *slots* (HND layout)."""
+    torch.cuda.synchronize()
+    return [mgr.get_buffers(layer, kv_layout="HND")[slots].clone() for layer in range(NUM_LAYERS)]
+
+
+def _v1_is_offloaded(mgr: KVCacheManager, block_id: int) -> bool:
+    try:
+        mgr.get_memory_pool_block_indices([block_id], window_size=mgr.max_attention_window_vec[0])
+    except RuntimeError as exc:
+        assert "Block is not in the primary pool" in str(exc), exc
+        return True
+    return False
+
+
+def _settle(check, expected: set, what: str, timeout_s: float = 60.0) -> None:
+    """Poll *check* without blocking until exactly the transfers in *expected* settled.
+
+    Any failed or cancelled transfer, a settled id outside *expected*, or running out of
+    time fails the test with the state seen so far. The status calls report outcomes
+    without raising; ``at_least_request_num=0`` keeps them from waiting inside, so this
+    deadline is the one that fires.
+    """
+    done, deadline = set(), time.monotonic() + timeout_s
+    while done != expected:
+        assert time.monotonic() < deadline, f"{what}: settled {done}, expected {expected}"
+        status = check()
+        assert status.error_request_ids == [], status
+        assert not getattr(status, "cancelled_requests", None), status
+        settled = set(status.completed_request_ids)
+        assert settled <= expected, status
+        if not settled:
+            time.sleep(0.01)
+        done |= settled
+
+
+@pytest.mark.timeout(180)
+def test_cache_transceiver_v1_sends_primary_slots_under_host_offload():
+    """Under context-side host offload the sender must move the bytes at the primary slots.
+
+    A block's ID and its primary slot diverge once blocks move to host; the real V1 reuse
+    adapter and the real NIXL path carry the transfer. Four-block context primary pool with
+    a host pool behind it, two-block prompts, two requests in flight per round:
+      1. A and B are sent, then released into the reuse tree.
+      2. C and D evict A/B to host and take over their slots under new block IDs; the
+         pool is rewritten as their "prefill", and the receiver must hold exactly the
+         rewritten slots.
+      3. A and B are re-issued: reuse onboards them from host; the receiver holds the
+         bytes at the translated slots, and the reused blocks are A/B's original bytes.
+         Everything is released and the receiver's pool is back to its starting free count.
+    A missing host pool or an eviction that does not offload fails the test rather than
+    skipping it: this is the CI replacement for the host-offload E2E case.
+    """
+    primary_blocks = _OFFLOAD_SEQ_LEN // TOKENS_PER_BLOCK
+    kv_bytes_per_token = NUM_LAYERS * 2 * NUM_KV_HEADS * HEAD_DIM * 4  # fp32 K and V
+    ctx_mgr = _offload_cycle_manager(
+        max_tokens=_OFFLOAD_SEQ_LEN,
+        host_cache_size=64 * TOKENS_PER_BLOCK * kv_bytes_per_token,
+        enable_block_reuse=True,
+    )
+    gen_mgr = _offload_cycle_manager(
+        max_tokens=_OFFLOAD_SEQ_LEN * 16, host_cache_size=0, enable_block_reuse=False
+    )
+    transceivers = []
+    try:
+        # Host pool large enough to hold both evicted rounds.
+        assert ctx_mgr.blocks_in_secondary_pool >= 2 * primary_blocks, (
+            ctx_mgr.blocks_in_secondary_pool
+        )
+        _init_pool_data_v1([ctx_mgr], 1, False, fill_random=True, seed_base=1000)
+        _init_pool_data_v1([gen_mgr], 1, False, fill_random=False)
+        config = CacheTransceiverConfig(
+            backend="NIXL", transceiver_runtime="PYTHON", max_tokens_in_buffer=512
+        )
+        (ctx_tc,) = create_instance_transceivers(1, 1, False, [ctx_mgr], config, False)
+        transceivers.append(ctx_tc)
+        (gen_tc,) = create_instance_transceivers(1, 1, False, [gen_mgr], config, False)
+        transceivers.append(gen_tc)
+        endpoint = ctx_tc._context_info_endpoint
+        # A, B, C, D
+        prompts = [list(range(base, base + _OFFLOAD_PROMPT_LEN)) for base in (0, 1000, 2000, 3000)]
+
+        def add(ctx, gen):
+            ctx_mgr.impl.add_sequence_batch([(ctx.py_request_id, ctx.prompt_len, 1)], [ctx])
+            _add_sequence(
+                gen_mgr, gen.py_request_id, gen.prompt_len, use_v2=False, is_generation=True
+            )
+            torch.cuda.synchronize()  # offload/onboard copies the manager issued
+
+        def transfer(pairs):
+            expected = {get_unique_rid(ctx) for ctx, _gen in pairs}
+            for _ctx, gen in pairs:
+                gen_tc.request_and_receive_async(gen)
+            for ctx, _gen in pairs:
+                ctx_tc.respond_and_send_async(ctx)
+            _settle(
+                lambda: ctx_tc.check_context_transfer_status(0, mark_complete=True),
+                expected,
+                "context send",
+            )
+            _settle(lambda: gen_tc.check_gen_transfer_status(0), expected, "generation receive")
+            for ctx, gen in pairs:
+                assert ctx.state == LlmRequestState.DISAGG_CONTEXT_COMPLETE, ctx.state
+                assert gen.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE, gen.state
+
+        def ctx_bytes(ctx):
+            _, slots = _v1_block_ids_and_slots(ctx_mgr, ctx.py_request_id)
+            return _v1_blocks_at(ctx_mgr, slots)
+
+        def assert_received(gen, expected):
+            block_ids, slots = _v1_block_ids_and_slots(gen_mgr, gen.py_request_id)
+            assert block_ids == slots  # nothing is offloaded on the receiver
+            for got, want in zip(_v1_blocks_at(gen_mgr, slots), expected):
+                torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+        def release(ctx, gen):
+            simulate_prefill_completion_only_use_for_testing(ctx)
+            ctx_mgr.free_resources(ctx)  # commits the blocks to the reuse tree
+            gen_mgr.free_resources(gen)
+
+        gen_free_blocks = gen_mgr.get_num_free_blocks()
+
+        # 1. Nothing offloaded yet: block IDs are the slots.
+        a, ga = _offload_request_pair(0, prompts[0], endpoint)
+        b, gb = _offload_request_pair(1, prompts[1], endpoint)
+        add(a, ga)
+        add(b, gb)
+        ids_a, slots_a = _v1_block_ids_and_slots(ctx_mgr, a.py_request_id)
+        ids_b, slots_b = _v1_block_ids_and_slots(ctx_mgr, b.py_request_id)
+        assert ids_a == slots_a and ids_b == slots_b
+        bytes_a, bytes_b = _v1_blocks_at(ctx_mgr, slots_a), _v1_blocks_at(ctx_mgr, slots_b)
+        transfer([(a, ga), (b, gb)])
+        assert_received(ga, bytes_a)
+        assert_received(gb, bytes_b)
+        release(a, ga)
+        release(b, gb)
+
+        # 2. C and D need every primary slot; the committed A/B blocks are offloaded (priority
+        #    0, host space available) and C/D take over their slots under new block IDs.
+        c, gc = _offload_request_pair(2, prompts[2], endpoint)
+        d, gd = _offload_request_pair(3, prompts[3], endpoint)
+        add(c, gc)
+        add(d, gd)
+        assert _v1_is_offloaded(ctx_mgr, ids_a[0]) and _v1_is_offloaded(ctx_mgr, ids_b[0]), (
+            ids_a,
+            ids_b,
+        )
+        ids_c, slots_c = _v1_block_ids_and_slots(ctx_mgr, c.py_request_id)
+        ids_d, slots_d = _v1_block_ids_and_slots(ctx_mgr, d.py_request_id)
+        assert sorted(slots_c + slots_d) == list(range(primary_blocks))
+        assert ids_c != slots_c or ids_d != slots_d, (ids_c, slots_c, ids_d, slots_d)
+        _init_pool_data_v1([ctx_mgr], 1, False, fill_random=True, seed_base=2000)  # C/D "prefill"
+        bytes_c, bytes_d = _v1_blocks_at(ctx_mgr, slots_c), _v1_blocks_at(ctx_mgr, slots_d)
+        transfer([(c, gc), (d, gd)])
+        assert_received(gc, bytes_c)
+        assert_received(gd, bytes_d)
+        release(c, gc)
+        release(d, gd)
+
+        # 3. Re-issuing A and B onboards their reusable prefix from host.
+        a2, ga2 = _offload_request_pair(4, prompts[0], endpoint)
+        b2, gb2 = _offload_request_pair(5, prompts[1], endpoint)
+        add(a2, ga2)
+        add(b2, gb2)
+        for req, original in ((a2, bytes_a), (b2, bytes_b)):
+            # The first block must come back whole; the second is at most a partial hit
+            # because the reuse keys stop one token short of the prompt end.
+            reused_blocks = req.prepopulated_prompt_len // TOKENS_PER_BLOCK
+            assert reused_blocks >= 1, req.prepopulated_prompt_len
+            for got, want in zip(ctx_bytes(req), original):
+                torch.testing.assert_close(
+                    got[:reused_blocks], want[:reused_blocks], rtol=0, atol=0
+                )
+        transfer([(a2, ga2), (b2, gb2)])
+        assert_received(ga2, ctx_bytes(a2))
+        assert_received(gb2, ctx_bytes(b2))
+        release(a2, ga2)
+        release(b2, gb2)
+
+        assert gen_mgr.get_num_free_blocks() == gen_free_blocks
+    finally:
+        for tc in transceivers:
+            try:
+                tc.shutdown()
+            except Exception:
+                pass
+        ctx_mgr.shutdown()
+        gen_mgr.shutdown()
 
 
 if __name__ == "__main__":

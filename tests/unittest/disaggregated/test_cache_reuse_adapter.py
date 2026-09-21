@@ -608,3 +608,78 @@ class TestTransceiverContextManager:
         tc.shutdown()
         tc.shutdown()  # second call short-circuits after completed teardown.
         tc._transfer_worker.shutdown.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# _CacheReuseAdapterV1 under host offload: the positional table holds primary
+# slots, not block IDs.
+# ---------------------------------------------------------------------------
+
+
+class _OffloadV1Mgr:
+    """KVCacheManager stand-in whose block IDs and primary slots differ."""
+
+    enable_block_reuse = True
+    tokens_per_block = 8
+
+    def __init__(self, chain, slots, error=None):
+        self._slots = dict(zip(chain, slots))
+        self._error = error
+        self.translations = []
+        self.impl = SimpleNamespace(
+            get_batch_cache_block_ids=lambda request_ids, window_size: [[list(chain)]]
+        )
+
+    def get_num_front_blocks_removed(self, request_id, window_size=None):  # noqa: ARG002
+        return 0
+
+    def get_memory_pool_block_indices(self, block_ids, *, window_size):
+        self.translations.append((list(block_ids), window_size))
+        if self._error is not None:
+            raise self._error
+        return [self._slots[block_id] for block_id in block_ids]
+
+
+class TestV1AdapterHostOffloadSlots:
+    """After host offload a block's ID and its primary slot diverge.
+
+    The V1 adapter's positional table must carry the slots the manager translates for
+    the group's window, and the manager's refusal for an offloaded block must surface.
+    """
+
+    def _req(self):
+        return SimpleNamespace(
+            prompt_len=3 * _OffloadV1Mgr.tokens_per_block,
+            py_request_id=7,
+            py_beam_width=1,
+            is_generation_only_request=False,
+        )
+
+    def test_ordinals_are_primary_slots_not_block_ids(self):
+        mgr = _OffloadV1Mgr(chain=[4, 5, 6], slots=[0, 1, 2])
+
+        ordinals = _CacheReuseAdapterV1(mgr).get_block_ordinals(self._req(), 0, _lg(window=64))
+
+        assert ordinals.dtype == np.int64
+        np.testing.assert_array_equal(ordinals, [0, 1, 2])
+        assert mgr.translations == [([4, 5, 6], 64)]
+
+    def test_offloaded_block_error_propagates(self):
+        mgr = _OffloadV1Mgr(
+            chain=[4], slots=[0], error=RuntimeError("Block is not in the primary pool")
+        )
+
+        with pytest.raises(RuntimeError, match="not in the primary pool"):
+            _CacheReuseAdapterV1(mgr).get_block_ordinals(self._req(), 0, _lg(window=64))
+
+    def test_sender_chunk_carries_the_translated_slots(self):
+        """Real adapter into the real chunk builder: the sender's table is the slots."""
+        mgr = _OffloadV1Mgr(chain=[4, 5, 6], slots=[0, 1, 2])
+        transceiver = object.__new__(KvCacheTransceiverV2)
+        transceiver._reuse_adapter = _CacheReuseAdapterV1(mgr)
+        transceiver._page_table = SimpleNamespace(layer_groups=[_lg(window=64)])
+        transceiver._kv_cache_manager = SimpleNamespace(num_extra_kv_tokens=0)
+
+        chunk = transceiver._create_chunk(self._req())
+
+        np.testing.assert_array_equal(chunk.block_ids_per_layer_groups[0], [0, 1, 2])
