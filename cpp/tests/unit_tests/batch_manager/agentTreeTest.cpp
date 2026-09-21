@@ -79,7 +79,6 @@ protected:
             /*encoderOutputLength=*/std::nullopt, tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
             /*inputTokenExtraIds=*/std::nullopt,
             /*returnPerfMetrics=*/false,
-            /*allottedTimeMs=*/std::nullopt,
             /*contextPhaseParams=*/std::nullopt,
             /*arrivalTime=*/std::nullopt, agentHierarchy);
     }

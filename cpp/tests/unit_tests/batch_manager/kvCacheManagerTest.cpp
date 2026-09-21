@@ -2327,7 +2327,6 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltTest)
         /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, /*inputTokenExtraIds=*/std::nullopt,
         /*returnPerfMetrics=*/false,
-        /*allottedTimeMs=*/std::nullopt,
         /*contextPhaseParams=*/std::nullopt, /*arrivalTime=*/std::nullopt,
         /*agent_hierarchy=*/std::nullopt); // No cache_salt
 
@@ -2376,7 +2375,6 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltTest)
         /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, /*inputTokenExtraIds=*/std::nullopt,
         /*returnPerfMetrics=*/false,
-        /*allottedTimeMs=*/std::nullopt,
         /*contextPhaseParams=*/std::nullopt, /*arrivalTime=*/std::nullopt, /*agent_hierarchy=*/std::nullopt,
         /*multimodalItemRunCuOffsets=*/std::nullopt, /*multimodalRunPositions=*/std::nullopt,
         /*multimodalRunLengths=*/std::nullopt,
@@ -2421,7 +2419,6 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltTest)
         /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, /*inputTokenExtraIds=*/std::nullopt,
         /*returnPerfMetrics=*/false,
-        /*allottedTimeMs=*/std::nullopt,
         /*contextPhaseParams=*/std::nullopt, /*arrivalTime=*/std::nullopt, /*agent_hierarchy=*/std::nullopt,
         /*multimodalItemRunCuOffsets=*/std::nullopt, /*multimodalRunPositions=*/std::nullopt,
         /*multimodalRunLengths=*/std::nullopt,
@@ -2467,7 +2464,6 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltTest)
         /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, /*inputTokenExtraIds=*/std::nullopt,
         /*returnPerfMetrics=*/false,
-        /*allottedTimeMs=*/std::nullopt,
         /*contextPhaseParams=*/std::nullopt, /*arrivalTime=*/std::nullopt, /*agent_hierarchy=*/std::nullopt,
         /*multimodalItemRunCuOffsets=*/std::nullopt, /*multimodalRunPositions=*/std::nullopt,
         /*multimodalRunLengths=*/std::nullopt,
@@ -2506,7 +2502,6 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltTest)
         /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, /*inputTokenExtraIds=*/std::nullopt,
         /*returnPerfMetrics=*/false,
-        /*allottedTimeMs=*/std::nullopt,
         /*contextPhaseParams=*/std::nullopt, /*arrivalTime=*/std::nullopt,
         /*agent_hierarchy=*/std::nullopt); // No cache_salt
 

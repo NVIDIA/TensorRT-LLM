@@ -111,7 +111,6 @@ public:
     using BeamUniqueTokens = std::vector<VecUniqueTokens>;
     using TensorPtr = TTensor;
     using RequestPtr = std::shared_ptr<GenericLlmRequest>;
-    using MillisecondsType = std::chrono::milliseconds;
     using TimePoint = std::chrono::time_point<std::chrono::steady_clock>;
     using Duration = std::chrono::time_point<std::chrono::steady_clock>::duration;
 
@@ -135,7 +134,7 @@ public:
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
         LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         std::optional<std::shared_ptr<VecTokenExtraIds>> inputTokenExtraIds = std::nullopt,
-        bool returnPerfMetrics = false, std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
+        bool returnPerfMetrics = false,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
         std::optional<TimePoint> arrivalTime = std::nullopt,
         std::optional<std::vector<std::tuple<std::string, int>>> agent_hierarchy = std::nullopt,
@@ -182,7 +181,6 @@ public:
         , mContextPhaseParams(contextPhaseParams)
         , mInputTokenExtraIds(std::move(inputTokenExtraIds))
         , mReturnPerfMetrics(returnPerfMetrics)
-        , mAllottedTimeMs(allottedTimeMs)
         , mCacheSalt(std::move(cacheSalt))
         , mAgentHierarchy(std::move(agent_hierarchy))
     {
@@ -266,7 +264,6 @@ public:
         , mEncoderOutputLength(req.getEncoderOutputLength())
         , mContextPhaseParams(req.getContextPhaseParams())
         , mReturnPerfMetrics(req.getOutputConfig().returnPerfMetrics)
-        , mAllottedTimeMs(req.getAllottedTimeMs())
         , mCacheSalt(req.getCacheSalt())
     {
         if (req.getRequestType() == executor::RequestType::REQUEST_TYPE_GENERATION_ONLY)
@@ -1181,11 +1178,6 @@ public:
         return mReturnAllGeneratedTokens;
     }
 
-    void setAllottedTimeMs(MillisecondsType allottedTimeMs)
-    {
-        mAllottedTimeMs = allottedTimeMs;
-    }
-
     void setReturnContextLogits(bool const returnContextLogits)
     {
         mReturnContextLogits = returnContextLogits;
@@ -1567,20 +1559,6 @@ public:
             });
     }
 
-    [[nodiscard]] bool isTimedOut() const
-    {
-        if (!mAllottedTimeMs.has_value())
-        {
-            return false;
-        }
-        auto const currentTime = std::chrono::steady_clock::now();
-        auto const elapsed = (std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - mStartTime));
-        TLLM_LOG_DEBUG("Checked timeOut for request %ld with allotted Time %ld after time %ld and got %d", mRequestId,
-            mAllottedTimeMs->count(), elapsed.count(), (elapsed >= mAllottedTimeMs));
-
-        return elapsed >= *mAllottedTimeMs;
-    }
-
     void setFinishedReason(executor::FinishReason reason, SizeType32 beam)
     {
         mFinishReasons.at(beam) = reason;
@@ -1906,8 +1884,6 @@ protected:
 
     // Timepoint at which the request started. Used for tracking the timeout
     std::chrono::steady_clock::time_point mStartTime;
-    // Time in milliseconds after which the model is finished with a `timeout` finishReason.
-    std::optional<MillisecondsType> mAllottedTimeMs{std::nullopt};
 
     // Tensors containing the additional context output.
     TensorMap mAdditionalContextOutputTensors;
@@ -2068,7 +2044,6 @@ public:
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
         LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         std::optional<VecTokenExtraIds> inputTokenExtraIds = std::nullopt, bool returnPerfMetrics = false,
-        std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
         std::optional<TimePoint> arrivalTime = std::nullopt,
         std::optional<std::vector<std::tuple<std::string, int>>> agent_hierarchy = std::nullopt,
@@ -2100,7 +2075,7 @@ public:
             returnEncoderOutput, priority, std::move(encoderInputFeatures), encoderOutputLength, llmRequestType,
             inputTokenExtraIds ? std::make_optional(std::make_shared<VecTokenExtraIds>(std::move(*inputTokenExtraIds)))
                                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
-            returnPerfMetrics, allottedTimeMs, contextPhaseParams, arrivalTime, std::move(agent_hierarchy),
+            returnPerfMetrics, contextPhaseParams, arrivalTime, std::move(agent_hierarchy),
             multimodalItemRunCuOffsets.has_value()
                 ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalItemRunCuOffsets.value()))
                 : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
