@@ -15,7 +15,13 @@ Differences vs the Triton path are absorbed inside this wrapper:
   * Pre-L2-normalize Q/K when ``use_qk_l2norm_in_kernel=True``
     (the FlashInfer prefill kernel does NOT apply L2 norm internally; the
     ``use_qk_l2norm_in_kernel`` parameter on ``flashinfer.chunk_gated_delta_rule``
-    is currently a dead arg, see ``flashinfer/gdn_prefill.py:317-356``).
+    is a dead arg in flashinfer 0.6.18, which ``requirements.txt`` pins exactly,
+    see ``flashinfer/gdn_prefill.py:317-356``). **Do not pass ``True`` to save
+    these normalizations**: the SM100 entry point does not accept the parameter,
+    and on 0.7.0rc3 passing ``True`` raises ``CakeGDNUnsupportedError``, which the
+    dispatcher swallows and falls back to a kernel that ignores the flag -- Q/K
+    stay unnormalized and accuracy degrades with no error. Re-verify when bumping
+    the pin.
   * SSM-state I/O, via one of two paths:
     - **Indexed pool I/O** -- SM100/SM103 with ``inplace_indexed_state_update``
       + ``initial_state_indices`` (the ``gdn_mixer`` prefill call site). Pool

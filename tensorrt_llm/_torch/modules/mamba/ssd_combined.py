@@ -78,6 +78,8 @@ def _flashinfer_ssd_supported(chunk_size, dstate, headdim):
     # chunk_size/16 mismatch smem K-mode = dstate/16. Only compiles when
     # dstate == chunk_size (masked the bug for NemotronH). See
     # https://github.com/flashinfer-ai/flashinfer/issues/3397 for upstream fix.
+    # Still unfixed in flashinfer 0.6.18, which ``requirements.txt`` pins exactly;
+    # re-check this constraint when bumping the pin.
     return (chunk_size in _FLASHINFER_SSD_VALID_M_MODES
             and dstate in _FLASHINFER_SSD_VALID_M_MODES
             and headdim in _FLASHINFER_SSD_VALID_HEAD_DIMS

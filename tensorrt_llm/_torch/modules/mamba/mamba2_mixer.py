@@ -281,12 +281,16 @@ class Mamba2Mixer(nn.Module):
             config.quant_config.mamba_ssm_stochastic_rounding)
         self._philox_rounds = config.quant_config.mamba_ssm_philox_rounds
 
-        # TODO: Update head_dims once flashinfer is updated.
-        # Nemotron-v2-Nano (mamba_head_dim=80) is not supported by flashinfer yet.
+        # Verified against flashinfer 0.6.18, which ``requirements.txt`` pins exactly:
+        # the SSU kernel headers are unchanged since v0.6.14, so there is no gap here.
+        # head_dim: stp.cuh:1304 derives numConsumers = (DIM/64)*4, so DIM must be a
+        # multiple of 64 -- Nemotron-v2-Nano (80) is genuinely unsupported.
         supported_head_dims = [64, 128]
-        # flashinfer supports some head group ratios:
-        # https://github.com/flashinfer-ai/flashinfer/blob/v0.6.14/include/flashinfer/mamba/kernel_selective_state_update_stp.cuh#L1338
+        # Matches stp.cuh:1338 dispatchRatio<1,2,4,8,16,32,64> exactly:
+        # https://github.com/flashinfer-ai/flashinfer/blob/v0.6.18/include/flashinfer/mamba/kernel_selective_state_update_stp.cuh#L1338
         supported_head_group_ratios = [1, 2, 4, 8, 16, 32, 64]
+        # Narrower than flashinfer's own constraint (DSTATE % 32 == 0 for bf16, so
+        # 32/96/160 would also compile) because those have no upstream test coverage.
         supported_d_states = [64, 128, 256]
         head_group_ratio = (self.tp_nheads //
                             self.tp_ngroups if self.tp_ngroups > 0 else 0)
