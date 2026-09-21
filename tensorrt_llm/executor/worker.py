@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import gc
 import os
 import sys
@@ -409,15 +412,19 @@ def worker_main(
             rpc_addr=rpc_addr,
             hmac_key=hmac_key)
     except Exception as e:
-        logger.error(f"Failed to initialize executor on rank {mpi_rank()}: {e}")
-        logger.error(traceback.format_exc())
-        logger_debug(f"error: {traceback.format_exc()}", "red")
+        rank = mpi_rank()
+        error_trace = traceback.format_exc()
+        error = RuntimeError(
+            f"Failed to initialize executor on rank {rank}:\n{error_trace}")
+        logger.error(str(error))
+        logger_debug(f"error: {error_trace}", "red")
         if is_leader:
             # Send error message with confirmation
-            error_msg = (e, traceback.format_exc())
-            if not worker_init_status_queue.notify_with_retry(error_msg):
-                logger.error("Failed to deliver error message to proxy")
-        return
+            error_msg = (error, error_trace)
+            if worker_init_status_queue.notify_with_retry(error_msg):
+                return
+            logger.error("Failed to deliver error message to proxy")
+        raise error from e
 
     # Optionally disable GC (default: not disabled)
     if os.getenv("TRTLLM_WORKER_DISABLE_GC", "0") == "1":
