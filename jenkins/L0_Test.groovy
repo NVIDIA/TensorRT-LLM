@@ -1799,9 +1799,16 @@ def boltedTarUrlIfPublished(String tarName)
     // curl-or-wget: the test pods are not uniform (the K8s ones ship wget, the
     // SLURM dispatcher curl), and artifactory.sh already learned this the hard
     // way. Retries so a transient blip is not misread as "not published".
+    //
+    // -L is load-bearing, not hygiene: Artifactory answers with a redirect to
+    // the storage/CDN backend, so without it %{http_code} is the redirect and
+    // every probe reads as "no bolted build" -- silently, since falling back to
+    // the canonical tarball is a legitimate outcome. BoltProfileGen's
+    // _bolt_range_download probes the same host with -fsSL -I for this reason.
+    // With -L, %{http_code} is the status of the FINAL response.
     def status = sh(returnStdout: true, script: """
         if command -v curl >/dev/null 2>&1; then
-            curl -sI -o /dev/null -w '%{http_code}' --retry 3 --retry-all-errors \
+            curl -sIL -o /dev/null -w '%{http_code}' --retry 3 --retry-all-errors \
                  --connect-timeout 30 '${base}/bolted-${tarName}' || echo 000
         elif wget -q --spider --tries=3 --timeout=30 '${base}/bolted-${tarName}'; then
             echo 200
