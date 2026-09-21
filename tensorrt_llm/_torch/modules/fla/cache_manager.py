@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
 
 import torch
 
@@ -15,11 +14,10 @@ if sys.version_info[:2] >= (3, 12):
 else:
     from typing_extensions import override
 
-from tensorrt_llm._torch.modules.mamba.cache_manager import Mamba2ReplayLayerCache, ReplayHistory
+from tensorrt_llm._torch.modules.mamba.cache_manager import ReplayHistory
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     IntermediateState,
     MambaAcceptanceBatch,
-    MambaLayerCache,
     MambaStateLayout,
     _mamba_effective_tp_size,
 )
@@ -34,11 +32,6 @@ from .cached_replay import (
     CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
     commit_gdn_cached_replay_history_layers,
 )
-
-
-@dataclass(frozen=True, kw_only=True)
-class GDNReplayLayerCache(Mamba2ReplayLayerCache):
-    """GDN cached-replay tensors for one recurrent layer."""
 
 
 class GDNReplayState(ReplayHistory):
@@ -123,19 +116,6 @@ class GDNReplayState(ReplayHistory):
         if num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE:
             self.commit_all_layers(batch.attention_metadata, num_decodes)
         super().update(batch)
-
-    @override
-    def make_layer_cache(
-        self,
-        layer_offset: int,
-        conv: torch.Tensor,
-        temporal: torch.Tensor,
-    ) -> MambaLayerCache:
-        return GDNReplayLayerCache(
-            conv=conv,
-            temporal=temporal,
-            **self._layer_cache_fields(layer_offset),
-        )
 
     def commit_all_layers(self, attention_metadata: object, num_decodes: int) -> None:
         """Commit every local GDN checkpoint using one partitioned launch."""
@@ -301,7 +281,6 @@ def get_gdn_cache_params(config, *, spec_config=None, quant_config=None):
 
 __all__ = [
     "GDNReplayState",
-    "GDNReplayLayerCache",
     "Qwen35HybridCacheManagerV2",
     "create_gdn_state",
     "select_gdn_replay_state",

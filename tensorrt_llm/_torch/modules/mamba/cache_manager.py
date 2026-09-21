@@ -22,7 +22,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaLayerCache,
     MambaStateLayout,
     ReplayStateUpdateMetadata,
-    SpeculativeMambaLayerCache,
     _promote_intermediate_states,
     _stack_state_views,
 )
@@ -44,9 +43,15 @@ _MAMBA_SSM_SEED_MIX_RANK = 0x9E3779B97F4A7C15
 
 
 @dataclass(frozen=True, kw_only=True)
-class Mamba2ReplayLayerCache(SpeculativeMambaLayerCache):
-    """Mamba2 compact-replay tensors for one recurrent layer."""
+class ReplayLayerCache(MambaLayerCache):
+    """Shared Mamba2/GDN replay views consumed by their recurrent mixers."""
 
+    intermediate_conv_window: torch.Tensor | None = None
+    intermediate_ssm: torch.Tensor | None = None
+    mamba_ssm_rand_seed: torch.Tensor | None = field(
+        default=None,
+        metadata={"slot_shared": True},
+    )
     prev_num_accepted_tokens: torch.Tensor | None = field(
         default=None,
         metadata={"slot_shared": True},
@@ -294,7 +299,7 @@ class ReplayHistory:
         conv: torch.Tensor,
         temporal: torch.Tensor,
     ) -> MambaLayerCache:
-        return Mamba2ReplayLayerCache(
+        return ReplayLayerCache(
             conv=conv,
             temporal=temporal,
             **self._layer_cache_fields(layer_offset),
@@ -460,7 +465,7 @@ def get_nemotron_cache_params(config, *, spec_config=None, quant_config=None):
 __all__ = [
     "Mamba2State",
     "ReplayHistory",
-    "Mamba2ReplayLayerCache",
+    "ReplayLayerCache",
     "NemotronHybridCacheManagerV2",
     "create_mamba2_state",
     "select_mamba2_state",

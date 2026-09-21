@@ -3679,8 +3679,8 @@ def test_v2_kda_replay_policy_allocates_logical_slot_caches():
         assert mgr.get_replay_state_update_metadata() is None
 
         layer_cache = mgr.mamba_layer_cache(0)
-        assert layer_cache.intermediate_ssm is None
-        assert layer_cache.intermediate_conv_window is None
+        assert not hasattr(layer_cache, "intermediate_ssm")
+        assert not hasattr(layer_cache, "intermediate_conv_window")
         cache_size = layer_cache.temporal.shape[0]
         assert layer_cache.kda_conv_q.shape == (cache_size, 48, 6)
         assert layer_cache.kda_conv_k.shape == (cache_size, 48, 6)
@@ -3705,8 +3705,8 @@ def test_v2_kda_replay_policy_allocates_logical_slot_caches():
         assert layer_cache.prev_num_accepted_tokens.data_ptr() == (
             policy.prev_num_accepted_tokens.data_ptr()
         )
-        assert layer_cache.intermediate_ssm is None
-        assert layer_cache.intermediate_conv_window is None
+        assert not hasattr(layer_cache, "intermediate_ssm")
+        assert not hasattr(layer_cache, "intermediate_conv_window")
     finally:
         mgr.shutdown()
 

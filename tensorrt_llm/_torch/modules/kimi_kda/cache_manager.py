@@ -25,7 +25,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaLayerCache,
     MambaStateLayout,
     ReplayStateUpdateMetadata,
-    SpeculativeMambaLayerCache,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
@@ -34,7 +33,7 @@ from tensorrt_llm.logger import logger
 
 
 @dataclass(frozen=True, kw_only=True)
-class KDAReplayLayerCache(SpeculativeMambaLayerCache):
+class KDAReplayLayerCache(MambaLayerCache):
     """Per-layer KDA replay tensors consumed by fused multi-token verify."""
 
     prev_num_accepted_tokens: torch.Tensor | None = field(
@@ -264,9 +263,6 @@ class KDAReplayState:
 
     def _layer_cache_fields(self, layer_offset: int) -> dict[str, torch.Tensor | None]:
         return {
-            "intermediate_conv_window": None,
-            "intermediate_ssm": None,
-            "mamba_ssm_rand_seed": self.rand_seed,
             "prev_num_accepted_tokens": self.prev_num_accepted_tokens,
             "kda_conv_q": None if self.kda_conv_q is None else self.kda_conv_q[layer_offset],
             "kda_conv_k": None if self.kda_conv_k is None else self.kda_conv_k[layer_offset],

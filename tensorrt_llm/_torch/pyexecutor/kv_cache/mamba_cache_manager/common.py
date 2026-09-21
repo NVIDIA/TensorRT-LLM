@@ -79,7 +79,7 @@ class MambaLayerCache:
 
 
 @dataclass(frozen=True, kw_only=True)
-class SpeculativeMambaLayerCache(MambaLayerCache):
+class IntermediateLayerCache(MambaLayerCache):
     """Generic intermediate-state view used during speculative decoding."""
 
     intermediate_conv_window: torch.Tensor | None = None
@@ -717,7 +717,7 @@ __all__ = [
     "BaseMambaCacheManager",
     "MambaHybridCacheManager",
     "MambaLayerCache",
-    "SpeculativeMambaLayerCache",
+    "IntermediateLayerCache",
     "MambaStateLayout",
     "MambaAcceptanceBatch",
     "IntermediateState",
@@ -885,6 +885,6 @@ class IntermediateState:
     def make_layer_cache(
         self, layer_offset: int, conv: torch.Tensor, temporal: torch.Tensor
     ) -> MambaLayerCache:
-        return SpeculativeMambaLayerCache(
+        return IntermediateLayerCache(
             conv=conv, temporal=temporal, **self._layer_cache_fields(layer_offset)
         )

@@ -15,11 +15,11 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .common import (
         BaseMambaCacheManager,
+        IntermediateLayerCache,
         MambaHybridCacheManager,
         MambaLayerCache,
         MambaRole,
         ReplayStateUpdateMetadata,
-        SpeculativeMambaLayerCache,
     )
     from .legacy import (
         CppMambaHybridCacheManager,
@@ -46,7 +46,7 @@ _EXPORTS = {
     "MixedMambaHybridCacheManager": ("legacy", "MixedMambaHybridCacheManager"),
     "PythonMambaCacheManager": ("legacy", "PythonMambaCacheManager"),
     "ReplayStateUpdateMetadata": ("common", "ReplayStateUpdateMetadata"),
-    "SpeculativeMambaLayerCache": ("common", "SpeculativeMambaLayerCache"),
+    "IntermediateLayerCache": ("common", "IntermediateLayerCache"),
     "_advance_replay_state": ("common", "_advance_replay_state"),
     "_allocate_mamba_seed_buffer": ("common", "_allocate_mamba_seed_buffer"),
     "_compute_deterministic_mamba_seed": (
@@ -93,6 +93,6 @@ __all__ = [
     "MixedMambaHybridCacheManager",
     "PythonMambaCacheManager",
     "ReplayStateUpdateMetadata",
-    "SpeculativeMambaLayerCache",
+    "IntermediateLayerCache",
     "use_py_mamba_cache_manager",
 ]

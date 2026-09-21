@@ -11,6 +11,7 @@ import torch
 
 from tensorrt_llm._torch.modules.fla.cache_manager import GDNReplayState, Qwen35HybridCacheManagerV2
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
+    KDAReplayLayerCache,
     KDAReplayState,
     KimiK3HybridCacheManagerV2,
 )
@@ -18,6 +19,7 @@ from tensorrt_llm._torch.modules.mamba.cache_manager import (
     Mamba2State,
     NemotronHybridCacheManagerV2,
     ReplayHistory,
+    ReplayLayerCache,
 )
 from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
     PLE_CONV_STATE,
@@ -28,6 +30,7 @@ from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
+    IntermediateLayerCache,
     IntermediateState,
     MambaAcceptanceBatch,
     MambaHybridCacheManager,
@@ -651,6 +654,85 @@ def test_kda_scratch_cost_matches_allocated_slot_buffers():
     actual = sum(buffer.untyped_storage().nbytes() for buffer in buffers)
     estimated = sum(state.bytes_per_slot(layout, layer_id) for layer_id in layout.mamba_pp_layers)
     assert actual == estimated * layout.slot_capacity
+
+
+@pytest.mark.parametrize("layer", [0, 1])
+@pytest.mark.parametrize("kind", ["intermediate", "mamba2", "replay", "gdn", "kda"])
+def test_layer_payload_preserves_storage_and_strides(kind, layer):
+    states = {
+        "intermediate": IntermediateState,
+        "mamba2": Mamba2State,
+        "replay": lambda: ReplayHistory(3),
+        "gdn": lambda: GDNReplayState(3),
+        "kda": lambda: KDAReplayState(2),
+    }
+    state = states[kind]()
+    layout = replace(_layout(), stochastic_rounding=True)
+    # Interleave persistent slots to exercise borrowed, non-contiguous pool views.
+    conv = torch.zeros(2, 10, 24, 3)[:, ::2]
+    ssm = torch.zeros(2, 10, 2, 4, 4)[:, ::2]
+    state.bind(layout, list(ssm.unbind()), list(conv.unbind()))
+    payload = state.make_layer_cache(layer, conv[layer], ssm[layer])
+    expected_type = {
+        "intermediate": IntermediateLayerCache,
+        "mamba2": IntermediateLayerCache,
+        "replay": ReplayLayerCache,
+        "gdn": ReplayLayerCache,
+        "kda": KDAReplayLayerCache,
+    }[kind]
+    assert type(payload) is expected_type
+    pairs = [(payload.conv, conv[layer]), (payload.temporal, ssm[layer])]
+    if kind == "kda":
+        assert payload.has_kda_replay_caches
+        assert not hasattr(payload, "intermediate_ssm")
+        assert not hasattr(payload, "intermediate_conv_window")
+        assert not hasattr(payload, "mamba_ssm_rand_seed")
+        for name in (
+            "kda_conv_q",
+            "kda_conv_k",
+            "kda_conv_v",
+            "kda_qkg_cache",
+            "kda_v_cache",
+            "kda_beta_cache",
+        ):
+            pairs.append((getattr(payload, name), getattr(state, name)[layer]))
+        assert payload.prev_num_accepted_tokens is state.prev_num_accepted_tokens
+    else:
+        pairs.append((payload.intermediate_conv_window, state.intermediate_conv[layer]))
+        if kind in ("replay", "gdn"):
+            assert payload.intermediate_ssm is None
+            assert payload.cache_buf_idx is state.cache_buf_idx
+            assert payload.prev_num_accepted_tokens is state.prev_num_accepted_tokens
+            for name in ("old_x", "old_B", "old_dt", "old_dA_cumsum"):
+                pairs.append((getattr(payload, name), getattr(state, name)[layer]))
+        else:
+            pairs.append((payload.intermediate_ssm, state.intermediate_ssm[layer]))
+        if kind == "intermediate":
+            assert payload.mamba_ssm_rand_seed is None
+        else:
+            assert payload.mamba_ssm_rand_seed is state.rand_seed
+    for view, source in pairs:
+        assert view.data_ptr() == source.data_ptr()
+        assert view.shape == source.shape
+        assert view.stride() == source.stride()
+        view.fill_(7)
+        assert torch.all(source == 7)
+    state.shutdown()
+
+
+def test_kda_seed_lifecycle_is_independent_of_layer_payload():
+    state = KDAReplayState(2)
+    layout = replace(_layout(), stochastic_rounding=True, seed_rank_offset=17)
+    views = _state_views()
+    state.bind(layout, views.all_ssm_states, views.all_conv_states)
+    original = state.rand_seed.clone()
+    payload = state.make_layer_cache(0, views.all_conv_states[0], views.all_ssm_states[0])
+    assert not hasattr(payload, "mamba_ssm_rand_seed")
+    state.reset_slots(torch.tensor([1, 3]), [1, 3])
+    assert torch.all(state.rand_seed[[1, 3]] != original[[1, 3]])
+    torch.testing.assert_close(state.rand_seed[[0, 2, 4]], original[[0, 2, 4]])
+    state.shutdown()
+    assert state.rand_seed is None
 
 
 def test_mamba2_seed_lifecycle_does_not_require_speculative_decoding():
