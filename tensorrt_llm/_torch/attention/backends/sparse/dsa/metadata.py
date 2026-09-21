@@ -276,6 +276,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._group_remap_struct = None
         self._group_remap_struct_kv_id = 0
         self._group_remap_batched = {}
+        # Opt-in native gather worklist; owns its buffers independently of
+        # cuda_graph_buffers, whose named reservations can alias other metadata.
+        self._nvfp4_owner_worklist = None
         self.num_ctx_mla_kv_tokens = 0
         self.nvfp4_mla_context_fp8_scratch = None
         self._radix_rows_per_sequence = 1
@@ -287,6 +290,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def __post_init__(self):
         """Allocate indexer K-cache buffers and heuristic TopK metadata."""
+        # create_cuda_graph_metadata shallow-copies the eager object. Never
+        # share its mutable owner map or reset the original object's context.
+        if (self._nvfp4_owner_worklist is not None
+                and not self._nvfp4_owner_worklist.owns(self)):
+            self._nvfp4_owner_worklist = None
+            self._group_remap_batched = {}
         super().__post_init__()
         if self.is_cross:
             # Ragged verification is a target self-attention capability. A
@@ -889,6 +898,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def _create_nvfp4_mla_generation_buffers(self, capture_graph=False):
         """Allocate stable NVFP4 gather outputs for all MTP generation rows."""
+        if (self._nvfp4_owner_worklist is not None
+                and not self._nvfp4_owner_worklist.owns(self)):
+            self._nvfp4_owner_worklist = None
+            self._group_remap_batched = {}
         self.nvfp4_mla_fp8_scratch = None
         self.nvfp4_mla_compact_indices = None
         if getattr(self.kv_cache_manager, "dtype", None) != tensorrt_llm.bindings.DataType.NVFP4:
@@ -918,6 +931,19 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        if os.environ.get("TRTLLM_DSA_NVFP4_OWNER_WORKLIST", "off") != "off":
+            if self._nvfp4_owner_worklist is not None:
+                self._nvfp4_owner_worklist.ensure_capacity(self)
+            elif (
+                self.max_num_sequences > 0 and self.num_sparse_topk > 0
+                and self.kv_cache_manager.head_dim == 576
+                and self.kv_cache_manager.mla_kv_cache_residual_dim == 64
+            ):
+                from .nvfp4_owner_worklist import Nvfp4OwnerWorklist
+
+                # Allocation is part of normal buffer preparation,
+                # before profiling/cache budgeting or CUDA graph capture.
+                self._nvfp4_owner_worklist = Nvfp4OwnerWorklist(self)
 
     def _create_radix_aux_buffers(self, capture_graph: bool) -> None:
         max_num_rows = self.max_num_sequences * self._radix_rows_per_sequence
@@ -1483,6 +1509,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # can never read a previous step's batch, and so the tensors are not
         # retained across idle steps. Python-only -> safe under graph replay
         # (replay does not re-run this).
+        if self._nvfp4_owner_worklist is not None:
+            if self._nvfp4_owner_worklist.owns(self):
+                self._nvfp4_owner_worklist.reset()
+            else:
+                self._nvfp4_owner_worklist = None
+                self._group_remap_batched = {}
         self._group_remap_batched.clear()
         self.nvfp4_mla_context_fp8_scratch = None
 
