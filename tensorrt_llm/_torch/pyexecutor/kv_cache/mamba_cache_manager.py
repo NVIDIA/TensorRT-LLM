@@ -61,7 +61,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, PageIndexMode,
 
 # Shared with the KV budget estimator so allocator and budgeting can never
 # diverge on the sharding rule (config_utils is import-cycle-free).
-from ..config_utils import mamba_effective_tp_size as _mamba_effective_tp_size
+from ..config_utils import mamba_effective_tp_size
 
 GB = 1 << 30
 
@@ -527,7 +527,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         self._seed_request_counter = 0
 
         # get tp size
-        tp_size = _mamba_effective_tp_size(mapping)
+        tp_size = mamba_effective_tp_size(mapping)
 
         # derive mamba parameters for conv and ssm states
         d_inner = head_dim * num_heads
@@ -2343,7 +2343,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             return
 
         # Derive ssm_state_shape and conv_state_shape from mamba params (same as MambaCacheManager)
-        tp_size = _mamba_effective_tp_size(mapping)
+        tp_size = mamba_effective_tp_size(mapping)
         d_inner = mamba_head_dim * mamba_num_heads
         conv_dim = d_inner + 2 * mamba_n_groups * mamba_d_state
         nheads = mamba_num_heads
@@ -3133,7 +3133,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             and self.local_num_mamba_layers > 0)
 
         if self.local_num_mamba_layers > 0:
-            tp_size = _mamba_effective_tp_size(mapping)
+            tp_size = mamba_effective_tp_size(mapping)
             d_inner = mamba_head_dim * mamba_num_heads
             grouped_state_dim = mamba_n_groups * mamba_d_state
             conv_dim = d_inner + 2 * grouped_state_dim
