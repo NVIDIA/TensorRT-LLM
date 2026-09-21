@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
+from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
 pytestmark = pytest.mark.cpu_only
@@ -45,10 +46,12 @@ _LINEAR_NUM_VALUE_HEADS = 4
 _LINEAR_VALUE_HEAD_DIM = 4
 
 
-def _make_mapper(quant_algo: QuantAlgo) -> Qwen3_5MoeHfWeightMapper:
+def _make_mapper(
+    quant_algo: QuantAlgo, exclude_modules: list[str] | None = None
+) -> Qwen3_5MoeHfWeightMapper:
     mapper = Qwen3_5MoeHfWeightMapper()
     mapper._config = SimpleNamespace(
-        quant_config=SimpleNamespace(quant_algo=quant_algo),
+        quant_config=QuantConfig(quant_algo=quant_algo, exclude_modules=exclude_modules),
         pretrained_config=SimpleNamespace(
             linear_num_key_heads=_LINEAR_NUM_KEY_HEADS,
             linear_key_head_dim=_LINEAR_KEY_HEAD_DIM,
@@ -139,3 +142,80 @@ def test_fp8_rowwise_full() -> None:
     _assert_common(out)
     assert out[f"{_ATTN_PREFIX}.in_proj_ba.weight"].dtype == torch.float8_e4m3fn
     assert out[f"{_ATTN_PREFIX}.in_proj_ba.weight_scale"].shape == (_PACKED_BA_ROWS, 1)
+
+
+def test_modelopt_fp8_per_tensor_linear_attention() -> None:
+    # ModelOpt stores QKV and Z as separate per-tensor FP8 projections with independent scales.
+    checkpoint_prefix = "model.language_model.layers.0.linear_attn"
+    weights = {}
+    for name, rows, weight_scale, input_scale in [
+        ("in_proj_qkv", _Q_ROWS * 2 + _V_ROWS, 2.0, 3.0),
+        ("in_proj_z", _V_ROWS, 4.0, 5.0),
+    ]:
+        weights[f"{checkpoint_prefix}.{name}.weight"] = torch.ones(
+            rows, _HIDDEN, dtype=torch.float8_e4m3fn
+        )
+        weights[f"{checkpoint_prefix}.{name}.weight_scale"] = torch.tensor(weight_scale)
+        weights[f"{checkpoint_prefix}.{name}.input_scale"] = torch.tensor(input_scale)
+    for name in ("in_proj_b", "in_proj_a"):
+        weights[f"{checkpoint_prefix}.{name}.weight"] = _bf16(_BA_ROWS)
+
+    # Global FP8 maps both checkpoint projections into one fused FP8 module, so the mapper must
+    # requantize them onto a shared scale before packing the weights.
+    mapper = _make_mapper(QuantAlgo.FP8)
+    out = mapper.preprocess_weights(weights)
+
+    assert out[f"{_ATTN_PREFIX}.in_proj_qkvz.weight"].shape == (_PACKED_QKVZ_ROWS, _HIDDEN)
+    assert out[f"{_ATTN_PREFIX}.in_proj_qkvz.weight"].dtype == torch.float8_e4m3fn
+    packed_weight = out[f"{_ATTN_PREFIX}.in_proj_qkvz.weight"]
+    qkv_rows = _Q_ROWS * 2 + _V_ROWS
+    # QKV moves from scale 2 to the fused scale 4, halving its stored FP8 values. Z already uses
+    # scale 4, so its packed values remain unchanged.
+    torch.testing.assert_close(
+        packed_weight[:qkv_rows].float(), torch.full((qkv_rows, _HIDDEN), 0.5)
+    )
+    torch.testing.assert_close(packed_weight[qkv_rows:].float(), torch.ones((_V_ROWS, _HIDDEN)))
+    torch.testing.assert_close(out[f"{_ATTN_PREFIX}.in_proj_qkvz.weight_scale"], torch.tensor(4.0))
+    torch.testing.assert_close(out[f"{_ATTN_PREFIX}.in_proj_qkvz.input_scale"], torch.tensor(5.0))
+    assert out[f"{_ATTN_PREFIX}.in_proj_ba.weight"].dtype == torch.bfloat16
+
+
+def test_modelopt_fp8_excluded_linear_attention_falls_back_to_bf16() -> None:
+    # Small but valid Qwen3.5 linear-attention dimensions: q/k each have 2 heads * 4 dims, while
+    # v/z each have 4 heads * 4 dims. These sizes exercise the qkv+z packing path without
+    # constructing a full model.
+    checkpoint_prefix = "model.language_model.layers.0.linear_attn"
+    weights = {}
+    for name, rows, weight_scale, input_scale in [
+        ("in_proj_qkv", _Q_ROWS * 2 + _V_ROWS, 2.0, 3.0),
+        ("in_proj_z", _V_ROWS, 4.0, 5.0),
+    ]:
+        weights[f"{checkpoint_prefix}.{name}.weight"] = torch.ones(
+            rows, _HIDDEN, dtype=torch.float8_e4m3fn
+        )
+        weights[f"{checkpoint_prefix}.{name}.weight_scale"] = torch.tensor(weight_scale)
+        weights[f"{checkpoint_prefix}.{name}.input_scale"] = torch.tensor(input_scale)
+
+    # Use the real `QuantConfig` exclusion check instead of stubbing it: the global FP8 must respect
+    # an excluded fused in_proj_qkvz module and therefore fall back to bf16.
+    mapper = _make_mapper(QuantAlgo.FP8, exclude_modules=[f"{_ATTN_PREFIX}.in_proj_qkvz"])
+    # `preprocess_weights` only needs the mapper config for this path; binding a full model would
+    # add unrelated construction cost and GPU-facing setup.
+    out = mapper.preprocess_weights(weights)
+
+    assert out[f"{_ATTN_PREFIX}.in_proj_qkvz.weight"].shape == (
+        _PACKED_QKVZ_ROWS,
+        _HIDDEN,
+    )
+    assert out[f"{_ATTN_PREFIX}.in_proj_qkvz.weight"].dtype == torch.bfloat16
+    # The scalar per-projection scales are consumed by the bf16 fallback before
+    # split projections are packed; no fused FP8 scales should be synthesized.
+    for name in (
+        f"{_ATTN_PREFIX}.in_proj_qkvz.weight_scale",
+        f"{_ATTN_PREFIX}.in_proj_qkvz.input_scale",
+        f"{_ATTN_PREFIX}.in_proj_qkv.weight_scale",
+        f"{_ATTN_PREFIX}.in_proj_qkv.input_scale",
+        f"{_ATTN_PREFIX}.in_proj_z.weight_scale",
+        f"{_ATTN_PREFIX}.in_proj_z.input_scale",
+    ):
+        assert name not in out
