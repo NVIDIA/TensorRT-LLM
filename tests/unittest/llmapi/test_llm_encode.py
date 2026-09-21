@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -374,14 +376,14 @@ def bert_encode_llm_cuda_graph_with_token_type_ids():
 
 
 def _build_token_type_ids(prompts, device="cuda"):
-    """Build a packed token_type_ids tensor sized to the BERT tokenization."""
+    """Build observable packed token_type_ids sized to the BERT tokenization."""
     from transformers import AutoTokenizer
 
     model_dir = get_model_path(BERT_MODEL_PATH)
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     encoded = tokenizer(prompts, padding=False, truncation=True, max_length=512)
     total = sum(len(t) for t in encoded["input_ids"])
-    return torch.zeros(total, dtype=torch.int32, device=device)
+    return torch.ones(total, dtype=torch.int32, device=device)
 
 
 def test_encode_with_declared_token_type_ids(bert_encode_llm_cuda_graph_with_token_type_ids):
@@ -442,15 +444,15 @@ def test_encode_declared_kwarg_accepts_either_device(
     """A declared kwarg may be passed on the host or on the device.
 
     Graph replay copies it into the static buffer and the eager path moves it
-    to the device, so the caller must not have to know which one runs. The
-    all-zero segment ids match BERT's internal default, so both devices must
-    also reproduce the plain eager logits.
+    to the device, so the caller must not have to know which one runs. Non-zero
+    segment ids make dropping the caller-provided tensor observable.
     """
     llm = bert_encode_llm_cuda_graph_with_token_type_ids
     token_type_ids = _build_token_type_ids(PROMPTS, device=device)
     outs = llm.encode(PROMPTS, token_type_ids=token_type_ids)
 
-    eager_outs = bert_encode_llm.encode(PROMPTS)
+    eager_token_type_ids = _build_token_type_ids(PROMPTS)
+    eager_outs = bert_encode_llm.encode(PROMPTS, token_type_ids=eager_token_type_ids)
     got = torch.stack([o.logits.cpu() for o in outs])
     eager = torch.stack([o.logits.cpu() for o in eager_outs])
     torch.testing.assert_close(got, eager, rtol=1e-3, atol=1e-3)
@@ -469,7 +471,8 @@ def test_encode_host_declared_kwarg_on_eager_fallback(
     token_type_ids = _build_token_type_ids(PROMPTS, device="cpu")
     outs = llm.encode(PROMPTS, token_type_ids=token_type_ids, some_flag=True)
 
-    eager_outs = bert_encode_llm.encode(PROMPTS)
+    eager_token_type_ids = _build_token_type_ids(PROMPTS)
+    eager_outs = bert_encode_llm.encode(PROMPTS, token_type_ids=eager_token_type_ids)
     got = torch.stack([o.logits.cpu() for o in outs])
     eager = torch.stack([o.logits.cpu() for o in eager_outs])
     torch.testing.assert_close(got, eager, rtol=1e-3, atol=1e-3)
@@ -490,10 +493,17 @@ def test_encode_undeclared_non_tensor_kwarg_falls_back_to_eager(
     token_type_ids = _build_token_type_ids(PROMPTS)
     # `some_flag` is undeclared and non-tensor: previously this raised
     # ("not declared"); now it is allowed and triggers eager fallback.
-    graph_outs = llm.encode(PROMPTS, token_type_ids=token_type_ids, some_flag=True)
+    graph_runner = llm._encoder_executor.model_engine._runner._encoder_cuda_graph_runner
+    with patch.object(graph_runner, "replay", wraps=graph_runner.replay) as replay:
+        llm.encode(PROMPTS, token_type_ids=token_type_ids)
+        assert replay.call_count == 1
+        replay.reset_mock()
+
+        graph_outs = llm.encode(PROMPTS, token_type_ids=token_type_ids, some_flag=True)
+        replay.assert_not_called()
     assert len(graph_outs) == len(PROMPTS)
 
-    eager_outs = bert_encode_llm.encode(PROMPTS)
+    eager_outs = bert_encode_llm.encode(PROMPTS, token_type_ids=token_type_ids)
     graph = torch.stack([o.logits.cpu() for o in graph_outs])
     eager = torch.stack([o.logits.cpu() for o in eager_outs])
     torch.testing.assert_close(graph, eager, rtol=1e-3, atol=1e-3)
