@@ -62,6 +62,7 @@ class GatedMLP(nn.Module):
             swiglu_beta) if swiglu_beta is not None else None
 
         config = config or ModelConfig()
+        locality_domain_policy = getattr(config, "locality_domain_policy", None)
         use_cute_dsl_bf16_gemm = getattr(config, "use_cute_dsl_bf16_gemm",
                                          False)
         self.mapping = config.mapping
@@ -138,7 +139,7 @@ class GatedMLP(nn.Module):
             use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
             enable_locality_domain_bf16_linear=(
                 use_cute_dsl_bf16_gemm and enable_locality_domain_bf16_linear),
-            locality_domain_policy=config.locality_domain_policy,
+            locality_domain_policy=locality_domain_policy,
             disable_deep_gemm=disable_deep_gemm,
             fused_weight_shard_indices_mapping=gateup_shard_indices_mapping,
             use_custom_cublas_mm=use_custom_cublas_mm,
@@ -173,7 +174,7 @@ class GatedMLP(nn.Module):
             use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
             enable_locality_domain_bf16_linear=(
                 use_cute_dsl_bf16_gemm and enable_locality_domain_bf16_linear),
-            locality_domain_policy=config.locality_domain_policy,
+            locality_domain_policy=locality_domain_policy,
             disable_deep_gemm=disable_deep_gemm,
             use_custom_cublas_mm=use_custom_cublas_mm,
         )

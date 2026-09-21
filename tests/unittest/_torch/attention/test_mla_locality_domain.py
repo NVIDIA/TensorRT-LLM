@@ -354,6 +354,8 @@ def test_absorption_shards_forward_inputs_to_disabled_plan(
         (True, 107, True, "locality_domain"),
         (True, 107, False, "rubin"),
         (True, 100, True, "blackwell"),
+        (True, 103, True, "blackwell"),
+        (True, 90, True, "bmm_out"),
         (False, 107, True, "bmm_out"),
     ],
 )
@@ -368,6 +370,7 @@ def test_bf16_bmm_dispatch_and_fallback(
     nn.Module.__init__(mla)
     mla.use_cute_dsl_bf16_bmm = use_cute
     monkeypatch.setattr(mla_module, "get_sm_version", lambda: sm_version)
+    monkeypatch.setattr(mla_module, "is_sm_100f", lambda: 100 <= sm_version < 110)
 
     calls = []
 
