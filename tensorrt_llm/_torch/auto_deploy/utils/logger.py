@@ -59,8 +59,8 @@ class ADLogger(metaclass=Singleton):
 
     def __init__(self):
         self._logger = logging.getLogger("auto_deploy")
-        level_str = os.environ.get(self.ENV_VARIABLE, self.DEFAULT_LEVEL).upper()
-        self._logger.setLevel(getattr(logging, level_str, logging.INFO))
+        level_str = os.environ.get(self.ENV_VARIABLE, self.DEFAULT_LEVEL).lower()
+        self._logger.setLevel(self._SEVERITY_TO_LEVEL.get(level_str, logging.INFO))
         if not self._logger.handlers:
             handler = logging.StreamHandler()
             handler.setFormatter(logging.Formatter(f"[{self.PREFIX}] [%(levelname)s] %(message)s"))
@@ -104,7 +104,7 @@ class ADLogger(metaclass=Singleton):
 
     def set_level(self, level):
         if isinstance(level, str):
-            level = getattr(logging, level.upper(), logging.INFO)
+            level = self._SEVERITY_TO_LEVEL.get(level.lower(), logging.INFO)
         self._logger.setLevel(level)
 
 
