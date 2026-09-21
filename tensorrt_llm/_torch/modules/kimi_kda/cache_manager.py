@@ -15,10 +15,6 @@ if sys.version_info[:2] >= (3, 12):
 else:
     from typing_extensions import override
 
-from tensorrt_llm._torch.modules.mamba.cache_manager import (
-    allocate_mamba_seed_buffer,
-    compute_deterministic_mamba_seed,
-)
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     IntermediateState,
     MambaAcceptanceBatch,
@@ -28,6 +24,10 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.seeds import (
+    allocate_mamba_seed_buffer,
+    compute_deterministic_mamba_seed,
 )
 from tensorrt_llm.logger import logger
 

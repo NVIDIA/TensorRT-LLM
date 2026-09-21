@@ -203,8 +203,8 @@ def _advance_replay_state(
     accepted_tokens: torch.Tensor,
     is_dummy_request: torch.Tensor | None = None,
 ) -> None:
-    """Compatibility wrapper for Mamba2-owned replay bookkeeping."""
-    from tensorrt_llm._torch.modules.mamba.cache_manager import advance_replay_state
+    """Compatibility wrapper for shared replay bookkeeping."""
+    from .replay import advance_replay_state
 
     advance_replay_state(replay_metadata, state_indices, accepted_tokens, is_dummy_request)
 
@@ -212,15 +212,15 @@ def _advance_replay_state(
 def _allocate_mamba_seed_buffer(
     cache_size: int, rank_offset: int, device: torch.device
 ) -> torch.Tensor:
-    """Compatibility wrapper for Mamba2-owned seed allocation."""
-    from tensorrt_llm._torch.modules.mamba.cache_manager import allocate_mamba_seed_buffer
+    """Compatibility wrapper for shared per-slot seed allocation."""
+    from .seeds import allocate_mamba_seed_buffer
 
     return allocate_mamba_seed_buffer(cache_size, rank_offset, device)
 
 
 def _compute_deterministic_mamba_seed(counter: int, slot: int, rank_offset: int) -> int:
-    """Compatibility wrapper for Mamba2-owned deterministic seeding."""
-    from tensorrt_llm._torch.modules.mamba.cache_manager import compute_deterministic_mamba_seed
+    """Compatibility wrapper for shared deterministic seeding."""
+    from .seeds import compute_deterministic_mamba_seed
 
     return compute_deterministic_mamba_seed(counter, slot, rank_offset)
 

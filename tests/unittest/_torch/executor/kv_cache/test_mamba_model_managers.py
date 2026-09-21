@@ -18,8 +18,6 @@ from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
 from tensorrt_llm._torch.modules.mamba.cache_manager import (
     Mamba2State,
     NemotronHybridCacheManagerV2,
-    ReplayHistory,
-    ReplayLayerCache,
 )
 from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
     PLE_CONV_STATE,
@@ -36,6 +34,10 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaHybridCacheManager,
     MambaRole,
     MambaStateLayout,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.replay import (
+    ReplayHistory,
+    ReplayLayerCache,
 )
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -754,6 +756,8 @@ def test_mamba2_seed_lifecycle_does_not_require_speculative_decoding():
 def test_replay_and_intermediate_are_independent_algorithms():
     assert ReplayHistory.__bases__ == (object,)
     assert GDNReplayState.__bases__ == (ReplayHistory,)
+    assert ReplayHistory.__module__.endswith("mamba_cache_manager.replay")
+    assert not any("modules.mamba" in cls.__module__ for cls in GDNReplayState.__mro__)
     assert Mamba2State.__bases__ == (IntermediateState,)
     assert not issubclass(ReplayHistory, IntermediateState)
     assert not issubclass(GDNReplayState, Mamba2State)

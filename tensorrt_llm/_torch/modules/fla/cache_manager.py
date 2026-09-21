@@ -14,7 +14,6 @@ if sys.version_info[:2] >= (3, 12):
 else:
     from typing_extensions import override
 
-from tensorrt_llm._torch.modules.mamba.cache_manager import ReplayHistory
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     IntermediateState,
     MambaAcceptanceBatch,
@@ -24,6 +23,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.replay import ReplayHistory
 from tensorrt_llm._torch.utils import is_gdn_replay_enabled
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger

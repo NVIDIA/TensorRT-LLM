@@ -22,11 +22,7 @@ from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     KDAReplayState,
     KimiK3HybridCacheManagerV2,
 )
-from tensorrt_llm._torch.modules.mamba.cache_manager import (
-    IntermediateState,
-    NemotronHybridCacheManagerV2,
-    ReplayHistory,
-)
+from tensorrt_llm._torch.modules.mamba.cache_manager import NemotronHybridCacheManagerV2
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor._util import (
     KvCacheCreator,
@@ -58,7 +54,11 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     _mamba_snapshot_rule_counts,
     _promote_mamba_state_triton,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import _stack_state_views
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
+    IntermediateState,
+    _stack_state_views,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.replay import ReplayHistory
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
     LlmRequest,
