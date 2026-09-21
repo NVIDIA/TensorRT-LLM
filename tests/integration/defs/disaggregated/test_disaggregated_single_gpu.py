@@ -45,6 +45,24 @@ def bootstrap_prte_dvm():
         assert executor.submit(_noop, 1).result() == 1
 
 
+@pytest.fixture(autouse=True)
+def unpublish_port_after_test():
+    """Unpublish 'my_port' after each test.
+
+    Open MPI 5's PMIx name service appends publications instead of replacing
+    them, and Lookup_name returns the oldest entry. A port left published by a
+    previous test in the same pytest process therefore makes the next test's
+    workers connect to a dead port, hanging the parent forever in
+    MPI.COMM_SELF.Accept. See https://nvbugs/6759021.
+    """
+    yield
+    try:
+        port_name = MPI.Lookup_name('my_port')
+        MPI.Unpublish_name('my_port', port_name)
+    except MPI.Exception as e:
+        print(f"Cleanup of published port failed (ignored): {e}", flush=True)
+
+
 def get_ucx_tls():
     """Get UCX_TLS value based on GPU architecture.
 
@@ -117,6 +135,11 @@ def mpi_send_termination_request(intercomm):
         intercomm.send(None, dest=0, tag=MPI_REQUEST)
         intercomm.send(None, dest=1, tag=MPI_REQUEST)
         print("Sent termination requests to the workers.")
+        # Collectively disconnect (workers do the same after they exit their
+        # request loop). Without this, Open MPI 5 segfaults at MPI_Finalize in
+        # ompi_dpm_dyn_finalize while trying to disconnect from the
+        # already-exited workers.
+        intercomm.Disconnect()
 
 
 def model_path(model_name):
@@ -268,6 +291,11 @@ async def run_worker(kv_cache_config,
         except Exception as e:
             print(f"Unexpected error: {e}", flush=True)
             raise e
+
+    # Collectively disconnect from the parent (which calls Disconnect in
+    # mpi_send_termination_request); required on Open MPI 5, see there.
+    print(f"Worker {rank}: disconnecting intercomm", flush=True)
+    intercomm.Disconnect()
 
 
 def send_requests_to_worker(requests, worker_rank, intercomm):
