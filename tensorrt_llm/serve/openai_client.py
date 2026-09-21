@@ -264,6 +264,21 @@ class OpenAIHttpClient(OpenAIClient):
                 server, _ = await self._router.get_next_server(request)
             else:
                 server, _ = await self._router.get_next_server(request, req_id=req_id)
+        # A retry below re-issues disagg_request_id, but the router keyed this
+        # request's reservation by the id it was routed with. Pin that id here so
+        # every later renew/finish still addresses the original reservation --
+        # otherwise the coordinator never sees a release for it and the placement
+        # load only drains when the expiration task fires. Only the context role
+        # needs this: the coordinator keys generation requests by ctx_request_id,
+        # which the retry loop never rewrites.
+        if (
+            req_id is None
+            and self._role == ServerRole.CONTEXT
+            and self._disagg_id_generator is not None
+        ):
+            pinned_dp = request.disaggregated_params
+            if pinned_dp is not None:
+                req_id = pinned_dp.disagg_request_id
         url = f"http://{server}/{endpoint}"
         # disaggregated_params is None when conditional_disagg bypasses ctx.
         _dp = request.disaggregated_params

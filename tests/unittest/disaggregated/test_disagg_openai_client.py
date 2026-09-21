@@ -848,6 +848,47 @@ class TestDisaggIdRegenOnRetry:
 
         assert req.disaggregated_params.disagg_request_id == 42
 
+    @pytest.mark.asyncio
+    async def test_retry_keeps_original_reservation_id_without_explicit_req_id(self):
+        """Renew/finish must keep using the id the request was routed with.
+
+        Without an explicit req_id the coordinator router keys a context
+        reservation by disagg_request_id, which the retry path re-issues. If the
+        client let that leak into renew/finish, the coordinator would look up a
+        reservation it never created and the original one would linger until it
+        expired.
+        """
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        ids = iter(range(1000, 2000))
+
+        async def next_id():
+            return next(ids)
+
+        client = self._make_client(session, disagg_id_generator=next_id)
+        session.post.side_effect = [
+            aiohttp.ClientError("transient"),
+            self._mock_http_ok(self._ok_response()),
+        ]
+        req = CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=False,
+            disaggregated_params=DisaggregatedParams(
+                request_type="context_only", disagg_request_id=42
+            ),
+        )
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await client.send_request(req)
+
+        assert req.disaggregated_params.disagg_request_id != 42
+        assert client._router.renew_request.await_count == 2
+        assert all(
+            call.kwargs["req_id"] == 42 for call in client._router.renew_request.await_args_list
+        )
+        assert client._router.finish_request.await_count == 1
+        assert client._router.finish_request.await_args.kwargs["req_id"] == 42
+
 
 class TestSelectiveTransientTcpRetry:
     """Selective retry budget for transient TCP race symptoms.

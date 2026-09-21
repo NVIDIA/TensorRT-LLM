@@ -315,6 +315,45 @@ async def test_coordinator_renew_replaces_reservation_timer():
     assert coordinator._reservation_tasks == {}
 
 
+def _active_gen_load(coordinator) -> int:
+    return sum(
+        state.num_active_requests() for state in coordinator.gen_router._server_state.values()
+    )
+
+
+@pytest.mark.asyncio
+async def test_coordinator_renew_restarts_the_full_expiration_period():
+    """Renewing must reset the deadline, not merely swap the expiration task.
+
+    A renewal that kept the original deadline would still pass an
+    identity-only assertion, so this drives the observable behaviour: the
+    reservation has to outlive the deadline it was created with and only drop
+    once a full timeout has elapsed since the renewal.
+    """
+    timeout = 0.2
+    config = _make_config([], ["gen:8000"], "round_robin", "load_balancing")
+    coordinator = DisaggCoordinatorService(
+        config, _client_factory, reservation_timeout_secs=timeout
+    )
+
+    await coordinator.select("generation", {}, 123, None)
+    assert _active_gen_load(coordinator) == 1
+
+    # Renew shortly before the original deadline would have fired.
+    await asyncio.sleep(timeout * 0.75)
+    await coordinator.renew("generation", 123)
+
+    # Past the original deadline, but inside the renewed one: still reserved.
+    await asyncio.sleep(timeout * 0.5)
+    assert ("generation", 123) in coordinator._reservation_tasks
+    assert _active_gen_load(coordinator) == 1
+
+    # Past the renewed deadline: released.
+    await asyncio.sleep(timeout)
+    assert coordinator._reservation_tasks == {}
+    assert _active_gen_load(coordinator) == 0
+
+
 def test_coordinator_compacts_route_info():
     compact = DisaggCoordinatorService._compact_route_info(
         {
