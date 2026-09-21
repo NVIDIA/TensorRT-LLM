@@ -693,8 +693,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         rem = global_lens - full * ledger
         return full * phys + (rem - cp_rank * phys).clamp_(0, phys)
 
-    def recompute_helix_spec_buffers(self, num_ctx_tokens: int,
-                                     num_gen_tokens: int,
+    def recompute_helix_spec_buffers(self, num_gen_tokens: int,
                                      tokens_per_gen_seq: int) -> None:
         """Derive per-token helix buffers from (corrected) global positions.
 
@@ -702,9 +701,15 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         to helix_position_offsets, so every derived quantity reflects the
         real committed length even though the host packed provisional values.
         Static shapes only; safe under CUDA graph capture.
+
+        Two index bases meet here, and they are not the same:
+          * helix_position_offsets / helix_local_slots / helix_kv_bounds are
+            GENERATION-RELATIVE -- the packing loops only append for extend
+            and generation rows, so token 0 is the first generation token.
+          * kv_lens_cuda is BATCH-indexed, hence the num_contexts offset on
+            the write below.
         """
-        pos = self.helix_position_offsets[num_ctx_tokens:num_ctx_tokens +
-                                          num_gen_tokens]
+        pos = self.helix_position_offsets[:num_gen_tokens]
         phys = self.kv_cache_manager.tokens_per_block
         cp_rank = self.mapping.cp_rank
         cp_size = self.mapping.cp_size
@@ -713,22 +718,18 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         local_before = self.helix_local_len_vec(pos)
         # Scalar overload: no per-step allocation (CUDA-graph capture treats
         # these ops as part of the graph; keep them allocation-free).
-        self.helix_local_slots[num_ctx_tokens:num_ctx_tokens +
-                               num_gen_tokens].copy_(
-                                   torch.where(active, local_before, -1))
-        self.helix_kv_bounds[num_ctx_tokens:num_ctx_tokens +
-                             num_gen_tokens].copy_(
-                                 self.helix_local_len_vec(pos + 1))
+        self.helix_local_slots[:num_gen_tokens].copy_(
+            torch.where(active, local_before, -1))
+        self.helix_kv_bounds[:num_gen_tokens].copy_(
+            self.helix_local_len_vec(pos + 1))
         # Per-sequence rank-local kv length = bound of the sequence's last
         # token (attention over committed + owned in-flight tokens).
         assert num_gen_tokens % tokens_per_gen_seq == 0, (
             f"helix spec expects uniform verify groups: {num_gen_tokens} gen "
             f"tokens not divisible by group size {tokens_per_gen_seq}")
         num_gen_seqs = num_gen_tokens // tokens_per_gen_seq
-        last_bounds = self.helix_kv_bounds[num_ctx_tokens:num_ctx_tokens +
-                                           num_gen_tokens].view(
-                                               num_gen_seqs,
-                                               tokens_per_gen_seq)[:, -1]
+        last_bounds = self.helix_kv_bounds[:num_gen_tokens].view(
+            num_gen_seqs, tokens_per_gen_seq)[:, -1]
         self.kv_lens_cuda[self.num_contexts:self.num_contexts +
                           num_gen_seqs].copy_(last_bounds)
 

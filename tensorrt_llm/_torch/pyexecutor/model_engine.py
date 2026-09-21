@@ -3875,7 +3875,7 @@ class PyTorchModelEngine(ModelEngine):
                     md.helix_position_offsets[:helix_gen_tokens] += (
                         self.previous_pos_id_offsets_cuda[:helix_gen_tokens])
                 md.recompute_helix_spec_buffers(
-                    0, helix_gen_tokens,
+                    helix_gen_tokens,
                     self.get_runtime_tokens_per_gen_step(
                         self.runtime_draft_len))
                 md.on_update_kv_lens()
