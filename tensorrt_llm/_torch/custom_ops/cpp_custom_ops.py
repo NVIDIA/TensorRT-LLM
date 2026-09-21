@@ -844,6 +844,43 @@ def _register_fake():
     ) -> List[torch.Tensor]:
         return outputs
 
+    @torch.library.register_fake("trtllm::fused_sample_from_logits")
+    def _(
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        min_ps: torch.Tensor,
+        seed: Optional[torch.Tensor] = None,
+        offset: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return logits.new_empty((logits.shape[0], ), dtype=torch.int32)
+
+    @torch.library.register_fake("trtllm::fused_sample_from_logits_with_probs")
+    def _(
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        min_ps: torch.Tensor,
+        seed: Optional[torch.Tensor] = None,
+        offset: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return (
+            logits.new_empty((logits.shape[0], ), dtype=torch.int32),
+            logits.new_empty(logits.shape, dtype=torch.float32),
+        )
+
+    @torch.library.register_fake("trtllm::fused_compute_probs_from_logits")
+    def _(
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        min_ps: torch.Tensor,
+    ) -> torch.Tensor:
+        return logits.new_empty(logits.shape, dtype=torch.float32)
+
     @torch.library.register_fake(
         "trtllm::mtp_sampling_and_accepted_draft_tokens_op")
     def _(logits: torch.Tensor, draft_tokens: torch.Tensor,
@@ -1734,3 +1771,13 @@ def _register_fake():
         out_shape = shape if shape is not None else list(like.shape)
         dtype = out_dtype if out_dtype is not None else like.dtype
         return like.new_empty(out_shape, dtype=dtype), output_buffer_kind
+
+    @torch.library.register_fake("trtllm::allocate_output_with_nccl_window")
+    def _(like: torch.Tensor,
+          output_buffer_kind: int,
+          group: Optional[List[int]],
+          shape: Optional[List[int]] = None,
+          out_dtype: Optional[torch.dtype] = None):
+        out_shape = shape if shape is not None else list(like.shape)
+        dtype = out_dtype if out_dtype is not None else like.dtype
+        return like.new_empty(out_shape, dtype=dtype), output_buffer_kind, 0

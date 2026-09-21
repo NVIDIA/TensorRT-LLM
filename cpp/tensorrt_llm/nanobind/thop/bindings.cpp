@@ -22,7 +22,7 @@
 #include <tensorrt_llm/common/attentionOp.h>
 #include <tensorrt_llm/kernels/helixAllToAll.h>
 #include <tensorrt_llm/thop/attentionOp.h>
-#include <tensorrt_llm/thop/moeAlltoAllMeta.h>
+#include <tensorrt_llm/thop/moe/moeAlltoAllMeta.h>
 #include <tensorrt_llm/thop/outputTensor.h>
 #include <tensorrt_llm/thop/trtllmGenFusedOps.h>
 #include <torch/extension.h>
