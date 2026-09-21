@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -55,16 +55,15 @@ protected:
     {
         VecTokens inputTokens{1, 2, 3, 4, 5};
         SizeType32 maxNewTokens = 60;
-        tr::SamplingConfig samplingConfig(1);
+        tensorrt_llm::executor::SamplingConfig samplingConfig(1);
 
         return std::make_shared<tb::LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, false,
             std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
             std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-            std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, false, false,
-            std::nullopt, std::nullopt, false, std::nullopt, false, std::nullopt, false, std::nullopt,
-            tensorrt_llm::executor::Request::kDefaultPriority, std::nullopt, std::nullopt, std::nullopt,
-            tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, 1, std::nullopt, std::nullopt,
-            false, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, agentHierarchy);
+            std::nullopt, false, false, false, std::nullopt, false, std::nullopt, false, std::nullopt,
+            tensorrt_llm::executor::Request::kDefaultPriority, std::nullopt, std::nullopt,
+            tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, false, std::nullopt, std::nullopt,
+            std::nullopt, std::nullopt, agentHierarchy);
     }
 
     LlmRequestPtr createAgentDeepResearchRequest(SizeType32 nodeId, SizeType32 requestId)

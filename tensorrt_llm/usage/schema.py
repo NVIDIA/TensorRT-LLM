@@ -62,15 +62,39 @@ class _LlmCounterSnapshot(BaseModel):
     """
 
     llm_initialization_attempts: int = Field(
-        default=0, ge=0, le=_UINT32_MAX, alias="llmInitializationAttempts"
+        default=0,
+        ge=0,
+        le=_UINT32_MAX,
+        alias="llmInitializationAttempts",
+        description="Number of LLM construction attempts in this process.",
     )
-    llm_instances_created: int = Field(default=0, ge=0, le=_UINT32_MAX, alias="llmInstancesCreated")
-    active_llm_instances: int = Field(default=0, ge=0, le=_UINT32_MAX, alias="activeLlmInstances")
+    llm_instances_created: int = Field(
+        default=0,
+        ge=0,
+        le=_UINT32_MAX,
+        alias="llmInstancesCreated",
+        description="Number of LLM instances successfully created in this process.",
+    )
+    active_llm_instances: int = Field(
+        default=0,
+        ge=0,
+        le=_UINT32_MAX,
+        alias="activeLlmInstances",
+        description="Number of initialized LLM instances not yet shut down.",
+    )
     max_concurrent_llm_instances: int = Field(
-        default=0, ge=0, le=_UINT32_MAX, alias="maxConcurrentLlmInstances"
+        default=0,
+        ge=0,
+        le=_UINT32_MAX,
+        alias="maxConcurrentLlmInstances",
+        description="Highest number of concurrently active LLM instances observed.",
     )
     llm_initialization_failures: int = Field(
-        default=0, ge=0, le=_UINT32_MAX, alias="llmInitializationFailures"
+        default=0,
+        ge=0,
+        le=_UINT32_MAX,
+        alias="llmInitializationFailures",
+        description="Number of LLM construction attempts that raised an exception.",
     )
 
     model_config = {"populate_by_name": True}
@@ -114,7 +138,10 @@ class TrtllmInitialReport(_LlmCounterSnapshot):
         default="", max_length=_LONG_STR, alias="architectureClassName"
     )
     architecture_class_hash: str = Field(
-        default="", max_length=_LONG_STR, alias="architectureClassHash"
+        default="",
+        max_length=_LONG_STR,
+        alias="architectureClassHash",
+        description="Stable hash of the model architecture class definition.",
     )
 
     # TRT-LLM config
@@ -139,11 +166,26 @@ class TrtllmInitialReport(_LlmCounterSnapshot):
     )  # ShortString
 
     # Ingress point (how TRT-LLM was invoked) (ShortString)
-    ingress_point: str = Field(default="", max_length=_SHORT_STR, alias="ingressPoint")
+    ingress_point: str = Field(
+        default="",
+        max_length=_SHORT_STR,
+        alias="ingressPoint",
+        description="TRT-LLM API or CLI entry point that created this session.",
+    )
 
     # Disaggregated serving metadata (ShortString)
-    disagg_role: str = Field(default="", max_length=_SHORT_STR, alias="disaggRole")
-    deployment_id: str = Field(default="", max_length=_SHORT_STR, alias="deploymentId")
+    disagg_role: str = Field(
+        default="",
+        max_length=_SHORT_STR,
+        alias="disaggRole",
+        description="Role of this process in a disaggregated deployment.",
+    )
+    deployment_id: str = Field(
+        default="",
+        max_length=_SHORT_STR,
+        alias="deploymentId",
+        description="Identifier used to correlate a disaggregated deployment.",
+    )
 
     # Legacy feature summary and sanitized opt-in LLM API config capture.
     features_json: str = Field(default="{}", alias="featuresJson")
@@ -161,10 +203,31 @@ class TrtllmHeartbeat(_LlmCounterSnapshot):
     fields, and the latest aggregate LLM lifecycle counter snapshot.
     """
 
-    seq: int = Field(..., ge=0, le=_UINT32_MAX, alias="seq")  # PositiveInt
-    ingress_point: str = Field(default="", max_length=_SHORT_STR, alias="ingressPoint")
-    disagg_role: str = Field(default="", max_length=_SHORT_STR, alias="disaggRole")
-    deployment_id: str = Field(default="", max_length=_SHORT_STR, alias="deploymentId")
+    seq: int = Field(
+        ...,
+        ge=0,
+        le=_UINT32_MAX,
+        alias="seq",
+        description="Zero-based heartbeat sequence number for this session.",
+    )
+    ingress_point: str = Field(
+        default="",
+        max_length=_SHORT_STR,
+        alias="ingressPoint",
+        description="TRT-LLM API or CLI entry point that created this session.",
+    )
+    disagg_role: str = Field(
+        default="",
+        max_length=_SHORT_STR,
+        alias="disaggRole",
+        description="Role of this process in a disaggregated deployment.",
+    )
+    deployment_id: str = Field(
+        default="",
+        max_length=_SHORT_STR,
+        alias="deploymentId",
+        description="Identifier used to correlate a disaggregated deployment.",
+    )
 
     model_config = {"populate_by_name": True}
 
@@ -202,16 +265,63 @@ class TrtllmExitReport(_LlmCounterSnapshot):
     sentinels instead of inferred causes.
     """
 
-    exit_code_known: bool = Field(..., alias="exitCodeKnown")
-    exit_code: int = Field(..., ge=0, le=_UINT32_MAX, alias="exitCode")
-    signal_number: int = Field(..., ge=0, le=_UINT32_MAX, alias="signalNumber")
-    termination_kind: TerminationKind = Field(..., alias="terminationKind")
-    lifecycle_phase: LifecyclePhase = Field(..., alias="lifecyclePhase")
-    component: TerminationComponent = Field(..., alias="component")
-    reporting_source: ReportingSource = Field(..., alias="reportingSource")
-    ingress_point: str = Field(default="", max_length=_SHORT_STR, alias="ingressPoint")
-    disagg_role: str = Field(default="", max_length=_SHORT_STR, alias="disaggRole")
-    deployment_id: str = Field(default="", max_length=_SHORT_STR, alias="deploymentId")
+    exit_code_known: bool = Field(
+        ...,
+        alias="exitCodeKnown",
+        description="Whether exitCode is an observed process exit code.",
+    )
+    exit_code: int = Field(
+        ...,
+        ge=0,
+        le=_UINT32_MAX,
+        alias="exitCode",
+        description="Observed process exit code, or zero when unavailable.",
+    )
+    signal_number: int = Field(
+        ...,
+        ge=0,
+        le=_UINT32_MAX,
+        alias="signalNumber",
+        description="Observed terminating signal number, or zero when unavailable.",
+    )
+    termination_kind: TerminationKind = Field(
+        ...,
+        alias="terminationKind",
+        description="Allowlisted classification of how the session terminated.",
+    )
+    lifecycle_phase: LifecyclePhase = Field(
+        ...,
+        alias="lifecyclePhase",
+        description="Last known lifecycle phase when the session terminated.",
+    )
+    component: TerminationComponent = Field(
+        ...,
+        alias="component",
+        description="TRT-LLM component associated with the terminal outcome.",
+    )
+    reporting_source: ReportingSource = Field(
+        ...,
+        alias="reportingSource",
+        description="Observer that classified and reported the terminal outcome.",
+    )
+    ingress_point: str = Field(
+        default="",
+        max_length=_SHORT_STR,
+        alias="ingressPoint",
+        description="TRT-LLM API or CLI entry point that created this session.",
+    )
+    disagg_role: str = Field(
+        default="",
+        max_length=_SHORT_STR,
+        alias="disaggRole",
+        description="Role of this process in a disaggregated deployment.",
+    )
+    deployment_id: str = Field(
+        default="",
+        max_length=_SHORT_STR,
+        alias="deploymentId",
+        description="Identifier used to correlate a disaggregated deployment.",
+    )
 
     model_config = {"populate_by_name": True}
 

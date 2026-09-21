@@ -18,12 +18,12 @@ Companion to ``gvr_topk_decode_self_sampling.py`` (the device module).
 Three sections:
 
 1. dispatch — the CUDA host dispatch as a pure function
-   ``route(b, n, npad, k)``;
+   ``route(b, n, npad, k, num_sms=148, sm_version=100)``;
 2. workspace — one zero-initialised per-device slab (20,973,568 B) via the
    torch caching allocator, with keep-alive + double-checked locking;
 3. operator entry — ``run(logits, pre_idx, n_valid, indices)`` /
    ``run_ws(..., workspace)`` DPS forms with input hardening and a
-   bind-once launch cache keyed on ``(b, n, npad, k)``.
+   bind-once launch cache keyed on shape plus a packed device route profile.
 
 OPERATOR CONTRACT (batch-uniform entries): ``n_valid`` is one host python
 int for the whole batch — every row shares the same valid prefix, in
@@ -72,10 +72,10 @@ def _device():
 # ===========================================================================
 """Pure-Python mirror of the GVR CUDA host dispatch (gvr_topk_launch).
 
-route(b, n, npad, k) is a PURE function of its four ints -- no env knobs, no
-GPU, stdlib only.  It returns the kernel family, its compile-time template
-tuple, the runtime scalar pack `rt`, grid/cluster/block geometry, smem size,
-and whether the family needs the workspace.
+route(b, n, npad, k, num_sms, sm_version) is a PURE function of its arguments -- no env
+knobs, no GPU, stdlib only.  It returns the kernel family, its compile-time
+template tuple, the runtime scalar pack `rt`, grid/cluster/block geometry,
+smem size, and whether the family needs the workspace.
 
 rt carries the FULL runtime scalar list each kernel receives, in signature
 order, always starting with (n, npad, k).
@@ -101,27 +101,49 @@ C-semantics notes encoded here:
 
 # ---- dispatch constants (must match the device kernels) ---------------------
 NB = 1024  # register-path histogram bins
-QUADC = 96  # crossing-bin O(mc^2) rank gate (streaming/reg paths)
+QUADC = 96  # crossing-bin O(mc^2) rank gate (streaming/reg paths, every register plan)
 SNB = 256  # streaming-path bin count
 CMPC = 4096  # crossing-bin slots per CTA, clustered register path
 BLKC = 1024  # CTA size of the clustered register path
 
 
-def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
-    """Mirror of the CUDA gvr_topk_launch dispatch. Pure. See module doc."""
+def route(
+    b: int,
+    n: int,
+    npad: int,
+    k: int,
+    num_sms: int = 148,
+    sm_version: int = 100,
+) -> dict[str, object]:
+    """Mirror of the CUDA gvr_topk_launch dispatch. Pure. See module doc.
+
+    Deviations from the CUDA reference (self-sampling only): the 4K < n <= 8K
+    register rungs, QC = QUADC for every register plan, NB bins for the
+    not-wide register plans up to n4 <= 2048."""
     if b < 1:
         raise RuntimeError(f"route requires b >= 1, got {b}")
-    wide = b <= 148
+    if num_sms < 1:
+        raise RuntimeError(f"route requires num_sms >= 1, got {num_sms}")
+    # Only the register-resident rungs scale with the available SM count. The
+    # streaming and clustered-register paths below retain their independently
+    # tuned 148/296 constants.
+    wide = b <= num_sms
 
     # ======================= register-resident block ========================
     n4 = n >> 2
     CMP = n if n < 2560 else 2560
-    QC = 1024 if b > 148 else QUADC
-    CURE = not (n < 2 * k and b > 148)
+    # QC = QUADC for every register plan: the O(mc^2) rank loop is taken only
+    # for mc <= QC, so a wider gate lets one row whose first-k bracket misses
+    # the k-th value stall the whole one-wave launch. Rows with mc <= QUADC
+    # take the same branch under either gate.
+    QC = QUADC
+    CURE = not (n < 2 * k and b > num_sms)
     DEGE = (n <= 3 * k) or (n <= 4 * k + 64)
     if DEGE and CMP < n:
         CMP = n
-    NBSEL = (2 * NB) if (n4 > 512 and not (n4 <= 1024 and not wide)) else NB
+    # NB bins for the not-wide register plans up to n4 <= 2048 (incl. the
+    # (512, 4, 2) rung below) so IMGOFF == NBH holds at every reg site.
+    NBSEL = (2 * NB) if (n4 > 512 and not (n4 <= 2048 and not wide)) else NB
     IMGOFF = NBSEL
     smem_reg = (NBSEL + 2 * CMP) * 4
 
@@ -215,6 +237,24 @@ def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
                 "smem": smc,
                 "ws": False,
             }
+
+    # 4K < n <= 8K (n4 in (1024, 2048]): one-wave register rungs. Wide rows:
+    # BLK=1024 x VPT=2 covers n4 <= 2048 exactly (the VPT=4 plan below carries
+    # two empty float4 slots per thread). num_sms < b <= 2*num_sms: two
+    # BLK=512 CTAs per SM form one wave; taller batches keep the main slab.
+    if n4 <= 2048:
+        if wide:
+            return _reg(1024, 2, 1, 2 * NB)
+        # On SM103 with 148 SMs, the existing register plan remains faster
+        # across the measured b=512..1024, k=2048 range. Keep the exception
+        # architecture- and shape-exact: smaller K and nearby lower batches
+        # have different winners, while SM100 retains its original streaming
+        # route byte-for-byte.
+        sm103_large_batch_k2048 = (
+            sm_version == 103 and num_sms == 148 and 512 <= b <= 1024 and k == 2048
+        )
+        if b <= 2 * num_sms or sm103_large_batch_k2048:
+            return _reg(512, 4, 2, NB)
 
     if n4 <= 4096 and wide:
         return _reg(1024, 4, 1, 2 * NB)
@@ -406,12 +446,14 @@ if __name__ == "__main__":
         (64, 4096, 4096, 1024),  # reg   wide but DEGE (n<=4k+64)
         (8, 65536, 65536, 1024),  # reg_clus (vsel=2, cs=8; b<=15 no veto)
         (16, 131072, 131072, 512),  # main  cs=8 veto fall-through -> SPLIT slab, tshg=True
+        (64, 8192, 8192, 512),  # reg   wide 4K<n<=8K rung (1024,2,1)
+        (256, 8192, 8192, 1024),  # reg   148<b<=296, 4K<n<=8K rung (512,4,2)
         (64, 16384, 16384, 1024),  # reg   wide 4k fallback (1024,4,1)
         (64, 262144, 262144, 1024),  # clus  R=2 shallow cluster split
         (1, 1048576, 1048576, 1024),  # main  deep slab SPLIT R=148
         (20, 262144, 262144, 2048),  # main  k>1024 split (no useclus)
         (512, 131072, 131072, 1024),  # main  b>296 BLK=256
-        (256, 6144, 6144, 2048),  # main  small_dense sample gate
+        (512, 6144, 6144, 2048),  # main  small_dense sample gate (b > 296)
         (256, 262144, 262144, 2048),  # main  KBIG-domain (k>1024), BLK=512 KPT=4
     ]
     for shp in smoke:
@@ -421,8 +463,8 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 # two-time-scale dispatch split (per-row varlen / CUDA-graph groundwork)
 # ---------------------------------------------------------------------------
-# route(b, n, npad, k) factored into
-#   route_static(b, n, npad, k)  — everything that must be frozen per launch:
+# route(b, n, npad, k, num_sms, sm_version) factored into
+#   route_static(...) — everything frozen per launch:
 #       family, compile tuple, grid, cluster, block, and the rt scalars that
 #       change only at discrete n-thresholds;
 #   route_dynamic(static, n)     — the n-continuous scalars a per-row kernel
@@ -445,11 +487,18 @@ _DYN_RT = {
 _DYN_SMEM = ("reg", "regimg")  # smem depends on CMP/IMGW -> recomputed per n
 
 
-def route_static(b: int, n: int, npad: int, k: int) -> dict[str, object]:
+def route_static(
+    b: int,
+    n: int,
+    npad: int,
+    k: int,
+    num_sms: int = 148,
+    sm_version: int = 100,
+) -> dict[str, object]:
     """route() with the n-continuous fields redacted (see _DYN_RT/_DYN_SMEM).
     Constant on maximal n-intervals ("bands"); every redacted field is
     reconstructible from (static, n) by route_dynamic."""
-    plan = route(b, n, npad, k)
+    plan = route(b, n, npad, k, num_sms, sm_version)
     st = {key: (dict(val) if isinstance(val, dict) else val) for key, val in plan.items()}
     for f in _DYN_RT[st["kernel"]]:
         st["rt"].pop(f)
@@ -535,10 +584,17 @@ def route_dynamic(static: dict[str, object], n: int) -> tuple[dict[str, object],
     )
 
 
-def route_split(b: int, n: int, npad: int, k: int) -> dict[str, object]:
+def route_split(
+    b: int,
+    n: int,
+    npad: int,
+    k: int,
+    num_sms: int = 148,
+    sm_version: int = 100,
+) -> dict[str, object]:
     """route_static + route_dynamic recombined — must equal route() exactly
     (the factorization fuzz in the unit tests asserts this)."""
-    st = route_static(b, n, npad, k)
+    st = route_static(b, n, npad, k, num_sms, sm_version)
     dyn, smem = route_dynamic(st, n)
     plan = {key: (dict(val) if isinstance(val, dict) else val) for key, val in st.items()}
     plan["rt"].update(dyn)
@@ -676,19 +732,108 @@ def route_streaming(
     return _main(256, 4, 8, False)
 
 
+# (rows, npad, k, n_env, next_n, cr, packed device profile) -> compiled launcher
 _VARLEN_CACHE = {}
 
+# ---- prefill launcher cache ------------------------------------------------
+# Prefill forces R==1 (route_streaming gives R>1 only for b<=74). The compiled
+# launcher depends only on the row tier, k and the envelope bucket — never on the
+# exact row count or npad — so the cache stays bounded on a long-running server.
+_PREFILL_CACHE = {}
+_PREFILL_ROW_SLAB = 32768  # gridDim.y <= 65535; slab so keys stay bounded
+_PREFILL_TIER_ROWS = (75, 149, 297)  # (rows<=148, 149..296, >296) band reps
+# The tier-0 plan is the BLK=1024 non-split slab, whose compile-time pair-sample
+# gate is n > 16384, so under an envelope <= 16384 every row runs the unsampled
+# path. The tier-1 BLK=512 plan samples above its own gate (4096 for k <= 1024,
+# 8192 for k > 1024); <= 148-row launches take it when the envelope is above
+# that gate by a margin (just above the gate the freshly sampling BLK=512 plan
+# is slower than the unsampled BLK=1024 plan for b >= 32) and at most 16384
+# (above that the BLK=1024 plan samples too and is the better slab).
+_PREFILL_T1_MARGIN = 256
+_PREFILL_T1_MAX = 16384
 
-def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
+
+def _prefill_scpb_tier1(k: int) -> int:
+    return 8192 if k > 1024 else 4096
+
+
+def _prefill_tier(rows: int, n_env: int, k: int) -> int:
+    tier = 0 if rows <= 148 else 1 if rows <= 296 else 2
+    if tier == 0 and _prefill_scpb_tier1(k) + _PREFILL_T1_MARGIN < n_env <= _PREFILL_T1_MAX:
+        tier = 1
+    return tier
+
+
+def _prefill_bucket(n_env: int) -> int:
+    # pow2-quantize the envelope so a growing envelope reuses one plan; cap at
+    # 32768 because U=8 for every n>=32768 on the tier-0 arm.
+    return min(1 << max(int(n_env) - 1, 1).bit_length(), 32768)
+
+
+def _prefill_cache_key(tier: int, k: int, n_bucket: int):
+    # tiers 1/2 fix U, so the bucket does not change their engine — collapse it
+    # to one key so warmup covers them with a single launch.
+    return (tier, k, n_bucket if tier == 0 else 0)
+
+
+def _prefill_launcher(tier: int, k: int, n_bucket: int) -> tuple:
+    """Prefill plan + compiled launcher: ``_varlen_launcher``'s main branch with
+    r_const=1, split=False and the prefill compile flag. SCAP_/CMP_ are envelope
+    upper bounds; npad is filled per call in ``run_prefill``."""
+    key = _prefill_cache_key(tier, k, n_bucket)
+    hit = _PREFILL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    b_route = _PREFILL_TIER_ROWS[tier]
+    n_route = max(n_bucket, k + 1)
+    plan = route_streaming(b_route, n_route, n_route, k, force_main=True)
+    if plan["kernel"] != "main":
+        raise RuntimeError(f"prefill route did not land on gvr_main: {plan['kernel']}")
+    rt = plan["rt"]
+    if rt["R"] != 1:
+        raise RuntimeError(f"prefill requires R==1 (got {rt['R']})")
+    tpl = tuple(plan["tpl"])
+    dev = _device()
+    fn = dev.get_compiled(tpl[:6] + (False,) + (1, 0, 1), hint_free=True, prefill=True)
+    big = tier == 0
+    # r_const==1 branch of the _varlen_launcher tuning scalars
+    aim_base = (
+        (4 * k if k >= 1024 else 2 * k) if big else ((11 * k) // 8 if k >= 1024 else (3 * k) // 2)
+    )
+    sfac = 64 if k >= 1024 else 32
+    amin = (7 * k) // 2
+    sd_en = 1 if (k > 1024 and not big) else 0
+    tail = (aim_base, sfac, amin, sd_en, 0)  # tsh_en=0 (split=False)
+    lc = ("main", fn, (rt["SCAP_"], rt["CMP_"]), tail)
+    _PREFILL_CACHE[key] = lc
+    return lc
+
+
+def _varlen_launcher(
+    num_rows: int,
+    npad: int,
+    k: int,
+    n_env: int,
+    next_n: int,
+    cr: int,
+    num_sms: int = 148,
+    sm_version: int = 100,
+) -> tuple:
     """Capture-time varlen plan + compiled launcher.  The gvr_main port is
     the universally correct fallback; specialist family tiers below.  Every
     choice here is a function of capture-stable quantities only — mirroring
     the in-tree runner's pick_tuning(graph_capture=...) discipline."""
-    key = (num_rows, npad, k, n_env, next_n, cr)
+    profile = _pack_device_profile(num_sms, sm_version)
+    key = (num_rows, npad, k, n_env, next_n, cr, profile)
     hit = _VARLEN_CACHE.get(key)
     if hit is not None:
         return hit
-    n_eff = max(min(n_env, npad), k + 1)
+    # Two envelopes: the kernel gets the PHYSICAL bound (never past the row
+    # stride, so a row whose kv length exceeds the logits width clamps and
+    # takes the short path instead of reading into the next row); the router
+    # gets the k+1 floor it needs to pick a non-degenerate family.
+    n_kernel = min(n_env, npad)
+    n_route = max(n_kernel, k + 1)
     cr_shift = 0 if cr == 1 else 2
     dev = _device()
     # ---- route() parity, family tier 1: clustered register-resident --------
@@ -696,12 +841,16 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     # admission window (n4 <= 32768) fits capture-frozen envelopes. The
     # choice is a pure function of this cache key, so CUDA-graph replay
     # safety is unchanged; per-row n / short-row handling lives in-kernel.
-    plan_free = route(num_rows, n_eff, npad, k)
+    plan_free = route(num_rows, n_route, npad, k, num_sms, sm_version)
     if plan_free["kernel"] == "reg_clus":
         fn = dev.get_compiled__regclus(
-            tuple(plan_free["tpl"]), varlen=True, next_n=next_n, cr_shift=cr_shift
+            tuple(plan_free["tpl"]),
+            varlen=True,
+            next_n=next_n,
+            cr_shift=cr_shift,
+            hint_free=True,
         )
-        lc = ("reg_clus", fn, n_eff)
+        lc = ("reg_clus", fn, n_kernel)
         _VARLEN_CACHE[key] = lc
         return lc
     # ---- route() parity, family tier 2: register-resident (+img flavor) ----
@@ -713,13 +862,17 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     # / short-row handling lives in-kernel.
     if plan_free["kernel"] in ("reg", "regimg"):
         fn = dev.get_compiled__reg(
-            tuple(plan_free["tpl"]), varlen=True, next_n=next_n, cr_shift=cr_shift
+            tuple(plan_free["tpl"]),
+            varlen=True,
+            next_n=next_n,
+            cr_shift=cr_shift,
+            hint_free=True,
         )
         rt_f = plan_free["rt"]
         lc = (
             "reg",
             fn,
-            (rt_f["n"], rt_f["CMP"], rt_f["QC"], dev.STATIC_BYTES + plan_free["smem"]),
+            (n_kernel, rt_f["CMP"], rt_f["QC"], dev.STATIC_BYTES + plan_free["smem"]),
         )
         _VARLEN_CACHE[key] = lc
         return lc
@@ -739,22 +892,23 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
             varlen=True,
             next_n=next_n,
             cr_shift=cr_shift,
+            hint_free=True,
         )
         lc = (
             "clus",
             fn,
-            (n_eff, npad, k, rt_f["SCAP"], rt_f["CMP"], 0, 0, 0, 0, 0),
+            (n_kernel, npad, k, rt_f["SCAP"], rt_f["CMP"], 0, 0, 0, 0, 0),
         )
         _VARLEN_CACHE[key] = lc
         return lc
-    plan = route_streaming(num_rows, n_eff, npad, k, force_main=True)
+    plan = route_streaming(num_rows, n_route, npad, k, force_main=True)
     tpl = tuple(plan["tpl"])  # (BLK, U, MINB, SNB, KPT, SPLIT, TSHG)
     rt = plan["rt"]
     r_const = rt["R"]
     # TSHG (tpl[6]) is dead under varlen (the ctor compiles the TSH
     # machinery in whenever SPLIT); normalize it out of the compile key so
     # row counts differing only in that slot share one engine
-    fn = dev.get_compiled(tpl[:6] + (False,) + (next_n, cr_shift, r_const))
+    fn = dev.get_compiled(tpl[:6] + (False,) + (next_n, cr_shift, r_const), hint_free=True)
     big = num_rows * r_const <= 148
     aim_base = (
         ((4 * k if k >= 1024 else 2 * k) if r_const == 1 else 2 * k)
@@ -781,7 +935,13 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
 
 
 def route_bands(
-    b: int, npad: int, k: int, n_lo: int | None = None, n_hi: int | None = None
+    b: int,
+    npad: int,
+    k: int,
+    n_lo: int | None = None,
+    n_hi: int | None = None,
+    num_sms: int = 148,
+    sm_version: int = 100,
 ) -> list[tuple[int, int, dict[str, object]]]:
     """Enumerate maximal n-intervals on which route_static is constant.
     Dense O(n_hi - n_lo) scan of the pure host dispatch — an offline /
@@ -792,7 +952,7 @@ def route_bands(
     bands = []
     cur_key, cur_lo, cur_plan = None, lo, None
     for n in range(lo, hi + 1):
-        st = route_static(b, n, npad, k)
+        st = route_static(b, n, npad, k, num_sms, sm_version)
         key = repr(st)
         if key != cur_key:
             if cur_key is not None:
@@ -878,13 +1038,13 @@ def default_workspace(ref: torch.Tensor) -> torch.Tensor:
 def validate_run_ws(workspace: torch.Tensor, logits: torch.Tensor) -> None:
     """run_ws() workspace hardening, in a fixed predicate order:
     CUDA + same device as logits; numel*element_size >= workspace_bytes();
-    base 8-byte aligned."""
+    base 16-byte aligned (the DSL workspace fake declares assumed_align=16)."""
     if not (workspace.is_cuda and workspace.get_device() == logits.get_device()):
         raise RuntimeError("workspace must be a CUDA tensor on the same device")
     if workspace.numel() * workspace.element_size() < WS_BYTES:
         raise RuntimeError(f"workspace too small: need {WS_BYTES} bytes")
-    if workspace.data_ptr() & 7:
-        raise RuntimeError("workspace must be 8-byte aligned")
+    if workspace.data_ptr() & 15:
+        raise RuntimeError("workspace must be 16-byte aligned")
 
 
 def kernel_view(workspace: torch.Tensor) -> torch.Tensor:
@@ -892,10 +1052,9 @@ def kernel_view(workspace: torch.Tensor) -> torch.Tensor:
     bytes at the tensor's data_ptr() as int32[WS_BYTES/4], ignoring
     dtype/shape.
 
-    NOTE: the DSL-side fake tensor declares assumed_align=16; a workspace at
-    8-but-not-16-byte alignment passes the validate_run_ws check but is
-    rejected by the DSL at conversion -- surfaced as a launch failure with
-    shape context."""
+    NOTE: the DSL-side fake tensor declares assumed_align=16, matching the
+    validate_run_ws base-alignment check, so misaligned workspaces fail on
+    the host with a clear message instead of at DSL conversion."""
     if (
         workspace.dtype is torch.int32
         and workspace.dim() == 1
@@ -942,10 +1101,10 @@ Hardening checks run in a fixed order with fixed predicates:
  12. n_valid >= 0
  13. n = min(nv, npad) clamped in unbounded ints BEFORE any narrowing
 
-Dispatch: route(b, n, npad, k) -> compile cache keyed on (kernel family,
-constexpr tuple) in the device module -> bind-once launch cache keyed on the
-shape key (b, n, npad, k): caches the compiled callable + the prebuilt
-runtime-scalar arg pack as plain Python ints (never pre-wrapped
+Dispatch: route(b, n, npad, k, num_sms, sm_version) -> compile cache keyed on
+(kernel family, constexpr tuple) in the device module -> bind-once launch
+cache keyed on shape plus a packed device route profile: caches the compiled
+callable + the prebuilt runtime-scalar arg pack as plain Python ints (never pre-wrapped
 cutlass.Int32 -- the FFI per-argument cost is paid every call regardless;
 pre-binding removes only route()/marshal-prep work).
 
@@ -959,9 +1118,12 @@ builder in _build_launcher; only the main family takes the workspace.
 """
 
 
-# shape key (b, n, npad, k) -> (fn, args tuple of python ints, needs_ws)
+# shape key (b, n, npad, k, packed device profile) -> (fn, args tuple, needs_ws)
 _LAUNCH_CACHE = {}
 _DUMMY_KV = {}
+_DEVICE_PROFILE = {}
+_DEVICE_PROFILE_SHIFT = 16
+_DEVICE_NUM_SMS_MASK = (1 << _DEVICE_PROFILE_SHIFT) - 1
 
 
 def _dummy_kv(dev_index, device):
@@ -983,13 +1145,48 @@ _is_capturing = torch.cuda.is_current_stream_capturing
 _index = operator.index
 _ws_hot = _ws_keep  # shared dict object (hot-path load)
 _GVR_MAX_DEV = GVR_MAX_DEV
+_get_device_properties = torch.cuda.get_device_properties
+
+
+def _pack_device_profile(num_sms: int, sm_version: int) -> int:
+    """Pack route topology into one cache-key integer."""
+    if not 1 <= num_sms <= _DEVICE_NUM_SMS_MASK:
+        raise RuntimeError(f"invalid SM count for device profile: {num_sms}")
+    if sm_version < 1:
+        raise RuntimeError(f"invalid SM version for device profile: {sm_version}")
+    return (sm_version << _DEVICE_PROFILE_SHIFT) | num_sms
+
+
+def _unpack_device_profile(profile: int) -> tuple[int, int]:
+    """Return ``(SM count, SM version)`` from a packed cache key."""
+    return profile & _DEVICE_NUM_SMS_MASK, profile >> _DEVICE_PROFILE_SHIFT
+
+
+def _device_profile_key(dev_index: int) -> int:
+    """Return the packed route profile, cached per CUDA device."""
+    profile = _DEVICE_PROFILE.get(dev_index)
+    if profile is None:
+        properties = _get_device_properties(dev_index)
+        num_sms = int(properties.multi_processor_count)
+        sm_version = int(properties.major) * 10 + int(properties.minor)
+        try:
+            profile = _pack_device_profile(num_sms, sm_version)
+        except RuntimeError as error:
+            raise RuntimeError(f"device {dev_index} reports an invalid profile: {error}") from error
+        _DEVICE_PROFILE[dev_index] = profile
+    return profile
+
+
+def _device_num_sms(dev_index: int) -> int:
+    """Return the cached CUDA runtime-reported SM count."""
+    return _unpack_device_profile(_device_profile_key(dev_index))[0]
 
 
 # ---------------------------------------------------------------------------
 # per-family launcher builders (cold path: once per distinct shape key)
 # ---------------------------------------------------------------------------
-def _build_launcher(b, n, npad, k):
-    rd = route(b, n, npad, k)
+def _build_launcher(b, n, npad, k, num_sms, sm_version=100):
+    rd = route(b, n, npad, k, num_sms, sm_version)
     fam = rd["kernel"]
     tpl = tuple(rd["tpl"])
     rt = rd["rt"]
@@ -1167,10 +1364,13 @@ def _run_impl(logits, pre_idx, n_valid, indices, ws, values=None):
                 values[:, n:] = torch.finfo(_F32).min  # -FLT_MAX pad
         return
 
-    key = (b, n, npad, k)
+    dev_index = logits.get_device()
+    profile = _device_profile_key(dev_index)
+    key = (b, n, npad, k, profile)
     lc = _LAUNCH_CACHE.get(key)
     if lc is None:
-        lc = _build_launcher(b, n, npad, k)
+        num_sms, sm_version = _unpack_device_profile(profile)
+        lc = _build_launcher(b, n, npad, k, num_sms, sm_version)
         _LAUNCH_CACHE[key] = lc
     fn, args, needs_ws = lc
     try:
@@ -1234,17 +1434,15 @@ def run_ws(
 
 def run_varlen(
     logits: torch.Tensor,
-    pre_idx: torch.Tensor,
     kv_lens: torch.Tensor,
     indices: torch.Tensor,
     next_n: int = 1,
     compress_ratio: int = 1,
     values: torch.Tensor | None = None,
     max_seq_len: int | None = None,
-    engine: str = "auto",
     workspace: torch.Tensor | None = None,
 ) -> None:
-    """Production-contract varlen entry (per-row device kv_lens).
+    """Run hint-free self-sampling Top-K with per-request device KV lengths.
 
     Row semantics (mirror of ``heuristicTopKDecode.cu`` and the in-tree
     ``cute_dsl_gvr_topk_decode`` runner):
@@ -1255,19 +1453,18 @@ def run_varlen(
       not new-token seq_lens); row ``r`` uses
       ``n_r = (kv_lens[r // next_n] - next_n + (r % next_n) + 1) //
       compress_ratio`` valid entries (cr 1 = DSv3.2, 4 = DSv4 Flash/Pro);
-      ``pre_idx`` ``[batch, k]`` is REQUEST-level raw prev-step top-K,
-      shared by a request's ``next_n`` rows (offset-free hint contract);
+      the bracket is derived from the current row itself (register families:
+      min/max fold of the first k row values; streaming families do not
+      consume a temporal hint on the accept path); ``k`` comes from
+      ``indices.shape[1]``;
       per-row ``n_r <= k`` takes the short path (identity + ``-1`` tail).
 
-    ENGINES: ``engine="auto"`` (default) launches the per-row IN-KERNEL
-    gvr_main varlen port — ONE launch for the whole batch; each CTA reads its
-    row's kv_len on device and re-derives the sampling ladder (route_dynamic
+    The per-row in-kernel engine launches once for the whole batch. Each CTA
+    reads its row's kv_len on device and re-derives the sampling ladder (route_dynamic
     formula mirror), so with ``max_seq_len`` given (a capture-stable engine
     constant, e.g. dsa.py's ``indexer_max_seq_len``) the call performs NO
     host reads.  Without ``max_seq_len`` the envelope comes from ONE
     ``kv_lens.max()`` host read (documented sync, refused under capture).
-    ``engine="reference"`` keeps the b=1 host-loop reference implementation —
-    the differential oracle the in-kernel engine is validated against.
 
     KNOWN LIMITATION: on rows containing NaN logits the selected index SET
     can differ from ``heuristicTopKDecode.cu`` (both kernels order NaNs
@@ -1306,10 +1503,6 @@ def run_varlen(
     batch = num_rows // nn
     if kv_lens.shape[0] != batch:
         raise RuntimeError(f"kv_lens length {kv_lens.shape[0]} != num_rows/next_n = {batch}")
-    if len(pre_idx.shape) != 2 or pre_idx.shape[0] != batch:
-        raise RuntimeError(
-            f"pre_idx must be [batch={batch}, k] REQUEST-level, got {tuple(pre_idx.shape)}"
-        )
     d = logits.get_device()
     if not 0 <= d < _GVR_MAX_DEV:
         raise RuntimeError(f"device index out of range: {d}")
@@ -1323,142 +1516,224 @@ def run_varlen(
         if ws is None:
             ws = default_workspace(logits)
 
-    if engine == "auto":
-        # ---- per-row in-kernel engine (gvr_main varlen port) ----------------
-        # Full validation battery (the engine bypasses _run_impl — every
-        # check the batch-uniform path enforces is replayed here; the
-        # batch-dim check is CRITICAL: the kernel grid comes from
-        # logits.shape[0], so a short indices/values tensor would be written
-        # out of bounds).
-        if not (logits.is_cuda and pre_idx.is_cuda and indices.is_cuda):
-            raise RuntimeError("all tensors must be CUDA")
-        if logits.dtype is not _F32 or pre_idx.dtype is not _I32 or indices.dtype is not _I32:
-            raise RuntimeError("logits must be float32; pre_idx/indices int32")
-        if len(indices.shape) != 2 or indices.shape[0] != num_rows:
-            raise RuntimeError(
-                f"indices must be [num_rows={num_rows}, >=k], got {tuple(indices.shape)}"
-            )
-        k = pre_idx.shape[1]
-        if indices.shape[1] < k:
-            raise RuntimeError(f"indices width {indices.shape[1]} < k={k}")
-        if not (pre_idx.is_contiguous() and indices.is_contiguous() and kv_lens.is_contiguous()):
-            raise RuntimeError("pre_idx/indices/kv_lens must be contiguous")
-        # logits: accept row-major views with a wider row stride (the DSL
-        # paged-MQA logits arena is 256-aligned and column-sliced — a legal
-        # NON-contiguous view). The kernel only needs (base, row stride):
-        # widen back to a compact [rows, stride] view over the same storage;
-        # the tail columns are never classified (per-row n gates all reads).
-        if logits.stride(1) != 1:
-            raise RuntimeError("logits inner stride must be 1")
-        npad = logits.stride(0) if num_rows > 1 else logits.shape[1]
-        lg = logits
-        if not logits.is_contiguous():
-            need = logits.storage_offset() + num_rows * npad
-            if logits.untyped_storage().size() // 4 < need:
-                raise RuntimeError("logits view storage too small to widen to its row stride")
-            lg = logits.as_strided((num_rows, npad), (npad, 1), logits.storage_offset())
-        if npad & 3:
-            raise RuntimeError(f"npad (logits row stride) must be a multiple of 4, got {npad}")
-        if lg.data_ptr() & 15:
-            raise RuntimeError("logits base must be 16-byte aligned")
-        if values is not None:
-            if not values.is_cuda or values.dtype is not _F32:
-                raise RuntimeError("values must be CUDA float32")
-            if (
-                len(values.shape) != 2
-                or values.shape[0] != num_rows
-                or values.shape[1] < k
-                or not values.is_contiguous()
-            ):
-                raise RuntimeError(
-                    f"values must be contiguous [num_rows={num_rows}, >=k], "
-                    f"got {tuple(values.shape)}"
-                )
-        cshift = 0 if cr == 1 else 2
-        if max_seq_len is not None:
-            n_env = int(max_seq_len) >> cshift
-        else:
-            if _is_capturing():
-                raise RuntimeError(
-                    "run_varlen without max_seq_len reads kv_lens.max() on "
-                    "host — pass max_seq_len (a capture-stable engine "
-                    "constant) under CUDA graph capture"
-                )
-            n_env = int(kv_lens.max().item()) >> cshift
-            # eager mode: quantize the data-dependent envelope up to the next
-            # power of two so a growing decode does not recompile at every
-            # R increment (bounded plans, bounded _VARLEN_CACHE)
-            n_env = 1 << max(n_env - 1, 1).bit_length()
-        n_env = min(max(n_env, 1), npad)
-        key = (num_rows, npad, k, n_env, nn, cr)
-        lc = _VARLEN_CACHE.get(key)
-        if lc is None:
-            if _is_capturing():
-                raise RuntimeError(
-                    "varlen launcher not compiled for this shape — warm up "
-                    "before CUDA graph capture"
-                )
-            lc = _varlen_launcher(num_rows, npad, k, n_env, nn, cr)
-        idx = indices
-        if idx.shape[1] != k:
-            idx = idx.reshape(-1)[: num_rows * k].view(num_rows, k)
-        vals = values
-        if vals is not None and vals.shape[1] != k:
-            vals = vals.reshape(-1)[: num_rows * k].view(num_rows, k)
-        if lc[0] == "reg_clus":
-            # compiled ABI: (logits, pre_idx, kv_lens, out, n_envelope)
-            lc[1](lg, pre_idx, kv_lens, idx, lc[2])
-        elif lc[0] == "reg":
-            # compiled ABI: (logits, pre_idx, kv_lens, out, n_env, CMP, QC, smem)
-            lc[1](lg, pre_idx, kv_lens, idx, *lc[2])
-        elif lc[0] == "clus":
-            # compiled ABI: (logits, pre_idx, kv_lens, out, n_env, npad, k,
-            #                SCAP, CMP, dead DYN x5)
-            lc[1](lg, pre_idx, kv_lens, idx, *lc[2])
-        else:
-            _, fn, pre, tail = lc
-            fn(lg, pre_idx, idx, ws, *pre, kv_lens, *tail)
-        if vals is not None:
-            idx64 = idx.to(torch.int64)
-            vals.copy_(lg.gather(1, idx64.clamp_min(0)))
-            vals.masked_fill_(idx < 0, torch.finfo(_F32).min)
-        return
-    if engine != "reference":
-        raise RuntimeError(f"engine must be 'auto' or 'reference', got {engine!r}")
-
-    # ---- reference engine (differential oracle): b=1 host loop --------------
-    if _is_capturing():
-        raise RuntimeError(
-            "run_varlen reference engine reads kv_lens on host, illegal under CUDA graph capture"
-        )
-    # match the engine's flat-packed output convention for wider-than-k
-    # buffers (pack ONCE from the tensor base, then slice per row)
-    k = pre_idx.shape[1]
-    idx = indices
-    if len(idx.shape) != 2 or idx.shape[0] != num_rows:
+    # ---- per-row in-kernel engine (gvr_main varlen port) ----------------
+    # Full validation battery (the engine bypasses _run_impl — every
+    # check the batch-uniform path enforces is replayed here; the
+    # batch-dim check is CRITICAL: the kernel grid comes from
+    # logits.shape[0], so a short indices/values tensor would be written
+    # out of bounds).
+    if not (logits.is_cuda and indices.is_cuda):
+        raise RuntimeError("all tensors must be CUDA")
+    if logits.dtype is not _F32 or indices.dtype is not _I32:
+        raise RuntimeError("logits must be float32; indices must be int32")
+    if len(indices.shape) != 2 or indices.shape[0] != num_rows:
         raise RuntimeError(
             f"indices must be [num_rows={num_rows}, >=k], got {tuple(indices.shape)}"
         )
+    k = indices.shape[1]
+    if not (indices.is_contiguous() and kv_lens.is_contiguous()):
+        raise RuntimeError("indices/kv_lens must be contiguous")
+    # logits: accept row-major views with a wider row stride (the DSL
+    # paged-MQA logits arena is 256-aligned and column-sliced — a legal
+    # NON-contiguous view). The kernel only needs (base, row stride):
+    # widen back to a compact [rows, stride] view over the same storage;
+    # the tail columns are never classified (per-row n gates all reads).
+    if logits.stride(1) != 1:
+        raise RuntimeError("logits inner stride must be 1")
+    npad = logits.stride(0) if num_rows > 1 else logits.shape[1]
+    lg = logits
+    if not logits.is_contiguous():
+        need = logits.storage_offset() + num_rows * npad
+        if logits.untyped_storage().size() // 4 < need:
+            raise RuntimeError("logits view storage too small to widen to its row stride")
+        lg = logits.as_strided((num_rows, npad), (npad, 1), logits.storage_offset())
+    if npad & 3:
+        raise RuntimeError(f"npad (logits row stride) must be a multiple of 4, got {npad}")
+    if lg.data_ptr() & 15:
+        raise RuntimeError("logits base must be 16-byte aligned")
+    if values is not None:
+        if not values.is_cuda or values.dtype is not _F32:
+            raise RuntimeError("values must be CUDA float32")
+        if (
+            len(values.shape) != 2
+            or values.shape[0] != num_rows
+            or values.shape[1] < k
+            or not values.is_contiguous()
+        ):
+            raise RuntimeError(
+                f"values must be contiguous [num_rows={num_rows}, >=k], got {tuple(values.shape)}"
+            )
+    cshift = 0 if cr == 1 else 2
+    if max_seq_len is not None:
+        n_env = int(max_seq_len) >> cshift
+    else:
+        if _is_capturing():
+            raise RuntimeError(
+                "run_varlen without max_seq_len reads kv_lens.max() on "
+                "host — pass max_seq_len (a capture-stable engine "
+                "constant) under CUDA graph capture"
+            )
+        n_env = int(kv_lens.max().item()) >> cshift
+        # eager mode: quantize the data-dependent envelope up to the next
+        # power of two so a growing decode does not recompile at every
+        # R increment (bounded plans, bounded _VARLEN_CACHE)
+        n_env = 1 << max(n_env - 1, 1).bit_length()
+    n_env = min(max(n_env, 1), npad)
+    profile = _device_profile_key(d)
+    key = (num_rows, npad, k, n_env, nn, cr, profile)
+    lc = _VARLEN_CACHE.get(key)
+    if lc is None:
+        if _is_capturing():
+            raise RuntimeError(
+                "varlen launcher not compiled for this shape — warm up before CUDA graph capture"
+            )
+        num_sms, sm_version = _unpack_device_profile(profile)
+        lc = _varlen_launcher(num_rows, npad, k, n_env, nn, cr, num_sms, sm_version)
+    idx = indices
     if idx.shape[1] != k:
         idx = idx.reshape(-1)[: num_rows * k].view(num_rows, k)
     vals = values
     if vals is not None and vals.shape[1] != k:
         vals = vals.reshape(-1)[: num_rows * k].view(num_rows, k)
-    kl = kv_lens.tolist()  # the ONE documented D2H sync of this engine
-    for r in range(num_rows):
-        # production graph slots can carry kv_len < next_n (padded / evicted
-        # requests): clamp to the empty row, emitting all -1 — the same
-        # contract the in-kernel engine implements
-        actual = max(kl[r // nn] - nn + (r % nn) + 1, 0)
-        req = r // nn
-        _run_impl(
-            logits[r : r + 1],
-            pre_idx[req : req + 1],
-            actual // cr,
-            idx[r : r + 1],
-            ws,
-            None if vals is None else vals[r : r + 1],
+    # Hint-free engines do not read the compiled kernel's pre_idx ABI slot.
+    pre_arg = idx
+    if lc[0] == "reg_clus":
+        # compiled ABI: (logits, pre_idx, kv_lens, out, n_envelope)
+        lc[1](lg, pre_arg, kv_lens, idx, lc[2])
+    elif lc[0] == "reg":
+        # compiled ABI: (logits, pre_idx, kv_lens, out, n_env, CMP, QC, smem)
+        lc[1](lg, pre_arg, kv_lens, idx, *lc[2])
+    elif lc[0] == "clus":
+        # compiled ABI: (logits, pre_idx, kv_lens, out, n_env, npad, k,
+        #                SCAP, CMP, dead DYN x5)
+        lc[1](lg, pre_arg, kv_lens, idx, *lc[2])
+    else:
+        _, fn, pre, tail = lc
+        fn(lg, pre_arg, idx, ws, *pre, kv_lens, *tail)
+    if vals is not None:
+        idx64 = idx.to(torch.int64)
+        vals.copy_(lg.gather(1, idx64.clamp_min(0)))
+        vals.masked_fill_(idx < 0, torch.finfo(_F32).min)
+    return
+
+
+def run_prefill(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    indices: torch.Tensor,
+    max_row_len: int | None = None,
+    workspace: torch.Tensor | None = None,
+) -> None:
+    """Hint-free self-sampling Top-K for prefill: row ``r`` selects the Top-K of
+    ``logits[r, ks:ke]`` (compressed columns) into the local frame (column - ks)
+    with a -1 pad; ``nv <= k`` rows get the identity, as ``indexer_topk_prefill``.
+    No device reads, never compiles under capture; trusts 0 <= ks <= ke <= shape[1]."""
+    if logits.dtype is not _F32:
+        raise RuntimeError(
+            f"logits must be float32 (got {logits.dtype}); bf16/fp16 paths "
+            "are a follow-up — see the PR roadmap"
         )
+    for _nm, _t in (("row_starts", row_starts), ("row_ends", row_ends)):
+        if not (isinstance(_t, _TENSOR) and _t.is_cuda):
+            raise RuntimeError(f"{_nm} must be a CUDA tensor")
+        if _t.dtype is not _I32:
+            raise RuntimeError(f"{_nm} must be int32")
+        if _t.dim() != 1:
+            raise RuntimeError(f"{_nm} must be 1-D")
+        if not _t.is_contiguous():
+            raise RuntimeError(f"{_nm} must be contiguous")
+    if len(logits.shape) != 2:
+        raise RuntimeError("logits must be 2-D")
+    num_rows = logits.shape[0]
+    if num_rows == 0:
+        return
+    if row_starts.shape[0] != num_rows or row_ends.shape[0] != num_rows:
+        raise RuntimeError(
+            f"row_starts/row_ends length must equal logits.shape[0]={num_rows}, "
+            f"got {row_starts.shape[0]}/{row_ends.shape[0]}"
+        )
+    if not (logits.is_cuda and indices.is_cuda):
+        raise RuntimeError("all tensors must be CUDA")
+    if indices.dtype is not _I32:
+        raise RuntimeError("indices must be int32")
+    if len(indices.shape) != 2 or indices.shape[0] != num_rows:
+        raise RuntimeError(f"indices must be [num_rows={num_rows}, k], got {tuple(indices.shape)}")
+    if not indices.is_contiguous():
+        raise RuntimeError("indices must be contiguous")
+    k = indices.shape[1]
+    if k < 4 or (k & 3):
+        raise RuntimeError(f"index_topk must be a multiple of 4 and >= 4, got {k}")
+    if indices.data_ptr() & 15:
+        raise RuntimeError("indices base must be 16-byte aligned")
+    if logits.stride(1) != 1:
+        raise RuntimeError("logits inner stride must be 1")
+    # key on stride(0) for every row count: DeepGEMM prefill rows are 1024B-aligned
+    # with slack, and the varlen 1-row shape[1] rule would reject odd-width tiles.
+    npad = logits.stride(0)
+    if npad & 3:
+        raise RuntimeError(f"npad (logits row stride) must be a multiple of 4, got {npad}")
+    if logits.data_ptr() & 15:
+        raise RuntimeError("logits base must be 16-byte aligned")
+    d = logits.get_device()
+    if not 0 <= d < _GVR_MAX_DEV:
+        raise RuntimeError(f"device index out of range: {d}")
+    lg = logits
+    if logits.shape[1] != npad:
+        need = logits.storage_offset() + num_rows * npad
+        if logits.untyped_storage().size() // 4 < need:
+            raise RuntimeError("logits view storage too small to widen to its row stride")
+        lg = logits.as_strided((num_rows, npad), (npad, 1), logits.storage_offset())
+    if workspace is not None:
+        validate_run_ws(workspace, logits)
+        ws = kernel_view(workspace)
+    else:
+        ws = _ws_hot.get(d)
+        if ws is None:
+            ws = default_workspace(logits)
+    n_env = _index(max_row_len) if max_row_len is not None else logits.shape[1]
+    n_env = min(max(n_env, 1), npad)
+    n_bucket = _prefill_bucket(n_env)
+    for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
+        r1 = min(r0 + _PREFILL_ROW_SLAB, num_rows)
+        tier = _prefill_tier(r1 - r0, n_env, k)
+        lc = _PREFILL_CACHE.get(_prefill_cache_key(tier, k, n_bucket))
+        if lc is None:
+            if _is_capturing():
+                raise RuntimeError(
+                    "prefill launcher not compiled for this shape — warm up "
+                    "before CUDA graph capture"
+                )
+            lc = _prefill_launcher(tier, k, n_bucket)
+        _, fn, (scap, cmp_), tail = lc
+        # varlen main ABI: pre_idx slot = row_ends, kv_lens slot = row_starts;
+        # only npad / k / SCAP_ / CMP_ matter (R=1), the other scalars are dead.
+        pre = (0, npad, k, scap, cmp_, 1, 0, 0, 0, 0, 0)
+        fn(lg[r0:r1], row_ends[r0:r1], indices[r0:r1], ws, *pre, row_starts[r0:r1], *tail)
+    return
+
+
+def prefill_ready(
+    logits: torch.Tensor, indices: torch.Tensor, max_row_len: int | None = None
+) -> bool:
+    """True iff ``run_prefill(logits, ..., indices, max_row_len)`` would launch
+    without compiling — the same (tier, k, envelope bucket) keys it looks up, so
+    a caller can route around the engine under CUDA graph capture. Host-only.
+    Pass the same ``max_row_len`` as the ``run_prefill`` call (the envelope
+    bucket, and with it the tier, is derived from it)."""
+    num_rows = logits.shape[0]
+    if num_rows == 0:
+        return True
+    k = indices.shape[1]
+    npad = logits.stride(0)
+    n_env = _index(max_row_len) if max_row_len is not None else logits.shape[1]
+    n_env = min(max(n_env, 1), max(npad, 1))
+    n_bucket = _prefill_bucket(n_env)
+    for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
+        tier = _prefill_tier(min(r0 + _PREFILL_ROW_SLAB, num_rows) - r0, n_env, k)
+        if _prefill_cache_key(tier, k, n_bucket) not in _PREFILL_CACHE:
+            return False
+    return True
 
 
 __all__ = [
@@ -1470,7 +1745,10 @@ __all__ = [
     "run",
     "run_ws",
     "run_varlen",
+    "run_prefill",
+    "prefill_ready",
     "warmup_varlen",
+    "warmup_prefill",
     "workspace_bytes",
     "WS_BYTES",
     "default_workspace",
@@ -1511,8 +1789,11 @@ def warmup_varlen(
     producer layout (e.g. the DSL paged-MQA arena's 256-element rounding)
     must pass it; the 64-element default only matches producers that round
     the same way.
+
     """
     dev = torch.cuda.current_device()
+    profile = _device_profile_key(dev)
+    num_sms, sm_version = _unpack_device_profile(profile)
     nn = max(1, int(next_n))
     # round each request down to a next_n multiple (min next_n) and dedup
     req_rows = sorted({max(int(r) - int(r) % nn, nn) for r in num_rows_list})
@@ -1531,7 +1812,14 @@ def warmup_varlen(
     r = nn
     r_max = req_rows[-1]
     while r <= r_max:
-        plan_free = route(r, max(min(n_env_c, npad_c), int(top_k) + 1), npad_c, int(top_k))
+        plan_free = route(
+            r,
+            max(min(n_env_c, npad_c), int(top_k) + 1),
+            npad_c,
+            int(top_k),
+            num_sms,
+            sm_version,
+        )
         if plan_free["kernel"] == "reg_clus":
             ekey = ("reg_clus", tuple(plan_free["tpl"]))
         elif plan_free["kernel"] in ("reg", "regimg"):
@@ -1560,36 +1848,111 @@ def warmup_varlen(
             raise RuntimeError(
                 f"row_stride must be a float4-multiple >= n_env={n_env}, got {row_stride}"
             )
-    key = (dev, int(top_k), int(max_seq_len), int(compress_ratio), nn, tuple(rows_list), npad)
+    key = (
+        dev,
+        int(top_k),
+        int(max_seq_len),
+        int(compress_ratio),
+        nn,
+        tuple(rows_list),
+        npad,
+        profile,
+    )
+    # The done key covers the GPU band launches only (one per engine compile
+    # key). The exact-row launcher population below is keyed by the requested
+    # row counts, which the band key does not see, so it always runs: a later
+    # call with a new row count inside an already-warmed band must still
+    # create that row count's entry, or capture at it raises not-compiled.
     with _VARLEN_WARMUP_LOCK:
-        if key in _VARLEN_WARMUP_DONE:
-            return
-    rows_max = rows_list[-1]
-    # one allocation at the largest geometry; smaller row counts run on
-    # contiguous prefix views (compile keys depend on shapes only)
-    logits = torch.zeros((rows_max, npad), dtype=torch.float32, device=dev)
-    kv_lens = torch.full((rows_max // nn,), int(max_seq_len), dtype=torch.int32, device=dev)
-    pre_idx = torch.zeros((rows_max // nn, int(top_k)), dtype=torch.int32, device=dev)
-    out = torch.empty((rows_max, int(top_k)), dtype=torch.int32, device=dev)
-    for rows in rows_list:
-        batch = rows // nn
-        run_varlen(
-            logits[:rows],
-            pre_idx[:batch],
-            kv_lens[:batch],
-            out[:rows],
-            next_n=nn,
-            compress_ratio=int(compress_ratio),
-            max_seq_len=int(max_seq_len),
-        )
-    del logits, kv_lens, pre_idx, out
-    torch.cuda.synchronize()
+        bands_done = key in _VARLEN_WARMUP_DONE
+    if not bands_done:
+        rows_max = rows_list[-1]
+        # one allocation at the largest geometry; smaller row counts run on
+        # contiguous prefix views (compile keys depend on shapes only)
+        logits = torch.zeros((rows_max, npad), dtype=torch.float32, device=dev)
+        kv_lens = torch.full((rows_max // nn,), int(max_seq_len), dtype=torch.int32, device=dev)
+        out = torch.empty((rows_max, int(top_k)), dtype=torch.int32, device=dev)
+        for rows in rows_list:
+            batch = rows // nn
+            run_varlen(
+                logits[:rows],
+                kv_lens[:batch],
+                out[:rows],
+                next_n=nn,
+                compress_ratio=int(compress_ratio),
+                max_seq_len=int(max_seq_len),
+            )
+        del logits, kv_lens, out
+        torch.cuda.synchronize()
     # band launches compiled every ENGINE; now populate the per-row-count
     # LAUNCHER cache entries for the exact requested row counts (pure host
     # work, zero allocation/launch — engines hit the compile cache), so a
     # CUDA-graph capture at any requested geometry finds its key immediately.
     n_env_l = min(max(int(max_seq_len) >> (0 if int(compress_ratio) == 1 else 2), 1), npad)
     for r in req_rows:
-        _varlen_launcher(r, npad, int(top_k), n_env_l, nn, int(compress_ratio))
-    with _VARLEN_WARMUP_LOCK:
-        _VARLEN_WARMUP_DONE.add(key)
+        _varlen_launcher(
+            r,
+            npad,
+            int(top_k),
+            n_env_l,
+            nn,
+            int(compress_ratio),
+            num_sms,
+            sm_version,
+        )
+    if not bands_done:
+        with _VARLEN_WARMUP_LOCK:
+            _VARLEN_WARMUP_DONE.add(key)
+
+
+_PREFILL_WARMUP_DONE: set = set()
+_PREFILL_WARMUP_LOCK = threading.Lock()
+
+
+def warmup_prefill(
+    top_k: int,
+    max_cols: int,
+    num_rows_list: Sequence[int] = (1, 149, 297),
+    row_stride: int | None = None,
+) -> None:
+    """Compile every prefill engine ``run_prefill`` can request before serving:
+    the tier-0 arm per pow2 envelope bucket where a <= 148-row launch keeps it
+    (``_prefill_tier`` is evaluated at both edges of every bucket), tiers 1/2
+    one launch each. ``max_cols`` is the compressed max column count;
+    idempotent per done-key."""
+    dev = torch.cuda.current_device()
+    k = int(top_k)
+    max_cols = int(max_cols)
+    lo = _prefill_bucket(k + 1)
+    hi = _prefill_bucket(max_cols)
+    buckets = []
+    b = lo
+    while b <= hi:
+        buckets.append(b)
+        b <<= 1
+    if not buckets:
+        buckets = [hi]
+    keys = {}  # cache_key -> (tier, bucket, envelope) representative for the launch
+    for rows in num_rows_list:
+        for bk in buckets:
+            for n_env in (bk // 2 + 1, bk):  # the tier can change inside a bucket
+                tier = _prefill_tier(int(rows), n_env, k)
+                keys.setdefault(_prefill_cache_key(tier, k, bk), (tier, bk, n_env))
+    done_key = (dev, k, max_cols, tuple(sorted(int(r) for r in num_rows_list)), row_stride)
+    with _PREFILL_WARMUP_LOCK:
+        if done_key in _PREFILL_WARMUP_DONE:
+            return
+    for tier, bk, n_env in keys.values():
+        rows = _PREFILL_TIER_ROWS[tier]
+        stride = row_stride if row_stride is not None else ((bk + 256 + 255) // 256 * 256)
+        if stride < bk or stride % 4:
+            stride = (max(stride, bk) + 256 + 255) // 256 * 256
+        logits = torch.zeros((rows, stride), dtype=torch.float32, device=dev)
+        ks = torch.zeros((rows,), dtype=torch.int32, device=dev)
+        ke = torch.full((rows,), n_env, dtype=torch.int32, device=dev)
+        out = torch.empty((rows, k), dtype=torch.int32, device=dev)
+        run_prefill(logits[:, :bk], ks, ke, out, max_row_len=n_env)
+        del logits, ks, ke, out
+    torch.cuda.synchronize()
+    with _PREFILL_WARMUP_LOCK:
+        _PREFILL_WARMUP_DONE.add(done_key)

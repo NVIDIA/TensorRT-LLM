@@ -29,7 +29,6 @@ import tempfile
 import pytest
 
 # Add path for test utilities
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (

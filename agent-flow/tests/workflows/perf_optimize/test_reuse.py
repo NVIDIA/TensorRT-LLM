@@ -112,17 +112,13 @@ def test_discover_skips_a_trailing_replan_round(tmp_path):
     assert found.kernel_ledger == found.findings.parent / "kernel_ledger.yaml"
 
 
-@pytest.mark.parametrize("trace_kind", ["torch", "ncu"])
-def test_discover_recognizes_a_profile_that_omitted_nsys(tmp_path, trace_kind):
-    """`profile.methods` supports torch-only and ncu-only profiling rounds."""
+def test_discover_recognizes_a_profile_that_omitted_nsys(tmp_path):
+    """`profile.methods` supports ncu-only profiling rounds."""
     source = tmp_path / "optimize"
     _write(source / "baseline" / "benchmark_results.md", "# baseline\n")
     profiled = source / "rounds" / "round_2" / "analysis"
     _write(profiled / "profile_findings.md", "# profiled without nsys\n")
-    if trace_kind == "torch":
-        _write(profiled / "torch_trace" / "trace.json", "{}\n")
-    else:
-        _write(profiled / "server_ncu.ncu-rep", "capture\n")
+    _write(profiled / "server_ncu.ncu-rep", "capture\n")
     replan = source / "rounds" / "round_3" / "analysis"
     _write(replan / "profile_findings.md", "# trailing replan note\n")
 
@@ -204,6 +200,27 @@ def test_import_leaves_the_sources_non_analysis_files_behind(tmp_path):
         assert not (analysis / stray).exists()
         assert not (ws / "baseline" / stray).exists()
     assert not (ws / "task.yaml").exists()
+
+
+def test_import_brings_the_nsys_timeline_analysis_along(tmp_path):
+    """The `nsys_analysis/` products travel with the trace they describe.
+
+    A reused analysis is planned from, so the per-iteration budget and
+    the compute-absent split matter as much as the `.nsys-rep` — and
+    unlike the multi-GB `.sqlite` export they are small JSON.
+    """
+    source = _perf_analyze_workspace(tmp_path / "analyze")
+    _write(source / "nsys_analysis" / "summary.json", '{"mode": "single-variant"}\n')
+    _write(source / "nsys_analysis" / "rank-0" / "gap.json", "{}\n")
+    _write(source / "server_nsys.sqlite", "regenerable export\n")
+    ws = tmp_path / "ws"
+    _import_into(source, ws)
+
+    analysis = ws / "rounds" / "round_1" / "analysis"
+    assert (analysis / "nsys_analysis" / "summary.json").is_file()
+    assert (analysis / "nsys_analysis" / "rank-0" / "gap.json").is_file()
+    # The sqlite stays behind: regenerable from the .nsys-rep next to it.
+    assert not (analysis / "server_nsys.sqlite").exists()
 
 
 def test_import_from_perf_optimize_brings_ledger_and_prior_roadmap(tmp_path):

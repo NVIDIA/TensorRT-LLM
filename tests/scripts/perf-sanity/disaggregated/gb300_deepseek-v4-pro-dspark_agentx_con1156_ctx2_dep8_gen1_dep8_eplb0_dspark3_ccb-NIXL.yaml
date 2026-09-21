@@ -1,7 +1,7 @@
 metadata:
-  model_name: deepseek_v4_pro_dspark
+  model_name: deepseek_v4_pro_nvfp4_dspark
   precision: fp4
-  model_dir_name: DeepSeek-V4-Pro-DSpark
+  model_dir_name: DeepSeek-V4-Pro-nvfp4-DSpark
   supported_gpus:
   - GB300
   script_file: disaggr_torch.slurm
@@ -36,7 +36,7 @@ environment:
   trtllm_repo: ''
   build_wheel: false
   work_dir: <full_path_to_work_dir>
-  client_env_var: AGENTX_MAX_CTX=996579 AGENTX_DURATION=3600 AGENTX_WARMUP_PER_LANE=3
+  client_env_var: AGENTX_MAX_CTX=996579 AGENTX_DURATION=3600 AGENTX_WARMUP_PER_LANE=3 AGENTX_TIMEOUT_GRACE=5400
   worker_env_var: TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 ENROOT_ALLOW_DEV=yes NCCL_GRAPH_MIXING_SUPPORT=0 MIMALLOC_ARENA_RESERVE=0 OMP_NUM_THREADS=1 TRTLLM_PINNED_WEIGHT_STAGING=1
   ctx_worker_env_var: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_SCALE_LAUNCH_QUEUES=4x TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET=1073741824 TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=2.08
   gen_worker_env_var: TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=2.08
@@ -84,7 +84,7 @@ worker_config:
       decoding_type: DSpark
       max_draft_len: 3
       block_size: 3
-      speculative_model: DeepSeek-V4-Pro-DSpark
+      speculative_model: DeepSeek-V4-Pro-nvfp4-DSpark
     custom_tokenizer: deepseek_v4
     return_perf_metrics: true
     perf_metrics_max_requests: 100000

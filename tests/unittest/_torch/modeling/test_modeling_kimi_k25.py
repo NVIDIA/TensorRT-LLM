@@ -50,6 +50,7 @@ from transformers import AutoTokenizer, PretrainedConfig
 from utils.llm_data import llm_models_root
 from utils.util import skip_pre_blackwell_unittest
 
+from tensorrt_llm._torch.attention.attention import Attention
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._torch.models.modeling_kimi_k25 import (
@@ -59,7 +60,6 @@ from tensorrt_llm._torch.models.modeling_kimi_k25 import (
     _frames_to_chunks,
 )
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
-from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.mlp import MLP

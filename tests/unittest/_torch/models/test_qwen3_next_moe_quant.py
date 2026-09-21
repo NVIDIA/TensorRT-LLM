@@ -270,8 +270,8 @@ def test_excluded_layer_builds_bf16_on_cutlass(backend, layer_idx):
     "backend,sm,quant_algo,expected_moe_cls",
     [
         ("CUTLASS", 90, QuantAlgo.FP8_BLOCK_SCALES, "CutlassFusedMoE"),
-        ("TRTLLM", 100, QuantAlgo.FP8_BLOCK_SCALES, "TRTLLMGenFusedMoE"),
-        ("DEEPGEMM", 100, QuantAlgo.FP8_BLOCK_SCALES, "DeepGemmFusedMoE"),
+        ("TRTLLM", 100, QuantAlgo.FP8_BLOCK_SCALES, "TrtllmTrtllmGenFp8BlockScalesImpl"),
+        ("DEEPGEMM", 100, QuantAlgo.FP8_BLOCK_SCALES, "DeepgemmCudaFp8BlockScalesImpl"),
         ("CUTEDSL", 100, QuantAlgo.NVFP4, "CuteDslFusedMoE"),
     ],
     ids=[

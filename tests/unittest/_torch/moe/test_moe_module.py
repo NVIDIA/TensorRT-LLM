@@ -73,6 +73,7 @@ from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe import (
+    DEFAULT_MOE_ACTIVATION,
     DeepSeekV3MoeRoutingMethod,
     DefaultMoeRoutingMethod,
     Llama4RenormalizeMoeRoutingMethod,
@@ -81,10 +82,11 @@ from tensorrt_llm._torch.moe.fused_moe import (
     RenormalizeMoeRoutingMethod,
     RenormalizeNaiveMoeRoutingMethod,
     SigmoidRenormMoeRoutingMethod,
+    SwigluBiasActivation,
     create_moe,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
-from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
+from tensorrt_llm._torch.moe.fused_moe.interface import MoE, MoEWeightLoadingMode
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
@@ -108,6 +110,7 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     WFP4A16FusedMoEMethod,
     WInt4AFP8FusedMoEMethod,
 )
+from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm._utils import get_sm_version, mpi_comm, mpi_rank
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
 from tensorrt_llm.mapping import Mapping
@@ -121,6 +124,18 @@ MPI.pickle.__init__(
     cloudpickle.loads,
     pickle.HIGHEST_PROTOCOL,
 )
+
+
+def test_duplicate_layer_ids_preserve_all_moe_registrations() -> None:
+    model_config = ModelConfig(skip_create_weights_in_init=True)
+    moe_layers = [torch.nn.Module() for _ in range(3)]
+    for layer in moe_layers:
+        layer.layer_idx = 0
+        layer.layer_idx_str = "0"
+        MoE._register_layer(layer, model_config)
+
+    assert [layer.layer_idx_str for layer in moe_layers] == ["0", "0_0", "0_1"]
+    assert [ref() for ref in model_config.extra_attrs["moe_layers"].values()] == moe_layers
 
 
 def _ensure_dist_for_megamoe(moe_backend: str, rank: int, world_size: int) -> None:
@@ -589,15 +604,18 @@ def _test_moe_worker_impl(
                 (seq_len, num_experts), dtype=dtype_routing_logits, device="cuda"
             )
 
+        backend_type = MoeBackendType(moe_backend)
+
         # Determine swiglu_gptoss_style
         swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
+        is_minimax_megamoe = backend_type == MoeBackendType.MEGAMOE_CUTEDSL and swiglu_gptoss_style
+        expert_bias = swiglu_gptoss_style and not is_minimax_megamoe
 
         # In EP mode, swiglu tensors must be sized per local experts
         # (C++ kernels check: swiglu_alpha.size(0) == num_experts_on_rank)
         num_local_experts = num_experts // mapping.moe_ep_size
 
         # Setup quantization
-        backend_type = MoeBackendType(moe_backend)
         quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
             quant_algo, x, backend_type
         )
@@ -607,12 +625,15 @@ def _test_moe_worker_impl(
             intermediate_size=intermediate_size,
             hidden_size=hidden_size,
             quant_config=quant_config,
-            bias=swiglu_gptoss_style,
+            bias=expert_bias,
             swiglu_gptoss_style=swiglu_gptoss_style,
             swiglu_alpha=swiglu_alpha if swiglu_gptoss_style else None,
             swiglu_beta=swiglu_beta if swiglu_gptoss_style else None,
             swiglu_limit=swiglu_limit if swiglu_gptoss_style else None,
             num_local_experts=num_local_experts,
+            activation_type=(
+                ActivationType.SwigluBias if is_minimax_megamoe else ActivationType.Swiglu
+            ),
         )
         ref_cls = quant_kwargs.pop("ref_cls", None)
         ref_module_kwargs = {}
@@ -657,13 +678,22 @@ def _test_moe_worker_impl(
                 routing_method=routing_method,
                 reduce_results=True,
                 model_config=model_cfg,
-                bias=swiglu_gptoss_style,
-                swiglu_alpha=swiglu_tensors["swiglu_alpha"] if swiglu_tensors else None,
-                swiglu_beta=swiglu_tensors["swiglu_beta"] if swiglu_tensors else None,
-                swiglu_limit=swiglu_tensors["swiglu_limit"] if swiglu_tensors else None,
+                bias=expert_bias,
+                activation=(
+                    SwigluBiasActivation(
+                        gate_sigmoid_scale=swiglu_tensors["swiglu_alpha"],
+                        linear_offset=swiglu_tensors["swiglu_beta"],
+                        clamp=swiglu_tensors["swiglu_limit"],
+                    )
+                    if swiglu_tensors
+                    else DEFAULT_MOE_ACTIVATION
+                ),
                 weight_loading_mode=weight_loading_mode,
             ) as fused_moe,
         ):
+            # Direct construction: no host post-init to allocate for us, and
+            # the branch below reads the backend's quant_method shapes.
+            fused_moe.create_weights()
             # W4A8_MXFP4_MXFP8 needs backend-layout-aware weights.  In
             # particular, MegaMoEDeepGemm and TRTLLMGen can have different
             # padded backend/ref tensor layouts, so create weights after the
@@ -1571,7 +1601,7 @@ def test_configurable_moe_single_gpu(
     )
 
     # DeepSeekV3 routing requires float32 routing_logits for TRTLLM backend
-    # See: cpp/tensorrt_llm/thop/fp4BlockScaleMoe.cpp:70-72
+    # See: cpp/tensorrt_llm/thop/moe/fp4BlockScaleMoe.cpp:70-72
     dtype_routing_logits = None
     if (
         moe_backend == MoeBackendType.TRTLLM.value
@@ -1791,7 +1821,7 @@ def test_configurable_moe_multi_gpu(
     )
 
     # DeepSeekV3 routing requires float32 routing_logits for TRTLLM backend
-    # See: cpp/tensorrt_llm/thop/fp4BlockScaleMoe.cpp:70-72
+    # See: cpp/tensorrt_llm/thop/moe/fp4BlockScaleMoe.cpp:70-72
     dtype_routing_logits = None
     if (
         moe_backend == MoeBackendType.TRTLLM.value

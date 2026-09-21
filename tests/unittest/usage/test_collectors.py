@@ -126,21 +126,24 @@ class TestModelInfo:
         assert usage_lib._extract_architecture_class_name(None) is None
 
     def test_extract_architecture_empty_list(self):
-        """Falls back to class name when architectures list is empty."""
-        mock = MagicMock(spec=[])  # No attributes by default
-        mock.architectures = []
-        result = usage_lib._extract_architecture_class_name(mock)
-        assert result is not None  # Should return the class name
+        """An empty architectures list falls back to the config class name."""
+
+        class FakeConfig:
+            architectures = []
+
+        assert usage_lib._extract_architecture_class_name(FakeConfig()) == "FakeConfig"
 
     def test_extract_architecture_no_attr(self):
-        """Falls back to class name when architecture attr is missing."""
+        """A config without architecture fields falls back to its class name."""
 
         class FakeConfig:
             pass
 
         config = FakeConfig()
-        result = usage_lib._extract_architecture_class_name(config)
-        assert result == "FakeConfig"
+        assert usage_lib._extract_architecture_class_name(config) == "FakeConfig"
+        name, digest = usage_lib._architecture_telemetry_fields(config)
+        assert name == ""
+        assert digest.startswith("sha256:")
 
     def test_extract_architecture_trtllm_singular(self):
         """TRT-LLM PretrainedConfig uses .architecture (singular string)."""
@@ -169,6 +172,13 @@ class TestModelInfo:
         mock.architecture = "ShouldNotBeUsed"
         assert usage_lib._extract_architecture_class_name(mock) == "LlamaForCausalLM"
 
+    def test_extract_architecture_malformed_first_item_fails_closed(self) -> None:
+        """A non-string first list item is not coerced or skipped."""
+        mock = MagicMock(spec=[])
+        mock.architectures = [object(), "LlamaForCausalLM"]
+        mock.architecture = "LlamaForCausalLM"
+        assert usage_lib._extract_architecture_class_name(mock) is None
+
     def test_extract_architecture_singular_over_nested(self):
         """Direct .architecture (singular) takes priority over nested dict."""
 
@@ -188,10 +198,44 @@ class TestModelInfo:
         assert "num_attention_heads" not in fields
         assert "model_type" not in fields
 
-    def test_extract_arch_catches_attribute_error(self):
-        """_extract_architecture_class_name handles configs without expected attrs."""
-        result = usage_lib._extract_architecture_class_name(42)  # int has no .architectures
-        assert result is not None  # falls through to type(42).__name__ == "int"
+    def test_public_architecture_is_reported_by_name(self) -> None:
+        """Allowlisted public names use plaintext and no hash."""
+        mock = MagicMock(spec=[])
+        mock.architectures = ["LlamaForCausalLM"]
+        assert usage_lib._architecture_telemetry_fields(mock) == ("LlamaForCausalLM", "")
+
+    def test_unknown_architecture_is_hashed(self) -> None:
+        """Unknown names use a stable domain-separated SHA-256 digest."""
+        mock = MagicMock(spec=[])
+        mock.architectures = ["PrivateAcmeForCausalLM"]
+        assert usage_lib._architecture_telemetry_fields(mock) == (
+            "",
+            "sha256:76873ad24ad3dc7dc6b25e04899914610d375e85177cdac3ce6538f6294ccd04",
+        )
+
+    def test_allowlist_matching_is_exact(self) -> None:
+        """Whitespace is not normalized into an allowlisted public name."""
+        mock = MagicMock(spec=[])
+        mock.architectures = [" Qwen2ForCausalLM "]
+        assert usage_lib._architecture_telemetry_fields(mock) == (
+            "",
+            "sha256:20e36456e99ce3fbeda8ae98a8827b6a11c0cad17933ef2c9fca78416264a731",
+        )
+
+    @pytest.mark.parametrize("architecture", [None, "", "   ", 42, {"name": "Secret"}])
+    def test_missing_or_malformed_architecture_uses_empty_sentinels(
+        self, architecture: object
+    ) -> None:
+        """Missing and malformed values fail closed without a name or hash."""
+        mock = MagicMock(spec=[])
+        mock.architectures = [architecture]
+        assert usage_lib._architecture_telemetry_fields(mock) == ("", "")
+
+    def test_unencodable_architecture_uses_empty_sentinels(self) -> None:
+        """A malformed Unicode value cannot escape fail-silent collection."""
+        mock = MagicMock(spec=[])
+        mock.architectures = ["Private\ud800Architecture"]
+        assert usage_lib._architecture_telemetry_fields(mock) == ("", "")
 
 
 # ---------------------------------------------------------------------------

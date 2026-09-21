@@ -25,10 +25,6 @@ Verifies:
 
 Run:
     pytest tests/unittest/_torch/visual_gen/test_wan22_t2v_teacache.py -v -s
-
-Override checkpoint path:
-    DIFFUSION_MODEL_PATH_WAN22_T2V=/path/to/wan22 \\
-        pytest tests/unittest/_torch/visual_gen/test_wan22_t2v_teacache.py -v -s
 """
 
 import os
@@ -36,10 +32,10 @@ import os
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
 import gc
-from pathlib import Path
 
 import pytest
 import torch
+from utils.llm_data import get_checkpoint
 
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.visual_gen.args import TeaCacheConfig, VisualGenArgs
@@ -61,28 +57,10 @@ def _cleanup_gpu():
 
 
 # ============================================================================
-# Path helpers
+# Checkpoints
 # ============================================================================
 
-
-def _llm_models_root() -> Path:
-    if "LLM_MODELS_ROOT" in os.environ:
-        root = Path(os.environ["LLM_MODELS_ROOT"])
-    else:
-        root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
-    if not root.exists():
-        root = Path("/scratch.trt_llm_data/llm-models/")
-    assert root.exists(), (
-        "Set LLM_MODELS_ROOT or ensure /home/scratch.trt_llm_data_ci/llm-models/ is accessible."
-    )
-    return root
-
-
-def _checkpoint(env_var: str, default_name: str) -> str:
-    return os.environ.get(env_var) or str(_llm_models_root() / default_name)
-
-
-WAN22_A14B_PATH = _checkpoint("DIFFUSION_MODEL_PATH_WAN22_T2V", "Wan2.2-T2V-A14B-Diffusers")
+WAN22_A14B_SUBDIR = "Wan2.2-T2V-A14B-Diffusers"
 
 INFER_NUM_FRAMES = 33  # (33-1)/4+1 = 9 latent frames; smallest realistic shape
 INFER_NUM_STEPS = 20  # Wan 2.2 has no reference hit rate; just enough to exercise both backends
@@ -114,10 +92,8 @@ WAN22_T2V_LOW_NOISE_COEFFICIENTS = [
 
 @pytest.fixture
 def wan22_t2v_pipeline():
-    if not os.path.exists(WAN22_A14B_PATH):
-        pytest.skip(f"Checkpoint not found: {WAN22_A14B_PATH}")
     args = VisualGenArgs(
-        model=WAN22_A14B_PATH,
+        model=get_checkpoint(WAN22_A14B_SUBDIR),
         cache_config=TeaCacheConfig(
             teacache_thresh=0.15,
             coefficients=WAN22_T2V_HIGH_NOISE_COEFFICIENTS,

@@ -20,6 +20,7 @@ from tensorrt_llm.visual_gen.args import (
     RuntimeLoRAConfig,
     TeaCacheConfig,
     TorchCompileConfig,
+    VAEConfig,
     VisualGenArgs,
 )
 
@@ -47,6 +48,10 @@ class TestVisualGenArgsStrictValidation:
     def test_nested_attention_unknown_field_rejected(self):
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
             AttentionConfig(backend="VANILLA", extra_key="bad")
+
+    def test_nested_vae_unknown_field_rejected(self):
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            VisualGenArgs(model="/tmp/model", vae_config={"unknown_field": True})
 
     def test_nested_teacache_unknown_field_rejected(self):
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
@@ -107,17 +112,33 @@ class TestAttentionConfigQuantValidation:
         ],
     )
     def test_supported_quant_config_sage(self, qk_dtype, q_block_size, k_block_size, v_block_size):
-        attention = AttentionConfig(
-            backend="TRTLLM",
-            quant_attention_config=QuantAttentionConfig(
-                qk_dtype=qk_dtype,
-                q_block_size=q_block_size,
-                k_block_size=k_block_size,
-                v_block_size=v_block_size,
-            ),
-        )
+        # int8 Q/K SAGE has a compiled cubin only on SM100; pin the SM so this
+        # supported-recipe check is host-independent (CI CPU stages have no GPU).
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
+            attention = AttentionConfig(
+                backend="TRTLLM",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype=qk_dtype,
+                    q_block_size=q_block_size,
+                    k_block_size=k_block_size,
+                    v_block_size=v_block_size,
+                ),
+            )
 
         assert attention.quant_attention_config is not None
+
+    @pytest.mark.parametrize("sm_version", [90, 107, 120])
+    def test_int8_sage_rejected_on_non_sm100(self, sm_version):
+        # int8 Q/K SAGE only has an SM100 cubin; validation must fail fast on
+        # any other SM instead of silently falling back to unfused MHA.
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=sm_version):
+            with pytest.raises(ValidationError, match="only supports sm_100"):
+                AttentionConfig(
+                    backend="TRTLLM",
+                    quant_attention_config=QuantAttentionConfig(
+                        qk_dtype="int8", q_block_size=1, k_block_size=1, v_block_size=1
+                    ),
+                )
 
     def test_supported_quant_config_cute(self):
         attention = AttentionConfig(
@@ -155,12 +176,79 @@ class TestAttentionConfigQuantValidation:
         assert attention.quant_attention_config is not None
         assert attention.quant_attention_config.v_block_size == v_block_size
 
+    @pytest.mark.parametrize(
+        ("qk_dtype", "v_dtype"),
+        [("mxfp8", "fp8"), ("nvfp4", "fp8"), ("nvfp4", "nvfp4")],
+    )
+    def test_supported_quant_config_flashinfer(self, qk_dtype: str, v_dtype: str) -> None:
+        attention = AttentionConfig(
+            backend="FLASHINFER",
+            quant_attention_config=QuantAttentionConfig(
+                qk_dtype=qk_dtype,
+                v_dtype=v_dtype,
+            ),
+        )
+
+        assert attention.quant_attention_config is not None
+
+    @pytest.mark.parametrize("qk_dtype", ("mxfp8", "nvfp4"))
+    @pytest.mark.parametrize("block_field", ("q_block_size", "k_block_size", "v_block_size"))
+    def test_blockscaled_block_size_rejected_on_flashinfer(
+        self, qk_dtype: str, block_field: str
+    ) -> None:
+        with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
+            AttentionConfig(
+                backend="FLASHINFER",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype=qk_dtype,
+                    v_dtype="fp8",
+                    **{block_field: 1},
+                ),
+            )
+
+    def test_mxfp8_with_nvfp4_v_rejected_on_flashinfer(self) -> None:
+        with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
+            AttentionConfig(
+                backend="FLASHINFER",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype="mxfp8",
+                    v_dtype="nvfp4",
+                ),
+            )
+
+    def test_fp8_qk_dtype_rejected_on_flashinfer(self) -> None:
+        with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
+            AttentionConfig(
+                backend="FLASHINFER",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype="fp8",
+                    v_dtype="fp8",
+                ),
+            )
+
     def test_blockscaled_qk_dtype_rejected_on_trtllm(self):
         with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
             AttentionConfig(
                 backend="TRTLLM",
                 quant_attention_config=QuantAttentionConfig(qk_dtype="nvfp4"),
             )
+
+    def test_supported_quant_config_cudnn_fp8(self):
+        attention = AttentionConfig(
+            backend="CUDNN",
+            quant_attention_config=QuantAttentionConfig(qk_dtype="fp8", v_dtype="fp8"),
+        )
+
+        assert attention.quant_attention_config is not None
+
+    def test_supported_quant_config_cudnn_mxfp8(self):
+        attention = AttentionConfig(
+            backend="CUDNN",
+            quant_attention_config=QuantAttentionConfig(qk_dtype="mxfp8", v_dtype="mxfp8"),
+        )
+
+        assert attention.quant_attention_config is not None
+        assert attention.quant_attention_config.v_dtype == "mxfp8"
 
     def test_sage_qk_block_size_rejected_on_cute(self):
         with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
@@ -229,6 +317,12 @@ class TestVisualGenArgsCacheBackend:
 class TestVisualGenArgsFromDict:
     """VisualGenArgs construction from dicts enforces strict validation."""
 
+    def test_vae_config_defaults_to_checkpoint_driven_quantization(self):
+        args = VisualGenArgs(model="/tmp/model")
+
+        assert isinstance(args.vae_config, VAEConfig)
+        assert args.vae_config.quant_conv_config is None
+
     def test_valid_dict(self):
         args = VisualGenArgs(
             **{
@@ -253,11 +347,15 @@ class TestVisualGenArgsFromDict:
             **{
                 "model": "/tmp/model",
                 "attention_config": {"backend": "TRTLLM"},
+                "vae_config": {"quant_conv_config": {"quant_algo": "NVFP4", "dynamic": True}},
                 "cache_config": {"cache_backend": "teacache", "teacache_thresh": 0.3},
             }
         )
         assert isinstance(args.attention_config, AttentionConfig)
         assert args.attention_config.backend == "TRTLLM"
+        assert isinstance(args.vae_config, VAEConfig)
+        assert isinstance(args.vae_config.quant_conv_config, dict)
+        assert args.vae_config.quant_conv_config["dynamic"] is True
         assert isinstance(args.cache_config, TeaCacheConfig)
         assert args.teacache.teacache_thresh == 0.3
 

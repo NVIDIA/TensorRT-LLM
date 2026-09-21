@@ -46,6 +46,7 @@
 //   empty_input[N_INPUT]    pmap -> TMA (input slot empty)
 //   full_cast[2]            pmap -> MMA (A ready in TMEM)
 //   empty_cast[2]           MMA -> pmap (TMEM slot empty)
+//   full_mix[1]             TMA -> pmap (post_mix+comb_mix arrived)
 //   tmem_full[1]            MMA -> epilogue
 
 #pragma once
@@ -165,11 +166,53 @@ __device__ __forceinline__ float2 fma_f32x2_vv(float2 a, float2 b, float2 c)
 #endif
 }
 
+// The read-only cache is not coherent with stores issued earlier by the same
+// kernel, so Phase 4's store-to-load path cannot use __ldg.
+__device__ __forceinline__ uint4 ld_global_volatile_u128(uint4 const* addr)
+{
+    uint4 val;
+    asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
+                 : "l"(addr)
+                 : "memory");
+    return val;
+}
+
 __device__ __forceinline__ void stsm_x4_b16_rout(void* smem_dst, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
 {
     asm volatile(
         "stmatrix.sync.aligned.x4.m8n8.shared.b16 [%0], {%1, %2, %3, %4};\n" ::"l"(__cvta_generic_to_shared(smem_dst)),
         "r"(a), "r"(b), "r"(c), "r"(d));
+}
+
+// Blackwell can issue two independent FP32 FMAs with one packed instruction.
+// The pmap hot loop always updates adjacent bf16 values with the same mixing
+// coefficient, so keep the pair packed instead of lowering it to two FFMA.
+__device__ __forceinline__ float2 fma_f32x2(float2 const& a, float2 const& b, float2 const& c)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDA_ARCH__ < 1100)
+    float2 result;
+    asm volatile("fma.rn.f32x2 %0, %1, %2, %3;"
+                 : "=l"(reinterpret_cast<uint64_t&>(result))
+                 : "l"(reinterpret_cast<uint64_t const&>(a)), "l"(reinterpret_cast<uint64_t const&>(b)),
+                 "l"(reinterpret_cast<uint64_t const&>(c)));
+    return result;
+#else
+    return make_float2(fmaf(a.x, b.x, c.x), fmaf(a.y, b.y, c.y));
+#endif
+}
+
+__device__ __forceinline__ float2 mul_f32x2(float2 const& a, float2 const& b)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDA_ARCH__ < 1100)
+    float2 result;
+    asm volatile("mul.f32x2 %0, %1, %2;"
+                 : "=l"(reinterpret_cast<uint64_t&>(result))
+                 : "l"(reinterpret_cast<uint64_t const&>(a)), "l"(reinterpret_cast<uint64_t const&>(b)));
+    return result;
+#else
+    return make_float2(a.x * b.x, a.y * b.y);
+#endif
 }
 
 template <uint32_t SHAPE_N, uint32_t HIDDEN, uint32_t HC_MULT, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
@@ -179,16 +222,18 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
     const uint32_t shape_m, const __grid_constant__ cute::TmaDescriptor tensor_map_residual,
     const __grid_constant__ cute::TmaDescriptor tensor_map_x, const __grid_constant__ cute::TmaDescriptor tensor_map_b,
     const __grid_constant__ cute::TmaDescriptor tensor_map_residual_out,
-    float* __restrict__ D, // [M, SHAPE_N]  (caller memsets to 0)
-    float const* __restrict__ post_mix, float const* __restrict__ comb_mix, float* __restrict__ sqr_sum)
-{                          // [M]            (caller memsets to 0)
+    const __grid_constant__ cute::TmaDescriptor tensor_map_post,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_comb, float const* __restrict__ post_mix,
+    float const* __restrict__ comb_mix, float* __restrict__ D, float* __restrict__ sqr_sum)
+{ // D [M, SHAPE_N], sqr_sum [M] (caller memsets both to 0)
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000) and (__CUDA_ARCH__ < 1100)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
     constexpr uint32_t SHAPE_K = HC_MULT * HIDDEN;
     constexpr uint32_t H_TILES_PER_HC = HIDDEN / BLOCK_K;
-    static_assert(H_TILES_PER_HC % kNumSplits == 0, "H_TILES_PER_HC must be divisible by kNumSplits");
-    constexpr uint32_t H_TILES_PER_SPLIT = H_TILES_PER_HC / kNumSplits;
+    static_assert(kNumSplits <= H_TILES_PER_HC, "Each split must own at least one H tile");
+    constexpr uint32_t H_TILES_BASE = H_TILES_PER_HC / kNumSplits;
+    constexpr uint32_t H_TILES_EXTRA = H_TILES_PER_HC % kNumSplits;
     constexpr uint32_t kNumCastStages = 4;
     constexpr uint32_t kSwizzleAMode = cute::min(BLOCK_K * sizeof(nv_bfloat16), 128);
     constexpr uint32_t kSwizzleBMode = cute::min(BLOCK_K * sizeof(float), 128);
@@ -230,6 +275,8 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
         cute::prefetch_tma_descriptor(&tensor_map_x);
         cute::prefetch_tma_descriptor(&tensor_map_b);
         cute::prefetch_tma_descriptor(&tensor_map_residual_out);
+        cute::prefetch_tma_descriptor(&tensor_map_post);
+        cute::prefetch_tma_descriptor(&tensor_map_comb);
     }
 
     // SMEM layout: [cd, B stages, res stages, x stages, post, comb, rc (HC_MULT slices)]
@@ -262,9 +309,10 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
         [=](uint32_t const& i) { return barrier_start_ptr + 2 * N_B_STAGES + 2 * N_INPUT_STAGES + i; });
     auto empty_cast = PatternVisitor([=](uint32_t const& i)
         { return barrier_start_ptr + 2 * N_B_STAGES + 2 * N_INPUT_STAGES + kNumCastStages + i; });
-    auto tmem_full_barrier = barrier_start_ptr + 2 * N_B_STAGES + 2 * N_INPUT_STAGES + 2 * kNumCastStages;
+    auto full_mix = barrier_start_ptr + 2 * N_B_STAGES + 2 * N_INPUT_STAGES + 2 * kNumCastStages;
+    auto tmem_full_barrier = full_mix + 1;
 
-    cursor += (2 * N_B_STAGES + 2 * N_INPUT_STAGES + 2 * kNumCastStages + 1) * sizeof(Barrier);
+    cursor += (2 * N_B_STAGES + 2 * N_INPUT_STAGES + 2 * kNumCastStages + 2) * sizeof(Barrier);
     auto tmem_ptr_in_smem = reinterpret_cast<uint32_t*>(cursor);
 
     if (warp_idx == 1 and cute::elect_one_sync())
@@ -287,6 +335,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
             full_cast[i]->init(kNumPmapThreads);
             empty_cast[i]->init(1);
         }
+        full_mix->init(1);
         tmem_full_barrier->init(1);
         cutlass::arch::fence_barrier_init();
     }
@@ -300,21 +349,42 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
     const uint32_t m_block_idx = block_idx / kNumSplits;
     const uint32_t k_split_idx = block_idx % kNumSplits;
     const uint32_t m_offset = m_block_idx * BLOCK_M;
-    const uint32_t h_tile_start = k_split_idx * H_TILES_PER_SPLIT;
-    constexpr uint32_t num_total_stages = H_TILES_PER_SPLIT * HC_MULT;
+    // Give the first H_TILES_EXTRA splits one additional tile. This admits
+    // Rubin exact-wave KS=106/53 shapes for H=7168 (112 H tiles).
+    uint32_t h_tile_start;
+    uint32_t h_tiles_this_split;
+    if constexpr (H_TILES_EXTRA == 0)
+    {
+        h_tile_start = k_split_idx * H_TILES_BASE;
+        h_tiles_this_split = H_TILES_BASE;
+    }
+    else
+    {
+        h_tile_start = k_split_idx * H_TILES_BASE + cute::min(k_split_idx, H_TILES_EXTRA);
+        h_tiles_this_split = H_TILES_BASE + static_cast<uint32_t>(k_split_idx < H_TILES_EXTRA);
+    }
+    uint32_t const num_total_stages = h_tiles_this_split * HC_MULT;
 
-    // Prologue removed: pmap threads load their own post_mix/comb_mix rows
-    // directly into registers below, so the MMA/TMA warps never wait on those
-    // global loads and the TMA pipeline starts immediately.
+    // Pmap threads load their own post_mix/comb_mix rows directly into registers,
+    // so the MMA/TMA warps can start filling the TMA pipeline immediately.
     if (warp_idx < kNumMMAThreads / 32)
     {
         // ----- TMA warp (warp 0) -----
         if (warp_idx == 0 and cute::elect_one_sync())
         {
+            // Load the two row-wise pmap coefficient tiles asynchronously.
+            // Only the pmap warp group consumes them, so it waits on full_mix
+            // independently while this warp continues filling input/B stages.
+            deep_gemm::tma::copy<HC_MULT, BLOCK_M, /*kSwizzleMode=*/0>(
+                &tensor_map_post, full_mix, smem_post, /*inner_idx=*/0, m_offset);
+            deep_gemm::tma::copy<HC_MULT * HC_MULT, BLOCK_M, /*kSwizzleMode=*/0>(
+                &tensor_map_comb, full_mix, smem_comb, /*inner_idx=*/0, m_offset);
+            full_mix->arrive_and_expect_tx(SMEM_POST_SIZE + SMEM_COMB_SIZE);
+
             uint32_t b_stage = 0;
             uint32_t i_stage = 0;
             uint32_t s = 0;
-            for (uint32_t ht = 0; ht < H_TILES_PER_SPLIT; ++ht)
+            for (uint32_t ht = 0; ht < h_tiles_this_split; ++ht)
             {
                 const uint32_t h_tile = h_tile_start + ht;
                 empty_input[i_stage]->wait(((ht / N_INPUT_STAGES) & 1) ^ 1);
@@ -445,6 +515,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
     else
     {
         // ----- Pmap warp group (warps 4..7, 128 threads) -----
+        full_mix->wait(0);
         const uint32_t sub_warp_idx = warp_idx - kNumMMAThreads / 32;
         const uint32_t upper_row = sub_warp_idx * 16 + lane_idx / 4;
         const uint32_t lower_row = upper_row + 8;
@@ -484,7 +555,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
         static_assert(kNumLoads % 2 == 0, "kNumLoads must be even for LDSM.x4");
 
         uint32_t s = 0;
-        for (uint32_t ht = 0; ht < H_TILES_PER_SPLIT; ++ht)
+        for (uint32_t ht = 0; ht < h_tiles_this_split; ++ht)
         {
             const uint32_t i_stage = ht % N_INPUT_STAGES;
             full_input[i_stage]->wait((ht / N_INPUT_STAGES) & 1);
@@ -569,17 +640,43 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
 #pragma unroll
                 for (uint32_t hc = 0; hc < HC_MULT; ++hc)
                 {
-                    float2 nu0 = mul_f32x2(pm_u[hc], xf[0][i + 0]);
-                    float2 nu1 = mul_f32x2(pm_u[hc], xf[0][i + 1]);
-                    float2 nl0 = mul_f32x2(pm_l[hc], xf[1][i + 0]);
-                    float2 nl1 = mul_f32x2(pm_l[hc], xf[1][i + 1]);
+                    float2 nu0, nu1, nl0, nl1;
+                    if constexpr (kNumSplits >= 53)
+                    {
+                        // Packed coefficients are faster for Rubin exact-wave small-M splits.
+                        float2 const coefficientU = make_float2(pm_u[hc], pm_u[hc]);
+                        float2 const coefficientL = make_float2(pm_l[hc], pm_l[hc]);
+                        nu0 = mul_f32x2(coefficientU, xf[0][i + 0]);
+                        nu1 = mul_f32x2(coefficientU, xf[0][i + 1]);
+                        nl0 = mul_f32x2(coefficientL, xf[1][i + 0]);
+                        nl1 = mul_f32x2(coefficientL, xf[1][i + 1]);
+                    }
+                    else
+                    {
+                        nu0 = mul_f32x2(pm_u[hc], xf[0][i + 0]);
+                        nu1 = mul_f32x2(pm_u[hc], xf[0][i + 1]);
+                        nl0 = mul_f32x2(pm_l[hc], xf[1][i + 0]);
+                        nl1 = mul_f32x2(pm_l[hc], xf[1][i + 1]);
+                    }
 #pragma unroll
                     for (uint32_t j = 0; j < HC_MULT; ++j)
                     {
-                        nu0 = fma_f32x2(cm_u[j][hc], r_u[j][0], nu0);
-                        nu1 = fma_f32x2(cm_u[j][hc], r_u[j][1], nu1);
-                        nl0 = fma_f32x2(cm_l[j][hc], r_l[j][0], nl0);
-                        nl1 = fma_f32x2(cm_l[j][hc], r_l[j][1], nl1);
+                        if constexpr (kNumSplits >= 53)
+                        {
+                            float2 const coefficientU = make_float2(cm_u[j][hc], cm_u[j][hc]);
+                            float2 const coefficientL = make_float2(cm_l[j][hc], cm_l[j][hc]);
+                            nu0 = fma_f32x2(coefficientU, r_u[j][0], nu0);
+                            nu1 = fma_f32x2(coefficientU, r_u[j][1], nu1);
+                            nl0 = fma_f32x2(coefficientL, r_l[j][0], nl0);
+                            nl1 = fma_f32x2(coefficientL, r_l[j][1], nl1);
+                        }
+                        else
+                        {
+                            nu0 = fma_f32x2(cm_u[j][hc], r_u[j][0], nu0);
+                            nu1 = fma_f32x2(cm_u[j][hc], r_u[j][1], nu1);
+                            nl0 = fma_f32x2(cm_l[j][hc], r_l[j][0], nl0);
+                            nl1 = fma_f32x2(cm_l[j][hc], r_l[j][1], nl1);
+                        }
                     }
                     nv_bfloat162 b_u0 = __float22bfloat162_rn(nu0);
                     nv_bfloat162 b_u1 = __float22bfloat162_rn(nu1);
@@ -712,17 +809,17 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         const __grid_constant__ cute::TmaDescriptor tensor_map_x,            // x_prev,        bf16
         const __grid_constant__ cute::TmaDescriptor tensor_map_b,            // W_T,           tf32
         const __grid_constant__ cute::TmaDescriptor tensor_map_residual_out, // residual_cur,  bf16 (TMA store)
+        const __grid_constant__ cute::TmaDescriptor tensor_map_post,         // post_mix_prev, fp32
+        const __grid_constant__ cute::TmaDescriptor tensor_map_comb,         // comb_mix_prev, fp32
         __nv_bfloat16 const* __restrict__ residual_cur_ptr,                  // same buffer as TMA target
         __nv_bfloat16* __restrict__ layer_input_out,                         // [M, HIDDEN]    bf16
-        float* __restrict__ D,                   // [M, SHAPE_N]   fp32 (y_acc, caller zeros)
-        float* __restrict__ sqr_sum,             // [M]            fp32 (r_acc, caller zeros)
-        int* __restrict__ done_counter,          // [ceil(M/BLOCK_M)] int (caller zeros)
-        float const* __restrict__ post_mix_prev, // [M, HC_MULT]
-        float const* __restrict__ comb_mix_prev, // [M, HC_MULT, HC_MULT]
-        float const* __restrict__ hc_scale,      // [3]
-        float const* __restrict__ hc_base,       // [HC_MULT*(2+HC_MULT)]
-        float* __restrict__ post_mix_out,        // [M, HC_MULT]
-        float* __restrict__ comb_mix_out,        // [M, HC_MULT, HC_MULT]
+        float* __restrict__ D,              // [M, SHAPE_N]   fp32 (y_acc, caller zeros)
+        float* __restrict__ sqr_sum,        // [M]            fp32 (r_acc, caller zeros)
+        int* __restrict__ done_counter,     // [ceil(M/BLOCK_M)] int (caller zeros)
+        float const* __restrict__ hc_scale, // [3]
+        float const* __restrict__ hc_base,  // [HC_MULT*(2+HC_MULT)]
+        float* __restrict__ post_mix_out,   // [M, HC_MULT]
+        float* __restrict__ comb_mix_out,   // [M, HC_MULT, HC_MULT]
         // When kFuseNorm: layer_input_out receives the RMSNorm-normalized
         // values: out[t,h] = bf16(li[t,h] * rsqrt(mean(li²)+norm_eps) * w[h]).
         // norm_weight must be bf16 [HIDDEN]; norm_eps is the RMSNorm epsilon.
@@ -737,8 +834,9 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
     constexpr uint32_t HC_MULT3 = HC_MULT * (2 + HC_MULT);
     constexpr uint32_t SHAPE_K = HC_MULT * HIDDEN;
     constexpr uint32_t H_TILES_PER_HC = HIDDEN / BLOCK_K;
-    static_assert(H_TILES_PER_HC % kNumSplits == 0, "H_TILES_PER_HC must be divisible by kNumSplits");
-    constexpr uint32_t H_TILES_PER_SPLIT = H_TILES_PER_HC / kNumSplits;
+    static_assert(kNumSplits <= H_TILES_PER_HC, "Each split must own at least one H tile");
+    constexpr uint32_t H_TILES_BASE = H_TILES_PER_HC / kNumSplits;
+    constexpr uint32_t H_TILES_EXTRA = H_TILES_PER_HC % kNumSplits;
     constexpr uint32_t kNumCastStages = 4;
     constexpr uint32_t kSwizzleAMode = cute::min(BLOCK_K * sizeof(nv_bfloat16), 128);
     constexpr uint32_t kSwizzleBMode = cute::min(BLOCK_K * sizeof(float), 128);
@@ -781,6 +879,8 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         cute::prefetch_tma_descriptor(&tensor_map_x);
         cute::prefetch_tma_descriptor(&tensor_map_b);
         cute::prefetch_tma_descriptor(&tensor_map_residual_out);
+        cute::prefetch_tma_descriptor(&tensor_map_post);
+        cute::prefetch_tma_descriptor(&tensor_map_comb);
     }
 
     // SMEM layout: [cd, B stages, res stages, x stages, post, comb, rc (HC_MULT slices)]
@@ -813,9 +913,10 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         [=](uint32_t const& i) { return barrier_start_ptr + 2 * N_B_STAGES + 2 * N_INPUT_STAGES + i; });
     auto empty_cast = PatternVisitor([=](uint32_t const& i)
         { return barrier_start_ptr + 2 * N_B_STAGES + 2 * N_INPUT_STAGES + kNumCastStages + i; });
-    auto tmem_full_barrier = barrier_start_ptr + 2 * N_B_STAGES + 2 * N_INPUT_STAGES + 2 * kNumCastStages;
+    auto full_mix = barrier_start_ptr + 2 * N_B_STAGES + 2 * N_INPUT_STAGES + 2 * kNumCastStages;
+    auto tmem_full_barrier = full_mix + 1;
 
-    cursor += (2 * N_B_STAGES + 2 * N_INPUT_STAGES + 2 * kNumCastStages + 1) * sizeof(Barrier);
+    cursor += (2 * N_B_STAGES + 2 * N_INPUT_STAGES + 2 * kNumCastStages + 2) * sizeof(Barrier);
     auto tmem_ptr_in_smem = reinterpret_cast<uint32_t*>(cursor);
 
     if (warp_idx == 1 and cute::elect_one_sync())
@@ -838,6 +939,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             full_cast[i]->init(kNumPmapThreads);
             empty_cast[i]->init(1);
         }
+        full_mix->init(1);
         tmem_full_barrier->init(1);
         cutlass::arch::fence_barrier_init();
     }
@@ -851,51 +953,40 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
     const uint32_t m_block_idx = block_idx / kNumSplits;
     const uint32_t k_split_idx = block_idx % kNumSplits;
     const uint32_t m_offset = m_block_idx * BLOCK_M;
-    const uint32_t h_tile_start = k_split_idx * H_TILES_PER_SPLIT;
-    constexpr uint32_t num_total_stages = H_TILES_PER_SPLIT * HC_MULT;
-
-    // Prologue: pmap warp group loads post_mix_prev, comb_mix_prev into SMEM
-    if (warp_idx >= kNumMMAThreads / 32)
+    // Distribute remainder tiles over the first splits. Even-split instances
+    // fold to the original constants; KS=106/53 provide exact 212-CTA waves
+    // for H=7168 at M=128/256 on Rubin.
+    uint32_t h_tile_start;
+    uint32_t h_tiles_this_split;
+    if constexpr (H_TILES_EXTRA == 0)
     {
-        const uint32_t pmap_tid = threadIdx.x - kNumMMAThreads;
-#pragma unroll
-        for (uint32_t t = 0; t < 2; ++t)
-        {
-            uint32_t idx = pmap_tid + t * kNumPmapThreads;
-            if (idx < BLOCK_M * HC_MULT)
-            {
-                uint32_t m = idx / HC_MULT;
-                uint32_t hc = idx % HC_MULT;
-                uint32_t gmem_m = m_offset + m;
-                float v = (gmem_m < shape_m) ? post_mix_prev[gmem_m * HC_MULT + hc] : 0.f;
-                smem_post[idx] = v;
-            }
-        }
-#pragma unroll
-        for (uint32_t t = 0; t < 8; ++t)
-        {
-            uint32_t idx = pmap_tid + t * kNumPmapThreads;
-            if (idx < BLOCK_M * HC_MULT * HC_MULT)
-            {
-                uint32_t m = idx / (HC_MULT * HC_MULT);
-                uint32_t jk = idx % (HC_MULT * HC_MULT);
-                uint32_t gmem_m = m_offset + m;
-                float v = (gmem_m < shape_m) ? comb_mix_prev[gmem_m * HC_MULT * HC_MULT + jk] : 0.f;
-                smem_comb[idx] = v;
-            }
-        }
+        h_tile_start = k_split_idx * H_TILES_BASE;
+        h_tiles_this_split = H_TILES_BASE;
     }
-    __syncthreads();
+    else
+    {
+        h_tile_start = k_split_idx * H_TILES_BASE + cute::min(k_split_idx, H_TILES_EXTRA);
+        h_tiles_this_split = H_TILES_BASE + static_cast<uint32_t>(k_split_idx < H_TILES_EXTRA);
+    }
+    const uint32_t num_total_stages = h_tiles_this_split * HC_MULT;
 
     if (warp_idx < kNumMMAThreads / 32)
     {
         // ----- TMA warp (warp 0) -----
         if (warp_idx == 0 and cute::elect_one_sync())
         {
+            // Fetch coefficient tiles asynchronously while this warp starts
+            // filling the regular input/B pipeline. Only pmap waits on full_mix.
+            deep_gemm::tma::copy<HC_MULT, BLOCK_M, /*kSwizzleMode=*/0>(
+                &tensor_map_post, full_mix, smem_post, /*inner_idx=*/0, m_offset);
+            deep_gemm::tma::copy<HC_MULT * HC_MULT, BLOCK_M, /*kSwizzleMode=*/0>(
+                &tensor_map_comb, full_mix, smem_comb, /*inner_idx=*/0, m_offset);
+            full_mix->arrive_and_expect_tx(SMEM_POST_SIZE + SMEM_COMB_SIZE);
+
             uint32_t b_stage = 0;
             uint32_t i_stage = 0;
             uint32_t s = 0;
-            for (uint32_t ht = 0; ht < H_TILES_PER_SPLIT; ++ht)
+            for (uint32_t ht = 0; ht < h_tiles_this_split; ++ht)
             {
                 const uint32_t h_tile = h_tile_start + ht;
                 empty_input[i_stage]->wait(((ht / N_INPUT_STAGES) & 1) ^ 1);
@@ -1026,6 +1117,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
     else
     {
         // ----- Pmap warp group (warps 4..7, 128 threads) -----
+        full_mix->wait(0);
         const uint32_t sub_warp_idx = warp_idx - kNumMMAThreads / 32;
         const uint32_t upper_row = sub_warp_idx * 16 + lane_idx / 4;
         const uint32_t lower_row = upper_row + 8;
@@ -1059,7 +1151,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         static_assert(kNumLoads % 2 == 0, "kNumLoads must be even for LDSM.x4");
 
         uint32_t s = 0;
-        for (uint32_t ht = 0; ht < H_TILES_PER_SPLIT; ++ht)
+        for (uint32_t ht = 0; ht < h_tiles_this_split; ++ht)
         {
             const uint32_t i_stage = ht % N_INPUT_STAGES;
             full_input[i_stage]->wait((ht / N_INPUT_STAGES) & 1);
@@ -1184,8 +1276,9 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             }
         }
 
-        // Drain any in-flight residual_out TMA stores before exit.
-        cute::tma_store_wait<0>();
+        // tma_store_wait is the `.read` form and retires only the SMEM reads,
+        // so the global writes could still be in flight at the Phase-3 fence.
+        asm volatile("cp.async.bulk.wait_group 0;" : : : "memory");
 
         // Warp-reduce sqr across 4 col_lanes then atomicAdd to global.
         sqr_u += __shfl_xor_sync(0xffffffff, sqr_u, 1);
@@ -1245,6 +1338,8 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             {
                 /* spin */
             }
+            // Acquire the Phase-2 writes published before each increment.
+            __threadfence();
         }
         __syncthreads();
     }
@@ -1307,67 +1402,47 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         if (tok >= shape_m)
             continue;
 
-        // Lanes 0..HC_MULT-1 compute rmsnorm / sigmoid / sinkhorn; pre_mix is
-        // held in `pre_mix_local` on lanes 0..HC_MULT-1 and later broadcast to
-        // all 32 lanes via __shfl_sync.  All warps in a team redundantly run
-        // these ~tens of FLOPs (cheap) to avoid a cross-warp SMEM sync; only
-        // warp_in_team==0 writes comb_mix_out / post_mix_out to GMEM.
+        // Every team warp needs pre_mix locally for the HIDDEN-stride loop.
+        // post_mix and iterative Sinkhorn are token-only results, so only the
+        // first warp computes them. KS=112/56/28 thereby removes 8x/4x/2x
+        // redundant Sinkhorn work without adding a cross-warp synchronization.
+        // Lanes 0..HC_MULT-1 hold the four rows and broadcast pre_mix below.
         float pre_mix_local = 0.f;
         if (lane_bf < HC_MULT)
         {
             float const r_val = sqr_sum[tok];
-            float y_local[HC_MULT3];
             float const* y_row = D + static_cast<long long>(tok) * SHAPE_N;
-#pragma unroll
-            for (uint32_t c = 0; c < HC_MULT3; ++c)
-                y_local[c] = y_row[c];
-
             float const rstd = rsqrtf(r_val / static_cast<float>(HC_MULT * HIDDEN) + rms_eps);
             float const s0 = hc_scale[0];
-            float const s1 = hc_scale[1];
-            float const s2 = hc_scale[2];
 
-            float v = y_local[lane_bf] * rstd * s0 + hc_base[lane_bf];
+            float v = y_row[lane_bf] * rstd * s0 + hc_base[lane_bf];
             pre_mix_local = 1.0f / (1.0f + __expf(-v)) + hc_pre_eps;
 
-            v = y_local[HC_MULT + lane_bf] * rstd * s1 + hc_base[HC_MULT + lane_bf];
-            float post_val = 1.0f / (1.0f + __expf(-v)) * hc_post_mult_value;
             if (warp_in_team == 0)
             {
+                float const s1 = hc_scale[1];
+                float const s2 = hc_scale[2];
+                v = y_row[HC_MULT + lane_bf] * rstd * s1 + hc_base[HC_MULT + lane_bf];
+                float const post_val = 1.0f / (1.0f + __expf(-v)) * hc_post_mult_value;
                 post_mix_out[tok * HC_MULT + lane_bf] = post_val;
-            }
 
-            float cm_vals[HC_MULT];
-#pragma unroll
-            for (uint32_t k = 0; k < HC_MULT; ++k)
-                cm_vals[k] = y_local[2 * HC_MULT + lane_bf * HC_MULT + k] * rstd * s2
-                    + hc_base[2 * HC_MULT + lane_bf * HC_MULT + k];
-
-            constexpr unsigned LANE_MASK = (1u << HC_MULT) - 1;
-            float const rowMax = fmaxf(fmaxf(cm_vals[0], cm_vals[1]), fmaxf(cm_vals[2], cm_vals[3]));
-#pragma unroll
-            for (uint32_t k = 0; k < HC_MULT; ++k)
-                cm_vals[k] = __expf(cm_vals[k] - rowMax);
-            // Reciprocal-multiply for sinkhorn: 1 fdiv + 4 fmul instead of 4
-            // fdivs per row-normalize. Equivalent under fp32 round-off.
-            float inv_rs = 1.0f / (cm_vals[0] + cm_vals[1] + cm_vals[2] + cm_vals[3]);
-#pragma unroll
-            for (uint32_t k = 0; k < HC_MULT; ++k)
-                cm_vals[k] = cm_vals[k] * inv_rs + hc_sinkhorn_eps;
-#pragma unroll
-            for (uint32_t k = 0; k < HC_MULT; ++k)
-            {
-                float cs = cm_vals[k];
-                cs += __shfl_xor_sync(LANE_MASK, cs, 1);
-                cs += __shfl_xor_sync(LANE_MASK, cs, 2);
-                cm_vals[k] *= 1.0f / (cs + hc_sinkhorn_eps);
-            }
-            for (uint32_t it = 1; it < sinkhorn_repeat; ++it)
-            {
-                inv_rs = 1.0f / (cm_vals[0] + cm_vals[1] + cm_vals[2] + cm_vals[3] + hc_sinkhorn_eps);
+                float cm_vals[HC_MULT];
 #pragma unroll
                 for (uint32_t k = 0; k < HC_MULT; ++k)
-                    cm_vals[k] *= inv_rs;
+                    cm_vals[k] = y_row[2 * HC_MULT + lane_bf * HC_MULT + k] * rstd * s2
+                        + hc_base[2 * HC_MULT + lane_bf * HC_MULT + k];
+
+                constexpr unsigned LANE_MASK = (1u << HC_MULT) - 1;
+                float const rowMax = fmaxf(fmaxf(cm_vals[0], cm_vals[1]), fmaxf(cm_vals[2], cm_vals[3]));
+#pragma unroll
+                for (uint32_t k = 0; k < HC_MULT; ++k)
+                    cm_vals[k] = __expf(cm_vals[k] - rowMax);
+                // Reciprocal-multiply for sinkhorn: 1 fdiv + 4 fmul instead of 4
+                // fdivs per row-normalize. Equivalent under fp32 round-off.
+                float inv_rs = 1.0f / (cm_vals[0] + cm_vals[1] + cm_vals[2] + cm_vals[3]);
+#pragma unroll
+                for (uint32_t k = 0; k < HC_MULT; ++k)
+                    cm_vals[k] = cm_vals[k] * inv_rs + hc_sinkhorn_eps;
 #pragma unroll
                 for (uint32_t k = 0; k < HC_MULT; ++k)
                 {
@@ -1376,9 +1451,21 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
                     cs += __shfl_xor_sync(LANE_MASK, cs, 2);
                     cm_vals[k] *= 1.0f / (cs + hc_sinkhorn_eps);
                 }
-            }
-            if (warp_in_team == 0)
-            {
+                for (uint32_t it = 1; it < sinkhorn_repeat; ++it)
+                {
+                    inv_rs = 1.0f / (cm_vals[0] + cm_vals[1] + cm_vals[2] + cm_vals[3] + hc_sinkhorn_eps);
+#pragma unroll
+                    for (uint32_t k = 0; k < HC_MULT; ++k)
+                        cm_vals[k] *= inv_rs;
+#pragma unroll
+                    for (uint32_t k = 0; k < HC_MULT; ++k)
+                    {
+                        float cs = cm_vals[k];
+                        cs += __shfl_xor_sync(LANE_MASK, cs, 1);
+                        cs += __shfl_xor_sync(LANE_MASK, cs, 2);
+                        cm_vals[k] *= 1.0f / (cs + hc_sinkhorn_eps);
+                    }
+                }
                 float* cm_out_ptr = comb_mix_out + tok * HC_MULT2;
 #pragma unroll
                 for (uint32_t k = 0; k < HC_MULT; ++k)
@@ -1613,7 +1700,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
 #pragma unroll
             for (uint32_t h = h_start; h < H_VEC_END; h += H_STRIDE)
             {
-                uint4 li_raw = __ldg(reinterpret_cast<uint4 const*>(&obase[h]));
+                uint4 li_raw = ld_global_volatile_u128(reinterpret_cast<uint4 const*>(&obase[h]));
                 uint4 nw_raw = __ldg(reinterpret_cast<uint4 const*>(&nbase[h]));
                 __nv_bfloat162 const* li_pairs = reinterpret_cast<__nv_bfloat162 const*>(&li_raw);
                 __nv_bfloat162 const* nw_pairs = reinterpret_cast<__nv_bfloat162 const*>(&nw_raw);
@@ -1636,7 +1723,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
                 if (my_chunk < TAIL_CHUNKS)
                 {
                     const uint32_t h = H_VEC_END + my_chunk * BF16_VEC_LI;
-                    uint4 li_raw = __ldg(reinterpret_cast<uint4 const*>(&obase[h]));
+                    uint4 li_raw = ld_global_volatile_u128(reinterpret_cast<uint4 const*>(&obase[h]));
                     uint4 nw_raw = __ldg(reinterpret_cast<uint4 const*>(&nbase[h]));
                     __nv_bfloat162 const* li_pairs = reinterpret_cast<__nv_bfloat162 const*>(&li_raw);
                     __nv_bfloat162 const* nw_pairs = reinterpret_cast<__nv_bfloat162 const*>(&nw_raw);

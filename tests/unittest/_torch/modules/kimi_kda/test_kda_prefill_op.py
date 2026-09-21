@@ -11,6 +11,7 @@ import torch
 pytest.importorskip("fla")
 
 from fla.modules import ShortConvolution  # noqa: E402
+from kimi_kda_test_utils import KimiKDAReference, get_production_prefill_kernel_path
 
 from tensorrt_llm._torch.modules.kimi_kda import (
     KimiKDALinearAttention,  # noqa: E402
@@ -19,12 +20,9 @@ from tensorrt_llm._torch.modules.kimi_kda import (
 from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import (  # noqa: E402
     copy_kda_replay_conv_window,
     fused_kda_post_conv,
+    is_kda_optimized_supported,
 )
 from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn  # noqa: E402
-from tests.unittest._torch.modules.kimi_kda.kimi_kda_test_utils import (  # noqa: E402
-    KimiKDAReference,
-    get_production_prefill_kernel_path,
-)
 
 NUM_HEADS = 96
 HEAD_DIM = 128
@@ -33,12 +31,18 @@ HIDDEN_SIZE = 7168
 
 
 def _has_supported_gpu() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability(0) in {(10, 0), (10, 3)}
+    # Defer to the predicate the runtime actually dispatches on rather than
+    # restating its capability set. It accepts SM100/SM103 only; SM107 takes
+    # the FLA fallback in KDAKernelDispatch, so admitting it here would run
+    # these parity assertions against the unoptimized path.
+    if not torch.cuda.is_available():
+        return False
+    return is_kda_optimized_supported()
 
 
 pytestmark = pytest.mark.skipif(
     not _has_supported_gpu(),
-    reason="Kimi K3 is supported only on Blackwell (SM100/SM103)",
+    reason="KDA optimized prefill kernels require Blackwell SM100/SM103",
 )
 
 
@@ -128,7 +132,7 @@ def _run_production_prefill(
         state_indices=slot_indices.to(torch.int32),
         query_start_loc=cu_seqlens.to(torch.int32),
     )
-    output = attention.forward_prefill(
+    core = attention.forward_prefill(
         hidden_states.reshape(-1, HIDDEN_SIZE),
         cu_seqlens,
         metadata,
@@ -137,6 +141,7 @@ def _run_production_prefill(
         state_pool,
         slot_indices,
     )
+    output = attention._project_output(core)
     return output.reshape_as(hidden_states)
 
 

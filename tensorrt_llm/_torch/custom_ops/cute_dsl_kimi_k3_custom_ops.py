@@ -901,13 +901,17 @@ def _chunk_kda_fwd(
     # Varlen with non-aligned seq lengths is a separate problem (Phase 2):
     # multi-seq varlen can't be host-padded without repacking memory.
     real_T = T
-    needs_eqlen_pad = (not is_varlen) and (T % BT != 0)
+    CPB_BT = 4 * BT  # CHUNKS_PER_BLOCK * BT, the cgs_per_head divisibility unit
+    # The trigger is CPB_BT, not BT: the eqlen scheduler floors `cgs_per_head`
+    # and has no `chunk_idx < num_chunks` guard, so a BT-aligned T whose chunk
+    # count is not a multiple of CHUNKS_PER_BLOCK (T = 64, 128, 192, 320, ...)
+    # would silently drop its trailing chunks.
+    needs_eqlen_pad = (not is_varlen) and (T % CPB_BT != 0)
     if needs_eqlen_pad:
         if B != 1:
             raise NotImplementedError(
-                f"eqlen with B>1 and T % {BT} != 0 not supported (got B={B}, T={T})."
+                f"eqlen with B>1 and T % {CPB_BT} != 0 not supported (got B={B}, T={T})."
             )
-        CPB_BT = 4 * BT  # CHUNKS_PER_BLOCK * BT, the cgs_per_head divisibility unit
         T_padded = ((T + CPB_BT - 1) // CPB_BT) * CPB_BT
         # Pre-allocated padded scratch buffers (per (B,T_padded,H,K,dtype) cache
         # key). torch.cat would reallocate + copy the full 200MB q tensor every
@@ -1001,16 +1005,11 @@ def _chunk_kda_fwd(
         if chunk_indices is None:
             chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
         NT = len(chunk_indices)
-        if NT < 4:
-            # The persistent K123 scheduler launches NT // 4 cooperative
-            # groups per head; fewer than 4 total chunks produces a
-            # zero-size grid (DSLCudaRuntimeError at launch). Callers must
-            # route such batches to the FLA path — see
-            # KDAKernelDispatch.prefill_chunk_kda.
-            raise ValueError(
-                f"kda_prefill requires >= 4 total varlen chunks (got {NT}); "
-                "route small varlen batches to the FLA fallback"
-            )
+        # Any chunk count is launchable: the varlen scheduler rounds up
+        # (`total_cgs_per_head = ceil(num_chunks / CHUNKS_PER_BLOCK)`), launches
+        # the constant `NUM_SMS` grid, and guards every chunk loop with
+        # `chunk_idx < num_chunks`. Only eqlen needs divisibility, and it gets
+        # that from its own `CPB_BT` pad above.
         N_seqs = len(cu_seqlens) - 1
     else:
         NT = T // BT

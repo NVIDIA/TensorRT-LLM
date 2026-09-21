@@ -5,10 +5,9 @@ import os
 import subprocess  # nosec B404
 import sys
 import threading
+from pathlib import Path
 from subprocess import PIPE, Popen
 from typing import Literal
-
-cur_dir = os.path.dirname(os.path.abspath(__file__))
 
 import pytest
 
@@ -18,10 +17,6 @@ from tensorrt_llm.llmapi.mpi_session import (_DEFAULT_IDENTITY_TIMEOUT,
                                              RemoteMpiCommSessionClient,
                                              _identity_barrier_timeout,
                                              split_mpi_env)
-
-# isort: off
-sys.path.append(os.path.join(cur_dir, '..'))
-# isort: on
 
 
 def task0():
@@ -72,17 +67,35 @@ def run_client(server_addr, values_to_process, hmac_key: bytes):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("task_type", ["submit", "submit_sync"])
-def test_remote_mpi_session(task_type: Literal["submit", "submit_sync"]):
+@pytest.mark.parametrize("task_type", [
+    "submit", "submit_sync", "flashinfer_workspace",
+    "flashinfer_temporary_cleanup"
+])
+def test_remote_mpi_session(
+    task_type: Literal["submit", "submit_sync", "flashinfer_workspace",
+                       "flashinfer_temporary_cleanup"],
+    tmp_path: Path,
+) -> None:
     """Test RemoteMpiPoolSessionClient and RemoteMpiPoolSessionServer interaction"""
     cur_dir = os.path.dirname(os.path.abspath(__file__))
     test_file = os.path.join(cur_dir, "_test_remote_mpi_session.sh")
     assert os.path.exists(test_file), f"Test file {test_file} does not exist"
     command = ["bash", test_file, task_type]
     print(' '.join(command))
+    env = os.environ.copy()
+    if task_type == "flashinfer_workspace":
+        env["HOME"] = str(tmp_path)
+        env.pop("FLASHINFER_WORKSPACE_BASE", None)
+        env.pop("FLASHINFER_CUBIN_DIR", None)
+        env.pop("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", None)
+    elif task_type == "flashinfer_temporary_cleanup":
+        invalid_home = tmp_path / "home-file"
+        invalid_home.touch()
+        env["HOME"] = str(invalid_home)
+        env["TMPDIR"] = str(tmp_path)
 
     with Popen(command,
-               env=os.environ,
+               env=env,
                stdout=PIPE,
                stderr=PIPE,
                bufsize=1,
@@ -115,6 +128,9 @@ def test_remote_mpi_session(task_type: Literal["submit", "submit_sync"]):
 
         if return_code != 0:
             raise subprocess.CalledProcessError(return_code, command)
+
+    if task_type == "flashinfer_temporary_cleanup":
+        assert not list(tmp_path.glob("trtllm-flashinfer-rank-*"))
 
 
 def task1():
@@ -178,6 +194,149 @@ def test_llmapi_launch_multiple_tasks(task_script: str):
 
         if return_code != 0:
             raise subprocess.CalledProcessError(return_code, command)
+
+
+_LAUNCHER = (Path(__file__).parents[3] / "tensorrt_llm" / "llmapi" /
+             "trtllm-llmapi-launch")
+
+# Variables that would steer the launcher's workspace setup; each launcher test
+# starts from an environment without them and adds back only what it exercises.
+_LAUNCHER_ENV_SCRUB = (
+    "SLURM_NTASKS",
+    "SLURM_PROCID",
+    "OMPI_COMM_WORLD_SIZE",
+    "OMPI_COMM_WORLD_RANK",
+    "PMI_SIZE",
+    "PMI_ID",
+    "FLASHINFER_WORKSPACE_BASE",
+    "FLASHINFER_CUBIN_DIR",
+    "TRTLLM_FLASHINFER_WORKSPACE_MANAGED",
+    "TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS",
+)
+
+
+def _launcher_env(tmp_path: Path, home: str) -> dict:
+    """Environment for a rank-0 launcher-managed run of ``trtllm-llmapi-launch``.
+
+    ``python3`` and ``openssl`` are stubbed so the launcher can hand out an IPC
+    address and an HMAC key without importing tensorrt_llm; the stubbed
+    ``python3 -S`` used for the workspace lock exits 0, so the persistent slot
+    is treated as acquired.
+    """
+    stub_bin = tmp_path / "bin"
+    stub_bin.mkdir(exist_ok=True)
+    python_stub = stub_bin / "python3"
+    python_stub.write_text("#!/bin/sh\n"
+                           "if [ \"$1\" = \"-c\" ]; then\n"
+                           "    echo ipc:///tmp/trtllm-pmi-workspace-test\n"
+                           "fi\n")
+    python_stub.chmod(0o755)
+    openssl_stub = stub_bin / "openssl"
+    openssl_stub.write_text("#!/bin/sh\nprintf '%064d\\n' 0\n")
+    openssl_stub.chmod(0o755)
+
+    env = os.environ.copy()
+    for name in _LAUNCHER_ENV_SCRUB:
+        env.pop(name, None)
+    env["PMI_RANK"] = "0"
+    env["HOME"] = home
+    env["PATH"] = f"{stub_bin}{os.pathsep}{env['PATH']}"
+    return env
+
+
+def _run_launcher_env(env: dict) -> subprocess.CompletedProcess:
+    return subprocess.run(  # nosec B603
+        ["bash", str(_LAUNCHER), "/usr/bin/env"],
+        check=True,
+        capture_output=True,
+        env=env,
+        text=True,
+        timeout=10,
+    )
+
+
+@pytest.mark.cpu_only
+def test_llmapi_launch_isolates_pmi_rank_without_size(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    env = _launcher_env(tmp_path, str(home))
+
+    result = _run_launcher_env(env)
+
+    workspace = home / ".cache" / "tensorrt_llm" / "flashinfer" / "rank-0"
+    assert f"FLASHINFER_WORKSPACE_BASE={workspace}" in result.stdout
+    assert "TRTLLM_FLASHINFER_WORKSPACE_MANAGED=1" in result.stdout
+    # The artifact cache must follow the per-rank workspace, so the launcher
+    # must not pin FLASHINFER_CUBIN_DIR to a shared directory.
+    assert "FLASHINFER_CUBIN_DIR=" not in result.stdout
+
+
+@pytest.mark.cpu_only
+def test_llmapi_launch_preserves_explicit_cubin_dir(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    shared = tmp_path / "shared-cubins"
+    env = _launcher_env(tmp_path, str(home))
+    env["FLASHINFER_CUBIN_DIR"] = str(shared)
+
+    result = _run_launcher_env(env)
+
+    workspace = home / ".cache" / "tensorrt_llm" / "flashinfer" / "rank-0"
+    assert f"FLASHINFER_WORKSPACE_BASE={workspace}" in result.stdout
+    lines = [
+        line for line in result.stdout.splitlines()
+        if line.startswith("FLASHINFER_CUBIN_DIR=")
+    ]
+    assert lines == [f"FLASHINFER_CUBIN_DIR={shared}"]
+
+
+@pytest.mark.cpu_only
+def test_llmapi_launch_temporary_fallback_leaves_cubin_dir_unset(
+        tmp_path: Path) -> None:
+    # A regular file as HOME makes the persistent workspace root impossible to
+    # create, which sends the launcher down the temporary-workspace fallback.
+    invalid_home = tmp_path / "home-file"
+    invalid_home.touch()
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+    env = _launcher_env(tmp_path, str(invalid_home))
+    env["TMPDIR"] = str(tmpdir)
+
+    result = _run_launcher_env(env)
+
+    prefix = f"FLASHINFER_WORKSPACE_BASE={tmpdir}/trtllm-flashinfer-rank-0."
+    assert any(line.startswith(prefix)
+               for line in result.stdout.splitlines()), result.stdout
+    assert "TRTLLM_FLASHINFER_WORKSPACE_MANAGED=1" in result.stdout
+    assert "FLASHINFER_CUBIN_DIR=" not in result.stdout
+    assert "temporary FlashInfer JIT workspace" in result.stderr
+    # The fallback workspace, artifacts included, is removed at exit.
+    assert list(tmpdir.iterdir()) == []
+
+
+@pytest.mark.cpu_only
+def test_llmapi_launch_aborts_when_no_workspace_is_available(
+        tmp_path: Path) -> None:
+    env = os.environ.copy()
+    for name in _LAUNCHER_ENV_SCRUB:
+        env.pop(name, None)
+    env["PMI_RANK"] = "0"
+    env["HOME"] = ""
+    env["TMPDIR"] = str(tmp_path / "missing")
+
+    result = subprocess.run(  # nosec B603
+        ["/bin/bash", str(_LAUNCHER), "/usr/bin/true"],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 1
+    assert (
+        "Failed to create a temporary FlashInfer JIT workspace; aborting launch"
+        in result.stderr)
 
 
 # ---- wait_shutdown: shutdown blocks until worker processes actually exit ----

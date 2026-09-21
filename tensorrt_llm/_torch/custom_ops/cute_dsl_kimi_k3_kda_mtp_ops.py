@@ -265,6 +265,24 @@ def _require_stride_layout(
         raise ValueError(
             f"Expected recurrent_state shape [pool, {HV}, {V}, {K}] (V-first pool layout)."
         )
+    if recurrent_state.dtype != torch.float32:
+        # This kernel generation reads and writes the state pool as fp32. A
+        # bf16 pool (kv_cache_config.mamba_ssm_cache_dtype=bfloat16) is staged
+        # to fp32 for prefill and single-token decode, but the fused verify
+        # path updates the pool rows in place through ssm_state_indices and has
+        # no staging, so reject it here instead of reinterpreting the bytes.
+        # bf16 acceptance is a property of the tensor-core (tcgen05) kernel
+        # formulation, not a dtype switch: it derives the TMA box geometry from
+        # the element width (64 vs 32 state columns per 128 B row) and skips the
+        # hi/lo tf32 split GEMM that an fp32 state needs. This kernel generation
+        # is register-resident with no TMA or tcgen05 path to attach that to.
+        raise ValueError(
+            "kda_mtp_decode requires an fp32 recurrent_state pool; got "
+            f"{recurrent_state.dtype}. A bf16 KDA state pool is not supported "
+            "together with fused KDA MTP verify; set "
+            "kv_cache_config.mamba_ssm_cache_dtype=float32 (the Kimi K3 "
+            "default) to run speculative decoding."
+        )
     if qkg_cache.ndim != 4 or qkg_cache.shape[1:] != (num_spec, 3, H * K):
         raise ValueError(f"Expected qkg_cache shape [pool, {num_spec}, 3, {H * K}].")
     if v_cache.ndim != 3 or v_cache.shape[1:] != (num_spec, HV * V):
@@ -460,6 +478,8 @@ def kda_mtp_decode_impl(
         out = torch.zeros(1, T_total, HV, V_dim, dtype=x_q.dtype, device=x_q.device)
     if num_accepted_tokens.dtype != torch.int32:
         num_accepted_tokens = num_accepted_tokens.to(torch.int32)
+    if ssm_state_indices.data_ptr() % 16 != 0:
+        raise ValueError("ssm_state_indices must be 16-byte aligned before CuTe DLPack conversion")
 
     _require_stride_layout(
         x_q=x_q,

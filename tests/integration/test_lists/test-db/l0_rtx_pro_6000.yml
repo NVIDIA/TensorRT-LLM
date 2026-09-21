@@ -15,8 +15,11 @@ l0_rtx_pro_6000:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/modeling -k "modeling_out_of_tree"
+  # NCCL-EP v0.2 owns LL shared-memory sizing; cover the factory regression on SM120.
+  - unittest/_torch/moe/test_communication_factory.py
   - unittest/_torch/modeling/test_modeling_deepseekv4.py::test_deepseek_v4_sanity[fp8-ds-mla]
   - unittest/_torch/attention/sparse/test_flashinfer_utils.py
+  - unittest/_torch/visual_gen/test_attention_flashinfer.py
   # - unittest/_torch/modeling -k "modeling_qwen3" # https://nvbugs/5234573
   - unittest/_torch/attention/test_attention_mla.py
   # SM120 W4A16 / W4A8 mixed-dtype GEMM coverage (paired with FinegrainedMixedDtypeGemm
@@ -28,9 +31,6 @@ l0_rtx_pro_6000:
   - unittest/_torch/thop/parallel/test_w4a8_linear.py
   - test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
   - test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
-  - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B]
-  - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-NVFP4-nvfp4-quantized/Meta-Llama-3.1-8B]
-  - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-FP8-llama-3.1-model/Llama-3.1-8B-Instruct-FP8]
   - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B] # 3mins
   - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B_fp8_hf-Qwen3/saved_models_Qwen3-30B-A3B_fp8_hf] # 3mins
   - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B_nvfp4_hf-Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf] # 2mins

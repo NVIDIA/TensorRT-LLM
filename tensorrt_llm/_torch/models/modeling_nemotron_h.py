@@ -35,10 +35,10 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo  # noqa: E402
 
-from ..attention_backend import AttentionMetadata
+from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.linear import (Linear, NVFP4LinearMethod, TensorParallelMode,
@@ -47,7 +47,7 @@ from ..modules.mamba.mamba2_mixer import Mamba2Mixer
 from ..modules.mlp import MLP
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
-from ..moe.fused_moe import MoEWeightLoadingMode, create_moe
+from ..moe.fused_moe import MoEWeightLoadingMode, SimpleActivation, create_moe
 from ..moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from ..moe.fused_moe.quantization import (NVFP4CutlassFusedMoEMethod,
                                           W4A16NVFP4CutlassFusedMoEMethod)
@@ -177,7 +177,7 @@ class NemotronHMOE(nn.Module):
         # Import here to avoid circular dependency.
         from .modeling_deepseekv3 import DeepseekV3Gate
 
-        self.activation_type = ActivationType.Relu2
+        self.moe_activation = SimpleActivation(kind=ActivationType.Relu2)
         self.reduce_results = False
 
         config = model_config.pretrained_config
@@ -259,6 +259,21 @@ class NemotronHMOE(nn.Module):
                     override_quant_config = cfg
                     break
 
+        # Last, so it overrides the per-layer entry above: an override is
+        # authoritative over anything __post_init__ wrote, so this stands in
+        # for both quantization passes and exclusion runs second. Otherwise an
+        # excluded layer keeps the per-layer format and loads quantized weights
+        # the checkpoint left in bf16. No trailing dot -- unlike the weight-form
+        # keys above, exclusion matches module names.
+        from tensorrt_llm.models.modeling_utils import QuantConfig
+
+        global_quant_config = model_config.quant_config
+        if (global_quant_config is not None
+                and global_quant_config.is_module_excluded_from_quantization(
+                    f"model.layers.{layer_idx}.mixer.experts")):
+            override_quant_config = QuantConfig(
+                kv_cache_quant_algo=global_quant_config.kv_cache_quant_algo)
+
         # Setup MoE experts.
         self.experts = create_moe(
             routing_method=self.gate.routing_method,
@@ -273,7 +288,7 @@ class NemotronHMOE(nn.Module):
             layer_idx=self.layer_idx,
             weight_loading_mode=MoEWeightLoadingMode.VANILLA,
             bias=self.mlp_bias,
-            activation_type=self.activation_type,
+            activation=self.moe_activation,
         )
 
         if reduce_output:
@@ -888,6 +903,13 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
                 re.sub(r"(model\.layers\.)?backbone", "model", k)
                 for k in model_config.quant_config.exclude_modules
             ]
+        else:
+            model_config.quant_config.exclude_modules = []
+        # Depthwise conv1d is stored in a Linear for TP, but it is not a GEMM.
+        # NVFP4 groups along in_features (d_conv, typically 4), which is not
+        # divisible by the block size of 16, so keep this Linear unquantized.
+        if "*.mixer.conv1d" not in model_config.quant_config.exclude_modules:
+            model_config.quant_config.exclude_modules.append("*.mixer.conv1d")
 
         # Rename quant_config_dict keys from 'backbone.layers.' to 'model.layers.' so that
         # apply_layerwise_quant_config() can correctly match TRT-LLM module names, which use
