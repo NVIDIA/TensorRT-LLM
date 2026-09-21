@@ -183,21 +183,6 @@ def _get_mnnvl_workspace_comm(mapping: Mapping):
         mapping.tp_rank)
 
 
-def _mnnvl_workspace_barrier(comm) -> None:
-    """Barrier over the communicator returned by _get_mnnvl_workspace_comm."""
-    if mpi_disabled():
-        # MNNVL workspaces are created while models may be under MetaInitMode.
-        # The public ProcessGroup barrier is a c10d operator, so MetaInitMode
-        # intercepts and rejects it before the collective reaches Gloo.  Ray
-        # initializes the TP ProcessGroup with ``cuda:nccl,cpu:gloo``; call its
-        # CPU backend directly to keep this host-only setup barrier outside the
-        # tensor dispatcher.
-        work = comm._get_backend(torch.device("cpu")).barrier()
-        work.wait()
-    else:
-        comm.Barrier()
-
-
 def _mnnvl_device_index(mapping: Mapping) -> int:
     """CUDA device index backing this rank's MNNVL buffers.
 
@@ -245,8 +230,11 @@ def _mnnvl_workspace_all_succeeded(comm, local_success: bool) -> bool:
     """
     if mpi_disabled():
         flag = torch.tensor([1 if local_success else 0], dtype=torch.int32)
-        # Reduce on the CPU backend rather than through torch.distributed, for the same reason
-        # _mnnvl_workspace_barrier does: workspaces are built while the model is under MetaInitMode.
+        # Reach the CPU backend directly rather than going through torch.distributed: the public
+        # collectives are c10d operators, and workspaces are set up while the model is still under
+        # MetaInitMode, which redirects their dispatched at::empty to the meta device and then
+        # rejects the operator. Ray builds the TP group with ``cuda:nccl,cpu:gloo``, so a CPU
+        # backend is always there.
         work = comm._get_backend(torch.device("cpu")).allreduce([flag])
         work.wait()
         return int(flag.item()) == _mnnvl_workspace_size(comm)

@@ -26,8 +26,43 @@ import pytest
 from tensorrt_llm._torch.distributed import ops
 
 
+class _FakeWork:
+    def __init__(self):
+        self.waits = 0
+
+    def wait(self):
+        self.waits += 1
+
+
+class _FakeBackend:
+    def __init__(self, group_size):
+        self.group_size = group_size
+        self.allreduces = 0
+        self.work = _FakeWork()
+
+    def allreduce(self, tensors):
+        self.allreduces += 1
+        # Stand in for the peers by having every rank report what this one did.
+        for tensor in tensors:
+            tensor.mul_(self.group_size)
+        return self.work
+
+
 class _FakeProcessGroup:
-    pass
+    """Records the backend lookups the workspace collectives make."""
+
+    GROUP_SIZE = 4
+
+    def __init__(self):
+        self.backend = _FakeBackend(self.GROUP_SIZE)
+        self.requested_devices = []
+
+    def size(self):
+        return self.GROUP_SIZE
+
+    def _get_backend(self, device):
+        self.requested_devices.append(device)
+        return self.backend
 
 
 class _FakeMapping:
@@ -93,29 +128,52 @@ def test_workspace_comm_splits_mpi_comm_by_tp_rank(mpi_mode, monkeypatch):
     assert recorded == {"color": 0, "key": mapping.tp_rank}
 
 
-def test_barrier_uses_process_group_under_ray(ray_mode, monkeypatch):
-    pg = _FakeProcessGroup()
-    seen = {}
+def test_convergence_uses_process_group_cpu_backend_under_ray(ray_mode, monkeypatch):
+    """Convergence must reach the group's CPU backend without going through the dispatcher.
 
+    torch.distributed's collectives are c10d operators that build their tensors with at::empty.
+    Workspaces are set up while the model is still under MetaInitMode, which redirects that
+    allocation to the meta device and then rejects the operator with MetaInitException.
+    """
     monkeypatch.setattr(
-        ops.torch.distributed, "barrier", lambda group: seen.setdefault("group", group)
+        ops.torch.distributed,
+        "all_reduce",
+        lambda *args, **kwargs: pytest.fail(
+            "workspace convergence must not use the dispatched torch.distributed.all_reduce"
+        ),
     )
 
-    ops._mnnvl_workspace_barrier(pg)
-    assert seen["group"] is pg
+    pg = _FakeProcessGroup()
+    assert ops._mnnvl_workspace_all_succeeded(pg, True)
+
+    assert pg.requested_devices == [ops.torch.device("cpu")]
+    assert pg.backend.allreduces == 1
+    # The reduction is what fences the handle exchange, so it has to be waited on, not just issued.
+    assert pg.backend.work.waits == 1
 
 
-def test_barrier_uses_mpi_comm_under_mpi(mpi_mode):
+def test_convergence_reports_a_failed_rank_under_ray(ray_mode):
+    """One rank failing has to be visible to all of them, not just to itself."""
+    pg = _FakeProcessGroup()
+    assert not ops._mnnvl_workspace_all_succeeded(pg, False)
+
+
+def test_convergence_uses_mpi_comm_under_mpi(mpi_mode):
     class _FakeMpiComm:
         def __init__(self):
-            self.barriers = 0
+            self.reduced = []
 
-        def Barrier(self):
-            self.barriers += 1
+        def allreduce(self, value):
+            self.reduced.append(value)
+            return value * 4
+
+        def Get_size(self):
+            return 4
 
     comm = _FakeMpiComm()
-    ops._mnnvl_workspace_barrier(comm)
-    assert comm.barriers == 1
+    assert ops._mnnvl_workspace_all_succeeded(comm, True)
+    assert comm.reduced == [1]
+    assert not ops._mnnvl_workspace_all_succeeded(comm, False)
 
 
 def test_mcast_buffer_receives_process_group_under_ray(ray_mode, monkeypatch):
