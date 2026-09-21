@@ -74,7 +74,6 @@ ARTIFACTORY_CREDENTIALS_ID = "trtllm-artifactory-credentials"
 DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.08-py3"
 
 MODEL_EXPRESS_VERSION = "0.5.1"
-MODEL_EXPRESS_NIXL_VERSION = "1.4.0"
 MODEL_EXPRESS_SERVER_IMAGE = "urm.nvidia.com/docker/nvidia/ai-dynamo/modelexpress-server:${MODEL_EXPRESS_VERSION}"
 MODEL_EXPRESS_REDIS_IMAGE = "urm.nvidia.com/docker/redis:7-alpine"
 
@@ -5132,13 +5131,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
             }
             if (stageName.contains("-ModelExpress-")) {
+                // The wheel goes in with --no-deps above, so its `mx` extra never
+                // applies. nixl comes from the image (install_nixl.sh).
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install modelexpress==${MODEL_EXPRESS_VERSION}")
-                // ModelExpress imports nixl._api, while requirements-dev.txt
-                // installs only the nixl-cu13 backend. Install the matching
-                // namespace shim without pulling the unused CUDA 12 backend. The
-                // shim only dispatches; which nixl_cu13 it resolves to is decided
-                // by the PYTHONPATH runLLMTestlistOnPlatform sets for this stage.
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install --no-deps nixl==${MODEL_EXPRESS_NIXL_VERSION}")
             }
         }
 
@@ -5557,41 +5552,17 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", boolean isFinalAttempt=true, Map retryContext=null, boolean useClusterDurations=false)
 {
     cacheErrorAndUploadResult(stageName, {
-        // Open MPI 5 fails a singleton MPI_Comm_spawn -- one per MpiPoolSession
-        // worker -- when the hostname PMIx is handed is too long for MPI, despite
-        // being a perfectly valid hostname: the generated singleton ID
-        // "singleton.{hostname}.{pid}.{rank}" has to fit a 50-byte buffer, so how
-        // long a hostname is too long depends on the system-assigned pid. Our pod
-        // names are 63 characters, well past any of it. PMIX_HOSTNAME replaces only
-        // the name PMIx uses, so the pod keeps its own for logging and for port
-        // sectioning in getHostNodeName().
-        // Not inside runLLMTestlistOnPlatformImpl: the SLURM path runs that too, on
-        // the compute node, where one name shared by every node would break locality.
-        // PRRTE also refuses to fork its DVM as root without the ALLOW_RUN_AS_ROOT
-        // pair (Open MPI 4 only checked that in mpirun). An outer `mpirun
-        // --allow-run-as-root` does not cover the DVM a nested MPI_Comm_spawn
-        // starts, so test_mpi_session's spawn dies with MPI_ERR_UNKNOWN.
+        // PMIx builds a singleton ID, singleton.{hostname}.{pid}, that must fit a
+        // 50-byte buffer; our 63-character pod names overflow it and every
+        // MpiPoolSession spawn fails. PMIX_HOSTNAME replaces only the name PMIx
+        // sees, so the pod keeps its own for logging and for port sectioning in
+        // getHostNodeName(). Kept out of runLLMTestlistOnPlatformImpl: the SLURM
+        // path runs that on the compute node, where one shared name would break
+        // locality. The ALLOW_RUN_AS_ROOT pair now comes from the image
+        // (Dockerfile.multi); only the bare-metal sanity stages still set it.
         def testEnv = [
-            "OMPI_ALLOW_RUN_AS_ROOT=1",
-            "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1",
-            "PRTE_ALLOW_RUN_AS_ROOT=1",
-            "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1",
             "PMIX_HOSTNAME=mpi-node0",
         ]
-        // The NGC 26.08 torch links HPCX's UCX directly (libtorch_cuda.so lists
-        // libucp/libucs/libucc as NEEDED), so plain `import torch` already maps
-        // /opt/hpcx/ucx into the process. The PyPI nixl-cu13 wheel then loads the
-        // second UCX it bundles -- auditwheel renamed those sonames, so nothing
-        // dedups them -- and two UCX runtimes registering ucm hooks in one process
-        // segfault inside uct_md_query_tl_resources. Resolve nixl_cu13 to the
-        // build in the image instead: it links the container UCX, leaving exactly
-        // one stack loaded. Ahead of site-packages, so the PyPI wheel can stay
-        // installed for everything else. Prepended, not overwritten, so whatever
-        // PYTHONPATH the environment already carries survives.
-        if (stageName.contains("-ModelExpress-")) {
-            def nixlPythonPath = "/opt/nvidia/nvda_nixl/lib/python3/dist-packages"
-            testEnv += "PYTHONPATH=" + (env.PYTHONPATH ? "${nixlPythonPath}:${env.PYTHONPATH}" : nixlPythonPath)
-        }
         withEnv(testEnv) {
             runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag, useClusterDurations)
         }
@@ -6489,6 +6460,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B200-8_GPUs-PyTorch-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-4": ["auto:dgx-b200-flex", "l0_dgx_b200", 4, 4, 8, 1, true],
+        // M3 CTX TP2/EP2 -> GEN TP4/EP1 C++ NIXL bounce accuracy (6 GPUs).
+        "DGX_B200-6_GPUs-PyTorch-M3-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200_m3_6gpu", 1, 1, 6, 1, true],
         "DGX_B200-8_GPUs-PyTorch-Ray-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
         // Disabled while https://nvbugs/6759612 is open. The verl_setup fixture clones verl and
         // pip-installs it; verl hard-pins numpy<2.0.0, which is mutually exclusive with the
@@ -6663,6 +6636,24 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         20,
         5
     )
+    // gen_only_no_context: gen1 (2 nodes, 8 GPUs), no ctx fleet = 8 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-GEN1-NODE2-GPU8-Post-Merge",
+        "auto:gb200-flex",
+        "l0_gb200_multi_nodes_perf_sanity_gen1_node2_gpu8",
+        3,
+        8,
+        2
+    )
+    // gen_only_no_context: gen1 (4 nodes, 16 GPUs), no ctx fleet = 16 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB200-16_GPUs-4_Nodes-PyTorch-PerfSanity-GEN1-NODE4-GPU16-Post-Merge",
+        "auto:gb200-flex",
+        "l0_gb200_multi_nodes_perf_sanity_gen1_node4_gpu16",
+        1,
+        16,
+        4
+    )
     // GB300 PerfSanity post-merge aggregated
     // 2 Nodes
     multiNodesSBSAConfigs += buildStageConfigs(
@@ -6746,6 +6737,33 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         3,
         56,
         14
+    )
+    // gen_only_no_context: gen1 (2 nodes, 8 GPUs), no ctx fleet = 8 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-8_GPUs-2_Nodes-PyTorch-PerfSanity-GEN1-NODE2-GPU8-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_gen1_node2_gpu8",
+        5,
+        8,
+        2
+    )
+    // gen_only_no_context: gen1 (4 nodes, 16 GPUs), no ctx fleet = 16 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-16_GPUs-4_Nodes-PyTorch-PerfSanity-GEN1-NODE4-GPU16-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_gen1_node4_gpu16",
+        2,
+        16,
+        4
+    )
+    // gen_only_no_context: gen1 (8 nodes, 32 GPUs), no ctx fleet = 32 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-32_GPUs-8_Nodes-PyTorch-PerfSanity-GEN1-NODE8-GPU32-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_gen1_node8_gpu32",
+        2,
+        32,
+        8
     )
     // Nemotron-Ultra-V3 8k64k con1: ctx1 (1 node, 4 GPUs) + gen1 tep4 (1 node, 4 GPUs) = 8 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(

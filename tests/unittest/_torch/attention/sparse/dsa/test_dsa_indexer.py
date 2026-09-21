@@ -57,7 +57,7 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import (
 from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
     transform_local_topk_and_prepare_pool_view_grouped,
 )
-from tensorrt_llm._torch.attention.backends.sparse.dsa.params import use_self_sampling_gvr
+from tensorrt_llm._torch.attention.backends.sparse.params import use_self_sampling_gvr
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation

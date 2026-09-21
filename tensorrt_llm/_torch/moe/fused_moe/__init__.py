@@ -7,6 +7,8 @@ from .create_moe import (MoEImplClass, create_moe, resolve_moe_cls,
                          resolve_moe_impl)
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+from .fused_moe_cute_dsl_fc12 import (CuteDslFc12FusedMoE,
+                                      TrtllmCutedslFusedFc12Nvfp4Impl)
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_marlin import MarlinFusedMoE
 from .fused_moe_triton import TritonFusedMoE
@@ -46,6 +48,8 @@ __all__ = [
     "SwigluActivation",
     "SwigluBiasActivation",
     "CuteDslB12xFusedMoE",
+    "CuteDslFc12FusedMoE",
+    "TrtllmCutedslFusedFc12Nvfp4Impl",
     "CuteDslFusedMoE",
     "CutlassFusedMoE",
     "DeepSeekV3MoeRoutingMethod",
