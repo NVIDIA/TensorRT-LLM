@@ -265,7 +265,7 @@ class TestSplitGpuBudgetForDraft:
         assert target_kv_config.max_attention_window == [16384]
         assert get_manager_cls.call_args.args[1] is draft_kv_config
 
-    def test_target_cost_uses_derived_layer_type_windows(self) -> None:
+    def test_target_cost_uses_derived_layer_type_windows(self, mocker) -> None:
         """A target with a mixed sliding/full `layer_types` schedule on
         KVCacheManagerV2 is costed from the same derived per-layer windows
         `_create_kv_cache_manager` builds it with: its three sliding layers
@@ -297,6 +297,7 @@ class TestSplitGpuBudgetForDraft:
             """A one-layer full-attention draft head without window metadata."""
 
             quant_config = None
+            sparse_attention_config = None
             pretrained_config = SimpleNamespace(
                 num_hidden_layers=1,
                 hidden_size=1024,
@@ -337,6 +338,12 @@ class TestSplitGpuBudgetForDraft:
         creator._max_seq_len = 16384
         creator._max_batch_size = max_batch_size
         creator._max_num_tokens = 128
+        # The separate-draft arm of _get_draft_cache_cost resolves the draft
+        # manager class through get_kv_cache_manager_cls and the V2 fallback
+        # gate, which read these fields off the creator.
+        creator._max_beam_width = 1
+        creator._kv_connector_manager = None
+        creator._cache_transceiver_config = None
         creator._mapping = Mock(enable_attention_dp=False, tp_size=1)
         creator._mapping.pp_layers.return_value = [0, 1, 2, 3]
         creator._mapping.is_last_pp_rank.return_value = True
@@ -360,6 +367,12 @@ class TestSplitGpuBudgetForDraft:
         creator._should_create_separate_draft_kv_cache = Mock(return_value=True)
         creator._get_effective_draft_config = Mock(return_value=draft_model_config)
         creator._get_num_draft_layers = Mock(return_value=1)
+        # Route the draft manager back to the recording class so the draft
+        # windows it is costed with are captured alongside the target's.
+        mocker.patch(
+            "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",
+            return_value=RecordingKVCacheManager,
+        )
 
         target_kv, draft_kv = creator._get_target_and_draft_cache_costs()
 
