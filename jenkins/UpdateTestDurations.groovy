@@ -305,8 +305,14 @@ pipeline {
                                     trackedPaths << clusterDurationPath
                                 }
 
+                                // Stage before diffing: `git diff --name-only` only compares
+                                // tracked paths against HEAD and misses untracked files, so a
+                                // brand-new per-cluster file (no prior baseline) would otherwise
+                                // be invisible and the pipeline would skip committing it.
+                                sh "cd ${LLM_ROOT} && git add ${trackedPaths.join(' ')}"
+
                                 def changeCount = sh(
-                                    script: "cd ${LLM_ROOT} && git diff --name-only ${trackedPaths.join(' ')} | wc -l",
+                                    script: "cd ${LLM_ROOT} && git diff --cached --name-only -- ${trackedPaths.join(' ')} | wc -l",
                                     returnStdout: true).trim()
                                 echo "Changed duration-file count: ${changeCount}"
                                 if (changeCount == "0") {
@@ -316,7 +322,6 @@ pipeline {
 
                                 sh """
                                     cd ${LLM_ROOT}
-                                    git add ${trackedPaths.join(' ')}
                                     git commit -s -m "[None][infra] Auto-update test durations from OpenSearch (last ${params.DAYS} days)"
                                 """
 
