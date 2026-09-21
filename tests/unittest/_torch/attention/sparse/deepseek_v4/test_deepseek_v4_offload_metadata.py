@@ -63,8 +63,13 @@ class _SparseRuntime:
         return self.converters[layer_id]
 
     def get_mem_pool_base_address(self, layer_id, role, index_mode):
-        assert index_mode == PageIndexMode.SHARED
+        if index_mode == PageIndexMode.SHARED:
+            return self.pool_bases[layer_id] + self.converters[layer_id].layer_offset * 4096
+        assert index_mode == PageIndexMode.PER_LAYER
         return self.pool_bases[layer_id]
+
+    def get_page_index_upper_bound(self, layer_id, role):
+        return 320 - self.converters[layer_id].layer_offset
 
     def copy_base_page_indices_to_device(self, kv_caches, layer_group_id, out, stream):
         assert stream == torch.cuda.current_stream().cuda_stream
@@ -82,6 +87,10 @@ class _SparseRuntime:
 def _manager(tokens_per_block=128):
     manager = object.__new__(DeepseekV4CacheManager)
     manager._enable_kv_cache_offload = True
+    manager.enable_block_reuse = False
+    manager.kv_compression_manages_history = False
+    manager._has_cp_helix = False
+    manager.is_draft = False
     manager._use_nvfp4_compress = False
     manager.use_fp8_ds_mla = False
     manager.pp_layers = [2, 3, 4]

@@ -55,6 +55,8 @@ def _deepseek_v4_local_to_global_kernel(
     out_extra_stride1,
     SPLIT_EXTRA: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
+    active_request_count_ptr,
+    MASK_DECODE_PADDING: tl.constexpr,
 ):
     """
     Triton kernel for converting local indices to global KV cache pool indices.
@@ -92,6 +94,10 @@ def _deepseek_v4_local_to_global_kernel(
 
     # Load request ID for this token
     req = tl.load(req_id_ptr + token_id)
+    live = True
+    if MASK_DECODE_PADDING:
+        active = tl.load(active_request_count_ptr)
+        live = (token_id < active) & (req >= 0) & (req < active)
 
     # Load all SWA local indices for this token
     swa_ids = tl.arange(0, num_swa_indices)
@@ -103,7 +109,7 @@ def _deepseek_v4_local_to_global_kernel(
     swa_block_ordinal = swa_local_idx // tokens_per_block_swa
     swa_token_in_block = swa_local_idx % tokens_per_block_swa
     swa_valid_block = swa_block_ordinal < max_blocks_swa
-    swa_full_mask = swa_valid_mask & swa_valid_block
+    swa_full_mask = live & swa_valid_mask & swa_valid_block
 
     swa_bt_ptr = block_table_swa_ptr + req * bt_swa_stride0 + swa_block_ordinal * bt_swa_stride1
     swa_page_index = tl.load(swa_bt_ptr, mask=swa_full_mask, other=0)
@@ -133,7 +139,7 @@ def _deepseek_v4_local_to_global_kernel(
         compressed_block_ordinal = compressed_local_idx // tokens_per_block_compressed
         compressed_token_in_block = compressed_local_idx % tokens_per_block_compressed
         compressed_valid_block = compressed_block_ordinal < max_blocks_compressed
-        compressed_full_mask = compressed_valid_mask & compressed_valid_block
+        compressed_full_mask = live & compressed_valid_mask & compressed_valid_block
 
         compressed_bt_ptr = (
             block_table_compressed_ptr
@@ -191,6 +197,7 @@ def deepseek_v4_local_to_global_indices(
     dequant_scale_kv: torch.Tensor | None = None,
     host_bmm1_scale: float = 1.0,
     split_extra: bool = False,
+    active_request_count: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
     """
     Convert local token indices to global KV cache pool indices.
@@ -223,6 +230,9 @@ def deepseek_v4_local_to_global_indices(
         num_compressed_indices: Max number of compressed indices for CUDA graph compatibility
             Output width = num_swa_indices + num_compressed_indices.
         split_extra: Return separate SWA and compressed index tensors.
+        active_request_count: Optional CUDA int32 [1] live prefix for single-token
+            decode. Mask both pools for padded queries without reading their
+            page-table rows. Do not pass this for multi-query context inputs.
 
     Returns:
         A combined index tensor, or separate SWA and compressed tensors when
@@ -238,6 +248,10 @@ def deepseek_v4_local_to_global_indices(
 
     num_tokens = req_id.shape[0]
     num_swa_indices = swa_local_indices.shape[1]
+    if active_request_count is not None:
+        _check_sparse_offload_tensor(active_request_count, "active_request_count", 1, req_id.device)
+        if active_request_count.shape != (1,):
+            raise ValueError("active_request_count must be [1]")
 
     assert swa_local_indices.shape[0] == num_tokens
 
@@ -381,6 +395,8 @@ def deepseek_v4_local_to_global_indices(
         out_extra_stride1=out_extra_stride1,
         SPLIT_EXTRA=split_extra,
         LAUNCH_WITH_PDL=launch_with_pdl,
+        active_request_count_ptr=active_request_count,
+        MASK_DECODE_PADDING=active_request_count is not None,
         launch_pdl=launch_with_pdl,
     )
 
@@ -631,6 +647,120 @@ def merge_sparse_read_table(
             MAX_BLOCKS=max_blocks,
             FETCHED_PAGE_SCALE=fetched_page_scale,
             BLOCK=256,
+        )
+
+
+@triton.jit
+def _check_sparse_read_table_kernel(
+    topk_ptr,
+    requests_ptr,
+    active_ptr,
+    lengths_ptr,
+    read_ptr,
+    valid_ptr,
+    topk_stride0,
+    topk_stride1,
+    requests_stride,
+    lengths_stride,
+    read_stride0,
+    read_stride1,
+    NUM_REQUESTS: tl.constexpr,
+    NUM_QUERIES: tl.constexpr,
+    TOPK: tl.constexpr,
+    MAX_BLOCKS: tl.constexpr,
+    TOKENS_PER_PAGE: tl.constexpr,
+    PAGE_BOUND: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    query = tl.program_id(0)
+    active = tl.load(active_ptr)
+    live = query < active
+    req = tl.load(requests_ptr + query * requests_stride)
+    request_ok = (req >= 0) & (req < active) & (req < NUM_REQUESTS)
+    length = tl.load(lengths_ptr + req * lengths_stride, mask=live & request_ok, other=0)
+    k = tl.arange(0, BLOCK_K)
+    token = tl.load(topk_ptr + query * topk_stride0 + k * topk_stride1, mask=k < TOPK, other=-1)
+    required = live & (token >= 0)
+    ordinal = token // TOKENS_PER_PAGE
+    token_ok = (token < length) & (ordinal < MAX_BLOCKS)
+    page = tl.load(
+        read_ptr + req * read_stride0 + ordinal * read_stride1,
+        mask=required & request_ok & token_ok,
+        other=-1,
+    )
+    page_ok = (page >= 0) & (page < PAGE_BOUND)
+    valid = (
+        (active >= 0)
+        & (active <= NUM_REQUESTS)
+        & (active <= NUM_QUERIES)
+        & (~live | request_ok)
+        & tl.min((~required | (token_ok & page_ok)).to(tl.int32), axis=0)
+    )
+    tl.atomic_and(valid_ptr, valid.to(tl.int32), sem="relaxed")
+
+
+def check_sparse_read_table(
+    topk_indices: torch.Tensor,
+    request_rows: torch.Tensor,
+    active_request_count: torch.Tensor,
+    compressed_lengths: torch.Tensor,
+    read_page_table: torch.Tensor,
+    compressed_tokens_per_page: int,
+    page_index_upper_bound: int,
+    out: torch.Tensor,
+) -> None:
+    """Check every live decode selection has an addressable physical KV page.
+
+    Inputs are CUDA int32: top-k [Q, K], request rows [Q], active count [1],
+    lengths [B], and read table [B, M]. The positive, exclusive page bound is
+    relative to the layer's SHARED pointer and must include KVCM scratch.
+    ``out`` is a disjoint persistent int32 [1], rewritten to 1 on success or
+    0 on invalid request/token, missing page, or out-of-bounds page. Padded
+    queries and negative token sentinels are ignored. The caller may pass it
+    to torch._assert_async before launching attention; no host read is needed.
+    """
+    device = read_page_table.device
+    for tensor, name, ndim in (
+        (topk_indices, "topk_indices", 2),
+        (request_rows, "request_rows", 1),
+        (active_request_count, "active_request_count", 1),
+        (compressed_lengths, "compressed_lengths", 1),
+        (read_page_table, "read_page_table", 2),
+        (out, "out", 1),
+    ):
+        _check_sparse_offload_tensor(tensor, name, ndim, device)
+    batch, max_blocks = read_page_table.shape
+    queries, topk = topk_indices.shape
+    if queries <= 0 or topk <= 0:
+        raise ValueError(
+            "Sparse read validation requires nonempty fixed-capacity query/top-k dimensions"
+        )
+    if request_rows.shape != (queries,) or compressed_lengths.shape != (batch,):
+        raise ValueError("request_rows must be [Q] and compressed_lengths must be [B]")
+    if active_request_count.shape != (1,) or out.shape != (1,):
+        raise ValueError("active_request_count and out must be [1]")
+    if compressed_tokens_per_page <= 0 or not 0 < page_index_upper_bound <= 0x7FFFFFFF:
+        raise ValueError("Tokens per page and physical page bound must be positive")
+    with torch.cuda.device(device):
+        out.fill_(1)
+        _check_sparse_read_table_kernel[(queries,)](
+            topk_indices,
+            request_rows,
+            active_request_count,
+            compressed_lengths,
+            read_page_table,
+            out,
+            *topk_indices.stride(),
+            request_rows.stride(0),
+            compressed_lengths.stride(0),
+            *read_page_table.stride(),
+            NUM_REQUESTS=batch,
+            NUM_QUERIES=queries,
+            TOPK=topk,
+            MAX_BLOCKS=max_blocks,
+            TOKENS_PER_PAGE=compressed_tokens_per_page,
+            PAGE_BOUND=page_index_upper_bound,
+            BLOCK_K=triton.next_power_of_2(topk),
         )
 
 

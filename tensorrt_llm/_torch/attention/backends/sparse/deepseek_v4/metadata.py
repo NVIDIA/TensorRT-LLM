@@ -333,6 +333,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             ),
             fetched_page_table=allocate("fetched_page_table", (batch, max_blocks), -1),
             compress_read_table=allocate("compress_read_table", (batch, max_blocks), -1),
+            read_table_valid=allocate("read_table_valid", (1,), 1),
         )
 
     def prepare_for_indexer_k_cache(self):

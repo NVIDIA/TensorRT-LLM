@@ -280,6 +280,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             local_layer_idx, DeepseekV4AttentionType.SWA.value
         ]
 
+        active_request_count = None
         if self.compress_ratio > 1:
             compressed_buffer_ptr = metadata.compressed_buffer_ptrs[layer_idx]
             compress_pool_base_ptr = metadata.sparse_mla_base_ptrs[self.compress_ratio]
@@ -328,6 +329,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                             metadata.compressed_kv_lens_cuda[self.compress_ratio],
                             block_table_compressed,
                         )
+                        active_request_count = state.active_request_count
                     else:
                         raise NotImplementedError("Unsupported sparse offload attention phase")
             else:
@@ -394,6 +396,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             num_compressed_indices=metadata.max_compressed_indices[self.compress_ratio],
             **sched_kwargs,
             split_extra=self.use_fp8_ds_mla,
+            active_request_count=active_request_count,
         )
 
         if self.use_fp8_ds_mla:

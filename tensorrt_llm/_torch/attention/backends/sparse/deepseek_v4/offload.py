@@ -41,6 +41,9 @@ class SparseOffloadLayerDescriptor:
     buffer_id: BufferId
     group_id: LayerGroupId
     page_scale: int
+    # Exclusive physical-page bound relative to this layer's SHARED pointer,
+    # as returned by KVCM. Its runtime implementation must include scratch.
+    page_index_upper_bound: int
     fetched_page_scale: int | None = None
 
 
@@ -67,6 +70,7 @@ class SparseOffloadState:
     selected_history_pages: torch.Tensor
     fetched_page_table: torch.Tensor
     compress_read_table: torch.Tensor
+    read_table_valid: torch.Tensor
     history_upload_done: torch.cuda.Event = field(default_factory=torch.cuda.Event)
     history_upload_pending: bool = False
     prepared: bool = False

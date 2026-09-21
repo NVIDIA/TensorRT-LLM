@@ -355,8 +355,10 @@ def _check_consumption(case, backend, runtime):
     # Existing SWA addressing is unaffected by selecting/fetching compressed KV.
     swa_offset = {2: 7, 4: 11}[backend.layer_idx]
     torch.testing.assert_close(
-        indices[:3, :2], torch.tensor([[swa_offset, swa_offset + 3]] * 3, dtype=torch.int32)
+        indices[:active, :2],
+        torch.tensor([[swa_offset, swa_offset + 3]] * active, dtype=torch.int32).reshape(active, 2),
     )
+    assert (indices[active:] == -1).all()
     assert (indices[:, 2:128] == -1).all()
 
 
@@ -414,6 +416,9 @@ def test_decode_fetches_even_for_zero_history_or_all_invalid_selection():
     case = _attention_case()
     for cache in case.manager.kv_cache_map.values():
         cache.history_length = 0
+    case.args.sparse_backend_args.topk_indices[:3].copy_(
+        torch.tensor([[0, 1, -1, -1, -1, -1, -1, -1]] * 3, dtype=torch.int32, device="cuda")
+    )
     case.manager.prepare_sparse_offload(
         case.state, case.metadata.request_ids, case.metadata.compress_block_tables[4], beam_width=1
     )

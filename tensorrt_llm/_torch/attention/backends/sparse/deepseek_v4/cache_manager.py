@@ -16,7 +16,7 @@
 from collections import defaultdict
 from dataclasses import replace
 from math import gcd
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple
 
 import torch
 
@@ -59,6 +59,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 from .compressor import NVFP4_COMPRESS_RESIDUAL_DIM, KVCacheDtype
 from .kernels import (
+    check_sparse_read_table,
     merge_sparse_read_table,
     prepare_sparse_write_table,
     select_sparse_history_pages,
@@ -72,6 +73,9 @@ from .params import (
     compress_ratio_has_attention,
     is_overlap_compressor,
 )
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 
 COMPRESS_BLOCK_SCALE_ROLE = DataRole("deepseek_v4_compress_block_scale")
 KV_CACHE_COPY_ALIGNMENT = 16
@@ -1607,6 +1611,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests) -> None:
+        if self._enable_kv_cache_offload:
+            self._validate_sparse_history_policy()
         if self._enable_kv_cache_offload and any(
             not (request.is_first_context_chunk and request.is_last_context_chunk)
             for request in scheduled_batch.context_requests
@@ -1616,6 +1622,57 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             # that does not complete its prompt. Reject before model writes.
             raise NotImplementedError("Sparse offload does not support chunked prefill")
         super().prepare_resources(scheduled_batch)
+
+    def _validate_sparse_history_policy(self) -> None:
+        if (
+            self.enable_block_reuse
+            or self.kv_compression_manages_history
+            or self._has_cp_helix
+            or self.is_draft
+        ):
+            raise NotImplementedError(
+                "Sparse offload requires block reuse, KV compression, CP Helix, and draft caches disabled"
+            )
+
+    def _order_sparse_history_update(self, requests: Iterable[llm_request.LlmRequest]) -> None:
+        """Order demotion after all model producers and attention readers.
+
+        The non-overlap executor orders its calling stream after model forward.
+        Join it onto the cache stream before resize may demote/recycle pages.
+        prepare_sparse_offload() supplies the reverse dependency for the next
+        forward. No host/device synchronization or per-layer history mutation
+        is needed. Other executor schedules remain behind the inference guard.
+        """
+        if not self._enable_kv_cache_offload:
+            return
+        self._validate_sparse_history_policy()
+        active = False
+        for request in requests:
+            cache = self.kv_cache_map.get(request.py_request_id)
+            if cache is None or not cache.is_active:
+                continue
+            if cache.cuda_stream != self._stream.cuda_stream:
+                raise RuntimeError("Sparse history updates require the manager's cache stream")
+            active = True
+        if active:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("Sparse history updates must run outside CUDA graph capture")
+            self._stream.wait_stream(torch.cuda.current_stream(self._stream.device))
+
+    def update_context_resources(self, scheduled_batch: ScheduledRequests) -> None:
+        self._order_sparse_history_update(scheduled_batch.context_requests)
+        super().update_context_resources(scheduled_batch)
+
+    def update_resources(
+        self,
+        scheduled_batch: ScheduledRequests,
+        attn_metadata: "AttentionMetadata | None" = None,
+        kv_cache_dtype_byte_size: float | None = None,
+    ) -> None:
+        self._order_sparse_history_update(scheduled_batch.generation_requests)
+        # The base computes max_beam_num_tokens - 1, excluding the sampled
+        # output token whose KV has not been produced yet. Never increment here.
+        super().update_resources(scheduled_batch, attn_metadata, kv_cache_dtype_byte_size)
 
     def get_sparse_offload_descriptors(self) -> dict[int, SparseOffloadLayerDescriptor]:
         """Validate the ratio-4 shared write-table contract using runtime IDs.
@@ -1659,17 +1716,23 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             layout = (
                 group_id,
                 int(converter.scale),
-                self.impl.get_mem_pool_base_address(layer_id, role, PageIndexMode.SHARED),
+                # SHARED includes this buffer's offset. PER_LAYER exposes
+                # the common pool origin, even when the layer offsets differ.
+                self.impl.get_mem_pool_base_address(layer_id, role, PageIndexMode.PER_LAYER),
             )
             if shared_layout is not None and layout != shared_layout:
                 raise NotImplementedError(
-                    "Ratio-4 sparse layers must share a layer group, page scale, and SHARED pool"
+                    "Ratio-4 sparse layers must share a layer group, page scale, and GPU pool"
                 )
             shared_layout = layout
+            page_bound = int(self.impl.get_page_index_upper_bound(layer_id, role))
+            if not 0 < page_bound <= 0x7FFFFFFF:
+                raise ValueError("Sparse GPU pool must have a positive int32 physical-page bound")
             descriptors[layer] = SparseOffloadLayerDescriptor(
                 buffer_id=BufferId(layer_id, role),
                 group_id=group_id,
                 page_scale=int(converter.scale),
+                page_index_upper_bound=page_bound,
             )
 
         sparse_groups = {descriptor.group_id for descriptor in descriptors.values()}
@@ -1836,6 +1899,22 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 state.active_request_count,
                 state.compress_read_table,
                 fetched_page_scale=fetched_page_scale,
+            )
+            check_sparse_read_table(
+                topk_indices,
+                request_rows,
+                state.active_request_count,
+                compressed_lengths,
+                state.compress_read_table,
+                self.tokens_per_block // DEEPSEEK_V4_SPARSE_RATIO,
+                descriptor.page_index_upper_bound,
+                state.read_table_valid,
+            )
+            # A sentinel is address-safe but would silently drop required KV.
+            # Fail on device before conversion/FMHA, including during replay.
+            torch._assert_async(
+                state.read_table_valid,
+                "Sparse offload: invalid top-k request/token or missing/out-of-bounds KV page",
             )
         return state.compress_read_table
 
