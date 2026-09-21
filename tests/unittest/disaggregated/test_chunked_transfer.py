@@ -690,6 +690,7 @@ def test_pipelined_transfer_accepts_chunked_prefill_for_auto_deploy():
     request = MagicMock()
     request.sampling_config = None
     request.py_beam_width = 1
+    request.py_multimodal_data = None
     request.llm_request_type = LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY
     request.py_disaggregated_params = SimpleNamespace(
         schedule_style=DisaggScheduleStyle.GENERATION_FIRST
