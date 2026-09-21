@@ -878,25 +878,35 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.enable_helix:
             # If helix is inactive, attend to the previously cached tokens only.
             assert cached_token_lens is not None, "cached_token_lens should be set for helix"
-            # Both branches index a per-GENERATION-sequence buffer with
-            # [:num_seqs] against a contexts-first cached_token_lens, which
-            # only lines up when the batch carries no context rows. That has
-            # been the (unstated) helix invariant since the boolean branch
-            # landed on main; helix_is_inactive_rank_cpu is uninitialized
-            # memory for any row the packing loops did not write, so a mixed
-            # batch is already wrong rather than merely imprecise.
+            # The helix per-sequence buffers are GENERATION-relative: the
+            # packing loops in model_engine append only for extend and plain
+            # generation rows, so update_helix_param writes exactly
+            # [0, num_generations). Every device consumer indexes them the
+            # same way (the MLA rope generation kernel, the XQA preprocessing
+            # kernels, the FP4 MLA generation kernel), so the host read cannot
+            # slice them from 0 against a contexts-first cached_token_lens:
+            # that both shifts every pairing by num_contexts and reads past
+            # the written region, which for helix_is_inactive_rank_cpu is
+            # uninitialized memory. Pair them with the generation slice of the
+            # batch-indexed tensors instead.
+            num_gen = self.num_generations
+            gen = slice(self.num_contexts, self.num_seqs)
+            # Context rows are not part of a verify group and are not packed
+            # into the helix buffers at all; they append every one of their
+            # tokens, exactly like the non-helix path below.
+            kv_lens = cached_token_lens + self.seq_lens_kv
             if self._helix_spec_tokens_valid:
                 # Speculative verify groups: a group may straddle a page
                 # boundary, so ownership of this step's new tokens is a
                 # per-sequence COUNT, not a boolean. Provisional host values;
                 # recompute_helix_spec_buffers overrides the device copy
                 # after the overlap correction.
-                kv_lens = cached_token_lens + \
-                    self.helix_owned_new_tokens_cpu[:self.num_seqs]
+                kv_lens[gen] = (cached_token_lens[gen] +
+                                self.helix_owned_new_tokens_cpu[:num_gen])
             else:
-                active_rank = ~self.helix_is_inactive_rank_cpu[:self.num_seqs]
-                kv_lens = cached_token_lens.clone()
-                kv_lens[active_rank] += self.seq_lens_kv[active_rank]
+                inactive_rank = self.helix_is_inactive_rank_cpu[:num_gen]
+                kv_lens[gen] = torch.where(inactive_rank,
+                                           cached_token_lens[gen], kv_lens[gen])
         else:
             kv_lens = cached_token_lens + \
                 self.seq_lens_kv if cached_token_lens is not None else self.seq_lens_kv
