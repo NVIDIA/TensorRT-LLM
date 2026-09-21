@@ -41,26 +41,64 @@ def add_arguments(parser: ArgumentParser):
                         type=int,
                         default=60,
                         help="Timeout in minutes")
-    parser.add_argument("--bolted",
+    parser.add_argument("--bolt-branch",
                         "-b",
-                        action="store_true",
-                        help="Require the BOLT-optimized build "
-                        "(bolted-<tarfile>) that BoltProfileGen publishes "
-                        "alongside the plain one. The canonical tarfile "
-                        "appears as soon as the build stage finishes, long "
-                        "before BOLT has run, so an image that must ship "
-                        "optimized binaries has to wait on this distinct "
-                        "name instead. Never falls back.")
+                        default=None,
+                        help="Comma-separated branches whose promoted BOLT "
+                        "profile bundle should be applied to the extracted "
+                        "wheel, tried in order. The image installs this wheel, "
+                        "so optimizing it here is what makes the released "
+                        "container carry optimized binaries. Omit to install "
+                        "the wheel as built. Fatal if set and no branch has a "
+                        "usable bundle.")
 
 
-def get_wheel_from_package(arch, artifact_path, timeout, bolted=False):
+def bolt_optimize_wheels(build_dir, arch, bolt_branch):
+    """Apply the latest promoted BOLT bundle to each wheel in `build_dir`.
+
+    Deliberately uses the branch's last promoted bundle rather than one
+    generated from this commit: the optimized tarball for THIS run is not
+    published until BoltProfileGen finishes, hours after the image build starts,
+    and waiting on it would serialize the release behind a multi-hour GPU job.
+    Profiles are function-name-keyed and applied with -infer-stale-profile, so a
+    bundle from a nearby commit costs some optimization quality, never
+    correctness -- the same trade the pre-merge consume path and the image
+    profile overlay already make.
+    """
+    bolt_internal = get_project_dir() / "scripts" / "bolt" / "internal"
+    apply_latest = bolt_internal / "apply_latest.sh"
+    triple = "x86_64-linux-gnu" if arch == "x86_64" else "aarch64-linux-gnu"
+    branches = [b.strip() for b in bolt_branch.split(",") if b.strip()]
+
+    for wheel in sorted(Path(build_dir).glob("tensorrt_llm*.whl")):
+        bolted = wheel.with_suffix(".whl.bolted")
+        for branch in branches:
+            print(f"Applying BOLT profiles from {branch}/{triple} to "
+                  f"{wheel.name}")
+            # 3 = that branch has nothing promoted; anything else is decisive.
+            rc = subprocess.run(
+                ["bash", str(apply_latest), branch, triple,
+                 str(wheel), str(bolted)]).returncode
+            if rc == 0:
+                os.replace(bolted, wheel)
+                print(f"BOLT optimized {wheel.name} ({branch}/{triple})")
+                break
+            if rc != 3:
+                raise RuntimeError(
+                    f"BOLT apply failed for {wheel.name} (rc={rc})")
+            print(f"No promoted bundle for {branch}/{triple}; "
+                  "trying next branch")
+        else:
+            raise RuntimeError(
+                f"No promoted BOLT bundle for any of {branches} ({triple}); "
+                f"refusing to build an unoptimized release image")
+
+
+def get_wheel_from_package(arch, artifact_path, timeout, bolt_branch=None):
     if arch == "x86_64":
         tarfile_name = "TensorRT-LLM.tar.gz"
     else:
         tarfile_name = "TensorRT-LLM-GH200.tar.gz"
-
-    if bolted:
-        tarfile_name = f"bolted-{tarfile_name}"
 
     tarfile_link = f"https://urm.nvidia.com/artifactory/{artifact_path}/{tarfile_name}"
     for attempt in range(timeout):
@@ -104,6 +142,11 @@ def get_wheel_from_package(arch, artifact_path, timeout, bolted=False):
 
     if os.path.exists(tarfile_name):
         os.remove(tarfile_name)
+
+    # After the move, before the Dockerfile's release stage pip installs
+    # whatever is in build/.
+    if bolt_branch:
+        bolt_optimize_wheels(build_dir, arch, bolt_branch)
 
 
 if __name__ == "__main__":
