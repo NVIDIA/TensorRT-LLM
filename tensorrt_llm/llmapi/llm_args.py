@@ -749,6 +749,27 @@ class QSASparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             "geometry is loaded; an explicit value below token_topk is raised "
             "to token_topk because it cannot reduce attention work."),
     )
+    enable_heuristic_topk: bool = Field(
+        default=False,
+        description=
+        "Whether to enable the Guess-Verify-Refine (GVR) Top-K for the QSA "
+        "indexer instead of the exact radix Top-K. QSA dispatches only the "
+        "hint-free self-sampling engine, which requires Blackwell (SM100/103), "
+        "the CUTLASS DSL, a compressed-group budget "
+        "(indexer_budget / indexer_compress_ratio) in {512, 1024, 2048}, and "
+        "an indexer_compress_ratio of 4. Falls back to the exact radix "
+        "Top-K with a one-time warning when the prerequisites are not met.")
+    index_share_for_mtp_iteration: Optional[bool] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Whether the MTP draft loop reuses the indexer selection captured by "
+        "its draft-extend pass instead of re-running the indexer on every "
+        "draft decode step. The query advances by at most max_draft_len "
+        "positions, so the captured ranking is the one the indexer would "
+        "recompute; compressed groups that complete during the loop are "
+        "appended at lookup. When omitted, the checkpoint config supplies the "
+        "value, defaulting to off.")
     # Index projection dimensions, compression, and selection budget are part
     # of the checkpoint contract rather than serving-time tuning knobs.
     _resolved_params: Optional["QSASparseParams"] = PrivateAttr(default=None)
@@ -810,7 +831,16 @@ class QSASparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             compress_ratio=self._checkpoint_value(pretrained_config,
                                                   "indexer_compress_ratio"),
             seq_len_threshold=seq_len_threshold,
+            enable_heuristic_topk=self.enable_heuristic_topk,
+            mtp_index_share=self._mtp_index_share(pretrained_config),
         )
+
+    def _mtp_index_share(self, pretrained_config: object) -> bool:
+        """Resolve the draft-loop index-share opt-in from config or checkpoint."""
+        if self.index_share_for_mtp_iteration is not None:
+            return bool(self.index_share_for_mtp_iteration)
+        return bool(
+            getattr(pretrained_config, "index_share_for_mtp_iteration", False))
 
     def to_sparse_metadata_params(
             self, **kwargs: object) -> "QSASparseMetadataParams":
@@ -821,6 +851,7 @@ class QSASparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         return QSASparseMetadataParams(
             token_topk=params.token_topk,
             compress_ratio=params.compress_ratio,
+            mtp_index_share=params.mtp_index_share,
         )
 
 
@@ -3081,18 +3112,18 @@ class DSparkDecodingConfig(DecodingBaseConfig):
 
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
 
-    attention_backend: Literal["VANILLA", "TRTLLM"] = Field(
-        default="VANILLA",
+    attention_backend: Literal["AUTO", "VANILLA", "TRTLLM", "CUTEDSL"] = Field(
+        default="AUTO",
         description=
-        "Attention backend for the pooled-context cross-attention of a "
-        "standalone DSpark drafter (one shipped as its own checkpoint rather "
-        "than inside the target's mtp.* namespace). Ignored by the embedded "
-        "DeepSeek-V4-Pro draft, which uses its own captured-context attention. "
-        "This is independent of the backend used to construct the drafter's "
-        "standard attention modules. TRTLLM requires FlashInfer and an NVIDIA "
-        "Blackwell GPU with SM100 or SM103, and uses generated FMHA kernels "
-        "with a private paged context cache; VANILLA uses FlashAttention with "
-        "a contiguous cache.")
+        "Block-decode attention backend for a standalone DSpark drafter (one "
+        "shipped as its own checkpoint, not inside the target's mtp.* "
+        "namespace). Ignored by the embedded DeepSeek-V4-Pro draft. Independent "
+        "of the backend that builds the drafter's own attention modules.\n\n"
+        "AUTO resolves per drafter family and is right unless you are pinning a "
+        "kernel: a GQA backbone degrades when its kernel is missing, an MLA one "
+        "raises. TRTLLM needs FlashInfer and SM100/SM103. CUTEDSL is MLA-only "
+        "and needs a cute-dsl MLA decode taking per-token kv_bounds that is not "
+        "upstream yet. Which kernel each name selects: MLADSparkForCausalLM.")
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
@@ -5633,6 +5664,16 @@ class TorchLlmArgs(BaseLlmArgs):
         description="Disable the overlap scheduler.",
         status="beta")
 
+    enable_return_routed_experts: bool = Field(
+        default=False,
+        description=
+        "Router Replay (R3): capture per-token pre-EPLB logical top-k MoE expert "
+        "ids so they can be returned on outputs (per request via "
+        "SamplingParams.return_routed_experts), for train/inference routing "
+        "alignment in MoE reinforcement learning. Zero overhead when disabled. "
+        "Separated-routing MoE backends only.",
+        status="beta")
+
     moe_config: MoeConfig = Field(default_factory=MoeConfig,
                                   description="MoE config.",
                                   status="beta")
@@ -6399,6 +6440,22 @@ class TorchLlmArgs(BaseLlmArgs):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
 
             if isinstance(self.speculative_config, DFlashDecodingConfig):
+                if (self.cache_transceiver_config is not None
+                        and self.cache_transceiver_config.backend is not None):
+                    # The transceiver moves the target KV cache, but the
+                    # drafter's context is built from target hidden states
+                    # during prefill and is not transferred with it, so a
+                    # generation server drafts without the prompt. Drafts are
+                    # verified against the target, so this costs acceptance
+                    # rather than correctness: warn, do not reject.
+                    logger.warning(
+                        "DFlash acceptance is degraded under disaggregated "
+                        "serving: the cache transceiver moves the target KV "
+                        "cache, but the drafter's context is built during "
+                        "prefill and is not transferred, so a generation "
+                        "server drafts without the prompt context. Output is "
+                        "unaffected; expect a lower acceptance rate than the "
+                        "same configuration run aggregated.")
                 assert self.speculative_config.max_draft_len > 0, "DFlash max_draft_len must be > 0"
                 # A Hugging Face repo id is not readable yet; CachedModelLoader
                 # calls this again after the drafter is downloaded.
