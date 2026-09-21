@@ -618,6 +618,11 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             if h3_workflow not in ("fl2va", "ref2va"):
                 raise ValueError("MiniMax-H3 workflow must be 'fl2va' or 'ref2va'.")
             extra_attrs["workflow"] = h3_workflow
+        # Preserve H3 VAE options, including explicit False values. Registry
+        # validation happens in PipelineLoader before this conversion.
+        for key in ("vae_use_tiling", "vae_tile_parallel", "vae_tile_size", "vae_tile_overlap"):
+            if key in resolved_pipeline_config:
+                extra_attrs[key] = resolved_pipeline_config[key]
 
         # Discover pipeline components (diffusers layout)
         components = discover_pipeline_components(checkpoint_path)
