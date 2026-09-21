@@ -123,6 +123,7 @@ from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
 from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
 from tensorrt_llm.serve.rl_control_auth import validate_rl_control_request
+from tensorrt_llm.serve.serving_extensions import apply_model_chat_extensions
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_server_timings, build_visual_gen_timing_headers)
@@ -2013,6 +2014,7 @@ class OpenAIServer(_VideoRoutesMixin):
             model_type = resolve_top_level_model_type(self.model_config)
             is_kimi_k3 = model_type == "kimi_k3"
             _apply_kimi_chat_extensions(request, model_type)
+            apply_model_chat_extensions(request, model_type)
             if request.tool_choice == "required" and not is_kimi_k3:
                 # Schema-accepting "required" everywhere but enforcing it only
                 # for kimi_k3 would silently degrade to "auto" elsewhere;

@@ -62,6 +62,7 @@ from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.sampling_params import (check_logprobs_limit,
                                           validate_thinking_token_budget)
 from tensorrt_llm.scheduling_params import AgentHierarchy
+from tensorrt_llm.serve.serving_extensions import structured_output_format_for
 from tensorrt_llm.visual_gen.params import MediaRole
 
 _LOGIT_BIAS_MIN = -100.0
@@ -485,7 +486,14 @@ def _response_format_to_guided_decoding_params(
     elif guided_decoding_params.grammar is not None:
         content = {"type": "grammar", "grammar": guided_decoding_params.grammar}
 
-    if reasoning_parser == "gpt_oss":
+    extension_format = structured_output_format_for(reasoning_parser)
+    if extension_format is not None:
+        # A registered per-model serving extension owns the placement of the
+        # constraint relative to this model's reasoning markup.
+        stag_format = extension_format(content, chat_template_kwargs)
+        if stag_format is None:
+            return guided_decoding_params
+    elif reasoning_parser == "gpt_oss":
         # Trigger user constraint by final channel
         stag_format = {
             "type":
