@@ -114,10 +114,10 @@ def build_aux_transfer_layout(
 
 AuxSlot = namedtuple("AuxSlot", ["id", "buffer"])
 
-_DRAFT_HISTORY_VERSION = 1
-_DRAFT_HISTORY_FIELDS = 8
+_DRAFT_HISTORY_VERSION = 2
+_DRAFT_HISTORY_FIELDS = 10
 _DRAFT_DTYPE_CODES = {"torch.float16": 1, "torch.bfloat16": 2}
-_DRAFT_BACKEND_CODES = {"VANILLA": 1, "TRTLLM": 2}
+_DRAFT_BACKEND_CODES = {"VANILLA": 1, "TRTLLM": 2, "DSv4": 3}
 
 
 def _encode_draft_history(history: dict[str, Any]) -> list[int]:
@@ -134,27 +134,43 @@ def _encode_draft_history(history: dict[str, Any]) -> list[int]:
         layout["head_dim"],
         _DRAFT_DTYPE_CODES[layout["dtype"]],
         _DRAFT_BACKEND_CODES[layout["attention_backend"]],
+        layout.get("kv_factor", 2),
+        layout.get("window_size") or 0,
     ]
 
 
 def _decode_draft_history(values: list[int]) -> dict[str, Any]:
     if values[0] != _DRAFT_HISTORY_VERSION:
         raise ValueError("Missing or unsupported standalone draft history metadata version")
-    _, valid_length, position, num_layers, num_kv_heads, head_dim, dtype_code, backend_code = values
+    (
+        _,
+        valid_length,
+        position,
+        num_layers,
+        num_kv_heads,
+        head_dim,
+        dtype_code,
+        backend_code,
+        kv_factor,
+        window_size,
+    ) = values
     dtypes = {code: name for name, code in _DRAFT_DTYPE_CODES.items()}
     backends = {code: name for name, code in _DRAFT_BACKEND_CODES.items()}
     # The receiving transceiver validates prompt coverage and the manager checks
     # storage identity and local allocation before publishing this history.
+    layout = {
+        "num_layers": num_layers,
+        "num_kv_heads": num_kv_heads,
+        "head_dim": head_dim,
+        "dtype": dtypes.get(dtype_code),
+        "attention_backend": backends.get(backend_code),
+    }
+    if kv_factor != 2 or window_size != 0:
+        layout.update(kv_factor=kv_factor, window_size=window_size or None)
     return {
         "valid_length": valid_length,
         "position": position,
-        "layout": {
-            "num_layers": num_layers,
-            "num_kv_heads": num_kv_heads,
-            "head_dim": head_dim,
-            "dtype": dtypes.get(dtype_code),
-            "attention_backend": backends.get(backend_code),
-        },
+        "layout": layout,
     }
 
 

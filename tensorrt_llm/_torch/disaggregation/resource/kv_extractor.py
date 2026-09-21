@@ -481,6 +481,8 @@ def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
     inverse = {}
     for (model_layer, attn_type), layer_id in manager._layer_attn_to_layer_id.items():
         inverse[layer_id] = (model_layer, attn_type.value)
+    for draft_layer in getattr(manager, "draft_layer_ids", ()):
+        inverse[manager.layer_offsets[draft_layer]] = (draft_layer, 0)
 
     # Use the full enum range for consistent encoding across all PP ranks.
     # Different PP ranks may have different subsets of attention types (e.g.,
@@ -740,7 +742,11 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
             # may exceed the length of num_kv_heads_per_layer. Use index 0 as
             # all layers within a pool group share the same kv_heads count.
             first_local_layer = all_internal_layer_ids[0]
-            if first_local_layer < len(manager.num_kv_heads_per_layer):
+            if getattr(
+                manager, "draft_layout", None
+            ) is not None and manager._is_standalone_draft_layer(first_local_layer):
+                num_kv_heads = manager.draft_layout.num_kv_heads
+            elif first_local_layer < len(manager.num_kv_heads_per_layer):
                 num_kv_heads = manager.num_kv_heads_per_layer[first_local_layer]
             else:
                 num_kv_heads = manager.num_kv_heads_per_layer[0]

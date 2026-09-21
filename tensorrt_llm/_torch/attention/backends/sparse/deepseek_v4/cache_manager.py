@@ -26,8 +26,11 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS,
     GPU_LEVEL,
     KVCacheManagerV2,
+    _estimate_cache_size_components,
     _fill_kv_pages,
+    _get_generation_kv_capacity,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.standalone_draft_cache import StandaloneDraftLayout
 from tensorrt_llm._utils import (
     TensorWrapper,
     convert_to_torch_tensor,
@@ -66,6 +69,26 @@ from .params import (
 COMPRESS_BLOCK_SCALE_ROLE = DataRole("deepseek_v4_compress_block_scale")
 KV_CACHE_COPY_ALIGNMENT = 16
 NVFP4_VECTOR_SIZE = 16
+
+
+def _draft_cache_size_components(
+    layout: StandaloneDraftLayout | None,
+    tokens_per_block: int,
+    generation_capacity_headroom: int,
+    target_context_bytes: int,
+) -> tuple[int, int, int]:
+    """The draft contribution to static profiling and runtime byte quotas."""
+    if layout is None:
+        return 0, 0, 0
+    context, generation, per_request = _estimate_cache_size_components(
+        [layout.bytes_per_layer_token] * layout.num_layers,
+        [layout.retention_window_size] * layout.num_layers,
+        tokens_per_block,
+        scratch=False,
+        generation_capacity_headroom=generation_capacity_headroom,
+        standalone_draft_reserve=layout.extra_tokens,
+    )
+    return context, generation, per_request + layout.extra_tokens * target_context_bytes
 
 
 def get_attn_dim(
@@ -956,6 +979,16 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
         )
+        if self.draft_layout is not None:
+            draft_context, draft_generation, draft_per_request = _draft_cache_size_components(
+                self.draft_layout,
+                self.tokens_per_block,
+                self._generation_kv_capacity_headroom,
+                non_sliding_attn_size_per_token + context_swa_size_per_token,
+            )
+            context_swa_size_per_token += draft_context
+            generation_swa_size_per_token += draft_generation
+            generation_swa_size_per_request += draft_per_request
         max_context_tokens = (
             self._max_num_tokens if self._max_num_tokens is not None else max_tokens
         )
@@ -1009,6 +1042,16 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
         )
+        if self.draft_layout is not None:
+            draft_context, draft_generation, draft_per_request = _draft_cache_size_components(
+                self.draft_layout,
+                self.tokens_per_block,
+                self._generation_kv_capacity_headroom,
+                non_sliding_attn_size_per_token + context_swa_size_per_token,
+            )
+            context_swa_size_per_token += draft_context
+            generation_swa_size_per_token += draft_generation
+            generation_swa_size_per_request += draft_per_request
         padding = self._get_extra_quota_padding()
         size_per_batch = self.max_batch_size * generation_swa_size_per_request + padding
         if quota < size_per_batch:
@@ -1177,6 +1220,13 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             config,
             layers=layers,
         )
+
+    def _append_standalone_draft_layers(
+        self, config: KVCacheManagerConfigPy
+    ) -> KVCacheManagerConfigPy:
+        # Target model indices describe several virtual attention layers each.
+        # Draft layers are independent config entries, not extra target layers.
+        return super()._append_standalone_draft_layers(config, register_model_layers=False)
 
     def _init_indexer_dtype(self, sparse_attn_config: DeepSeekV4SparseAttentionConfig) -> None:
         # Indexer compressor cache layout. Two modes are supported:
@@ -1383,9 +1433,33 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
         )
+        draft_context, draft_generation, draft_per_request = (
+            _draft_cache_size_components(
+                self.draft_layout,
+                self.tokens_per_block,
+                self._generation_kv_capacity_headroom,
+                non_sliding_attn_size_per_token
+                + _estimate_swa_cache_size(
+                    self.head_dim,
+                    self.index_head_dim,
+                    compress_ratios,
+                    has_fp8_kv_cache,
+                    self.tokens_per_block,
+                    self._swa_window_size,
+                    context=True,
+                    scratch=False,
+                    indexer_k_dtype=self._indexer_k_dtype,
+                    use_fp8_ds_mla=self.use_fp8_ds_mla,
+                )[0],
+            )
+            if self.draft_layout is not None
+            else (0, 0, 0)
+        )
         return int(
             total_tokens * (non_sliding_attn_size_per_token + swa_size_per_token)
             + swa_size_per_request
+            + total_tokens * (draft_context if context else draft_generation)
+            + draft_per_request
         )
 
     def get_needed_resource_to_completion(self, request: llm_request.LlmRequest) -> int:
@@ -1400,6 +1474,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         local_layer_idx: int,
         data_role: DataRole,
     ) -> int:
+        if self._is_standalone_draft_layer(local_layer_idx):
+            return super().get_layer_bytes_per_token(local_layer_idx, data_role)
         # The generic layers in the base config are replaced by
         # _build_cache_config, so their buffer sizes are only placeholders.
         return 1
@@ -1674,6 +1750,29 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             use_fp8_ds_mla=use_fp8_ds_mla,
         )
         max_batch_size = int(kwargs.get("max_batch_size") or 0)
+        draft_layout = kwargs.get("draft_layout")
+        if draft_layout is not None:
+            _, headroom = _get_generation_kv_capacity(kwargs.get("spec_config"), is_draft=False)
+            target_context_swa_bytes, _ = _estimate_swa_cache_size(
+                head_dim,
+                index_head_dim,
+                compress_ratios,
+                has_fp8_kv_cache,
+                kwargs["tokens_per_block"],
+                model_config.sparse_attention_config.window_size,
+                context=True,
+                scratch=False,
+                indexer_k_dtype=indexer_k_dtype,
+                use_fp8_ds_mla=use_fp8_ds_mla,
+            )
+            _, draft_generation, draft_per_request = _draft_cache_size_components(
+                draft_layout,
+                kwargs["tokens_per_block"],
+                headroom + draft_layout.extra_tokens,
+                non_sliding_attn_size_per_token + target_context_swa_bytes,
+            )
+            swa_size_per_token += draft_generation
+            swa_size_per_request += draft_per_request
         return (
             non_sliding_attn_size_per_token + swa_size_per_token,
             swa_size_per_request * max_batch_size,

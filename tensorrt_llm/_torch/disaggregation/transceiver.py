@@ -428,47 +428,65 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     else np.array([], dtype=np.int64)
                 )
                 continue
-            block_ids = adapter.get_block_ids(req, idx, lg)
             window_size = lg.sliding_window_size
 
             if window_size is not None:
-                draft_len = get_draft_token_length(req) if is_gen_only else 0
-                allocated_blocks = (
-                    req.prompt_len
-                    + draft_len
-                    + self._kv_cache_manager.num_extra_kv_tokens
-                    + tpb
-                    - 1
-                ) // tpb
-                if block_ids.size > allocated_blocks:
-                    block_ids = block_ids[:allocated_blocks]
-                # Current PyExecutor cache managers disable KV-cache token sinks,
-                # so SWA block lists contain an evictable prompt prefix followed
-                # by the speculative scratch tail. If token sinks are enabled,
-                # this must use block-ordinal metadata to preserve the sink prefix.
-                # Remove scratch before trimming stale prompt blocks; otherwise a
-                # boundary-crossing allocation can displace initialized prompt KV.
-                scratch_blocks = max(0, allocated_blocks - prompt_blocks)
-                if scratch_blocks > 0:
-                    if req.py_beam_width != 1:
-                        raise ValueError("speculative scratch blocks require beam_width == 1")
-                    block_ids = (
-                        block_ids[:-scratch_blocks]
-                        if scratch_blocks < block_ids.size
-                        else np.array([], dtype=np.int64)
-                    )
-                # Drop stale blocks the manager may still expose (V1 pre-eviction).
                 stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
-                expected_valid = max(0, prompt_blocks - stale_end)
-                if block_ids.size > expected_valid:
-                    block_ids = (
-                        block_ids[-expected_valid:]
-                        if expected_valid > 0
-                        else np.array([], dtype=np.int64)
+                if (
+                    isinstance(self._kv_cache_manager, KVCacheManagerV2)
+                    and self._kv_cache_manager.draft_layout is not None
+                ):
+                    # Preserve logical ordinals until both the stale prefix and
+                    # speculative tail have been excluded. Filtering holes first
+                    # loses their positions and can trim valid prompt pages.
+                    cache = self._kv_cache_manager.kv_cache_map[req.py_request_id]
+                    pages = np.fromiter(
+                        cache.get_aggregated_page_indices(idx, valid_only=False),
+                        dtype=np.int64,
                     )
+                    block_ids = pages[stale_end:prompt_blocks]
+                    if block_ids.size != prompt_blocks - stale_end or np.any(block_ids < 0):
+                        raise ValueError("Missing allocated prompt pages for windowed KV transfer")
+                else:
+                    block_ids = adapter.get_block_ids(req, idx, lg)
+                    draft_len = get_draft_token_length(req) if is_gen_only else 0
+                    allocated_blocks = (
+                        req.prompt_len
+                        + draft_len
+                        + self._kv_cache_manager.num_extra_kv_tokens
+                        + tpb
+                        - 1
+                    ) // tpb
+                    if block_ids.size > allocated_blocks:
+                        block_ids = block_ids[:allocated_blocks]
+                    # Current PyExecutor cache managers disable KV-cache token sinks,
+                    # so SWA block lists contain an evictable prompt prefix followed
+                    # by the speculative scratch tail. If token sinks are enabled,
+                    # this must use block-ordinal metadata to preserve the sink prefix.
+                    # Remove scratch before trimming stale prompt blocks; otherwise a
+                    # boundary-crossing allocation can displace initialized prompt KV.
+                    scratch_blocks = max(0, allocated_blocks - prompt_blocks)
+                    if scratch_blocks > 0:
+                        if req.py_beam_width != 1:
+                            raise ValueError("speculative scratch blocks require beam_width == 1")
+                        block_ids = (
+                            block_ids[:-scratch_blocks]
+                            if scratch_blocks < block_ids.size
+                            else np.array([], dtype=np.int64)
+                        )
+                    # Drop stale blocks the manager may still expose (V1 pre-eviction).
+                    stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
+                    expected_valid = max(0, prompt_blocks - stale_end)
+                    if block_ids.size > expected_valid:
+                        block_ids = (
+                            block_ids[-expected_valid:]
+                            if expected_valid > 0
+                            else np.array([], dtype=np.int64)
+                        )
                 # Skip reused blocks that remain after stale-prefix pruning.
                 cache_skip = max(0, cached_per_lg[idx] // tpb - stale_end)
             else:
+                block_ids = adapter.get_block_ids(req, idx, lg)
                 # Drop the speculative scratch tail; only prompt_len is transferred.
                 if block_ids.size > prompt_blocks:
                     block_ids = block_ids[:prompt_blocks]
@@ -537,22 +555,32 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         params = req.py_disaggregated_params
         if params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST:
             raise ValueError(
-                "Standalone DSpark draft-state transfer requires context_first scheduling; "
-                "generation_first is not yet supported for standalone draft history."
+                "DSpark draft-state transfer requires context_first scheduling; "
+                "generation_first is not yet supported for draft history."
             )
         if self.pipeline_transfer_enabled:
-            raise ValueError(
-                "Standalone DSpark draft-state transfer does not support pipelined transfer."
-            )
+            raise ValueError("DSpark draft-state transfer does not support pipelined transfer.")
 
     @staticmethod
     def _validate_draft_history_range(req: LlmRequest, history: dict) -> None:
-        # The shared transfer extent covers the complete prompt. Draft noise KV is scratch,
-        # never valid history. A partial history needs per-group extents before it can be sent.
-        if history["valid_length"] != req.prompt_len or history["position"] != req.prompt_len:
+        # Full-attention drafters retain the whole prompt; rolling drafters
+        # retain its complete live suffix. Neither includes speculative scratch.
+        window_size = history["layout"].get("window_size")
+        expected_length = req.prompt_len
+        if window_size is not None:
+            if type(window_size) is not int or window_size <= 0:
+                raise ValueError("Invalid draft history window size")
+            expected_length = min(expected_length, window_size)
+        if (
+            type(history["valid_length"]) is not int
+            or type(history["position"]) is not int
+            or history["valid_length"] != expected_length
+            or history["position"] != req.prompt_len
+        ):
             raise ValueError(
-                "Standalone DSpark transfer requires valid draft history and sequence position "
-                f"covering the complete prompt ({req.prompt_len} tokens)."
+                "DSpark transfer requires valid draft history and sequence position "
+                f"covering the complete prompt ({req.prompt_len} tokens, "
+                f"{expected_length} retained)."
             )
 
     def _pack_draft_history(self, req: LlmRequest) -> Optional[dict]:

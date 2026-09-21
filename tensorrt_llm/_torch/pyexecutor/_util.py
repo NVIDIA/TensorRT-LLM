@@ -1674,83 +1674,103 @@ class KvCacheCreator:
                 and not spec_config.draft_is_embedded_in_target
                 and not spec_config._use_shared_kv_cache)
 
+    def _is_embedded_dspark(self) -> bool:
+        spec_config = self._speculative_config
+        return (spec_config is not None
+                and spec_config.spec_dec_mode.is_dspark()
+                and spec_config.draft_is_embedded_in_target)
+
     def _uses_unified_standalone_draft_cache(self) -> bool:
-        if not self._is_standalone_dspark() or not self._is_kv_cache_manager_v2:
+        if (not (self._is_standalone_dspark() or self._is_embedded_dspark())
+                or not self._is_kv_cache_manager_v2):
             return False
         if self._is_disagg:
             # Disaggregation must validate unified ownership, never fall back
             # to draft state that the transceiver cannot transfer.
             return True
-        from tensorrt_llm.runtime.kv_cache_manager_v2 import BACKEND
-
-        # Preserve the existing aggregate C++/CUDA-graph draft-cache path.
-        # Python V2 with eager execution also supports unified aggregate runs
-        # for comparison with the same configuration in disaggregation.
-        return BACKEND == "python" and self._llm_args.cuda_graph_config is None
+        # Keep existing aggregate execution for settings the unified draft
+        # lifecycle cannot support. Disaggregation must never take this path.
+        return self._unified_draft_cache_unsupported_reason() is None
 
     def _validate_standalone_draft_cache(self) -> None:
-        """Reject unsupported standalone state ownership before profiling."""
-        if not self._is_standalone_dspark():
+        """Reject unsupported DSpark state ownership before profiling."""
+        if not (self._is_standalone_dspark() or self._is_embedded_dspark()):
             return
         if not self._is_kv_cache_manager_v2:
             if self._kv_cache_config.use_kv_cache_manager_v2 is True:
                 raise ValueError(
-                    "Standalone DSpark requested KVCacheManagerV2 but its "
+                    "DSpark requested KVCacheManagerV2 but its "
                     "configuration resolved to V1. Remove unsupported V2 "
                     "features, including beam search, instead of falling "
                     "back to private draft state.")
             if self._is_disagg:
-                raise ValueError(
-                    "Standalone DSpark disaggregation requires "
-                    "kv_cache_config.use_kv_cache_manager_v2=True and "
-                    "TLLM_KV_CACHE_MANAGER_V2_BACKEND=python on both workers.")
+                raise ValueError("DSpark disaggregation requires "
+                                 "kv_cache_config.use_kv_cache_manager_v2=True "
+                                 "on both workers.")
             return
-        if not self._uses_unified_standalone_draft_cache():
-            return
-        from tensorrt_llm.runtime.kv_cache_manager_v2 import BACKEND
+        if self._is_disagg:
+            reason = self._unified_draft_cache_unsupported_reason()
+            if reason is not None:
+                raise ValueError(reason)
 
-        if BACKEND != "python":
-            raise ValueError("Unified standalone DSpark KV cache requires "
-                             "TLLM_KV_CACHE_MANAGER_V2_BACKEND=python.")
+    def _unified_draft_cache_unsupported_reason(self) -> Optional[str]:
+        """Shared admission requirements for unified aggregate and disagg KV."""
+        if self._kv_cache_config.enable_block_reuse:
+            return "Unified DSpark draft KV does not yet support prefix reuse"
+        if self._kv_cache_config.enable_swa_scratch_reuse:
+            return ("Unified DSpark draft KV cannot use SWA scratch reuse; "
+                    "draft prefill requires ordinary pages. "
+                    "set kv_cache_config.enable_swa_scratch_reuse=False")
+        if self._kv_cache_config.pool_ratio is not None:
+            return "Unified DSpark draft KV does not yet support explicit pool_ratio"
         if (self._speculative_config.draft_len_schedule is not None
                 or self._speculative_config.max_concurrency is not None):
-            raise ValueError(
-                "Unified standalone DSpark KV cache does not yet support "
+            return (
+                "Unified DSpark KV cache does not yet support "
                 "draft_len_schedule or max_concurrency: skipped drafting "
                 "would lose accepted-token history before speculation resumes.")
         if self._llm_args.cuda_graph_config is not None:
-            raise ValueError(
-                "Unified standalone DSpark KV cache currently requires eager "
-                "execution; set cuda_graph_config=None.")
+            return ("Unified DSpark KV cache currently requires eager "
+                    "execution; set cuda_graph_config=None.")
         if not self._disable_overlap_scheduler:
-            raise ValueError("Unified standalone DSpark KV cache requires "
-                             "disable_overlap_scheduler=True.")
+            return ("Unified DSpark KV cache requires "
+                    "disable_overlap_scheduler=True.")
         if self._llm_args.enable_chunked_prefill:
-            raise ValueError(
-                "Unified standalone DSpark KV cache does not yet support "
-                "chunked prefill; set enable_chunked_prefill=False.")
+            return ("Unified DSpark KV cache does not yet support "
+                    "chunked prefill; set enable_chunked_prefill=False.")
         if self._mapping.pp_size != 1 or self._mapping.cp_size != 1:
-            raise ValueError(
-                "Unified standalone DSpark KV cache requires PP=1 and CP=1.")
-        if self._mapping.enable_attention_dp:
-            raise ValueError(
-                "Unified standalone DSpark KV cache does not yet support "
+            return "Unified DSpark KV cache requires PP=1 and CP=1."
+        if (self._mapping.enable_attention_dp
+                and not self._is_embedded_dspark()):
+            return (
+                "Unified DSpark KV cache does not yet support "
                 "attention data parallelism; set enable_attention_dp=False.")
         if self._kv_connector_manager is not None:
-            raise ValueError(
-                "Unified standalone DSpark KV cache does not yet support "
-                "KV cache connectors.")
+            return ("Unified DSpark KV cache does not yet support "
+                    "KV cache connectors.")
         transceiver_config = self._cache_transceiver_config
         if self._is_disagg and (transceiver_config is None
                                 or transceiver_config.transceiver_runtime
                                 != "PYTHON"
                                 or transceiver_config.backend != "NIXL"):
-            raise ValueError(
-                "Standalone DSpark draft-state transfer requires the PYTHON "
-                "NIXL transceiver on both workers.")
+            return ("DSpark draft-state transfer requires the PYTHON "
+                    "NIXL transceiver on both workers.")
+        return None
 
     def _get_standalone_draft_layout(self) -> StandaloneDraftLayout:
-        """Describe distinct standalone layers without borrowing target shapes."""
+        """Describe distinct draft layers without borrowing target shapes."""
+        if self._is_embedded_dspark():
+            draft = self._model_engine.model.draft_model
+            return StandaloneDraftLayout(
+                num_layers=draft.num_stages,
+                num_kv_heads=1,
+                head_dim=int(draft._attn_params["head_dim"]),
+                dtype=torch.bfloat16,
+                extra_tokens=0,
+                attention_backend="DSv4",
+                kv_factor=1,
+                window_size=int(draft._attn_params["window_size"]),
+            )
         config = self._draft_config.pretrained_config
         num_heads = config.num_attention_heads
         num_kv_heads = getattr(config, "num_key_value_heads", num_heads)

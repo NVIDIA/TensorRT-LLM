@@ -204,20 +204,22 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         slotGroups.push_back(std::move(var));
     }
 
-    // Merge SlotDescVariants that share the same slotSizeList.
-    // Key: tuple of sizes (sorted desc).
-    std::map<std::vector<size_t>, std::vector<SlotDescVariant>> poolGroupsBySizes;
+    // Equal storage sizes permit merging only within a compatible ownership domain.
+    // Existing target attention/SSM groups retain their shared physical pool behavior.
+    std::map<std::pair<std::string, std::vector<size_t>>, std::vector<SlotDescVariant>> poolGroupsByLayout;
     for (auto& sg : slotGroups)
     {
+        auto const* attn = std::get_if<AttnLifeCycle>(&registry[sg.lifeCycleId]);
+        std::string const cacheDomain = attn ? attn->cacheDomain : "target";
         auto sizes = sg.slotSizeList();
-        poolGroupsBySizes[sizes.raw()].push_back(std::move(sg));
+        poolGroupsByLayout[{cacheDomain, sizes.raw()}].push_back(std::move(sg));
     }
 
     StorageConfig out;
     out.cacheTiers = TypedVec<CacheLevel, CacheTierConfig>{config.cacheTiers};
     out.expansion = expansionMap;
 
-    for (auto& [sizes, variants] : poolGroupsBySizes)
+    for (auto& [layout, variants] : poolGroupsByLayout)
     {
         SlotDesc sd;
         sd.variants = std::move(variants);

@@ -30,6 +30,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
+from ..pyexecutor.resource_manager import ResourceManagerType
 from .dflash import DFlashWorker, dflash_draft_slot_ids
 from .interface import SpecMetadata, SpecWorkerBase
 
@@ -195,9 +196,10 @@ class DSv4DSparkWorker(SpecWorkerBase):
     window, refines the per-position logits with the Markov head, and predicts a
     per-position acceptance confidence used to truncate the proposed prefix.
 
-    Unlike DFlash, the draft does NOT use the paged KV cache or mask-token
-    cross-attention: its attention K/V come from the worker-owned rolling window
-    of projected captured context (one ``main_kv`` per decode step, per stage).
+    Unlike DFlash, attention reads a rolling window of projected captured
+    context (one ``main_kv`` per decode step, per stage). With unified V2,
+    manager-owned pages preserve that history and the rolling tensors are kernel
+    staging; legacy aggregate execution keeps the windows in the worker.
     Acceptance of the previous block goes through the unified
     :meth:`SpecWorkerBase.sample_and_accept_draft_tokens` (strict target-verify,
     or rejection sampling for a non-greedy batch), so greedy parity with no-spec
@@ -240,6 +242,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._valid_len: Optional[torch.Tensor] = None  # [max_batch] written window entries
         self._position_initialized: Optional[torch.Tensor] = None  # [max_batch] bool
         self._win = 0
+        self._draft_kv_manager = None
+        self._draft_kv_buffers = ()
+        self._draft_block_tables = None
 
         # Slot management. ``_req_to_slot`` (python dict) + ``_free_slots`` are the
         # source of truth, updated in prepare()/forward(); ``_batch_to_slot`` is the
@@ -354,6 +359,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
 
     def _assign_slot(self, req_id: int, reset: bool) -> int:
         """Get (or refresh) the slot for a request; reset clears its window."""
+        if self._draft_kv_manager is not None and not self._is_managed_request(req_id):
+            return self._scratch_slot
         if reset and req_id in self._req_to_slot:
             old = self._req_to_slot.pop(req_id)
             self._ctx_len[old] = 0
@@ -374,6 +381,104 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._position_initialized[slot] = False
             self._kv_windows[slot].zero_()
         return self._req_to_slot[req_id]
+
+    def _is_managed_request(self, request_id: int) -> bool:
+        return (
+            request_id != ATTENTION_DP_DUMMY_REQUEST_ID
+            and request_id < self._graph_dummy_id_floor
+            and request_id not in self._draft_kv_manager._draft_dummy_request_ids
+        )
+
+    def _bind_managed_history(self, resource_manager) -> None:
+        manager = (
+            resource_manager.get_resource_manager(ResourceManagerType.KV_CACHE_MANAGER)
+            if resource_manager is not None
+            else None
+        )
+        layout = getattr(manager, "draft_layout", None)
+        if layout is None:
+            manager = None
+        if manager is self._draft_kv_manager:
+            return
+        buffers = ()
+        if manager is not None:
+            if (
+                layout.window_size != self._win
+                or layout.kv_factor != 1
+                or layout.num_layers != self._kv_windows.shape[1]
+                or layout.head_dim != self._kv_windows.shape[-1]
+            ):
+                raise ValueError("Embedded DSpark draft cache does not match its rolling window")
+            buffers = tuple(manager.get_draft_buffers(stage) for stage in range(layout.num_layers))
+        self._draft_kv_manager = manager
+        self._draft_kv_buffers = buffers
+
+    def _managed_window_indices(self, row: int, position: int, length: int):
+        """Map logical token p to a local page and DSpark's frame (p + 1) % W."""
+        positions = torch.arange(position - length, position, device=self._kv_windows.device)
+        page_size = self._draft_kv_manager.tokens_per_block
+        pages = self._draft_block_tables[row, positions // page_size].long()
+        if torch.any(pages < 0).item():
+            raise ValueError("Embedded DSpark committed window contains an unallocated page")
+        return pages, positions % page_size, (positions + 1) % self._win
+
+    def _prepare_managed_history(self, request_ids: list[int], num_contexts: int) -> None:
+        """Restore authoritative history once, before any local accepted-token writes."""
+        # Startup probes and graph/ADP padding never publish synthetic history.
+        real_rows = [
+            row
+            for row, request_id in enumerate(request_ids)
+            if self._is_managed_request(request_id)
+        ]
+        real_ids = [request_ids[row] for row in real_rows]
+        table = self._draft_kv_manager.get_draft_block_table(real_ids)
+        self._draft_block_tables = torch.zeros(
+            (len(request_ids), table.shape[1]), dtype=table.dtype, device=self._kv_windows.device
+        )
+        self._draft_block_tables[real_rows] = table.to(self._kv_windows.device)
+        self._kv_windows[self._scratch_slot].zero_()
+        self._ctx_len[self._scratch_slot] = 0
+        self._valid_len[self._scratch_slot] = 0
+        self._position_initialized[self._scratch_slot] = False
+        batch_slots = [self._scratch_slot] * len(request_ids)
+        for row in real_rows:
+            request_id = request_ids[row]
+            history = self._draft_kv_manager.get_draft_history(request_id)
+            if row >= num_contexts and history is None:
+                raise ValueError(
+                    f"Embedded DSpark generation request {request_id} has no committed draft history"
+                )
+            slot = self._assign_slot(request_id, reset=False)
+            batch_slots[row] = slot
+            self._kv_windows[slot].zero_()
+            self._ctx_len[slot] = history.position if history is not None else 0
+            self._valid_len[slot] = history.valid_length if history is not None else 0
+            self._position_initialized[slot] = history is not None
+            if history is not None:
+                pages, offsets, frames = self._managed_window_indices(
+                    row, history.position, history.valid_length
+                )
+                for stage, pool in enumerate(self._draft_kv_buffers):
+                    self._kv_windows[slot, stage, frames] = pool[pages, 0, 0, offsets]
+        self._batch_to_slot[: len(request_ids)].copy_(
+            torch.tensor(batch_slots, dtype=torch.long, device=self._batch_to_slot.device)
+        )
+
+    def _publish_managed_history(self, request_ids: list[int]) -> None:
+        """Commit successful prefill/accepted-feature writes; proposal KV stays scratch."""
+        lengths = self._valid_len.tolist()
+        positions = self._ctx_len.tolist()
+        for row, request_id in enumerate(request_ids):
+            if not self._is_managed_request(request_id):
+                continue
+            slot = self._req_to_slot[request_id]
+            length, position = lengths[slot], positions[slot]
+            if position > self._draft_kv_manager.kv_cache_map[request_id].capacity:
+                raise ValueError("Embedded DSpark history exceeds its allocated draft capacity")
+            pages, offsets, frames = self._managed_window_indices(row, position, length)
+            for stage, pool in enumerate(self._draft_kv_buffers):
+                pool[pages, 0, 0, offsets] = self._kv_windows[slot, stage, frames]
+            self._draft_kv_manager.set_draft_history(request_id, length, position)
 
     def _seed_context_windows(
         self,
@@ -583,6 +688,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
         # Backref so DSparkSpecMetadata.prepare() can maintain the host slot map
         # and mirror it into _batch_to_slot for the CUDA-graph-safe gen path.
         spec_metadata._dspark_worker = self
+        self._bind_managed_history(resource_manager)
+        if self._draft_kv_manager is not None:
+            self._prepare_managed_history(spec_metadata.request_ids, num_contexts)
         self._execute_guided_decoder_if_present(logits)
 
         # Target-verify acceptance via the unified SpecWorkerBase entry: it
@@ -726,6 +834,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._valid_len.copy_(saved_valid_len)
             self._position_initialized.copy_(saved_position_initialized)
             self._kv_windows.copy_(saved_windows)
+        elif self._draft_kv_manager is not None:
+            self._publish_managed_history(spec_metadata.request_ids)
 
         return {
             "logits": raw_logits,
