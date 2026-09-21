@@ -5723,7 +5723,9 @@ class TestQwen3_8_2_4T_A95B(LlmapiAccuracyTestHarness):
 
     @skip_x86
     @pytest.mark.skip_less_mpi_world_size(16)
-    @pytest.mark.skip_device_not_contain(["GB200", "GB300"])
+    @pytest.mark.skipif(
+        get_sm_version() not in (100, 103, 107),
+        reason="This test is supported only on SM100, SM103 and SM107")
     def test_fp8_tp16_mtp3_trtllm(self, mocker):
         # The default AUTO uses MNNVL only when all TP ranks share one NVL72 fabric.
         self._run_fp8_block_scales(tensor_parallel_size=16,
@@ -5736,7 +5738,8 @@ class TestQwen3_8_2_4T_A95B(LlmapiAccuracyTestHarness):
 
     @skip_x86
     @pytest.mark.skip_less_mpi_world_size(16)
-    @pytest.mark.skip_device_not_contain(["GB300"])
+    @pytest.mark.skipif(get_sm_version() not in (103, 107),
+                        reason="This test is supported only on SM103 and SM107")
     def test_fp8_adp16_deepgemm(self, mocker):
         self._run_fp8_block_scales(tensor_parallel_size=16,
                                    pipeline_parallel_size=1,
@@ -5784,7 +5787,8 @@ class TestQwen3_8_2_4T_A95B(LlmapiAccuracyTestHarness):
 
     @skip_x86
     @pytest.mark.skip_less_mpi_world_size(8)
-    @pytest.mark.skip_device_not_contain(["GB300"])
+    @pytest.mark.skipif(get_sm_version() not in (103, 107),
+                        reason="This test is supported only on SM103 and SM107")
     def test_nvfp4_tp8_mtp3_trtllm(self, mocker):
         self._run_nvfp4(tensor_parallel_size=8,
                         ep_size=1,
@@ -5795,7 +5799,8 @@ class TestQwen3_8_2_4T_A95B(LlmapiAccuracyTestHarness):
 
     @skip_x86
     @pytest.mark.skip_less_mpi_world_size(16)
-    @pytest.mark.skip_device_not_contain(["GB300"])
+    @pytest.mark.skipif(get_sm_version() not in (103, 107),
+                        reason="This test is supported only on SM103 and SM107")
     def test_nvfp4_adp16_cutedsl(self, mocker):
         self._run_nvfp4(tensor_parallel_size=16,
                         ep_size=16,
