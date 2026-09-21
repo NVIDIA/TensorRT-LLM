@@ -115,6 +115,30 @@ class InfraDryRunPipelineTest(unittest.TestCase):
             classifier.index("retryContext.failureEvidence = evidence"),
         )
 
+    def test_post_actions_keep_interruptions_higher_priority_than_primary_failures(self) -> None:
+        result_handler = _function_body(
+            L0_TEST, "cacheErrorAndUploadResult", "createKubernetesPodConfig"
+        )
+        preserve_primary = _function_body(
+            L0_TEST, "preservePrimaryFailure", "rememberAvoidedKubernetesHostNodes"
+        )
+
+        self.assertIn("caughtError = e\n        stageIsInterrupted = true", result_handler)
+        self.assertIn("catch (InterruptedException e) {\n        throw e", preserve_primary)
+        self.assertIn(
+            "FailureClassifier.classify(e, InfraFailure.BOTH) instanceof PipelineInterruption",
+            preserve_primary,
+        )
+
+    def test_slurm_upload_skips_a_missing_result_directory(self) -> None:
+        upload_results = _function_body(L0_TEST, "uploadResults", "runIsolatedTests")
+
+        self.assertIn("if (!fileExists(stageName))", upload_results)
+        self.assertLess(
+            upload_results.index("if (!fileExists(stageName))"),
+            upload_results.index('sh "tar -czvf results-${stageName}${postTag}.tar.gz'),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

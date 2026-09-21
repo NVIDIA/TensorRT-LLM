@@ -364,6 +364,10 @@ def scrapeSlurmLogForDeviceFault(def pipeline, Map remote, String remoteLogPath)
 def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String nodeName, String stageName, String postTag="", boolean suppressTestReporting=false) {
     pipeline.stage('Submit Test Result') {
         sh "ls -al ${stageName}/ || true"
+        if (!fileExists(stageName)) {
+            echo "No local test-result directory for ${stageName}; skipping upload."
+            return
+        }
 
         if (suppressTestReporting) {
             // This attempt is superseded by a planned retry. Rename its XMLs so
