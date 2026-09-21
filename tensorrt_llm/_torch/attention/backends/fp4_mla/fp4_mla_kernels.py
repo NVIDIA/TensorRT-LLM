@@ -1922,6 +1922,9 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
             position = first_new_pos.to(tl.int64)
             if position < 0:
                 return
+            # Under helix the cache slot is rank-local while RoPE must use the
+            # GLOBAL position; they coincide everywhere else.
+            rope_position = rope_first_new_pos.to(tl.int64)
             page_idx = position // page_size
             page_pos = position - page_idx * page_size
             physical_page_offset = page_start + page_idx
@@ -1954,7 +1957,7 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                 latent_cache_ptr + latent_token * (NUM_DIM_BLOCKS * FP4_BLOCK) + tail_odd_d,
             ).to(tl.float32)
             rope_pair_offsets = tail_byte_offsets
-            rotary_offsets = position * (ROPE_DIM * 2) + rope_pair_offsets * 2
+            rotary_offsets = rope_position * (ROPE_DIM * 2) + rope_pair_offsets * 2
             cos = tl.load(rotary_cos_sin_ptr + rotary_offsets).to(tl.float32)
             sin = tl.load(rotary_cos_sin_ptr + rotary_offsets + 1).to(tl.float32)
             tail_even, tail_odd = _fp4_mla_rope_fp32(tail_even, tail_odd, cos, sin)
