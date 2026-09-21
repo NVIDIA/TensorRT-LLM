@@ -73,7 +73,7 @@ from ..speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_static_draft_len, update_draft_len
 from ..utils import (get_model_extra_attrs,
-                     get_per_request_prefill_cuda_graph_flag,
+                     get_per_request_prefill_cuda_graph_flag, helix_local_len,
                      set_per_request_prefill_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
 from .breakable_cuda_graph_runner import BreakableCUDAGraphRunner
@@ -4947,20 +4947,20 @@ class PyTorchModelEngine(ModelEngine):
         # Helix bookkeeping is needed by BOTH the extend (speculative verify
         # group) and the plain generation packing loops below, so initialize
         # it ahead of them. Positions are global; KV ownership follows the
-        # round-robin ledger (page b -> rank b % cp), mirrored host-side here
-        # (KVCacheManagerV2._helix_local_len) for provisional packing values.
+        # round-robin ledger (page b -> rank b % cp); the host-side
+        # provisional packing values come from the one shared definition in
+        # _torch.utils.helix_local_len.
         helix_is_inactive_rank, helix_position_offsets = [], []
         helix_owned_new_tokens = []
         _has_cp_helix = self.mapping.has_cp_helix()
         if _has_cp_helix and kv_cache_manager is not None:
             _helix_phys = kv_cache_manager.tokens_per_block
-            _helix_ledger = _helix_phys * self.mapping.cp_size
-            _helix_rank_off = self.mapping.cp_rank * _helix_phys
+            _helix_cp_size = self.mapping.cp_size
+            _helix_cp_rank = self.mapping.cp_rank
 
             def _helix_local_len_host(global_len: int) -> int:
-                full, rem = divmod(global_len, _helix_ledger)
-                return full * _helix_phys + min(max(rem - _helix_rank_off, 0),
-                                                _helix_phys)
+                return helix_local_len(global_len, _helix_phys, _helix_cp_size,
+                                       _helix_cp_rank)
 
             def _helix_pack_extend(request, group: int) -> int:
                 # A helix gen worker's token list is the rank-LOCAL

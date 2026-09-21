@@ -38,7 +38,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...pyexecutor.config_utils import is_mla
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
-                      get_model_extra_attrs)
+                      get_model_extra_attrs, helix_local_len_tensor)
 from .fmha.manager import FmhaManager
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
@@ -683,15 +683,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         For each global sequence length g, returns the number of the first g
         tokens whose ledger page lives on this CP rank (page b -> rank
-        b % cp_size). Mirrors KVCacheManagerV2._helix_local_len.
+        b % cp_size). The rule and its scalar twin live in
+        ``_torch.utils``; KVCacheManagerV2._helix_local_len and the host
+        packing in model_engine use the same definition.
         """
-        phys = self.kv_cache_manager.tokens_per_block
-        cp_size = self.mapping.cp_size
-        cp_rank = self.mapping.cp_rank
-        ledger = phys * cp_size
-        full = torch.div(global_lens, ledger, rounding_mode='floor')
-        rem = global_lens - full * ledger
-        return full * phys + (rem - cp_rank * phys).clamp_(0, phys)
+        return helix_local_len_tensor(global_lens,
+                                      self.kv_cache_manager.tokens_per_block,
+                                      self.mapping.cp_size,
+                                      self.mapping.cp_rank)
 
     def recompute_helix_spec_buffers(self, num_gen_tokens: int,
                                      tokens_per_gen_seq: int) -> None:
