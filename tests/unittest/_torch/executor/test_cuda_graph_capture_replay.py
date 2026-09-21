@@ -415,6 +415,44 @@ class TestStrictBufferCheck:
         with pytest.raises(RuntimeError, match="some_buf"):
             runner.replay(key, inputs)
 
+    def test_replay_rejects_rebound_spec_metadata_tensor(self, monkeypatch):
+        """Rebinding a spec_metadata tensor attribute must raise, naming the
+        attribute. Exercises the spec_metadata_ptrs snapshot/validation path,
+        which the attn_metadata-only tests above never touch.
+        """
+        runner, key, attn_metadata, inputs = self._make_runner_and_inputs(monkeypatch, value=10)
+        spec_metadata = _MetadataStub(value=20)
+        inputs["spec_metadata"] = spec_metadata
+
+        def forward_fn(fn_inputs):
+            return fn_inputs["input_ids"].clone() + fn_inputs["attn_metadata"].some_buf
+
+        runner.capture(key, forward_fn, inputs)
+
+        spec_metadata.some_buf = torch.full((1,), 99, device="cuda", dtype=torch.int32)
+
+        with pytest.raises(RuntimeError, match="some_buf"):
+            runner.replay(key, inputs)
+
+
+class TestStrictBufferCheckEnvVar:
+    """TLLM_CUDA_GRAPH_STRICT_BUFFERS must actually control
+    _strict_buffer_check_enabled(); TestStrictBufferCheck above patches
+    _STRICT_BUFFER_CHECK directly and never exercises this parsing.
+    """
+
+    def test_env_var_absent_disables_check(self, monkeypatch):
+        monkeypatch.delenv("TLLM_CUDA_GRAPH_STRICT_BUFFERS", raising=False)
+        assert cuda_graph_runner_module._strict_buffer_check_enabled() is False
+
+    def test_env_var_set_to_one_enables_check(self, monkeypatch):
+        monkeypatch.setenv("TLLM_CUDA_GRAPH_STRICT_BUFFERS", "1")
+        assert cuda_graph_runner_module._strict_buffer_check_enabled() is True
+
+    def test_env_var_set_to_other_value_disables_check(self, monkeypatch):
+        monkeypatch.setenv("TLLM_CUDA_GRAPH_STRICT_BUFFERS", "true")
+        assert cuda_graph_runner_module._strict_buffer_check_enabled() is False
+
 
 class _AttnMetadataStub:
     """Minimal stand-in for attn_metadata's create_cuda_graph_metadata() contract.

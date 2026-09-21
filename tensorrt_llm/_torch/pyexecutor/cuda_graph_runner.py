@@ -31,11 +31,15 @@ from .sampler import SampleStateTensors
 from .sampler.sampler_common import SampleType
 from .scheduler import ScheduledRequests
 
-# Opt-in check that catches attn_metadata/spec_metadata tensor attributes
-# getting rebound to a freshly allocated tensor between capture and replay.
-# Off by default: replay() is on the per-token critical path, and this walks
-# every CUDA tensor attribute on both metadata objects each call.
-_STRICT_BUFFER_CHECK = os.getenv("TLLM_CUDA_GRAPH_STRICT_BUFFERS", "0") == "1"
+
+# Opt-in: catches attn_metadata/spec_metadata tensors rebound between capture
+# and replay. Off by default since replay() is on the per-token critical path.
+def _strict_buffer_check_enabled() -> bool:
+    """Whether TLLM_CUDA_GRAPH_STRICT_BUFFERS enables strict buffer checking."""
+    return os.getenv("TLLM_CUDA_GRAPH_STRICT_BUFFERS", "0") == "1"
+
+
+_STRICT_BUFFER_CHECK = _strict_buffer_check_enabled()
 
 # A large prime number used for dummy request IDs to avoid collisions
 CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
