@@ -943,16 +943,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """Allow model-owned scratch state to follow the updated slot mapping."""
 
     def _reset_context_mamba_slots(self, num_contexts: int) -> None:
-        if num_contexts:
-            self._reset_model_slots(
+        if num_contexts and self._speculative_state is not None:
+            self._speculative_state.reset_slots(
                 self.cuda_state_indices[:num_contexts].long(),
                 self._host_state_indices[:num_contexts].tolist(),
             )
-
-    def _reset_model_slots(self, slots: torch.Tensor, host_slots: list[int]) -> None:
-        """Reset any model-owned request state for the supplied slots."""
-        if self._speculative_state is not None:
-            self._speculative_state.reset_slots(slots, host_slots)
 
     def _refresh_dummy_request_mask(self, is_dummy: list[bool]) -> None:
         count = len(is_dummy)
@@ -1029,7 +1024,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         state_indices_d = state_indices[num_contexts : num_contexts + num_gens].to(torch.int32)
         src_state_indices = self._generation_state_indices[:num_gens]
         is_dummy_request = self._dummy_request_mask[num_contexts : num_contexts + num_gens]
-        self._update_speculative_state(
+        if self._speculative_state is None:
+            raise NotImplementedError("The model manager must provide speculative state")
+        self._speculative_state.update(
             MambaAcceptanceBatch(
                 attention_metadata=attn_metadata,
                 num_contexts=num_contexts,
@@ -1041,11 +1038,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 is_dummy_request=is_dummy_request,
             ),
         )
-
-    def _update_speculative_state(self, batch: MambaAcceptanceBatch) -> None:
-        if self._speculative_state is None:
-            raise NotImplementedError("The model manager must provide speculative state")
-        self._speculative_state.update(batch)
 
     @override
     def try_commit_blocks(self, request: LlmRequest, kv_cache=None) -> None:
@@ -1330,7 +1322,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     @override
     def shutdown(self):
-        self._shutdown_model_state()
+        if self._speculative_state is not None:
+            self._speculative_state.shutdown()
         self._recurrent_buffers.clear()
         self.all_ssm_states = []
         self.all_conv_states = []
@@ -1339,11 +1332,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._generation_state_indices = None
         self._branch_snapshot_points.clear()
         super().shutdown()
-
-    def _shutdown_model_state(self) -> None:
-        """Release model-owned state before the common pool is destroyed."""
-        if self._speculative_state is not None:
-            self._speculative_state.shutdown()
 
 
 __all__ = ["MambaHybridCacheManagerV2"]

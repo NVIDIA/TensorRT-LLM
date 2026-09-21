@@ -34,7 +34,7 @@ from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
     Qwen4ExpHybridCacheManagerV2,
     Qwen4ExpPLECacheParams,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaAcceptanceBatch,
@@ -177,6 +177,30 @@ def _state_views(layers=2, slots=5):
     )
 
 
+def _shutdown_manager(manager, monkeypatch):
+    """Exercise real shutdown while replacing only the native pool teardown."""
+    manager._recurrent_buffers = {"buffer": object()}
+    manager._branch_snapshot_points = {"request": object()}
+    if isinstance(manager, Qwen4ExpHybridCacheManagerV2):
+        manager._ple_conv_states = {42: object()}
+        manager._ple_ngram_contexts = {42: object()}
+
+    def check_before_pool_shutdown():
+        assert manager.intermediate_state_indices is None
+        assert manager.intermediate_ssm_states is None
+        assert manager.intermediate_conv_states is None
+        assert not manager._recurrent_buffers
+        assert not manager._branch_snapshot_points
+        assert not manager.all_ssm_states and not manager.all_conv_states
+        if isinstance(manager, Qwen4ExpHybridCacheManagerV2):
+            assert not manager._ple_conv_states and not manager._ple_ngram_contexts
+
+    pool_shutdown = Mock(side_effect=check_before_pool_shutdown)
+    monkeypatch.setattr(KVCacheManagerV2, "shutdown", pool_shutdown)
+    manager.shutdown()
+    pool_shutdown.assert_called_once_with()
+
+
 def _prepare_model_layout(manager):
     """Supply constructor-resolved inputs when testing the pre-pool hook alone."""
     manager._mamba_ssm_stochastic_rounding = False
@@ -287,38 +311,31 @@ def test_k3_initializes_only_the_selected_state(
 
     manager._state_layout = object()
     manager.all_ssm_states, manager.all_conv_states = [], []
-    bind, update, reset = Mock(), Mock(), Mock()
+    bind = Mock()
     monkeypatch.setattr(state, "bind", bind)
-    monkeypatch.setattr(state, "update", update)
-    monkeypatch.setattr(state, "reset_slots", reset)
     manager._setup_model_state()
     bind.assert_called_once_with(
         manager._state_layout, manager.all_ssm_states, manager.all_conv_states
     )
-    batch, slots, host_slots = object(), object(), [0]
-    manager._update_speculative_state(batch)
-    update.assert_called_once_with(batch)
-    manager._reset_model_slots(slots, host_slots)
-    reset.assert_called_once_with(slots, host_slots)
 
     shutdown = Mock(wraps=state.shutdown)
     monkeypatch.setattr(state, "shutdown", shutdown)
-    manager._shutdown_model_state()
+    _shutdown_manager(manager, monkeypatch)
     shutdown.assert_called_once_with()
-    manager._shutdown_model_state()
+    _shutdown_manager(manager, monkeypatch)
     assert shutdown.call_count == 2
     if num_spec is not None:
         assert manager._speculative_state is manager._kda_replay
 
 
-def test_base_manager_without_model_state():
+def test_base_manager_without_model_state(monkeypatch):
     manager = object.__new__(MambaHybridCacheManagerV2)
     manager.spec_config = None
     manager._speculative_state = manager._initialize_model_state()
     assert manager._speculative_state is None
     manager._setup_model_state()
-    manager._reset_model_slots(object(), [0])
-    manager._shutdown_model_state()
+    manager._reset_context_mamba_slots(num_contexts=1)
+    _shutdown_manager(manager, monkeypatch)
     assert manager.intermediate_state_indices is None
     assert manager.intermediate_ssm_states is None
     assert manager.intermediate_conv_states is None
@@ -339,7 +356,7 @@ def test_seed_accessor_is_not_a_common_manager_capability(manager_cls):
     assert not hasattr(manager_cls, "get_mamba_ssm_rand_seed")
 
 
-def test_mamba2_seed_lifecycle_without_speculative_decoding():
+def test_mamba2_seed_lifecycle_without_speculative_decoding(monkeypatch):
     manager = object.__new__(NemotronHybridCacheManagerV2)
     manager.spec_config = None
     manager._requested_replay = False
@@ -352,19 +369,21 @@ def test_mamba2_seed_lifecycle_without_speculative_decoding():
     manager._setup_model_state()
     seeds = manager.get_mamba_ssm_rand_seed()
     before = seeds.clone()
-    manager._reset_model_slots(torch.tensor([1]), [1])
+    manager.cuda_state_indices = torch.tensor([1], dtype=torch.int32)
+    manager._host_state_indices = manager.cuda_state_indices.clone()
+    manager._reset_context_mamba_slots(num_contexts=1)
     assert manager.get_mamba_ssm_rand_seed() is seeds
     assert seeds[1] != before[1]
     torch.testing.assert_close(seeds[[0, 2, 3, 4]], before[[0, 2, 3, 4]])
     assert manager.intermediate_ssm_states is None
-    manager._shutdown_model_state()
+    _shutdown_manager(manager, monkeypatch)
     assert manager.get_mamba_ssm_rand_seed() is None
 
 
 @pytest.mark.parametrize(
     "state", [GDNIntermediateState(), ReplayHistory(3), GDNReplayState(3), KDAReplayState(2)]
 )
-def test_common_manager_consumes_model_state_contract(state):
+def test_common_manager_consumes_model_state_contract(state, monkeypatch):
     manager = object.__new__(MambaHybridCacheManagerV2)
     manager.spec_config = SimpleNamespace(tokens_per_gen_step=3)
     manager._speculative_state = state
@@ -387,7 +406,7 @@ def test_common_manager_consumes_model_state_contract(state):
     else:
         assert payload.intermediate_ssm is not None
     assert not hasattr(manager, "get_replay_state_update_metadata")
-    manager._shutdown_model_state()
+    _shutdown_manager(manager, monkeypatch)
     assert manager.intermediate_state_indices is None
     assert manager.intermediate_ssm_states is None
     assert manager.intermediate_conv_states is None
@@ -399,8 +418,15 @@ def test_base_manager_requires_model_for_speculative_decoding():
     with pytest.raises(NotImplementedError, match="model-specific"):
         manager._initialize_model_state()
     manager._speculative_state = None
+    manager.local_num_mamba_layers = 1
+    manager._generation_state_indices = torch.empty(0, dtype=torch.int32)
+    manager._dummy_request_mask = torch.empty(0, dtype=torch.bool)
     with pytest.raises(NotImplementedError, match="model manager"):
-        manager._update_speculative_state(object())
+        manager.update_mamba_states(
+            SimpleNamespace(num_seqs=0, num_contexts=0),
+            torch.empty(0, dtype=torch.int32),
+            state_indices=torch.empty(0, dtype=torch.int32),
+        )
 
 
 @pytest.mark.parametrize(
@@ -448,15 +474,38 @@ def test_model_owns_speculative_state_lifecycle(monkeypatch, manager_cls, mode):
     state.intermediate_conv = [conv] if mode != "plain" else None
     assert manager.intermediate_ssm_states == ([ssm] if mode == "intermediate" else None)
     assert manager.intermediate_conv_states == ([conv] if mode != "plain" else None)
-    batch, slots, host_slots = object(), object(), [0]
-    manager._reset_model_slots(slots, host_slots)
-    reset.assert_called_once_with(slots, host_slots)
-    manager._update_speculative_state(batch)
-    update.assert_called_once_with(batch)
+    manager.local_num_mamba_layers = 1
+    manager.cuda_state_indices = torch.tensor([4, 2, 3], dtype=torch.int32)
+    manager._host_state_indices = manager.cuda_state_indices.clone()
+    manager._generation_state_indices = torch.arange(2, dtype=torch.int32)
+    manager._dummy_request_mask = torch.tensor([False, False, True])
+    manager._reset_context_mamba_slots(num_contexts=1)
+    reset.assert_called_once()
+    slots, host_slots = reset.call_args.args
+    torch.testing.assert_close(slots, torch.tensor([4], dtype=torch.int64))
+    assert host_slots == [4]
+    manager._reset_context_mamba_slots(num_contexts=0)
+    reset.assert_called_once()
+
+    metadata = SimpleNamespace(num_seqs=3, num_contexts=1)
+    manager.update_mamba_states(
+        metadata,
+        torch.tensor([1, 3, 2], dtype=torch.int32),
+        state_indices=manager.cuda_state_indices,
+    )
+    update.assert_called_once()
+    batch = update.call_args.args[0]
+    assert batch.attention_metadata is metadata
+    assert (batch.num_contexts, batch.num_generations) == (1, 2)
+    assert batch.num_accepted_tokens.tolist() == [3, 2]
+    assert batch.accepted_positions.tolist() == [2, 1]
+    assert batch.source_state_indices.tolist() == [0, 1]
+    assert batch.destination_state_indices.tolist() == [2, 3]
+    assert batch.is_dummy_request.tolist() == [False, True]
 
     shutdown = Mock(wraps=state.shutdown)
     monkeypatch.setattr(state, "shutdown", shutdown)
-    manager._shutdown_model_state()
+    _shutdown_manager(manager, monkeypatch)
     shutdown.assert_called_once_with()
     assert manager.intermediate_ssm_states is None and state.intermediate_conv is None
     if mode == "replay":

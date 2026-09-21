@@ -556,10 +556,10 @@ class Qwen4ExpHybridCacheManagerV2(MambaHybridCacheManagerV2):
         )
 
     @override
-    def _shutdown_model_state(self) -> None:
+    def shutdown(self) -> None:
         self._ple_conv_states.clear()
         self._ple_ngram_contexts.clear()
-        super()._shutdown_model_state()
+        super().shutdown()
 
     def get_replay_state_update_metadata(self) -> ReplayStateUpdateMetadata | None:
         state = self._speculative_state
