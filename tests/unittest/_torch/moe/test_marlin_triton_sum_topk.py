@@ -48,9 +48,7 @@ def test_triton_sum_topk_matches_aten_scatter_reduce(
     )
 
     expected = _aten_reference(expert_outputs, num_tokens, top_k, hidden_size, torch.bfloat16)
-    actual = sum_topk_expert_outputs(
-        expert_outputs, num_tokens, top_k, hidden_size, torch.bfloat16
-    )
+    actual = sum_topk_expert_outputs(expert_outputs, num_tokens, top_k, hidden_size, torch.bfloat16)
 
     assert actual.shape == (num_tokens, hidden_size)
     assert actual.dtype == torch.bfloat16
