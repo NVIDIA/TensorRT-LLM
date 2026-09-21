@@ -20,7 +20,12 @@ from typing import Optional
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 from tensorrt_llm.logger import logger
 
-from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
+from ..llm_request import (
+    LlmRequest,
+    LlmRequestState,
+    get_draft_token_length,
+    rewind_context_after_cache_drop,
+)
 from .scheduler import (
     RequestList,
     RequestScheduler,
@@ -739,9 +744,25 @@ class KVCacheV2Scheduler(RequestScheduler):
         and never run the prefill the load was for. A loading request is kept
         out of the batch by its ``DISAGG_GENERATION_TRANS_IN_PROGRESS`` state.
         """
+        first_chunk = req.is_first_context_chunk
         if self.chunking_enabled:
-            return self._try_schedule_context_chunked(req, budget)
-        return self._try_schedule_context_full(req, budget)
+            result = self._try_schedule_context_chunked(req, budget)
+        else:
+            result = self._try_schedule_context_full(req, budget)
+
+        if first_chunk and result[0] is not ScheduleAction.SCHEDULED:
+            # Failed admission must not retain prefix-reuse holds. Suspension
+            # alone cannot release them when the last cache tier is full.
+            for manager in (
+                self.kv_cache_manager,
+                self.draft_kv_cache_manager,
+                self.cross_kv_cache_manager,
+            ):
+                if manager is not None and req.py_request_id in manager.kv_cache_map:
+                    manager.free_resources(req)
+            rewind_context_after_cache_drop(req, self.tokens_per_block)
+
+        return result
 
     def _try_schedule_context_full(
         self, req: LlmRequest, budget: BudgetTracker
@@ -854,10 +875,6 @@ class KVCacheV2Scheduler(RequestScheduler):
             chunk_size = (chunk_size // self.chunk_unit_size) * self.chunk_unit_size
 
         if chunk_size <= 0:
-            # TODO: consider suspending first-chunk KVCache to release
-            # GPU pages. Currently we skip without suspend to avoid
-            # pathological suspend/resume cycles. suspend_request is
-            # only called from eviction (_try_evict_for_gen).
             return ScheduleAction.SKIP, 0, False
 
         chunk_size = self._align_chunk_to_mm_block(
