@@ -30,6 +30,15 @@ regenerated for any modified members so `pip install` stays consistent.
                 --output bolt-TensorRT-LLM-GH200.tar.gz \
                 [--manifest manifest.json] [--strip] [--dry-run]
 
+`--wheel` is the same operation on a standalone .whl. The released SBSA
+manylinux wheel is built and uploaded on its own rather than packed into a
+tarball, so it needs an entry point that does not go through the release
+layout:
+
+  apply_bolt.py --wheel tensorrt_llm-<ver>-cp312-cp312-manylinux_2_39_aarch64.whl \
+                --profiles /path/to/_merged \
+                --output bolted.whl [--strip] [--dry-run]
+
 llvm-bolt must be on PATH (same version used to instrument/merge). The optimize
 flags mirror scripts/bolt/bolt_lib.sh::optimize_libraries -- keep them in sync.
 """
@@ -110,15 +119,25 @@ def is_elf(path: Path) -> bool:
         return False
 
 
+class BoltApplyError(RuntimeError):
+    """An in-scope ELF did not optimize.
+
+    Raised rather than reported, because there is no caller that can sensibly
+    carry on: an artifact where some matching ELFs were optimized and others
+    were skipped is indistinguishable from a fully optimized one, and it is the
+    version that would get uploaded.
+    """
+
+
 # ---------------------------------------------------------------------------
 # BOLT one ELF (in place)
 # ---------------------------------------------------------------------------
-def bolt_elf(elf: Path, profile: Path, flags: list[str], strip: bool, dry_run: bool) -> bool:
-    """BOLT `elf` in place using `profile`. Returns True if optimized."""
+def bolt_elf(elf: Path, profile: Path, flags: list[str], strip: bool, dry_run: bool) -> None:
+    """BOLT `elf` in place using `profile`. Raises BoltApplyError if it cannot."""
     rel = elf.name
     if dry_run:
         log(f"  would bolt {rel}  <-  {profile.name}")
-        return True
+        return
 
     out = elf.with_suffix(elf.suffix + ".bolted")
     cmd = ["llvm-bolt", str(elf), "-o", str(out), f"-data={profile}"] + flags
@@ -129,7 +148,7 @@ def bolt_elf(elf: Path, profile: Path, flags: list[str], strip: bool, dry_run: b
         for line in output.splitlines()[-15:]:
             err(f"    {line}")
         out.unlink(missing_ok=True)
-        return False
+        raise BoltApplyError(f"llvm-bolt failed for {rel} (rc={rc})")
 
     if strip:
         rc_s, _ = run(["llvm-strip", "--strip-all", str(out)])
@@ -139,7 +158,6 @@ def bolt_elf(elf: Path, profile: Path, flags: list[str], strip: bool, dry_run: b
     # Preserve mode, then replace original.
     out.chmod(elf.stat().st_mode)
     os.replace(out, elf)
-    return True
 
 
 # ---------------------------------------------------------------------------
@@ -205,9 +223,9 @@ def process_wheel(
             prof = profile_for(f.name, profiles_dir)
             if prof is None:
                 continue
-            if bolt_elf(f, prof, flags, strip, dry_run):
-                bolted += 1
-                changed.append(f)
+            bolt_elf(f, prof, flags, strip, dry_run)
+            bolted += 1
+            changed.append(f)
 
         if bolted == 0:
             log("  no matching ELFs in wheel; leaving it unchanged")
@@ -231,6 +249,45 @@ def process_wheel(
         os.replace(tmp_whl, wheel)
         log(f"  repacked wheel ({bolted} libs bolted, RECORD updated)")
         return bolted
+
+
+def bolt_standalone_wheel(
+    wheel: Path, output: Path, profiles_dir: Path, strip: bool, dry_run: bool
+) -> int:
+    """BOLT a .whl that is not packed inside a release tarball.
+
+    process_wheel() rewrites in place, so the copy happens first and the input
+    is never touched: a failed apply leaves the original wheel uploadable.
+    """
+    log(f"Standalone wheel: {wheel.name}")
+    if dry_run:
+        bolted = process_wheel(wheel, profiles_dir, DEFAULT_BOLT_FLAGS, strip, True)
+        log(f"dry-run: {bolted} member(s) would be bolted; skipping repack.")
+        return 0
+
+    # In place would break the contract above: process_wheel() rewrites its
+    # argument, so a failed apply would leave the caller's input half-written
+    # with nothing to fall back on.
+    if output.resolve() == wheel.resolve():
+        err("--output must differ from --wheel; the input is preserved so a "
+            "failed apply leaves it usable")
+        return 2
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(wheel, output)
+    try:
+        bolted = process_wheel(output, profiles_dir, DEFAULT_BOLT_FLAGS, strip, False)
+    except BoltApplyError:
+        # Partially bolted: drop it rather than leave something uploadable that
+        # looks finished.
+        output.unlink(missing_ok=True)
+        raise
+    if bolted == 0:
+        err("no ELF in the wheel matched a profile -- nothing bolted. Check --profiles names.")
+        output.unlink(missing_ok=True)
+        return 2
+    log(f"Done. Bolted wheel: {output} ({bolted} lib(s) bolted, RECORD updated)")
+    return 0
 
 
 def _rewrite_record(record_path: Path, wheel_root: Path, changed: list[Path]) -> None:
@@ -311,11 +368,16 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument(
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument(
         "--tarball",
-        required=True,
         type=Path,
         help="BOLT-compatible release tarball (TensorRT-LLM*.tar.gz)",
+    )
+    src.add_argument(
+        "--wheel",
+        type=Path,
+        help="BOLT-compatible standalone wheel (the released manylinux .whl)",
     )
     ap.add_argument(
         "--profiles",
@@ -347,74 +409,89 @@ def main() -> int:
     if not args.dry_run and shutil.which("llvm-bolt") is None:
         err("llvm-bolt not on PATH")
         return 2
-    if not args.tarball.is_file():
-        err(f"tarball not found: {args.tarball}")
+    source = args.tarball or args.wheel
+    if not source.is_file():
+        err(f"input not found: {source}")
         return 2
 
     owns_workdir = args.workdir is None
     workdir = Path(tempfile.mkdtemp(prefix="apply_bolt_")) if owns_workdir else args.workdir
     workdir.mkdir(parents=True, exist_ok=True)
     try:
-        profiles_dir = resolve_profiles(args.profiles, workdir)
-        log(
-            f"Profiles: {profiles_dir} "
-            f"({len(list(profiles_dir.glob('*.yaml')))} yaml, "
-            f"{len(list(profiles_dir.glob('*.fdata')))} fdata)"
-        )
-
-        # Extract the tarball.
-        extract = workdir / "extract"
-        extract.mkdir(parents=True, exist_ok=True)
-        log(f"Extracting {args.tarball.name}")
-        rc, out = run(["tar", "-xf", str(args.tarball), "-C", str(extract)])
-        if rc != 0:
-            err(f"failed to extract tarball: {out}")
-            return 2
-        roots = [p for p in extract.iterdir() if p.is_dir()]
-        tree = roots[0] if len(roots) == 1 else extract
-        log(f"Tarball root: {tree.name}")
-
-        if args.manifest:
-            verify_manifest(args.manifest, tree, args.strict)
-
-        total = 0
-        # 1) Loose ELFs in the layout (benchmarks/cpp, triton_backend, etc.).
-        for f in sorted(tree.rglob("*")):
-            if f.suffix == ".whl" or not f.is_file() or not is_elf(f):
-                continue
-            prof = profile_for(f.name, profiles_dir)
-            if prof is None:
-                continue
-            if bolt_elf(f, prof, DEFAULT_BOLT_FLAGS, args.strip, args.dry_run):
-                total += 1
-
-        # 2) Wheel(s).
-        for wheel in sorted(tree.rglob("tensorrt_llm-*.whl")):
-            total += process_wheel(
-                wheel, profiles_dir, DEFAULT_BOLT_FLAGS, args.strip, args.dry_run
-            )
-
-        if total == 0:
-            err("no ELFs matched a profile -- nothing bolted. Check --profiles names.")
-            return 2
-        log(f"Bolted {total} ELF(s) total (loose + wheel).")
-
-        if args.dry_run:
-            log("dry-run: skipping repack.")
-            return 0
-
-        # Repack the tarball under the new name.
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        log(f"Repacking -> {args.output}")
-        rc, out = run(["tar", "-C", str(extract), "-czf", str(args.output), tree.name])
-        if rc != 0:
-            err(f"repack failed: {out}")
-            return 2
-        log(f"Done. Bolted tarball: {args.output}")
-        return 0
+        return _apply(args, workdir)
+    except BoltApplyError as e:
+        # Already reported in detail by bolt_elf; this is the exit code, and the
+        # guarantee that a partial result never reaches the output path.
+        err(f"aborting without producing an output: {e}")
+        return 2
     finally:
         if owns_workdir:
             shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _apply(args: argparse.Namespace, workdir: Path) -> int:
+    profiles_dir = resolve_profiles(args.profiles, workdir)
+    log(
+        f"Profiles: {profiles_dir} "
+        f"({len(list(profiles_dir.glob('*.yaml')))} yaml, "
+        f"{len(list(profiles_dir.glob('*.fdata')))} fdata)"
+    )
+
+    if args.wheel:
+        return bolt_standalone_wheel(
+            args.wheel, args.output, profiles_dir, args.strip, args.dry_run
+        )
+
+    # Extract the tarball.
+    extract = workdir / "extract"
+    extract.mkdir(parents=True, exist_ok=True)
+    log(f"Extracting {args.tarball.name}")
+    rc, out = run(["tar", "-xf", str(args.tarball), "-C", str(extract)])
+    if rc != 0:
+        err(f"failed to extract tarball: {out}")
+        return 2
+    roots = [p for p in extract.iterdir() if p.is_dir()]
+    tree = roots[0] if len(roots) == 1 else extract
+    log(f"Tarball root: {tree.name}")
+
+    if args.manifest:
+        verify_manifest(args.manifest, tree, args.strict)
+
+    total = 0
+    # 1) Loose ELFs in the layout (benchmarks/cpp, triton_backend, etc.).
+    for f in sorted(tree.rglob("*")):
+        if f.suffix == ".whl" or not f.is_file() or not is_elf(f):
+            continue
+        prof = profile_for(f.name, profiles_dir)
+        if prof is None:
+            continue
+        bolt_elf(f, prof, DEFAULT_BOLT_FLAGS, args.strip, args.dry_run)
+        total += 1
+
+    # 2) Wheel(s).
+    for wheel in sorted(tree.rglob("tensorrt_llm-*.whl")):
+        total += process_wheel(
+            wheel, profiles_dir, DEFAULT_BOLT_FLAGS, args.strip, args.dry_run
+        )
+
+    if total == 0:
+        err("no ELFs matched a profile -- nothing bolted. Check --profiles names.")
+        return 2
+    log(f"Bolted {total} ELF(s) total (loose + wheel).")
+
+    if args.dry_run:
+        log("dry-run: skipping repack.")
+        return 0
+
+    # Repack the tarball under the new name.
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    log(f"Repacking -> {args.output}")
+    rc, out = run(["tar", "-C", str(extract), "-czf", str(args.output), tree.name])
+    if rc != 0:
+        err(f"repack failed: {out}")
+        return 2
+    log(f"Done. Bolted tarball: {args.output}")
+    return 0
 
 
 if __name__ == "__main__":
