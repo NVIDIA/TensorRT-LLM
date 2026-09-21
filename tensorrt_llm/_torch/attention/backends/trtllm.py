@@ -878,6 +878,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.enable_helix:
             # If helix is inactive, attend to the previously cached tokens only.
             assert cached_token_lens is not None, "cached_token_lens should be set for helix"
+            # Both branches index a per-GENERATION-sequence buffer with
+            # [:num_seqs] against a contexts-first cached_token_lens, which
+            # only lines up when the batch carries no context rows. That has
+            # been the (unstated) helix invariant since the boolean branch
+            # landed on main; helix_is_inactive_rank_cpu is uninitialized
+            # memory for any row the packing loops did not write, so a mixed
+            # batch is already wrong rather than merely imprecise.
             if self._helix_spec_tokens_valid:
                 # Speculative verify groups: a group may straddle a page
                 # boundary, so ownership of this step's new tokens is a
