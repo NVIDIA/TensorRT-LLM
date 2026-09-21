@@ -121,21 +121,16 @@ _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 # long-lived processes observe changes without re-import.
 _ALLOW_PRIVATE_URLS_ENV = "TRTLLM_MEDIA_ALLOW_PRIVATE_URLS"
 
-_warned_private_urls_allowed = False
-
 
 def _allow_private_urls() -> bool:
     if os.environ.get(_ALLOW_PRIVATE_URLS_ENV, "0") != "1":
         return False
-    global _warned_private_urls_allowed
-    if not _warned_private_urls_allowed:
-        _warned_private_urls_allowed = True
-        logger.warning(
-            "%s=1: media URLs resolving to private/loopback addresses are "
-            "allowed; server-side SSRF protection for media fetches is "
-            "relaxed.",
-            _ALLOW_PRIVATE_URLS_ENV,
-        )
+    logger.warning_once(
+        f"{_ALLOW_PRIVATE_URLS_ENV}=1: media URLs resolving to private/loopback "
+        "addresses are allowed; server-side SSRF protection for media fetches "
+        "is relaxed.",
+        key="media_allow_private_urls",
+    )
     return True
 
 
