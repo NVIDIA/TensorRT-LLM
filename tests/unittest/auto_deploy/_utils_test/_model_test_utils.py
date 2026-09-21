@@ -447,24 +447,6 @@ _SMALL_MODEL_CONFIGS = {
             "num_experts": 16,
         },
     },
-    "meta-llama/Llama-4-Scout-17B-16E-Instruct": {
-        "model_factory": "AutoModelForImageTextToText",
-        "model_kwargs": {
-            "text_config": {
-                "num_hidden_layers": 1,
-                "head_dim": 64,
-                "hidden_size": 32,
-                "intermediate_size": 64,
-                "intermediate_size_mlp": 64,
-                "num_attention_heads": 2,
-                "num_key_value_heads": 1,
-                "num_local_experts": 2,
-            },
-            "vision_config": {
-                "num_hidden_layers": 1,
-            },
-        },
-    },
     "deepseek-ai/DeepSeek-V3": {
         "model_kwargs": {
             "first_k_dense_replace": 1,
@@ -482,15 +464,6 @@ _SMALL_MODEL_CONFIGS = {
             "num_key_value_heads": 2,
             "num_experts_per_tok": 2,
             "q_lora_rank": 128,
-        },
-    },
-    "Qwen/Qwen2.5-3B-Instruct": {
-        "model_kwargs": {
-            "num_hidden_layers": 2,
-            "hidden_size": 64,
-            "intermediate_size": 128,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
         },
     },
     "mistralai/Mistral-Small-3.1-24B-Instruct-2503": {

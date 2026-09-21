@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (c) 2021, NAVER Corp.  Authored by CLOVA.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -361,7 +361,7 @@ struct MmaComputer
     static constexpr int k_phase_cnt = per_warp_tile_k / 16;
     static constexpr int m_iter_cnt = (tile_m + 15) / 16;
     static constexpr int n_iter_cnt = (tile_n + 7) / 8; // Possible to have non-1 n_iter_cnt for ab_swap m16 case.
-    static_assert(m_iter_cnt == 1);
+    static_assert(m_iter_cnt == 1 || m_iter_cnt == 2);
     static_assert(n_iter_cnt == 1 || n_iter_cnt == 2);
 
     __device__ MmaComputer(
@@ -393,13 +393,19 @@ public:
     {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 #pragma unroll
-        for (int i = 0; i < k_phase_cnt; i++)
+        for (int m = 0; m < m_iter_cnt; m++)
         {
-            int linear_idx = (lane_idx % 16) + (lane_idx / 16) * 128 + i * 256;
-            int m_idx = linear_idx % tile_m;
-            int k_idx = linear_idx / tile_m + warp_k_offset_in_tile_k;
-            k_idx = apply_swizzle_343_on_elem_row_col<bf16_t>(m_idx, k_idx);
-            a_smem_offsets[0][i] = m_idx * tile_k + k_idx;
+#pragma unroll
+            for (int i = 0; i < k_phase_cnt; i++)
+            {
+                int linear_idx = (lane_idx % 16) + (lane_idx / 16) * 128 + i * 256;
+                // The ldmatrix A fragment atom is 16 rows; index within the 16-row atom, then
+                // offset by m*16 so tile_m=32 addresses rows 0..31 (and k is /16, not /tile_m).
+                int m_idx = linear_idx % 16 + m * 16;
+                int k_idx = linear_idx / 16 + warp_k_offset_in_tile_k;
+                k_idx = apply_swizzle_343_on_elem_row_col<bf16_t>(m_idx, k_idx);
+                a_smem_offsets[m][i] = m_idx * tile_k + k_idx;
+            }
         }
 #pragma unroll
         for (int n_iter_idx = 0; n_iter_idx < n_iter_cnt; n_iter_idx++)
@@ -426,11 +432,15 @@ public:
             wait_barrier(smem_barrier + 0 + stage_idx * 2, phase_bit);
 
 #pragma unroll
-            for (int i = 0; i < k_phase_cnt; i++)
+            for (int m = 0; m < m_iter_cnt; m++)
             {
-                int smem_offset = a_smem_offsets[0][i];
-                bf16_t* smem_ptr_this_iter = smem_a + stage_idx * tile_m * tile_k + smem_offset;
-                ldsm_x4(smem_ptr_this_iter, reinterpret_cast<uint32_t*>(a_reg[0][i]));
+#pragma unroll
+                for (int i = 0; i < k_phase_cnt; i++)
+                {
+                    int smem_offset = a_smem_offsets[m][i];
+                    bf16_t* smem_ptr_this_iter = smem_a + stage_idx * tile_m * tile_k + smem_offset;
+                    ldsm_x4(smem_ptr_this_iter, reinterpret_cast<uint32_t*>(a_reg[m][i]));
+                }
             }
 
 #pragma unroll
@@ -451,8 +461,12 @@ public:
 #pragma unroll
                 for (int n_iter_idx = 0; n_iter_idx < n_iter_cnt; n_iter_idx++)
                 {
-                    hmma_16_8_16_f32acc_bf16ab(acc_reg[0][n_iter_idx], a_reg[0][k_iter_idx],
-                        b_reg[n_iter_idx][k_iter_idx], acc_reg[0][n_iter_idx]);
+#pragma unroll
+                    for (int m = 0; m < m_iter_cnt; m++)
+                    {
+                        hmma_16_8_16_f32acc_bf16ab(acc_reg[m][n_iter_idx], a_reg[m][k_iter_idx],
+                            b_reg[n_iter_idx][k_iter_idx], acc_reg[m][n_iter_idx]);
+                    }
                 }
             }
             ::arrive_barrier(smem_barrier + 1 + stage_idx * 2);
@@ -468,7 +482,7 @@ public:
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
         asm volatile("bar.sync %0, %1;" : : "r"(1), "r"(thread_cnt));
         // reorganize the acc_reg
-        constexpr int thread_m = 2;
+        constexpr int thread_m = 2 * m_iter_cnt;
         constexpr int thread_n = 2 * n_iter_cnt;
         constexpr int cta_mma_n = n_iter_cnt * 8;
         float acc_reg_reorg[thread_m][thread_n];
@@ -477,7 +491,7 @@ public:
         {
             for (int j = 0; j < thread_n; j++)
             {
-                acc_reg_reorg[i][j] = acc_reg[0][j / 2][(j % 2) + (i * 2)];
+                acc_reg_reorg[i][j] = acc_reg[i / 2][j / 2][(j % 2) + (i % 2) * 2];
             }
         }
 
@@ -499,7 +513,7 @@ public:
 #pragma unroll
             for (int n_idx_thread = 0; n_idx_thread < thread_n; n_idx_thread++)
             {
-                int m_idx = (lane_idx / 4) + m_idx_thread * 8;
+                int m_idx = (lane_idx / 4) + (m_idx_thread % 2) * 8 + (m_idx_thread / 2) * 16;
                 int n_idx = ((lane_idx % 4) * 2) + (n_idx_thread % 2) + (n_idx_thread / 2) * 8;
                 smem_c[cosize_smem_c * warp_idx + smem_c_index_func(m_idx, n_idx)]
                     = acc_reg_reorg[m_idx_thread][n_idx_thread];
@@ -573,7 +587,7 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
     static_assert(gemm_m % tile_m == 0);
     static_assert(tile_k == 128 || tile_k == 256 || tile_k == 512
         || tile_k == 1024); // tile_k must be larger than 64 since 4 warp splitK.
-    static_assert(tile_m == 16);
+    static_assert(tile_m == 16 || tile_m == 32);
     constexpr int g2s_vec_bytes = 16;
     constexpr int a_elem_bytes = 2;
     constexpr int b_elem_bytes = 2;
@@ -630,7 +644,7 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
 #endif
 }
 
-template <typename T, int kHdIn, int kHdOut, int kTileN>
+template <typename T, int kHdIn, int kHdOut, int kTileN, int kTileM>
 void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens, cudaStream_t const stream)
 {
     auto const sm = tensorrt_llm::common::getSMVersion();
@@ -639,12 +653,12 @@ void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens,
         std::cerr << "FusedAGemm required CUDA ARCH >= SM_90, not supported on this architecture" << std::endl;
         assert(false);
     }
-    constexpr int gemm_m = kHdOut; // 2112
-    int const gemm_n = num_tokens; // 16
-    constexpr int gemm_k = kHdIn;  // 7168
+    constexpr int gemm_m = kHdOut; // output dim: 2112 (DSV3) or 2624 (GLM)
+    int const gemm_n = num_tokens; // token count, 1..16
+    constexpr int gemm_k = kHdIn;  // contraction dim: 7168 (DSV3) or 6144 (GLM)
     constexpr int batch_size = 1;
     std::swap(mat_a, mat_b);
-    constexpr int tile_m = 16;
+    constexpr int tile_m = kTileM;                       // 16 (DSV3) or 32 (GLM: halves CTA count, fewer waves)
     constexpr int tile_n = kTileN;                       // 8 or 16
     constexpr int tile_k = std::max(256, 1024 / tile_n); // 256
     constexpr int max_stage_cnt = 1024 * 192 / ((tile_m + tile_n) * tile_k * sizeof(bf16_t));
@@ -679,10 +693,25 @@ void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens,
             output, mat_a, mat_b, gemm_n));
 }
 
-template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 8>(
+// DeepSeek-V3/V3.2: hd_in 7168 -> hd_out 2112. tile_m=16 -> 2112/16 = 132 CTAs.
+template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 8, 16>(
     __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
 
-template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 16>(
+template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 16, 16>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
+
+// GLM MoE DSA (GlmMoeDsaForCausalLM) MLA A-projection (kv_a_proj_with_mqa):
+// hidden_size 6144 -> kv_lora+rope+q_lora 2624.
+// This kernel parallelizes only over output rows, so the CTA count is gemm_m / tile_m. tile_m=32
+// gives 2624/32 = 82 CTAs, half the 164 CTAs at tile_m=16, which avoids a second, nearly-empty
+// wave (wave quantization) on any GPU whose SM count is below 164. Tiling constraints hold:
+// 6144 % tile_k(256) == 0, 2624 % tile_m(32) == 0.
+// On a GPU with >= 164 SMs, tile_m=16 (164 CTAs) is already a single wave and would be preferable;
+// revisit this shape->tile_m mapping if such a part is targeted.
+template void invokeFusedAGemm<__nv_bfloat16, 6144, 2624, 8, 32>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
+
+template void invokeFusedAGemm<__nv_bfloat16, 6144, 2624, 16, 32>(
     __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
 } // namespace kernels::dsv3MinLatencyKernels
 

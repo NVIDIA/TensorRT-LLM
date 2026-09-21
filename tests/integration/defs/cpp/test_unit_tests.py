@@ -3,23 +3,38 @@ import os as _os
 import defs.cpp.cpp_common as _cpp
 import pytest
 
+_TEST_GROUP_DIRS = {
+    "executor_bounce": "executor/bounce",
+}
+
 
 @pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
                          indirect=True)
 @pytest.mark.parametrize("test_group", [
-    "batch_manager", "common", "executor", "kernels", "layers", "runtime",
-    "thop"
+    "batch_manager", "common", "executor", "executor_bounce", "kernels",
+    "runtime", "thop"
 ])
 def test_unit_tests(build_google_tests, test_group, build_dir, lora_setup):
 
     xml_name = f"results-unit-tests-{test_group}.xml"
+    test_group_dir = _TEST_GROUP_DIRS.get(test_group, test_group)
+
+    if test_group == "executor_bounce":
+        # Real-NIXL bounce tests are conditionally built when NIXL and ZMQ are
+        # available. Require one here so pre-merge cannot pass with only the
+        # dependency-free subset after silently losing its E2E coverage.
+        required_test = (build_dir / "tests/unit_tests/executor/bounce" /
+                         "bounceAgentE2ETest")
+        if not required_test.is_file():
+            pytest.fail(
+                f"Required NIXL bounce E2E test was not built: {required_test}")
 
     # Discover and run the actual gtests
     ctest_command = [
         "ctest",
         "--output-on-failure",
         "--test-dir",
-        f"{build_dir}/tests/unit_tests/{test_group}",
+        f"{build_dir}/tests/unit_tests/{test_group_dir}",
         "--output-junit",
         f"{build_dir}/{xml_name}",
     ]
@@ -35,3 +50,23 @@ def test_unit_tests(build_google_tests, test_group, build_dir, lora_setup):
                             env=cpp_env,
                             timeout=2700,
                             parallel=parallel)
+
+
+@pytest.mark.parametrize("build_kv_cache_compression_tests", ["80", "100"],
+                         indirect=True)
+def test_kv_cache_compression_unit_tests(build_kv_cache_compression_tests,
+                                         build_dir):
+
+    xml_name = "results-unit-tests-kv_cache_compression.xml"
+
+    # Run the binary directly: the lightweight fixture builds only this gtest,
+    # so a ctest directory scan would trip over unbuilt neighbors.
+    _cpp.run_command(
+        [
+            f"{build_dir}/tests/unit_tests/kernels/nvfp4ColdPageKernelsTest",
+            f"--gtest_output=xml:{build_dir}/{xml_name}",
+        ],
+        cwd=build_dir,
+        env={**_os.environ},
+        timeout=2700,
+    )

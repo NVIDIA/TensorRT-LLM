@@ -32,10 +32,8 @@ HF_ID_TO_LLM_MODELS_SUBDIR = {
     "nvidia/Llama-3.1-8B-Instruct-FP8": "Llama-3.1-8B-Instruct-FP8",
     "nvidia/Llama-3.1-8B-Instruct-NVFP4": "Llama-3.1-8B-Instruct-NVFP4",
     "TinyLlama/TinyLlama-1.1B-Chat-v1.0": "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
-    "meta-llama/Llama-4-Scout-17B-16E-Instruct": "llama4-models/Llama-4-Scout-17B-16E-Instruct",
     "mistralai/Mistral-Small-3.1-24B-Instruct-2503": "Mistral-Small-3.1-24B-Instruct-2503",
     "Qwen/Qwen3-30B-A3B": "Qwen3/Qwen3-30B-A3B",
-    "Qwen/Qwen2.5-3B-Instruct": "Qwen2.5-3B-Instruct",
     "deepseek-ai/DeepSeek-V3": "DeepSeek-V3",
     "deepseek-ai/DeepSeek-R1": "DeepSeek-R1/DeepSeek-R1",
     "deepseek-ai/DeepSeek-R1-0528": "DeepSeek-R1/DeepSeek-R1-0528",
@@ -55,16 +53,13 @@ HF_ID_TO_LLM_MODELS_SUBDIR = {
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8": "NVIDIA-Nemotron-3-Super-120B-A12B-FP8",
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4": "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
     # AutoDeploy accuracy tests - overlapping with model registry
-    "google/gemma-3-1b-it": "gemma/gemma-3-1b-it",
     "google/gemma-3n-E2B-it": "gemma/gemma-3n-E2B-it",
     "google/gemma-4-E2B-it": "gemma/gemma-4-E2B-it",
     "nvidia/Qwen3.5-397B-A17B-NVFP4": "Qwen3.5-397B-A17B-NVFP4",
-    "Qwen/QwQ-32B": "QwQ-32B",
-    "meta-llama/Llama-3.3-70B-Instruct": "llama-3.3-models/Llama-3.3-70B-Instruct",
     "mistralai/Ministral-8B-Instruct-2410": "Ministral-8B-Instruct-2410",
-    "nvidia/Llama-3.1-Nemotron-Nano-8B-v1": "Llama-3.1-Nemotron-Nano-8B-v1",
     "google/gemma-4-26B-A4B-it": "gemma/gemma-4-26B-A4B-it",
     "Qwen/Qwen3.5-35B-A3B": "Qwen3.5-35B-A3B",
+    "Qwen/Qwen3.5-4B": "Qwen3.5-4B",
     "nvidia/Cosmos3-Nano": "nvidia/Cosmos3-Nano",
     "nvidia/Cosmos3-Super": "nvidia/Cosmos3-Super",
     "nvidia/Nemotron-Ultra-V3-NVFP4": "nemotron-ultra-sample-ckpt-old-format-sft_nvfp4_aggressive_03_04_26_nvfp4",
@@ -89,6 +84,17 @@ def llm_models_root(check: bool = False) -> Optional[Path]:
         )
 
     return root if root.exists() else None
+
+
+def get_checkpoint(model_subdir: str) -> str:
+    """Resolve a checkpoint under LLM_MODELS_ROOT, or fail loudly if missing."""
+    root = llm_models_root(check=True)
+    path = root / model_subdir
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Checkpoint not found: {path}. Stage '{model_subdir}' under LLM_MODELS_ROOT to run this test."
+        )
+    return str(path)
 
 
 def llm_datasets_root() -> str:

@@ -101,6 +101,49 @@ def test_nemotron_h_moe_uses_mixer_expert_layer_quant_config():
     assert captured["override_quant_config"] is layer_quant_config
 
 
+def test_nemotron_h_moe_exclusion_outranks_the_layer_quant_config():
+    """An excluded experts module has to reach create_moe unquantized.
+
+    The per-layer entry is applied first, so an exclusion that does not
+    override it leaves the layer on the per-layer format and loads quantized
+    weights the checkpoint left in bf16 -- wrong numerics rather than a
+    failure. ``kv_cache_quant_algo`` is not part of what an expert exclusion
+    turns off, so it has to survive.
+    """
+    global_quant_config = QuantConfig(
+        quant_algo=QuantAlgo.W4A16_NVFP4,
+        group_size=16,
+        kv_cache_quant_algo=QuantAlgo.FP8,
+        exclude_modules=["model.layers.1.mixer.experts"],
+    )
+    model_config = _make_nemotron_h_moe_config(global_quant_config)
+    model_config.quant_config_dict = {
+        "model.layers.1.mixer.experts.0.up_proj": QuantConfig(
+            quant_algo=QuantAlgo.W4A16_NVFP4, group_size=16
+        ),
+    }
+    captured = {}
+
+    def fake_create_moe(**kwargs):
+        captured.update(kwargs)
+        return nn.Identity()
+
+    with patch(
+        "tensorrt_llm._torch.models.modeling_nemotron_h.create_moe",
+        side_effect=fake_create_moe,
+    ):
+        with patch("torch.cuda.Event", side_effect=lambda: object()):
+            NemotronHMOE(
+                model_config=model_config,
+                layer_idx=1,
+                aux_stream_dict={AuxStreamType.MoeShared: None},
+            )
+
+    override = captured["override_quant_config"]
+    assert override.quant_algo is None
+    assert override.kv_cache_quant_algo == QuantAlgo.FP8
+
+
 def test_nemotron_h_mtp_overrides_quant_and_inherits_moe_backend():
     quant_config = QuantConfig(
         quant_algo=QuantAlgo.W4A16_NVFP4, group_size=16, exclude_modules=["lm_head"]

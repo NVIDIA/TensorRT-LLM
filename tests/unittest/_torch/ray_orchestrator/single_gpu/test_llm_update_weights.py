@@ -175,7 +175,7 @@ def run_generate(
     "model_dir",
     [
         "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
-        "Qwen2.5-0.5B-Instruct",
+        "Qwen3/Qwen3-0.6B",
         "Qwen3/Qwen3-8B",
         "Qwen3/Qwen3-30B-A3B",
         "Qwen3/Qwen3-8B-FP8",
@@ -230,7 +230,7 @@ def test_llm_update_weights(model_dir):
     "model_dir",
     [
         "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
-        "Qwen2.5-0.5B-Instruct",
+        "Qwen3/Qwen3-0.6B",
         "Qwen3/Qwen3-8B",
         "Qwen3/Qwen3-30B-A3B",
         "Qwen3/Qwen3-8B-FP8",

@@ -13,15 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import mmap
 import os
 import threading
+from pathlib import Path
 from unittest import mock
 
 import pytest
 
 from tensorrt_llm._torch.models.checkpoints import HfWeightLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
+from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import _LAZY_SAFETENSORS_MODEL_TYPES
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -502,7 +505,6 @@ def test_kimi_k3_lazy_load_records_the_checkpoint_dir(tmp_path):
     without this the model silently fell back to the shared mapping and the
     step was OOM-killed.
     """
-    import json
 
     import safetensors.torch
     import torch
@@ -519,3 +521,26 @@ def test_kimi_k3_lazy_load_records_the_checkpoint_dir(tmp_path):
         assert weights.checkpoint_dir == str(tmp_path)
     finally:
         loader.cleanup()
+
+
+@pytest.mark.parametrize("model_type", _LAZY_SAFETENSORS_MODEL_TYPES)
+def test_requires_lazy_safetensors_for_every_listed_model_type(
+    tmp_path: Path, model_type: str
+) -> None:
+    """Each model type in the table routes to the lazy (mmapped) load path."""
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+    assert HfWeightLoader._requires_lazy_safetensors(str(tmp_path)) is True
+
+
+@pytest.mark.parametrize("config", [{"model_type": "llama"}, {}])
+def test_requires_lazy_safetensors_is_false_for_other_checkpoints(
+    tmp_path: Path, config: dict[str, str]
+) -> None:
+    """Any other model type, or no model type at all, takes the eager path."""
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    assert HfWeightLoader._requires_lazy_safetensors(str(tmp_path)) is False
+
+
+def test_requires_lazy_safetensors_is_false_without_a_config(tmp_path: Path) -> None:
+    """A directory without config.json cannot opt in to lazy loading."""
+    assert HfWeightLoader._requires_lazy_safetensors(str(tmp_path)) is False

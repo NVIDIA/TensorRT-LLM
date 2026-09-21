@@ -46,6 +46,20 @@ llmapiLaunchScript="$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
 chmod +x $llmapiLaunchScript
 cd $llmSrcNode/tests/integration/defs
 
+# Every rank needs the test sources importable, not just rank 0. Rank 0 runs
+# pytest, whose pythonpath ini setting (tests/integration/defs/pytest.ini sets
+# `pythonpath = ../../`, i.e. the tests/ root) plus rootdir handling puts both
+# tests/ and tests/integration on sys.path; ranks 1..N run the mgmn_worker_node
+# started by trtllm-llmapi-launch, a bare MPI worker that unpickles
+# request-attached objects the tests define (for example the logits processors
+# in `defs.accuracy.accuracy_core`) and otherwise dies with
+# "ModuleNotFoundError: No module named 'defs'". tests/ is needed too:
+# importing `defs.accuracy.accuracy_core` pulls in `defs.conftest`, which
+# imports the `test_common` package that lives at tests/test_common.
+# Single-node stages never see any of this because MpiPoolSession spawns its
+# workers with rank 0's sys.path.
+export PYTHONPATH="$llmSrcNode/tests/integration:$llmSrcNode/tests${PYTHONPATH:+:$PYTHONPATH}"
+
 # Wheel path for the CBTS .coveragerc @TRTLLM_WHEEL_PATH@ substitution below.
 trtllmWhlPath=$(pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2)
 trtllmWhlPath=$(echo "$trtllmWhlPath" | sed 's/[[:space:]]+/_/g')
@@ -66,7 +80,8 @@ source "$llmSrcNode/jenkins/scripts/slurm_env_setup.sh"
 slurm_setup_runtime_env
 echo "Library Path:"
 echo "$LD_LIBRARY_PATH"
-env | sort
+# Redact secret values here so they do not leak into the job log
+env | sort | sed -E 's/^([^=]*(TOKEN|SECRET|PASSWORD|CREDENTIALS)[^=]*)=.*/\1=<redacted>/'
 
 echo "Full Command: $pytestCommand"
 
@@ -112,7 +127,9 @@ slurm_wait_all_ranks() {
     touch "$readyDir/rank_${SLURM_PROCID}.ready"
 
     # Bounded so a dead rank fails the stage loudly instead of hanging until the
-    # partition walltime kills it; the ceiling exceeds the 2700s pip3 retry budget
+    # partition walltime kills it. This bounds arrival skew between ranks (each
+    # rank's deadline starts after its own install finished) -- comfortably above
+    # the  ~10min skew seen in the bug -  not any single install-phase timeout;
     # in slurm_install.sh so a merely slow rank still releases the barrier.
     local timeoutSecs=3600
     local deadline=$((SECONDS + timeoutSecs))
@@ -131,10 +148,7 @@ slurm_wait_all_ranks() {
                  "all $numRanks ranks to be ready; ready: $ready/$numRanks"
             return 1
         fi
-        # One rank reports progress; all of them would spam the log every 10s.
-        if [ "$SLURM_PROCID" -eq 0 ]; then
-            echo "(Waiting for all $numRanks ranks to be ready) ready: $ready/$numRanks"
-        fi
+        echo "(Waiting for all $numRanks ranks to be ready) ready: $ready/$numRanks"
         sleep 10
     done
 }
@@ -151,8 +165,10 @@ perf_report_exit_code=0
 eval $pytestCommand
 pytest_exit_code=$?
 echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
-python3 "$llmSrcNode/tests/test_common/s3_output.py" \
-    --drain-spool "$jobWorkspace" || true
+if [ "${SLURM_PROCID:-0}" -eq 0 ]; then
+    python3 "$llmSrcNode/tests/test_common/s3_output.py" \
+        --drain-spool "$jobWorkspace" || true
+fi
 
 # DEBUG: Diagnose intermittent "unrecognized arguments" failure (Exit Code 4)
 # Remove this after the issue is resolved

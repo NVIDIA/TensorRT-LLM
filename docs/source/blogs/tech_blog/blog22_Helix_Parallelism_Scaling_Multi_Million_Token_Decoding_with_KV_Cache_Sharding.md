@@ -180,7 +180,7 @@ The integration in [`DeepseekV3ForCausalLM`](https://github.com/NVIDIA/TensorRT-
 
 1. During model initialization, when `has_cp_helix()` is true, a deep copy of the original mapping (with CP) is saved as `mapping_with_cp`.
 2. The model config's mapping is repurposed via `repurpose_helix_cp_to_tp()`, which converts CP ranks to additional TP ranks (setting `tp_size = tp_size × cp_size`, `cp_size = 1`).
-3. The attention layers (in [`tensorrt_llm/_torch/modules/attention.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/attention.py)) receive the original `mapping_with_cp` to execute with KV parallelism, while all other layers (FFN, MoE, embeddings) use the repurposed TP-only mapping.
+3. The attention layers (in [`tensorrt_llm/_torch/attention/attention.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/attention/attention.py)) receive the original `mapping_with_cp` to execute with KV parallelism, while all other layers (FFN, MoE, embeddings) use the repurposed TP-only mapping.
 
 This design means that from the perspective of non-attention layers, Helix is transparent: they simply see a larger TP group. Only the attention module needs awareness of the CP configuration.
 
@@ -212,7 +212,7 @@ active = (decode_block_id % cp_size) == cp_rank
 ```
 
 - If a rank is **active**, it allocates a new KV slot, increments `seqlen_this_rank_cp`, and runs attention with the new token writing into its local KV cache.
-- If a rank is **inactive** for this step (`req.py_helix_is_inactive_rank = True`), it does not allocate KV and its attention kernels attend over previously cached tokens only. In [`tensorrt_llm/_torch/attention_backend/trtllm.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/attention_backend/trtllm.py), `kv_lens[active_rank] += seq_lens_kv` ensures inactive ranks see no cache growth for the current step.
+- If a rank is **inactive** for this step (`req.py_helix_is_inactive_rank = True`), it does not allocate KV and its attention kernels attend over previously cached tokens only. In [`tensorrt_llm/_torch/attention/backends/trtllm.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/attention/backends/trtllm.py), `kv_lens[active_rank] += seq_lens_kv` ensures inactive ranks see no cache growth for the current step.
 
 `total_input_len_cp` and `seqlen_this_rank_cp` are tracked per request so the global position id and per-rank attention length stay correct even though only one CP rank "owns" each new token.
 

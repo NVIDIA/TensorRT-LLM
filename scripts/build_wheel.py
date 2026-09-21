@@ -23,6 +23,7 @@ import sysconfig
 import tempfile
 import time
 import warnings
+import zipfile
 from argparse import ArgumentParser, ArgumentTypeError
 from contextlib import contextmanager
 from functools import partial
@@ -756,9 +757,12 @@ def stage_python_package(project_dir: Path, staging_dir: Path) -> None:
                   staging_dir / tree,
                   exclude=("__pycache__", "*.pyc"))
     top_level_files = [
-        "setup.py", "pyproject.toml", "requirements.txt",
-        "requirements-dev.txt", "constraints.txt", "LICENSE", "README.md"
+        "setup.py", "pyproject.toml", "constraints.txt", "LICENSE", "README.md"
     ]
+    # setup.py reads requirements for optional extras and platform variants too.
+    top_level_files += sorted(f.name
+                              for f in project_dir.glob("requirements*.txt")
+                              if f.is_file())
     top_level_files += [
         f.name for f in project_dir.glob("ATTRIBUTIONS-CPP-*.md")
     ]
@@ -766,6 +770,43 @@ def stage_python_package(project_dir: Path, staging_dir: Path) -> None:
         src = project_dir / name
         if src.exists():
             copy(src, staging_dir / name)
+
+
+def install_editable_package(venv_python: Path) -> None:
+    """Editable-install the built package into the venv `setup_venv` created.
+
+    Not `sys.executable`: a fresh checkout has to start this script with the
+    system interpreter, so installing with it puts the package in the system
+    site-packages and leaves the new venv without it. The wheel build above
+    already uses `venv_python` for the same reason.
+    """
+    build_run(f"\"{venv_python}\" -m pip install -e .[devel]")
+
+
+def has_sm90_or_newer(cuda_architectures: str) -> bool:
+    """Return whether a CUDA architecture list includes an SM90+ target."""
+    if cuda_architectures == "all":
+        return True
+    for arch in cuda_architectures.split(";"):
+        match = re.match(r"^\d+", arch)
+        if match and int(match.group()) >= 90:
+            return True
+    return False
+
+
+def stage_nccl_extensions_package(wheel: Path, staging_dir: Path) -> None:
+    """Stage NCCL-EP namespace packages from the intermediate wheel."""
+    package_root = staging_dir / "3rdparty" / "nccl_extensions"
+    nccl_root = package_root / "nccl"
+    if nccl_root.exists():
+        rmtree(nccl_root)
+    package_root.mkdir(parents=True, exist_ok=True)
+
+    prefixes = ("nccl/_extensions/", "nccl/ep/")
+    with zipfile.ZipFile(wheel) as archive:
+        for member in archive.infolist():
+            if member.filename.startswith(prefixes):
+                archive.extract(member, package_root)
 
 
 def main(*,
@@ -978,10 +1019,12 @@ def main(*,
             )
 
     targets = ["tensorrt_llm"]
+    build_nccl_extensions_enabled = has_sm90_or_newer(cuda_architectures)
 
     if cpp_only:
         build_pyt = "OFF"
         build_deep_ep = "OFF"
+        build_nccl_extensions = "OFF"
         build_deep_gemm = "OFF"
         build_flash_mla = "OFF"
     else:
@@ -989,8 +1032,15 @@ def main(*,
             "th_common", "bindings", "deep_ep", "deep_gemm", "pg_utils",
             "flash_mla"
         ])
+        if build_nccl_extensions_enabled:
+            targets.append("nccl_extensions_wheel")
+        else:
+            print(
+                "WARNING: NCCL-EP requires SM90+ and will not be embedded in this wheel "
+                f"(CUDA architectures: {cuda_architectures}).")
         build_pyt = "ON"
         build_deep_ep = "ON"
+        build_nccl_extensions = "ON" if build_nccl_extensions_enabled else "OFF"
         build_deep_gemm = "ON"
         build_flash_mla = "ON"
 
@@ -1038,7 +1088,7 @@ def main(*,
                 )
             cmake_def_args = " ".join(cmake_def_args)
             cmake_configure_command = (
-                f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_DEEP_EP="{build_deep_ep}" -DBUILD_DEEP_GEMM="{build_deep_gemm}" -DBUILD_FLASH_MLA="{build_flash_mla}"'
+                f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_DEEP_EP="{build_deep_ep}" -DBUILD_NCCL_EXTENSIONS="{build_nccl_extensions}" -DBUILD_DEEP_GEMM="{build_deep_gemm}" -DBUILD_FLASH_MLA="{build_flash_mla}"'
                 f' -DNVTX_DISABLE="{disable_nvtx}" -DBUILD_MICRO_BENCHMARKS={build_micro_benchmarks}'
                 f' -DBUILD_WHEEL_TARGETS="{";".join(targets)}"'
                 f' -DPython_EXECUTABLE={venv_python} -DPython3_EXECUTABLE={venv_python}'
@@ -1060,6 +1110,17 @@ def main(*,
         print(cmake_build_command)
         build_run(cmake_build_command)
 
+    nccl_extensions_wheel = None
+    if not cpp_only and build_nccl_extensions_enabled:
+        nccl_extensions_wheels = sorted(
+            (build_dir / "tensorrt_llm" / "nccl_extensions" /
+             "dist").glob("nccl_extensions*.whl"))
+        if len(nccl_extensions_wheels) != 1:
+            raise RuntimeError(
+                "Expected exactly one source-built nccl-extensions wheel, found "
+                f"{len(nccl_extensions_wheels)}")
+        nccl_extensions_wheel = nccl_extensions_wheels[0]
+
     if cpp_only:
         assert not install, "Installing is not supported for cpp_only builds"
         return
@@ -1074,6 +1135,8 @@ def main(*,
 
     pkg_dir = wheel_project_dir / "tensorrt_llm"
     assert pkg_dir.is_dir(), f"{pkg_dir} is not a directory"
+    if nccl_extensions_wheel is not None:
+        stage_nccl_extensions_package(nccl_extensions_wheel, wheel_project_dir)
     lib_dir = pkg_dir / "libs"
     include_dir = pkg_dir / "include"
     if lib_dir.exists():
@@ -1523,7 +1586,7 @@ def main(*,
             env=env)
 
     if install:
-        build_run(f"\"{sys.executable}\" -m pip install -e .[devel]")
+        install_editable_package(venv_python)
 
 
 def add_arguments(parser: ArgumentParser):

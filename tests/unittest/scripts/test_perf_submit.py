@@ -64,6 +64,12 @@ def example_submit_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     return _load_module(EXAMPLE_SUBMIT_PATH, monkeypatch)
 
 
+@pytest.fixture
+def local_submit_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    """The local harness only; the CI submit.py has no SLURM GRES helpers."""
+    return _load_module(SUBMIT_PATHS[1], monkeypatch)
+
+
 def _get_benchmark_config(module: ModuleType, concurrency):
     config = {"benchmark": {"concurrency_list": concurrency}}
     if Path(module.__file__).parent.name == "local":
@@ -376,3 +382,120 @@ def test_resolve_llm_models_root_does_not_mask_malformed_command(
 
     with pytest.raises(ValueError, match="cannot parse exported pytestCommand"):
         ci_submit_module._resolve_llm_models_root(lines)
+
+
+# --------------------- gen-only request-queue capacity cap -----------------------
+# The fill loop cannot reach a target above the GEN executor's active capacity,
+# so TLLM_BENCHMARK_REQ_QUEUES_SIZE is clamped to it. This applies to every
+# gen_only run of the local harness, not just BOLT ones.
+@pytest.mark.parametrize(
+    "gen_config, concurrency, expected",
+    [
+        # Capacity above the ask: concurrency wins (no clamp).
+        ({"max_batch_size": 512}, 128, 128),
+        # Capacity below the ask: clamped to max_batch_size.
+        ({"max_batch_size": 64}, 128, 64),
+        # Exactly equal: no clamp.
+        ({"max_batch_size": 128}, 128, 128),
+        # attention_dp multiplies capacity by TP.
+        ({"max_batch_size": 64, "enable_attention_dp": True, "tensor_parallel_size": 4}, 128, 128),
+        # TP is ignored unless attention_dp is on.
+        ({"max_batch_size": 64, "tensor_parallel_size": 4}, 128, 64),
+        # attention_dp on but TP still too small to cover the ask.
+        ({"max_batch_size": 8, "enable_attention_dp": True, "tensor_parallel_size": 2}, 128, 16),
+        # Missing max_batch_size defaults to concurrency, i.e. no clamp.
+        ({}, 128, 128),
+    ],
+)
+def test_get_benchmark_request_queue_size(
+    local_submit_module: ModuleType, gen_config, concurrency, expected
+):
+    config = {"worker_config": {"gen": gen_config}}
+    assert local_submit_module.get_benchmark_request_queue_size(config, concurrency) == expected
+
+
+@pytest.mark.parametrize("worker_config", [{}, {"gen": None}, None])
+def test_get_benchmark_request_queue_size_tolerates_absent_gen_config(
+    local_submit_module: ModuleType, worker_config
+):
+    config = {} if worker_config is None else {"worker_config": worker_config}
+    assert local_submit_module.get_benchmark_request_queue_size(config, 32) == 32
+
+
+# ------------------------- partition GRES tri-state / #SBATCH --------------------
+def _fake_sinfo(monkeypatch, module, gres_out, raises=False):
+    def fake_check_output(cmd, **kwargs):
+        if raises:
+            raise OSError("sinfo unavailable")
+        return gres_out
+
+    monkeypatch.setattr(module.subprocess, "check_output", fake_check_output)
+
+
+def test_partition_gpu_gres_prefers_gpu_row_over_null(local_submit_module: ModuleType, monkeypatch):
+    _fake_sinfo(monkeypatch, local_submit_module, "(null)\ngpu:8\n")
+    assert local_submit_module.partition_gpu_gres("batch") == "gpu:8"
+
+
+def test_partition_gpu_gres_reports_null_as_definitive(
+    local_submit_module: ModuleType, monkeypatch
+):
+    # NOT None: "(null)" means the partition really has no GPU GRES (e.g. EOS),
+    # which generate_gpu_request must distinguish from "sinfo could not answer".
+    _fake_sinfo(monkeypatch, local_submit_module, "(null)\n")
+    assert local_submit_module.partition_gpu_gres("batch") == "(null)"
+
+
+def test_partition_gpu_gres_returns_none_when_sinfo_fails(
+    local_submit_module: ModuleType, monkeypatch
+):
+    _fake_sinfo(monkeypatch, local_submit_module, "", raises=True)
+    assert local_submit_module.partition_gpu_gres("batch") is None
+
+
+def test_partition_gpu_gres_returns_none_for_sentinel_partition(
+    local_submit_module: ModuleType,
+):
+    assert local_submit_module.partition_gpu_gres("unspecified") is None
+
+
+def test_generate_gpu_request_adds_gres_when_partition_advertises_gpus(
+    local_submit_module: ModuleType, monkeypatch
+):
+    _fake_sinfo(monkeypatch, local_submit_module, "gpu:4\n")
+    assert local_submit_module.generate_gpu_request("batch", 4) == [
+        "#SBATCH --gpus-per-node=4",
+        "#SBATCH --gres=gpu:4",
+    ]
+
+
+def test_generate_gpu_request_omits_everything_on_gpu_less_partition(
+    local_submit_module: ModuleType, monkeypatch
+):
+    # "(null)" is definitive, so ask for nothing -- --gres would be rejected as
+    # an invalid generic resource on a cluster that registers no GRES at all.
+    _fake_sinfo(monkeypatch, local_submit_module, "(null)\n")
+    assert local_submit_module.generate_gpu_request("batch", 4) == []
+
+
+def test_generate_gpu_request_still_asks_when_sinfo_cannot_answer(
+    local_submit_module: ModuleType, monkeypatch
+):
+    # Undeterminable must NOT be read as "no GPUs": request --gpus-per-node
+    # (but not --gres, which we cannot justify without a GRES reading).
+    _fake_sinfo(monkeypatch, local_submit_module, "", raises=True)
+    assert local_submit_module.generate_gpu_request("batch", 8) == ["#SBATCH --gpus-per-node=8"]
+
+
+def test_default_slurm_partition_picks_the_starred_entry(
+    local_submit_module: ModuleType, monkeypatch
+):
+    _fake_sinfo(monkeypatch, local_submit_module, "batch\ninteractive*\n")
+    assert local_submit_module.default_slurm_partition() == "interactive"
+
+
+def test_default_slurm_partition_empty_when_none_flagged(
+    local_submit_module: ModuleType, monkeypatch
+):
+    _fake_sinfo(monkeypatch, local_submit_module, "batch\ninteractive\n")
+    assert local_submit_module.default_slurm_partition() == ""

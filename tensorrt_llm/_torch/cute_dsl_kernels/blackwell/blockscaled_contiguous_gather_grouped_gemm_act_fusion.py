@@ -47,10 +47,15 @@ from .utils import (
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
     is_power_of_2,
+    sigmoid_f32,
     silu_f32,
 )
 
-SUPPORTED_ACTIVATION_TYPES = (ActivationType.Swiglu, ActivationType.Relu2)
+SUPPORTED_ACTIVATION_TYPES = (
+    ActivationType.Swiglu,
+    ActivationType.Relu2,
+    ActivationType.SiTu,
+)
 
 
 def validate_activation_type(activation_type) -> ActivationType:
@@ -72,6 +77,8 @@ fusion example for the NVIDIA Blackwell architecture using CUTE DSL.
 Supported fused activations (selected at construction via ``activation_type``):
     - ActivationType.Swiglu: C = up * silu(gate), where up/gate come from interleaved weight matrix B
     - ActivationType.Relu2:  C = relu(alpha * x)^2
+    - ActivationType.SiTu:   C = (beta*tanh(gate/beta)*sigmoid(gate)) * (linear_beta*tanh(up/linear_beta)),
+                             gated like Swiglu; requires situ_beta / situ_linear_beta
 
 Any other ``ActivationType`` value raises an assertion at construction time.
 
@@ -276,13 +283,18 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         raster_along_m: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
         swiglu_limit: cutlass.Float32 = float("inf"),
+        use_expert_counts: bool = False,
+        num_local_experts: int = 0,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and fused activation.
 
         ``activation_type`` accepts a value from ``ActivationType``; only
-        ``ActivationType.Swiglu`` (gated path) and ``ActivationType.Relu2``
-        (non-gated path) are currently supported.
+        ``ActivationType.Swiglu`` (gated path), ``ActivationType.Relu2``
+        (non-gated path) and ``ActivationType.SiTu`` (gated path, Kimi K3)
+        are currently supported.
 
         This configuration includes several key aspects:
 
@@ -316,8 +328,15 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :param topk: Number of experts selected per token (used for token ID mapping).
         :type topk: cutlass.Int64
         :param activation_type: Fused activation. Must be ``ActivationType.Swiglu``
-            (gated, default) or ``ActivationType.Relu2`` (non-gated).
+            (gated, default), ``ActivationType.Relu2`` (non-gated) or
+            ``ActivationType.SiTu`` (gated).
         :type activation_type: ActivationType
+        :param situ_beta: Gate-side SiTU constant. Required for -- and only
+            valid with -- ``ActivationType.SiTu``.
+        :type situ_beta: Optional[float]
+        :param situ_linear_beta: Linear-side (up) SiTU constant. Required for --
+            and only valid with -- ``ActivationType.SiTu``.
+        :type situ_linear_beta: Optional[float]
         """
 
         self.sf_vec_size = sf_vec_size
@@ -406,6 +425,41 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             swiglu_limit = float("inf")
         self.swiglu_limit = swiglu_limit
         self.has_swiglu_limit = swiglu_limit != float("inf")
+        self.use_expert_counts = use_expert_counts
+        self.num_local_experts = num_local_experts
+        self.num_tile_info_fields = 6 if self.use_expert_counts else 5
+        if self.use_expert_counts:
+            assert self.topk == 1
+            assert self.num_local_experts > 0
+
+        # SiTU constants. They are per-model scalars (not per-expert), so they
+        # are folded at trace time -- which also means they belong in the
+        # caller's compiled-kernel cache key.
+        if self.activation_type == ActivationType.SiTu:
+            if situ_beta is None or situ_linear_beta is None:
+                raise ValueError(
+                    "ActivationType.SiTu requires both situ_beta and "
+                    f"situ_linear_beta, got {situ_beta} and {situ_linear_beta}."
+                )
+            if situ_beta <= 0 or situ_linear_beta <= 0:
+                raise ValueError(
+                    "SiTU beta parameters must be positive, got "
+                    f"{situ_beta} and {situ_linear_beta}."
+                )
+            if self.has_swiglu_limit:
+                # Matches MegaMoE (both backends) and DeepGEMM, which reject
+                # activation_clamp together with SiTU.
+                raise ValueError(
+                    "ActivationType.SiTu does not support a SwiGLU clamp; "
+                    "drop swiglu_limit for SiTU checkpoints."
+                )
+        elif situ_beta is not None or situ_linear_beta is not None:
+            raise ValueError(
+                "situ_beta / situ_linear_beta require "
+                f"ActivationType.SiTu, got {self.activation_type.name}."
+            )
+        self.situ_beta = None if situ_beta is None else float(situ_beta)
+        self.situ_linear_beta = None if situ_linear_beta is None else float(situ_linear_beta)
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -598,6 +652,43 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.iter_acc_early_release_in_epilogue = self.num_sf_tmem_cols // self.epi_tile_n_required
 
     @cute.jit
+    def _expert_count_tile_info(
+        self,
+        expert_counts: cute.Tensor,
+        tile_idx: cutlass.Int32,
+        expert_capacity: cutlass.Int32,
+    ):
+        """Resolve a compact tile directly from expert-major receive counts."""
+        tile_size = cutlass.Int32(self.mma_tiler[0])
+        num_valid_tiles = cutlass.Int32(0)
+        expert_idx = cutlass.Int32(-1)
+        expert_tile_start = cutlass.Int32(0)
+        expert_count = cutlass.Int32(0)
+        for candidate_expert in cutlass.range_constexpr(self.num_local_experts):
+            count = cutlass.min(
+                cutlass.max(expert_counts[candidate_expert], cutlass.Int32(0)),
+                expert_capacity,
+            )
+            num_expert_tiles = (count + tile_size - 1) // tile_size
+            is_target = (tile_idx >= num_valid_tiles) and (
+                tile_idx < num_valid_tiles + num_expert_tiles
+            )
+            if is_target:
+                expert_idx = cutlass.Int32(candidate_expert)
+                expert_tile_start = num_valid_tiles
+                expert_count = count
+            num_valid_tiles += num_expert_tiles
+
+        row_in_expert = (tile_idx - expert_tile_start) * tile_size
+        rows_in_tile = cutlass.min(
+            tile_size,
+            cutlass.max(expert_count - row_in_expert, cutlass.Int32(0)),
+        )
+        mn_limit = tile_idx * tile_size + rows_in_tile
+        expanded_row_start = expert_idx * expert_capacity + row_in_expert
+        return num_valid_tiles, expert_idx, mn_limit, expanded_row_start
+
+    @cute.jit
     def __call__(
         self,
         a: cute.Tensor,
@@ -612,6 +703,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         token_id_mapping_tensor: cute.Tensor,
         num_non_exiting_tiles: cute.Tensor,
         alpha: Union[cute.Tensor, Tuple[cute.Tensor, ...]],
+        expert_capacity: cutlass.Int32,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -824,9 +916,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # Define shared storage for kernel
         @cute.struct
         class SharedStorage1cta:
-            # (bidx, bidy, bidz, valid, mn_limit)
+            # (bidx, bidy, expert, valid, mn_limit, expanded_row_start)
             sInfo: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Int32, 5 * self.num_tile_stage],
+                cute.struct.MemRange[
+                    cutlass.Int32, self.num_tile_info_fields * self.num_tile_stage
+                ],
                 # 1 byte alignment
                 1,
             ]
@@ -867,9 +961,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         @cute.struct
         class SharedStorage2cta:
-            # (bidx, bidy, bidz, valid, mn_limit)
+            # (bidx, bidy, expert, valid, mn_limit, expanded_row_start)
             sInfo: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Int32, 5 * self.num_tile_stage],
+                cute.struct.MemRange[
+                    cutlass.Int32, self.num_tile_info_fields * self.num_tile_stage
+                ],
                 # 1 byte alignment
                 1,
             ]
@@ -932,6 +1028,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             token_id_mapping_tensor,
             num_non_exiting_tiles,
             alpha_tuple,
+            expert_capacity,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -1016,6 +1113,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         token_id_mapping_tensor: cute.Tensor,
         num_non_exiting_tiles: cute.Tensor,
         alpha_tuple: Tuple[cute.Tensor, ...],
+        expert_capacity: cutlass.Int32,
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -1177,8 +1275,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         sSFA = storage.sSFA.get_tensor(sfa_smem_layout_staged)
         # (granularity_n, repeat_n), (granularity_k, repeat_k), num_scale_stage)
         sSFB = storage.sSFB.get_tensor(sfb_smem_layout_staged)
-        # (bidx, bidy, bidz, valid, mn_limit)
-        info_layout = cute.make_layout((5, self.num_tile_stage), stride=(1, 5))
+        # (bidx, bidy, expert, valid, mn_limit, expanded_row_start)
+        info_layout = cute.make_layout(
+            (self.num_tile_info_fields, self.num_tile_stage),
+            stride=(1, self.num_tile_info_fields),
+        )
         sInfo = storage.sInfo.get_tensor(info_layout)
 
         #
@@ -1327,7 +1428,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 pipeline.PipelineUserType.Producer, self.num_tile_stage
             )
 
-            num_non_exiting_tiles_value = num_non_exiting_tiles[0]
+            if cutlass.const_expr(self.use_expert_counts):
+                num_non_exiting_tiles_value, _, _, _ = self._expert_count_tile_info(
+                    tile_idx_to_expert_idx, cutlass.Int32(0), expert_capacity
+                )
+            else:
+                num_non_exiting_tiles_value = num_non_exiting_tiles[0]
 
             if cutlass.const_expr(self.raster_along_m):
                 while work_tile.is_valid_tile:
@@ -1336,8 +1442,20 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     if mma_tile_coord_m < num_non_exiting_tiles_value:
                         tile_info_pipeline.producer_acquire(tile_info_producer_state)
                         cur_tile_coord = work_tile.tile_idx
-                        expert_idx = tile_idx_to_expert_idx[mma_tile_coord_m]
-                        mn_limit = tile_idx_to_mn_limit[mma_tile_coord_m]
+                        expanded_row_start = cutlass.Int32(-1)
+                        if cutlass.const_expr(self.use_expert_counts):
+                            _, expert_idx, mn_limit, expanded_mma_row_start = (
+                                self._expert_count_tile_info(
+                                    tile_idx_to_expert_idx, mma_tile_coord_m, expert_capacity
+                                )
+                            )
+                            expanded_row_start = (
+                                expanded_mma_row_start
+                                + mma_tile_coord_v * self.cta_tile_shape_mnk[0]
+                            )
+                        else:
+                            expert_idx = tile_idx_to_expert_idx[mma_tile_coord_m]
+                            mn_limit = tile_idx_to_mn_limit[mma_tile_coord_m]
                         with cute.arch.elect_one():
                             sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[0]
                             sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[1]
@@ -1346,6 +1464,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                 work_tile.is_valid_tile
                             )
                             sInfo[(4, tile_info_producer_state.index)] = mn_limit
+                            if cutlass.const_expr(self.use_expert_counts):
+                                sInfo[(5, tile_info_producer_state.index)] = expanded_row_start
                             # fence view async shared
                         cute.arch.fence_proxy(
                             "async.shared",
@@ -1366,8 +1486,20 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     if mma_tile_coord_m < num_non_exiting_tiles_value:
                         tile_info_pipeline.producer_acquire(tile_info_producer_state)
                         cur_tile_coord = work_tile.tile_idx
-                        expert_idx = tile_idx_to_expert_idx[mma_tile_coord_m]
-                        mn_limit = tile_idx_to_mn_limit[mma_tile_coord_m]
+                        expanded_row_start = cutlass.Int32(-1)
+                        if cutlass.const_expr(self.use_expert_counts):
+                            _, expert_idx, mn_limit, expanded_mma_row_start = (
+                                self._expert_count_tile_info(
+                                    tile_idx_to_expert_idx, mma_tile_coord_m, expert_capacity
+                                )
+                            )
+                            expanded_row_start = (
+                                expanded_mma_row_start
+                                + mma_tile_coord_v * self.cta_tile_shape_mnk[0]
+                            )
+                        else:
+                            expert_idx = tile_idx_to_expert_idx[mma_tile_coord_m]
+                            mn_limit = tile_idx_to_mn_limit[mma_tile_coord_m]
                         with cute.arch.elect_one():
                             sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[0]
                             sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[1]
@@ -1376,6 +1508,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                 work_tile.is_valid_tile
                             )
                             sInfo[(4, tile_info_producer_state.index)] = mn_limit
+                            if cutlass.const_expr(self.use_expert_counts):
+                                sInfo[(5, tile_info_producer_state.index)] = expanded_row_start
                             # fence view async shared
                         cute.arch.fence_proxy(
                             "async.shared",
@@ -1398,6 +1532,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 sInfo[(2, tile_info_producer_state.index)] = -1
                 sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(0)
                 sInfo[(4, tile_info_producer_state.index)] = -1
+                if cutlass.const_expr(self.use_expert_counts):
+                    sInfo[(5, tile_info_producer_state.index)] = -1
             cute.arch.fence_proxy(
                 "async.shared",
                 space="cta",
@@ -1486,11 +1622,13 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             )
 
             # Get the first tile info
-            tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
+            tile_info = cute.make_rmem_tensor((self.num_tile_info_fields,), cutlass.Int32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
             tile_info[0] = sInfo[(0, tile_info_consumer_state.index)]
             tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
             tile_info[4] = sInfo[(4, tile_info_consumer_state.index)]
+            if cutlass.const_expr(self.use_expert_counts):
+                tile_info[5] = sInfo[(5, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy(
                 "async.shared",
@@ -1503,29 +1641,44 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 # Load token IDs for gather operation
                 # For A matrix: each thread loads 8 token offsets (for 8 LDGSTS.128 operations)
                 # For SFA matrix: each thread loads 1 token offset (for 4 LDGSTS.32 operations)
-                gToken_ml_tile = gToken_ml[(None, tile_info[0])]
+                if cutlass.const_expr(not self.use_expert_counts):
+                    gToken_ml_tile = gToken_ml[(None, tile_info[0])]
                 for i in range(8):
                     token_ml_tile_offset = (tidx_in_warpgroup // 8) + i * 16
-                    a_token_offset_tensor[i] = gToken_ml_tile[token_ml_tile_offset]
+                    if cutlass.const_expr(self.use_expert_counts):
+                        a_token_offset_tensor[i] = tile_info[5] + token_ml_tile_offset
+                    else:
+                        a_token_offset_tensor[i] = gToken_ml_tile[token_ml_tile_offset]
                     a_predicate_tensor[i] = (
                         cutlass.Boolean(1)
                         if tile_info[0] * self.cta_tile_shape_mnk[0] + token_ml_tile_offset
                         < tile_info[4]
                         else cutlass.Boolean(0)
                     )
-                    a_token_offset_tensor[i] = (
-                        a_token_offset_tensor[i] // self.topk
-                        if tile_info[0] * self.cta_tile_shape_mnk[0] + token_ml_tile_offset
-                        < tile_info[4]
-                        else 0
-                    )
+                    if cutlass.const_expr(self.use_expert_counts):
+                        a_token_offset_tensor[i] = (
+                            a_token_offset_tensor[i]
+                            if tile_info[0] * self.cta_tile_shape_mnk[0] + token_ml_tile_offset
+                            < tile_info[4]
+                            else 0
+                        )
+                    else:
+                        a_token_offset_tensor[i] = (
+                            a_token_offset_tensor[i] // self.topk
+                            if tile_info[0] * self.cta_tile_shape_mnk[0] + token_ml_tile_offset
+                            < tile_info[4]
+                            else 0
+                        )
 
                 token_ml_tile_offset = (
                     8 * (tidx_in_warpgroup // 32)
                     + 32 * ((tidx_in_warpgroup % 32) // 8)
                     + (tidx_in_warpgroup % 8)
                 )
-                sfa_token_offset_tensor[0] = gToken_ml_tile[token_ml_tile_offset] // self.topk
+                if cutlass.const_expr(self.use_expert_counts):
+                    sfa_token_offset_tensor[0] = tile_info[5] + token_ml_tile_offset
+                else:
+                    sfa_token_offset_tensor[0] = gToken_ml_tile[token_ml_tile_offset] // self.topk
                 sfa_predicate_tensor[0] = (
                     cutlass.Boolean(1)
                     if tile_info[0] * self.cta_tile_shape_mnk[0] + token_ml_tile_offset
@@ -1647,6 +1800,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 tile_info[0] = sInfo[(0, tile_info_consumer_state.index)]
                 tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
                 tile_info[4] = sInfo[(4, tile_info_consumer_state.index)]
+                if cutlass.const_expr(self.use_expert_counts):
+                    tile_info[5] = sInfo[(5, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy(
                     "async.shared",
@@ -2373,6 +2528,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     if cutlass.const_expr(self.activation_type == ActivationType.Swiglu):
                         acc_vec_gate = tTR_rAcc_gate.load()
                         self._apply_swiglu_epilogue(acc_vec_up, acc_vec_gate, alpha_val, tCompute)
+                    elif cutlass.const_expr(self.activation_type == ActivationType.SiTu):
+                        acc_vec_gate = tTR_rAcc_gate.load()
+                        self._apply_situ_epilogue(acc_vec_up, acc_vec_gate, alpha_val, tCompute)
                     elif cutlass.const_expr(self.activation_type == ActivationType.Relu2):
                         self._apply_relu2_epilogue(acc_vec_up, alpha_val, tCompute)
 
@@ -2660,6 +2818,93 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     acc_vec_gate_alpha = fmin(acc_vec_gate_alpha, self.swiglu_limit)
                     acc_vec_up_alpha = fclip_xorsign(acc_vec_up_alpha, self.swiglu_limit)
                 tCompute[i] = acc_vec_up_alpha * silu_f32(acc_vec_gate_alpha, fastmath=True)
+
+    @cute.jit
+    def _apply_situ_epilogue(
+        self,
+        acc_vec_up: cute.Tensor,
+        acc_vec_gate: cute.Tensor,
+        alpha_val,
+        tCompute: cute.Tensor,
+    ):
+        """SiTU (Kimi K3), matching ``kimi_k3_moe/_mlp.py::SituAndMul``
+        (itself byte-identical to HF ``modeling_kimi.py``)::
+
+            g = alpha * gate,  u = alpha * up
+            situ_gate = beta        * tanh(g / beta) * sigmoid(g)
+            situ_up   = linear_beta * tanh(u / linear_beta)
+            tCompute  = situ_gate * situ_up
+
+        ``up`` and ``gate`` come from the two interleaved accumulator subtiles
+        loaded by the caller, same as the SwiGLU epilogue.
+
+        There is no packed tanh, so the vectorized path uses the identity
+        ``tanh(z) = 2 * sigmoid(2z) - 1`` (the same one ``utils.gelu_tanh_f32``
+        uses) to stay on the packed f32x2 path -- calling a scalar tanh would
+        force the whole loop back to scalar. The reciprocals and ``2*beta``
+        factors fold at trace time because both betas are ``const_expr``::
+
+            beta * tanh(x/beta) = beta * (2*sigmoid(2x/beta) - 1)
+                                = 2*beta*sigmoid((2/beta)*x) - beta
+        """
+        beta = self.situ_beta
+        linear_beta = self.situ_linear_beta
+        if cutlass.const_expr(self.vectorized_f32):
+            LOG2_E = cutlass.Float32(1.4426950408889634)
+            neg_log2e_pair = (-LOG2_E, -LOG2_E)
+            one_pair = (cutlass.Float32(1.0), cutlass.Float32(1.0))
+
+            inv_2beta = cutlass.Float32(2.0 / beta)
+            two_beta = cutlass.Float32(2.0 * beta)
+            neg_beta = cutlass.Float32(-beta)
+            inv_2lbeta = cutlass.Float32(2.0 / linear_beta)
+            two_lbeta = cutlass.Float32(2.0 * linear_beta)
+            neg_lbeta = cutlass.Float32(-linear_beta)
+
+            # sigmoid(x) = rcp(1 + exp2(-x * log2e)), shared by both cores.
+            def _sigmoid(p0, p1):
+                neg = cute.arch.mul_packed_f32x2((p0, p1), neg_log2e_pair)
+                e = (
+                    cute.math.exp2(neg[0], fastmath=True),
+                    cute.math.exp2(neg[1], fastmath=True),
+                )
+                d = cute.arch.add_packed_f32x2(e, one_pair)
+                return (cute.arch.rcp_approx(d[0]), cute.arch.rcp_approx(d[1]))
+
+            alpha_pair = (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val))
+            for i in cutlass.range_constexpr(0, cute.size(acc_vec_up.shape), 2):
+                g = cute.arch.mul_packed_f32x2((acc_vec_gate[i], acc_vec_gate[i + 1]), alpha_pair)
+                u = cute.arch.mul_packed_f32x2((acc_vec_up[i], acc_vec_up[i + 1]), alpha_pair)
+
+                sigmoid_g = _sigmoid(g[0], g[1])
+
+                gs = _sigmoid(*cute.arch.mul_packed_f32x2(g, (inv_2beta, inv_2beta)))
+                tanh_g = cute.arch.add_packed_f32x2(
+                    cute.arch.mul_packed_f32x2(gs, (two_beta, two_beta)), (neg_beta, neg_beta)
+                )
+
+                us = _sigmoid(*cute.arch.mul_packed_f32x2(u, (inv_2lbeta, inv_2lbeta)))
+                tanh_u = cute.arch.add_packed_f32x2(
+                    cute.arch.mul_packed_f32x2(us, (two_lbeta, two_lbeta)), (neg_lbeta, neg_lbeta)
+                )
+
+                situ_gate = cute.arch.mul_packed_f32x2(tanh_g, sigmoid_g)
+                out_pair = cute.arch.mul_packed_f32x2(situ_gate, tanh_u)
+                tCompute[i] = out_pair[0]
+                tCompute[i + 1] = out_pair[1]
+        else:
+            inv_2beta = cutlass.Float32(2.0 / beta)
+            two_beta = cutlass.Float32(2.0 * beta)
+            beta_f32 = cutlass.Float32(beta)
+            inv_2lbeta = cutlass.Float32(2.0 / linear_beta)
+            two_lbeta = cutlass.Float32(2.0 * linear_beta)
+            lbeta_f32 = cutlass.Float32(linear_beta)
+            for i in cutlass.range_constexpr(cute.size(acc_vec_up.shape)):
+                g = acc_vec_gate[i] * cutlass.Float32(alpha_val)
+                u = acc_vec_up[i] * cutlass.Float32(alpha_val)
+                tanh_g = two_beta * sigmoid_f32(g * inv_2beta, fastmath=True) - beta_f32
+                tanh_u = two_lbeta * sigmoid_f32(u * inv_2lbeta, fastmath=True) - lbeta_f32
+                tCompute[i] = (tanh_g * sigmoid_f32(g, fastmath=True)) * tanh_u
 
     @cute.jit
     def _apply_relu2_epilogue(
@@ -3332,6 +3577,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         n: cutlass.Int64,
         k: cutlass.Int64,
         l: cutlass.Int64,  # noqa: E741
+        expert_capacity: cutlass.Int32,
         tile_size: cutlass.Constexpr,
         scaling_vector_size: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,
@@ -3342,8 +3588,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         """Single-B wrapper.
 
         ``l`` is the number of experts in the (sole) B tensor.  ``activation_type``
-        must match the one passed to ``__init__``; only ``Swiglu`` and ``Relu2``
-        are supported.
+        must match the one passed to ``__init__``; only ``Swiglu``, ``Relu2``
+        and ``SiTu`` are supported.
         """
         is_gated = is_gated_activation(activation_type)
         scale_k = k // scaling_vector_size
@@ -3400,6 +3646,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             token_id_mapping,
             num_non_exiting_tiles,
             alpha,
+            expert_capacity,
             max_active_clusters=max_active_clusters,
             stream=stream,
             epilogue_op=epilogue_op,
