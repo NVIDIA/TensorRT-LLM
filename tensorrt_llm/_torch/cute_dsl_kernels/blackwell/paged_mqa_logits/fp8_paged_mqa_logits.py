@@ -214,7 +214,7 @@ class FP8MQALogitsKernel:
         epi_dtype=cutlass.Float32,
         acc_dtype=cutlass.Float32,
         output_dtype=cutlass.Float32,
-        use_relu_trick: bool = True,
+        use_relu_trick: bool = False,
         use_flat_logits_view=None,
     ):
         self.block_kv = block_kv
@@ -245,7 +245,9 @@ class FP8MQALogitsKernel:
         self.num_epi_subtiles = num_epi_subtiles
         self.epi_dtype = epi_dtype
         # relu(x) = (x + |x|) / 2 (FADD2 + abs) instead of max(x, 0)
-        # (FMNMX). fp32 epilogue only -- f16x2 has no abs modifier.
+        # (FMNMX), fp32 epilogue only. Opt-in: x + |x| overflows to inf
+        # for finite x >= 2^127, which the unbounded block scales and
+        # weights of the public API can reach.
         self.use_relu_trick = use_relu_trick
         # Flat logits view + carried row offset: the store address is
         # base + out_row*stride0 + kv_pos, but out_row only changes on a

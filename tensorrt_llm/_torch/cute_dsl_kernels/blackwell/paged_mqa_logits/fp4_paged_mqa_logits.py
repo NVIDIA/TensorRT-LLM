@@ -487,7 +487,7 @@ class FP4MQALogitsKernel:
         cand_cap: int = 5120,
         emit_cand_bucketed: bool = False,
         accept_cap: int = 8192,
-        use_relu_trick: bool = True,
+        use_relu_trick: bool = False,
     ):
         # Static FP4 invariants — see plan Sanity checklist.
         assert num_heads == 64, "FP4 kernel hardcodes num_heads=64 for TMEM/SMEM budget"
@@ -519,7 +519,9 @@ class FP4MQALogitsKernel:
         ), f"FP4 output_dtype must be fp32/bf16/fp16; got {output_dtype}"
         assert block_kv == 128, "FP4 compute tile (block_kv) hardcoded to 128"
         # relu(x) = (x + |x|) / 2 (FADD2 + abs) instead of max(x, 0)
-        # (FMNMX). fp32 epilogue only -- f16x2 has no abs modifier.
+        # (FMNMX), fp32 epilogue only. Opt-in: x + |x| overflows to inf
+        # for finite x >= 2^127, which the unbounded block scales and
+        # weights of the public API can reach.
         self.use_relu_trick = use_relu_trick
         self.block_kv = block_kv
         self.phys_block_kv = phys_block_kv
