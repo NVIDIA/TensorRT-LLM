@@ -13,6 +13,9 @@ regressions.
 """
 
 import json
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 from transformers import AutoConfig
@@ -238,7 +241,59 @@ def test_nemotron_h_invalid_pattern_rejected():
     from tensorrt_llm._torch.configs import NemotronHConfig
 
     with pytest.raises(ValueError, match="hybrid_override_pattern"):
-        NemotronHConfig(hybrid_override_pattern="M*XZ-")
+        NemotronHConfig(
+            hybrid_override_pattern="M*XZ-",
+            layers_block_type=["mamba", "attention", "moe", "mlp", "mlp"],
+        )
+
+
+@pytest.mark.parametrize(
+    "layers_block_type",
+    [
+        ["moe", "moe", "moe"],
+        ["mamba"],
+    ],
+)
+def test_nemotron_h_pattern_overrides_explicit_block_types(layers_block_type):
+    from tensorrt_llm._torch.configs import NemotronHConfig
+
+    config = NemotronHConfig(hybrid_override_pattern="M-*", layers_block_type=layers_block_type)
+
+    assert config.layers_block_type == ["mamba", "mlp", "attention"]
+    assert len(config.layers_block_type) == config.num_hidden_layers
+
+
+def test_transformers_tokenizer_registers_dense_nemotron_h_in_clean_process(tmp_path):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+
+    config_dict = _nemotron_h_min_config(_NEMOTRON_H_DENSE_PATTERN)
+    config_dict["tokenizer_class"] = "PreTrainedTokenizerFast"
+    model_dir = Path(_write_config(tmp_path, "nemotron_h_tokenizer", config_dict))
+
+    backend = Tokenizer(WordLevel({"<unk>": 0, "hello": 1}, unk_token="<unk>"))
+    backend.pre_tokenizer = Whitespace()
+    backend.save(str(model_dir / "tokenizer.json"))
+
+    script = """
+import sys
+
+from tensorrt_llm.tokenizer.tokenizer import TransformersTokenizer
+
+assert "tensorrt_llm._torch.configs" not in sys.modules
+tokenizer = TransformersTokenizer.from_pretrained(sys.argv[1])
+assert tokenizer.encode("hello") == [1]
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(model_dir)],
+        cwd=Path(__file__).parents[3],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_load_hf_model_config_handles_dense_nemotron_h(tmp_path):

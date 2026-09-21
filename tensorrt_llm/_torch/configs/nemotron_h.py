@@ -170,11 +170,10 @@ class NemotronHConfig(PretrainedConfig):
                 f"pattern length."
             )
         self.num_hidden_layers = pattern_layers
-        self.layers_block_type = (
-            layers_block_type
-            if layers_block_type is not None
-            else _pattern_to_block_types(hybrid_override_pattern)
-        )
+        # The pattern is the source of truth used by both TRT-LLM model paths.
+        # Ignore a serialized block-type list so it cannot disagree in content
+        # or length, and always validate every pattern character here.
+        self.layers_block_type = _pattern_to_block_types(hybrid_override_pattern)
 
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
