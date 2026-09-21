@@ -296,9 +296,7 @@ def test_embedding_bias_with_torch_sampler_strategies():
     """Test embedding bias application in TorchSampler."""
     tokenizer = AutoTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
-    vocab_size_padded = 32000
-    embedding_bias = torch.zeros(vocab_size_padded)
-    embedding_bias[biased_word_id] = torch.finfo(torch.float32).max
+    embedding_bias = ((biased_word_id, torch.finfo(torch.float32).max), )
 
     sampling_kwargs = {
         "max_tokens": 6,
