@@ -56,3 +56,7 @@ l0_gb300_multi_gpus_perf_sanity:
   # nemotron-ultra-v3-fp4 50k2k (ctx_only)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_nemotron-ultra-v3-fp4_50k2k_con12_ctx1_dep4_gen6_tep4_eplb0_mtp6_ccb-NIXL] TIMEOUT (90)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_nemotron-ultra-v3-fp4_50k2k_con1197_ctx16_dep4_gen1_dep8_eplb0_mtp3_ccb-NIXL] TIMEOUT (90)
+  # gen_only_no_context tests (disagg config)
+  # nemotron-ultra-v3-fp4
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_nemotron-ultra-v3-fp4_8k64k_con1_ctx1_dep4_gen1_tep4_eplb0_mtp5_ccb-NIXL] TIMEOUT (90)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_nemotron-ultra-v3-fp4_50k2k_con12_ctx1_dep4_gen6_tep4_eplb0_mtp6_ccb-NIXL] TIMEOUT (90)

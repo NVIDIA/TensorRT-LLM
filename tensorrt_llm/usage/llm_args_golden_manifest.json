@@ -384,7 +384,17 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "enable_return_routed_experts"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "enable_speculative_beam_history_d2h"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "enable_tokenization_cache"
     },
     {
       "capture_policy": "bool",
@@ -896,6 +906,7 @@
         "AUTO",
         "CUTLASS",
         "CUTEDSL",
+        "CUTEDSL_FC12",
         "TRTLLM",
         "DEEPGEMM",
         "DENSEGEMM",
@@ -1645,6 +1656,7 @@
         "AUTO",
         "CUTLASS",
         "CUTEDSL",
+        "CUTEDSL_FC12",
         "TRTLLM",
         "DEEPGEMM",
         "DENSEGEMM",

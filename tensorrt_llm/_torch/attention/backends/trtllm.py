@@ -18,7 +18,7 @@ import math
 import os
 import weakref
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import torch
 
@@ -47,6 +47,7 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         merge_attention_forward_args)
 from .sparse.hooks import prepare_sparse_runtime_params
 from .sparse.params import BlockSparseForwardInputs, SparseParams
+from .sparse.skip_softmax import SkipSoftmaxParams
 from .utils import log_attention_failure_context
 
 _SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
@@ -69,6 +70,23 @@ def _resolve_skip_correction_threshold(threshold: float,
         key="skip_correction_unsupported_sm",
     )
     return 0.0
+
+
+def _resolve_uses_spcompress(sparse_params: Optional[SparseParams],
+                             sm_version: int) -> bool:
+    uses_spcompress = bool(
+        isinstance(sparse_params, SkipSoftmaxParams)
+        and sparse_params.uses_spcompress)
+    if not uses_spcompress:
+        return False
+    if sm_version == 107:
+        return True
+    logger.warning_once(
+        "spcompress is supported only on SM107; "
+        f"disabling it on SM{sm_version}.",
+        key="uses_spcompress_unsupported_sm",
+    )
+    return False
 
 
 @functools.cache
@@ -213,6 +231,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     _mla_ctx_cu_seqlens_valid: bool = field(default=False,
                                             init=False,
                                             repr=False)
+    _fp4_mla_fp8_context_state: Optional[Tuple[Any, Any]] = field(init=False,
+                                                                  default=None,
+                                                                  repr=False,
+                                                                  compare=False)
 
     # `DSAtrtllmAttentionMetadata` overrides this; the dense path keeps 0.
     num_sparse_topk: int = 0
@@ -683,6 +705,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         return None
 
     def prepare(self) -> None:
+        # The FP8 scratch metadata view is shared by every local FP4 MLA layer
+        # in one eager context forward and must be rebuilt for the next batch.
+        self._fp4_mla_fp8_context_state = None
         super().prepare()
         # Recomputed on first use this iteration; see mla_prepare_scheduler_buffers.
         self._invalidate_mla_scheduler_buffers()
@@ -1386,6 +1411,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                                          If None, positional embedding should be applied by the model before calling the backend.
                                                          Otherwise, the backend is in-charge of applying positional embedding and may cache K without embedding it first.
             mla_params (MLAParams): Optional parameters for MLA. If None, MLA is not enabled.
+            sparse_params (SparseParams): Optional sparse-attention backend parameters
+                (e.g. skip-softmax). Algorithm-specific fields are documented on the
+                corresponding ``SparseParams`` subclass.
             kv_cache_dtype (str): KV-cache dtype selected by ``KvCacheConfig``. Accepted
                 values are ``auto``, ``fp8``, ``fp8_ds_mla``, ``nvfp4``, and supported
                 torch dtype strings. ``fp8_ds_mla`` selects the packed sparse-MLA cache
@@ -1421,6 +1449,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             skip_correction_threshold,
             get_sm_version(),
             is_mla=self.is_mla_enable)
+        self.uses_spcompress = _resolve_uses_spcompress(sparse_params,
+                                                        get_sm_version())
 
         if self.is_mla_enable:
             self.q_lora_rank = self.mla_params.q_lora_rank
@@ -1597,6 +1627,19 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.local_layer_idx = metadata.kv_cache_manager.layer_offsets[
             self.layer_idx]
         return self.local_layer_idx
+
+    def get_fp4_mla_local_layer_idx(self,
+                                    metadata: TrtllmAttentionMetadata) -> int:
+        """Return the compact index used by FP4 MLA-only side pools."""
+        local_layer_idx = self.get_local_layer_idx(metadata)
+        if metadata.kv_cache_manager is None:
+            return local_layer_idx
+        to_compact = getattr(metadata.kv_cache_manager,
+                             "_fp4_mla_compact_layer_idx", None)
+        if not callable(to_compact):
+            raise RuntimeError(
+                "FP4 MLA requires a cache manager with compact layer mapping.")
+        return to_compact(local_layer_idx)
 
     def use_nvfp4_output(
         self,
@@ -1814,7 +1857,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             forward_args.output_sf = outputs[1] if len(outputs) == 2 else None
 
         has_q_only = False
-        if not self.is_mla_enable and not metadata.is_cross and k is None and v is None:
+        if self.is_mla_enable:
+            forward_args.is_fused_qkv = False
+            forward_args.update_kv_cache = True
+            has_q_only = k is None and v is None
+        elif not metadata.is_cross and k is None and v is None:
             q_hidden_size = self.num_heads * self.head_dim
             qkv_hidden_size = q_hidden_size + 2 * self.num_kv_heads * self.head_dim
             has_q_only = q.size(-1) == q_hidden_size
@@ -1980,19 +2027,20 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 assert k.shape[0] == num_tokens
                 assert v.shape[0] == num_tokens
         else:
+            assert not forward_args.is_fused_qkv
             sparse_attn_indices = forward_args.sparse_runtime_params.sparse_attn_indices
             is_sparse_attn = sparse_attn_indices is not None and sparse_attn_indices.numel(
             ) > 0
             if attention_input_type == AttentionInputType.context_only and is_sparse_attn:
-                assert forward_args.is_fused_qkv
+                assert k is None and v is None
                 qkv_hidden_size = self.num_heads * (self.kv_lora_rank +
                                                     self.qk_rope_head_dim)
             elif attention_input_type == AttentionInputType.context_only:
-                assert not forward_args.is_fused_qkv
+                assert k is not None and v is not None
                 qkv_hidden_size = self.num_heads * (self.qk_nope_head_dim +
                                                     self.qk_rope_head_dim)
             elif attention_input_type == AttentionInputType.generation_only:
-                assert forward_args.is_fused_qkv
+                assert k is None and v is None
                 qkv_hidden_size = self.num_heads * (self.kv_lora_rank +
                                                     self.qk_rope_head_dim)
             else:

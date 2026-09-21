@@ -3598,6 +3598,20 @@ class NVFP4MarlinFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         """Transform CUTLASS-format NVFP4 weights to Marlin tiled format."""
         from tensorrt_llm.quantization.utils import marlin_utils
 
+        # An AWQ-style checkpoint carries a per-channel pre-quant scale, which
+        # ``load_quant_scales`` turns into ``fc31_act_scale``. CutlassFusedMoE
+        # pre-multiplies the input by it; the Marlin kernel takes no activation
+        # scale and this family's ``run_moe`` never applies one, so serving such
+        # a checkpoint here would be silently wrong rather than merely slower.
+        # Checked at this stage because that parameter does not exist until the
+        # weights have been loaded, and refused rather than ignored.
+        if getattr(module, "fc31_act_scale", None) is not None:
+            raise ValueError(
+                f"{type(module).__name__} cannot serve a checkpoint with a "
+                "pre-quant activation scale (NVFP4_AWQ / NVFP4_ARC): the Marlin "
+                "kernel applies no activation scale. Select a backend that does, "
+                "e.g. moe_backend=CUTLASS.")
+
         # Standard CUTLASS loading (swizzles scales, computes alpha, etc.)
         super().transform_weights(module)
 
