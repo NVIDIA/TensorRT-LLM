@@ -271,9 +271,9 @@ def _fwd_kernel(
                 K_Buffer + offs_buf_k,
                 mask=mask_n[None, :] & mask_d[:, None] & valid_page[None, :],
                 other=0.0,
-            )
+            ).to(q.dtype)
 
-            qk = tl.dot(q.to(k.dtype), k)
+            qk = tl.dot(q, k)
             qk *= sm_scale
 
             if logit_cap > 0:
@@ -300,7 +300,7 @@ def _fwd_kernel(
                 V_Buffer + offs_buf_v,
                 mask=mask_n[:, None] & mask_dv[None, :] & valid_page[:, None],
                 other=0.0,
-            )
+            ).to(q.dtype)
             p = p.to(v.dtype)
             acc = acc * re_scale[:, None] + tl.dot(p, v)
             e_max = n_e_max
@@ -589,19 +589,11 @@ def triton_prefill_with_custom_mask(
     prefix_indptr = torch.zeros(num_contexts + 1, dtype=torch.int32, device=device)
     prefix_indptr[1:] = torch.cumsum(prefix_lens, dim=0)
 
-    # Extract K/V views from paged cache.  When the KV cache uses a
-    # narrower dtype (e.g. FP8 with NVFP4 quantization), cast to the
-    # compute dtype (Q's dtype, typically BF16) so the Triton kernel
-    # can run tl.dot in BF16.  Only the accessed pages are copied.
-    compute_dtype = q.dtype
+    # Keep views of the original cache. The kernel casts loaded K/V tiles to
+    # Q's dtype before tl.dot, avoiding compute-dtype copies of the entire pool.
     if kv_cache is not None:
         k_buffer = kv_cache.select(1, 0)  # [num_pages, num_kv_heads, page_size, head_dim]
         v_buffer = kv_cache.select(1, 1)
-        if k_buffer.dtype != compute_dtype:
-            num_prefix_pages = int(page_table_indptr[-1].item())
-            if num_prefix_pages > 0:
-                k_buffer = k_buffer.to(compute_dtype)
-                v_buffer = v_buffer.to(compute_dtype)
     else:
         # Dummy 4D buffers — not accessed when all prefix_lens are 0,
         # but must have 4 dims so stride(0..3) works in the kernel launcher.

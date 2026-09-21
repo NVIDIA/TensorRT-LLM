@@ -57,6 +57,7 @@ from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
 def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
     """Refresh DSA mappings after switching to the draft cache."""
     events = []
+    state = {}
     draft_manager = object.__new__(DSACacheManagerV2)
 
     class _Metadata(DSAtrtllmAttentionMetadata):
@@ -66,13 +67,13 @@ def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
             self._num_ctx_tokens = 0
 
         def set_in_mtp_draft_loop(self, active):
-            pass
+            state["in_mtp_draft_loop"] = active
 
         def set_mtp_num_accepted(self, value):
-            pass
+            state["mtp_num_accepted"] = value
 
         def set_skip_topk(self, value):
-            pass
+            state["skip_topk"] = value
 
         def on_update_kv_lens(self):
             events.append("refresh")
@@ -116,6 +117,13 @@ def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
         )
 
     assert events == ["switch", "refresh", "forward"]
+    # The draft forward raised, so only the ExitStack callback can have cleared
+    # this; a leaked flag would let the next target forward reuse the selections.
+    assert state == {
+        "in_mtp_draft_loop": False,
+        "mtp_num_accepted": None,
+        "skip_topk": False,
+    }
 
 
 def test_dynamic_tree_metadata_forces_target_mask_prepare_each_step() -> None:

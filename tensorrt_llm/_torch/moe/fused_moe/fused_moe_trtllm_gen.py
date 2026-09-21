@@ -14,28 +14,19 @@
 # limitations under the License.
 """The ``TRTLLMGenFusedMoE`` family name, kept importable from its own path.
 
-The implementation lives in the :mod:`.trtllm_gen` subpackage. Of the three
-names in ``__all__`` only ``TRTLLMGenFusedMoE`` is defined here; the two lookup
+The implementation lives in the :mod:`.trtllm_gen` subpackage; the lookup
 helpers are forwarded so that this path resolves everything the pre-split one
-did. The split moved the code out and left the name behind on purpose: the
-leaves are the addressable implementations, and this name stands for all
-of them at once, which no descriptor can publish.
+did.
 
-Following the ``DeepGemmFusedMoE`` precedent in :mod:`.fused_moe_deepgemm`, it
-is an alias and not a parent, so there is no second class to keep in step.
-
-Every gate against it has to be ``issubclass`` / ``isinstance`` and not an
-equality check: this name is the family, and the leaves are what
-resolution actually hands over, so ``type(x) is TRTLLMGenFusedMoE`` matches
-nothing.
+Every gate against this name has to be ``issubclass`` / ``isinstance`` and not
+an equality check: the leaves are what resolution hands over, so
+``type(x) is TRTLLMGenFusedMoE`` matches nothing.
 """
 
 from .trtllm_gen import (TrtllmGenFusedMoEBase, find_trtllm_gen_leaf,
                          trtllm_gen_leaf)
 
-#: The family base under its pre-split name. Not a subclass of it: an alias, so
-#: that ``isinstance``/``issubclass`` against either name give the same answer
-#: and there is no second class to keep in step.
+# An alias, not a base class, so there is no second class to keep in step.
 TRTLLMGenFusedMoE = TrtllmGenFusedMoEBase
 
 __all__ = ["TRTLLMGenFusedMoE", "trtllm_gen_leaf", "find_trtllm_gen_leaf"]
