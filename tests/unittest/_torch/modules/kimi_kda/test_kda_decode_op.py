@@ -18,6 +18,9 @@ from kimi_kda_test_utils import (  # noqa: E402
 )
 
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention, _kda_decode  # noqa: E402
+from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import (  # noqa: E402
+    is_kda_optimized_supported,
+)
 
 # 73: deliberately odd and > 64 to cover non-power-of-two batched decode.
 BATCH_SIZE = 73
@@ -30,12 +33,18 @@ COMPACT_WORK_THRESHOLD = 144
 
 
 def _has_supported_gpu() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability(0) in {(10, 0), (10, 3)}
+    # Defer to the predicate the runtime actually dispatches on rather than
+    # restating its capability set. It accepts SM100/SM103 only; SM107 takes
+    # the FLA fallback in KDAKernelDispatch, so admitting it here would run
+    # these parity assertions against the unoptimized path.
+    if not torch.cuda.is_available():
+        return False
+    return is_kda_optimized_supported()
 
 
 pytestmark = pytest.mark.skipif(
     not _has_supported_gpu(),
-    reason="Kimi K3 is supported only on Blackwell (SM100/SM103)",
+    reason="KDA optimized decode kernels require Blackwell SM100/SM103",
 )
 
 

@@ -58,6 +58,7 @@ tensorrt_llm/flash_mla
 tensorrt_llm/flash_mla_cpp_tllm.*.so
 tensorrt_llm/flash_mla_cpp_tllm.pyi
 /3rdparty/fmha_sm100/
+/3rdparty/nccl_extensions/
 tensorrt_llm/runtime/kv_cache_manager_v2/**/*.so
 **/*__mypyc*.so
 tensorrt_llm/scripts

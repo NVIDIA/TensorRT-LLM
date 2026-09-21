@@ -82,7 +82,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     _KVCache,
     exact_div,
     gen_multimodal_cache_key_tokens,
-    sequence_to_blockchain_keys,
     typed_range,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BACKEND as KV_CACHE_MANAGER_V2_BACKEND
@@ -101,7 +100,12 @@ from ..kv_cache_stats import (
     KVCacheV2SsmLifeCycleIterationStats,
     KVCacheV2SsmSnapshotIterationStats,
 )
-from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
+from ..llm_request import (
+    LlmRequest,
+    LlmRequestState,
+    get_draft_token_length,
+    rewind_context_after_cache_drop,
+)
 from ..resource_manager import (
     BaseResourceManager,
     CacheTypeCpp,
@@ -915,39 +919,6 @@ def _augment_tokens_with_contiguous_mm_metadata(
     return result
 
 
-def _first_new_block_key(
-    tokens: Sequence[TokenIdExt],
-    tokens_per_block: int,
-    reuse_scope: ReuseScope,
-    num_reusable_tokens: int,
-) -> bytes | None:
-    """Key of the first block *tokens* would commit past its reusable prefix.
-
-    *num_reusable_tokens* is what ``probe_reuse`` reports for the same
-    ``(reuse_scope, tokens)``, i.e. the window-aware, pruned prefix length.
-    Returns None when that block would be partial: a partial block is never
-    committed, so it has no key yet.
-
-    Split out from ``KVCacheManagerV2.probe_first_new_block_key`` so the key math
-    can be exercised against a real radix tree without a full model runtime.
-    """
-    # Integer division also covers a partial (mid-block) match: that block is
-    # still the first one this sequence completes and commits.
-    block_index = num_reusable_tokens // tokens_per_block
-    num_tokens_needed = (block_index + 1) * tokens_per_block
-    if num_tokens_needed > len(tokens):
-        return None
-    # A block key depends only on the tokens preceding it, so hashing the
-    # truncated prefix is exact -- and keeps both the token marshalling and the
-    # hash chain proportional to the block we want, not to the whole prompt.
-    key = None
-    for _, key in sequence_to_blockchain_keys(
-        tokens_per_block, reuse_scope, tokens[:num_tokens_needed]
-    ):
-        pass
-    return key
-
-
 def _locate_accepted_draft_tokens(requests: List[LlmRequest]):
     num_accepted_draft_tokens = []
     accepted_draft_tokens_indices = []
@@ -1349,12 +1320,14 @@ class KVCacheManagerV2(BaseResourceManager):
                     attention_dp_rank=mapping.rank,
                     attention_dp_gather=Distributed.get(mapping).allgather,
                     hash_algo=kv_cache_event_hash_algo,
+                    mm_token_id_offset=vocab_size,
                 )
             elif mpi_rank() == 0:
                 self.event_manager = KVCacheEventManager(
                     self.event_buffer_max_size,
                     window_size=event_window_size,
                     hash_algo=kv_cache_event_hash_algo,
+                    mm_token_id_offset=vocab_size,
                 )
 
         if isinstance(num_kv_heads, int):
@@ -3401,12 +3374,7 @@ class KVCacheManagerV2(BaseResourceManager):
             return True
         if kv_cache.history_length > pre_cap:
             self.free_resources(req)
-            req.set_prepopulated_prompt_len(0, self.tokens_per_block)
-            # setPrepopulatedPromptLen only moves forward, so rewind the same
-            # fields LlmRequest::pause() resets for a recompute pause.
-            req.context_current_position = 0
-            req.context_chunk_size = req.prompt_len
-            req.estimated_reusable_tokens = 0
+            rewind_context_after_cache_drop(req, self.tokens_per_block)
             return False
         history_length = min(kv_cache.history_length, pre_cap)
         if not kv_cache.resize(pre_cap, history_length):
@@ -4061,10 +4029,13 @@ class KVCacheManagerV2(BaseResourceManager):
         see py_executor._adp_dummy_is_gen), and a disaggregated generation
         worker receives prompt KV rather than prefilling it.
 
-        Returns None when the IndexMapper is saturated. A context request can
-        retry next iteration; a generation request cannot, and skipping it only
-        defers the failure to copy_batch_block_offsets(), which asserts in C++
-        on the unmapped request ID.
+        Returns None when the IndexMapper is saturated, which neither branch
+        survives. copy_batch_block_offsets() runs later in the SAME iteration and
+        feeds every id in the batch -- context ids included, IndexMapper::getCopyIndex
+        -- to getIndex(), which TLLM_CHECKs on an unmapped id
+        (kvCacheManagerV2Utils.cpp), so the caller's `continue` defers to nothing.
+
+        Pre-existing, and left as is here; only the claim about it is corrected.
         """
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is not None:
@@ -4081,6 +4052,25 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache.stop_committing()
         return kv_cache
 
+    def _draft_pool_diagnostic(self) -> str:
+        """Draft-pool occupancy, for the resize-failure messages below.
+
+        The draft manager mirrors the target's tokens but is sized from its own
+        byte budget, and the capacity scheduler admits on the TARGET pool alone
+        (`scheduler_v2` touches `draft_kv_cache_manager` only to suspend/free). A
+        draft pool smaller in tokens than the target cannot backpressure -- it can
+        only raise, and the raise kills every rank.
+
+        The first question is always how big the draft pool was and how full, so the
+        message answers it rather than leaving post-hoc arithmetic over the split log.
+
+        """
+        live = sum(c.capacity for c in self.kv_cache_map.values())
+        return (
+            f" [draft pool: {len(self.kv_cache_map)} live caches holding "
+            f"{live} tokens, gpu_max_tokens={self._gpu_max_tokens}]"
+        )
+
     def _prepare_draft_resources(self, scheduled_batch: ScheduledRequests):
         """Create/resize KV caches in the draft V2 manager for scheduled requests.
 
@@ -4095,12 +4085,14 @@ class KVCacheManagerV2(BaseResourceManager):
             for req in scheduled_batch.context_requests:
                 kv_cache = self._mirror_draft_kv_cache(req)
                 if kv_cache is None:
-                    # Retryable here, unlike the generation loop below: a
-                    # context request has not drafted yet, so the next
-                    # iteration can mirror it once slots free up.
+                    # Pre-existing behaviour, kept deliberately: skipping does NOT buy a
+                    # retry, because copy_batch_block_offsets() asserts on this id later in
+                    # the same iteration. Saturation needs cancelled requests piling past
+                    # the 2x slack, so this is a loud symptom, not a recoverable state.
                     logger.warning(
                         f"Draft KV cache mirror has no free IndexMapper slot for "
-                        f"context request {req.py_request_id}; retrying next iteration."
+                        f"context request {req.py_request_id}; this iteration "
+                        f"will fail in copy_batch_block_offsets."
                     )
                     continue
                 if not self._resume_and_restore(req.py_request_id, kv_cache):
@@ -4118,6 +4110,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     raise RuntimeError(
                         f"Draft KV cache context resize failed for request "
                         f"{req.py_request_id}: could not resize to {capacity} tokens"
+                        f"{self._draft_pool_diagnostic()}"
                     )
 
             for req in scheduled_batch.generation_requests:
@@ -4140,6 +4133,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     raise RuntimeError(
                         f"Draft KV cache generation resize failed for request "
                         f"{req.py_request_id}: could not resize to {new_cap} tokens"
+                        f"{self._draft_pool_diagnostic()}"
                     )
 
     def _reuse_token_source(self, req: LlmRequest) -> Sequence[int]:
@@ -4881,6 +4875,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 if capture_sampling_params is not None
                 else None,
                 top_p=capture_sampling_params.top_p
+                if capture_sampling_params is not None
+                else None,
+                min_p=capture_sampling_params.min_p
                 if capture_sampling_params is not None
                 else None,
             )
@@ -5692,8 +5689,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # excluded, so there is nothing to look up and nothing to contribute.
             return None
         scope = ReuseScope(lora_id=req.lora_task_id, salt=self._derive_reuse_salt(req.cache_salt))
-        num_reusable = self.impl.probe_reuse(scope, tokens)
-        return _first_new_block_key(tokens, self.tokens_per_block, scope, num_reusable)
+        return self.impl.probe_first_new_block_key(scope, tokens)
 
     def prefetch_for_context_tokens(self, requests: list) -> bool:
         """Prefetch radix-tree blocks from disk→host for upcoming context requests.

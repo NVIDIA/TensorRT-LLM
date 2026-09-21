@@ -553,6 +553,10 @@ class StreamingKVCacheEventManager:
         self.enqueued_events = 0
         self.dropped_batches = 0
 
+    def needs_token_digest_context(self) -> bool:
+        # Streaming events do not emit multimodal keys.
+        return False
+
     def start(self) -> None:
         """Bind the publisher's sockets and start its background thread.
 
