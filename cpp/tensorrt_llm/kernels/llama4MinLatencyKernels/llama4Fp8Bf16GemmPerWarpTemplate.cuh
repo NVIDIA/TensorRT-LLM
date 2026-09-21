@@ -143,8 +143,8 @@ __launch_bounds__(BLOCK_SIZE) __global__ void llama4_fp8_bf16_gemm_per_warp_kern
 #pragma unroll
                     for (int i = 0; i < VEC_SIZE / 4; i++)
                     {
-                        float4 a_val = float4(a_vec_current.data[i]);
-                        float4 b_val = float4(b_vec_current.data[i]);
+                        float4 a_val = static_cast<float4>(a_vec_current.data[i]);
+                        float4 b_val = static_cast<float4>(b_vec_current.data[i]);
 
                         thread_sum[tile_token_idx][tile_out_idx] = ffma2(make_float2(a_val.x, a_val.y),
                             make_float2(b_val.x, b_val.y), thread_sum[tile_token_idx][tile_out_idx]);
@@ -211,8 +211,8 @@ __launch_bounds__(BLOCK_SIZE) __global__ void llama4_fp8_bf16_gemm_per_warp_kern
 #pragma unroll
                         for (int i = 0; i < VEC_SIZE / 4; i++)
                         {
-                            float4 a_val = float4(a_vec_current.data[i]);
-                            float4 b_val = float4(b_vec_current.data[i]);
+                            float4 a_val = static_cast<float4>(a_vec_current.data[i]);
+                            float4 b_val = static_cast<float4>(b_vec_current.data[i]);
 
                             thread_sum[tile_token_idx][tile_out_idx] = ffma2(make_float2(a_val.x, a_val.y),
                                 make_float2(b_val.x, b_val.y), thread_sum[tile_token_idx][tile_out_idx]);

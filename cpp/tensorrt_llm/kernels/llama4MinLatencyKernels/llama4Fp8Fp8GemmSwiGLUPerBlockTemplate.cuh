@@ -143,9 +143,9 @@ __launch_bounds__(BLOCK_SIZE) __global__ void llama4_fp8_fp8_gemm_swiglu_per_blo
 #pragma unroll
                 for (int i = 0; i < VEC_SIZE / 4; i++)
                 {
-                    float4 a_val = float4(a_vec_current.data[i]);
-                    float4 b_val_gate = float4(b_vec_current_gate.data[i]);
-                    float4 b_val_linear = float4(b_vec_current_linear.data[i]);
+                    float4 a_val = static_cast<float4>(a_vec_current.data[i]);
+                    float4 b_val_gate = static_cast<float4>(b_vec_current_gate.data[i]);
+                    float4 b_val_linear = static_cast<float4>(b_vec_current_linear.data[i]);
 
                     thread_sum_gate[tile_token_idx][tile_out_idx] = ffma2(make_float2(a_val.x, a_val.y),
                         make_float2(b_val_gate.x, b_val_gate.y), thread_sum_gate[tile_token_idx][tile_out_idx]);
@@ -201,9 +201,9 @@ __launch_bounds__(BLOCK_SIZE) __global__ void llama4_fp8_fp8_gemm_swiglu_per_blo
 #pragma unroll
                     for (int i = 0; i < VEC_SIZE / 4; i++)
                     {
-                        float4 a_val = float4(a_vec_current.data[i]);
-                        float4 b_val_gate = float4(b_vec_current_gate.data[i]);
-                        float4 b_val_linear = float4(b_vec_current_linear.data[i]);
+                        float4 a_val = static_cast<float4>(a_vec_current.data[i]);
+                        float4 b_val_gate = static_cast<float4>(b_vec_current_gate.data[i]);
+                        float4 b_val_linear = static_cast<float4>(b_vec_current_linear.data[i]);
 
                         thread_sum_gate[tile_token_idx][tile_out_idx] = ffma2(make_float2(a_val.x, a_val.y),
                             make_float2(b_val_gate.x, b_val_gate.y), thread_sum_gate[tile_token_idx][tile_out_idx]);
