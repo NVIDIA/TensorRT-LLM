@@ -26,7 +26,6 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-import torch
 
 from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
@@ -2662,6 +2661,7 @@ def _connector_event_count(folder: Path, rank: int, event: str) -> int:
 
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+@pytest.mark.skip_less_device(2)
 def test_connector_adp_persistent_pool(
         monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
         disable_overlap_scheduler: bool,
@@ -2671,7 +2671,6 @@ def test_connector_adp_persistent_pool(
     A single request exercises an idle owner; four equal requests exercise
     balanced batches; unequal prompt lengths exercise uneven prefill work.
     """
-    assert torch.cuda.device_count() >= 2, "This regression requires two GPUs"
     monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
     monkeypatch.setenv("CONNECTOR_CACHE_FOLDER", str(tmp_path))
     kwargs = dict(
@@ -2716,6 +2715,7 @@ def test_connector_adp_persistent_pool(
 
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+@pytest.mark.skip_less_device(2)
 def test_connector_adp_async_without_dummy(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2723,7 +2723,6 @@ def test_connector_adp_async_without_dummy(
     recording_connector: KvCacheConnectorConfig,
 ) -> None:
     """An async owner at its slot cap must preserve its peer's prepared V2 batch."""
-    assert torch.cuda.device_count() >= 2, "This regression requires two GPUs"
     monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
     monkeypatch.setenv("CONNECTOR_CACHE_FOLDER", str(tmp_path / "cache"))
     kwargs = dict(

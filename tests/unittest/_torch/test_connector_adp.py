@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+from pydantic import ValidationError
 
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
     AsyncRequests,
@@ -25,6 +26,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import LlmRequestState
+from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
@@ -71,6 +73,11 @@ def _configure_recovery_controls(executor: "PyExecutor") -> None:
     executor.kv_connector_manager = None
     executor._kv_connector_failed = False
     executor._kv_connector_deadlines = {}
+    executor._kv_connector_config = KvCacheConnectorConfig(
+        connector_module=CONNECTOR_MODULE,
+        connector_scheduler_class="KvCacheConnectorScheduler",
+        connector_worker_class="KvCacheConnectorWorker",
+    )
     executor.is_shutdown = False
     executor.canceled_req_ids = []
     executor.executor_request_queue = ExecutorRequestQueue(
@@ -451,13 +458,14 @@ def test_adp_recovery_failure_reaches_ready_peer_without_reallocation(
             executors[rank]._kv_connector_start_batch(batches[rank])
         return str(exc.value)
 
+    for executor in executors:
+        executor._kv_connector_config.transfer_timeout_sec = 1.0
+        executor._kv_connector_config.control_grace_sec = 0.03
     ticks = itertools.count(step=0.01)
     clock = SimpleNamespace(monotonic=lambda: next(ticks), sleep=MagicMock())
     with (
         patch("torch.cuda.current_stream"),
         patch("tensorrt_llm._torch.pyexecutor.py_executor.time", clock),
-        patch("tensorrt_llm._torch.pyexecutor.py_executor._KV_CONNECTOR_TRANSFER_TIMEOUT_SEC", 1.0),
-        patch("tensorrt_llm._torch.pyexecutor.py_executor._KV_CONNECTOR_CONTROL_GRACE_SEC", 0.03),
         ThreadPoolExecutor(max_workers=2) as pool,
     ):
         futures = [pool.submit(run, rank) for rank in range(2)]
@@ -581,12 +589,19 @@ def test_non_adp_cancellation_keeps_existing_behavior() -> None:
     executor.kv_connector_manager.has_pending_transfers.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "transfer_timeout,control_grace", [(60.0, 1.0), (120.0, 5.0), (60.0, 120.0)]
+)
 @pytest.mark.parametrize("batch_kind", ["dummy", "mixed"])
 @pytest.mark.parametrize(
     "outcome", ["timeout", "cancel", "cancel_child", "shutdown", "complete", "poll_error"]
 )
 def test_pending_transfer_deadline_across_iterations(
-    forbid_connector_collectives: None, batch_kind: str, outcome: str
+    forbid_connector_collectives: None,
+    batch_kind: str,
+    outcome: str,
+    transfer_timeout: float,
+    control_grace: float,
 ) -> None:
     """A ready peer must observe a stalled owner's failure even when compute can run."""
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
@@ -611,6 +626,8 @@ def test_pending_transfer_deadline_across_iterations(
         manager.build_scheduler_output(batch, cache)
         executor = object.__new__(PyExecutor)
         _configure_recovery_controls(executor)
+        executor._kv_connector_config.transfer_timeout_sec = transfer_timeout
+        executor._kv_connector_config.control_grace_sec = control_grace
         executor.kv_connector_manager = manager
         executor.kv_cache_manager = cache
         executor.kv_cache_transceiver = None
@@ -649,6 +666,7 @@ def test_pending_transfer_deadline_across_iterations(
         assert poll() == [None, None]
         owner = executors[1]
         deadline = owner._kv_connector_deadlines[11].expires_at
+        assert deadline == transfer_timeout
         now[0] = 10.0
         futures = [pool.submit(e._kv_connector_start_batch, b) for e, b in zip(executors, batches)]
         for future in futures:
@@ -663,10 +681,10 @@ def test_pending_transfer_deadline_across_iterations(
         assert poll() == [None, None]
         if outcome in ("cancel", "cancel_child", "shutdown"):
             deadline = owner._kv_connector_deadlines[11].expires_at
-            assert deadline == 11.0
+            assert deadline == min(transfer_timeout, 10.0 + control_grace)
         else:
             assert owner._kv_connector_deadlines[11].expires_at == deadline
-        now[0] = deadline + 0.1
+        now[0] = deadline - 0.1 if outcome == "complete" else deadline + 0.1
         if outcome == "complete":
             owner.kv_connector_manager.worker.get_finished.return_value = ([], [11])
             assert poll() == [None, None]
@@ -797,3 +815,34 @@ def test_callback_failure_marks_retention_before_loop_cleanup(with_connector: bo
         executor._event_loop_wrapper()
     executor._executor_loop_cleanup.assert_called_once()
     kill.assert_called_once()
+
+
+@pytest.mark.parametrize("field", ["transfer_timeout_sec", "control_grace_sec"])
+@pytest.mark.parametrize("value", [0.0, -1.0, float("inf"), float("-inf"), float("nan")])
+def test_connector_rejects_invalid_deadline(field: str, value: float) -> None:
+    """Invalid budgets must fail before an executor or backend starts."""
+    with pytest.raises(ValidationError, match=field):
+        KvCacheConnectorConfig(
+            connector_module=CONNECTOR_MODULE,
+            connector_scheduler_class="KvCacheConnectorScheduler",
+            connector_worker_class="KvCacheConnectorWorker",
+            **{field: value},
+        )
+
+
+def test_connector_deadline_config_round_trip() -> None:
+    """Worker configuration serialization preserves custom transfer budgets."""
+    config = KvCacheConnectorConfig(
+        connector_module=CONNECTOR_MODULE,
+        connector_scheduler_class="KvCacheConnectorScheduler",
+        connector_worker_class="KvCacheConnectorWorker",
+    )
+    assert config.transfer_timeout_sec == 60.0
+    assert config.control_grace_sec == 1.0
+    custom = config.model_dump()
+    custom.update(transfer_timeout_sec=120.0, control_grace_sec=5.0)
+    restored = KvCacheConnectorConfig.model_validate_json(
+        KvCacheConnectorConfig.model_validate(custom).model_dump_json()
+    )
+    assert restored.transfer_timeout_sec == 120.0
+    assert restored.control_grace_sec == 5.0

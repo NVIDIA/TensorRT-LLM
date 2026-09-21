@@ -16,7 +16,7 @@ The KV Cache Connector is designed to support a variety of advanced serving scen
 
 The connector architecture is split into two main components:
 
-* **Scheduler (Leader)**: Responsible for orchestration. It decides *what* needs to be loaded or saved and builds metadata instructions. It runs only on the leader rank (rank 0).
+* **Scheduler (Leader)**: Responsible for orchestration. It decides *what* needs to be loaded or saved and builds metadata instructions. Without attention DP, it runs only on the leader rank (rank 0). With attention DP, each owner rank runs its own scheduler; see [Attention data parallelism](#attention-data-parallelism).
 * **Worker**: Responsible for execution. It receives metadata from the scheduler and performs the actual data transfers (loading/saving) on the KV cache tensors. It runs on all ranks.
 
 ### API Reference
@@ -25,12 +25,13 @@ To implement a custom connector, you must subclass `KvCacheConnectorScheduler` a
 
 #### 1. Scheduler (Leader) Interface (`KvCacheConnectorScheduler`)
 
-These methods run on the leader process and drive the connector's behavior.
+These methods drive the connector's behavior. Without attention DP, they run
+on the leader process; with attention DP, they run on each owning rank.
 
 * **`build_connector_meta(self, scheduler_output: SchedulerOutput) -> object`**
   * **Description**: The core orchestration method. Called during the scheduling phase. It examines the current requests and decides which blocks need to be loaded from or saved to the external store.
   * **Arguments**: `scheduler_output` contains information about new requests, blocks allocated, current request states, and the cumulative `RequestData.block_hashes` chain. `block_hashes` is read directly from each KV cache block's stored hash, which the KV cache manager commits as soon as a block becomes full -- the value matches the hash that KV cache events will subsequently emit for the same block. The chain only covers beam 0; the executor rejects `kv_connector_config` at startup when `max_beam_width > 1`, so connectors may assume beam-width-1 inputs.
-  * **Returns**: An arbitrary metadata object (picklable) that describes the tasks for the workers. This object is broadcasted to all workers.
+  * **Returns**: An arbitrary metadata object (picklable) that describes the tasks for the workers. Without attention DP, this object is broadcast to all workers. With attention DP, metadata stays local to the owning rank.
 
 * **`get_num_new_matched_tokens(self, request: LlmRequest, num_computed_tokens: int) -> tuple[int, bool]`**
   * **Description**: Called when a new request arrives. It checks to see if any KV cache can be loaded from an external KV store.
@@ -325,11 +326,15 @@ it polls local transfer completion until at least one request is ready, then
 runs the already-prepared batch. Owners exchange readiness and failure status
 at an executor gate during this fallback; their V2 allocations and connector
 plans are preserved. Each outstanding asynchronous load or save has a persistent
-60-second deadline, checked during normal iterations as well as this recovery
+deadline (`kv_connector_config.transfer_timeout_sec`, default 60 seconds),
+checked during normal iterations as well as this recovery
 loop. Dummy or unrelated compute does not reset that deadline. Shutdown or
-cancellation shortens the remaining wait to at most one second, allowing a
+cancellation shortens the remaining wait to at most
+`kv_connector_config.control_grace_sec` (default one second), allowing a
 healthy transfer to drain normally. These checks run at the next polling gate;
-they cannot interrupt a running forward pass or blocking callback.
+they cannot interrupt a running forward pass or blocking callback. Both settings
+must be positive and finite, apply only to ADP, and can be increased for slower
+backends. Control grace never extends an existing transfer deadline.
 
 A timeout or polling exception fails all owners through a rank-synchronized
 gate. Exceptions inside forward/layer hooks fail through the executor's crash

@@ -778,6 +778,16 @@
       "path": "kv_connector_config.connector"
     },
     {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_connector_config.control_grace_sec"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_connector_config.transfer_timeout_sec"
+    },
+    {
       "capture_policy": "list[int]|none",
       "kind": "value",
       "path": "layer_wise_benchmarks_config.calibration_layer_indices"

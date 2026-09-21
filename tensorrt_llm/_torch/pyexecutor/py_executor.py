@@ -138,11 +138,6 @@ def _stats_buffer_is_unbounded(max_stats_len: int) -> bool:
 # Set to a path to save detailed tracing of PyTorch operations.
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 
-# Bound outstanding ADP transfers across iterations, even while other work
-# can run. Expiration retains DMA-owned pages and requires process restart.
-_KV_CONNECTOR_TRANSFER_TIMEOUT_SEC = 60.0
-_KV_CONNECTOR_CONTROL_GRACE_SEC = 1.0
-
 
 @dataclasses.dataclass
 class _KvConnectorTransferDeadline:
@@ -540,6 +535,7 @@ class PyExecutor:
         self.max_draft_len = max_draft_len
         self.max_total_draft_tokens = max_total_draft_tokens
         self.llm_args = self.model_engine.llm_args
+        self._kv_connector_config = self.llm_args.kv_connector_config
         self.max_stats_len = self.llm_args.max_stats_len
         self.max_num_tokens = self.llm_args.max_num_tokens
         self.print_log = self.llm_args.print_iter_log
@@ -3930,6 +3926,7 @@ class PyExecutor:
                                   waiting: bool,
                                   error: Optional[str] = None) -> bool:
         """Vote at a rank-aligned gate, including idle and dummy-only iterations."""
+        assert self._kv_connector_config is not None
         pending = self.kv_connector_manager.get_pending_transfer_requests()
         now = time.monotonic()
         for request_id in list(self._kv_connector_deadlines):
@@ -3939,7 +3936,7 @@ class PyExecutor:
             deadline = self._kv_connector_deadlines.get(request_id)
             if deadline is None:
                 deadline = _KvConnectorTransferDeadline(
-                    now + _KV_CONNECTOR_TRANSFER_TIMEOUT_SEC)
+                    now + self._kv_connector_config.transfer_timeout_sec)
                 self._kv_connector_deadlines[request_id] = deadline
             if now >= deadline.expires_at and error is None:
                 error = f"{deadline.reason} (request {request_id})"
@@ -3979,7 +3976,7 @@ class PyExecutor:
                              if request.is_child else request.py_request_id)
                 if stop_all or client_id in all_canceled:
                     deadline = self._kv_connector_deadlines[request_id]
-                    expires_at = now + _KV_CONNECTOR_CONTROL_GRACE_SEC
+                    expires_at = now + self._kv_connector_config.control_grace_sec
                     if expires_at < deadline.expires_at:
                         deadline.expires_at = expires_at
                         deadline.reason = (
