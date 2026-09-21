@@ -105,6 +105,16 @@ class InfraDryRunPipelineTest(unittest.TestCase):
             result_handler.index('junit(testResults: "${stageName}/results*.xml")'),
         )
 
+    def test_failure_evidence_match_is_logged_before_caching(self) -> None:
+        classifier = _function_body(L0_TEST, "classifyFailure", "preservePrimaryFailure")
+
+        self.assertIn("[FAILURE-EVIDENCE]", classifier)
+        self.assertIn("evidence.matchedQueryId", classifier)
+        self.assertLess(
+            classifier.index("[FAILURE-EVIDENCE]"),
+            classifier.index("retryContext.failureEvidence = evidence"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

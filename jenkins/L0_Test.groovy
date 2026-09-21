@@ -3184,6 +3184,9 @@ def classifyFailure(def pipeline, Throwable error, String scope, Map retryContex
     Map evidence = cachedForFailure ? retryContext.failureEvidence : null
     if (evidence == null) {
         evidence = FailureEvidenceCollector.collectOriginatingStepEvidence(pipeline, error, FailureClassifier.failureEvidenceQueries(scope))
+        if (evidence.collectionStatus == "MATCHED") {
+            echo "[FAILURE-EVIDENCE] ${scope}: originating step matched ${evidence.matchedQueryId} [${evidence.matchedTerms.join(', ')}]"
+        }
         if (retryContext != null) {
             retryContext.failureEvidence = evidence
             retryContext.failureEvidenceError = error
