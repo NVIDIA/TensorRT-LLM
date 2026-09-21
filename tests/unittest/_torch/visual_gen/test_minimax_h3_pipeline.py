@@ -350,6 +350,7 @@ def test_pipeline_keeps_torch_compile_enabled(
             cpu_offload_config=SimpleNamespace(enable=False),
             cuda_graph=SimpleNamespace(enable=False),
             torch_compile=torch_compile,
+            extra_attrs={},
         )
 
     # The contract is the asymmetry: MiniMax-H3 rejects CUDA graphs and caching
@@ -443,6 +444,7 @@ def test_trtllm_attention_accepts_supported_gpu(
         cache=None,
         cpu_offload_config=SimpleNamespace(enable=False),
         cuda_graph=SimpleNamespace(enable=False),
+        extra_attrs={},
     )
     MiniMaxH3Pipeline(config)
 
@@ -835,3 +837,105 @@ def test_keyframe_reference_role_must_be_a_keyframe_slot() -> None:
     )
     with pytest.raises(ValueError, match="first_frame"):
         _SyntheticMiniMaxH3Pipeline()._load_request_keyframes(req)
+
+
+@pytest.mark.parametrize("tiling,parallel", [(True, True), (True, False), (False, False)])
+@pytest.mark.parametrize("resolved", [True, False])
+def test_vae_tiling_options_reach_pipeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tiling: bool, parallel: bool, resolved: bool
+) -> None:
+    (tmp_path / "transformer").mkdir()
+    (tmp_path / "transformer" / "config.json").write_text('{"hidden_size": 32}')
+    (tmp_path / "modular_model_index.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "MiniMaxH3ModularPipeline",
+                "transformer": ["diffusers", "MiniMaxH3Transformer3DModel"],
+            }
+        )
+    )
+    options = {
+        "vae_use_tiling": tiling,
+        "vae_tile_parallel": parallel,
+        "vae_tile_size": 128,
+        "vae_tile_overlap": 32,
+    }
+    args = VisualGenArgs(model=str(tmp_path), pipeline_config=options)
+    kwargs = (
+        {"pipeline_config": PipelineLoader(args)._resolve_pipeline_config(str(tmp_path))}
+        if resolved
+        else {}
+    )
+    config = DiffusionPipelineConfig.from_pretrained(str(tmp_path), args=args, **kwargs)
+    assert all(config.extra_attrs[key] == value for key, value in options.items())
+    monkeypatch.setattr(
+        h3_pipeline.BasePipeline, "__init__", lambda self, config: torch.nn.Module.__init__(self)
+    )
+    pipeline = MiniMaxH3Pipeline(config)
+    assert pipeline._vae_tiling_options == options
+
+
+def _ulysses_pipeline_config(world_size: int = 8) -> SimpleNamespace:
+    return SimpleNamespace(
+        mapping=SimpleNamespace(world_size=world_size, tp_size=1),
+        visual_gen_mapping=SimpleNamespace(
+            cfg_size=1,
+            ulysses_size=world_size,
+            cp_size=1,
+            ring_size=1,
+            attn2d_row_size=1,
+            attn2d_col_size=1,
+        ),
+        attention=SimpleNamespace(backend="VANILLA"),
+        cache=None,
+        cpu_offload_config=SimpleNamespace(enable=False),
+        cuda_graph=SimpleNamespace(enable=False),
+        extra_attrs={},
+    )
+
+
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+def test_pipeline_accepts_pure_ulysses(monkeypatch: pytest.MonkeyPatch, world_size: int) -> None:
+    initialized = []
+
+    def initialize(self, config):
+        torch.nn.Module.__init__(self)
+        initialized.append(config)
+
+    monkeypatch.setattr(h3_pipeline.BasePipeline, "__init__", initialize)
+    config = _ulysses_pipeline_config(world_size)
+    MiniMaxH3Pipeline(config)
+    assert initialized == [config]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("cfg_size", 2),
+        ("ulysses_size", 4),
+        ("cp_size", 2),
+        ("ring_size", 2),
+        ("attn2d_row_size", 2),
+        ("attn2d_col_size", 2),
+        ("tp_size", 2),
+        ("missing_mapping", True),
+    ],
+)
+def test_pipeline_rejects_unsupported_ulysses_topology(field: str, value: int) -> None:
+    config = _ulysses_pipeline_config()
+    if field == "missing_mapping":
+        config.visual_gen_mapping = None
+    elif field == "tp_size":
+        config.mapping.tp_size = value
+    else:
+        setattr(config.visual_gen_mapping, field, value)
+    with pytest.raises(NotImplementedError, match="pure Ulysses"):
+        MiniMaxH3Pipeline(config)
+
+
+@pytest.mark.parametrize("backend", ["TRTLLM", "FA4", "CUTEDSL"])
+def test_pipeline_rejects_unvalidated_ulysses_attention(backend: str) -> None:
+    config = _ulysses_pipeline_config()
+    config.attention.backend = backend
+    with pytest.raises(NotImplementedError, match="VANILLA"):
+        MiniMaxH3Pipeline(config)

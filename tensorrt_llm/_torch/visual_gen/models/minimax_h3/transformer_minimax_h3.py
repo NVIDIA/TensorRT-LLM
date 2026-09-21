@@ -821,9 +821,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                     "VANILLA."
                 )
             key_padding_mask = (
-                (token_tags_for_mask >= 0)
-                .unsqueeze(0)
-                .expand(packed_hidden_states.shape[0], -1)
+                (token_tags_for_mask >= 0).unsqueeze(0).expand(packed_hidden_states.shape[0], -1)
             )
 
         padded_sequence_length = packed_hidden_states.shape[1]
