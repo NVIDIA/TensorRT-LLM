@@ -149,7 +149,6 @@ public:
         , mSamplingConfig(samplingConfig)
         , mIsStreaming(isStreaming)
         , mOrigPromptLen(mPromptLen)
-        , mNumPreDecodedTokens(samplingConfig.getBeamWidth(), 0)
         , mMaxSentTokenLen(mPromptLen)
         , mPromptEmbeddingTable(std::move(promptEmbeddingTable))
         , mPromptVocabSize(promptVocabSize)
@@ -214,7 +213,6 @@ public:
         , mSamplingConfig(samplingConfig)
         , mIsStreaming(isStreaming)
         , mOrigPromptLen(mPromptLen)
-        , mNumPreDecodedTokens(samplingConfig.getBeamWidth(), 0)
         , mMaxSentTokenLen(mPromptLen)
         , mPromptEmbeddingTable(std::move(promptEmbeddingTable))
         , mPromptVocabSize(promptVocabSize)
@@ -252,7 +250,6 @@ public:
         , mSamplingConfig(req.getSamplingConfig())
         , mIsStreaming(req.getStreaming())
         , mOrigPromptLen(mPromptLen)
-        , mNumPreDecodedTokens(mSamplingConfig.getBeamWidth(), 0)
         , mMaxSentTokenLen(mPromptLen)
         , mContextChunkSizeTarget{mPromptLen}
         , mContextChunkSizeDraft{mPromptLen}
@@ -474,7 +471,7 @@ public:
     /// @return  The number of tokens
     [[nodiscard]] SizeType32 getNumTokens(SizeType32 beam) const
     {
-        return mTokens.at(beam).size() - mNumPreDecodedTokens[beam];
+        return mTokens.at(beam).size();
     }
 
     /// @brief Get the number of subrequests, the expected number of responses under non-streaming mode. In sampling
@@ -685,14 +682,6 @@ public:
             // New token's extra id is 0
             mUniqueTokens.at(beam).push_back({outputId, 0});
         }
-    }
-
-    /// @brief Set the number of pre-decoded tokens
-    /// @param num_tokens The number of pre-decoded tokens
-    /// @param beam The beam to which to set the number of pre-decoded tokens
-    void setNumPreDecodedTokens(SizeType32 num_tokens, SizeType32 beam)
-    {
-        mNumPreDecodedTokens[beam] = num_tokens;
     }
 
     /// @brief Erases all previous generated tokens, only leaving the prompt.
@@ -1869,12 +1858,6 @@ protected:
 
     // Length of input prompt tokens, never changes during generation process.
     SizeType32 mOrigPromptLen;
-
-    // List of numbers of pre-deocded tokens on the last PP rank when using pipeline parallelism.
-    // It is introduced as a WAR to solve the hanging problem caused by overestimating the used KV cache on the last PP
-    // rank (because new tokens are decoded earlier). By excluding the numbers of pre-decoded tokens, the used KV cache
-    // can be estimated correctly.
-    std::vector<SizeType32> mNumPreDecodedTokens;
 
     // Number of tokens already in KV cache before context phase.
     // A value > 0 indicates cached KV cache blocks were reused.
