@@ -30,6 +30,11 @@ from .status import StatusContext
 NODES_DIRNAME = "nodes"
 STATUS_FILENAME = "status.md"
 PROGRESS_FILENAME = "progress.yaml"
+# Per-turn handoff files under ``--no-mcp-tools``. Node-private, mirroring the
+# linear path's ``<workspace>/.turn``: parallel nodes each write a
+# ``<role>.yaml`` every turn, so one shared directory would have them clobber
+# each other's handoffs.
+TURN_DIRNAME = ".turn"
 
 
 def node_dir_slug(node_id: str) -> str:
@@ -60,16 +65,30 @@ class NodeWorkspace:
     ``progress_context()`` / ``status_context()`` return fresh contexts pointed
     at this node's private ``progress.yaml`` / ``status.md`` so the existing
     progress/status tool factories operate on per-node state.
+
+    ``shared_progress_path`` is the one exception to the privacy rule: human
+    feedback is the *user's* voice and is only ever appended to the shared
+    workspace ``progress.yaml``, so it is read from there rather than from the
+    node's private (always empty) ``human_feedback`` list.
     """
 
     node_id: str
     dir: Path
     status_path: Path
     progress_path: Path
+    turn_dir: Path
+    shared_progress_path: Path
 
     def progress_context(self) -> ProgressContext:
-        """Return a :class:`ProgressContext` bound to this node's progress.yaml."""
-        return ProgressContext(path=self.progress_path)
+        """Return a :class:`ProgressContext` bound to this node's progress.yaml.
+
+        Human feedback is split off to the shared workspace file — see
+        :attr:`shared_progress_path`.
+        """
+        return ProgressContext(
+            path=self.progress_path,
+            feedback_path=self.shared_progress_path,
+        )
 
     def status_context(self) -> StatusContext:
         """Return a :class:`StatusContext` bound to this node's status.md."""
@@ -115,4 +134,8 @@ def create_node_workspace(workspace: Path, node_id: str) -> NodeWorkspace:
         dir=node_dir,
         status_path=status_path,
         progress_path=progress_path,
+        # Not created here: only ``--no-mcp-tools`` runs ever write handoffs, so
+        # the directory is made on first use rather than seeded into every run.
+        turn_dir=node_dir / TURN_DIRNAME,
+        shared_progress_path=workspace / PROGRESS_FILENAME,
     )

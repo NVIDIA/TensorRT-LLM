@@ -245,6 +245,34 @@ and `--build-human-review` are rejected at construction time rather than
 silently ignored, and `HUMAN_APPROVED` — which the MCP block is what
 introduces — is absent from the PlanDrafter's accepted decisions.
 
+#### With `--concurrent`
+
+The two combine. Every per-node agent is built with `tools=None` and no
+required-tool stop hooks, and each node's turn is recorded through the
+same handoff protocol — scoped to that node:
+
+| | linear path | `--concurrent` |
+|---|---|---|
+| handoff file | `<workspace>/.turn/<role>.yaml` | `<workspace>/nodes/<id>/.turn/<role>.yaml` |
+| recorded into | `<workspace>/progress.yaml` | `<workspace>/nodes/<id>/progress.yaml` |
+| `status.md` overwritten | `<workspace>/status.md` | `<workspace>/nodes/<id>/status.md` |
+
+The handoff directory is node-private for the same reason the progress
+log is: nodes run in parallel, and one shared `.turn/coder.yaml` would
+have them clobber each other's handoffs mid-turn.
+
+The per-turn prompts in [`node_runner.py`](node_runner.py) follow the
+same split as the system prompts — a transport-neutral body plus a
+protocol block that is either the MCP tool list or `mcpless`'s preamble,
+never both and never neither.
+
+Human feedback is the one read that deliberately crosses the node
+boundary: `--feedback` is only ever appended to the *shared*
+`progress.yaml`, so a node reads its progress entries from its own log
+but its `human_feedback` from the shared file
+(`ProgressContext.feedback_path`). Without that split a node agent would
+be told to take in user guidance and always find an empty list.
+
 ### Injecting mid-run feedback
 
 To correct course while the workflow is running:
@@ -257,7 +285,9 @@ To correct course while the workflow is running:
    the next iteration and the active stage, then resumes.
 3. On the next coder/reviewer/qa turn, the agents call
    `read_human_feedback` and address the new entry along with any
-   prior, still-unresolved entries.
+   prior, still-unresolved entries. Under `--no-mcp-tools` the same
+   entries arrive inlined in the turn's `CONTEXT` block instead. Under
+   `--concurrent` every node reads this same shared list.
 
 Each `--feedback` invocation **appends** — old feedback is preserved.
 There is no auto-clear: entries remain visible to every subsequent

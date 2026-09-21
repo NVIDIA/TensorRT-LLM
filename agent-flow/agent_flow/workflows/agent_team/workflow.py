@@ -684,6 +684,7 @@ class AgentTeamWorkflow:
             num_iterations=self.num_iterations,
             backend_kind=self.backend_kind,
             model=self.model,
+            use_in_process_tools=self.use_in_process_tools,
         )
 
         # Pre-scheduler feedback replan. A ``--feedback`` concurrent resume folds

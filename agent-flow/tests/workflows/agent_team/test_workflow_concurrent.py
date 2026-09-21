@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_flow.orchestration import NodeOutcome, NodeState
 from agent_flow.workflows.agent_team import node_runner as node_runner_module
 from agent_flow.workflows.agent_team import progress as progress_module
 from agent_flow.workflows.agent_team import workflow as _workflow_module
@@ -57,18 +58,60 @@ Just prose. No execution graph block here.
 """
 
 
-def _make_concurrent_workflow(tmp_path: Path, *, plan: str, num_iterations: int = 5):
+def _make_concurrent_workflow(
+    tmp_path: Path,
+    *,
+    plan: str,
+    num_iterations: int = 5,
+    use_in_process_tools: bool = True,
+):
     return _workflow_module.AgentTeamWorkflow(
         workspace=tmp_path,
         num_iterations=num_iterations,
         concurrent=True,
         plan=plan,
         acceptance_criteria="- [ ] the goals are built",
+        use_in_process_tools=use_in_process_tools,
     )
 
 
 def _node_progress_path(workspace: Path, node_id: str) -> Path:
     return workspace / "nodes" / node_runner_module.node_dir_slug(node_id) / "progress.yaml"
+
+
+@pytest.mark.parametrize("use_in_process_tools", [True, False])
+def test_concurrent_threads_tool_mode_into_the_node_runner(
+    tmp_path, monkeypatch, use_in_process_tools
+):
+    """``--no-mcp-tools`` reaches the per-node runner instead of being dropped.
+
+    Without this the concurrent path silently re-enables in-process MCP tools
+    for every node agent, which is exactly what ``--no-mcp-tools`` exists to
+    prevent on a host where dynamic MCP registration is blocked.
+    """
+    seen: list[bool] = []
+
+    def _spy(**kwargs):
+        seen.append(kwargs["use_in_process_tools"])
+
+        async def _run_node(node, _cwd):
+            # Stubbed out deliberately: this test asserts the wiring, and
+            # running the real loop in no-MCP mode would build live agents.
+            return NodeOutcome(terminal_state=NodeState.DONE, info={"node_id": node.id})
+
+        return _run_node
+
+    monkeypatch.setattr(node_runner_module, "make_run_node", _spy)
+
+    workflow = _make_concurrent_workflow(
+        tmp_path, plan=_TWO_GOAL_PLAN, use_in_process_tools=use_in_process_tools
+    )
+    try:
+        workflow.run(_write_task_yaml(workflow.workspace))
+    finally:
+        workflow.close()
+
+    assert seen == [use_in_process_tools]
 
 
 def test_concurrent_run_drives_both_goals_to_done(tmp_path, monkeypatch):

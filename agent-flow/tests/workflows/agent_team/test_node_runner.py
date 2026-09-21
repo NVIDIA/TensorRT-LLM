@@ -97,6 +97,13 @@ class _FakeInvoker:
 
 
 def _install_fake(monkeypatch, invoker: _FakeInvoker) -> None:
+    """Install the fake invoker for an MCP-tools run.
+
+    MCP mode only: ``_run_turn`` dispatches to ``_invoke_node_agent_mcpless``
+    under ``--no-mcp-tools``, so this patch would not take effect there and the
+    loop would build live agents. Those runs are covered in
+    ``test_node_runner_mcpless.py``, which fakes ``_build_node_agent`` instead.
+    """
     monkeypatch.setattr(node_runner_module, "_invoke_node_agent", invoker)
 
 
