@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,40 +15,33 @@
  * limitations under the License.
  */
 
-#include <utility>
-
-#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/requestImpl.h"
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
 
+#include <utility>
+
 namespace tensorrt_llm::executor
 {
 Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, SamplingConfig const& samplingConfig,
-    OutputConfig const& outputConfig, std::optional<SizeType32> const& endId, std::optional<SizeType32> const& padId,
+    OutputConfig const& outputConfig, std::optional<SizeType32> const& endId,
     std::optional<std::vector<SizeType32>> positionIds, std::optional<std::list<VecTokens>> badWords,
     std::optional<std::list<VecTokens>> stopWords, std::optional<Tensor> embeddingBias,
     std::optional<PromptTuningConfig> pTuningConfig, std::optional<MultimodalInput> multimodalInput,
     std::optional<Tensor> multimodalEmbedding, std::optional<MropeConfig> mRopeConfig,
-    std::optional<LoraConfig> loraConfig, std::optional<LookaheadDecodingConfig> lookaheadConfig,
-    std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig, std::optional<std::string> logitsPostProcessorName,
-    std::optional<LogitsPostProcessor> logitslogitsPostProcessor, std::optional<VecTokens> encoderInputTokenIds,
-    std::optional<IdType> clientId, bool returnAllGeneratedTokens, float priority, RequestType type,
-    std::optional<ContextPhaseParams> contextPhaseParams, std::optional<Tensor> encoderInputFeatures,
-    std::optional<SizeType32> encoderOutputLength, std::optional<Tensor> crossAttentionMask,
-    SizeType32 numReturnSequences, std::optional<Tensor> skipCrossAttnBlocks,
-    std::optional<GuidedDecodingParams> guidedDecodingParams, std::optional<SizeType32> languageAdapterUid,
-    std::optional<MillisecondsType> allottedTimeMs, std::optional<IdType> disaggRequestId,
-    std::optional<std::string> cacheSalt)
+    std::optional<LoraConfig> loraConfig, std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig,
+    std::optional<VecTokens> encoderInputTokenIds, std::optional<IdType> clientId, bool returnAllGeneratedTokens,
+    float priority, RequestType type, std::optional<ContextPhaseParams> contextPhaseParams,
+    std::optional<Tensor> encoderInputFeatures, std::optional<SizeType32> encoderOutputLength,
+    std::optional<GuidedDecodingParams> guidedDecodingParams, std::optional<MillisecondsType> allottedTimeMs,
+    std::optional<IdType> disaggRequestId, std::optional<std::string> cacheSalt)
     : mImpl(std::make_unique<Impl>(std::move(inputTokenIds), maxTokens, streaming, samplingConfig, outputConfig, endId,
-        padId, std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
+        std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
         std::move(pTuningConfig), std::move(multimodalInput), std::move(multimodalEmbedding), std::move(mRopeConfig),
-        std::move(loraConfig), lookaheadConfig, std::move(kvCacheRetentionConfig), std::move(logitsPostProcessorName),
-        std::move(logitslogitsPostProcessor), std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens,
-        priority, type, std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
-        crossAttentionMask, numReturnSequences, skipCrossAttnBlocks, std::move(guidedDecodingParams),
-        languageAdapterUid, allottedTimeMs, disaggRequestId, std::move(cacheSalt)))
+        std::move(loraConfig), std::move(kvCacheRetentionConfig), std::move(encoderInputTokenIds), clientId,
+        returnAllGeneratedTokens, priority, type, std::move(contextPhaseParams), std::move(encoderInputFeatures),
+        encoderOutputLength, std::move(guidedDecodingParams), allottedTimeMs, disaggRequestId, std::move(cacheSalt)))
 {
 }
 
@@ -107,11 +100,6 @@ std::optional<SizeType32> Request::getEndId() const
     return mImpl->getEndId();
 }
 
-std::optional<SizeType32> Request::getPadId() const
-{
-    return mImpl->getPadId();
-}
-
 std::optional<std::vector<SizeType32>> Request::getPositionIds() const
 {
     return mImpl->getPositionIds();
@@ -157,24 +145,9 @@ std::optional<LoraConfig> Request::getLoraConfig() const
     return mImpl->getLoraConfig();
 }
 
-std::optional<LookaheadDecodingConfig> Request::getLookaheadConfig() const
-{
-    return mImpl->getLookaheadConfig();
-}
-
 std::optional<KvCacheRetentionConfig> Request::getKvCacheRetentionConfig() const
 {
     return mImpl->getKvCacheRetentionConfig();
-}
-
-std::optional<std::string> Request::getLogitsPostProcessorName() const
-{
-    return mImpl->getLogitsPostProcessorName();
-}
-
-std::optional<LogitsPostProcessor> Request::getLogitsPostProcessor() const
-{
-    return mImpl->getLogitsPostProcessor();
 }
 
 std::optional<VecTokens> Request::getEncoderInputTokenIds() const
@@ -222,24 +195,9 @@ std::optional<SizeType32> Request::getEncoderOutputLength() const
     return mImpl->getEncoderOutputLength();
 }
 
-std::optional<Tensor> Request::getCrossAttentionMask() const
-{
-    return mImpl->getCrossAttentionMask();
-}
-
-std::optional<Tensor> Request::getSkipCrossAttnBlocks() const
-{
-    return mImpl->getSkipCrossAttnBlocks();
-}
-
 std::optional<GuidedDecodingParams> Request::getGuidedDecodingParams() const
 {
     return mImpl->getGuidedDecodingParams();
-}
-
-std::optional<SizeType32> Request::getLanguageAdapterUid() const
-{
-    return mImpl->getLanguageAdapterUid();
 }
 
 std::optional<std::string> Request::getCacheSalt() const
@@ -270,11 +228,6 @@ void Request::setOutputConfig(OutputConfig const& outputConfig)
 void Request::setEndId(SizeType32 endId)
 {
     mImpl->setEndId(endId);
-}
-
-void Request::setPadId(SizeType32 padId)
-{
-    mImpl->setPadId(padId);
 }
 
 void Request::setPositionIds(std::vector<SizeType32> const& positionIds)
@@ -322,24 +275,9 @@ void Request::setLoraConfig(LoraConfig const& loraConfig)
     mImpl->setLoraConfig(loraConfig);
 }
 
-void Request::setLookaheadConfig(LookaheadDecodingConfig const& lookaheadConfig)
-{
-    mImpl->setLookaheadConfig(lookaheadConfig);
-}
-
 void Request::setKvCacheRetentionConfig(KvCacheRetentionConfig const& kvCacheRetentionConfig)
 {
     mImpl->setKvCacheRetentionConfig(kvCacheRetentionConfig);
-}
-
-void Request::setLogitsPostProcessorName(std::string const& logitsPostProcessorName)
-{
-    mImpl->setLogitsPostProcessorName(logitsPostProcessorName);
-}
-
-void Request::setLogitsPostProcessor(std::optional<LogitsPostProcessor> const& logitsPostProcessor)
-{
-    mImpl->setLogitsPostProcessor(logitsPostProcessor);
 }
 
 void Request::setEncoderInputTokenIds(VecTokens const& encoderInputTokenIds)
@@ -382,16 +320,6 @@ void Request::setEncoderOutputLength(SizeType32 encoderOutputLength)
     mImpl->setEncoderOutputLength(encoderOutputLength);
 }
 
-void Request::setCrossAttentionMask(Tensor crossAttentionMask)
-{
-    mImpl->setCrossAttentionMask(crossAttentionMask);
-}
-
-void Request::setSkipCrossAttnBlocks(Tensor skipCrossAttnBlocks)
-{
-    mImpl->setSkipCrossAttnBlocks(skipCrossAttnBlocks);
-}
-
 void Request::setGuidedDecodingParams(GuidedDecodingParams const& guidedDecodingParams)
 {
     mImpl->setGuidedDecodingParams(guidedDecodingParams);
@@ -400,11 +328,6 @@ void Request::setGuidedDecodingParams(GuidedDecodingParams const& guidedDecoding
 void Request::setAllottedTimeMs(MillisecondsType allottedTimeMs)
 {
     mImpl->setAllottedTimeMs(allottedTimeMs);
-}
-
-void Request::setLanguageAdapterUid(SizeType32 languageAdapterUid)
-{
-    mImpl->setLanguageAdapterUid(languageAdapterUid);
 }
 
 void Request::setCacheSalt(std::optional<std::string> cacheSalt)
