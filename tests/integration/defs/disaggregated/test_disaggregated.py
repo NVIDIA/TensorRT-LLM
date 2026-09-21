@@ -1926,14 +1926,14 @@ def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
                                      llama_model_root):
     setup_model_symlink(llm_venv, llama_model_root,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-    # Cold sampling and attention JIT across eight Blackwell ranks can exceed
-    # the default 300s readiness budget (NVBug 6771023).
+    # Cold model initialization and JIT across eight Blackwell ranks took
+    # about 640s on B300; allow headroom for CI variability (NVBug 6771023).
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp4_genpp4",
                            env=llm_venv._new_env,
                            model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory(),
-                           server_start_timeout=500)
+                           server_start_timeout=900)
 
 
 #tiny llama pp4 will have uneven layer per pp. pp4
