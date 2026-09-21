@@ -200,6 +200,12 @@ public:
 
     // ---- Query helpers -----------------------------------------------------
 
+    //! Workloads selected during initialization, after any quota-based relaxation.
+    std::vector<BatchDesc> const& resolvedConstraints() const noexcept
+    {
+        return mResolvedConstraints;
+    }
+
     LifeCycleRegistry const& lifeCycles() const noexcept
     {
         return mLifeCycles;
@@ -331,6 +337,10 @@ private:
     using PagesByLifeCycle = TypedVec<LifeCycleId, PageQueue>;
     using MigrationBatchKey = std::pair<CacheLevel, LayerGroupId>;
 
+    std::vector<BatchDesc> resolveConstraints(std::vector<BatchDesc> const& constraints,
+        TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists, size_t gpuQuota, size_t granularity,
+        int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse, float maxUtilForResume) const;
+
     // Minimum per-pool-group slot counts to support a BatchDesc.
     TypedVec<PoolGroupIndex, SlotCount> computePoolGroupSlotsForBatch(
         BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const;
@@ -357,7 +367,8 @@ private:
         TypedVec<PoolGroupIndex, SlotCount> const& numSlots, size_t granularity) const;
     TypedVec<PoolGroupIndex, SlotCount> computeSlotCountForLevel(CacheTierConfig const& tierConfig,
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
-        TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
+        TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
+        bool fitToQuota = false) const;
     size_t minQuotaForLevel(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
         size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
 
@@ -441,6 +452,7 @@ private:
     // Slot sizes per (level, pool group), built from mSlotDescLists.
     TypedVec<CacheLevel, TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>>> mSlotSizes;
     TypedVec<PoolGroupIndex, SlotCount> mMinSlots;
+    std::vector<BatchDesc> mResolvedConstraints;
     // All GPU cache levels borrow this allocator. It must outlive mLevels.
     std::unique_ptr<PooledPhysMemAllocator> mGpuPhysMemAllocator;
     TypedVec<CacheLevel, CacheLevelManager> mLevels;

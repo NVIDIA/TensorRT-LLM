@@ -204,10 +204,15 @@ class SsmLayerConfig:
 
 LayerConfig = AttentionLayerConfig | SsmLayerConfig
 
+class ConstraintPolicy(enum.IntEnum):
+    FIXED = 0
+    FIT_TO_QUOTA = 1
+
 @dataclass(slots=True)
 class KVCacheDesc:
     capacity: int
     history_length: int
+    constraint_policy: ConstraintPolicy = ConstraintPolicy.FIXED
 
 @dataclass(slots=True)
 class BatchDesc:
@@ -622,6 +627,8 @@ class KVCacheManager:
     def event_manager(self) -> Any | None: ...
     @property
     def init_config(self) -> KVCacheManagerConfig: ...
+    @property
+    def resolved_constraints(self) -> list[BatchDesc]: ...
     @property
     def allow_seq_rebasing(self) -> bool: ...
     @property

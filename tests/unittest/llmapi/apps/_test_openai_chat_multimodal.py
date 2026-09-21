@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import io
 import os
 import tempfile
@@ -43,6 +46,7 @@ def temp_extra_llm_api_options_file(request):
             "kv_cache_config": {
                 "enable_block_reuse": False,
                 "free_gpu_memory_fraction": 0.6,
+                "use_kv_cache_manager_v2": True,
             },
         }
 
