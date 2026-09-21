@@ -18,6 +18,7 @@ from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
 from tensorrt_llm._torch.modules.mamba.cache_manager import (
     Mamba2State,
     NemotronHybridCacheManagerV2,
+    ReplayHistory,
 )
 from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
     PLE_CONV_STATE,
@@ -35,10 +36,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaRole,
     MambaStateLayout,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.replay import (
-    ReplayHistory,
-    ReplayLayerCache,
-)
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.replay import ReplayLayerCache
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
@@ -376,12 +374,12 @@ def test_common_manager_consumes_model_state_contract(state):
     assert payload.temporal is manager.all_ssm_states[0]
     if isinstance(state, KDAReplayState):
         assert payload.kda_qkg_cache is not None
-    elif isinstance(state, ReplayHistory):
+    elif isinstance(state, (ReplayHistory, GDNReplayState)):
         assert payload.old_x is not None
     else:
         assert payload.intermediate_ssm is not None
     assert (manager.get_replay_state_update_metadata() is not None) == isinstance(
-        state, ReplayHistory
+        state, (ReplayHistory, GDNReplayState)
     )
     manager._shutdown_model_state()
     assert manager.intermediate_state_indices is None
@@ -755,8 +753,10 @@ def test_mamba2_seed_lifecycle_does_not_require_speculative_decoding():
 
 def test_replay_and_intermediate_are_independent_algorithms():
     assert ReplayHistory.__bases__ == (object,)
-    assert GDNReplayState.__bases__ == (ReplayHistory,)
-    assert ReplayHistory.__module__.endswith("mamba_cache_manager.replay")
+    assert GDNReplayState.__bases__ == (object,)
+    assert not issubclass(GDNReplayState, ReplayHistory)
+    assert ReplayHistory.__module__.endswith("modules.mamba.cache_manager")
+    assert GDNReplayState.__module__.endswith("modules.fla.cache_manager")
     assert not any("modules.mamba" in cls.__module__ for cls in GDNReplayState.__mro__)
     assert Mamba2State.__bases__ == (IntermediateState,)
     assert not issubclass(ReplayHistory, IntermediateState)
@@ -863,13 +863,13 @@ def test_algorithm_borrows_only_tensor_views_and_releases_them(state):
     state.bind(_layout(), views.all_ssm_states, views.all_conv_states)
     assert state._conv_states[0] is views.all_conv_states[0]
     assert not hasattr(state, "manager")
-    if isinstance(state, (IntermediateState, ReplayHistory)):
+    if isinstance(state, (IntermediateState, ReplayHistory, GDNReplayState)):
         assert state._ssm_states[0] is views.all_ssm_states[0]
         assert not hasattr(state, "_publish_compatibility_views")
     state.shutdown()
     state.shutdown()
     assert state._conv_states == ()
-    if isinstance(state, (IntermediateState, ReplayHistory)):
+    if isinstance(state, (IntermediateState, ReplayHistory, GDNReplayState)):
         assert state._ssm_states == ()
     assert not any(isinstance(value, torch.Tensor) for value in vars(state).values())
     # Releasing borrowed references must not mutate the persistent pool.

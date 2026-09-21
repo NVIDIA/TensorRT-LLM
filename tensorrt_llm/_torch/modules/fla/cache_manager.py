@@ -15,15 +15,24 @@ else:
     from typing_extensions import override
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
+    MIN_REPLAY_HISTORY_SIZE,
     IntermediateState,
     MambaAcceptanceBatch,
+    MambaLayerCache,
     MambaStateLayout,
+    ReplayStateUpdateMetadata,
     _mamba_effective_tp_size,
+    _promote_intermediate_states,
+    _stack_state_views,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.replay import ReplayHistory
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.replay import ReplayLayerCache
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.seeds import (
+    _reset_mamba_seed_buffer,
+    allocate_mamba_seed_buffer,
+)
 from tensorrt_llm._torch.utils import is_gdn_replay_enabled
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
@@ -34,23 +43,99 @@ from .cached_replay import (
 )
 
 
-class GDNReplayState(ReplayHistory):
-    """Own GDN all-layer cached-replay checkpoint commits."""
+class GDNReplayState:
+    """Own GDN replay buffers, bookkeeping, and checkpoint commits."""
 
-    @override
     def __init__(self, tokens_per_gen_step: int) -> None:
-        super().__init__(tokens_per_gen_step)
+        self._ssm_states: tuple[torch.Tensor, ...] = ()
+        self._conv_states: tuple[torch.Tensor, ...] = ()
+        self._stacked_conv: torch.Tensor | None = None
+        self.intermediate_conv: torch.Tensor | None = None
+        self.intermediate_indices: torch.Tensor | None = None
+        self.rand_seed: torch.Tensor | None = None
+        self._seed_request_counter = 0
+        self._seed_rank_offset = 0
+        self.replay_step_width = tokens_per_gen_step
+        self.replay_history_size = max(MIN_REPLAY_HISTORY_SIZE, tokens_per_gen_step)
+        self.prev_num_accepted_tokens: torch.Tensor | None = None
+        self.cache_buf_idx: torch.Tensor | None = None
+        self.old_x: torch.Tensor | None = None
+        self.old_B: torch.Tensor | None = None
+        self.old_dt: torch.Tensor | None = None
+        self.old_dA_cumsum: torch.Tensor | None = None
         self._state_descriptors: torch.Tensor | None = None
         self._state_strides: tuple[int, int, int] | None = None
 
-    @override
+    @property
+    def intermediate_ssm(self) -> torch.Tensor | None:
+        return None
+
+    @property
+    def uses_replay(self) -> bool:
+        return True
+
+    @property
+    def has_bound_states(self) -> bool:
+        return self._state_descriptors is not None or self._state_strides is not None
+
+    def validate(self, context: MambaStateLayout) -> None:
+        if context.spec_config is None:
+            raise ValueError("GDN replay requires speculative decoding")
+        if context.n_groups_per_rank <= 0 and context.mamba_pp_layers:
+            raise ValueError("GDN replay requires at least one state group per rank")
+
     def bind(
         self,
         context: MambaStateLayout,
         ssm_states: list[torch.Tensor],
         conv_states: list[torch.Tensor],
     ) -> None:
-        super().bind(context, ssm_states, conv_states)
+        self._ssm_states = tuple(ssm_states)
+        self._conv_states = tuple(conv_states)
+        self._stacked_conv = _stack_state_views(conv_states)
+        self._seed_rank_offset = context.seed_rank_offset
+        if not context.mamba_pp_layers:
+            return
+
+        states = ssm_states
+        cache_size = states[0].shape[0]
+        device = states[0].device
+        tokens_per_step = context.spec_config.tokens_per_gen_step
+        common_intermediate_shape = [
+            len(context.mamba_pp_layers),
+            context.max_batch_size,
+            tokens_per_step,
+        ]
+        self.intermediate_conv = torch.zeros(
+            common_intermediate_shape + list(context.conv_state_shape),
+            dtype=context.conv_state_dtype,
+            device=device,
+        )
+        self.intermediate_indices = torch.arange(
+            context.max_batch_size, dtype=torch.int32, device=device
+        )
+        self.rand_seed = allocate_mamba_seed_buffer(cache_size, context.seed_rank_offset, device)
+
+        num_heads, head_dim, d_state = context.ssm_state_shape
+        common_replay_shape = [len(context.mamba_pp_layers), cache_size, 2]
+        self.prev_num_accepted_tokens = torch.zeros(cache_size, dtype=torch.int32, device=device)
+        self.cache_buf_idx = torch.zeros(cache_size, dtype=torch.int32, device=device)
+        self.old_x = torch.zeros(
+            common_replay_shape + [self.replay_history_size, num_heads, head_dim],
+            dtype=context.conv_state_dtype,
+            device=device,
+        )
+        self.old_B = torch.zeros(
+            common_replay_shape + [self.replay_history_size, context.n_groups_per_rank, d_state],
+            dtype=context.conv_state_dtype,
+            device=device,
+        )
+        self.old_dt = torch.zeros(
+            common_replay_shape + [num_heads, self.replay_history_size],
+            dtype=torch.float32,
+            device=device,
+        )
+        self.old_dA_cumsum = torch.zeros_like(self.old_dt)
         states = self._ssm_states
         if not states:
             return
@@ -106,16 +191,66 @@ class GDNReplayState(ReplayHistory):
             key="gdn_cached_replay_v2_commit_mode_fused",
         )
 
-    @property
-    def has_bound_states(self) -> bool:
-        return self._state_descriptors is not None or self._state_strides is not None
+    def _layer_cache_fields(self, layer_offset: int) -> dict[str, torch.Tensor | None]:
+        return {
+            "mamba_ssm_rand_seed": self.rand_seed,
+            "intermediate_conv_window": self.intermediate_conv[layer_offset],
+            "prev_num_accepted_tokens": self.prev_num_accepted_tokens,
+            "cache_buf_idx": self.cache_buf_idx,
+            "old_x": self.old_x[layer_offset],
+            "old_B": self.old_B[layer_offset],
+            "old_dt": self.old_dt[layer_offset],
+            "old_dA_cumsum": self.old_dA_cumsum[layer_offset],
+        }
 
-    @override
+    def make_layer_cache(
+        self,
+        layer_offset: int,
+        conv: torch.Tensor,
+        temporal: torch.Tensor,
+    ) -> MambaLayerCache:
+        return ReplayLayerCache(
+            conv=conv,
+            temporal=temporal,
+            **self._layer_cache_fields(layer_offset),
+        )
+
+    def reset_slots(self, slots: torch.Tensor, host_slots: list[int]) -> None:
+        if self.prev_num_accepted_tokens is None:
+            return
+        self.prev_num_accepted_tokens.index_fill_(0, slots, 0)
+        self.cache_buf_idx.index_fill_(0, slots, 0)
+        for buffer in (self.old_x, self.old_B, self.old_dt, self.old_dA_cumsum):
+            buffer.index_fill_(1, slots, 0)
+        if self.rand_seed is not None:
+            self._seed_request_counter += 1
+            _reset_mamba_seed_buffer(
+                self.rand_seed,
+                slots,
+                host_slots,
+                counter=self._seed_request_counter,
+                rank_offset=self._seed_rank_offset,
+            )
+
     def update(self, batch: MambaAcceptanceBatch) -> None:
         num_decodes = batch.num_generations
         if num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE:
             self.commit_all_layers(batch.attention_metadata, num_decodes)
-        super().update(batch)
+        metadata = self.get_replay_metadata()
+        if metadata is None:
+            raise RuntimeError("GDN replay buffers are not bound")
+        # Import through the facade to retain the established monkeypatch point.
+        from tensorrt_llm._torch.pyexecutor.kv_cache import mamba_cache_manager
+
+        mamba_cache_manager._advance_replay_state(
+            metadata,
+            batch.destination_state_indices,
+            batch.num_accepted_tokens,
+            batch.is_dummy_request,
+        )
+        _promote_intermediate_states(
+            self._conv_states, self.intermediate_conv, batch, self._stacked_conv
+        )
 
     def commit_all_layers(self, attention_metadata: object, num_decodes: int) -> None:
         """Commit every local GDN checkpoint using one partitioned launch."""
@@ -153,9 +288,29 @@ class GDNReplayState(ReplayHistory):
             history_size=self.replay_history_size,
         )
 
-    @override
+    def get_replay_metadata(self) -> ReplayStateUpdateMetadata | None:
+        if self.prev_num_accepted_tokens is None or self.cache_buf_idx is None:
+            return None
+        return ReplayStateUpdateMetadata(
+            prev_num_accepted_tokens=self.prev_num_accepted_tokens,
+            cache_buf_idx=self.cache_buf_idx,
+            replay_step_width=self.replay_step_width,
+            replay_history_size=self.replay_history_size,
+        )
+
     def shutdown(self) -> None:
-        super().shutdown()
+        self._ssm_states = ()
+        self._conv_states = ()
+        self._stacked_conv = None
+        self.intermediate_conv = None
+        self.intermediate_indices = None
+        self.rand_seed = None
+        self.prev_num_accepted_tokens = None
+        self.cache_buf_idx = None
+        self.old_x = None
+        self.old_B = None
+        self.old_dt = None
+        self.old_dA_cumsum = None
         self._state_descriptors = None
         self._state_strides = None
 
