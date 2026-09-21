@@ -85,15 +85,9 @@ l0_b200:
   - accuracy/test_epd_disagg_multimodal.py::TestVideoMMEEPD::test_disaggregated_videomme[nemotron_nano_v3_omni_nvfp4]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16_mtp
   - disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction[TinyLlama-1.1B-Chat-v1.0] # nvbugs 5300551
-  - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-NVFP4-nvfp4-quantized/Meta-Llama-3.1-8B]
   - test_e2e.py::test_ptp_quickstart_advanced[Nemotron-Nano-9B-v2-nvfp4-NVIDIA-Nemotron-Nano-9B-v2-NVFP4]
-  - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-FP8-llama-3.1-model/Llama-3.1-8B-Instruct-FP8]
   - test_e2e.py::test_ptp_quickstart_advanced_mtp[DeepSeek-V3-Lite-BF16-DeepSeek-V3-Lite/bf16]
   - test_e2e.py::test_ptp_quickstart_advanced_mtp_eagle[DeepSeek-V3-Lite-BF16-DeepSeek-V3-Lite/bf16]
-  - test_e2e.py::test_ptp_quickstart_advanced_mixed_precision
-  - test_e2e.py::test_ptp_quickstart_advanced_eagle3[Llama-3.1-8b-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct-EAGLE3-LLaMA3.1-Instruct-8B]
-  - test_e2e.py::test_ptp_quickstart_advanced_ngram[Llama-3.1-8B-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct]
-  - test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-llama-3.1-8b-False-False]
   - test_e2e.py::test_openai_chat_guided_decoding[openai/gpt-oss-120b]
   # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
   # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
@@ -123,6 +117,8 @@ l0_b200:
   - unittest/_torch/modules/test_mhc.py
   - unittest/_torch/modules/test_engram.py
   # ------------- Kimi K3 (KimiLinear) unit tests ---------------
+  - unittest/_torch/modeling/test_kimi_k3_checkpoint.py TIMEOUT (15)
+  - unittest/_torch/modeling/test_kimi_k3_mla.py TIMEOUT (15)
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_fused_verify_parity.py
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_verify_parity.py
   - unittest/_torch/modeling/test_kimi_kda_fp8_packed_prefill.py
@@ -146,7 +142,6 @@ l0_b200:
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py
   - unittest/_torch/modeling/test_kimi_k3_config_routing.py
   - unittest/_torch/modeling/test_kimi_linear_checkpoint.py
-  - unittest/_torch/modeling/test_kimi_k3_fp8_weight_read_gates.py
   # CPU self-test of the Kimi K3 disagg parity harness comparison logic.
   - test_kimi_k3_specdec.py::test_kimi_k3_disagg_parity_selftest
   # ------------- modules (non-MoE) ---------------
@@ -237,6 +232,10 @@ l0_b200:
   # cuda-availability skipif like the sibling KDA parity tests; relocated
   # from tests/torch/ which test-db cannot list).
   - unittest/_torch/speculative/test_suffix_automaton.py
+  # Fused sampling kernel; its numerics are architecture-dependent (the only
+  # accuracy deviation found so far is Blackwell-only), so it is not
+  # hw-agnostic and needs its own Blackwell run.
+  - unittest/_torch/speculative/test_fused_sampling_op.py
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial

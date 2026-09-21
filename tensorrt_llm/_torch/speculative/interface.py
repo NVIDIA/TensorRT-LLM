@@ -44,9 +44,8 @@ if IS_FLASHINFER_AVAILABLE:
 from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 
 from ..pyexecutor.sampler import penalties as penalty_ops
-from ..pyexecutor.sampler.ops.flashinfer import (
-    compute_probs_from_logits, resolve_advanced_sampling_filters,
-    sample_from_logits_op, sampling_batch_spec_dec_one_model_for_rejection)
+from ..pyexecutor.sampler.ops import custom as fused_sampling
+from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
 
 
@@ -122,6 +121,12 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
         return False
     if spec_config._use_shared_kv_cache:
         return False
+    # Only TRTLLM attention borrows the managed paged context pool. VANILLA
+    # and FA4 keep context KV in worker-owned buffers; a second cache would
+    # reserve unused pages and impose an unrelated scheduler admission limit.
+    if (spec_config.spec_dec_mode.is_dflash()
+            and spec_config.attention_backend in ("VANILLA", "FA4")):
+        return False
     # The embedded DSpark draft owns a dedicated rolling-window cache in
     # DSv4DSparkWorker and never reads the paged draft KV cache that attention
     # metadata manages. A standalone DSpark drafter runs on DSparkWorker
@@ -158,9 +163,15 @@ def draft_prompt_lookahead(spec_config) -> Optional[int]:
         # PARDWorker feeds the drafter input_ids[:num_ctx_tokens] verbatim, so
         # its draft state at i is a function of tokens [0, i] like the target's.
         return 0
-    # Unestablished elsewhere: DraftTargetOneModel likely shifts by 1 but is
-    # unvalidated; DFlash/DSpark build context draft K/V from projected target
-    # hidden states into worker-owned buffers, which block reuse cannot restore.
+    if spec_mode.is_dflash() or spec_mode.is_dspark():
+        # precompute_context_kv(projected_hidden, positions) writes the drafter's
+        # OWN post-norm post-RoPE K/V, one entry per context token, and the
+        # target hidden at i already depends on exactly tokens [0, i]. Same
+        # dependency face as the target's own KV, so raw-prompt keys describe it
+        # and no chunk-tail lookahead token is needed. The paged pool then makes
+        # a matched prefix addressable again (dflash.py _store_prefill_context).
+        return 0
+    # DraftTargetOneModel likely shifts by 1 but is unvalidated upstream.
     return None
 
 
@@ -528,7 +539,7 @@ class SpecMetadata:
     runtime_tokens_per_gen_step: int = 1
 
     # Auto-detected per step from populated sampling params:
-    # True if every request is greedy (no temp/top_k/top_p) and we can take
+    # True if every request is greedy (no temp/top_k/top_p/min_p) and we can take
     # the argmax fast-path. False if any request needs sampling.
     # Used as part of the CUDA graph key so we capture two variants
     # (greedy fast-path vs advanced sampling) and dispatch at replay.
@@ -579,6 +590,7 @@ class SpecMetadata:
     temperatures: Optional[torch.Tensor] = None
     top_ks: Optional[torch.Tensor] = None
     top_ps: Optional[torch.Tensor] = None
+    min_ps: Optional[torch.Tensor] = None
     # Pre-computed top_k_max scalar (CPU-side) to avoid CUDA-graph-incompatible
     # dynamic boolean tensor indexing inside verify_dynamic_tree_rejection_from_logits_out.
     top_k_max: int = 0
@@ -586,6 +598,7 @@ class SpecMetadata:
     request_temperatures: Optional[torch.Tensor] = None
     request_top_ks: Optional[torch.Tensor] = None
     request_top_ps: Optional[torch.Tensor] = None
+    request_min_ps: Optional[torch.Tensor] = None
     # Describe what the sampling-parameter buffers currently hold, so a step
     # that reproduces them can skip the refill. Two entries because the two
     # buffer groups depend on different things:
@@ -641,7 +654,7 @@ class SpecMetadata:
     # request reproduces bit-exactly only for a given slot history.
     _rng_window_counter: dict = field(default_factory=dict)
     # The same state expanded to one entry per logits row, mirroring the
-    # temperatures / top_ks / top_ps layout, for the sampling calls that
+    # temperatures / top_ks / top_ps / min_ps layout, for the sampling calls that
     # consume rows rather than requests.
     seeds: Optional[torch.Tensor] = None
     offsets: Optional[torch.Tensor] = None
@@ -722,9 +735,9 @@ class SpecMetadata:
             tokens_cpu, non_blocking=True)
 
     def _populate_request_rng_state(
-            self, requests: list["LlmRequest"],
-            per_request_normalized: list[tuple[float, int, float,
-                                               int]]) -> None:
+        self, requests: list["LlmRequest"],
+        per_request_normalized: list[tuple[float, int, float, float,
+                                           int]]) -> None:
         """Fill the Philox seed/offset buffers for this batch.
 
         A request's seed is fixed for its lifetime, so the offset is what has
@@ -735,7 +748,7 @@ class SpecMetadata:
 
         Both layouts are produced: ``request_*`` with one entry per request,
         and ``seeds`` / ``offsets`` expanded to one entry per logits row (the
-        temperatures / top_ks / top_ps layout), because the sampling calls
+        temperatures / top_ks / top_ps / min_ps layout), because the sampling calls
         take one or the other.
 
         A request that specified no seed gets ``DEFAULT_SAMPLING_SEED``. Its
@@ -1110,7 +1123,7 @@ class SpecMetadata:
 
     def _scan_one_model_sampling(
         self, requests: list["LlmRequest"]
-    ) -> tuple[list[tuple[float, int, float, int]], list[int]]:
+    ) -> tuple[list[tuple[float, int, float, float, int]], list[int]]:
         """Single source of truth for one-engine sampling-param detection.
 
         Scans the batch's sampling configs and sets skip_*/is_all_greedy_sample
@@ -1133,25 +1146,27 @@ class SpecMetadata:
         # Very large values disable topk.
         DISABLE_TOPK_VAL = torch.iinfo(torch.int32).max
         DISABLE_TOPP_VAL = 1.0
+        DISABLE_MINP_VAL = 0.0
 
         def _normalize_request_sampling_params(
             *,
             temperature: Optional[float],
             top_k: Optional[int],
             top_p: Optional[float],
-        ) -> tuple[float, int, float, bool, bool, bool, bool]:
+            min_p: Optional[float],
+        ) -> tuple[float, int, float, float, bool]:
             """Convert request sampling params into normalized per-request scalars."""
-            # NB: min_p is intentionally omitted here. One-engine speculative
-            # decoding does not support min_p (there is no request_min_p buffer
-            # nor min_p wiring in the sampling_batch_spec_dec_one_model*
-            # kernels); a min_p request is rejected at admission by
-            # SpecSampler.validate_request, so nothing reaching this scan
-            # carries a min_p that would change its classification. The
-            # two-model draft/target path honors min_p via _request_strategy.
+            # min_p participates in the greedy classification and must: a request whose
+            # ONLY knob is min_p is not greedy (params_imply_greedy_decoding treats
+            # 0 < min_p < 1 as an active sampling knob), and min_p == 1.0 is explicit
+            # greedy. Omitting it here would classify a min_p-only request as greedy, send
+            # it down the argmax fast path, and drop min_p silently -- and since this flag
+            # is part of the CUDA graph key, it would also pick the wrong graph variant.
             is_greedy = SamplingParams.params_imply_greedy_decoding(
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
+                min_p=min_p,
                 use_beam_search=False)
 
             use_top_k = not is_greedy and top_k is not None and top_k > 0
@@ -1163,16 +1178,20 @@ class SpecMetadata:
             normalized_top_k = DISABLE_TOPK_VAL if not use_top_k else top_k
             normalized_top_p = (DISABLE_TOPP_VAL
                                 if is_greedy or top_p is None else top_p)
+            # Unlike top_p, min_p's neutral value is 0.0, not 1.0.
+            normalized_min_p = (DISABLE_MINP_VAL
+                                if is_greedy or min_p is None else min_p)
 
             return (
                 normalized_temperature,
                 normalized_top_k,
                 normalized_top_p,
+                normalized_min_p,
                 is_greedy,
             )
 
         # Phase 1: collect per-request flags and normalized values.
-        per_request_normalized: list[tuple[float, int, float, int]] = []
+        per_request_normalized: list[tuple[float, int, float, float, int]] = []
         has_non_greedy_requests = False
         per_request_slot_ids: list[int] = []
 
@@ -1181,6 +1200,7 @@ class SpecMetadata:
             temp_val = sampling_config.temperature
             tk_val = sampling_config.top_k
             tp_val = sampling_config.top_p
+            mp_val = sampling_config.min_p
 
             # Context requests have no draft tokens yet.
             num_tokens = 1 + self.runtime_draft_len if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1
@@ -1189,17 +1209,19 @@ class SpecMetadata:
                 temp_val,
                 tk_val,
                 tp_val,
+                mp_val,
                 is_greedy,
             ) = _normalize_request_sampling_params(
                 temperature=temp_val,
                 top_k=tk_val,
                 top_p=tp_val,
+                min_p=mp_val,
             )
 
             has_non_greedy_requests |= not is_greedy
 
             per_request_normalized.append(
-                (temp_val, tk_val, tp_val, num_tokens))
+                (temp_val, tk_val, tp_val, mp_val, num_tokens))
             # py_seq_slot is a stable per-request id used to scatter/gather draft
             # probs across iterations. Dummy/padding requests (py_seq_slot is
             # None) route to the scratch row captured at allocation time (the
@@ -1282,8 +1304,8 @@ class SpecMetadata:
                               self.is_spec_dec_tree else self.max_draft_len + 1)
         # Warmup batches may exceed max_num_requests * tokens_per_request (e.g.
         # when CUDA-graph warmup passes use max_batch_size > max_num_requests).
-        actual_flat_size = sum(
-            num_tokens for _, _, _, num_tokens in per_request_normalized)
+        actual_flat_size = sum(num_tokens
+                               for *_, num_tokens in per_request_normalized)
         required_flat_size = max(tokens_per_request * self.max_num_requests,
                                  actual_flat_size)
 
@@ -1301,6 +1323,10 @@ class SpecMetadata:
             self.top_ps = torch.ones(required_flat_size,
                                      dtype=torch.float32,
                                      device='cuda')
+            # zeros, not ones: min_p's neutral value is 0.0 where top_p's is 1.0.
+            self.min_ps = torch.zeros(required_flat_size,
+                                      dtype=torch.float32,
+                                      device='cuda')
             self.request_temperatures = torch.ones(self.max_num_requests,
                                                    dtype=torch.float32,
                                                    device='cuda')
@@ -1310,6 +1336,9 @@ class SpecMetadata:
             self.request_top_ps = torch.ones(self.max_num_requests,
                                              dtype=torch.float32,
                                              device='cuda')
+            self.request_min_ps = torch.zeros(self.max_num_requests,
+                                              dtype=torch.float32,
+                                              device='cuda')
 
         self._populate_request_rng_state(requests, per_request_normalized)
 
@@ -1345,6 +1374,7 @@ class SpecMetadata:
         # forward, so skip whichever group is already current.
         need_update_sampler_param, need_update_expanded_sampler_param = (
             self._sampling_params_buffers_need_update(per_request_normalized))
+        fill_min_p = self.advanced_sampling_mode.is_fused
         if not (need_update_sampler_param
                 or need_update_expanded_sampler_param):
             return
@@ -1353,10 +1383,13 @@ class SpecMetadata:
             request_temperatures: list[float] = []
             request_top_ks: list[int] = []
             request_top_ps: list[float] = []
-            for temp_val, tk_val, tp_val, _ in per_request_normalized:
+            request_min_ps: list[float] = []
+            for temp_val, tk_val, tp_val, mp_val, _ in per_request_normalized:
                 request_temperatures.append(temp_val)
                 request_top_ks.append(tk_val)
                 request_top_ps.append(tp_val)
+                if fill_min_p:
+                    request_min_ps.append(mp_val)
 
             self.request_temperatures[:len(request_temperatures)].copy_(
                 torch.tensor(request_temperatures,
@@ -1375,6 +1408,13 @@ class SpecMetadata:
                              pin_memory=prefer_pinned()),
                 non_blocking=True,
             )
+            if fill_min_p:
+                self.request_min_ps[:len(request_min_ps)].copy_(
+                    torch.tensor(request_min_ps,
+                                 dtype=torch.float32,
+                                 pin_memory=prefer_pinned()),
+                    non_blocking=True,
+                )
 
             # Pre-compute top_k_max on the CPU so CUDA-graph capture does not
             # encounter boolean-tensor indexing (dynamic size) or .item()
@@ -1390,10 +1430,13 @@ class SpecMetadata:
             temperatures: list[float] = []
             top_ks: list[int] = []
             top_ps: list[float] = []
-            for temp_val, tk_val, tp_val, num_tokens in per_request_normalized:
+            min_ps: list[float] = []
+            for temp_val, tk_val, tp_val, mp_val, num_tokens in per_request_normalized:
                 temperatures.extend(temp_val for _ in range(num_tokens))
                 top_ks.extend(tk_val for _ in range(num_tokens))
                 top_ps.extend(tp_val for _ in range(num_tokens))
+                if fill_min_p:
+                    min_ps.extend(mp_val for _ in range(num_tokens))
 
             self.temperatures[:len(temperatures)].copy_(torch.tensor(
                 temperatures, dtype=torch.float32, pin_memory=prefer_pinned()),
@@ -1404,9 +1447,13 @@ class SpecMetadata:
             self.top_ps[:len(top_ps)].copy_(torch.tensor(
                 top_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
                                             non_blocking=True)
+            if fill_min_p:
+                self.min_ps[:len(min_ps)].copy_(torch.tensor(
+                    min_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
+                                                non_blocking=True)
 
     def _sampling_params_buffers_need_update(
-        self, per_request_normalized: list[tuple[float, int, float, int]]
+        self, per_request_normalized: list[tuple[float, int, float, float, int]]
     ) -> tuple[bool, bool]:
         """Report which sampling-parameter buffers this step has to refill.
 
@@ -1433,8 +1480,9 @@ class SpecMetadata:
         ``top_k_max`` derives from the same values as the per-request buffers,
         so it stays valid for as long as they do.
         """
-        values = tuple((temp, top_k, top_p)
-                       for temp, top_k, top_p, _ in per_request_normalized)
+        values = tuple(
+            (temp, top_k, top_p, min_p)
+            for temp, top_k, top_p, min_p, _ in per_request_normalized)
         num_tokens = tuple(n for *_, n in per_request_normalized)
 
         request_signature = values
@@ -2067,6 +2115,115 @@ class SpecWorkerBase(nn.Module, ABC):
         from ..distributed.ops import allgather
         return allgather(logits, self.mapping, dim=-1)
 
+    @staticmethod
+    def _sample_from_logits(
+        advanced_sampling_mode: AdvancedSamplingMode,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        min_ps: Optional[torch.Tensor],
+        *,
+        seed: Optional[torch.Tensor] = None,
+        offset: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if advanced_sampling_mode.is_fused:
+            return fused_sampling.fused_sample_from_logits(logits,
+                                                           temperatures,
+                                                           top_ks,
+                                                           top_ps,
+                                                           min_ps,
+                                                           seed=seed,
+                                                           offset=offset)
+        top_ks, top_ps = flashinfer_sampling.resolve_advanced_sampling_filters(
+            advanced_sampling_mode, top_ks, top_ps)
+        return flashinfer_sampling.sample_from_logits_op(logits,
+                                                         temperatures,
+                                                         top_ks,
+                                                         top_ps,
+                                                         seed=seed,
+                                                         offset=offset)
+
+    @staticmethod
+    def _sample_from_logits_with_probs(
+        advanced_sampling_mode: AdvancedSamplingMode,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        min_ps: Optional[torch.Tensor],
+        *,
+        seed: Optional[torch.Tensor] = None,
+        offset: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if advanced_sampling_mode.is_fused:
+            return fused_sampling.fused_sample_from_logits_with_probs(
+                logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                min_ps,
+                seed=seed,
+                offset=offset)
+        top_ks, top_ps = flashinfer_sampling.resolve_advanced_sampling_filters(
+            advanced_sampling_mode, top_ks, top_ps)
+        return flashinfer_sampling.sampling_batch_spec_dec_one_model_for_rejection(
+            logits, temperatures, top_ks, top_ps, seed=seed, offset=offset)
+
+    @staticmethod
+    def _compute_probs_from_logits(
+        advanced_sampling_mode: AdvancedSamplingMode,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        min_ps: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if advanced_sampling_mode.is_fused:
+            return fused_sampling.fused_compute_probs_from_logits(
+                logits, temperatures, top_ks, top_ps, min_ps)
+        top_ks, top_ps = flashinfer_sampling.resolve_advanced_sampling_filters(
+            advanced_sampling_mode, top_ks, top_ps)
+        return flashinfer_sampling.compute_probs_from_logits(
+            logits, temperatures, top_ks, top_ps)
+
+    @staticmethod
+    def _zero_padding_rows(logits: torch.Tensor, spec_metadata,
+                           num_contexts: int, batch_size: int,
+                           rows_per_request: int) -> torch.Tensor:
+        """Zero the logits rows belonging to CUDA-graph padding requests.
+
+        A padding request decodes from an uninitialized KV/hidden state, so its
+        logits can be non-finite and its probs degenerate. flashinfer's
+        ``chain_speculative_sampling`` then rejects at a position whose
+        ``relu(target - draft)`` residual has no mass, reads an uninitialized
+        shared-memory slot and emits an out-of-range token id. Zeroed logits are legal.
+
+        Padding requests are the ones ``populate_sampling_params_for_one_model``
+        routed to ``dummy_slot_row`` (``py_seq_slot is None``), so this needs no
+        extra host-side state. Shapes are static: CUDA-graph safe. No-op while
+        ``dummy_slot_row`` is still 0, which is a live request's row rather than
+        a padding marker; ``prepare_rejection_sampling_buffers`` and
+        ``prepare_penalty_buffers`` are the two places that publish it.
+
+        Args:
+            logits: ``[(batch_size - num_contexts) * rows_per_request, vocab]``;
+                returned unchanged if the row count does not match.
+            rows_per_request: logits rows each request contributes.
+        Returns:
+            ``logits`` with the padding requests' rows zeroed.
+        """
+        slot_ids = getattr(spec_metadata, "batch_slot_ids", None)
+        dummy_slot_row = getattr(spec_metadata, "dummy_slot_row", 0)
+        num_gens = batch_size - num_contexts
+        if (slot_ids is None or dummy_slot_row <= 0 or num_gens <= 0
+                or logits.shape[0] != num_gens * rows_per_request):
+            return logits
+        is_padding = slot_ids[num_contexts:batch_size] == dummy_slot_row
+        if rows_per_request > 1:
+            is_padding = is_padding.repeat_interleave(rows_per_request)
+        return logits.masked_fill(is_padding.unsqueeze(-1), 0.0)
+
     def advanced_sample_draft(self,
                               logits: torch.Tensor,
                               spec_metadata: "SpecMetadata",
@@ -2085,9 +2242,8 @@ class SpecWorkerBase(nn.Module, ABC):
         temperatures = spec_metadata.request_temperatures[:batch_size]
         top_ks = spec_metadata.request_top_ks[:batch_size]
         top_ps = spec_metadata.request_top_ps[:batch_size]
+        min_ps = spec_metadata.request_min_ps[:batch_size]
 
-        eff_top_ks, eff_top_ps = resolve_advanced_sampling_filters(
-            spec_metadata.advanced_sampling_mode, top_ks, top_ps)
         # One row per request here, matching the request_* slices above.
         # Slot 0 of the step's offset window belongs to the target sampler, so
         # draft step i takes 1 + i. Callers that do not pass a draft_step run
@@ -2097,13 +2253,19 @@ class SpecWorkerBase(nn.Module, ABC):
                                                    step_offset=1 +
                                                    (draft_step or 0))
         if spec_metadata.use_rejection_sampling and draft_step is not None:
-            draft_tokens, probs = (
-                sampling_batch_spec_dec_one_model_for_rejection(logits,
-                                                                temperatures,
-                                                                eff_top_ks,
-                                                                eff_top_ps,
-                                                                seed=seed,
-                                                                offset=offset))
+            # The proposal stored below is read back by next iteration's
+            # rejection kernel, so a padding row must not poison it either.
+            logits = self._zero_padding_rows(logits, spec_metadata, 0,
+                                             batch_size, 1)
+            draft_tokens, probs = self._sample_from_logits_with_probs(
+                spec_metadata.advanced_sampling_mode,
+                logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                min_ps,
+                seed=seed,
+                offset=offset)
             # Scatter probs into the slot-indexed buffer so each request's data
             # lands at its stable py_seq_slot row regardless of batch shifts.
             assert spec_metadata.batch_slot_ids is not None, (
@@ -2115,12 +2277,15 @@ class SpecWorkerBase(nn.Module, ABC):
             spec_metadata.draft_probs[batch_slots, draft_step, :vocab] = probs
             spec_metadata.draft_probs_last_dim = vocab
         else:
-            draft_tokens = sample_from_logits_op(logits,
-                                                 temperatures,
-                                                 eff_top_ks,
-                                                 eff_top_ps,
-                                                 seed=seed,
-                                                 offset=offset)
+            draft_tokens = self._sample_from_logits(
+                spec_metadata.advanced_sampling_mode,
+                logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                min_ps,
+                seed=seed,
+                offset=offset)
 
         return draft_tokens.type(torch.int32)
 
@@ -2229,7 +2394,7 @@ class SpecWorkerBase(nn.Module, ABC):
           - generation rows (`[num_contexts:batch_size]`) run the rejection
             sampling kernel on slot-gathered draft probs.
 
-        Per-token sampling-parameter tensors (`temperatures / top_ks / top_ps`)
+        Per-token sampling-parameter tensors (`temperatures / top_ks / top_ps / min_ps`)
         are laid out as `[ctx (1 each), gen (draft_len+1 each)]`, matching the
         logits layout, so slicing is symmetric for both subsets.
         """
@@ -2263,16 +2428,18 @@ class SpecWorkerBase(nn.Module, ABC):
             gen_end = num_contexts + num_gen_logits
 
             temperatures = spec_metadata.temperatures[gen_start:gen_end]
-            # A filter the mode disables becomes None, which lets the C++ op
-            # short-circuit on a host-side check rather than an
-            # `.item<bool>()` sync that would break CUDA graph capture.
-            top_ks, top_ps = resolve_advanced_sampling_filters(
-                spec_metadata.advanced_sampling_mode,
+            gen_logits = self._zero_padding_rows(gen_logits, spec_metadata,
+                                                 num_contexts, batch_size,
+                                                 runtime_draft_len + 1)
+            # The target distribution the acceptance test divides by. It must be
+            # filtered exactly as the draft probs were (see advanced_sample_draft),
+            # which is why both use the same backend selection on the same mode --
+            # a mismatch here corrupts acceptance silently rather than raising.
+            target_probs_flat = self._compute_probs_from_logits(
+                spec_metadata.advanced_sampling_mode, gen_logits, temperatures,
                 spec_metadata.top_ks[gen_start:gen_end],
-                spec_metadata.top_ps[gen_start:gen_end])
-
-            target_probs_flat = compute_probs_from_logits(
-                gen_logits, temperatures, top_ks, top_ps)
+                spec_metadata.top_ps[gen_start:gen_end],
+                spec_metadata.min_ps[gen_start:gen_end])
             target_probs = target_probs_flat.reshape(num_gens,
                                                      runtime_draft_len + 1,
                                                      vocab_size)
@@ -2394,7 +2561,7 @@ class SpecWorkerBase(nn.Module, ABC):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Philox (seed, offset) laid out one entry per logits row.
 
-        Mirrors how ``temperatures`` / ``top_ks`` / ``top_ps`` are sliced at
+        Mirrors how ``temperatures`` / ``top_ks`` / ``top_ps`` / ``min_ps`` are sliced at
         the same call sites.
         """
         return spec_metadata.seeds[:
@@ -2526,10 +2693,10 @@ class SpecWorkerBase(nn.Module, ABC):
             num_contexts:batch_size].repeat_interleave(K)
         top_ps = spec_metadata.request_top_ps[
             num_contexts:batch_size].repeat_interleave(K)
+        min_ps = spec_metadata.request_min_ps[
+            num_contexts:batch_size].repeat_interleave(K)
 
         flat_logits = gen_logits.reshape(num_gens * K, vocab)
-        eff_top_ks, eff_top_ps = resolve_advanced_sampling_filters(
-            spec_metadata.advanced_sampling_mode, top_ks, top_ps)
         # A block sampler emits all K draft positions in one launch, so the
         # kernel's per-row subsequence already separates them and they share
         # the first draft slot of the step's offset window.
@@ -2540,13 +2707,17 @@ class SpecWorkerBase(nn.Module, ABC):
                                                    step_offset=1)
 
         if getattr(spec_metadata, "use_rejection_sampling", False):
-            flat_tokens, flat_probs = (
-                sampling_batch_spec_dec_one_model_for_rejection(flat_logits,
-                                                                temps,
-                                                                eff_top_ks,
-                                                                eff_top_ps,
-                                                                seed=seed,
-                                                                offset=offset))
+            flat_logits = self._zero_padding_rows(flat_logits, spec_metadata,
+                                                  num_contexts, batch_size, K)
+            flat_tokens, flat_probs = self._sample_from_logits_with_probs(
+                spec_metadata.advanced_sampling_mode,
+                flat_logits,
+                temps,
+                top_ks,
+                top_ps,
+                min_ps,
+                seed=seed,
+                offset=offset)
             # Scatter the K prob rows per gen request into its stable slot row.
             if spec_metadata.draft_probs is not None:
                 assert spec_metadata.batch_slot_ids is not None, (
@@ -2558,12 +2729,15 @@ class SpecWorkerBase(nn.Module, ABC):
                 spec_metadata.draft_probs[gen_slot_ids, :K, :vocab] = probs
                 spec_metadata.draft_probs_last_dim = vocab
         else:
-            flat_tokens = sample_from_logits_op(flat_logits,
-                                                temps,
-                                                eff_top_ks,
-                                                eff_top_ps,
-                                                seed=seed,
-                                                offset=offset)
+            flat_tokens = self._sample_from_logits(
+                spec_metadata.advanced_sampling_mode,
+                flat_logits,
+                temps,
+                top_ks,
+                top_ps,
+                min_ps,
+                seed=seed,
+                offset=offset)
 
         return flat_tokens.reshape(num_gens, K).type(torch.int32)
 
@@ -2837,18 +3011,20 @@ class SpecWorkerBase(nn.Module, ABC):
             temperatures = spec_metadata.temperatures[:num_tokens]
             top_ks = spec_metadata.top_ks[:num_tokens]
             top_ps = spec_metadata.top_ps[:num_tokens]
+            min_ps = spec_metadata.min_ps[:num_tokens]
 
-            eff_top_ks, eff_top_ps = resolve_advanced_sampling_filters(
-                spec_metadata.advanced_sampling_mode, top_ks, top_ps)
             # One row per logits row here, the same slice the per-token
             # sampling params above use.
             seed, offset = self._rng_state_per_token(spec_metadata, num_tokens)
-            sampled_tokens = sample_from_logits_op(logits,
-                                                   temperatures,
-                                                   eff_top_ks,
-                                                   eff_top_ps,
-                                                   seed=seed,
-                                                   offset=offset)
+            sampled_tokens = self._sample_from_logits(
+                spec_metadata.advanced_sampling_mode,
+                logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                min_ps,
+                seed=seed,
+                offset=offset)
         else:
             sampled_tokens = torch.argmax(logits, dim=-1)
 
