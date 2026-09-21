@@ -46,9 +46,8 @@ _CUTEDSL_FC2_N_TILE_SIZE_ENV = "TRTLLM_CUTEDSL_FC2_N_TILE_SIZE"
 _CUTEDSL_FC2_N_TILE_SIZES = (128, 256)
 _CUTEDSL_FC2_DEFAULT_N_TILE_SIZE = 128
 
-# The torch.library schema needs a concrete float, so "unset" is a sentinel
-# rather than ``None``. SiTU betas are required to be positive, so any
-# non-positive value is unambiguously "not provided".
+# Legacy Rubin ops use a float sentinel for absent SiTU soft-caps.
+# The Blackwell act-fusion op accepts Optional[float] directly.
 SITU_BETA_DISABLED = -1.0
 
 
@@ -3966,12 +3965,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             """Initialize the runner.
 
             Args:
-                activation_type: ``ActivationType`` for the fused epilogue. Only
+                activation_type: ``ActivationType`` for the fused epilogue.
                     ``Swiglu`` (gated), ``Relu2`` (non-gated) and ``SiTu``
                     (gated) are supported.
                 swiglu_limit_scalar: Uniform clamp limit for SwiGLU. ``+inf`` disables clamp.
-                situ_beta: Gate-side SiTU constant; required for ``SiTu`` only.
-                situ_linear_beta: Linear-side SiTU constant; required for ``SiTu`` only.
+                situ_beta: Gate-side SiTU soft-cap. Required for -- and only
+                    valid with -- ``ActivationType.SiTu``.
+                situ_linear_beta: Linear-side SiTU soft-cap, same rule.
             """
             super().__init__()
             self.activation_type = validate_activation_type(activation_type)
@@ -4005,6 +4005,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
 
         def unique_id(self):
+            """Identity of the compiled kernel, for the autotuner's cache.
+
+            Every entry here is a trace-time constant folded into the kernel,
+            so two runners that differ in any of them are different kernels
+            and must not share a tuning result. That is why the activation
+            soft-caps appear: ``swiglu_limit_scalar`` and the two SiTU betas
+            are baked in as ``const_expr``, not passed at launch.
+            """
             return (
                 self.num_experts,
                 self.top_k,
@@ -4387,8 +4395,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
         expert_counts: Optional[torch.Tensor] = None,
         expert_capacity: int = 0,
-        situ_beta: float = SITU_BETA_DISABLED,
-        situ_linear_beta: float = SITU_BETA_DISABLED,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion.
 
@@ -4396,8 +4404,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         (non-gated) and ``ActivationType.SiTu`` (gated) epilogues; other
         ``ActivationType`` values raise an assertion in the runner.
 
-        ``situ_beta``/``situ_linear_beta`` are only meaningful for
-        ``ActivationType.SiTu``; values <= 0 disable them.
+        ``situ_beta`` / ``situ_linear_beta`` carry the two SiTU soft-caps, and
+        are ``None`` for every other activation. The runner rejects a mismatch
+        against ``activation_type`` in either direction.
         """
         tuner = AutoTuner.get()
         swiglu_limit_scalar = _canonicalize_swiglu_limit_scalar(
@@ -4424,8 +4433,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             activation_type=ActivationType(activation_type),
             swiglu_limit_scalar=swiglu_limit_scalar,
             use_expert_counts=expert_counts is not None,
-            situ_beta=_canonicalize_situ_beta(situ_beta),
-            situ_linear_beta=_canonicalize_situ_beta(situ_linear_beta))
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta)
         inputs = [
             input, weight, input_scale, weight_scale, alpha,
             tile_idx_to_group_idx, tile_idx_to_mn_limit,
@@ -4464,9 +4473,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
         swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
         expert_counts: Optional[torch.Tensor] = None,
         expert_capacity: int = 0,
-        situ_beta: float = SITU_BETA_DISABLED,
-        situ_linear_beta: float = SITU_BETA_DISABLED,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Meta-device shapes for the FC1 output and its block scales.
+
+        A gated activation halves the N it emits, so the interleaved
+        gate/up pair collapses to one value per output element; the extra
+        ``// 2`` on the tensor itself is NVFP4's two values per byte.
+
+        The activation soft-caps are accepted and ignored: they change what
+        the kernel computes, never the shape it returns, but the fake must
+        still mirror the op's schema exactly.
+        """
         if expert_counts is not None:
             helper = GroupedGemmInputsHelper(num_experts, top_k,
                                              num_local_experts,
