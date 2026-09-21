@@ -22,11 +22,11 @@ from tensorrt_llm._utils import get_sm_version
 @pytest.mark.parametrize("use_pdl,zero_output", [(False, False), (False, True), (True, True)])
 def test_fc12_quantize_reset(dtype, num_tokens, hidden, use_pdl, zero_output):
     """Check native bytes, empty input, reset coverage, and changing graph input."""
-    from cuda.bindings import driver as cuda
-
     import cutlass
     import cutlass.cute as cute
+    from cuda.bindings import driver as cuda
     from cutlass.cute.runtime import make_ptr
+
     from tensorrt_llm._torch.cute_dsl_kernels.rubin.moe.fused_fc12_workspace import (
         reset_fc12_sync_workspace,
     )
@@ -107,11 +107,11 @@ def test_fc12_quantize_reset(dtype, num_tokens, hidden, use_pdl, zero_output):
 @pytest.mark.parametrize("use_pdl,zero_output", [(False, False), (False, True), (True, True)])
 def test_fc12_reset_only_replay(num_ready, num_output, use_pdl, zero_output):
     """Reset-only calls preserve all buffers and graph ordering without raw input."""
-    from cuda.bindings import driver as cuda
-
     import cutlass
     import cutlass.cute as cute
+    from cuda.bindings import driver as cuda
     from cutlass.cute.runtime import make_ptr
+
     from tensorrt_llm._torch.cute_dsl_kernels.rubin.moe.fused_fc12_workspace import (
         reset_fc12_sync_workspace,
     )

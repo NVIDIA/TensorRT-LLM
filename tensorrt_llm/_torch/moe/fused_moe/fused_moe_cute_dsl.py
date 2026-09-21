@@ -43,8 +43,7 @@ from ...model_config import ModelConfig
 from ...utils import (ActivationType, AuxStreamType, EventType,
                       Fp4QuantizedTensor,
                       get_last_power_of_2_num_tokens_buckets,
-                      last_positive_power_of_2, swizzle_sf,
-                      unswizzle_sf)
+                      last_positive_power_of_2, swizzle_sf, unswizzle_sf)
 from .activation import (DEFAULT_MOE_ACTIVATION, ActivationParamShape,
                          MoEActivation, MoEActivationSupport)
 from .impl_base import MoEImplBase, apply_moe_impl_construction_state
@@ -1097,7 +1096,8 @@ class CuteDslFusedMoE(MoEImplBase):
         self._locality_domain_runtime = None
         self._locality_domain_weight_shards = None  # set in post_load_weights
         # num_tokens -> use the localized MXFP8 MoE (see _select_mxfp8_locality_domain)
-        self._mxfp8_locality_domain_decisions: Dict[_Mxfp8DecisionKey, bool] = {}
+        self._mxfp8_locality_domain_decisions: Dict[_Mxfp8DecisionKey,
+                                                    bool] = {}
         planner = LocalityDomainExecutionPlanner(
             model_config.locality_domain_policy)
         self._locality_domain_plan = planner.plan_moe(
@@ -1112,7 +1112,7 @@ class CuteDslFusedMoE(MoEImplBase):
                        and self.quant_config.quant_mode.has_mxfp8())
         if (self._locality_domain_plan.enabled and plans_mxfp8
                 and self.intermediate_size_per_partition %
-                (128 * self._locality_domain_plan.num_partitions) != 0):
+            (128 * self._locality_domain_plan.num_partitions) != 0):
             reason = (
                 "MXFP8 locality domain MoE needs intermediate_size_per_partition "
                 f"({self.intermediate_size_per_partition}) to split into "
@@ -1171,7 +1171,8 @@ class CuteDslFusedMoE(MoEImplBase):
         # SM107, so selection never lands here. Raise rather than fall back: any
         # other method owns a weight layout these kernels cannot read.
         raise ValueError(
-            f"CuteDslFusedMoE only supports NVFP4 or MXFP8, got {self.quant_config}")
+            f"CuteDslFusedMoE only supports NVFP4 or MXFP8, got {self.quant_config}"
+        )
 
     def _supports_load_balancer(self) -> bool:
         return True
@@ -1236,8 +1237,8 @@ class CuteDslFusedMoE(MoEImplBase):
         ``hidden / 32`` columns, so the two agree only when the hidden size
         is a multiple of the weight alignment.
         """
-        return (x.dtype in (torch.bfloat16, torch.float16)
-                and x.dim() == 2 and x.is_contiguous()
+        return (x.dtype in (torch.bfloat16, torch.float16) and x.dim() == 2
+                and x.is_contiguous()
                 and x.shape[1] % self.quant_method.BLOCK_SIZE == 0
                 and x.shape[1] % self.quant_method.weight_alignment == 0
                 and x.data_ptr() % 16 == 0
@@ -1819,7 +1820,7 @@ class CuteDslFusedMoE(MoEImplBase):
 
     @staticmethod
     def _mxfp8_decision_key(num_tokens: int,
-                             dtype: torch.dtype) -> _Mxfp8DecisionKey:
+                            dtype: torch.dtype) -> _Mxfp8DecisionKey:
         """Preserve existing E4M3 decisions and isolate raw-input decisions."""
         return (num_tokens if dtype == torch.float8_e4m3fn else
                 (num_tokens, dtype))
@@ -2807,13 +2808,13 @@ class CuteDslFusedMoE(MoEImplBase):
             fc1_scale.shape, fc2_scale.shape)
         # Linear [E, rows, cols / 32] byte views of the swizzled scales.
         fc1_scale_linear = unswizzle_sf(fc1_scale.view(torch.uint8), fc1_n,
-                                        hidden, sf_vec).view(
-                                            num_experts, fc1_n,
-                                            hidden // sf_vec)
+                                        hidden,
+                                        sf_vec).view(num_experts, fc1_n,
+                                                     hidden // sf_vec)
         fc2_scale_linear = unswizzle_sf(fc2_scale.view(torch.uint8), hidden,
-                                        inner, sf_vec).view(
-                                            num_experts, hidden,
-                                            inner // sf_vec)
+                                        inner,
+                                        sf_vec).view(num_experts, hidden,
+                                                     inner // sf_vec)
         shards = []
         for pid in range(num_p):
             n_slice = slice(pid * 2 * half_inner, (pid + 1) * 2 * half_inner)
@@ -2825,17 +2826,16 @@ class CuteDslFusedMoE(MoEImplBase):
                 hidden, sf_vec).view(num_experts, 2 * half_inner,
                                      hidden // sf_vec).view(fc1_scale.dtype)
             fc2_shard_scale = swizzle_sf(
-                fc2_scale_linear[:, :, sk_slice].contiguous(), hidden,
-                half_inner, sf_vec).view(num_experts, hidden,
-                                         half_inner // sf_vec).view(
-                                             fc2_scale.dtype)
+                fc2_scale_linear[:, :,
+                                 sk_slice].contiguous(), hidden, half_inner,
+                sf_vec).view(num_experts, hidden,
+                             half_inner // sf_vec).view(fc2_scale.dtype)
             with self._locality_domain_runtime.partition_weight_context(pid):
                 shards.append({
                     'w3_w1_weight':
                     _copy_to_new_cuda_allocation(self.w3_w1_weight[:, n_slice]),
                     'w2_weight':
-                    _copy_to_new_cuda_allocation(self.w2_weight[:, :,
-                                                                k_slice]),
+                    _copy_to_new_cuda_allocation(self.w2_weight[:, :, k_slice]),
                     'fc31_weight_block_scale':
                     _copy_to_new_cuda_allocation(fc1_shard_scale),
                     'fc2_weight_block_scale':

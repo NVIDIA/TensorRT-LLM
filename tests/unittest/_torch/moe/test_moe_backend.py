@@ -1901,7 +1901,9 @@ def should_skip_locality_domain_param(
         and intermediate_size is not None
         and intermediate_size % 256 != 0
     ):
-        return "MXFP8 locality domain MoE splits the intermediate size into two 128-channel multiples"
+        return (
+            "MXFP8 locality domain MoE splits the intermediate size into two 128-channel multiples"
+        )
     # plan_moe only enables the unquantized path for bfloat16 activations.
     if quant_algo is None and dtype != torch.bfloat16:
         return "unquantized locality domain MoE requires bfloat16"

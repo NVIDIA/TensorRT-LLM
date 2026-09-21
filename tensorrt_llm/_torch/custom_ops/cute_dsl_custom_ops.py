@@ -16413,18 +16413,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             tuple(int(v) for v in cluster_shape_mn),
                             str(scheduler), stream_weights, fc2_stream_weights)
 
-                def _is_tactic_feasible(
-                        self,
-                        mma_tiler: Tuple[int, int, int],
-                        mma_inst_shape: Tuple[int, int, int],
-                        cluster_shape_mn: Tuple[int, int],
-                        scheduler: str,
-                        m: int,
-                        fc1_n: int,
-                        k: int,
-                        l: int,
-                        fc2_n: int,  # noqa: E741
-                        fc2_k: int) -> bool:
+                def _is_tactic_feasible(self, mma_tiler: Tuple[int, int, int],
+                                        mma_inst_shape: Tuple[int, int, int],
+                                        cluster_shape_mn: Tuple[int, int],
+                                        scheduler: str, m: int, fc1_n: int,
+                                        k: int, num_groups: int, fc2_n: int,
+                                        fc2_k: int) -> bool:
                     if not self.__class__.kernel_class.can_implement(
                             a_dtype=cutlass.Float8E4M3FN,
                             b_dtype=cutlass.Float8E4M3FN,
@@ -16435,8 +16429,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             mma_inst_shape=mma_inst_shape,
                             mma_tiler=mma_tiler,
                             cluster_shape_mn=cluster_shape_mn,
-                            fc1_gemm_shape=(m, fc1_n, k, l),
-                            fc2_gemm_shape=(m, fc2_n, fc2_k, l),
+                            fc1_gemm_shape=(m, fc1_n, k, num_groups),
+                            fc2_gemm_shape=(m, fc2_n, fc2_k, num_groups),
                             a_major="k",
                             b_major="k",
                             fc1_c_major="n",

@@ -38,7 +38,6 @@ from tensorrt_llm._torch.locality_domain_utils import (
     locality_domain_device,
     start_for_all_locality_domain,
 )
-from tensorrt_llm._torch.moe.fused_moe.impl_contract import MoECommPlan, MoERunContext
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
     CuteDslFusedMoE,
     _expert_count_tile_plan,
@@ -46,6 +45,7 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
     _runner_tactics_match_tile_size,
     cute_dsl_nvfp4_grouped_gemm_ref,
 )
+from tensorrt_llm._torch.moe.fused_moe.impl_contract import MoECommPlan, MoERunContext
 from tensorrt_llm._torch.moe.fused_moe.quantization import interleave_linear_and_gate
 from tensorrt_llm._torch.utils import (
     ActivationType,
@@ -5246,6 +5246,7 @@ def test_mxfp8_local_input_quantization_deferred(monkeypatch, hidden, dtype):
     strided = torch.empty((2, hidden * 2), dtype=dtype)[:, :hidden]
     quantized, _ = CuteDslFusedMoE.quantize_input(backend, strided, post_quant_comm=False)
     assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 5
+
 
 def test_mxfp8_input_quantization_tuning_cache_isolation():
     """Changing activation dtype must not reuse prequantized timing decisions."""
