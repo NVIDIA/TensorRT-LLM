@@ -1276,8 +1276,13 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
     permuted_idx_to_expanded_idx_list = permuted_idx_to_expanded_idx.cpu().tolist()
     tile_idx_to_mn_limit_list = tile_idx_to_mn_limit.cpu().tolist()
 
-    a_gathered = torch.empty(max_num_permuted_tokens, hidden_size // 2, dtype=a.dtype)
-    a_sf_gathered = torch.empty(
+    # Zero-initialise: rows past a tile's mn_limit stay unwritten, and a stray
+    # NaN scale byte would poison the reference and ``global_sf``.
+    # ``torch.zeros`` has no CPU FP4 fill kernel, hence the uint8 view.
+    a_gathered = torch.zeros(max_num_permuted_tokens, hidden_size // 2, dtype=torch.uint8).view(
+        a.dtype
+    )
+    a_sf_gathered = torch.zeros(
         max_num_permuted_tokens, hidden_size // sf_vec_size, dtype=a_sf.dtype
     )
     for i in range(num_valid_permuted_tokens):
@@ -1482,8 +1487,13 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
     permuted_idx_to_expanded_idx_list = permuted_idx_to_expanded_idx.cpu().tolist()
     tile_idx_to_mn_limit_list = tile_idx_to_mn_limit.cpu().tolist()
 
-    a_gathered = torch.empty(max_num_permuted_tokens, hidden_size // 2, dtype=a.dtype)
-    a_sf_gathered = torch.empty(
+    # Zero-initialise: rows past a tile's mn_limit stay unwritten, and a stray
+    # NaN scale byte would poison the reference and ``global_sf``.
+    # ``torch.zeros`` has no CPU FP4 fill kernel, hence the uint8 view.
+    a_gathered = torch.zeros(max_num_permuted_tokens, hidden_size // 2, dtype=torch.uint8).view(
+        a.dtype
+    )
+    a_sf_gathered = torch.zeros(
         max_num_permuted_tokens, hidden_size // sf_vec_size, dtype=a_sf.dtype
     )
     for i in range(num_valid_permuted_tokens):
@@ -1653,8 +1663,13 @@ def test_nvfp4_gather_grouped_gemm_situ_rubin(tile_size: int):
     permuted_idx_to_expanded_idx_list = permuted_idx_to_expanded_idx.cpu().tolist()
     tile_idx_to_mn_limit_list = tile_idx_to_mn_limit.cpu().tolist()
 
-    a_gathered = torch.empty(max_num_permuted_tokens, hidden_size // 2, dtype=a.dtype)
-    a_sf_gathered = torch.empty(
+    # Zero-initialise: rows past a tile's mn_limit stay unwritten, and a stray
+    # NaN scale byte would poison the reference and ``global_sf``.
+    # ``torch.zeros`` has no CPU FP4 fill kernel, hence the uint8 view.
+    a_gathered = torch.zeros(max_num_permuted_tokens, hidden_size // 2, dtype=torch.uint8).view(
+        a.dtype
+    )
+    a_sf_gathered = torch.zeros(
         max_num_permuted_tokens, hidden_size // sf_vec_size, dtype=a_sf.dtype
     )
     for i in range(num_valid_permuted_tokens):
