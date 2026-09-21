@@ -176,29 +176,6 @@ def test_executor_request_to_llm_request_owns_position_ids_in_python() -> None:
     assert llm_request.child_requests[0].py_position_ids is not llm_request.py_position_ids
 
 
-def test_executor_request_to_llm_request_owns_multimodal_embedding_in_python() -> None:
-    embedding = torch.arange(6, dtype=torch.float32).reshape(2, 3)
-    executor_request = trtllm.Request(
-        input_token_ids=[1, 2, 3],
-        max_tokens=10,
-        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
-        multimodal_embedding=embedding,
-    )
-
-    llm_request = executor_request_to_llm_request(
-        42,
-        executor_request,
-        child_req_ids=[43],
-        exclude_last_generation_logits=False,
-    )
-
-    torch.testing.assert_close(llm_request.py_multimodal_embedding, embedding)
-    assert llm_request.py_multimodal_embedding.data_ptr() == embedding.data_ptr()
-    child_embedding = llm_request.child_requests[0].py_multimodal_embedding
-    torch.testing.assert_close(child_embedding, embedding)
-    assert child_embedding.data_ptr() != embedding.data_ptr()
-
-
 def test_executor_request_to_llm_request_owns_guided_decoding_params_in_python() -> None:
     params = trtllm.GuidedDecodingParams(trtllm.GuidedDecodingParams.GuideType.REGEX, guide=r"\d+")
     executor_request = trtllm.Request(

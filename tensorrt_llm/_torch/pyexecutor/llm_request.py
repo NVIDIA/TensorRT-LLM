@@ -919,8 +919,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             "embedding_bias", None)
         self.py_position_ids: list[int] | None = kwargs.pop(
             "position_ids", None)
-        self.py_multimodal_embedding: Optional[torch.Tensor] = kwargs.pop(
-            "multimodal_embedding", None)
         self.py_guided_decoding_params = kwargs.pop("guided_decoding_params",
                                                     None)
         self.py_end_id: Optional[int] = kwargs.pop("end_id", None)
@@ -1607,7 +1605,6 @@ def executor_request_to_llm_request(
         multimodal_item_run_cu_offsets=multimodal_item_run_cu_offsets,
         multimodal_run_positions=multimodal_run_positions,
         multimodal_run_lengths=multimodal_run_lengths,
-        multimodal_embedding=executor_request.multimodal_embedding,
         lora_task_id=executor_request.lora_config.task_id
         if executor_request.lora_config is not None else None,
         lora_weights=executor_request.lora_config.weights
