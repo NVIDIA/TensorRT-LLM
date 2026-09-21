@@ -23,7 +23,6 @@
 #include "tensorrt_llm/kernels/moe/communication/moeAlltoAllCftSupport.h"
 #include "tensorrt_llm/kernels/moe/communication/moeAlltoAllKernels.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
-#include <cerrno>
 #include <cooperative_groups.h>
 #include <cstdint>
 #include <cstdlib>
@@ -70,55 +69,6 @@ namespace kernels::moe_comm
 {
 
 using tensorrt_llm::common::launchWithPdlWhenEnabled;
-
-// Resolve the completion-flag wait budget; see the header. Seconds are converted at
-// an assumed 2 GHz SM clock, so they are nominal rather than wall-clock.
-int64_t moeA2AGetTimeoutCycles(bool is_warmup)
-{
-    static constexpr int64_t kAssumedClockHz = 2000ll * 1000ll * 1000ll;
-    static constexpr int64_t kDefaultTimeoutSec = 300;
-    // Warmup contains one-time per-rank costs (JIT compilation, autotuning, module
-    // loading) that can run for minutes and are not synchronized against this
-    // collective, so it needs a larger budget than steady state.
-    static constexpr int64_t kDefaultWarmupTimeoutSec = 1800;
-
-    // Reject trailing garbage, out-of-range values and anything that would overflow
-    // the cycle multiplication.
-    auto const readEnv = [](char const* name, int64_t fallback) -> int64_t
-    {
-        static constexpr int64_t kMaxSec = 24 * 60 * 60; // 1 day; * 2e9 stays well inside int64
-        char const* v = std::getenv(name);
-        if (v == nullptr || *v == '\0')
-        {
-            return fallback;
-        }
-        errno = 0;
-        char* end = nullptr;
-        int64_t parsed = std::strtoll(v, &end, 10);
-        bool const trailingGarbage = (end == v) || (*end != '\0');
-        if (trailingGarbage || errno == ERANGE || parsed <= 0 || parsed > kMaxSec)
-        {
-            TLLM_LOG_WARNING("Ignoring invalid %s=\"%s\" (expected 1..%ld seconds); using %ld s", name, v,
-                static_cast<long>(kMaxSec), static_cast<long>(fallback));
-            return fallback;
-        }
-        return parsed;
-    };
-
-    static int64_t const sSteadySec = readEnv("TRTLLM_NVLINK_ONE_SIDED_A2A_TIMEOUT_SEC", kDefaultTimeoutSec);
-    static int64_t const sWarmupSec
-        = readEnv("TRTLLM_NVLINK_ONE_SIDED_A2A_WARMUP_TIMEOUT_SEC", kDefaultWarmupTimeoutSec);
-    static bool const sLogged = []()
-    {
-        TLLM_LOG_INFO(
-            "MoE all-to-all completion-flag budget: steady=%ld s, warmup=%ld s (nominal, at an "
-            "assumed 2 GHz clock64 rate)",
-            static_cast<long>(sSteadySec), static_cast<long>(sWarmupSec));
-        return true;
-    }();
-    (void) sLogged;
-    return (is_warmup ? sWarmupSec : sSteadySec) * kAssumedClockHz;
-}
 
 #define ENABLE_DEBUG_PRINT 0
 #define DISABLE_SYNC_FOR_PROFILING 0
@@ -232,16 +182,10 @@ int64_t moeA2AGetTimeoutCycles(bool is_warmup)
     }                                                                                                                  \
     }
 
-#ifndef TLLM_MOE_A2A_TIMEOUT_SECONDS
-#define TLLM_MOE_A2A_TIMEOUT_SECONDS 300
-#endif
 #if DISABLE_TIMEOUT
 #define check_timeout(s, budget) false
 #else
-// `budget` is in clock64() cycles, resolved on the host by moeA2AGetTimeoutCycles().
-// Multi-rank warmup can enter these kernels with large rank skew while CuTeDSL
-// kernels are still being JIT/autotuned on peer ranks; host budgets (incl. warmup)
-// cover that skew via moeA2AGetTimeoutCycles().
+// The host supplies the wait budget in clock64() cycles as a launch argument.
 #define check_timeout(s, budget) ((clock64() - (s)) > (budget))
 #endif
 

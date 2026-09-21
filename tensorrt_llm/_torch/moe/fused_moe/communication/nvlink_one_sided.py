@@ -63,6 +63,38 @@ _CFT_MAX_BATCH_FOR_COMBINE_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_
 FORCE_CFT_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT"
 _CFT_ALIGNMENT_BYTES = 16
 _CFT_MIN_DRIVER_BRANCH = 615
+_TIMEOUT_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_TIMEOUT_SEC"
+_WARMUP_TIMEOUT_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_WARMUP_TIMEOUT_SEC"
+_DEFAULT_TIMEOUT_SEC = 300
+_DEFAULT_WARMUP_TIMEOUT_SEC = 1800
+_MAX_TIMEOUT_SEC = 24 * 60 * 60
+
+
+def get_timeout_seconds(in_warmup: bool = False) -> int:
+    """Resolve the nominal collective timeout for the engine's execution phase.
+
+    First-touch JIT compilation, autotuning and module loading can delay peer
+    ranks by minutes during warmup, so that phase gets a larger default budget.
+    """
+    name = _WARMUP_TIMEOUT_ENV if in_warmup else _TIMEOUT_ENV
+    default = _DEFAULT_WARMUP_TIMEOUT_SEC if in_warmup else _DEFAULT_TIMEOUT_SEC
+    value = os.environ.get(name)
+    if not value:
+        return default
+    try:
+        if re.fullmatch(r"\s*[+-]?[0-9]+", value) is not None:
+            seconds = int(value)
+            if 0 < seconds <= _MAX_TIMEOUT_SEC:
+                return seconds
+    except ValueError:
+        # Very long integer strings may exceed Python's conversion limit.
+        pass
+    tllm_logger.warning_once(
+        f'Ignoring invalid {name}="{value}" (expected 1..{_MAX_TIMEOUT_SEC} seconds); '
+        f"using {default} s",
+        key=f"{name}_invalid_{value}",
+    )
+    return default
 
 
 def get_force_cft() -> bool | None:
@@ -237,6 +269,24 @@ class NVLinkOneSided(Communication):
     _WORKSPACES: Dict[Tuple[object, ...], dict] = {}
     _WORKSPACE_REFCOUNTS: Dict[Tuple[object, ...], int] = {}
     _WORKSPACE: dict | None = None
+    _timeout_initialized = False
+
+    @staticmethod
+    def set_timeout(timeout_sec: int) -> None:
+        """Set the process-wide timeout for subsequent one-sided A2A launches.
+
+        Args:
+            timeout_sec: Integer in [1, 86400], nominal seconds at an assumed
+                2 GHz SM clock. Applies to both dispatch/combine and CFT/fence.
+
+        Existing CUDA graphs retain the budget recorded at capture time.
+        """
+        if isinstance(timeout_sec, bool) or not isinstance(timeout_sec, int):
+            raise TypeError("timeout_sec must be an integer number of seconds")
+        if not 0 < timeout_sec <= _MAX_TIMEOUT_SEC:
+            raise ValueError(f"timeout_sec must be in 1..{_MAX_TIMEOUT_SEC} seconds")
+        torch.ops.trtllm.moe_a2a_set_timeout(timeout_sec)
+        NVLinkOneSided._timeout_initialized = True
 
     # MetaInfo indices - initialized from C++ constants
     FLAG_VAL_OFFSET_INDEX = None
@@ -376,6 +426,11 @@ class NVLinkOneSided(Communication):
             raise RuntimeError(
                 f"NVLinkOneSided supports at most {self.MAX_RANKS} EP ranks, got ep_size={self.ep_size}."
             )
+
+        # Standalone callers have no engine phase transitions. Initialize their
+        # steady-state budget without overwriting an explicit or warmup timeout.
+        if not NVLinkOneSided._timeout_initialized:
+            NVLinkOneSided.set_timeout(get_timeout_seconds())
 
         # Store needed parameters
         self.num_experts = num_slots

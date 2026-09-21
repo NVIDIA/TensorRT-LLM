@@ -39,13 +39,15 @@ namespace torch_ext
 namespace moe_comm
 {
 
-// Whether the engine is in its startup warmup phase, which uses a larger
-// completion-flag budget. See moeA2AGetTimeoutCycles().
-static std::atomic<bool> gInWarmup{false};
+// Process-wide budget copied into subsequent dispatch/combine launch arguments.
+static std::atomic<int64_t> gTimeoutCycles{tensorrt_llm::kernels::moe_comm::kDefaultTimeoutCycles};
 
-void moeA2ASetWarmupOp(bool in_warmup)
+void moeA2ASetTimeoutOp(int64_t timeoutSec)
 {
-    gInWarmup.store(in_warmup, std::memory_order_relaxed);
+    constexpr int64_t kMaxTimeoutSec = 24 * 60 * 60;
+    TORCH_CHECK(timeoutSec > 0 && timeoutSec <= kMaxTimeoutSec, "MoE all-to-all timeout must be in 1..", kMaxTimeoutSec,
+        " seconds");
+    gTimeoutCycles.store(timeoutSec * tensorrt_llm::kernels::moe_comm::kAssumedClockHz, std::memory_order_relaxed);
 }
 
 static constexpr size_t CACHELINE_ALIGNMENT = 128;
@@ -720,8 +722,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     }
 
     params.stream = at::cuda::getCurrentCUDAStream();
-    params.timeout_cycles
-        = tensorrt_llm::kernels::moe_comm::moeA2AGetTimeoutCycles(gInWarmup.load(std::memory_order_relaxed));
+    params.timeout_cycles = gTimeoutCycles.load(std::memory_order_relaxed);
 
     // Prepare for dispatch (zero counters/indices and increment flag_val)
     moe_a2a_prepare_dispatch_launch(params);
@@ -973,8 +974,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
         = params.use_cft_for_combine ? params.wire_bytes_per_token : params.workspace_stride_per_token;
 
     params.stream = at::cuda::getCurrentCUDAStream();
-    params.timeout_cycles
-        = tensorrt_llm::kernels::moe_comm::moeA2AGetTimeoutCycles(gInWarmup.load(std::memory_order_relaxed));
+    params.timeout_cycles = gTimeoutCycles.load(std::memory_order_relaxed);
 
     moe_a2a_prepare_combine_launch(params);
 
@@ -1104,7 +1104,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "moe_a2a_get_combine_payload_tensor(Tensor(a) workspace, int ep_rank, int ep_size, int "
         "runtime_max_tokens_per_rank, "
         "int combine_payload_offset, ScalarType out_dtype, int hidden_size) -> Tensor(a)");
-    module.def("moe_a2a_set_warmup(bool in_warmup) -> ()", &tensorrt_llm::torch_ext::moe_comm::moeA2ASetWarmupOp);
+    module.def("moe_a2a_set_timeout(int timeout_sec) -> ()", &tensorrt_llm::torch_ext::moe_comm::moeA2ASetTimeoutOp);
     module.def(
         "moe_a2a_get_aux_data_size(int ep_size, int max_num_tokens, int? eplb_stats_num_experts=None, "
         "bool can_use_cft_counted_writes=False) -> int",

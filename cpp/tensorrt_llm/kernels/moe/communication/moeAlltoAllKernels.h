@@ -51,8 +51,9 @@ struct CftPeerLeIds
     uint64_t active_rank_mask[kRankMaskWords];
 };
 
-// Default completion-flag wait budget: 300 s at an assumed 2 GHz clock64 rate.
-static constexpr int64_t kDefaultTimeoutCycles = 300ll * 2000ll * 1000ll * 1000ll;
+// Nominal clock64 rate used to convert timeout seconds to SM cycles.
+static constexpr int64_t kAssumedClockHz = 2000ll * 1000ll * 1000ll;
+static constexpr int64_t kDefaultTimeoutCycles = 300ll * kAssumedClockHz;
 
 // Default per-block dynamic shared-memory cap on sm_90+; larger requests must opt in via
 // cudaFuncAttributeMaxDynamicSharedMemorySize.
@@ -120,7 +121,7 @@ struct DispatchKernelPointers
     // The local rank's own bit must always be set; this is checked at launch time.
     uint64_t active_rank_mask[kRankMaskWords];
 
-    // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
+    // Host-selected wait budget in clock64() cycles.
     int64_t timeout_cycles{kDefaultTimeoutCycles};
 };
 
@@ -150,7 +151,7 @@ struct CombineKernelPointers
     // completion flag writes/waits to/from inactive peers.
     uint64_t active_rank_mask[kRankMaskWords];
 
-    // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
+    // Host-selected wait budget in clock64() cycles.
     int64_t timeout_cycles{kDefaultTimeoutCycles};
 };
 
@@ -222,21 +223,12 @@ struct MoeA2ADispatchParams
     // CUDA graph replay until generation-scoped invalidation and recapture are available.
     uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}};
 
-    // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
+    // Host-selected wait budget in clock64() cycles.
     int64_t timeout_cycles{kDefaultTimeoutCycles};
 
     // CUDA stream
     cudaStream_t stream;
 };
-
-// Resolve the completion-flag wait budget, in clock64() cycles.
-//
-// No collective separates a rank's first-touch JIT/autotune work from its dispatch
-// launch, so this device-side budget is in effect a deadline on the slowest peer's
-// host-side progress. Warmup therefore uses a larger budget than steady state.
-// Overridable via TRTLLM_NVLINK_ONE_SIDED_A2A_TIMEOUT_SEC / TRTLLM_NVLINK_ONE_SIDED_A2A_WARMUP_TIMEOUT_SEC.
-// See nvbugs/6482566.
-int64_t moeA2AGetTimeoutCycles(bool is_warmup);
 
 // Dispatch kernels
 void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params);
@@ -312,7 +304,7 @@ struct MoeA2ACombineParams
     // CUDA graph replay until generation-scoped invalidation and recapture are available.
     uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}};
 
-    // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
+    // Host-selected wait budget in clock64() cycles.
     int64_t timeout_cycles{kDefaultTimeoutCycles};
 
     // CUDA stream
