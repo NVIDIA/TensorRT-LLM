@@ -272,3 +272,17 @@ def test_same_src_dst_is_noop(sync_tree, tmp_path):
     before = snapshot(src)
     sync_tree(src, src)
     assert snapshot(src) == before
+
+
+@pytest.mark.parametrize(
+    ("cuda_architectures", "expected"),
+    [
+        ("80-real", False),
+        ("86-real;89-real", False),
+        ("90-real", True),
+        ("86-real;90-real;120-real", True),
+        ("all", True),
+    ],
+)
+def test_has_sm90_or_newer(build_wheel_module, cuda_architectures, expected):
+    assert build_wheel_module.has_sm90_or_newer(cuda_architectures) is expected

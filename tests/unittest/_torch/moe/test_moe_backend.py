@@ -93,7 +93,12 @@ from tensorrt_llm._torch.moe.fused_moe.impl_environment import (
     override_moe_environment,
 )
 from tensorrt_llm._torch.moe.fused_moe.interface import MoE, MoESchedulerKind, MoEWeightLoadingMode
-from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
+from tensorrt_llm._torch.moe.fused_moe.marlin import MarlinCudaNvfp4Impl, MarlinCudaW4a16Nvfp4Impl
+from tensorrt_llm._torch.moe.fused_moe.mega_moe import (
+    MegaMoECuteDsl,
+    MegaMoEDeepGemm,
+    TrtllmCutedslMegaMoeNvfp4Impl,
+)
 from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
     build_moe_deployment,
     impl_class_for,
@@ -777,6 +782,31 @@ def test_marlin_moe_repack_is_transform_stage():
     assert NVFP4MarlinFusedMoEMethod.post_load_weights is FusedMoEMethodBase.post_load_weights
 
 
+@pytest.mark.parametrize("act_scale", [None, torch.ones(1, 8)], ids=["absent", "present"])
+def test_marlin_refuses_a_pre_quant_activation_scale(act_scale):
+    """An AWQ-style checkpoint must be refused, not served with the scale dropped.
+
+    ``canonical_quant`` folds NVFP4_AWQ / NVFP4_ARC into ``nvfp4`` before the
+    ``MoEProblem`` is built, so no eligibility gate can see the distinction --
+    the guard has to sit where the evidence appears, which is after
+    ``load_quant_scales`` has materialized ``fc31_act_scale``.
+
+    ``__new__`` without ``__init__``: the check reads one attribute off the
+    module and a real constructor would need a GPU.
+    """
+    method = NVFP4MarlinFusedMoEMethod.__new__(NVFP4MarlinFusedMoEMethod)
+    module = SimpleNamespace(fc31_act_scale=act_scale)
+
+    if act_scale is None:
+        # Nothing to refuse; it falls through to the real repack, which needs
+        # loaded weights. Reaching past the guard is the assertion here.
+        with pytest.raises(AttributeError):
+            method.transform_weights(module)
+    else:
+        with pytest.raises(ValueError, match="pre-quant activation scale"):
+            method.transform_weights(module)
+
+
 def _marlin_model_config(quant_algo=QuantAlgo.NVFP4):
     cfg = ModelConfig()
     cfg.moe_backend = "MARLIN"
@@ -789,10 +819,19 @@ def _marlin_environment(sm: int = 90) -> MoEEnvironment:
     return MoEEnvironment(sm=sm)
 
 
-def test_marlin_is_selected_for_nvfp4():
+@pytest.mark.parametrize(
+    "quant_algo, expected_leaf",
+    [
+        pytest.param(QuantAlgo.NVFP4, MarlinCudaNvfp4Impl, id="nvfp4"),
+        pytest.param(QuantAlgo.W4A16_NVFP4, MarlinCudaW4a16Nvfp4Impl, id="w4a16_nvfp4"),
+    ],
+)
+def test_marlin_selects_the_leaf_that_publishes_the_format(quant_algo, expected_leaf):
+    """``moe_backend: MARLIN`` names the family; the quant picks which leaf."""
     with override_moe_environment(_marlin_environment()):
-        report = resolve_moe_impl(_marlin_model_config())
-    assert impl_class_for(report) is MarlinFusedMoE
+        report = resolve_moe_impl(_marlin_model_config(quant_algo))
+    assert impl_class_for(report) is expected_leaf
+    assert issubclass(impl_class_for(report), MarlinFusedMoE)
     assert report.selected_by == "pinned"
     assert not report.degraded
 
@@ -1201,6 +1240,42 @@ def test_megamoe_cache_derived_state_survives_the_read_only_reader_walk():
 
     backend._alloc_symm_buffer.assert_called_once_with()
     backend.quant_method.cache_derived_state.assert_called_once_with(backend)
+    wrapper.cache_derived_state.assert_not_called()
+
+
+def test_megamoe_cutedsl_cache_derived_state_survives_the_read_only_reader_walk():
+    """The CuteDSL leaf's override has to be the one the walk reaches.
+
+    Same wrapper geometry as the DeepGEMM sibling above, but this override
+    guards a different thing: the base hook dereferences ``self.quant_method``
+    unguarded, and a weights-removed reader never reaches
+    ``post_load_weights``, so losing the override here leaves the derived
+    MegaMoE-format state silently never recomputed.
+    """
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+
+    # ``__new__`` rather than the constructor: the real ``__init__`` would want
+    # a process group and the cuMem symmetric-memory rendezvous.
+    backend = TrtllmCutedslMegaMoeNvfp4Impl.__new__(TrtllmCutedslMegaMoeNvfp4Impl)
+    torch.nn.Module.__init__(backend)
+    backend.quant_method = None
+    quant_method = SimpleNamespace(cache_derived_state=MagicMock())
+    backend.create_weights = MagicMock(
+        side_effect=lambda: setattr(backend, "quant_method", quant_method)
+    )
+
+    wrapper = torch.nn.Module()
+    wrapper._weights_removed = True
+    wrapper.cache_derived_state = MagicMock()
+    wrapper.backend = backend
+
+    model = torch.nn.Module()
+    model.moe = wrapper
+
+    ModelLoader._walk_cache_state(model)
+
+    backend.create_weights.assert_called_once_with()
+    quant_method.cache_derived_state.assert_called_once_with(backend)
     wrapper.cache_derived_state.assert_not_called()
 
 
@@ -1821,6 +1896,7 @@ BACKEND_TYPES_TO_TEST = [
     MoeBackendType.MEGAMOE_CUTEDSL,
     MoeBackendType.CUTE_DSL_B12X,
     MoeBackendType.MARLIN,
+    MoeBackendType.CUTEDSL_FC12,
 ]
 
 # Data types to test
@@ -1848,6 +1924,7 @@ CI_MOE_MODEL_CONFIGS = [
 LOCAL_MOE_MODEL_CONFIGS = CI_MOE_MODEL_CONFIGS + [
     MoeModelConfig(256, 8, 7168, 2048),  # DeepSeek-V3
     MoeModelConfig(256, 6, 4096, 2048),  # DeepSeek-V4-Flash
+    MoeModelConfig(384, 6, 7168, 3072),  # DeepSeek-V4-Pro
     MoeModelConfig(8, 2, 4096, 14336),  # Mixtral-8x7B
     MoeModelConfig(64, 6, 2048, 1408),  # DeepSeek-MoE-16B / DeepSeek-V2-Lite
     MoeModelConfig(8, 2, 6144, 32768),  # Grok-1
