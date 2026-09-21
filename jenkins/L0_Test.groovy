@@ -1168,7 +1168,10 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
                 }
                 def slurmCommand = SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl, imageForSlurm, mounts)
-                def clusterExcludes = placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName)
+                def clusterExcludes = SlurmConfig.getSlurmPlacementExcludes(
+                    pipeline, remote, partition,
+                    placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName)
+                )
                 def slurmCommandWithExclusion = trtllm_utils.addSlurmExcludeToCommand(slurmCommand, clusterExcludes)
                 def slurmExcludeArg = trtllm_utils.buildSlurmExcludeArg(clusterExcludes)
                 if (slurmExcludeArg) {
@@ -1374,9 +1377,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                                 dockerArgs += " --device=/dev/gdrdrv:/dev/gdrdrv"
                             }
                         }
-                        if (stageName.contains("VR200") && fileExists('/mnt/cifs/home/scratch.trt_llm_data')) {
-                            dockerArgs += " -v /mnt/cifs/home/scratch.trt_llm_data:/scratch.trt_llm_data:ro "
-                        } else if (fileExists('/home/scratch.trt_llm_data_ci')) {
+                        if (fileExists('/home/scratch.trt_llm_data_ci')) {
                             dockerArgs += " -v /home/scratch.trt_llm_data_ci:/scratch.trt_llm_data:ro "
                         } else if (fileExists('/home/scratch.trt_llm_data')) {
                             dockerArgs += " -v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro "
@@ -2175,7 +2176,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 if (SlurmConfig.needsIdleGpuExemption(cluster)) {
                     exemptionComment = "--comment='${SlurmConfig.IDLE_GPU_EXEMPTION_PAYLOAD}'"
                 }
-                def slurmExcludeArg = trtllm_utils.buildSlurmExcludeArg(placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName))
+                def clusterExcludes = SlurmConfig.getSlurmPlacementExcludes(
+                    pipeline, remote, partition,
+                    placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName)
+                )
+                def slurmExcludeArg = trtllm_utils.buildSlurmExcludeArg(clusterExcludes)
                 def slurmExcludeDirective = slurmExcludeArg ? "#SBATCH ${slurmExcludeArg}" : ""
                 if (slurmExcludeArg) {
                     echo "[INFRA-RETRY] ${stageName}: requesting SLURM retry placement exclusion: ${slurmExcludeArg}"
