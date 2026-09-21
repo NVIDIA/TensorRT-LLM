@@ -5093,6 +5093,21 @@ class PyTorchModelEngine(ModelEngine):
                     request.py_num_compressed_tokens)
                 request.cached_tokens = (past_seen_token_num +
                                          runtime_tokens_per_gen_step)
+                if _has_cp_helix:
+                    # In-flight predecessor: mirror the non-helix convention
+                    # above -- positions are packed from the stale base (the
+                    # overlap device correction adds the accepted count) and
+                    # KV numbers assume full acceptance (the device recompute
+                    # in recompute_helix_spec_buffers overrides them). The
+                    # base is reconstructed GLOBALLY (see the no-previous
+                    # branch: the token list is rank-local under helix).
+                    group = runtime_tokens_per_gen_step
+                    base = _helix_pack_extend(request, group)
+                    local_full = _helix_local_len_host(base + group)
+                    helix_owned_new_tokens.append(0)
+                    num_cached_tokens_per_seq[-1] = (
+                        local_full - request.py_num_compressed_tokens)
+                    request.cached_tokens = local_full
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend) and spec_config.is_linear_tree:
                     prompt_lengths.append(runtime_tokens_per_gen_step)
@@ -5287,6 +5302,10 @@ class PyTorchModelEngine(ModelEngine):
                         helix_is_inactive_rank.append(
                             request.py_helix_is_inactive_rank)
                         helix_position_offsets.append(position_id)
+                        # Keep the per-seq owned-count list aligned when the
+                        # spec path is active in the same batch.
+                        helix_owned_new_tokens.append(
+                            0 if request.py_helix_is_inactive_rank else 1)
 
                 request.cached_tokens = past_seen_token_num
                 for beam in range(beam_width):
