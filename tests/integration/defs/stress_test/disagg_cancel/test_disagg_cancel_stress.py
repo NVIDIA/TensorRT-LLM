@@ -40,7 +40,7 @@ _CONFIG_DIR = Path(__file__).parent / "configs"
 # Marathon configurations exercised by the parametrized test below.
 # Add a new entry here to wire an additional YAML into the suite.
 _MARATHON_CONFIGS: list[str] = [
-    "marathon_cpp_v1_deepseek.yaml",
+    "marathon_python_v1_deepseek.yaml",
 ]
 
 
@@ -126,7 +126,7 @@ def test_stress_config_accepts_supported_modes(tmp_path: Path, mode: str) -> Non
             mode: {mode}
             duration_min: 1
             kv_cache_manager: v1
-            transceiver: cpp
+            transceiver: python
             """,
         )
     )
@@ -134,6 +134,17 @@ def test_stress_config_accepts_supported_modes(tmp_path: Path, mode: str) -> Non
     assert cfg.mode == mode
     assert cfg.is_log_only is (mode == "log_only")
     assert cfg.is_full_cancel_poison is (mode == "full_cancel_poison")
+
+
+def test_stress_config_defaults_to_python(tmp_path: Path) -> None:
+    cfg = StressConfig.from_yaml_path(_write_mode_yaml(tmp_path, "mode: log_only"))
+    assert cfg.transceiver == "python"
+
+
+@pytest.mark.parametrize("runtime", ["cpp", "auto", "unknown"])
+def test_stress_config_rejects_non_python_transceiver(tmp_path: Path, runtime: str) -> None:
+    with pytest.raises(ValueError, match="transceiver must be 'python'"):
+        StressConfig.from_yaml_path(_write_mode_yaml(tmp_path, f"transceiver: {runtime}"))
 
 
 def test_stress_config_rejects_unknown_mode(tmp_path: Path) -> None:
@@ -146,7 +157,7 @@ def test_stress_config_rejects_unknown_mode(tmp_path: Path) -> None:
                 mode: accidental
                 duration_min: 1
                 kv_cache_manager: v1
-                transceiver: cpp
+                transceiver: python
                 """,
             )
         )
@@ -163,7 +174,7 @@ def test_log_only_thread_sends_probe_and_stops(
             mode: log_only
             duration_min: 1
             kv_cache_manager: v1
-            transceiver: cpp
+            transceiver: python
             log_only_probe:
               interval_s: 0.01
               max_tokens: 8

@@ -18,7 +18,6 @@ context_servers:
   cache_transceiver_config:
     backend: NIXL
     transceiver_runtime: PYTHON
-    max_tokens_in_buffer: 1024
 generation_servers:
   num_instances: 1
   max_batch_size: 1
@@ -33,4 +32,3 @@ generation_servers:
   cache_transceiver_config:
     backend: NIXL
     transceiver_runtime: PYTHON
-    max_tokens_in_buffer: 1024

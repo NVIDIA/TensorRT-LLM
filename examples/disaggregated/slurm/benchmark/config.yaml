@@ -109,7 +109,6 @@ worker_config:
       load_balancer:
         num_slots: 0
     cache_transceiver_config:
-      max_tokens_in_buffer: 4608
       backend: DEFAULT
     stream_interval: 20
     num_postprocess_workers: 4
@@ -134,7 +133,6 @@ worker_config:
       free_gpu_memory_fraction: 0.85
       dtype: fp8
     cache_transceiver_config:
-      max_tokens_in_buffer: 4608
       backend: DEFAULT
     speculative_config: # when mtp_size is 0, remove this section.
       decoding_type: MTP

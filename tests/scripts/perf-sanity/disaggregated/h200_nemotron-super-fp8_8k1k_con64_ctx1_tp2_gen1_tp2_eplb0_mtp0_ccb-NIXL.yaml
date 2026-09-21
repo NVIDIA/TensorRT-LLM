@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 metadata:
   model_name: super_fp8
   precision: fp8
@@ -63,8 +66,8 @@ worker_config:
     moe_config:
       backend: TRTLLM
     cache_transceiver_config:
-      backend: UCX
-      transceiver_runtime: CPP
+      backend: NIXL
+      transceiver_runtime: PYTHON
     disable_overlap_scheduler: false
   ctx:
     print_iter_log: true
@@ -86,6 +89,6 @@ worker_config:
     moe_config:
       backend: TRTLLM
     cache_transceiver_config:
-      backend: UCX
-      transceiver_runtime: CPP
+      backend: NIXL
+      transceiver_runtime: PYTHON
     disable_overlap_scheduler: false

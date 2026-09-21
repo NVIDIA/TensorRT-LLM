@@ -16,7 +16,6 @@ context_servers:
     free_gpu_memory_fraction: 0.05
     max_tokens: 512
   cache_transceiver_config:
-    max_tokens_in_buffer: 8448
     backend: NIXL
     transceiver_runtime: PYTHON
 generation_servers:
@@ -38,7 +37,6 @@ generation_servers:
     free_gpu_memory_fraction: 0.7
     max_tokens: 2560
   cache_transceiver_config:
-    max_tokens_in_buffer: 8448
     backend: NIXL
     transceiver_runtime: PYTHON
   stream_interval: 1

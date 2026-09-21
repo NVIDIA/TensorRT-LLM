@@ -68,7 +68,6 @@ worker_config:
       backend: CUTEDSL
       use_low_precision_moe_combine: true
     cache_transceiver_config:
-      max_tokens_in_buffer: 120000
       backend: NIXL
       transceiver_runtime: PYTHON
       kv_transfer_timeout_ms: 600000
@@ -98,7 +97,6 @@ worker_config:
     moe_config:
       backend: TRTLLM
     cache_transceiver_config:
-      max_tokens_in_buffer: 120000
       backend: NIXL
       transceiver_runtime: PYTHON
       kv_transfer_timeout_ms: 600000

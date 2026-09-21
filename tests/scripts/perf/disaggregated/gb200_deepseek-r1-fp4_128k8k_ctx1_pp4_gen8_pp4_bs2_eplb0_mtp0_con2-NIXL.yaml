@@ -69,7 +69,6 @@ worker_config:
     moe_config:
       backend: TRTLLM
     cache_transceiver_config:
-      max_tokens_in_buffer: 131104
       backend: NIXL
       transceiver_runtime: PYTHON
     disable_overlap_scheduler: false
@@ -92,7 +91,6 @@ worker_config:
       free_gpu_memory_fraction: 0.4
       dtype: fp8
     cache_transceiver_config:
-      max_tokens_in_buffer: 131104
       backend: NIXL
       transceiver_runtime: PYTHON
     moe_config:
