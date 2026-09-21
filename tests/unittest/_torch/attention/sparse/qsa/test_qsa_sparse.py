@@ -20,6 +20,7 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
     _qsa_index_scores_query_tile,
     triton_qsa_decode_pre_indexer,
     triton_qsa_decode_token_mapping,
+    triton_qsa_mtp_reuse_topk,
     triton_qsa_paged_index_scores,
     triton_qsa_paged_kv_store,
     triton_qsa_prefill_compress,
@@ -27,6 +28,7 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
 )
 from tensorrt_llm._torch.attention.backends.sparse.qsa.metadata import QSAAttentionMetadata
 from tensorrt_llm._torch.attention.backends.sparse.qsa.module import (
+    _capture_mtp_shared_topk,
     _store_paged_kv_reference,
     expand_qsa_block_indices,
     qsa_sparse_gqa,
@@ -185,6 +187,170 @@ def test_expand_qsa_blocks_column_split_matches_whole_row(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_mtp_reuse_topk_appends_groups_completed_since_capture() -> None:
+    """The reused row keeps the captured prefix and adds only newer groups."""
+    block_topk = 8
+    # request 0: 3 of 8 slots used at capture, so the 2 new groups fit after them.
+    # request 1: all 8 slots used, so the 2 new groups displace the row's tail.
+    shared = torch.tensor(
+        [[5, 2, 9, -1, -1, -1, -1, -1], [7, 1, 4, 6, 3, 0, 8, 2]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    shared_visible = torch.tensor([10, 20], device="cuda", dtype=torch.int32)
+    request_indices = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    visible_blocks = torch.tensor([12, 22], device="cuda", dtype=torch.int32)
+    out = torch.full((2, block_topk), -99, device="cuda", dtype=torch.int32)
+
+    triton_qsa_mtp_reuse_topk(
+        shared_indices=shared,
+        shared_visible_blocks=shared_visible,
+        request_indices=request_indices,
+        visible_blocks=visible_blocks,
+        output=out,
+    )
+
+    assert out[0].tolist() == [5, 2, 9, 10, 11, -1, -1, -1]
+    assert out[1].tolist() == [7, 1, 4, 6, 3, 0, 20, 21]
+    for row in out:
+        valid = [v for v in row.tolist() if v >= 0]
+        assert len(valid) == len(set(valid)), "a reused row must not repeat a group"
+        # Valid IDs stay a contiguous prefix, which the expansion kernel requires.
+        assert row.tolist()[: len(valid)] == valid
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_mtp_reuse_topk_is_verbatim_without_new_groups() -> None:
+    """A draft step that completes no group reuses the captured row unchanged."""
+    shared = torch.tensor([[5, 2, 9, -1]], device="cuda", dtype=torch.int32)
+    out = torch.full((3, 4), -99, device="cuda", dtype=torch.int32)
+    triton_qsa_mtp_reuse_topk(
+        shared_indices=shared,
+        shared_visible_blocks=torch.tensor([10], device="cuda", dtype=torch.int32),
+        request_indices=torch.zeros(3, device="cuda", dtype=torch.int32),
+        visible_blocks=torch.tensor([10, 10, 10], device="cuda", dtype=torch.int32),
+        output=out,
+    )
+    assert out.tolist() == [[5, 2, 9, -1]] * 3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_mtp_capture_uses_each_request_own_rows() -> None:
+    """Requests of unequal length each capture their own last accepted row."""
+    # Two single-row requests ahead of a four-row speculative one. The six rows
+    # divide evenly by three requests, so a single stride would read rows 0, 2
+    # and 5 and hand request 1 a row belonging to request 2.
+    seq_lens = torch.tensor([1, 1, 4], device="cuda", dtype=torch.int32)
+    indices = torch.arange(6, device="cuda", dtype=torch.int32).unsqueeze(1).repeat(1, 2)
+    visible_blocks = torch.arange(100, 106, device="cuda", dtype=torch.int32)
+    metadata = SimpleNamespace(
+        num_seqs=3,
+        seq_lens_cuda=seq_lens,
+        qsa_mtp_num_accepted=torch.tensor([1, 1, 3], device="cuda", dtype=torch.int32),
+        qsa_shared_topk_indices=torch.full((1, 3, 2), -99, device="cuda", dtype=torch.int32),
+        qsa_shared_topk_visible_blocks=torch.full((1, 3), -99, device="cuda", dtype=torch.int32),
+        qsa_shared_topk_captured_slots=set(),
+    )
+
+    _capture_mtp_shared_topk(metadata, 0, indices, visible_blocks)
+
+    # Request 2 starts at row 2 and accepted three tokens, so it keeps row 4.
+    assert metadata.qsa_shared_topk_indices[0, :, 0].tolist() == [0, 1, 4]
+    assert metadata.qsa_shared_topk_visible_blocks[0].tolist() == [100, 101, 104]
+    assert metadata.qsa_shared_topk_captured_slots == {0}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_mtp_capture_keeps_each_layer_in_its_own_slot() -> None:
+    """Two sparse layers that rank the same requests differently both survive."""
+    metadata = SimpleNamespace(
+        num_seqs=2,
+        seq_lens_cuda=torch.ones(2, device="cuda", dtype=torch.int32),
+        qsa_mtp_num_accepted=None,
+        qsa_shared_topk_indices=torch.full((2, 2, 2), -99, device="cuda", dtype=torch.int32),
+        qsa_shared_topk_visible_blocks=torch.full((2, 2), -99, device="cuda", dtype=torch.int32),
+        qsa_shared_topk_captured_slots=set(),
+    )
+
+    for slot, base in enumerate((10, 20)):
+        indices = torch.tensor(
+            [[base, base + 1], [base + 2, base + 3]], device="cuda", dtype=torch.int32
+        )
+        visible_blocks = torch.tensor([base, base], device="cuda", dtype=torch.int32)
+        _capture_mtp_shared_topk(metadata, slot, indices, visible_blocks)
+
+    assert metadata.qsa_shared_topk_indices.tolist() == [
+        [[10, 11], [12, 13]],
+        [[20, 21], [22, 23]],
+    ]
+    assert metadata.qsa_shared_topk_visible_blocks.tolist() == [[10, 10], [20, 20]]
+    assert metadata.qsa_shared_topk_captured_slots == {0, 1}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_mtp_reuse_waits_for_the_calling_layer_to_capture() -> None:
+    """A layer whose own slot is unset must score, not read the empty slot.
+
+    The draft loop's first step can be a context pass, which captures nothing.
+    The next step then captures layer by layer, so a layer can reach the reuse
+    branch while its own slot still holds nothing.
+    """
+    params = _params(index_head_dim=16)
+    tokens_per_block = 8
+    index_cache = torch.zeros(
+        2, tokens_per_block, 1, params.index_head_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    block_table = torch.tensor([[0, 1]], dtype=torch.int32, device="cuda")
+    for compressed_idx in range(4):
+        logical = compressed_idx * params.compress_ratio + params.compress_ratio - 1
+        page_column, within = divmod(logical, tokens_per_block)
+        index_cache[int(block_table[0, page_column]), within, 0] = compressed_idx + 1
+
+    q = torch.ones(
+        1, params.index_n_heads, params.index_head_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    query_positions = torch.tensor([5], device="cuda")
+    sequence_lengths = torch.tensor([16], device="cuda")
+    request_indices = torch.tensor([0], dtype=torch.int32, device="cuda")
+
+    # Slot 0 captured this step. Slot 1 holds a sentinel standing in for the
+    # contents of a slot no layer has written yet.
+    shared = torch.zeros((2, 1, params.block_topk), dtype=torch.int32, device="cuda")
+    shared[1].fill_(999)
+    metadata = SimpleNamespace(
+        qsa_block_table=block_table,
+        kv_cache_manager=SimpleNamespace(tokens_per_block=tokens_per_block),
+        qsa_indexer_skip_topk=True,
+        qsa_shared_topk_captured_slots={0},
+        qsa_shared_topk_indices=shared,
+        qsa_shared_topk_visible_blocks=torch.full((2, 1), 1, dtype=torch.int32, device="cuda"),
+        qsa_mtp_num_accepted=None,
+        num_seqs=1,
+        seq_lens_cuda=torch.tensor([1], dtype=torch.int32, device="cuda"),
+    )
+
+    selected = select_qsa_paged_tokens(
+        q,
+        index_cache,
+        query_positions,
+        sequence_lengths,
+        request_indices,
+        metadata,
+        params,
+        top_k_output=torch.empty((1, params.block_topk), dtype=torch.int32, device="cuda"),
+        mtp_share_slot=1,
+    )
+
+    chosen = [token for token in selected[0].tolist() if token >= 0]
+    assert chosen, "the visible block must still be selected"
+    assert max(chosen) <= int(query_positions[0]), "the selection must stay causal"
+    # Scoring ran for this layer, so its slot now carries a real selection
+    # rather than what a premature reuse would have read back.
+    assert metadata.qsa_shared_topk_captured_slots == {0, 1}
+    assert 999 not in metadata.qsa_shared_topk_indices[1].tolist()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_qsa_prefill_compress_matches_gemma_norm_with_identity_rope() -> None:
     torch.manual_seed(42)
     tokens_per_block = 8
@@ -331,6 +497,44 @@ def test_qsa_decode_token_mapping_matches_reference(rows: int) -> None:
     torch.testing.assert_close(logical_positions, (kv_lens - seq_lens).to(torch.int64))
     torch.testing.assert_close(sequence_lengths, kv_lens)
     torch.testing.assert_close(visible_blocks, ((kv_lens - seq_lens + 1) // 4))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_spec_dec_remaps_rows_after_the_draft_loop_packs_one_row_per_request() -> None:
+    """The first draft step repacks the batch, so the row mapping must follow it."""
+    num_seqs, rows_per_seq = 2, 2
+    num_tokens = num_seqs * rows_per_seq
+    metadata = object.__new__(QSAAttentionMetadata)
+    metadata._seq_lens = torch.full((num_seqs,), rows_per_seq, dtype=torch.int32)
+    metadata._seq_lens_cuda = metadata._seq_lens.cuda()
+    metadata._num_contexts = 0
+    metadata._num_tokens = num_tokens
+    metadata.kv_lens_cuda_runtime = torch.tensor([40, 56], dtype=torch.int32, device="cuda")
+    metadata.sparse_metadata_params = SimpleNamespace(compress_ratio=4)
+    metadata.qsa_has_local_layers = True
+    metadata.enable_flash_mla = False
+    metadata._mla_scheduler_buffers_valid = True
+    metadata._mla_ctx_cu_seqlens_valid = True
+    metadata.qsa_req_idx_per_token = torch.zeros(num_tokens, dtype=torch.int32, device="cuda")
+    metadata.qsa_logical_positions = torch.zeros(num_tokens, dtype=torch.int64, device="cuda")
+    metadata.qsa_sequence_lengths = torch.zeros(num_tokens, dtype=torch.int32, device="cuda")
+    metadata.qsa_visible_blocks = torch.zeros(num_tokens, dtype=torch.int32, device="cuda")
+    metadata._qsa_cu_seq_lens = torch.zeros(num_seqs + 1, dtype=torch.int64, device="cuda")
+    metadata._qsa_token_arange = torch.arange(num_tokens, dtype=torch.int64, device="cuda")
+
+    metadata._refresh_qsa_token_mapping()
+    assert metadata.qsa_req_idx_per_token.tolist() == [0, 0, 1, 1]
+
+    # What the draft loop does to the metadata between its first two steps.
+    metadata._seq_lens.fill_(1)
+    metadata._seq_lens_cuda.fill_(1)
+    metadata._num_tokens = num_seqs
+    metadata.update_for_spec_dec()
+
+    assert metadata.qsa_req_idx_per_token[:num_seqs].tolist() == [0, 1]
+    torch.testing.assert_close(
+        metadata.qsa_sequence_lengths[:num_seqs], metadata.kv_lens_cuda_runtime
+    )
 
 
 @pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])

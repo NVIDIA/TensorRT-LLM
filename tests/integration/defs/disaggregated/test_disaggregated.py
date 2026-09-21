@@ -418,8 +418,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml",
         "cancel_stress_test":
         f"{test_configs_root}/disagg_config_cancel_stress_test.yaml",
-        "llama31_8b":
-        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_llama31_8b.yaml",
+        "qwen3_8b":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_qwen3_8b.yaml",
         "mamba_conc_greater_than_mbs":
         f"{test_configs_root}/disagg_config_mamba_conc_greater_than_mbs.yaml",
         "mamba_bs1_concurrency2":
@@ -2350,9 +2350,6 @@ def benchmark_model_root(request):
         model_path = os.path.join(models_root, "DeepSeek-V3-Lite", "fp8")
     elif (request.param == "DeepSeek-V3-Lite-bf16"):
         model_path = os.path.join(models_root, "DeepSeek-V3-Lite", "bf16")
-    elif request.param == "llama-3.1-8b-instruct-hf-fp8":
-        model_path = os.path.join(models_root, "llama-3.1-model",
-                                  "Llama-3.1-8B-Instruct-FP8")
     else:
         raise ValueError(f"Failed to find the model: {request.param}")
     return model_path
@@ -4074,11 +4071,8 @@ def test_disaggregated_cancel_large_context_requests(disaggregated_test_root,
 
 
 @pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("llama_model_root", ['llama-3.1-8b-instruct'],
-                         indirect=True)
 def test_disaggregated_logprobs_serving(disaggregated_test_root,
-                                        disaggregated_example_root, llm_venv,
-                                        llama_model_root):
+                                        disaggregated_example_root, llm_venv):
     """Test logprobs via OpenAI API in disaggregated serving with multi-GPU TP.
 
     Covers the RCCA scenario (NVBug 5926823): disaggregated + streaming + logprobs,
@@ -4140,10 +4134,11 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
         logprobs = [item.get("logprob") for item in content]
         return tokens, logprobs
 
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "llama-3.1-model/Llama-3.1-8B-Instruct")
+    model_path = "Qwen3/Qwen3-8B"
+    model_dir = f"{llm_models_root()}/{model_path}"
+    setup_model_symlink(llm_venv, model_dir, model_path)
 
-    config_file = get_test_config("llama31_8b", disaggregated_example_root,
+    config_file = get_test_config("qwen3_8b", disaggregated_example_root,
                                   os.path.dirname(__file__))
 
     env = llm_venv._new_env.copy()
@@ -4151,13 +4146,13 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
     ctx_workers, gen_workers, disagg_server, work_dir = [], [], None, None
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, env=env,
-                             model_name=llama_model_root,
+                             model_name=model_dir,
                              cwd=llm_venv.get_working_directory(),
                              server_start_timeout=600)
 
     server_host = config.get("hostname", "localhost")
     server_url = f"http://{server_host}:{server_port}"
-    model_name = "llama-3.1-model/Llama-3.1-8B-Instruct"
+    model_name = model_path
     max_tokens = 20
     timeout = aiohttp.ClientTimeout(total=120)
     # Use emoji prompt to also stress-test multi-byte tokenizer handling
