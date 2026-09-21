@@ -970,7 +970,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             super().__init__(llm_request)
         else:
             super().__init__(*args,
-                             client_id=client_id,
                              return_log_probs=return_log_probs,
                              return_context_logits=False,
                              return_generation_logits=False,

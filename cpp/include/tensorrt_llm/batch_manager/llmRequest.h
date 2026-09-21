@@ -130,7 +130,6 @@ public:
         std::optional<std::shared_ptr<VecTokens>> const& draftTokens = std::nullopt,
         bool excludeInputFromOutput = false,
         std::optional<std::shared_ptr<VecTokens>> encoderInputTokens = std::nullopt, bool returnEncoderOutput = false,
-        std::optional<RequestIdType> clientId = std::nullopt,
         executor::PriorityType priority = executor::Request::kDefaultPriority,
         std::optional<TensorPtr> encoderInputFeatures = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
@@ -148,7 +147,6 @@ public:
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
         , mSamplingConfig(samplingConfig)
-        , mClientId(clientId)
         , mIsStreaming(isStreaming)
         , mOrigPromptLen(mPromptLen)
         , mNumPreDecodedTokens(samplingConfig.getBeamWidth(), 0)
@@ -207,7 +205,6 @@ public:
         bool returnContextLogits = false, bool returnGenerationLogits = false,
         std::optional<VecTokens> draftTokens = std::nullopt, bool excludeInputFromOutput = false,
         std::optional<VecTokens> encoderInputTokens = std::nullopt, bool returnEncoderOutput = false,
-        std::optional<RequestIdType> clientId = std::nullopt,
         executor::PriorityType priority = executor::Request::kDefaultPriority,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
         std::optional<std::string> cacheSalt = std::nullopt)
@@ -215,7 +212,6 @@ public:
         , mPromptLen(inputTokens.size())
         , mMaxNewTokens(maxNewTokens)
         , mSamplingConfig(samplingConfig)
-        , mClientId(clientId)
         , mIsStreaming(isStreaming)
         , mOrigPromptLen(mPromptLen)
         , mNumPreDecodedTokens(samplingConfig.getBeamWidth(), 0)
@@ -254,7 +250,6 @@ public:
         , mPromptLen(req.getInputTokenIds().size())
         , mMaxNewTokens(req.getMaxTokens())
         , mSamplingConfig(req.getSamplingConfig())
-        , mClientId(req.getClientId())
         , mIsStreaming(req.getStreaming())
         , mOrigPromptLen(mPromptLen)
         , mNumPreDecodedTokens(mSamplingConfig.getBeamWidth(), 0)
@@ -1858,7 +1853,6 @@ public:
     SizeType32 mMaxNewTokens;
     executor::SamplingConfig mSamplingConfig;
     std::optional<SizeType32> mSeqSlot{std::nullopt};
-    std::optional<RequestIdType> mClientId{std::nullopt};
 
     LlmRequestState mState{LlmRequestState::kCONTEXT_INIT};
 
@@ -2151,7 +2145,6 @@ public:
         bool returnLogProbs = false, bool returnContextLogits = false, bool returnGenerationLogits = false,
         std::optional<VecTokens> draftTokens = std::nullopt, bool excludeInputFromOutput = false,
         std::optional<VecTokens> encoderInputTokens = std::nullopt, bool returnEncoderOutput = false,
-        std::optional<RequestIdType> clientId = std::nullopt,
         executor::PriorityType priority = executor::Request::kDefaultPriority,
         std::optional<TensorPtr> encoderInputFeatures = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
@@ -2186,8 +2179,7 @@ public:
             excludeInputFromOutput,
             encoderInputTokens ? std::make_optional(std::make_shared<VecTokens>(std::move(*encoderInputTokens)))
                                : std::optional<std::shared_ptr<VecTokens>>(std::nullopt),
-            returnEncoderOutput, clientId, priority, std::move(encoderInputFeatures), encoderOutputLength,
-            llmRequestType,
+            returnEncoderOutput, priority, std::move(encoderInputFeatures), encoderOutputLength, llmRequestType,
             inputTokenExtraIds ? std::make_optional(std::make_shared<VecTokenExtraIds>(std::move(*inputTokenExtraIds)))
                                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
             returnPerfMetrics, allottedTimeMs, contextPhaseParams, arrivalTime, std::move(agent_hierarchy),
