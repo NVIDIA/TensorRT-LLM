@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import _sum_topk_expert_outputs
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import sum_topk_expert_outputs
 
 
 def _aten_reference(
@@ -48,7 +48,7 @@ def test_triton_sum_topk_matches_aten_scatter_reduce(
     )
 
     expected = _aten_reference(expert_outputs, num_tokens, top_k, hidden_size, torch.bfloat16)
-    actual = _sum_topk_expert_outputs(
+    actual = sum_topk_expert_outputs(
         expert_outputs, num_tokens, top_k, hidden_size, torch.bfloat16
     )
 
@@ -78,6 +78,6 @@ def test_noncontiguous_fallback_matches_triton() -> None:
     assert not non_contig.is_contiguous(), "test setup error: tensor should be non-contiguous"
 
     aten_out = _aten_reference(non_contig, num_tokens, top_k, hidden_size, torch.bfloat16)
-    triton_out = _sum_topk_expert_outputs(base, num_tokens, top_k, hidden_size, torch.bfloat16)
+    triton_out = sum_topk_expert_outputs(base, num_tokens, top_k, hidden_size, torch.bfloat16)
 
     torch.testing.assert_close(triton_out, aten_out, rtol=2e-2, atol=0.125)

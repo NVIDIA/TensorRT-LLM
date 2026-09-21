@@ -82,7 +82,7 @@ def _sum_topk_kernel(
     tl.store(output + token_idx * hidden_size + hidden_offsets, accumulator, mask=mask)
 
 
-def _sum_topk_expert_outputs(
+def sum_topk_expert_outputs(
     expert_outputs: torch.Tensor,
     num_tokens: int,
     top_k: int,
@@ -428,7 +428,7 @@ class MarlinFusedMoEBase(MoEImplBase):
         # than BF16 index_add_ which rounds after each expert).
         gemm2_out = gemm2_out[:num_tokens_gemm2, : self.unpadded_hidden_size]
         if gemm2_out.is_contiguous():
-            return _sum_topk_expert_outputs(
+            return sum_topk_expert_outputs(
                 gemm2_out,
                 num_tokens,
                 top_k,

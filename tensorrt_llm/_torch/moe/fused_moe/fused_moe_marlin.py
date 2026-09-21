@@ -23,9 +23,9 @@ an equality check: the leaves are what resolution hands over, so
 """
 
 from .marlin import MarlinFusedMoEBase, find_marlin_leaf, marlin_leaf
-from .marlin.base import _sum_topk_expert_outputs
+from .marlin.base import sum_topk_expert_outputs
 
 # An alias, not a base class, so there is no second class to keep in step.
 MarlinFusedMoE = MarlinFusedMoEBase
 
-__all__ = ["MarlinFusedMoE", "marlin_leaf", "find_marlin_leaf", "_sum_topk_expert_outputs"]
+__all__ = ["MarlinFusedMoE", "marlin_leaf", "find_marlin_leaf", "sum_topk_expert_outputs"]
