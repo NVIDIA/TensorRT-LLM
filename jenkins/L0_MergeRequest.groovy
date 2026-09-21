@@ -2527,14 +2527,16 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'boltOverlayEnabled': true,
                             'boltProfilesRequired': true,
                             // The overlay above only bakes in the profile bundle; it
-                            // leaves the installed wheel unoptimized. This makes the
-                            // SBSA release image install the BOLT-optimized wheel,
-                            // by waiting for BoltProfileGen to publish
-                            // bolted-<tarball> rather than grabbing whichever
-                            // tarball exists first. Inert on x86_64 (no promoted
-                            // bundle) and whenever the wheel is built from source
-                            // rather than downloaded.
-                            'boltRequireBoltedWheel': true,
+                            // leaves the installed wheel unoptimized. This BOLTs the
+                            // wheel the SBSA release image installs, applying the
+                            // branch's last promoted bundle during the image build.
+                            // Deliberately not this run's profiles: those are not
+                            // published until BoltProfileGen finishes, hours after
+                            // this build starts, so depending on them would serialize
+                            // every release behind a multi-hour GPU job. Inert on
+                            // x86_64 (no promoted bundle) and whenever the wheel is
+                            // built from source rather than downloaded.
+                            'boltOptimizeWheel': true,
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [
@@ -2599,7 +2601,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             // appear.
                             'boltOverlayEnabled': true,
                             'boltProfilesRequired': true,
-                            'boltRequireBoltedWheel': true,
+                            'boltOptimizeWheel': true,
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [
