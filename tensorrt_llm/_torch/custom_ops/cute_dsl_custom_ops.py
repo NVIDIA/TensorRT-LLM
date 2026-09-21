@@ -112,6 +112,7 @@ def _kimi_k3_mxfp8_tuning_bucket(num_tokens: int) -> int:
         return next(m for m in _KIMI_K3_MXFP8_TUNING_BUCKETS if num_tokens <= m)
     return next_positive_power_of_2(num_tokens)
 
+
 _CUTEDSL_NVMMH_TACTIC_SEARCH_CACHE_VERSION = "cutedsl-nvmmh-v1"
 
 
