@@ -773,3 +773,92 @@ class TestWarmupCleanup(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.fixture
+def warmup_timing(monkeypatch):
+    """Exercise the real timing helpers without constructing a GPU engine."""
+    from tensorrt_llm._torch.pyexecutor import model_engine
+
+    engine = SimpleNamespace(
+        mapping=SimpleNamespace(rank=3),
+        _warmup_purpose="memory_profiling",
+        _warmup_pass=1,
+        _warmup_timings={},
+        _WARMUP_SLOW_PHASE_SEC=PyTorchModelEngine._WARMUP_SLOW_PHASE_SEC,
+    )
+    clock = Mock()
+    log = Mock()
+    monkeypatch.setattr(model_engine.time, "perf_counter", clock)
+    monkeypatch.setattr(model_engine, "logger", log)
+    monkeypatch.setattr(model_engine.os, "getpid", lambda: 42)
+    return engine, clock, log
+
+
+@pytest.mark.cpu_only
+def test_warmup_phase_repeated_names(warmup_timing):
+    """Repeated names accumulate and the summary reports identity and percentages."""
+    engine, clock, log = warmup_timing
+    clock.side_effect = [0, 2, 3, 6]
+    for _ in range(2):
+        with PyTorchModelEngine._warmup_phase(engine, "attention"):
+            pass
+    assert engine._warmup_timings == {"attention": 5}
+    PyTorchModelEngine._log_warmup_summary(engine, 10)
+    log.info.assert_any_call(
+        "[warmup][pid=42][rank=3][purpose=memory_profiling][pass=1] "
+        "summary: total=10.0s | attention=5.0s (50%)"
+    )
+    log.warning.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("error_type", [ValueError, KeyboardInterrupt])
+def test_warmup_phase_failure_records_elapsed(warmup_timing, error_type):
+    """Preserve elapsed time and the original exception on interrupted warmup."""
+    engine, clock, log = warmup_timing
+    clock.side_effect = [2, 7]
+    error = error_type("warmup failed")
+    with pytest.raises(error_type) as caught:
+        with PyTorchModelEngine._warmup_phase(engine, "attention"):
+            raise error
+    assert caught.value is error
+    assert engine._warmup_timings == {"attention": 5}
+    log.warning.assert_called_once_with(
+        "[warmup][pid=42][rank=3][purpose=memory_profiling][pass=1] attention: failed after 5.0s"
+    )
+    assert not any(": done" in c.args[0] for c in log.info.call_args_list)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "timings, expected",
+    [
+        ({}, "summary: total=0.0s (no phases ran)"),
+        ({"attention": 0.0}, "summary: total=0.0s | attention=0.0s (0%)"),
+    ],
+)
+def test_warmup_summary_empty_or_zero(warmup_timing, timings, expected):
+    """Empty or zero-duration summaries remain finite and do not warn."""
+    engine, _, log = warmup_timing
+    engine._warmup_timings = timings
+    PyTorchModelEngine._log_warmup_summary(engine, 0)
+    assert log.info.call_args.args[0].endswith(expected)
+    log.warning.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("over_threshold", [False, True])
+def test_warmup_slow_phase_warning(warmup_timing, over_threshold):
+    """Warn only when a phase strictly exceeds the slow-phase threshold."""
+    engine, _, log = warmup_timing
+    elapsed = engine._WARMUP_SLOW_PHASE_SEC + int(over_threshold)
+    engine._warmup_timings = {"attention": elapsed}
+    PyTorchModelEngine._log_warmup_summary(engine, elapsed)
+    if over_threshold:
+        log.warning.assert_called_once_with(
+            "[warmup][pid=42][rank=3][purpose=memory_profiling][pass=1] "
+            f"slow phases (>{engine._WARMUP_SLOW_PHASE_SEC:.0f}s): attention={elapsed:.1f}s"
+        )
+    else:
+        log.warning.assert_not_called()

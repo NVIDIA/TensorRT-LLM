@@ -223,6 +223,7 @@ def _run_create_py_executor(
     enable_chunked_prefill=False,
     is_hybrid_linear_model=False,
     ctx_chunk_configs=None,
+    kv_cache_creator_cls=_DummyKvCacheCreator,
 ):
     """Execute create_py_executor with mocked dependencies and return MLA runtime flags.
 
@@ -242,6 +243,7 @@ def _run_create_py_executor(
         enable_chunked_prefill: Whether to request MLA chunked prefill support.
         is_hybrid_linear_model: Whether to emulate a hybrid linear model.
         ctx_chunk_configs: Optional list that receives the executor chunk config.
+        kv_cache_creator_cls: Mock cache creator, including optional capacity estimation.
 
     Returns:
         Tuple of (kv_cache_reuse_flag, runtime_cache_reuse_flag,
@@ -289,7 +291,7 @@ def _run_create_py_executor(
         lambda _: is_hybrid_linear_model,
     )
     monkeypatch.setattr(py_executor_creator, "get_sm_version", lambda: sm_version)
-    monkeypatch.setattr(py_executor_creator, "KvCacheCreator", _DummyKvCacheCreator)
+    monkeypatch.setattr(py_executor_creator, "KvCacheCreator", kv_cache_creator_cls)
 
     monkeypatch.setattr(py_executor_creator.torch.cuda, "mem_get_info", lambda: (2 << 30, 4 << 30))
     monkeypatch.setattr(py_executor_creator.torch.cuda, "empty_cache", lambda: None)
@@ -496,3 +498,79 @@ def test_mla_sm121_fallback_preserves_cache_reuse_and_disables_chunked_prefill(
     assert kv_cache_reuse is True
     assert runtime_cache_reuse is True
     assert runtime_chunked_prefill is False
+
+
+@pytest.mark.parametrize("estimate", [False, True])
+def test_startup_allocation_phases(monkeypatch, estimate):
+    """Verify real creator timing across direct and profiling-based allocation."""
+    from tensorrt_llm._startup import _StartupTimer
+
+    timers = []
+    events = []
+
+    class RecordingTimer(_StartupTimer):
+        """Retain the real timer for assertions after executor creation."""
+
+        def __init__(self, name):
+            super().__init__(name)
+            timers.append(self)
+
+    class EstimatingCacheCreator(_DummyKvCacheCreator):
+        """Drive capacity estimation without CUDA allocations."""
+
+        def try_prepare_estimation(self):
+            return estimate
+
+        def build_managers(self, resources, estimating_kv_cache):
+            events.append(("allocate", estimating_kv_cache))
+            super().build_managers(resources, estimating_kv_cache)
+
+        def configure_kv_cache_capacity(self, executor):
+            events.append(("profile", executor.model_engine._warmup_purpose))
+
+        def teardown_managers(self, resources):
+            events.append(("teardown", None))
+            resources.pop(ResourceManagerType.KV_CACHE_MANAGER)
+
+    monkeypatch.setattr(py_executor_creator, "_StartupTimer", RecordingTimer)
+    _run_create_py_executor(
+        monkeypatch,
+        sm_version=100,
+        kv_cache_quant_algo=QuantAlgo.NO_QUANT,
+        kv_cache_creator_cls=EstimatingCacheCreator,
+    )
+    assert len(timers) == 1
+    phases = list(timers[0].timings)
+    allocation_phases = [
+        name
+        for name in phases
+        if name
+        in {
+            "profiling_kv_cache_allocation",
+            "profiling_executor_creation",
+            "memory_profiling_and_capacity",
+            "profiling_resource_teardown",
+            "final_kv_cache_allocation",
+            "final_executor_creation",
+        }
+    ]
+    if estimate:
+        assert events == [
+            ("allocate", True),
+            ("profile", "memory_profiling"),
+            ("teardown", None),
+            ("allocate", False),
+        ]
+        assert allocation_phases == [
+            "profiling_kv_cache_allocation",
+            "profiling_executor_creation",
+            "memory_profiling_and_capacity",
+            "profiling_resource_teardown",
+            "final_kv_cache_allocation",
+            "final_executor_creation",
+        ]
+    else:
+        assert events == [("allocate", False)]
+        assert allocation_phases == ["final_kv_cache_allocation", "final_executor_creation"]
+    assert phases[-1] == "executor_start_worker"
+    assert timers[0].depth == 0

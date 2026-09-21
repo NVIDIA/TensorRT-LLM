@@ -19,17 +19,20 @@ class _StartupTimer:
     """
 
     def __init__(self, name: str):
+        """Initialize an empty timer for the named startup interval."""
         self.name = name
         self.timings: dict[str, float] = {}
         self.depth = 0
         self.started = 0.0
 
     def __enter__(self):
+        """Start the interval and emit its start marker."""
         self.started = time.perf_counter()
         logger.info(f"[startup][pid={os.getpid()}] {self.name}: start")
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+        """Log the complete or failed interval without suppressing exceptions."""
         total = time.perf_counter() - self.started
         measured = sum(self.timings.values())
         parts = ", ".join(f"{name}={seconds:.3f}s" for name, seconds in self.timings.items())
@@ -47,6 +50,11 @@ class _StartupTimer:
 
     @contextmanager
     def phase(self, name: str) -> Iterator[None]:
+        """Record outermost elapsed time, including failures, and log status.
+
+        Failed work still contributes to startup time; its exception propagates
+        and its completion marker is explicitly labelled ``failed``.
+        """
         logger.info(f"[startup][pid={os.getpid()}] {self.name}/{name}: start")
         start = time.perf_counter()
         outermost = self.depth == 0
