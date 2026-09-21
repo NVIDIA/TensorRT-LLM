@@ -99,7 +99,6 @@ def update_spec_metadata(
     *,
     runtime_draft_len: int,
     runtime_tokens_per_gen_step: int,
-    is_draft_model: bool,
     attention_backend: type[AttentionBackend],
     original_max_draft_len: int,
     original_max_total_draft_tokens: int,
@@ -109,10 +108,7 @@ def update_spec_metadata(
     spec_metadata.runtime_draft_len = runtime_draft_len
     spec_metadata.runtime_tokens_per_gen_step = runtime_tokens_per_gen_step
 
-    is_spec_dec_mode = spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(
-        is_draft_model,
-        attention_backend,
-    )
+    is_spec_dec_mode = spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(attention_backend)
     # Parallel-draft modes advertise their full generation width rather than a
     # conventional draft length, so attention needs the total-token capacity.
     if spec_metadata.spec_dec_mode.is_parallel_draft():
@@ -122,7 +118,7 @@ def update_spec_metadata(
         max_draft_len = original_max_draft_len
         max_total_draft_tokens = spec_dec_max_total_draft_tokens
 
-    if spec_tree_manager is not None and not is_draft_model:
+    if spec_tree_manager is not None:
         spec_tree_manager.slot_storage.fill_all_slot_ids(
             scheduled_requests.context_requests,
             scheduled_requests.generation_requests,

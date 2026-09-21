@@ -59,7 +59,6 @@ def _encoder_config(
         attention_backend=TrtllmAttention,
         attention_runtime_features=AttentionRuntimeFeatures(),
         enable_autotuner=False,
-        draft_model=False,
     )
     if encoder_decoder:
         kwargs["is_encoder_decoder"] = True

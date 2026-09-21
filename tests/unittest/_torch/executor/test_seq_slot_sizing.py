@@ -736,7 +736,6 @@ def test_kv_cache_manager_receives_the_overlap_scheduler_flag(disable_overlap_sc
     creator = _make_kv_cache_creator(disable_overlap_scheduler)
     model_engine = SimpleNamespace(
         model=SimpleNamespace(model_config=SimpleNamespace(is_generation=True)),
-        is_draft_model=False,
     )
 
     with patch(

@@ -196,18 +196,16 @@ class RouteCapture:
         enabled: bool,
         pp_size: int,
         is_spec_decode: bool,
-        is_draft_model: bool,
     ) -> Optional["RouteCapture"]:
         """Build the engine's capturer, or ``None`` when Router Replay is off.
 
-        Draft engines never capture: their MoE layers are not target routing.
         Fails closed on paths this capture cannot attribute correctly: pipeline
         parallelism (routes live on the last PP stage only) and speculative
         decoding / MTP (accepted-token remap not handled). All flags are passed
         explicitly so this does not depend on engine attribute initialization
         order.
         """
-        if not enabled or is_draft_model:
+        if not enabled:
             return None
         if pp_size > 1 or is_spec_decode:
             raise RuntimeError(
