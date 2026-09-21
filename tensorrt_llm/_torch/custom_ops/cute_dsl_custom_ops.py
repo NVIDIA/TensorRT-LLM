@@ -11772,6 +11772,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kv_bounds: Optional[torch.Tensor],
     ) -> None:
         """CuTe DSL FP8 MLA decode (Blackwell SM100/SM103).
+
+        kv_bounds: helix speculative verify groups -- per-token rank-local
+        attention bounds of shape (B * seq_len_q,), int32.
         """
         if (sm_version := get_sm_version()) not in (100, 103):
             raise ValueError(
@@ -11790,7 +11793,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         )
         inputs = [
             q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o,
-            workspace, softmax_stats
+            workspace, softmax_stats, kv_bounds
         ]
         tuner = AutoTuner.get()
         _, best_tactic = tuner.choose_one(
