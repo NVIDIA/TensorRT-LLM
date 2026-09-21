@@ -258,34 +258,12 @@ def resolve_ssm_cache_dtype(config):
     return None
 
 
-KIMI_KDA_STATE_DTYPES = (torch.float32, torch.bfloat16)
-
-
 def resolve_auto_ssm_cache_dtype(config, fallback):
-    """Resolve mamba_ssm_cache_dtype="auto" for ``config``.
-
-    Kimi K3 defaults to fp32: the HF reference (fla chunk/fused_recurrent
-    KDA kernels) carries the delta-rule recurrent state in fp32. A bf16
-    state pool is an explicit opt-in through
-    kv_cache_config.mamba_ssm_cache_dtype; prefill, decode and sequential
-    verify then stage the addressed rows through an fp32 copy and round the
-    committed state back to bf16. The fused MTP verify kernel
-    (``trtllm::kda_mtp_decode``) has no such staging and rejects a non-fp32
-    pool outright, so bf16 and fused KDA MTP verify are mutually exclusive.
-    A checkpoint-declared
-    mamba_ssm_cache_dtype is not applied to Kimi K3 (the released
-    checkpoints do not carry the field); it is logged when it would have
-    changed the dtype.
-    """
+    """Resolve the model's automatic recurrent-state dtype."""
     if is_kimi_linear(config):
-        declared = resolve_ssm_cache_dtype(config)
-        if declared is not None and declared != torch.float32:
-            logger.info(
-                "Kimi K3: the checkpoint declares "
-                f"mamba_ssm_cache_dtype={declared}; keeping the fp32 "
-                "recurrent-state pool (kv_cache_config.mamba_ssm_cache_dtype "
-                "opts in to bfloat16).")
-        return torch.float32
+        from ..modules.kimi_kda.cache_manager import \
+            resolve_kimi_ssm_cache_dtype
+        return resolve_kimi_ssm_cache_dtype(config)
     return (resolve_ssm_cache_dtype(config) or resolve_hf_torch_dtype(config)
             or fallback)
 
@@ -293,23 +271,12 @@ def resolve_auto_ssm_cache_dtype(config, fallback):
 def validate_kimi_kda_state_dtype(config,
                                   mamba_ssm_cache_dtype,
                                   mamba_ssm_stochastic_rounding=False):
-    """Reject state-cache settings the Kimi K3 KDA kernels cannot honor.
-
-    The kernels read fp32 or bf16 state and round the committed state to
-    nearest; stochastic rounding is a Mamba2 fp16-cache feature that would
-    otherwise be accepted and silently ignored here.
-    """
-    if not is_kimi_linear(config):
-        return
-    if mamba_ssm_cache_dtype not in KIMI_KDA_STATE_DTYPES:
-        raise ValueError(
-            "Kimi K3 KDA recurrent-state cache supports float32 (default) or "
-            f"bfloat16; got mamba_ssm_cache_dtype={mamba_ssm_cache_dtype}.")
-    if mamba_ssm_stochastic_rounding and mamba_ssm_cache_dtype != torch.float32:
-        raise ValueError(
-            "Kimi K3 KDA kernels round the committed recurrent state to "
-            "nearest; mamba_ssm_stochastic_rounding is not supported with a "
-            f"{mamba_ssm_cache_dtype} state cache.")
+    """Delegate KDA state-cache validation to the model owner."""
+    if is_kimi_linear(config):
+        from ..modules.kimi_kda.cache_manager import \
+            validate_kimi_state_cache_dtype
+        validate_kimi_state_cache_dtype(mamba_ssm_cache_dtype,
+                                        mamba_ssm_stochastic_rounding)
 
 
 def resolve_vocab_size(config) -> Optional[int]:
@@ -456,61 +423,6 @@ def get_qwen3_hybrid_num_attention_layers(config):
     return sum(layer_mask)
 
 
-def get_qwen4_exp_ple_layer_mask(
-        config: transformers.PretrainedConfig) -> list[bool]:
-    """Return the decoder-layer mask for the one-based PLE layer IDs."""
-    ple_layer_ids = list(getattr(config, "ple_layer_ids", None) or [])
-    invalid_ids = [
-        layer_id for layer_id in ple_layer_ids
-        if not isinstance(layer_id, int) or isinstance(layer_id, bool)
-        or not 1 <= layer_id <= config.num_hidden_layers
-    ]
-    if invalid_ids:
-        raise ValueError(
-            "ple_layer_ids must contain one-based decoder-layer IDs in "
-            f"[1, {config.num_hidden_layers}], got {invalid_ids}")
-    if len(ple_layer_ids) != len(set(ple_layer_ids)):
-        raise ValueError("ple_layer_ids must not contain duplicate layer IDs")
-    if len(ple_layer_ids) > 1:
-        # Qwen4ExpModel._prepare_ple_state currently resolves one shared state
-        # tuple. Supporting multiple PLE layers requires separate per-layer
-        # metadata and pools; removing only this guard would silently reuse state.
-        raise ValueError(
-            "Qwen4-Exp currently supports at most one PLE decoder layer, "
-            f"got ple_layer_ids={ple_layer_ids}")
-    ple_layer_id_set = set(ple_layer_ids)
-    return [(layer_id + 1) in ple_layer_id_set
-            for layer_id in range(config.num_hidden_layers)]
-
-
-@dataclasses.dataclass
-class Qwen4ExpPLECacheParams:
-    """Shapes and dtypes for PLE recurrent-state pools."""
-
-    ple_layer_mask: list[bool]
-    num_ple_layers: int
-    short_conv_channels: int
-    short_conv_state_len: int
-    ngram_context_len: int
-    conv_state_dtype: torch.dtype
-
-
-def extract_qwen4_exp_ple_cache_params(
-        config: transformers.PretrainedConfig) -> Qwen4ExpPLECacheParams:
-    """Derive PLE recurrent-state pool dimensions from the model config."""
-    ple_layer_mask = get_qwen4_exp_ple_layer_mask(config)
-    hc_count = getattr(config, "hc_count", 1) or 1
-    return Qwen4ExpPLECacheParams(
-        ple_layer_mask=ple_layer_mask,
-        num_ple_layers=sum(ple_layer_mask),
-        short_conv_channels=hc_count * config.hidden_size,
-        short_conv_state_len=(config.ple_conv_kernel_size - 1) *
-        config.ngram_size,
-        ngram_context_len=config.ngram_size - 1,
-        conv_state_dtype=resolve_hf_torch_dtype(config) or torch.bfloat16,
-    )
-
-
 @dataclasses.dataclass
 class MambaKVCacheParams:
     """Normalized mamba-related inputs for kv_cache_manager_cls.
@@ -585,62 +497,36 @@ class MambaKVCacheParams:
         return state_bytes_per_layer
 
 
-def extract_mamba_kv_cache_params(
-    config,
-    spec_config=None,
-    quant_config=None,
-) -> MambaKVCacheParams:
-    """Build the mamba-related inputs for kv_cache_manager_cls.
-
-    Supports Nemotron-hybrid, Qwen3-hybrid (Qwen3-Next + Qwen3.5),
-    Qwen4-Exp, and Kimi K3 (kimi_linear).
-
-    Args:
-        config: HuggingFace model config of a hybrid Mamba model.
-        spec_config: Optional speculative-decoding config used to describe
-            appended attention-only MTP/draft layers separately from target
-            layers.
-        quant_config: Optional, used only to surface `mamba_ssm_cache_dtype`.
-
-    Returns:
-        MambaKVCacheParams with normalized field names.
-    """
+def extract_mamba_kv_cache_params(config,
+                                  spec_config=None,
+                                  quant_config=None) -> MambaKVCacheParams:
+    """Dispatch geometry extraction to the model's cache implementation."""
     if is_nemotron_hybrid(config):
-        state_size = config.ssm_state_size
-        conv_kernel = config.conv_kernel
-        num_heads = config.mamba_num_heads
-        n_groups = config.n_groups
-        head_dim = config.mamba_head_dim
-        pattern = config.hybrid_override_pattern
-        target_full_attn_mask = [layer_type == "*" for layer_type in pattern]
-        mamba_mask = [layer_type == "M" for layer_type in pattern]
+        from ..modules.mamba.cache_manager import \
+            get_nemotron_cache_params as extract
     elif is_qwen3_hybrid(config) or is_qwen4_exp(config):
-        state_size = config.linear_key_head_dim
-        conv_kernel = config.linear_conv_kernel_dim
-        num_heads = config.linear_num_value_heads
-        n_groups = config.linear_num_key_heads
-        head_dim = config.linear_value_head_dim
-        target_full_attn_mask, mamba_mask = get_qwen3_hybrid_layer_masks(config)
+        from ..modules.fla.cache_manager import get_gdn_cache_params as extract
     elif is_kimi_linear(config):
-        # Kimi K3 KDA (Kimi Delta Attention) state, mapped onto the Mamba
-        # cache-manager parametrization (see PythonMambaCacheManager):
-        #   conv_dim = head_dim*num_heads + 2*n_groups*state_size
-        #            = 3 * num_heads * head_dim  -> [q | k | v] short-conv
-        #   ssm state shape = [num_heads, head_dim, state_size]
-        #            = [H, V, K] fp32 delta-rule recurrent state.
-        # The pool stores the W - 1 raw inputs needed by the production
-        # causal-convolution kernels, where W is short_conv_kernel_size.
-        lin = unwrap_kimi_text_config(config).linear_attn_config
-        state_size = lin["head_dim"]
-        conv_kernel = lin["short_conv_kernel_size"]
-        num_heads = lin["num_heads"]
-        n_groups = lin["num_heads"]
-        head_dim = lin["head_dim"]
-        target_full_attn_mask, mamba_mask = get_kimi_linear_layer_masks(config)
+        from ..modules.kimi_kda.cache_manager import \
+            get_kimi_cache_params as extract
     else:
         raise ValueError(
             f"{type(config).__name__} is not a supported hybrid Mamba config")
+    return extract(config, spec_config=spec_config, quant_config=quant_config)
 
+
+def build_mamba_kv_cache_params(config,
+                                *,
+                                state_size,
+                                conv_kernel,
+                                num_heads,
+                                n_groups,
+                                head_dim,
+                                mamba_mask,
+                                target_full_attn_mask,
+                                spec_config=None,
+                                quant_config=None) -> MambaKVCacheParams:
+    """Normalize dtype and draft layout after model-owned geometry extraction."""
     num_draft_layers = 0
     if spec_config is not None:
         # Imported lazily to avoid a circular dependency between

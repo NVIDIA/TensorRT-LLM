@@ -9,7 +9,6 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
-from .cache_manager import QSAMambaHybridCacheManagerV2
 from .constants import QSA_KEY_ROLE_INDEX
 from .kernels import triton_qsa_unscale_block_table
 from .params import QSASparseMetadataParams
@@ -45,6 +44,8 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
         super().__init__(*args, **kwargs)
 
     def __post_init__(self) -> None:
+        from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import Qwen4ExpHybridCacheManagerV2
+
         super().__post_init__()
         # Draft-loop state; set by the speculative driver, read by the indexer.
         self.qsa_in_mtp_draft_loop = False
@@ -53,8 +54,8 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
         self.qsa_shared_topk_indices: Optional[torch.Tensor] = None
         self.qsa_shared_topk_visible_blocks: Optional[torch.Tensor] = None
         self.qsa_shared_topk_captured_slots: set[int] = set()
-        if not isinstance(self.kv_cache_manager, QSAMambaHybridCacheManagerV2):
-            raise TypeError("QSA sparse attention requires QSAMambaHybridCacheManagerV2")
+        if not isinstance(self.kv_cache_manager, Qwen4ExpHybridCacheManagerV2):
+            raise TypeError("QSA sparse attention requires Qwen4ExpHybridCacheManagerV2")
         if not isinstance(self.sparse_metadata_params, QSASparseMetadataParams):
             raise TypeError("QSA sparse attention requires QSASparseMetadataParams")
         self.qsa_has_local_layers = self.kv_cache_manager.qsa_position_layer_id is not None

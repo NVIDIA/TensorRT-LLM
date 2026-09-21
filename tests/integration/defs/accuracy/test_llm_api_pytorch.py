@@ -6700,8 +6700,10 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                                                   enable_padding=True),
                 disable_overlap_scheduler=False,
                 moe_config=MoeConfig(backend="CUTLASS"),
-                decoding_config=mtp_config,
+                speculative_config=mtp_config,
         ) as llm:
+            assert isinstance(llm.args.speculative_config, MTPDecodingConfig)
+            assert llm.args.speculative_config.max_draft_len == 3
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
@@ -6857,8 +6859,10 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                                                   enable_padding=True),
                 disable_overlap_scheduler=False,
                 moe_config=MoeConfig(backend="CUTLASS"),
-                decoding_config=mtp_config,
+                speculative_config=mtp_config,
         ) as llm:
+            assert isinstance(llm.args.speculative_config, MTPDecodingConfig)
+            assert llm.args.speculative_config.max_draft_len == 3
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
