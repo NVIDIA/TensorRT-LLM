@@ -23,7 +23,6 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-#include "tensorrt_llm/runtime/modelConfig.h"
 
 #include <algorithm>
 #include <cassert>
@@ -644,7 +643,7 @@ public:
     /// @brief Returns true if request reaches max number of tokens in the next iteration.
     [[nodiscard]] bool willCompleteNextIteration() const
     {
-        return getMaxNumGeneratedTokens() + mNumTokensPerIteration >= mMaxNewTokens;
+        return getMaxNumGeneratedTokens() + 1 >= mMaxNewTokens;
     }
 
     [[nodiscard]] LlmRequestType getLlmRequestType() const
@@ -1077,24 +1076,6 @@ public:
         TLLM_CHECK_WITH_INFO(numTokensToDiscard <= getNumDraftTokens(),
             "Can't discard more draft tokens (%d) than exists (%d).", numTokensToDiscard, getNumDraftTokens());
         mDraftTokens->resize(getNumDraftTokens() - numTokensToDiscard);
-    }
-
-    void updateNumTokensPerIteration(SizeType32 numTokensPerIteration, runtime::ModelConfig const& modelConfig)
-    {
-        mNumTokensPerIteration = std::max(1, numTokensPerIteration);
-
-        if (modelConfig.hasSpeculativeDecodingModule() && getReturnPerfMetrics() && hasDraftTokens())
-        {
-            auto& specDecMetrics = mPerfMetrics.speculativeDecoding;
-            specDecMetrics.totalAcceptedDraftTokens += mNumTokensPerIteration - 1;
-            auto const maxAcceptedDraftTokens = modelConfig.getSpeculativeDecodingModule().getMaxDraftPathLen();
-            specDecMetrics.totalDraftTokens += std::min(getNumDraftTokens(), maxAcceptedDraftTokens);
-        }
-    }
-
-    [[nodiscard]] SizeType32 getNumTokensPerIteration() const
-    {
-        return mNumTokensPerIteration;
     }
 
     void setReturnEncoderOutput(bool const returnEncoderOutput)
@@ -1822,7 +1803,6 @@ protected:
     std::vector<VecLogProbs> mLogProbs; // [beamSize, seqLen]
     VecLogProbs mCumLogProbs;           // [beamSize]
     std::shared_ptr<VecTokens> mDraftTokens{nullptr};
-    SizeType32 mNumTokensPerIteration{1};
 
     // whether to return the full beams on each iteration. True when doing streaming + beamsearch
     bool mReturnAllGeneratedTokens;

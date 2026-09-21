@@ -179,8 +179,6 @@ void initBindings(nb::module_& m)
         .def("set_priority", nb::overload_cast<tle::PriorityType>(&GenLlmReq::setPriority))
         .def_prop_ro("cum_log_probs", &GenLlmReq::getCumLogProbs)
         .def("set_cum_log_prob", &GenLlmReq::setCumLogProb, nb::arg("cum_log_prob"), nb::arg("beam"))
-        .def("update_num_tokens_per_iteration", &GenLlmReq::updateNumTokensPerIteration,
-            nb::arg("num_tokens_per_iteration"), nb::arg("model_config"))
         .def_prop_ro("orig_prompt_len", &GenLlmReq::getOrigPromptLen)
         .def("has_draft_tokens", &GenLlmReq::hasDraftTokens)
         .def("discard_draft_tokens", &GenLlmReq::discardDraftTokens, nb::arg("num_tokens_to_discard"))

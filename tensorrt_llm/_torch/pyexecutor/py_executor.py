@@ -8022,8 +8022,7 @@ class PyExecutor:
                 continue
             request.py_num_draft_tokens_verified = 0
             py_num_accepted = request.py_num_accepted_draft_tokens
-            # Mirror C++ LlmRequest::updateNumTokensPerIteration, which
-            # clamps the drafted count to getMaxDraftPathLen(): with
+            # Clamp the drafted count to max_draft_len: with
             # tree-based drafting the request carries up to
             # max_total_draft_tokens draft tokens, but at most
             # max_draft_len (the max path length) of them can be accepted
@@ -8618,10 +8617,8 @@ class PyExecutor:
                     response.result.per_pos_drafted = request.py_per_pos_drafted
                     response.result.per_pos_accepted = request.py_per_pos_accepted
                     if request.py_total_draft_tokens > 0:
-                        # Backfills RequestPerfMetrics.speculative_decoding on
-                        # the client side; the C++ section is only populated
-                        # by updateNumTokensPerIteration, which the PyTorch
-                        # flow never calls.
+                        # Backfill RequestPerfMetrics.speculative_decoding on
+                        # the client side from the Python-owned counters.
                         response.result.spec_dec_totals = (
                             request.py_total_accepted_draft_tokens,
                             request.py_total_draft_tokens)
