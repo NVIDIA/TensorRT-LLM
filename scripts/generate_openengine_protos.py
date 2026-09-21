@@ -207,9 +207,9 @@ def _validate_gencode_versions(
     if grpc_version != str(generator["grpc_gencode"]):
         raise RuntimeError(f"Expected gRPC gencode {generator['grpc_gencode']}, got {grpc_version}")
 
-    constraints_path = project_root / "constraints.txt"
-    declared_protobuf_floor = _read_runtime_floor(constraints_path, "protobuf")
-    declared_protobuf_ceiling = _read_runtime_ceiling(constraints_path, "protobuf")
+    requirements_path = project_root / "requirements.txt"
+    declared_protobuf_floor = _read_runtime_floor(requirements_path, "protobuf")
+    declared_protobuf_ceiling = _read_runtime_ceiling(requirements_path, "protobuf")
     declared_grpc_floor = _read_runtime_floor(
         project_root / "requirements-openengine.txt", "grpcio"
     )
@@ -217,7 +217,7 @@ def _validate_gencode_versions(
     expected_grpc_floor = str(runtime_floors["grpcio"])
     if declared_protobuf_floor != expected_protobuf_floor:
         raise RuntimeError(
-            f"Manifest records protobuf>={expected_protobuf_floor}, but constraints.txt declares "
+            f"Manifest records protobuf>={expected_protobuf_floor}, but requirements.txt declares "
             f"protobuf>={declared_protobuf_floor}"
         )
     if declared_grpc_floor != expected_grpc_floor:
