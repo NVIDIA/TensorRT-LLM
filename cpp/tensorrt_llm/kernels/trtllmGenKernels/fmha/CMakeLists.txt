@@ -68,11 +68,13 @@ tllm_add_cubin_archive_sources(
   trtllm_gen_fmha "${CMAKE_CURRENT_SOURCE_DIR}/cubin" ARCHS 100 103 107 100f)
 set(TRTLLM_FMHA_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}")
 target_compile_definitions(
-  trtllm_gen_fmha PRIVATE TRTLLM_FMHA_BUILD_DIR="${TRTLLM_FMHA_BUILD_DIR}"
-                          TLLM_GEN_EXPORT_INTERFACE TLLM_FMHA_TRTLLM_COMPAT)
+  trtllm_gen_fmha
+  PRIVATE TRTLLM_FMHA_BUILD_DIR="${TRTLLM_FMHA_BUILD_DIR}" TLLM_RUBIN_FEATURES
+          TLLM_GEN_EXPORT_INTERFACE TLLM_FMHA_TRTLLM_COMPAT)
 target_compile_definitions(
-  trtllm_gen_fmha_interface INTERFACE TLLM_GEN_EXPORT_INTERFACE
-                                      TLLM_FMHA_TRTLLM_COMPAT)
+  trtllm_gen_fmha_interface
+  INTERFACE TLLM_GEN_EXPORT_INTERFACE TLLM_FMHA_TRTLLM_COMPAT
+            TLLM_RUBIN_FEATURES)
 
 # Link the TrtLlmGen FMHA static library
 set(TRTLLM_GEN_FMHA_LIB

@@ -461,7 +461,9 @@ accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_mxfp8_piecewise_cuda_graph
 accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=False] TIMEOUT (180)
 accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True]
 accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True] TIMEOUT (60)
-accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=False-overlap_scheduler=True-eval_mode=inferencex]
+accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=False-overlap_scheduler=True-fuse_qkv_index_projection=False-eval_mode=inferencex]
+accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=False-overlap_scheduler=True-fuse_qkv_index_projection=True-eval_mode=inferencex]
+accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=True-overlap_scheduler=True-fuse_qkv_index_projection=True-eval_mode=inferencex]
 accuracy/test_llm_api_pytorch.py::TestMinistral8BInstruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestMinistral8BInstruct::test_fp8
 accuracy/test_llm_api_pytorch.py::TestMistralLarge3_675B::test_fp8[latency_moe_deepgemm]
@@ -603,6 +605,7 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_fp8_block_scales_early_firs
 accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_prims_ts_bfloat16
 accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_w4a8_mxfp4[fp8-latency]
 accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_w4a8_mxfp4[mxfp8-latency]
+accuracy/test_llm_api_pytorch.py::TestQwen3_8_27B::test_dflash2[VANILLA]
 accuracy/test_llm_api_pytorch.py::TestQwen3_8_2_4T_A95B::test_nvfp4_adp16_cutedsl
 accuracy/test_llm_api_pytorch.py::TestQwen3_8_2_4T_A95B::test_nvfp4_tp8_mtp3_trtllm
 accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_bf16_tep4_cutlass
@@ -610,6 +613,7 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_fp8_adp4_mtp3_trt
 accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_fp8_adp4_mtp3_prefix_cache
 accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_1gpu_cutedsl_ple_offload
 accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_adp4_mtp3_trtllm_ple_offload
+accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_adp4_megamoe_cutedsl_ple_offload
 accuracy/test_llm_api_pytorch.py::TestSeedOss_36B::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestStep3p7SpeculativeDecoding::test_guided_decoding TIMEOUT (60)
 accuracy/test_llm_api_pytorch.py::TestStep3p7SpeculativeDecoding::test_step3p7_mtp TIMEOUT (60)
@@ -705,7 +709,7 @@ disaggregated/test_disaggregated.py::test_disaggregated_genbs1[TinyLlama-1.1B-Ch
 disaggregated/test_disaggregated.py::test_disaggregated_gpt_oss_120b_harmony[gpt_oss/gpt-oss-120b]
 disaggregated/test_disaggregated.py::test_disaggregated_kv_cache_time_output[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_load_balance[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_logprobs_serving[llama-3.1-8b-instruct]
+disaggregated/test_disaggregated.py::test_disaggregated_logprobs_serving
 disaggregated/test_disaggregated.py::test_disaggregated_mamba_bs1_concurrency2
 disaggregated/test_disaggregated.py::test_disaggregated_mamba_conc_greater_than_mbs[NVIDIA-Nemotron-3-Super-120B-A12B-FP8]
 disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
@@ -745,7 +749,7 @@ disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[False-True-Qwen3-8B-FP8]
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[True-False-Qwen3-8B-FP8]
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[True-True-Qwen3-8B-FP8]
-disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_spec_dec_batch_slot_limit[False-EAGLE3-LLaMA3.1-Instruct-8B-Llama-3.1-8B-Instruct]
+disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_spec_dec_batch_slot_limit[False-Qwen3-8B-eagle3-Qwen3-8B]
 disaggregated/test_workers.py::test_workers_conditional_disaggregation[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_workers.py::test_workers_conditional_disaggregation_deepseek_v3_lite_bf16[DeepSeek-V3-Lite-bf16]
 disaggregated/test_workers.py::test_workers_conversation_router[TinyLlama-1.1B-Chat-v1.0]
@@ -765,7 +769,6 @@ test_e2e.py::test_eagle3_output_repetition_4gpus[Qwen3/saved_models_Qwen3-235B-A
 test_e2e.py::test_openai_chat_guided_decoding[openai/gpt-oss-120b]
 test_e2e.py::test_openai_chat_harmony_perf_metrics
 test_e2e.py::test_openai_kv_cache_contamination
-test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B]
 test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B]
 test_e2e.py::test_ptp_quickstart_advanced_deepseek_r1_8gpus[DeepSeek-R1-DeepSeek-R1/DeepSeek-R1]
 test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
@@ -800,3 +803,27 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4_fine_grain
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4_fine_grained_sync[False-False-autotuner]
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4_fine_grained_sync[True-True-no_autotuner]
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4_fine_grained_sync[True-True-autotuner]
+
+# ------------- VisualGen Wan 2.2 E2E (SM >= 100) ---------------
+
+# BF16/VANILLA pipeline correctness and batch generation for all three variants.
+unittest/_torch/visual_gen/test_wan22_t2v_pipeline.py::TestWan22_A14B_PipelineCorrectness
+unittest/_torch/visual_gen/test_wan22_t2v_pipeline.py::TestWan22T2VBatchGeneration
+unittest/_torch/visual_gen/test_wan22_i2v_pipeline.py::TestWan22_I2V_A14B_PipelineCorrectness
+unittest/_torch/visual_gen/test_wan22_i2v_pipeline.py::TestWan22I2VBatchGeneration
+unittest/_torch/visual_gen/test_wan22_ti2v_5b_pipeline.py::TestWan22TI2V5B_T2V_PipelineCorrectness
+unittest/_torch/visual_gen/test_wan22_ti2v_5b_pipeline.py::TestWan22TI2V5B_I2V_PipelineCorrectness
+unittest/_torch/visual_gen/test_wan22_ti2v_5b_pipeline.py::TestWan22TI2V5BBatchGeneration
+
+# FP8 + TRTLLM attention combination smoke tests with CacheDiT.
+unittest/_torch/visual_gen/test_wan22_t2v_pipeline.py::TestWan22T2VCombinedOptimizations
+unittest/_torch/visual_gen/test_wan22_i2v_pipeline.py::TestWan22I2VCombinedOptimizations
+unittest/_torch/visual_gen/test_wan22_ti2v_5b_pipeline.py::TestWan22TI2V5BCombinedOptimizations
+
+# NVFP4 examples for T2V-A14B and I2V-A14B.
+examples/visual_gen/test_visual_gen_wan.py::test_wan_t2v_example
+examples/visual_gen/test_visual_gen_wan.py::test_wan_i2v_example
+
+# Wan 2.2 I2V serving: synchronous and asynchronous video-generation requests.
+unittest/_torch/visual_gen/test_trtllm_serve_e2e.py::TestWanImageToVideo::test_ti2v_sync
+unittest/_torch/visual_gen/test_trtllm_serve_e2e.py::TestWanImageToVideo::test_ti2v_async_lifecycle
