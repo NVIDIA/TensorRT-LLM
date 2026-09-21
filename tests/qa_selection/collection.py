@@ -176,6 +176,10 @@ class SelectionRequest:
         Naming a rung and asking for artifacts at once is a usage error: the
         rung's list is one of the files the same command writes without
         `--gpus`.
+
+        The directory is created here rather than at write time so that a run
+        which cannot produce its output says so before collecting, and says it
+        as a usage error naming the option.
         """
         if text is None:
             return None
@@ -184,7 +188,14 @@ class SelectionRequest:
                 "--selection-out-dir: cannot be combined with --gpus and --ladder; "
                 "drop --gpus and every rung is written at once"
             )
-        return Path(text)
+        out_dir = Path(text)
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise pytest.UsageError(
+                f"--selection-out-dir: cannot create {str(out_dir)!r}: {error.strerror}"
+            ) from error
+        return out_dir
 
     @staticmethod
     def ladder_for(text: Optional[str], profile: MachineProfile) -> Optional[Ladder]:
