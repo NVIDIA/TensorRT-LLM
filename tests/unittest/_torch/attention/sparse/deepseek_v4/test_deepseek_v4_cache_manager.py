@@ -391,8 +391,10 @@ class TestDeepseekV4CacheManager:
         return cache_manager, sparse_attn_config
 
     def test_nvfp4_cold_page_codec_accepts_real_csa_hca_lifecycle(self):
+        # These tests check the layout that keeps the RoPE part of each compressed
+        # row bit-exact; the default quantizes the whole row.
         provider = Nvfp4ColdPageQuantizationCompression(
-            ColdPageQuantizationCompressionConfig(),
+            ColdPageQuantizationCompressionConfig(skip_rope_quantization=True),
             pretrained_config=SimpleNamespace(model_type="deepseek_v4"),
         )
         with patch.object(
@@ -444,8 +446,10 @@ class TestDeepseekV4CacheManager:
         prompt_len = 64 * self.tokens_per_block
         pressure_len = 65 * self.tokens_per_block
         compress_ratios = [4, 128]
+        # These tests check the layout that keeps the RoPE part of each compressed
+        # row bit-exact; the default quantizes the whole row.
         provider = Nvfp4ColdPageQuantizationCompression(
-            ColdPageQuantizationCompressionConfig(),
+            ColdPageQuantizationCompressionConfig(skip_rope_quantization=True),
             pretrained_config=SimpleNamespace(model_type="deepseek_v4"),
         )
         requests: list[LlmRequest] = []
