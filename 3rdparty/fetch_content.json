@@ -30,6 +30,13 @@
       "patch_file": "patches/deep_ep_intranode_combine_fix.patch"
     },
     {
+      "name": "nccl_extensions_download",
+      "display_name": "nccl_extensions",
+      "git_repository": "${github_base_url}/NVIDIA/nccl-extensions",
+      "git_tag": "af42925a9cc6a818b04681eb8bdbedaed506aa30",
+      "use_url": true
+    },
+    {
       "name": "deepgemm",
       "git_repository": "https://github.com/deepseek-ai/DeepGEMM",
       "git_tag": "8b1392b978f5a03c828dd1711090d7fb50958b8a",

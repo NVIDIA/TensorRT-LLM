@@ -69,8 +69,6 @@ QWEN38_MTP_MODELS = {
     "qwen3.8_flash_next_fp4_mtp",
 }
 KIMI_K3_SERVER_ENV = {
-    "KIMI_K3_FP8_WEIGHT_READ": "1",
-    "KIMI_K3_FP8_WEIGHT_READ_GATE_UP": "1",
     "TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING": "1",
 }
 
@@ -1485,6 +1483,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 server_timeout = 3600
             elif self._config.model_name in KIMI_K3_MODELS:
                 server_timeout = 5400
+            elif self._config.model_name == "minimax_m3_fp4":
+                # Cold MSA JIT compilation can exceed the default 10 minutes.
+                server_timeout = 1800
             else:
                 server_timeout = 600
             return PerfServeScriptTestCmds(server_cmd=server_cmd,

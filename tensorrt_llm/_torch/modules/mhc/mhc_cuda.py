@@ -875,7 +875,7 @@ class MhcFusedHcRunner(TunableRunner):
                 if m_tiles * ks <= max_grid_ctas:
                     for bs in _fused_hc_mma_bigfuse_bs_options(M):
                         add(("fused_half_mma", 0, ks, bs, 1))
-                    if M >= 64:
+                    if M >= 64 and ks in _FUSED_HC_ALL_MMA_KS:
                         add(("fused_all_mma", 0, ks, 0, 1))
 
         if not mma_ok and M > 32:

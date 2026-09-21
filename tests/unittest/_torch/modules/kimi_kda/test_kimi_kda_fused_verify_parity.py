@@ -78,7 +78,7 @@ LB = -5.0
 
 
 @torch.no_grad()
-def _make_runtime(seed, aux_stream=None):
+def _make_runtime(seed, aux_stream=None, checkpoint_fp8=False):
     # A real KimiLinearConfig (not a SimpleNamespace) so the runtime sees the
     # same config surface it does in production. ``linear_attn_config`` carries
     # the per-layer KDA params the runtime reads plus the (unused here)
@@ -96,10 +96,28 @@ def _make_runtime(seed, aux_stream=None):
             gate_lower_bound=LB,
         ),
     )
-    rt = KimiKDALinearAttention(cfg, layer_idx=0, aux_stream=aux_stream).to("cuda")
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization import QuantAlgo
+
+    model_config = ModelConfig(
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES if checkpoint_fp8 else None)
+    )
+    rt = KimiKDALinearAttention(
+        cfg,
+        layer_idx=0,
+        aux_stream=aux_stream,
+        model_config=model_config,
+    ).to("cuda")
     gen = torch.Generator(device="cuda").manual_seed(seed)
     for name, p in rt.named_parameters():
-        if name.endswith("A_log"):
+        if p.dtype == torch.float8_e4m3fn:
+            p.copy_(torch.randint(-32, 33, p.shape, generator=gen, device="cuda").to(p.dtype))
+        elif name.endswith("weight_scale"):
+            p.fill_(0.001)
+        elif name.endswith("input_scale"):
+            p.fill_(1.0)
+        elif name.endswith("A_log"):
             p.copy_(torch.randn(p.shape, generator=gen, device="cuda", dtype=torch.float32) * 0.5)
         elif name.endswith("dt_bias"):
             p.copy_(torch.randn(p.shape, generator=gen, device="cuda", dtype=torch.float32) * 0.1)
@@ -181,18 +199,29 @@ def _rep(name, a, b):
     return cos > 0.999 and rel < 3e-2
 
 
+@pytest.mark.parametrize("checkpoint_fp8", [False, True])
 @torch.no_grad()
-def test_fused_vs_sequential_two_rounds():
+def test_fused_vs_sequential_two_rounds(checkpoint_fp8):
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 
     torch.manual_seed(0)
     B = 4
     T = M + 1
-    rt_seq = _make_runtime(seed=1)
-    rt_fused = _make_runtime(seed=1, aux_stream=torch.cuda.Stream())
+    rt_seq = _make_runtime(seed=1, checkpoint_fp8=checkpoint_fp8)
+    rt_fused = _make_runtime(seed=1, aux_stream=torch.cuda.Stream(), checkpoint_fp8=checkpoint_fp8)
     rt_fused.finalize_decode_weights()
-    assert rt_fused._qkvg_proj_weight is not None
-    assert rt_fused._bfa_proj_weight is not None
+    if checkpoint_fp8:
+        from tensorrt_llm._torch.modules.linear import Linear
+
+        for runtime in (rt_seq, rt_fused):
+            for module in runtime.modules():
+                if isinstance(module, Linear):
+                    module.post_load_weights()
+        assert rt_fused.qkvg_proj is not None
+        assert rt_fused._bfa_proj_weight is not None
+    else:
+        assert rt_fused._qkvg_proj_weight is not None
+        assert rt_fused._bfa_proj_weight is not None
     slot_indices = torch.arange(B, dtype=torch.int32, device="cuda")
 
     conv_pool_seq, ssm_pool_seq = _make_pools(B, seed=2)

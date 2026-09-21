@@ -42,6 +42,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           DecodeCudaGraphConfig,
                                           DecodingBaseConfig,
                                           DeepSeekV4SparseAttentionConfig,
+                                          DFlashDecodingConfig,
                                           DSparkDecodingConfig,
                                           DynamicBatchConfig,
                                           Eagle3DecodingConfig,
@@ -308,6 +309,69 @@ def test_rejection_sampling_still_gated_on_context_parallel():
         TorchLlmArgs(model=llama_model_path,
                      context_parallel_size=2,
                      speculative_config=spec_cfg)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend",
+                         ["DEFAULT", "UCX", "NIXL", "MOONCAKE", "MPI"])
+@pytest.mark.parametrize("dict_config", [False, True])
+def test_dflash_disagg_warns_about_degraded_acceptance(
+        tmp_path: Path, backend: str, dict_config: bool) -> None:
+    speculative_config = DFlashDecodingConfig(max_draft_len=2,
+                                              use_rejection_sampling=False)
+    cache_transceiver_config = CacheTransceiverConfig(backend=backend)
+    if dict_config:
+        speculative_config = speculative_config.model_dump()
+        cache_transceiver_config = cache_transceiver_config.model_dump()
+
+    with patch.object(llm_args_mod.logger, "warning") as warning:
+        args = TorchLlmArgs(model=tmp_path,
+                            gpus_per_node=1,
+                            speculative_config=speculative_config,
+                            cache_transceiver_config=cache_transceiver_config)
+
+    # Accepted, not rejected: the configuration runs, only acceptance suffers.
+    assert isinstance(args.speculative_config, DFlashDecodingConfig)
+    assert args.cache_transceiver_config.backend == backend
+    assert any("DFlash acceptance is degraded" in call.args[0]
+               for call in warning.call_args_list)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "cache_transceiver_config",
+    [None, {}, CacheTransceiverConfig(backend=None)])
+def test_dflash_aggregated_config_allowed(
+        tmp_path: Path,
+        cache_transceiver_config: CacheTransceiverConfig | dict | None) -> None:
+    with patch.object(llm_args_mod.logger, "warning") as warning:
+        args = TorchLlmArgs(model=tmp_path,
+                            gpus_per_node=1,
+                            speculative_config=DFlashDecodingConfig(
+                                max_draft_len=2, use_rejection_sampling=False),
+                            cache_transceiver_config=cache_transceiver_config)
+    assert isinstance(args.speculative_config, DFlashDecodingConfig)
+    assert (args.cache_transceiver_config is None
+            or args.cache_transceiver_config.backend is None)
+    assert not any("DFlash acceptance is degraded" in call.args[0]
+                   for call in warning.call_args_list)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("speculative_config",
+                         [None, NGramDecodingConfig(max_draft_len=2)])
+def test_disagg_config_without_dflash_allowed(
+        tmp_path: Path, speculative_config: NGramDecodingConfig | None) -> None:
+    with patch.object(llm_args_mod.logger, "warning") as warning:
+        args = TorchLlmArgs(
+            model=tmp_path,
+            gpus_per_node=1,
+            speculative_config=speculative_config,
+            cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"))
+    assert args.speculative_config == speculative_config
+    assert args.cache_transceiver_config.backend == "NIXL"
+    assert not any("DFlash acceptance is degraded" in call.args[0]
+                   for call in warning.call_args_list)
 
 
 @pytest.mark.cpu_only
@@ -3806,6 +3870,19 @@ sparse_attention_config:
             "prefill": 0.5,
             "decode": 0.3,
         }
+
+    def test_uses_spcompress_defaults_false(self):
+        config = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0)
+        assert config.uses_spcompress is False
+        sparse_params = config.to_sparse_params()
+        assert sparse_params.uses_spcompress is False
+
+    def test_uses_spcompress_plumbs_to_sparse_params(self):
+        config = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0,
+                                            uses_spcompress=True)
+        assert config.uses_spcompress is True
+        sparse_params = config.to_sparse_params()
+        assert sparse_params.uses_spcompress is True
 
     @pytest.mark.parametrize("target_sparsity", [-0.1, 1.1])
     def test_target_sparsity_scalar_must_be_in_unit_interval(

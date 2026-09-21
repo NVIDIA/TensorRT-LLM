@@ -4,7 +4,7 @@
 one-model speculative path cannot honor.
 
 ``SpecSampler.validate_request`` has always rejected min_length, bad_words,
-no_repeat_ngram_size, embedding_bias, top_p_decay and min_p, but it runs on the
+no_repeat_ngram_size, embedding_bias and top_p_decay, but it runs on the
 executor's admission path. For a streaming OpenAI request that is too late: the
 frontend has already answered 200 and opened the response stream, so the client
 receives a truncated stream (``ClientPayloadError`` / ``TransferEncodingError``)
@@ -45,7 +45,6 @@ UNSUPPORTED_CASES = [
     ("bad", dict(bad="nope"), UNSUPPORTED_BAD_WORDS_MSG),
     ("no_repeat_ngram_size", dict(no_repeat_ngram_size=3), UNSUPPORTED_NO_REPEAT_NGRAM_MSG),
     ("top_p_decay", dict(top_p_decay=0.5), UNSUPPORTED_TOP_P_DECAY_MSG),
-    ("min_p", dict(min_p=0.1), UNSUPPORTED_MIN_P_MSG),
 ]
 
 # Values a frontend forwards explicitly at their neutral setting. These must not
@@ -53,7 +52,6 @@ UNSUPPORTED_CASES = [
 NEUTRAL_CASES = [
     ("min_tokens_zero", dict(min_tokens=0)),
     ("no_repeat_ngram_zero", dict(no_repeat_ngram_size=0)),
-    ("min_p_zero", dict(min_p=0.0)),
     # top_p_decay == 1.0 means "no decay"; top_p_min / top_p_reset_ids alone do
     # not activate dynamic behavior either.
     ("top_p_decay_one", dict(top_p_decay=1.0)),
@@ -94,6 +92,11 @@ def _check_arguments(spec_config, sampling_params):
 )
 def test_rejection_reason_names_the_feature(name, kwargs, expected):
     assert one_model_sampling_rejection_reason(SamplingParams(**kwargs)) == expected
+    # None of these depend on the deploy's sampling mode.
+    assert (
+        one_model_sampling_rejection_reason(SamplingParams(**kwargs), fused_sampling=True)
+        == expected
+    )
 
 
 @pytest.mark.cpu_only
@@ -242,6 +245,7 @@ def _validate_on_executor(request) -> None:
         ),
         _enable_penalty=False,
         _penalty_supported=True,
+        _fused_sampling=False,
     )
     SpecSampler.validate_request(sampler, request)
 
@@ -251,7 +255,7 @@ def _validate_on_executor(request) -> None:
 # These are the backstops for submission paths that bypass the LLM API: a
 # regression here would return a different (or no) error after stream setup.
 @pytest.mark.cpu_only
-def test_executor_side_check_still_rejects_min_p():
+def test_executor_side_check_rejects_min_p_outside_the_fused_mode():
     with pytest.raises(ValueError) as excinfo:
         _validate_on_executor(_executor_request(min_p=0.1))
     assert str(excinfo.value) == UNSUPPORTED_MIN_P_MSG

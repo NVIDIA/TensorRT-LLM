@@ -94,6 +94,7 @@ Welcome to TensorRT LLM's Documentation!
    features/kv-cache-connector.md
    features/sparse-attention.md
    features/visual-generation.md
+   features/prefix-tokenization-cache.md
 
 
 .. toctree::

@@ -231,15 +231,12 @@ def test_setup_helix_mappings_dual_mapping_swap_restore():
     instance_helix = _MinimalInstanceHelix()
 
     with patch.object(prod_mod, "run_concurrently", _capture_run_concurrently):
-        with patch.object(
-            prod_mod, "_resolve_fp8_weight_read_gates", return_value=(False, False, False)
-        ):
-            prod_mod.KimiLinearForCausalLM._load_trunk_params(
-                instance_helix,
-                fake_weights,
-                {sharded_name: sharded_param_helix},
-                {sharded_name: sharded_ckpt_key},
-            )
+        prod_mod.KimiLinearForCausalLM._load_trunk_params(
+            instance_helix,
+            fake_weights,
+            {sharded_name: sharded_param_helix},
+            {sharded_name: sharded_ckpt_key},
+        )
 
     expected_helix_tp_rank = obj._repurposed_tp_mapping.tp_rank
     expected_lo = (expected_helix_tp_rank % repurposed_tp) * shard_size
@@ -260,15 +257,12 @@ def test_setup_helix_mappings_dual_mapping_swap_restore():
     instance_no_helix = _MinimalInstanceNoHelix()
 
     with patch.object(prod_mod, "run_concurrently", _capture_run_concurrently):
-        with patch.object(
-            prod_mod, "_resolve_fp8_weight_read_gates", return_value=(False, False, False)
-        ):
-            prod_mod.KimiLinearForCausalLM._load_trunk_params(
-                instance_no_helix,
-                fake_weights,
-                {sharded_name: sharded_param_no_helix},
-                {sharded_name: sharded_ckpt_key},
-            )
+        prod_mod.KimiLinearForCausalLM._load_trunk_params(
+            instance_no_helix,
+            fake_weights,
+            {sharded_name: sharded_param_no_helix},
+            {sharded_name: sharded_ckpt_key},
+        )
 
     expected_slice_nh = fake_weights[sharded_ckpt_key][:, :shard_size]
     assert torch.equal(

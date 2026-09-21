@@ -56,7 +56,14 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._event_manager import (
 
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2 import CacheLevel, CudaStream, KVCacheManager, TokenId, _introspection
-    from kv_cache_manager_v2._block_radix_tree import Block, ReuseScope, RootBlock
+    from kv_cache_manager_v2._block_radix_tree import (
+        Block,
+        BlockRadixTree,
+        ReuseScope,
+        RootBlock,
+        detach_next,
+    )
+    from kv_cache_manager_v2._life_cycle_registry import LifeCycleRegistry
     from kv_cache_manager_v2._utils import CachedCudaStream, init_cuda_once, temporary_sys_path
 else:
     from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -68,9 +75,12 @@ else:
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
         Block,
+        BlockRadixTree,
         ReuseScope,
         RootBlock,
+        detach_next,
     )
+    from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import LifeCycleRegistry
     from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
         CachedCudaStream,
         init_cuda_once,
@@ -1034,6 +1044,133 @@ def test_v2_kv_cache_event_manager_uses_stored_registry_for_removed_event(
     assert "layer_groups" not in events[1]["data"]
 
 
+@pytest.mark.parametrize("ancestor_coverage", [1, 4])
+def test_v2_kv_cache_event_manager_derives_mm_keys_across_blocks(
+    real_block_factory, ancestor_coverage
+):
+    event_manager = NativeKVCacheEventManager(
+        max_kv_event_entries=8, window_size=128, mm_token_id_offset=1000
+    )
+    make_block = real_block_factory(event_manager)
+    digest_a = bytes(range(32))
+    digest_b = bytes(reversed(range(32)))
+    first = make_block([1, digest_a, 1001, 1002], [ancestor_coverage])
+    gap = make_block([2, 3, 4, 5], [ancestor_coverage], parent=first)
+    continued = make_block([1003, 7, 1004, 1005], [4], parent=gap)
+    last = make_block([1006, digest_b, 1001, 9], [4], parent=continued)
+
+    # The digest must survive a text-only block, including ancestors whose
+    # incomplete page coverage prevents them from publishing stored events.
+    for block in (first, gap, continued, last):
+        _add_stored_block(event_manager, block)
+    events = _flush_serialized_events(event_manager)
+    mm_keys_by_hash = {
+        block["block_hash"]: block["mm_keys"]
+        for event in _stored_events(events)
+        for block in event["data"]["blocks"]
+    }
+    expected = {
+        _block_key(continued).hex(): [
+            {"type": "mm_key", "hash": digest_a.hex(), "start_offset": 3},
+            {"type": "mm_key", "hash": digest_a.hex(), "start_offset": 4},
+        ],
+        _block_key(last).hex(): [
+            {"type": "mm_key", "hash": digest_a.hex(), "start_offset": 6},
+            {"type": "mm_key", "hash": digest_b.hex(), "start_offset": 0},
+        ],
+    }
+    if ancestor_coverage == 4:
+        expected[_block_key(first).hex()] = [
+            {"type": "mm_key", "hash": digest_a.hex(), "start_offset": 0}
+        ]
+        expected[_block_key(gap).hex()] = []
+    assert mm_keys_by_hash == expected
+
+
+def test_v2_kv_cache_event_manager_preserves_mm_keys_after_life_cycle_removal(real_block_factory):
+    event_manager = NativeKVCacheEventManager(
+        max_kv_event_entries=8, window_size=128, mm_token_id_offset=1000
+    )
+    make_block = real_block_factory(event_manager, num_life_cycles=2)
+    mm_hash = bytes(range(32))
+    block = make_block([mm_hash, 1001], [2, 2])
+    block_key = _block_key(block)
+
+    _add_stored_block(event_manager, block)
+    events = _flush_serialized_events(event_manager)
+
+    expected_mm_keys = [
+        {
+            "type": "mm_key",
+            "hash": mm_hash.hex(),
+            "start_offset": 0,
+        }
+    ]
+    assert events[0]["data"]["blocks"][0]["mm_keys"] == expected_mm_keys
+    assert events[1]["data"]["blocks"][0]["mm_keys"] == expected_mm_keys
+
+    # Lifecycle removal does not change the block's normalized token stream.
+    event_manager.add_removed_life_cycle_event(block_key, 0)
+    event_manager.add_removed_life_cycle_event(block_key, 1)
+    _flush_serialized_events(event_manager)
+    _add_stored_life_cycle(event_manager, block, 0)
+    events = _flush_serialized_events(event_manager)
+    assert events[0]["data"]["blocks"][0]["mm_keys"] == expected_mm_keys
+
+    event_manager.add_removed_event(block_key)
+    _flush_serialized_events(event_manager)
+    _add_stored_life_cycle(event_manager, block, 1)
+    events = _flush_serialized_events(event_manager)
+    assert events[0]["data"]["blocks"][0]["mm_keys"] == expected_mm_keys
+
+
+def test_v2_kv_cache_event_manager_requires_mm_token_encoding(real_block_factory):
+    event_manager = NativeKVCacheEventManager(max_kv_event_entries=8, window_size=128)
+    make_block = real_block_factory(event_manager)
+    mm_hash = bytes(range(32))
+    block = make_block([mm_hash, 1001], [2])
+
+    _add_stored_block(event_manager, block)
+    events = _flush_serialized_events(event_manager)
+    stored_block = events[0]["data"]["blocks"][0]
+    assert stored_block["mm_keys"] == []
+    assert [token["token_id"] for token in stored_block["tokens"]] == [mm_hash.hex(), 1001]
+
+
+def test_python_v2_mm_digest_context_survives_detached_ancestor():
+    event_manager = KVCacheEventManager(max_kv_event_entries=8, mm_token_id_offset=1000)
+    life_cycles = LifeCycleRegistry(
+        create_config(
+            tokens_per_block=4,
+            gpu_quota=16 << 20,
+            host_quota=0,
+            disk_quota=0,
+            num_layers=0,
+            window_size=None,
+            sink_tokens=0,
+        )
+    )
+    tree = BlockRadixTree(life_cycles, tokens_per_block=4, event_manager=event_manager)
+    root = tree.add_or_get_existing(ReuseScope())
+    digest = bytes(range(32))
+    first = Block([0, digest, 1001, 1002], root)
+    gap = Block([1, 2, 3, 4], first)
+    continued = Block([1003, 5, 1004, 1005], gap)
+    parent_ref = gap._prev
+    try:
+        assert detach_next(first, gap.key) is gap
+        assert gap.last_token_digest == digest
+        assert event_manager._mm_keys_from_radix_block(continued) == [(digest, 3), (digest, 4)]
+
+        gap._prev = parent_ref
+        first.next[gap.key] = gap
+        assert event_manager._mm_keys_from_radix_block(continued) == [(digest, 3), (digest, 4)]
+    finally:
+        gap._prev = parent_ref
+        first.next[gap.key] = gap
+        tree.clear()
+
+
 def test_v2_kv_cache_event_manager_omits_partial_life_cycle_coverage(
     real_block_factory,
 ):
@@ -1339,6 +1476,54 @@ def test_v2_reused_prefix_does_not_emit_duplicate_stored_events():
         assert prefix_hashes == [block_key.hex() for block_key in prefix_keys]
         assert reused_hashes == [block2_key.hex()]
         assert not (set(prefix_hashes) & set(reused_hashes))
+    finally:
+        gc.enable()
+        if manager is not None:
+            manager.shutdown()
+
+
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
+def test_v2_mm_partial_commit_reuses_actual_longer_block():
+    init_cuda_once()
+    gc.collect()
+    gc.disable()
+    event_manager = NativeKVCacheEventManager(
+        max_kv_event_entries=16, window_size=128, mm_token_id_offset=1000
+    )
+    manager = None
+    try:
+        manager = _create_test_manager(event_manager, tokens_per_block=8)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        digest = bytes(range(32))
+        tokens = [0, digest, 1001, 1002, 1003, 5, 6, 7]
+        _commit_and_close(manager, stream, tokens)
+        first_events = _flush_serialized_events(event_manager)
+        first_block = _stored_events(first_events)[0]["data"]["blocks"][0]
+        assert first_block["mm_keys"] == [
+            {"type": "mm_key", "hash": digest.hex(), "start_offset": 0}
+        ]
+
+        # A shorter commit is already covered by the existing longer sibling.
+        # Event metadata follows that actual block, with no partial-key entry.
+        _commit_and_close(manager, stream, tokens[:6])
+        assert _stored_events(_flush_serialized_events(event_manager)) == []
+
+        manager.clear_reusable_blocks()
+        removal_events = _flush_serialized_events(event_manager)
+        assert [
+            block_hash
+            for event in removal_events
+            if event["data"]["type"] == "removed"
+            for block_hash in event["data"]["block_hashes"]
+        ] == [first_block["block_hash"]]
+
+        _commit_and_close(manager, stream, tokens[:6])
+        partial_events = _flush_serialized_events(event_manager)
+        partial_block = _stored_events(partial_events)[0]["data"]["blocks"][0]
+        assert partial_block["block_hash"] != first_block["block_hash"]
+        assert len(partial_block["tokens"]) == 6
+        assert partial_block["mm_keys"] == first_block["mm_keys"]
     finally:
         gc.enable()
         if manager is not None:

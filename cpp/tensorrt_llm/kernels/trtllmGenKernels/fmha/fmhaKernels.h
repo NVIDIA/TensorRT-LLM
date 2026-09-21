@@ -311,8 +311,8 @@ public:
         parseOptionsFromRunnerParams(params, options);
         options.mCudaArch = intToCudaArch(mSM);
 
-        FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
-        std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+        std::tie(options, optionsFromArgs, ctaDim)
+            = selectKernelAutotuned(options, optionsFromArgs, params.mMultiProcessorCount);
 
         // Check if the options are valid or not.
         checkFmhaOptions(options, optionsFromArgs);
@@ -409,8 +409,8 @@ private:
         parseOptionsFromRunnerParams(params, options);
         options.mCudaArch = intToCudaArch(mSM);
 
-        FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
-        std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+        std::tie(options, optionsFromArgs, ctaDim)
+            = selectKernelAutotuned(options, optionsFromArgs, params.mMultiProcessorCount);
 
         checkFmhaOptions(options, optionsFromArgs);
         updateFmhaOptions(options, optionsFromArgs);
@@ -527,8 +527,8 @@ public:
         parseOptionsFromRunnerParams(params, options);
         options.mCudaArch = intToCudaArch(mSM);
 
-        FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
-        std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+        std::tie(options, optionsFromArgs, ctaDim)
+            = selectKernelAutotuned(options, optionsFromArgs, params.mMultiProcessorCount);
 
         // Overwrite AutoTuner decision: SageAttention with SfsPV is known to cause regression to persistent scheduler.
         // Remove this overwritten once we refresh the cubin kernels that containing the related fix.
@@ -663,6 +663,54 @@ public:
     }
 
 private:
+    // Autotuner entry for checkIfKernelExist, warmupOneKernel, and run. SM107 may select
+    // CgaSmemReduction configs where clusterDimX * mMaxNumCtasPerSeqKv must stay <= 16;
+    // the pre/post clamps below enforce that. Other architectures keep the legacy path.
+    std::tuple<FmhaOptions, FmhaOptionsFromArgs, int32_t> selectKernelAutotuned(
+        FmhaOptions options, FmhaOptionsFromArgs optionsFromArgs, int32_t multiProcessorCount) const
+    {
+        // CGA SMEM reduction cluster limits are Rubin SM107-specific; clamping on SM100/SM103
+        // changed autotuner choices without fixing a known failure mode on those GPUs.
+        if (mSM != kSM_107)
+        {
+            FmhaAutoTuner autoTuner(options, optionsFromArgs, multiProcessorCount);
+            return autoTuner.selectKernel();
+        }
+
+        if (isGmemReduction(options.mMultiCtasKvMode) && options.mTileScheduler == TileScheduler::Static)
+        {
+            constexpr int kMaxCgaClusterDimX = 16;
+            constexpr int kMinPreSelectCgaClusterDimX = 2;
+            // selectKernel may promote this candidate to CgaSmemReduction and call computeNumCtas
+            // before returning the selected options. Keep the candidate legal for both 1-CTA and
+            // 2-CTA FMHA kernels; the exact selected clusterDimX is applied below.
+            options.mMaxNumCtasPerSeqKv = std::min(options.mMaxNumCtasPerSeqKv,
+                kMaxCgaClusterDimX / std::max(options.mClusterDimX, kMinPreSelectCgaClusterDimX));
+        }
+
+        int32_t ctaDim = 512;
+        FmhaAutoTuner autoTuner(options, optionsFromArgs, multiProcessorCount);
+        std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+        limitCgaSmemReductionCtasKv(options);
+        return {options, optionsFromArgs, ctaDim};
+    }
+
+    void limitCgaSmemReductionCtasKv(FmhaOptions& options) const
+    {
+        if (!isCgaSmemReduction(options.mMultiCtasKvMode))
+        {
+            return;
+        }
+        constexpr int kMaxCgaClusterDimX = 16;
+        if (options.mClusterDimX * options.mMaxNumCtasPerSeqKv > kMaxCgaClusterDimX)
+        {
+            TLLM_LOG_WARNING(
+                "CGA reduction is not supported when numCtasPerSeqKv * clusterDimX > 16. Set mMaxNumCtasPerSeqKv to "
+                "16 / clusterDimX");
+            options.mMaxNumCtasPerSeqKv = kMaxCgaClusterDimX / options.mClusterDimX;
+        }
+    }
+
     inline uint64_t hashID(int qkvLayout, int maskType, int kernelType, int scheduler, int multiCtasKvMode,
         int headDimPerCtaV, int headDimQk, int headDimV, int tileSizeQ, int tileSizeKv, int numTokensPerPage,
         bool reuseSmemKForV, bool uses2CtaMma, int sparseAttention, bool skipsSoftmax, bool groupsHeadsQ,
