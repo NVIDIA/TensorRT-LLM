@@ -109,6 +109,8 @@ def model_with_connector(use_kv_cache_manager_v2):
 
         importlib_mock.import_module.return_value.KvConnectorScheduler.return_value = mock_scheduler
         importlib_mock.import_module.return_value.KvConnectorWorker.return_value = mock_worker
+        importlib_mock.import_module.return_value.KvConnectorScheduler.supports_attention_dp = False
+        importlib_mock.import_module.return_value.KvConnectorWorker.supports_attention_dp = False
 
         kv_connector_config = KvCacheConnectorConfig(
             connector_module="",
@@ -1185,8 +1187,8 @@ def test_connector_priorities_default(enforce_single_worker,
         ),
         pytest.param(
             dict(enable_attention_dp=True),
-            "attention data parallelism",
-            "attention data parallelism",
+            "supports_attention_dp=True",
+            "supports_attention_dp=True",
             id="attention_dp",
         ),
     ],
@@ -1212,8 +1214,11 @@ def test_connector_rejects_unsupported_config(enforce_single_worker,
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
                          ids=["kv_cache_manager_v1", "kv_cache_manager_v2"],
                          indirect=True)
-def test_connector_e2e_persistent_cache(enforce_single_worker,
-                                        use_kv_cache_manager_v2, monkeypatch):
+@pytest.mark.parametrize("enable_attention_dp", [False, True])
+def test_connector_e2e_persistent_cache(enforce_single_worker: None,
+                                        use_kv_cache_manager_v2: bool,
+                                        monkeypatch: pytest.MonkeyPatch,
+                                        enable_attention_dp: bool) -> None:
     """End-to-end KV connector test using PersistentKvCacheConnector from examples.
 
     Runs the same prompt through two separate LLM instances sharing a
@@ -1233,7 +1238,7 @@ def test_connector_e2e_persistent_cache(enforce_single_worker,
     sys.path.insert(0, examples_dir)
 
     cache_dir = tempfile.mkdtemp()
-    monkeypatch.setenv("CONNECTOR_CACHE_FOLDER", cache_dir)
+    monkeypatch.setenv("TLLM_CONNECTOR_CACHE_FOLDER", cache_dir)
 
     try:
         import llm_kv_cache_connector
@@ -1271,6 +1276,8 @@ def test_connector_e2e_persistent_cache(enforce_single_worker,
             kv_cache_config=KvCacheConfig(
                 free_gpu_memory_fraction=0.1,
                 use_kv_cache_manager_v2=use_kv_cache_manager_v2),
+            enable_attention_dp=enable_attention_dp,
+            enable_chunked_prefill=False,
         )
 
         prompt = (
@@ -1282,7 +1289,9 @@ def test_connector_e2e_persistent_cache(enforce_single_worker,
             "high-performance computing, and mobile and automotive "
             "applications. Tell me about the company.")
 
-        sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
+        sampling_params = SamplingParams(max_tokens=32,
+                                         ignore_eos=True,
+                                         temperature=0)
 
         llm1 = LLM(**llm_kwargs)
         try:

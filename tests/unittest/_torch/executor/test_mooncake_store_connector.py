@@ -22,6 +22,8 @@ plain integers, which is all the addressing arithmetic needs.
 import contextlib
 import json
 import time
+from collections.abc import Iterator
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -168,11 +170,12 @@ def store_config(tmp_path, monkeypatch):
     return path
 
 
-def make_llm_args():
+def make_llm_args(*, enable_attention_dp: bool = False) -> SimpleNamespace:
     return SimpleNamespace(
         model="/models/test-model",
         kv_cache_config=SimpleNamespace(tokens_per_block=TOKENS_PER_BLOCK),
         tensor_parallel_size=1,
+        enable_attention_dp=enable_attention_dp,
         pipeline_parallel_size=1,
         context_parallel_size=1,
         sparse_attention_config=None,
@@ -192,14 +195,19 @@ def fake_store(monkeypatch):
 
 
 @contextlib.contextmanager
-def make_worker(fake_store, *, layout=None):
+def make_worker(
+    fake_store: FakeStore,
+    *,
+    layout: KvCacheLayout | None = None,
+    enable_attention_dp: bool = False,
+) -> Iterator[MooncakeStoreConnectorWorker]:
     """Build a worker and shut it down before the test call phase ends.
 
     Registering a layout starts the background save thread, and
     pytest-threadleak snapshots threads around the call phase only, so
     fixture teardown would run too late to keep it quiet.
     """
-    worker = MooncakeStoreConnectorWorker(make_llm_args())
+    worker = MooncakeStoreConnectorWorker(make_llm_args(enable_attention_dp=enable_attention_dp))
     fake_store.workers.append(worker)
     if layout is not None:
         worker.register_kv_cache_layout(layout)
@@ -1017,6 +1025,53 @@ def test_scheduler_cancel_load_truncates_the_offer(store_config):
     assert [page.page_index for page in metadata.loads[0].pages] == [10]
 
 
+@pytest.mark.parametrize(
+    "cancel_ranges,expected_pages",
+    [
+        ([(4, 8)], [12, 13, 14]),
+        ([(4, 12)], [13, 14]),
+        ([(4, 8), (16, 20)], [12, 13]),
+        ([(16, 20), (4, 8)], [12, 13]),
+        ([(4, 20)], []),
+        ([(0, 24)], []),
+        ([(0, 4), (20, 24)], [11, 12, 13, 14]),
+        ([(8, 8)], [11, 12, 13, 14]),
+        ([(4, 5)], [12, 13, 14]),
+        ([(19, 24)], [11, 12, 13]),
+    ],
+)
+def test_scheduler_cancel_load_preserves_uncanceled_range(
+    store_config: Path,
+    cancel_ranges: list[tuple[int, int]],
+    expected_pages: list[int],
+) -> None:
+    """Cancel from either end of a nonzero-offset offer without losing its remainder."""
+    scheduler = make_scheduler(store_config, hit_blocks=4)
+    tokens = list(range(6 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    assert scheduler.get_num_new_matched_tokens(request, TOKENS_PER_BLOCK) == (16, False)
+    for start, end in cancel_ranges:
+        scheduler.cancel_load(request, start, end)
+    metadata = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[request_data(1, tokens, list(range(10, 16)))])
+    )
+    assert [page.page_index for load in metadata.loads for page in load.pages] == expected_pages
+    # A consumed offer must not be issued again on the next iteration.
+    next_metadata = scheduler.build_connector_meta(
+        SchedulerOutput(cached_requests=[request_data(1, [], [])])
+    )
+    assert next_metadata.loads == []
+
+
+def test_scheduler_rejects_cancellation_that_splits_an_offer(store_config: Path) -> None:
+    scheduler = make_scheduler(store_config, hit_blocks=4)
+    tokens = list(range(6 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    scheduler.get_num_new_matched_tokens(request, 0)
+    with pytest.raises(ValueError, match="beginning or end"):
+        scheduler.cancel_load(request, TOKENS_PER_BLOCK, 2 * TOKENS_PER_BLOCK)
+
+
 def test_scheduler_request_finished_pins_pages_only_when_saving(store_config):
     scheduler = make_scheduler(store_config, hit_blocks=0)
     tokens = list(range(2 * TOKENS_PER_BLOCK))
@@ -1041,3 +1096,72 @@ def test_scheduler_isolates_requests_by_cache_salt(store_config):
     scheduler.get_num_new_matched_tokens(make_request(1, tokens, cache_salt="a"), 0)
     scheduler.get_num_new_matched_tokens(make_request(2, tokens, cache_salt="b"), 0)
     assert scheduler._worker.queries[0] != scheduler._worker.queries[1]
+
+
+@pytest.mark.parametrize("producer_rank,consumer_rank", [(0, 3), (3, 1), (1, 0)])
+def test_adp_reuses_another_owners_pages(
+    store_config: Path,
+    fake_store: FakeStore,
+    monkeypatch: pytest.MonkeyPatch,
+    producer_rank: int,
+    consumer_rank: int,
+) -> None:
+    """A full prefix needs one copy per layer group, independent of its owner."""
+    monkeypatch.setattr(worker_module, "mpi_world_size", lambda: 4)
+    monkeypatch.setattr(worker_module, "mpi_rank", lambda: producer_rank)
+    layout = make_layout(num_groups=3, regions_per_group=2)
+    hashes = BlockHashChain(TOKENS_PER_BLOCK).extend(list(range(8)))
+    with make_worker(fake_store, layout=layout, enable_attention_dp=True) as producer:
+        producer._put(
+            [RequestTransfers(7, [PageTransfer(hashes[0], group, 1) for group in range(3)])]
+        )
+        # An incompletely published next block must not extend the offer.
+        producer._put([RequestTransfers(7, [PageTransfer(hashes[1], 0, 2)])])
+        monkeypatch.setattr(worker_module, "mpi_rank", lambda: consumer_rank)
+        with make_worker(fake_store, layout=layout, enable_attention_dp=True) as consumer:
+            assert consumer._namespaces == producer._namespaces
+            assert consumer.count_prefix_hit(hashes) == 1
+            assert len(fake_store.exist_calls[-1]) == 2 * 3
+            transfers = RequestTransfers(
+                19, [PageTransfer(hashes[0], group, 5) for group in range(3)]
+            )
+            consumer.bind_connector_meta(SimpleNamespace(loads=[transfers], saves=[]))
+            consumer.start_load_kv(None)
+            keys, addresses, sizes = fake_store.get_calls[-1]
+            assert keys == [producer._namespaces[group].key(hashes[0]) for group in range(3)]
+            addressing = PageAddressing(layout)
+            assert addresses == [addressing.buffers(group, 5)[0] for group in range(3)]
+            assert sizes == [addressing.buffers(group, 5)[1] for group in range(3)]
+            # Reuse is shared, while request completion belongs to each worker.
+            producer._outstanding_saves[7] = 1
+            assert producer.get_finished([7], []) == ([], [])
+            assert consumer.get_finished([7], []) == ([7], [])
+            producer._outstanding_saves.clear()
+            assert producer.get_finished([], []) == ([7], [])
+
+
+def test_tp_lookup_still_requires_all_attention_shards(
+    store_config: Path, fake_store: FakeStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(worker_module, "mpi_world_size", lambda: 4)
+    monkeypatch.setattr(worker_module, "mpi_rank", lambda: 0)
+    block_hash = BlockHashChain(TOKENS_PER_BLOCK).extend(list(range(4)))[0]
+    with make_worker(fake_store, layout=make_layout(num_groups=2)) as worker:
+        worker._put(
+            [RequestTransfers(7, [PageTransfer(block_hash, group, 1) for group in range(2)])]
+        )
+        assert worker.count_prefix_hit([block_hash]) == 0
+        for namespaces in worker._peer_namespaces.values():
+            for namespace in namespaces:
+                fake_store.objects.add(namespace.key(block_hash))
+        assert worker.count_prefix_hit([block_hash]) == 1
+        assert len(fake_store.exist_calls[-1]) == 4 * 2
+        with make_worker(
+            fake_store, layout=make_layout(num_groups=2), enable_attention_dp=True
+        ) as adp:
+            assert adp.count_prefix_hit([block_hash]) == 0
+
+
+def test_mooncake_declares_adp_support() -> None:
+    assert MooncakeStoreConnectorScheduler.supports_attention_dp
+    assert MooncakeStoreConnectorWorker.supports_attention_dp

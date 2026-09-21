@@ -15,3 +15,5 @@ l0_cpu_x86:
   tests:
   - unittest/executor/test_rpc.py
   - unittest/executor/test_multi_frontend_routing.py
+  - unittest/_torch/test_connector_adp.py
+  - unittest/_torch/test_connector_shared_pool.py

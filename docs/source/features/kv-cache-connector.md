@@ -16,7 +16,7 @@ The KV Cache Connector is designed to support a variety of advanced serving scen
 
 The connector architecture is split into two main components:
 
-* **Scheduler (Leader)**: Responsible for orchestration. It decides *what* needs to be loaded or saved and builds metadata instructions. It runs only on the leader rank (rank 0).
+* **Scheduler (Leader)**: Responsible for orchestration. It decides *what* needs to be loaded or saved and builds metadata instructions. With tensor parallelism it runs on rank 0. With attention data parallelism (ADP), each rank runs an owner-local scheduler adapter.
 * **Worker**: Responsible for execution. It receives metadata from the scheduler and performs the actual data transfers (loading/saving) on the KV cache tensors. It runs on all ranks.
 
 ### API Reference
@@ -25,12 +25,12 @@ To implement a custom connector, you must subclass `KvCacheConnectorScheduler` a
 
 #### 1. Scheduler (Leader) Interface (`KvCacheConnectorScheduler`)
 
-These methods run on the leader process and drive the connector's behavior.
+These methods run on the leader process for TP, or on each request-owning rank for ADP.
 
 * **`build_connector_meta(self, scheduler_output: SchedulerOutput) -> object`**
   * **Description**: The core orchestration method. Called during the scheduling phase. It examines the current requests and decides which blocks need to be loaded from or saved to the external store.
   * **Arguments**: `scheduler_output` contains information about new requests, blocks allocated, current request states, and the cumulative `RequestData.block_hashes` chain. `block_hashes` is read directly from each KV cache block's stored hash, which the KV cache manager commits as soon as a block becomes full, so the value matches the hash that KV cache events will subsequently emit for the same block. The chain only covers beam 0; the executor rejects `kv_connector_config` at startup when `max_beam_width > 1`, so connectors may assume beam-width-1 inputs.
-  * **Returns**: An arbitrary metadata object (picklable) that describes the tasks for the workers. This object is broadcasted to all workers.
+  * **Returns**: An arbitrary metadata object (picklable) that describes the tasks for the workers. Under TP it is broadcast to all workers. Under ADP it is bound only to the local worker; `scheduler_output.attention_dp_rank` identifies the owner of its block IDs.
 
 * **`get_num_new_matched_tokens(self, request: LlmRequest, num_computed_tokens: int) -> tuple[int, bool]`**
   * **Description**: Called when a new request arrives. It checks to see if any KV cache can be loaded from an external KV store.
@@ -85,6 +85,63 @@ These methods run on all workers (GPU processes) and interact with the actual GP
 * **`get_finished(self, finished_gen_req_ids, started_loading_req_ids) -> tuple[list[int], list[int]]`**
   * **Description**: Polled by the runtime to check the status of asynchronous operations.
   * **Returns**: Two lists of request IDs: those that have finished saving, and those that have finished loading.
+
+## Attention data parallelism
+
+Set `enable_attention_dp=True` with a connector whose **scheduler and worker
+classes both declare `supports_attention_dp = True`**. Existing connectors that
+have not opted in are rejected before construction. No extra scheduler adapter
+configuration is required: the executor creates a scheduler and worker on each
+ADP rank, including rank 0.
+
+Each adapter owns its request lookup, allocation feedback and worker metadata.
+Connector callbacks and completion polling do not perform collectives between
+ADP owners. The current ADP mapping has one attention worker per owner (model TP
+ranks still cooperate for the non-attention computation). TP without ADP keeps
+the rank-0 scheduler and waits for all attention shards to finish a transfer.
+
+Adapters can use **one shared logical storage pool**. They must use distinct
+worker endpoints and owner-scoped request/transfer IDs, while using common,
+representation-compatible content keys for reusable KV. A local block ID is an
+index into the registered local tensor, not a globally addressable page.
+Do not partition the content namespace by ADP rank: distinguish model revision,
+KV layout/dtype, block size, complete preceding prefix and cache salt instead.
+Pool capacity and placement remain the backend's responsibility; enabling ADP
+does not turn unused peer HBM into directly usable local attention memory.
+
+The capability flag commits an implementation to these requirements:
+
+* Scheduler constructors and callbacks work on nonzero ranks and never require
+  all ADP owners to issue the same requests or call sequence.
+* Workers consume only local metadata. Dummy requests do not appear in storage
+  lookup, allocation feedback, metadata or request-finished callbacks. Empty
+  metadata is valid, including during a dummy-only forward.
+* `get_finished` reports only IDs previously provided to that worker and only
+  after all transfers touching the corresponding local blocks have completed.
+  Cancellation is deferred until those DMA users drain; the generic API does
+  not provide a transport abort operation.
+* Independently arriving writes/readers share content safely, with complete
+  publication, compatible representations and backend pinning during reads.
+
+Async loading may remove every real request from an owner's scheduled batch.
+The executor attempts to add a compute dummy so other owners can advance while
+the transfer proceeds. If the owner has no dummy capacity or sequence slot,
+the existing ADP forward gate still defers the batch.
+
+ADP supports the V1 single-primary-pool interface and V2 layer-group layouts.
+PP=1, CP=1 and beam width 1 are required. V1 retains guaranteed-no-evict
+scheduling; V2 retains its allocation and asynchronous-save lifetime handling.
+Internal host/disk tiers and Mamba/hybrid state remain unsupported. Mooncake
+requires V2 and rejects sliding-window layouts. Third-party presets must
+explicitly opt in.
+
+The built-in `mooncake-store` adapter shares one unsharded attention namespace
+across ADP owners. Each owner opens its own store client and contributes its
+configured segment to the common master. TP uses separate keys for each
+attention shard and still requires all shards for a prefix hit. A disaggregated
+DEP4 prefill / TEP8 decode deployment attaches the store connector to prefill;
+decode can donate host memory while keeping its native KV transceiver. The
+store does not convert attention shard layouts during prefill-to-decode handoff.
 
 ## Built-in Connectors
 
@@ -237,7 +294,7 @@ The store is addressed by whole blocks. The connector is handed the device match
 
 #### How it keys pages
 
-`KVCacheManagerV2` reports `RequestData.block_hashes` empty, so the connector derives block identity itself: a blake2b chain where each block's hash covers its own tokens *and* every token before it, seeded by the request's `cache_salt`. A key is `<prefix>/<model>/w<world size>r<rank>/lg<layer group>/t<tokens per block>b<bytes per page>/<block hash>`. The namespace pins down everything that would make the stored bytes mean something different, so a mismatched shard count, layer group or page geometry reads as a cache miss rather than as garbage.
+`KVCacheManagerV2` reports `RequestData.block_hashes` empty, so the connector derives block identity itself: a blake2b chain where each block's hash covers its own tokens *and* every token before it, seeded by the request's `cache_salt`. A key is `<prefix>/<model>/w<attention shard count>r<attention shard rank>/lg<layer group>/t<tokens per block>b<bytes per page>/<block hash>`. Under ADP all owners use `w1r0`, since each holds complete attention KV; the MPI owner rank remains local transfer state. The namespace pins down everything that would make the stored bytes mean something different, so a mismatched shard count, layer group or page geometry reads as a cache miss rather than as garbage.
 
 The value for one key is the concatenation of that layer group's regions for one page slot, handed to Mooncake's multi-buffer batch APIs as a list of `(address, size)` pairs.
 
@@ -259,7 +316,7 @@ These are rejected at startup, before any request is admitted:
 | Pipeline parallelism | Untested rather than unsound. Use tensor parallelism. |
 | `KVCacheManagerV1` | Identity here is a per-layer-group hash chain; V1 supplies real block hashes over a single flat block space. |
 
-Beam search, attention data parallelism, non-GPU cache tiers and Mamba caches are rejected for all connectors by the executor.
+Beam search, non-GPU cache tiers and Mamba caches are rejected for all connectors by the executor. Attention DP is supported through a local scheduler adapter on every owner.
 
 #### Example
 
@@ -279,11 +336,22 @@ This example implements a file-system based KV cache.
 
 * **Metadata**: The example defines a `PersistentKvCacheConnectorMetadata` dataclass containing lists of `(file_path, block_id)` tuples for both loading and saving. This simple structure allows the Scheduler to tell the Worker exactly which file corresponds to which GPU block index.
 
-* **Hashing Strategy**: The `PersistentKvCacheConnectorLeader` hashes the token sequence of a block to generate a unique filename (e.g., `hash_value.pt`). This acts as the lookup key.
+* **Hashing Strategy**: The `PersistentKvCacheConnectorLeader` uses SHA-256 over the complete prefix through each block and its cache salt. Keys are stable across independently started ADP processes.
 
 * **Worker Logic**:
   * `start_load_kv`: Iterates through the load list provided in the metadata, loads the `.pt` file to CPU, and copies it to the specific `block_id` in the GPU tensor.
   * `wait_for_save`: Performs the reverse. It copies data from the GPU `block_id` to CPU and saves it to disk using `torch.save`.
+    It writes a temporary file in the same directory and atomically publishes
+    the completed file so concurrent owners cannot read a partial write.
+
+For an ADP demonstration, point `TLLM_CONNECTOR_CACHE_FOLDER` at the same shared
+filesystem directory on every rank. The `TLLM_` prefix matters: only `TRTLLM*`
+and `TLLM*` variables are forwarded to spawned MPI workers, and the scheduler
+reads this variable inside them. Use a dedicated directory for each model
+revision and KV representation. The example supports unsharded attention KV
+(single rank or ADP); it does not support sharded attention TP or chunked prefill.
+This filesystem example demonstrates sharing, not elastic HBM placement or
+production performance.
 
 ### Limitations & Patterns
 

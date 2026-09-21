@@ -16,9 +16,9 @@
 
 Every rejection here is a configuration whose failure mode is a wrong answer
 rather than a slow one: KV that gets replayed without all of the state it was
-computed with. Beam search, attention data parallelism, host and disk cache
-tiers, and Mamba caches are rejected for all connectors in `py_executor`, so
-they are not repeated.
+computed with. Beam search, host and disk cache tiers, and Mamba caches are
+rejected for all connectors in `py_executor`, so they are not repeated.
+Attention DP uses one complete attention cache per owner and a shared namespace.
 
 Checks run at construction, before any request is admitted, so a bad deployment
 fails at startup instead of after the first cache hit.
