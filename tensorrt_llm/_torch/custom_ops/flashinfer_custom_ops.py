@@ -63,6 +63,50 @@ if IS_FLASHINFER_AVAILABLE:
                           eps,
                           enable_pdl=get_env_enable_pdl())
 
+    @torch.library.custom_op("trtllm::flashinfer_fused_add_add_rmsnorm",
+                             mutates_args=("input", "residual"))
+    def flashinfer_fused_add_add_rmsnorm(
+            input: torch.Tensor,  # noqa: A002 - part of the public op schema
+            additional: torch.Tensor,
+            residual: torch.Tensor,
+            weight: torch.Tensor,
+            eps: float) -> None:
+        """Fuse a BF16 MoE add, residual add, and RMSNorm in place.
+
+        Args:
+            input: Contiguous or row-strided BF16 tensor of shape ``(M, H)``.
+                Updated in place with the normalized output.
+            additional: BF16 tensor of shape ``(M, H)`` containing the second
+                MoE contribution. This tensor is not modified.
+            residual: BF16 tensor of shape ``(M, H)``. Updated in place with
+                the BF16-rounded MoE sum plus the original residual.
+            weight: Contiguous BF16 RMSNorm weight of shape ``(H,)``.
+            eps: Epsilon added to the RMSNorm variance.
+
+        Returns:
+            ``None``. ``input`` and ``residual`` are updated in place.
+        """
+        # Keep this import lazy so installations that use FlashInfer's CUDA
+        # norm fallback do not need CUTLASS DSL unless the default-off WideEP
+        # path is explicitly selected.
+        from ..cute_dsl_kernels.flashinfer_fused_add_add_rmsnorm import \
+            fused_add_add_rmsnorm_cute
+        fused_add_add_rmsnorm_cute(input,
+                                   additional,
+                                   residual,
+                                   weight,
+                                   eps,
+                                   enable_pdl=get_env_enable_pdl())
+
+    @flashinfer_fused_add_add_rmsnorm.register_fake
+    def _(
+            input: torch.Tensor,  # noqa: A002 - mirrors the public op schema
+            additional: torch.Tensor,
+            residual: torch.Tensor,
+            weight: torch.Tensor,
+            eps: float) -> None:
+        pass
+
     @torch.library.custom_op("trtllm::flashinfer_fused_add_rmsnorm_quant",
                              mutates_args=("out", "residual"))
     def flashinfer_fused_add_rmsnorm_quant(out: torch.Tensor,
