@@ -1304,26 +1304,6 @@ public:
             runtime::ITensor::makeShape({1, getNumDraftTokens() + 1, vocabSizePadded}), logitsDataType);
     }
 
-    [[nodiscard]] std::vector<TensorPtr> const& getGenerationLogitsFragments() const
-    {
-        return mGenerationLogitsFragments;
-    }
-
-    void addGenerationLogitsFragment(TensorPtr& genLogits)
-    {
-        mGenerationLogitsFragments.push_back(genLogits);
-    }
-
-    [[nodiscard]] SizeType32 getGenerationLogitsFragmentsSize() const noexcept
-    {
-        return static_cast<SizeType32>(mGenerationLogitsFragments.size());
-    }
-
-    void clearGenerationLogitsFragments() noexcept
-    {
-        mGenerationLogitsFragments.clear();
-    }
-
     [[nodiscard]] bool hasAdditionalOutputs() const noexcept
     {
         return !mAdditionalContextOutputTensors.empty() || !mAdditionalGenerationOutputTensors.empty();
@@ -1915,7 +1895,6 @@ protected:
     bool mReturnLogProbs{false};
     TensorPtr mContextLogitsHost;    // [mPromptLen, vocabSizePadded]
     TensorPtr mGenerationLogitsHost; // [beamSize, mMaxNewTokens, vocabSizePadded]
-    std::vector<TensorPtr> mGenerationLogitsFragments;
 
     bool mExcludeInputFromOutput;
 
