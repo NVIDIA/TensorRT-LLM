@@ -196,8 +196,8 @@ async def test_framework_decorator_produces_callable_handler_without_sdk_depende
 
 
 async def test_legacy_sdk_tool_conversion_preserves_annotations_and_handler():
+    from claude_agent_sdk import ToolAnnotations
     from claude_agent_sdk import tool as claude_tool
-    from mcp.types import ToolAnnotations
 
     @claude_tool(
         "read",
