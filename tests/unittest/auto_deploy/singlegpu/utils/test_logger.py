@@ -73,20 +73,35 @@ def test_set_level_falls_back_to_info_for_unknown_severity(fresh_ad_logger):
     assert fresh_ad_logger._logger.level == logging.INFO
 
 
-@pytest.mark.parametrize("severity,expected_level", _SEVERITY_CASES)
-def test_env_variable_init_maps_public_severity_names(monkeypatch, severity, expected_level):
-    monkeypatch.setenv("AUTO_DEPLOY_LOG_LEVEL", severity)
+@pytest.fixture
+def reset_ad_logger_singleton():
+    """Clear the ADLogger singleton so the next construction picks up env changes."""
     underlying_logger = logging.getLogger("auto_deploy")
     original_instance = Singleton._instances.get(ADLogger)
     original_level = underlying_logger.level
 
     Singleton._instances.pop(ADLogger, None)
     try:
-        logger = ADLogger()
-        assert logger._logger.level == expected_level
+        yield
     finally:
         underlying_logger.setLevel(original_level)
         if original_instance is not None:
             Singleton._instances[ADLogger] = original_instance
         else:
             Singleton._instances.pop(ADLogger, None)
+
+
+@pytest.mark.parametrize("severity,expected_level", _SEVERITY_CASES)
+def test_env_variable_init_maps_public_severity_names(
+    reset_ad_logger_singleton, monkeypatch, severity, expected_level
+):
+    monkeypatch.setenv("AUTO_DEPLOY_LOG_LEVEL", severity)
+    assert ADLogger()._logger.level == expected_level
+
+
+@pytest.mark.parametrize("severity,expected_level", _SEVERITY_CASES)
+def test_env_variable_init_is_case_insensitive(
+    reset_ad_logger_singleton, monkeypatch, severity, expected_level
+):
+    monkeypatch.setenv("AUTO_DEPLOY_LOG_LEVEL", severity.upper())
+    assert ADLogger()._logger.level == expected_level
