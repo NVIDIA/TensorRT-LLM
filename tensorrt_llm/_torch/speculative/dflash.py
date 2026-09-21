@@ -348,8 +348,8 @@ def validate_dflash_ctx_buffer_budget(
         # silent; skip_ctx_buffer_budget_check suppresses the warning.
         logger.warning(
             f"{message} TRTLLM normally uses the managed KV-cache pool and "
-            "never allocates this arena; this warning fires only if it falls "
-            "back to the private arena during warmup."
+            "never allocates this arena; if warmup instead falls back to the "
+            "private arena, that allocation can exceed the budget and fail."
         )
         return
     raise ValueError(message)
