@@ -40,3 +40,7 @@ l0_gb200_multi_gpus_perf_sanity:
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb200_qwen3-235b-fp4_8k1k_con1_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL] TIMEOUT (90)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL] TIMEOUT (90)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb200_qwen3-235b-fp4_8k1k_con1024_ctx1_tp1_gen1_dep8_eplb0_mtp0_ccb-NIXL] TIMEOUT (90)
+  # gen_only_no_context tests (disagg config)
+  # qwen3-235b-fp4
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb200_qwen3-235b-fp4_8k1k_con1_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL] TIMEOUT (90)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL] TIMEOUT (90)

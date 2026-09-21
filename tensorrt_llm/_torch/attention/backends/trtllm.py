@@ -47,6 +47,7 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         merge_attention_forward_args)
 from .sparse.hooks import prepare_sparse_runtime_params
 from .sparse.params import BlockSparseForwardInputs, SparseParams
+from .sparse.skip_softmax import SkipSoftmaxParams
 from .utils import log_attention_failure_context
 
 _SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
@@ -69,6 +70,23 @@ def _resolve_skip_correction_threshold(threshold: float,
         key="skip_correction_unsupported_sm",
     )
     return 0.0
+
+
+def _resolve_uses_spcompress(sparse_params: Optional[SparseParams],
+                             sm_version: int) -> bool:
+    uses_spcompress = bool(
+        isinstance(sparse_params, SkipSoftmaxParams)
+        and sparse_params.uses_spcompress)
+    if not uses_spcompress:
+        return False
+    if sm_version == 107:
+        return True
+    logger.warning_once(
+        "spcompress is supported only on SM107; "
+        f"disabling it on SM{sm_version}.",
+        key="uses_spcompress_unsupported_sm",
+    )
+    return False
 
 
 @functools.cache
@@ -1393,6 +1411,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                                          If None, positional embedding should be applied by the model before calling the backend.
                                                          Otherwise, the backend is in-charge of applying positional embedding and may cache K without embedding it first.
             mla_params (MLAParams): Optional parameters for MLA. If None, MLA is not enabled.
+            sparse_params (SparseParams): Optional sparse-attention backend parameters
+                (e.g. skip-softmax). Algorithm-specific fields are documented on the
+                corresponding ``SparseParams`` subclass.
             kv_cache_dtype (str): KV-cache dtype selected by ``KvCacheConfig``. Accepted
                 values are ``auto``, ``fp8``, ``fp8_ds_mla``, ``nvfp4``, and supported
                 torch dtype strings. ``fp8_ds_mla`` selects the packed sparse-MLA cache
@@ -1428,6 +1449,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             skip_correction_threshold,
             get_sm_version(),
             is_mla=self.is_mla_enable)
+        self.uses_spcompress = _resolve_uses_spcompress(sparse_params,
+                                                        get_sm_version())
 
         if self.is_mla_enable:
             self.q_lora_rank = self.mla_params.q_lora_rank

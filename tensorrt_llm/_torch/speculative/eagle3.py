@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Set
 
@@ -14,6 +15,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends import AttentionMetadata
 from ..attention.backends.flashinfer import FlashInferAttentionMetadata
+from ..attention.backends.sparse.params import MTPIndexShareMetadata
 from ..model_config import ModelConfig
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
@@ -27,6 +29,13 @@ from .spec_tree_manager import SpecTreeManager
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import EagleDecodingConfig
+
+
+def _reset_mtp_index_share(attn_metadata: MTPIndexShareMetadata) -> None:
+    """Clear the draft-loop state a sparse indexer reads."""
+    attn_metadata.set_skip_topk(False)
+    attn_metadata.set_in_mtp_draft_loop(False)
+    attn_metadata.set_mtp_num_accepted(None)
 
 
 class Eagle3ResourceManager(BaseResourceManager):
@@ -758,8 +767,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                    num_accepted_tokens,
                                    original_all_rank_num_tokens):
         """Linear draft loop, unified for Eagle3 and MTP Eagle."""
-        from ..attention.backends.sparse.dsa import (DSAtrtllmAttentionMetadata,
-                                                     is_dsa_cache_manager)
+        from ..attention.backends.sparse.dsa import is_dsa_cache_manager
 
         runtime_draft_len = spec_metadata.runtime_draft_len
         num_gens = batch_size - num_contexts
@@ -768,18 +776,29 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
         position_ids = inputs["position_ids"]
 
-        uses_dsa_mtp_metadata = self.is_mtp_eagle and isinstance(
-            attn_metadata, DSAtrtllmAttentionMetadata)
-        if uses_dsa_mtp_metadata:
-            attn_metadata.set_in_mtp_draft_loop(True)
-            # Accepted counts let the indexer stash each gen's last-accepted row.
-            attn_metadata.set_mtp_num_accepted(num_accepted_tokens)
-
-        with self.draft_kv_cache_context(
-                attn_metadata, draft_kv_cache_manager) as draft_attn_metadata:
+        # Sparse backends that can reuse one indexer selection across the draft
+        # loop expose this setter; each indexer still decides whether its own
+        # config turns the reuse on.
+        uses_mtp_index_share = self.is_mtp_eagle and isinstance(
+            attn_metadata, MTPIndexShareMetadata)
+        with contextlib.ExitStack() as draft_scope:
+            if uses_mtp_index_share:
+                attn_metadata.set_in_mtp_draft_loop(True)
+                # Accepted counts let the indexer stash each gen's last-accepted row.
+                attn_metadata.set_mtp_num_accepted(num_accepted_tokens)
+                # The metadata outlives this call, so clear the state even when a
+                # draft step raises: a stale draft-loop flag would make the next
+                # target forward reuse these selections. The loop writes
+                # set_skip_topk on the metadata yielded below, which is this same
+                # object: draft_kv_cache_context swaps buffers in place for every
+                # TrtllmAttentionMetadata, and sparse metadata all derive from it.
+                draft_scope.callback(_reset_mtp_index_share, attn_metadata)
+            draft_attn_metadata = draft_scope.enter_context(
+                self.draft_kv_cache_context(attn_metadata,
+                                            draft_kv_cache_manager))
             attn_metadata = draft_attn_metadata
             inputs["attn_metadata"] = draft_attn_metadata
-            if uses_dsa_mtp_metadata and is_dsa_cache_manager(
+            if self.is_mtp_eagle and is_dsa_cache_manager(
                     draft_kv_cache_manager):
                 # Overlap scheduling corrects kv_lens_cuda from the runtime
                 # accepted-token counts inside the captured graph. The target
@@ -788,7 +807,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # writes the separate DSA indexer cache at the same positions.
                 attn_metadata.on_update_kv_lens()
             for i in range(runtime_draft_len):
-                if uses_dsa_mtp_metadata:
+                if uses_mtp_index_share:
                     attn_metadata.set_skip_topk(i > 0)
                 # Run draft model (mode-specific via helper). The helper
                 # passes ``all_rank_num_tokens`` as a kwarg so the draft model
@@ -996,11 +1015,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     "spec_metadata": spec_metadata,
                 }
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
-
-        if uses_dsa_mtp_metadata:
-            attn_metadata.set_skip_topk(False)
-            attn_metadata.set_in_mtp_draft_loop(False)
-            attn_metadata.set_mtp_num_accepted(None)
 
         # Override with SA draft tokens after all draft layers have run,
         # so that draft layers never see SA tokens in their inputs.
