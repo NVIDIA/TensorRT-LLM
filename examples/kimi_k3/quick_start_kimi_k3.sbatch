@@ -27,8 +27,7 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: sbatch $0 --model PATH --image PATH [--enable-block-reuse]" \
-         "[--moe-backend BACKEND]"
+    echo "Usage: sbatch $0 --model PATH --image PATH [--enable-block-reuse]"
 }
 
 MODEL=""
@@ -39,15 +38,6 @@ while [[ $# -gt 0 ]]; do
         --enable-block-reuse)
             # Forwarded verbatim to quick_start_kimi_k3.py (see its --help).
             FEATURE_ARGS="$FEATURE_ARGS $1"
-            shift
-            ;;
-        --moe-backend)
-            [[ $# -ge 2 ]] || { echo "error: --moe-backend requires a value" >&2; usage >&2; exit 2; }
-            FEATURE_ARGS="$FEATURE_ARGS --moe-backend $2"
-            shift 2
-            ;;
-        --moe-backend=*)
-            FEATURE_ARGS="$FEATURE_ARGS --moe-backend ${1#*=}"
             shift
             ;;
         --model)
@@ -105,14 +95,6 @@ srun --mpi=pmix \
         # ranks during autotune JIT (stale file handles).
         export TRITON_CACHE_DIR=/tmp/triton-cache-rank\${SLURM_PROCID:-0}
         mkdir -p \"\$TRITON_CACHE_DIR\"
-
-        # DeepGEMM JIT writes compiled artifacts through a temporary file +
-        # rename. Sharing one cache across ranks lets two compilers race that
-        # rename (444447: compiler.hpp:147 runtime != nullptr in
-        # fp8_swap_ab_gemm). Keep it node-local and per-rank, like GSM8K.
-        export DG_JIT_CACHE_DIR=/tmp/deep-gemm-rank\${SLURM_PROCID:-0}
-        mkdir -p \"\$DG_JIT_CACHE_DIR\"
-        echo \"[k3] DG_JIT_CACHE_DIR=\$DG_JIT_CACHE_DIR\"
 
         # Node-local flashinfer cache: the default (\$HOME) is shared NFS and
         # races across ranks during cubin download (stale file handles).
