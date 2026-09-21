@@ -329,11 +329,15 @@ def test_build_prefill_chunk_defers_partial_swa_chunk(source_block_ids):
     layer_group = SimpleNamespace(
         kind=CacheKind.PAGED, sliding_window_size=window_blocks * tokens_per_block
     )
+
+    def _unexpected_get_block_ids(req, idx, lg):
+        raise AssertionError("context-side transfer must use get_block_ordinals, not get_block_ids")
+
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._reuse_adapter = SimpleNamespace(
         tokens_per_block=tokens_per_block,
         get_cached_token_count_per_layer_group=lambda req, layer_groups: [0],
-        get_block_ids=lambda req, idx, lg: source_block_ids,
+        get_block_ids=_unexpected_get_block_ids,
         get_block_ordinals=lambda req, idx, lg: source_block_ids,
     )
     transceiver._page_table = SimpleNamespace(layer_groups=[layer_group])

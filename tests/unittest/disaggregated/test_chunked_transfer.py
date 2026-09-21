@@ -961,9 +961,13 @@ def test_pipelined_multiple_chunks_use_real_builder_and_tx_session():
     transceiver._send_reqs = {}
     transceiver._ever_had_send_session = False
     transceiver._transfer_worker = SimpleNamespace(create_tx_session=lambda _req: session)
+
+    def _unexpected_get_block_ids(_req, _idx, _lg):
+        raise AssertionError("context-side transfer must use get_block_ordinals, not get_block_ids")
+
     transceiver._reuse_adapter = SimpleNamespace(
         tokens_per_block=tokens_per_block,
-        get_block_ids=lambda _req, _idx, _lg: source_block_ids,
+        get_block_ids=_unexpected_get_block_ids,
         get_block_ordinals=lambda _req, _idx, _lg: source_block_ids,
     )
     transceiver._page_table = SimpleNamespace(

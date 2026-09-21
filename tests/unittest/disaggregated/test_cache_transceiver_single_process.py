@@ -1055,6 +1055,11 @@ def verify_all_requests_helix(
                 # compare just those -- exactly the ctx stride count.
                 n = expected.shape[0]
                 if gen_full is not None and gen_full.shape[0] > n:
+                    assert gen_full.shape[0] <= n + 1, (
+                        f"cp_rank {cp_rank} holds {gen_full.shape[0]} blocks but "
+                        f"the ctx stride is {n} (at most one trailing ledger page "
+                        f"is expected) at req={req_idx} layer={layer_idx}"
+                    )
                     gen_full = gen_full[:n]
                 if n == 0:
                     assert gen_full is None or gen_full.shape[0] == 0, (
@@ -1635,10 +1640,6 @@ def test_cache_transceiver(
     run was spec_off (gen_scratch_tokens=0). The transfer must still cover exactly
     the prompt blocks the receiver needs; a count-based slice would let the
     surplus shift or drop a live prompt block.
-
-    NEEDS-GPU VALIDATION for the spec_on cases: run them against the pre-fix
-    (count-based) _describe_local and confirm the sliding-window ones FAIL; on
-    the ordinal fix all must PASS.
     """
     # Speculative scratch materialisation (resize past history_length) is V2-only
     # here; the V1 path in _add_sequence uses a different allocation entry.
@@ -1767,16 +1768,13 @@ def test_cache_transceiver_helix_cp(gen_cp, is_mla):
     transfer.py:1036 and KVCacheManagerV2._helix_local_len). verify_all_requests_helix
     asserts each gen rank received exactly its stride of the context blocks.
 
-    Scope (deliberately narrow, all validated on GPU by the author):
+    Scope (deliberately narrow):
       * V2 only -- helix awareness lives in KVCacheManagerV2.
       * Full attention only -- the transfer path rejects a token_range (chunked /
         windowed slice) under CP (transfer.py:979), so no sliding window here.
       * tp=pp=1 on both sides -- keeps a rank == a CP rank so the verify is a
         plain positional stride without also unfolding TP head-concat.
       * No speculation -- helix rejects draft tokens.
-
-    HELIX VALIDATE: this whole path (dist-mock collectives under a tp*pp*cp world,
-    ledger block ownership, strided verify) is only meaningful on GPU. Run it.
     """
     print(
         f"\nRunning helix-CP transfer test: gen_cp={gen_cp} mla={is_mla} "
