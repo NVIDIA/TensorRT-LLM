@@ -1585,8 +1585,11 @@ class BaseLLM:
         # is short enough that both leave it alone.
         from .._torch.speculative import spec_sampler_base
 
+        mode = getattr(self.args.speculative_config, "advanced_sampling_mode",
+                       None)
         reason = spec_sampler_base.one_model_sampling_rejection_reason(
-            sampling_params)
+            sampling_params,
+            fused_sampling=bool(mode is not None and mode.is_fused))
         if reason is not None:
             raise RequestError(reason)
 
@@ -2030,6 +2033,7 @@ class _TorchLLM(BaseLLM):
             self.tokenizer,
             checkpoint_format,
             trust_remote_code=self.args.trust_remote_code,
+            enable_tokenization_cache=self.args.enable_tokenization_cache,
             **input_processor_kwargs)
         self._tokenizer = self.input_processor.tokenizer
 

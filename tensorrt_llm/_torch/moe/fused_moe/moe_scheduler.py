@@ -526,6 +526,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 dispatch_kwargs["use_direct_expert_metadata"] = use_deep_ep_direct_metadata
                 dispatch_kwargs["remove_adapter"] = use_deep_ep_direct_metadata
 
+            uses_internal_dispatch_quantization = moe.comm.uses_internal_dispatch_quantization()
             if supports_post_quant:
                 # Quantize -> Dispatch
                 if not used_fused_route_quant:
@@ -559,7 +560,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     use_dp_padding=use_dp_padding,
                     **dispatch_kwargs,
                 )
-                x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
+                if not uses_internal_dispatch_quantization:
+                    x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
         else:
             # No comm: just quantize
             if not used_fused_route_quant:

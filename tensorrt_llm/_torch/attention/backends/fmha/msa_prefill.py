@@ -244,9 +244,9 @@ class MsaPrefillFmha(PhasedFmha):
             ]
         run_msa_prefill_gqa(
             params.attn,
-            params.attention_input,
+            params.query_input,
             metadata,
-            params.context_buf,
+            params.output,
             kv_block_indexes=kv_block_indexes,
             plan=(
                 metadata.msa_prefill_gqa_plan

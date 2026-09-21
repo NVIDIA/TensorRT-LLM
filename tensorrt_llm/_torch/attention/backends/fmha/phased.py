@@ -38,15 +38,20 @@ if TYPE_CHECKING:
 
 @dataclass(slots=True)
 class FmhaParams:
+    """Phase inputs with exactly one of packed QKV or a separate query tensor.
+
+    MLA uses ``query_input`` with ``is_fused_qkv=False``.
+    """
+
     attn: "TrtllmAttention"
     meta: "TrtllmAttentionMetadata"
     fwd: AttentionForwardArgs
     workspace: torch.Tensor
-    attention_input: Optional[torch.Tensor] = None
     qkv_input: Optional[torch.Tensor] = None
+    query_input: Optional[torch.Tensor] = None
     key_input: Optional[torch.Tensor] = None
     value_input: Optional[torch.Tensor] = None
-    context_buf: Optional[torch.Tensor] = None
+    output: Optional[torch.Tensor] = None
     sequence_lengths: Optional[torch.Tensor] = None
     context_lengths: Optional[torch.Tensor] = None
     input_seq_length: int = 0
@@ -211,6 +216,7 @@ class PhasedFmha(Fmha):
             metadata.tokens_per_block if metadata.tokens_per_block is not None else 64
         )
 
+        is_fused_qkv = forward_args.is_fused_qkv
         params = FmhaParams(
             attn=attn,
             meta=metadata,
@@ -239,15 +245,16 @@ class PhasedFmha(Fmha):
                 host_past_key_value_lengths[seq_offset : seq_offset + num_seqs].max()
             )
 
-            params.attention_input = q[token_offset : token_offset + num_ctx_tokens]
-            params.qkv_input = params.attention_input
+            phase_input = q[token_offset : token_offset + num_ctx_tokens]
+            params.qkv_input = phase_input if is_fused_qkv else None
+            params.query_input = None if is_fused_qkv else phase_input
             params.key_input = (
                 k[token_offset : token_offset + num_ctx_tokens] if k is not None else None
             )
             params.value_input = (
                 v[token_offset : token_offset + num_ctx_tokens] if v is not None else None
             )
-            params.context_buf = out_tensor[token_offset : token_offset + num_ctx_tokens]
+            params.output = out_tensor[token_offset : token_offset + num_ctx_tokens]
             params.sequence_lengths = sequence_length[seq_offset:]
             params.context_lengths = context_lengths[seq_offset:]
             params.max_past_kv_length = max_past_kv_len
@@ -284,15 +291,16 @@ class PhasedFmha(Fmha):
                     )
                 spec_pos_offsets = position_offsets_for_cpp
 
-            params.attention_input = q[token_offset : token_offset + num_gen_tokens]
-            params.qkv_input = params.attention_input
+            phase_input = q[token_offset : token_offset + num_gen_tokens]
+            params.qkv_input = phase_input if is_fused_qkv else None
+            params.query_input = None if is_fused_qkv else phase_input
             params.key_input = (
                 k[token_offset : token_offset + num_gen_tokens] if k is not None else None
             )
             params.value_input = (
                 v[token_offset : token_offset + num_gen_tokens] if v is not None else None
             )
-            params.context_buf = out_tensor[token_offset : token_offset + num_gen_tokens]
+            params.output = out_tensor[token_offset : token_offset + num_gen_tokens]
             params.sequence_lengths = sequence_length[seq_offset:]
             params.max_past_kv_length = max_past_kv_len
             params.num_tokens = num_gen_tokens
