@@ -56,8 +56,6 @@
 #define DISABLE_TIMEOUT 0
 #endif
 
-#define TLLM_MOE_A2A_COMPILE_CFT_DISPATCH TLLM_MOE_A2A_COMPILE_SM100
-
 #if TLLM_MOE_A2A_COMPILE_SM90
 #include <cuda/ptx>
 #include <cuda_awbarrier_primitives.h>
@@ -405,9 +403,6 @@ __global__ void moeA2APrepareDispatchKernel(
         uint32_t const next_parity = current_parity ^ 1U;
         recv_counters[next_parity * ep_size + idx] = -1;
     }
-    // NOTE: LE-backed counters use cumulative baselines and are deliberately not zeroed
-    // here, so that the kernel never issues SM stores to LE-backed memory (historically
-    // broke fabric.try_put.counted with PDL).
 }
 
 // ============================================================================
@@ -624,7 +619,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 //   3. Last block sends recv_counters through symmetric memory using the current round parity
 //   4. Poll metadata + data counters from all peers (no fence.sys needed)
 // ============================================================================
-#if TLLM_MOE_A2A_COMPILE_CFT_DISPATCH
+#if TLLM_MOE_A2A_COMPILE_SM100
 __device__ __forceinline__ void cft_barrier_wait_parity(__mbarrier_t* barrier, int parity)
 {
     while (!::cuda::ptx::mbarrier_try_wait_parity(::cuda::ptx::sem_relaxed, ::cuda::ptx::scope_cta,
@@ -736,11 +731,15 @@ __device__ __forceinline__ void cft_publish_recv_counters(DispatchKernelPointers
 }
 
 // Elect the CTA that finishes routing last and have it publish the counters.
-// Should be run by only 1 warp.
+// Called by the CTA; only warp 0 participates.
 template <bool ENABLE_EPLB, bool ENABLE_RANK_MASK>
 __device__ __forceinline__ void cft_elect_and_publish(DispatchKernelPointers const& ptrs, int rank_id, int ep_size,
     uint32_t parity, int eplb_stats_num_experts, int local_num_tokens, int& is_last_token_cta)
 {
+    if (threadIdx.x >= warpSize)
+    {
+        return;
+    }
     int const lane_id = threadIdx.x % warpSize;
     bool is_last_token = false;
     if (lane_id == 0)
@@ -769,9 +768,9 @@ __device__ __forceinline__ void cft_elect_and_publish(DispatchKernelPointers con
 }
 
 template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK>
-__global__ void moeA2ADispatchCountedWriteKernel(int32_t const* token_selected_experts,
-    DispatchKernelPointers const ptrs, int num_payloads, int max_tokens_per_rank, int local_num_tokens, int rank_id,
-    int ep_size, int num_experts, int eplb_stats_num_experts)
+__global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, DispatchKernelPointers const ptrs,
+    int num_payloads, int max_tokens_per_rank, int local_num_tokens, int rank_id, int ep_size, int num_experts,
+    int eplb_stats_num_experts)
 {
     int local_token_idx = blockIdx.x;
     uint32_t parity = 0;
@@ -787,12 +786,8 @@ __global__ void moeA2ADispatchCountedWriteKernel(int32_t const* token_selected_e
             return;
         cudaGridDependencySynchronize();
         parity = round_parity(*ptrs.flag_val);
-        __syncthreads();
-        if (threadIdx.x < warpSize)
-        {
-            cft_elect_and_publish<ENABLE_EPLB, ENABLE_RANK_MASK>(
-                ptrs, rank_id, ep_size, parity, eplb_stats_num_experts, local_num_tokens, is_last_token_cta);
-        }
+        cft_elect_and_publish<ENABLE_EPLB, ENABLE_RANK_MASK>(
+            ptrs, rank_id, ep_size, parity, eplb_stats_num_experts, local_num_tokens, is_last_token_cta);
     }
     else
     {
@@ -811,6 +806,7 @@ __global__ void moeA2ADispatchCountedWriteKernel(int32_t const* token_selected_e
         // runs on the TMA engine in parallel with routing + self-send.
         constexpr int kRoutingBytes = 2 * TOP_K * static_cast<int>(sizeof(int));
         uint8_t* smem_bytes = reinterpret_cast<uint8_t*>(smem);
+        // Wait for TMA staging, then reuse this barrier as the fabric put report target.
         __mbarrier_t* tma_bar = reinterpret_cast<__mbarrier_t*>(smem_bytes + kRoutingBytes);
         uint8_t* smem_staging = smem_bytes + kRoutingBytes + kCftMbarrierSlotBytes;
 
@@ -851,11 +847,8 @@ __global__ void moeA2ADispatchCountedWriteKernel(int32_t const* token_selected_e
 
         // Routing is done, so send_counters is final. Publish it here rather than after the data
         // issue, so peers see the counts as early as possible.
-        if (threadIdx.x < warpSize)
-        {
-            cft_elect_and_publish<ENABLE_EPLB, ENABLE_RANK_MASK>(
-                ptrs, rank_id, ep_size, parity, eplb_stats_num_experts, local_num_tokens, is_last_token_cta);
-        }
+        cft_elect_and_publish<ENABLE_EPLB, ENABLE_RANK_MASK>(
+            ptrs, rank_id, ep_size, parity, eplb_stats_num_experts, local_num_tokens, is_last_token_cta);
 
         int topk_target_ranks[TOP_K];
         int topk_send_indices[TOP_K];
@@ -957,7 +950,6 @@ __global__ void moeA2ADispatchCountedWriteKernel(int32_t const* token_selected_e
 
         if (threadIdx.x == 0 && has_remote)
             cft_fabric_wait_reads();
-        __syncthreads();
     }
 
     cudaTriggerProgrammaticLaunchCompletion();
@@ -1075,11 +1067,11 @@ __global__ void moeA2ADispatchCountedWriteKernel(int32_t const* token_selected_e
     }
 #endif // !DISABLE_SYNC_FOR_PROFILING
 }
-#else  // TLLM_MOE_A2A_COMPILE_CFT_DISPATCH
+#else  // TLLM_MOE_A2A_COMPILE_SM100
 template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK>
-__global__ void moeA2ADispatchCountedWriteKernel(int32_t const* token_selected_experts,
-    DispatchKernelPointers const ptrs, int num_payloads, int max_tokens_per_rank, int local_num_tokens, int rank_id,
-    int ep_size, int num_experts, int eplb_stats_num_experts)
+__global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, DispatchKernelPointers const ptrs,
+    int num_payloads, int max_tokens_per_rank, int local_num_tokens, int rank_id, int ep_size, int num_experts,
+    int eplb_stats_num_experts)
 {
     (void) token_selected_experts;
     (void) ptrs;
@@ -1092,13 +1084,10 @@ __global__ void moeA2ADispatchCountedWriteKernel(int32_t const* token_selected_e
     (void) eplb_stats_num_experts;
     asm volatile("trap;" ::: "memory");
 }
-#endif // TLLM_MOE_A2A_COMPILE_CFT_DISPATCH
+#endif // TLLM_MOE_A2A_COMPILE_SM100
 
 void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params)
 {
-    // NOTE: LE counters are NOT zeroed between iterations. They grow monotonically.
-    // Cumulative baselines in regular device memory track the expected value.
-
     launchWithPdlWhenEnabled("moeA2APrepareDispatchKernel", moeA2APrepareDispatchKernel, 1, params.ep_size, 0,
         params.stream, params.send_counters, params.recv_counters[params.ep_rank], params.local_token_counter,
         params.ep_size, params.flag_val);
@@ -1227,14 +1216,14 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
 
         SWITCH_BOOL(params.enable_rank_mask, ENABLE_RANK_MASK,
             {SWITCH_BOOL(params.enable_eplb, EPLB_STATS, SWITCH_TOP_K(params.top_k, TOP_K, {
-                auto kernel_fn = moeA2ADispatchCountedWriteKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK>;
+                auto kernel_fn = moeA2ADispatchKernel_Cft<TOP_K, EPLB_STATS, ENABLE_RANK_MASK>;
                 if (shared_bytes > kDefaultDynamicSmemBytes)
                 {
                     TLLM_CUDA_CHECK(
                         cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
                 }
-                launchWithPdlWhenEnabled("moeA2ADispatchCountedWriteKernel", kernel_fn, grid_size, kBlockSize,
-                    shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs, params.num_payloads,
+                launchWithPdlWhenEnabled("moeA2ADispatchKernel_Cft", kernel_fn, grid_size, kBlockSize, shared_bytes,
+                    params.stream, params.token_selected_experts, kernel_ptrs, params.num_payloads,
                     params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank, params.ep_size,
                     params.num_experts, params.eplb_stats_num_experts);
             }))})
@@ -1640,8 +1629,10 @@ __device__ void vectorized_quant(DstT* dst, SrcT const* src, int num_elements)
         vectorized_quant_impl<1, SrcT, DstT>(dst, src, num_elements);
 }
 
-// LOW_PRECISION=false: vectorized byte-copy (SrcT = payload dtype).
-// LOW_PRECISION=true:  vectorized SrcT→FP8 quantization via vectorized_quant<SrcT, fp8_e4m3>.
+// Advance flag_val to the combine phase and prepare valid tokens in the requested range.
+// Copy SrcT payloads, or quantize them to FP8 when LOW_PRECISION is enabled.
+// CFT self contributions go to region_c_base; other prepared tokens go to recv_buffer_bytes.
+// This kernel performs no remote transfers or reduction.
 template <bool LOW_PRECISION, typename SrcT>
 __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, void const* source_payload,
     int elements_per_token, int ep_size, int max_tokens_per_rank, uint32_t* flag_val_ptr, int const* recv_counters,
@@ -1659,7 +1650,6 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, void cons
     {
         *flag_val_ptr = *flag_val_ptr + 1;
     }
-    // NOTE: LE counters are NOT zeroed. They grow monotonically with cumulative baselines.
 
     if (blockIdx.x >= prepare_num_tokens)
         return;
@@ -1836,7 +1826,7 @@ __global__ void moeA2ACombineKernel(
 static constexpr int kCombinePushWarpsPerBlock = 4;
 
 template <bool ENABLE_RANK_MASK>
-__global__ void moeA2ACftCombinePushKernel(
+__global__ void moeA2ACombinePushKernel_Cft(
     uint8_t const* local_payload, // Expert output (combine payload or dispatch recv_buffer)
     int const* recv_counters,     // [2, ep_size] tokens received from each source rank
     uint32_t const* flag_val,
@@ -1844,9 +1834,9 @@ __global__ void moeA2ACftCombinePushKernel(
     int rank_id, int ep_size, int max_tokens_per_rank, int bytes_per_token, uint64_t combine_payload_base,
     uint64_t combine_counter_base, int combine_counter_ep_stride, int local_stride_per_token)
 {
-#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000) || CLANGD_HOST_PASS
+#if TLLM_MOE_A2A_COMPILE_SM100
     // Wait for prepareCombine to finish writing the workspace we read from, then immediately
-    // signal the next kernel (combineCountedWrite) that it can start. combineCountedWrite
+    // signal moeA2ACombineKernel_Cft that it can start. moeA2ACombineKernel_Cft
     // polls for incoming counter writes from peers — it touches disjoint memory from our
     // local pushes, so it can run concurrently with the rest of this kernel.
     cudaGridDependencySynchronize();
@@ -1873,15 +1863,13 @@ __global__ void moeA2ACftCombinePushKernel(
         return; // only lane 0 of each warp drives TMA + fabric
 
     // Per-warp smem layout: [mbarrier slot (kCftMbarrierSlotBytes) | staging (bytes_per_token)]
-    // repeated kCombinePushWarpsPerBlock times. Each warp drives its own slot independently
-    // and tracks its own put completion via put_bar — no __syncthreads, no CTA-scope drain
-    // serialization. submit + wait_reads are issued per-warp; the fabric engine pipelines
-    // drains across warps.
+    // repeated kCombinePushWarpsPerBlock times. Each warp drives its own slot and
+    // issues submit + wait_reads independently, without a CTA barrier between tokens.
     extern __shared__ uint8_t smem_push[];
     int per_warp_bytes = kCftMbarrierSlotBytes + bytes_per_token;
     uint8_t* warp_smem = smem_push + warp_id * per_warp_bytes;
-    __mbarrier_t* tma_bar = reinterpret_cast<__mbarrier_t*>(warp_smem);
-    __mbarrier_t* put_bar = tma_bar + 1;
+    __mbarrier_t* tma_bar = reinterpret_cast<__mbarrier_t*>(warp_smem); // Tracks global-to-shared staging.
+    __mbarrier_t* put_bar = tma_bar + 1; // Fabric put report target; not polled by this kernel.
     uint8_t* staging = warp_smem + kCftMbarrierSlotBytes;
 
     uint32_t le_id = peer_le_ids.ids[source_rank]; // push back to source rank's LE
@@ -1905,15 +1893,12 @@ __global__ void moeA2ACftCombinePushKernel(
         cft_barrier_wait_parity(tma_bar, tma_phase & 1);
         tma_phase++;
 
-        // Issue the fabric put with put_bar tracking; arm put_bar to expect bytes_per_token
-        // bytes of fabric.report::fabric.counted::bytes events.
+        // Push the staged token to its source rank and increment that receive slot's byte counter.
         uint64_t data_offset
             = combine_payload_base + (static_cast<uint64_t>(rank_id) * max_tokens_per_rank + t) * bytes_per_token;
         uint64_t counter_offset = combine_counter_base
             + (static_cast<uint64_t>(rank_id) * combine_counter_ep_stride + t) * kCftCounterStride;
-        // put_bar is a required mbarrier::report destination for the PTX but is not waited on:
-        // mbarrier::report::fabric does not deliver reports on this Rubin/driver combo, so
-        // smem-reuse completion is enforced via CTA-scope fabric.wait.sync_restrict::reads below.
+        // wait_reads protects staging reuse; the receiver polls its byte counter for arrival.
         cft_fabric_try_put_counted(le_id, data_offset, counter_offset, staging, bytes_per_token, put_bar);
         cft_fabric_submit();
         cft_fabric_wait_reads();
@@ -1926,12 +1911,12 @@ __global__ void moeA2ACftCombinePushKernel(
 }
 
 template <typename T, int TOP_K, bool LOW_PRECISION, bool ENABLE_RANK_MASK>
-__global__ void moeA2ACombineCountedWriteKernel(const CombineKernelPointers ptrs, int max_tokens_per_rank,
+__global__ void moeA2ACombineKernel_Cft(const CombineKernelPointers ptrs, int max_tokens_per_rank,
     int elements_per_token, int local_num_tokens, int rank_id)
 {
     using InputT = std::conditional_t<LOW_PRECISION, __nv_fp8_e4m3, T>;
 
-#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000) || CLANGD_HOST_PASS
+#if TLLM_MOE_A2A_COMPILE_SM100
     int local_token_idx = blockIdx.x;
     int const size_per_token = elements_per_token * sizeof(InputT);
 
@@ -2008,7 +1993,7 @@ __global__ void moeA2ACombineCountedWriteKernel(const CombineKernelPointers ptrs
     // Launched only on the CFT path, which requires sm_100+; fail loudly rather than
     // completing with an empty body.
     asm volatile("trap;" ::: "memory");
-#endif // __CUDA_ARCH__ >= 1000
+#endif // TLLM_MOE_A2A_COMPILE_SM100
 }
 
 void moe_a2a_cft_combine_push_launch(MoeA2ACombineParams const& params)
@@ -2058,14 +2043,14 @@ void moe_a2a_cft_combine_push_launch(MoeA2ACombineParams const& params)
         auto set_attr = [&](auto* kernel_fn)
         { TLLM_CUDA_CHECK(cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size)); };
         if (params.enable_rank_mask)
-            set_attr(moeA2ACftCombinePushKernel<true>);
+            set_attr(moeA2ACombinePushKernel_Cft<true>);
         else
-            set_attr(moeA2ACftCombinePushKernel<false>);
+            set_attr(moeA2ACombinePushKernel_Cft<false>);
     }
 
     SWITCH_BOOL(params.enable_rank_mask, ENABLE_RANK_MASK, {
-        auto kernel_fn = moeA2ACftCombinePushKernel<ENABLE_RANK_MASK>;
-        launchWithPdlWhenEnabled("moeA2ACftCombinePushKernel", kernel_fn, dim3(params.ep_size, blocks_per_rank),
+        auto kernel_fn = moeA2ACombinePushKernel_Cft<ENABLE_RANK_MASK>;
+        launchWithPdlWhenEnabled("moeA2ACombinePushKernel_Cft", kernel_fn, dim3(params.ep_size, blocks_per_rank),
             dim3(blockThreads), smem_size, params.stream, local_payload, params.recv_counters, params.flag_val, le_ids,
             params.ep_rank, params.ep_size, params.max_tokens_per_rank, bytes_per_token,
             params.cft_le_combine_payload_base, params.cft_le_combine_counter_base, params.combine_counter_ep_stride,
@@ -2084,10 +2069,8 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
         = params.use_cft_for_combine ? static_cast<uint8_t*>(const_cast<void*>(params.cft_le_combine_recv)) : nullptr;
     int const grid = std::max(params.prepare_num_tokens, 1);
 
-    // Zero LE-backed counters from HOST before kernel launch.
-    // NOTE: Combine LE counters are zeroed in prepare_dispatch_launch (before any fabric activity).
-    // Zeroing them here (after dispatch's fabric puts) corrupts subsequent counter increments
-    // because cudaDeviceSynchronize does NOT wait for fabric engine completion.
+    // Preserve params.cft_le_combine_counters and params.cft_combine_counter_baseline
+    // across rounds. The CFT reduce kernel advances each slot's baseline after its wait completes.
 
     SWITCH_BOOL(params.use_low_precision, LOW_PRECISION, {
         SWITCH_DTYPE(params.dtype, SrcT, {
@@ -2177,8 +2160,8 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
             SWITCH_DTYPE(params.dtype, T, {
                 SWITCH_BOOL(params.use_low_precision, LOW_PRECISION, {
                     SWITCH_TOP_K(params.top_k, TOP_K, {
-                        auto kernel_fn = moeA2ACombineCountedWriteKernel<T, TOP_K, LOW_PRECISION, ENABLE_RANK_MASK>;
-                        launchWithPdlWhenEnabled("moeA2ACombineCountedWriteKernel", kernel_fn, cft_grid, kBlockSize, 0,
+                        auto kernel_fn = moeA2ACombineKernel_Cft<T, TOP_K, LOW_PRECISION, ENABLE_RANK_MASK>;
+                        launchWithPdlWhenEnabled("moeA2ACombineKernel_Cft", kernel_fn, cft_grid, kBlockSize, 0,
                             params.stream, kp, params.max_tokens_per_rank, params.elements_per_token,
                             params.local_num_tokens, params.ep_rank);
                     });
