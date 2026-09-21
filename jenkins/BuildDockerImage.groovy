@@ -61,21 +61,15 @@ BOLT_PROFILES_REQUIRED = (params.boltProfilesRequired ?: env.boltProfilesRequire
 // Separate from the two above: those govern the profile BUNDLE baked in as a
 // thin layer (Dockerfile.bolt), which documents how to reproduce a BOLTed build
 // but does NOT optimize the binaries the image actually installs. This one
-// governs the INSTALLED wheel -- when true, the release image must be built from
-// the BOLT-optimized tarball (bolted-<tarball>) rather than whichever tarball
-// happens to exist first. Kept independent so it can be rolled back on its own.
-BOLT_REQUIRE_BOLTED_WHEEL = (params.boltRequireBoltedWheel ?: env.boltRequireBoltedWheel ?: "false").toString() == "true"
+// governs the INSTALLED wheel -- when true, the wheel unpacked from the build
+// tarball is BOLT-optimized in the image build, before the release stage pip
+// installs it. Kept independent so it can be rolled back on its own.
+BOLT_OPTIMIZE_WHEEL = (params.boltOptimizeWheel ?: env.boltOptimizeWheel ?: "false").toString() == "true"
 // <<< BOLT profile-bundle overlay <<<
 
 ENABLE_USE_WHEEL_FROM_BUILD_STAGE = params.useWheelFromBuildStage ?: false
 
 WAIT_TIME_FOR_BUILD_STAGE = 60  // minutes
-// The canonical tarball lands as soon as the build stage finishes; the BOLTed
-// one only after BoltProfileGen's SLURM fan-out (three perf workloads at up to
-// 4h walltime each, plus queue and merge -- its own stage timeout is 8h). So
-// requiring the optimized build means waiting on a different, much longer clock
-// than "the build stage finished".
-WAIT_TIME_FOR_BOLTED_BUILD_STAGE = 480  // minutes
 
 BUILD_JOBS = "32"
 BUILD_JOBS_RELEASE_X86_64 = "32"
@@ -299,20 +293,27 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
     }
 
     def wheelScript = 'scripts/get_wheel_from_package.py'
-    // Only aarch64 has a promoted profile bundle, so only the SBSA image has an
-    // optimized tarball to wait for; x86 keeps taking the canonical one.
-    def requireBolted = BOLT_REQUIRE_BOLTED_WHEEL && arch == "sbsa"
-    def waitTime = requireBolted ? WAIT_TIME_FOR_BOLTED_BUILD_STAGE : WAIT_TIME_FOR_BUILD_STAGE
     // UPLOAD_PATH, not env.uploadPath: they agree whenever the parent passed the
     // parameter, but an unset env leaves the raw reference interpolating to
-    // "null" and the download polls .../null/<tarball>. That used to cost a
-    // wasted wait before the build fell back to compiling from source; with the
-    // bolted wheel required there is no fallback, so it becomes an 8h wait
-    // followed by a failure.
-    def wheelArgs = "--arch ${arch} --timeout ${waitTime} --artifact_path ${UPLOAD_PATH}"
-    if (requireBolted) {
-        echo "Release image for ${arch} requires the BOLT-optimized build; waiting up to ${waitTime} minutes for it"
-        wheelArgs += " --bolted"
+    // "null" and the download then polls .../null/<tarball> until it times out.
+    def wheelArgs = "--arch ${arch} --timeout ${WAIT_TIME_FOR_BUILD_STAGE} --artifact_path ${UPLOAD_PATH}"
+
+    // Only aarch64 has a promoted profile bundle, so only the SBSA image has
+    // anything to apply; x86 installs the wheel as built.
+    if (BOLT_OPTIMIZE_WHEEL && arch == "sbsa") {
+        // The branch whose promoted bundle to apply, resolved the same way the
+        // image overlay resolves it: an explicit override, else this build's own
+        // branch, else main. Deliberately NOT this run's own profiles -- those
+        // are not published until BoltProfileGen finishes, hours after this
+        // build starts, and waiting on them would serialize every release
+        // behind a multi-hour GPU job. get_wheel_from_package.py tries these in
+        // order and fails if none has a bundle.
+        def branches = [params.boltProfileBranch, LLM_BRANCH, "main"]
+            .collect { it?.toString()?.trim() }
+            .findAll { it }
+            .unique()
+        echo "Release image for ${arch} will BOLT-optimize its wheel using profiles from: ${branches.join(', ')}"
+        wheelArgs += " --bolt-branch ${branches.join(',')}"
     }
     return " BUILD_WHEEL_SCRIPT=${wheelScript} BUILD_WHEEL_ARGS='${wheelArgs}'"
 }
@@ -320,10 +321,10 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
 // Whether a docker build that failed WITH the downloaded-wheel args may be
 // retried without them. The retry rebuilds the wheel from source in-container,
 // which is a fine recovery for an ordinary build but silently defeats the point
-// when the whole reason for the download was to install BOLT-optimized binaries
-// -- the retry would produce an unoptimized release image that looks identical.
+// when that build was also responsible for optimizing the wheel -- the retry
+// would produce an unoptimized release image that looks identical.
 def mayRetryWithoutBuildStageWheel(arch) {
-    return !(BOLT_REQUIRE_BOLTED_WHEEL && arch == "sbsa")
+    return !(BOLT_OPTIMIZE_WHEEL && arch == "sbsa")
 }
 
 // Produce each CANONICAL image from its raw `-noprofiles` build by
@@ -909,9 +910,9 @@ pipeline {
             description: "When boltOverlayEnabled is true, treat a missing/empty BOLT bundle as a FATAL error instead of retagging the plain build as canonical. Enable for the release/nightly path to guarantee canonical images carry profiles."
         )
         booleanParam(
-            name: "boltRequireBoltedWheel",
+            name: "boltOptimizeWheel",
             defaultValue: false,
-            description: "Build the SBSA release image from the BOLT-optimized tarball (bolted-<tarball>) instead of the canonical one, waiting for it to be published and failing if it never is. Independent of boltOverlayEnabled, which only bakes in the profile bundle and leaves the installed binaries unoptimized. Enable for the release path; ignored on x86_64, which has no promoted bundle."
+            description: "BOLT-optimize the wheel the SBSA release image installs, applying the branch's latest promoted profile bundle during the image build, and fail if no bundle can be applied. Independent of boltOverlayEnabled, which only bakes the bundle in as a layer and leaves the installed binaries unoptimized. Uses the last promoted bundle rather than this run's, so the image build never waits on BoltProfileGen. Ignored on x86_64, which has no promoted bundle."
         )
         string(
             name: "boltProfileBranch",
