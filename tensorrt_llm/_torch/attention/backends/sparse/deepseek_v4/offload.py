@@ -31,12 +31,17 @@ class SparseOffloadLayerDescriptor:
     """One local model layer's main compressed buffer in KVCM's namespace.
 
     ``page_scale`` converts resident raw GPU slots to SHARED physical pages.
-    It does not specify the units of the unfinished sparse fetch API.
+    ``fetched_page_scale`` must be bound separately once KVCM specifies fetch
+    output units: 1 for SHARED physical pages, or the appropriate converter
+    scale for raw slots in the same pool. None keeps decode disabled rather
+    than guessing the unfinished API's units. Buffer pointers supply the
+    layer offset in either case.
     """
 
     buffer_id: BufferId
     group_id: LayerGroupId
     page_scale: int
+    fetched_page_scale: int | None = None
 
 
 @dataclass(kw_only=True)
@@ -48,6 +53,10 @@ class SparseOffloadState:
     pinned CPU memory. Layer workspaces are reused only after the previous
     layer's attention has consumed them on the same stream. Concurrent
     forwards require separate metadata and KVCM scratch ownership.
+
+    ``prepared`` means preparation was enqueued successfully; stream ordering
+    establishes device readiness. ``is_prefill`` is set by host batch validation
+    before execution, never inferred from a device count inside a layer.
     """
 
     layers: dict[int, SparseOffloadLayerDescriptor]
@@ -60,3 +69,5 @@ class SparseOffloadState:
     compress_read_table: torch.Tensor
     history_upload_done: torch.cuda.Event = field(default_factory=torch.cuda.Event)
     history_upload_pending: bool = False
+    prepared: bool = False
+    is_prefill: bool = False

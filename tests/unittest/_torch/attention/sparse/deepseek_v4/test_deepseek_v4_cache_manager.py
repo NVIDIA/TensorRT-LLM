@@ -151,7 +151,7 @@ def test_sparse_offload_rejects_inference_before_cache_allocation() -> None:
     with (
         patch.object(deepseek_v4_cache, "get_sm_version") as get_sm_version,
         patch.object(deepseek_v4_cache.KVCacheManagerV2, "__init__") as initialize_cache,
-        pytest.raises(NotImplementedError, match="per-layer attention fetch integration"),
+        pytest.raises(NotImplementedError, match="KVCM v2 sparse runtime"),
     ):
         DeepseekV4CacheManager(
             kv_cache_config=KvCacheConfig(enable_block_reuse=False, host_cache_size=1 << 20),

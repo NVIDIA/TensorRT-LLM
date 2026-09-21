@@ -573,9 +573,57 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         for field in self._DRAFT_SPARSE_FIELDS:
             setattr(self, field, saved_state[field])
 
+    def validate_sparse_offload_batch(self) -> None:
+        """Reject unsupported layouts on the host before any model writes.
+
+        Only a fresh, unchunked context batch or one query per decode request
+        is supported. This runs during prepare(), outside capture/replay;
+        the per-layer path consumes the resulting phase and device metadata.
+        """
+        if not self.sparse_metadata_params.enable_kv_cache_offload:
+            return
+        state = self.sparse_offload_state
+        if state is not None:
+            state.prepared = False
+            state.is_prefill = False
+        if self.beam_width != 1 or self.max_draft_tokens or self.draft_kv_cache_manager is not None:
+            raise NotImplementedError(
+                "Sparse offload requires single-beam, non-speculative execution"
+            )
+        if self.num_contexts and self.num_generations:
+            raise NotImplementedError(
+                "Sparse offload does not support mixed context/decode batches"
+            )
+        if self.seq_lens.device.type != "cpu" or self.seq_lens_kv.device.type != "cpu":
+            raise ValueError("Sparse offload batch validation requires host sequence lengths")
+        if not torch.equal(self.seq_lens, self.seq_lens_kv):
+            raise NotImplementedError("Sparse offload requires matching query and new-KV lengths")
+        if not self.num_contexts:
+            if not torch.all(self.seq_lens == 1):
+                raise NotImplementedError("Sparse offload decode requires one query per request")
+            return
+        cached = self.kv_cache_params.num_cached_tokens_per_seq
+        if (
+            self.prompt_lens is None
+            or len(self.prompt_lens) < self.num_contexts
+            or len(cached) < self.num_contexts
+            or any(cached[: self.num_contexts])
+            or self.seq_lens.tolist() != self.prompt_lens[: self.num_contexts]
+            or any(
+                self.kv_cache_manager.kv_cache_map[request_id].history_length != 0
+                for request_id in self.request_ids
+            )
+        ):
+            raise NotImplementedError(
+                "Sparse offload prefill must be fresh, uncached, and unchunked"
+            )
+        if state is not None:
+            state.is_prefill = True
+
     def prepare(self):
         assert self.kv_cache_manager is not None
         assert self.request_ids is not None
+        self.validate_sparse_offload_batch()
 
         self.kv_cache_manager.compute_sliding_block_tables(
             self.request_ids,
