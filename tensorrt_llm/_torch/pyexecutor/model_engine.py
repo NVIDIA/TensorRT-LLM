@@ -5303,9 +5303,16 @@ class PyTorchModelEngine(ModelEngine):
                             request.py_helix_is_inactive_rank)
                         helix_position_offsets.append(position_id)
                         # Keep the per-seq owned-count list aligned when the
-                        # spec path is active in the same batch.
-                        helix_owned_new_tokens.append(
-                            0 if request.py_helix_is_inactive_rank else 1)
+                        # spec path is active in the same batch. Only then:
+                        # a non-empty list arms _helix_spec_tokens_valid, and
+                        # the per-token slots/bounds it gates are filled by
+                        # recompute_helix_spec_buffers, which _preprocess_inputs
+                        # runs under enable_spec_decode only. Populating it in
+                        # ordinary generation would point consumers at
+                        # uninitialized buffers.
+                        if self.enable_spec_decode:
+                            helix_owned_new_tokens.append(
+                                0 if request.py_helix_is_inactive_rank else 1)
 
                 request.cached_tokens = past_seen_token_num
                 for beam in range(beam_width):
