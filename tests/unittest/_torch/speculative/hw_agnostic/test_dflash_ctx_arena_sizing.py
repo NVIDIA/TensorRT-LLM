@@ -36,6 +36,8 @@ import pytest
 
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 
+pytestmark = pytest.mark.cpu_only
+
 SERVED = 49152
 POSITION_TABLE = 1048576
 

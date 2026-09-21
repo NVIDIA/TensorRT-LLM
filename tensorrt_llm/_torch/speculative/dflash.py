@@ -63,13 +63,13 @@ def compute_dflash_ctx_buffer_bytes(
     Mirrors the allocation exactly: ``max_batch_size + 1`` slots (one scratch
     slot for padding/warmup dummies), capacity ``max_ctx_len + block_size``
     per slot, K and V for every drafter attention layer. The VANILLA backend
-    holds two contiguous ``[slots, L, capacity, Hkv, D]`` tensors; the TRTLLM
-    backend holds one paged ``[L, pages, 2, Hkv, page, D]`` tensor whose
-    per-slot capacity is rounded up to whole pages.
+    holds two contiguous ``[slots, L, capacity, Hkv, D]`` tensors; the paged
+    backends (``TRTLLM``, ``FA4``) hold one paged ``[L, pages, 2, Hkv, page,
+    D]`` tensor whose per-slot capacity is rounded up to whole pages.
     """
     num_slots = max_batch_size + 1
     capacity = max_ctx_len + block_size
-    if attention_backend == "TRTLLM":
+    if attention_backend in _PAGED_ATTENTION_BACKENDS:
         pages_per_slot = (capacity + page_size - 1) // page_size
         capacity = pages_per_slot * page_size
     per_slot_elems = 2 * num_attn_layers * capacity * num_kv_heads_per_rank * head_dim
