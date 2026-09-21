@@ -1830,7 +1830,7 @@ __global__ void moeA2ACombinePushKernel_Cft(
     uint8_t const* local_payload, // Expert output (combine payload or dispatch recv_buffer)
     int const* recv_counters,     // [2, ep_size] tokens received from each source rank
     uint32_t const* flag_val,
-    CftPeerLeIds peer_le_ids,     // LE IDs passed by value (no device pointer needed)
+    CftCombinePeerInfo peer_info, // Peer LE IDs and readiness flag pointers passed by value.
     int rank_id, int ep_size, int max_tokens_per_rank, int bytes_per_token, uint64_t combine_payload_base,
     uint64_t combine_counter_base, int combine_counter_ep_stride, int local_stride_per_token)
 {
@@ -1843,13 +1843,24 @@ __global__ void moeA2ACombinePushKernel_Cft(
     cudaTriggerProgrammaticLaunchCompletion();
 
     int source_rank = blockIdx.x;
-    if (source_rank == rank_id)
-        return;
     if constexpr (ENABLE_RANK_MASK)
     {
-        if (!is_rank_active(peer_le_ids.active_rank_mask, source_rank))
+        if (!is_rank_active(peer_info.active_rank_mask, source_rank))
             return;
     }
+
+#if !DISABLE_SYNC_FOR_PROFILING
+    // The dependency wait has completed upstream MoE reads of the dispatch region.
+    // Publish readiness even when this peer has no contribution to receive.
+    if (blockIdx.y == 0 && threadIdx.x == 0)
+    {
+        uint32_t* flag_addr = &peer_info.completion_flags[source_rank][rank_id];
+        uint32_t const expected_value = *flag_val;
+        asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(expected_value) : "memory");
+    }
+#endif
+    if (source_rank == rank_id)
+        return;
 
     uint32_t const parity = round_parity(*flag_val);
     int num_tokens = recv_counters[parity * ep_size + source_rank];
@@ -1872,7 +1883,7 @@ __global__ void moeA2ACombinePushKernel_Cft(
     __mbarrier_t* put_bar = tma_bar + 1; // Fabric put report target; not polled by this kernel.
     uint8_t* staging = warp_smem + kCftMbarrierSlotBytes;
 
-    uint32_t le_id = peer_le_ids.ids[source_rank]; // push back to source rank's LE
+    uint32_t le_id = peer_info.ids[source_rank]; // push back to source rank's LE
 
     // Tokens are fanned across all warps of all blocks for this source rank; blockIdx.y selects
     // the token-chunk. Each warp uses its own per-warp smem slot.
@@ -1912,7 +1923,7 @@ __global__ void moeA2ACombinePushKernel_Cft(
 
 template <typename T, int TOP_K, bool LOW_PRECISION, bool ENABLE_RANK_MASK>
 __global__ void moeA2ACombineKernel_Cft(const CombineKernelPointers ptrs, int max_tokens_per_rank,
-    int elements_per_token, int local_num_tokens, int rank_id)
+    int elements_per_token, int local_num_tokens, int rank_id, int ep_size)
 {
     using InputT = std::conditional_t<LOW_PRECISION, __nv_fp8_e4m3, T>;
 
@@ -1923,71 +1934,108 @@ __global__ void moeA2ACombineKernel_Cft(const CombineKernelPointers ptrs, int ma
     cudaGridDependencySynchronize();
     cudaTriggerProgrammaticLaunchCompletion();
 
-    // Empty rank: this block exists only for the PDL handshake above; no local token to reduce.
-    if (local_num_tokens == 0)
-        return;
+    // Empty ranks skip reduction but still participate in the readiness wait below.
+    if (local_num_tokens > 0)
+    {
 
 #if !DISABLE_SYNC_FOR_PROFILING
-    // Per-token readiness: warp 0 polls ONLY the k receive-slots its local token needs
-    // (slot = target_rank*max + dst_idx), so a token reduces as soon as its own pieces land
-    // (overlapping the still-running push under PDL) rather than waiting for every peer's counter.
-    int lane_id = threadIdx.x % warpSize;
-    // One token per block -> only warp 0 polls its receive-slots.
-    if (threadIdx.x / warpSize == 0)
-    {
-        int const my_token = local_token_idx;
-#pragma unroll 1
-        for (int kk = lane_id; kk < TOP_K; kk += warpSize)
+        // Per-token readiness: warp 0 polls ONLY the k receive-slots its local token needs
+        // (slot = target_rank*max + dst_idx), so a token reduces as soon as its own pieces land
+        // (overlapping the still-running push under PDL) rather than waiting for every peer's counter.
+        int lane_id = threadIdx.x % warpSize;
+        // One token per block -> only warp 0 polls its receive-slots.
+        if (threadIdx.x / warpSize == 0)
         {
-            int tr = ptrs.topk_target_ranks[my_token * TOP_K + kk];
-            int di = ptrs.topk_send_indices[my_token * TOP_K + kk];
-            if (tr < 0 || di < 0)
-                continue; // duplicate / invalid routing slot
+            int const my_token = local_token_idx;
+#pragma unroll 1
+            for (int kk = lane_id; kk < TOP_K; kk += warpSize)
+            {
+                int tr = ptrs.topk_target_ranks[my_token * TOP_K + kk];
+                int di = ptrs.topk_send_indices[my_token * TOP_K + kk];
+                if (tr < 0 || di < 0)
+                    continue; // duplicate / invalid routing slot
+                if constexpr (ENABLE_RANK_MASK)
+                {
+                    if (!is_rank_active(ptrs.active_rank_mask, tr))
+                        continue;
+                }
+                if (tr == rank_id)
+                    continue; // self contribution: not fabric-pushed
+
+                int slot = tr * ptrs.combine_counter_ep_stride + di;
+                uint64_t combine_base = ptrs.combine_counter_baseline[slot];
+                uint64_t combine_target = combine_base + static_cast<uint64_t>(size_per_token);
+
+                uint64_t* combineCounterPtr = &ptrs.combine_counters[static_cast<size_t>(slot) * kCftCounterStrideU64];
+                uint64_t current_combine_counter = 0;
+                auto s = clock64();
+                while (true)
+                {
+                    asm volatile("ld.relaxed.sys.u64 %0, [%1];"
+                                 : "=l"(current_combine_counter)
+                                 : "l"(combineCounterPtr));
+                    if (current_combine_counter >= combine_target)
+                    {
+                        break;
+                    }
+                    if (check_timeout(s, ptrs.timeout_cycles))
+                    {
+                        printf(
+                            "combine(cft): ---Rank %d tok %d k %d slot %d timed out counter=%llu base=%llu "
+                            "target=%llu\n",
+                            rank_id, my_token, kk, slot, (unsigned long long) current_combine_counter,
+                            (unsigned long long) combine_base, (unsigned long long) combine_target);
+                        asm volatile("trap;");
+                        return;
+                    }
+                }
+                ptrs.combine_counter_baseline[slot] = combine_target;
+            }
+#if TLLM_CFT_HAS_CUDA_13_4_SUPPORT
+            asm volatile("fence.proxy.generic::fabric.alias.acquire.sys;" ::: "memory");
+#endif
+        }
+        __syncthreads();
+#endif
+
+        T* token_output = static_cast<T*>(ptrs.src_data_ptrs[0]) + local_token_idx * elements_per_token;
+        vectorized_combine<TOP_K, T, InputT>(
+            token_output, size_per_token, size_per_token, rank_id, max_tokens_per_rank, ptrs);
+    }
+
+#if !DISABLE_SYNC_FOR_PROFILING
+    // Keep one CTA alive until every peer has consumed its old dispatch inputs.
+    // Other token CTAs reduce independently; the next dispatch's dependency wait
+    // prevents it from overwriting peer inputs before this grid completes.
+    if (blockIdx.x == 0 && threadIdx.x < warpSize)
+    {
+        uint32_t const expected_value = *ptrs.flag_val;
+        for (int peer_rank = threadIdx.x; peer_rank < ep_size; peer_rank += warpSize)
+        {
             if constexpr (ENABLE_RANK_MASK)
             {
-                if (!is_rank_active(ptrs.active_rank_mask, tr))
+                if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
                     continue;
             }
-            if (tr == rank_id)
-                continue; // self contribution: not fabric-pushed
-
-            int slot = tr * ptrs.combine_counter_ep_stride + di;
-            uint64_t combine_base = ptrs.combine_counter_baseline[slot];
-            uint64_t combine_target = combine_base + static_cast<uint64_t>(size_per_token);
-
-            uint64_t* combineCounterPtr = &ptrs.combine_counters[static_cast<size_t>(slot) * kCftCounterStrideU64];
-            uint64_t current_combine_counter = 0;
-            auto s = clock64();
-            while (true)
+            uint32_t const* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
+            auto const start = clock64();
+            uint32_t flag_value;
+            do
             {
-                asm volatile("ld.relaxed.sys.u64 %0, [%1];" : "=l"(current_combine_counter) : "l"(combineCounterPtr));
-                if (current_combine_counter >= combine_target)
-                {
+                asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr) : "memory");
+                if (flag_value == expected_value)
                     break;
-                }
-                if (check_timeout(s, ptrs.timeout_cycles))
+                if (check_timeout(start, ptrs.timeout_cycles))
                 {
-                    printf(
-                        "combine(cft): ---Rank %d tok %d k %d slot %d timed out counter=%llu base=%llu target=%llu\n",
-                        rank_id, my_token, kk, slot, (unsigned long long) current_combine_counter,
-                        (unsigned long long) combine_base, (unsigned long long) combine_target);
-                    asm volatile("trap;");
+                    printf("combine(cft): ---Rank %d timed out readiness from rank %d flag=%u expected=%u\n", rank_id,
+                        peer_rank, flag_value, expected_value);
+                    asm volatile("trap;" ::: "memory");
                     return;
                 }
-            }
-            ptrs.combine_counter_baseline[slot] = combine_target;
+            } while (true);
         }
-#if TLLM_CFT_HAS_CUDA_13_4_SUPPORT
-        asm volatile("fence.proxy.generic::fabric.alias.acquire.sys;" ::: "memory");
-#endif
     }
-    __syncthreads();
 #endif
-
-    __threadfence_system(); // system-scope fence before the gather (dispatch gets this from its kernel boundary)
-    T* token_output = static_cast<T*>(ptrs.src_data_ptrs[0]) + local_token_idx * elements_per_token;
-    vectorized_combine<TOP_K, T, InputT>(
-        token_output, size_per_token, size_per_token, rank_id, max_tokens_per_rank, ptrs);
     cudaTriggerProgrammaticLaunchCompletion();
 #else
     // Launched only on the CFT path, which requires sm_100+; fail loudly rather than
@@ -2004,11 +2052,14 @@ void moe_a2a_cft_combine_push_launch(MoeA2ACombineParams const& params)
     uint8_t const* local_payload = static_cast<uint8_t const*>(params.cft_push_payload);
 
     // Pass peer metadata by value as a kernel argument.
-    CftPeerLeIds le_ids = {};
+    CftCombinePeerInfo peer_info = {};
     for (int i = 0; i < params.ep_size; i++)
-        le_ids.ids[i] = params.cft_peer_le_ids[i];
+    {
+        peer_info.ids[i] = params.cft_peer_le_ids[i];
+        peer_info.completion_flags[i] = params.completion_flags[i];
+    }
     for (int w = 0; w < kRankMaskWords; ++w)
-        le_ids.active_rank_mask[w] = params.active_rank_mask[w];
+        peer_info.active_rank_mask[w] = params.active_rank_mask[w];
 
     // Push parallelism is env-overridable for tuning:
     //   TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_PUSH_WARPS           : warps per block (default kCombinePushWarpsPerBlock)
@@ -2051,8 +2102,8 @@ void moe_a2a_cft_combine_push_launch(MoeA2ACombineParams const& params)
     SWITCH_BOOL(params.enable_rank_mask, ENABLE_RANK_MASK, {
         auto kernel_fn = moeA2ACombinePushKernel_Cft<ENABLE_RANK_MASK>;
         launchWithPdlWhenEnabled("moeA2ACombinePushKernel_Cft", kernel_fn, dim3(params.ep_size, blocks_per_rank),
-            dim3(blockThreads), smem_size, params.stream, local_payload, params.recv_counters, params.flag_val, le_ids,
-            params.ep_rank, params.ep_size, params.max_tokens_per_rank, bytes_per_token,
+            dim3(blockThreads), smem_size, params.stream, local_payload, params.recv_counters, params.flag_val,
+            peer_info, params.ep_rank, params.ep_size, params.max_tokens_per_rank, bytes_per_token,
             params.cft_le_combine_payload_base, params.cft_le_combine_counter_base, params.combine_counter_ep_stride,
             local_stride_per_token);
     });
@@ -2163,7 +2214,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
                         auto kernel_fn = moeA2ACombineKernel_Cft<T, TOP_K, LOW_PRECISION, ENABLE_RANK_MASK>;
                         launchWithPdlWhenEnabled("moeA2ACombineKernel_Cft", kernel_fn, cft_grid, kBlockSize, 0,
                             params.stream, kp, params.max_tokens_per_rank, params.elements_per_token,
-                            params.local_num_tokens, params.ep_rank);
+                            params.local_num_tokens, params.ep_rank, params.ep_size);
                     });
                 });
             });

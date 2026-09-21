@@ -616,10 +616,9 @@ CASES = [
                     Round((128, 3, 1, 0), Routing.SPREAD, 3),
                     Round((5, 2, 0, 3), Routing.LOCAL, 0),
                     Round((1, 0, 4, 2), Routing.SPREAD, 1),
-                    # With local-only routing and CFT combine, rank 0 can finish while
-                    # delayed rank 1 still reads its dispatch inputs. Raising the next
-                    # round's runtime token limit from 128 to 129 shifts payload/scale
-                    # offsets and can overwrite those inputs without synchronization.
+                    # Local-only routing gives rank 0 no token dependency on rank 1.
+                    # Combine on rank 0 must still wait for rank 1 until rank 1 consumes its dispatched inputs.
+                    # Otherwise, rank 0's next dispatch would abrupt the data that rank 1 is consuming.
                     Round((1, 128, 0, 0), Routing.LOCAL, 1),
                     Round((129, 1, 0, 0), Routing.SPREAD, 0),
                 ),
@@ -631,15 +630,6 @@ CASES = [
                 eplb=False,
             ),
             id=f"round-sequence-ep4-{mode}-{'graph' if graph else 'eager'}",
-            # TODO: Define whether unsynchronized runtime-token changes between
-            # rounds are supported, then revisit the CFT overlap failures.
-            marks=(
-                pytest.mark.skip(
-                    reason="TODO: clarify support for changing runtime token counts across overlapping CFT rounds"
-                )
-                if mode != "fence"
-                else ()
-            ),
         )
         for mode, graph in (
             ("auto", False),

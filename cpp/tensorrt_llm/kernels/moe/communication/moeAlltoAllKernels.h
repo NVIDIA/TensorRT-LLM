@@ -45,9 +45,10 @@ static constexpr size_t kCftCounterStrideU64 = kCftCounterStride / sizeof(uint64
 static constexpr int kCftMbarrierSlotBytes = 64;
 
 // Fixed-size peer metadata passed by value to the CFT combine push kernel.
-struct CftPeerLeIds
+struct CftCombinePeerInfo
 {
     uint32_t ids[kMaxRanks];
+    uint32_t* completion_flags[kMaxRanks];
     uint64_t active_rank_mask[kRankMaskWords];
 };
 
@@ -132,7 +133,7 @@ struct CombineKernelPointers
     void* src_data_ptrs[kMaxPayloads];                 // src_data_ptrs[0] is output
     void const* recv_buffers[kMaxRanks][kMaxPayloads]; // 2D array of receive buffer pointers (const)
 
-    // Completion flags for synchronization (fence-based path)
+    // Combine readiness flags shared by the fence and CFT paths.
     uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
                                            // rank has signaled the target rank
     uint32_t* flag_val;                    // The value of the flag for this round (stored on the local rank)
