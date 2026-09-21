@@ -23,11 +23,11 @@ import torch
 
 pytest.importorskip("fla")
 
+from kimi_kda_test_utils import get_production_decode_kernel_path
+
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
+from tensorrt_llm._torch.modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
-from tests.unittest._torch.modules.kimi_kda.kimi_kda_test_utils import (
-    get_production_decode_kernel_path,
-)
 
 
 class _Cfg:
@@ -81,15 +81,89 @@ def test_forward_preserves_native_int32_state_indices(monkeypatch):
         ),
         num_contexts=0,
         num_ctx_tokens=0,
+        num_tokens=2,
         seq_lens=torch.tensor([1, 1]),
         kv_cache_manager=SimpleNamespace(mamba_layer_cache=lambda _: layer_cache),
     )
 
-    output = attention(torch.empty(2, _Cfg.hidden_size), metadata)
+    output = attention(torch.empty(2, _Cfg.hidden_size, dtype=torch.bfloat16), metadata)
 
     assert output.shape == (2, _Cfg.hidden_size)
     assert captured["slot_indices"].data_ptr() == state_indices.data_ptr()
     assert captured["ssm_state_indices"].data_ptr() == state_indices.data_ptr()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_forward_uses_metadata_aligned_generation_state_indices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attention = KimiKDALinearAttention(_Cfg(), layer_idx=0).cuda()
+    captured: dict[str, torch.Tensor] = {}
+
+    def forward_prefill(
+        hidden_states: torch.Tensor, *args: object, **kwargs: object
+    ) -> torch.Tensor:
+        return torch.zeros_like(hidden_states)
+
+    def forward_verify(
+        hidden_states: torch.Tensor,
+        num_steps: int,
+        layer_cache: SimpleNamespace,
+        conv_pool: torch.Tensor,
+        ssm_pool: torch.Tensor,
+        slot_indices: torch.Tensor,
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        captured["slot_indices"] = slot_indices
+        return torch.zeros_like(hidden_states)
+
+    monkeypatch.setattr(attention, "forward_prefill", forward_prefill)
+    monkeypatch.setattr(attention, "forward_verify", forward_verify)
+    layer_cache = SimpleNamespace(
+        conv=torch.empty(0, device="cuda"),
+        temporal=torch.empty(0, device="cuda"),
+    )
+
+    class KdaCacheManager:
+        use_kda_replay_update = True
+
+        def __init__(self) -> None:
+            self.state_indices = torch.tensor([9, 4], dtype=torch.int32, device="cuda")
+
+        def get_state_indices(self, request_ids: list[int], is_padding: list[bool]) -> torch.Tensor:
+            return self.state_indices[: len(request_ids)]
+
+        def mamba_layer_cache(self, layer_idx: int) -> SimpleNamespace:
+            return layer_cache
+
+    manager = KdaCacheManager()
+    mamba_metadata = KimiK3MambaMetadata(max_batch_size=2, chunk_size=8, max_num_tokens=4)
+    metadata = SimpleNamespace(
+        num_contexts=1,
+        num_ctx_tokens=1,
+        num_tokens=4,
+        seq_lens=torch.tensor([1, 1], dtype=torch.int),
+        seq_lens_cuda=torch.tensor([1, 1], dtype=torch.int, device="cuda"),
+        kv_cache_manager=manager,
+        request_ids=[10, 11],
+        kv_cache_params=SimpleNamespace(
+            num_cached_tokens_per_seq=torch.tensor([0], dtype=torch.int),
+        ),
+    )
+    mamba_metadata.prepare(metadata)
+    metadata.mamba_metadata = mamba_metadata
+    hidden_states = torch.empty(4, _Cfg.hidden_size, dtype=torch.bfloat16, device="cuda")
+    generation_slice = mamba_metadata.state_indices[1:]
+    aligned_indices = mamba_metadata.generation_state_indices
+
+    assert generation_slice.data_ptr() % 16 != 0
+    assert aligned_indices.data_ptr() % 16 == 0
+
+    output = attention(hidden_states, metadata)
+
+    assert output.shape == hidden_states.shape
+    assert captured["slot_indices"].data_ptr() == aligned_indices.data_ptr()
+    torch.testing.assert_close(aligned_indices, generation_slice)
 
 
 class _LayerCache:
@@ -102,6 +176,9 @@ class _LayerCache:
         self.intermediate_ssm = torch.zeros(
             slots, t_max, h, v, k, dtype=torch.float32, device=device
         )
+        # This double drives the sequential-verify path, not the KDA
+        # fused-replay path, so it has no kda_* replay caches.
+        self.has_kda_replay_caches = False
 
 
 def _decode_metadata(layer_cache: SimpleNamespace, slot_indices: torch.Tensor) -> SimpleNamespace:
@@ -116,6 +193,7 @@ def _decode_metadata(layer_cache: SimpleNamespace, slot_indices: torch.Tensor) -
         mamba_metadata=mamba_metadata,
         num_contexts=0,
         num_ctx_tokens=0,
+        num_tokens=batch,
         seq_lens=torch.ones(batch, device=slot_indices.device, dtype=torch.int32),
         kv_cache_manager=cache_manager,
     )
@@ -137,13 +215,14 @@ def _prefill_metadata(
         mamba_metadata=mamba_metadata,
         num_contexts=batch,
         num_ctx_tokens=int(cu_seqlens[-1]),
+        num_tokens=int(cu_seqlens[-1]),
         seq_lens=cu_seqlens[1:] - cu_seqlens[:-1],
         kv_cache_manager=cache_manager,
     )
 
 
 @torch.no_grad()
-def test_kda_fused_prefill_matches_separate_projections():
+def test_kda_prefill_matches_reference():
     if not torch.cuda.is_available():
         pytest.skip("needs a GPU")
 
@@ -165,23 +244,26 @@ def test_kda_fused_prefill_matches_separate_projections():
 
     reference = KimiKDALinearAttention(cfg, layer_idx=0).to(device)
     reference.load_state_dict(runtime.state_dict())
+    reference._build_mtp_conv_weights()
     runtime.finalize_decode_weights()
-    assert runtime._qkvg_proj_weight is not None
-    assert runtime._bfa_proj_weight is not None
 
     slots = 4
     slot_indices = torch.tensor([2, 0], device=device, dtype=torch.long)
     cu_seqlens = torch.tensor([0, 3, 5], device=device, dtype=torch.long)
     hidden_states = torch.randn(5, cfg.hidden_size, device=device, dtype=torch.bfloat16) * 0.05
-    conv_seed = torch.randn(slots, 3 * d, w, device=device, dtype=torch.bfloat16) * 0.02
+    conv_seed = torch.randn(slots, 3 * d, w - 1, device=device, dtype=torch.bfloat16) * 0.02
     state_seed = (
         torch.randn(slots, h, head_dim, head_dim, device=device, dtype=torch.float32) * 0.01
     )
 
-    expected_cache = SimpleNamespace(conv=conv_seed.clone(), temporal=state_seed.clone())
+    expected_cache = SimpleNamespace(
+        conv=conv_seed.clone(), temporal=state_seed.clone(), has_kda_replay_caches=False
+    )
     expected = reference(hidden_states, _prefill_metadata(expected_cache, slot_indices, cu_seqlens))
 
-    actual_cache = SimpleNamespace(conv=conv_seed.clone(), temporal=state_seed.clone())
+    actual_cache = SimpleNamespace(
+        conv=conv_seed.clone(), temporal=state_seed.clone(), has_kda_replay_caches=False
+    )
     actual = runtime(hidden_states, _prefill_metadata(actual_cache, slot_indices, cu_seqlens))
 
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
@@ -190,13 +272,15 @@ def test_kda_fused_prefill_matches_separate_projections():
 
 
 @torch.no_grad()
-def test_kda_qkvg_multistream_decode_matches_separate_projections():
+@pytest.mark.parametrize("num_heads", [6, 8])
+def test_kda_decode_matches_reference(num_heads):
     if not torch.cuda.is_available():
         pytest.skip("needs a GPU")
 
     torch.manual_seed(0)
     device = "cuda"
     cfg = _K3Cfg()
+    cfg.linear_attn_config = {**cfg.linear_attn_config, "num_heads": num_heads}
     lin = cfg.linear_attn_config
     h = lin["num_heads"]
     head_dim = lin["head_dim"]
@@ -220,21 +304,29 @@ def test_kda_qkvg_multistream_decode_matches_separate_projections():
     slots = batch + 2
     slot_indices = torch.tensor([2, 0, 4], device=device, dtype=torch.long)
     hidden_states = torch.randn(batch, cfg.hidden_size, device=device, dtype=torch.bfloat16) * 0.05
-    conv_seed = torch.randn(slots, 3 * d, w, device=device, dtype=torch.bfloat16) * 0.02
+    conv_seed = torch.randn(slots, 3 * d, w - 1, device=device, dtype=torch.bfloat16) * 0.02
     state_seed = (
         torch.randn(slots, h, head_dim, head_dim, device=device, dtype=torch.float32) * 0.01
     )
 
-    expected_cache = SimpleNamespace(conv=conv_seed.clone(), temporal=state_seed.clone())
+    expected_cache = SimpleNamespace(
+        conv=conv_seed.clone(), temporal=state_seed.clone(), has_kda_replay_caches=False
+    )
     expected = reference(hidden_states, _decode_metadata(expected_cache, slot_indices))
 
-    actual_cache = SimpleNamespace(conv=conv_seed.clone(), temporal=state_seed.clone())
+    actual_cache = SimpleNamespace(
+        conv=conv_seed.clone(), temporal=state_seed.clone(), has_kda_replay_caches=False
+    )
     with with_multi_stream(True):
         actual = runtime(hidden_states, _decode_metadata(actual_cache, slot_indices))
 
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(actual_cache.conv, expected_cache.conv, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(actual_cache.temporal, expected_cache.temporal, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(actual_cache.conv, expected_cache.conv, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(actual_cache.temporal, expected_cache.temporal, rtol=2e-4, atol=2e-4)
+    untouched = torch.ones(slots, dtype=torch.bool, device=device)
+    untouched[slot_indices] = False
+    assert torch.equal(actual_cache.conv[untouched], expected_cache.conv[untouched])
+    assert torch.equal(actual_cache.temporal[untouched], expected_cache.temporal[untouched])
 
 
 @pytest.mark.parametrize("batch", [1, 3])
@@ -256,7 +348,7 @@ def test_kda_verify_matches_sequential_decode(batch, t_steps):
     # NaN/Inf bit pattern poisons both paths identically (nvbug 6599150).
     torch.nn.init.normal_(runtime.dt_bias, std=0.1)
     slots = batch + 2  # non-trivial slot mapping
-    cache = _LayerCache(slots, 3 * dim, w, h, lin["head_dim"], lin["head_dim"], t_steps, device)
+    cache = _LayerCache(slots, 3 * dim, w - 1, h, lin["head_dim"], lin["head_dim"], t_steps, device)
     slot_indices = torch.arange(2, 2 + batch, device=device, dtype=torch.long)
 
     # Random-but-fixed starting state and inputs.
@@ -269,7 +361,8 @@ def test_kda_verify_matches_sequential_decode(batch, t_steps):
     ref_ssm = cache.temporal.clone()
     ref_outs, ref_conv_steps, ref_ssm_steps = [], [], []
     for t in range(t_steps):
-        out = runtime.forward_decode(x[:, t], ref_conv, ref_ssm, slot_indices)
+        core = runtime.forward_decode(x[:, t], ref_conv, ref_ssm, slot_indices)
+        out = runtime._project_output(core)
         ref_outs.append(out)
         ref_conv_steps.append(ref_conv.index_select(0, slot_indices).clone())
         ref_ssm_steps.append(ref_ssm.index_select(0, slot_indices).clone())
@@ -277,14 +370,24 @@ def test_kda_verify_matches_sequential_decode(batch, t_steps):
     # --- Verify path: one call, intermediates into the scratch buffers. ---
     pristine_conv = cache.conv.clone()
     pristine_ssm = cache.temporal.clone()
-    out_verify = runtime.forward_verify(
+    verify_core = torch.empty(
+        batch * t_steps,
+        h,
+        lin["head_dim"],
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    verify_result = runtime.forward_verify(
         x.reshape(batch * t_steps, cfg.hidden_size),
         t_steps,
         cache,
         cache.conv,
         cache.temporal,
         slot_indices,
+        output=verify_core,
     )
+    assert verify_result is verify_core
+    out_verify = runtime._project_output(verify_core)
 
     # Live pools must be untouched by verification.
     torch.testing.assert_close(cache.conv, pristine_conv, rtol=0, atol=0)

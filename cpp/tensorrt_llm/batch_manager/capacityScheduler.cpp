@@ -76,7 +76,7 @@ prefillWithChunkedContextsAlreadyExecuting(RequestList const& activeRequests,
 /// @brief Check if a single manager's summary indicates we should skip this request.
 /// @details Returns true if the request's first new context block was already contributed
 /// by an earlier scheduled request (so waiting would let us reuse it). Does NOT mutate
-/// the set — registration is deferred to beneficialToSkip after both KV checks pass.
+/// the set — registration is the caller's job, see registerContributedBlocks.
 bool oneManagerBeneficialToSkip(std::optional<kv_cache_manager::PrefixReuseSummary> const& summary,
     std::unordered_set<BlockKey, BlockKeyHasher> const& newlyContributedContextBlocks)
 {
@@ -87,23 +87,28 @@ bool oneManagerBeneficialToSkip(std::optional<kv_cache_manager::PrefixReuseSumma
 /// @brief Check if it is beneficial to skip this request rather than schedule it.
 /// @details Returns true if this request can reuse KV cache block(s) that will be contributed
 /// by already-scheduled context requests. Uses pre-computed PrefixReuseSummary values.
-/// When the request is NOT skipped, registers its firstNewBlock contributions so that
-/// subsequent duplicate requests can be deferred.
+/// @note Pure: this does NOT register the request's own contributions. Callers must invoke
+/// registerContributedBlocks once — and only once — the request has actually been admitted.
+/// Registering at check time would defer later duplicates on behalf of a contributor that the
+/// budget checks below then reject, and in MaxUtilization it would make a request skip itself
+/// on the retry that follows a pause.
 bool beneficialToSkip(std::optional<kv_cache_manager::PrefixReuseSummary> const& summary,
+    std::optional<kv_cache_manager::PrefixReuseSummary> const& crossSummary,
+    std::unordered_set<BlockKey, BlockKeyHasher> const& newlyContributedContextBlocks,
+    std::unordered_set<BlockKey, BlockKeyHasher> const& newlyContributedCrossContextBlocks)
+{
+    return oneManagerBeneficialToSkip(summary, newlyContributedContextBlocks)
+        || oneManagerBeneficialToSkip(crossSummary, newlyContributedCrossContextBlocks);
+}
+
+/// @brief Register the blocks this request will newly contribute to the reuse tree.
+/// @details Call only after the request has been scheduled. This upholds the invariant that
+/// no request is ever deferred in an iteration where its contributor was not scheduled.
+void registerContributedBlocks(std::optional<kv_cache_manager::PrefixReuseSummary> const& summary,
     std::optional<kv_cache_manager::PrefixReuseSummary> const& crossSummary,
     std::unordered_set<BlockKey, BlockKeyHasher>& newlyContributedContextBlocks,
     std::unordered_set<BlockKey, BlockKeyHasher>& newlyContributedCrossContextBlocks)
 {
-    if (oneManagerBeneficialToSkip(summary, newlyContributedContextBlocks))
-    {
-        return true;
-    }
-    if (oneManagerBeneficialToSkip(crossSummary, newlyContributedCrossContextBlocks))
-    {
-        return true;
-    }
-    // Request is NOT skipped — register its contributions so subsequent duplicate
-    // requests can be deferred correctly.
     if (summary.has_value() && summary->firstNewBlock.has_value())
     {
         newlyContributedContextBlocks.insert(summary->firstNewBlock.value());
@@ -112,7 +117,6 @@ bool beneficialToSkip(std::optional<kv_cache_manager::PrefixReuseSummary> const&
     {
         newlyContributedCrossContextBlocks.insert(crossSummary->firstNewBlock.value());
     }
-    return false;
 }
 
 template <typename KVCacheManagerT>
@@ -360,8 +364,11 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                         crossSummary = kv_cache_manager::PrefixReuseSummary{};
                     }
                 }
-                // Beneficial-to-skip check using the cached summary
-                if (!StaticBatchScheduling && skippingIsRelevant && (isFirstChunkContext || isEncoderInit)
+                // Beneficial-to-skip check using the cached summary. The same predicate gates the
+                // registration below, so the check and the registration can never drift apart.
+                bool const skipTrackingApplies
+                    = !StaticBatchScheduling && skippingIsRelevant && (isFirstChunkContext || isEncoderInit);
+                if (skipTrackingApplies
                     && beneficialToSkip(
                         summary, crossSummary, newlyContributedContextBlocks, newlyContributedCrossContextBlocks))
                 {
@@ -388,7 +395,14 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                         {
                             uniqTaskIds.insert(req->getLoraTaskId().value());
                         }
+                        if (skipTrackingApplies)
+                        {
+                            registerContributedBlocks(summary, crossSummary, newlyContributedContextBlocks,
+                                newlyContributedCrossContextBlocks);
+                        }
                     }
+                    // A PEFT-page shortage falls through to the next request without registering
+                    // anything: this request contributes no blocks in this iteration.
                 }
                 else if (req->isContextInitState() || req->isDisaggGenerationInitState())
                 {
@@ -418,6 +432,11 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                         if (isNewTask)
                         {
                             uniqTaskIds.insert(req->getLoraTaskId().value());
+                        }
+                        if (skipTrackingApplies)
+                        {
+                            registerContributedBlocks(summary, crossSummary, newlyContributedContextBlocks,
+                                newlyContributedCrossContextBlocks);
                         }
                     }
                     else if (!enoughBlocks || !enoughCrossBlocks)
@@ -541,8 +560,10 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
             summary = kvCacheManager.analyzePrefixReuse(uniqueTokens, *req);
         }
 
-        // Beneficial-to-skip check using the cached summary (no cross KV cache for MaxUtil)
-        if (skippingIsRelevant && isFirstChunkContext
+        // Beneficial-to-skip check using the cached summary (no cross KV cache for MaxUtil).
+        // The same predicate gates the registration below, so the two can never drift apart.
+        bool const skipTrackingApplies = skippingIsRelevant && isFirstChunkContext;
+        if (skipTrackingApplies
             && beneficialToSkip(
                 summary, std::nullopt, newlyContributedContextBlocks, newlyContributedCrossContextBlocks))
         {
@@ -556,6 +577,15 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
         if (wasScheduled)
         {
             TLLM_LOG_DEBUG("MaxUtilizationScheduler: request ID %lu -> start", req->mRequestId);
+            // Register only now. The failure branch below pauses a started request and retries this
+            // same request without advancing reqIt; registering at check time would put this
+            // request's own firstNewBlock in the set and make it skip itself on that retry —
+            // wasting the capacity the pause just freed.
+            if (skipTrackingApplies)
+            {
+                registerContributedBlocks(
+                    summary, std::nullopt, newlyContributedContextBlocks, newlyContributedCrossContextBlocks);
+            }
             reqIt++;
         }
         else

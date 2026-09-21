@@ -27,8 +27,7 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm.logger import logger
-
+from ...sampling_params import SamplingParams
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.sampler import (
@@ -45,6 +44,84 @@ from ..pyexecutor.sampler.penalties import has_occurrence_penalty
 from ..pyexecutor.sampler.sampler_common import _request_get_sampling_params, top_p_decay_active
 from ..pyexecutor.sampler.sampler_features import handle_stop_criteria
 from ..pyexecutor.scheduler import ScheduledRequests
+
+# Rejection messages for the sampling features the one-model speculative path
+# cannot honor. They are module constants because two places raise them: the
+# executor-side SpecSampler.validate_request below, and the admission-time
+# check LLM._check_arguments runs before the response stream opens. Sharing the
+# text is what keeps the two from drifting apart.
+UNSUPPORTED_MIN_LENGTH_MSG = (
+    "min_length is not supported with one-model speculative decoding. "
+    "Drop min_length from the request, or disable speculative decoding."
+)
+UNSUPPORTED_BAD_WORDS_MSG = (
+    "bad_words is not supported with one-model speculative decoding. "
+    "Drop bad_words from the request, or disable speculative decoding."
+)
+UNSUPPORTED_NO_REPEAT_NGRAM_MSG = (
+    "no_repeat_ngram_size is not supported with one-model speculative "
+    "decoding. Drop no_repeat_ngram_size from the request, or disable "
+    "speculative decoding."
+)
+UNSUPPORTED_EMBEDDING_BIAS_MSG = (
+    "embedding_bias is not supported with one-model speculative decoding. "
+    "Drop embedding_bias from the request, or disable speculative decoding."
+)
+UNSUPPORTED_TOP_P_DECAY_MSG = (
+    "top_p_decay is not supported with one-model speculative decoding. "
+    "Drop top_p_decay / top_p_min from the request, or disable "
+    "speculative decoding."
+)
+UNSUPPORTED_MIN_P_MSG = (
+    "min_p requires 'advanced_sampling_mode: full' in the speculative decoding "
+    "config when using one-model speculative decoding. Restore that default, "
+    "drop min_p from the request, or disable speculative decoding."
+)
+
+
+def one_model_sampling_rejection_reason(
+    sampling_params: Optional[SamplingParams], *, fused_sampling: bool = False
+) -> Optional[str]:
+    """Why ``sampling_params`` cannot be served by the one-model speculative path.
+
+    ``SpecSampler.validate_request`` is the authoritative check, but it runs on
+    the executor's admission path. By then the OpenAI frontend has already
+    answered 200 and opened the response stream, so the rejection reaches the
+    client as an aborted stream (``ClientPayloadError`` /
+    ``TransferEncodingError``) that it cannot tell apart from a network fault.
+    This mirrors the subset of those rules ``SamplingParams`` alone can decide,
+    so the request can be rejected before the stream opens; the executor-side
+    check stays as the backstop for submission paths that bypass the LLM API.
+
+    Returns ``None`` when nothing in ``sampling_params`` is unsupported.
+    """
+    if sampling_params is None:
+        return None
+    # min_tokens is what SamplingParams calls the field LlmRequest carries as
+    # py_min_length. The OpenAI frontend always forwards it, so gate on the
+    # value rather than on its presence -- same reasoning as the LlmRequest
+    # check below.
+    min_tokens = sampling_params.min_tokens
+    if min_tokens and min_tokens > 0:
+        return UNSUPPORTED_MIN_LENGTH_MSG
+    # Either form populates py_bad_words; the string form needs a tokenizer to
+    # resolve, so test the raw fields rather than _get_bad_words().
+    if sampling_params.bad or sampling_params.bad_token_ids:
+        return UNSUPPORTED_BAD_WORDS_MSG
+    if sampling_params.no_repeat_ngram_size:
+        return UNSUPPORTED_NO_REPEAT_NGRAM_MSG
+    if sampling_params.embedding_bias is not None:
+        return UNSUPPORTED_EMBEDDING_BIAS_MSG
+    # The same predicate top_p_decay_active() delegates to, so "active" cannot
+    # mean one thing here and another in the sampler.
+    if SamplingParams.params_imply_top_p_decay_active(sampling_params.top_p_decay):
+        return UNSUPPORTED_TOP_P_DECAY_MSG
+    # The one filter whose support depends on the deploy config rather than on
+    # sampling_params, so the caller has to supply it.
+    min_p = sampling_params.min_p
+    if min_p and min_p > 0.0 and not fused_sampling:
+        return UNSUPPORTED_MIN_P_MSG
+    return None
 
 
 @dataclass(kw_only=True)
@@ -93,24 +170,30 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
     def validate_request(self, request: LlmRequest) -> None:
         """Reject sampling parameters the one-model speculative path cannot honor.
 
-        The one-model sampling kernels take only temperature/top_k/top_p (see
-        SpecMetadata.populate_sampling_params_for_one_model); min_p has no
-        buffer there, so it would be silently dropped and the request would
-        decode from a different distribution than the user asked for. Threading
-        it through costs measurable throughput on the rejection path, so reject
-        instead. Raised from validate_request (request admission), so only the
+        The fused backend supports min_p; other one-model sampling backends do
+        not. This sampler also does not return context logits, generation logits,
+        or log probabilities. Raised during request admission, so only the
         offending request fails rather than the whole executor step.
         """
+        requested_outputs = (
+            ("return_context_logits / prompt_logprobs", request.py_return_context_logits),
+            ("return_generation_logits", request.py_return_generation_logits),
+            ("logprobs", request.py_return_log_probs),
+        )
+        unsupported_outputs = [name for name, requested in requested_outputs if requested]
+        if unsupported_outputs:
+            raise ValueError(
+                "The following output options are not supported with speculative decoding: "
+                f"{', '.join(unsupported_outputs)}. Drop these options from "
+                "the request, or disable speculative decoding."
+            )
+
         sampling_config = request.sampling_config
         if sampling_config is None:
             return
-        # min_p lives on the C++ SamplingConfig as an optional singleton list.
         min_p = sampling_config.min_p
-        if min_p and min_p[0] > 0.0:
-            raise ValueError(
-                "min_p is not supported with one-model speculative decoding. "
-                "Drop min_p from the request, or disable speculative decoding."
-            )
+        if min_p and min_p > 0.0 and not self._fused_sampling:
+            raise ValueError(UNSUPPORTED_MIN_P_MSG)
         self._validate_unsupported_logits_processors(request)
         # The occurrence penalties need a [slots, vocab_size] workspace that is only
         # allocated when the deploy opted in, so a request asking for them while the
@@ -132,9 +215,9 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         if not self._penalty_supported:
             raise ValueError(
                 "repetition_penalty / presence_penalty / frequency_penalty are not "
-                "supported with tree speculative decoding (eagle_choices / dynamic "
-                "tree) yet. Drop the penalties, use a linear speculation mode, or "
-                "disable speculative decoding."
+                "supported with tree speculative decoding (dynamic tree) yet. Drop "
+                "the penalties, use a linear speculation mode, or disable "
+                "speculative decoding."
             )
 
     @staticmethod
@@ -150,38 +233,21 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         frontend may forward a default explicitly.
         """
         # py_min_length mirrors the C++ SamplingConfig field, i.e. an optional
-        # singleton list. The OpenAI frontend always forwards min_tokens (default
-        # 0), so the list is routinely present and holds the neutral value --
-        # gate on the value, not on the list being non-empty.
+        # scalar. The OpenAI frontend always forwards min_tokens (default 0), so
+        # it is routinely present and holds the neutral value -- gate on the
+        # value, not on its presence.
         min_length = getattr(request, "py_min_length", None)
-        if min_length and min_length[0] > 0:
-            raise ValueError(
-                "min_length is not supported with one-model speculative decoding. "
-                "Drop min_length from the request, or disable speculative decoding."
-            )
+        if min_length and min_length > 0:
+            raise ValueError(UNSUPPORTED_MIN_LENGTH_MSG)
         if getattr(request, "py_bad_words", None):
-            raise ValueError(
-                "bad_words is not supported with one-model speculative decoding. "
-                "Drop bad_words from the request, or disable speculative decoding."
-            )
+            raise ValueError(UNSUPPORTED_BAD_WORDS_MSG)
         if getattr(request, "py_no_repeat_ngram_size", None):
-            raise ValueError(
-                "no_repeat_ngram_size is not supported with one-model speculative "
-                "decoding. Drop no_repeat_ngram_size from the request, or disable "
-                "speculative decoding."
-            )
-        if getattr(request, "_py_embedding_bias_1d", None) is not None:
-            raise ValueError(
-                "embedding_bias is not supported with one-model speculative decoding. "
-                "Drop embedding_bias from the request, or disable speculative decoding."
-            )
+            raise ValueError(UNSUPPORTED_NO_REPEAT_NGRAM_MSG)
+        if getattr(request, "py_embedding_bias", None) is not None:
+            raise ValueError(UNSUPPORTED_EMBEDDING_BIAS_MSG)
         # Reuse the handler's own predicate so "active" cannot drift between paths.
         if top_p_decay_active(_request_get_sampling_params(request)):
-            raise ValueError(
-                "top_p_decay is not supported with one-model speculative decoding. "
-                "Drop top_p_decay / top_p_min from the request, or disable "
-                "speculative decoding."
-            )
+            raise ValueError(UNSUPPORTED_TOP_P_DECAY_MSG)
 
     @dataclass(kw_only=True)
     class Store:
@@ -196,27 +262,25 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self,
         args: TorchSampler.Args,
         *,
-        accepted_path_len: Optional[int] = None,
         enable_penalty: bool = False,
         penalty_supported: bool = True,
+        fused_sampling: bool = False,
     ):
         """
         Initialize the speculative sampler.
 
         Args:
             args: TorchSampler.Args with max_num_sequences, max_seq_len, etc.
-            accepted_path_len: Upper bound on the number of tokens a single step
-                can accept, used to size new_tokens. Defaults to
-                ``args.max_draft_len + 1``; see the store comment below for the
-                one mode that has to override it.
             enable_penalty: whether the deploy enabled the occurrence penalties.
                 Only used to decide whether a request asking for them is admitted;
                 the penalties themselves are applied inside the worker.
             penalty_supported: whether this speculation mode's row layout is one
                 the penalties can map (linear modes yes, tree modes not yet).
+            fused_sampling: whether the configured sampler supports min_p.
         """
         self._enable_penalty = enable_penalty
         self._penalty_supported = penalty_supported
+        self._fused_sampling = fused_sampling
         self._async_worker_init(args.enable_async_worker)
         self.mapping = None
         self.max_seq_len = args.max_seq_len
@@ -231,23 +295,12 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         assert self.max_beam_width == 1, "beam width must be 1 for speculative decoding"
 
         # new_tokens holds the accepted tokens only, so it is sized to how many
-        # a step can accept rather than to the wire width. Normally that is
-        # max_draft_len + 1: the drafter advances max_draft_len times, and the
-        # golden token the target always accepts adds one. Verified against
-        # Eagle3 dynamic tree (K=6, T=60), MTP dynamic tree, PARD (T=2K-1) and
-        # the linear modes -- none exceed it.
-        #
-        # The exception is the deprecated eagle_choices static tree. There the
-        # one-model drafter ignores the tree and runs _forward_draft_loop, a
-        # linear loop over runtime_draft_len == max_total_draft_tokens, so a
-        # step can accept up to max_total_draft_tokens + 1 tokens even though
-        # max_draft_len only describes the depth of a tree that is never built.
-        # (Tree-aware acceptance lives in TorchSampler, i.e. the two-model
-        # path.) get_spec_decoder passes the wire width for that mode; both it
-        # and this workaround go away with the feature in release 1.4.
-        self.max_accepted_path_len = (
-            accepted_path_len if accepted_path_len is not None else args.max_draft_len + 1
-        )
+        # a step can accept rather than to the wire width: max_draft_len + 1,
+        # because the drafter advances max_draft_len times and the golden token
+        # the target always accepts adds one. Verified against Eagle3 dynamic
+        # tree (K=6, T=60), MTP dynamic tree, PARD (T=2K-1) and the linear
+        # modes -- none exceed it.
+        self.max_accepted_path_len = args.max_draft_len + 1
         self.store = self.Store(
             new_tokens=int_tensor((self.max_accepted_path_len, seq_slots, self.max_beam_width)),
             next_new_tokens=int_tensor(
@@ -264,23 +317,6 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         runtime_draft_len: Optional[int],
     ) -> None:
         """Common handling for both context and generation requests."""
-        if request.py_return_context_logits:
-            logger.warning(
-                "return_context_logits not supported with speculative decoding, "
-                "skipping for request %s",
-                request.py_request_id,
-            )
-        if request.py_return_generation_logits:
-            logger.warning(
-                "return_generation_logits not supported with speculative decoding, "
-                "skipping for request %s",
-                request.py_request_id,
-            )
-        if request.py_return_log_probs:
-            logger.warning(
-                "return_log_probs not supported with speculative decoding, skipping for request %s",
-                request.py_request_id,
-            )
         request.py_draft_tokens = next_draft_tokens[request.py_seq_slot][:runtime_draft_len]
         request.py_decoding_iter += 1
 

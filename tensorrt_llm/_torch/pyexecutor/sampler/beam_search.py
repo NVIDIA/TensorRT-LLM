@@ -45,7 +45,7 @@ from ..llm_request import LlmRequest, LlmRequestState
 from .logprobs import LogProbsStore
 from .ops.flashinfer import radix_topk_op
 from .ops.vanilla import StrategyMetadata
-from .sampler_common import _get_beam_width_in, _unwrap_singleton, int_tensor
+from .sampler_common import _get_beam_width_in, int_tensor
 from .sampler_features import _SideStreamCopier
 
 BEAM_SEARCH_PAD_TOKEN = -1
@@ -648,11 +648,11 @@ def _cba_step_math(
     # applied before log_softmax and so never reaches the accumulated score,
     # and vLLM, which ranks purely by cum_logprob / seq_len**length_penalty.
     #
-    # The C++ kernels here diverge from all three: they fold
-    # `diversityRate * source_beam_index` into pLocalLogProbs
-    # (beamSearchKernels.cu), which then flows into normedScoresCBA and
-    # bestAttainableScore (beamSearchKernelsTemplate.h), so with diversity_rate
-    # set they order the pool and reach the done verdict differently. Do not
+    # The former C++ beam-search kernels diverged from all three: they folded
+    # `diversityRate * source_beam_index` into the local log-probs, which then
+    # flowed into the normalized CBA scores and the best-attainable score, so
+    # with diversity_rate set they ordered the pool and reached the done verdict
+    # differently. Do not
     # "fix" this by matching them: a cumulative_logprob carrying
     # `diversity_rate * beam_index` is no longer a log-probability, and the
     # offset depends on which slot the beam happened to occupy (TRTLLM-14792).
@@ -1138,10 +1138,7 @@ def _prepare_beam_history_cba(
     active_width = _get_beam_width_in(request)
     return_log_probs = request.py_return_log_probs
 
-    length_penalty = (
-        _unwrap_singleton(cast(Optional[list[float]], request.sampling_config.length_penalty))
-        or 0.0
-    )
+    length_penalty = request.sampling_config.length_penalty or 0.0
 
     def _builder() -> BeamHistory | None:
         if not cba_group.should_stop[row].item():

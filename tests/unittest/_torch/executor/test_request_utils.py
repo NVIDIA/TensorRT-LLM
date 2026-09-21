@@ -127,7 +127,7 @@ def test_executor_request_to_llm_request_adopts_context_phase_draft_tokens() -> 
         exclude_last_generation_logits=False,
     )
 
-    assert llm_request.is_generation_only_request()
+    assert llm_request.is_generation_only_request
     assert llm_request.has_draft_tokens()
     assert llm_request.num_draft_tokens == len(draft_tokens)
     assert llm_request.draft_tokens == draft_tokens
@@ -617,3 +617,17 @@ class TestDeriveAttentionDpPerRankRequestCap:
             )
             == 128
         )
+
+
+def test_executor_request_to_llm_request_adopts_return_routed_experts() -> None:
+    def _build(flag):
+        executor_request = trtllm.Request(input_token_ids=[1, 2, 3], max_tokens=4)
+        if flag is not None:
+            # Set by BaseWorker._enqueue_request from SamplingParams (py_* side channel).
+            executor_request.py_return_routed_experts = flag
+        return executor_request_to_llm_request(
+            7, executor_request, child_req_ids=[], exclude_last_generation_logits=False
+        )
+
+    assert _build(None).py_return_routed_experts is False  # default: opted out
+    assert _build(True).py_return_routed_experts is True

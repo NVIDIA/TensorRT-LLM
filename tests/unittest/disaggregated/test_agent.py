@@ -313,6 +313,8 @@ class TestBindingsNixlTransferAgentShutdown(TestCase):
             backend_params={"num_threads": "1"},
             rank=2,
             world_size=4,
+            agent_buffer_size_mb=0,
+            bounce_params={},
         )
         cpp_agent.assert_called_once_with(base_config.return_value)
 

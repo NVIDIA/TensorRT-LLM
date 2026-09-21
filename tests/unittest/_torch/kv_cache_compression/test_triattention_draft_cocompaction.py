@@ -91,7 +91,13 @@ def test_speculative_admission_gates_raise(gate, match):
         eviction_mode="per_head" if gate == "union_only_per_head" else "union",
     )
 
-    with pytest.raises(ValueError, match=match):
+    with (
+        mock.patch(
+            "tensorrt_llm._torch.pyexecutor._util.is_sm_100f",
+            return_value=True,
+        ),
+        pytest.raises(ValueError, match=match),
+    ):
         validate_kv_cache_compression_compatibility(
             config,
             SimpleNamespace(enable_block_reuse=False),

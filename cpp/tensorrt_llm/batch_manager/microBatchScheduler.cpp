@@ -16,11 +16,45 @@
  */
 
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
-#include "tensorrt_llm/batch_manager/utils/inflightBatchingUtils.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 
 namespace tensorrt_llm::batch_manager
 {
+
+namespace
+{
+
+void sortRequests(RequestVector& contextRequests, RequestVector& generationRequests, bool chunksPresent)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    auto sortByLoraId = [](RequestVector::iterator begin, RequestVector::iterator end)
+    {
+        std::sort(
+            begin, end, [](auto const& lhs, auto const& rhs) { return lhs->getLoraTaskId() < rhs->getLoraTaskId(); });
+    };
+
+    if (chunksPresent)
+    {
+        // Move context requests that reached the last context chunk to the end of the vector.
+        // This order is required to efficiently group requests in the sampler.
+        auto firstFinished = std::partition(contextRequests.begin(), contextRequests.end(),
+            [](auto const& llmReq) { return !llmReq->isLastContextChunk(); });
+
+        // Sort context requests by lora task id, but keep finished requests separate.
+        sortByLoraId(contextRequests.begin(), firstFinished);
+        sortByLoraId(firstFinished, contextRequests.end());
+    }
+    else
+    {
+        sortByLoraId(contextRequests.begin(), contextRequests.end());
+    }
+    sortByLoraId(generationRequests.begin(), generationRequests.end());
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+} // namespace
 
 using SizeType32 = MicroBatchScheduler::SizeType32;
 
@@ -487,7 +521,7 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
         }
     }
 
-    utils::sortRequests(contextRequests, generationRequests, !allContextRequestsFit);
+    sortRequests(contextRequests, generationRequests, !allContextRequestsFit);
 
     TLLM_LOG_DEBUG(
         "batchSize (num ctx/enc requests + num gen requests): %u", contextRequests.size() + generationRequests.size());

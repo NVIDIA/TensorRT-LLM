@@ -14,7 +14,7 @@
 
 """Sampler package.
 
-The upper-level orchestration (``Sampler`` / ``TorchSampler`` / ``TRTLLMSampler``)
+The upper-level orchestration (``Sampler`` / ``TorchSampler``)
 lives in ``sampler.py`` and depends on operation-level APIs in
 ``sampler_strategy.py``. Implementation-specific kernel providers (FlashInfer,
 vanilla/PyTorch, TRT-LLM ops) live under ``ops/`` and are selected

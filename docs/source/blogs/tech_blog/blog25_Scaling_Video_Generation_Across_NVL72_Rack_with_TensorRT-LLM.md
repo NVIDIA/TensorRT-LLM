@@ -35,7 +35,7 @@ The same runtime carries over unchanged to Cosmos3-Super (a 64B Mixture-of-Trans
 - [Serving with trtllm-serve](#serving-with-trtllm-serve)  
 - [Quality Evaluation](#quality-evaluation)  
 - [Conclusion](#conclusion)  
-- [Picking the Right Configuration](#picking-the-right-configuration)  
+- [Picking the Right Configuration](#picking-the-performant-configuration)  
 - [Limitations and Future Work](#limitations-and-future-work)  
 - [References](#references)
 - [Acknowledgement](#acknowledgement)
@@ -295,7 +295,7 @@ For the full property catalog (every `*_group`, `*_rank`, the flattened `seq_mes
 
 ## NVL72 Scaling Results
 
-All performance numbers in this section use the same measured workload and publish one distributed recipe: [`examples/visual_gen/configs/wan22_t2v_bf16_gb200_nvl72.yml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/visual_gen/configs/wan22_t2v_bf16_gb200_nvl72.yml).
+All performance numbers in this section use the same measured workload and publish one distributed recipe: [`examples/visual_gen/configs/wan22_t2v_bf16_gb200_nvl72.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/visual_gen/configs/wan22_t2v_bf16_gb200_nvl72.yaml).
 
 | Item | Value |
 | :--- | :--- |
@@ -348,7 +348,7 @@ compilation_config:
 
 ### Cosmos3-Super
 
-The same runtime scales a very different model unchanged. Cosmos3-Super is a 64B Mixture-of-Transformers with 64 attention heads, generating a longer 189-frame clip — so each denoising step is an even larger dense prefill than Wan. Only the workload and the per-width recipe change; the CFG, Ulysses, Attention2D, and parallel-VAE knobs are identical ([`examples/visual_gen/configs/cosmos3_t2v_bf16_gb200_nvl72.yml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/visual_gen/configs/cosmos3_t2v_bf16_gb200_nvl72.yml))
+The same runtime scales a very different model unchanged. Cosmos3-Super is a 64B Mixture-of-Transformers with 64 attention heads, generating a longer 189-frame clip — so each denoising step is an even larger dense prefill than Wan. Only the workload and the per-width recipe change; the CFG, Ulysses, Attention2D, and parallel-VAE knobs are identical ([`examples/visual_gen/configs/cosmos3_t2v_bf16_gb200_nvl72.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/visual_gen/configs/cosmos3_t2v_bf16_gb200_nvl72.yaml))
 
 | Item | Value |
 | :--- | :--- |
@@ -386,7 +386,7 @@ The same `--visual_gen_args` YAML drives `trtllm-serve` for online serving. Dist
 export CONTAINER_IMAGE=/path/to/tensorrt-llm.sqsh
 export PROJECT_ROOT=/path/to/TensorRT-LLM
 export MODEL=Wan-AI/Wan2.2-T2V-A14B-Diffusers
-export SERVER_CONFIG=examples/visual_gen/configs/wan22_t2v_bf16_gb200_nvl72.yml
+export SERVER_CONFIG=examples/visual_gen/configs/wan22_t2v_bf16_gb200_nvl72.yaml
 
 # Fill in <ACCOUNT_NAME> and <PARTITION> with your SLURM account and partition
 sbatch -A <ACCOUNT_NAME> -p <PARTITION> -N 18 --ntasks-per-node=4 --ntasks=72 examples/visual_gen/serve/benchmark_visual_gen_mgmn_distributed.sh
@@ -398,7 +398,7 @@ The script spawns `trtllm-serve` across all allocated ranks in the background, p
 
 We validate the implementation in two ways - **correctness** checks that every parallel configuration reproduces a single-GPU reference forward of the transformer, and **quality** compares full decoded video against a single-GPU reference across many prompts.
 
-#### Distributed correctness
+### Distributed correctness
 
 A single-node (4- and 8-GPU) parity harness ([`test_wan_transformer_parallel.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tests/unittest/_torch/visual_gen/multi_gpu/test_wan_transformer_parallel.py)) runs a BF16 `WanTransformer3DModel` forward (reduced layers, FA4) under each parallel configuration and compares it against an unsharded single-GPU reference on identical weights and seeded inputs.
 

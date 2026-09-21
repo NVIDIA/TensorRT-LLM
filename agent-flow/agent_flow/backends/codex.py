@@ -429,6 +429,20 @@ class CodexClient(BackendClient):
         self._session_init = session_init
         self._session_init_emitted = False
 
+    async def list_available_skills(self) -> list[str] | None:
+        """Skill names from the session init built at client creation.
+
+        ``_build_session_init_event`` already asked the Codex client for
+        ``skills_list`` when this client was created, so the answer is in
+        hand before any turn — the event that ``send_message`` replays is
+        only the same cached value. ``None`` when that call came back
+        empty or failed, which is the backend declining to say rather
+        than reporting an empty environment.
+        """
+        if self._session_init is None:
+            return None
+        return list(self._session_init.skills)
+
     async def send_message(self, message: str) -> AsyncIterator[BackendEvent]:
         TextInput = _symbol("openai_codex", "TextInput")
 

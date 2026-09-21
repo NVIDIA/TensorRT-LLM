@@ -1,0 +1,86 @@
+# Example brief for the perf-analyze workflow. Copy this file to
+# `task.yaml`, fill in your paths and knobs, then run:
+#
+#     perf-analyze \
+#         --task path/to/your/task.yaml \
+#         --workspace workspace/perf-analyze/<model-name>
+#
+# Required paths. With remote execution the checkpoint is remote, while
+# the TensorRT-LLM checkout and optional tuning YAML remain local.
+
+checkpoint_path:  /path/to/checkpoints/<ModelName>-<Variant>  # remote when using SSH
+trtllm_repo_path: /path/to/TensorRT-LLM                       # always local
+# extra_llm_api_options: /local/path/to/extra_llm_api_options.yaml
+
+# Optional: the benchmark operating point(s) driven by
+# benchmark_serving.py.
+benchmark:
+  dataset_name: random       # random | sharegpt | hf | sonnet | burstgpt
+  random_input_len: 1024     # ISL
+  random_output_len: 128     # OSL
+  num_prompts: 200
+  concurrency: 64
+  # concurrency: [8, 32, 128]  # list => Pareto-curve mode: one benchmark run
+  #                            # per point (over one server launch), profiling
+  #                            # at the largest point, and the report gains a
+  #                            # measured Pareto curve (x = tok/s/user =
+  #                            # 1000/mean_tpot_ms, y = tok/s/gpu =
+  #                            # output_throughput/num_gpus)
+  # num_prompts: [32, 128, 512]  # curve mode only: per-point num_prompts,
+  #                            # paired index-by-index with the concurrency
+  #                            # list (each entry >= its point). Keeps
+  #                            # low-concurrency points cheap; a scalar
+  #                            # means the same count at every point.
+  # request_rate: inf        # requests/sec; "inf" sends all at once
+  # dataset_path: /path/to/ShareGPT.json   # for sharegpt / hf datasets
+
+# Optional: which profilers the Analyzer runs, and the steady-state
+# iteration window that gates them (TLLM_PROFILE_START_STOP for nsys;
+# ncu arms on the same window via --profile-from-start off).
+# The nsys timeline is decomposed with the internal-perf-nsight-system-analysis
+# skill (per-iteration time, busy/idle rungs, compute-absent causes);
+# ncu is the bounded per-kernel deep dive on the top nsys kernels,
+# interpreted with the perf-nsight-compute-analysis skill.
+profile:
+  methods: [nsys, ncu]
+  nsys_iter_range: "100-150"
+  # Which ranks nsys captures. Default [0] — the historical single-wrap
+  # behaviour, and all a bare `trtllm-serve` can give: at world size > 1 it
+  # creates its workers with MPI.COMM_SELF.Spawn and nsys does not follow
+  # spawned processes. Several ranks need one wrap per rank inside the
+  # launcher (the Slurm `trtllm-llmapi-launch` shape), and buy the skill's
+  # rank-jitter step: mean jitter wait per iteration, the busy spread, the
+  # imbalance operator, and the pinned-vs-rotating straggler verdict — the
+  # only evidence that says the job waits on a slow rank rather than on the
+  # network. Wrap only the ranks you list: a rank slowed by its own profiler
+  # shows up as jitter the others wait on. One representative per part of
+  # the parallelism is enough; capturing all 8 costs 8 exports.
+  # profile_ranks: [0, 4]
+
+# Optional: include this section only when the server + benchmark must run
+# through Slurm (otherwise everything runs locally on the current node).
+# `cluster_ssh` enables remote execution. `remote_run_root` is optional;
+# it defaults to ~/agent_flow_workspace/<campaign-name> on that host.
+# slurm-environment:
+#   slurm_partition: <partition>
+#   docker_image: /remote/path/to/trtllm-pytorch-<version>.sqsh
+#   cluster_ssh: user@login-host
+#   remote_run_root: /remote/path/to/perf-analyze/my-campaign
+
+# Optional: the analytical SOL-projection stage (benchmarker ->
+# projector -> analyzer -> reporter) runs **by default**, so this section
+# only has to be written to turn it off or to hand the skill a hint. The
+# projector follows the internal-perf-sol-analysis skill
+# (trtllm-agent-toolkit) for the speed-of-light ceiling. Every field is
+# optional: `enabled` gates the stage (default true) and `gpu` is the
+# part-name hint for the skill's peaks calculator when the automatic
+# mapping would guess wrong.
+# The skill is internal, so open-source builds of the toolkit strip it.
+# Without it the stage still completes: the projector falls back to the
+# perf-analysis skill, grounds the peaks from named sources instead of
+# the calculator, writes no peaks file, and the analyzer skips the
+# measured-vs-SOL correlation. Set `enabled: false` to skip the stage's
+# wall-clock outright in an environment that has no toolkit.
+# sol:
+#   enabled: false   # skip the projector entirely
+#   gpu: H100

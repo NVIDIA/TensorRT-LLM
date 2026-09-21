@@ -257,9 +257,9 @@ class SamplingParams:
         exclude_input_from_output (bool): Controls if output tokens in Result should include the input tokens. Defaults to True.
         return_encoder_output (bool): Controls if Result should contain encoder output hidden states (for encoder-only and encoder-decoder models). Defaults to False.
         return_perf_metrics (bool): Controls if Result should contain the performance metrics for this request. Defaults to False.
+        return_routed_experts (bool): Router Replay (R3): return per-token pre-EPLB logical top-k MoE expert ids for train/inference routing alignment in MoE reinforcement learning. Requires the engine-level enable_return_routed_experts. Defaults to False.
         additional_model_outputs (List[str], optional): The additional outputs to gather from the model. Defaults to None.
 
-        lookahead_config (tensorrt_llm.bindings.executor.LookaheadDecodingConfig , optional): Lookahead decoding config. Defaults to None.
         guided_decoding (tensorrt_llm.sampling_params.GuidedDecodingParams, optional): Guided decoding params. Defaults to None.
         thinking_token_budget (int, optional): Experimental. Maximum number of tokens allowed inside a reasoning block. Set to -1 or None for unlimited. Defaults to None.
 
@@ -330,6 +330,12 @@ class SamplingParams:
     exclude_input_from_output: bool = True
     return_encoder_output: bool = False
     return_perf_metrics: bool = False
+    # Router Replay (R3): return per-token pre-EPLB logical top-k MoE expert ids
+    # on this request's output (via additional_generation_outputs["routed_experts"]),
+    # for train/inference routing alignment in MoE reinforcement learning. Requires
+    # the engine-level enable_return_routed_experts. Separated-routing MoE backends
+    # only (fused backends fail closed).
+    return_routed_experts: bool = False
     additional_model_outputs: Optional[List[str]] = None
 
     # Decoder tokens moved from generated output into the input prefix. The
@@ -345,9 +351,6 @@ class SamplingParams:
 
     # TODO: deprecate this after trtllm-serve migrate to use TopK logprobs
     _return_log_probs: bool = False
-
-    # Lookahead decoding config
-    lookahead_config: Optional[tllme.LookaheadDecodingConfig] = None
 
     # Guided decoding params
     guided_decoding: Optional[GuidedDecodingParams] = None

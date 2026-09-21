@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <vector>
 
 namespace
@@ -121,6 +122,35 @@ TEST(KvCacheManagerV2StatsTest, PendingReuseSurvivesAllocationRollbackUntilClear
     EXPECT_EQ(iteration.iterPartialReusedBlocks, 1);
 
     pending.clear();
+    EXPECT_TRUE(pending.empty());
+}
+
+TEST(KvCacheManagerV2StatsTest, PendingReuseByLevelRidesAlongWithScalarCounts)
+{
+    PendingStats pending;
+    ReusedBlocksByLevel firstMatch;
+    firstMatch.full = {2, 0, 1};
+    firstMatch.partial = {0, 1, 0};
+    EXPECT_TRUE(pending.recordReuse(LifeCycleId{0}, /*fullReusedBlocks=*/3, /*partialReusedBlocks=*/1, firstMatch));
+
+    // A second match on the same life cycle accumulates element-wise.
+    ReusedBlocksByLevel secondMatch;
+    secondMatch.full = {1, 4, 0};
+    secondMatch.partial = {0, 0, 0};
+    EXPECT_TRUE(pending.recordReuse(LifeCycleId{0}, /*fullReusedBlocks=*/5, /*partialReusedBlocks=*/0, secondMatch));
+
+    auto const& byLevel = pending.reusedBlocksByLevelByLifeCycle().at(LifeCycleId{0});
+    EXPECT_EQ(byLevel.full.raw(), (std::vector<int64_t>{3, 4, 1}));
+    EXPECT_EQ(byLevel.partial.raw(), (std::vector<int64_t>{0, 1, 0}));
+    // The by-level split must agree with the scalar counters it rides along with.
+    auto const& iteration = pending.iterationStatsByLifeCycle().at(LifeCycleId{0});
+    EXPECT_EQ(std::accumulate(byLevel.full.begin(), byLevel.full.end(), int64_t{0}), iteration.iterFullReusedBlocks);
+    EXPECT_EQ(
+        std::accumulate(byLevel.partial.begin(), byLevel.partial.end(), int64_t{0}), iteration.iterPartialReusedBlocks);
+
+    // Discarding the request drops the by-level split together with the scalar counters.
+    pending.clear();
+    EXPECT_TRUE(pending.reusedBlocksByLevelByLifeCycle().empty());
     EXPECT_TRUE(pending.empty());
 }
 
@@ -334,7 +364,7 @@ TEST(KvCacheManagerV2StatsTest, MigrationAndLastTierDropRecordersReceiveExactPag
         storage.excludeFromEviction(*page);
         targets.push_back({page, kDefaultBeamIndex, ordinal, lifeCycle});
     }
-    storage.batchedMigrateToGpu(targets, *cache, migrationRecorder);
+    storage.batchedMigrateToGpu(targets, migrationRecorder);
     EXPECT_EQ(onboarded, 2);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     for (size_t index = 0; index < firstPages.size(); ++index)
@@ -369,6 +399,59 @@ TEST(KvCacheManagerV2StatsTest, MigrationAndLastTierDropRecordersReceiveExactPag
         storage.releaseSlot(lifeCycle, kHotLevel, std::move(slot));
     }
     cache->close();
+}
+
+TEST(KvCacheManagerV2StatsTest, SuspendResumeIterationCountersTrackPreemptionOnly)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    auto manager = std::make_shared<KvCacheManager>(makeConfig());
+    auto cache = manager->createKvCache({}, {}, 1);
+
+    // A freshly-created cache starts SUSPENDED and is activated by its first resume().
+    // That is an admission, not a preemption recovery, so neither counter moves.
+    ASSERT_TRUE(cache->resume(stream));
+    auto [admittedSuspended, admittedResumed] = manager->getAndResetIterationSuspendResumeStats();
+    EXPECT_EQ(admittedSuspended, 0);
+    EXPECT_EQ(admittedResumed, 0);
+
+    // A real ACTIVE->SUSPENDED->ACTIVE cycle is a preemption and does count.
+    cache->suspend();
+    EXPECT_FALSE(cache->isActive());
+    ASSERT_TRUE(cache->resume(stream));
+    EXPECT_TRUE(cache->isActive());
+    auto [suspended, resumed] = manager->getAndResetIterationSuspendResumeStats();
+    EXPECT_EQ(suspended, 1);
+    EXPECT_EQ(resumed, 1);
+
+    // The drain resets both counters for the next iteration window.
+    auto [drainedSuspended, drainedResumed] = manager->getAndResetIterationSuspendResumeStats();
+    EXPECT_EQ(drainedSuspended, 0);
+    EXPECT_EQ(drainedResumed, 0);
+
+    cache->close();
+    EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
+TEST(KvCacheManagerV2StatsTest, DisabledStatsSuppressSuspendResumeCounters)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    auto manager = std::make_shared<KvCacheManager>(makeConfig(false));
+    auto cache = manager->createKvCache({}, {}, 1);
+
+    ASSERT_TRUE(cache->resume(stream));
+    cache->suspend();
+    ASSERT_TRUE(cache->resume(stream));
+
+    auto [suspended, resumed] = manager->getAndResetIterationSuspendResumeStats();
+    EXPECT_EQ(suspended, 0);
+    EXPECT_EQ(resumed, 0);
+
+    cache->close();
+    EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 }
 
 } // namespace

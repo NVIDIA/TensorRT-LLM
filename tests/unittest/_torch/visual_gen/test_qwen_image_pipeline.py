@@ -287,3 +287,61 @@ def test_forward_honors_profile_step_range(tmp_path):
         str(tmp_path / "visual-gen-trace-rank-0.json")
     )
     cudart.cudaProfilerStop.assert_called_once_with()
+
+
+class TestQwenImageEditReferenceLoading:
+    """``forward`` doubles as a library entry point, so it takes PIL too.
+
+    A request always arrives as encoded bytes, but a direct caller may already
+    hold a decoded image and should not have to re-encode it just to get in.
+    """
+
+    @staticmethod
+    def _png(mode="RGB", color=(10, 20, 30)):
+        import io
+
+        import PIL.Image
+
+        buffer = io.BytesIO()
+        PIL.Image.new(mode, (8, 8), color).save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    def test_bytes_and_pil_both_load(self):
+        import io
+
+        import PIL.Image
+
+        from tensorrt_llm._torch.visual_gen.models.qwen_image.pipeline_qwen_image_edit import (
+            QwenImageEditPlusPipeline,
+        )
+
+        data = self._png()
+        images = QwenImageEditPlusPipeline._load_edit_images(
+            [data, PIL.Image.open(io.BytesIO(data))]
+        )
+
+        assert len(images) == 2
+        assert all(image.mode == "RGB" for image in images)
+        assert all(image.size == (8, 8) for image in images)
+
+    def test_alpha_is_dropped_not_composited(self):
+        """A transparent pixel keeps its stored RGB.
+
+        ``convert("RGB")`` discards the channel; compositing onto white instead
+        rewrites every pixel with ``alpha < 255``, silently, so a reference with
+        transparency would reach the model as a different image.
+        """
+        import PIL.Image
+
+        from tensorrt_llm._torch.visual_gen.models.qwen_image.pipeline_qwen_image_edit import (
+            QwenImageEditPlusPipeline,
+        )
+
+        transparent = PIL.Image.new("RGBA", (4, 4), (10, 20, 30, 0))
+        encoded = self._png(mode="RGBA", color=(10, 20, 30, 0))
+
+        from_pil, from_bytes = QwenImageEditPlusPipeline._load_edit_images([transparent, encoded])
+
+        assert from_pil.mode == "RGB" and from_bytes.mode == "RGB"
+        assert from_pil.getpixel((0, 0)) == (10, 20, 30)
+        assert from_bytes.getpixel((0, 0)) == (10, 20, 30)

@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 1993-2022 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -46,6 +46,7 @@ add_compile_definitions(TRTLLM_ABI_NAMESPACE=${TRTLLM_ABI_NAMESPACE})
 option(BUILD_PYT "Build in PyTorch TorchScript class mode" ON)
 option(BUILD_TESTS "Build Google tests" ON)
 option(BUILD_DEEP_EP "Build the Deep EP module" ON)
+option(BUILD_NCCL_EXTENSIONS "Build the nccl-extensions Python wheel" ON)
 option(BUILD_DEEP_GEMM "Build the DeepGEMM module" ON)
 option(BUILD_FLASH_MLA "Build the FlashMLA module" ON)
 option(BUILD_MICRO_BENCHMARKS "Build C++ micro benchmarks" OFF)
@@ -280,8 +281,15 @@ include_directories(${CMAKE_BINARY_DIR}/_deps/nanobind-src/include)
 
 FetchContent_MakeAvailable(cutlass cxxopts flashmla json msa xgrammar)
 
+# cppzmq (header-only) is the bounce v2 control-plane dependency AND the UCX
+# bootstrap dependency. Make it available whenever NIXL (-> bounce) or UCX is
+# enabled, so bounce does NOT require UCX (its real deps are NIXL + zmq,
+# orthogonal to UCX). ucxx stays UCX-only.
+if(NIXL_ROOT OR ENABLE_UCX)
+  FetchContent_MakeAvailable(cppzmq)
+endif()
 if(ENABLE_UCX)
-  FetchContent_MakeAvailable(cppzmq ucxx)
+  FetchContent_MakeAvailable(ucxx)
 endif()
 
 if(NOT NVTX_DISABLE)
