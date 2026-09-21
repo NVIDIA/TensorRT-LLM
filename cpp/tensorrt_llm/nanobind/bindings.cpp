@@ -39,7 +39,6 @@
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManagerV2.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManagerV2Utils.h"
-#include "tensorrt_llm/nanobind/batch_manager/llmRequest.h"
 #include "tensorrt_llm/nanobind/common/tllmExceptions.h"
 #include "tensorrt_llm/nanobind/executor/bindings.h"
 #include "tensorrt_llm/nanobind/kvCacheCompression/bindings.h"

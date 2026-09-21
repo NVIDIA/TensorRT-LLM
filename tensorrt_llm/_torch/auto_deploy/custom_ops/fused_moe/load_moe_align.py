@@ -21,11 +21,11 @@ TensorRT-LLM build instead of being JIT-compiled on first use. This reduces
 startup time and avoids compilation overhead.
 
 The kernel implementation is in:
-- cpp/tensorrt_llm/kernels/moeAlignKernels.cu
-- cpp/tensorrt_llm/kernels/moeAlignKernels.h
+- cpp/tensorrt_llm/kernels/moe/utils/moeAlignKernels.cu
+- cpp/tensorrt_llm/kernels/moe/utils/moeAlignKernels.h
 
 The torch binding is in:
-- cpp/tensorrt_llm/thop/moeAlignOp.cpp
+- cpp/tensorrt_llm/thop/moe/moeAlignOp.cpp
 """
 
 import torch

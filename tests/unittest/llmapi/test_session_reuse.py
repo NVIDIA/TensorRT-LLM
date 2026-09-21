@@ -497,16 +497,14 @@ def test_torch_compile_nodeids_are_private():
     from test_common.session_reuse_hooks import _is_private_nodeid
 
     assert _is_private_nodeid(
-        "accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::"
-        "test_fp8[fp8kv=False-attn_backend=TRTLLM-torch_compile=True]"
+        "accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8[latency-torch_compile=True]"
     )
     assert _is_private_nodeid(
         "accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::"
         "test_nvfp4_multi_gpus_piecewise_cuda_graph[baseline]"
     )
     assert not _is_private_nodeid(
-        "accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::"
-        "test_fp8[fp8kv=False-attn_backend=TRTLLM-torch_compile=False]"
+        "accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8[latency-torch_compile=False]"
     )
     assert not _is_private_nodeid(
         "unittest/llmapi/test_llm_args.py::test_torch_compile_config_round_trip"

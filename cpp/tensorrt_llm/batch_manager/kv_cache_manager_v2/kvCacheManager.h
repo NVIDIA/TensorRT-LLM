@@ -151,6 +151,11 @@ public:
         ReuseScope const& reuseScope, TokenSpan inputTokens, bool knownNoDigest = false) const;
     int probeReuse(ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false) const;
 
+    // Read-only, advisory key of the first full block past the reusable prefix.
+    // Uses the same fresh, window-aware match as probeReuse without acquiring pages.
+    std::optional<BlockKey> probeFirstNewBlockKey(
+        ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false) const;
+
     // ---- Memory pool queries -----------------------------------------------
 
     // Base address of the memory pool. When indexMode is PER_LAYER, returns pool group base

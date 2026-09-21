@@ -178,6 +178,12 @@ def test_session_status_enum():
 # ---------------------------------------------------------------------------
 
 
+def _valid(table) -> np.ndarray:
+    """Slots a positional block table actually holds (drops the -1 holes)."""
+    table = np.asarray(table, dtype=np.int64)
+    return table[table >= 0]
+
+
 def _send_prefill_chunks(
     all_block_ids,
     chunk_size_blocks,
@@ -298,10 +304,9 @@ def test_build_prefill_chunk_slices_chunk_window_from_whole_prompt():
 
         kv_slice = None if extent is None else extent.local
 
-        assert np.array_equal(
-            kv_slice.block_ids_per_layer_groups[0],
-            np.arange(chunk_start, chunk_end, dtype=np.int64),
-        )
+        expected = np.full(prompt_blocks, -1, dtype=np.int64)
+        expected[chunk_start:chunk_end] = np.arange(chunk_start, chunk_end)
+        assert np.array_equal(kv_slice.block_ids_per_layer_groups[0], expected)
         assert kv_slice.token_range == TokenRange(
             start=chunk_start * tokens_per_block, end=chunk_end * tokens_per_block
         )
@@ -324,11 +329,16 @@ def test_build_prefill_chunk_defers_partial_swa_chunk(source_block_ids):
     layer_group = SimpleNamespace(
         kind=CacheKind.PAGED, sliding_window_size=window_blocks * tokens_per_block
     )
+
+    def _unexpected_get_block_ids(req, idx, lg):
+        raise AssertionError("context-side transfer must use get_block_ordinals, not get_block_ids")
+
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._reuse_adapter = SimpleNamespace(
         tokens_per_block=tokens_per_block,
         get_cached_token_count_per_layer_group=lambda req, layer_groups: [0],
-        get_block_ids=lambda req, idx, lg: source_block_ids,
+        get_block_ids=_unexpected_get_block_ids,
+        get_block_ordinals=lambda req, idx, lg: source_block_ids,
     )
     transceiver._page_table = SimpleNamespace(layer_groups=[layer_group])
     transceiver._kv_cache_manager = SimpleNamespace(
@@ -387,7 +397,7 @@ def test_send_prefill_chunks_integrity_check(prepopulated_blocks):
     for lg_idx, original in enumerate(all_block_ids):
         reassembled = []
         for s in slices:
-            reassembled.extend(s.block_ids_per_layer_groups[lg_idx])
+            reassembled.extend(_valid(s.block_ids_per_layer_groups[lg_idx]).tolist())
         assert reassembled == original
 
 
@@ -405,8 +415,8 @@ def test_send_prefill_chunks_unaligned_boundary_splits_on_a_block():
         TokenRange(start=0, end=4 * tokens_per_block),
         TokenRange(start=4 * tokens_per_block, end=8 * tokens_per_block),
     ]
-    assert np.array_equal(slices[0].block_ids_per_layer_groups[0], np.arange(4))
-    assert np.array_equal(slices[1].block_ids_per_layer_groups[0], np.arange(4, 8))
+    assert np.array_equal(_valid(slices[0].block_ids_per_layer_groups[0]), np.arange(4))
+    assert np.array_equal(_valid(slices[1].block_ids_per_layer_groups[0]), np.arange(4, 8))
 
 
 def test_send_prefill_chunks_multiple_layer_groups():
@@ -414,10 +424,15 @@ def test_send_prefill_chunks_multiple_layer_groups():
     all_block_ids = [list(range(8)), list(range(100, 108))]
     slices = _send_prefill_chunks(all_block_ids, chunk_size_blocks=4)
     assert len(slices) == 2
-    assert np.array_equal(slices[0].block_ids_per_layer_groups[0], np.array([0, 1, 2, 3]))
-    assert np.array_equal(slices[1].block_ids_per_layer_groups[0], np.array([4, 5, 6, 7]))
-    assert np.array_equal(slices[0].block_ids_per_layer_groups[1], np.array([100, 101, 102, 103]))
-    assert np.array_equal(slices[1].block_ids_per_layer_groups[1], np.array([104, 105, 106, 107]))
+    # Positional tables: the chunk keeps its own ordinals and blanks the rest.
+    assert np.array_equal(slices[0].block_ids_per_layer_groups[0], [0, 1, 2, 3, -1, -1, -1, -1])
+    assert np.array_equal(slices[1].block_ids_per_layer_groups[0], [-1, -1, -1, -1, 4, 5, 6, 7])
+    assert np.array_equal(
+        slices[0].block_ids_per_layer_groups[1], [100, 101, 102, 103, -1, -1, -1, -1]
+    )
+    assert np.array_equal(
+        slices[1].block_ids_per_layer_groups[1], [-1, -1, -1, -1, 104, 105, 106, 107]
+    )
     # Default tokens_per_block is 1, so the token range doubles as block coords.
     assert slices[0].token_range == TokenRange(start=0, end=4)
     assert slices[1].token_range == TokenRange(start=4, end=8)
@@ -780,7 +795,11 @@ def get_block_data(
     use_v2: bool,
     request_id: Optional[int] = None,
 ) -> torch.Tensor:
-    """Unified block data retrieval for both V1 and V2 KVCacheManager."""
+    """Unified block data retrieval for both V1 and V2 KVCacheManager.
+
+    ``block_ids`` may be a positional table with -1 holes; only held slots are read.
+    """
+    block_ids = [int(b) for b in np.asarray(block_ids, dtype=np.int64).tolist() if b >= 0]
     if use_v2:
         layer_grouping = kv_cache_manager.impl.layer_grouping
         # Read layers in ascending global-layer order so this verification does
@@ -821,35 +840,47 @@ def get_block_data(
 
 
 def get_block_ids_per_layer_groups(
-    kv_cache_manager, transfer_worker, request_id: int, use_v2: bool, tokens_per_block: int
-) -> List[List[int]]:
-    """Get block_ids for each layer group with window_size filtering."""
+    kv_cache_manager,
+    transfer_worker,
+    request_id: int,
+    use_v2: bool,
+    tokens_per_block: int,
+    prompt_len: int,
+) -> List[np.ndarray]:
+    """Positional block table per layer group, straight from the cache manager.
+
+    Entry i is the pool slot for block ordinal i or -1 (SWA-evicted / unbound),
+    fitted to ceil(prompt_len / tpb) entries -- the same shape
+    KvCacheTransceiverV2._describe_local produces.
+    """
     page_table = transfer_worker._rank_info.page_table
-    block_ids_per_layer_groups: List[List[int]] = []
+    prompt_blocks = (prompt_len + tokens_per_block - 1) // tokens_per_block
+    tables: List[np.ndarray] = []
 
     for group_id, group_meta in enumerate(page_table.layer_groups):
         if use_v2:
-            block_ids = list(
+            ordinals = list(
                 kv_cache_manager.kv_cache_map[request_id].get_aggregated_page_indices(
-                    group_id, valid_only=True
+                    group_id, valid_only=False
                 )
             )
         else:
-            first_global_layer_id = group_meta.local_layers[0].global_layer_id
-            block_ids = kv_cache_manager.get_batch_cache_indices(
-                [request_id], first_global_layer_id
-            )[0]
+            # V1 keeps evicted ids in the chain (index == ordinal) and counts
+            # them; mask them the way _CacheReuseAdapterV1 does.
+            window_size = group_meta.sliding_window_size
+            chain = kv_cache_manager.impl.get_batch_cache_block_ids([request_id], window_size)[0]
+            ordinals = list(chain[0]) if chain else []
+            stale = kv_cache_manager.get_num_front_blocks_removed(
+                request_id, window_size=window_size
+            )
+            ordinals[: min(stale, len(ordinals))] = [-1] * min(stale, len(ordinals))
 
-        # Filter by window_size if request_len > window_size
-        window_size = group_meta.sliding_window_size
-        if window_size is not None:
-            max_blocks_in_window = window_size // tokens_per_block + 1
-            if len(block_ids) > max_blocks_in_window:
-                block_ids = block_ids[-max_blocks_in_window:]
+        table = np.full(prompt_blocks, -1, dtype=np.int64)
+        n = min(len(ordinals), prompt_blocks)
+        table[:n] = ordinals[:n]
+        tables.append(table)
 
-        block_ids_per_layer_groups.append(np.asarray(block_ids, dtype=np.int64))
-
-    return block_ids_per_layer_groups
+    return tables
 
 
 def add_and_verify_request(
@@ -973,6 +1004,7 @@ def add_and_verify_request(
             ctx_request.py_request_id,
             use_v2,
             tokens_per_block,
+            ctx_request.prompt_len,
         )
         for ctx_kv_cache_manager, ctx_transfer_worker in zip(
             valid_ctx_kv_cache_managers, valid_ctx_transfer_workers
@@ -986,6 +1018,7 @@ def add_and_verify_request(
             gen_request.py_request_id,
             use_v2,
             tokens_per_block,
+            gen_request.prompt_len,
         )
         for gen_kv_cache_manager, gen_transfer_worker in zip(
             valid_gen_kv_cache_managers, valid_gen_transfer_workers
@@ -1449,18 +1482,25 @@ def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
         )
 
     # Get block IDs
-    ctx_block_ids = get_block_ids_per_layer_groups(ctx_mgr, ctx_tw, 0, use_v2, tokens_per_block)
-    gen_block_ids = get_block_ids_per_layer_groups(gen_mgr, gen_tw, 1, use_v2, tokens_per_block)
+    ctx_block_ids = get_block_ids_per_layer_groups(
+        ctx_mgr, ctx_tw, 0, use_v2, tokens_per_block, request_len
+    )
+    gen_block_ids = get_block_ids_per_layer_groups(
+        gen_mgr, gen_tw, 1, use_v2, tokens_per_block, request_len
+    )
 
-    # Gen: only provide suffix block IDs (skip prefix_blocks)
-    gen_suffix_block_ids = [
-        np.asarray(bids[prefix_blocks:], dtype=np.int64) for bids in gen_block_ids
-    ]
+    # Gen already holds the reused prefix: mask those ordinals so the sender
+    # skips them (positional table, -1 == not accepted).
+    gen_suffix_block_ids = []
+    for bids in gen_block_ids:
+        table = np.array(bids, dtype=np.int64)
+        table[:prefix_blocks] = -1
+        gen_suffix_block_ids.append(table)
 
     try:
         tx = ctx_tw.create_tx_session(ctx_request)
 
-        # Gen receives only the suffix list; dst_start is derived from block count.
+        # Gen's table masks the reused prefix; the sender pairs the remaining ordinals.
         rx = gen_tw.create_rx_session(gen_request)
         recv_slice = Chunk(
             block_ids_per_layer_groups=gen_suffix_block_ids,
@@ -1495,9 +1535,8 @@ def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
         # Verify: suffix blocks on gen should match corresponding ctx blocks
         num_layer_groups = len(ctx_block_ids)
         for lg_id in range(num_layer_groups):
-            ctx_all_bids = ctx_block_ids[lg_id]
-            ctx_suffix_bids = ctx_all_bids[prefix_blocks:]
-            gen_suffix_bids = gen_suffix_block_ids[lg_id]
+            ctx_suffix_bids = ctx_block_ids[lg_id][prefix_blocks:]
+            gen_suffix_bids = gen_suffix_block_ids[lg_id][prefix_blocks:]
 
             ctx_data = get_block_data(ctx_mgr, ctx_suffix_bids, lg_id, use_v2, 0)
             gen_data = get_block_data(gen_mgr, gen_suffix_bids, lg_id, use_v2, 1)
@@ -1702,11 +1741,15 @@ def _setup_chunked_request(setup, ctx_request_id, gen_request_id, request_len):
             )
 
     ctx_block_ids = [
-        get_block_ids_per_layer_groups(mgr, tw, ctx_request.py_request_id, use_v2, tokens_per_block)
+        get_block_ids_per_layer_groups(
+            mgr, tw, ctx_request.py_request_id, use_v2, tokens_per_block, request_len
+        )
         for mgr, tw in zip(ctx_kv_cache_managers, ctx_transfer_workers, strict=True)
     ]
     gen_block_ids = [
-        get_block_ids_per_layer_groups(mgr, tw, gen_request.py_request_id, use_v2, tokens_per_block)
+        get_block_ids_per_layer_groups(
+            mgr, tw, gen_request.py_request_id, use_v2, tokens_per_block, request_len
+        )
         for mgr, tw in zip(gen_kv_cache_managers, gen_transfer_workers, strict=True)
     ]
 

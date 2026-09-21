@@ -38,9 +38,9 @@ def mod():
 
 def test_validate_models_allows_same_name_with_different_config_id(mod):
     models = [
-        {"name": "meta-llama/Llama-3.1-8B-Instruct", "yaml_extra": ["world_size_1.yaml"]},
+        {"name": "Qwen/Qwen3-8B", "yaml_extra": ["world_size_1.yaml"]},
         {
-            "name": "meta-llama/Llama-3.1-8B-Instruct",
+            "name": "Qwen/Qwen3-8B",
             "config_id": "fp8",
             "yaml_extra": ["world_size_1.yaml", "fp8.yaml"],
         },

@@ -42,6 +42,7 @@ from tensorrt_llm._torch.speculative.utils import (
     get_spec_metadata,
     get_spec_resource_manager,
 )
+from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 
 R, POOL = 8, 16  # max_batch_size, 2 * max_batch_size (overlap headroom)
 
@@ -61,7 +62,9 @@ def test_slot_pool_size_is_applied_centrally(monkeypatch):
     monkeypatch.setattr(
         "tensorrt_llm._torch.speculative.utils._build_spec_metadata", lambda *a, **k: built
     )
-    spec_config = types.SimpleNamespace(enable_penalty=False)
+    spec_config = types.SimpleNamespace(
+        enable_penalty=False, advanced_sampling_mode=AdvancedSamplingMode.FULL
+    )
 
     out = get_spec_metadata(
         spec_config,
@@ -88,7 +91,9 @@ def test_unknown_slot_pool_leaves_the_max_num_requests_fallback(monkeypatch):
     monkeypatch.setattr(
         "tensorrt_llm._torch.speculative.utils._build_spec_metadata", lambda *a, **k: built
     )
-    spec_config = types.SimpleNamespace(enable_penalty=False)
+    spec_config = types.SimpleNamespace(
+        enable_penalty=False, advanced_sampling_mode=AdvancedSamplingMode.FULL
+    )
 
     get_spec_metadata(
         spec_config,

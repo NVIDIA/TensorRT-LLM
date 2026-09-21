@@ -281,7 +281,7 @@ sbatch --account <account> --partition batch --qos <qos> --time 04:00:00 \
     --task gsm8k --parallel tep
 ```
 
-The batch script declares `--nodes=4 --ntasks-per-node=4 --gpus-per-node=4`, and takes `--account`, `--partition` and `--qos` from the submitting command line. Export `KIMI_K3_ROUTER_BF16=0` before submitting: with attention-DP off the MoE router gate defaults to its BF16 fast path, which can flip borderline expert picks, so the reference scores above are only comparable with that path disabled. `KIMI_K3_FP8_WEIGHT_READ` defaults to `0`, which is the precision the reference scores were measured at.
+The batch script declares `--nodes=4 --ntasks-per-node=4 --gpus-per-node=4`, and takes `--account`, `--partition` and `--qos` from the submitting command line. Export `KIMI_K3_ROUTER_BF16=0` before submitting: with attention-DP off the MoE router gate defaults to its BF16 fast path, which can flip borderline expert picks, so the reference scores above are only comparable with that path disabled. The reference scores used BF16 shared/latent MLP projections, which remain the default (`KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=0`). Set `KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=1` to opt into lossy FP8 conversion of those projections. Attention projection datatypes follow the checkpoint quantization configuration.
 
 Measured on 16 GB200 GPUs (4 nodes, `100-real` build, 184.31 GiB per GPU), with the checkpoint's native MXFP4 routed experts:
 

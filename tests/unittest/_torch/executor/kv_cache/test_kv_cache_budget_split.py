@@ -25,7 +25,7 @@ from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.config_utils import uses_vswa_kv_cache_layout
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig, KvCacheConfig, MTPDecodingConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -1032,3 +1032,146 @@ class TestBuildManagersBudgetGates:
         for call in calls:
             config = call.kwargs["kv_cache_config_override"]
             assert config.max_gpu_total_bytes == 10 * GB
+
+
+class TestExternalDrafterKvDtype:
+    """The draft budget must be charged at the dtype the draft pool is ALLOCATED in.
+
+    ``kv_cache_config.dtype: fp8`` stamps the target's fp8 KV algo onto an
+    external drafter's ModelConfig, but the drafter keeps a bf16 pool. The
+    allocation path dropped the inherited algo; the cost path did not, so the
+    split charged 2880 B/token for a pool costing 5760 and handed the draft
+    manager half the tokens the target got.
+
+    The GEN worker then died in ``_prepare_draft_resources`` at ~50% target
+    utilization, fatal to every rank: the capacity scheduler admits on the target
+    pool alone.
+    """
+
+    # MLA drafter: kv_lora_rank 512 + qk_rope_head_dim 64 = 576, kv_factor 1,
+    # 5 layers. These are the numbers from the run that exposed the bug.
+    DRAFT_LAYERS = 5
+    HEAD_DIM = 576
+    FP8_SLOPE = DRAFT_LAYERS * HEAD_DIM  # 2880 -- what the split wrongly charged
+    BF16_SLOPE = FP8_SLOPE * 2  # 5760 -- what the pool actually costs
+
+    def _creator(self, mocker, draft_quant_config):
+        class DraftModelConfig:
+            quant_config = draft_quant_config
+            pretrained_config = SimpleNamespace(
+                num_hidden_layers=TestExternalDrafterKvDtype.DRAFT_LAYERS,
+                hidden_size=32,
+                num_attention_heads=4,
+                num_key_value_heads=1,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+                torch_dtype=None,
+            )
+
+            def get_num_attention_layers(self):
+                return TestExternalDrafterKvDtype.DRAFT_LAYERS
+
+        # pretrained_config is read on the target (non-draft) cost path by
+        # _derive_v2_layer_type_attention_windows. Empty on purpose: with no
+        # layer_types it returns None, so the single-window default stands and
+        # this test keeps measuring only the draft dtype.
+        target_model_config = SimpleNamespace(
+            is_encoder_decoder=False, pretrained_config=SimpleNamespace()
+        )
+        draft_model_config = DraftModelConfig()
+        seen_draft_model_configs = []
+
+        class ProbeKVCacheManager(KVCacheManagerV2):
+            @staticmethod
+            def get_cache_size_per_token(model_config, *args, **kwargs):
+                if model_config is target_model_config:
+                    return 0
+                seen_draft_model_configs.append(model_config)
+                return KVCacheManagerV2.get_cache_size_per_token(model_config, *args, **kwargs)
+
+        c = object.__new__(KvCacheCreator)
+        c._kv_cache_config = KvCacheConfig(dtype="fp8")
+        c._tokens_per_block = 64
+        c._max_seq_len = 16384
+        c._max_batch_size = 1
+        # Read by _build_managers on the draft path (_util.py); the cost
+        # assertions below are per-token, so the value only has to exist.
+        c._max_num_tokens = 8192
+        c._mapping = Mock(enable_attention_dp=True, tp_size=1)
+        c._mapping.has_cp_helix.return_value = False
+        c._mapping.pp_layers.return_value = list(range(self.DRAFT_LAYERS))
+        c._mapping.is_last_pp_rank.return_value = True
+        # The real config, not Mock() or SimpleNamespace: a bare Mock answers True
+        # to every predicate, and a SimpleNamespace needs a new attribute stubbed
+        # each time the cost path reads one more spec-config field.
+        c._speculative_config = DSparkDecodingConfig(max_draft_len=4)
+        c._model_engine = SimpleNamespace(model=SimpleNamespace(model_config=target_model_config))
+        c._draft_model_engine = None
+        c._draft_config = draft_model_config
+        c._kv_cache_manager_cls = ProbeKVCacheManager
+        c._is_disagg = True
+        c._is_encoder_decoder = Mock(return_value=False)
+        c._should_create_separate_draft_kv_cache = Mock(return_value=True)
+        c._get_num_draft_layers = Mock(return_value=self.DRAFT_LAYERS)
+        mocker.patch(
+            "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",
+            return_value=ProbeKVCacheManager,
+        )
+        return c, draft_model_config, seen_draft_model_configs
+
+    def test_inherited_fp8_kv_algo_is_dropped_from_the_draft_cost(self, mocker):
+        from tensorrt_llm.models.modeling_utils import QuantConfig
+        from tensorrt_llm.quantization.mode import QuantAlgo
+
+        # What the args-level kv_cache_config.dtype sync puts on the drafter.
+        inherited = QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8)
+        assert inherited.quant_mode.has_fp8_kv_cache()
+        c, draft_model_config, seen = self._creator(mocker, inherited)
+
+        cost = c._get_kv_size_per_token()
+
+        # The draft pool is bf16, so the split must charge bf16 bytes/token.
+        assert cost.slope == self.BF16_SLOPE, (
+            f"draft charged {cost.slope} B/token; the bf16 pool costs "
+            f"{self.BF16_SLOPE}. Charging {self.FP8_SLOPE} gives the draft "
+            f"manager half the tokens the target gets."
+        )
+        assert len(seen) == 1
+        assert not seen[0].quant_config.quant_mode.has_fp8_kv_cache()
+        # Both cached_property caches must be invalidated, or the
+        # draft_kv_config.dtype guard in the allocation path silently no-ops.
+        assert not seen[0].quant_config.layer_quant_mode.has_fp8_kv_cache()
+        # The drafter's own ModelConfig must not be mutated in place.
+        assert draft_model_config.quant_config is inherited
+        assert inherited.quant_mode.has_fp8_kv_cache()
+
+    def test_cost_and_allocation_paths_agree(self, mocker):
+        """Both call sites must resolve the draft config through one helper."""
+        from tensorrt_llm.models.modeling_utils import QuantConfig
+        from tensorrt_llm.quantization.mode import QuantAlgo
+
+        c, _, seen = self._creator(mocker, QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8))
+        c._get_kv_size_per_token()
+
+        allocation_config = c._get_draft_kv_model_config()
+        assert (
+            seen[0].quant_config.quant_mode.has_fp8_kv_cache()
+            == allocation_config.quant_config.quant_mode.has_fp8_kv_cache()
+        )
+
+    def test_non_external_drafter_is_untouched(self, mocker):
+        """MTP/Eagle3 share the target's layout, so nothing is neutralized."""
+        from tensorrt_llm.models.modeling_utils import QuantConfig
+        from tensorrt_llm.quantization.mode import QuantAlgo
+
+        inherited = QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8)
+        c, draft_model_config, _ = self._creator(mocker, inherited)
+        # A real non-external config, not a patched predicate:
+        # MTP_EAGLE_ONE_MODEL shares the target's KV layout, exactly the case
+        # this asserts is untouched. Swapped whole rather than by assigning
+        # spec_dec_mode, which MTPDecodingConfig derives from
+        # num_nextn_predict_layers and does not accept being set.
+        c._speculative_config = MTPDecodingConfig(num_nextn_predict_layers=1, max_draft_len=4)
+        assert c._speculative_config.spec_dec_mode == SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
+
+        assert c._get_draft_kv_model_config() is draft_model_config
