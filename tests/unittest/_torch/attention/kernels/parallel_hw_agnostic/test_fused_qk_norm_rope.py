@@ -14,6 +14,8 @@
 # limitations under the License.
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from tensorrt_llm._torch.attention.backends.interface import RopeParams
 from tensorrt_llm._torch.attention.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
@@ -24,9 +26,6 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 @pytest.mark.parametrize("producer", ["norm_rope", "main_kv", "horizontal"])
 def test_fp8_producer_meta_keeps_dynamic_num_tokens(producer: str) -> None:
     """All FP8 fake kernels must retain the symbolic token dimension."""
-    from torch._subclasses.fake_tensor import FakeTensorMode
-    from torch.fx.experimental.symbolic_shapes import ShapeEnv
-
     with FakeTensorMode(shape_env=ShapeEnv()) as mode:
         num_tokens = mode.shape_env.create_unbacked_symint()
         qkv = torch.empty((num_tokens, 1280), dtype=torch.bfloat16)

@@ -838,6 +838,9 @@ def _minimax_m3_qkv_index_proj_fake(
     return hidden_states.new_empty((hidden_states.shape[0], sum(qkv_proj.local_output_sizes)))
 
 
+# Projection and cache insertion inspect runtime shapes and layouts. Keep those
+# checks opaque to avoid Dynamo specialization or graph breaks while PCG captures
+# the fused kernels; explicit mutable cache inputs keep their writes visible.
 @torch.library.custom_op(
     "trtllm::minimax_m3_fused_sparse_qkv_producer",
     mutates_args=("kv_cache", "index_k_cache"),
@@ -1384,7 +1387,7 @@ class MiniMaxM3Attention(Attention):
             return None
 
         if cache_tensors is None:
-            kv_cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
+            kv_cache_manager = attn_metadata.kv_cache_manager
             if kv_cache_manager is None:
                 return None
             buffers = kv_cache_manager.get_buffers(self.layer_idx, kv_layout="HND")
@@ -2690,6 +2693,8 @@ def _fold_gemma_boundary_norm_weights(weights):
 class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, PretrainedConfig]):
     """Text-only M3 model."""
 
+    # Preserve M3's hand-fused eager decode and above-ceiling prefill paths,
+    # including MXFP8 decode-graph backend tuning, instead of the FX fallback.
     use_fx_for_pcg_fallback = False
 
     @classmethod

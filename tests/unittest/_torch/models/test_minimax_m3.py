@@ -23,23 +23,37 @@ from __future__ import annotations
 import json
 import os
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 from safetensors import safe_open
 from torch import nn
+from torch._dynamo.backends.common import aot_autograd
+from torch._functorch.aot_autograd import make_boxed_func
+from torch._higher_order_ops.auto_functionalize import auto_functionalized, auto_functionalized_v2
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from transformers import AutoConfig
 from utils.llm_data import llm_models_root
 
 import tensorrt_llm._torch.models.modeling_minimaxm3 as modeling_minimaxm3
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
+    MiniMaxM3MsaSparseAttention,
+    MiniMaxM3SparseRuntimeBackend,
+)
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
     MiniMaxM3SparseConfig,
     MiniMaxM3SparseMetadataParams,
     MiniMaxM3SparseParams,
     index_head_range,
 )
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import (
+    MiniMaxM3MsaSparseAttentionMetadata,
+)
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer import _group_max_reduce
+from tensorrt_llm._torch.compilation.remove_copy_pass import remove_copy_for_mutates_args
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
     MiniMaxM3HfWeightMapper,
@@ -417,7 +431,8 @@ def test_piecewise_attention_boundary_runs_horizontal_producer(monkeypatch) -> N
             assert idx_q.shape == (attn_metadata.num_tokens, 1)
             output.copy_(q)
 
-    metadata = SimpleNamespace(num_tokens=2)
+    metadata = AttentionMetadata(max_num_requests=1, max_num_tokens=4)
+    metadata._num_tokens = 2
     layer = FakeAttentionLayer()
     monkeypatch.setattr(
         modeling_minimaxm3,
@@ -451,10 +466,11 @@ def test_piecewise_projection_fake_preserves_padded_hidden_rows(monkeypatch) -> 
     nn.Module.__init__(projection)
     projection.local_output_sizes = (3, 4)
     layer = SimpleNamespace(qkv_proj=projection)
+    metadata = AttentionMetadata(max_num_requests=1, max_num_tokens=256)
     monkeypatch.setattr(
         modeling_minimaxm3,
         "_extract_minimax_m3_attention_extra_attrs",
-        lambda layer_idx: (SimpleNamespace(), layer),
+        lambda layer_idx: (metadata, layer),
     )
     hidden_states = torch.randn(256, 5)
     position_ids = torch.arange(6).reshape(1, 6)
@@ -471,6 +487,8 @@ def test_piecewise_fused_projection_preserves_input_token_dimension(monkeypatch)
     """Do not inherit a bucket-specialized token dimension from the GEMM output."""
     packed = torch.randn(2, 7)
     captured = {}
+    metadata = AttentionMetadata(max_num_requests=1, max_num_tokens=6)
+    metadata._num_tokens = 6
 
     def fake_boundary(q, k, v, idx_q, idx_k, packed_arg, position_ids, layer_idx, output):
         assert q is None and k is None and v is None
@@ -483,7 +501,7 @@ def test_piecewise_fused_projection_preserves_input_token_dimension(monkeypatch)
     layer = SimpleNamespace(
         enable_fused_qkv_index_projection=True,
         qkv_proj=lambda hidden_states: packed,
-        attn=object(),  # Compatibility path, without the captured FP8 producer.
+        attn=Mock(spec_set=MiniMaxM3SparseRuntimeBackend),  # Non-MSA compatibility path.
         register_to_config=True,
         num_heads=1,
         head_dim=3,
@@ -494,7 +512,7 @@ def test_piecewise_fused_projection_preserves_input_token_dimension(monkeypatch)
     monkeypatch.setattr(
         modeling_minimaxm3,
         "_extract_minimax_m3_attention_extra_attrs",
-        lambda layer_idx: (SimpleNamespace(), layer),
+        lambda layer_idx: (metadata, layer),
     )
     monkeypatch.setattr(modeling_minimaxm3, "is_torch_compiling", lambda: True)
     monkeypatch.setattr(
@@ -509,7 +527,7 @@ def test_piecewise_fused_projection_preserves_input_token_dimension(monkeypatch)
         layer,
         position_ids=position_ids,
         hidden_states=hidden_states,
-        attn_metadata=SimpleNamespace(),
+        attn_metadata=metadata,
     )
 
     assert captured["packed"] is packed
@@ -523,9 +541,6 @@ def test_piecewise_captured_producer_preserves_symbolic_shapes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Retain an unbacked symbolic token count in both fake query outputs."""
-    from torch._subclasses.fake_tensor import FakeTensorMode
-    from torch.fx.experimental.symbolic_shapes import ShapeEnv
-
     layer = SimpleNamespace(q_size=1024, index_q_size=128)
     monkeypatch.setattr(
         modeling_minimaxm3,
@@ -553,8 +568,6 @@ def test_piecewise_captures_horizontal_producer_before_attention(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Run the captured producer before eager sparse attention consumes caches."""
-    from unittest.mock import Mock
-
     backend = object.__new__(MiniMaxM3MsaSparseAttention)
     backend.indexer_kv_dtype = "fp8"
     packed = torch.empty((4, 7), dtype=torch.bfloat16)
@@ -564,8 +577,12 @@ def test_piecewise_captures_horizontal_producer_before_attention(
     kv_cache = torch.empty(8, dtype=torch.float8_e4m3fn)
     index_cache = torch.empty_like(kv_cache)
     slots = torch.tensor([0, 1, -1, -1], dtype=torch.int32)
-    metadata = SimpleNamespace(
-        num_tokens=2, msa_layer_cache_tensors={3: (kv_cache, index_cache)}, msa_out_cache_loc=slots
+    metadata = Mock(
+        spec_set=MiniMaxM3MsaSparseAttentionMetadata,
+        num_tokens=2,
+        kv_cache_manager=None,
+        msa_layer_cache_tensors={3: (kv_cache, index_cache)},
+        msa_out_cache_loc=slots,
     )
     layer = SimpleNamespace(
         enable_fused_qkv_index_projection=True,
@@ -601,8 +618,6 @@ def test_piecewise_captured_producer_rejects_unavailable_fusion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Reject unsupported fused geometry without an eager fallback in capture."""
-    from unittest.mock import Mock
-
     layer = SimpleNamespace(
         qkv_proj=Mock(side_effect=lambda hidden: hidden.clone()),
         _fused_fp8_qkv_indexer_norm_rope_kv_insert=Mock(return_value=None),
@@ -632,14 +647,6 @@ def test_piecewise_captured_producer_declares_cache_mutations(
     restore_inplace: bool,
 ) -> None:
     """Real custom-op schema/AOT checks with CPU cache writes in place of CUDA math."""
-    from torch._dynamo.backends.common import aot_autograd
-    from torch._functorch.aot_autograd import make_boxed_func
-    from torch._higher_order_ops.auto_functionalize import (
-        auto_functionalized,
-        auto_functionalized_v2,
-    )
-
-    from tensorrt_llm._torch.compilation.remove_copy_pass import remove_copy_for_mutates_args
 
     def producer(
         packed: torch.Tensor,
@@ -741,12 +748,11 @@ def test_piecewise_captured_producer_declares_cache_mutations(
 @pytest.mark.cpu_only
 def test_piecewise_unfused_indexer_keeps_cache_write_eager(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep index-cache mutation outside capture when projections are separate."""
-    from unittest.mock import Mock
-
     backend = object.__new__(MiniMaxM3MsaSparseAttention)
     backend.indexer_kv_dtype = "fp8"
     q, k, v, idx_q, idx_k = [torch.empty((4, 128), dtype=torch.float8_e4m3fn) for _ in range(5)]
-    metadata = SimpleNamespace(num_tokens=2)
+    metadata = AttentionMetadata(max_num_requests=1, max_num_tokens=4)
+    metadata._num_tokens = 2
     layer = SimpleNamespace(
         enable_fused_qkv_index_projection=False,
         register_to_config=True,
@@ -799,8 +805,6 @@ def test_piecewise_attention_boundary_preserves_indexer_cache_contract(
     monkeypatch: pytest.MonkeyPatch, indexer_dtype: str, caches_prewritten: bool
 ) -> None:
     """Exercise the real MSA indexer after live-row slicing and cache insertion."""
-    from unittest.mock import Mock
-
     dtype = torch.float8_e4m3fn if indexer_dtype == "fp8" else torch.bfloat16
     q, k, v, idx_q, idx_k = [torch.full((4, 128), value).to(dtype) for value in range(1, 6)]
     index_cache = torch.zeros((4, 1, 1, 128), dtype=dtype)
@@ -809,8 +813,10 @@ def test_piecewise_attention_boundary_preserves_indexer_cache_contract(
     if caches_prewritten:
         index_cache.copy_(expected_cache)
     selected_blocks = torch.zeros(2, 1, 16, dtype=torch.int32)
-    attn_metadata = SimpleNamespace(
+    attn_metadata = Mock(
+        spec_set=MiniMaxM3MsaSparseAttentionMetadata,
         num_tokens=2,
+        kv_cache_manager=None,
         msa_decode_span=None,
         msa_idx_k_cache=Mock(return_value=index_cache),
         msa_write_idx_k=Mock(),
@@ -826,7 +832,7 @@ def test_piecewise_attention_boundary_preserves_indexer_cache_contract(
         live_k: torch.Tensor,
         live_v: torch.Tensor,
         live_idx_k: torch.Tensor,
-        metadata: SimpleNamespace,
+        metadata: AttentionMetadata,
     ) -> None:
         """Replace only CUDA scatter math, retaining the live cache-write inputs."""
         assert metadata is attn_metadata
