@@ -303,7 +303,13 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
     // optimized tarball to wait for; x86 keeps taking the canonical one.
     def requireBolted = BOLT_REQUIRE_BOLTED_WHEEL && arch == "sbsa"
     def waitTime = requireBolted ? WAIT_TIME_FOR_BOLTED_BUILD_STAGE : WAIT_TIME_FOR_BUILD_STAGE
-    def wheelArgs = "--arch ${arch} --timeout ${waitTime} --artifact_path " + env.uploadPath
+    // UPLOAD_PATH, not env.uploadPath: they agree whenever the parent passed the
+    // parameter, but an unset env leaves the raw reference interpolating to
+    // "null" and the download polls .../null/<tarball>. That used to cost a
+    // wasted wait before the build fell back to compiling from source; with the
+    // bolted wheel required there is no fallback, so it becomes an 8h wait
+    // followed by a failure.
+    def wheelArgs = "--arch ${arch} --timeout ${waitTime} --artifact_path ${UPLOAD_PATH}"
     if (requireBolted) {
         echo "Release image for ${arch} requires the BOLT-optimized build; waiting up to ${waitTime} minutes for it"
         wheelArgs += " --bolted"
