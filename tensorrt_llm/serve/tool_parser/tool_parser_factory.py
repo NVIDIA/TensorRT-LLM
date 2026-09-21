@@ -37,9 +37,9 @@ MODEL_TYPE_TO_TOOL_PARSER: dict[str, str] = {
     "qwen2": "qwen3",
     "qwen3": "qwen3",
     "qwen3_moe": "qwen3",
-    "qwen3_5": "qwen3",
-    "qwen3_5_text": "qwen3",
-    "qwen3_5_moe": "qwen3",
+    "qwen3_5": "qwen3_coder",
+    "qwen3_5_text": "qwen3_coder",
+    "qwen3_5_moe": "qwen3_coder",
     "qwen3_5_moe_text": "qwen3_coder",
     "qwen3_next": "qwen3",
     "qwen4_exp": "qwen3_coder",
@@ -64,27 +64,10 @@ MODEL_TYPE_TO_TOOL_PARSER: dict[str, str] = {
     "nemotron_h_omni": "qwen3_coder",
 }
 
-_QWEN_SHARED_TOOL_FORMAT_MODEL_TYPES = {
-    "qwen3_5",
-    "qwen3_5_text",
-    "qwen3_5_moe",
-}
-
-
-def _uses_qwen3_coder_tool_format(value: object) -> bool:
-    if isinstance(value, str):
-        return "<function=" in value and "<parameter=" in value
-    if isinstance(value, dict):
-        return any(_uses_qwen3_coder_tool_format(item) for item in value.values())
-    if isinstance(value, list):
-        return any(_uses_qwen3_coder_tool_format(item) for item in value)
-    return False
-
 
 def resolve_auto_tool_parser(model: str) -> Optional[str]:
     """Resolve 'auto' tool parser by reading the model's HF config."""
-    model_path = Path(model)
-    config_path = model_path / "config.json"
+    config_path = Path(model) / "config.json"
     if not config_path.exists():
         return None
 
@@ -92,13 +75,6 @@ def resolve_auto_tool_parser(model: str) -> Optional[str]:
         config = json.load(f)
 
     model_type = config.get("model_type", "")
-    if model_type in _QWEN_SHARED_TOOL_FORMAT_MODEL_TYPES:
-        tokenizer_config_path = model_path / "tokenizer_config.json"
-        if tokenizer_config_path.exists():
-            with open(tokenizer_config_path) as f:
-                tokenizer_config = json.load(f)
-            if _uses_qwen3_coder_tool_format(tokenizer_config.get("chat_template")):
-                return "qwen3_coder"
     return MODEL_TYPE_TO_TOOL_PARSER.get(model_type)
 
 
