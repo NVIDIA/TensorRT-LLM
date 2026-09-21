@@ -134,15 +134,26 @@ class TestCtxBufferBudget:
         # batch, so the buffer-fit check is skipped when max_seq_len is None.
         _validate(max_batch_size=32, max_seq_len=None)  # no raise
 
-    def test_trtllm_backend_skips_the_buffer_check(self):
-        # TRTLLM borrows the KV-cache manager's paged pool and reserves no
-        # private arena, so a budget that would refuse the VANILLA arena is not
-        # charged against it.
-        _validate(
-            max_batch_size=32,
-            attention_backend="TRTLLM",
-            memory_budget_bytes=PER_SLOT_BYTES_MSL,
-        )  # no raise
+    def test_trtllm_over_budget_warns_not_raises(self):
+        # TRTLLM normally binds the managed pool and reserves no private arena,
+        # so an over-budget estimate is a warning, not a hard refusal -- but it
+        # is not silent, because the pool is not guaranteed and the private
+        # arena fallback would allocate exactly this.
+        with patch.object(dflash.logger, "warning") as mock_warning:
+            _validate(
+                max_batch_size=32,
+                attention_backend="TRTLLM",
+                memory_budget_bytes=PER_SLOT_BYTES_MSL,
+            )  # no raise
+        assert mock_warning.call_count == 1
+        assert "managed KV-cache pool" in mock_warning.call_args[0][0]
+
+    @pytest.mark.parametrize("bypass", [{"max_seq_len": None}, {"attention_backend": "TRTLLM"}])
+    def test_token_budget_checked_before_buffer_bypass(self, bypass):
+        # The token-budget check must run before the max_seq_len-None and
+        # TRTLLM buffer-check bypasses, so a violated token budget still raises.
+        with pytest.raises(ValueError, match="max_num_tokens >= 256"):
+            _validate(max_batch_size=32, max_num_tokens=100, **bypass)
 
     def test_max_seq_len_caps_the_capacity(self):
         # The same batch the 1M fallback refuses fits easily once the

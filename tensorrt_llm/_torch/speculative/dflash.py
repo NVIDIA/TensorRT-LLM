@@ -220,7 +220,10 @@ def validate_dflash_ctx_buffer_budget(
 
     Raises:
         ValueError: On a token-budget violation or when the pooled-context
-            buffers cannot fit the budget, with the fitting value named.
+            buffers cannot fit the budget, with the fitting value named. For
+            the TRTLLM backend, which normally binds the managed pool but can
+            fall back to the private arena, an over-budget estimate is warned
+            rather than raised.
     """
     if max_batch_size is None:
         return
@@ -263,13 +266,6 @@ def validate_dflash_ctx_buffer_budget(
     # refuse every batch size. Skip the buffer-fit check in that case; the
     # token-budget check above still applies.
     if max_seq_len is None:
-        return
-    # The TRTLLM backend borrows the KV-cache manager's paged pool for the
-    # draft context (should_use_separate_draft_kv_cache is True) and reserves
-    # no private arena, so charging the full pooled-buffer arena here would
-    # refuse configs whose memory it never allocates. VANILLA and FA4 own the
-    # arena, so they keep the check.
-    if attention_backend == "TRTLLM":
         return
     if memory_budget_bytes is None:
         return
@@ -327,7 +323,7 @@ def validate_dflash_ctx_buffer_budget(
         if fitting >= 1
         else "no max_batch_size fits; lower max_seq_len or the drafter context"
     )
-    raise ValueError(
+    message = (
         f"DFlash: the pooled-context K/V buffers for max_batch_size="
         f"{max_batch_size} need {required / gib:.2f} GiB per GPU, exceeding "
         f"the estimated {memory_budget_bytes / gib:.2f} GiB left free once "
@@ -341,6 +337,22 @@ def validate_dflash_ctx_buffer_budget(
         f"{block_size}) x {num_kv_heads_per_rank} x {head_dim} x "
         f"{dtype_bytes}. With the current settings, {remedy}."
     )
+    if attention_backend == "TRTLLM":
+        # TRTLLM normally binds the KV-cache manager's paged pool and reserves
+        # no private arena, so this estimate is usually a false alarm and a
+        # hard raise would refuse the common managed-pool config. But the pool
+        # is not guaranteed: when it is unavailable (no draft manager, or an
+        # incompatible pool/block-table) _lazy_init_ctx_buffers falls back to
+        # allocating exactly this private arena. Warn rather than raise so the
+        # managed-pool case is not refused while the fallback OOM is not
+        # silent; skip_ctx_buffer_budget_check suppresses the warning.
+        logger.warning(
+            f"{message} TRTLLM normally uses the managed KV-cache pool and "
+            "never allocates this arena; this warning fires only if it falls "
+            "back to the private arena during warmup."
+        )
+        return
+    raise ValueError(message)
 
 
 def dflash_draft_slot_ids(
