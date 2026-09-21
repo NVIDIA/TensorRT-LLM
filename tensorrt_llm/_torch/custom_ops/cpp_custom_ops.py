@@ -200,6 +200,42 @@ def _register_fake():
                                           dtype=torch.float32)
         return output, rsigma, probs, logits
 
+    @torch.library.register_fake("trtllm::attn_res_rmsnorm_fwd")
+    def _(layer_residual: torch.Tensor, block_residual: torch.Tensor,
+          res_weight: torch.Tensor, rms_weight: torch.Tensor,
+          output_rms_weight: torch.Tensor, rms_eps: float,
+          output_rms_eps: float) -> torch.Tensor:
+        # layer_residual: [T, B, H] bf16; the op returns the normalized output
+        # with the same shape/dtype/device.
+        return torch.empty_like(layer_residual)
+
+    @torch.library.register_fake("trtllm::attn_res_add_rmsnorm_fwd")
+    def _(layer_residual: torch.Tensor, layer_residual_add: torch.Tensor,
+          block_residual: torch.Tensor, res_weight: torch.Tensor,
+          rms_weight: torch.Tensor, output_rms_weight: torch.Tensor,
+          rms_eps: float,
+          output_rms_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Returns (updated_layer_residual, output), both [T, B, H] like the
+        # layer residual.
+        return torch.empty_like(layer_residual), torch.empty_like(
+            layer_residual)
+
+    @torch.library.register_fake("trtllm::attn_res_add_rmsnorm_persistent_fwd")
+    def _(layer_residual: torch.Tensor,
+          layer_residual_add: Optional[torch.Tensor],
+          block_residual: torch.Tensor, res_weight: torch.Tensor,
+          rms_weight: torch.Tensor, output_rms_weight: torch.Tensor,
+          rms_eps: float,
+          output_rms_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Returns (updated_layer_residual, output), both [T, B, H]. The eager
+        # implementation returns layer_residual itself as the first result when
+        # layer_residual_add is None; that conditional aliasing cannot be
+        # expressed in the schema, so the fake reports a fresh tensor, which is
+        # what the schema promises. Callers on that branch must discard the
+        # first result (they already do).
+        return torch.empty_like(layer_residual), torch.empty_like(
+            layer_residual)
+
     @torch.library.register_fake("trtllm::fused_inv_rope_fp8_quant_vllm_port")
     def _(o: torch.Tensor, positions: torch.Tensor, cos_sin_cache: torch.Tensor,
           n_groups: int, heads_per_group: int, nope_dim: int, rope_dim: int,
@@ -823,6 +859,43 @@ def _register_fake():
     ) -> List[torch.Tensor]:
         return outputs
 
+    @torch.library.register_fake("trtllm::fused_sample_from_logits")
+    def _(
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        min_ps: torch.Tensor,
+        seed: Optional[torch.Tensor] = None,
+        offset: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return logits.new_empty((logits.shape[0], ), dtype=torch.int32)
+
+    @torch.library.register_fake("trtllm::fused_sample_from_logits_with_probs")
+    def _(
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        min_ps: torch.Tensor,
+        seed: Optional[torch.Tensor] = None,
+        offset: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return (
+            logits.new_empty((logits.shape[0], ), dtype=torch.int32),
+            logits.new_empty(logits.shape, dtype=torch.float32),
+        )
+
+    @torch.library.register_fake("trtllm::fused_compute_probs_from_logits")
+    def _(
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        min_ps: torch.Tensor,
+    ) -> torch.Tensor:
+        return logits.new_empty(logits.shape, dtype=torch.float32)
+
     @torch.library.register_fake(
         "trtllm::mtp_sampling_and_accepted_draft_tokens_op")
     def _(logits: torch.Tensor, draft_tokens: torch.Tensor,
@@ -1414,6 +1487,7 @@ def _register_fake():
         host_kv_cache_pool_mapping: Optional[torch.Tensor],
         kv_scale_orig_quant: Optional[torch.Tensor],
         kv_scale_quant_orig: Optional[torch.Tensor],
+        kv_cache_scale_orig_quant: Optional[torch.Tensor],
         out_scale: Optional[torch.Tensor],
         block_ids_per_seq: Optional[torch.Tensor],
         helix_tensor_params: List[Optional[torch.Tensor]],
@@ -1422,6 +1496,7 @@ def _register_fake():
         num_heads: int,
         num_kv_heads: int,
         head_size: int,
+        residual_dim: int,
         tokens_per_block: int,
         attention_window_size: int,
         beam_width: int,
@@ -1440,6 +1515,9 @@ def _register_fake():
         kv_only: bool = False,
         kv_done_elsewhere: bool = False,
         quant_scale_qkv: Optional[torch.Tensor] = None,
+        # Declared by the schema in dsv3RopeOp.cpp; meta dispatch passes it
+        # positionally, so the fake has to accept it.
+        q_rope_applied: bool = False,
     ) -> None:
         # This is a fake implementation for shape inference
         # The actual operation modifies fused_q and q_pe in-place
@@ -1708,3 +1786,13 @@ def _register_fake():
         out_shape = shape if shape is not None else list(like.shape)
         dtype = out_dtype if out_dtype is not None else like.dtype
         return like.new_empty(out_shape, dtype=dtype), output_buffer_kind
+
+    @torch.library.register_fake("trtllm::allocate_output_with_nccl_window")
+    def _(like: torch.Tensor,
+          output_buffer_kind: int,
+          group: Optional[List[int]],
+          shape: Optional[List[int]] = None,
+          out_dtype: Optional[torch.dtype] = None):
+        out_shape = shape if shape is not None else list(like.shape)
+        dtype = out_dtype if out_dtype is not None else like.dtype
+        return like.new_empty(out_shape, dtype=dtype), output_buffer_kind, 0

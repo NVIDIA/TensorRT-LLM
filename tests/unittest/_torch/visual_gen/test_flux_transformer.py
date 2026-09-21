@@ -90,6 +90,13 @@ def _make_fake_flux2_parallel_attn():
         pre_quant_scale=None,
         force_dynamic_quantization=False,
     )
+    # Flux now dispatches on Linear.can_use_cute_dsl_nvfp4_swiglu_blackwell(), the
+    # same predicate that drives the gate/up interleave, so the stand-in has to
+    # expose it. Mirror the predicate's dependence on use_cute_dsl_blockscaling_mm
+    # to keep the guard tests below meaningful.
+    gate_up_proj.can_use_cute_dsl_nvfp4_swiglu_blackwell = (
+        lambda: gate_up_proj.use_cute_dsl_blockscaling_mm
+    )
     attn.to_qkv_mlp_proj = SimpleNamespace(
         tp_size=2,
         qkv_proj=object(),

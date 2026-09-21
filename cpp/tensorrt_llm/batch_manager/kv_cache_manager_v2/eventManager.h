@@ -162,9 +162,17 @@ class EventManager final : public EventSink
 public:
     using AttentionDpGatherFn = std::function<std::vector<std::vector<KVCacheEvent>>(std::vector<KVCacheEvent> const&)>;
 
+    //! mmTokenIdOffset enables decoding MM keys from digest-first item tokens; otherwise it is disabled.
+    //! Integers above this offset must be reserved for MM continuations. Items may contain text but must not
+    //! interleave.
     EventManager(int maxKvEventEntries, int windowSize = 0, std::optional<int> attentionDpRank = std::nullopt,
         AttentionDpGatherFn attentionDpGather = {}, std::string hashAlgo = "v2_sha256",
-        std::map<int, int> windowSizeByLayerGroup = {});
+        std::map<int, int> windowSizeByLayerGroup = {}, std::optional<int> mmTokenIdOffset = std::nullopt);
+
+    bool needsTokenDigestContext() const override
+    {
+        return mMaxKvEventEntries > 0 && mMmTokenIdOffset.has_value();
+    }
 
     void addCreatedEvent(
         std::vector<int> numBlocksPerCacheLevel, std::optional<std::vector<int>> layerGroupIds = std::nullopt);
@@ -242,6 +250,9 @@ private:
     AttentionDpGatherFn mAttentionDpGather;
     HashAlgorithm mHashAlgo;
     std::string mHashAlgoName;
+    // Enables the digest-first MM convention: digest at offset zero, then idOffset + item offset.
+    // Integers above this offset are reserved for continuations of the most recent item.
+    std::optional<int> mMmTokenIdOffset;
     int64_t mNextEventId = 0;
 
     std::unordered_map<Digest, StoredBlockState> mStoredBlocks;

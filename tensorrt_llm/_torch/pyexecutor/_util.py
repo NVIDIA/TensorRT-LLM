@@ -2747,13 +2747,14 @@ def _create_kv_cache_manager(
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
         manager_extra_kwargs[
             "disable_overlap_scheduler"] = disable_overlap_scheduler
-        # V2 builds the block-reuse cache key of a multimodal token run from
-        # the vocabulary size. Resolve it here rather than per-branch: the
-        # manager needs it whenever block reuse can meet multimodal input,
-        # whichever branch below builds it, and a branch that omits it leaves
-        # the key generator to be called with None on the first image request.
-        manager_extra_kwargs["vocab_size"] = resolve_vocab_size(config)
-        if (manager_extra_kwargs["vocab_size"] is None
+        # Vocab size also enables multimodal event decoding and its per-block
+        # digest scan. Leave it unset for text-only engines. Without an engine
+        # (e.g. separate one-model draft caches), preserve config resolution:
+        # a text sub-config alone cannot identify a multimodal deployment.
+        needs_multimodal_keys = model_engine is None or model_engine.is_multimodal
+        manager_extra_kwargs["vocab_size"] = (resolve_vocab_size(config) if
+                                              needs_multimodal_keys else None)
+        if (needs_multimodal_keys and manager_extra_kwargs["vocab_size"] is None
                 and kv_cache_config.enable_block_reuse):
             logger.warning(
                 "Could not resolve vocab_size from the model config; "
