@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Kimi K3 disaggregated serving (ctx/gen split)
 
 Configuration pair + deployment wiring for running Kimi K3 with separate
@@ -32,16 +35,17 @@ for constraints.
   replicated share ~113 GiB + experts/8), leaving no activation headroom
   on GB300 (288 GiB) and not fitting GB200 (186 GiB). Treat DEP8-ctx as
   ruled out on GB200 and an open (likely negative) question on GB300.
-- **`transceiver_runtime: PYTHON` is mandatory**: `auto` resolves to the
-  C++ transceiver, which throws at construction for K3's
-  `MixedMambaHybridCacheManager`.
+- **Use `backend: NIXL` and `transceiver_runtime: PYTHON`** for K3's
+  `MixedMambaHybridCacheManager`. The standard PyTorch model-loading path
+  also resolves `auto` to Python through K3's model preference; the recipes
+  select it explicitly rather than depending on runtime resolution.
 - `disable_overlap_scheduler: true` on the ctx server (disagg
   requirement) and on the gen server (SA runs eager; also keeps the
   SA-off smoke maximally comparable).
 - `enable_block_reuse: false`, `tokens_per_block: 64`, no chunked
   prefill, beam width 1 (model requirements).
-- `max_tokens_in_buffer: 8448` covers the target max ISL of 8192; raise
-  it together with `max_num_tokens`/`max_seq_len` for longer ISL.
+- The Python-transceiver recipes do not set `max_tokens_in_buffer`.
+  Size `max_num_tokens` and `max_seq_len` for the target input/output lengths.
 - **`kv_cache_bounce_size_mb: 1024` on both sides**: the V2 transceiver's default
   pool-to-pool path cannot use inter-node cuda_ipc on MNNVL (the KV pool
   is a plain, non-fabric allocation) and falls back to ~0.4 GB/s
@@ -179,5 +183,6 @@ python3 examples/disaggregated/slurm/benchmark/submit.py \
    job time limits accordingly. The disaggregated proxy does not serve
    `/v1/models` (404) — point readiness probes at a different endpoint.
 10. **`max_num_tokens` coupling.** The generation side must cover
-    `max_batch_size × (1 + max_draft_len)`; the context side needs
-    `max_tokens_in_buffer` ≥ max ISL (see constraints above).
+    `max_batch_size × (1 + max_draft_len)`; with chunked prefill disabled,
+    the context side must accommodate the prompt in `max_num_tokens` and
+    `max_seq_len`.
