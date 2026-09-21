@@ -53,8 +53,11 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear, TensorParallelMode
+from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe.fp32_router_gemm import fp32_router_gemm
 from ..pyexecutor.config_utils import unwrap_glm5_next_text_config
+from ..utils import AuxStreamType
 from .checkpoints.hf.glm5_next_weight_mapper import (
     Glm5NextHfWeightMapper,
     glm5_next_is_quantized,
@@ -1446,6 +1449,16 @@ class Glm5NextGate(DeepseekV3Gate):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         flat = hidden_states.reshape(-1, self.hidden_size)
+        if (
+            flat.is_cuda
+            and flat.dtype == torch.bfloat16
+            and self.weight.dtype == torch.float32
+            and self.weight.shape == (288, 4096)
+            and self.weight.is_contiguous()
+            and flat.stride(-1) == 1
+            and 1 <= flat.shape[0] <= 8
+        ):
+            return fp32_router_gemm(flat, self.weight)
         return torch.nn.functional.linear(flat.float(), self.weight)
 
 
@@ -1463,6 +1476,7 @@ class Glm5NextMoE(nn.Module):
         model_config: ModelConfig,
         layer_idx: int,
         dtype: torch.dtype = torch.bfloat16,
+        aux_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
         hidden = int(config.hidden_size)
@@ -1521,6 +1535,9 @@ class Glm5NextMoE(nn.Module):
         # DeepSeek-V3 composition).
         self.mapping = model_config.mapping
         self.use_dp = bool(self.mapping.enable_attention_dp)
+        self.shared_expert_stream = None if self.use_dp else aux_stream
+        self.shared_expert_start = torch.cuda.Event() if self.shared_expert_stream else None
+        self.shared_expert_done = torch.cuda.Event() if self.shared_expert_stream else None
         # Reduce routed and TP-sharded shared-expert partials once. Under
         # attention DP the fused layer combines across ranks itself and the
         # shared expert is replicated, so there is nothing to reduce here.
@@ -1558,16 +1575,26 @@ class Glm5NextMoE(nn.Module):
         # serves prefill and decode with no host-dependent branching, so
         # decode stays CUDA-graph-capturable. ``all_rank_num_tokens`` drives
         # the fused layer's dispatch/combine under attention DP.
-        routed = self.experts(
-            flat,
-            self.gate(flat),
-            all_rank_num_tokens=all_rank_num_tokens if self.use_dp else None,
+        # Small TP batches leave enough GPU capacity to overlap the shared
+        # expert with routing and the routed experts. The helper limits stream
+        # switching to CUDA graphs and joins before the single reduction.
+        routed, shared = maybe_execute_in_parallel(
+            lambda: self.experts(
+                flat,
+                self.gate(flat),
+                all_rank_num_tokens=all_rank_num_tokens if self.use_dp else None,
+            ),
+            lambda: self.shared_experts(flat),
+            self.shared_expert_start,
+            self.shared_expert_done,
+            self.shared_expert_stream if flat.shape[0] <= 8 else None,
+            disable_on_compile=True,
         )
         # Routed and shared are both rank partials (a K-dim partial per expert
         # in the TP4 layout, the local-expert partial sum in the TP4/EP4
         # layout). Sum them, then exactly one reduction covers the whole MoE
         # branch -- the DeepSeek-V3 order.
-        mixed = routed + self.shared_experts(flat)
+        mixed = routed + shared
         if self.moe_all_reduce is not None:
             mixed = self.moe_all_reduce(mixed)
         return mixed.view_as(x)
@@ -1638,6 +1665,7 @@ class Glm5NextDecoderLayer(DecoderLayer):
         schedule: Glm5NextSchedule,
         model_config: ModelConfig,
         dtype: torch.dtype = torch.bfloat16,
+        aux_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
@@ -1663,7 +1691,7 @@ class Glm5NextDecoderLayer(DecoderLayer):
                 model_config=model_config,
             )
         self.mlp = (
-            Glm5NextMoE(config, model_config, layer_idx, dtype=dtype)
+            Glm5NextMoE(config, model_config, layer_idx, dtype=dtype, aux_stream=aux_stream)
             if self.mlp_type == SPARSE_MLP
             else GatedMLP(
                 hidden_size=int(config.hidden_size),
@@ -1751,20 +1779,28 @@ class Glm5NextModel(DecoderModel):
         self.hc_mult = int(config.hc_mult)
         dtype = getattr(config, "torch_dtype", None) or torch.bfloat16
 
+        # Decoder and draft layers execute serially and share this side stream.
+        self.aux_stream_dict = {}
+        if not model_config.mapping.enable_attention_dp and torch.cuda.is_available():
+            self.aux_stream_dict[AuxStreamType.MoeShared] = torch.cuda.Stream()
+
         self.embed_tokens = Embedding(int(config.vocab_size), int(config.hidden_size), dtype=dtype)
         self.layers = nn.ModuleList(
             [
-                Glm5NextDecoderLayer(config, i, schedule, model_config, dtype=dtype)
+                Glm5NextDecoderLayer(
+                    config,
+                    i,
+                    schedule,
+                    model_config,
+                    dtype=dtype,
+                    aux_stream=self.aux_stream_dict.get(AuxStreamType.MoeShared),
+                )
                 for i in range(schedule.num_layers)
             ]
         )
         self.norm = RMSNorm(
             hidden_size=int(config.hidden_size), eps=float(config.rms_norm_eps), dtype=dtype
         )
-        # Read by the one-model MTP drafter factory (``MTPForCausalLM`` passes
-        # ``model.aux_stream_dict`` to every MTP layer). This model runs its
-        # branches on the main stream, so the draft layer receives an empty map.
-        self.aux_stream_dict: dict[Any, Any] = {}
 
     def forward(
         self,
@@ -1950,7 +1986,6 @@ class Glm5NextMTP(nn.Module):
         is_separate_draft_engine: bool = False,
     ) -> None:
         super().__init__()
-        del aux_stream_dict  # single-stream model; accepted for the factory's call shape
         if is_separate_draft_engine:
             raise NotImplementedError(
                 "glm5_next MTP runs one-model speculative decoding only (MTP / MTP_EAGLE_ONE_MODEL)"
@@ -1992,7 +2027,13 @@ class Glm5NextMTP(nn.Module):
             attn_backend=model_config.attn_backend,
             model_config=model_config,
         )
-        self.mlp = Glm5NextMoE(config, model_config, layer_idx, dtype=dtype)
+        self.mlp = Glm5NextMoE(
+            config,
+            model_config,
+            layer_idx,
+            dtype=dtype,
+            aux_stream=aux_stream_dict.get(AuxStreamType.MoeShared) if aux_stream_dict else None,
+        )
         self.shared_head = Glm5NextMTPHead(config, model_config, dtype)
 
     def forward(
