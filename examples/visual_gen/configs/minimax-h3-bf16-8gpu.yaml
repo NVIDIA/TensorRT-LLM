@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# 4-GPU BF16 MiniMax-H3 VisualGen configuration using pure Ulysses sequence
+# 8-GPU BF16 MiniMax-H3 VisualGen configuration using pure Ulysses sequence
 # parallelism. The checkpoint path is supplied by examples/visual_gen/models/
 # minimax_h3.py through --model.
 cuda_graph_config:
@@ -11,7 +11,7 @@ attention_config:
   backend: VANILLA
 
 parallel_config:
-  ulysses_size: 4
+  ulysses_size: 8
 
 compilation_config:
   skip_warmup: false
@@ -19,3 +19,7 @@ compilation_config:
     - [544, 960]
   num_frames:
     - 124
+
+# Reuse the Ulysses GPUs to decode independent spatial VAE tiles.
+pipeline_config:
+  vae_tile_parallel: true

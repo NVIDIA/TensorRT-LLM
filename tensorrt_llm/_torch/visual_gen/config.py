@@ -604,6 +604,12 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             if value:
                 extra_attrs[key] = value
 
+        # Preserve H3 VAE options, including explicit False values. Registry
+        # validation happens in PipelineLoader before this conversion.
+        for key in ("vae_use_tiling", "vae_tile_parallel", "vae_tile_size", "vae_tile_overlap"):
+            if key in resolved_pipeline_config:
+                extra_attrs[key] = resolved_pipeline_config[key]
+
         # Discover pipeline components (diffusers layout)
         components = discover_pipeline_components(checkpoint_path)
         component_config_dicts: Dict[str, Dict[str, Any]] = {}

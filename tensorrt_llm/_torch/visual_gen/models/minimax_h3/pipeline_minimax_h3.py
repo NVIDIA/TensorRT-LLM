@@ -23,7 +23,7 @@ from typing import Any, Optional
 
 import numpy as np
 import torch
-from diffusers import AutoencoderKLMiniMaxH3, AutoencoderKLMiniMaxH3Audio, MiniMaxH3Scheduler
+from diffusers import AutoencoderKLMiniMaxH3Audio, MiniMaxH3Scheduler
 from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image, ImageOps
 from transformers import Qwen2TokenizerFast, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
@@ -59,6 +59,11 @@ from .packing import (
     unpack_audio_tokens,
     unpatchify_video_tokens,
     video_latent_num_frames,
+)
+from .tiled_vae import (
+    MINIMAX_H3_VAE_DEFAULTS,
+    TiledAutoencoderKLMiniMaxH3,
+    validate_vae_tiling_config,
 )
 from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel
 
@@ -109,6 +114,7 @@ def _check_denoise_step(velocity: torch.Tensor, name: str, step: int) -> None:
 @register_pipeline(
     "MiniMaxH3ModularPipeline",
     hf_ids=["MiniMaxAI/MiniMax-H3"],
+    defaults=MINIMAX_H3_VAE_DEFAULTS,
     download_patterns=[
         "modular_model_index.json",
         "LICENSE",
@@ -192,6 +198,11 @@ class MiniMaxH3Pipeline(BasePipeline):
             raise NotImplementedError(
                 "CUDA graphs are not yet supported for MiniMax-H3's packed layout inputs."
             )
+        self._vae_tiling_options = {
+            key: pipeline_config.extra_attrs.get(key, value)
+            for key, value in MINIMAX_H3_VAE_DEFAULTS.items()
+        }
+        validate_vae_tiling_config(self._vae_tiling_options)
         self.audio_vae = None
         self.audio_scheduler = None
         self.processor = None
@@ -288,12 +299,25 @@ class MiniMaxH3Pipeline(BasePipeline):
             ).to(device)
             self.text_encoder.eval()
         if not _component_skipped(skip_components, PipelineComponent.VAE):
-            self.vae = AutoencoderKLMiniMaxH3.from_pretrained(
+            self.vae = TiledAutoencoderKLMiniMaxH3.from_pretrained(
                 checkpoint_dir,
                 subfolder=PipelineComponent.VAE,
                 torch_dtype=torch.float32,
             ).to(device)
             self.vae.eval()
+            vgm = self.pipeline_config.visual_gen_mapping
+            self.vae.configure_tiling(
+                self._vae_tiling_options,
+                group=vgm.ulysses_group if vgm is not None else None,
+            )
+            tile_group = self.vae.tile_parallel_group
+            tile_ranks = (
+                torch.distributed.get_world_size(tile_group) if tile_group is not None else 1
+            )
+            logger.info(
+                f"MiniMax-H3 VAE: spatial tiling={self.vae.use_tiling}, "
+                f"tile decode ranks={tile_ranks}"
+            )
         if not _component_skipped(skip_components, PipelineComponent.AUDIO_VAE):
             self.audio_vae = AutoencoderKLMiniMaxH3Audio.from_pretrained(
                 checkpoint_dir,

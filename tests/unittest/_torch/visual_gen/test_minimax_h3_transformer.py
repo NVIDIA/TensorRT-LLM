@@ -1176,3 +1176,130 @@ def test_pinned_diffusers_golden_matches_live_hf_reference() -> None:
         rtol=2e-2,
         atol=2e-2,
     )
+
+
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+@pytest.mark.parametrize("sequence_length", [1, 7, 8, 9, 16])
+def test_ulysses_refiner_masks_padding_and_restores_sequence(
+    world_size: int,
+    sequence_length: int,
+) -> None:
+    hidden = torch.arange(2 * sequence_length * 4, dtype=torch.float32).reshape(
+        2, sequence_length, 4
+    )
+    padded_length = ((sequence_length + world_size - 1) // world_size) * world_size
+    expected_padded = F.pad(hidden, (0, 0, 0, padded_length - sequence_length))
+    expected_mask = torch.arange(padded_length).expand(2, -1) < sequence_length
+    for rank in range(world_size):
+
+        class RankSharder:
+            size = world_size
+
+            def shard(self, tensor, dim):
+                assert dim == 1
+                torch.testing.assert_close(tensor, expected_padded)
+                return tensor.chunk(world_size, dim=dim)[rank]
+
+            def gather(self, tensor, dim, unpad_to):
+                assert dim == 1 and unpad_to == sequence_length
+                torch.testing.assert_close(
+                    tensor, (expected_padded + 1).chunk(world_size, dim=1)[rank]
+                )
+                return (expected_padded + 1)[:, :unpad_to]
+
+        class MaskedBlock(nn.Module):
+            def forward(self, tensor, key_padding_mask):
+                if padded_length == sequence_length:
+                    assert key_padding_mask is None
+                else:
+                    torch.testing.assert_close(key_padding_mask, expected_mask)
+                return tensor + 1
+
+        refiner = h3.MiniMaxH3TokenRefiner.__new__(h3.MiniMaxH3TokenRefiner)
+        nn.Module.__init__(refiner)
+        refiner.sharder = RankSharder()
+        refiner.refiner_blocks = nn.ModuleList([MaskedBlock()])
+        refiner.final_norm = nn.Identity()
+        torch.testing.assert_close(refiner(hidden), hidden + 1)
+
+
+@requires_cuda
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+@pytest.mark.parametrize("existing_padding", [False, True])
+def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
+    world_size: int,
+    existing_padding: bool,
+) -> None:
+    """Exercise each rank's H3 forward; emulate only the collective transport."""
+    model = h3.MiniMaxH3Transformer3DModel(_make_model_config()).to("cuda")
+    _initialize_weights(model)
+    inputs = _model_inputs("cuda")
+    if existing_padding:
+        inputs["token_tags"] = F.pad(inputs["token_tags"], (0, 1), value=-1)
+        inputs["timestep_indices"] = F.pad(inputs["timestep_indices"], (0, 1))
+        inputs["position_ids"] = F.pad(inputs["position_ids"], (0, 0, 0, 1))
+    sequence_length = inputs["token_tags"].numel()
+    baseline_packed = []
+    handle = model.norm_out.register_forward_hook(
+        lambda module, args, output: baseline_packed.append(output.detach().clone())
+    )
+    expected = model(**inputs)
+    handle.remove()
+    padded_length = ((sequence_length + world_size - 1) // world_size) * world_size
+    pad = padded_length - sequence_length
+    full_indices = F.pad(
+        inputs["timestep_indices"] * 3 + inputs["token_tags"].clamp(min=0), (0, pad)
+    )
+    full_timesteps = F.pad(inputs["timestep_indices"], (0, pad))
+    full_mask = F.pad(inputs["token_tags"] >= 0, (0, pad), value=False).unsqueeze(0)
+    cos, sin = model.rope(inputs["position_ids"])
+    full_rope = (F.pad(cos, (0, 0, 0, pad), value=1), F.pad(sin, (0, 0, 0, pad), value=0))
+
+    for rank in range(world_size):
+
+        class RankSharder:
+            size = world_size
+
+            def shard(self, tensor, dim):
+                assert tensor.shape[dim] == padded_length
+                return tensor.chunk(world_size, dim=dim)[rank]
+
+            def shard_rope(self, rope, seq_len, seq_dim):
+                assert seq_len == padded_length and seq_dim == 0
+                return tuple(self.shard(t, seq_dim) for t in rope)
+
+            def gather(self, tensor, dim, unpad_to):
+                assert dim == 1 and unpad_to == sequence_length
+                offset = rank * (padded_length // world_size)
+                valid = max(0, min(tensor.shape[1], sequence_length - offset))
+                torch.testing.assert_close(
+                    tensor[:, :valid],
+                    baseline_packed[0][:, offset : offset + valid],
+                    rtol=2e-2,
+                    atol=2e-3,
+                )
+                return baseline_packed[0]
+
+        class CaptureBlock(nn.Module):
+            def forward(
+                self, hidden_states, temb, adaln_indices, rotary_emb, key_padding_mask, timestep
+            ):
+                torch.testing.assert_close(adaln_indices, full_indices.chunk(world_size)[rank])
+                for actual, expected_rope in zip(rotary_emb, full_rope):
+                    torch.testing.assert_close(actual, expected_rope.chunk(world_size)[rank])
+                if pad or existing_padding:
+                    torch.testing.assert_close(key_padding_mask, full_mask)
+                else:
+                    assert key_padding_mask is None
+                return hidden_states
+
+        def check_norm_indices(module, args):
+            torch.testing.assert_close(args[2], full_timesteps.chunk(world_size)[rank])
+
+        model.sharder = RankSharder()
+        model.transformer_blocks = nn.ModuleList([CaptureBlock()])
+        handle = model.norm_out.register_forward_pre_hook(check_norm_indices)
+        actual = model(**inputs)
+        handle.remove()
+        torch.testing.assert_close(actual.sample, expected.sample, rtol=0, atol=0)
+        torch.testing.assert_close(actual.audio_sample, expected.audio_sample, rtol=0, atol=0)
