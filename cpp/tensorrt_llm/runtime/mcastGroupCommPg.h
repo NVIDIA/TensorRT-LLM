@@ -19,6 +19,8 @@
 #include "tensorrt_llm/runtime/mcastGroupComm.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
 
+#include <torch/csrc/distributed/c10d/Backend.hpp>
+
 #include <exception>
 #include <utility>
 
@@ -34,6 +36,14 @@ namespace tensorrt_llm::runtime
 //! exchanged in place over that backend: the collective reads and writes the caller's buffers
 //! directly, with no device round-trip and no copies. The exchange happens only when a workspace
 //! is created or grown, never on the steady-state path.
+//!
+//! Every collective below is issued on the CPU backend directly rather than through the
+//! ProcessGroup, because the ProcessGroup entry points are dispatched c10d operators and workspaces
+//! are set up while the model is still under MetaInitMode. That mode redirects dispatched at::empty
+//! to the meta device, so ProcessGroup::barrier -- which allocates its dummy tensor that way --
+//! comes back holding a meta tensor and is then rejected with MetaInitException. Going straight to
+//! the backend keeps this host-only setup path out of the tensor dispatcher entirely; the Python
+//! side does the same in _mnnvl_workspace_barrier.
 //!
 //! This header pulls in torch headers and must only be included from translation units that link
 //! against torch (the nanobind bindings and thop).
@@ -71,12 +81,12 @@ public:
         options.rootRank = root;
         // Broadcasts in place, so the caller's buffer holds the result.
         std::vector<at::Tensor> payloads{hostView(buf, static_cast<int64_t>(bytes))};
-        PGCHECK_THROW(mPg->broadcast(payloads, options));
+        PGCHECK_THROW(mPg->getBackend(c10::DeviceType::CPU)->broadcast(payloads, options));
     }
 
     void barrier() override
     {
-        PGCHECK_THROW(mPg->barrier());
+        PGCHECK_THROW(mPg->getBackend(c10::DeviceType::CPU)->barrier());
     }
 
     //! Taken from the world process group when the runtime registered one (TorchDist always does).
@@ -108,7 +118,7 @@ private:
         auto const count = static_cast<int64_t>(bytes);
         auto input = hostView(const_cast<void*>(sendBuf), count);
         auto output = hostView(recvBuf, count * mPg->getSize());
-        PGCHECK_THROW(mPg->_allgather_base(output, input));
+        PGCHECK_THROW(mPg->getBackend(c10::DeviceType::CPU)->_allgather_base(output, input));
     }
 
     //! c10d offers no query for "does this group have a CPU backend", and getBackend() reports the
