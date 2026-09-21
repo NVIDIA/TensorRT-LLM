@@ -115,16 +115,34 @@ class TestComputeCtxBufferBytes:
 
 class TestCtxBufferBudget:
     def test_oversized_batch_is_a_config_error_naming_the_fitting_value(self):
-        # No serve-time max_seq_len: capacity falls back to the drafter's 1M
-        # advertised positions, which no reasonable batch fits.
+        # A batch that overruns the buffer budget (here a tight budget at the
+        # serve-time max_seq_len) is refused, and the message names the largest
+        # batch that fits.
+        budget = 10 * PER_SLOT_BYTES_MSL
         with pytest.raises(ValueError) as excinfo:
-            _validate(max_batch_size=32, max_seq_len=None)
+            _validate(max_batch_size=32, memory_budget_bytes=budget)
         message = str(excinfo.value)
-        required_gib = 33 * PER_SLOT_BYTES / GIB
-        fitting = BUDGET // PER_SLOT_BYTES - 1
+        required_gib = 33 * PER_SLOT_BYTES_MSL / GIB
+        fitting = budget // PER_SLOT_BYTES_MSL - 1
         assert f"{required_gib:.2f} GiB" in message
         assert f"max_batch_size estimated to fit is {fitting}" in message
         assert "max_batch_size + 1 slots" in message  # the formula
+
+    def test_unset_max_seq_len_skips_the_buffer_check(self):
+        # max_seq_len is unset at config time and resolved later from the model
+        # config; falling back to the drafter's 1M positions would refuse every
+        # batch, so the buffer-fit check is skipped when max_seq_len is None.
+        _validate(max_batch_size=32, max_seq_len=None)  # no raise
+
+    def test_trtllm_backend_skips_the_buffer_check(self):
+        # TRTLLM borrows the KV-cache manager's paged pool and reserves no
+        # private arena, so a budget that would refuse the VANILLA arena is not
+        # charged against it.
+        _validate(
+            max_batch_size=32,
+            attention_backend="TRTLLM",
+            memory_budget_bytes=PER_SLOT_BYTES_MSL,
+        )  # no raise
 
     def test_max_seq_len_caps_the_capacity(self):
         # The same batch the 1M fallback refuses fits easily once the
@@ -172,14 +190,30 @@ class TestCtxBufferBudget:
 
 
 class TestWeightEstimate:
-    def test_sums_weight_shards_only(self, tmp_path):
+    def test_prefers_safetensors_over_bin(self, tmp_path):
+        # Repos that ship both .safetensors and .bin copies of the same weights
+        # must not be double-counted: prefer .safetensors, ignore the .bin.
         (tmp_path / "model-00001-of-00002.safetensors").write_bytes(b"a" * 100)
         (tmp_path / "model-00002-of-00002.safetensors").write_bytes(b"b" * 50)
         (tmp_path / "pytorch_model.bin").write_bytes(b"c" * 7)
         (tmp_path / "config.json").write_text("{}")  # not a shard
         (tmp_path / "model.safetensors.index.json").write_text("{}")
 
-        assert estimate_checkpoint_weight_bytes(str(tmp_path)) == 157
+        assert estimate_checkpoint_weight_bytes(str(tmp_path)) == 150
+
+    def test_falls_back_to_bin_without_safetensors(self, tmp_path):
+        (tmp_path / "pytorch_model-00001-of-00002.bin").write_bytes(b"c" * 40)
+        (tmp_path / "pytorch_model-00002-of-00002.bin").write_bytes(b"d" * 20)
+        (tmp_path / "config.json").write_text("{}")
+
+        assert estimate_checkpoint_weight_bytes(str(tmp_path)) == 60
+
+    def test_walks_subdirectory_shards(self, tmp_path):
+        sub = tmp_path / "weights"
+        sub.mkdir()
+        (sub / "model-00001-of-00001.safetensors").write_bytes(b"a" * 80)
+
+        assert estimate_checkpoint_weight_bytes(str(tmp_path)) == 80
 
     def test_no_shards_is_none_not_zero(self, tmp_path):
         (tmp_path / "config.json").write_text("{}")
@@ -234,9 +268,41 @@ class TestLlmArgsWiring:
         )
 
     def test_oversized_batch_rejected_through_llm_args(self, tmp_path):
-        args = self._args(tmp_path, max_batch_size=32, max_seq_len=None)
+        # A batch that overruns a tight buffer budget at the serve-time
+        # max_seq_len is refused through the TorchLlmArgs entry point.
+        args = self._args(tmp_path, max_batch_size=32)
         with pytest.raises(ValueError, match="max_batch_size estimated to fit"):
-            args._validate_dflash_ctx_budget(memory_budget_bytes=BUDGET)
+            args._validate_dflash_ctx_budget(memory_budget_bytes=10 * PER_SLOT_BYTES_MSL)
+
+    def test_default_batch_is_clamped_not_rejected(self, tmp_path):
+        # max_batch_size left at its default overruns a tight token budget;
+        # rather than failing construction it is clamped to what fits, with a
+        # warning. An explicitly-set max_batch_size would hard-fail instead.
+        from tensorrt_llm.llmapi import llm_args as llm_args_module
+        from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig, KvCacheConfig, TorchLlmArgs
+
+        drafter_dir = tmp_path / "drafter"
+        drafter_dir.mkdir()
+        (drafter_dir / "config.json").write_text(json.dumps(DRAFT_CONFIG))
+        args = TorchLlmArgs.model_construct(
+            model="unused",
+            speculative_config=DFlashDecodingConfig(
+                max_draft_len=7, speculative_model=str(drafter_dir)
+            ),
+            max_num_tokens=100,
+            max_seq_len=8192,
+            tensor_parallel_size=4,
+        )
+        # An explicit max_tokens cap skips the GPU-based budget derivation, so
+        # the clamp is exercised without touching a device.
+        args.kv_cache_config = KvCacheConfig(max_tokens=1024)
+        assert "max_batch_size" not in args.model_fields_set
+        with patch.object(llm_args_module.logger, "warning") as mock_warning:
+            args._validate_dflash_ctx_budget(memory_budget_bytes=None)
+        # 100 // (1 + 7) = 12
+        assert args.max_batch_size == 12
+        assert mock_warning.call_count == 1
+        assert "clamping max_batch_size to 12" in mock_warning.call_args[0][0]
 
     def test_max_seq_len_admits_the_same_batch_through_llm_args(self, tmp_path):
         # Identical shape to the rejected case, plus the serve-time cap.
@@ -266,7 +332,9 @@ class TestLlmArgsWiring:
         with open(target_dir / "model.safetensors", "wb") as f:
             f.truncate(200 * GIB)
 
-        args = self._args(tmp_path, max_batch_size=32, max_seq_len=None, model=str(target_dir))
+        # Batch large enough to overrun the weight-subtracted budget even at
+        # the capped max_seq_len (each slot is ~40 MiB at msl 8192).
+        args = self._args(tmp_path, max_batch_size=200, max_seq_len=8192, model=str(target_dir))
         args.kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
         fake_props = SimpleNamespace(total_memory=100 * GIB)
         with (
