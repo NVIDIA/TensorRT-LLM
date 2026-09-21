@@ -946,7 +946,7 @@ class Glm5NextIndexer(nn.Module):
             torch.zeros(self.index_kpool, self.head_dim, dtype=torch.bfloat16)
         )
         # Reuse DSA's TopK, bounded by each request's candidate count.
-        # Prefer CuTe DSL radix selection, with CUDA radix as the fallback.
+        # Torch handles the FP32 fallback without caller-owned CUDA radix scratch.
         from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
         from ..modules.top_k import TopK, TopKImplementation
 
@@ -956,7 +956,7 @@ class Glm5NextIndexer(nn.Module):
             decode_implementation=(
                 TopKImplementation.CUTE_DSL_RADIX
                 if IS_CUTLASS_DSL_AVAILABLE
-                else TopKImplementation.CUDA_RADIX
+                else TopKImplementation.TORCH
             ),
         )
 
