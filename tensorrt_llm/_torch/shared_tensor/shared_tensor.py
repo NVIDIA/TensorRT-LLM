@@ -453,13 +453,16 @@ class SharedTensorContainer:
                 self.tensor_handle)
         elif self.method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CPU:
             sharing_strategy = get_sharing_strategy()
-            # Here we use file_system sharing strategy to make it serializable between two non-python independent processes
+            # Use file_system to make the handle serializable between two
+            # independent, non-Python processes.
             set_sharing_strategy("file_system")
-            storage = self.tensor_handle[1]
-            meta_data = self.tensor_handle[2]
-            storage_handle = reduce_storage(storage)
-            # restore the original sharing strategy
-            set_sharing_strategy(sharing_strategy)
+            try:
+                storage = self.tensor_handle[1]
+                meta_data = self.tensor_handle[2]
+                storage_handle = reduce_storage(storage)
+            finally:
+                # restore the original sharing strategy
+                set_sharing_strategy(sharing_strategy)
             # exclude the first element which is the type of the storage
             storage_metadata = storage_handle[-1][1:]
             tensor_dict = SharedTensorContainer.cpu_handle_to_dict(

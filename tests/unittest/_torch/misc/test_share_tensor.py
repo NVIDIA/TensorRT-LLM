@@ -1,7 +1,10 @@
 import multiprocessing as mp
 import unittest
+from unittest import mock
 
 import torch
+from torch.multiprocessing import (get_all_sharing_strategies,
+                                   get_sharing_strategy, set_sharing_strategy)
 
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 
@@ -87,6 +90,25 @@ class TestShareTensor(unittest.TestCase):
             # Explicit cleanup to prevent QueueFeederThread leak
             queue.close()
             queue.join_thread()
+
+    def test_share_cpu_tensor_restores_strategy_on_error(self):
+        """The process-wide sharing strategy is restored if serialization fails."""
+        if "file_descriptor" not in get_all_sharing_strategies():
+            self.skipTest("file_descriptor sharing is not available")
+
+        original_strategy = get_sharing_strategy()
+        set_sharing_strategy("file_descriptor")
+        try:
+            container = SharedTensorContainer.from_tensor(self.ref_tensor)
+            with mock.patch(
+                    "tensorrt_llm._torch.shared_tensor.shared_tensor.reduce_storage",
+                    side_effect=RuntimeError("serialization failed")):
+                with self.assertRaisesRegex(RuntimeError,
+                                            "serialization failed"):
+                    container.dump_to_dict()
+            self.assertEqual(get_sharing_strategy(), "file_descriptor")
+        finally:
+            set_sharing_strategy(original_strategy)
 
     def test_share_tensor_different_shapes(self):
         """Test CPU tensor sharing with different tensor shapes."""
