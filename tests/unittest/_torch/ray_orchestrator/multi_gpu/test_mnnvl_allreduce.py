@@ -23,6 +23,7 @@ matching a NCCL reference.
 """
 
 import os
+import platform
 from typing import Optional
 
 import pytest
@@ -98,8 +99,8 @@ class MnnvlAllReduceWorker:
     def mnnvl_supported(self) -> bool:
         """Whether the hardware can do MNNVL at all.
 
-        Only the hardware capability, not is_mnnvl(): the test bypasses that policy gate below, so
-        skipping has to key off what the machine can actually do.
+        Only the hardware capability, not is_mnnvl(): off aarch64 the test bypasses that policy
+        gate below, so skipping has to key off what the machine can actually do.
         """
         from tensorrt_llm._mnnvl_utils import MnnvlMemory
 
@@ -109,17 +110,21 @@ class MnnvlAllReduceWorker:
     def run(self, fusion: bool) -> bool:
         from tensorrt_llm._torch.distributed import AllReduce, AllReduceParams
 
-        # Same bypass the MPI test uses: is_mnnvl() only opts in on aarch64 and, for AUTO, only
-        # when the group spans nodes. Neither holds for a single-node CI runner, so the policy
-        # gate is lifted to get at the code under test. Which allocator runs still follows the
-        # machine: an IMEX-provisioned NVL domain exchanges fabric handles, anything else falls
-        # back to POSIX file descriptors over an IPC socket.
-        os.environ["TLLM_TEST_MNNVL"] = "1"
+        # is_mnnvl() only opts in on aarch64 and, for AUTO, only when the group spans nodes.
+        # On aarch64 the explicit MNNVL strategy below is enough to get past it on a single
+        # node, so leave the policy gate up and let this test cover that path for real.
+        # Elsewhere the aarch64 check alone would reject the request, so fall back to the same
+        # bypass the MPI test uses to reach the code under test. Which allocator runs still
+        # follows the machine either way: an IMEX-provisioned NVL domain exchanges fabric
+        # handles, anything else falls back to POSIX file descriptors over an IPC socket.
+        if "aarch64" not in platform.machine().lower():
+            os.environ["TLLM_TEST_MNNVL"] = "1"
         torch.distributed.barrier()
 
         allreduce = AllReduce(mapping=self.mapping, strategy=AllReduceStrategy.MNNVL, dtype=DTYPE)
         assert allreduce.mnnvl_allreduce is not None, (
-            "MNNVL AllReduce was requested but is not enabled"
+            "MNNVL AllReduce was requested but is not enabled; on aarch64 this means is_mnnvl() "
+            "turned down an explicit MNNVL request on a single-node group"
         )
 
         # The point of the Ray path: the workspace is built from the TP ProcessGroup, never from
