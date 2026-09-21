@@ -632,3 +632,82 @@ def merge_sparse_read_table(
             FETCHED_PAGE_SCALE=fetched_page_scale,
             BLOCK=256,
         )
+
+
+@triton.jit
+def _prepare_sparse_write_table_kernel(
+    raw_ptr,
+    history_ptr,
+    active_count_ptr,
+    out_ptr,
+    raw_stride0,
+    raw_stride1,
+    history_stride,
+    out_stride0,
+    out_stride1,
+    MAX_BLOCKS: tl.constexpr,
+    PAGE_SCALE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    request = tl.program_id(0)
+    ordinal = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    active = request < tl.load(active_count_ptr)
+    history = tl.load(history_ptr + request * history_stride)
+    resident = active & (ordinal >= history) & (ordinal < MAX_BLOCKS)
+    raw = tl.load(raw_ptr + request * raw_stride0 + ordinal * raw_stride1, resident, other=-1)
+    page = raw.to(tl.int64) * PAGE_SCALE
+    valid = resident & (raw >= 0) & (page <= 0x7FFFFFFF)
+    tl.store(
+        out_ptr + request * out_stride0 + ordinal * out_stride1,
+        tl.where(valid, page, -1),
+        ordinal < MAX_BLOCKS,
+    )
+
+
+def prepare_sparse_write_table(
+    raw_page_table: torch.Tensor,
+    history_blocks: torch.Tensor,
+    active_request_count: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    page_scale: int,
+) -> None:
+    """Convert only resident raw slots to SHARED pages, preserving invalids.
+
+    All tensors are CUDA int32 on one device: tables are [B, M], history
+    counts [B], and the active count [1]. ``out`` must be disjoint from inputs.
+    Host history and padded requests become -1, including host slot zero.
+    The caller supplies the resident converter scale (expansion must be 1);
+    the layer offset is already part of the compressed buffer pointer.
+    No tensor allocation or host synchronization is performed.
+    """
+    device = raw_page_table.device
+    for tensor, name, ndim in (
+        (raw_page_table, "raw_page_table", 2),
+        (history_blocks, "history_blocks", 1),
+        (active_request_count, "active_request_count", 1),
+        (out, "out", 2),
+    ):
+        _check_sparse_offload_tensor(tensor, name, ndim, device)
+    batch, max_blocks = raw_page_table.shape
+    if out.shape != raw_page_table.shape:
+        raise ValueError("raw_page_table and out must have the same [B, M] shape")
+    if history_blocks.shape != (batch,) or active_request_count.shape != (1,):
+        raise ValueError("history_blocks must be [B] and active_request_count must be [1]")
+    if not 0 < page_scale <= 0x7FFFFFFF:
+        raise ValueError("page_scale must be a positive int32 scale")
+    if batch == 0 or max_blocks == 0:
+        return
+    with torch.cuda.device(device):
+        _prepare_sparse_write_table_kernel[(batch, triton.cdiv(max_blocks, 256))](
+            raw_page_table,
+            history_blocks,
+            active_request_count,
+            out,
+            *raw_page_table.stride(),
+            history_blocks.stride(0),
+            *out.stride(),
+            MAX_BLOCKS=max_blocks,
+            PAGE_SCALE=page_scale,
+            BLOCK=256,
+        )

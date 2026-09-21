@@ -24,6 +24,7 @@ from tensorrt_llm._torch.pyexecutor import llm_request
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _GUARD_PAGE_REQUEST_ID,
     _RESERVED_REQUEST_IDS,
+    CUDA_GRAPH_DUMMY_REQUEST_ID,
     GPU_LEVEL,
     KVCacheManagerV2,
     _fill_kv_pages,
@@ -45,6 +46,8 @@ from tensorrt_llm.runtime import ModelConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BufferConfig,
+    BufferId,
+    CudaStream,
     DataRole,
     LayerId,
     PageIndexMode,
@@ -54,6 +57,8 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVC
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 from .compressor import NVFP4_COMPRESS_RESIDUAL_DIM, KVCacheDtype
+from .kernels import prepare_sparse_write_table
+from .offload import SparseOffloadLayerDescriptor, SparseOffloadState
 from .params import (
     DEEPSEEK_V4_NON_SLIDING_ATTENTION,
     DEEPSEEK_V4_SLIDING_ATTENTION,
@@ -1595,6 +1600,164 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             non_blocking=True,
         )
 
+    def get_sparse_offload_descriptors(self) -> dict[int, SparseOffloadLayerDescriptor]:
+        """Validate the ratio-4 shared write-table contract using runtime IDs.
+
+        Called once when constructing each metadata instance. Different layer
+        offsets are allowed in SHARED mode, where the buffer pointer supplies
+        the offset. Different groups/scales require per-layer write tables and
+        are not supported by the current ratio-shared compressor interface.
+        """
+        if not self._enable_kv_cache_offload:
+            raise ValueError("Sparse offload metadata requires an offload-enabled cache manager")
+        if self._use_nvfp4_compress or self.use_fp8_ds_mla:
+            raise NotImplementedError(
+                "Sparse offload metadata supports BF16/per-tensor FP8 KV only"
+            )
+        local_layers = [
+            layer
+            for layer in self.pp_layers
+            if self._compress_ratios[layer] == DEEPSEEK_V4_SPARSE_RATIO
+        ]
+        if not local_layers:
+            return {}
+        if not callable(getattr(self.impl, "is_sparse", None)) or not callable(
+            getattr(self.impl, "copy_base_page_indices_to_device", None)
+        ):
+            raise NotImplementedError("KVCM v2 sparse page-table APIs are not implemented")
+
+        descriptors = {}
+        shared_layout = None
+        for layer in local_layers:
+            layer_id = self._layer_attn_to_layer_id[layer, DeepseekV4AttentionType.COMPRESS]
+            role = DeepseekV4AttentionType.COMPRESS.role
+            if not self.impl.is_sparse(layer_id, role):
+                raise ValueError(f"Layer {layer}'s COMPRESS buffer must be sparse")
+            converter = self.impl.get_page_index_converter(layer_id, role)
+            if converter.expansion != 1 or not 0 < converter.scale <= 0x7FFFFFFF:
+                raise NotImplementedError(
+                    "Sparse offload requires expansion 1 and a positive int32 scale"
+                )
+            group_id = self.impl.get_layer_group_id(layer_id)
+            layout = (
+                group_id,
+                int(converter.scale),
+                self.impl.get_mem_pool_base_address(layer_id, role, PageIndexMode.SHARED),
+            )
+            if shared_layout is not None and layout != shared_layout:
+                raise NotImplementedError(
+                    "Ratio-4 sparse layers must share a layer group, page scale, and SHARED pool"
+                )
+            shared_layout = layout
+            descriptors[layer] = SparseOffloadLayerDescriptor(
+                buffer_id=BufferId(layer_id, role),
+                group_id=group_id,
+                page_scale=int(converter.scale),
+            )
+
+        sparse_groups = {descriptor.group_id for descriptor in descriptors.values()}
+        for (layer, attn_type), layer_id in self._layer_attn_to_layer_id.items():
+            if layer in descriptors and attn_type == DeepseekV4AttentionType.COMPRESS:
+                continue
+            if self.impl.get_layer_group_id(layer_id) in sparse_groups:
+                raise ValueError(
+                    "Sparse COMPRESS must have a separate lifecycle from ordinary cache buffers"
+                )
+        return descriptors
+
+    @nvtx_range_debug("dsv4_prepare_sparse_offload")
+    def prepare_sparse_offload(
+        self,
+        state: SparseOffloadState,
+        request_ids: list[int],
+        write_page_table: torch.Tensor,
+        *,
+        beam_width: int,
+    ) -> None:
+        """Snapshot mixed-tier tables in request order before model execution.
+
+        The caller must keep request locks stable through the forward. Uploads
+        and write-table conversion use the current stream, ordered after the
+        manager's stream. This host preparation is outside graph capture;
+        subsequent replay consumes the persistent device buffers in place.
+        Only trailing CUDA-graph dummy requests are padding. Real requests
+        must be unique, with one beam, and retain their supplied order.
+        """
+        if not self._enable_kv_cache_offload or beam_width != 1:
+            raise ValueError("Sparse offload preparation requires offload enabled and beam width 1")
+        batch = state.history_blocks.numel()
+        if len(request_ids) > batch:
+            raise ValueError("Request batch exceeds sparse offload metadata capacity")
+        if (
+            write_page_table.shape != (batch, self.max_blocks_per_seq)
+            or write_page_table.dtype != torch.int32
+            or write_page_table.device != state.history_blocks.device
+        ):
+            raise ValueError(
+                "Sparse write table must match the metadata's CUDA int32 [B, M] layout"
+            )
+        active_count = len(request_ids)
+        if CUDA_GRAPH_DUMMY_REQUEST_ID in request_ids:
+            active_count = request_ids.index(CUDA_GRAPH_DUMMY_REQUEST_ID)
+            if any(req != CUDA_GRAPH_DUMMY_REQUEST_ID for req in request_ids[active_count:]):
+                raise ValueError("CUDA-graph dummy requests must form a trailing suffix")
+        live_ids = request_ids[:active_count]
+        if len(set(live_ids)) != active_count:
+            raise ValueError("Sparse offload requires unique live request IDs")
+        caches = [self.kv_cache_map[request_id] for request_id in live_ids]
+        histories = []
+        for cache in caches:
+            if cache.beam_width != 1:
+                raise ValueError("Sparse offload supports one beam per request")
+            history = cache.history_length
+            if not 0 <= history <= cache.capacity:
+                raise ValueError("Invalid KVCM history frontier")
+            if cache.num_blocks > self.max_blocks_per_seq:
+                raise ValueError("Request allocation exceeds sparse offload page-table capacity")
+            histories.append(history // self.tokens_per_block)
+
+        with torch.cuda.device(state.history_blocks.device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Sparse offload page tables must be prepared outside graph capture"
+                )
+            stream = torch.cuda.current_stream()
+            stream.wait_stream(self._stream)
+            # A queued H2D copy borrows the pinned host staging. Wait only for
+            # that upload before reusing its storage, never for the whole GPU.
+            if state.history_upload_pending:
+                state.history_upload_done.synchronize()
+            state.history_blocks_host.zero_()
+            for row, history in enumerate(histories):
+                state.history_blocks_host[row] = history
+            state.history_blocks.copy_(state.history_blocks_host, non_blocking=True)
+            state.history_upload_done.record(stream)
+            state.history_upload_pending = True
+            state.active_request_count.fill_(active_count)
+            state.selected_history_pages.fill_(BAD_PAGE_INDEX)
+            state.fetched_page_table.fill_(BAD_PAGE_INDEX)
+            state.compress_read_table.fill_(BAD_PAGE_INDEX)
+
+            for group_id, raw_table in state.base_page_tables.items():
+                raw_table.fill_(BAD_PAGE_INDEX)
+                if active_count:
+                    self.impl.copy_base_page_indices_to_device(
+                        kv_caches=caches,
+                        layer_group_id=group_id,
+                        out=raw_table[:active_count],
+                        stream=CudaStream(stream.cuda_stream),
+                    )
+
+            # Descriptor validation guarantees one compatible ratio-4 table.
+            descriptor = next(iter(state.layers.values()))
+            prepare_sparse_write_table(
+                state.base_page_tables[descriptor.group_id],
+                state.history_blocks,
+                state.active_request_count,
+                write_page_table,
+                page_scale=descriptor.page_scale,
+            )
+
     @nvtx_range_debug("dsv4_copy_batch_compress_block_tables")
     def copy_batch_compress_block_tables(
         self,
@@ -1606,6 +1769,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         num_seqs: int,
     ) -> None:
         """Build the COMPRESS block table for one compression ratio and copy it to the destination."""
+        if self._enable_kv_cache_offload and compress_ratio == DEEPSEEK_V4_SPARSE_RATIO:
+            raise RuntimeError("Use prepare_sparse_offload() for the mixed-tier ratio-4 table")
         assert beam_width == 1, "DSV4 only supports beam width 1 now"
         copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
         staging = self._host_compress_block_tables_staging[compress_ratio]
