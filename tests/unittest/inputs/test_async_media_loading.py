@@ -13,9 +13,10 @@ Covers:
 import base64
 import tempfile
 import threading
+from collections.abc import AsyncIterator, Sequence
 from io import BytesIO
 from unittest.mock import patch
-from urllib.parse import urlparse
+from urllib.parse import ParseResult, urlparse
 
 import numpy as np
 import pytest
@@ -111,26 +112,28 @@ class TestParseDataUri:
             ("data:text/plain;Base64,QUJD", "text/plain"),
         ],
     )
-    def test_returns_media_type_and_undecoded_payload(self, url, expected_media_type):
+    def test_returns_media_type_and_undecoded_payload(
+        self, url: str, expected_media_type: str
+    ) -> None:
         media_type, payload = parse_data_uri(url)
         assert media_type == expected_media_type
         assert payload == "QUJD"  # returned still encoded; callers decode
 
-    def test_base64_must_be_a_whole_parameter_not_a_substring(self):
+    def test_base64_must_be_a_whole_parameter_not_a_substring(self) -> None:
         """`;name=base64` is a parameter *value*, so the URI is not base64."""
         with pytest.raises(NotImplementedError, match="Only base64 data URLs"):
             parse_data_uri("data:image/png;name=base64,hello")
 
-    def test_empty_payload_parses_rather_than_raising(self):
+    def test_empty_payload_parses_rather_than_raising(self) -> None:
         """A trailing comma with no data is well-formed; decoding fails later."""
         assert parse_data_uri("data:image/jpeg;base64,") == ("image/jpeg", "")
 
-    def test_empty_spec_is_not_base64(self):
+    def test_empty_spec_is_not_base64(self) -> None:
         """`data:,hello` has no parameters at all, so it is not base64."""
         with pytest.raises(NotImplementedError, match="Only base64 data URLs"):
             parse_data_uri("data:,hello")
 
-    def test_non_base64_raises_not_implemented(self):
+    def test_non_base64_raises_not_implemented(self) -> None:
         """A well-formed but unencoded data URI is unsupported, not malformed."""
         with pytest.raises(NotImplementedError, match="Only base64 data URLs") as excinfo:
             parse_data_uri("data:image/png,hello")
@@ -139,14 +142,14 @@ class TestParseDataUri:
         assert isinstance(excinfo.value, NotImplementedError)
         assert isinstance(excinfo.value, ValueError)
 
-    def test_missing_comma_raises_readable_value_error(self):
+    def test_missing_comma_raises_readable_value_error(self) -> None:
         with pytest.raises(ValueError, match="Malformed data URI") as excinfo:
             parse_data_uri("data:image/png;base64")
         message = str(excinfo.value)
         assert "unpack" not in message, "should not leak a tuple-unpacking error"
         assert "data:image/png;base64" in message
 
-    def test_malformed_and_unsupported_are_distinguishable_by_type(self):
+    def test_malformed_and_unsupported_are_distinguishable_by_type(self) -> None:
         """The two failure modes must not collapse into one bare ValueError.
 
         Both are ValueErrors so either maps to a client error, but only the
@@ -171,7 +174,7 @@ class TestParseDataUri:
             "/tmp/plain.mp4",  # no comma at all
         ],
     )
-    def test_non_data_scheme_is_rejected_as_such(self, path):
+    def test_non_data_scheme_is_rejected_as_such(self, path: str) -> None:
         """A filesystem path must not be diagnosed as bad base64.
 
         Without a scheme check, a path containing a "," is split like a data
@@ -193,10 +196,10 @@ class TestParseDataUri:
             "/tmp/holiday,2026.mp4",
         ],
     )
-    def test_accepts_str_and_parseresult_identically(self, url):
+    def test_accepts_str_and_parseresult_identically(self, url: str) -> None:
         """Callers holding a parsed URL pass it through, avoiding a re-serialize."""
 
-        def outcome(value):
+        def outcome(value: str | ParseResult) -> tuple[object, object]:
             try:
                 return ("ok", parse_data_uri(value))
             except ValueError as exc:
@@ -206,11 +209,11 @@ class TestParseDataUri:
 
 
 class TestUnsupportedDataURIEncodingError:
-    def test_subclasses_both_not_implemented_error_and_value_error(self):
+    def test_subclasses_both_not_implemented_error_and_value_error(self) -> None:
         assert issubclass(UnsupportedDataURIEncodingError, NotImplementedError)
         assert issubclass(UnsupportedDataURIEncodingError, ValueError)
 
-    def test_is_caught_by_either_except_clause(self):
+    def test_is_caught_by_either_except_clause(self) -> None:
         for exception_type in (NotImplementedError, ValueError):
             with pytest.raises(exception_type):
                 raise UnsupportedDataURIEncodingError("boom")
@@ -224,45 +227,45 @@ class TestUnsupportedDataURIEncodingError:
 class TestLoadBase64Image:
     """`load_base64_image` takes an already-parsed URL, not a string."""
 
-    def test_parameterized_data_url_loads(self):
+    def test_parameterized_data_url_loads(self) -> None:
         url = _data_uri("image/jpeg;charset=utf-8;base64", _make_jpeg_bytes())
         assert isinstance(load_base64_image(urlparse(url)), Image.Image)
 
-    def test_plain_data_url_still_loads(self):
+    def test_plain_data_url_still_loads(self) -> None:
         url = _data_uri("image/jpeg;base64", _make_jpeg_bytes())
         assert isinstance(load_base64_image(urlparse(url)), Image.Image)
 
-    def test_empty_media_type_loads(self):
+    def test_empty_media_type_loads(self) -> None:
         url = _data_uri(";base64", _make_jpeg_bytes())
         assert isinstance(load_base64_image(urlparse(url)), Image.Image)
 
     @pytest.mark.parametrize("parameter", ["BASE64", "Base64"])
-    def test_case_variants_load(self, parameter):
+    def test_case_variants_load(self, parameter: str) -> None:
         url = _data_uri(f"image/jpeg;{parameter}", _make_jpeg_bytes())
         assert isinstance(load_base64_image(urlparse(url)), Image.Image)
 
-    def test_non_base64_raises_not_implemented(self):
+    def test_non_base64_raises_not_implemented(self) -> None:
         with pytest.raises(NotImplementedError, match="Only base64 data URLs") as excinfo:
             load_base64_image(urlparse("data:image/png,hello"))
         # Both, so callers catching either builtin behave sensibly.
         assert isinstance(excinfo.value, NotImplementedError)
         assert isinstance(excinfo.value, ValueError)
 
-    def test_base64_as_parameter_value_raises_not_implemented(self):
+    def test_base64_as_parameter_value_raises_not_implemented(self) -> None:
         with pytest.raises(NotImplementedError, match="Only base64 data URLs"):
             load_base64_image(urlparse("data:image/png;name=base64,hello"))
 
-    def test_empty_spec_raises_not_implemented(self):
+    def test_empty_spec_raises_not_implemented(self) -> None:
         with pytest.raises(NotImplementedError, match="Only base64 data URLs") as excinfo:
             load_base64_image(urlparse("data:,hello"))
         assert isinstance(excinfo.value, NotImplementedError)
         assert isinstance(excinfo.value, ValueError)
 
-    def test_missing_comma_raises_value_error(self):
+    def test_missing_comma_raises_value_error(self) -> None:
         with pytest.raises(ValueError, match="Malformed data URI"):
             load_base64_image(urlparse("data:image/png;base64"))
 
-    def test_parsed_url_is_not_re_serialized(self, monkeypatch):
+    def test_parsed_url_is_not_re_serialized(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The ParseResult is handed to the parser as-is, not urlunparse'd back."""
         monkeypatch.setattr(
             media_io_module,
@@ -278,44 +281,44 @@ class TestLoadBase64Video:
 
     PAYLOAD = b"\x00\x01\x02fake-mp4-bytes"
 
-    def test_parameterized_data_url_loads(self):
+    def test_parameterized_data_url_loads(self) -> None:
         url = _data_uri("video/mp4;codecs=avc1;base64", self.PAYLOAD)
         assert load_base64_video(url) == self.PAYLOAD
 
-    def test_plain_data_url_still_loads(self):
+    def test_plain_data_url_still_loads(self) -> None:
         url = _data_uri("video/mp4;base64", self.PAYLOAD)
         assert load_base64_video(url) == self.PAYLOAD
 
-    def test_empty_media_type_loads(self):
+    def test_empty_media_type_loads(self) -> None:
         url = _data_uri(";base64", self.PAYLOAD)
         assert load_base64_video(url) == self.PAYLOAD
 
     @pytest.mark.parametrize("parameter", ["BASE64", "Base64"])
-    def test_case_variants_load(self, parameter):
+    def test_case_variants_load(self, parameter: str) -> None:
         url = _data_uri(f"video/mp4;{parameter}", self.PAYLOAD)
         assert load_base64_video(url) == self.PAYLOAD
 
-    def test_empty_payload_decodes_to_empty_bytes(self):
+    def test_empty_payload_decodes_to_empty_bytes(self) -> None:
         """Matches pre-existing behaviour: parsing succeeds, payload is empty."""
         assert load_base64_video("data:video/mp4;base64,") == b""
 
-    def test_non_base64_raises_not_implemented(self):
+    def test_non_base64_raises_not_implemented(self) -> None:
         with pytest.raises(NotImplementedError, match="Only base64 data URLs") as excinfo:
             load_base64_video("data:video/mp4,hello")
         assert isinstance(excinfo.value, NotImplementedError)
         assert isinstance(excinfo.value, ValueError)
 
-    def test_base64_as_parameter_value_raises_not_implemented(self):
+    def test_base64_as_parameter_value_raises_not_implemented(self) -> None:
         with pytest.raises(NotImplementedError, match="Only base64 data URLs"):
             load_base64_video("data:video/mp4;name=base64,hello")
 
-    def test_empty_spec_raises_not_implemented(self):
+    def test_empty_spec_raises_not_implemented(self) -> None:
         with pytest.raises(NotImplementedError, match="Only base64 data URLs") as excinfo:
             load_base64_video("data:,hello")
         assert isinstance(excinfo.value, NotImplementedError)
         assert isinstance(excinfo.value, ValueError)
 
-    def test_missing_comma_raises_value_error(self):
+    def test_missing_comma_raises_value_error(self) -> None:
         with pytest.raises(ValueError, match="Malformed data URI"):
             load_base64_video("data:video/mp4;base64")
 
@@ -327,7 +330,7 @@ class TestLoadBase64Video:
 
 class TestAsyncLoadImage:
     @pytest.mark.asyncio
-    async def test_load_image_from_parameterized_data_url(self):
+    async def test_load_image_from_parameterized_data_url(self) -> None:
         """Extra RFC 2397 parameters ahead of `base64` must not break parsing."""
         url = _data_uri("image/jpeg;charset=utf-8;base64", _make_jpeg_bytes())
         image = await async_load_image(url, format="pil")
@@ -335,33 +338,33 @@ class TestAsyncLoadImage:
         assert image.mode == "RGB"
 
     @pytest.mark.asyncio
-    async def test_load_image_from_data_url_without_media_type(self):
+    async def test_load_image_from_data_url_without_media_type(self) -> None:
         url = _data_uri(";base64", _make_jpeg_bytes())
         image = await async_load_image(url, format="pil")
         assert isinstance(image, Image.Image)
         assert image.mode == "RGB"
 
     @pytest.mark.asyncio
-    async def test_load_image_from_non_base64_data_url_raises(self):
+    async def test_load_image_from_non_base64_data_url_raises(self) -> None:
         with pytest.raises(NotImplementedError, match="Only base64 data URLs"):
             await async_load_image("data:image/png,hello", format="pil")
 
     @pytest.mark.asyncio
-    async def test_load_image_from_data_url_pil(self):
+    async def test_load_image_from_data_url_pil(self) -> None:
         url = _make_image_data_url()
         image = await async_load_image(url, format="pil")
         assert isinstance(image, Image.Image)
         assert image.mode == "RGB"
 
     @pytest.mark.asyncio
-    async def test_load_image_from_data_url_pt(self):
+    async def test_load_image_from_data_url_pt(self) -> None:
         url = _make_image_data_url()
         image_tensor = await async_load_image(url, format="pt")
         assert isinstance(image_tensor, torch.Tensor)
         assert image_tensor.shape[0] == 3  # C x H x W
 
     @pytest.mark.asyncio
-    async def test_load_image_pil_input_passthrough(self):
+    async def test_load_image_pil_input_passthrough(self) -> None:
         """Already-decoded PIL image should be returned as RGB."""
         grayscale_img = Image.new("L", (4, 4))
         rgb_image = await async_load_image(grayscale_img, format="pil")
@@ -369,14 +372,14 @@ class TestAsyncLoadImage:
         assert rgb_image.mode == "RGB"
 
     @pytest.mark.asyncio
-    async def test_cpu_work_runs_in_executor(self):
+    async def test_cpu_work_runs_in_executor(self) -> None:
         """PIL decoding must not run on the event loop thread."""
         event_loop_thread_id = threading.current_thread().ident
         worker_thread_ids = []
 
         original_load = utils_module._load_and_convert_image
 
-        def tracking_load(*args, **kwargs):
+        def tracking_load(*args: object, **kwargs: object) -> Image.Image:
             worker_thread_ids.append(threading.current_thread().ident)
             return original_load(*args, **kwargs)
 
@@ -397,7 +400,7 @@ class TestAsyncLoadImage:
 
 class TestAsyncLoadAudio:
     @pytest.mark.asyncio
-    async def test_load_audio_from_file(self):
+    async def test_load_audio_from_file(self) -> None:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             wav_path = _make_audio_file(f.name)
         audio_array, sample_rate = await async_load_audio(wav_path)
@@ -405,14 +408,14 @@ class TestAsyncLoadAudio:
         assert sample_rate == 16000  # matches the sr=16000 used in _make_audio_file
 
     @pytest.mark.asyncio
-    async def test_cpu_work_runs_in_executor(self):
+    async def test_cpu_work_runs_in_executor(self) -> None:
         """soundfile.read must not run on the event loop thread."""
         event_loop_thread_id = threading.current_thread().ident
         worker_thread_ids = []
 
         original_read = soundfile.read
 
-        def tracking_read(*args, **kwargs):
+        def tracking_read(*args: object, **kwargs: object) -> tuple[np.ndarray, int]:
             worker_thread_ids.append(threading.current_thread().ident)
             return original_read(*args, **kwargs)
 
@@ -437,7 +440,7 @@ class TestMediaIODataUrl:
     """`BaseMediaIO.async_load` reaches `data:` URLs through the shared parser."""
 
     @pytest.mark.asyncio
-    async def test_load_audio_from_parameterized_data_url(self):
+    async def test_load_audio_from_parameterized_data_url(self) -> None:
         # The payload is PCM WAV; `codecs=opus` is present only to exercise a
         # second parameter ahead of `base64`, which used to be misread as the
         # encoding and rejected.
@@ -447,36 +450,36 @@ class TestMediaIODataUrl:
         assert sample_rate == 16000  # matches the default in _make_wav_bytes
 
     @pytest.mark.asyncio
-    async def test_load_audio_from_data_url_without_media_type(self):
+    async def test_load_audio_from_data_url_without_media_type(self) -> None:
         url = _data_uri(";base64", _make_wav_bytes())
         audio_array, sample_rate = await AudioMediaIO().async_load(url)
         assert isinstance(audio_array, np.ndarray)
         assert sample_rate == 16000
 
     @pytest.mark.asyncio
-    async def test_load_audio_from_non_base64_data_url_raises(self):
+    async def test_load_audio_from_non_base64_data_url_raises(self) -> None:
         with pytest.raises(NotImplementedError, match="Only base64 data URLs"):
             await AudioMediaIO().async_load("data:audio/wav,hello")
 
     @pytest.mark.asyncio
-    async def test_load_audio_from_data_url_without_comma_raises(self):
+    async def test_load_audio_from_data_url_without_comma_raises(self) -> None:
         with pytest.raises(ValueError, match="Malformed data URI"):
             await AudioMediaIO().async_load("data:audio/wav;base64")
 
     @pytest.mark.asyncio
-    async def test_base64_as_parameter_value_raises_not_implemented(self):
+    async def test_base64_as_parameter_value_raises_not_implemented(self) -> None:
         with pytest.raises(NotImplementedError, match="Only base64 data URLs"):
             await AudioMediaIO().async_load("data:audio/wav;name=base64,hello")
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("parameter", ["BASE64", "Base64"])
-    async def test_case_variants_load(self, parameter):
+    async def test_case_variants_load(self, parameter: str) -> None:
         url = _data_uri(f"audio/wav;{parameter}", _make_wav_bytes())
         audio_array, _ = await AudioMediaIO().async_load(url)
         assert isinstance(audio_array, np.ndarray)
 
     @pytest.mark.asyncio
-    async def test_empty_media_type_reaches_every_subclass(self):
+    async def test_empty_media_type_reaches_every_subclass(self) -> None:
         """No `load_base64` override dispatches on media_type, so "" is safe."""
         image = await ImageMediaIO(format="pil").async_load(
             _data_uri(";base64", _make_jpeg_bytes())
@@ -494,7 +497,7 @@ class TestMediaIODataUrl:
 
 class TestSessionReuse:
     @pytest_asyncio.fixture(autouse=True)
-    async def reset_global_session(self):
+    async def reset_global_session(self) -> AsyncIterator[None]:
         media_io_module._global_aiohttp_session = None
         yield
         if media_io_module._global_aiohttp_session is not None:
@@ -502,7 +505,7 @@ class TestSessionReuse:
         media_io_module._global_aiohttp_session = None
 
     @pytest.mark.asyncio
-    async def test_same_session_returned_on_repeated_calls(self):
+    async def test_same_session_returned_on_repeated_calls(self) -> None:
         first_session = await _get_aiohttp_session()
         second_session = await _get_aiohttp_session()
         assert first_session is second_session, (
@@ -510,7 +513,7 @@ class TestSessionReuse:
         )
 
     @pytest.mark.asyncio
-    async def test_new_session_created_after_close(self):
+    async def test_new_session_created_after_close(self) -> None:
         first_session = await _get_aiohttp_session()
         await first_session.close()
         second_session = await _get_aiohttp_session()
@@ -537,21 +540,21 @@ class TestRetrieveAllAsync:
         self,
         tracker: MultimodalDataTracker,
         modality: str,
-        values: list,
+        values: Sequence[object],
         *,
         is_embedding: bool = False,
-    ):
+    ) -> None:
         """Directly insert coroutines into the tracker without registry checks."""
         target = tracker._embeddings if is_embedding else tracker._data
         for val in values:
 
-            async def _coro(x=val):
+            async def _coro(x: object = val) -> object:
                 return x
 
             target[modality].append(_coro())
 
     @pytest.mark.asyncio
-    async def test_single_modality_returns_correct_data(self):
+    async def test_single_modality_returns_correct_data(self) -> None:
         image_values = [1, 2, 3]
         tracker = self._make_tracker()
         self._inject(tracker, "image", image_values)
@@ -561,7 +564,7 @@ class TestRetrieveAllAsync:
         assert embeddings is None
 
     @pytest.mark.asyncio
-    async def test_multiple_modalities_returns_correct_data(self):
+    async def test_multiple_modalities_returns_correct_data(self) -> None:
         image_values = ["img1", "img2"]
         video_values = ["vid1"]
         tracker = self._make_tracker()
@@ -573,7 +576,7 @@ class TestRetrieveAllAsync:
         assert data["video"] == video_values
 
     @pytest.mark.asyncio
-    async def test_embeddings_returned_separately(self):
+    async def test_embeddings_returned_separately(self) -> None:
         image_data = ["img"]
         embedding_data = ["emb"]
         tracker = self._make_tracker()
@@ -585,7 +588,7 @@ class TestRetrieveAllAsync:
         assert embeddings == {"image": embedding_data}
 
     @pytest.mark.asyncio
-    async def test_empty_tracker_returns_none(self):
+    async def test_empty_tracker_returns_none(self) -> None:
         tracker = self._make_tracker()
         data, embeddings = await tracker.retrieve_all_async()
         assert data is None
