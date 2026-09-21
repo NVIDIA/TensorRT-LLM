@@ -4469,6 +4469,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           sampling_params=sampling_params,
                           extra_evaluator_kwargs=extra_evaluator_kwargs)
 
+    @pytest.mark.skipif(get_sm_version() == 90,
+                        reason="Triton MoE on Hopper is deprecated")
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("one_model", [True], ids=["one_model"])
     @pytest.mark.parametrize("v2_kv_cache", [True, False],
