@@ -304,6 +304,12 @@ runs from the native cache hot path. Pipeline parallelism and context parallelis
 rejected. Events are not published for draft models or during KV-cache-size estimation.
 When streaming is enabled the buffered pull API returns an empty list rather than raising.
 
+For V2 multimodal prefixes, streaming uses the same digest-first representation as the
+buffered path. A digest token is emitted as a hexadecimal string in `token_ids`, and
+`mm_keys` is aligned one-for-one with `block_hashes`; each nested list contains that block's
+multimodal segments using the `hash` and `start_offset` semantics described above. Consumers
+must normalize these typed tokens before applying their ordinary token hashing logic.
+
 **Endpoint convention.** Every attention-DP rank binds `base_port + rank` using its
 **global** rank, so `N` ranks occupy `[base_port, base_port + N - 1]` cluster-wide and
 each rank's port is distinct — on a multi-node deployment, rank 8 binds `base_port + 8`

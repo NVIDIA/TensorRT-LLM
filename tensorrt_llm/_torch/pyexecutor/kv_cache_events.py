@@ -46,6 +46,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._event_manager import KVCacheEvent
 # Subscribers decode block hashes as 64-bit ints, so a bytes value would fail the
 # decode for the entire batch.
 ExternalBlockHash = int
+EventTokenId = int | str
 
 
 class EventBatch(
@@ -70,12 +71,24 @@ class KVCacheWireEvent(
     """Base class for KV cache event wire messages."""
 
 
+class MultimodalKey(
+    msgspec.Struct,
+    omit_defaults=True,  # type: ignore[call-arg]
+    gc=False,  # type: ignore[call-arg]
+    tag="mm_key",
+):
+    """One continuous multimodal segment within a stored block."""
+
+    hash: str
+    start_offset: int
+
+
 class BlockStored(KVCacheWireEvent):
     """A sequence of full KV cache blocks was stored."""
 
     block_hashes: list[ExternalBlockHash]
     parent_block_hash: ExternalBlockHash | None
-    token_ids: list[int]
+    token_ids: list[EventTokenId]
     block_size: int
     lora_id: int | None
     medium: str | None
@@ -85,6 +98,8 @@ class BlockStored(KVCacheWireEvent):
     kv_cache_spec_kind: str | None = None
     kv_cache_spec_sliding_window: int | None = None
     locality: str | None = None
+    # Aligned one-for-one with block_hashes when multimodal decoding is enabled.
+    mm_keys: list[list[MultimodalKey]] | None = None
 
 
 class BlockRemoved(KVCacheWireEvent):
@@ -497,15 +512,6 @@ def _kv_event_wire_hash_from_radix_key(block_key: bytes) -> int:
     return unsigned_hash - 2**64 if unsigned_hash >= 2**63 else unsigned_hash
 
 
-class _MultimodalBlockError(ValueError):
-    """A block token is a multimodal cache-key digest (bytes), not a wire int.
-
-    ``gen_multimodal_cache_key_tokens`` stores the per-item digest as ``bytes``,
-    which has no integer wire representation. Such blocks are skipped
-    quietly rather than routed through the malformed-data traceback path.
-    """
-
-
 class StreamingKVCacheEventManager:
     """Scheduler-local facade for streaming KV event capture and publishing.
 
@@ -524,6 +530,7 @@ class StreamingKVCacheEventManager:
         block_size: int,
         max_window_size: int,
         max_entries: int = 50_000,
+        mm_token_id_offset: int | None = None,
         native_event_sink: object | None = None,
     ) -> None:
         self._rank = data_parallel_rank
@@ -531,6 +538,9 @@ class StreamingKVCacheEventManager:
         self._block_size = block_size
         self._max_window_size = max_window_size
         self._max_entries = max_entries
+        if mm_token_id_offset is not None and mm_token_id_offset < 0:
+            raise ValueError("mm_token_id_offset must be non-negative")
+        self._mm_token_id_offset = mm_token_id_offset
         self._native_event_sink = native_event_sink
         self._target_life_cycle_id: int | None = None
         self._stored_blocks: dict[bytes, int] = {}
@@ -540,7 +550,6 @@ class StreamingKVCacheEventManager:
         self.stored_blocks = 0
         self.removed_blocks = 0
         self.partial_blocks_suppressed = 0
-        self.multimodal_blocks_suppressed = 0
         self.non_target_life_cycles_ignored = 0
         self.dropped_events = 0
         self.enqueued_batches = 0
@@ -548,8 +557,7 @@ class StreamingKVCacheEventManager:
         self.dropped_batches = 0
 
     def needs_token_digest_context(self) -> bool:
-        # Streaming events do not emit multimodal keys.
-        return False
+        return self._mm_token_id_offset is not None
 
     def start(self) -> None:
         """Bind the publisher's sockets and start its background thread.
@@ -633,14 +641,8 @@ class StreamingKVCacheEventManager:
         if not self._reserve_entries(1):
             return
         try:
-            token_ids = self._token_ids(block.tokens)
+            token_ids, mm_keys = self._decode_block(block)
             block_hash, parent_hash = self._block_hashes(block)
-        except _MultimodalBlockError:
-            # Expected for multimodal cache-key blocks; skip without the
-            # malformed-data traceback that would otherwise flood the log.
-            self.multimodal_blocks_suppressed += 1
-            self._pending_entries -= 1
-            return
         except ValueError:
             self.dropped_events += 1
             self._pending_entries -= 1
@@ -655,6 +657,8 @@ class StreamingKVCacheEventManager:
             if previous.block_hashes and previous.block_hashes[-1] == parent_hash:
                 previous.block_hashes.append(block_hash)
                 previous.token_ids.extend(token_ids)
+                if previous.mm_keys is not None:
+                    previous.mm_keys.append(mm_keys)
                 self.stored_blocks += 1
                 return
         self._pending_events.append(
@@ -666,21 +670,50 @@ class StreamingKVCacheEventManager:
                 lora_id=None,
                 medium="GPU",
                 lora_name=None,
+                mm_keys=[mm_keys] if self.needs_token_digest_context() else None,
             )
         )
         self.stored_blocks += 1
 
-    @staticmethod
-    def _token_ids(tokens: Any) -> list[int]:
-        token_ids: list[int] = []
-        for token in tokens:
+    def _decode_block(self, block: Any) -> tuple[list[EventTokenId], list[MultimodalKey]]:
+        """Decode the same digest-first V2 event representation as the buffered path."""
+        parent = block.prev
+        digest = (
+            getattr(parent, "last_token_digest", None)
+            if getattr(parent, "ordinal", -1) >= 0
+            else None
+        )
+        in_mm_run = False
+        token_ids: list[EventTokenId] = []
+        mm_keys: list[MultimodalKey] = []
+        for token in block.tokens:
             if type(token) is bytes:
-                # Multimodal cache-key digest; not representable as a wire int.
-                raise _MultimodalBlockError
-            if type(token) is not int:
-                raise ValueError("KV cache event wire format requires integer token IDs")
-            token_ids.append(token)
-        return token_ids
+                digest = token
+                token_ids.append(token.hex())
+                if self.needs_token_digest_context():
+                    mm_keys.append(MultimodalKey(hash=token.hex(), start_offset=0))
+                    in_mm_run = True
+            elif type(token) is int:
+                token_ids.append(token)
+                if (
+                    self._mm_token_id_offset is not None
+                    and digest is not None
+                    and token > self._mm_token_id_offset
+                ):
+                    if not in_mm_run:
+                        mm_keys.append(
+                            MultimodalKey(
+                                hash=bytes(digest).hex(),
+                                start_offset=token - self._mm_token_id_offset,
+                            )
+                        )
+                    in_mm_run = True
+                else:
+                    # Text separates runs of the same item, but not its inherited context.
+                    in_mm_run = False
+            else:
+                raise ValueError("KV cache event tokens must be int or digest bytes")
+        return token_ids, mm_keys
 
     def _block_hashes(
         self,
@@ -808,6 +841,17 @@ class StreamingKVCacheEventManager:
                         lora_id=None,
                         medium="GPU",
                         lora_name=None,
+                        mm_keys=(
+                            [
+                                [
+                                    MultimodalKey(hash=bytes(key[0]).hex(), start_offset=key[1])
+                                    for key in block_keys
+                                ]
+                                for block_keys in event.mm_keys
+                            ]
+                            if self.needs_token_digest_context()
+                            else None
+                        ),
                     )
                 )
             elif isinstance(event, kv_cache_manager_v2_runtime.StreamingBlockRemovedData):
@@ -824,7 +868,6 @@ class StreamingKVCacheEventManager:
         self.stored_blocks = stats.stored_blocks
         self.removed_blocks = stats.removed_blocks
         self.partial_blocks_suppressed = stats.partial_blocks_suppressed
-        self.multimodal_blocks_suppressed = stats.multimodal_blocks_suppressed
         self.non_target_life_cycles_ignored = stats.non_target_life_cycles_ignored
         self.dropped_events = stats.dropped_events
 

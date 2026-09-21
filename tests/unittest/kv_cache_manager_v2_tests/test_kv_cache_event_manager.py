@@ -337,6 +337,72 @@ def test_native_streaming_sink_to_python_wire_structs(real_block_factory):
         manager.shutdown()
 
 
+@pytest.mark.skipif(not _USING_CPP_BACKEND, reason="requires the native C++ streaming sink")
+def test_native_streaming_sink_preserves_multimodal_event_data(real_block_factory):
+    event_sink = kv_cache_manager_v2_runtime.StreamingEventSink(
+        tokens_per_block=4,
+        max_entries=8,
+        mm_token_id_offset=1000,
+    )
+    manager = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=4,
+        max_window_size=128,
+        mm_token_id_offset=1000,
+        native_event_sink=event_sink,
+    )
+    manager.start()
+    try:
+        manager.set_layer_group_window_sizes({0: 128})
+        published = []
+        manager._publisher.publish = lambda batch: published.append(batch) or True
+        make_block = real_block_factory(event_sink, tokens_per_block=4)
+        digest_a = bytes(range(32))
+        digest_b = bytes(reversed(range(32)))
+        first = make_block([1, digest_a, 1001, 1002], [4])
+        gap = make_block([2, 3, 4, 5], [4], parent=first)
+        continued = make_block([1003, 7, 1004, 1005], [4], parent=gap)
+        last = make_block([1006, digest_b, 1001, 9], [4], parent=continued)
+
+        for block in (first, gap, continued, last):
+            _add_streaming_stored_block(event_sink, block)
+        manager.flush_iteration_events()
+
+        assert len(published) == 1
+        assert len(published[0].events) == 1
+        stored = published[0].events[0]
+        assert stored.token_ids == [
+            1,
+            digest_a.hex(),
+            1001,
+            1002,
+            2,
+            3,
+            4,
+            5,
+            1003,
+            7,
+            1004,
+            1005,
+            1006,
+            digest_b.hex(),
+            1001,
+            9,
+        ]
+        assert [
+            [(key.hash, key.start_offset) for key in block_keys] for block_keys in stored.mm_keys
+        ] == [
+            [(digest_a.hex(), 0)],
+            [],
+            [(digest_a.hex(), 3), (digest_a.hex(), 4)],
+            [(digest_a.hex(), 6), (digest_b.hex(), 0)],
+        ]
+        assert manager.stored_blocks == 4
+    finally:
+        manager.shutdown()
+
+
 def test_native_event_manager_v1_hash_matches_legacy_cpp_hasher():
     _tb = pytest.importorskip("tensorrt_llm.bindings")
     block_key = _tb.internal.batch_manager.BlockKey

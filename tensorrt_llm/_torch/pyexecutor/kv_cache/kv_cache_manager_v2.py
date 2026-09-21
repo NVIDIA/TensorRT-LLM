@@ -1309,6 +1309,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 native_event_sink = (
                     kv_cache_manager_v2_runtime.StreamingEventSink(
                         tokens_per_block=self.tokens_per_block,
+                        mm_token_id_offset=vocab_size,
                     )
                     if KV_CACHE_MANAGER_V2_BACKEND == "cpp"
                     else None
@@ -1318,6 +1319,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     data_parallel_rank=event_rank,
                     block_size=self.tokens_per_block,
                     max_window_size=event_window_size,
+                    mm_token_id_offset=vocab_size,
                     native_event_sink=native_event_sink,
                 )
         elif self.event_buffer_max_size > 0:

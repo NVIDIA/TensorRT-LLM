@@ -23,6 +23,7 @@
 
 #include <cinttypes>
 #include <cstddef>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -30,9 +31,10 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
-StreamingEventSink::StreamingEventSink(int tokensPerBlock, int maxEntries)
+StreamingEventSink::StreamingEventSink(int tokensPerBlock, int maxEntries, std::optional<int> mmTokenIdOffset)
     : mTokensPerBlock(tokensPerBlock)
     , mMaxEntries(maxEntries)
+    , mMmTokenIdOffset(mmTokenIdOffset)
 {
     if (mTokensPerBlock <= 0)
     {
@@ -41,6 +43,10 @@ StreamingEventSink::StreamingEventSink(int tokensPerBlock, int maxEntries)
     if (mMaxEntries <= 0)
     {
         throw std::invalid_argument("maxEntries must be positive");
+    }
+    if (mMmTokenIdOffset.has_value() && *mMmTokenIdOffset < 0)
+    {
+        throw std::invalid_argument("mmTokenIdOffset must be non-negative");
     }
 }
 
@@ -132,14 +138,6 @@ void StreamingEventSink::addStoredBlockUnlocked(Block const& block)
     {
         return;
     }
-    for (auto const& token : block.tokens)
-    {
-        if (token.isDigest())
-        {
-            ++mStats.multimodalBlocksSuppressed;
-            return;
-        }
-    }
     if (!reserveEntryUnlocked())
     {
         return;
@@ -156,12 +154,7 @@ void StreamingEventSink::addStoredBlockUnlocked(Block const& block)
         parentHash = wireHash(static_cast<Block const*>(block.prev)->key);
     }
 
-    std::vector<TokenId> tokenIds;
-    tokenIds.reserve(block.tokens.size());
-    for (auto const& token : block.tokens)
-    {
-        tokenIds.push_back(token.tokenId());
-    }
+    auto decoded = decodeEventBlock(block, mMmTokenIdOffset);
 
     mStoredBlocks.emplace(block.key, blockHash);
     if (!mPendingEvents.empty())
@@ -171,12 +164,17 @@ void StreamingEventSink::addStoredBlockUnlocked(Block const& block)
             && stored->blockHashes.back() == *parentHash)
         {
             stored->blockHashes.push_back(blockHash);
-            stored->tokenIds.insert(stored->tokenIds.end(), tokenIds.begin(), tokenIds.end());
+            stored->tokenIds.insert(stored->tokenIds.end(), std::make_move_iterator(decoded.tokenIds.begin()),
+                std::make_move_iterator(decoded.tokenIds.end()));
+            stored->mmKeys.push_back(std::move(decoded.mmKeys));
             ++mStats.storedBlocks;
             return;
         }
     }
-    mPendingEvents.emplace_back(StreamingBlockStoredData{{blockHash}, parentHash, std::move(tokenIds)});
+    std::vector<std::vector<MmKey>> mmKeys;
+    mmKeys.push_back(std::move(decoded.mmKeys));
+    mPendingEvents.emplace_back(
+        StreamingBlockStoredData{{blockHash}, parentHash, std::move(decoded.tokenIds), std::move(mmKeys)});
     ++mStats.storedBlocks;
 }
 

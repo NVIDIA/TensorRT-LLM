@@ -461,10 +461,10 @@ static std::vector<kv::MmKey> castMmKeys(nb::handle values)
     return result;
 }
 
-static nb::list castMmKeys(kv::KVCacheStoredBlockData const& data)
+static nb::list castMmKeys(std::vector<kv::MmKey> const& mmKeys)
 {
     nb::list result;
-    for (auto const& mmKey : data.mmKeys)
+    for (auto const& mmKey : mmKeys)
     {
         auto hash = nb::bytes(mmKey.hash.data(), mmKey.hash.size());
         if (mmKey.hasUuidField)
@@ -475,6 +475,21 @@ static nb::list castMmKeys(kv::KVCacheStoredBlockData const& data)
         {
             result.append(nb::make_tuple(std::move(hash), mmKey.startOffset));
         }
+    }
+    return result;
+}
+
+static nb::list castMmKeys(kv::KVCacheStoredBlockData const& data)
+{
+    return castMmKeys(data.mmKeys);
+}
+
+static nb::list castStreamingMmKeys(kv::StreamingBlockStoredData const& data)
+{
+    nb::list result;
+    for (auto const& mmKeys : data.mmKeys)
+    {
+        result.append(castMmKeys(mmKeys));
     }
     return result;
 }
@@ -1055,7 +1070,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     nb::class_<kv::StreamingBlockStoredData>(m, "StreamingBlockStoredData")
         .def_ro("block_hashes", &kv::StreamingBlockStoredData::blockHashes)
         .def_ro("parent_block_hash", &kv::StreamingBlockStoredData::parentBlockHash)
-        .def_ro("token_ids", &kv::StreamingBlockStoredData::tokenIds);
+        .def_ro("token_ids", &kv::StreamingBlockStoredData::tokenIds)
+        .def_prop_ro("mm_keys", [](kv::StreamingBlockStoredData const& self) { return castStreamingMmKeys(self); });
 
     nb::class_<kv::StreamingBlockRemovedData>(m, "StreamingBlockRemovedData")
         .def_ro("block_hashes", &kv::StreamingBlockRemovedData::blockHashes);
@@ -1064,12 +1080,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_ro("stored_blocks", &kv::StreamingEventStats::storedBlocks)
         .def_ro("removed_blocks", &kv::StreamingEventStats::removedBlocks)
         .def_ro("partial_blocks_suppressed", &kv::StreamingEventStats::partialBlocksSuppressed)
-        .def_ro("multimodal_blocks_suppressed", &kv::StreamingEventStats::multimodalBlocksSuppressed)
         .def_ro("non_target_life_cycles_ignored", &kv::StreamingEventStats::nonTargetLifeCyclesIgnored)
         .def_ro("dropped_events", &kv::StreamingEventStats::droppedEvents);
 
     nb::class_<kv::StreamingEventSink, kv::EventSink>(m, "StreamingEventSink")
-        .def(nb::init<int, int>(), nb::arg("tokens_per_block"), nb::arg("max_entries") = 50'000)
+        .def(nb::init<int, int, std::optional<int>>(), nb::arg("tokens_per_block"), nb::arg("max_entries") = 50'000,
+            nb::arg("mm_token_id_offset") = std::nullopt)
         .def(
             "set_target_life_cycle",
             [](kv::StreamingEventSink& self, int lifeCycleId)

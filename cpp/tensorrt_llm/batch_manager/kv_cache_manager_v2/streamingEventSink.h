@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "kv_cache_manager_v2/eventData.h"
 #include "kv_cache_manager_v2/eventSink.h"
 
 #include <cstdint>
@@ -34,7 +35,9 @@ struct StreamingBlockStoredData
 {
     std::vector<int64_t> blockHashes;
     std::optional<int64_t> parentBlockHash;
-    std::vector<TokenId> tokenIds;
+    std::vector<EventTokenId> tokenIds;
+    //! One entry per blockHash. Empty block entries represent text-only blocks.
+    std::vector<std::vector<MmKey>> mmKeys;
 };
 
 //! Semantic data for one wire-level BlockRemoved event.
@@ -51,7 +54,6 @@ struct StreamingEventStats
     int64_t storedBlocks = 0;
     int64_t removedBlocks = 0;
     int64_t partialBlocksSuppressed = 0;
-    int64_t multimodalBlocksSuppressed = 0;
     int64_t nonTargetLifeCyclesIgnored = 0;
     int64_t droppedEvents = 0;
 };
@@ -60,7 +62,12 @@ struct StreamingEventStats
 class StreamingEventSink final : public EventSink
 {
 public:
-    StreamingEventSink(int tokensPerBlock, int maxEntries);
+    StreamingEventSink(int tokensPerBlock, int maxEntries, std::optional<int> mmTokenIdOffset = std::nullopt);
+
+    bool needsTokenDigestContext() const override
+    {
+        return mMmTokenIdOffset.has_value();
+    }
 
     void setTargetLifeCycle(LifeCycleId lifeCycle);
     [[nodiscard]] std::vector<StreamingEventData> drainIterationEvents();
@@ -82,6 +89,7 @@ private:
 
     int mTokensPerBlock;
     int mMaxEntries;
+    std::optional<int> mMmTokenIdOffset;
     std::optional<LifeCycleId> mTargetLifeCycle;
     int mPendingEntries = 0;
     std::unordered_map<Digest, int64_t> mStoredBlocks;

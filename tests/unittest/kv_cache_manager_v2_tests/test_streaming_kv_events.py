@@ -139,6 +139,80 @@ def test_streaming_sink_supports_real_radix_blocks(monkeypatch: pytest.MonkeyPat
         manager.shutdown()
 
 
+def test_streaming_sink_emits_multimodal_keys_across_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Streaming uses the buffered V2 digest and continuation-token contract."""
+    manager = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=4,
+        max_window_size=128,
+        mm_token_id_offset=1000,
+    )
+    life_cycles = LifeCycleRegistry(
+        KVCacheManagerConfig(
+            tokens_per_block=4,
+            cache_tiers=[GpuCacheTierConfig(quota=4096)],
+            layers=[],
+        )
+    )
+    tree = BlockRadixTree(life_cycles, tokens_per_block=4, event_manager=manager)
+    published: list[KVEventBatch] = []
+    monkeypatch.setattr(
+        manager._publisher, "publish", lambda batch: published.append(batch) or True
+    )
+    try:
+        digest_a = bytes(range(32))
+        digest_b = bytes(reversed(range(32)))
+        root = tree.add_or_get_existing(ReuseScope())
+        first = Block([1, digest_a, 1001, 1002], root)
+        gap = Block([2, 3, 4, 5], first)
+        continued = Block([1003, 7, 1004, 1005], gap)
+        last = Block([1006, digest_b, 1001, 9], continued)
+
+        for block in (first, gap, continued, last):
+            manager._add_full_block(block)
+        manager.flush_iteration_events()
+
+        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(published[0]))
+        stored = decoded[1][0]
+        assert stored["token_ids"] == [
+            1,
+            digest_a.hex(),
+            1001,
+            1002,
+            2,
+            3,
+            4,
+            5,
+            1003,
+            7,
+            1004,
+            1005,
+            1006,
+            digest_b.hex(),
+            1001,
+            9,
+        ]
+        assert stored["mm_keys"] == [
+            [{"type": "mm_key", "hash": digest_a.hex(), "start_offset": 0}],
+            [],
+            [
+                {"type": "mm_key", "hash": digest_a.hex(), "start_offset": 3},
+                {"type": "mm_key", "hash": digest_a.hex(), "start_offset": 4},
+            ],
+            [
+                {"type": "mm_key", "hash": digest_a.hex(), "start_offset": 6},
+                {"type": "mm_key", "hash": digest_b.hex(), "start_offset": 0},
+            ],
+        ]
+        assert manager.stored_blocks == 4
+    finally:
+        tree.clear()
+        manager.shutdown()
+
+
 def test_streaming_fast_path_publishes_only_full_max_window_blocks() -> None:
     """Protect radix hash reuse, filtering, wire format, and shutdown."""
     topic = "kv-events"

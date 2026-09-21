@@ -56,6 +56,7 @@ set(KV_CACHE_MANAGER_V2_SRCS
     kv_cache_manager_v2/blockRadixTree.cpp
     kv_cache_manager_v2/batchedPageCopy.cu
     kv_cache_manager_v2/coldPageCodec.cpp
+    kv_cache_manager_v2/eventData.cpp
     kv_cache_manager_v2/eventManager.cpp
     kv_cache_manager_v2/streamingEventSink.cpp
     kv_cache_manager_v2/page.cpp
