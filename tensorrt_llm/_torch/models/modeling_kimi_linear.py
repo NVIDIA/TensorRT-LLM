@@ -2196,6 +2196,27 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     "committed token per iteration, which accepted draft "
                     "tokens break."
                 )
+            # draft_len_schedule is the user-facing alternative to
+            # max_concurrency (llm_args rejects setting both) and reaches the
+            # same end by a route that does not go through
+            # should_use_spec_decode at all: py_executor turns speculation off
+            # directly once the schedule yields draft_len 0 for the active
+            # batch size. Guarding only max_concurrency would leave this door
+            # open. Skip the schedule that llm_args synthesized from
+            # max_concurrency, so a config that set only that field raises the
+            # message above naming the field the user actually wrote.
+            if (
+                spec_config.draft_len_schedule is not None
+                and not spec_config._translated_from_max_concurrency
+            ):
+                raise ValueError(
+                    "Kimi K3 helix does not support the dynamic draft-length "
+                    "schedule (draft_len_schedule): a batch size past the "
+                    "last entry drops the draft length to 0 and turns "
+                    "speculation off mid-run, leaving in-flight helix "
+                    "requests on a position formula that assumes one "
+                    "committed token per iteration."
+                )
         cp = model_config.mapping.cp_size
         repurposed_tp = model_config.mapping.tp_size * cp
         if cfg.num_attention_heads % repurposed_tp != 0:
