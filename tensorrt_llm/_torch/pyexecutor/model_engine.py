@@ -5303,16 +5303,11 @@ class PyTorchModelEngine(ModelEngine):
                             request.py_helix_is_inactive_rank)
                         helix_position_offsets.append(position_id)
                         # Keep the per-seq owned-count list aligned when the
-                        # spec path is active in the same batch. Only then:
-                        # a non-empty list arms _helix_spec_tokens_valid, and
-                        # the per-token slots/bounds it gates are filled by
-                        # recompute_helix_spec_buffers, which _preprocess_inputs
-                        # runs under enable_spec_decode only. Populating it in
-                        # ordinary generation would point consumers at
-                        # uninitialized buffers.
-                        if self.enable_spec_decode:
-                            helix_owned_new_tokens.append(
-                                0 if request.py_helix_is_inactive_rank else 1)
+                        # spec path is active in the same batch. Whether the
+                        # list arms the spec path at all is decided once, at
+                        # the update_helix_param call below.
+                        helix_owned_new_tokens.append(
+                            0 if request.py_helix_is_inactive_rank else 1)
 
                 request.cached_tokens = past_seen_token_num
                 for beam in range(beam_width):
@@ -5730,11 +5725,20 @@ class PyTorchModelEngine(ModelEngine):
                                                       num_first_draft]] += accepted_tokens
 
         if self.mapping.has_cp_helix():
+            # A non-None owned-count list is what arms
+            # _helix_spec_tokens_valid, and the per-token slots/bounds that
+            # flag gates are only ever filled by recompute_helix_spec_buffers,
+            # which _preprocess_inputs runs under enable_spec_decode. Gate the
+            # hand-off here, at the single choke point, so no packing loop can
+            # arm the spec path for ordinary helix generation and send its
+            # consumers to uninitialized buffers.
+            helix_spec_active = bool(self.enable_spec_decode
+                                     and helix_owned_new_tokens)
             attn_metadata.update_helix_param(
                 helix_position_offsets=helix_position_offsets,
                 helix_is_inactive_rank=helix_is_inactive_rank,
                 helix_owned_new_tokens=(helix_owned_new_tokens
-                                        if helix_owned_new_tokens else None),
+                                        if helix_spec_active else None),
             )
 
         if not attn_metadata.is_cuda_graph:
