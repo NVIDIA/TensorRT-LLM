@@ -250,7 +250,7 @@ _BEAM_SEARCH_CASES = [
 
 
 def test_whisper_pytorch_block_reuse_enabled(monkeypatch):
-    """Greedy transcription with KV block reuse left at its default (enabled).
+    """Greedy transcription with KV block reuse explicitly enabled.
 
     Whisper requests carry encoder features, not encoder token ids, so the
     cross-KV pool has nothing to key reuse on; the executor must still admit
