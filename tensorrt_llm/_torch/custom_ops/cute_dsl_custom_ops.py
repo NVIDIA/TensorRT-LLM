@@ -14775,16 +14775,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tuning_config_cache = dict()
 
             def __init__(
-                    self,
-                    num_experts: int,
-                    top_k: int,
-                    num_local_experts: int,
-                    local_expert_offset: int,
-                    tile_size: int,
-                    scaling_vector_size: int = 16,
-                    activation_type: ActivationType = ActivationType.Swiglu,
-                    situ_beta: Optional[float] = None,
-                    situ_linear_beta: Optional[float] = None):
+                self,
+                num_experts: int,
+                top_k: int,
+                num_local_experts: int,
+                local_expert_offset: int,
+                tile_size: int,
+                scaling_vector_size: int = 16,
+                activation_type: ActivationType = ActivationType.Swiglu,
+                situ_beta: Optional[float] = None,
+                situ_linear_beta: Optional[float] = None,
+                swiglu_limit_scalar: float = float("inf")):
                 super().__init__()
                 self.num_experts = num_experts
                 self.top_k = top_k
@@ -14796,6 +14797,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     activation_type)
                 self.situ_beta = situ_beta
                 self.situ_linear_beta = situ_linear_beta
+                # Trace-time constant folded into the kernel; part of unique_id
+                # and the kernel cache key so clamped / unclamped kernels never
+                # share a compilation or a tuning result.
+                self.swiglu_limit = _canonicalize_swiglu_limit_scalar(
+                    swiglu_limit_scalar)
                 self.is_gated = is_gated_activation(self.activation_type)
 
                 if (sm_version := get_sm_version()) != 107:
@@ -14819,6 +14825,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     int(self.activation_type),
                     self.situ_beta,
                     self.situ_linear_beta,
+                    self.swiglu_limit,
                 )
 
             def get_valid_tactics(
@@ -15122,7 +15129,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                              cluster_shape_mn, raster_along_m,
                              locality_domain_half_gemm, a_path,
                              int(self.activation_type), self.situ_beta,
-                             self.situ_linear_beta, max_active_clusters)
+                             self.situ_linear_beta, self.swiglu_limit,
+                             max_active_clusters)
                 if cache_key not in self.__class__.kernel_cache:
                     gemm = self.__class__.kernel_class(
                         sf_vec_size=self.scaling_vector_size,
@@ -15137,6 +15145,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         activation_type=self.activation_type,
                         situ_beta=self.situ_beta,
                         situ_linear_beta=self.situ_linear_beta,
+                        swiglu_limit=self.swiglu_limit,
                     )
                     compiled_gemm = cute.compile(
                         gemm.wrapper,
@@ -15215,6 +15224,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             activation_type: ActivationType,
             situ_beta: float,
             situ_linear_beta: float,
+            swiglu_limit_scalar: float,
             precomputed_tactic: Optional[str],
             tuner_key: str,
         ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -15243,6 +15253,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 activation_type=activation_type,
                 situ_beta=_canonicalize_situ_beta(situ_beta),
                 situ_linear_beta=_canonicalize_situ_beta(situ_linear_beta),
+                swiglu_limit_scalar=_canonicalize_swiglu_limit_scalar(
+                    swiglu_limit_scalar),
             )
             inputs = [
                 input, weight, input_scale, weight_scale, alpha,
@@ -15284,6 +15296,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             "SymInt scaling_vector_size=16, SymInt partition_id=-1, "
             f"SymInt activation_type={int(ActivationType.Swiglu)}, "
             "float situ_beta=-1.0, float situ_linear_beta=-1.0, "
+            "float swiglu_limit_scalar=-1.0, "
             "str? precomputed_tactic=None) -> (Tensor?, Tensor?)",
             device_types="cuda")
         def cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
@@ -15309,6 +15322,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             activation_type: int = int(ActivationType.Swiglu),
             situ_beta: float = SITU_BETA_DISABLED,
             situ_linear_beta: float = SITU_BETA_DISABLED,
+            swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
             precomputed_tactic: Optional[str] = None,
         ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
             return _run_nvfp4_gather_grouped_gemm_act_fusion_rubin(
@@ -15319,7 +15333,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 tile_size, output_tensor, output_sf_tensor,
                 scaling_vector_size, partition_id,
                 ActivationType(activation_type), situ_beta, situ_linear_beta,
-                precomputed_tactic,
+                swiglu_limit_scalar, precomputed_tactic,
                 "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin")
 
         @torch.library.register_fake(
@@ -15347,6 +15361,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             activation_type: int = int(ActivationType.Swiglu),
             situ_beta: float = SITU_BETA_DISABLED,
             situ_linear_beta: float = SITU_BETA_DISABLED,
+            swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
             precomputed_tactic: Optional[str] = None,
         ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
             m = permuted_idx_to_expanded_idx.size(0)
@@ -15379,7 +15394,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             "SymInt tile_size, Tensor(a!) output_tensor, "
             "Tensor(b!) output_sf_tensor, SymInt scaling_vector_size=16, "
             f"SymInt activation_type={int(ActivationType.Swiglu)}, "
-            "float situ_beta=-1.0, float situ_linear_beta=-1.0) -> ()",
+            "float situ_beta=-1.0, float situ_linear_beta=-1.0, "
+            "float swiglu_limit_scalar=-1.0) -> ()",
             device_types="cuda")
         def cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_locality_domain_inplace_rubin(
             input: torch.Tensor,
@@ -15405,6 +15421,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             activation_type: int = int(ActivationType.Swiglu),
             situ_beta: float = SITU_BETA_DISABLED,
             situ_linear_beta: float = SITU_BETA_DISABLED,
+            swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
         ) -> None:
             """Tune and launch both Rubin locality domain NVFP4 MoE FC1 partitions.
 
@@ -15448,6 +15465,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     activation_type=ActivationType(activation_type),
                     situ_beta=_canonicalize_situ_beta(situ_beta),
                     situ_linear_beta=_canonicalize_situ_beta(situ_linear_beta),
+                    swiglu_limit_scalar=_canonicalize_swiglu_limit_scalar(
+                        swiglu_limit_scalar),
                 ))
             inputs = [
                 input,
@@ -15495,6 +15514,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     activation_type=activation_type,
                     situ_beta=situ_beta,
                     situ_linear_beta=situ_linear_beta,
+                    swiglu_limit_scalar=swiglu_limit_scalar,
                     precomputed_tactic=repr(tactic),
                 )
 
@@ -15536,6 +15556,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             activation_type: int = int(ActivationType.Swiglu),
             situ_beta: float = SITU_BETA_DISABLED,
             situ_linear_beta: float = SITU_BETA_DISABLED,
+            swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
         ) -> None:
             return None
 
