@@ -976,18 +976,16 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         self._msa_fields_ready = False
         if not self._msa_buffers_ready:
             return
-        # Captured producers execute the whole padded bucket, including on
-        # attention-DP ranks without local requests. Invalidate the tail before
-        # any early return so replay cannot write padding into stale KV slots.
-        self.msa_out_cache_loc.fill_(-1)
         request_ids = self.request_ids
         qo_lens_cpu = self.msa_qo_lens_cpu
         kv_lens_cpu = self.msa_kv_lens_cpu
         qo_offset_cpu = self.msa_qo_offset_cpu
         if request_ids is None or qo_lens_cpu is None:
+            self.msa_out_cache_loc.fill_(-1)
             return
         batch_size = int(qo_lens_cpu.shape[0])
         if batch_size == 0:
+            self.msa_out_cache_loc.fill_(-1)
             return
 
         kv_cache_manager = self.kv_cache_manager
@@ -1037,6 +1035,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             )
 
         self.msa_out_cache_loc[:total_new_tokens].copy_(out_cache_loc, non_blocking=True)
+        # Captured producers also execute padded rows. Invalidate only the
+        # unwritten tail so they cannot reuse the previous step's live slots.
+        if total_new_tokens < self.msa_out_cache_loc.shape[0]:
+            self.msa_out_cache_loc[total_new_tokens:].fill_(-1)
         if kv_indices is not None:
             self.msa_kv_indices[: int(kv_indices.shape[0])].copy_(kv_indices, non_blocking=True)
 

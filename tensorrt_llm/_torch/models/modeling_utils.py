@@ -8,8 +8,8 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import (Any, Callable, Dict, Generic, Iterator, List, Literal,
-                    Optional, Tuple, Type, TypeVar, Union)
+from typing import (Any, Callable, ClassVar, Dict, Generic, Iterator, List,
+                    Literal, Optional, Tuple, Type, TypeVar, Union)
 
 import torch
 from torch import nn
@@ -387,6 +387,9 @@ TModel = TypeVar("TModel", bound=DecoderModel)
 class DecoderModelForCausalLM(nn.Module,
                               Generic[TModel, TConfig],
                               metaclass=PostInitCaller):
+
+    # Opt in to original eager execution outside capture-eligible PCG batches.
+    use_prefill_only_compile: ClassVar[bool] = False
 
     @staticmethod
     def _checkpoint_has_lm_head_scale(config: ModelConfig[TConfig]) -> bool:

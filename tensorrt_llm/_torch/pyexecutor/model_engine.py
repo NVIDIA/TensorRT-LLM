@@ -196,8 +196,8 @@ def _make_single_token_context_graph_batch(
     return graph_batch, promoted_context_request_ids
 
 
-class _ContextOnlyCompiledModel(torch.nn.Module):
-    """Share parameters between captured context and eager generation paths.
+class _PrefillCompiledModel(torch.nn.Module):
+    """Share weights between eligible prefill/mixed and original eager paths.
 
     The prefill flag includes the all-rank attention-DP decision and capture
     ceiling. A decode-only rank must still compile when another rank prefills.
@@ -208,7 +208,9 @@ class _ContextOnlyCompiledModel(torch.nn.Module):
         """Keep eager and compiled entry points sharing the same model weights."""
         super().__init__()
         self.eager_model = eager_model
-        self.compiled_model = compiled_model
+        # The compiled callable references the same weights. Register only the
+        # eager tree so state_dict(), children() and _apply() visit it once.
+        object.__setattr__(self, "compiled_model", compiled_model)
 
     def named_modules(
         self,
@@ -218,8 +220,7 @@ class _ContextOnlyCompiledModel(torch.nn.Module):
     ) -> Iterator[Tuple[str, torch.nn.Module]]:
         """Expose checkpoint-compatible module names for partial weight reloads."""
         # Weight reloads match checkpoint prefixes against this traversal.
-        # Neither routing wrapper owns parameters; expose the original tree
-        # once, including when the loader requests remove_duplicate=False.
+        # Hide the eager_model prefix even with remove_duplicate=False.
         yield from self.eager_model.named_modules(memo, prefix,
                                                   remove_duplicate)
 
@@ -232,8 +233,7 @@ class _ContextOnlyCompiledModel(torch.nn.Module):
 
     def __getattr__(self, name: str) -> Any:
         """Delegate model-specific attributes to the original eager model."""
-        # Model-specific epilogues (including M3 Eagle3) access embed_tokens
-        # and other transformer attributes after the wrapped forward returns.
+        # Epilogues can access transformer attributes after forward returns.
         try:
             return super().__getattr__(name)
         except AttributeError:
@@ -378,7 +378,6 @@ class PyTorchModelEngine(ModelEngine):
         model_weights_memory_tag: Optional[str] = None,
         model_weights_restore_mode=None,
     ):
-        """Initialize model execution, cache management, and graph configuration."""
         _configure_deep_gemm_pdl()
 
         self.forward_pass_callable = None
@@ -644,7 +643,7 @@ class PyTorchModelEngine(ModelEngine):
 
         self._torch_compile_enabled = torch_compile_enabled
         self._torch_compile_piecewise_cuda_graph = torch_compile_piecewise_cuda_graph
-        self._torch_compile_context_only = False
+        self._torch_compile_prefill_only = False
 
         prefill_cuda_graph_num_tokens = self.llm_args.prefill_capture_num_tokens
         if prefill_cuda_graph_num_tokens is None:
@@ -696,10 +695,12 @@ class PyTorchModelEngine(ModelEngine):
                         eager_model,
                         backend=self._torch_compile_backend,
                         fullgraph=torch_compile_fullgraph)
-                    self._torch_compile_context_only = self._torch_compile_piecewise_cuda_graph
+                    self._torch_compile_prefill_only = (
+                        self._torch_compile_piecewise_cuda_graph
+                        and self.model.use_prefill_only_compile)
                     self.model.model = (
-                        _ContextOnlyCompiledModel(eager_model, compiled_model)
-                        if self._torch_compile_context_only else compiled_model)
+                        _PrefillCompiledModel(eager_model, compiled_model)
+                        if self._torch_compile_prefill_only else compiled_model)
                 elif callable(apply_llm_torch_compile):
                     # TODO: Move this contract to MultimodalModelMixin once
                     # multimodal models consistently expose their LLM compile
@@ -2184,12 +2185,12 @@ class PyTorchModelEngine(ModelEngine):
         native_mxfp8_methods = [
             method for method in mxfp8_methods if method.needs_native_autotune
         ]
-        compile_all_batches = (
-            self._torch_compile_enabled
-            and not getattr(self, "_torch_compile_context_only", False))
-        if compile_all_batches:
+        compile_all_batches = (self._torch_compile_enabled
+                               and not self._torch_compile_prefill_only)
+        if (compile_all_batches
+                and "TRTLLM_MXFP8_GEMM_BACKEND" not in os.environ):
             # Compiled auto dispatch uses native; do not tune unused backends.
-            # Context-only compile retains the eager generation-graph policy.
+            # Prefill-only compile retains the eager generation-graph policy.
             for method in mxfp8_methods:
                 method.disable_flashinfer_auto()
         use_mxfp8_flashinfer_graph_default = (
@@ -6298,7 +6299,6 @@ class PyTorchModelEngine(ModelEngine):
             return outputs
 
     def model_forward(self, **kwargs):
-        """Run the full model under the current batch's compile and graph flags."""
         attrs = get_model_extra_attrs()
         assert attrs is not None, "Model extra attrs is not set"
         attrs["attention_metadata"] = weakref.ref(kwargs['attn_metadata'])
@@ -6322,7 +6322,7 @@ class PyTorchModelEngine(ModelEngine):
         # eager decode and over-ceiling prefill do not select compile-only ops.
         compile_scope = (
             torch_compiling(get_per_request_prefill_cuda_graph_flag())
-            if self._torch_compile_context_only else contextlib.nullcontext())
+            if self._torch_compile_prefill_only else contextlib.nullcontext())
         with reclaim_scope, compile_scope:
             if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
                 return trace_func(self.model.forward)(**kwargs)

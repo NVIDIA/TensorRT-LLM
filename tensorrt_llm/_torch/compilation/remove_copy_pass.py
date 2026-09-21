@@ -32,7 +32,6 @@ def remove_copy_for_mutates_args(graph: Graph):
     nodes_to_remove: list[Node] = []
 
     def remove_functionalize_inner(node: Node, mutates_args: dict, is_v2=False):
-        """Restore in-place calls while preserving regular and mutated outputs."""
         getitem_nodes = [
             user for user in node.users if is_call_function(user, getitem)
         ]

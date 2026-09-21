@@ -15,7 +15,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
 
 def _register_fake():
-    """Register shape-only implementations for native operators during tracing."""
 
     @torch.library.register_fake("trtllm::allreduce")
     def allreduce(

@@ -40,7 +40,10 @@ from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
 
 @pytest.mark.cpu_only
-def test_msa_metadata_clears_padded_cache_slot_tail(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("empty_state", ["empty_batch", "no_requests", "no_lengths"])
+def test_msa_metadata_clears_padded_cache_slot_tail(
+    monkeypatch: pytest.MonkeyPatch, empty_state: str
+) -> None:
     """A smaller replay must not reuse the previous step's live cache slots."""
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
 
@@ -62,7 +65,7 @@ def test_msa_metadata_clears_padded_cache_slot_tail(monkeypatch: pytest.MonkeyPa
     metadata._msa_kv_lens_may_change = lambda: False
     original_ptr = metadata.msa_out_cache_loc.data_ptr()
 
-    for count in (4, 2, 1):
+    for count in (4, 2, 0, 1):
         metadata._msa_qo_lens_cpu = torch.tensor([count], dtype=torch.int32)
         metadata._msa_kv_lens_cpu = metadata._msa_qo_lens_cpu.clone()
         metadata._msa_qo_offset_cpu = torch.zeros(1, dtype=torch.int32)
@@ -73,8 +76,13 @@ def test_msa_metadata_clears_padded_cache_slot_tail(monkeypatch: pytest.MonkeyPa
         assert metadata.msa_out_cache_loc.data_ptr() == original_ptr
         assert metadata._msa_fields_ready
 
-    metadata.request_ids = []
-    metadata._msa_qo_lens_cpu = torch.empty(0, dtype=torch.int32)
+    if empty_state == "empty_batch":
+        metadata.request_ids = []
+        metadata._msa_qo_lens_cpu = torch.empty(0, dtype=torch.int32)
+    elif empty_state == "no_requests":
+        metadata.request_ids = None
+    else:
+        metadata._msa_qo_lens_cpu = None
     metadata._build_msa_fields()
     assert metadata.msa_out_cache_loc.tolist() == [-1] * 4
 
