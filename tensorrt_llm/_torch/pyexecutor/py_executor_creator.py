@@ -460,12 +460,16 @@ def _create_py_executor_impl(
 
     if not _flashinfer_one_engine_spec_supported(llm_args.attn_backend,
                                                  spec_config):
+        if spec_config.spec_dec_mode.is_dflash():
+            raise ValueError(
+                "FLASHINFER target attention is not qualified for DFlash, "
+                "regardless of the draft attention backend or cache ownership. "
+                "Use TRTLLM target attention for DFlash.")
         raise ValueError(
-            "FLASHINFER target attention is not qualified for DFlash, "
-            "regardless of the draft attention backend or cache ownership. "
-            "Other one-engine speculative modes require no separate draft "
-            "KV cache manager on this backend. Use TRTLLM target attention "
-            "for DFlash.")
+            f"FLASHINFER target attention is not qualified for "
+            f"{spec_config.spec_dec_mode.name}: this one-engine speculative "
+            "mode needs a separate draft KV cache manager, which FLASHINFER "
+            "does not support. Use TRTLLM target attention.")
 
     if mm_encoder_only:
         llm_args.mm_encoder_only = True

@@ -2984,6 +2984,14 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         "and supports SM100/SM103 only. FA4 uses the flash-attn CuTe DSL kernels "
         "on the same paged cache and supports SM90 only.")
 
+    skip_ctx_buffer_budget_check: bool = Field(
+        default=False,
+        description=
+        "Skip the config-time check that the pooled-context K/V buffers fit in "
+        "the memory left free after the KV-cache pool commits. The estimate is "
+        "deliberately conservative; set this to proceed when you know the "
+        "device has the headroom. The token-budget check is not affected.")
+
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
         self.max_total_draft_tokens = self.max_draft_len
@@ -6315,6 +6323,33 @@ class TorchLlmArgs(BaseLlmArgs):
             estimate_checkpoint_weight_bytes, validate_dflash_ctx_buffer_budget)
 
         spec_cfg = self.speculative_config
+
+        # Token budget: max_batch_size * (1 + max_draft_len) must fit
+        # max_num_tokens or the config corrupts memory at engine init. Under
+        # the stock defaults (max_batch_size=2048, max_num_tokens=8192) this is
+        # violated for any max_draft_len >= 4, so a plain
+        # DFlashDecodingConfig(max_draft_len=7) would fail at construction.
+        # When max_batch_size was not set explicitly, clamp it to what fits and
+        # warn; an explicitly-set max_batch_size is left to hard-fail in the
+        # validator below rather than silently overridden.
+        K = spec_cfg.max_draft_len
+        if (self.max_num_tokens is not None and self.max_batch_size is not None
+                and "max_batch_size" not in self.model_fields_set):
+            tokens_per_req = 1 + K
+            if self.max_batch_size * tokens_per_req > self.max_num_tokens:
+                clamped = self.max_num_tokens // tokens_per_req
+                if clamped >= 1:
+                    logger.warning(
+                        f"DFlash: max_batch_size ({self.max_batch_size}) x (1 "
+                        f"+ max_draft_len ({K})) exceeds max_num_tokens "
+                        f"({self.max_num_tokens}); clamping max_batch_size to "
+                        f"{clamped}. Set max_num_tokens explicitly to raise "
+                        "it.")
+                    self.max_batch_size = clamped
+                # clamped < 1 means not even one request fits; leave
+                # max_batch_size so the validator below raises with the
+                # actionable token-budget message.
+
         draft_config = None
         if spec_cfg.speculative_model is not None:
             draft_config_path = os.path.join(str(spec_cfg.speculative_model),
@@ -6323,7 +6358,11 @@ class TorchLlmArgs(BaseLlmArgs):
                 with open(draft_config_path) as f:
                     draft_config = json.load(f)
 
-        if memory_budget_bytes is None:
+        if spec_cfg.skip_ctx_buffer_budget_check:
+            # Opt out of the pooled-context buffer-fit check (the estimate is
+            # conservative); the token-budget check above still applies.
+            memory_budget_bytes = None
+        elif memory_budget_bytes is None:
             kv_fraction = self.kv_cache_config.free_gpu_memory_fraction
             if (kv_fraction is not None
                     and self.kv_cache_config.max_tokens is None

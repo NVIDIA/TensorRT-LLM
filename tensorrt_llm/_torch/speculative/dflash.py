@@ -56,23 +56,34 @@ def compute_dflash_ctx_buffer_bytes(
     dtype_bytes: int = 2,
     attention_backend: str = "VANILLA",
     page_size: int = 32,
+    kv_factor: int = 2,
+    paged: Optional[bool] = None,
 ) -> int:
     """Per-GPU bytes ``_lazy_init_ctx_buffers`` will allocate for the DFlash
     pooled-context K/V buffers.
 
     Mirrors the allocation exactly: ``max_batch_size + 1`` slots (one scratch
     slot for padding/warmup dummies), capacity ``max_ctx_len + block_size``
-    per slot, K and V for every drafter attention layer. The VANILLA backend
-    holds two contiguous ``[slots, L, capacity, Hkv, D]`` tensors; the paged
-    backends (``TRTLLM``, ``FA4``) hold one paged ``[L, pages, 2, Hkv, page,
-    D]`` tensor whose per-slot capacity is rounded up to whole pages.
+    per slot, ``kv_factor`` halves for every drafter attention layer (K and V,
+    so 2; the MLA drafter keeps one latent and no V, so 1). The dense layout
+    holds ``kv_factor`` contiguous ``[slots, L, capacity, Hkv, D]`` tensors;
+    the paged layout holds one ``[L, pages, kv_factor, Hkv, page, D]`` tensor
+    whose per-slot capacity is rounded up to whole pages.
+
+    ``paged`` selects the layout. At runtime the caller passes the resolved
+    ``_ctx_paged`` flag (the backend's kernels are paged, or the drafter opts
+    into pages itself). When ``None`` -- the config-time estimate, which has
+    no drafter to ask -- it falls back to whether ``attention_backend`` is a
+    paged backend.
     """
     num_slots = max_batch_size + 1
     capacity = max_ctx_len + block_size
-    if attention_backend in _PAGED_ATTENTION_BACKENDS:
+    if paged is None:
+        paged = attention_backend in _PAGED_ATTENTION_BACKENDS
+    if paged:
         pages_per_slot = (capacity + page_size - 1) // page_size
         capacity = pages_per_slot * page_size
-    per_slot_elems = 2 * num_attn_layers * capacity * num_kv_heads_per_rank * head_dim
+    per_slot_elems = kv_factor * num_attn_layers * capacity * num_kv_heads_per_rank * head_dim
     return num_slots * per_slot_elems * dtype_bytes
 
 
@@ -116,13 +127,21 @@ def estimate_checkpoint_weight_bytes(checkpoint_dir) -> Optional[int]:
     try:
         if not checkpoint_dir or not os.path.isdir(checkpoint_dir):
             return None
-        total = 0
-        for name in os.listdir(checkpoint_dir):
-            if name.endswith(_WEIGHT_SHARD_SUFFIXES):
-                path = os.path.join(checkpoint_dir, name)
-                if os.path.isfile(path):
-                    total += os.path.getsize(path)
-        return total or None
+        # Many checkpoints ship BOTH .safetensors and .bin copies of the same
+        # weights; summing both double-counts and shrinks the budget. Prefer
+        # .safetensors when any is present and fall back to .bin only
+        # otherwise. Walk subdirectories so sharded layouts are not missed.
+        for suffix in _WEIGHT_SHARD_SUFFIXES:
+            total = 0
+            for root, _dirs, files in os.walk(checkpoint_dir):
+                for name in files:
+                    if name.endswith(suffix):
+                        path = os.path.join(root, name)
+                        if os.path.isfile(path):
+                            total += os.path.getsize(path)
+            if total:
+                return total
+        return None
     except OSError:
         return None
 
@@ -236,6 +255,22 @@ def validate_dflash_ctx_buffer_budget(
             "width."
         )
 
+    # The pooled-context buffer capacity is min(max_seq_len,
+    # max_position_embeddings). max_seq_len is often unset at config time (it
+    # is resolved later from the model config and not written back to the args
+    # here), and falling back to the drafter's max_position_embeddings -- often
+    # ~1M -- would size the buffers off a length the serve never reaches and
+    # refuse every batch size. Skip the buffer-fit check in that case; the
+    # token-budget check above still applies.
+    if max_seq_len is None:
+        return
+    # The TRTLLM backend borrows the KV-cache manager's paged pool for the
+    # draft context (should_use_separate_draft_kv_cache is True) and reserves
+    # no private arena, so charging the full pooled-buffer arena here would
+    # refuse configs whose memory it never allocates. VANILLA and FA4 own the
+    # arena, so they keep the check.
+    if attention_backend == "TRTLLM":
+        return
     if memory_budget_bytes is None:
         return
     num_layers = draft_config.get("num_hidden_layers")
@@ -262,6 +297,10 @@ def validate_dflash_ctx_buffer_budget(
     ]
     max_ctx = min(_ctx_candidates) if _ctx_candidates else 8192
     num_kv_heads_per_rank = (num_kv_heads + tp_size - 1) // tp_size
+    # Config-time approximations of the real allocation's inputs: the lazy
+    # allocation reads draft_model.fc.weight.dtype and _draft_block_width()
+    # (both subclass-overridable), whereas here dtype_bytes is derived from
+    # config["torch_dtype"] and the block width is hardcoded to K + 1.
     dtype_bytes = 4 if draft_config.get("torch_dtype") in ("float32", "float") else 2
     block_size = K + 1
 
@@ -685,12 +724,24 @@ class DFlashWorker(SpecWorkerBase):
         neither the buffer nor the knob that controls it.
         """
         itemsize = torch.tensor([], dtype=dtype).element_size()
-        if self._ctx_paged:
-            page_size = self._ctx_page_size
-            pages_per_slot = (capacity + page_size - 1) // page_size
-            arena = L * num_slots * pages_per_slot * kv_factor * nkv * page_size * hd * itemsize
-        else:
-            arena = kv_factor * num_slots * L * capacity * nkv * hd * itemsize
+        # Reuse the allocation-sizing helper so this runtime check and the
+        # config-time estimate cannot drift. num_slots and capacity are already
+        # resolved here, so feed them directly (max_batch_size = num_slots - 1,
+        # block_size = 0, dtype_bytes = itemsize); kv_factor and the resolved
+        # paged flag carry the drafter-specific layout.
+        arena = compute_dflash_ctx_buffer_bytes(
+            num_slots - 1,
+            capacity,
+            0,
+            L,
+            nkv,
+            hd,
+            dtype_bytes=itemsize,
+            attention_backend=self._dflash_attention_backend,
+            page_size=self._ctx_page_size,
+            kv_factor=kv_factor,
+            paged=self._ctx_paged,
+        )
 
         # mem_get_info() excludes the caching allocator's reserved-but-unused
         # segments, which torch.zeros() below can serve from.
