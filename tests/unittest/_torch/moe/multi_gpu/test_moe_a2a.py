@@ -225,6 +225,20 @@ def make_bfloat16_payloads(
     return payloads, 1
 
 
+_CFT_COUNTER_STRIDE_BYTES = 256
+_CFT_COUNTER_STRIDE_U64 = _CFT_COUNTER_STRIDE_BYTES // 8
+
+
+def read_cft_dispatch_counters(moe_a2a, rank: int,
+                               ep_size: int) -> torch.Tensor:
+    counter_offset = moe_a2a.metainfo[MoeAlltoAll._METAINFO_INDEX[
+        "DISPATCH_COUNTED_WRITE_COUNTERS_OFFSET_INDEX"]].item()
+    counters = moe_a2a.workspace[rank, counter_offset:counter_offset +
+                                 ep_size * _CFT_COUNTER_STRIDE_BYTES].view(
+                                     torch.int64)
+    return counters[::_CFT_COUNTER_STRIDE_U64][:ep_size].cpu()
+
+
 def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
                                      workspace_size_per_rank, num_experts,
                                      hidden_size, invalid_token_expert_id,
@@ -280,6 +294,11 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
             and all(bytes_per_token % 16 == 0
                     for bytes_per_token in payload_bytes_per_token))
 
+        cft_counters_before = (read_cft_dispatch_counters(
+            moe_a2a, rank, ep_size) if actual_cft_dispatch else None)
+        if actual_cft_dispatch:
+            tllm.mpi_barrier()
+
         recv_tensors = moe_a2a.dispatch(
             token_selected_experts,
             payloads,
@@ -328,6 +347,21 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
             rank, topk_send_indices_offset:topk_send_indices_offset +
             max_num_tokens * top_k * 4].view(torch.int32).view(
                 max_num_tokens, top_k).cpu()
+
+        if actual_cft_dispatch:
+            cft_counters_after = read_cft_dispatch_counters(
+                moe_a2a, rank, ep_size)
+            cft_counter_delta = cft_counters_after - cft_counters_before
+            expected_payload_bytes_per_token = sum(payload_bytes_per_token)
+            for peer_rank in range(ep_size):
+                if peer_rank == rank:
+                    continue
+                expected_bytes = (recv_counters[peer_rank].item() *
+                                  expected_payload_bytes_per_token)
+                actual_bytes = cft_counter_delta[peer_rank].item()
+                assert actual_bytes >= expected_bytes, (
+                    f"Rank {rank} CFT dispatch counter from rank {peer_rank}: "
+                    f"delta={actual_bytes}, expected at least {expected_bytes}")
 
         # Return results to be collected (move to CPU for MPI transfer)
         eplb_gathered_stats = moe_a2a._state.eplb_gathered_stats
