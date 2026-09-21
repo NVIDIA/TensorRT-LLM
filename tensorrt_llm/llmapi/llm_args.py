@@ -1700,12 +1700,11 @@ Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin']
 class Nvfp4GemmConfig(StrictBaseModel):
     """Configuration for NVFP4 GEMM backend selection."""
     allowed_backends: List[Nvfp4Backend] = Field(
-        default_factory=lambda: ['cutlass', 'cublaslt', 'cuda_core'],
+        default_factory=lambda: ['cutlass', 'cublaslt', 'cutedsl', 'cuda_core'],
         min_length=1,
         description="List of backends to consider for auto-selection. "
-        "Default excludes 'cutedsl' for faster build time. "
-        "Add 'cutedsl' for extreme performance at the cost of longer server launch time."
-    )
+        "CuTeDSL is enabled by default and may increase first-launch "
+        "compilation time.")
 
 
 class AttentionDpConfig(StrictBaseModel):
