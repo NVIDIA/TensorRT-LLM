@@ -49,25 +49,20 @@ class StandaloneDraftLayout:
         return self.num_layers * self.bytes_per_layer_token
 
     def transfer_identity(self) -> dict:
-        identity = {
+        return {
             "num_layers": self.num_layers,
             "num_kv_heads": self.num_kv_heads,
             "head_dim": self.head_dim,
             "dtype": str(self.dtype),
             "attention_backend": self.attention_backend,
+            "kv_factor": self.kv_factor,
+            "window_size": self.window_size,
         }
-        if self.kv_factor != 2 or self.window_size is not None:
-            identity.update(kv_factor=self.kv_factor, window_size=self.window_size)
-        return identity
 
 
 @dataclass(frozen=True)
 class StandaloneDraftHistory:
-    """Committed draft tokens and their next absolute sequence position.
-
-    These are deliberately separate from the target cache's monotonic history
-    watermark and from its speculative allocation capacity.
-    """
+    """Committed length and next absolute position, independent of target/scratch state."""
 
     valid_length: int
     position: int

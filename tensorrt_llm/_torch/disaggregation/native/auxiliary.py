@@ -134,8 +134,8 @@ def _encode_draft_history(history: dict[str, Any]) -> list[int]:
         layout["head_dim"],
         _DRAFT_DTYPE_CODES[layout["dtype"]],
         _DRAFT_BACKEND_CODES[layout["attention_backend"]],
-        layout.get("kv_factor", 2),
-        layout.get("window_size") or 0,
+        layout["kv_factor"],
+        layout["window_size"] or 0,
     ]
 
 
@@ -156,17 +156,15 @@ def _decode_draft_history(values: list[int]) -> dict[str, Any]:
     ) = values
     dtypes = {code: name for name, code in _DRAFT_DTYPE_CODES.items()}
     backends = {code: name for name, code in _DRAFT_BACKEND_CODES.items()}
-    # The receiving transceiver validates prompt coverage and the manager checks
-    # storage identity and local allocation before publishing this history.
     layout = {
         "num_layers": num_layers,
         "num_kv_heads": num_kv_heads,
         "head_dim": head_dim,
         "dtype": dtypes.get(dtype_code),
         "attention_backend": backends.get(backend_code),
+        "kv_factor": kv_factor,
+        "window_size": window_size or None,
     }
-    if kv_factor != 2 or window_size != 0:
-        layout.update(kv_factor=kv_factor, window_size=window_size or None)
     return {
         "valid_length": valid_length,
         "position": position,
@@ -265,8 +263,7 @@ class AuxBuffer(AuxBufferBase):
         self._prompt_token_counts_buffer = torch.zeros(
             self._max_slot_num, 2, dtype=data_type, device=self._device
         )
-        # This participates in the existing auxiliary memory registration and
-        # transfer. Version zero denotes an unfilled or newly allocated slot.
+        # Version zero denotes an unfilled or recycled slot.
         self._draft_history_buffer = (
             torch.zeros(
                 self._max_slot_num, _DRAFT_HISTORY_FIELDS, dtype=torch.int64, device=self._device

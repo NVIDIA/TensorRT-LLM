@@ -742,9 +742,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
             # may exceed the length of num_kv_heads_per_layer. Use index 0 as
             # all layers within a pool group share the same kv_heads count.
             first_local_layer = all_internal_layer_ids[0]
-            if getattr(
-                manager, "draft_layout", None
-            ) is not None and manager._is_standalone_draft_layer(first_local_layer):
+            if manager._is_standalone_draft_layer(first_local_layer):
                 num_kv_heads = manager.draft_layout.num_kv_heads
             elif first_local_layer < len(manager.num_kv_heads_per_layer):
                 num_kv_heads = manager.num_kv_heads_per_layer[first_local_layer]

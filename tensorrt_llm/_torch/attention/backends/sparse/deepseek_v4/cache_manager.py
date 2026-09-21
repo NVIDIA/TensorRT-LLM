@@ -72,14 +72,12 @@ NVFP4_VECTOR_SIZE = 16
 
 
 def _draft_cache_size_components(
-    layout: StandaloneDraftLayout | None,
+    layout: StandaloneDraftLayout,
     tokens_per_block: int,
     generation_capacity_headroom: int,
     target_context_bytes: int,
 ) -> tuple[int, int, int]:
     """The draft contribution to static profiling and runtime byte quotas."""
-    if layout is None:
-        return 0, 0, 0
     context, generation, per_request = _estimate_cache_size_components(
         [layout.bytes_per_layer_token] * layout.num_layers,
         [layout.retention_window_size] * layout.num_layers,
@@ -1224,8 +1222,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
     def _append_standalone_draft_layers(
         self, config: KVCacheManagerConfigPy
     ) -> KVCacheManagerConfigPy:
-        # Target model indices describe several virtual attention layers each.
-        # Draft layers are independent config entries, not extra target layers.
+        # Preserve target virtual-layer indices when registering draft layers.
         return super()._append_standalone_draft_layers(config, register_model_layers=False)
 
     def _init_indexer_dtype(self, sparse_attn_config: DeepSeekV4SparseAttentionConfig) -> None:

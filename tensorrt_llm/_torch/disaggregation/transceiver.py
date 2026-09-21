@@ -475,7 +475,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                             else np.array([], dtype=np.int64)
                         )
                     # Drop stale blocks the manager may still expose (V1 pre-eviction).
-                    stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
                     expected_valid = max(0, prompt_blocks - stale_end)
                     if block_ids.size > expected_valid:
                         block_ids = (
@@ -543,8 +542,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _need_aux_transfer(self, req: LlmRequest) -> bool:
         params = req.py_disaggregated_params
-        manager = getattr(self, "_kv_cache_manager", None)
-        return getattr(manager, "draft_layout", None) is not None or (
+        return getattr(self._kv_cache_manager, "draft_layout", None) is not None or (
             params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         )
 
@@ -565,35 +563,29 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def _validate_draft_history_range(req: LlmRequest, history: dict) -> None:
         # Full-attention drafters retain the whole prompt; rolling drafters
         # retain its complete live suffix. Neither includes speculative scratch.
-        window_size = history["layout"].get("window_size")
+        window_size = history["layout"]["window_size"]
         expected_length = req.prompt_len
         if window_size is not None:
             if type(window_size) is not int or window_size <= 0:
                 raise ValueError("Invalid draft history window size")
             expected_length = min(expected_length, window_size)
-        if (
-            type(history["valid_length"]) is not int
-            or type(history["position"]) is not int
-            or history["valid_length"] != expected_length
-            or history["position"] != req.prompt_len
-        ):
+        if history["valid_length"] != expected_length or history["position"] != req.prompt_len:
             raise ValueError(
                 "DSpark transfer requires valid draft history and sequence position "
                 f"covering the complete prompt ({req.prompt_len} tokens, "
                 f"{expected_length} retained)."
             )
 
-    def _pack_draft_history(self, req: LlmRequest) -> Optional[dict]:
+    def _pack_draft_history(self, req: LlmRequest) -> None:
         manager = getattr(self, "_kv_cache_manager", None)
         if getattr(manager, "draft_layout", None) is None:
-            return None
+            return
         self._validate_draft_transfer(req)
         history = self._kv_cache_manager.export_draft_history(req.py_request_id)
         self._validate_draft_history_range(req, history)
         req.py_draft_transfer_history = history
-        return history
 
-    def _received_draft_history(self, req: LlmRequest) -> Optional[dict]:
+    def _restore_draft_history(self, req: LlmRequest) -> None:
         history = getattr(req, "py_draft_transfer_history", None)
         manager = getattr(self, "_kv_cache_manager", None)
         has_draft = getattr(manager, "draft_layout", None) is not None
@@ -603,20 +595,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     "Standalone DSpark generation requires draft history from a prefill worker "
                     "with matching speculative configuration; draft history metadata is missing."
                 )
-            return None
+            return
         if not has_draft:
             raise ValueError(
                 "Received standalone DSpark draft history without a manager-owned draft cache."
             )
         self._validate_draft_history_range(req, history)
-        return history
-
-    def _restore_draft_history(self, req: LlmRequest) -> None:
-        history = self._received_draft_history(req)
-        if history is not None:
-            # K/V is already in this request's local pages. Only portable validity/position
-            # metadata crosses the wire; the manager retains the receiver's request/page map.
-            self._kv_cache_manager.restore_draft_history(req.py_request_id, history)
+        # K/V already occupies receiver-local pages; restore only validity and position.
+        self._kv_cache_manager.restore_draft_history(req.py_request_id, history)
 
     def _prepare_received_history(self, session: RxSessionBase, req: LlmRequest) -> None:
         if self._need_aux_transfer(req):
@@ -909,8 +895,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """Unpack aux tokens from session into request's context_phase_params."""
         params = req.py_disaggregated_params
         if params is not None and params.schedule_style != DisaggScheduleStyle.GENERATION_FIRST:
-            # Context-first already carries tokens and usage in the context response. The
-            # existing registered auxiliary transfer carries only the additional draft state.
+            # Context-first tokens and usage already arrived in the context response.
             session.unpack_draft_history(req)
             return
         session.unpack_aux(req)
@@ -921,7 +906,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req.context_phase_params = ContextPhaseParams(
                 first_gen_tokens=first_gen_tokens,
                 req_id=req.py_request_id,
-                opaque_state=None,
+                opaque_state=b"",
                 draft_tokens=draft_tokens,
                 ctx_dp_rank=0,
                 disagg_info_endpoint="",
@@ -1328,9 +1313,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 req = self._recv_reqs[rid]
                 if has_draft_history:
                     try:
-                        # Restore also validates the receiver's allocation and page map.
-                        # A peer failure below leaves this request unschedulable; its
-                        # ordinary failure cleanup releases any restored history and KV.
+                        # Validate local pages/history before rank consensus; any peer
+                        # failure follows ordinary failed-request KV/history cleanup.
                         self._prepare_received_history(session, req)
                     except (ValueError, RuntimeError) as error:
                         logger.warning(

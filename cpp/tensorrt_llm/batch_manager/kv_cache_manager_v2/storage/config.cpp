@@ -204,8 +204,7 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         slotGroups.push_back(std::move(var));
     }
 
-    // Equal storage sizes permit merging only within a compatible ownership domain.
-    // Existing target attention/SSM groups retain their shared physical pool behavior.
+    // Merge equal storage sizes only within the same cache domain.
     std::map<std::pair<std::string, std::vector<size_t>>, std::vector<SlotDescVariant>> poolGroupsByLayout;
     for (auto& sg : slotGroups)
     {

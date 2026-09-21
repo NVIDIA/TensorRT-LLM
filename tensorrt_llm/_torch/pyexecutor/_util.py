@@ -61,7 +61,8 @@ from .config_utils import (MambaKVCacheParams, extract_mamba_kv_cache_params,
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
-from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from .kv_cache.kv_cache_manager_v2 import (KVCacheManagerV2,
+                                           get_draft_cache_unsupported_reason)
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            CppMambaHybridCacheManager,
                                            MambaHybridCacheManagerV2,
@@ -1684,13 +1685,9 @@ class KvCacheCreator:
         if (not (self._is_standalone_dspark() or self._is_embedded_dspark())
                 or not self._is_kv_cache_manager_v2):
             return False
-        if self._is_disagg:
-            # Disaggregation must validate unified ownership, never fall back
-            # to draft state that the transceiver cannot transfer.
-            return True
-        # Keep existing aggregate execution for settings the unified draft
-        # lifecycle cannot support. Disaggregation must never take this path.
-        return self._unified_draft_cache_unsupported_reason() is None
+        # Disaggregation validates unified support; aggregate may use legacy state.
+        return (self._is_disagg
+                or self._unified_draft_cache_unsupported_reason() is None)
 
     def _validate_standalone_draft_cache(self) -> None:
         """Reject unsupported DSpark state ownership before profiling."""
@@ -1715,14 +1712,9 @@ class KvCacheCreator:
 
     def _unified_draft_cache_unsupported_reason(self) -> Optional[str]:
         """Shared admission requirements for unified aggregate and disagg KV."""
-        if self._kv_cache_config.enable_block_reuse:
-            return "Unified DSpark draft KV does not yet support prefix reuse"
-        if self._kv_cache_config.enable_swa_scratch_reuse:
-            return ("Unified DSpark draft KV cannot use SWA scratch reuse; "
-                    "draft prefill requires ordinary pages. "
-                    "set kv_cache_config.enable_swa_scratch_reuse=False")
-        if self._kv_cache_config.pool_ratio is not None:
-            return "Unified DSpark draft KV does not yet support explicit pool_ratio"
+        reason = get_draft_cache_unsupported_reason(self._kv_cache_config)
+        if reason is not None:
+            return reason
         if (self._speculative_config.draft_len_schedule is not None
                 or self._speculative_config.max_concurrency is not None):
             return (
@@ -2663,37 +2655,36 @@ def _get_qwen4_exp_ple_cache_params(config, *, total_layers: int,
 
 
 def _create_kv_cache_manager(
-    model_engine: Optional[PyTorchModelEngine],
-    kv_cache_manager_cls,
-    mapping: Mapping,
-    kv_cache_config: KvCacheConfig,
-    tokens_per_block: int,
-    max_seq_len: int,
-    max_batch_size: int,
-    spec_config: Optional[SpeculativeConfig],
-    sparse_attention_config: Optional[SparseAttentionConfig],
-    max_num_tokens: int,
-    max_beam_width: int,
-    kv_connector_manager: Optional[KvCacheConnectorManager],
-    estimating_kv_cache: bool = False,
-    enable_kv_cache_stats: bool = False,
-    execution_stream: Optional[torch.cuda.Stream] = None,
-    # Optional overrides for one-model draft case (when model_engine is None)
-    model_config: Optional[ModelConfig] = None,
-    dtype: Optional[torch.dtype] = None,
-    is_draft: Optional[bool] = None,
-    layer_mask: Optional[List[bool]] = None,
-    num_layers: Optional[int] = None,
-    num_kv_heads: Optional[Union[int, List[int]]] = None,
-    head_dim: Optional[int] = None,
-    kv_cache_type=None,
-    is_disagg: bool = False,
-    disable_overlap_scheduler: bool = False,
-    cold_page_codec_provider: Optional[object] = None,
-    kv_events_config: Optional[KVEventsConfig] = None,
-    joint_kv_cache_reuse: bool = False,
-    standalone_draft_layout: Optional[StandaloneDraftLayout] = None
-) -> KVCacheManager:
+        model_engine: Optional[PyTorchModelEngine],
+        kv_cache_manager_cls,
+        mapping: Mapping,
+        kv_cache_config: KvCacheConfig,
+        tokens_per_block: int,
+        max_seq_len: int,
+        max_batch_size: int,
+        spec_config: Optional[SpeculativeConfig],
+        sparse_attention_config: Optional[SparseAttentionConfig],
+        max_num_tokens: int,
+        max_beam_width: int,
+        kv_connector_manager: Optional[KvCacheConnectorManager],
+        estimating_kv_cache: bool = False,
+        enable_kv_cache_stats: bool = False,
+        execution_stream: Optional[torch.cuda.Stream] = None,
+        # Optional overrides for one-model draft case (when model_engine is None)
+        model_config: Optional[ModelConfig] = None,
+        dtype: Optional[torch.dtype] = None,
+        is_draft: Optional[bool] = None,
+        layer_mask: Optional[List[bool]] = None,
+        num_layers: Optional[int] = None,
+        num_kv_heads: Optional[Union[int, List[int]]] = None,
+        head_dim: Optional[int] = None,
+        kv_cache_type=None,
+        is_disagg: bool = False,
+        disable_overlap_scheduler: bool = False,
+        cold_page_codec_provider: Optional[object] = None,
+        kv_events_config: Optional[KVEventsConfig] = None,
+        standalone_draft_layout: Optional[StandaloneDraftLayout] = None,
+        joint_kv_cache_reuse: bool = False) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config

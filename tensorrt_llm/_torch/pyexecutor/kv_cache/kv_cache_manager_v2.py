@@ -1134,6 +1134,21 @@ def _settle_context_cursor(req: LlmRequest, reuse: int, tokens_per_block: int) -
     req.context_chunk_size = req.context_remaining_length
 
 
+def get_draft_cache_unsupported_reason(kv_cache_config: KvCacheConfig) -> Optional[str]:
+    """Restrictions shared by creator admission and direct manager construction."""
+    if kv_cache_config.enable_block_reuse:
+        return "Unified DSpark draft KV does not yet support prefix reuse"
+    if kv_cache_config.enable_swa_scratch_reuse:
+        return (
+            "Unified DSpark draft KV cannot use SWA scratch reuse; "
+            "draft prefill requires ordinary pages. "
+            "set kv_cache_config.enable_swa_scratch_reuse=False"
+        )
+    if kv_cache_config.pool_ratio is not None:
+        return "Unified DSpark draft KV does not yet support explicit pool_ratio"
+    return None
+
+
 class KVCacheManagerV2(BaseResourceManager):
     draft_layout: Optional[StandaloneDraftLayout] = None
     draft_layer_ids: tuple[int, ...] = ()
@@ -1188,18 +1203,9 @@ class KVCacheManagerV2(BaseResourceManager):
             standalone_draft_layout.extra_tokens if standalone_draft_layout is not None else 0
         )
         if standalone_draft_layout is not None:
-            if kv_cache_config.enable_block_reuse:
-                raise ValueError("Unified standalone draft KV does not yet support prefix reuse")
-            if kv_cache_config.enable_swa_scratch_reuse:
-                raise ValueError(
-                    "Unified DSpark draft KV cannot use SWA scratch reuse; "
-                    "draft prefill requires ordinary pages. "
-                    "set kv_cache_config.enable_swa_scratch_reuse=False"
-                )
-            if kv_cache_config.pool_ratio is not None:
-                raise ValueError(
-                    "Unified standalone draft KV does not yet support explicit pool_ratio"
-                )
+            reason = get_draft_cache_unsupported_reason(kv_cache_config)
+            if reason is not None:
+                raise ValueError(reason)
         self.mapping = mapping
         self.dtype = dtype
         self.is_disagg = is_disagg
@@ -2980,13 +2986,10 @@ class KVCacheManagerV2(BaseResourceManager):
                             buffers=buffers,
                             sliding_window_size=layer.sliding_window_size,
                             num_sink_tokens=layer.num_sink_tokens,
-                            **(
-                                {"cache_domain": layer.cache_domain}
-                                if self.draft_layout is not None
-                                else {}
-                            ),
                         )
                     )
+                    if hasattr(layer, "cache_domain"):
+                        layers[-1].cache_domain = layer.cache_domain
                 else:
                     layers.append(SsmLayerConfig(layer_id=layer_id, buffers=buffers))
 
@@ -3144,7 +3147,7 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
     def _is_standalone_draft_layer(self, local_layer_idx: int) -> bool:
-        return getattr(self, "draft_layout", None) is not None and any(
+        return self.draft_layout is not None and any(
             self.layer_offsets[layer_id] == local_layer_idx for layer_id in self.draft_layer_ids
         )
 
@@ -3245,7 +3248,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"Standalone draft request {request_id} has no active cache allocation"
             )
         history = StandaloneDraftHistory(valid_length, position)
-        if history.valid_length > cache.capacity or history.position > cache.capacity:
+        if history.position > cache.capacity:
             raise ValueError("Standalone draft history exceeds allocated capacity")
         if (
             self.draft_layout.window_size is not None
@@ -3277,8 +3280,7 @@ class KVCacheManagerV2(BaseResourceManager):
         valid_length = metadata.get("valid_length")
         position = metadata.get("position")
         history = StandaloneDraftHistory(valid_length, position)
-        # Accessing the receiving mapping here verifies ownership before the
-        # worker can see this history. The sender's slot/page IDs are never used.
+        # Validate receiver-local allocation before publishing history.
         self.get_draft_block_table([request_id], [history])
         self.set_draft_history(request_id, valid_length, position)
 
@@ -5442,7 +5444,7 @@ class KVCacheManagerV2(BaseResourceManager):
         return out_tensor
 
     def get_cache_bytes_per_token(self) -> int:
-        if getattr(self, "draft_layout", None) is not None:
+        if self.draft_layout is not None:
             return sum(self._get_runtime_cache_size_layer_components()[0])
         data_roles = [Role.KEY]
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:

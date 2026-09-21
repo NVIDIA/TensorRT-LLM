@@ -1678,8 +1678,7 @@ class Sender(SenderBase):
     @nvtx_range("_respond_with_kv")
     def _respond_with_kv(self, _send_id: bytes, message: list[bytes]):
         # _sessions_lock prevents a race between session lookup and req_info save.
-        # session.lock atomically saves peer info and snapshots tasks against
-        # send() and send_aux(), including context-first auxiliary submission.
+        # session.lock saves peer info and snapshots tasks against send() and send_aux().
         info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
         with self._sessions_lock:
             session = self._get_session(info.unique_rid)

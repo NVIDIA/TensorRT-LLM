@@ -346,17 +346,10 @@ class DFlashWorker(SpecWorkerBase):
         return super().get_draft_kv_cache_manager(resource_manager)
 
     def _has_unified_draft_cache(self) -> bool:
-        return getattr(getattr(self, "_ctx_kv_manager", None), "draft_layout", None) is not None
+        return getattr(self._ctx_kv_manager, "draft_layout", None) is not None
 
     def _prepare_managed_history(self, request_ids: list[int]) -> None:
-        """Restore each request's committed history before this forward's writes.
-
-        Metadata preparation precedes lazy buffer binding. That binding can
-        replace an estimation manager and clear its staging slots, so generation
-        must rebind here even when metadata preparation already assigned slots.
-        Context requests also restore here so continuation and restart detection
-        use the same authoritative state as generation.
-        """
+        """Restore history before writes, including after profiling replaces the manager."""
         updates = {self._dummy_slot: 0}
         for request_id in request_ids:
             if (
@@ -381,11 +374,7 @@ class DFlashWorker(SpecWorkerBase):
         )
 
     def _gather_managed_context(self, request_ids: list[int]) -> None:
-        """Refresh VANILLA's dense input staging from manager-owned history.
-
-        The dense tensors are forward workspaces: they are never exported or
-        used to recover request history. Noise K/V may overwrite their suffix.
-        """
+        """Refresh VANILLA's dense staging; manager pages remain authoritative."""
         if self._dflash_attention_backend != "VANILLA":
             return
         for row, request_id in enumerate(request_ids):
@@ -699,25 +688,17 @@ class DFlashWorker(SpecWorkerBase):
                 for pool in self._ctx_kv_buf
             ):
                 raise ValueError("Unified DSpark draft pool does not match the drafter KV layout")
-            self._ctx_block_tables = torch.zeros(
-                (num_slots, draft_kv_cache_manager.max_blocks_per_seq),
-                dtype=torch.int32,
-                device="cuda",
-            )
             max_blocks = draft_kv_cache_manager.max_blocks_per_seq
+            self._ctx_block_tables = torch.zeros(
+                (num_slots, max_blocks), dtype=torch.int32, device="cuda"
+            )
             self._ctx_block_indptr = torch.arange(
                 0, (num_slots + 1) * max_blocks, max_blocks, dtype=torch.int32, device="cuda"
             )
             self._ctx_kv_last_page_len = torch.full(
                 (num_slots,), self._ctx_page_size, dtype=torch.int32, device="cuda"
             )
-            if self._dflash_attention_backend == "VANILLA":
-                # Dense FlashAttention inputs are transient forward staging;
-                # every history read is refreshed from the authoritative pool.
-                kv_shape = (num_slots, L, capacity, nkv, hd)
-                self._ctx_k_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
-                self._ctx_v_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
-            else:  # TRTLLM; StandaloneDraftLayout validates the backend.
+            if self._dflash_attention_backend == "TRTLLM":
                 validate_dflash_trtllm_gen_runtime(
                     dtype=dtype,
                     num_heads=nh,
@@ -790,8 +771,9 @@ class DFlashWorker(SpecWorkerBase):
             self._ctx_kv_last_page_len = torch.full(
                 (num_slots,), page_size, dtype=torch.int32, device="cuda"
             )
-        else:  # VANILLA DFlash backend (FlashAttention)
-            self._check_ctx_arena_fits(capacity, num_slots, L, nkv, hd, dtype)
+        if self._dflash_attention_backend == "VANILLA":
+            if not unified:
+                self._check_ctx_arena_fits(capacity, num_slots, L, nkv, hd, dtype)
             kv_shape = (num_slots, L, capacity, nkv, hd)
             self._ctx_k_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
             self._ctx_v_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
@@ -1009,8 +991,7 @@ class DFlashWorker(SpecWorkerBase):
             # where the previous one ended. Everything else -- a fresh request, a
             # request id reused after completion, a prefill restarted after
             # preemption -- has to start from a clean slot.
-            previous_position = self._req_ctx_pos.get(req_id)
-            reset = previous_position != first_pos
+            reset = self._req_ctx_pos.get(req_id) != first_pos
             if self._assign_slot(req_id, reset=reset, updates=ctx_len_updates) is None:
                 logger.warning("DFlash: no free slots, skipping context store")
                 self._req_ctx_pos.pop(req_id, None)
