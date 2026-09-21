@@ -227,7 +227,7 @@ __device__ __forceinline__ uint32_t round_parity(uint32_t flag_val)
     return ((flag_val - 1U) >> 1U) & 1U;
 }
 
-template <int TOP_K, bool ENABLE_RANK_MASK>
+template <int TOP_K, bool ENABLE_RANK_MASK, bool COMPACT_FANOUT>
 __device__ __forceinline__ void route_dispatch_token(int32_t const* token_selected_experts,
     DispatchKernelPointers const& ptrs, int local_token_idx, int ep_size, int num_experts, int* topk_target_ranks,
     int* topk_send_indices)
@@ -235,6 +235,14 @@ __device__ __forceinline__ void route_dispatch_token(int32_t const* token_select
     static_assert(TOP_K <= 32, "warp-parallel routing requires TOP_K <= warpSize");
     uint32_t const lane_mask = (TOP_K == 32) ? ~0U : ((1U << TOP_K) - 1U);
     int const k = threadIdx.x;
+
+    if constexpr (COMPACT_FANOUT)
+    {
+        // EP < TOP_K, so the routing lanes initialize every destination slot.
+        topk_target_ranks[k] = -1;
+        topk_send_indices[k] = -1;
+        __syncwarp(lane_mask);
+    }
 
     int const ep_base = num_experts / ep_size;
     int const ep_remainder = num_experts - ep_base * ep_size;
@@ -253,8 +261,21 @@ __device__ __forceinline__ void route_dispatch_token(int32_t const* token_select
 
     ptrs.topk_target_ranks[local_token_idx * TOP_K + k] = target_rank_to_store;
     ptrs.topk_send_indices[local_token_idx * TOP_K + k] = send_index_to_store;
-    topk_target_ranks[k] = target_rank_to_store;
-    topk_send_indices[k] = send_index_to_store;
+    if constexpr (COMPACT_FANOUT)
+    {
+        uint32_t const kept_lanes = __ballot_sync(lane_mask, keep);
+        if (keep)
+        {
+            int const compact_index = __popc(kept_lanes & ((1U << k) - 1U));
+            topk_target_ranks[compact_index] = target_rank;
+            topk_send_indices[compact_index] = send_index_to_store;
+        }
+    }
+    else
+    {
+        topk_target_ranks[k] = target_rank_to_store;
+        topk_send_indices[k] = send_index_to_store;
+    }
 }
 
 // ============================================================================
@@ -303,80 +324,82 @@ __device__ void vectorized_copy(void* dst, void const* src, int size)
     }
 }
 
-// Vectorized dispatch: load one vec from source and write to up to TOP_K destinations
-template <int VEC_SIZE, int TOP_K>
+// Cache destination addresses once per payload, then fan each source vector out.
+template <int VEC_SIZE, int TOP_K, int MAX_FANOUT>
 __device__ void vectorized_dispatch_impl(uint8_t const* src_ptr, int bytes_per_token, int rank_id,
     int max_tokens_per_rank, int payload_idx, DispatchKernelPointers const& ptrs, int const* topk_target_ranks,
     int const* topk_send_indices)
 {
     using flashinfer::vec_t;
-
-    // Precompute destination base pointers per k
-    uint8_t* dst_base_k[TOP_K];
-#pragma unroll
-    for (int k = 0; k < TOP_K; ++k)
+    constexpr bool kCompact = MAX_FANOUT > 0;
+    constexpr int kDestinations = kCompact ? MAX_FANOUT : TOP_K;
+    if constexpr (kCompact)
     {
-        int dst_idx_k = topk_send_indices[k];
-        int target_rank_k = topk_target_ranks[k];
-        if (dst_idx_k < 0)
+        if (threadIdx.x * VEC_SIZE >= bytes_per_token)
         {
-            dst_base_k[k] = nullptr;
-            continue;
+            return;
         }
-        uint8_t* dst_data = static_cast<uint8_t*>(ptrs.recv_buffers[target_rank_k][payload_idx]);
-        size_t base_source_rank
-            = static_cast<size_t>(rank_id) * static_cast<size_t>(max_tokens_per_rank) + static_cast<size_t>(dst_idx_k);
-        size_t base_token = base_source_rank * static_cast<size_t>(bytes_per_token);
-        dst_base_k[k] = dst_data + base_token;
     }
 
-    int const stride = blockDim.x * VEC_SIZE;
-    for (int offset = threadIdx.x * VEC_SIZE; offset < bytes_per_token; offset += stride)
-    {
-        vec_t<uint8_t, VEC_SIZE> v;
-        v.load(src_ptr + offset);
-
+    uint8_t* destinations[kDestinations];
 #pragma unroll
-        for (int k = 0; k < TOP_K; ++k)
+    for (int k = 0; k < kDestinations; ++k)
+    {
+        int const send_index = topk_send_indices[k];
+        if (send_index < 0)
         {
-            uint8_t* dst_base = dst_base_k[k];
-            if (dst_base == nullptr)
+            destinations[k] = nullptr;
+            continue;
+        }
+        int const peer = topk_target_ranks[k];
+        auto* data = static_cast<uint8_t*>(ptrs.recv_buffers[peer][payload_idx]);
+        size_t const token = static_cast<size_t>(rank_id) * max_tokens_per_rank + send_index;
+        destinations[k] = data + token * bytes_per_token;
+    }
+
+    for (int offset = threadIdx.x * VEC_SIZE; offset < bytes_per_token; offset += blockDim.x * VEC_SIZE)
+    {
+        vec_t<uint8_t, VEC_SIZE> value;
+        value.load(src_ptr + offset);
+#pragma unroll
+        for (int k = 0; k < kDestinations; ++k)
+        {
+            if (destinations[k] != nullptr)
             {
-                continue;
+                value.store(destinations[k] + offset);
             }
-            v.store(dst_base + offset);
         }
     }
 }
 
-template <int TOP_K>
+template <int TOP_K, int MAX_FANOUT>
 __device__ void vectorized_dispatch(uint8_t const* src_ptr, int bytes_per_token, int rank_id, int max_tokens_per_rank,
     int payload_idx, DispatchKernelPointers const& ptrs, int const* topk_target_ranks, int const* topk_send_indices)
 {
     if (bytes_per_token % 16 == 0)
     {
-        vectorized_dispatch_impl<16, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank, payload_idx, ptrs,
-            topk_target_ranks, topk_send_indices);
+        vectorized_dispatch_impl<16, TOP_K, MAX_FANOUT>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+            payload_idx, ptrs, topk_target_ranks, topk_send_indices);
     }
     else if (bytes_per_token % 8 == 0)
     {
-        vectorized_dispatch_impl<8, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank, payload_idx, ptrs,
-            topk_target_ranks, topk_send_indices);
+        vectorized_dispatch_impl<8, TOP_K, MAX_FANOUT>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+            payload_idx, ptrs, topk_target_ranks, topk_send_indices);
     }
     else if (bytes_per_token % 4 == 0)
     {
-        vectorized_dispatch_impl<4, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank, payload_idx, ptrs,
-            topk_target_ranks, topk_send_indices);
+        vectorized_dispatch_impl<4, TOP_K, MAX_FANOUT>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+            payload_idx, ptrs, topk_target_ranks, topk_send_indices);
     }
     else if (bytes_per_token % 2 == 0)
     {
-        vectorized_dispatch_impl<2, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank, payload_idx, ptrs,
-            topk_target_ranks, topk_send_indices);
+        vectorized_dispatch_impl<2, TOP_K, MAX_FANOUT>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+            payload_idx, ptrs, topk_target_ranks, topk_send_indices);
     }
     else
     {
-        vectorized_dispatch_impl<1, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank, payload_idx, ptrs,
-            topk_target_ranks, topk_send_indices);
+        vectorized_dispatch_impl<1, TOP_K, MAX_FANOUT>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+            payload_idx, ptrs, topk_target_ranks, topk_send_indices);
     }
 }
 
@@ -409,13 +432,14 @@ __global__ void moeA2APrepareDispatchKernel(
 // Dispatch Kernels
 // ============================================================================
 
-template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK>
+template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK, int MAX_FANOUT>
 __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [local_num_tokens, TOP_K]
     const DispatchKernelPointers ptrs,                                      // Struct containing all kernel pointers
     int num_payloads,                                                       // Number of payloads
     int max_tokens_per_rank,                                                // Maximum tokens per rank
     int local_num_tokens, int rank_id, int ep_size, int num_experts, int eplb_stats_num_experts)
 {
+    constexpr bool COMPACT_FANOUT = MAX_FANOUT > 0;
     int thread_idx = threadIdx.x;
     int local_token_idx = blockIdx.x;
 
@@ -436,7 +460,8 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         if (local_token_idx >= local_num_tokens)
             return;
 
-        // One block per token: a single shared-memory tile is reused by the entire CTA.
+        // Compact tiles keep valid destinations in top-k order and pad with -1 send indices.
+        // Global routing metadata always retains all top-k slots.
         extern __shared__ int smem[];
         int* smem_topk_target_ranks = smem;
         int* smem_topk_send_indices = smem + TOP_K;
@@ -446,8 +471,8 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 #endif
         if (thread_idx < TOP_K)
         {
-            route_dispatch_token<TOP_K, ENABLE_RANK_MASK>(token_selected_experts, ptrs, local_token_idx, ep_size,
-                num_experts, smem_topk_target_ranks, smem_topk_send_indices);
+            route_dispatch_token<TOP_K, ENABLE_RANK_MASK, COMPACT_FANOUT>(token_selected_experts, ptrs, local_token_idx,
+                ep_size, num_experts, smem_topk_target_ranks, smem_topk_send_indices);
         }
         // Sync before dispatching data
         __syncthreads();
@@ -455,11 +480,14 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         // Read staged routing once into registers per thread
         int topk_target_ranks[TOP_K];
         int topk_send_indices[TOP_K];
-#pragma unroll
-        for (int k = 0; k < TOP_K; ++k)
+        if constexpr (!COMPACT_FANOUT)
         {
-            topk_target_ranks[k] = smem_topk_target_ranks[k];
-            topk_send_indices[k] = smem_topk_send_indices[k];
+#pragma unroll
+            for (int k = 0; k < TOP_K; ++k)
+            {
+                topk_target_ranks[k] = smem_topk_target_ranks[k];
+                topk_send_indices[k] = smem_topk_send_indices[k];
+            }
         }
 
         // Perform a single source load and TOP_K fanout per payload
@@ -468,9 +496,9 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             uint8_t const* src_data = static_cast<uint8_t const*>(ptrs.src_data_ptrs[payload_idx]);
             int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
             uint8_t const* src_ptr = src_data + local_token_idx * bytes_per_token;
-
-            vectorized_dispatch<TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank, payload_idx, ptrs,
-                topk_target_ranks, topk_send_indices);
+            vectorized_dispatch<TOP_K, MAX_FANOUT>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank, payload_idx,
+                ptrs, COMPACT_FANOUT ? smem_topk_target_ranks : topk_target_ranks,
+                COMPACT_FANOUT ? smem_topk_send_indices : topk_send_indices);
         }
 
         __syncthreads();
@@ -767,11 +795,12 @@ __device__ __forceinline__ void cft_elect_and_publish(DispatchKernelPointers con
     }
 }
 
-template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK>
+template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK, int MAX_FANOUT>
 __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, DispatchKernelPointers const ptrs,
     int num_payloads, int max_tokens_per_rank, int local_num_tokens, int rank_id, int ep_size, int num_experts,
     int eplb_stats_num_experts)
 {
+    constexpr bool COMPACT_FANOUT = MAX_FANOUT > 0;
     int local_token_idx = blockIdx.x;
     uint32_t parity = 0;
     __shared__ int is_last_token_cta;
@@ -840,8 +869,8 @@ __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, 
         // ---- Routing: map tokens to target ranks ----
         if (threadIdx.x < TOP_K)
         {
-            route_dispatch_token<TOP_K, ENABLE_RANK_MASK>(token_selected_experts, ptrs, local_token_idx, ep_size,
-                num_experts, smem_topk_target_ranks, smem_topk_send_indices);
+            route_dispatch_token<TOP_K, ENABLE_RANK_MASK, COMPACT_FANOUT>(token_selected_experts, ptrs, local_token_idx,
+                ep_size, num_experts, smem_topk_target_ranks, smem_topk_send_indices);
         }
         __syncthreads();
 
@@ -852,11 +881,14 @@ __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, 
 
         int topk_target_ranks[TOP_K];
         int topk_send_indices[TOP_K];
-#pragma unroll
-        for (int k = 0; k < TOP_K; ++k)
+        if constexpr (!COMPACT_FANOUT)
         {
-            topk_target_ranks[k] = smem_topk_target_ranks[k];
-            topk_send_indices[k] = smem_topk_send_indices[k];
+#pragma unroll
+            for (int k = 0; k < TOP_K; ++k)
+            {
+                topk_target_ranks[k] = smem_topk_target_ranks[k];
+                topk_send_indices[k] = smem_topk_send_indices[k];
+            }
         }
 
         // ---- Data dispatch: self via TMA s2g, remote via fabric.try_put.counted ----
@@ -869,11 +901,13 @@ __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, 
         bool has_remote = false;
         bool has_self = false;
 #pragma unroll
-        for (int k = 0; k < TOP_K; ++k)
+        for (int k = 0; k < (COMPACT_FANOUT ? MAX_FANOUT : TOP_K); ++k)
         {
-            if (topk_send_indices[k] < 0)
+            int const dst_idx = COMPACT_FANOUT ? smem_topk_send_indices[k] : topk_send_indices[k];
+            int const target_rank = COMPACT_FANOUT ? smem_topk_target_ranks[k] : topk_target_ranks[k];
+            if (dst_idx < 0)
                 continue;
-            if (topk_target_ranks[k] == rank_id)
+            if (target_rank == rank_id)
                 has_self = true;
             else
                 has_remote = true;
@@ -898,10 +932,10 @@ __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, 
             {
                 int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
 #pragma unroll
-                for (int k = 0; k < TOP_K; ++k)
+                for (int k = 0; k < (COMPACT_FANOUT ? MAX_FANOUT : TOP_K); ++k)
                 {
-                    int dst_idx_k = topk_send_indices[k];
-                    int target_rank_k = topk_target_ranks[k];
+                    int const dst_idx_k = COMPACT_FANOUT ? smem_topk_send_indices[k] : topk_send_indices[k];
+                    int const target_rank_k = COMPACT_FANOUT ? smem_topk_target_ranks[k] : topk_target_ranks[k];
                     if (dst_idx_k < 0 || target_rank_k != rank_id)
                         continue;
                     uint8_t* dst = static_cast<uint8_t*>(ptrs.recv_buffers[rank_id][payload_idx])
@@ -926,10 +960,10 @@ __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, 
             {
                 int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
 #pragma unroll
-                for (int k = 0; k < TOP_K; ++k)
+                for (int k = 0; k < (COMPACT_FANOUT ? MAX_FANOUT : TOP_K); ++k)
                 {
-                    int dst_idx_k = topk_send_indices[k];
-                    int target_rank_k = topk_target_ranks[k];
+                    int const dst_idx_k = COMPACT_FANOUT ? smem_topk_send_indices[k] : topk_send_indices[k];
+                    int const target_rank_k = COMPACT_FANOUT ? smem_topk_target_ranks[k] : topk_target_ranks[k];
                     if (dst_idx_k < 0 || target_rank_k == rank_id)
                         continue;
                     uint64_t base_le_offset = ptrs.le_payload_offsets[payload_idx]
@@ -1097,8 +1131,41 @@ void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params)
 // Launch Functions
 // ============================================================================
 
+// Bound compact pointer/accumulator arrays without specializing every EP size.
+// Zero selects the unchanged top-k path; unused compact slots are initialized to -1.
+template <int TOP_K, typename Launch>
+void launch_with_fanout(int ep_size, Launch&& launch)
+{
+    if (ep_size >= TOP_K)
+    {
+        launch(std::integral_constant<int, 0>{});
+    }
+    else if (ep_size <= 2)
+    {
+        launch(std::integral_constant<int, (TOP_K < 2 ? TOP_K : 2)>{});
+    }
+    else if (ep_size <= 4)
+    {
+        launch(std::integral_constant<int, (TOP_K < 4 ? TOP_K : 4)>{});
+    }
+    else if (ep_size <= 8)
+    {
+        launch(std::integral_constant<int, (TOP_K < 8 ? TOP_K : 8)>{});
+    }
+    else if (ep_size <= 16)
+    {
+        launch(std::integral_constant<int, (TOP_K < 16 ? TOP_K : 16)>{});
+    }
+    else
+    {
+        launch(std::integral_constant<int, TOP_K>{});
+    }
+}
+
 void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
 {
+    constexpr int kBlockSize = 256;
+
     // Validate parameters
     TLLM_CHECK(params.top_k > 0 && params.top_k <= kMaxTopK);
     TLLM_CHECK(params.ep_size > 0 && params.ep_size <= kMaxRanks);
@@ -1175,8 +1242,6 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
         kernel_ptrs.active_rank_mask[w] = params.active_rank_mask[w];
     }
 
-    constexpr int kBlockSize = 256;
-
     int grid_size = params.local_num_tokens;
     if (grid_size == 0)
     {
@@ -1214,30 +1279,46 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
                 shared_bytes, maxOptinBytes);
         }
 
-        SWITCH_BOOL(params.enable_rank_mask, ENABLE_RANK_MASK,
-            {SWITCH_BOOL(params.enable_eplb, EPLB_STATS, SWITCH_TOP_K(params.top_k, TOP_K, {
-                auto kernel_fn = moeA2ADispatchKernel_Cft<TOP_K, EPLB_STATS, ENABLE_RANK_MASK>;
-                if (shared_bytes > kDefaultDynamicSmemBytes)
-                {
-                    TLLM_CUDA_CHECK(
-                        cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
-                }
-                launchWithPdlWhenEnabled("moeA2ADispatchKernel_Cft", kernel_fn, grid_size, kBlockSize, shared_bytes,
-                    params.stream, params.token_selected_experts, kernel_ptrs, params.num_payloads,
-                    params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank, params.ep_size,
-                    params.num_experts, params.eplb_stats_num_experts);
-            }))})
+        SWITCH_BOOL(params.enable_rank_mask, ENABLE_RANK_MASK, {
+            SWITCH_BOOL(params.enable_eplb, EPLB_STATS, {
+                SWITCH_TOP_K(params.top_k, TOP_K, {
+                    launch_with_fanout<TOP_K>(params.ep_size,
+                        [&](auto fanout)
+                        {
+                            constexpr int kMaxFanout = decltype(fanout)::value;
+                            auto kernel_fn = moeA2ADispatchKernel_Cft<TOP_K, EPLB_STATS, ENABLE_RANK_MASK, kMaxFanout>;
+                            if (shared_bytes > kDefaultDynamicSmemBytes)
+                            {
+                                TLLM_CUDA_CHECK(cudaFuncSetAttribute(
+                                    kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
+                            }
+                            launchWithPdlWhenEnabled("moeA2ADispatchKernel_Cft", kernel_fn, grid_size, kBlockSize,
+                                shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
+                                params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens,
+                                params.ep_rank, params.ep_size, params.num_experts, params.eplb_stats_num_experts);
+                        });
+                });
+            });
+        });
     }
     else
     {
-        SWITCH_BOOL(params.enable_rank_mask, ENABLE_RANK_MASK,
-            {SWITCH_BOOL(params.enable_eplb, EPLB_STATS, SWITCH_TOP_K(params.top_k, TOP_K, {
-                auto kernel_fn = moeA2ADispatchKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK>;
-                launchWithPdlWhenEnabled("moeA2ADispatchKernel", kernel_fn, grid_size, kBlockSize, shared_bytes,
-                    params.stream, params.token_selected_experts, kernel_ptrs, params.num_payloads,
-                    params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank, params.ep_size,
-                    params.num_experts, params.eplb_stats_num_experts);
-            }))})
+        SWITCH_BOOL(params.enable_rank_mask, ENABLE_RANK_MASK, {
+            SWITCH_BOOL(params.enable_eplb, EPLB_STATS, {
+                SWITCH_TOP_K(params.top_k, TOP_K, {
+                    launch_with_fanout<TOP_K>(params.ep_size,
+                        [&](auto fanout)
+                        {
+                            constexpr int kMaxFanout = decltype(fanout)::value;
+                            auto kernel_fn = moeA2ADispatchKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK, kMaxFanout>;
+                            launchWithPdlWhenEnabled("moeA2ADispatchKernel", kernel_fn, grid_size, kBlockSize,
+                                shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
+                                params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens,
+                                params.ep_rank, params.ep_size, params.num_experts, params.eplb_stats_num_experts);
+                        });
+                });
+            });
+        });
     }
 }
 
@@ -1496,6 +1577,113 @@ __device__ void vectorized_combine_impl(OutputT* dst_typed_base, int size_per_to
     }
 }
 
+// Compact routing contains only valid contributions, in their original top-k order.
+// Bound the register arrays by EP rather than top-k while retaining parallel loads.
+template <int VEC_SIZE, int GROUP_SIZE, typename OutputT, typename InputT>
+__device__ void vectorized_combine_compact_impl(
+    OutputT* output, int size_per_token, uint8_t const* const* sources, int source_count)
+{
+    using flashinfer::vec_t;
+    constexpr int kElements = VEC_SIZE / static_cast<int>(sizeof(InputT));
+    for (int offset = threadIdx.x * VEC_SIZE; offset < size_per_token; offset += blockDim.x * VEC_SIZE)
+    {
+        vec_t<float, kElements> values[GROUP_SIZE];
+#pragma unroll
+        for (int k = 0; k < GROUP_SIZE; ++k)
+        {
+            if (k < source_count)
+            {
+                reinterpret_cast<vec_t<InputT, kElements>&>(values[k]).load(
+                    reinterpret_cast<InputT const*>(sources[k] + offset));
+            }
+            else
+            {
+                values[k].fill(0.0f);
+            }
+        }
+#pragma unroll
+        for (int k = 0; k < GROUP_SIZE; ++k)
+        {
+            if (k < source_count)
+            {
+#pragma unroll
+                for (int j = kElements - 1; j >= 0; --j)
+                {
+                    values[k][j] = static_cast<float>(reinterpret_cast<InputT const*>(&values[k])[j]);
+                }
+            }
+        }
+#pragma unroll
+        for (int step = 1; step < GROUP_SIZE; step *= 2)
+        {
+#pragma unroll
+            for (int k = 0; k < GROUP_SIZE; k += 2 * step)
+            {
+                if (k + step < GROUP_SIZE)
+                {
+#pragma unroll
+                    for (int j = 0; j < kElements; ++j)
+                    {
+                        values[k][j] += values[k + step][j];
+                    }
+                }
+            }
+        }
+        values[0].cast_store(output + offset / static_cast<int>(sizeof(InputT)));
+    }
+}
+
+template <int TOP_K, int GROUP_SIZE, typename OutputT, typename InputT>
+__device__ void vectorized_combine_compact(OutputT* output, int size_per_token, int stride_per_token, int rank_id,
+    int max_tokens_per_rank, CombineKernelPointers const& ptrs)
+{
+    static_assert(TOP_K <= 32, "compact combine routing requires TOP_K <= warpSize");
+    static_assert(GROUP_SIZE > 0 && GROUP_SIZE <= TOP_K);
+    __shared__ uint8_t const* sources[GROUP_SIZE];
+    __shared__ int source_count;
+    if (threadIdx.x < warpSize)
+    {
+        int const k = threadIdx.x;
+        int const index = blockIdx.x * TOP_K + k;
+        int const send_index = k < TOP_K ? ptrs.topk_send_indices[index] : -1;
+        uint32_t const valid = __ballot_sync(~0U, send_index >= 0);
+        if (k == 0)
+        {
+            source_count = __popc(valid);
+        }
+        if (send_index >= 0)
+        {
+            int const peer = ptrs.topk_target_ranks[index];
+            int const compact_index = __popc(valid & ((1U << k) - 1U));
+            size_t const token = static_cast<size_t>(rank_id) * max_tokens_per_rank + send_index;
+            sources[compact_index] = static_cast<uint8_t const*>(ptrs.recv_buffers[peer][0]) + token * stride_per_token;
+        }
+    }
+    __syncthreads();
+
+    constexpr int kGroupSize = GROUP_SIZE;
+    if (size_per_token % 16 == 0)
+    {
+        vectorized_combine_compact_impl<16, kGroupSize, OutputT, InputT>(output, size_per_token, sources, source_count);
+    }
+    else if (size_per_token % 8 == 0)
+    {
+        vectorized_combine_compact_impl<8, kGroupSize, OutputT, InputT>(output, size_per_token, sources, source_count);
+    }
+    else if (size_per_token % 4 == 0)
+    {
+        vectorized_combine_compact_impl<4, kGroupSize, OutputT, InputT>(output, size_per_token, sources, source_count);
+    }
+    else if (size_per_token % 2 == 0)
+    {
+        vectorized_combine_compact_impl<2, kGroupSize, OutputT, InputT>(output, size_per_token, sources, source_count);
+    }
+    else if constexpr (sizeof(InputT) == 1)
+    {
+        vectorized_combine_compact_impl<1, kGroupSize, OutputT, InputT>(output, size_per_token, sources, source_count);
+    }
+}
+
 // Wrapper that selects vector width based on size_per_token alignment.
 // stride_per_token: byte distance between tokens in the recv buffer (may differ from
 // size_per_token when low-precision in-place data retains its payload-dtype workspace stride).
@@ -1695,7 +1883,7 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, void cons
 // Generic Combine Kernel Implementation (Templated by data type)
 // ============================================================================
 
-template <typename T, int TOP_K, bool LOW_PRECISION, bool ENABLE_RANK_MASK>
+template <typename T, int TOP_K, bool LOW_PRECISION, bool ENABLE_RANK_MASK, int MAX_FANOUT>
 __global__ void moeA2ACombineKernel(
     const CombineKernelPointers ptrs, // Combine-specific struct, src_data_ptrs[0] is output
     int max_tokens_per_rank, int elements_per_token, int local_num_tokens, int rank_id, int ep_size,
@@ -1805,8 +1993,16 @@ __global__ void moeA2ACombineKernel(
         return;
 
     T* token_output = static_cast<T*>(ptrs.src_data_ptrs[0]) + local_token_idx * elements_per_token;
-    vectorized_combine<TOP_K, T, InputT>(
-        token_output, size_per_token, stride_per_token, rank_id, max_tokens_per_rank, ptrs);
+    if constexpr (MAX_FANOUT > 0)
+    {
+        vectorized_combine_compact<TOP_K, MAX_FANOUT, T, InputT>(
+            token_output, size_per_token, stride_per_token, rank_id, max_tokens_per_rank, ptrs);
+    }
+    else
+    {
+        vectorized_combine<TOP_K, T, InputT>(
+            token_output, size_per_token, stride_per_token, rank_id, max_tokens_per_rank, ptrs);
+    }
 #if TLLM_MOE_A2A_COMPILE_SM90
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
@@ -1921,7 +2117,7 @@ __global__ void moeA2ACombinePushKernel_Cft(
 #endif
 }
 
-template <typename T, int TOP_K, bool LOW_PRECISION, bool ENABLE_RANK_MASK>
+template <typename T, int TOP_K, bool LOW_PRECISION, bool ENABLE_RANK_MASK, int MAX_FANOUT>
 __global__ void moeA2ACombineKernel_Cft(const CombineKernelPointers ptrs, int max_tokens_per_rank,
     int elements_per_token, int local_num_tokens, int rank_id, int ep_size)
 {
@@ -1999,8 +2195,16 @@ __global__ void moeA2ACombineKernel_Cft(const CombineKernelPointers ptrs, int ma
 #endif
 
         T* token_output = static_cast<T*>(ptrs.src_data_ptrs[0]) + local_token_idx * elements_per_token;
-        vectorized_combine<TOP_K, T, InputT>(
-            token_output, size_per_token, size_per_token, rank_id, max_tokens_per_rank, ptrs);
+        if constexpr (MAX_FANOUT > 0)
+        {
+            vectorized_combine_compact<TOP_K, MAX_FANOUT, T, InputT>(
+                token_output, size_per_token, size_per_token, rank_id, max_tokens_per_rank, ptrs);
+        }
+        else
+        {
+            vectorized_combine<TOP_K, T, InputT>(
+                token_output, size_per_token, size_per_token, rank_id, max_tokens_per_rank, ptrs);
+        }
     }
 
 #if !DISABLE_SYNC_FOR_PROFILING
@@ -2211,10 +2415,16 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
             SWITCH_DTYPE(params.dtype, T, {
                 SWITCH_BOOL(params.use_low_precision, LOW_PRECISION, {
                     SWITCH_TOP_K(params.top_k, TOP_K, {
-                        auto kernel_fn = moeA2ACombineKernel_Cft<T, TOP_K, LOW_PRECISION, ENABLE_RANK_MASK>;
-                        launchWithPdlWhenEnabled("moeA2ACombineKernel_Cft", kernel_fn, cft_grid, kBlockSize, 0,
-                            params.stream, kp, params.max_tokens_per_rank, params.elements_per_token,
-                            params.local_num_tokens, params.ep_rank, params.ep_size);
+                        launch_with_fanout<TOP_K>(params.ep_size,
+                            [&](auto fanout)
+                            {
+                                constexpr int kMaxFanout = decltype(fanout)::value;
+                                auto kernel_fn
+                                    = moeA2ACombineKernel_Cft<T, TOP_K, LOW_PRECISION, ENABLE_RANK_MASK, kMaxFanout>;
+                                launchWithPdlWhenEnabled("moeA2ACombineKernel_Cft", kernel_fn, cft_grid, kBlockSize, 0,
+                                    params.stream, kp, params.max_tokens_per_rank, params.elements_per_token,
+                                    params.local_num_tokens, params.ep_rank, params.ep_size);
+                            });
                     });
                 });
             });
@@ -2264,10 +2474,16 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
         SWITCH_DTYPE(params.dtype, T, {
             SWITCH_BOOL(params.use_low_precision, LOW_PRECISION, {
                 SWITCH_TOP_K(params.top_k, TOP_K, {
-                    auto kernel_fn = moeA2ACombineKernel<T, TOP_K, LOW_PRECISION, ENABLE_RANK_MASK>;
-                    launchWithPdlWhenEnabled("moeA2ACombineKernel", kernel_fn, grid, kBlockSize, 0, params.stream,
-                        kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token, params.local_num_tokens,
-                        params.ep_rank, params.ep_size, params.reduce_stride_per_token);
+                    launch_with_fanout<TOP_K>(params.ep_size,
+                        [&](auto fanout)
+                        {
+                            constexpr int kMaxFanout = decltype(fanout)::value;
+                            auto kernel_fn = moeA2ACombineKernel<T, TOP_K, LOW_PRECISION, ENABLE_RANK_MASK, kMaxFanout>;
+                            launchWithPdlWhenEnabled("moeA2ACombineKernel", kernel_fn, grid, kBlockSize, 0,
+                                params.stream, kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token,
+                                params.local_num_tokens, params.ep_rank, params.ep_size,
+                                params.reduce_stride_per_token);
+                        });
                 });
             });
         });
