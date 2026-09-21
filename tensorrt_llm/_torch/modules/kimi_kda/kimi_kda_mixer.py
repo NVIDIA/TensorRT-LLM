@@ -26,11 +26,14 @@ import torch
 from fla.modules import ShortConvolution
 from torch import nn
 
+from ....models.modeling_utils import QuantConfig
+from ....quantization import QuantAlgo
 from ...attention.backends import AttentionMetadata
 from ...distributed import AllReduce, AllReduceStrategy
 from ...model_config import ModelConfig
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ...utils import get_model_extra_attrs
+from ..linear import Linear
 from ..mamba.causal_conv1d import causal_conv1d_fn
 from ..mamba.fuse_elementwise_ops import extract_transpose_prefill_slice
 from ..mamba.layernorm_gated import RMSNorm, rms_norm_gated_token_major
@@ -63,7 +66,28 @@ def _meta_safe_cast_dtype(module: nn.Module, dtype: torch.dtype) -> None:
             return torch.empty_like(tensor, dtype=dtype)
         return tensor.to(dtype=dtype)
 
-    module._apply(_cast)
+    for child in module.children():
+        if isinstance(child, Linear) and child.has_fp8_block_scales:
+            continue
+        child._apply(_cast)
+    for name, param in module.named_parameters(recurse=False):
+        param.data = _cast(param.data)
+
+
+def _stage_state_rows(ssm_pool: torch.Tensor, slot_indices: torch.Tensor) -> torch.Tensor:
+    """Dense fp32 copy of the addressed recurrent-state rows.
+
+    The fp32-only consumers (indexed prefill kernel, fused decode kernel) run on
+    this copy when the pool is bf16; ``_writeback_state_rows`` rounds it back.
+    """
+    return ssm_pool.index_select(0, slot_indices.long()).float()
+
+
+def _writeback_state_rows(
+    ssm_pool: torch.Tensor, slot_indices: torch.Tensor, rows: torch.Tensor
+) -> None:
+    """Scatter dense state rows back into the pool, rounded to the pool dtype."""
+    ssm_pool.index_copy_(0, slot_indices.long(), rows.to(ssm_pool.dtype))
 
 
 def _kda_split_conv_sections(
@@ -155,12 +179,44 @@ class KimiKDALinearAttention(nn.Module):
         projection_size = self.num_heads * self.head_dim
         self.proj_size = projection_size
 
+        projection_quant_configs = (model_config.quant_config_dict or {}) if model_config else {}
+        default_quant_config = (
+            model_config.quant_config if model_config else None
+        ) or QuantConfig()
+        fp8_projections = ("q_proj", "k_proj", "v_proj", "g_proj", "o_proj")
+        declared = [
+            projection_quant_configs.get(name, default_quant_config).quant_algo
+            for name in fp8_projections
+        ]
+        if any(algo is not None for algo in declared) and not all(
+            algo == QuantAlgo.FP8_BLOCK_SCALES for algo in declared
+        ):
+            raise ValueError("KDA requires all q/k/v/g/o projections to be declared FP8 together")
+
+        def projection(name: str, in_features: int, out_features: int) -> nn.Module:
+            quant_config = projection_quant_configs.get(name, default_quant_config)
+            if quant_config.quant_algo is None:
+                return nn.Linear(in_features, out_features, bias=False)
+            if in_features % 128 or out_features % 128:
+                raise ValueError("KDA FP8 projection shards must be aligned to 128x128 blocks")
+            return Linear(
+                in_features,
+                out_features,
+                bias=False,
+                dtype=torch.bfloat16,
+                quant_config=quant_config,
+                reduce_output=False,
+                use_cute_dsl_blockscaling_mm=(
+                    model_config.use_cute_dsl_blockscaling_mm if model_config else False
+                ),
+            )
+
         # Keep the logical projections separate for checkpoint-compatible
         # parameter names and portable fallbacks. After weight loading, the
         # Blackwell path aliases them into one fused QKVG weight buffer.
-        self.q_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
+        self.q_proj = projection("q_proj", self.hidden_size, projection_size)
+        self.k_proj = projection("k_proj", self.hidden_size, projection_size)
+        self.v_proj = projection("v_proj", self.hidden_size, projection_size)
         self.q_conv1d = ShortConvolution(
             hidden_size=projection_size, kernel_size=self.conv_size, activation="silu"
         )
@@ -193,14 +249,14 @@ class KimiKDALinearAttention(nn.Module):
         self.b_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
 
         if self.use_full_rank_gate:
-            self.g_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
+            self.g_proj = projection("g_proj", self.hidden_size, projection_size)
         else:
             self.g_a_proj = nn.Linear(self.hidden_size, self.head_dim, bias=False)
             self.g_b_proj = nn.Linear(self.head_dim, projection_size, bias=False)
         self.o_norm = RMSNorm(self.head_dim, eps=self.rms_norm_eps)
         if not self.o_norm.weight.is_meta:
             nn.init.ones_(self.o_norm.weight)
-        self.o_proj = nn.Linear(projection_size, self.hidden_size, bias=False)
+        self.o_proj = projection("o_proj", projection_size, self.hidden_size)
         # Installed together by the FP8 weight loader as the fused
         # [q | k | v | g] projection and its output-section metadata.
         self.qkvg_proj: Optional[nn.Module] = None
@@ -217,8 +273,7 @@ class KimiKDALinearAttention(nn.Module):
 
         # Fused prefill/decode/verify projection weights, built after checkpoint
         # load. BF16 uses separate fused [q | k | v | g] and [f_a | b]
-        # GEMMs; FP8 supplies qkvg through the fused projection and reuses the
-        # BF16 [f_a | b] weight.
+        # GEMMs; FP8 fuses QKVG from checkpoint codes/scales and keeps BFA BF16.
         self._qkvg_proj_weight: Optional[torch.Tensor] = None
         self._bfa_proj_weight: Optional[torch.Tensor] = None
         self._w_q_t = self._w_k_t = self._w_v_t = None
@@ -262,20 +317,52 @@ class KimiKDALinearAttention(nn.Module):
         if self.q_proj.weight.device.type != "cuda":
             return
         with torch.no_grad():
-            qkvg_modules = (
-                self.q_proj,
-                self.k_proj,
-                self.v_proj,
-                self.g_proj,
+            qkvg_modules = (self.q_proj, self.k_proj, self.v_proj, self.g_proj)
+            if all(isinstance(module, nn.Linear) for module in qkvg_modules):
+                self._qkvg_proj_weight = self._merge_projection_weights(qkvg_modules)
+            elif all(
+                isinstance(module, Linear) and module.has_fp8_block_scales
+                for module in qkvg_modules
+            ):
+                self.qkvg_proj = self._fuse_checkpoint_projections(qkvg_modules)
+                self.qkvg_split_sizes = [module.out_features for module in qkvg_modules]
+            self._bfa_proj_weight = self._merge_projection_weights(
+                (self.f_a_proj, self.b_proj), pad_rows_to=8
             )
-            qkvg_weight = self._merge_projection_weights(qkvg_modules)
-            # Eight BF16 outputs occupy 16 bytes, so padding keeps each output row
-            # aligned for vectorized f_b consumption; it is not a kernel requirement.
-            bfa_weight = self._merge_projection_weights((self.f_a_proj, self.b_proj), pad_rows_to=8)
             self._build_decode_kernel_constants()
-            self._bfa_proj_weight = bfa_weight
-            # Publish last: both weights are required by the BF16 fast path.
-            self._qkvg_proj_weight = qkvg_weight
+
+    @staticmethod
+    def _fuse_checkpoint_projections(modules: tuple[Linear, ...]) -> Linear:
+        """Fuse block-aligned checkpoint pairs before backend scale preparation."""
+        if any(module.out_features % 128 for module in modules[:-1]):
+            raise ValueError("KDA FP8 fusion boundaries must be aligned to 128 rows")
+        first = modules[0]
+        with torch.device(first.weight.device):
+            fused = Linear(
+                first.in_features,
+                sum(module.out_features for module in modules),
+                bias=False,
+                dtype=torch.bfloat16,
+                quant_config=first.quant_config,
+                reduce_output=False,
+                use_cute_dsl_blockscaling_mm=first.use_cute_dsl_blockscaling_mm,
+            )
+        offset = 0
+        scale_offset = 0
+        for module in modules:
+            rows = module.weight.shape[0]
+            fused.weight.data[offset : offset + rows].copy_(module.weight.data)
+            offset += rows
+            scale_rows = module.weight_scale.shape[0]
+            fused.weight_scale.data[scale_offset : scale_offset + scale_rows].copy_(
+                module.weight_scale.data
+            )
+            scale_offset += scale_rows
+        fused.input_scale.data = first.input_scale.data
+        fused.inv_input_scale.data = first.inv_input_scale.data
+        # DeepGEMM resmooths codes in place. The model loader aliases the
+        # projection views only after each scale grid has been prepared.
+        return fused
 
     @staticmethod
     def _merge_projection_weights(
@@ -295,7 +382,7 @@ class KimiKDALinearAttention(nn.Module):
         return fused
 
     def _build_decode_kernel_constants(self) -> None:
-        """Kernel-layout constants shared by both finalize variants."""
+        """Kernel-layout constants shared by BF16 and FP8 projections."""
         self._w_q_t = (
             self.q_conv1d.weight.detach().squeeze(1).transpose(0, 1).to(torch.bfloat16).contiguous()
         )
@@ -311,31 +398,6 @@ class KimiKDALinearAttention(nn.Module):
         # Build the fused-verify conv constants eagerly too, so the first
         # verify call never allocates (a capture-unsafe lazy allocation).
         self._build_mtp_conv_weights()
-
-    def finalize_decode_weights_fp8(self) -> None:
-        """FP8 counterpart of ``finalize_decode_weights()``.
-
-        Runs AFTER ``_convert_kda_projections_to_fp8_weight_read``, so
-        q/k/v/g already live in the fused FP8 ``qkvg_proj`` GEMM. Only the
-        two small BF16 projections reading the same hidden — ``f_a_proj`` and
-        ``b_proj`` — are fused here into one ``[f_a | b]`` weight, with the
-        source parameters repointed to row views. Prefill, decode, and
-        verification then share both fused projections; the kernel-layout
-        constants are decode-only.
-        """
-        if self._dispatch.decode_kernel_path != "optimized" or not self.use_full_rank_gate:
-            return
-        fused_qkvg = self.qkvg_proj
-        split_sizes = self.qkvg_split_sizes
-        if fused_qkvg is None or split_sizes is None or len(split_sizes) != 4:
-            return
-        if self.f_a_proj.weight.device.type != "cuda":
-            return
-        with torch.no_grad():
-            bfa_weight = self._merge_projection_weights((self.f_a_proj, self.b_proj), pad_rows_to=8)
-            self._build_decode_kernel_constants()
-            # Publish last: enables fused [f_a | b] in prefill/decode/verify.
-            self._bfa_proj_weight = bfa_weight
 
     def forward(
         self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
@@ -375,7 +437,7 @@ class KimiKDALinearAttention(nn.Module):
 
         layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
         conv_pool = layer_cache.conv  # [slots, 3D, W - 1] bf16
-        ssm_pool = layer_cache.temporal  # [slots, H, V, K] fp32
+        ssm_pool = layer_cache.temporal  # [slots, H, V, K] fp32 or bf16
         generation_state_indices = getattr(mamba_metadata, "generation_state_indices", None)
         if generation_state_indices is None:
             generation_state_indices = state_indices[num_prefills:]
@@ -525,22 +587,41 @@ class KimiKDALinearAttention(nn.Module):
         # and for prefix-cache hits (block reuse), where the previous
         # conv/recurrent state was onboarded into this request's slot.
         has_init = mamba_metadata.has_initial_states[:num_prefills]
+        slot_indices_long = slot_indices.long()
+        # The indexed prefill op updates fp32 V-first pool rows in place, so
+        # ``can_use_indexed_prefill`` rejects a bf16 pool outright. Staging the
+        # addressed rows through a dense fp32 copy keeps prefill on that
+        # fixed-configuration kernel instead of dropping it onto the FLA
+        # fallback, whose Triton kernels are autotuned per process and
+        # therefore do not reproduce run to run. The copy is rounded back into
+        # the pool once the kernel has finished with it.
+        staged_state = None
+        kernel_pool, kernel_indices = ssm_pool, slot_indices
+        if ssm_pool.dtype != torch.float32:
+            staged_state = _stage_state_rows(ssm_pool, slot_indices_long)
+            kernel_pool = staged_state
+            # Staged rows are dense, so the kernel addresses them by position.
+            kernel_indices = mamba_metadata._arange_buffer[:num_prefills]
         use_indexed_state = self._dispatch.can_use_indexed_prefill(
-            state_pool=ssm_pool,
-            state_indices=slot_indices,
+            state_pool=kernel_pool,
+            state_indices=kernel_indices,
             has_initial_states=has_init,
             cu_seqlens=cu_seqlens,
             num_sequences=num_prefills,
             num_tokens=x2d.shape[0],
             chunk_indices=chunk_indices,
         )
-        slot_indices_long = slot_indices.long()
         recurrent_in = None
         if use_indexed_state:
             # The packed convolution clears fresh convolution rows itself.
-            reset_recurrent_state_rows(ssm_pool, slot_indices, has_init)
+            reset_recurrent_state_rows(kernel_pool, kernel_indices, has_init)
         elif mamba_metadata.use_initial_states:
-            recurrent_in = ssm_pool.index_select(0, slot_indices_long)
+            # The FLA core carries the state in fp32 (no-op for fp32 pools).
+            recurrent_in = (
+                staged_state
+                if staged_state is not None
+                else _stage_state_rows(ssm_pool, slot_indices_long)
+            )
             recurrent_in[~has_init] = 0
 
         # Reuse GDN's packed variable-length causal convolution. It reads
@@ -590,17 +671,19 @@ class KimiKDALinearAttention(nn.Module):
             lower_bound=lower_bound,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
-            state_pool=ssm_pool if use_indexed_state else None,
-            state_indices=slot_indices if use_indexed_state else None,
+            state_pool=kernel_pool if use_indexed_state else None,
+            state_indices=kernel_indices if use_indexed_state else None,
             varlen_is_aligned=varlen_is_aligned,
             single_sequence_length=single_sequence_length,
         )
 
         # The packed convolution persisted the live convolution pool in place.
         if final_state is not None:
-            ssm_pool.index_copy_(0, slot_indices_long, final_state.to(ssm_pool.dtype))
+            _writeback_state_rows(ssm_pool, slot_indices_long, final_state)
         else:
             assert use_indexed_state
+            if staged_state is not None:
+                _writeback_state_rows(ssm_pool, slot_indices_long, staged_state)
         # Fused-verify replay caches: seed the committed conv window so the
         # first verify round convolves the correct history (pending drafts
         # are zero for a fresh request, so the tail columns are unused).
@@ -648,7 +731,6 @@ class KimiKDALinearAttention(nn.Module):
             or not has_qkvg_projection
             or self._bfa_proj_weight is None
             or mamba_metadata is None
-            or ssm_pool.dtype != torch.float32
             or ssm_state_indices is None
         ):
             return self.forward_decode_fallback(
@@ -664,6 +746,21 @@ class KimiKDALinearAttention(nn.Module):
         hd = self.head_dim
         H = self.num_heads
         B = x2d.shape[0]
+
+        # The fused decode kernel updates fp32 state rows in place, addressing the
+        # conv and state pools with the same slot indices. A bf16 pool is staged
+        # through dense copies of the addressed rows (fp32 state, conv window as
+        # is), the kernel runs in its batch-dense form on them and the rows are
+        # written back (state rounded), which keeps the fused projections and
+        # kernel-native layouts of this path instead of the portable fallback.
+        staged_state = staged_conv = None
+        slots_long = None
+        kernel_state, kernel_state_indices, conv_src = ssm_pool, ssm_state_indices, conv_pool
+        if ssm_pool.dtype != torch.float32:
+            slots_long = slot_indices.long()
+            staged_state = _stage_state_rows(ssm_pool, slots_long)
+            staged_conv = conv_pool.index_select(0, slots_long)
+            kernel_state, kernel_state_indices, conv_src = staged_state, None, staged_conv
 
         # kda_decode is inplace-only. BCG supplies its graph-owned core buffer;
         # eager decode uses a persistent buffer whose pointer remains stable
@@ -723,9 +820,9 @@ class KimiKDALinearAttention(nn.Module):
 
         # Section views retain the live pool's slot stride, including V2
         # manager padding. The kernel uses ssm_state_indices for both pools.
-        cs_q = conv_pool[:, :d]
-        cs_k = conv_pool[:, d : 2 * d]
-        cs_v = conv_pool[:, 2 * d :]
+        cs_q = conv_src[:, :d]
+        cs_k = conv_src[:, d : 2 * d]
+        cs_v = conv_src[:, 2 * d :]
 
         o = self._dispatch.decode_kda(
             x_q=x_qkvg[:, :d].unflatten(-1, (H, hd)).unsqueeze(0),
@@ -744,11 +841,11 @@ class KimiKDALinearAttention(nn.Module):
             g=g.unflatten(-1, (H, hd)).unsqueeze(0),
             dt_bias=self._dt_bias_f32,
             beta=beta.unsqueeze(0),
-            state=ssm_pool,
+            state=kernel_state,
             onorm_g=x_qkvg[:, 3 * d :].unflatten(-1, (H, hd)).unsqueeze(0),
             onorm_weight=self._onorm_w_f32,
             out=kda_out,
-            ssm_state_indices=ssm_state_indices,
+            ssm_state_indices=kernel_state_indices,
             cu_seqlens=mamba_metadata._arange_buffer[: B + 1],
             scale=hd**-0.5,
             onorm_eps=self.o_norm.eps,
@@ -757,6 +854,9 @@ class KimiKDALinearAttention(nn.Module):
             verbose=False,
             update_conv_cache=True,
         )
+        if staged_state is not None:
+            conv_pool.index_copy_(0, slots_long, staged_conv)
+            _writeback_state_rows(ssm_pool, slots_long, staged_state)
         # Fused-verify replay caches (spec decoding only): keep the
         # committed conv window in sync with the plain-decode advance.
         self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool)
@@ -787,10 +887,14 @@ class KimiKDALinearAttention(nn.Module):
         x = x2d.unsqueeze(1)  # [B, 1, hidden]
         cs = conv_pool.index_select(0, slot_indices_long)
         conv_q, conv_k, conv_v = _kda_split_conv_sections(cs, d)
+        if ssm_pool.dtype != torch.float32:
+            # The decode kernel and the FLA core carry the state in fp32:
+            # gather and widen the rows here, narrow on the write-back below.
+            ssm_state_indices = None
         state = (
             ssm_pool
             if ssm_state_indices is not None
-            else ssm_pool.index_select(0, slot_indices_long)
+            else _stage_state_rows(ssm_pool, slot_indices_long)
         )
 
         q_proj = self.q_proj(x)
@@ -894,7 +998,7 @@ class KimiKDALinearAttention(nn.Module):
             torch.cat([new_conv_q, new_conv_k, new_conv_v], dim=1).to(conv_pool.dtype),
         )
         if ssm_state_indices is None:
-            ssm_pool.index_copy_(0, slot_indices_long, state.to(ssm_pool.dtype))
+            _writeback_state_rows(ssm_pool, slot_indices_long, state)
         # Fused-verify replay caches: keep the committed conv window in
         # sync with the plain-decode advance. NOTE: this path is only
         # correct for requests with no pending accepted drafts
@@ -1120,7 +1224,7 @@ class KimiKDALinearAttention(nn.Module):
             raise RuntimeError(
                 "Kimi K3 fused-verify conv weights were not prebuilt; call "
                 "_build_mtp_conv_weights() (done by load_weights() and by "
-                "finalize_decode_weights() / finalize_decode_weights_fp8()) "
+                "finalize_decode_weights()) "
                 "after weight load and before the first verify step."
             )
         return cached
@@ -1174,7 +1278,7 @@ class KimiKDALinearAttention(nn.Module):
         conv_q = _kda_expand_fla_conv_cache(conv_q)
         conv_k = _kda_expand_fla_conv_cache(conv_k)
         conv_v = _kda_expand_fla_conv_cache(conv_v)
-        state = ssm_pool.index_select(0, slot_indices_long)
+        state = _stage_state_rows(ssm_pool, slot_indices_long)
 
         step_outputs: List[torch.Tensor] = []
         for t in range(num_steps):

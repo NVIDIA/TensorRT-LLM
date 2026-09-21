@@ -31,10 +31,10 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from .activation import ActivationParamShape, MoEActivation, activation_constant_names
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+from .fused_moe_cute_dsl_fc12 import TrtllmCutedslFusedFc12Nvfp4Impl
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepgemmCudaFp8BlockScalesImpl
-from .fused_moe_densegemm import DenseGEMMFusedMoE
-from .fused_moe_marlin import MarlinFusedMoE
+from .fused_moe_densegemm import TrtllmCutedslDenseGemmNvfp4Impl
 from .fused_moe_triton import TritonFusedMoE
 from .fused_moe_vanilla import VanillaMoE
 from .impl_base import MoEImplBase
@@ -52,7 +52,8 @@ from .impl_contract import (
 from .impl_environment import collect_moe_environment
 from .impl_identity import MOE_IMPL_REGISTRY, MoEImplId, MoEImplQuery
 from .interface import MoE
-from .mega_moe import DeepgemmCudaW4a8Mxfp4Mxfp8Impl, MegaMoECuteDsl
+from .marlin import MarlinCudaNvfp4Impl, MarlinCudaW4a16Nvfp4Impl
+from .mega_moe import DeepgemmCudaW4a8Mxfp4Mxfp8Impl, TrtllmCutedslMegaMoeNvfp4Impl
 from .moe_load_balancer import get_moe_load_balancer
 from .trtllm_gen import (
     FlashinferTrtllmGenBf16Impl,
@@ -89,14 +90,15 @@ MoEImplClass = type[MoE] | type[MoEImplBase] | type[VanillaMoE]
 # intersect their candidate set with this tuple -- ``_candidates_for`` against a
 # BACKEND_FAMILY entry, ``_candidates_for_impl_id`` against the registry -- so a
 # class missing from here resolves to an empty candidate list.
-# The DeepGEMM entries use the identity-derived names rather than the
-# ``DeepGemmFusedMoE`` / ``MegaMoEDeepGemm`` aliases, so what is ranked here
-# reads the same as what a resolution report prints.
+# The registered entries use the identity-derived names rather than the
+# ``DeepGemmFusedMoE`` / ``MegaMoEDeepGemm`` / ``MegaMoECuteDsl`` aliases, so
+# what is ranked here reads the same as what a resolution report prints.
 IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     CuteDslB12xFusedMoE,  # SM120/121 NVFP4 decode only -- narrowest, so first
     DeepgemmCudaW4a8Mxfp4Mxfp8Impl,  # ahead of plain CuteDSL / DeepGEMM: better perf when eligible
-    MegaMoECuteDsl,
+    TrtllmCutedslMegaMoeNvfp4Impl,
     CuteDslFusedMoE,
+    TrtllmCutedslFusedFc12Nvfp4Impl,
     # The TRTLLM-Gen leaves. FlashInfer sits ahead of the native leaf
     # for the same format because the opt-in flag is what selects it: with the
     # flag unset every FlashInfer leaf rejects in ``check_flashinfer_provider``
@@ -116,8 +118,9 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     TrtllmTrtllmGenW4a8Nvfp4Fp8Impl,
     TrtllmTrtllmGenW4a8Mxfp4Fp8Impl,
     DeepgemmCudaFp8BlockScalesImpl,
-    DenseGEMMFusedMoE,
-    MarlinFusedMoE,
+    TrtllmCutedslDenseGemmNvfp4Impl,
+    MarlinCudaNvfp4Impl,
+    MarlinCudaW4a16Nvfp4Impl,
     TritonFusedMoE,
     CutlassFusedMoE,  # widest coverage, hence the fallback
     VanillaMoE,  # reference implementation, never preferred
@@ -129,10 +132,11 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
 BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
     "CUTLASS": frozenset({CutlassFusedMoE}),
     "VANILLA": frozenset({VanillaMoE}),
-    "MARLIN": frozenset({MarlinFusedMoE}),
+    "MARLIN": frozenset({MarlinCudaNvfp4Impl, MarlinCudaW4a16Nvfp4Impl}),
     "CUTEDSL": frozenset({CuteDslB12xFusedMoE, CuteDslFusedMoE}),
+    "CUTEDSL_FC12": frozenset({TrtllmCutedslFusedFc12Nvfp4Impl}),
     "DEEPGEMM": frozenset({DeepgemmCudaFp8BlockScalesImpl}),
-    "DENSEGEMM": frozenset({DenseGEMMFusedMoE}),
+    "DENSEGEMM": frozenset({TrtllmCutedslDenseGemmNvfp4Impl}),
     # The coarse literal still names the whole family, so ``moe_backend:
     # TRTLLM`` keeps meaning "any TRTLLM-Gen leaf" and IMPL_PRIORITY picks
     # which. A pinned ``impl_id`` names exactly one of them.
@@ -153,7 +157,7 @@ BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
     ),
     "TRITON": frozenset({TritonFusedMoE}),
     "MEGAMOE_DEEPGEMM": frozenset({DeepgemmCudaW4a8Mxfp4Mxfp8Impl}),
-    "MEGAMOE_CUTEDSL": frozenset({MegaMoECuteDsl}),
+    "MEGAMOE_CUTEDSL": frozenset({TrtllmCutedslMegaMoeNvfp4Impl}),
 }
 
 # Catch table drift at import time.

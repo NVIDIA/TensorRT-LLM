@@ -561,6 +561,8 @@ public:
     float mSkipSoftmaxThresholdScaleFactorDecode = 0;
     // Skip correction when the row-max increase is within this base-2 threshold.
     float mSkipCorrectionThreshold = 0;
+    // Use spcompress (context phase, SM107 only).
+    bool mUsesSpcompress = false;
     // Optional SageAttention block sizes.
     // Currently, these are only consumed by the TllmGen backend path.
     int mSageAttnNumEltsPerBlkQ = 0;
@@ -591,7 +593,7 @@ public:
             mUlyssesMQABroadcast, mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache,
             mSkipAttn, mFuseFp4Quant, mFusesDsv4InvRopeFp8Quant, mNbMultiBlockSemaphores,
             mAttentionChunkSize.value_or(-1), mSkipSoftmaxThresholdScaleFactorPrefill,
-            mSkipSoftmaxThresholdScaleFactorDecode, mSkipCorrectionThreshold, mSageAttnNumEltsPerBlkQ,
+            mSkipSoftmaxThresholdScaleFactorDecode, mSkipCorrectionThreshold, mUsesSpcompress, mSageAttnNumEltsPerBlkQ,
             mSageAttnNumEltsPerBlkK, mSageAttnNumEltsPerBlkV, mSageAttnQkInt8);
     };
 

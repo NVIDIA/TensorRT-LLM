@@ -756,14 +756,7 @@ def set_strides(workspace: torch.Tensor, g: int, m: int, k: int):
 class DeepgemmCudaFp8BlockScalesImpl(MoEImplBase):
     """``deepgemm.cuda.grouped_gemm.fp8_block_scales``.
 
-    DeepGEMM masked grouped GEMM over FP8 block scales, SM100/SM103/SM107. One
-    class carries the identity and the whole contract: construction, the
-    pooled memory buffers, workspace sizing, eligibility, quantization, and
-    ``run_moe``. That is the shape ``MOE_DEVELOPER_GUIDE.md`` asks for while
-    a backend supports a single quantization format -- an abstract parent
-    would carry no identity, implement nothing, and have one subclass.
-
-    ``DeepGemmFusedMoE`` below is an alias onto this class.
+    DeepGEMM masked grouped GEMM over FP8 block scales, SM100/SM103/SM107.
 
     Args:
         num_experts (int): Number of experts in the MoE layer.

@@ -139,9 +139,9 @@ class CutlassFusedMoE(MoEImplBase):
             "sm_constraint": ("in", {90, 120}),
             "dtypes": {torch.bfloat16},
         },
-        # NVFP4: SM in {100, 103, 120, 121}
+        # NVFP4: SM in {100, 103, 107, 120, 121}
         QuantAlgo.NVFP4: {
-            "sm_constraint": ("in", {100, 103, 120, 121}),
+            "sm_constraint": ("in", {100, 103, 107, 120, 121}),
             "dtypes": {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
         },
         # W4A16_NVFP4: weights stay NVFP4 but are dequantized to the activation
@@ -166,14 +166,14 @@ class CutlassFusedMoE(MoEImplBase):
             "sm_constraint": ("exact", 90),
             "dtypes": {torch.float16, torch.bfloat16},
         },
-        # W4A8_MXFP4_FP8: SM in {100, 103}
+        # W4A8_MXFP4_FP8: SM in {100, 103, 107}
         QuantAlgo.W4A8_MXFP4_FP8: {
-            "sm_constraint": ("in", {100, 103}),
+            "sm_constraint": ("in", {100, 103, 107}),
             "dtypes": {torch.float16, torch.bfloat16, torch.float32},
         },
-        # W4A8_MXFP4_MXFP8: SM in {100, 103, 120, 121}
+        # W4A8_MXFP4_MXFP8: SM in {100, 103, 107, 120, 121}
         QuantAlgo.W4A8_MXFP4_MXFP8: {
-            "sm_constraint": ("in", {100, 103, 120, 121}),
+            "sm_constraint": ("in", {100, 103, 107, 120, 121}),
             "dtypes": {torch.float16, torch.bfloat16},
         },
         # MXFP8 (W8A8 e4m3xe4m3 with UE8M0 1x32 block scales): SM in {100, 103}.
