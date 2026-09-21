@@ -210,7 +210,17 @@ def _stub_agents(
         # from; the orchestrator gates on it, because a report can exist and
         # still carry no measurement.
         _write_baseline_result_json(workflow.baseline_dir)
-        _append({"step": 1, "agent": "benchmarker", "summary": "b"})
+        _append(
+            {
+                "step": 1,
+                "agent": "benchmarker",
+                "summary": "b",
+                "measurement_status": "MEASURED",
+                "target_metric": "output_throughput",
+                "target_metric_value": 100.0,
+                "metric_source": "baseline/result.json",
+            }
+        )
 
     def projector(state):
         trace.append("projector")
@@ -4462,6 +4472,7 @@ def _workflow_with_baseline(tmp_path, results: dict | None, *, metric="output_th
     wf.baseline_dir = baseline
     wf.baseline_results_path = baseline / "benchmark_results.md"
     wf._optimize_block = lambda: {"target_metric": metric}
+    wf._task_data = lambda: {"benchmark": {"type": "builtin"}}
     return wf
 
 
@@ -4487,6 +4498,77 @@ def test_baseline_gate_ignores_unreadable_json(tmp_path):
     wf = _workflow_with_baseline(tmp_path, {"output_throughput": 1.0})
     (wf.baseline_dir / "junk.json").write_text("\x00not json\x00", encoding="utf-8")
     wf._require_baseline_measurement()  # the good one still counts
+
+
+def test_external_baseline_gate_does_not_parse_benchmark_artifacts(tmp_path):
+    wf = _workflow_with_baseline(tmp_path, None, metric="tps_user_p10")
+    wf._task_data = lambda: {
+        "benchmark": {
+            "type": "external",
+            "path": "/opt/aiperf",
+            "command": "aiperf benchmark",
+            "notes": "Metric is in stdout.",
+        }
+    }
+
+    wf._require_baseline_measurement()  # structured progress is the external handoff
+
+
+def _workflow_with_benchmarker_handoff(tmp_path, entry: dict):
+    from agent_flow.workflows.perf_optimize.workflow import PerfOptimizeWorkflow
+
+    wf = PerfOptimizeWorkflow.__new__(PerfOptimizeWorkflow)
+    wf.progress_path = tmp_path / "progress.yaml"
+    progress_module.write_progress(wf.progress_path, {"optimization": [entry]})
+    wf._optimize_block = lambda: {"target_metric": "tps_user_p10"}
+    return wf
+
+
+def test_benchmarker_metric_handoff_accepts_a_finite_value(tmp_path):
+    wf = _workflow_with_benchmarker_handoff(
+        tmp_path,
+        {
+            "agent": "benchmarker",
+            "measurement_status": "MEASURED",
+            "target_metric": "tps_user_p10",
+            "target_metric_value": 712.4,
+            "metric_source": "aiperf stdout",
+        },
+    )
+
+    wf._require_benchmarker_metric_handoff()
+
+
+def test_benchmarker_metric_handoff_stops_when_target_is_missing(tmp_path):
+    wf = _workflow_with_benchmarker_handoff(
+        tmp_path,
+        {
+            "agent": "benchmarker",
+            "measurement_status": "TARGET_METRIC_MISSING",
+            "target_metric": "tps_user_p10",
+            "metric_source": "aiperf stdout and report.json",
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="could not find.*tps_user_p10"):
+        wf._require_benchmarker_metric_handoff()
+
+
+@pytest.mark.parametrize("value", [None, True, float("nan"), float("inf")])
+def test_benchmarker_metric_handoff_rejects_non_finite_values(tmp_path, value):
+    wf = _workflow_with_benchmarker_handoff(
+        tmp_path,
+        {
+            "agent": "benchmarker",
+            "measurement_status": "MEASURED",
+            "target_metric": "tps_user_p10",
+            "target_metric_value": value,
+            "metric_source": "aiperf stdout",
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="finite numeric value"):
+        wf._require_benchmarker_metric_handoff()
 
 
 # --------------------------------------------------------------------------- #

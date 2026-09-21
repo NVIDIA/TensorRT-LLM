@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 import shutil
 import time
@@ -23,7 +24,12 @@ from agent_flow.workflows.perf_analyze.sol_methodology import (
     output_instruction,
     projector_instruction,
 )
-from agent_flow.workflows.perf_analyze.task_schema import CASEBOOK_SKILL_NAMES, casebook_enabled
+from agent_flow.workflows.perf_analyze.task_schema import (
+    CASEBOOK_SKILL_NAMES,
+    EXTERNAL_BENCHMARK,
+    benchmark_type,
+    casebook_enabled,
+)
 from agent_flow.workflows.perf_analyze.workflow import clear_stale_benchmark_results
 
 from . import gitops, kernel_ledger, nsys_items, reuse, roadmap_schema
@@ -403,6 +409,7 @@ class PerfOptimizeWorkflow:
                 clear_stale_benchmark_results(self.baseline_dir)
                 self._run_benchmarker(state)
                 self._require_stage_outputs(STAGE_BENCHMARKER, [self.baseline_results_path])
+                self._require_benchmarker_metric_handoff()
                 self._require_baseline_measurement()
                 state.benchmarker_done = True
                 state.stage = STAGE_PROJECTOR
@@ -1576,7 +1583,7 @@ class PerfOptimizeWorkflow:
         )
 
     def _require_baseline_measurement(self) -> None:
-        """Fail loudly when the baseline stage produced no measurement.
+        """Require the builtin benchmark's result JSON to carry the metric.
 
         ``_require_stage_outputs`` only proves the report exists. A report
         can exist and still carry no numbers: the benchmarker is required
@@ -1591,6 +1598,9 @@ class PerfOptimizeWorkflow:
         the prose: at least one result JSON under ``baseline/`` must carry
         the target metric.
         """
+        if benchmark_type(self._task_data()) == EXTERNAL_BENCHMARK:
+            return
+
         metric = str(self._optimize_block()["target_metric"])
         for path in sorted(self.baseline_dir.rglob("*.json")):
             try:
@@ -1608,6 +1618,45 @@ class PerfOptimizeWorkflow:
             f"a configuration that cannot serve a request. Fix the blocker and "
             f"re-run to retry the baseline, or pass --clean to start over."
         )
+
+    def _require_benchmarker_metric_handoff(self) -> None:
+        """Stop the campaign when the benchmarker could not resolve its target metric."""
+        expected = str(self._optimize_block()["target_metric"])
+        entry = latest_entry(self.progress_path, "benchmarker")
+        if entry is None:
+            raise RuntimeError(
+                "the benchmarker did not submit its target-metric handoff; "
+                "re-run the workflow to retry the baseline"
+            )
+
+        reported = entry.get("target_metric")
+        if reported != expected:
+            raise RuntimeError(
+                f"the benchmarker reported target metric {reported!r}, but "
+                f"optimize.target_metric is {expected!r}; the flow is stopped"
+            )
+
+        source = str(entry.get("metric_source") or "benchmark output")
+        if entry.get("measurement_status") == "TARGET_METRIC_MISSING":
+            raise RuntimeError(
+                f"the benchmarker could not find optimize.target_metric "
+                f"{expected!r} in {source}; the flow is stopped"
+            )
+        if entry.get("measurement_status") != "MEASURED":
+            raise RuntimeError(
+                "the benchmarker submitted an invalid measurement_status; the flow is stopped"
+            )
+
+        value = entry.get("target_metric_value")
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            raise RuntimeError(
+                f"the benchmarker did not provide a finite numeric value for "
+                f"optimize.target_metric {expected!r}; the flow is stopped"
+            )
 
     def _require_stage_outputs(self, stage: str, paths: list[Path]) -> None:
         """Fail loudly if a stage finished without its required deliverable.
