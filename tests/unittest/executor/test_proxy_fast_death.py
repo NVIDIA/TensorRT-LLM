@@ -320,6 +320,43 @@ def test_worker_publishes_identities_before_backend_construction(monkeypatch):
     assert events == [("notify", GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL)]
 
 
+def test_non_leader_worker_propagates_backend_initialization_error(monkeypatch):
+    rank = 3
+    identity = WorkerProcessIdentity(
+        rank=rank, pid=12345, start_time=67890, hostname="localhost", pid_namespace=1
+    )
+
+    class _FakeComm:
+        def barrier(self):
+            pass
+
+        def allgather(self, captured_identity):
+            assert captured_identity == identity
+            return [identity]
+
+    class _FailingWorker:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("expected construction failure")
+
+    monkeypatch.setattr(worker_module, "mpi_comm", lambda: _FakeComm())
+    monkeypatch.setattr(worker_module, "mpi_rank", lambda: rank)
+    monkeypatch.setattr(worker_module, "capture_worker_process_identity", lambda _: identity)
+    monkeypatch.setattr(worker_module, "set_mpi_session_cpp", lambda comm: None)
+
+    worker_queues = _Mock(frontend_result_queue_addrs=None)
+    with pytest.raises(RuntimeError, match="Failed to initialize executor on rank 3") as exc_info:
+        worker_module.worker_main(
+            engine=object(),
+            worker_queues=worker_queues,
+            log_level=worker_module.logger.level,
+            worker_cls=_FailingWorker,
+            ready_signal=GenerationExecutorProxy.READY_SIGNAL,
+        )
+
+    assert "expected construction failure" in str(exc_info.value)
+    assert "Traceback (most recent call last)" in str(exc_info.value)
+
+
 def test_result_step_raises_on_engine_dead():
     res = GenerationResult.__new__(GenerationResult)
     res.queue = _queue.Queue()
