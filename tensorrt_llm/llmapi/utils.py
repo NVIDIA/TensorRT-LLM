@@ -232,6 +232,15 @@ class DisabledTqdm(tqdm):
 
 
 def download_hf_model(model: str, revision: Optional[str] = None) -> Path:
+    """Download a full model snapshot from the configured model hub.
+
+    Args:
+        model: The model name or path.
+        revision: The revision to use for the model.
+
+    Returns:
+        The path to the downloaded model.
+    """
     ignore_patterns = ["original/**/*"]
     hub_name = "ModelScope" if use_modelscope() else "Hugging Face"
     logger.info(f"Downloading model {model} from {hub_name}")

@@ -1668,6 +1668,15 @@ class BaseLLM:
         self._engine_dir, self._hf_model_dir = model_loader()
 
     def _try_load_tokenizer(self) -> Optional[TokenizerBase]:
+        """Resolve the tokenizer for this LLM instance.
+
+        Prefers an explicitly supplied tokenizer, then a single LoRA
+        directory on the PyTorch backends, and otherwise falls back to the
+        downloaded model directory or the configured model reference.
+
+        Returns:
+            The resolved tokenizer, or None when tokenizer init is skipped.
+        """
         if self.args.skip_tokenizer_init:
             return None
 
@@ -1718,6 +1727,14 @@ class BaseLLM:
 
     def _try_load_generation_config(
             self) -> Optional[transformers.GenerationConfig]:
+        """Load the Hugging Face generation config for this model.
+
+        Reads from the downloaded model directory when one is available so
+        that remotely fetched snapshots are not re-resolved.
+
+        Returns:
+            The generation config, or None when the model does not ship one.
+        """
         model_dir = self._hf_model_dir or self.args.model
         return ModelLoader.load_hf_generation_config(model_dir)
 
@@ -1729,6 +1746,14 @@ class BaseLLM:
 
     def _try_load_hf_model_config(
             self) -> Optional[transformers.PretrainedConfig]:
+        """Load the Hugging Face model config for this model.
+
+        Reads from the downloaded model directory when one is available so
+        that remotely fetched snapshots are not re-resolved.
+
+        Returns:
+            The model config, or None when the model does not ship one.
+        """
         model_dir = self._hf_model_dir or self.args.model
         return ModelLoader.load_hf_model_config(
             model_dir, trust_remote_code=self.args.trust_remote_code)

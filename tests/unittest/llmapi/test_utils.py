@@ -22,6 +22,12 @@ pytestmark = pytest.mark.cpu_only
 
 
 def _stub_modelscope(monkeypatch, snapshot_download):
+    """Register a fake ``modelscope`` package exposing ``snapshot_download``.
+
+    Args:
+        monkeypatch: The pytest monkeypatch fixture.
+        snapshot_download: The callable to install as the hub entry point.
+    """
     modelscope = types.ModuleType("modelscope")
     hub = types.ModuleType("modelscope.hub")
     snapshot_module = types.ModuleType("modelscope.hub.snapshot_download")
@@ -33,9 +39,11 @@ def _stub_modelscope(monkeypatch, snapshot_download):
 
 
 def test_modelscope_download_maps_snapshot_filters(monkeypatch, tmp_path):
+    """Partial downloads forward allow patterns and revision to ModelScope."""
     calls = []
 
     def snapshot_download(**kwargs):
+        """Record the hub call and return the temporary snapshot path."""
         calls.append(kwargs)
         return str(tmp_path)
 
@@ -57,9 +65,11 @@ def test_modelscope_download_maps_snapshot_filters(monkeypatch, tmp_path):
 
 
 def test_modelscope_download_maps_ignored_files(monkeypatch, tmp_path):
+    """Full downloads forward the default ignore patterns to ModelScope."""
     calls = []
 
     def snapshot_download(**kwargs):
+        """Record the hub call and return the temporary snapshot path."""
         calls.append(kwargs)
         return str(tmp_path)
 
@@ -73,9 +83,11 @@ def test_modelscope_download_maps_ignored_files(monkeypatch, tmp_path):
 
 
 def test_hugging_face_download_remains_the_default(monkeypatch, tmp_path):
+    """Downloads route to Hugging Face when ModelScope is not enabled."""
     calls = []
 
     def snapshot_download(model, **kwargs):
+        """Record the hub call and return the temporary snapshot path."""
         calls.append((model, kwargs))
         return str(tmp_path)
 
@@ -90,6 +102,7 @@ def test_hugging_face_download_remains_the_default(monkeypatch, tmp_path):
 
 
 def test_modelscope_download_requires_optional_dependency(monkeypatch):
+    """A missing ``modelscope`` install raises an actionable ImportError."""
     monkeypatch.setenv("TRTLLM_USE_MODELSCOPE", "true")
     monkeypatch.setitem(sys.modules, "modelscope", None)
     monkeypatch.delitem(sys.modules,
