@@ -926,8 +926,13 @@ using MyTypes = testing::Types<
     // fp4xfp4=fp16
     TestConfig<cutlass::float_e2m1_t, cutlass::float_e2m1_t, cutlass::half_t, cutlass::half_t, cutlass::float_ue4m3_t,
         cutlass::float_ue4m3_t>,
+    // fp4xfp4=bf16
+    TestConfig<cutlass::float_e2m1_t, cutlass::float_e2m1_t, cutlass::bfloat16_t, cutlass::bfloat16_t,
+        cutlass::float_ue4m3_t, cutlass::float_ue4m3_t>,
     // fp8xfp8=fp16
     TestConfig<cutlass::float_e4m3_t, cutlass::float_e4m3_t, cutlass::half_t, cutlass::half_t>,
+    // fp8xfp8=bf16
+    TestConfig<cutlass::float_e4m3_t, cutlass::float_e4m3_t, cutlass::bfloat16_t, cutlass::bfloat16_t>,
     // fp16xfp16=fp16
     TestConfig<cutlass::half_t, cutlass::half_t, cutlass::half_t, cutlass::half_t>>;
 

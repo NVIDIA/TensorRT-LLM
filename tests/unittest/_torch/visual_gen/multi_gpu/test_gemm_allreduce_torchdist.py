@@ -22,6 +22,8 @@ from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.functional import AllReduceStrategy
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -54,13 +56,78 @@ def _run_raw_runner(rank: int, world_size: int) -> None:
         expected = input @ weight.t()
         dist.all_reduce(expected, group=process_group)
 
-        runner = torch.classes.trtllm.GemmAllreduceRunner(dtype, process_group.boxed())
+        runner = torch.classes.trtllm.GemmAllreduceRunner(dtype, dtype, process_group.boxed())
         assert runner.get_num_configs() > 0
 
         # The second call exercises the global allocation/workspace cache.
         for _ in range(2):
             output = runner.run_gemm(input, weight, -1)
             _assert_close(output, expected)
+
+    torch.manual_seed(2468 + rank)
+    input_fp8 = torch.randn(16, 128, device="cuda").to(torch.float8_e4m3fn)
+    weight_fp8 = torch.randn(64, 128, device="cuda").to(torch.float8_e4m3fn)
+    for output_dtype in (torch.float16, torch.bfloat16):
+        expected = (input_fp8.float() @ weight_fp8.float().t()).to(output_dtype)
+        dist.all_reduce(expected, group=process_group)
+        runner = torch.classes.trtllm.GemmAllreduceRunner(
+            torch.float8_e4m3fn, output_dtype, process_group.boxed()
+        )
+        output = runner.run_gemm(input_fp8, weight_fp8, -1)
+        torch.testing.assert_close(output, expected, rtol=3e-2, atol=1.25e-1)
+
+
+def _quantize_weight_128x128(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference FP8 quantization matching FP8_BLOCK_SCALES checkpoints."""
+    n, k = weight.shape
+    quantized = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
+    scales = torch.empty(
+        ((n + 127) // 128, (k + 127) // 128), dtype=torch.float32, device=weight.device
+    )
+    for n_block in range(scales.shape[0]):
+        for k_block in range(scales.shape[1]):
+            block = weight[n_block * 128 : (n_block + 1) * 128, k_block * 128 : (k_block + 1) * 128]
+            scale = block.abs().max().float().clamp_min(torch.finfo(torch.float32).tiny) / 448.0
+            scales[n_block, k_block] = scale
+            quantized[n_block * 128 : (n_block + 1) * 128, k_block * 128 : (k_block + 1) * 128] = (
+                block.float() / scale
+            ).to(torch.float8_e4m3fn)
+    return quantized, scales
+
+
+def _run_fp8_blockscale_runner(rank: int) -> None:
+    process_group = dist.group.WORLD
+    torch.manual_seed(1357 + rank)
+    m, n, k = 65, 256, 256
+    input = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    input_fp8, input_scale = torch.ops.trtllm.fp8_quantize_1x128(input)
+    weight_fp8, weight_scale = _quantize_weight_128x128(weight)
+
+    # The Hopper kernel scales every K=128 partial before adding it to the
+    # FP32 accumulator. Reproduce that order rather than dequantizing the
+    # complete operands and issuing one matmul.
+    expected = torch.zeros(m, n, device="cuda", dtype=torch.float32)
+    padded_m = (m + 3) // 4 * 4
+    input_scale = input_scale[: padded_m * (k // 128)].view(k // 128, padded_m)
+    for k_block in range(k // 128):
+        partial = (
+            input_fp8[:, k_block * 128 : (k_block + 1) * 128].float()
+            @ weight_fp8[:, k_block * 128 : (k_block + 1) * 128].float().t()
+        )
+        row_scale = input_scale[k_block, :m, None]
+        column_scale = weight_scale[:, k_block].repeat_interleave(128)[:n]
+        expected += partial * row_scale * column_scale[None, :]
+    expected = expected.to(torch.bfloat16)
+    dist.all_reduce(expected, group=process_group)
+
+    runner = torch.classes.trtllm.Fp8BlockScaleGemmAllreduceRunner(
+        torch.bfloat16, process_group.boxed()
+    )
+    assert runner.get_num_configs() > 0
+    for _ in range(2):
+        output = runner.run_gemm(input_fp8, weight_fp8, input_scale, weight_scale, -1)
+        torch.testing.assert_close(output, expected, rtol=5e-2, atol=1.0)
 
 
 def _run_distinct_process_groups(rank: int) -> None:
@@ -72,7 +139,9 @@ def _run_distinct_process_groups(rank: int) -> None:
     for process_group in groups:
         expected = input @ weight.t()
         dist.all_reduce(expected, group=process_group)
-        runner = torch.classes.trtllm.GemmAllreduceRunner(torch.float16, process_group.boxed())
+        runner = torch.classes.trtllm.GemmAllreduceRunner(
+            torch.float16, torch.float16, process_group.boxed()
+        )
         output = runner.run_gemm(input, weight, -1)
         _assert_close(output, expected)
 
@@ -116,14 +185,63 @@ def _run_visual_gen_linear(rank: int, world_size: int) -> None:
     _assert_close(output, expected)
 
 
+def _run_visual_gen_fp8_blockscale_linear(rank: int, world_size: int) -> None:
+    mapping = VisualGenMapping(world_size=world_size, rank=rank, tp_size=world_size)
+    process_group = mapping.tp_group_pg
+    linear = Linear(
+        in_features=256 * world_size,
+        out_features=256,
+        bias=False,
+        dtype=torch.bfloat16,
+        mapping=mapping,
+        tensor_parallel_mode=TensorParallelMode.ROW,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES),
+        allreduce_strategy=AllReduceStrategy.NCCL,
+    ).cuda()
+    assert linear.use_fused_gemm_allreduce
+
+    torch.manual_seed(8642 + rank)
+    input = torch.randn(2, 5, 256, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
+    weight_fp8, weight_scale = _quantize_weight_128x128(weight)
+    linear.weight.data.copy_(weight_fp8)
+    linear.weight_scale.data.copy_(weight_scale)
+
+    input_2d = input.reshape(-1, input.shape[-1])
+    input_fp8, input_scale = torch.ops.trtllm.fp8_quantize_1x128(input_2d)
+    expected = torch.zeros(input_2d.shape[0], weight.shape[0], device="cuda", dtype=torch.float32)
+    padded_m = (input_2d.shape[0] + 3) // 4 * 4
+    input_scale = input_scale[: padded_m * (input_2d.shape[1] // 128)].view(
+        input_2d.shape[1] // 128, padded_m
+    )
+    for k_block in range(input_2d.shape[1] // 128):
+        partial = (
+            input_fp8[:, k_block * 128 : (k_block + 1) * 128].float()
+            @ weight_fp8[:, k_block * 128 : (k_block + 1) * 128].float().t()
+        )
+        row_scale = input_scale[k_block, : input_2d.shape[0], None]
+        column_scale = weight_scale[:, k_block].repeat_interleave(128)
+        expected += partial * row_scale * column_scale[None, :]
+    expected = expected.to(torch.bfloat16)
+    dist.all_reduce(expected, group=process_group)
+    expected = expected.reshape(*input.shape[:-1], weight.shape[0])
+
+    assert not hasattr(linear, "_torch_dist_fp8_blockscale_gemm_allreduce_runner")
+    output = linear(input)
+    assert linear._torch_dist_fp8_blockscale_gemm_allreduce_runner is not None
+    torch.testing.assert_close(output, expected, rtol=2e-2, atol=1.25e-1)
+
+
 def _worker(rank: int, world_size: int, port: int, include_visual_gen: bool) -> None:
     try:
         _init_dist(rank, world_size, port)
         _run_raw_runner(rank, world_size)
+        _run_fp8_blockscale_runner(rank)
         if world_size == 2:
             _run_distinct_process_groups(rank)
         if include_visual_gen:
             _run_visual_gen_linear(rank, world_size)
+            _run_visual_gen_fp8_blockscale_linear(rank, world_size)
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()

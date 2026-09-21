@@ -2798,11 +2798,38 @@ def record_stream(tensor: torch.Tensor, stream_id: int) -> None:
 
 
 class GemmAllreduceRunner:
-    """Bound TorchDist runner for FP16/BF16 GEMM + all-reduce.
+    """Bound TorchDist runner for dense or FP8 GEMM + all-reduce.
 
     The C++ custom class owns the ProcessGroup, so callers need not pass a
     non-Tensor distributed object through every compiled forward.
     """
+
+    runner_dict = dict()
+
+    def __init__(self,
+                 output_dtype: torch.dtype,
+                 process_group: torch.distributed.ProcessGroup,
+                 device: torch.device,
+                 input_dtype: Optional[torch.dtype] = None):
+        device = torch.device(device)
+        input_dtype = input_dtype or output_dtype
+        instance_key = (input_dtype, output_dtype, device.index, process_group)
+        if instance_key not in self.runner_dict:
+            with torch.cuda.device(device):
+                self.runner_dict[
+                    instance_key] = torch.classes.trtllm.GemmAllreduceRunner(
+                        input_dtype, output_dtype, process_group.boxed())
+        self.runner = self.runner_dict[instance_key]
+
+    def __call__(self,
+                 mat1: torch.Tensor,
+                 mat2: torch.Tensor,
+                 tactic: int = -1) -> torch.Tensor:
+        return self.runner.run_gemm(mat1, mat2, tactic)
+
+
+class Fp8BlockScaleGemmAllreduceRunner:
+    """ProcessGroup-bound MXFP8 block-scaled GEMM + all-reduce runner."""
 
     runner_dict = dict()
 
@@ -2813,16 +2840,18 @@ class GemmAllreduceRunner:
         instance_key = (output_dtype, device.index, process_group)
         if instance_key not in self.runner_dict:
             with torch.cuda.device(device):
-                self.runner_dict[
-                    instance_key] = torch.classes.trtllm.GemmAllreduceRunner(
-                        output_dtype, process_group.boxed())
+                self.runner_dict[instance_key] = (
+                    torch.classes.trtllm.Fp8BlockScaleGemmAllreduceRunner(
+                        output_dtype, process_group.boxed()))
         self.runner = self.runner_dict[instance_key]
 
     def __call__(self,
                  mat1: torch.Tensor,
                  mat2: torch.Tensor,
+                 mat1_scale: torch.Tensor,
+                 mat2_scale: torch.Tensor,
                  tactic: int = -1) -> torch.Tensor:
-        return self.runner.run_gemm(mat1, mat2, tactic)
+        return self.runner.run_gemm(mat1, mat2, mat1_scale, mat2_scale, tactic)
 
 
 class Fp4GemmAllreduceRunner(TunableRunner):
@@ -2836,22 +2865,42 @@ class Fp4GemmAllreduceRunner(TunableRunner):
     def __init__(
         self,
         output_dtype: torch.dtype,
-        tp_rank: int,
-        tp_group: List[int],
+        tp_rank: Optional[int] = None,
+        tp_group: Optional[List[int]] = None,
+        process_group: Optional[torch.distributed.ProcessGroup] = None,
+        device: Optional[torch.device] = None,
     ):
         self.output_dtype = output_dtype
-        self.tp_rank = tp_rank
-        self.tp_group_str = '-'.join(str(g) for g in tp_group)
-        instance_key = (output_dtype, self.tp_group_str)
-        if instance_key not in Fp4GemmAllreduceRunner.runner_dict:
-            Fp4GemmAllreduceRunner.runner_dict[
-                instance_key] = torch.classes.trtllm.Fp4GemmAllreduceRunner(
-                    output_dtype, tp_rank, tp_group)
-        self.fp4_gemm_all_reduce_runner = Fp4GemmAllreduceRunner.runner_dict[
-            instance_key]
+        if process_group is not None:
+            device = (torch.device("cuda", torch.cuda.current_device())
+                      if device is None else torch.device(device))
+            self.tp_rank = process_group.rank()
+            self.tp_group_str = f"pg:{id(process_group)}"
+            instance_key = (output_dtype, device.index, process_group)
+            if instance_key not in self.runner_dict:
+                with torch.cuda.device(device):
+                    runner = torch.classes.trtllm.Fp4GemmAllreduceRunner(
+                        output_dtype, process_group.rank(),
+                        list(range(process_group.size())))
+                    runner.set_process_group(process_group.boxed())
+                    self.runner_dict[instance_key] = runner
+        else:
+            if tp_rank is None or tp_group is None:
+                raise ValueError(
+                    "Either process_group or both tp_rank and tp_group are required"
+                )
+            self.tp_rank = tp_rank
+            self.tp_group_str = '-'.join(str(g) for g in tp_group)
+            instance_key = (output_dtype, self.tp_group_str)
+            if instance_key not in self.runner_dict:
+                self.runner_dict[
+                    instance_key] = torch.classes.trtllm.Fp4GemmAllreduceRunner(
+                        output_dtype, tp_rank, tp_group)
+        self.fp4_gemm_all_reduce_runner = self.runner_dict[instance_key]
+        self._instance_key = instance_key
 
     def unique_id(self):
-        return (self.output_dtype, self.tp_group_str)
+        return self._instance_key
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile, **kwargs) -> List[int]:

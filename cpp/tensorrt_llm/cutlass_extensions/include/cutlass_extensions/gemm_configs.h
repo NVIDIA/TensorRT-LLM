@@ -219,6 +219,7 @@ enum class EpilogueScheduleType
 enum class TileShape : int
 {
     Undefined = 0,
+    TileShape_32x128x128 = shape_tuple_to_enum(32, 128, 128),
     TileShape_64x16x128 = shape_tuple_to_enum(64, 16, 128),
     TileShape_64x32x128 = shape_tuple_to_enum(64, 32, 128),
     TileShape_64x64x128 = shape_tuple_to_enum(64, 64, 128),
