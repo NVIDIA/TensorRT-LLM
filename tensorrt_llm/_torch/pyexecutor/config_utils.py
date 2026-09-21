@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import dataclasses
+from collections.abc import Mapping as AbcMapping
 from typing import List, Optional, Sequence
 
 import torch
@@ -254,6 +255,100 @@ def resolve_ssm_cache_dtype(config):
             getattr(candidate_config, "mamba_ssm_cache_dtype", None))
         if coerced is not None:
             return coerced
+    return None
+
+
+KIMI_KDA_STATE_DTYPES = (torch.float32, torch.bfloat16)
+
+
+def resolve_auto_ssm_cache_dtype(config, fallback):
+    """Resolve mamba_ssm_cache_dtype="auto" for ``config``.
+
+    Kimi K3 defaults to fp32: the HF reference (fla chunk/fused_recurrent
+    KDA kernels) carries the delta-rule recurrent state in fp32. A bf16
+    state pool is an explicit opt-in through
+    kv_cache_config.mamba_ssm_cache_dtype; prefill, decode and sequential
+    verify then stage the addressed rows through an fp32 copy and round the
+    committed state back to bf16. The fused MTP verify kernel
+    (``trtllm::kda_mtp_decode``) has no such staging and rejects a non-fp32
+    pool outright, so bf16 and fused KDA MTP verify are mutually exclusive.
+    A checkpoint-declared
+    mamba_ssm_cache_dtype is not applied to Kimi K3 (the released
+    checkpoints do not carry the field); it is logged when it would have
+    changed the dtype.
+    """
+    if is_kimi_linear(config):
+        declared = resolve_ssm_cache_dtype(config)
+        if declared is not None and declared != torch.float32:
+            logger.info(
+                "Kimi K3: the checkpoint declares "
+                f"mamba_ssm_cache_dtype={declared}; keeping the fp32 "
+                "recurrent-state pool (kv_cache_config.mamba_ssm_cache_dtype "
+                "opts in to bfloat16).")
+        return torch.float32
+    return (resolve_ssm_cache_dtype(config) or resolve_hf_torch_dtype(config)
+            or fallback)
+
+
+def validate_kimi_kda_state_dtype(config,
+                                  mamba_ssm_cache_dtype,
+                                  mamba_ssm_stochastic_rounding=False):
+    """Reject state-cache settings the Kimi K3 KDA kernels cannot honor.
+
+    The kernels read fp32 or bf16 state and round the committed state to
+    nearest; stochastic rounding is a Mamba2 fp16-cache feature that would
+    otherwise be accepted and silently ignored here.
+    """
+    if not is_kimi_linear(config):
+        return
+    if mamba_ssm_cache_dtype not in KIMI_KDA_STATE_DTYPES:
+        raise ValueError(
+            "Kimi K3 KDA recurrent-state cache supports float32 (default) or "
+            f"bfloat16; got mamba_ssm_cache_dtype={mamba_ssm_cache_dtype}.")
+    if mamba_ssm_stochastic_rounding and mamba_ssm_cache_dtype != torch.float32:
+        raise ValueError(
+            "Kimi K3 KDA kernels round the committed recurrent state to "
+            "nearest; mamba_ssm_stochastic_rounding is not supported with a "
+            f"{mamba_ssm_cache_dtype} state cache.")
+
+
+def resolve_vocab_size(config) -> Optional[int]:
+    """Return the language model's vocabulary size, or None if absent.
+
+    Multimodal wrappers keep the language model's fields on a nested config
+    and leave ``vocab_size`` unset at the top level, so reading
+    ``config.vocab_size`` on them yields None. The nested attribute name
+    differs per family: ``llm_config`` for Nemotron-H Omni, ``text_config``
+    for the Kimi K3 / Qwen composite configs, ``language_config`` for
+    HyperCLOVAX, which holds a plain dict rather than a config object.
+
+    The top-level read comes first because a composite config may carry both
+    a top-level ``vocab_size`` and a nested one; the top-level value is what
+    the cache key generator has always been given, and lowering it would let
+    synthetic multimodal ids collide with real token ids.
+    """
+    vocab_size = getattr(config, "vocab_size", None)
+    if vocab_size is not None:
+        return vocab_size
+    # ``get_text_config`` covers ``text_config``, ``text_encoder``, ``decoder``
+    # and ``generator``, plus per-model overrides that install their own. It
+    # does not know ``llm_config`` or ``language_config``, so the loop below
+    # stays. Not every config here is an HF one, hence the callable check.
+    get_text_config = getattr(config, "get_text_config", None)
+    if callable(get_text_config):
+        vocab_size = getattr(get_text_config(), "vocab_size", None)
+        if vocab_size is not None:
+            return vocab_size
+    for attr in ("llm_config", "text_config", "language_config"):
+        inner = getattr(config, attr, None)
+        if inner is None:
+            continue
+        if isinstance(inner, AbcMapping):
+            vocab_size = inner.get("vocab_size")
+        else:
+            vocab_size = getattr(inner, "vocab_size", None)
+        if vocab_size is not None:
+            return vocab_size
     return None
 
 
@@ -558,18 +653,9 @@ def extract_mamba_kv_cache_params(
         mamba_ssm_cache_dtype = _coerce_torch_dtype(
             quant_config.mamba_ssm_cache_dtype)
     if mamba_ssm_cache_dtype is None:
-        mamba_ssm_cache_dtype = (resolve_ssm_cache_dtype(config)
-                                 or resolve_hf_torch_dtype(config)
-                                 or torch.bfloat16)
-    if is_kimi_linear(config) and mamba_ssm_cache_dtype != torch.float32:
-        # The KDA delta-rule recurrent state must be kept in fp32 for
-        # numerical parity with the HF reference (fla chunk/fused_recurrent
-        # KDA kernels carry the state in fp32).
-        logger.info(
-            f"Kimi K3: overriding mamba_ssm_cache_dtype "
-            f"{mamba_ssm_cache_dtype} -> torch.float32 (KDA recurrent state "
-            "must be fp32)")
-        mamba_ssm_cache_dtype = torch.float32
+        mamba_ssm_cache_dtype = resolve_auto_ssm_cache_dtype(
+            config, torch.bfloat16)
+    validate_kimi_kda_state_dtype(config, mamba_ssm_cache_dtype)
 
     return MambaKVCacheParams(
         state_size=state_size,
@@ -753,8 +839,52 @@ _CONFIG_REGISTRY: dict[str, type[transformers.PretrainedConfig]] = LazyConfigDic
     deepseek_v32="DeepseekV3Config",
     kimi_k2="DeepseekV3Config",
     glm_moe_dsa="DeepseekV3Config",
+    k3_dspark="K3DsparkConfig",
     laguna="LagunaConfig",
 )  # NOTE: HF config.json uses deepseek_v32 as model_type but with same DSV3 config class
+
+_NEMOTRON_H_LEGACY_LAYER_TYPES = {
+    "linear_attention": "mamba",
+    "full_attention": "attention",
+}
+
+
+def nemotron_h_legacy_layer_types(config_dict):
+    """``config_dict`` respelled with pre-5.13 Nemotron-H layer names, else None.
+
+    transformers 5.13 renamed the per-layer vocabulary and made
+    ``hybrid_override_pattern`` a derived property that is no longer serialized,
+    so a checkpoint re-saved under a newer transformers cannot be parsed by the
+    pinned one. Restoring the legacy spelling regenerates the pattern, which the
+    Nemotron-H model path reads for its layer counts and mamba/attention masks.
+    """
+    if config_dict.get("model_type") != "nemotron_h":
+        return None
+    patched = dict(config_dict)
+    renamed = False
+    for field in ("layers_block_type", "mtp_layers_block_type"):
+        layer_types = patched.get(field)
+        if not isinstance(layer_types, list):
+            continue
+        renamed |= any(t in _NEMOTRON_H_LEGACY_LAYER_TYPES for t in layer_types)
+        patched[field] = [
+            _NEMOTRON_H_LEGACY_LAYER_TYPES.get(t, t) for t in layer_types
+        ]
+    return patched if renamed else None
+
+
+def match_nemotron_h_layer_types(model_config, layer_types):
+    """``layer_types`` respelled to match ``model_config``'s own vocabulary.
+
+    Assigning to a config bypasses ``__init__``, and with it transformers'
+    legacy-to-modern remap, so a mismatched spelling is stored unvalidated and
+    surfaces only when a pattern is later derived from it.
+    """
+    native = getattr(model_config, "layers_block_type", None) or []
+    if any(t in _NEMOTRON_H_LEGACY_LAYER_TYPES for t in native):
+        modern = {v: k for k, v in _NEMOTRON_H_LEGACY_LAYER_TYPES.items()}
+        return [modern.get(t, t) for t in layer_types]
+    return [_NEMOTRON_H_LEGACY_LAYER_TYPES.get(t, t) for t in layer_types]
 
 
 def load_pretrained_config(model_name_or_path: str,
@@ -905,8 +1035,28 @@ def load_pretrained_config(model_name_or_path: str,
         }
         model_config = CONFIG_MAPPING[model_type].from_dict(patched_dict)
     else:
-        model_config = transformers.AutoConfig.from_pretrained(
-            model_name_or_path, trust_remote_code=trust_remote_code)
+        try:
+            model_config = transformers.AutoConfig.from_pretrained(
+                model_name_or_path, trust_remote_code=trust_remote_code)
+        except Exception as exc:
+            # Retried only on failure, so a transformers that parses the
+            # checkpoint itself never reaches this. Broad by necessity: the
+            # vocabulary mismatch surfaces as a strict-dataclass validation
+            # error from the built-in config, or as an AssertionError raised
+            # by a checkpoint's own remote code.
+            renamed = nemotron_h_legacy_layer_types(config_dict)
+            if renamed is None:
+                raise
+            from transformers.models.auto.configuration_auto import \
+                CONFIG_MAPPING
+            model_config = CONFIG_MAPPING[model_type].from_dict(
+                renamed, **kwargs)
+            cause = (str(exc).splitlines() or [""])[0]
+            logger.warning(
+                f"{model_name_or_path} uses the transformers>=5.13 Nemotron-H "
+                f"layer vocabulary; rebuilt it with the legacy names after "
+                f"{type(exc).__name__}: {cause} -- hybrid_override_pattern="
+                f"{getattr(model_config, 'hybrid_override_pattern', None)!r}")
 
     # Transformers 5.x sets rope_scaling to {"rope_type": "default"} instead
     # of None for models with standard RoPE (no scaling).  Clear it so that

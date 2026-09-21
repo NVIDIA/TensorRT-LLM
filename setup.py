@@ -19,7 +19,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from setuptools import find_packages, setup
+from setuptools import find_namespace_packages, find_packages, setup
 from setuptools.dist import Distribution
 
 
@@ -250,6 +250,73 @@ def should_skip_precompiled_package_data(filename: str) -> bool:
         source_owned_package_data_prefixes)
 
 
+def warn_on_build_skew(precompiled_location: str) -> None:
+    """Warn when the source checkout differs from this one where it matters.
+
+    The precompiled artifacts are reused as they are, never rebuilt, so any
+    difference in what feeds the native build makes them stale. This is
+    advisory: it never fails the install, since the two checkouts are often
+    meant to differ (that is the point of reusing a build) and only some of
+    those differences matter.
+    """
+    import subprocess
+
+    NATIVE_BUILD_INPUTS = [
+        "cpp/", "3rdparty/", "setup.py", "scripts/build_wheel.py",
+        "requirements.txt"
+    ]
+
+    def head_of(checkout: str) -> str | None:
+        try:
+            done = subprocess.run(["git", "-C", checkout, "rev-parse", "HEAD"],
+                                  capture_output=True,
+                                  text=True,
+                                  check=True)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return done.stdout.strip() or None
+
+    source_head = head_of(precompiled_location)
+    current_head = head_of(".")
+    if source_head is None or current_head is None:
+        print("Cannot check for build skew: one of the two checkouts is not a "
+              "git repository. Make sure the precompiled artifacts were built "
+              "from these sources.")
+        return
+    if source_head == current_head:
+        return
+
+    stale = ("Import errors mentioning 'rebuild and install' after this may be "
+             "ABI skew; rebuild, or pick a precompiled source that matches.")
+    try:
+        # Both revisions are reachable here when the two checkouts are
+        # worktrees of one clone, which is the case this is meant to catch.
+        done = subprocess.run(
+            ["git", "diff", "--name-only", source_head, current_head, "--"] +
+            NATIVE_BUILD_INPUTS,
+            capture_output=True,
+            text=True,
+            check=True)
+    except (OSError, subprocess.SubprocessError):
+        print(
+            f"WARNING: the precompiled artifacts come from {source_head[:12]} "
+            f"but this checkout is {current_head[:12]}, and the difference "
+            f"could not be inspected from here. {stale}")
+        return
+
+    changed = done.stdout.split()
+    if not changed:
+        return
+    shown = ", ".join(changed[:3])
+    if len(changed) > 3:
+        shown += ", ..."
+    count = f"{len(changed)} file" + ("s" if len(changed) > 1 else "")
+    print(
+        f"WARNING: the precompiled artifacts come from {source_head[:12]} but "
+        f"this checkout is {current_head[:12]}; {count} feeding the "
+        f"native build changed ({shown}). {stale}")
+
+
 def extract_from_precompiled(precompiled_location: str, package_data: list[str],
                              workspace: str) -> None:
     """Extract package data (binaries and other materials) from a precompiled wheel or local directory to the working directory.
@@ -259,6 +326,9 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
     - Local directory (git clone structure): e.g., /home/dev/TensorRT-LLM
     - Local wheel file: e.g., /path/to/tensorrt_llm-*.whl
     - Remote URL: Downloads and extracts from URL (wheel or tar.gz)
+
+    With TRTLLM_PRECOMPILED_LINK=1 a local directory is symlinked instead of
+    copied, so several checkouts can share one build tree.
     """
     import fnmatch
     import shutil
@@ -268,12 +338,31 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
 
     from setuptools.errors import SetupError
 
+    # Only a local directory can be linked; a wheel or a URL has no build tree
+    # to point at.
+    link_artifacts = os.getenv("TRTLLM_PRECOMPILED_LINK", "0") not in ("", "0")
+    if link_artifacts and not os.path.isdir(precompiled_location):
+        raise SetupError(
+            "TRTLLM_PRECOMPILED_LINK=1 requires TRTLLM_PRECOMPILED_LOCATION to "
+            "be a local directory in git-clone layout, but got "
+            f"{precompiled_location}.")
+    # Linking a checkout onto itself would unlink the real artifacts and
+    # replace them with symlinks that point to themselves, destroying the
+    # build tree this mode is meant to share.
+    if link_artifacts and os.path.realpath(
+            precompiled_location) == os.path.realpath("."):
+        raise SetupError(
+            "TRTLLM_PRECOMPILED_LINK=1 needs a source checkout separate from "
+            "this one, but TRTLLM_PRECOMPILED_LOCATION resolves to the current "
+            "directory.")
+
     # Handle local directory (assuming repo structure)
     if os.path.isdir(precompiled_location):
         precompiled_location = os.path.abspath(precompiled_location)
         print(
             f"Using local directory as precompiled source: {precompiled_location}"
         )
+        warn_on_build_skew(precompiled_location)
         source_tensorrt_llm = os.path.join(precompiled_location, "tensorrt_llm")
         if not os.path.isdir(source_tensorrt_llm):
             raise SetupError(
@@ -317,8 +406,19 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
                 dst_dir = os.path.dirname(dst_file)
                 if dst_dir:
                     os.makedirs(dst_dir, exist_ok=True)
-                print(f"Copying {rel_path} from local directory.")
-                shutil.copy2(src_file, dst_file)
+                if link_artifacts:
+                    if os.path.lexists(dst_file):
+                        os.unlink(dst_file)
+                    print(f"Linking {rel_path} from local directory.")
+                    os.symlink(os.path.abspath(src_file), dst_file)
+                else:
+                    print(f"Copying {rel_path} from local directory.")
+                    # Drop a stale symlink from a prior link-mode run so
+                    # copy2 writes a real file instead of following the link
+                    # into the shared build tree.
+                    if os.path.islink(dst_file):
+                        os.unlink(dst_file)
+                    shutil.copy2(src_file, dst_file)
 
         source_fmha = os.path.join(precompiled_location, "3rdparty",
                                    "fmha_sm100")
@@ -328,12 +428,62 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
                 "packaging and does not contain 3rdparty/fmha_sm100. Use a "
                 "precompiled source built with MSA packaging support.")
         dst_fmha = os.path.join("3rdparty", "fmha_sm100")
-        print(f"Copying fmha_sm100 from local directory: {source_fmha}")
-        if os.path.islink(dst_fmha):
-            os.unlink(dst_fmha)
-        elif os.path.isdir(dst_fmha):
-            shutil.rmtree(dst_fmha)
-        shutil.copytree(source_fmha, dst_fmha)
+        if link_artifacts:
+            if os.path.islink(dst_fmha) and os.path.realpath(
+                    dst_fmha) == os.path.realpath(source_fmha):
+                # Already points at this source; leave the shared link alone.
+                print(f"Keeping existing fmha_sm100 symlink: {dst_fmha}")
+            else:
+                # A stale link (pointing at a different source) or a real
+                # directory: replace it so fmha_sm100 tracks the same source
+                # as the other linked artifacts.
+                if os.path.islink(dst_fmha):
+                    os.unlink(dst_fmha)
+                elif os.path.isdir(dst_fmha):
+                    shutil.rmtree(dst_fmha)
+                # copytree() creates the parent below; os.symlink() does not.
+                os.makedirs(os.path.dirname(dst_fmha), exist_ok=True)
+                print(f"Linking fmha_sm100 from local directory: {source_fmha}")
+                os.symlink(source_fmha, dst_fmha)
+        else:
+            print(f"Copying fmha_sm100 from local directory: {source_fmha}")
+            if os.path.islink(dst_fmha):
+                os.unlink(dst_fmha)
+            elif os.path.isdir(dst_fmha):
+                shutil.rmtree(dst_fmha)
+            shutil.copytree(source_fmha, dst_fmha)
+
+        source_nccl_extensions = os.path.join(precompiled_location, "3rdparty",
+                                              "nccl_extensions")
+        if os.path.isdir(source_nccl_extensions):
+            dst_nccl_extensions = os.path.join("3rdparty", "nccl_extensions")
+            if link_artifacts:
+                if os.path.islink(dst_nccl_extensions) and os.path.realpath(
+                        dst_nccl_extensions) == os.path.realpath(
+                            source_nccl_extensions):
+                    print("Keeping existing NCCL-EP symlink: "
+                          f"{dst_nccl_extensions}")
+                else:
+                    if os.path.islink(dst_nccl_extensions):
+                        os.unlink(dst_nccl_extensions)
+                    elif os.path.isdir(dst_nccl_extensions):
+                        shutil.rmtree(dst_nccl_extensions)
+                    os.makedirs(os.path.dirname(dst_nccl_extensions),
+                                exist_ok=True)
+                    print("Linking embedded NCCL-EP packages from local "
+                          f"directory: {source_nccl_extensions}")
+                    os.symlink(source_nccl_extensions, dst_nccl_extensions)
+            else:
+                print("Copying embedded NCCL-EP packages from local directory: "
+                      f"{source_nccl_extensions}")
+                if os.path.islink(dst_nccl_extensions):
+                    os.unlink(dst_nccl_extensions)
+                elif os.path.isdir(dst_nccl_extensions):
+                    shutil.rmtree(dst_nccl_extensions)
+                shutil.copytree(source_nccl_extensions, dst_nccl_extensions)
+        else:
+            print("Precompiled directory does not contain embedded NCCL-EP "
+                  "packages; continuing without NCCL-EP.")
         return
 
     # Handle local file or remote URL
@@ -361,7 +511,7 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
                     break
             else:
                 raise SetupError(
-                    f"Failed to get wheel file from {precompiled_path}.") from e
+                    f"Failed to get wheel file from {precompiled_path}.")
 
             wheel_path = os.path.join(workspace, member.name)
             tar.extract(member, path=workspace, filter=tarfile.data_filter)
@@ -381,6 +531,11 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
             os.unlink(dst_fmha)
         elif os.path.isdir(dst_fmha):
             shutil.rmtree(dst_fmha)
+        dst_nccl_extensions = os.path.join("3rdparty", "nccl_extensions")
+        if os.path.islink(dst_nccl_extensions):
+            os.unlink(dst_nccl_extensions)
+        elif os.path.isdir(dst_nccl_extensions):
+            shutil.rmtree(dst_nccl_extensions)
         for file in wheel.filelist:
             # Skip yaml files
             if file.filename.endswith(".yaml"):
@@ -398,6 +553,15 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
                     f"Extracting and including {file.filename} from precompiled wheel."
                 )
                 wheel.extract(file, path="3rdparty")
+                continue
+
+            # NCCL-EP is a top-level namespace package in the wheel. Stage it
+            # beneath 3rdparty for package_dir, matching build_wheel.py.
+            if file.filename.startswith(("nccl/ep/", "nccl/_extensions/")):
+                print(
+                    f"Extracting and including {file.filename} from precompiled wheel."
+                )
+                wheel.extract(file, path=dst_nccl_extensions)
                 continue
 
             # Skip .py files EXCEPT for generated C++ extension wrappers
@@ -485,8 +649,26 @@ packages += find_packages(include=["triton_kernels", "triton_kernels.*"])
 
 # fmha_sm100 is staged under 3rdparty/ by scripts/build_wheel.py from the
 # CMake FetchContent tree (same packaging role as tensorrt_llm/deep_ep).
-msa_package_dir = {"fmha_sm100": "3rdparty/fmha_sm100"}
+package_dirs = {"fmha_sm100": "3rdparty/fmha_sm100"}
 packages += ["fmha_sm100"]
+
+# NCCL-EP is staged from the source-built nccl-extensions wheel under
+# 3rdparty/. Its ``nccl`` package is a namespace shared with nccl4py, so
+# register only its staged namespace subpackages and preserve nccl4py core.
+nccl_extensions_root = Path("3rdparty/nccl_extensions")
+nccl_extensions_package_data = {}
+if (nccl_extensions_root / "nccl").is_dir():
+    packages += find_namespace_packages(
+        where=str(nccl_extensions_root),
+        include=("nccl.ep", "nccl.ep.*", "nccl._extensions",
+                 "nccl._extensions.*"),
+    )
+    package_dirs["nccl"] = str(nccl_extensions_root / "nccl")
+    nccl_extensions_package_data = {
+        "nccl.ep": ["lib/*.so", "include/**/*"],
+        "nccl._extensions.bindings": ["*.so", "_internal/*.so"],
+        "nccl._extensions.bindings._internal": ["*.so"],
+    }
 
 
 def get_build_state_options():
@@ -527,7 +709,7 @@ setup(
     url="https://github.com/NVIDIA/TensorRT-LLM",
     download_url="https://github.com/NVIDIA/TensorRT-LLM/tags",
     packages=packages,
-    package_dir=msa_package_dir,
+    package_dir=package_dirs,
     exclude_package_data=exclude_package_data,
     # TODO Add windows support for python bindings.
     classifiers=[
@@ -552,6 +734,7 @@ setup(
             'cutlass/tools/util/include/**/*',
             'cutlass/LICENSE.txt',
         ],
+        **nccl_extensions_package_data,
     },
     license_files=get_license(),
     entry_points={

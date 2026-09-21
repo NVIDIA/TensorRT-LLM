@@ -39,6 +39,11 @@ CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
 ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM = 2
 
 
+def get_mrope_dummy_seq_slot(max_num_tokens: int, pp_size: int) -> int:
+    """Cache slot index reserved for MRoPE dummy/no-delta requests."""
+    return max_num_tokens * pp_size
+
+
 class KeyType(NamedTuple):
     batch_size: int
     draft_len: int
@@ -723,15 +728,6 @@ class CUDAGraphRunner:
             "spec_metadata": initial_inputs.get("spec_metadata", None),
         }
 
-        def _setup_spec_decoding_and_forward(key: KeyType, forward_fn: Callable,
-                                             capture_inputs: Dict[str, Any]):
-            is_first_draft = key.is_first_draft
-            needs_kv_cache_recompute = True if enable_spec_decode and self.config.spec_config.spec_dec_mode.needs_kv_cache_recompute(
-            ) else False
-            if is_first_draft and self.config.is_draft_model and needs_kv_cache_recompute:
-                capture_inputs['attn_metadata'].use_spec_decoding = True
-            return forward_fn(capture_inputs)
-
         output = None
         with with_multi_stream(True), piecewise_cuda_graph(False):
             # We have to do a warmup run to initialize PyTorch's internal
@@ -740,8 +736,7 @@ class CUDAGraphRunner:
             # This also lets us initialize states in the attn_metadata and
             # resize the shared attention workspace before any graph is captured.
             for _ in range(self.WARMUP_STEPS):
-                output = _setup_spec_decoding_and_forward(
-                    key, forward_fn, capture_inputs)
+                output = forward_fn(capture_inputs)
                 if postprocess_fn is not None:
                     postprocess_fn(capture_inputs)
                 _restore_spec_decode_capture_state(attn_metadata,
@@ -755,8 +750,7 @@ class CUDAGraphRunner:
             # setup/capture; release its reference before entering.
             output = None
             with torch.cuda.graph(graph, pool=self.memory_pool):
-                output = _setup_spec_decoding_and_forward(
-                    key, forward_fn, capture_inputs)
+                output = forward_fn(capture_inputs)
             if postprocess_fn is not None:
                 postprocess_fn(capture_inputs)
             _restore_spec_decode_capture_state(attn_metadata,
@@ -782,20 +776,59 @@ class CUDAGraphRunner:
 
         input_ids = current_inputs["input_ids"]
         seqlen = input_ids.shape[0]
+        expected_num_tokens = self._get_num_tokens_for_key(key)
+        if seqlen != expected_num_tokens:
+            raise ValueError(
+                f"replay() got {seqlen} tokens for key {key}, but the graph "
+                f"was captured for {expected_num_tokens} tokens. A shorter "
+                "input_ids leaves the tail of the static input buffer stale.")
         static_tensors["input_ids"][:seqlen].copy_(input_ids)
 
         position_ids = current_inputs["position_ids"]
         if self.config.use_mrope:
+            expected_position_ids_shape = (3, 1, seqlen)
+            if tuple(position_ids.shape) != expected_position_ids_shape:
+                raise ValueError(
+                    f"replay() got position_ids of shape {tuple(position_ids.shape)} "
+                    f"for key {key}, but expected {expected_position_ids_shape}. "
+                    "torch.Tensor.copy_() silently broadcasts mismatched shapes, "
+                    "which would corrupt the static input buffer.")
             static_tensors["position_ids"][:, :, :seqlen].copy_(position_ids)
             mrope_delta_read_seq_slots = current_inputs.get(
                 'mrope_delta_read_seq_slots')
+            num_slots = key.batch_size * self.max_beam_width
             if mrope_delta_read_seq_slots is not None:
+                if mrope_delta_read_seq_slots.shape[0] != num_slots:
+                    raise ValueError(
+                        f"replay() got {mrope_delta_read_seq_slots.shape[0]} "
+                        f"mrope_delta_read_seq_slots for key {key}, but the graph "
+                        f"was captured for {num_slots} "
+                        "mrope_delta_read_seq_slots.")
                 static_tensors[
                     'mrope_delta_read_seq_slots'][:mrope_delta_read_seq_slots.
                                                   shape[0]].copy_(
                                                       mrope_delta_read_seq_slots,
                                                       non_blocking=True)
+            else:
+                # Omission means every slot reads the dummy seq slot's
+                # permanently-zero delta (model_engine.py's mrope_dummy_seq_slot
+                # fast path). Fill explicitly instead of leaving stale values.
+                logger.debug(
+                    "replay() got no mrope_delta_read_seq_slots for a "
+                    "use_mrope graph; filling the static buffer with the "
+                    "dummy seq slot instead of copying real values.")
+                mrope_dummy_seq_slot = get_mrope_dummy_seq_slot(
+                    self.config.max_num_tokens, self.config.mapping.pp_size)
+                static_tensors['mrope_delta_read_seq_slots'][:num_slots].fill_(
+                    mrope_dummy_seq_slot)
         else:
+            expected_position_ids_shape = (1, seqlen)
+            if tuple(position_ids.shape) != expected_position_ids_shape:
+                raise ValueError(
+                    f"replay() got position_ids of shape {tuple(position_ids.shape)} "
+                    f"for key {key}, but expected {expected_position_ids_shape}. "
+                    "torch.Tensor.copy_() silently broadcasts mismatched shapes, "
+                    "which would corrupt the static input buffer.")
             static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
 
         num_encoder_tokens = key.num_encoder_tokens
@@ -825,9 +858,40 @@ class CUDAGraphRunner:
 
         return output_ref
 
+    def _max_padded_batch_size(self) -> int:
+        """Largest padded batch size ``_get_padded_batch`` may choose.
+
+        ``max_supported_batch_size`` bounds the captured graphs; the engine's
+        own ``batch_size`` bounds concurrent requests, and the padded size is
+        exactly ``padding_size + batch.batch_size``, so both apply to the
+        padded size itself.
+        """
+        return min(self.max_supported_batch_size, self.config.batch_size)
+
     def _get_padded_batch(self, batch: ScheduledRequests,
                           resource_manager: ResourceManager,
                           runtime_draft_len: int) -> int:
+        """Pads ``batch.generation_requests`` up to a captured graph size.
+
+        Returns the number of appended dummy rows; the caller strips exactly
+        that many entries off the *end* of the list afterwards.
+
+        Dummy rows are deliberately tail-only.  Inserting a dummy at the front
+        would mis-associate every real request with another request's output,
+        because three separate consumers hard-code "the generation rows start
+        at index 0":
+          * ``ModelEngine._prepare_tp_inputs`` skips the input_ids of
+            CUDA-graph dummies and blits the overlap scheduler's tokens at
+            ``input_ids_cuda[num_tokens:...]``, which only lines up with the
+            per-row position_ids while every dummy sits after every real row;
+          * ``TorchSampler`` reads generation logits as ``raw_logits_cuda[:
+            len(generation_requests)]`` (and via request offsets that start at
+            zero), against the batch with the padding already stripped;
+          * ``ModelEngine._execute_logit_post_processors`` walks the padded
+            batch with a row offset starting at zero.
+        Offsetting all three is a change to the output association, not to
+        padding, so it does not belong here.
+        """
         can_run_cuda_graph = self._can_run_cuda_graph_batch(batch)
         batch_size = batch.batch_size
         new_batch_size = batch_size
@@ -1007,8 +1071,7 @@ class CUDAGraphRunner:
         max batch size 1, every batch already matches a graph size and no
         padding dummy is ever needed.
         """
-        max_unpadded_batch_size = min(self.config.batch_size,
-                                      self.max_supported_batch_size)
+        max_unpadded_batch_size = self._max_padded_batch_size()
         for batch_size in range(1, max_unpadded_batch_size + 1):
             padded = self._round_up_batch_size_with_draft_len(
                 batch_size, runtime_draft_len)
@@ -1293,8 +1356,8 @@ class EncoderCUDAGraphRunner:
 
         # Replays served from a captured feature graph. A populated `graphs`
         # only proves capture happened; both `pad_batch` and the shape checks
-        # in `_maybe_forward_encoder_graph` can route every request to the
-        # eager encoder without emptying it, so tests need this to tell a
+        # in `EncoderMixin._prepare_encoder_feature_graph_inputs` can route requests
+        # to the eager encoder without emptying it, so tests need this to tell a
         # working graph path from a silent eager fallback.
         self.num_feature_replays = 0
 
@@ -1818,7 +1881,7 @@ class EncoderCUDAGraphRunner:
             return None, None
 
         if "multi_item_part_lens" in inputs:
-            # See model_engine.py for more details
+            # Per-request scoring metadata cannot share captured graph state.
             logger.warning_once(
                 "Encoder CUDA graph does not support multi-item scoring; "
                 "falling back to eager.",

@@ -17,6 +17,7 @@
 import datetime
 import gc
 import importlib
+import importlib.util
 import logging
 import os
 import platform
@@ -451,6 +452,26 @@ def llm_venv(request, llm_root, custom_user_workspace):
             shutil.rmtree(workspace_dir, ignore_errors=True)
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _auto_install_media_deps(llm_venv):
+    """Ensure OpenCV is available for video multimodal tests.
+
+    Uses ``opencv-python-headless`` already on the system when present. Otherwise
+    set ``TRTLLM_AUTO_INSTALL_MEDIA_DEPS=1`` to install it.
+    """
+    if importlib.util.find_spec("cv2") is not None:
+        return
+    if os.environ.get("TRTLLM_AUTO_INSTALL_MEDIA_DEPS", "0") != "1":
+        # TODO remove autouse once callers that need OpenCV depend on this
+        # fixture explicitly, and replace this warning with an error.
+        print_warning(
+            "OpenCV (cv2) is not installed, which is required for some tests.\n"
+            "You may need to install opencv-python-headless manually, or set "
+            "TRTLLM_AUTO_INSTALL_MEDIA_DEPS=1 to auto-install.")
+        return
+    llm_venv.run_cmd(["-m", "pip", "install", "opencv-python-headless"])
+
+
 @pytest.fixture(scope="session")
 @cached_in_llm_models_root("gpt-next/megatron_converted_843m_tp1_pp1.nemo",
                            True)
@@ -659,18 +680,6 @@ def llama_model_root(request):
     if request.param == "TinyLlama-1.1B-Chat-v1.0":
         llama_model_root = os.path.join(models_root, "llama-models-v2",
                                         "TinyLlama-1.1B-Chat-v1.0")
-    elif request.param == "llama-3.1-8b":
-        llama_model_root = os.path.join(models_root, "llama-3.1-model",
-                                        "Meta-Llama-3.1-8B")
-    elif request.param == "llama-3.1-8b-instruct-hf-fp8":
-        llama_model_root = os.path.join(models_root, "llama-3.1-model",
-                                        "Llama-3.1-8B-Instruct-FP8")
-    elif request.param == "llama-3.1-8b-instruct":
-        llama_model_root = os.path.join(models_root, "llama-3.1-model",
-                                        "Llama-3.1-8B-Instruct")
-    elif request.param == "llama-3.1-8b-hf-nvfp4":
-        llama_model_root = os.path.join(models_root, "nvfp4-quantized",
-                                        "Meta-Llama-3.1-8B")
     assert os.path.exists(
         llama_model_root
     ), f"{llama_model_root} does not exist under NFS LLM_MODELS_ROOT dir"

@@ -19,6 +19,9 @@ Python and C++ codebase with PyTorch and AutoDeploy execution paths.
   `tensorrt_llm/usage/architecture_allowlist.py` with its exact Hugging Face architecture name;
   never add private or customer-specific names
 - PR title format: `[JIRA/NVBUG/None][type] description` (e.g., `[TRTLLM-5516][perf] optimize cuda graph padding`)
+- Put a change's rationale and history (why it was made, what it replaces, ticket/PR references) in the PR
+  description, not in code comments. Code comments should explain the code as it stands for a future reader,
+  not narrate how it got there.
 - Set `LLM_MODELS_ROOT` env var when running tests that need model weights
 
 ## Common Commands
@@ -111,7 +114,7 @@ PyTorch backend where it makes sense (attention, quantization, parallelism).
 
 Key entry points:
 - Public Python API: `from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams`.
-- Serving CLI: `trtllm-serve --model <HF id> --visual_gen_args <YAML path>`.
+- Serving CLI: `trtllm-serve <HF id> --visual_gen_args <YAML path>`.
 
 Key files:
 - `tensorrt_llm/_torch/visual_gen/ENGINEERING_CRITERIA.md`: **Engineering criteria for any change under `tensorrt_llm/visual_gen/` or `tensorrt_llm/_torch/visual_gen/`** — API discipline, feature/test/lossy-vs-lossless requirements, examples & docs rules. Read before modifying anything in those trees.

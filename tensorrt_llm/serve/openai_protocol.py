@@ -47,8 +47,9 @@ from openai.types.responses.response import ToolChoice
 from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
-from pydantic import (AliasChoices, BaseModel, ConfigDict, Field, PositiveInt,
-                      field_validator, model_validator)
+from pydantic import (AliasChoices, BaseModel, ConfigDict, Field,
+                      NonNegativeInt, PositiveInt, field_validator,
+                      model_validator)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
@@ -259,6 +260,14 @@ class ConversationParams(OpenAIBaseModel):
 
     conversation_id: str = Field(
         description=("Stable multi-turn conversation id used for routing"), )
+
+    # Forwarded as a header; excluded from the request body for older workers.
+    subagent_affinity_id: Optional[str] = Field(
+        default=None,
+        exclude=True,
+        description=("Server-private parent-session id for sub-agent routing "
+                     "affinity; forwarded to workers as a header, never in the "
+                     "body."))
 
     @field_validator("conversation_id", mode="before")
     @classmethod
@@ -1318,6 +1327,27 @@ ResponseInputOutputItem: TypeAlias = Union[ResponseInputItemParam,
 _ID_STRIPPED_ROLES = ("user", "system", "developer")
 
 
+def _drop_explicit_nulls(value, _depth=0):
+    """Recursively drop dict keys whose value is an explicit ``null``.
+
+    On the OpenAI wire an unset optional field is omitted, so an explicit
+    ``null`` carries no information — but the vendored Responses item types
+    validate ``null`` differently from omitted and reject it. Dropping
+    null-valued keys restores the omit-unset wire shape for clients that
+    serialize every unset optional as ``null`` (litellm among them).
+    """
+    if _depth > 12:
+        return value
+    if isinstance(value, dict):
+        return {
+            k: _drop_explicit_nulls(v, _depth + 1)
+            for k, v in value.items() if v is not None
+        }
+    if isinstance(value, list):
+        return [_drop_explicit_nulls(v, _depth + 1) for v in value]
+    return value
+
+
 def _materialize_validator_iterators(value, _depth=0):
     """Recursively replace pydantic ValidatorIterator objects with lists.
 
@@ -1377,6 +1407,10 @@ class ResponsesRequest(OpenAIBaseModel):
         """
         if not isinstance(value, list):
             return value
+
+        # Must run before the per-item shaping below: the item types reject
+        # explicit nulls that mean "unset" (see _drop_explicit_nulls).
+        value = [_drop_explicit_nulls(item) for item in value]
 
         def _with_annotations(part):
             """output_text requires annotations; clients often omit it."""
@@ -1509,6 +1543,20 @@ class ResponsesRequest(OpenAIBaseModel):
         )
         _record_sampling_params_request_fields(self, sampling_params)
         return sampling_params
+
+    @model_validator(mode="before")
+    @classmethod
+    def _null_top_level_fields_mean_unset(cls, data):
+        """Drop explicitly-null top-level fields so they take their defaults.
+
+        Shallow on purpose: ``input`` items are scrubbed recursively by their
+        own validator, and the remaining structured fields are Optional
+        throughout. A null required field (``model``, ``input``) still
+        reports as missing.
+        """
+        if not isinstance(data, dict):
+            return data
+        return {k: v for k, v in data.items() if v is not None}
 
     @model_validator(mode="before")
     @classmethod
@@ -2257,3 +2305,31 @@ class VideoJobList(OpenAIBaseModel):
 
 UCompletionRequest = Union[CompletionRequest, ChatCompletionRequest]
 UCompletionResponse = Union[CompletionResponse, ChatCompletionResponse]
+
+ProfileActivity = Literal["CPU", "GPU", "CUDA_PROFILER"]
+
+
+class StartProfileRequest(OpenAIBaseModel):
+    """Request body for the POST /start_profile endpoint."""
+    output_dir: Optional[str] = Field(
+        default=None,
+        description="Directory where chrome traces are written. Defaults "
+        "to the TLLM_TORCH_PROFILER_DIR environment variable, "
+        "then /tmp.")
+    num_steps: Optional[PositiveInt] = Field(
+        default=None,
+        description="Number of iterations to profile. Must be >= 1 if "
+        "provided; if omitted, profiling runs until /stop_profile is "
+        "called. ``num_steps == 0`` is rejected because the profile "
+        "window would never close — the stop iteration would equal the "
+        "start iteration, profile_step() would discard the stop marker "
+        "as stale, and the window would run forever.")
+    start_step: NonNegativeInt = Field(
+        default=0,
+        description="Skip this many iterations before profiling begins. "
+        "Must be >= 0.")
+    activities: List[ProfileActivity] = Field(
+        default_factory=lambda: ["CPU", "GPU"],
+        description="Which activities to trace. Supported values: "
+        "'CPU', 'GPU', 'CUDA_PROFILER'. Unknown values are rejected at "
+        "schema validation time.")

@@ -20,7 +20,12 @@ from typing import Optional
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 from tensorrt_llm.logger import logger
 
-from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
+from ..llm_request import (
+    LlmRequest,
+    LlmRequestState,
+    get_draft_token_length,
+    rewind_context_after_cache_drop,
+)
 from .scheduler import (
     RequestList,
     RequestScheduler,
@@ -184,6 +189,15 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.cross_kv_cache_manager = cross_kv_cache_manager
         self.enable_prefix_aware_scheduling = enable_prefix_aware_scheduling
         self.enable_recompute_pause = enable_recompute_pause
+        # Every input to the prefix-aware skip is fixed for this scheduler's
+        # lifetime: the knob is a constructor argument, and both manager
+        # attributes are assigned once in ``KVCacheManagerV2.__init__``. Resolve
+        # the gate here rather than re-deriving it on every schedule_request.
+        self._prefix_skip_enabled = (
+            enable_prefix_aware_scheduling
+            and kv_cache_manager.enable_block_reuse
+            and self._skip_pays_off_under_reuse_policy()
+        )
         if scheduler_policy != CapacitySchedulerPolicy.MAX_UTILIZATION:
             logger.warning(
                 "KVCacheV2Scheduler only supports MAX_UTILIZATION for now, "
@@ -211,6 +225,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             f"max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}, "
             f"draft_mgr={draft_mgr_name}, cross_mgr={cross_mgr_name}, "
             f"enable_prefix_aware_scheduling={enable_prefix_aware_scheduling}, "
+            f"prefix_skip_enabled={self._prefix_skip_enabled}, "
             f"enable_recompute_pause={enable_recompute_pause}"
         )
         if ctx_chunk_config is not None:
@@ -292,13 +307,6 @@ class KVCacheV2Scheduler(RequestScheduler):
             self.max_num_requests,
             self.peft_cache_manager,
         )
-
-        # TODO: block reuse skip optimization (_beneficial_to_skip).
-        # V1 skips first-chunk ctx requests whose next block overlaps with
-        # an executing chunked ctx's current chunk. Waiting one iteration
-        # lets the new request reuse the committed block instead of
-        # recomputing it. Saves computation, not just memory.
-        # Requires a read-only radix tree probe API.
 
         # Use indexed iteration (while + req_it_end) so that MAX_UTIL
         # eviction can shrink the range from the tail.
@@ -437,9 +445,42 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # --- Phase 2: schedule deferred context / encoder requests ---
         # Generation PEFT pages are now fully committed in the budget.
+        #
+        # Prefix-aware skip: when several first-chunk context requests would
+        # contribute the same not-yet-cached block, admitting them together
+        # makes every one of them recompute that prefix. Admit one, defer the
+        # rest by one iteration and let them reuse the block it commits.
+        # `_collect_contributed_blocks` returns the blocks already promised by
+        # context requests running this iteration, or None when the skip cannot
+        # fire at all and every probe below can be avoided.
+        contributed_blocks = self._collect_contributed_blocks(
+            requests_list, pending_ctx, inflight_request_ids
+        )
+
         for req in pending_ctx:
             if budget.requests_full:
                 break
+            # Probe context requests before peft_pages_needed and before
+            # _try_schedule_context so that a deferral costs nothing: KV pages
+            # are allocated inline, so a skip decided after prepare_context
+            # would pay a create/suspend cycle. Chunk continuations are probed
+            # too -- they cannot be deferred, but they do contribute a block, so
+            # they register once scheduled.
+            first_new_block = None
+            if contributed_blocks is not None and (
+                req.state_value == self._context_init_state_value
+            ):
+                first_new_block = self.kv_cache_manager.probe_first_new_block_key(req)
+                if (
+                    req.is_first_context_chunk
+                    and first_new_block is not None
+                    and first_new_block in contributed_blocks
+                ):
+                    logger.debug(
+                        f"Deferring context request {req.py_request_id}: its first new "
+                        "block is already contributed by a request that runs this iteration"
+                    )
+                    continue
             peft_pages = budget.peft_pages_needed(req)
             if peft_pages is None:
                 continue
@@ -458,6 +499,19 @@ class KVCacheV2Scheduler(RequestScheduler):
                 has_chunking = has_chunking or chunking_flag
                 scheduled_ctx.append(req)
                 budget.commit(req, tokens, peft_pages)
+                # Register the block only once the request has cleared its
+                # budget and is committed. Registering earlier, inside the check
+                # above, would let a request that then fails to schedule defer
+                # its duplicates anyway -- and this loop `continue`s on every
+                # ScheduleAction.SKIP, so failing to schedule is routine.
+                #
+                # Together with the in-flight-only pre-pass this gives the
+                # invariant that keeps the deadlock detector below sound:
+                # a request is only ever deferred behind a contributor that
+                # actually runs this iteration, so a deferral always leaves
+                # either inflight_request_ids or scheduled_ctx non-empty.
+                if first_new_block is not None:
+                    contributed_blocks.add(first_new_block)
 
         # Deadlock detection: if generation requests exist but none were
         # scheduled and none were evicted, no forward pass will run and no
@@ -478,14 +532,28 @@ class KVCacheV2Scheduler(RequestScheduler):
                 and not recompute_paused
                 and not inflight_request_ids
             ):
+                # A connector rejects every tier below GPU at bring-up
+                # (`PyExecutor._reject_non_gpu_cache_tiers`), so offering those
+                # two settings there is advice the user cannot act on.
+                if getattr(self.kv_cache_manager, "kv_connector_manager", None) is not None:
+                    remedy = (
+                        "A KV connector is attached, which requires a GPU-only cache, "
+                        "so no secondary tier can be configured. Increase "
+                        "kv_cache_config.max_tokens or kv_cache_config."
+                        "free_gpu_memory_fraction, or lower max_num_tokens to hand "
+                        "memory back to the KV pool."
+                    )
+                else:
+                    remedy = (
+                        "Configure kv_cache_config.host_cache_size or "
+                        "kv_cache_config.disk_cache_size, or increase "
+                        "kv_cache_config.max_tokens."
+                    )
                 raise RuntimeError(
                     f"V2 scheduler deadlock: {num_gen_candidates} generation "
                     f"request(s) active but none could be scheduled or "
                     f"evicted or recompute-paused. KV cache pool is likely exhausted with no "
-                    f"secondary cache tier for suspend/resume offload. "
-                    f"Configure kv_cache_config.host_cache_size or "
-                    f"kv_cache_config.disk_cache_size, or increase "
-                    f"kv_cache_config.max_tokens."
+                    f"secondary cache tier for suspend/resume offload. {remedy}"
                 )
 
         return (
@@ -497,6 +565,111 @@ class KVCacheV2Scheduler(RequestScheduler):
             disagg_candidates,
             has_chunking,
         )
+
+    # ---- Prefix-aware skip ----
+
+    def _is_prefix_skip_candidate(self, req: LlmRequest) -> bool:
+        """Whether *req* may be deferred in favour of a duplicate prefix.
+
+        Only first-chunk context requests: a request already mid-prefill cannot
+        be skipped, and an encoder request contributes to the cross pool, which
+        the skip deliberately leaves alone.
+        """
+        return req.state_value == self._context_init_state_value and req.is_first_context_chunk
+
+    def _skip_pays_off_under_reuse_policy(self) -> bool:
+        """Whether a one-iteration deferral can actually be repaid by a reuse hit.
+
+        The skip trades TTFT for prefill FLOPs on the premise that the contributor
+        commits its first new block promptly, so the deferred duplicate matches it
+        on the next pass. That premise is a property of the block-reuse policy, not
+        of the scheduler.
+
+        Under ``ALL_REUSABLE`` it holds: blocks are committed per block as prefill
+        advances (``should_commit = is_all_reusable or ...``,
+        ``kv_cache/kv_cache_manager_v2.py:4112``), so the deferral is bounded by
+        one iteration and always pays.
+
+        Under every other policy it does not. The case that matters today is
+        hybrid/SSM: any mamba layer downgrades ``ALL_REUSABLE`` to ``PER_REQUEST``
+        (``kv_cache/mamba_cache_manager.py:3140-3146``), and
+        ``MambaHybridCacheManagerV2.update_context_resources``
+        (``kv_cache/mamba_cache_manager.py:4217-4218``) then commits only at an SSM
+        snapshot boundary or at the end of the whole context. Snapshots are off by
+        default (``MambaStateConfig.periodic_snapshot_interval`` defaults to 0,
+        ``llm_args.py:3989``), so in the default configuration nothing is committed
+        until the contributor's entire prefill finishes -- and the duplicate is
+        re-deferred for all of it, because the contributor stays in flight and
+        re-registers its key every iteration.
+
+        Worse, a commit tags exactly one block with an SSM page, the ordinal
+        holding ``num_committed_tokens - 1`` (``_core/_kv_cache.py:1078``), and
+        ``_prune_match`` truncates a match to the last block carrying such a page,
+        or to nothing when there is none (``_block_radix_tree.py:755-758``). A
+        duplicate that shares a prefix but diverges before the contributor's end
+        therefore waits out that whole prefill and then still reuses nothing. That
+        is a TTFT regression with no compensating saving, so gate rather than
+        defer.
+
+        Keying this on the policy rather than on "is there an SSM life cycle"
+        makes the gate self-lifting: configuring periodic snapshots does not by
+        itself restore per-block commits, and any future policy that does commit
+        eagerly can opt in here explicitly.
+
+        Called once, from ``__init__``, to fold into ``_prefix_skip_enabled``.
+        """
+        from ..kv_cache.kv_cache_manager_v2 import BlockReusePolicy
+
+        return self.kv_cache_manager.block_reuse_policy == BlockReusePolicy.ALL_REUSABLE
+
+    def _collect_contributed_blocks(
+        self, requests_list: RequestList, pending_ctx: RequestList, inflight_request_ids: set[int]
+    ) -> Optional[set]:
+        """Blocks already promised by context requests executing right now.
+
+        A request that is mid-prefill cannot be skipped, so whatever it is about
+        to commit is registered up front and later duplicates defer to it. This
+        seeds the set that the phase-2 loop then extends as it schedules.
+
+        Only chunk continuations that are actually in flight qualify. One that
+        is merely pending registers through the normal post-``SCHEDULED`` path
+        instead: it precedes its duplicates in arrival order, so coverage is the
+        same in practice, and nothing is ever deferred behind a contributor that
+        might not run. Deferring behind a request that does not run could
+        produce an iteration scheduling nothing, which the deadlock detector
+        would report as a hang.
+
+        Returns None when the skip provably cannot fire this iteration, which
+        lets the caller avoid every probe: nothing else consumes the radix walk,
+        so a probe that cannot change a decision is pure overhead.
+        """
+        if not self._prefix_skip_enabled:
+            return None
+        num_candidates = sum(1 for req in pending_ctx if self._is_prefix_skip_candidate(req))
+        if num_candidates == 0:
+            return None
+        in_flight = [
+            req
+            for req in requests_list
+            if req.state_value == self._context_init_state_value
+            and not req.is_first_context_chunk
+            and req.request_id in inflight_request_ids
+        ]
+        if not in_flight and num_candidates < 2:
+            # A lone candidate with nothing running can never be deferred: only
+            # requests examined before it can register, and there are none.
+            has_pending_continuation = any(
+                req.state_value == self._context_init_state_value and not req.is_first_context_chunk
+                for req in pending_ctx
+            )
+            if not has_pending_continuation:
+                return None
+        contributed = set()
+        for req in in_flight:
+            key = self.kv_cache_manager.probe_first_new_block_key(req)
+            if key is not None:
+                contributed.add(key)
+        return contributed
 
     # ---- Per-type scheduling methods ----
 
@@ -558,10 +731,38 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         Returns ``(action, tokens, chunking_flag)``.  *tokens* and
         *chunking_flag* are meaningful only when *action* is ``SCHEDULED``.
+
+        Deliberately connector-blind: the connector is asked later, in
+        the cache manager's ``prepare_resources``, so the budget here assumes it
+        serves nothing. That is safe because honouring an offer only ever
+        removes tokens from the forward pass, and it costs only that a served
+        prefix frees no budget for another request in the same iteration.
+
+        ``should_add_sequence`` must not gate scheduling either: it stays false
+        from the moment an asynchronous load completes until
+        ``request_finished``, so a request gated on it would be skipped forever
+        and never run the prefill the load was for. A loading request is kept
+        out of the batch by its ``DISAGG_GENERATION_TRANS_IN_PROGRESS`` state.
         """
+        first_chunk = req.is_first_context_chunk
         if self.chunking_enabled:
-            return self._try_schedule_context_chunked(req, budget)
-        return self._try_schedule_context_full(req, budget)
+            result = self._try_schedule_context_chunked(req, budget)
+        else:
+            result = self._try_schedule_context_full(req, budget)
+
+        if first_chunk and result[0] is not ScheduleAction.SCHEDULED:
+            # Failed admission must not retain prefix-reuse holds. Suspension
+            # alone cannot release them when the last cache tier is full.
+            for manager in (
+                self.kv_cache_manager,
+                self.draft_kv_cache_manager,
+                self.cross_kv_cache_manager,
+            ):
+                if manager is not None and req.py_request_id in manager.kv_cache_map:
+                    manager.free_resources(req)
+            rewind_context_after_cache_drop(req, self.tokens_per_block)
+
+        return result
 
     def _try_schedule_context_full(
         self, req: LlmRequest, budget: BudgetTracker
@@ -674,10 +875,6 @@ class KVCacheV2Scheduler(RequestScheduler):
             chunk_size = (chunk_size // self.chunk_unit_size) * self.chunk_unit_size
 
         if chunk_size <= 0:
-            # TODO: consider suspending first-chunk KVCache to release
-            # GPU pages. Currently we skip without suspend to avoid
-            # pathological suspend/resume cycles. suspend_request is
-            # only called from eviction (_try_evict_for_gen).
             return ScheduleAction.SKIP, 0, False
 
         chunk_size = self._align_chunk_to_mm_block(
@@ -737,6 +934,8 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     def _prepare_context_pair(self, req: LlmRequest) -> bool:
         """Prepare target/draft caches with one verified logical reuse depth."""
+        from ..kv_cache.kv_cache_manager_v2 import _settle_context_cursor
+
         draft_manager = self._joint_draft_manager
         if draft_manager is None:
             return self.kv_cache_manager.prepare_context(req)
@@ -781,11 +980,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # No enable_block_reuse guard: reaching here means a paired draft pool
         # exists, and KvCacheCreator only pairs when block reuse is on.
-        if common_reuse < req.context_current_position:
-            # setPrepopulatedPromptLen only moves forward, so a match shallower
-            # than a previous attempt's has to be rewound by hand.
-            req.context_current_position = common_reuse
-        req.set_prepopulated_prompt_len(common_reuse, self.kv_cache_manager.tokens_per_block)
+        _settle_context_cursor(req, common_reuse, self.kv_cache_manager.tokens_per_block)
         return True
 
     def _try_allocate_context(self, req: LlmRequest, num_tokens: int) -> bool:

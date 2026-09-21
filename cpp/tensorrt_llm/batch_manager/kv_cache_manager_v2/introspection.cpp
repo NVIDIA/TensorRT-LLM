@@ -95,19 +95,6 @@ std::optional<bool> KvCacheIntrospection::committedPageIsLinked(KvCache const& k
     return committed->block != nullptr;
 }
 
-TypedVec<PoolGroupIndex, StorageStatistics> KvCacheIntrospection::storageStatistics(
-    KvCacheManager& manager, CacheLevel level)
-{
-    TypedVec<PoolGroupIndex, StorageStatistics> result;
-    PoolGroupIndex const numPoolGroups = manager.storage().numPoolGroups(level);
-    result.reserve(numPoolGroups);
-    for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups; ++pgIdx)
-    {
-        result.push_back(manager.storage().getStatistics(level, pgIdx));
-    }
-    return result;
-}
-
 TypedVec<PoolGroupIndex, SlotCount> KvCacheIntrospection::computeSlotsForBatch(KvCacheManager& manager,
     BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse)
 {

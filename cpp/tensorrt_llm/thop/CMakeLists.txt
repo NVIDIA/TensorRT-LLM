@@ -31,6 +31,13 @@ endif()
 add_library(th_utils STATIC thUtils.cpp)
 set_property(TARGET th_utils PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET th_utils PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+# Newer Torch headers (e.g. ATen/native/cuda/Resize.h) compare ArrayRef against
+# OptionalArrayRef in the reverse order, relying on C++20's automatic generation
+# of the reversed comparison operator. th_utils/th_common only contain host .cpp
+# sources, so scope the bump to these targets instead of the repo-wide C++17
+# standard.
+set_target_properties(th_utils PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
+                                                          ON)
 # Declare the dependency on the main shared library explicitly so consumers
 # (e.g. thUtilsTest) place it after th_utils on the link line; this was
 # previously satisfied transitively via the removed TensorRT plugin target.
@@ -47,13 +54,13 @@ add_library(
   asyncUlyssesOp.cpp
   attentionOp.cpp
   causalConv1dOp.cpp
-  cuteDslMoeUtilsOp.cpp
+  moe/cuteDslMoeUtilsOp.cpp
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
   cublasFp4ScaledMM.cpp
   cudaNvfp4MM.cpp
   marlinNvfp4MM.cpp
-  marlinNvfp4MoeMM.cpp
+  moe/marlinNvfp4MoeMM.cpp
   marlinRepack.cpp
   cudaScaledMM.cpp
   fmhaPackMaskOp.cpp
@@ -93,20 +100,20 @@ add_library(
   llama4MinLatency.cpp
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
-  moeOp.cpp
-  moeUtilOp.cpp
-  moeGateOp.cpp
-  moeCommOp.cpp
-  moeAlltoAllOp.cpp
-  moeLoadBalanceOp.cpp
-  moeAlignOp.cpp
-  megaMoePrepareOp.cpp
-  mxFp4BlockScaleMoe.cpp
+  moe/moeOp.cpp
+  moe/moeUtilOp.cpp
+  moe/moeGateOp.cpp
+  moe/moeCommOp.cpp
+  moe/moeAlltoAllOp.cpp
+  moe/moeLoadBalanceOp.cpp
+  moe/moeAlignOp.cpp
+  moe/megaMoePrepareOp.cpp
+  moe/mxFp4BlockScaleMoe.cpp
   mxFp8Quantize.cpp
   mxfp8Gemm.cpp
-  fp8BlockScaleMoe.cpp
-  fp8PerTensorScaleMoe.cpp
-  fp4BlockScaleMoe.cpp
+  moe/fp8BlockScaleMoe.cpp
+  moe/fp8PerTensorScaleMoe.cpp
+  moe/fp4BlockScaleMoe.cpp
   noAuxTcOp.cpp
   fusedCatFp4Op.cpp
   fusedCatFp8Op.cpp
@@ -123,7 +130,7 @@ add_library(
   reducescatterOp.cpp
   relativeAttentionBiasOp.cpp
   dsv3RouterGemmOp.cpp
-  customMoeRoutingOp.cpp
+  moe/customMoeRoutingOp.cpp
   localityDomainAllocator.cpp
   mamba2MTPSSMCacheOp.cpp
   selectiveScanOp.cpp
@@ -133,6 +140,7 @@ add_library(
   weightOnlyQuantGemm.cpp
   weightOnlyQuantOp.cpp
   specDecOp.cpp
+  fusedSamplingOp.cpp
   dynamicTreeOp.cpp
   loraOp.cpp
   finegrained_mixed_dtype_gemm_thop.cpp
@@ -146,6 +154,8 @@ add_library(
   mhcOp.cpp
   compressorOp.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_target_properties(th_common PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
+                                                           ON)
 target_link_libraries(
   th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
                     ${SHARED_TARGET} pg_utils)
