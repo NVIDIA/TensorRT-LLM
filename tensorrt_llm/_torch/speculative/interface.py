@@ -826,7 +826,7 @@ class SpecMetadata:
 
     def prepare_rejection_sampling_buffers(self):
         """
-        Allocate the slot-indexed buffers used by one-model rejection sampling.
+        Allocate slot state and batch scratch for one-model rejection sampling.
 
         Idempotent and gated on ``use_rejection_sampling``.
         """
@@ -859,10 +859,12 @@ class SpecMetadata:
                                               device='cuda')
         # full_draft_probs (d2t-expanded) is read only when draft and target
         # vocabularies differ; skip it otherwise. Zero-filled once.
+        # This scratch is indexed by generation batch position after gathering
+        # draft_probs by slot, so it needs neither the slot pool nor a dummy row.
         if (self.full_draft_probs is None and self.vocab_size > 0
                 and self.draft_vocab_size not in (0, self.vocab_size)):
             self.full_draft_probs = torch.zeros(
-                (num_slot_rows, self.max_draft_len, self.vocab_size),
+                (self.max_num_requests, self.max_draft_len, self.vocab_size),
                 dtype=torch.float32,
                 device='cuda')
 

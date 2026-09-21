@@ -59,11 +59,27 @@ def test_prepare_buffers_allocates_when_enabled():
     assert m.draft_probs_vocab_size == V
 
 
-def test_prepare_buffers_allocates_full_draft_probs_on_vocab_mismatch():
-    # Distinct draft vocab: full_draft_probs (d2t-expanded) is allocated.
-    m = _alloc_meta(draft_vocab_size=V - 1)
+@pytest.mark.parametrize("num_seq_slots", [0, R, 2 * R])
+def test_prepare_buffers_allocates_full_draft_probs_on_vocab_mismatch(num_seq_slots):
+    # Expanded probabilities are batch scratch; only draft_probs is slot-indexed.
+    m = _alloc_meta(draft_vocab_size=V - 1, num_seq_slots=num_seq_slots)
     SpecMetadata.prepare_rejection_sampling_buffers(m)
-    assert m.full_draft_probs is not None and tuple(m.full_draft_probs.shape) == (R + 1, K, V)
+    assert tuple(m.full_draft_probs.shape) == (R, K, V)
+    assert m.full_draft_probs.untyped_storage().nbytes() == R * K * V * 4
+    assert torch.count_nonzero(m.full_draft_probs).item() == 0
+    pool = num_seq_slots or R
+    assert tuple(m.draft_probs.shape) == (pool + 1, K, V)
+    assert m.dummy_slot_row == pool
+
+    # A smaller graph bucket shares preallocated storage. Preparing it again
+    # must preserve both addresses and the original dummy slot index.
+    m.is_cuda_graph = False
+    m.__post_init__ = lambda: None
+    graph = SpecMetadata.create_cuda_graph_metadata(m, R // 2)
+    SpecMetadata.prepare_rejection_sampling_buffers(graph)
+    assert graph.full_draft_probs is m.full_draft_probs
+    assert graph.draft_probs is m.draft_probs
+    assert graph.dummy_slot_row == pool
 
 
 def test_prepare_buffers_span_seq_slot_pool():
