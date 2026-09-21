@@ -128,6 +128,8 @@ l0_h100:
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_v1_masked_dsa_indexer_across_asymmetric_pp
   # Python transceiver with the C++ NIXL agent's bounce v2 enabled.
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_python_nixl_cache_transceiver_uses_cpp_bounce
+  # Helix CP
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_helix_cp
   - unittest/disaggregated/test_cache_transceiver_harness_report.py
   - unittest/disaggregated/test_cache_transceiver_harness.py
   - unittest/disaggregated/test_cache_transceiver_precheck_e2e.py
