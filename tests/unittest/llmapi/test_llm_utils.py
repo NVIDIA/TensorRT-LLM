@@ -16,14 +16,20 @@ import asyncio
 import json
 import threading
 import time
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.auto_deploy.llm_args import \
     LlmArgs as AutoDeployLlmArgs
+from tensorrt_llm.llmapi import llm as llm_module
+from tensorrt_llm.llmapi import mm_encoder as mm_encoder_module
+from tensorrt_llm.llmapi.llm import _TorchLLM
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.llmapi.llm_utils import CachedModelLoader, ModelLoader
+from tensorrt_llm.llmapi.mm_encoder import MultimodalEncoder
 from tensorrt_llm.llmapi.utils import AsyncQueue
 
 # isort: off
@@ -79,6 +85,58 @@ def test_cached_model_loader_returns_none_for_autodeploy(tmp_path):
     model_dir = CachedModelLoader(llm_args)()
 
     assert model_dir is None
+
+
+@pytest.mark.cpu_only
+def test_torch_llm_build_passes_model_dir_to_executor(monkeypatch, tmp_path):
+    llm = object.__new__(_TorchLLM)
+    llm.args = TorchLlmArgs(model=str(tmp_path), gpus_per_node=1)
+    llm.mpi_session = None
+    llm._executor_cls = MagicMock()
+
+    monkeypatch.setattr(CachedModelLoader, "__call__", lambda self: tmp_path)
+    monkeypatch.setattr(_TorchLLM, "_try_load_tokenizer", lambda self: None)
+    monkeypatch.setattr(_TorchLLM, "_try_load_hf_model_config",
+                        lambda self: None)
+    monkeypatch.setattr(_TorchLLM,
+                        "_reject_token_encoder_config_without_buckets",
+                        lambda self: None)
+    monkeypatch.setattr(_TorchLLM, "_try_load_generation_config",
+                        lambda self: None)
+    monkeypatch.setattr(_TorchLLM,
+                        "_try_load_generation_config_explicit_values",
+                        lambda self: {})
+    monkeypatch.setattr(llm_module, "create_input_processor",
+                        lambda *args, **kwargs: SimpleNamespace(tokenizer=None))
+    monkeypatch.setattr(llm_module, "external_mpi_comm_available",
+                        lambda world_size: False)
+
+    llm._build_model()
+
+    create_call = llm._executor_cls.create.call_args
+    assert create_call.args == (None, )
+    assert create_call.kwargs["hf_model_dir"] == tmp_path
+
+
+@pytest.mark.cpu_only
+def test_multimodal_encoder_build_passes_none_to_executor(
+        monkeypatch, tmp_path):
+    encoder = object.__new__(MultimodalEncoder)
+    encoder.args = TorchLlmArgs(model=str(tmp_path), gpus_per_node=1)
+    encoder.mpi_session = None
+    encoder._executor_cls = MagicMock()
+
+    monkeypatch.setattr(CachedModelLoader, "__call__", lambda self: tmp_path)
+    monkeypatch.setattr(MultimodalEncoder, "_try_load_tokenizer",
+                        lambda self: None)
+    monkeypatch.setattr(mm_encoder_module, "create_input_processor",
+                        lambda *args, **kwargs: SimpleNamespace(tokenizer=None))
+    monkeypatch.setattr(mm_encoder_module, "external_mpi_comm_available",
+                        lambda world_size: False)
+
+    encoder._build_model()
+
+    assert encoder._executor_cls.create.call_args.args == (None, )
 
 
 @pytest.mark.cpu_only
