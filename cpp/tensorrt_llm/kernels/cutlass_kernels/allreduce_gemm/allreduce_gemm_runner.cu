@@ -57,6 +57,11 @@ template <typename KeyType, typename ValueType>
 class GemmAllReduceRegistryBuilder
 {
 public:
+    explicit GemmAllReduceRegistryBuilder(runtime::IpcNvlsRendezvousPtr rendezvous = nullptr)
+        : mRendezvous(std::move(rendezvous))
+    {
+    }
+
     template <typename GemmTraits, GemmAllReduceImpl Impl, MainloopScheduleType Schedule, TileShape TileShape_MNK,
         ClusterShape ClusterShape_MNK>
     void addSm90()
@@ -87,7 +92,7 @@ public:
 
         const GemmAllReduceImplInterface::LaunchConfig key(
             {Impl, Schedule, TileShape_MNK, ClusterShape_MNK, 1, true /* transposed*/});
-        auto value = std::make_shared<GemmType>();
+        auto value = std::make_shared<GemmType>(mRendezvous);
 
         mGemmRegistry.insert({key, value});
     }
@@ -159,6 +164,7 @@ private:
             and std::is_same_v<typename GemmTraits::ElementB, cutlass::float_e4m3_t>;
     }
 
+    runtime::IpcNvlsRendezvousPtr mRendezvous;
     std::map<KeyType, ValueType> mGemmRegistry;
 };
 
@@ -168,7 +174,21 @@ private:
 template <typename GemmTraits>
 GemmAllReduceImplRunner<GemmTraits>::GemmAllReduceImplRunner()
 {
-    GemmAllReduceRegistryBuilder<KeyType, ValueType> registry_builder;
+    initializeRegistry();
+}
+
+template <typename GemmTraits>
+GemmAllReduceImplRunner<GemmTraits>::GemmAllReduceImplRunner(runtime::IpcNvlsRendezvousPtr rendezvous)
+    : mRendezvous(std::move(rendezvous))
+{
+    TLLM_CHECK_WITH_INFO(mRendezvous != nullptr, "NVLS rendezvous must not be null");
+    initializeRegistry();
+}
+
+template <typename GemmTraits>
+void GemmAllReduceImplRunner<GemmTraits>::initializeRegistry()
+{
+    GemmAllReduceRegistryBuilder<KeyType, ValueType> registry_builder(mRendezvous);
     constexpr int bits_input = cutlass::sizeof_bits<typename GemmTraits::ElementA>::value;
 
     // Instantiate GEMMs for each config
@@ -192,6 +212,8 @@ GemmAllReduceImplRunner<GemmTraits>::GemmAllReduceImplRunner()
     // Blackwell
     case 100:
     case 103:
+        TLLM_CHECK_WITH_INFO(!mRendezvous || mRendezvous->kind() == runtime::IpcNvlsRendezvousKind::kMPI,
+            "TorchDist rendezvous for GEMM+allreduce is not implemented on SM100/SM103");
         registry_builder.addSm100<GemmTraits, GemmAllReduceImpl::kNVLS_2SHOT, _2SM, TileShape::TileShape_128x256x128,
             ClusterShape::ClusterShape_4x1x1>();
         break;

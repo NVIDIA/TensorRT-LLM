@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/allreduce_gemm_runner.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
+#include "tensorrt_llm/runtime/ipcNvlsMemoryTorch.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/EmptyTensor.h>
@@ -42,10 +43,13 @@ struct AllocationKey
 {
     int64_t device_index;
     std::set<int> group;
+    uintptr_t rendezvous_identity{0};
+    at::ScalarType output_dtype;
 
     bool operator==(AllocationKey const& other) const
     {
-        return device_index == other.device_index && group == other.group;
+        return device_index == other.device_index && group == other.group
+            && rendezvous_identity == other.rendezvous_identity && output_dtype == other.output_dtype;
     }
 
     std::string toString() const
@@ -56,7 +60,7 @@ struct AllocationKey
         {
             ss << rank << ", ";
         }
-        ss << "])";
+        ss << "], rendezvous: " << rendezvous_identity << ", dtype: " << static_cast<int>(output_dtype) << ")";
         return ss.str();
     }
 };
@@ -75,6 +79,8 @@ struct AllocationKeyHash
         {
             hash_combine(seed, elem);
         }
+        hash_combine(seed, key.rendezvous_identity);
+        hash_combine(seed, static_cast<int>(key.output_dtype));
 
         return seed;
     }
@@ -90,10 +96,12 @@ private:
 class IpcNvlsHandleWrapper
 {
 public:
-    IpcNvlsHandleWrapper(size_t size, std::set<int> groups)
+    IpcNvlsHandleWrapper(size_t size, tensorrt_llm::runtime::IpcNvlsRendezvousPtr rendezvous)
         : mSize(size)
+        , mRendezvous(std::move(rendezvous))
     {
-        mHandle = tensorrt_llm::runtime::ipcNvlsAllocate(size, groups);
+        TLLM_CHECK_WITH_INFO(mRendezvous != nullptr, "NVLS rendezvous must not be null");
+        mHandle = mRendezvous->allocate(size);
     }
 
     tensorrt_llm::runtime::IpcNvlsHandle* getHandle() const
@@ -113,7 +121,8 @@ public:
 
 private:
     size_t mSize;
-    tensorrt_llm::runtime::IpcNvlsHandle* mHandle;
+    tensorrt_llm::runtime::IpcNvlsRendezvousPtr mRendezvous;
+    tensorrt_llm::runtime::IpcNvlsHandle* mHandle{nullptr};
 };
 
 std::once_flag init_flag;
@@ -151,11 +160,13 @@ public:
 
     std::pair<PersistentWorkspaceInterface*, tensorrt_llm::runtime::IpcNvlsHandle*> getWorkspace(
         GemmAllReduceImplInterface* runner, GemmAllReduceImplInterface::ProblemArgs const& problem,
-        AllocationKey const& key)
+        AllocationKey const& key, at::ScalarType outputDtype,
+        tensorrt_llm::runtime::IpcNvlsRendezvousPtr const& rendezvous)
     {
         int M = std::get<0>(problem.problem_size);
         int N = std::get<1>(problem.problem_size);
-        size_t requiredSize = M * N * 2;
+        size_t const elementSize = c10::elementSize(outputDtype);
+        size_t requiredSize = static_cast<size_t>(M) * static_cast<size_t>(N) * elementSize;
         size_t preferredWorkspaceSize = getPreferredWorkspaceSize();
         if (requiredSize > preferredWorkspaceSize)
         {
@@ -168,10 +179,10 @@ public:
         if (handle == nullptr)
         {
             TLLM_LOG_DEBUG("Creating allreduce workspace for %s", key.toString().c_str());
-            handle = std::make_shared<IpcNvlsHandleWrapper>(preferredWorkspaceSize, key.group);
+            handle = std::make_shared<IpcNvlsHandleWrapper>(preferredWorkspaceSize, rendezvous);
             GemmAllReduceImplInterface::ProblemArgs tmpArgs;
             int maxN = 16384;
-            int maxM = preferredWorkspaceSize / (maxN * 2);
+            int maxM = preferredWorkspaceSize / (maxN * elementSize);
             tmpArgs.argProblemShape(maxM, maxN, 512, 1)
                 .argRanks(problem.rank, problem.ranks)
                 .argLaunchConfig(runner->getSupportedLaunchConfigs()[0]);
@@ -195,10 +206,16 @@ GemmAllreduceNvlsMemoryManager* getGemmAllreduceNvlsMemoryManager()
 }
 
 at::Tensor runGemmImpl(GemmAllReduceImplInterface* runner, GemmAllReduceImplInterface::ProblemArgs& problem,
-    at::ScalarType outputDtype, c10::cuda::CUDAStream stream)
+    at::ScalarType outputDtype, c10::cuda::CUDAStream stream,
+    tensorrt_llm::runtime::IpcNvlsRendezvousPtr rendezvous = nullptr)
 {
-    AllocationKey key{stream.device_index(), problem.ranks};
-    auto [workspace, handle] = getGemmAllreduceNvlsMemoryManager()->getWorkspace(runner, problem, key);
+    if (!rendezvous)
+    {
+        rendezvous = tensorrt_llm::runtime::makeMpiIpcNvlsRendezvous(problem.ranks);
+    }
+    AllocationKey key{stream.device_index(), problem.ranks, rendezvous->identity(), outputDtype};
+    auto [workspace, handle]
+        = getGemmAllreduceNvlsMemoryManager()->getWorkspace(runner, problem, key, outputDtype, rendezvous);
     problem.argD((void*) handle->uc_ptr, (void*) handle->mc_ptr, (void**) handle->ipc_uc_ptrs.data());
     problem.argWorkspace(workspace);
     runner->run(problem, stream);
@@ -289,6 +306,88 @@ private:
     std::vector<GemmAllReduceImplInterface::LaunchConfig> mConfigs;
 };
 
+#ifdef USING_OSS_CUTLASS_ALLREDUCE_GEMM
+class GemmAllreduceRunner : public torch::CustomClassHolder
+{
+public:
+    GemmAllreduceRunner(at::ScalarType outputDtype, c10::intrusive_ptr<c10d::ProcessGroup> processGroup)
+        : mOutputDtype(outputDtype)
+        , mRendezvous(tensorrt_llm::runtime::makeTorchDistIpcNvlsRendezvous(std::move(processGroup)))
+        , mRank(mRendezvous->rank())
+    {
+        for (int rank = 0; rank < mRendezvous->size(); ++rank)
+        {
+            mGroup.insert(rank);
+        }
+
+        if (outputDtype == at::ScalarType::Half)
+        {
+            using Traits = GemmTypes<cutlass::half_t, cutlass::half_t, cutlass::half_t, cutlass::half_t, void, void,
+                cutlass::layout::RowMajor, cutlass::layout::ColumnMajor, cutlass::layout::RowMajor,
+                cutlass::layout::RowMajor>;
+            mRunner = std::make_shared<GemmAllReduceImplRunner<Traits>>(mRendezvous);
+        }
+        else if (outputDtype == at::ScalarType::BFloat16)
+        {
+            using Traits = GemmTypes<cutlass::bfloat16_t, cutlass::bfloat16_t, cutlass::bfloat16_t, cutlass::bfloat16_t,
+                void, void, cutlass::layout::RowMajor, cutlass::layout::ColumnMajor, cutlass::layout::RowMajor,
+                cutlass::layout::RowMajor>;
+            mRunner = std::make_shared<GemmAllReduceImplRunner<Traits>>(mRendezvous);
+        }
+        else
+        {
+            TLLM_THROW("Unsupported output dtype: %s", torch::toString(outputDtype));
+        }
+        mConfigs = mRunner->getSupportedLaunchConfigs();
+    }
+
+    at::Tensor runGemm(at::Tensor const& mat1, at::Tensor const& mat2, int64_t configIdx) const
+    {
+        TORCH_CHECK(mat1.is_cuda() && mat2.is_cuda(), "GEMM+allreduce inputs must be CUDA tensors");
+        TORCH_CHECK(mat1.dim() == 2 && mat2.dim() == 2, "GEMM+allreduce inputs must be matrices");
+        TORCH_CHECK(mat1.scalar_type() == mOutputDtype && mat2.scalar_type() == mOutputDtype,
+            "GEMM+allreduce input and output dtypes must match");
+        TORCH_CHECK(mat1.is_contiguous() && mat2.is_contiguous(), "GEMM+allreduce inputs must be contiguous");
+        TORCH_CHECK(mat1.size(1) == mat2.size(1), "GEMM+allreduce K dimensions must match");
+        if (configIdx < 0)
+        {
+            configIdx = 0;
+        }
+        TORCH_CHECK(configIdx < static_cast<int64_t>(mConfigs.size()), "configIdx out of bounds");
+
+        int64_t const M = mat1.size(0);
+        int64_t const N = mat2.size(0);
+        int64_t const K = mat1.size(1);
+
+        GemmAllReduceImplInterface::ProblemArgs problemArgs;
+        problemArgs.argProblemShape(M, N, K, 1)
+            .argA(mat1.data_ptr())
+            .argB(mat2.data_ptr())
+            .argC(nullptr)
+            .argAlpha(1.0F)
+            .argBeta(0.0F)
+            .argRanks(mRank, mGroup)
+            .argLaunchConfig(mConfigs[configIdx]);
+
+        auto stream = at::cuda::getCurrentCUDAStream(mat1.get_device());
+        return runGemmImpl(mRunner.get(), problemArgs, mOutputDtype, stream, mRendezvous);
+    }
+
+    int64_t getNumConfigs() const
+    {
+        return static_cast<int64_t>(mConfigs.size());
+    }
+
+private:
+    at::ScalarType mOutputDtype;
+    tensorrt_llm::runtime::IpcNvlsRendezvousPtr mRendezvous;
+    int mRank;
+    std::set<int> mGroup;
+    std::shared_ptr<GemmAllReduceImplInterface> mRunner;
+    std::vector<GemmAllReduceImplInterface::LaunchConfig> mConfigs;
+};
+#endif // USING_OSS_CUTLASS_ALLREDUCE_GEMM
+
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -297,4 +396,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         .def(torch::init<at::ScalarType, int64_t, torch::List<int64_t>>())
         .def("run_gemm", &torch_ext::Fp4GemmAllreduceRunner::runGemm)
         .def("get_num_configs", &torch_ext::Fp4GemmAllreduceRunner::getNumConfigs);
+#ifdef USING_OSS_CUTLASS_ALLREDUCE_GEMM
+    m.class_<torch_ext::GemmAllreduceRunner>("GemmAllreduceRunner")
+        .def(torch::init<at::ScalarType, c10::intrusive_ptr<c10d::ProcessGroup>>())
+        .def("run_gemm", &torch_ext::GemmAllreduceRunner::runGemm)
+        .def("get_num_configs", &torch_ext::GemmAllreduceRunner::getNumConfigs);
+#endif
 }

@@ -2797,6 +2797,34 @@ def record_stream(tensor: torch.Tensor, stream_id: int) -> None:
     tensor.record_stream(stream)
 
 
+class GemmAllreduceRunner:
+    """Bound TorchDist runner for FP16/BF16 GEMM + all-reduce.
+
+    The C++ custom class owns the ProcessGroup, so callers need not pass a
+    non-Tensor distributed object through every compiled forward.
+    """
+
+    runner_dict = dict()
+
+    def __init__(self, output_dtype: torch.dtype,
+                 process_group: torch.distributed.ProcessGroup,
+                 device: torch.device):
+        device = torch.device(device)
+        instance_key = (output_dtype, device.index, process_group)
+        if instance_key not in self.runner_dict:
+            with torch.cuda.device(device):
+                self.runner_dict[
+                    instance_key] = torch.classes.trtllm.GemmAllreduceRunner(
+                        output_dtype, process_group.boxed())
+        self.runner = self.runner_dict[instance_key]
+
+    def __call__(self,
+                 mat1: torch.Tensor,
+                 mat2: torch.Tensor,
+                 tactic: int = -1) -> torch.Tensor:
+        return self.runner.run_gemm(mat1, mat2, tactic)
+
+
 class Fp4GemmAllreduceRunner(TunableRunner):
     runner_dict = dict()
     tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(

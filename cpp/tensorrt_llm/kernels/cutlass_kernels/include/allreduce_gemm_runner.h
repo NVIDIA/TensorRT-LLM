@@ -25,6 +25,9 @@
 #include "cutlass/layout/layout.h"
 #include "cutlass_extensions/gemm_configs.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
+#ifdef USING_OSS_CUTLASS_ALLREDUCE_GEMM
+#include "tensorrt_llm/runtime/ipcNvlsMemory.h"
+#endif
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -234,6 +237,10 @@ class GemmAllReduceImplRunner : public GemmAllReduceImplInterface
 public:
     GemmAllReduceImplRunner();
 
+#ifdef USING_OSS_CUTLASS_ALLREDUCE_GEMM
+    explicit GemmAllReduceImplRunner(runtime::IpcNvlsRendezvousPtr rendezvous);
+#endif
+
     ~GemmAllReduceImplRunner() override = default;
 
     std::shared_ptr<PersistentWorkspaceInterface> getPersistentWorkspace(ProblemArgs const& max_problem) override;
@@ -247,6 +254,11 @@ private:
 
     using KeyType = GemmAllReduceImplInterface::LaunchConfig;
     using ValueType = std::shared_ptr<GemmAllReduceImplInterface>;
+
+#ifdef USING_OSS_CUTLASS_ALLREDUCE_GEMM
+    void initializeRegistry();
+    runtime::IpcNvlsRendezvousPtr mRendezvous;
+#endif
 
     std::map<KeyType, ValueType> mGemmRegistry;
 };
