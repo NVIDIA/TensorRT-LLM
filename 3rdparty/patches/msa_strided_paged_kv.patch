@@ -732,3 +732,16 @@ index e3473fb..dc4cfb0 100644
  
  
  def assume_strides_aligned(t):
+diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
+--- a/python/fmha_sm100/jit.py
++++ b/python/fmha_sm100/jit.py
+@@ -199,6 +199,9 @@
+         "--expt-relaxed-constexpr", "--expt-extended-lambda",
+         "-gencode=arch=compute_100a,code=sm_100a",
+         "-gencode=arch=compute_103a,code=sm_103a",
++        # SM100-family image so the rest of the family can load these kernels;
++        # sm_100a/sm_103a are arch-conditional and outrank it on those devices.
++        "-gencode=arch=compute_100f,code=sm_100f",
+         "-static-global-template-stub=false",
+         "-DFLASHINFER_ENABLE_BF16",
+         "-DFLASHINFER_ENABLE_FP8_E4M3",

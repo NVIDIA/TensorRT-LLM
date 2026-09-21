@@ -110,6 +110,6 @@ measured: []
   `cpp/tensorrt_llm/kernels/noAuxTcKernels.cu`, `moeTopKFuncs.cuh`,
   `cpp/tensorrt_llm/thop/noAuxTcOp.cpp`,
   `tensorrt_llm/_torch/models/modeling_deepseekv3.py`; analogous TRTLLM-Gen MoE
-  routing kernels under `kernels/trtllmGenKernels/blockScaleMoe/Routing*.cu`.
+  routing kernels under `kernels/moe/trtllmGen/routing/Routing*.cu`.
   Owning specialist: **kernel-cuda-specialist**. Related: `perf-host-analysis`
   (inter-kernel gap), `perf-nsight-systems` (launch count).

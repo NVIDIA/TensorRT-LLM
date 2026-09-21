@@ -487,10 +487,15 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
             from ...custom_ops.cute_dsl_custom_ops import (
                 Sm107BlockScaledContiguousGatherGroupedGemmActFusionRunner,
-                Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner)
+                Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
+                Sm107BlockScaledContiguousGroupedGemmFusedFc12Runner)
             checked_runner_types.extend([
                 Sm107BlockScaledContiguousGatherGroupedGemmActFusionRunner,
                 Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
+                # The fused FC12 runner also requires mma_tiler_m == tile_size;
+                # without it the Cartesian replay pairs inner tactics captured
+                # under one routing tile with a different outer tile.
+                Sm107BlockScaledContiguousGroupedGemmFusedFc12Runner,
             ])
 
         return _runner_tactics_match_tile_size(
@@ -681,12 +686,29 @@ class CuteDslFusedMoE(MoEImplBase):
 
     input_requirement = MoEInputRequirement(routing_scales_dtype=torch.float32)
 
-    # Kinds mirror the kernel's own SUPPORTED_ACTIVATION_TYPES in
-    # cute_dsl_kernels/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py.
+    # Kinds mirror the act-fusion kernels' own SUPPORTED_ACTIVATION_TYPES.
+    # There are two of them and ``run_moe_nvfp4`` picks between them by SM:
+    #   cute_dsl_kernels/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py
+    #   cute_dsl_kernels/rubin/moe/rubin_contiguous_gather_grouped_blockscaled_gemm_act_fusion.py
+    # SiTU is enabled here only for the Blackwell path. The Rubin kernels
+    # also expose SiTU, but their end-to-end integration is outside this
+    # enablement; ``can_implement`` keeps that path gated by SM.
+    #
     # The clamp is a kernel-cache-key scalar and the epilogue has no
     # "clamp absent" branch, so an absent clamp is +inf, not None.
+    #
+    # alpha/beta are declared here rather than narrowed per instance:
+    # ``moe_resolution._reject_unsupported_activation`` states the invariant -- an
+    # instance may narrow a shape, never admit one its class refuses.
+    # Declaring UNSUPPORTED here and widening per instance made every K3 layer
+    # resolve away to CUTLASS with "CuteDslFusedMoE kernels take no activation
+    # alpha". Safe for the other two kinds because neither supplies the pair:
+    # ``SwigluActivation.constants()`` fills only ``limit`` and Relu2 fills
+    # nothing. ``SwigluBias`` is the kind that does, and it is not in ``kinds``.
     activation_support = MoEActivationSupport(
-        kinds=frozenset({ActivationType.Swiglu, ActivationType.Relu2}),
+        kinds=frozenset(
+            {ActivationType.Swiglu, ActivationType.Relu2, ActivationType.SiTu}),
+        alpha_beta=ActivationParamShape.UNIFORM_SCALAR,
         limit=ActivationParamShape.UNIFORM_SCALAR,
         limit_when_absent=float("inf"),
     )
@@ -811,6 +833,13 @@ class CuteDslFusedMoE(MoEImplBase):
                     MoERejectReason.DEP_MISSING,
                     "NVFP4 CuteDSL MoE on SM107 requires Rubin support in CuTe DSL"
                 )
+            # Keep SiTU enablement scoped to the Blackwell path. Rubin
+            # integration needs separate end-to-end validation.
+            if p.activation == "SiTu" and sm_version == 107:
+                return _reject(
+                    MoERejectReason.ACTIVATION_UNSUPPORTED,
+                    "CuteDSL SiTU is enabled only on SM100/SM103; "
+                    "SM107 integration is not enabled")
             # process_weights_after_loading() unswizzles the FC1 block scales,
             # which asserts 128-row tiles; without this gate an unaligned shard
             # dies mid weight load with a bare swizzle error.
@@ -1050,9 +1079,10 @@ class CuteDslFusedMoE(MoEImplBase):
         assert self.has_nvfp4
         assert weight_view is not None
         if self.activation_type not in (ActivationType.Swiglu,
-                                        ActivationType.Relu2):
+                                        ActivationType.Relu2,
+                                        ActivationType.SiTu):
             raise NotImplementedError(
-                "CuteDSL NVFP4 FC1 supports only SwiGLU and Relu2; "
+                "CuteDSL NVFP4 FC1 supports only SwiGLU, Relu2 and SiTU; "
                 f"got {self.activation_type.name}")
         output_dtype = torch.bfloat16
 
@@ -1277,6 +1307,15 @@ class CuteDslFusedMoE(MoEImplBase):
             gather_act_kwargs["activation_type"] = self.activation_type
             gather_act_kwargs["swiglu_limit_scalar"] = self.act_clamp
         gather_act_kwargs["activation_type"] = self.activation_type
+        # ``act_alpha`` / ``act_beta`` are where ``SiTuActivation.constants()``
+        # lands: gate_softcap -> alpha, linear_softcap -> beta, both reduced to
+        # a uniform scalar by the shape this backend declares. Only forwarded
+        # for SiTU so every other activation keeps the op's ``None`` default --
+        # passing them unconditionally would make the op signature lie about
+        # which kinds have soft-caps.
+        if self.activation_type == ActivationType.SiTu:
+            gather_act_kwargs["situ_beta"] = self.act_alpha
+            gather_act_kwargs["situ_linear_beta"] = self.act_beta
 
         x, x_sf = gather_act_op(**gather_act_kwargs)
 
