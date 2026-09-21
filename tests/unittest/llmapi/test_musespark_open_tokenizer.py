@@ -43,7 +43,7 @@ ORACLE_RAW_PROMPTS = [
 @pytest.fixture(scope="module")
 def tokenizer():
     if not CHECKPOINT or not os.path.isdir(CHECKPOINT):
-        pytest.skip("checkpoint not present; set MUSESPARK_OPEN_ROOT")
+        pytest.skip("checkpoint not present; set MUSESPARK_REFERENCE_CKPT")
     return load_custom_tokenizer("musespark_open", CHECKPOINT)
 
 

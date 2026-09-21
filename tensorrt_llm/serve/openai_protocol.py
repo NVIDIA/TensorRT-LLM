@@ -566,55 +566,6 @@ def _response_format_to_guided_decoding_params(
         stag_format = extension_format(content, chat_template_kwargs)
         if stag_format is None:
             return guided_decoding_params
-    elif reasoning_parser == "musespark":
-        # This checkpoint's template does not read `enable_thinking`; its own
-        # switch is `disable_reasoning` (default false), with `reasoning_effort`
-        # as the second knob. Reasoning off means the model answers directly, so
-        # prepending the private-reasoning header would constrain the output to
-        # a shape the model was just told not to produce -- which is what made
-        # every reasoning-off structured request come back with reasoning and no
-        # JSON.
-        parser = ReasoningParserFactory.create_reasoning_parser(
-            reasoning_parser)
-        if (chat_template_kwargs or {}).get("disable_reasoning") is True:
-            # Trigger on the answer header rather than dropping the header
-            # entirely. The generation prompt ends at `<|start|>assistant`, so
-            # the model's first tokens are its own recipient header; a schema
-            # applied from the first generated token forbids that header, and
-            # the model answers with nothing at all (observed: HTTP 200, zero
-            # tokens decoded, finish reason `stop`). Unlike kimi_k3's
-            # non-thinking path, whose prompt already ends inside the response
-            # channel, this trigger is always generated.
-            stag_format = {
-                "type":
-                "triggered_tags",
-                "triggers": [parser.answer_start],
-                "tags": [
-                    {
-                        "begin": parser.answer_start,
-                        "content": content,
-                        "end": "",
-                    },
-                ],
-                "stop_after_first":
-                True,
-            }
-        else:
-            stag_format = {
-                "type":
-                "sequence",
-                "elements": [
-                    {
-                        "type": "tag",
-                        "begin": parser.reasoning_start,
-                        "content": {
-                            "type": "any_text"
-                        },
-                        "end": parser.reasoning_end,
-                    },
-                    content,
-                ],
-            }
     else:
         # Force thinking and then trigger user constraint
         parser = ReasoningParserFactory.create_reasoning_parser(

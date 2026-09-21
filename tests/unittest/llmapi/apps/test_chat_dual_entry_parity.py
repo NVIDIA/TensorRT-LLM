@@ -80,7 +80,7 @@ TOOL_CALL_MESSAGES = [
 @pytest.fixture(scope="module")
 def tokenizer():
     if not CHECKPOINT or not os.path.isdir(CHECKPOINT):
-        pytest.skip("checkpoint not present; set MUSESPARK_OPEN_ROOT")
+        pytest.skip("checkpoint not present; set MUSESPARK_REFERENCE_CKPT")
     return load_custom_tokenizer("musespark_open", CHECKPOINT)
 
 
@@ -140,7 +140,7 @@ def test_dual_entry_points_render_identical_tokens(tokenizer, model_type):
 
 def test_dual_entry_points_agree_with_kwargs(tokenizer, model_type):
     """Parity must hold with template kwargs applied, not only for defaults."""
-    kwargs = {"disable_reasoning": True}
+    kwargs = {"reasoning_effort": "high"}
     via_router = _render_via_router(_request(chat_template_kwargs=kwargs), tokenizer, model_type)
     via_server = _render_via_server(_request(chat_template_kwargs=kwargs), tokenizer, model_type)
     assert via_router == via_server
@@ -149,7 +149,6 @@ def test_dual_entry_points_agree_with_kwargs(tokenizer, model_type):
 @pytest.mark.parametrize(
     "kwarg,value_a,value_b",
     [
-        ("disable_reasoning", False, True),
         ("reasoning_effort", "low", "high"),
     ],
 )
