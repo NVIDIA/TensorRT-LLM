@@ -227,6 +227,37 @@ __device__ __forceinline__ uint32_t round_parity(uint32_t flag_val)
     return ((flag_val - 1U) >> 1U) & 1U;
 }
 
+// Round flags use system-scope relaxed accesses. Required payload visibility
+// fences stay at the call sites; fence and CFT use different memory proxies.
+__device__ __forceinline__ void publish_round_flag(uint32_t* address, uint32_t value)
+{
+    asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(address), "r"(value) : "memory");
+}
+
+__device__ __forceinline__ bool wait_round_flag(
+    uint32_t const* address, uint32_t expected, int64_t timeout_cycles, int rank_id, int peer_rank, char const* phase)
+{
+    auto const start = clock64();
+    uint32_t observed;
+    do
+    {
+        asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(observed) : "l"(address) : "memory");
+#if ENABLE_DEBUG_PRINT
+        printf("%s: rank %d waiting for rank %d flag=%u expected=%u address=%p\n", phase, rank_id, peer_rank, observed,
+            expected, address);
+#endif
+        if (observed == expected)
+        {
+            return true;
+        }
+    } while (!check_timeout(start, timeout_cycles));
+
+    printf("%s: rank %d timed out waiting for rank %d flag=%u expected=%u\n", phase, rank_id, peer_rank, observed,
+        expected);
+    asm volatile("trap;" ::: "memory");
+    return false;
+}
+
 template <int TOP_K, bool ENABLE_RANK_MASK, bool COMPACT_FANOUT>
 __device__ __forceinline__ void route_dispatch_token(int32_t const* token_selected_experts,
     DispatchKernelPointers const& ptrs, int local_token_idx, int ep_size, int num_experts, int* topk_target_ranks,
@@ -586,7 +617,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                         continue;
                 }
                 uint32_t* flag_addr = &ptrs.completion_flags[target_rank][rank_id];
-                asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(expected_value));
+                publish_round_flag(flag_addr, expected_value);
 
 #if ENABLE_DEBUG_PRINT
                 printf("dispatch: +++Rank %d setting completion flag to %d for rank %d\n", rank_id, expected_value,
@@ -607,28 +638,9 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                         continue;
                     }
                 }
-                bool flag_set = false;
-                auto s = clock64();
-                do
+                if (!wait_round_flag(&ptrs.completion_flags[rank_id][peer_rank], expected_value, ptrs.timeout_cycles,
+                        rank_id, peer_rank, "dispatch"))
                 {
-                    uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
-                    uint32_t flag_value;
-                    // Acquire load to ensure visibility of peer's release-store
-                    asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
-#if ENABLE_DEBUG_PRINT
-                    printf(
-                        "combine: ---Rank %d received completion flag from rank %d, flag_value: %d, expected_value: "
-                        "%d, address: %p\n",
-                        rank_id, peer_rank, flag_value, expected_value, flag_ptr);
-#endif
-                    flag_set = flag_value == expected_value;
-                } while (!flag_set && !check_timeout(s, ptrs.timeout_cycles));
-
-                if (__builtin_expect(!flag_set, 0))
-                {
-                    printf("dispatch: ---Rank %d timed out waiting for completion flag from rank %d\n", rank_id,
-                        peer_rank);
-                    asm volatile("trap;");
                     return;
                 }
             }
@@ -892,12 +904,8 @@ __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, 
         }
 
         // ---- Data dispatch: self via TMA s2g, remote via fabric.try_put.counted ----
-        // Both are issued by thread 0 fire-and-forget. They run in parallel on
-        // different HW units (TMA engine for s2g, fabric engine for puts), with a
-        // single combined wait phase at the end.
-        //
-        // Self-send needs smem_staging populated, so it must come AFTER the TMA g2s
-        // wait. Remote-send also reads smem_staging — both share the same source.
+        // Separate issuing warps overlap self and remote transfers. Both consume
+        // smem_staging only after the TMA g2s wait below.
         bool has_remote = false;
         bool has_self = false;
 #pragma unroll
@@ -1936,7 +1944,7 @@ __global__ void moeA2ACombineKernel(
                         continue;
                 }
                 uint32_t* flag_addr = &ptrs.completion_flags[peer_rank][rank_id];
-                asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(expected_value));
+                publish_round_flag(flag_addr, expected_value);
 #if ENABLE_DEBUG_PRINT
                 printf("combine: +++Rank %d setting completion flag to %d for rank %d\n", rank_id, expected_value,
                     peer_rank);
@@ -1954,28 +1962,9 @@ __global__ void moeA2ACombineKernel(
                 if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
                     continue;
             }
-            bool flag_set = false;
-            auto s = clock64();
-            do
+            if (!wait_round_flag(&ptrs.completion_flags[rank_id][peer_rank], expected_value, ptrs.timeout_cycles,
+                    rank_id, peer_rank, "combine"))
             {
-                uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
-                uint32_t flag_value;
-                // Acquire load to ensure visibility of peer's release-store
-                asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
-#if ENABLE_DEBUG_PRINT
-                printf(
-                    "combine: ---Rank %d received completion flag from rank %d, flag_value: %d, expected_value: "
-                    "%d, "
-                    "address: %p\n",
-                    rank_id, peer_rank, flag_value, expected_value, flag_ptr);
-#endif
-                flag_set = flag_value == expected_value;
-            } while (!flag_set && !check_timeout(s, ptrs.timeout_cycles));
-
-            if (__builtin_expect(!flag_set, 0))
-            {
-                printf("combine: ---Rank %d timed out waiting for completion flag from rank %d\n", rank_id, peer_rank);
-                asm volatile("trap;");
                 return;
             }
         }
@@ -2052,7 +2041,7 @@ __global__ void moeA2ACombinePushKernel_Cft(
     {
         uint32_t* flag_addr = &peer_info.completion_flags[source_rank][rank_id];
         uint32_t const expected_value = *flag_val;
-        asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(expected_value) : "memory");
+        publish_round_flag(flag_addr, expected_value);
     }
 #endif
     if (source_rank == rank_id)
@@ -2221,22 +2210,11 @@ __global__ void moeA2ACombineKernel_Cft(const CombineKernelPointers ptrs, int ma
                 if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
                     continue;
             }
-            uint32_t const* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
-            auto const start = clock64();
-            uint32_t flag_value;
-            do
+            if (!wait_round_flag(&ptrs.completion_flags[rank_id][peer_rank], expected_value, ptrs.timeout_cycles,
+                    rank_id, peer_rank, "combine(cft)"))
             {
-                asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr) : "memory");
-                if (flag_value == expected_value)
-                    break;
-                if (check_timeout(start, ptrs.timeout_cycles))
-                {
-                    printf("combine(cft): ---Rank %d timed out readiness from rank %d flag=%u expected=%u\n", rank_id,
-                        peer_rank, flag_value, expected_value);
-                    asm volatile("trap;" ::: "memory");
-                    return;
-                }
-            } while (true);
+                return;
+            }
         }
     }
 #endif
