@@ -3180,7 +3180,7 @@ def classifyFailure(def pipeline, Throwable error, String scope, Map retryContex
 
     // Reuse evidence only when it was collected for this exact error and classification scope.
     boolean cachedForFailure = retryContext?.failureEvidence != null &&
-        retryContext.failureEvidenceError?.is(error) && retryContext.failureEvidenceScope == scope
+        retryContext.failureEvidenceError == error && retryContext.failureEvidenceScope == scope
     Map evidence = cachedForFailure ? retryContext.failureEvidence : null
     if (evidence == null) {
         evidence = FailureEvidenceCollector.collectOriginatingStepEvidence(pipeline, error, FailureClassifier.failureEvidenceQueries(scope))
