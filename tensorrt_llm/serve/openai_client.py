@@ -309,6 +309,8 @@ class OpenAIHttpClient(OpenAIClient):
         _TRANSIENT_TCP_BUDGET = 0 if self._no_retry else 5
         loop_max = max(self._max_retries, _TRANSIENT_TCP_BUDGET) + 1
         for attempt in range(loop_max):
+            if attempt > 0:
+                await self._router.renew_request(request, req_id=req_id)
             # Regenerate disagg_request_id on retry to avoid ID collision on workers
             if attempt > 0 and self._disagg_id_generator is not None:
                 dp = getattr(request, "disaggregated_params", None)
@@ -429,6 +431,7 @@ class OpenAIHttpClient(OpenAIClient):
                     f"{self._role} client error to {url}: {e} - retry {attempt} of {effective_max}",
                     traceback.format_exc(),
                 )
+                await self._router.renew_request(request, req_id=req_id)
                 await asyncio.sleep(self._retry_interval_sec)
                 self._metrics_collector.retry_requests.inc()
             except Exception as e:

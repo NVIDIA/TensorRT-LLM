@@ -68,6 +68,7 @@ from tensorrt_llm.serve.router import (
     KV_CACHE_HASH_ALGO_V2,
     CoordinatorDelegatingRouter,
     KvCacheAwareRouter,
+    LoadBalancingRouter,
 )
 from tensorrt_llm.serve.router_utils import BlockHashMixin as SharedBlockHashMixin
 
@@ -273,6 +274,44 @@ async def test_coordinator_expires_stale_reservation():
     await asyncio.sleep(0.02)
 
     assert coordinator.gen_router._server_content_load["gen:8000"] == 0
+    assert coordinator._reservation_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_concurrent_select_replaces_same_reservation_without_leaking_load():
+    config = _make_config([], ["gen0:8000", "gen1:8000"], "round_robin", "load_balancing")
+    coordinator = DisaggCoordinatorService(config, _client_factory, reservation_timeout_secs=60)
+    assert isinstance(coordinator.gen_router, LoadBalancingRouter)
+
+    await asyncio.gather(
+        coordinator.select("generation", {}, 123, None),
+        coordinator.select("generation", {}, 123, None),
+    )
+
+    assert (
+        sum(state.num_active_requests() for state in coordinator.gen_router._server_state.values())
+        == 1
+    )
+    await coordinator.finish("generation", 123)
+    assert (
+        sum(state.num_active_requests() for state in coordinator.gen_router._server_state.values())
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_coordinator_renew_replaces_reservation_timer():
+    config = _make_config([], ["gen:8000"], "round_robin", "load_balancing")
+    coordinator = DisaggCoordinatorService(config, _client_factory, reservation_timeout_secs=60)
+
+    await coordinator.select("generation", {}, 123, None)
+    reservation_key = ("generation", 123)
+    original_reservation = coordinator._reservation_tasks[reservation_key]
+
+    await coordinator.renew("generation", 123)
+
+    assert coordinator._reservation_tasks[reservation_key] is not original_reservation
+    await coordinator.finish("generation", 123)
     assert coordinator._reservation_tasks == {}
 
 

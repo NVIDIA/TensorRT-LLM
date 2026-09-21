@@ -907,6 +907,25 @@ class TestSelectiveTransientTcpRetry:
         )
 
     @pytest.mark.asyncio
+    async def test_retry_renews_coordinator_reservation(self):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        client = self._make_client(session)
+        session.post.side_effect = [
+            aiohttp.ClientError("transient"),
+            self._mock_http_ok(self._ok_response()),
+        ]
+        request = self._make_request()
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await client.send_request(request, req_id=71)
+
+        assert client._router.renew_request.await_count == 2
+        assert all(
+            call.args == (request,) and call.kwargs == {"req_id": 71}
+            for call in client._router.renew_request.await_args_list
+        )
+
+    @pytest.mark.asyncio
     async def test_server_disconnected_gets_extra_retries(self):
         """ServerDisconnectedError: even with max_retries=1, retry up to 5."""
         session = AsyncMock(spec=aiohttp.ClientSession)

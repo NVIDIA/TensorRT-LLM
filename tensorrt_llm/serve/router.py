@@ -495,6 +495,12 @@ class Router(ABC):
                              req_id: Optional[int] = None):
         pass
 
+    async def renew_request(self,
+                            request: OpenAIRequest,
+                            req_id: Optional[int] = None) -> None:
+        """Extend a request reservation when retrying a backend request."""
+        del request, req_id
+
     @property
     def session(self) -> aiohttp.ClientSession:
         if not self._session:
@@ -1878,6 +1884,21 @@ class CoordinatorDelegatingRouter(Router):
                     f"CoordinatorDelegatingRouter finish queue full; "
                     f"coordinator expiration will release dropped requests "
                     f"(dropped={self._dropped_finishes})")
+
+    async def renew_request(self,
+                            request: OpenAIRequest,
+                            req_id: Optional[int] = None) -> None:
+        req_id = self._request_id(request, req_id)
+        payload = {"role": self._role, "req_id": req_id}
+        async with self.session.post(f"{self._coordinator_url}/renew",
+                                     data=msgpack.packb(payload,
+                                                        use_bin_type=True),
+                                     headers=_MSGPACK_HEADERS,
+                                     timeout=self._request_timeout_s) as resp:
+            body = msgpack.unpackb(await resp.read(), raw=False)
+            if resp.status != 200:
+                raise ValueError(f"coordinator /renew returned {resp.status}: "
+                                 f"{body.get('error', body)}")
 
     def _ensure_finish_workers(self) -> None:
         if self._finish_workers:
