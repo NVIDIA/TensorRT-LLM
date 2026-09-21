@@ -372,6 +372,23 @@ class MoEEligibility:
         return cls(eligible=False, reject_reason=reason, detail=detail)
 
 
+def identity_quant_of(cls: type) -> str:
+    """The single format ``cls`` publishes, spelled as the identities spell it."""
+    return cls.descriptor.identity.quant
+
+
+def check_quant_matches_identity(cls: type, p: "MoEProblem") -> Optional[MoEEligibility]:
+    """Reject any format other than the one in this leaf's own identity."""
+    expected = identity_quant_of(cls)
+    actual = p.identity_quant
+    if actual != expected:
+        return MoEEligibility.no(
+            MoERejectReason.QUANT_UNSUPPORTED,
+            f"{cls.__name__} implements quant={expected}, got {actual}",
+        )
+    return None
+
+
 def nvfp4_fc1_row_alignment_rejection(
     p: "MoEProblem", d: "MoEDeployment"
 ) -> Optional[MoEEligibility]:

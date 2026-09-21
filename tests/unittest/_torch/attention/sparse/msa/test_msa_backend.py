@@ -32,7 +32,10 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils 
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.paged_cache import (
     write_kv_slots,
 )
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import MsaDecodeSpan
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import (
+    MiniMaxM3MsaSparseAttentionMetadata,
+    MsaDecodeSpan,
+)
 from tensorrt_llm._torch.attention.backends.sparse.registry import _resolve_minimax_m3_backend_cls
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.bindings import DataType
@@ -158,7 +161,7 @@ def test_cache_manager_honors_executor_sparse_attention_config(
         del args, kwargs
         self.is_disagg = False
         self.dtype = base_dtype
-        self.layer_offsets = {}
+        self.layer_offsets = {3: 0}
 
     def fake_get_index_k_buffer(self, layer_idx, **kwargs):
         del self, layer_idx
@@ -184,6 +187,87 @@ def test_cache_manager_honors_executor_sparse_attention_config(
     assert manager.get_index_k_buffer(3) is None
     assert observed_index_buffer_args["head_dim"] == expected_sparse_index_dim
     assert observed_index_buffer_args["dtype"] is expected_dtype
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("indexer_kv_dtype", ["bf16", "fp8"])
+@pytest.mark.parametrize("implementation", ["msa", "triton"])
+def test_index_k_views_are_fullgraph_safe(
+    monkeypatch: pytest.MonkeyPatch, indexer_kv_dtype: str, implementation: str
+) -> None:
+    """Compiled cache reads/writes preserve per-layer and per-manager aliases."""
+    dtype = torch.float8_e4m3fn if indexer_kv_dtype == "fp8" else torch.bfloat16
+    pools = []
+
+    def fake_base_init(self: KVCacheManagerV2, *args: object, **kwargs: object) -> None:
+        self.is_disagg = False
+        # Dense layer 0 and draft layer 60 have no INDEX_KEY; sparse layer 5
+        # is non-local. Two local sparse layers share an interleaved pool.
+        self.layer_offsets = {0: 0, 3: 1, 4: 2, 60: 3}
+        self._test_index_pool = torch.zeros((3, 2, 4, 1, 8), dtype=dtype)
+        pools.append(self._test_index_pool)
+
+    @torch.compiler.disable
+    def resolve_index_view(
+        self: KVCacheManagerV2, layer_idx: int, **kwargs: object
+    ) -> torch.Tensor:
+        # Model the eager-only nanobind/TensorWrapper boundary. Entering this
+        # resolver from forward must fail with fullgraph=True.
+        view = self._test_index_pool[:, layer_idx - 3]
+        return view.permute(0, 2, 1, 3) if kwargs["kv_layout"] == "HND" else view
+
+    monkeypatch.setattr(KVCacheManagerV2, "__init__", fake_base_init)
+    monkeypatch.setattr(KVCacheManagerV2, "get_index_k_buffer", resolve_index_view)
+    monkeypatch.setattr(MiniMaxM3KVCacheManagerV2, "_compute_num_total_slots", lambda self: 0)
+    config = SimpleNamespace(implementation=implementation, indexer_kv_dtype=indexer_kv_dtype)
+    managers = [
+        MiniMaxM3KVCacheManagerV2(
+            num_layers=61,
+            sparse_layer_ids=[3, 4, 5],
+            sparse_index_dim=8,
+            sparse_attention_config=config,
+        )
+        for _ in range(2)
+    ]
+    metadata = [object.__new__(MiniMaxM3MsaSparseAttentionMetadata) for _ in managers]
+    for manager, meta in zip(managers, metadata):
+        meta.kv_cache_manager = manager
+        for layer in (0, 5, 60):
+            assert manager.get_index_k_buffer(layer) is None
+        cache = manager.get_index_k_buffer(3)
+        expected_shape = (3, 1, 4, 8) if implementation == "msa" else (3, 4, 1, 8)
+        assert cache.shape == expected_shape
+        assert cache.data_ptr() == manager._test_index_pool.data_ptr()
+        assert cache.stride(0) == 2 * 4 * 8
+        if implementation == "msa":
+            assert meta.msa_idx_k_cache(3) is cache
+
+    def forward(meta: MiniMaxM3MsaSparseAttentionMetadata, value: torch.Tensor) -> torch.Tensor:
+        get_cache = (
+            meta.msa_idx_k_cache
+            if implementation == "msa"
+            else meta.kv_cache_manager.get_index_k_buffer
+        )
+        first = get_cache(3)
+        second = get_cache(4)
+        first.copy_(value.to(first.dtype))
+        return first.float() + second.float()
+
+    compiled = torch.compile(forward, backend="eager", fullgraph=True)
+    value = torch.full(expected_shape, 2.0)
+    try:
+        pools[0].fill_(1)
+        torch.testing.assert_close(compiled(metadata[0], value), torch.full_like(value, 3))
+        # A later replay must see writes to the underlying pool without a
+        # cloned or stale tensor. The other layer must remain independent.
+        pools[0][:, 1].fill_(7)
+        torch.testing.assert_close(compiled(metadata[0], value + 2), torch.full_like(value, 11))
+        torch.testing.assert_close(pools[0][:, 0].float(), torch.full((3, 4, 1, 8), 4.0))
+        pools[1].fill_(9)
+        torch.testing.assert_close(compiled(metadata[1], value + 4), torch.full_like(value, 15))
+        torch.testing.assert_close(pools[0][:, 0].float(), torch.full((3, 4, 1, 8), 4.0))
+    finally:
+        torch._dynamo.reset()
 
 
 @pytest.mark.parametrize("sparse_index_dim", [0, -1])
@@ -475,8 +559,8 @@ def test_msa_index_k_uses_hnd_cache_view_and_writer():
         def __init__(self):
             self.calls = []
 
-        def get_index_k_buffer(self, layer_idx, kv_layout="NHD"):
-            self.calls.append((layer_idx, kv_layout))
+        def get_index_k_buffer(self, layer_idx):
+            self.calls.append(layer_idx)
             return hnd_cache
 
     manager = FakeCacheManager()
@@ -489,7 +573,7 @@ def test_msa_index_k_uses_hnd_cache_view_and_writer():
 
     assert returned.data_ptr() == hnd_cache.data_ptr()
     assert not returned.is_contiguous()
-    assert manager.calls == [(3, "HND"), (3, "HND")]
+    assert manager.calls == [3, 3]
     torch.testing.assert_close(hnd_cache[0, 0, 2], values[0, 0].to(torch.bfloat16))
     torch.testing.assert_close(hnd_cache[1, 0, 5], values[1, 0].to(torch.bfloat16))
 
@@ -781,10 +865,6 @@ def test_msa_proxy_max_score_strided_index_k_matches_packed(
         pytest.skip("CUDA required")
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("SM100 (Blackwell) required")
-    from tensorrt_llm._utils import get_sm_version
-
-    if get_sm_version() == 107:
-        pytest.skip("fmha_sm100 (vendored MiniMax-M3 MSA kernel) JIT targets sm_100a only")
 
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
         msa_package_available,

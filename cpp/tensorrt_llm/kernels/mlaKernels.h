@@ -145,6 +145,9 @@ struct MlaParams
     // `latent_cache` row stride in elements; the fused path passes a slice of
     // kv_a_proj, so rows are wider than packed. 0 means packed.
     int latent_row_stride = 0;
+    // The caller has already applied Q RoPE and written the complete FP8 Q to
+    // `quant_q_buf`. Context preprocessing must still rotate/cache K.
+    bool q_rope_applied = false;
 
     // DSv4 fused inverse-RoPE + FP8 quant epilogue parameters.
     Dsv4EpilogueFusionParams dsv4_epilogue_fusion;
