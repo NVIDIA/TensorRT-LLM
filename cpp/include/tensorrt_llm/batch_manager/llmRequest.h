@@ -1125,51 +1125,10 @@ public:
         mEncoderOutputHost = std::move(encoderOutputHost);
     }
 
-    void setEncoderOutput(TensorPtr encoderOutput)
-    {
-        mEncoderOutput = std::move(encoderOutput);
-    }
-
     void allocEncoderOutputHost(SizeType32 encoderHiddenSize, tensorrt_llm::DataType dataType)
     {
         mEncoderOutputHost = runtime::BufferManager::pinned(
             runtime::ITensor::makeShape({getEncoderOutputLen(), encoderHiddenSize}), dataType);
-    }
-
-    [[nodiscard]] TensorPtr const& getEncoderOutput() const noexcept
-    {
-        return mEncoderOutput;
-    }
-
-    [[nodiscard]] TensorPtr const& getEncoderHiddenStates() const noexcept
-    {
-        return mEncoderHiddenStates;
-    }
-
-    void allocEncoderOutput(runtime::BufferManager const& manager, tensorrt_llm::DataType dataType)
-    {
-        // unique_ptr --> shared_ptr ownership move
-        mEncoderOutput = std::move(manager.emptyTensor(runtime::MemoryType::kGPU, dataType));
-    }
-
-    void allocEncoderHiddenStates(runtime::BufferManager const& manager, tensorrt_llm::DataType dataType)
-    {
-        // unique_ptr --> shared_ptr ownership move
-        mEncoderHiddenStates = std::move(manager.emptyTensor(runtime::MemoryType::kGPU, dataType));
-    }
-
-    void freeEncoderOutputBuffers()
-    {
-        TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-        TLLM_LOG_DEBUG(
-            "Encoder output buffers use count: %u, %u", mEncoderOutput.use_count(), mEncoderHiddenStates.use_count());
-
-        // TODO: better ways to free shared_ptr buffers
-        mEncoderOutput.reset();
-        mEncoderHiddenStates.reset();
-
-        TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     }
 
     [[nodiscard]] bool constexpr getReturnPerfMetrics() const noexcept
@@ -1904,10 +1863,7 @@ protected:
 
     bool mReturnEncoderOutput;
 
-    // Encoder output, used to compute cross attention KV-Cache.
-    TensorPtr mEncoderOutput;       // [numTokens, hidden_size]
-    TensorPtr mEncoderHiddenStates; // [numTokens, hiddenSize] for for Pipeline-Parallelism
-    TensorPtr mEncoderOutputHost;   // [mEncoderOutputLength, encoderHiddenSize]
+    TensorPtr mEncoderOutputHost; // [mEncoderOutputLength, encoderHiddenSize]
 
     SizeType32 mDecodingIter{0};
 
