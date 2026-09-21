@@ -24,13 +24,8 @@ from tensorrt_llm.logger import logger
 GUARDRAIL_HF_REPO = "nvidia/Cosmos-1.0-Guardrail"
 GUARDRAIL_REVISION = "cf03c0395fac8c4de386c0bdab12cc4fc8d66362"
 
-# The repo also carries the Cosmos 1.0-era `aegis/` (LlamaGuard-7b) and
-# `video_content_safety_filter/` (SigLIP-so400m) subtrees, ~34 GB combined,
-# which CosmosSafetyChecker no longer instantiates: Qwen3Guard replaced Aegis
-# for text, and VideoContentSafetyFilter is disabled upstream. Fetch only what
-# Blocklist and RetinaFaceFilter open. Widen this if a future cosmos_guardrail
-# loads more, or its own snapshot_download will pull the extra files off
-# unpinned `main` instead of GUARDRAIL_REVISION.
+# The guardrail repo carries ~17 GB of Cosmos 1.0-era checkpoints that
+# CosmosSafetyChecker no longer instantiates; fetch only what it loads.
 GUARDRAIL_ALLOW_PATTERNS = ["blocklist/*", "face_blur_filter/*"]
 
 
