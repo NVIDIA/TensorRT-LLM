@@ -3,7 +3,7 @@
 
 """System prompt for the parallel-candidate Integrator."""
 
-from ._common import BENCHMARK_FLAGS_REFERENCE, SERVER_LIFECYCLE
+from ._common import SERVER_LIFECYCLE
 
 SYSTEM_PROMPT = f"""You are the Integrator in a TensorRT-LLM performance campaign.
 
@@ -30,8 +30,8 @@ out in the worktree and represented by the final config.
 
 {SERVER_LIFECYCLE}
 
-Use the workflow's canonical benchmark contract:
-{BENCHMARK_FLAGS_REFERENCE}
+Use the benchmark-driver contract injected below and replay the same
+workload used for the candidates' standalone measurements.
 
 Finish by writing integration.md and calling append_integrator_progress once.
 Its decision and measurement fields drive the outcome after the orchestrator's

@@ -41,7 +41,7 @@ machinery, and its prompts compose these same fragments.
 """
 
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Mapping, Sequence
 
 # The starting taxonomy the nsys-timeline pipeline classifies kernels with.
 # The skill ships a generic template shaped for *training* frameworks
@@ -366,6 +366,58 @@ result-JSON metric named in your instructions (e.g.
 """
 
 
+def benchmark_driver_prompt(task: Mapping[str, Any] | None) -> str:
+    """Return the benchmark-specific prompt fragment for a resolved task."""
+    benchmark = task.get("benchmark") if isinstance(task, Mapping) else None
+    if not isinstance(benchmark, Mapping) or benchmark.get("type", "builtin") == "builtin":
+        return BENCHMARK_FLAGS_REFERENCE + "\n" + DERIVED_METRICS_REFERENCE
+
+    optimize = task.get("optimize") if isinstance(task, Mapping) else None
+    target = optimize.get("target_metric") if isinstance(optimize, Mapping) else None
+    target_instruction = (
+        f"Find the exact `optimize.target_metric` field `{target}` in the benchmark "
+        "output. Never substitute or derive a different metric. If it is absent, "
+        "report `TARGET_METRIC_MISSING`; the harness will stop the flow."
+        if isinstance(target, str) and target
+        else "Extract benchmark metrics exactly as directed by the notes; never invent a missing value."
+    )
+    return f"""\
+## External benchmark driver
+
+Use the user-supplied benchmark tool. Do not replace it with a built-in
+driver or assume a JSON output format.
+
+- Tool path: `{benchmark["path"]}`
+- Command supplied by the user:
+
+```bash
+{str(benchmark["command"]).rstrip()}
+```
+
+- User notes:
+
+{str(benchmark["notes"]).rstrip()}
+
+Run from the tool path unless the command or notes explicitly say otherwise.
+Treat the command and notes as the benchmark contract. Record the exact command
+you actually execute, retain the resulting stdout/log/files in the stage artifact
+directory when possible, and cite the precise source of every reported metric.
+{target_instruction}
+"""
+
+
+def external_benchmark_run_instruction(task: Mapping[str, Any], result_dir: Path) -> str:
+    """Return the per-turn instruction for running an external benchmark."""
+    benchmark = task["benchmark"]
+    return (
+        f"run the external benchmark declared in the `benchmark` block. Work from "
+        f"`{benchmark['path']}`, execute the supplied `command`, and follow `notes` "
+        f"for dataset, output, and metric handling. Keep or copy its artifacts under "
+        f"`{result_dir}` when possible, and record the exact executed command and "
+        f"metric source. Do not substitute a built-in driver or assume JSON"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Profiling references (shared by both workflows' analyzers)
 # --------------------------------------------------------------------------- #
@@ -460,21 +512,19 @@ time nsys runs, without waiting to be asked.
    - If your installed `nsys` is old enough to reject one of these flags,
      drop **only** that flag, note it in `profile_findings.md`, and keep
      going — do not fabricate a trace.
-2. Poll readiness, then replay the **same** `benchmark_serving.py` load.
-   The canonical benchmark command already carries **`--no-test-input`**,
-   which matters doubly here: the default warmup/test prompt runs through
-   the server first and advances the iteration counter, and without
-   `--no-test-input` it can push the counter into your window before the
-   real concurrency load arrives, so the capture lands on a single-request
-   decode instead of steady state. Make sure the load runs for more than
-   `<stop>` server iterations to reach the window (raise `num_prompts` or
-   lower the window if not), and confirm `serve.log` logs `Profiling
+2. Poll readiness, then replay the **same configured benchmark load**.
+   Do not add unrecorded warmup/test requests before the replay: they advance
+   the server iteration counter and can push it into the capture window before
+   the real load arrives. Follow the selected benchmark-driver contract rather
+   than inventing driver-specific flags. Make sure the load runs for more than
+   `<stop>` server iterations to reach the window (increase the workload or
+   lower the window if allowed), and confirm `serve.log` logs `Profiling
    started at iteration <start>` then `... stopped at iteration <stop>`.
 
-   Also pass **`--save-request-time-breakdown`** on this replay, which
-   fetches `/perf_metrics` (a per-request prefill-vs-decode breakdown) —
-   keep the resulting `*perf_metrics*.json`. That endpoint only returns
-   data when the server was launched with `return_perf_metrics` enabled
+   Also fetch `/perf_metrics` after this replay for the per-request
+   prefill-vs-decode breakdown and keep it as `perf_metrics.json`. That
+   endpoint only returns data when the server was launched with
+   `return_perf_metrics` enabled
    (it defaults off); set `return_perf_metrics: true` in an
    `extra_llm_api_options` YAML for this run if you need the breakdown,
    else drop the flag and note it.
@@ -898,8 +948,8 @@ never profile every kernel blindly.
    - `--target-processes all` follows trtllm-serve's forked workers.
      If your installed `ncu` rejects a flag, drop **only** that flag,
      note it, and keep going.
-4. Poll readiness, then replay the **same** benchmark load (canonical
-   command, `--no-test-input`). Expect the profiled window to take much
+4. Poll readiness, then replay the **same configured benchmark load**.
+   Expect the profiled window to take much
    longer wall-clock than Runs A/B — poll patiently rather than
    declaring a hang; the client-side numbers from this replay are
    **not measurements** (kernel replay serializes the GPU) and must
@@ -1151,7 +1201,7 @@ srun --partition=<slurm_partition> \\
 
 The local launch, readiness-poll, teardown, and profiling steps are
 otherwise identical — they just run inside the container. All artifacts
-(`serve.log`, result JSON, `*.nsys-rep`, `*.ncu-rep`, the `.md`
+(`serve.log`, benchmark output, `*.nsys-rep`, `*.ncu-rep`, the `.md`
 outputs) must land in `<workspace>` so later stages and the user can read
 them.
 
@@ -1646,8 +1696,8 @@ EVIDENCE_DISCIPLINE = """\
 ## Evidence discipline
 
 - **Never fabricate numbers.** Every metric, kernel name, or percentage
-  you report must come from a file you actually produced (the benchmark
-  JSON, `nsys stats` output, the ncu report, server logs). If a run
+  you report must come from an artifact you actually produced (benchmark
+  output, `nsys stats` output, the ncu report, server logs). If a run
   failed or a tool was unavailable, say so plainly — do not invent
   plausible-looking results.
 - **Record exact commands.** Anyone reading the workspace must be able to

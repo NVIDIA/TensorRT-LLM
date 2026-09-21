@@ -3129,6 +3129,28 @@ def _capture_driving_prompts(
     return captured
 
 
+def test_external_benchmark_driving_prompts_do_not_fall_back_to_builtin(tmp_path):
+    captured = _capture_driving_prompts(
+        tmp_path,
+        {
+            "benchmark": {
+                "type": "external",
+                "path": "/opt/aiperf",
+                "command": "aiperf benchmark --dataset traces",
+                "notes": "Read tps_user_p10 from stdout.",
+            },
+            "optimize": {"target_metric": "tps_user_p10"},
+        },
+    )
+
+    for role in ("benchmarker", "evaluator", "qa"):
+        prompt = captured[role]
+        assert "/opt/aiperf" in prompt
+        assert "external benchmark" in prompt
+        assert "benchmark_serving.py" not in prompt
+    assert "TARGET_METRIC_MISSING" in captured["benchmarker"]
+
+
 def test_driving_prompts_avoid_removed_builtin_tools(tmp_path):
     captured = _capture_driving_prompts(tmp_path)
     for role, prompt in captured.items():
