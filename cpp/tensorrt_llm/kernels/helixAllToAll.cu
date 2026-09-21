@@ -702,6 +702,10 @@ size_t computeHelixWorkspaceSizePerRank(int cpSize)
 
 void launchHelixAllToAll(HelixAllToAllParams const& params, bool allowVariableField1, cudaStream_t stream)
 {
+    // The sender divides the entry index by this to index the mask, so a
+    // nonpositive divisor would be an integer division by zero on device.
+    TLLM_CHECK_WITH_INFO(params.zeroKvMask == nullptr || params.zeroKvMaskDivisor > 0,
+        "zeroKvMaskDivisor must be positive when zeroKvMask is set, got %d", params.zeroKvMaskDivisor);
     if (allowVariableField1)
     {
         constexpr uintptr_t kBulkCopyAlignment = 16;
