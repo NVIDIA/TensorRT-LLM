@@ -159,8 +159,9 @@ public:
         // Every member must derive the same socket namespace, so the root's id wins.
         mGroupComm->bcast(&uniqueOpId, sizeof(uniqueOpId), 0);
 
-        uint32_t volatile abort_flag = 0;
-        mSocket = ncclIpcSocketInit(worldRank, uniqueOpId, &abort_flag);
+        // mAbortFlag, not a local: ncclIpcSocketInit only stores the pointer, and the send/recv
+        // retry loops dereference it on every EAGAIN/EINTR for as long as the socket is open.
+        mSocket = ncclIpcSocketInit(worldRank, uniqueOpId, &mAbortFlag);
         mGroupComm->barrier();
     }
 
@@ -194,6 +195,9 @@ private:
     int mGroupRank;
     std::vector<int> mGroupWorldRanks;
     std::shared_ptr<tensorrt_llm::runtime::McastGroupComm> mGroupComm;
+    //! Declared before mSocket so it outlives the socket that holds a pointer to it. Never
+    //! raised here; the handle exchange has no abort path, the flag only has to stay readable.
+    uint32_t volatile mAbortFlag{0};
     std::shared_ptr<NcclIpcSocket> mSocket;
 };
 
