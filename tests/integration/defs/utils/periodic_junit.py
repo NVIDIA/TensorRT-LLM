@@ -386,8 +386,9 @@ class PeriodicJUnitXML:
             # Preserve active tests if interrupted during setup/call/teardown.
             # Atomic replacement avoids losing them if cleanup is interrupted.
             with open(temp_path, "w", encoding="utf-8") as f:
-                f.writelines(line for line in lines if line.strip()
-                             not in self._completed_unfinished_tests)
+                f.writelines(
+                    line for line in lines
+                    if line.strip() not in self._completed_unfinished_tests)
             os.replace(temp_path, unfinished_test_path)
             self._completed_unfinished_tests.clear()
         except OSError as e:
