@@ -3,11 +3,13 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from agent_flow.workflows.perf_analyze.prompts import build_remote_execution_context
+from agent_flow.workflows.perf_analyze.prompts._common import CASEBOOK_DISABLED
 
 from ._common import (
     DISAGG_CAMPAIGN,
     EXECUTION_SLURM_BOOTSTRAP,
     KERNEL_COVERAGE_REPORTER_GUIDANCE,
+    NATIVE_RUNTIME_REUSE,
     REMOTE_SLURM_EXECUTION,
     SOL_ANALYZER_CONTEXT,
     SOL_OPTIMIZE_REPORTER_GUIDANCE,
@@ -89,6 +91,15 @@ DEFAULT_PROMPTS = PromptBundle(
     integrator=INTEGRATOR_SYSTEM_PROMPT,
     qa=QA_SYSTEM_PROMPT,
     reporter=REPORTER_SYSTEM_PROMPT,
+).with_extensions(
+    benchmarker=NATIVE_RUNTIME_REUSE,
+    projector=NATIVE_RUNTIME_REUSE,
+    analyzer=NATIVE_RUNTIME_REUSE,
+    optimizer=NATIVE_RUNTIME_REUSE,
+    evaluator=NATIVE_RUNTIME_REUSE,
+    integrator=NATIVE_RUNTIME_REUSE,
+    qa=NATIVE_RUNTIME_REUSE,
+    reporter=NATIVE_RUNTIME_REUSE,
 )
 
 
@@ -101,6 +112,7 @@ def build_perf_optimize_prompts(
     kernel_coverage: Mapping[str, Any] | None = None,
     sol_methodology: str = "full",
     include_disagg: bool = False,
+    include_casebook: bool = True,
 ) -> PromptBundle:
     """Return the workflow's prompt bundle, augmented per the task spec.
 
@@ -176,6 +188,12 @@ def build_perf_optimize_prompts(
     wrong.
     """
     bundle = DEFAULT_PROMPTS
+    if not include_casebook:
+        bundle = bundle.with_extensions(
+            benchmarker=CASEBOOK_DISABLED,
+            analyzer=CASEBOOK_DISABLED,
+            optimizer=CASEBOOK_DISABLED,
+        )
     if sol_methodology != "full":
         bundle = dataclasses.replace(bundle, projector=build_projector_prompt(sol_methodology))
     restriction = approach_restriction_note(approaches) if approaches is not None else ""

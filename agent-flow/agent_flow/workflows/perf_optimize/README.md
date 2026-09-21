@@ -123,7 +123,9 @@ benchmarker ──▶ (projector) ──▶ ┌──── round loop (max_roun
   integration worktree, resolves only conflicts and minimal combination
   defects, benchmarks the combined state, and emits the authoritative
   `APPROVE | FALLBACK_BEST | REJECT` verdict. It may diagnose/remediate twice;
-  after that it validates only the best standalone candidate, or rejects all.
+  after that it validates only the best standalone candidate, retaining it when
+  it remains above the noise floor and satisfies the curve regression rules, or
+  rejects all.
   Before applying the structured verdict, the Python orchestrator verifies
   that included ids are non-empty candidate-ready items and cross-checks the
   reported threshold, measured gain, and Pareto-curve regression budget.
@@ -204,6 +206,27 @@ exactly when the round produced an `items.json`. A replan-only round
 runs no profiler and writes none; a round whose skill was unavailable or
 whose pipeline errored writes none either and records the reason under
 *Caveats*. Neither owes the block anything.
+## Agent backend and model routing
+
+An optional top-level `agents` block in `task.yaml` selects `codex` or
+`claude-code`, a model slug, reasoning effort, and portable external MCP
+servers. `defaults` applies to every role and `roles.<name>` overrides
+individual fields. For example, this runs projector/analyzer on Astra ultra
+and leaves every other role on the historical Claude default:
+
+```yaml
+agents:
+  roles:
+    projector: {backend: codex, model: gpt-6-astra, reasoning_effort: ultra}
+    analyzer: {backend: codex, model: gpt-6-astra, reasoning_effort: ultra}
+```
+
+For an A/B run, set `casebook.enabled: false` in the control task. The
+optimization casebook remains enabled when the block is omitted.
+
+Omitting `agents` preserves the historical assignment. On resume, the
+checkpointed workspace's `task.yaml` remains authoritative, so a different
+new `--task` cannot change models midway through a campaign.
 
 ## The acceptance gate
 

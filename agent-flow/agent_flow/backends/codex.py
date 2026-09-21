@@ -4,7 +4,9 @@ import asyncio
 import importlib
 import importlib.util
 import inspect
+import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -12,7 +14,10 @@ from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, AsyncIterator, Awaitable, Callable
+
+from pydantic import RootModel
 
 from ..types import (
     AgentTextEvent,
@@ -24,13 +29,14 @@ from ..types import (
     ToolCallEvent,
     UsageInfo,
 )
+from ..workflow_tool import ToolCompletion, WorkflowTool, required_tools
 from .base import Backend, BackendClient, BackendEvent, ResultEvent
 
 # Dispatch table keyed by thread id. Populated when a CodexClient is created
 # with dynamic tools, drained when it is torn down. The AppServerClient's
 # approval handler reads this to route ``item/tool/call`` server requests to
 # the right handler without having to know about threads.
-_TOOL_HANDLERS: dict[str, dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]]] = {}
+_TOOL_HANDLERS: dict[str, dict[str, Callable[[dict[str, Any]], Awaitable[Any]]]] = {}
 
 
 def _module_or_none(name: str) -> Any | None:
@@ -424,10 +430,16 @@ def _usage_from_thread_token_usage(token_usage: Any) -> UsageInfo | None:
 
 
 class CodexClient(BackendClient):
-    def __init__(self, thread, session_init: SessionInitEvent | None = None) -> None:
+    def __init__(
+        self,
+        thread,
+        session_init: SessionInitEvent | None = None,
+        completion: ToolCompletion | None = None,
+    ) -> None:
         self._thread = thread
         self._session_init = session_init
         self._session_init_emitted = False
+        self._completion = completion
 
     async def list_available_skills(self) -> list[str] | None:
         """Skill names from the session init built at client creation.
@@ -446,6 +458,8 @@ class CodexClient(BackendClient):
     async def send_message(self, message: str) -> AsyncIterator[BackendEvent]:
         TextInput = _symbol("openai_codex", "TextInput")
 
+        if self._completion is not None:
+            self._completion.reset()
         turn = await self._thread.turn(TextInput(message))
         items: list[object] = []
         latest_usage: UsageInfo | None = None
@@ -532,7 +546,7 @@ class CodexClient(BackendClient):
 
 
 def _dynamic_tool_spec(tool: Any) -> dict[str, Any]:
-    """Serialize an ``SdkMcpTool`` into a Codex ``DynamicToolSpec`` dict."""
+    """Serialize a workflow or legacy SDK tool for Codex."""
     return {
         "name": tool.name,
         "description": tool.description,
@@ -549,6 +563,9 @@ def _mcp_to_codex_content(result: Any) -> tuple[list[dict[str, Any]], bool]:
     shaped as ``{type: "inputText", text: "..."}`` plus a top-level ``success``
     flag.
     """
+    if isinstance(result, str):
+        return [{"type": "inputText", "text": result}], True
+
     items: list[dict[str, Any]] = []
     success = True
     if isinstance(result, dict):
@@ -605,6 +622,18 @@ def _handle_dynamic_tool_call(params: dict[str, Any]) -> dict[str, Any]:
     return {"contentItems": items, "success": success}
 
 
+def _tool_handler(tool: Any, completion: ToolCompletion) -> Callable[..., Awaitable[Any]]:
+    if not isinstance(tool, WorkflowTool):
+        return tool.handler
+
+    async def handler(args: dict[str, Any]) -> str:
+        text = await tool.handler(args)
+        completion.mark(tool.name)
+        return text
+
+    return handler
+
+
 async def _call_optional_client_method(
     client: Any, names: tuple[str, ...], payload: dict[str, Any]
 ) -> Any:
@@ -616,7 +645,12 @@ async def _call_optional_client_method(
         if inspect.isawaitable(result):
             return await result
         return result
+
     return None
+
+
+class _SkillsResponse(RootModel[dict[str, Any]]):
+    pass
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -667,10 +701,10 @@ def _extract_codex_plugin_names(response: Any) -> list[str]:
 
 async def _build_session_init_event(client: Any, cwd: Path) -> SessionInitEvent | None:
     try:
-        skills_response = await _call_optional_client_method(
-            client,
-            ("skills_list", "skill_list"),
+        skills_response = await client.request(
+            "skills/list",
             {"cwds": [str(cwd)], "forceReload": False},
+            response_model=_SkillsResponse,
         )
         plugins_response = await _call_optional_client_method(
             client, ("plugin_list", "plugins_list"), {}
@@ -679,7 +713,7 @@ async def _build_session_init_event(client: Any, cwd: Path) -> SessionInitEvent 
         return None
 
     event = SessionInitEvent(
-        skills=_extract_codex_skill_names(skills_response),
+        skills=_extract_codex_skill_names(skills_response.root),
         plugins=_extract_codex_plugin_names(plugins_response),
         agents=[],
     )
@@ -744,6 +778,56 @@ def _codex_backend_version() -> str:
 _REASONING_EFFORT = "max"
 
 _SDK_PATCHED = False
+
+
+def _codex_mcp_servers(servers: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Translate the portable task MCP shape to Codex config keys."""
+    normalized: dict[str, dict[str, Any]] = {}
+    for name, raw in servers.items():
+        if name == "agent-tools":
+            raise ValueError("extra_mcp_servers name 'agent-tools' is reserved")
+        if not isinstance(raw, dict):
+            raise ValueError(f"extra_mcp_servers[{name!r}] must be a mapping")
+        server = dict(raw)
+        transport = server.pop("type", None)
+        if transport not in (None, "stdio", "http"):
+            raise ValueError(f"extra_mcp_servers[{name!r}].type must be 'stdio' or 'http'")
+        if "url" in server:
+            if transport != "http":
+                raise ValueError(f"extra_mcp_servers[{name!r}].type must be 'http' when url is set")
+            headers = server.pop("headers", None)
+            if headers is not None:
+                server["http_headers"] = headers
+        elif "command" not in server:
+            raise ValueError(f"extra_mcp_servers[{name!r}] must set either command or url")
+        normalized[name] = server
+    return normalized
+
+
+def _codex_stop_hooks(state_path: Path) -> dict[str, Any]:
+    command = shlex.join(
+        [sys.executable, str(Path(__file__).parents[1] / "workflow_tool.py"), str(state_path)]
+    )
+    return {
+        "Stop": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": command,
+                        "timeout": 30,
+                    }
+                ]
+            }
+        ]
+    }
+
+
+def _disabled_skills_override(names: tuple[str, ...]) -> tuple[str, ...]:
+    if not names:
+        return ()
+    entries = ", ".join(f"{{name={json.dumps(name)}, enabled=false}}" for name in names)
+    return (f"skills.config=[{entries}]",)
 
 
 def _relax_service_tier_on_module(module: Any) -> int:
@@ -824,15 +908,21 @@ def _patch_codex_sdk_service_tier() -> None:
 
 
 class CodexBackend(Backend):
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        reasoning_effort: str | None = None,
+        disabled_skills: tuple[str, ...] = (),
+    ) -> None:
         self._codex = None
         self._default_approval_handler: Callable[..., dict[str, Any]] | None = None
+        self._reasoning_effort = reasoning_effort or _REASONING_EFFORT
+        self._disabled_skills = disabled_skills
 
     def version(self) -> str:
         return _codex_backend_version()
 
     def reasoning_effort(self) -> str:
-        return _REASONING_EFFORT
+        return self._reasoning_effort
 
     async def __aenter__(self) -> "CodexBackend":
         _patch_codex_sdk_service_tier()
@@ -845,6 +935,7 @@ class CodexBackend(Backend):
             config=CodexConfig(
                 codex_bin=codex_bin,
                 experimental_api=True,
+                config_overrides=_disabled_skills_override(self._disabled_skills),
             )
         )
         await self._codex.__aenter__()
@@ -890,13 +981,9 @@ class CodexBackend(Backend):
         extra_mcp_servers: dict[str, Any] | None = None,
         cwd: Path | None = None,
     ) -> AsyncIterator[BackendClient]:
-        # ``disallowed_tools`` and ``extra_mcp_servers`` are currently
-        # Claude-Code-only concepts (they map onto
-        # ``ClaudeAgentOptions.disallowed_tools`` and
-        # ``ClaudeAgentOptions.mcp_servers``). The Codex backend has no
-        # analogous tool-filtering / external-MCP-server hooks, so we
-        # accept and ignore them to keep ``Backend.create_client``
-        # uniform.
+        # Codex still has no backend-neutral mapping for ``hooks`` or
+        # ``disallowed_tools``. External MCP servers do have a thread-scoped
+        # mapping and are normalized below.
         if self._codex is None:
             raise RuntimeError("CodexBackend must be entered before creating clients.")
 
@@ -908,13 +995,22 @@ class CodexBackend(Backend):
         ThreadStartParams = _symbol("openai_codex.generated.v2_all", "ThreadStartParams")
 
         session_cwd = cwd or Path.cwd()
+        required = required_tools(tools)
+        state_dir = TemporaryDirectory(prefix="agent-flow-stop-") if required else None
+        state_path = Path(state_dir.name) / "completion.json" if state_dir else None
+        completion = ToolCompletion(required, state_path)
+        thread_config: dict[str, Any] = {
+            "model_reasoning_effort": self._reasoning_effort,
+            "model_context_window": 1000000,
+        }
+        if extra_mcp_servers:
+            thread_config["mcp_servers"] = _codex_mcp_servers(extra_mcp_servers)
+        if state_path is not None:
+            thread_config["hooks"] = _codex_stop_hooks(state_path)
         params = ThreadStartParams(
             model=model,
             developer_instructions=system_prompt or None,
-            config={
-                "model_reasoning_effort": _REASONING_EFFORT,
-                "model_context_window": 1000000,
-            },
+            config=thread_config,
             cwd=str(session_cwd),
             sandbox=SandboxMode.danger_full_access,
             approval_policy=AskForApproval(root=AskForApprovalValue.never),
@@ -929,8 +1025,16 @@ class CodexBackend(Backend):
         thread_id = started.thread.id
 
         if tools:
-            _TOOL_HANDLERS[thread_id] = {t.name: t.handler for t in tools}
+            _TOOL_HANDLERS[thread_id] = {
+                tool.name: _tool_handler(tool, completion) for tool in tools
+            }
         try:
-            yield CodexClient(AsyncThread(self._codex, thread_id), session_init=session_init)
+            yield CodexClient(
+                AsyncThread(self._codex, thread_id),
+                session_init=session_init,
+                completion=completion,
+            )
         finally:
             _TOOL_HANDLERS.pop(thread_id, None)
+            if state_dir is not None:
+                state_dir.cleanup()

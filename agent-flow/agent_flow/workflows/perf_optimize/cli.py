@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 from agent_flow.workflows.perf_analyze.sol_methodology import resolve_sol_methodology
+from agent_flow.workflows.perf_analyze.task_schema import casebook_enabled
 
 from .disagg import has_disagg
 from .prompts import build_perf_optimize_prompts
@@ -46,7 +47,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Path to the task.yaml spec. Requires `checkpoint_path` and "
         "`trtllm_repo_path`; optional top-level `extra_llm_api_options` "
         "path, optional `benchmark` / `profile` / `optimize` / `accuracy` "
-        "blocks, an optional `slurm-environment` block, and an optional "
+        "blocks, an optional `agents` block for per-role backend/model routing, "
+        "an optional `slurm-environment` block, and an optional "
         "`sol` block (all fields optional: `enabled` gates the one-shot "
         "SOL projector stage — on by default — and `gpu` names the GPU "
         "part for the SOL skill's peaks calculator). "
@@ -139,6 +141,7 @@ def main(argv: list[str] | None = None) -> None:
         kernel_coverage=kernel_coverage(task_data),
         sol_methodology=methodology.name,
         include_disagg=has_disagg(task_data),
+        include_casebook=casebook_enabled(task_data),
     )
     with PerfOptimizeWorkflow(
         workspace=args.workspace,

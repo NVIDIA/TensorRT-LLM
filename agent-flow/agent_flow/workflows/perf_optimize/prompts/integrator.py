@@ -23,7 +23,8 @@ derived from the candidates' standalone measurements.
 You may diagnose and remediate a disappointing combination at most twice. If
 it still misses the requested threshold or curve rules, retain only the
 manifest candidate with the largest standalone measured gain (manifest order
-breaks ties), validate that state once, and return FALLBACK_BEST. If even that
+breaks ties), validate that state once, and return FALLBACK_BEST when it remains
+above the noise floor and satisfies the curve regression rules. If even that
 state fails, restore the integration worktree/config to the campaign base and
 return REJECT. APPROVE means the accepted integration state is already checked
 out in the worktree and represented by the final config.
@@ -34,6 +35,9 @@ Use the workflow's canonical benchmark contract:
 {BENCHMARK_FLAGS_REFERENCE}
 
 Finish by writing integration.md and calling append_integrator_progress once.
-Its decision and measurement fields drive the outcome after the orchestrator's
-consistency checks. Never commit to or edit the campaign checkout directly.
+Set `has_native_changes` true exactly when the final retained integration state
+contains native changes reported by an included candidate or introduced while
+resolving it; dropped candidates do not count. Its decision and measurement
+fields drive the outcome after the orchestrator's consistency checks. Never
+commit to or edit the campaign checkout directly.
 """

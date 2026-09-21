@@ -87,6 +87,7 @@ from agent_flow.workflows.perf_optimize.disagg import (
     user_set_benchmark_keys,
 )
 from agent_flow.workflows.perf_optimize.roadmap_schema import APPROACHES
+from agent_flow.workflows.perf_optimize.roles import ROLES
 
 # Defaults merged under the user's values. ``target_improvement_pct`` is
 # deliberately absent: when the user does not set it, there is no
@@ -421,7 +422,7 @@ def load_and_validate_task_yaml(
     agents read on disk is fully explicit; ``max_rounds_override`` (the
     CLI ``--max-rounds`` flag) is applied last, over the user's value.
     """
-    data = _base_load_and_validate(path)
+    data = _base_load_and_validate(path, agent_roles=ROLES)
 
     errors: list[str] = []
     # Disagg first: the harness config is the source of truth for the

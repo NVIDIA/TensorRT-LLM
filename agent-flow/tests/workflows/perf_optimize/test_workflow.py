@@ -167,6 +167,8 @@ def _stub_agents(
     *,
     analyzer_items: list[list[dict]] | None = None,
     evaluator_verdicts: list[tuple] | None = None,
+    evaluator_native_changes: list[bool] | None = None,
+    integrator_verdict: dict | None = None,
     baseline_curve: list[dict] | None = None,
     evaluator_curve: list[dict] | None = None,
 ):
@@ -181,6 +183,8 @@ def _stub_agents(
       one list per invocation (later invocations default to adding none).
     - ``evaluator_verdicts`` — ``(decision, reason, gain, value)`` per
       evaluator invocation (the last one repeats).
+    - ``integrator_verdict`` — fields that override the default APPROVE
+      verdict emitted by the integrator stub.
     - ``baseline_curve`` — curve the analyzer stub writes on
       ``baseline``/``current_best`` (Pareto-curve mode runs).
     - ``evaluator_curve`` — ``curve`` field every evaluator entry carries.
@@ -188,6 +192,7 @@ def _stub_agents(
     trace: list[str] = []
     items_per_round = list(analyzer_items if analyzer_items is not None else [[_item()]])
     verdicts = list(evaluator_verdicts or [("APPROVE", "none", 8.4, 108.4)])
+    native_changes = list(evaluator_native_changes or [False])
     counters = {"analyzer": 0, "evaluator": 0}
 
     def _append(entry: dict, local_path: Path | None = None) -> None:
@@ -270,6 +275,7 @@ def _stub_agents(
             "reason_category": reason,
             "measured_gain_pct": gain,
             "measured_value": value,
+            "has_native_changes": native_changes[min(idx, len(native_changes) - 1)],
         }
         if evaluator_curve is not None:
             entry["curve"] = [dict(p) for p in evaluator_curve]
@@ -311,7 +317,11 @@ def _stub_agents(
             "measured_value": float(best.get("measured_value") or 100),
             "required_gain_pct": max(noise_floor, best_gain - noise_floor),
             "best_candidate_id": included[0] if included else "",
+            "has_native_changes": any(
+                bool(candidate.get("has_native_changes", False)) for candidate in candidates
+            ),
         }
+        verdict.update(integrator_verdict or {})
         if best.get("curve"):
             verdict["curve"] = best["curve"]
         _append(verdict)
@@ -416,6 +426,10 @@ def test_happy_path_one_accepted_item(tmp_path, fake_git):
     ("verdict_overrides", "error"),
     [
         ({"measured_gain_pct": 0.1}, "below required"),
+        (
+            {"decision": "FALLBACK_BEST", "measured_gain_pct": 0.1},
+            "below noise floor",
+        ),
         ({"required_gain_pct": 0.0}, "required_gain_pct mismatch"),
         ({"included_item_ids": []}, "included no candidates"),
         ({"included_item_ids": ["opt-failed"]}, "non-candidate item"),
@@ -451,6 +465,7 @@ def test_integrator_rejects_invalid_acceptance_verdict(
             "measured_value": 108.4,
             "required_gain_pct": 7.4,
             "best_candidate_id": "opt-001",
+            "has_native_changes": False,
         }
         verdict.update(verdict_overrides)
         data["optimization"].append(verdict)
@@ -464,11 +479,36 @@ def test_integrator_rejects_invalid_acceptance_verdict(
             workflow.close()
 
     assert fake_git.count("fast_forward") == 0
+    assert integrator_prompts[0].startswith("Historical accepted native changes: `false`.")
     active_repo = str(ws / "worktrees" / "round_1" / "integration")
     assert f"Active runtime checkout: `{active_repo}`" in integrator_prompts[0]
     assert (
         f'export PYTHONPATH="{active_repo}${{PYTHONPATH:+:$PYTHONPATH}}"' in integrator_prompts[0]
     )
+
+
+def test_integrator_accepts_fallback_best_below_combined_threshold(tmp_path, fake_git):
+    """A reproducibly beneficial fallback need not meet the combined target."""
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    trace = _stub_agents(
+        workflow,
+        integrator_verdict={
+            "decision": "FALLBACK_BEST",
+            "measured_gain_pct": 3.0,
+            "measured_value": 103.0,
+        },
+    )
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    assert "qa" in trace
+    roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
+    assert roadmap["current_best"]["value"] == pytest.approx(103.0)
+    assert roadmap_schema.find_item(roadmap, "opt-001")["status"] == "accepted"
 
 
 def test_relative_workspace_resolves_reference_result_dir(tmp_path, fake_git, monkeypatch):
@@ -565,6 +605,89 @@ def test_git_stays_local_when_slurm_is_remote(tmp_path, fake_git):
     workflow.run(str(task))
     assert fake_git.count("is_git_repo") == 1
     assert fake_git.count("create_branch") == 1
+
+
+def test_resume_routes_agents_from_checkpointed_task_and_ignores_new_task(tmp_path, fake_git):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    checkpointed = {
+        "checkpoint_path": "/checkpoint",
+        "trtllm_repo_path": "/repo",
+        "agents": {
+            "defaults": {
+                "backend": "codex",
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "medium",
+            },
+            "roles": {
+                "projector": {"model": "gpt-6-astra", "reasoning_effort": "ultra"},
+                "analyzer": {"model": "gpt-6-astra", "reasoning_effort": "ultra"},
+            },
+        },
+    }
+    (ws / "task.yaml").write_text(yaml.safe_dump(checkpointed), encoding="utf-8")
+    state_module.save_state(
+        ws / state_module.STATE_FILENAME,
+        state_module.WorkflowState(
+            task_path=str(ws / "task.yaml"), stage=state_module.STAGE_BENCHMARKER
+        ),
+    )
+    new_task = _write_task(
+        tmp_path,
+        {"agents": {"defaults": {"backend": "claude-code", "model": "changed"}}},
+    )
+    workflow = Workflow(workspace=ws)
+
+    class StopAfterRouting(RuntimeError):
+        pass
+
+    workflow._ensure_optimization_branch = lambda *_: (_ for _ in ()).throw(StopAfterRouting())
+    try:
+        with pytest.raises(StopAfterRouting):
+            workflow.run(str(new_task))
+        assert workflow.projector.config.backend.model == "gpt-6-astra"
+        assert workflow.projector.config.backend.reasoning_effort == "ultra"
+        assert workflow.analyzer.config.backend.model == "gpt-6-astra"
+        assert workflow.reporter.config.backend.model == "gpt-5.6-sol"
+        before = workflow.optimizer.config.backend
+        workflow.optimizer.reset_session()
+        assert workflow.optimizer.config.backend == before
+    finally:
+        workflow.close()
+
+
+def test_casebook_disable_reaches_every_backend(tmp_path):
+    workflow = Workflow(workspace=tmp_path / "ws")
+    workflow.task_path.write_text("casebook: {enabled: false}\n", encoding="utf-8")
+    try:
+        workflow._configure_agents()
+        for role in _AGENT_ROLES:
+            assert getattr(workflow, role).config.backend.disabled_skills
+    finally:
+        workflow.close()
+
+
+def test_completed_resume_constructs_no_agents_and_close_is_safe(tmp_path, monkeypatch):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "task.yaml").write_text("agents: {defaults: {backend: codex}}\n", encoding="utf-8")
+    state_module.save_state(
+        ws / state_module.STATE_FILENAME,
+        state_module.WorkflowState(
+            task_path=str(ws / "task.yaml"),
+            stage=state_module.STAGE_REPORTER,
+            done=True,
+        ),
+    )
+    monkeypatch.setattr(
+        workflow_module,
+        "_make_agent",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("agent constructed")),
+    )
+    workflow = Workflow(workspace=ws)
+    workflow.run(str(tmp_path / "ignored.yaml"))
+    workflow.close()
+    assert all(getattr(workflow, role) is None for role in _ROLES)
 
 
 def test_resume_parked_at_projector_with_block_runs_it(tmp_path, fake_git):
@@ -1259,6 +1382,56 @@ def test_serial_items_reuse_worker_and_accept_directly(tmp_path, fake_git):
     assert fake_git.count("fast_forward") == 2
 
 
+@pytest.mark.parametrize("item_execution", ["serial", "parallel"])
+def test_accepted_native_change_updates_campaign_history(tmp_path, fake_git, item_execution):
+    task = _write_task(
+        tmp_path,
+        {"optimize": {"item_execution": item_execution, "max_rounds": 1}},
+    )
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents(workflow, evaluator_native_changes=[True])
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.has_accepted_native_changes is True
+
+
+def test_rejected_native_change_does_not_update_campaign_history(tmp_path, fake_git):
+    task = _write_task(
+        tmp_path,
+        {"optimize": {"item_execution": "serial", "max_rounds": 1}},
+    )
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents(
+        workflow,
+        evaluator_verdicts=[("REJECT", "functionality", 0.0, 100.0)],
+        evaluator_native_changes=[True],
+    )
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.has_accepted_native_changes is False
+
+
+def test_native_history_note_is_dynamic():
+    state = state_module.WorkflowState(task_path="task.yaml")
+    assert Workflow._native_history_note(state) == (
+        "Historical accepted native changes: `false`.\n\n"
+    )
+    state.has_accepted_native_changes = True
+    assert Workflow._native_history_note(state) == (
+        "Historical accepted native changes: `true`.\n\n"
+    )
+
+
 def test_serial_target_stops_before_unstarted_batch_items(tmp_path, fake_git):
     task = _write_task(
         tmp_path,
@@ -1457,6 +1630,8 @@ def test_each_parallel_item_uses_its_own_optimizer_session(tmp_path, fake_git):
     task = _write_task(tmp_path)
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
+    workflow.task_path.write_text(task.read_text(encoding="utf-8"), encoding="utf-8")
+    workflow._configure_agents()
     trace = _stub_agents(
         workflow,
         analyzer_items=[[_item("opt-001", gain=10.0), _item("opt-002", gain=5.0)]],
@@ -2721,11 +2896,19 @@ def test_clean_wipes_managed_files_and_dirs(tmp_path):
 def test_all_agents_use_claude_code_backend_with_scoped_sessions(tmp_path):
     workflow = Workflow(workspace=tmp_path / "ws")
     try:
+        workflow.task_path.write_text("{}\n", encoding="utf-8")
+        workflow._configure_agents()
         for role in _AGENT_ROLES:
             layer = getattr(workflow, role)
             assert layer.config.backend.kind == "claude-code", role
             assert layer.config.backend.model == CLAUDE_CODE_DEFAULT_MODEL, role
-            assert layer.config.backend.hooks is not None, role
+            assert layer.config.backend.hooks is None, role
+            append_tool = next(
+                tool
+                for tool in layer.config.backend.tools
+                if tool.name == f"append_{role}_progress"
+            )
+            assert append_tool.required_before_stop, role
             # The judges are stateless (fresh eyes per verdict); the
             # optimizer's persistent session is additionally reset per
             # item by the orchestrator (covered by
@@ -2741,6 +2924,8 @@ def test_all_agents_use_claude_code_backend_with_scoped_sessions(tmp_path):
 def test_each_agent_has_its_progress_tools(tmp_path):
     workflow = Workflow(workspace=tmp_path / "ws")
     try:
+        workflow.task_path.write_text("{}\n", encoding="utf-8")
+        workflow._configure_agents()
         for role in _AGENT_ROLES:
             layer = getattr(workflow, role)
             tool_names = [t.name for t in layer.config.backend.tools]
@@ -2760,6 +2945,8 @@ def test_no_role_wires_an_external_mcp_server(tmp_path):
     """
     workflow = Workflow(workspace=tmp_path / "ws")
     try:
+        workflow.task_path.write_text("{}\n", encoding="utf-8")
+        workflow._configure_agents()
         for role in _AGENT_ROLES:
             assert getattr(workflow, role).config.backend.extra_mcp_servers is None, role
     finally:
@@ -2992,6 +3179,12 @@ def test_driving_prompts_avoid_removed_builtin_tools(tmp_path):
     for role, prompt in captured.items():
         for name in ("Grep", "Glob"):
             assert not re.search(rf"\b{name}\b", prompt), (role, name)
+
+
+def test_every_role_turn_starts_with_native_history(tmp_path):
+    captured = _capture_driving_prompts(tmp_path)
+    for role, prompt in captured.items():
+        assert prompt.startswith("Historical accepted native changes: `false`."), role
 
 
 def test_driving_prompts_reinforce_casebook_for_serving_analysis_roles(tmp_path):
