@@ -193,6 +193,47 @@ def _helix_sanitize_empty_kv(
     return partial_o, softmax_stats
 
 
+# Distinct input specializations the NCCL reformat helpers below have been
+# asked to compile. ``dynamic=False`` specializes on the input shapes and
+# ``cp_size``, so this set tracks the same thing dynamo's per-frame cache does.
+_HELIX_NCCL_SHAPES: set = set()
+_HELIX_NCCL_LIMIT_REPORTED = False
+
+
+def _helix_note_nccl_specialization(partial_o: torch.Tensor,
+                                    softmax_stats: torch.Tensor,
+                                    cp_size: int) -> None:
+    """Warn once if the Helix NCCL reformat is past dynamo's recompile budget.
+
+    Past ``cache_size_limit`` dynamo stops compiling and runs the frame eagerly
+    without raising, which silently gives back the fusion these helpers exist
+    for. Report it once per process so the regression is visible in the log
+    instead of only in a kernel trace.
+    """
+    global _HELIX_NCCL_LIMIT_REPORTED
+    if _HELIX_NCCL_LIMIT_REPORTED:
+        return
+    key = (tuple(partial_o.shape), tuple(softmax_stats.shape), cp_size)
+    if key in _HELIX_NCCL_SHAPES:
+        return
+    _HELIX_NCCL_SHAPES.add(key)
+    try:
+        import torch._dynamo as _dynamo
+        limit = getattr(_dynamo.config, "cache_size_limit", None)
+    except ImportError:
+        limit = None
+    if limit is None or len(_HELIX_NCCL_SHAPES) <= limit:
+        return
+    _HELIX_NCCL_LIMIT_REPORTED = True
+    logger.warning(
+        "Helix NCCL all-to-all reformat has seen %d distinct input "
+        "specializations, above torch._dynamo.config.cache_size_limit=%d. "
+        "Dynamo stops recompiling past that limit and runs these helpers "
+        "eagerly without raising, losing the sanitize/transpose fusion. "
+        "Reduce the number of CUDA-graph batch buckets or raise "
+        "cache_size_limit.", len(_HELIX_NCCL_SHAPES), limit)
+
+
 @torch.compile(dynamic=False)
 def _helix_nccl_pre_alltoall(
     partial_o: torch.Tensor,
@@ -214,7 +255,9 @@ def _helix_nccl_pre_alltoall(
 
     The cost is one specialization per CUDA-graph batch bucket. Exceeding
     dynamo's ``cache_size_limit`` falls back to eager SILENTLY -- the symptom is
-    ``triton_poi_fused_*`` disappearing from the trace, not an error.
+    ``triton_poi_fused_*`` disappearing from the trace, not an error, so
+    ``_helix_note_nccl_specialization`` counts the distinct shapes at the call
+    site and says so once.
     """
     partial_o, softmax_stats = _helix_sanitize_empty_kv(partial_o,
                                                         softmax_stats,
@@ -263,6 +306,8 @@ def _helix_post_process(
     if mapping.cp_config.get("use_nccl_for_alltoall", True):
         # NCCL path. Sanitize is folded into _helix_nccl_pre_alltoall so
         # inductor can fuse it into the reformat.
+        _helix_note_nccl_specialization(partial_o, softmax_stats,
+                                        mapping.cp_size)
         chunks = _helix_nccl_pre_alltoall(partial_o, softmax_stats,
                                           zero_kv_mask, mapping.cp_size)
         gathered = alltoall_helix(chunks, mapping.cp_group)
