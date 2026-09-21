@@ -533,6 +533,66 @@ class TestOpenAIServerMultimodalTokenCollection:
             assert details["audio_tokens"] == 128
 
     @pytest.mark.asyncio
+    async def test_chat_multimodal_processor_priority(self):
+        """Verify that generator.input_processor is prioritized over server.processor."""
+        server = object.__new__(OpenAIServer)
+        server.model = "test-model"
+        hf_processor = MagicMock(name="hf_processor")
+        trt_processor = MagicMock(name="trt_processor")
+        server.processor = hf_processor
+        server.model_config = None
+        server.multimodal_server_config = None
+        server.tokenizer = MagicMock()
+        server.chat_template = None
+        server.log_stats = False
+        server._input_proc_executor = None
+        server.await_disconnected = AsyncMock()
+
+        generator = MagicMock()
+        generator.input_processor = trt_processor
+        generator.args = MagicMock(num_postprocess_workers=0, reasoning_parser=None)
+        promise = MagicMock()
+        promise.prompt_token_ids = list(range(50))
+        generator.generate_async.return_value = promise
+        server.generator = generator
+
+        async def fake_create_chat_response(promise, postproc_params, raw_request, disagg_params):
+            return ChatCompletionResponse(
+                id="chat-123",
+                created=1000,
+                model="test-model",
+                choices=[],
+                usage=UsageInfo(prompt_tokens=50),
+            )
+
+        server._create_chat_response = fake_create_chat_response
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "hello"}],
+            stream=False,
+        )
+
+        async def mm_coro():
+            return ({"image": [b"img"]}, None)
+
+        with (
+            patch("tensorrt_llm.serve.openai_server.parse_chat_messages_coroutines") as mock_parse,
+            patch("tensorrt_llm.serve.openai_server.async_apply_chat_template") as mock_template,
+            patch("tensorrt_llm.inputs.multimodal.find_mm_token_lengths") as mock_find_mm,
+        ):
+            mock_parse.return_value = ([], mm_coro(), None, None)
+            mock_template.return_value = "rendered text"
+            mock_find_mm.return_value = {"image": [576]}
+
+            await server.openai_chat(request, raw_request=None)
+
+            # Assert that find_mm_token_lengths was called with trt_processor, not hf_processor
+            mock_find_mm.assert_called_once()
+            args, kwargs = mock_find_mm.call_args
+            assert args[1] is trt_processor
+
+    @pytest.mark.asyncio
     async def test_chat_multimodal_token_collection_exception_suppressed(self):
         """Verify that when find_mm_token_lengths raises an exception, the request succeeds.
 
