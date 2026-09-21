@@ -1672,8 +1672,7 @@ def test_top_p_near_one_keeps_full_vocab():
     torch.manual_seed(0)
     logits = torch.randn(2, 32000)
     # Must not raise (pre-fix: searchsorted returned vocab_size -> OOB scatter).
-    tokens, probs = top_k_top_p_sampling_batch(
-        logits, temperature=1.0, top_p=0.9999999)
+    tokens, probs = top_k_top_p_sampling_batch(logits, temperature=1.0, top_p=0.9999999)
     assert tokens.shape == (2,)
     # No crossing -> nothing removed: full-vocabulary distribution, renormalized.
     torch.testing.assert_close(probs.sum(-1), torch.ones(2))
@@ -1693,8 +1692,7 @@ def test_top_p_mixed_crossing_and_no_crossing_rows():
     peaked = torch.zeros(32000)
     peaked[0] = 30.0
     logits = torch.stack([peaked, no_crossing])
-    tokens, probs = top_k_top_p_sampling_batch(
-        logits, temperature=1.0, top_p=0.9999999)
+    tokens, probs = top_k_top_p_sampling_batch(logits, temperature=1.0, top_p=0.9999999)
     assert tokens.shape == (2,)
     # Crossing row: only the top token survives nucleus filtering.
     assert int((probs[0] > 0).sum()) == 1
@@ -1713,7 +1711,8 @@ def _nucleus_reference_probs(logits: torch.Tensor, top_p: float) -> torch.Tensor
     reusing the implementation under test.
     """
     sorted_probs, sorted_indices = torch.sort(
-        torch.softmax(logits, dim=-1), descending=True, dim=-1)
+        torch.softmax(logits, dim=-1), descending=True, dim=-1
+    )
     cumulative = torch.cumsum(sorted_probs, dim=-1)
     keep = torch.cat(
         [
@@ -1737,8 +1736,7 @@ def test_top_p_ordinary_values_match_nucleus_reference(top_p: float):
     """
     torch.manual_seed(7)
     logits = torch.randn(4, 4096)
-    _, probs = top_k_top_p_sampling_batch(
-        logits.clone(), temperature=1.0, top_p=top_p)
+    _, probs = top_k_top_p_sampling_batch(logits.clone(), temperature=1.0, top_p=top_p)
     torch.testing.assert_close(probs, _nucleus_reference_probs(logits, top_p))
 
 
