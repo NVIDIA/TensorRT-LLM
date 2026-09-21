@@ -106,6 +106,8 @@ full:A100/disaggregated/test_disaggregated.py::test_disaggregated_python_transce
 full:A100/llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_logging SKIP (https://nvbugs/6727262)
 full:A100/llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_type_default SKIP (https://nvbugs/6727262)
 full:A30/unittest/_torch/sampler/test_beam_search_speculative_d2h.py::test_speculative_d2h_predictor_always_hit SKIP (https://nvbugs/6792615)
+full:B200/accuracy/test_disaggregated_serving.py::TestGPTOSS::test_eagle3[overlap_scheduler=False] SKIP (https://nvbugs/6813629)
+full:B200/accuracy/test_disaggregated_serving.py::TestGPTOSS::test_eagle3[overlap_scheduler=True] SKIP (https://nvbugs/6813629)
 full:B200/accuracy/test_disaggregated_serving.py::TestQwen3_5_4B::test_ctx_pp_gen_tp_asymmetric SKIP (https://nvbugs/6807864)
 full:B200/accuracy/test_epd_disagg_multimodal.py::TestVideoMMEEPD::test_disaggregated_videomme[nemotron_nano_v3_omni_fp8] SKIP (https://nvbugs/6327718)
 full:B200/accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_mxfp8[use_msa=False] SKIP (https://nvbugs/6424188)
