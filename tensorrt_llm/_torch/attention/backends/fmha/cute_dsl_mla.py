@@ -254,13 +254,6 @@ class CuteDslMlaFmha(PhasedFmha):
             (128, 2): 32,
         }
         min_batch = _PERF_MIN_BATCH_FP8.get((num_heads, seq_len_q))
-        if min_batch is None and num_heads == 96:
-            # For H=96 this table is a correctness constraint, not a perf
-            # tradeoff: TRTLLM-Gen rejects 64 < num_heads_q < 128 outright, so
-            # falling through does not reach a faster kernel, it reaches an
-            # executor-init failure. Admit every seq_len_q, which is what
-            # speculative decode (1 + draft_len) needs.
-            min_batch = 1
         if min_batch is None:
             return False, (
                 f"CuTe DSL MLA decode is not a perf win for "
@@ -329,15 +322,30 @@ class CuteDslMlaFmha(PhasedFmha):
 
         from tensorrt_llm._torch.autotuner import AutoTuner
 
-        # Perf gate (NOT a correctness limit).
-        favorable, reason = self._is_perf_favorable(
-            attn.num_heads,
-            None if AutoTuner.get().is_tuning_mode else batch_size,
-            seq_len_q,
-            self._get_kernel_dtype(attn, q),
+        # A multi-token verify group at H=96 has nowhere else to go: TRTLLM-Gen
+        # rejects 64 < num_heads_q < 128 outright, so falling through the perf
+        # gate does not reach a faster kernel, it reaches an executor-init
+        # failure. That makes this a correctness carve-out rather than a perf
+        # tradeoff, so it is decided here instead of being folded into
+        # _PERF_MIN_BATCH_FP8, which stays a pure measured-win table.
+        # Deliberately narrow: single-token H=96 is already a measured table
+        # entry and still goes through the gate, and non-helix multi-token
+        # H=96 keeps falling back exactly as it does today. Helix with
+        # seq_len_q > 1 implies _helix_spec_tokens_valid -- the helix block
+        # above returns False otherwise.
+        helix_h96_verify_group = (
+            attn.num_heads == 96 and seq_len_q > 1 and meta.helix_position_offsets is not None
         )
-        if not favorable:
-            return False, reason
+        if not helix_h96_verify_group:
+            # Perf gate (NOT a correctness limit).
+            favorable, reason = self._is_perf_favorable(
+                attn.num_heads,
+                None if AutoTuner.get().is_tuning_mode else batch_size,
+                seq_len_q,
+                self._get_kernel_dtype(attn, q),
+            )
+            if not favorable:
+                return False, reason
         if meta.kv_cache_manager is None:
             return False, "KV cache manager is required."
         if fwd.output is None:
