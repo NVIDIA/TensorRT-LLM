@@ -58,9 +58,11 @@ def unpublish_port_after_test():
     yield
     try:
         port_name = MPI.Lookup_name('my_port')
-        MPI.Unpublish_name('my_port', port_name)
-    except MPI.Exception as e:
-        print(f"Cleanup of published port failed (ignored): {e}", flush=True)
+    except MPI.Exception:
+        # Nothing published: the test failed before mpi_publish_name().
+        return
+    MPI.Unpublish_name('my_port', port_name)
+    MPI.Close_port(port_name)
 
 
 def get_ucx_tls():
