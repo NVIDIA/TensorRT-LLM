@@ -157,7 +157,9 @@ configured values are forwarded to dynamically spawned MPI workers.
 Configuring `TRTLLM_DG_CACHE_DIR`, either directly or through
 `TRTLLM_CACHE_DIR`, also defaults `TRTLLM_DG_JIT_DUMP_CUBIN` to `1` so its
 NVRTC-generated cubins are persisted. An explicitly configured dump setting
-still takes precedence.
+still takes precedence. See the
+[DeepGEMM environment variables](source:examples/models/core/deepseek_v3/README.md#deepgemm)
+for details.
 
 Note that, when `TRTLLM_CACHE_DIR` is set, the FlashInfer workspace isolation
 mechanism described below still applies. This will prevent race conditions
