@@ -1304,8 +1304,14 @@ def test_disaggregated_benchmark_gen_only_insufficient_kv(
             results = [f.result(timeout=120) for f in futures]
 
         errors = [r for r in results if isinstance(r, Exception)]
-        assert len(errors) > 0, \
-            "Expected at least one error due to insufficient KV cache"
+        # The executor's fail-fast message must reach a client; any other
+        # exception (connection refused, worker crash) is a different failure.
+        fail_fast_errors = [
+            e for e in errors
+            if "Insufficient KV cache for gen-only benchmark mode" in str(e)
+        ]
+        assert fail_fast_errors, \
+            f"Expected the insufficient-KV fail-fast error, got: {errors!r}"
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
         shutil.rmtree(work_dir, ignore_errors=True)
