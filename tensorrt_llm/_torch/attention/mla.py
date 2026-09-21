@@ -795,9 +795,9 @@ class MLA(nn.Module):
             assert self.kv_lora_rank == kv_lora_rank
 
             helix_kv_bounds = getattr(attn_metadata, "helix_kv_bounds", None)
-            if helix_kv_bounds is not None and getattr(
-                attn_metadata, "_helix_spec_tokens_valid", False
-            ):
+            # helix_kv_bounds is non-None only on TrtllmAttentionMetadata,
+            # where _helix_spec_tokens_valid is a declared field.
+            if helix_kv_bounds is not None and attn_metadata._helix_spec_tokens_valid:
                 # Speculative verify groups: KV ownership is per-TOKEN. A rank
                 # owning only the tail page of a group has zero visible KV for
                 # the group's leading tokens while its per-sequence kv_len is

@@ -89,7 +89,7 @@ class FallbackFmha(Fmha):
         # in the library list, this makes dispatch raise.
         if (
             metadata.helix_position_offsets is not None
-            and getattr(metadata, "_helix_spec_tokens_valid", False)
+            and metadata._helix_spec_tokens_valid
             and metadata.num_generations > 0
             # Count generation tokens only: in a mixed batch ``q`` also holds
             # the context tokens, which would otherwise trip this on a batch
