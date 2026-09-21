@@ -239,7 +239,7 @@ def get_kv_cache_manager_cls(
                 and model_config.mapping.has_cp_helix()
                 and model_config.spec_config is not None and not use_v2):
             raise ValueError(
-                "Kimi K3 helix with speculative decoding requires "
+                "Helix with speculative decoding requires "
                 "kv_cache_config.use_kv_cache_manager_v2=True; the V1-family "
                 "hybrid managers do not implement per-token verify-group "
                 "bookkeeping.")
