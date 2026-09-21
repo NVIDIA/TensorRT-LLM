@@ -2315,31 +2315,6 @@ class OpenAIServer(_VideoRoutesMixin):
             if request.mm_processor_kwargs:
                 prompt["mm_processor_kwargs"] = request.mm_processor_kwargs
 
-            if mm_data:
-                try:
-                    from tensorrt_llm.inputs.multimodal import \
-                        find_mm_token_lengths
-                    proc = getattr(self.generator, "input_processor",
-                                   None) or self.processor
-                    if proc is not None:
-                        mm_token_lengths = find_mm_token_lengths(
-                            mm_data,
-                            proc,
-                            multimodal_data=prompt.get("multi_modal_data"))
-                        if mm_token_lengths:
-                            if "image" in mm_token_lengths:
-                                postproc_args.image_tokens = sum(
-                                    mm_token_lengths["image"])
-                            if "video" in mm_token_lengths:
-                                postproc_args.video_tokens = sum(
-                                    mm_token_lengths["video"])
-                            if "audio" in mm_token_lengths:
-                                postproc_args.audio_tokens = sum(
-                                    mm_token_lengths["audio"])
-                except Exception as e:
-                    logger.debug(
-                        f"Failed to calculate multimodal token counts: {e}")
-
             postproc_args.reasoning_parser = self.generator.args.reasoning_parser
             # Templates that prefill <think>/</think> leave the marker in the
             # prompt, so the request kwargs alone cannot tell the parser which
@@ -2397,6 +2372,54 @@ class OpenAIServer(_VideoRoutesMixin):
                     self._input_proc_executor,
                     functools.partial(preprocess_fn, prompt, sampling_params,
                                       disaggregated_params))
+
+            if mm_data:
+                try:
+                    mm_metadata = None
+                    if isinstance(generate_inputs, dict):
+                        from tensorrt_llm.inputs.registry import \
+                            get_multimodal_encoder_item_metadata
+                        mm_metadata = get_multimodal_encoder_item_metadata(
+                            generate_inputs.get("multi_modal_data"))
+                    if mm_metadata is not None:
+                        modality_totals = {}
+                        for (modality,
+                             _), length in zip(mm_metadata.item_refs,
+                                              mm_metadata.output_embedding_lengths):
+                            modality_totals[modality] = modality_totals.get(
+                                modality, 0) + length
+                        if "image" in modality_totals:
+                            postproc_args.image_tokens = modality_totals["image"]
+                        if "video" in modality_totals:
+                            postproc_args.video_tokens = modality_totals["video"]
+                        if "audio" in modality_totals:
+                            postproc_args.audio_tokens = modality_totals["audio"]
+                    else:
+                        from tensorrt_llm.inputs.multimodal import \
+                            find_mm_token_lengths
+                        proc = getattr(self.generator, "input_processor",
+                                       None) or self.processor
+                        if proc is not None:
+                            mm_token_lengths = find_mm_token_lengths(
+                                mm_data,
+                                proc,
+                                multimodal_data=generate_inputs.get(
+                                    "multi_modal_data") if isinstance(
+                                        generate_inputs, dict) else prompt.get(
+                                            "multi_modal_data"))
+                            if mm_token_lengths:
+                                if "image" in mm_token_lengths:
+                                    postproc_args.image_tokens = sum(
+                                        mm_token_lengths["image"])
+                                if "video" in mm_token_lengths:
+                                    postproc_args.video_tokens = sum(
+                                        mm_token_lengths["video"])
+                                if "audio" in mm_token_lengths:
+                                    postproc_args.audio_tokens = sum(
+                                        mm_token_lengths["audio"])
+                except Exception as e:
+                    logger.debug(
+                        f"Failed to calculate multimodal token counts: {e}")
 
             promise = self.generator.generate_async(
                 inputs=generate_inputs,

@@ -669,3 +669,93 @@ class TestOpenAIServerMultimodalTokenCollection:
             assert "image_tokens" not in details
             assert "video_tokens" not in details
             assert "audio_tokens" not in details
+
+    @pytest.mark.asyncio
+    async def test_chat_multimodal_token_collection_from_preprocessed_item_metadata(self):
+        """Verify deriving token counts from preprocessed MultimodalEncoderItemMetadata post-preprocess."""
+        from tensorrt_llm.inputs.registry import MultimodalEncoderItemMetadata
+
+        server = object.__new__(OpenAIServer)
+        server.model = "test-model"
+        server.processor = MagicMock()
+        server.model_config = None
+        server.multimodal_server_config = None
+        server.tokenizer = MagicMock()
+        server.chat_template = None
+        server.log_stats = False
+        server._input_proc_executor = None
+        server.await_disconnected = AsyncMock()
+
+        item_metadata = MultimodalEncoderItemMetadata(
+            item_refs=[("image", 0), ("video", 0)],
+            encoder_token_lengths=[576, 1024],
+            output_embedding_lengths=[576, 1024],
+        )
+
+        def mock_preprocess(prompt, sampling_params, disaggregated_params):
+            return {
+                "prompt_token_ids": [1, 2, 3],
+                "multi_modal_data": {
+                    "multimodal_encoder_item_metadata": item_metadata
+                }
+            }
+
+        generator = MagicMock()
+        generator.preprocess = mock_preprocess
+        generator.args = MagicMock(num_postprocess_workers=0, reasoning_parser=None)
+        promise = MagicMock()
+        promise.prompt_token_ids = list(range(50))
+        generator.generate_async.return_value = promise
+        server.generator = generator
+
+        async def fake_create_chat_response(promise, postproc_params, raw_request, disagg_params):
+            args = postproc_params.postproc_args
+            details = PromptTokensDetails(
+                cached_tokens=0,
+                image_tokens=args.image_tokens,
+                video_tokens=args.video_tokens,
+                audio_tokens=args.audio_tokens,
+            )
+            usage = UsageInfo(
+                prompt_tokens=args.num_prompt_tokens,
+                completion_tokens=5,
+                total_tokens=args.num_prompt_tokens + 5,
+                prompt_tokens_details=details,
+            )
+            return ChatCompletionResponse(
+                id="chat-123",
+                created=1000,
+                model="test-model",
+                choices=[],
+                usage=usage,
+            )
+
+        server._create_chat_response = fake_create_chat_response
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "hello"}],
+            stream=False,
+        )
+
+        async def mm_coro():
+            return ({"image": [b"img"], "video": [b"vid"]}, None)
+
+        with (
+            patch("tensorrt_llm.serve.openai_server.parse_chat_messages_coroutines") as mock_parse,
+            patch("tensorrt_llm.serve.openai_server.async_apply_chat_template") as mock_template,
+            patch("tensorrt_llm.inputs.multimodal.find_mm_token_lengths") as mock_find_mm,
+        ):
+            mock_parse.return_value = ([], mm_coro(), None, None)
+            mock_template.return_value = "rendered text"
+
+            resp = await server.openai_chat(request, raw_request=None)
+            body = json.loads(resp.body.decode())
+            details = body["usage"]["prompt_tokens_details"]
+
+            # Verify that image_tokens and video_tokens were derived from item_metadata
+            assert details["image_tokens"] == 576
+            assert details["video_tokens"] == 1024
+            assert "audio_tokens" not in details
+            # Verify that find_mm_token_lengths was NOT called because item_metadata was present
+            mock_find_mm.assert_not_called()
