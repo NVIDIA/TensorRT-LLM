@@ -1,0 +1,61 @@
+# Attach-mode variant of marathon_python_v2_musespark_open.yaml.
+#
+# Muse Spark Open at TP4 per instance needs 8 GPUs for 1P1D; on 4-GPU
+# nodes the two instances cannot share one node (two weight-resident
+# TP4 engines exceed device memory), so the cluster is booted
+# externally — one tray per instance — and the marathon attaches to it
+# via stress_config.external_cluster instead of launching workers
+# locally. No context_servers/generation_servers sizing appears here
+# because no local launch happens.
+#
+# The run environment provides the endpoints via ${VAR} references
+# (resolved by the harness at setup() time; see configs/README.md):
+#   TRTLLM_TEST_EXTERNAL_CLUSTER_URL      e.g. http://nodename:8340
+#   TRTLLM_TEST_EXTERNAL_CLUSTER_LOG_DIR  serve dir containing
+#                                         ctx/server.log, gen1/server.log,
+#                                         orch/server.log
+#
+# model: is the externally-served model name (request envelope), not a
+# checkpoint path — attach mode loads no weights.
+
+model: musespark_open
+backend: pytorch
+
+# ============================================================================
+# Stress harness configuration (consumed by harness.py::StressConfig).
+# Schema documented in ../README.md.
+# ============================================================================
+stress_config:
+  mode: log_only
+  duration_min: 10
+
+  kv_cache_manager: v2
+  transceiver: python
+
+  external_cluster:
+    server_url: ${TRTLLM_TEST_EXTERNAL_CLUSTER_URL}
+    server_log: ${TRTLLM_TEST_EXTERNAL_CLUSTER_LOG_DIR}/orch/server.log
+    worker_logs:
+      - role: ctx
+        path: ${TRTLLM_TEST_EXTERNAL_CLUSTER_LOG_DIR}/ctx/server.log
+      - role: gen
+        path: ${TRTLLM_TEST_EXTERNAL_CLUSTER_LOG_DIR}/gen1/server.log
+
+  log_only_probe:
+    interval_s: 30
+    prompt: "Write one sentence about reliable distributed inference."
+    max_tokens: 32
+    seed: 42
+    request_timeout_s: 300   # first probe pays one-time JIT/warmup cost
+
+  log_scan:
+    hard_zero_patterns:
+      - "Broken promise"
+      - "Segfault"
+      - "Segmentation fault"
+      - "SIGSEGV"
+      - "0xffffffffffffffff"
+      - "use-after-free"
+      - "heap-use-after-free"
+      - "AddressSanitizer:.*use-after-free"
+      - "double[- ]free"

@@ -74,6 +74,149 @@ _STRESS_CONFIG_COERCERS: dict[str, Callable[[Any], Any]] = {
 }
 
 
+# ``${VAR}`` references in external_cluster string fields. Expanded at
+# setup() time, not YAML-parse time, so configs with unset placeholders
+# still pass the parse/validate gate (and CI collection).
+_ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _expand_env_refs(value: str, *, label: str) -> str:
+    """Expand ``${VAR}`` references in ``value`` from the environment.
+
+    Args:
+        value: String possibly containing ``${VAR}`` references.
+        label: Config-field name embedded in the error message.
+
+    Returns:
+        ``value`` with every reference replaced by the variable's value.
+
+    Raises:
+        ValueError: If any referenced variable is unset. Unset
+            references never pass through silently — a literal
+            ``${...}`` in a URL or log path would only fail later and
+            further from the root cause.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        env_value = os.environ.get(name)
+        if env_value is None:
+            raise ValueError(f"{label} references unset environment variable {name!r}")
+        return env_value
+
+    return _ENV_REF_RE.sub(replace, value)
+
+
+def _unset_env_refs(value: str) -> list[str]:
+    """Return the ``${VAR}`` names in ``value`` that are unset in the environment."""
+    return [name for name in _ENV_REF_RE.findall(value) if os.environ.get(name) is None]
+
+
+@dataclass(frozen=True)
+class ExternalClusterConfig:
+    """Parsed ``stress_config.external_cluster:`` block (attach mode).
+
+    When present, the harness attaches to an already-running
+    disaggregated cluster instead of launching one via
+    ``setup_disagg_cluster``: the orchestrator URL becomes the probe
+    endpoint and the worker log paths feed the log-scanner thread.
+    This is how models whose per-instance GPU footprint exceeds one
+    node run the marathon — the cluster is booted externally (e.g.
+    one tray per instance via ``srun``) and the test only needs
+    HTTP + filesystem access to it.
+
+    String fields may contain ``${VAR}`` environment references,
+    resolved at ``setup()`` time (see ``_expand_env_refs``); structural
+    validation here is env-independent so checked-in YAMLs with
+    placeholders still parse.
+    """
+
+    server_url: str
+    # (role, log_path) pairs in YAML order; per-role indices are
+    # assigned in that order at setup() time.
+    worker_logs: tuple[tuple[str, str], ...]
+    server_log: Optional[str] = None
+    worker_health_urls: tuple[str, ...] = ()
+    # Model name for the OpenAI request envelope; falls back to the
+    # YAML's top-level ``model``. Attach mode never loads weights, so
+    # this should be the externally-launched cluster's served model
+    # name rather than a checkpoint path.
+    model_name: Optional[str] = None
+
+    @classmethod
+    def from_raw(cls, raw: Any) -> "ExternalClusterConfig":
+        """Structurally validate the YAML subtree; no env expansion.
+
+        Raises:
+            ValueError: If the subtree is not a mapping, ``server_url``
+                is missing/empty, ``worker_logs`` is missing/empty, or
+                any entry lacks a valid ``role`` / ``path``.
+        """
+        if not isinstance(raw, dict):
+            raise ValueError(f"external_cluster must be a mapping, got {raw!r}")
+        server_url = raw.get("server_url")
+        if not isinstance(server_url, str) or not server_url:
+            raise ValueError("external_cluster.server_url must be a non-empty string")
+        raw_logs = raw.get("worker_logs")
+        if not isinstance(raw_logs, list) or not raw_logs:
+            raise ValueError(
+                "external_cluster.worker_logs must be a non-empty list of {role, path} mappings"
+            )
+        worker_logs: list[tuple[str, str]] = []
+        for i, entry in enumerate(raw_logs):
+            if not isinstance(entry, dict):
+                raise ValueError(f"external_cluster.worker_logs[{i}] must be a mapping")
+            role = entry.get("role")
+            path = entry.get("path")
+            if role not in ("ctx", "gen"):
+                raise ValueError(
+                    f"external_cluster.worker_logs[{i}].role must be 'ctx' or 'gen', got {role!r}"
+                )
+            if not isinstance(path, str) or not path:
+                raise ValueError(
+                    f"external_cluster.worker_logs[{i}].path must be a non-empty string"
+                )
+            worker_logs.append((role, path))
+        server_log = raw.get("server_log")
+        if server_log is not None and (not isinstance(server_log, str) or not server_log):
+            raise ValueError("external_cluster.server_log must be a non-empty string when set")
+        raw_health = raw.get("worker_health_urls", [])
+        if not isinstance(raw_health, list) or not all(
+            isinstance(u, str) and u for u in raw_health
+        ):
+            raise ValueError(
+                "external_cluster.worker_health_urls must be a list of non-empty strings"
+            )
+        model_name = raw.get("model_name")
+        if model_name is not None and (not isinstance(model_name, str) or not model_name):
+            raise ValueError("external_cluster.model_name must be a non-empty string when set")
+        return cls(
+            server_url=server_url,
+            worker_logs=tuple(worker_logs),
+            server_log=server_log,
+            worker_health_urls=tuple(raw_health),
+            model_name=model_name,
+        )
+
+    def missing_env_vars(self) -> list[str]:
+        """Names of ``${VAR}`` references that are currently unset.
+
+        Lets the pytest entry point ``skip`` (rather than fail) an
+        attach-mode marathon when no external cluster is provided —
+        e.g. when the YAML is parametrized but the run environment
+        did not export the endpoint variables.
+        """
+        missing: list[str] = []
+        fields = [self.server_url, self.server_log or "", self.model_name or ""]
+        fields.extend(path for _, path in self.worker_logs)
+        fields.extend(self.worker_health_urls)
+        for value in fields:
+            for name in _unset_env_refs(value):
+                if name not in missing:
+                    missing.append(name)
+        return missing
+
+
 @dataclass
 class StressConfig:
     """Parsed contents of a marathon YAML's ``stress_config:`` block.
@@ -90,6 +233,9 @@ class StressConfig:
     base_concurrency: int = 64
     client_cancel_rate: float = 0.10
     output_length: int = 512
+    # Attach mode: bind to an externally-launched cluster instead of
+    # calling setup_disagg_cluster. None = launch locally (default).
+    external_cluster: Optional[ExternalClusterConfig] = None
     # Full YAML subtree, for fields the harness consumes lazily
     # (bursts, injections, canary, log_scan, kv_cache_growth_max).
     raw: dict[str, Any] = field(default_factory=dict)
@@ -131,6 +277,8 @@ class StressConfig:
         for name, coerce in _STRESS_CONFIG_COERCERS.items():
             if name in sc:
                 kwargs[name] = coerce(sc[name])
+        if "external_cluster" in sc:
+            kwargs["external_cluster"] = ExternalClusterConfig.from_raw(sc["external_cluster"])
         cfg = cls(**kwargs)
         cfg.validate()
         return cfg
@@ -161,6 +309,16 @@ class StressConfig:
             )
         if self.transceiver not in ("cpp", "python"):
             raise ValueError(f"transceiver must be 'cpp' or 'python', got {self.transceiver!r}")
+        if self.external_cluster is not None and self.is_full_cancel_poison:
+            # Fault injection signals local worker subprocesses by PID
+            # and respawns them via the shared launcher; an externally
+            # launched cluster offers neither, so the combination is a
+            # config error rather than a silently-degraded marathon.
+            raise ValueError(
+                "mode=full_cancel_poison is unsupported with external_cluster: "
+                "injection and respawn require locally-launched worker processes. "
+                "Use mode=log_only for attach-mode marathons."
+            )
 
     @property
     def is_log_only(self) -> bool:
@@ -999,7 +1157,14 @@ class DisaggCancellationStressHarness:
         ``stress_config`` block is stripped from the temporary YAML
         passed to the shared launcher so worker config validation only
         sees normal ``trtllm-serve`` settings.
+
+        When ``stress_config.external_cluster`` is present, no cluster
+        is launched at all; see ``_setup_external_cluster``.
         """
+        if self.config.external_cluster is not None:
+            self._setup_external_cluster()
+            return
+
         from test_disaggregated import (
             build_worker_config,
             get_default_disagg_cluster_config,
@@ -1068,6 +1233,103 @@ class DisaggCancellationStressHarness:
             len(gen_workers),
             server_url,
         )
+
+    def _setup_external_cluster(self) -> None:
+        """Attach to an externally-launched disagg cluster (no local Popen).
+
+        Expands ``${VAR}`` references in the ``external_cluster``
+        block, binds the orchestrator endpoint for the probe thread,
+        and registers worker/server log paths as ``WorkerLaunchSpec``
+        shadows so the log-scanner thread tails them exactly as it
+        would for a locally-launched cluster. No workers are tracked
+        (``_tracked_workers`` stays empty): fault injection is
+        unavailable in attach mode, which ``StressConfig.validate``
+        already enforces by rejecting ``full_cancel_poison``.
+
+        Raises:
+            ValueError: If an ``${VAR}`` reference is unset, or the
+                YAML lacks both ``external_cluster.model_name`` and a
+                top-level ``model``.
+            RuntimeError: If a configured ``worker_health_urls`` probe
+                does not return HTTP 200.
+        """
+        ext = self.config.external_cluster
+        assert ext is not None  # guarded by setup()
+
+        server_url = _expand_env_refs(ext.server_url, label="external_cluster.server_url")
+
+        if ext.model_name is not None:
+            model_name = _expand_env_refs(ext.model_name, label="external_cluster.model_name")
+        else:
+            with self.yaml_path.open("r", encoding="utf-8") as f:
+                doc = yaml.safe_load(f)
+            model_name = str((doc or {}).get("model") or "")
+            if not model_name:
+                raise ValueError(
+                    f"YAML at {self.yaml_path} needs external_cluster.model_name "
+                    "or a top-level model for the request envelope"
+                )
+
+        specs: list[WorkerLaunchSpec] = []
+        role_counts = {"ctx": 0, "gen": 0}
+        for role, raw_path in ext.worker_logs:
+            index = role_counts[role]
+            role_counts[role] += 1
+            specs.append(
+                WorkerLaunchSpec(
+                    role=role,
+                    index=index,
+                    model_name=model_name,
+                    worker_config={},
+                    work_dir="",
+                    port=0,
+                    device="",
+                    env={},
+                    log_path=_expand_env_refs(
+                        raw_path, label=f"external_cluster.worker_logs[{role}_{index}].path"
+                    ),
+                )
+            )
+        self._worker_specs = specs
+        self._tracked_workers = []
+        if ext.server_log is not None:
+            self._server_log_path = _expand_env_refs(
+                ext.server_log, label="external_cluster.server_log"
+            )
+
+        for i, raw_url in enumerate(ext.worker_health_urls):
+            url = _expand_env_refs(raw_url, label=f"external_cluster.worker_health_urls[{i}]")
+            self._check_external_endpoint(url)
+        # The orchestrator must already be healthy — attach mode never
+        # waits for a boot, it verifies one that external tooling
+        # reported up.
+        self._check_external_endpoint(f"{server_url.rstrip('/')}/health")
+
+        self.bind_server_endpoint(server_url, model_name)
+        logger.info(
+            "[harness] setup() attached to external cluster %s with %d ctx / %d gen log(s)",
+            server_url,
+            role_counts["ctx"],
+            role_counts["gen"],
+        )
+
+    def _check_external_endpoint(self, url: str, *, timeout_s: float = 15.0) -> None:
+        """GET ``url`` once; raise if it is not reachable with HTTP 200.
+
+        Kept as a method so unit tests can monkeypatch it without a
+        live HTTP server.
+
+        Raises:
+            RuntimeError: On any connection error, timeout, or
+                non-200 status.
+        """
+        try:
+            with urllib.request.urlopen(url, timeout=timeout_s) as response:
+                status = response.status
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise RuntimeError(f"external cluster endpoint {url} unreachable: {exc}") from exc
+        if status != 200:
+            raise RuntimeError(f"external cluster endpoint {url} returned HTTP {status}")
 
     def _load_sanitized_cluster_config(self) -> dict[str, Any]:
         """Load YAML and remove harness-only fields before cluster launch."""

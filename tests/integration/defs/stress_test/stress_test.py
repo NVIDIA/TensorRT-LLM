@@ -458,6 +458,11 @@ def is_port_available(port: int,
         ModelConfig(model_dir="DeepSeek-R1/DeepSeek-R1-0528-FP4",
                     tp_size=4,
                     memory_requirement=172032),
+        # Configuration for Muse Spark Open with NVFP4 checkpoints (4 GPU setup, requires GB300 288GB)
+        # memory_requirement is in MiB (192 GB = 196608 MiB)
+        ModelConfig(model_dir="Muse-Spark-Open-NVFP4",
+                    tp_size=4,
+                    memory_requirement=196608),
     ],
     ids=lambda x: f"{os.path.basename(x.model_dir)}_tp{x.tp_size}")
 def test_run_stress_test(config, stress_time_timeout, capacity_scheduler_policy,
@@ -553,11 +558,13 @@ def stress_test(config,
     if run_performance:
         performance_config = PerformanceParams()
 
-        # For DeepSeek-V3 or DeepSeek-R1 specific parameters
-        if "DeepSeek-V3" in config.model_dir or "DeepSeek-R1" in config.model_dir:
+        # For DeepSeek-V3, DeepSeek-R1 or MuseSpark specific parameters
+        if ("DeepSeek-V3" in config.model_dir
+                or "DeepSeek-R1" in config.model_dir
+                or "MuseSpark" in config.model_dir):
             performance_config = PerformanceParams(
                 test_timeout=
-                36000  # 10 hours for DeepSeek-V3 or DeepSeek-R1, change this value if needed
+                36000  # 10 hours for large MoE models, change this value if needed
             )
 
     # For DeepSeek-V3 or DeepSeek-R1 specific server parameters
@@ -582,6 +589,24 @@ def stress_test(config,
             wait_interval=test_server_config.wait_interval,
             max_wait_seconds=
             28800,  # DeepSeek-V3 or DeepSeek-R1 specific wait time (8 hours)
+            health_check_timeout=test_server_config.health_check_timeout)
+
+    # Muse Spark Open server parameters, matching the validated single-node
+    # GB300 configuration in examples/musespark_open/serve_config.yaml
+    if "MuseSpark" in config.model_dir:
+        os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+        test_server_config = ServerConfig(
+            port=test_server_config.port,
+            host=test_server_config.host,
+            pp_size=test_server_config.pp_size,
+            ep_size=config.tp_size,  # TP4/EP4 on one GB300 node
+            max_batch_size=256,
+            max_num_tokens=8192,
+            kv_cache_free_gpu_memory_fraction=0.4,
+            capacity_scheduler_policy=test_server_config.
+            capacity_scheduler_policy,
+            wait_interval=test_server_config.wait_interval,
+            max_wait_seconds=7200,  # checkpoint load from Lustre can take ~30 min
             health_check_timeout=test_server_config.health_check_timeout)
 
     # Create a StressTestConfig with customized time parameters if provided
@@ -674,6 +699,37 @@ def stress_test(config,
             "cuda_graph_config": {
                 "enable_padding": True,
                 "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+            },
+            "print_iter_log": True,
+        })
+
+    # Muse Spark Open LLM-API options, matching the validated single-node
+    # GB300 configuration in examples/musespark_open/serve_config.yaml
+    # (tp/ep/batch/token/kv-fraction values are passed on the CLI instead)
+    if "MuseSpark" in config.model_dir:
+        extra_llm_options.update({
+            "max_seq_len": 49152,
+            "trust_remote_code": True,
+            "enable_chunked_prefill": True,
+            "disable_overlap_scheduler": False,
+            "attn_backend": "TRTLLM",
+            "allreduce_strategy": "NCCL",
+            "guided_decoding_backend": "xgrammar",
+            "cuda_graph_config": {
+                "max_batch_size": 256,
+                "enable_padding": True,
+            },
+            "moe_config": {
+                "backend": "TRTLLM",
+            },
+            "kv_cache_config": {
+                # FP8 KV cache is required on SM103 when chunked prefill or
+                # block reuse is enabled (head-dimension-64 paged-context
+                # FMHA constraint).
+                "dtype": "fp8",
+                "enable_block_reuse": True,
+                "enable_partial_reuse": True,
+                "free_gpu_memory_fraction": 0.4,
             },
             "print_iter_log": True,
         })
@@ -1198,16 +1254,21 @@ def stress_stage(model_name,
         request_count = int(stress_request_rate * stress_time)
         test_timeout = stress_config.stress_timeout
 
-    # Cap request count for large MoE models (DeepSeek-V3/R1) to prevent timeout
-    if "DeepSeek-V3" in model_path or "DeepSeek-R1" in model_path:
-        max_sustainable_rate = 3.0  # req/s - conservative estimate
+    # Cap request count for large MoE models to prevent timeout
+    if ("DeepSeek-V3" in model_path or "DeepSeek-R1" in model_path
+            or "MuseSpark" in model_path):
+        if "MuseSpark" in model_path:
+            # The rate cap keeps the stress stage near its nominal duration
+            # without risking the timeout.
+            max_sustainable_rate = 30.0  # req/s
+        else:
+            max_sustainable_rate = 3.0  # req/s - conservative estimate
         max_request_count = int(max_sustainable_rate *
                                 stress_config.stress_time)
         if request_count > max_request_count:
             print_info(
                 f"Capping request_count from {request_count} to {max_request_count} "
-                f"for DeepSeek V3/R1 model (sustainable rate: {max_sustainable_rate} req/s)"
-            )
+                f"(sustainable rate: {max_sustainable_rate} req/s)")
             request_count = max_request_count
 
     print_info(

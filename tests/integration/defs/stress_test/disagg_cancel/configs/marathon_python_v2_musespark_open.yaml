@@ -1,0 +1,110 @@
+# Python transceiver marathon: V2 KV cache + Python transceiver + NIXL,
+# Muse Spark Open NVFP4.
+#
+# 1P1D with TP4/EP4 on each side, sized for a single 4-GPU GB300 node: the
+# context and generation instances share the node's four GPUs, so KV cache
+# fractions are kept small enough for two weight-resident engines per GPU.
+# That is sufficient for log_only probes; full_cancel_poison load shapes
+# need dedicated GPUs per instance.
+#
+# The (V2 KV cache manager x Python transceiver) pair is the supported
+# combination for this model's VSWA + FLASHINFER attention configuration;
+# cache_transceiver_config must be identical on both sides.
+
+hostname: localhost
+model: Muse-Spark-Open-NVFP4
+backend: pytorch
+
+context_servers:
+  num_instances: 1
+  tensor_parallel_size: 4
+  moe_expert_parallel_size: 4
+  pipeline_parallel_size: 1
+  disable_overlap_scheduler: true   # overlap is unsupported on a disagg context server
+  max_batch_size: 8
+  max_num_tokens: 4096
+  max_seq_len: 8192
+  enable_chunked_prefill: true
+  trust_remote_code: true
+  attn_backend: FLASHINFER
+  allreduce_strategy: NCCL
+  moe_config:
+    backend: TRTLLM
+  kv_cache_config:
+    enable_block_reuse: true
+    enable_partial_reuse: true
+    free_gpu_memory_fraction: 0.05
+    use_kv_cache_manager_v2: true   # V2 KV cache manager
+  cache_transceiver_config:
+    backend: NIXL
+    transceiver_runtime: PYTHON     # Python transceiver (KvCacheTransceiverV2)
+    max_tokens_in_buffer: 8192
+    kv_transfer_timeout_ms: 600000
+
+generation_servers:
+  num_instances: 1
+  tensor_parallel_size: 4
+  moe_expert_parallel_size: 4
+  pipeline_parallel_size: 1
+  disable_overlap_scheduler: false
+  max_batch_size: 8
+  max_num_tokens: 4096
+  max_seq_len: 8192
+  enable_chunked_prefill: true
+  trust_remote_code: true
+  attn_backend: FLASHINFER
+  allreduce_strategy: NCCL
+  moe_config:
+    backend: TRTLLM
+  kv_cache_config:
+    enable_block_reuse: true
+    enable_partial_reuse: true
+    free_gpu_memory_fraction: 0.05
+    use_kv_cache_manager_v2: true
+  cache_transceiver_config:
+    backend: NIXL
+    transceiver_runtime: PYTHON
+    max_tokens_in_buffer: 8192
+    kv_transfer_timeout_ms: 600000
+
+# ============================================================================
+# Stress harness configuration (consumed by harness.py::StressConfig).
+# Schema documented in ../README.md.
+# ============================================================================
+stress_config:
+  mode: log_only
+  duration_min: 10
+  # Two GPU-shared TP4 engines load sequentially from network storage.
+  server_start_timeout_s: 3600
+
+  kv_cache_manager: v2
+  transceiver: python
+
+  log_only_probe:
+    interval_s: 30
+    prompt: "Write one sentence about reliable distributed inference."
+    max_tokens: 32
+    seed: 42
+    request_timeout_s: 300   # first probe pays one-time JIT/warmup cost
+
+  base_concurrency: 8
+  client_cancel_rate: 0.10
+  input_length:
+    distribution: uniform
+    min_tokens: 512
+    max_tokens: 2048
+  output_length: 128
+
+  log_scan:
+    hard_zero_patterns:
+      - "Broken promise"
+      - "Segfault"
+      - "Segmentation fault"
+      - "SIGSEGV"
+      - "0xffffffffffffffff"
+      - "use-after-free"
+      - "heap-use-after-free"
+      - "AddressSanitizer:.*use-after-free"
+      - "double[- ]free"
+
+  kv_cache_growth_max: 0.10

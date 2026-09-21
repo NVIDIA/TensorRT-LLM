@@ -331,7 +331,7 @@ def test_injector_sigkill_respawn_success_records_event(
             respawned_proc.wait(timeout=5.0)
 
 
-def test_respawn_uses_allocated_port_and_bounded_health_wait(
+def test_respawn_uses_registered_port_and_bounded_health_wait(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     yaml_path = tmp_path / "stress.yaml"
@@ -367,16 +367,28 @@ def test_respawn_uses_allocated_port_and_bounded_health_wait(
         device: str,
         save_log: bool,
         env: dict[str, str],
+        worker_index: int,
     ) -> SimpleNamespace:
         assert model_name == spec.model_name
         assert worker_config == spec.worker_config
         assert role == "gen"
-        assert port == 23456
+        # The respawn launches with port=0 (OS-assigned inside the child);
+        # the real port is resolved afterwards from /cluster_info.
+        assert port == 0
         assert work_dir == spec.work_dir
         assert device == spec.device
         assert save_log is False
         assert env == spec.env
-        return SimpleNamespace(process=None, port=port, log_file=None, log_path=None)
+        assert worker_index == spec.index
+        return SimpleNamespace(
+            process=SimpleNamespace(pid=4242), port=port, log_file=None, log_path=None
+        )
+
+    port_calls: list[tuple[str, int]] = []
+
+    def _fake_await_port(role_key: str, pid: int, *, deadline: float) -> int:
+        port_calls.append((role_key, pid))
+        return 23456
 
     health_calls: list[tuple[int, float]] = []
 
@@ -385,15 +397,20 @@ def test_respawn_uses_allocated_port_and_bounded_health_wait(
         return True
 
     fake_disagg_test_utils = ModuleType("disagg_test_utils")
-    fake_disagg_test_utils.get_free_port = lambda: 23456
     fake_disagg_test_utils._run_worker = _fake_run_worker
     monkeypatch.setitem(sys.modules, "disagg_test_utils", fake_disagg_test_utils)
+    monkeypatch.setattr(h, "_await_registered_worker_port", _fake_await_port)
     monkeypatch.setattr(h, "_wait_for_worker_health", _fake_health)
 
     assert h._respawn_tracked_worker(tracked, timeout_s=7.0) is True
     assert tracked.wrapper.port == 23456
     assert spec.port == 23456
-    assert health_calls == [(23456, 7.0)]
+    assert port_calls == [("gen", 4242)]
+    assert len(health_calls) == 1
+    port, timeout_s = health_calls[0]
+    assert port == 23456
+    # The health wait gets the remaining budget, bounded by the respawn timeout.
+    assert 0.0 < timeout_s <= 7.0
 
 
 def test_injector_exits_on_stop_event_before_distant_injection(tmp_path: Path) -> None:
