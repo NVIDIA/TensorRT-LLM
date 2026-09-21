@@ -146,7 +146,30 @@ class MiniMaxH3Pipeline(BasePipeline):
 
     def __init__(self, pipeline_config: DiffusionPipelineConfig) -> None:
         if pipeline_config.mapping.world_size != 1:
-            raise NotImplementedError("MiniMax-H3 initial support is single-GPU only.")
+            vgm = pipeline_config.visual_gen_mapping
+            is_pure_ulysses = (
+                vgm is not None
+                and pipeline_config.mapping.tp_size == 1
+                and vgm.cfg_size == 1
+                and vgm.ulysses_size == pipeline_config.mapping.world_size
+                and vgm.cp_size == 1
+                and vgm.ring_size == 1
+                and vgm.attn2d_row_size == 1
+                and vgm.attn2d_col_size == 1
+            )
+            if not is_pure_ulysses:
+                raise NotImplementedError(
+                    "MiniMax-H3 multi-GPU support is currently limited to pure "
+                    "Ulysses sequence parallelism: cfg_size=1, tp_size=1, "
+                    "ring_size=1, attn2d_size=(1, 1), and "
+                    "ulysses_size=world_size."
+                )
+            if pipeline_config.attention.backend != "VANILLA":
+                raise NotImplementedError(
+                    "MiniMax-H3 Ulysses is currently validated with VANILLA "
+                    "attention only. Other attention backends need packed-row "
+                    "padding mask validation."
+                )
         if (
             pipeline_config.attention.backend == "TRTLLM"
             and torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
