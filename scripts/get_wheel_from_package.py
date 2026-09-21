@@ -66,7 +66,7 @@ def bolt_optimize_wheels(build_dir, arch, bolt_branch):
     profile overlay already make.
     """
     bolt_internal = get_project_dir() / "scripts" / "bolt" / "internal"
-    apply_latest = bolt_internal / "apply_latest.sh"
+    apply_latest = str(bolt_internal / "apply_latest.sh")
     triple = "x86_64-linux-gnu" if arch == "x86_64" else "aarch64-linux-gnu"
     branches = [b.strip() for b in bolt_branch.split(",") if b.strip()]
 
@@ -75,10 +75,13 @@ def bolt_optimize_wheels(build_dir, arch, bolt_branch):
         for branch in branches:
             print(f"Applying BOLT profiles from {branch}/{triple} to "
                   f"{wheel.name}")
+            cmd = [
+                "bash", apply_latest, branch, triple,
+                str(wheel),
+                str(bolted)
+            ]
             # 3 = that branch has nothing promoted; anything else is decisive.
-            rc = subprocess.run(
-                ["bash", str(apply_latest), branch, triple,
-                 str(wheel), str(bolted)]).returncode
+            rc = subprocess.run(cmd).returncode
             if rc == 0:
                 os.replace(bolted, wheel)
                 print(f"BOLT optimized {wheel.name} ({branch}/{triple})")
