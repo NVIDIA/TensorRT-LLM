@@ -1646,10 +1646,15 @@ repos:
         pass_filenames: false
     -   id: openengine-bindings-check
         name: verify generated OpenEngine bindings are in sync
-        entry: python3 scripts/generate_openengine_protos.py --check --tool-env-root build/openengine-proto-tools
-        language: system
+        entry: python scripts/generate_openengine_protos.py --check
+        language: python
+        additional_dependencies:
+        - grpcio==1.67.1
+        - grpcio-tools==1.67.1
+        - protobuf==5.27.2
+        - setuptools==84.0.0
         pass_filenames: false
-        files: ^(constraints\.txt|requirements-(build-)?openengine\.txt|scripts/generate_openengine_protos\.py|tensorrt_llm/grpc/openengine/(proto/|_generated/))
+        files: ^(requirements\.txt|requirements-(build-)?openengine\.txt|scripts/generate_openengine_protos\.py|tensorrt_llm/grpc/openengine/(proto/|_generated/))
     -   id: test lists format
         name: Check for tabs and multiple spaces in test_lists txt files
         entry: ./scripts/format_test_list.py
