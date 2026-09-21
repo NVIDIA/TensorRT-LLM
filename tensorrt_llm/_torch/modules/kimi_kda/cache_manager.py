@@ -16,20 +16,54 @@ else:
     from typing_extensions import override
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
-    IntermediateState,
     MambaAcceptanceBatch,
     MambaLayerCache,
     MambaStateLayout,
-    ReplayStateUpdateMetadata,
+    _promote_intermediate_states,
+    _stack_state_views,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.seeds import (
-    allocate_mamba_seed_buffer,
-    compute_deterministic_mamba_seed,
-)
 from tensorrt_llm.logger import logger
+
+_MAMBA_SSM_SEED_MASK = (1 << 62) - 1
+_MAMBA_SSM_UINT64_MASK = (1 << 64) - 1
+_MAMBA_SSM_SEED_BASE = 0x6A09E667F3BCC908
+_MAMBA_SSM_SEED_MIX_COUNTER = 0x2545F4914F6CDD1D
+_MAMBA_SSM_SEED_MIX_SLOT = 0x1B873593CC9E2D51
+_MAMBA_SSM_SEED_MIX_RANK = 0x9E3779B97F4A7C15
+
+
+def _splitmix64(value: int) -> int:
+    """Return the SplitMix64 finalizer for ``value``."""
+    value = (value + 0x9E3779B97F4A7C15) & _MAMBA_SSM_UINT64_MASK
+    value ^= value >> 30
+    value = (value * 0xBF58476D1CE4E5B9) & _MAMBA_SSM_UINT64_MASK
+    value ^= value >> 27
+    value = (value * 0x94D049BB133111EB) & _MAMBA_SSM_UINT64_MASK
+    value ^= value >> 31
+    return value & _MAMBA_SSM_UINT64_MASK
+
+
+def compute_deterministic_mamba_seed(counter: int, slot: int, rank_offset: int) -> int:
+    """Return a reproducible, nonzero int64 Philox seed."""
+    folded = (
+        _MAMBA_SSM_SEED_BASE
+        + counter * _MAMBA_SSM_SEED_MIX_COUNTER
+        + slot * _MAMBA_SSM_SEED_MIX_SLOT
+        + rank_offset * _MAMBA_SSM_SEED_MIX_RANK
+    ) & _MAMBA_SSM_UINT64_MASK
+    seed = _splitmix64(folded) & _MAMBA_SSM_SEED_MASK
+    return seed or 1
+
+
+def allocate_mamba_seed_buffer(
+    cache_size: int, rank_offset: int, device: torch.device
+) -> torch.Tensor:
+    """Allocate the graph-stable per-slot Philox seed buffer."""
+    seeds = [compute_deterministic_mamba_seed(0, slot, rank_offset) for slot in range(cache_size)]
+    return torch.tensor(seeds, dtype=torch.int64, device=device)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -145,6 +179,101 @@ def allocate_kda_replay_fields(
     return fields, scratch
 
 
+@dataclass(frozen=True, kw_only=True)
+class KDAIntermediateLayerCache(MambaLayerCache):
+    """Generic intermediate-state view used during speculative decoding."""
+
+    intermediate_conv_window: torch.Tensor | None = None
+    intermediate_ssm: torch.Tensor | None = None
+
+
+class KDAIntermediateState:
+    """Own conventional speculative intermediate states and promotion."""
+
+    def __init__(self) -> None:
+        self._ssm_states: tuple[torch.Tensor, ...] = ()
+        self._conv_states: tuple[torch.Tensor, ...] = ()
+        self._stacked_ssm: torch.Tensor | None = None
+        self._stacked_conv: torch.Tensor | None = None
+        self.intermediate_ssm: torch.Tensor | None = None
+        self.intermediate_conv: torch.Tensor | None = None
+        self.intermediate_indices: torch.Tensor | None = None
+
+    def bind(
+        self,
+        context: MambaStateLayout,
+        ssm_states: list[torch.Tensor],
+        conv_states: list[torch.Tensor],
+    ) -> None:
+        """Borrow persistent per-layer views until shutdown; allocate owned scratch."""
+        self._ssm_states = tuple(ssm_states)
+        self._conv_states = tuple(conv_states)
+        self._stacked_ssm = _stack_state_views(ssm_states)
+        self._stacked_conv = _stack_state_views(conv_states)
+        if not context.mamba_pp_layers:
+            return
+
+        device = ssm_states[0].device
+
+        if context.spec_config is not None:
+            tokens_per_step = context.spec_config.tokens_per_gen_step
+            common_shape = [
+                len(context.mamba_pp_layers),
+                context.max_batch_size,
+                tokens_per_step,
+            ]
+            self.intermediate_ssm = torch.zeros(
+                common_shape + list(context.ssm_state_shape),
+                dtype=context.ssm_state_dtype,
+                device=device,
+            )
+            self.intermediate_conv = torch.zeros(
+                common_shape + list(context.conv_state_shape),
+                dtype=context.conv_state_dtype,
+                device=device,
+            )
+            self.intermediate_indices = torch.arange(
+                context.max_batch_size, dtype=torch.int32, device=device
+            )
+
+    def _layer_cache_fields(self, layer_offset: int) -> dict[str, torch.Tensor | None]:
+        fields: dict[str, torch.Tensor | None] = {}
+        if self.intermediate_conv is not None:
+            fields["intermediate_conv_window"] = self.intermediate_conv[layer_offset]
+        if self.intermediate_ssm is not None:
+            fields["intermediate_ssm"] = self.intermediate_ssm[layer_offset]
+        return fields
+
+    def reset_slots(self, slots: torch.Tensor, host_slots: list[int]) -> None:
+        """Plain intermediate buffers have no request-persistent bookkeeping."""
+
+    def update(self, batch: MambaAcceptanceBatch) -> None:
+        if self.intermediate_indices is None:
+            return
+        _promote_intermediate_states(
+            self._ssm_states, self.intermediate_ssm, batch, self._stacked_ssm
+        )
+        _promote_intermediate_states(
+            self._conv_states, self.intermediate_conv, batch, self._stacked_conv
+        )
+
+    def shutdown(self) -> None:
+        self._ssm_states = ()
+        self._conv_states = ()
+        self._stacked_ssm = None
+        self._stacked_conv = None
+        self.intermediate_ssm = None
+        self.intermediate_conv = None
+        self.intermediate_indices = None
+
+    def make_layer_cache(
+        self, layer_offset: int, conv: torch.Tensor, temporal: torch.Tensor
+    ) -> MambaLayerCache:
+        return KDAIntermediateLayerCache(
+            conv=conv, temporal=temporal, **self._layer_cache_fields(layer_offset)
+        )
+
+
 class KDAReplayState:
     """Own all V2 state used by the KDA fused multi-token verifier."""
 
@@ -156,13 +285,13 @@ class KDAReplayState:
     def intermediate_conv(self) -> torch.Tensor | None:
         return None
 
-    def get_replay_metadata(self) -> ReplayStateUpdateMetadata | None:
-        return None
-
     def __init__(
         self,
         num_speculative_tokens: int,
+        *,
+        stochastic_rounding: bool = False,
     ) -> None:
+        self._stochastic_rounding = stochastic_rounding
         self.num_speculative_tokens = num_speculative_tokens
         self._conv_states: tuple[torch.Tensor, ...] = ()
         self._committed_window = 0
@@ -214,7 +343,7 @@ class KDAReplayState:
         shared_bytes = 0
         if layer_id == context.mamba_pp_layers[0]:
             shared_bytes = 4
-            if context.stochastic_rounding:
+            if self._stochastic_rounding:
                 shared_bytes += 8
         return float_elements * 4 + shared_bytes
 
@@ -225,7 +354,11 @@ class KDAReplayState:
         conv_states: list[torch.Tensor],
     ) -> None:
         """Borrow per-layer conv views [slot, conv_dim, window] and allocate scratch."""
-        self._seed_rank_offset = context.seed_rank_offset
+        self._seed_rank_offset = (
+            context.mapping.tp_rank * 1_000_003
+            + context.mapping.pp_rank * 1_000_033
+            + context.mapping.rank * 1_009
+        )
         self._conv_section_dims = context.conv_section_dims
         self._conv_states = tuple(conv_states)
         self._committed_window = context.conv_state_shape[1] if conv_states else 0
@@ -253,10 +386,10 @@ class KDAReplayState:
             dtype=torch.int32,
             device=device,
         )
-        if context.stochastic_rounding:
+        if self._stochastic_rounding:
             self.rand_seed = allocate_mamba_seed_buffer(
                 cache_size,
-                context.seed_rank_offset,
+                self._seed_rank_offset,
                 device,
             )
         logger.info(f"Mamba Cache (kda-replay) is allocated for {cache_size} state slots")
@@ -476,21 +609,24 @@ class KimiK3HybridCacheManagerV2(MambaHybridCacheManagerV2):
     ) -> None:
         if use_replay_state_update:
             raise ValueError("KDA replay and Mamba2 replay are mutually exclusive")
+        self._mamba_ssm_stochastic_rounding = kwargs.pop("mamba_ssm_stochastic_rounding", False)
         self._requested_num_spec = kda_replay_num_spec
         self._kda_replay: KDAReplayState | None = None
         kwargs.setdefault("conv_state_layout", "q_k_v")
         super().__init__(*args, **kwargs)
 
     @override
-    def _initialize_model_state(self) -> IntermediateState | KDAReplayState:
+    def _initialize_model_state(self) -> KDAIntermediateState | KDAReplayState:
         num_spec = self._requested_num_spec
         if num_spec is None:
             num_spec = get_kda_replay_num_spec(self.spec_config, manager_supports_replay=True)
         if num_spec is not None:
-            self._kda_replay = KDAReplayState(num_spec)
+            self._kda_replay = KDAReplayState(
+                num_spec, stochastic_rounding=self._mamba_ssm_stochastic_rounding
+            )
             self._kda_replay.validate(self._state_layout)
             return self._kda_replay
-        return IntermediateState()
+        return KDAIntermediateState()
 
     @property
     def use_kda_replay_update(self) -> bool:
@@ -656,6 +792,8 @@ def get_kimi_cache_params(config, *, spec_config=None, quant_config=None):
 
 
 __all__ = [
+    "KDAIntermediateLayerCache",
+    "KDAIntermediateState",
     "KDAReplayState",
     "KDAReplayLayerCache",
     "KimiK3HybridCacheManagerV2",

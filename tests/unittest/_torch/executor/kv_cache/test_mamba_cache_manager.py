@@ -23,8 +23,12 @@ from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     KimiK3HybridCacheManagerV2,
 )
 from tensorrt_llm._torch.modules.mamba.cache_manager import (
+    MIN_REPLAY_HISTORY_SIZE,
+    Mamba2State,
     NemotronHybridCacheManagerV2,
     ReplayHistory,
+    ReplayStateUpdateMetadata,
+    _advance_replay_state,
 )
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor._util import (
@@ -42,25 +46,19 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
-    MIN_REPLAY_HISTORY_SIZE,
     CppMambaHybridCacheManager,
     MambaCacheManager,
     MambaHybridCacheManagerV2,
     MambaRole,
     MixedMambaHybridCacheManager,
     PythonMambaCacheManager,
-    ReplayStateUpdateMetadata,
-    _advance_replay_state,
     _get_local_mamba_cache_layout,
     _get_mamba_hybrid_pool_size,
     _get_num_cuda_graph_padding_dummy_slots,
     _mamba_snapshot_rule_counts,
     _promote_mamba_state_triton,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
-    IntermediateState,
-    _stack_state_views,
-)
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import _stack_state_views
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
     LlmRequest,
@@ -3678,7 +3676,7 @@ def test_v2_kda_replay_policy_allocates_logical_slot_caches():
     try:
         assert mgr._kda_replay is policy
         assert policy.intermediate_indices.shape == (4,)
-        assert mgr.get_replay_state_update_metadata() is None
+        assert not hasattr(mgr, "get_replay_state_update_metadata")
 
         layer_cache = mgr.mamba_layer_cache(0)
         assert not hasattr(layer_cache, "intermediate_ssm")
@@ -4235,7 +4233,7 @@ def test_v2_gdn_replay_commits_before_advancing_bookkeeping(monkeypatch):
         lambda **_kwargs: events.append("commit"),
     )
     monkeypatch.setattr(
-        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager._advance_replay_state",
+        "tensorrt_llm._torch.modules.fla.cache_manager._advance_replay_state",
         lambda *_args, **_kwargs: events.append("advance"),
     )
     monkeypatch.setattr(
@@ -4318,7 +4316,7 @@ def test_v2_hybrid_replay_update_skips_dummy_and_padding_rows(monkeypatch):
 def test_v2_hybrid_dynamic_tree_promotes_accepted_leaf_state(monkeypatch):
     mgr = object.__new__(NemotronHybridCacheManagerV2)
     mgr.local_num_mamba_layers = 1
-    policy = IntermediateState()
+    policy = Mamba2State()
     policy.intermediate_indices = torch.arange(2, dtype=torch.int32)
     policy.intermediate_ssm = torch.empty((1, 2, 8))
     policy.intermediate_conv = torch.empty((1, 2, 8))

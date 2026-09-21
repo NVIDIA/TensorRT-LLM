@@ -13,14 +13,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .common import (
-        BaseMambaCacheManager,
-        IntermediateLayerCache,
-        MambaHybridCacheManager,
-        MambaLayerCache,
-        MambaRole,
-        ReplayStateUpdateMetadata,
-    )
+    from .common import BaseMambaCacheManager, MambaHybridCacheManager, MambaLayerCache, MambaRole
     from .legacy import (
         CppMambaHybridCacheManager,
         MambaCacheManager,
@@ -34,7 +27,6 @@ _EXPORTS = {
     "_estimate_mamba_hybrid_cache_cost": ("common", "_estimate_mamba_hybrid_cache_cost"),
     "BaseMambaCacheManager": ("common", "BaseMambaCacheManager"),
     "CppMambaHybridCacheManager": ("legacy", "CppMambaHybridCacheManager"),
-    "MIN_REPLAY_HISTORY_SIZE": ("common", "MIN_REPLAY_HISTORY_SIZE"),
     "MambaCacheManager": ("legacy", "MambaCacheManager"),
     "MambaHybridCacheManager": ("common", "MambaHybridCacheManager"),
     "MambaHybridCacheManagerV2": (
@@ -45,14 +37,6 @@ _EXPORTS = {
     "MambaRole": ("common", "MambaRole"),
     "MixedMambaHybridCacheManager": ("legacy", "MixedMambaHybridCacheManager"),
     "PythonMambaCacheManager": ("legacy", "PythonMambaCacheManager"),
-    "ReplayStateUpdateMetadata": ("common", "ReplayStateUpdateMetadata"),
-    "IntermediateLayerCache": ("common", "IntermediateLayerCache"),
-    "_advance_replay_state": ("common", "_advance_replay_state"),
-    "_allocate_mamba_seed_buffer": ("common", "_allocate_mamba_seed_buffer"),
-    "_compute_deterministic_mamba_seed": (
-        "common",
-        "_compute_deterministic_mamba_seed",
-    ),
     "_get_local_mamba_cache_layout": ("common", "_get_local_mamba_cache_layout"),
     "_get_mamba_hybrid_pool_size": ("common", "_get_mamba_hybrid_pool_size"),
     "_get_num_cuda_graph_padding_dummy_slots": (
@@ -60,7 +44,6 @@ _EXPORTS = {
         "_get_num_cuda_graph_padding_dummy_slots",
     ),
     "_mamba_effective_tp_size": ("common", "_mamba_effective_tp_size"),
-    "_mamba_rank_offset": ("common", "_mamba_rank_offset"),
     "_mamba_snapshot_rule_counts": ("common", "_mamba_snapshot_rule_counts"),
     "_promote_mamba_state_triton": ("common", "_promote_mamba_state_triton"),
     "use_py_mamba_cache_manager": ("common", "use_py_mamba_cache_manager"),
@@ -84,7 +67,6 @@ def __dir__() -> list[str]:
 __all__ = [
     "BaseMambaCacheManager",
     "CppMambaHybridCacheManager",
-    "MIN_REPLAY_HISTORY_SIZE",
     "MambaCacheManager",
     "MambaHybridCacheManager",
     "MambaHybridCacheManagerV2",
@@ -92,7 +74,5 @@ __all__ = [
     "MambaRole",
     "MixedMambaHybridCacheManager",
     "PythonMambaCacheManager",
-    "ReplayStateUpdateMetadata",
-    "IntermediateLayerCache",
     "use_py_mamba_cache_manager",
 ]

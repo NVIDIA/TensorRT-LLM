@@ -26,6 +26,20 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
     from tensorrt_llm.sampling_params import SamplingParams
 
+from tensorrt_llm._torch.modules.mamba.cache_manager import (
+    MIN_REPLAY_HISTORY_SIZE,
+    ReplayStateUpdateMetadata,
+    _advance_replay_state,
+)
+from tensorrt_llm._torch.modules.mamba.cache_manager import (
+    allocate_mamba_seed_buffer as _allocate_mamba_seed_buffer,
+)
+from tensorrt_llm._torch.modules.mamba.cache_manager import (
+    compute_deterministic_mamba_seed as _compute_deterministic_mamba_seed,
+)
+from tensorrt_llm._torch.modules.mamba.cache_manager import (
+    mamba_seed_rank_offset as _mamba_rank_offset,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID, LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager,
@@ -43,17 +57,11 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from .common import (
-    MIN_REPLAY_HISTORY_SIZE,
     BaseMambaCacheManager,
     MambaHybridCacheManager,
-    ReplayStateUpdateMetadata,
-    _advance_replay_state,
-    _allocate_mamba_seed_buffer,
-    _compute_deterministic_mamba_seed,
     _get_local_mamba_cache_layout,
     _get_mamba_hybrid_pool_size,
     _mamba_effective_tp_size,
-    _mamba_rank_offset,
     _promote_mamba_state_triton,
     get_tensor_size_bytes,
 )

@@ -25,7 +25,9 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa.constants import (
 from tensorrt_llm._torch.attention.backends.sparse.qsa.params import QSASparseParams
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.modules.fla.cache_manager import (
+    GDNIntermediateState,
     GDNReplayState,
+    ReplayStateUpdateMetadata,
     create_gdn_state,
     validate_gdn_layout,
 )
@@ -33,7 +35,6 @@ from tensorrt_llm._torch.pyexecutor.config_utils import resolve_hf_torch_dtype
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
-    IntermediateState,
     _get_local_mamba_cache_layout,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import get_pp_layers
@@ -193,6 +194,7 @@ class Qwen4ExpHybridCacheManagerV2(MambaHybridCacheManagerV2):
         qwen4_exp_ple_cache_params: Qwen4ExpPLECacheParams | None = None,
         **kwargs,
     ) -> None:
+        kwargs.pop("mamba_ssm_stochastic_rounding", False)
         self._requested_replay = use_replay_state_update
         self._ple_params = qwen4_exp_ple_cache_params
         self._pretrained_config = pretrained_config
@@ -502,7 +504,7 @@ class Qwen4ExpHybridCacheManagerV2(MambaHybridCacheManagerV2):
         ]
 
     @override
-    def _initialize_model_state(self) -> IntermediateState | GDNReplayState:
+    def _initialize_model_state(self) -> GDNIntermediateState | GDNReplayState:
         state = create_gdn_state(self, self._requested_replay)
 
         validate_gdn_layout(self, state)
@@ -558,6 +560,10 @@ class Qwen4ExpHybridCacheManagerV2(MambaHybridCacheManagerV2):
         self._ple_conv_states.clear()
         self._ple_ngram_contexts.clear()
         super()._shutdown_model_state()
+
+    def get_replay_state_update_metadata(self) -> ReplayStateUpdateMetadata | None:
+        state = self._speculative_state
+        return state.get_replay_metadata() if isinstance(state, GDNReplayState) else None
 
     @property
     def use_gdn_cached_replay_all_layer_commit(self) -> bool:

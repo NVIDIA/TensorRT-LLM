@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import torch
 
@@ -15,12 +17,9 @@ else:
     from typing_extensions import override
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
-    MIN_REPLAY_HISTORY_SIZE,
-    IntermediateState,
     MambaAcceptanceBatch,
     MambaLayerCache,
     MambaStateLayout,
-    ReplayStateUpdateMetadata,
     _mamba_effective_tp_size,
     _promote_intermediate_states,
     _stack_state_views,
@@ -28,19 +27,211 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.replay import ReplayLayerCache
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.seeds import (
-    _reset_mamba_seed_buffer,
-    allocate_mamba_seed_buffer,
-)
 from tensorrt_llm._torch.utils import is_gdn_replay_enabled
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.logger import logger
 
 from .cached_replay import (
     CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
     commit_gdn_cached_replay_history_layers,
 )
+
+MIN_REPLAY_HISTORY_SIZE = 16
+
+
+class ReplayStateUpdateMetadata(NamedTuple):
+    """Shared tensors and fixed sizes for replay state updates."""
+
+    prev_num_accepted_tokens: torch.Tensor
+    cache_buf_idx: torch.Tensor
+    replay_step_width: int
+    replay_history_size: int
+
+
+def _advance_replay_state(
+    replay_metadata: ReplayStateUpdateMetadata,
+    state_indices: torch.Tensor,
+    accepted_tokens: torch.Tensor,
+    is_dummy_request: torch.Tensor | None = None,
+) -> None:
+    """Advance double-buffered replay bookkeeping after a verify step."""
+    slots = state_indices.long()
+    accepted_tokens = accepted_tokens.to(replay_metadata.prev_num_accepted_tokens.dtype)
+    previous = replay_metadata.prev_num_accepted_tokens[slots]
+    wrote_checkpoint = (
+        previous + replay_metadata.replay_step_width > replay_metadata.replay_history_size
+    )
+    next_accepted = torch.where(wrote_checkpoint, accepted_tokens, previous + accepted_tokens)
+    cache_buffer = replay_metadata.cache_buf_idx[slots]
+    next_cache_buffer = torch.where(wrote_checkpoint, 1 - cache_buffer, cache_buffer)
+    if is_dummy_request is not None:
+        next_accepted = torch.where(is_dummy_request, previous, next_accepted)
+        next_cache_buffer = torch.where(is_dummy_request, cache_buffer, next_cache_buffer)
+    replay_metadata.prev_num_accepted_tokens[slots] = next_accepted
+    replay_metadata.cache_buf_idx[slots] = next_cache_buffer
+
+
+_MAMBA_SSM_SEED_MASK = (1 << 62) - 1
+_MAMBA_SSM_UINT64_MASK = (1 << 64) - 1
+_MAMBA_SSM_SEED_BASE = 0x6A09E667F3BCC908
+_MAMBA_SSM_SEED_MIX_COUNTER = 0x2545F4914F6CDD1D
+_MAMBA_SSM_SEED_MIX_SLOT = 0x1B873593CC9E2D51
+_MAMBA_SSM_SEED_MIX_RANK = 0x9E3779B97F4A7C15
+
+
+def _splitmix64(value: int) -> int:
+    """Return the SplitMix64 finalizer for ``value``."""
+    value = (value + 0x9E3779B97F4A7C15) & _MAMBA_SSM_UINT64_MASK
+    value ^= value >> 30
+    value = (value * 0xBF58476D1CE4E5B9) & _MAMBA_SSM_UINT64_MASK
+    value ^= value >> 27
+    value = (value * 0x94D049BB133111EB) & _MAMBA_SSM_UINT64_MASK
+    value ^= value >> 31
+    return value & _MAMBA_SSM_UINT64_MASK
+
+
+def compute_deterministic_mamba_seed(counter: int, slot: int, rank_offset: int) -> int:
+    """Return a reproducible, nonzero int64 Philox seed."""
+    folded = (
+        _MAMBA_SSM_SEED_BASE
+        + counter * _MAMBA_SSM_SEED_MIX_COUNTER
+        + slot * _MAMBA_SSM_SEED_MIX_SLOT
+        + rank_offset * _MAMBA_SSM_SEED_MIX_RANK
+    ) & _MAMBA_SSM_UINT64_MASK
+    seed = _splitmix64(folded) & _MAMBA_SSM_SEED_MASK
+    return seed or 1
+
+
+def allocate_mamba_seed_buffer(
+    cache_size: int, rank_offset: int, device: torch.device
+) -> torch.Tensor:
+    """Allocate the graph-stable per-slot Philox seed buffer."""
+    seeds = [compute_deterministic_mamba_seed(0, slot, rank_offset) for slot in range(cache_size)]
+    return torch.tensor(seeds, dtype=torch.int64, device=device)
+
+
+def _reset_mamba_seed_buffer(
+    seed_buffer: torch.Tensor,
+    slots: torch.Tensor,
+    host_slots: list[int],
+    *,
+    counter: int,
+    rank_offset: int,
+) -> None:
+    """Refresh selected slots in the graph-stable int64 Philox buffer."""
+    seeds = [compute_deterministic_mamba_seed(counter, slot, rank_offset) for slot in host_slots]
+    seed_buffer[slots] = torch.tensor(seeds, dtype=torch.int64, pin_memory=prefer_pinned()).to(
+        seed_buffer.device, non_blocking=True
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class GDNLayerCache(MambaLayerCache):
+    """Per-layer GDN intermediate or replay views consumed by its mixer."""
+
+    intermediate_conv_window: torch.Tensor | None = None
+    intermediate_ssm: torch.Tensor | None = None
+    mamba_ssm_rand_seed: torch.Tensor | None = field(
+        default=None,
+        metadata={"slot_shared": True},
+    )
+    prev_num_accepted_tokens: torch.Tensor | None = field(
+        default=None,
+        metadata={"slot_shared": True},
+    )
+    cache_buf_idx: torch.Tensor | None = field(
+        default=None,
+        metadata={"slot_shared": True},
+    )
+    old_x: torch.Tensor | None = None
+    old_B: torch.Tensor | None = None
+    old_dt: torch.Tensor | None = None
+    old_dA_cumsum: torch.Tensor | None = None
+
+
+class GDNIntermediateState:
+    """Own conventional speculative intermediate states and promotion."""
+
+    def __init__(self) -> None:
+        self._ssm_states: tuple[torch.Tensor, ...] = ()
+        self._conv_states: tuple[torch.Tensor, ...] = ()
+        self._stacked_ssm: torch.Tensor | None = None
+        self._stacked_conv: torch.Tensor | None = None
+        self.intermediate_ssm: torch.Tensor | None = None
+        self.intermediate_conv: torch.Tensor | None = None
+        self.intermediate_indices: torch.Tensor | None = None
+
+    def bind(
+        self,
+        context: MambaStateLayout,
+        ssm_states: list[torch.Tensor],
+        conv_states: list[torch.Tensor],
+    ) -> None:
+        """Borrow persistent per-layer views until shutdown; allocate owned scratch."""
+        self._ssm_states = tuple(ssm_states)
+        self._conv_states = tuple(conv_states)
+        self._stacked_ssm = _stack_state_views(ssm_states)
+        self._stacked_conv = _stack_state_views(conv_states)
+        if not context.mamba_pp_layers:
+            return
+
+        device = ssm_states[0].device
+
+        if context.spec_config is not None:
+            tokens_per_step = context.spec_config.tokens_per_gen_step
+            common_shape = [
+                len(context.mamba_pp_layers),
+                context.max_batch_size,
+                tokens_per_step,
+            ]
+            self.intermediate_ssm = torch.zeros(
+                common_shape + list(context.ssm_state_shape),
+                dtype=context.ssm_state_dtype,
+                device=device,
+            )
+            self.intermediate_conv = torch.zeros(
+                common_shape + list(context.conv_state_shape),
+                dtype=context.conv_state_dtype,
+                device=device,
+            )
+            self.intermediate_indices = torch.arange(
+                context.max_batch_size, dtype=torch.int32, device=device
+            )
+
+    def _layer_cache_fields(self, layer_offset: int) -> dict[str, torch.Tensor | None]:
+        fields: dict[str, torch.Tensor | None] = {}
+        if self.intermediate_conv is not None:
+            fields["intermediate_conv_window"] = self.intermediate_conv[layer_offset]
+        if self.intermediate_ssm is not None:
+            fields["intermediate_ssm"] = self.intermediate_ssm[layer_offset]
+        return fields
+
+    def reset_slots(self, slots: torch.Tensor, host_slots: list[int]) -> None:
+        """Plain intermediate buffers have no request-persistent bookkeeping."""
+
+    def update(self, batch: MambaAcceptanceBatch) -> None:
+        if self.intermediate_indices is None:
+            return
+        _promote_intermediate_states(
+            self._ssm_states, self.intermediate_ssm, batch, self._stacked_ssm
+        )
+        _promote_intermediate_states(
+            self._conv_states, self.intermediate_conv, batch, self._stacked_conv
+        )
+
+    def shutdown(self) -> None:
+        self._ssm_states = ()
+        self._conv_states = ()
+        self._stacked_ssm = None
+        self._stacked_conv = None
+        self.intermediate_ssm = None
+        self.intermediate_conv = None
+        self.intermediate_indices = None
+
+    def make_layer_cache(
+        self, layer_offset: int, conv: torch.Tensor, temporal: torch.Tensor
+    ) -> MambaLayerCache:
+        return GDNLayerCache(conv=conv, temporal=temporal, **self._layer_cache_fields(layer_offset))
 
 
 class GDNReplayState:
@@ -93,7 +284,11 @@ class GDNReplayState:
         self._ssm_states = tuple(ssm_states)
         self._conv_states = tuple(conv_states)
         self._stacked_conv = _stack_state_views(conv_states)
-        self._seed_rank_offset = context.seed_rank_offset
+        self._seed_rank_offset = (
+            context.mapping.tp_rank * 1_000_003
+            + context.mapping.pp_rank * 1_000_033
+            + context.mapping.rank * 1_009
+        )
         if not context.mamba_pp_layers:
             return
 
@@ -114,7 +309,7 @@ class GDNReplayState:
         self.intermediate_indices = torch.arange(
             context.max_batch_size, dtype=torch.int32, device=device
         )
-        self.rand_seed = allocate_mamba_seed_buffer(cache_size, context.seed_rank_offset, device)
+        self.rand_seed = allocate_mamba_seed_buffer(cache_size, self._seed_rank_offset, device)
 
         num_heads, head_dim, d_state = context.ssm_state_shape
         common_replay_shape = [len(context.mamba_pp_layers), cache_size, 2]
@@ -209,7 +404,7 @@ class GDNReplayState:
         conv: torch.Tensor,
         temporal: torch.Tensor,
     ) -> MambaLayerCache:
-        return ReplayLayerCache(
+        return GDNLayerCache(
             conv=conv,
             temporal=temporal,
             **self._layer_cache_fields(layer_offset),
@@ -239,10 +434,7 @@ class GDNReplayState:
         metadata = self.get_replay_metadata()
         if metadata is None:
             raise RuntimeError("GDN replay buffers are not bound")
-        # Import through the facade to retain the established monkeypatch point.
-        from tensorrt_llm._torch.pyexecutor.kv_cache import mamba_cache_manager
-
-        mamba_cache_manager._advance_replay_state(
+        _advance_replay_state(
             metadata,
             batch.destination_state_indices,
             batch.num_accepted_tokens,
@@ -361,10 +553,10 @@ def select_gdn_replay_state(
 
 def create_gdn_state(
     manager: MambaHybridCacheManagerV2, use_replay: bool | None
-) -> IntermediateState | GDNReplayState:
+) -> GDNIntermediateState | GDNReplayState:
     """Shared selection for the Qwen3.5 and Qwen4 cache managers."""
     if use_replay is False:
-        return IntermediateState()
+        return GDNIntermediateState()
     if use_replay is True:
         if manager.spec_config is None:
             raise ValueError("GDN replay requires speculative decoding")
@@ -375,12 +567,12 @@ def create_gdn_state(
             ssm_cache_dtype=manager.ssm_state_dtype,
             manager_cls=type(manager),
         )
-        or IntermediateState()
+        or GDNIntermediateState()
     )
 
 
 def validate_gdn_layout(
-    manager: MambaHybridCacheManagerV2, state: IntermediateState | GDNReplayState
+    manager: MambaHybridCacheManagerV2, state: GDNIntermediateState | GDNReplayState
 ) -> None:
     if isinstance(state, GDNReplayState):
         if manager.local_num_mamba_layers and manager._global_n_groups % _mamba_effective_tp_size(
@@ -395,16 +587,21 @@ class Qwen35HybridCacheManagerV2(MambaHybridCacheManagerV2):
 
     @override
     def __init__(self, *args, use_replay_state_update: bool | None = None, **kwargs) -> None:
+        kwargs.pop("mamba_ssm_stochastic_rounding", False)
         self._requested_replay = use_replay_state_update
         kwargs.setdefault("conv_state_layout", "q_k_v")
         super().__init__(*args, **kwargs)
 
     @override
-    def _initialize_model_state(self) -> IntermediateState | GDNReplayState:
+    def _initialize_model_state(self) -> GDNIntermediateState | GDNReplayState:
         state = create_gdn_state(self, self._requested_replay)
 
         validate_gdn_layout(self, state)
         return state
+
+    def get_replay_state_update_metadata(self) -> ReplayStateUpdateMetadata | None:
+        state = self._speculative_state
+        return state.get_replay_metadata() if isinstance(state, GDNReplayState) else None
 
     @property
     def use_gdn_cached_replay_all_layer_commit(self) -> bool:
@@ -435,6 +632,8 @@ def get_gdn_cache_params(config, *, spec_config=None, quant_config=None):
 
 
 __all__ = [
+    "GDNIntermediateState",
+    "GDNLayerCache",
     "GDNReplayState",
     "Qwen35HybridCacheManagerV2",
     "create_gdn_state",

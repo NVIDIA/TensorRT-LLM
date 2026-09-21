@@ -21,6 +21,10 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.modules.mamba import mamba2_metadata
+from tensorrt_llm._torch.modules.mamba.cache_manager import (
+    MIN_REPLAY_HISTORY_SIZE,
+    ReplayStateUpdateMetadata,
+)
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
     REPLAY_WORK_CACHE_BUF_IDX,
     REPLAY_WORK_CACHE_SLOT,
@@ -31,10 +35,6 @@ from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
     _build_replay_work_items_triton,
     cu_seqlens_to_chunk_indices_offsets,
     cu_seqlens_to_chunk_indices_offsets_triton,
-)
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
-    MIN_REPLAY_HISTORY_SIZE,
-    ReplayStateUpdateMetadata,
 )
 
 skip_no_cuda = pytest.mark.skipif(

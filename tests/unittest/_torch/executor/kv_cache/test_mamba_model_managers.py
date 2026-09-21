@@ -9,13 +9,21 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from tensorrt_llm._torch.modules.fla.cache_manager import GDNReplayState, Qwen35HybridCacheManagerV2
+from tensorrt_llm._torch.modules.fla.cache_manager import (
+    GDNIntermediateState,
+    GDNLayerCache,
+    GDNReplayState,
+    Qwen35HybridCacheManagerV2,
+)
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
+    KDAIntermediateLayerCache,
+    KDAIntermediateState,
     KDAReplayLayerCache,
     KDAReplayState,
     KimiK3HybridCacheManagerV2,
 )
 from tensorrt_llm._torch.modules.mamba.cache_manager import (
+    Mamba2LayerCache,
     Mamba2State,
     NemotronHybridCacheManagerV2,
     ReplayHistory,
@@ -29,14 +37,12 @@ from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
-    IntermediateLayerCache,
-    IntermediateState,
     MambaAcceptanceBatch,
     MambaHybridCacheManager,
+    MambaLayerCache,
     MambaRole,
     MambaStateLayout,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.replay import ReplayLayerCache
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
@@ -173,6 +179,7 @@ def _state_views(layers=2, slots=5):
 
 def _prepare_model_layout(manager):
     """Supply constructor-resolved inputs when testing the pre-pool hook alone."""
+    manager._mamba_ssm_stochastic_rounding = False
     manager._state_layout = replace(_layout(), spec_config=manager.spec_config)
     manager.local_num_mamba_layers = 2
     manager._global_n_groups = 2
@@ -242,12 +249,12 @@ def test_k3_initializes_only_the_selected_state(
         else None
     )
     _prepare_model_layout(manager)
-    intermediate_factory = Mock(wraps=IntermediateState)
+    intermediate_factory = Mock(wraps=KDAIntermediateState)
     replay_factory = Mock(wraps=KDAReplayState)
     selector = Mock(return_value=selected_num_spec)
     monkeypatch.setitem(
         KimiK3HybridCacheManagerV2._initialize_model_state.__globals__,
-        "IntermediateState",
+        "KDAIntermediateState",
         intermediate_factory,
     )
     monkeypatch.setitem(
@@ -265,7 +272,7 @@ def test_k3_initializes_only_the_selected_state(
     num_spec = requested_num_spec if requested_num_spec is not None else selected_num_spec
     if num_spec is not None:
         intermediate_factory.assert_not_called()
-        replay_factory.assert_called_once_with(num_spec)
+        replay_factory.assert_called_once_with(num_spec, stochastic_rounding=False)
         assert manager._speculative_state is manager._kda_replay
         state = manager._kda_replay
     else:
@@ -315,7 +322,7 @@ def test_base_manager_without_model_state():
     assert manager.intermediate_state_indices is None
     assert manager.intermediate_ssm_states is None
     assert manager.intermediate_conv_states is None
-    assert manager.get_replay_state_update_metadata() is None
+    assert not hasattr(manager, "get_replay_state_update_metadata")
 
 
 @pytest.mark.parametrize(
@@ -336,7 +343,8 @@ def test_mamba2_seed_lifecycle_without_speculative_decoding():
     manager = object.__new__(NemotronHybridCacheManagerV2)
     manager.spec_config = None
     manager._requested_replay = False
-    manager._state_layout = replace(_layout(), spec_config=None, stochastic_rounding=True)
+    manager._mamba_ssm_stochastic_rounding = True
+    manager._state_layout = replace(_layout(), spec_config=None)
     views = _state_views()
     manager.all_ssm_states = views.all_ssm_states
     manager.all_conv_states = views.all_conv_states
@@ -354,7 +362,7 @@ def test_mamba2_seed_lifecycle_without_speculative_decoding():
 
 
 @pytest.mark.parametrize(
-    "state", [IntermediateState(), ReplayHistory(3), GDNReplayState(3), KDAReplayState(2)]
+    "state", [GDNIntermediateState(), ReplayHistory(3), GDNReplayState(3), KDAReplayState(2)]
 )
 def test_common_manager_consumes_model_state_contract(state):
     manager = object.__new__(MambaHybridCacheManagerV2)
@@ -378,9 +386,7 @@ def test_common_manager_consumes_model_state_contract(state):
         assert payload.old_x is not None
     else:
         assert payload.intermediate_ssm is not None
-    assert (manager.get_replay_state_update_metadata() is not None) == isinstance(
-        state, (ReplayHistory, GDNReplayState)
-    )
+    assert not hasattr(manager, "get_replay_state_update_metadata")
     manager._shutdown_model_state()
     assert manager.intermediate_state_indices is None
     assert manager.intermediate_ssm_states is None
@@ -409,8 +415,8 @@ def test_model_owns_speculative_state_lifecycle(monkeypatch, manager_cls, mode):
     _prepare_model_layout(manager)
     manager._speculative_state = manager._initialize_model_state()
     state = manager._speculative_state
-    assert isinstance(state, IntermediateState) == (mode != "replay")
-    assert isinstance(state, ReplayHistory) == (mode == "replay")
+    assert isinstance(state, (Mamba2State, GDNIntermediateState)) == (mode != "replay")
+    assert isinstance(state, (ReplayHistory, GDNReplayState)) == (mode == "replay")
 
     manager._state_layout = object()
     manager.local_num_mamba_layers = 0
@@ -543,7 +549,7 @@ def test_warmup_cleanup_clears_registered_persistent_roles_only(
     monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     manager._setup_states()
-    manager._speculative_state = GDNReplayState(3) if replay else IntermediateState()
+    manager._speculative_state = GDNReplayState(3) if replay else GDNIntermediateState()
     manager._setup_model_state()
     state = manager._speculative_state
     scratch_before = {}
@@ -596,7 +602,7 @@ def test_gdn_bind_accepts_affine_and_indirect_views(affine):
 
 
 @pytest.mark.parametrize(
-    "state", [IntermediateState(), ReplayHistory(3), GDNReplayState(3), KDAReplayState(2)]
+    "state", [GDNIntermediateState(), ReplayHistory(3), GDNReplayState(3), KDAReplayState(2)]
 )
 def test_no_local_recurrent_layers_allocate_no_algorithm_buffers(state):
     state.bind(_layout(layers=(), slot_capacity=0), [], [])
@@ -657,30 +663,37 @@ def test_kda_scratch_cost_matches_allocated_slot_buffers():
 
 
 @pytest.mark.parametrize("layer", [0, 1])
-@pytest.mark.parametrize("kind", ["intermediate", "mamba2", "replay", "gdn", "kda"])
+@pytest.mark.parametrize(
+    "kind", ["intermediate", "kda_intermediate", "mamba2", "replay", "gdn", "kda"]
+)
 def test_layer_payload_preserves_storage_and_strides(kind, layer):
     states = {
-        "intermediate": IntermediateState,
-        "mamba2": Mamba2State,
+        "intermediate": GDNIntermediateState,
+        "kda_intermediate": KDAIntermediateState,
+        "mamba2": lambda: Mamba2State(stochastic_rounding=True),
         "replay": lambda: ReplayHistory(3),
         "gdn": lambda: GDNReplayState(3),
-        "kda": lambda: KDAReplayState(2),
+        "kda": lambda: KDAReplayState(2, stochastic_rounding=True),
     }
     state = states[kind]()
-    layout = replace(_layout(), stochastic_rounding=True)
+    layout = _layout()
     # Interleave persistent slots to exercise borrowed, non-contiguous pool views.
     conv = torch.zeros(2, 10, 24, 3)[:, ::2]
     ssm = torch.zeros(2, 10, 2, 4, 4)[:, ::2]
     state.bind(layout, list(ssm.unbind()), list(conv.unbind()))
     payload = state.make_layer_cache(layer, conv[layer], ssm[layer])
     expected_type = {
-        "intermediate": IntermediateLayerCache,
-        "mamba2": IntermediateLayerCache,
-        "replay": ReplayLayerCache,
-        "gdn": ReplayLayerCache,
+        "intermediate": GDNLayerCache,
+        "kda_intermediate": KDAIntermediateLayerCache,
+        "mamba2": Mamba2LayerCache,
+        "replay": Mamba2LayerCache,
+        "gdn": GDNLayerCache,
         "kda": KDAReplayLayerCache,
     }[kind]
     assert type(payload) is expected_type
+    assert expected_type.__bases__ == (MambaLayerCache,)
+    if kind in ("replay", "gdn", "kda"):
+        assert expected_type.__module__ == type(state).__module__
     pairs = [(payload.conv, conv[layer]), (payload.temporal, ssm[layer])]
     if kind == "kda":
         assert payload.has_kda_replay_caches
@@ -709,6 +722,8 @@ def test_layer_payload_preserves_storage_and_strides(kind, layer):
             pairs.append((payload.intermediate_ssm, state.intermediate_ssm[layer]))
         if kind == "intermediate":
             assert payload.mamba_ssm_rand_seed is None
+        elif kind == "kda_intermediate":
+            assert not hasattr(payload, "mamba_ssm_rand_seed")
         else:
             assert payload.mamba_ssm_rand_seed is state.rand_seed
     for view, source in pairs:
@@ -721,8 +736,8 @@ def test_layer_payload_preserves_storage_and_strides(kind, layer):
 
 
 def test_kda_seed_lifecycle_is_independent_of_layer_payload():
-    state = KDAReplayState(2)
-    layout = replace(_layout(), stochastic_rounding=True, seed_rank_offset=17)
+    state = KDAReplayState(2, stochastic_rounding=True)
+    layout = replace(_layout(), mapping=Mapping(world_size=2, tp_size=2, rank=1))
     views = _state_views()
     state.bind(layout, views.all_ssm_states, views.all_conv_states)
     original = state.rand_seed.clone()
@@ -736,10 +751,8 @@ def test_kda_seed_lifecycle_is_independent_of_layer_payload():
 
 
 def test_mamba2_seed_lifecycle_does_not_require_speculative_decoding():
-    layout = replace(
-        _layout(), spec_config=None, stochastic_rounding=True, ssm_state_dtype=torch.float16
-    )
-    first, second = Mamba2State(), Mamba2State()
+    layout = replace(_layout(), spec_config=None, ssm_state_dtype=torch.float16)
+    first, second = Mamba2State(stochastic_rounding=True), Mamba2State(stochastic_rounding=True)
     first.bind(layout, _state_views().all_ssm_states, _state_views().all_conv_states)
     second.bind(layout, _state_views().all_ssm_states, _state_views().all_conv_states)
     torch.testing.assert_close(first.rand_seed, second.rand_seed)
@@ -752,27 +765,30 @@ def test_mamba2_seed_lifecycle_does_not_require_speculative_decoding():
 
 
 def test_replay_and_intermediate_are_independent_algorithms():
+    assert KDAIntermediateState.__bases__ == (object,)
+    assert GDNIntermediateState.__bases__ == (object,)
+    assert KDAReplayState.__bases__ == (object,)
     assert ReplayHistory.__bases__ == (object,)
     assert GDNReplayState.__bases__ == (object,)
     assert not issubclass(GDNReplayState, ReplayHistory)
     assert ReplayHistory.__module__.endswith("modules.mamba.cache_manager")
     assert GDNReplayState.__module__.endswith("modules.fla.cache_manager")
     assert not any("modules.mamba" in cls.__module__ for cls in GDNReplayState.__mro__)
-    assert Mamba2State.__bases__ == (IntermediateState,)
-    assert not issubclass(ReplayHistory, IntermediateState)
+    assert Mamba2State.__bases__ == (object,)
+    assert not issubclass(ReplayHistory, GDNIntermediateState)
     assert not issubclass(GDNReplayState, Mamba2State)
     assert ReplayHistory(3).intermediate_ssm is None
     assert GDNReplayState(3).intermediate_ssm is None
-    state = IntermediateState()
+    state = GDNIntermediateState()
     assert not {"rand_seed", "_seed_request_counter", "_seed_rank_offset"}.intersection(vars(state))
     assert not hasattr(state, "_promote_conv")
 
 
 @pytest.mark.parametrize("replay_cls", [ReplayHistory, GDNReplayState])
 def test_mamba_seed_reset_matches_between_intermediate_and_replay(replay_cls):
-    layout = replace(_layout(), stochastic_rounding=True, seed_rank_offset=17)
+    layout = replace(_layout(), mapping=Mapping(world_size=2, tp_size=2, rank=1))
     views = _state_views()
-    intermediate, replay = Mamba2State(), replay_cls(3)
+    intermediate, replay = Mamba2State(stochastic_rounding=True), replay_cls(3)
     for state in (intermediate, replay):
         state.bind(layout, views.all_ssm_states, views.all_conv_states)
     torch.testing.assert_close(intermediate.rand_seed, replay.rand_seed)
@@ -800,7 +816,8 @@ def test_mamba_seed_reset_matches_between_intermediate_and_replay(replay_cls):
 
 
 @pytest.mark.parametrize(
-    "state_cls", [IntermediateState, Mamba2State, ReplayHistory, GDNReplayState]
+    "state_cls",
+    [GDNIntermediateState, KDAIntermediateState, Mamba2State, ReplayHistory, GDNReplayState],
 )
 def test_accepted_state_promotion_preserves_algorithm_boundary(monkeypatch, state_cls):
     from tensorrt_llm._torch.pyexecutor.kv_cache import mamba_cache_manager
@@ -856,20 +873,26 @@ def test_accepted_state_promotion_preserves_algorithm_boundary(monkeypatch, stat
 
 @pytest.mark.parametrize(
     "state",
-    [IntermediateState(), Mamba2State(), ReplayHistory(3), GDNReplayState(3), KDAReplayState(2)],
+    [GDNIntermediateState(), Mamba2State(), ReplayHistory(3), GDNReplayState(3), KDAReplayState(2)],
 )
 def test_algorithm_borrows_only_tensor_views_and_releases_them(state):
     views = _state_views()
     state.bind(_layout(), views.all_ssm_states, views.all_conv_states)
     assert state._conv_states[0] is views.all_conv_states[0]
     assert not hasattr(state, "manager")
-    if isinstance(state, (IntermediateState, ReplayHistory, GDNReplayState)):
+    if isinstance(
+        state,
+        (GDNIntermediateState, KDAIntermediateState, Mamba2State, ReplayHistory, GDNReplayState),
+    ):
         assert state._ssm_states[0] is views.all_ssm_states[0]
         assert not hasattr(state, "_publish_compatibility_views")
     state.shutdown()
     state.shutdown()
     assert state._conv_states == ()
-    if isinstance(state, (IntermediateState, ReplayHistory, GDNReplayState)):
+    if isinstance(
+        state,
+        (GDNIntermediateState, KDAIntermediateState, Mamba2State, ReplayHistory, GDNReplayState),
+    ):
         assert state._ssm_states == ()
     assert not any(isinstance(value, torch.Tensor) for value in vars(state).values())
     # Releasing borrowed references must not mutate the persistent pool.
@@ -877,7 +900,7 @@ def test_algorithm_borrows_only_tensor_views_and_releases_them(state):
 
 
 @pytest.mark.parametrize(
-    "cls", [IntermediateState, Mamba2State, ReplayHistory, GDNReplayState, KDAReplayState]
+    "cls", [GDNIntermediateState, Mamba2State, ReplayHistory, GDNReplayState, KDAReplayState]
 )
 def test_algorithm_methods_do_not_depend_on_manager(cls):
     for function in vars(cls).values():
@@ -904,7 +927,7 @@ def test_algorithm_methods_do_not_depend_on_manager(cls):
 )
 def test_model_compatibility_properties_follow_owned_state(manager_cls):
     manager = object.__new__(manager_cls)
-    manager._speculative_state = IntermediateState()
+    manager._speculative_state = GDNIntermediateState()
     if manager_cls is KimiK3HybridCacheManagerV2:
         manager._kda_replay = None
     fields = {

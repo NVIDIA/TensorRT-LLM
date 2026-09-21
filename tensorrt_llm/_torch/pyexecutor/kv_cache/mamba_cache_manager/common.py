@@ -20,7 +20,7 @@ import os
 import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields, replace
-from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Protocol, Tuple
+from typing import TYPE_CHECKING, List, Literal, Optional, Protocol, Tuple
 
 import torch
 
@@ -49,15 +49,6 @@ if TYPE_CHECKING:
 GB = 1 << 30
 
 
-class ReplayStateUpdateMetadata(NamedTuple):
-    """Shared tensors and fixed sizes for replay state updates."""
-
-    prev_num_accepted_tokens: torch.Tensor
-    cache_buf_idx: torch.Tensor
-    replay_step_width: int
-    replay_history_size: int
-
-
 @dataclass(frozen=True, kw_only=True)
 class MambaLayerCache:
     """Persistent recurrent-state views for one local layer."""
@@ -79,18 +70,6 @@ class MambaLayerCache:
 
 
 @dataclass(frozen=True, kw_only=True)
-class IntermediateLayerCache(MambaLayerCache):
-    """Generic intermediate-state view used during speculative decoding."""
-
-    intermediate_conv_window: torch.Tensor | None = None
-    intermediate_ssm: torch.Tensor | None = None
-    mamba_ssm_rand_seed: torch.Tensor | None = field(
-        default=None,
-        metadata={"slot_shared": True},
-    )
-
-
-@dataclass(frozen=True, kw_only=True)
 class MambaStateLayout:
     """Resolved recurrent geometry; slot capacity is filled after pool allocation."""
 
@@ -107,8 +86,6 @@ class MambaStateLayout:
     state_index_capacity: int
     slot_capacity: int | None
     spec_config: object | None
-    stochastic_rounding: bool = False
-    seed_rank_offset: int = 0
     conv_section_dims: tuple[int, ...] = field(default_factory=tuple)
     conv_state_layout: Literal["x_b_c", "q_k_v"] = "x_b_c"
 
@@ -160,8 +137,6 @@ class MambaState(Protocol):
         self, layer_offset: int, conv: torch.Tensor, temporal: torch.Tensor
     ) -> MambaLayerCache: ...
 
-    def get_replay_metadata(self) -> ReplayStateUpdateMetadata | None: ...
-
 
 class BaseMambaCacheManager(ABC):
     """Abstract interface for accessing Mamba/recurrent state caches."""
@@ -169,10 +144,6 @@ class BaseMambaCacheManager(ABC):
     @abstractmethod
     def get_state_indices(self, *args, **kwargs) -> torch.Tensor:
         """Return slot indices of each request with shape ``[max_batch_size]``."""
-
-    def get_replay_state_update_metadata(self) -> ReplayStateUpdateMetadata | None:
-        """Return replay metadata tensors and fixed replay sizes."""
-        return None
 
     @abstractmethod
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
@@ -192,42 +163,6 @@ class BaseMambaCacheManager(ABC):
 
     def on_state_transfer_complete(self, request_ids: list[int]) -> None:
         """Notify a model manager after a disaggregated transfer."""
-
-
-MIN_REPLAY_HISTORY_SIZE = 16
-
-
-def _advance_replay_state(
-    replay_metadata: ReplayStateUpdateMetadata,
-    state_indices: torch.Tensor,
-    accepted_tokens: torch.Tensor,
-    is_dummy_request: torch.Tensor | None = None,
-) -> None:
-    """Compatibility wrapper for shared replay bookkeeping."""
-    from .replay import advance_replay_state
-
-    advance_replay_state(replay_metadata, state_indices, accepted_tokens, is_dummy_request)
-
-
-def _allocate_mamba_seed_buffer(
-    cache_size: int, rank_offset: int, device: torch.device
-) -> torch.Tensor:
-    """Compatibility wrapper for shared per-slot seed allocation."""
-    from .seeds import allocate_mamba_seed_buffer
-
-    return allocate_mamba_seed_buffer(cache_size, rank_offset, device)
-
-
-def _compute_deterministic_mamba_seed(counter: int, slot: int, rank_offset: int) -> int:
-    """Compatibility wrapper for shared deterministic seeding."""
-    from .seeds import compute_deterministic_mamba_seed
-
-    return compute_deterministic_mamba_seed(counter, slot, rank_offset)
-
-
-def _mamba_rank_offset(mapping: Mapping) -> int:
-    """Stable identity for per-rank recurrent state initialization."""
-    return mapping.tp_rank * 1_000_003 + mapping.pp_rank * 1_000_033 + mapping.rank * 1_009
 
 
 class _PrefixReuseDiagnostics(Protocol):
@@ -717,13 +652,9 @@ __all__ = [
     "BaseMambaCacheManager",
     "MambaHybridCacheManager",
     "MambaLayerCache",
-    "IntermediateLayerCache",
     "MambaStateLayout",
     "MambaAcceptanceBatch",
-    "IntermediateState",
-    "ReplayStateUpdateMetadata",
     "MambaRole",
-    "MIN_REPLAY_HISTORY_SIZE",
     "use_py_mamba_cache_manager",
     "get_tensor_size_bytes",
 ]
@@ -797,94 +728,4 @@ def _promote_intermediate_states(
             batch.source_state_indices,
             batch.accepted_positions,
             batch.destination_state_indices,
-        )
-
-
-class IntermediateState:
-    """Own conventional speculative intermediate states and promotion."""
-
-    def __init__(self) -> None:
-        self._ssm_states: tuple[torch.Tensor, ...] = ()
-        self._conv_states: tuple[torch.Tensor, ...] = ()
-        self._stacked_ssm: torch.Tensor | None = None
-        self._stacked_conv: torch.Tensor | None = None
-        self.intermediate_ssm: torch.Tensor | None = None
-        self.intermediate_conv: torch.Tensor | None = None
-        self.intermediate_indices: torch.Tensor | None = None
-
-    def bind(
-        self,
-        context: MambaStateLayout,
-        ssm_states: list[torch.Tensor],
-        conv_states: list[torch.Tensor],
-    ) -> None:
-        """Borrow persistent per-layer views until shutdown; allocate owned scratch."""
-        self._ssm_states = tuple(ssm_states)
-        self._conv_states = tuple(conv_states)
-        self._stacked_ssm = _stack_state_views(ssm_states)
-        self._stacked_conv = _stack_state_views(conv_states)
-        if not context.mamba_pp_layers:
-            return
-
-        device = ssm_states[0].device
-
-        if context.spec_config is not None:
-            tokens_per_step = context.spec_config.tokens_per_gen_step
-            common_shape = [
-                len(context.mamba_pp_layers),
-                context.max_batch_size,
-                tokens_per_step,
-            ]
-            self.intermediate_ssm = torch.zeros(
-                common_shape + list(context.ssm_state_shape),
-                dtype=context.ssm_state_dtype,
-                device=device,
-            )
-            self.intermediate_conv = torch.zeros(
-                common_shape + list(context.conv_state_shape),
-                dtype=context.conv_state_dtype,
-                device=device,
-            )
-            self.intermediate_indices = torch.arange(
-                context.max_batch_size, dtype=torch.int32, device=device
-            )
-
-    def _layer_cache_fields(self, layer_offset: int) -> dict[str, torch.Tensor | None]:
-        fields: dict[str, torch.Tensor | None] = {}
-        if self.intermediate_conv is not None:
-            fields["intermediate_conv_window"] = self.intermediate_conv[layer_offset]
-        if self.intermediate_ssm is not None:
-            fields["intermediate_ssm"] = self.intermediate_ssm[layer_offset]
-        return fields
-
-    def reset_slots(self, slots: torch.Tensor, host_slots: list[int]) -> None:
-        """Plain intermediate buffers have no request-persistent bookkeeping."""
-
-    def get_replay_metadata(self) -> ReplayStateUpdateMetadata | None:
-        return None
-
-    def update(self, batch: MambaAcceptanceBatch) -> None:
-        if self.intermediate_indices is None:
-            return
-        _promote_intermediate_states(
-            self._ssm_states, self.intermediate_ssm, batch, self._stacked_ssm
-        )
-        _promote_intermediate_states(
-            self._conv_states, self.intermediate_conv, batch, self._stacked_conv
-        )
-
-    def shutdown(self) -> None:
-        self._ssm_states = ()
-        self._conv_states = ()
-        self._stacked_ssm = None
-        self._stacked_conv = None
-        self.intermediate_ssm = None
-        self.intermediate_conv = None
-        self.intermediate_indices = None
-
-    def make_layer_cache(
-        self, layer_offset: int, conv: torch.Tensor, temporal: torch.Tensor
-    ) -> MambaLayerCache:
-        return IntermediateLayerCache(
-            conv=conv, temporal=temporal, **self._layer_cache_fields(layer_offset)
         )

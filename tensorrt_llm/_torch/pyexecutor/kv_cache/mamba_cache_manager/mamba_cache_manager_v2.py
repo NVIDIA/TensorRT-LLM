@@ -79,11 +79,9 @@ from .common import (
     MambaRole,
     MambaState,
     MambaStateLayout,
-    ReplayStateUpdateMetadata,
     _estimate_mamba_hybrid_cache_cost,
     _get_num_cuda_graph_padding_dummy_slots,
     _mamba_effective_tp_size,
-    _mamba_rank_offset,
     _mamba_regular_snapshot_interval,
     _mamba_snapshot_rule_counts,
     _PrefixReuseDiagnostics,
@@ -138,7 +136,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         layer_mask: Optional[List[bool]] = None,
         is_estimating_kv_cache: bool = False,
         is_draft: bool = False,
-        mamba_ssm_stochastic_rounding: bool = False,
         conv_state_layout: Literal["x_b_c", "q_k_v"] = "x_b_c",
         **kwargs,
     ) -> None:
@@ -170,8 +167,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         self._mamba_layer_mask = list(mamba_layer_mask)
         self.spec_config = spec_config
-        self._mamba_ssm_stochastic_rounding = mamba_ssm_stochastic_rounding
-        self._seed_rank_offset = _mamba_rank_offset(mapping)
         self._recurrent_evicted_blocks_total = 0
         self._recurrent_onboarded_blocks_total = 0
         self._recurrent_dropped_blocks_total = 0
@@ -266,8 +261,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             state_index_capacity=(max_batch_size + self._num_reserved_dummy_slots),
             slot_capacity=None,
             spec_config=spec_config,
-            stochastic_rounding=mamba_ssm_stochastic_rounding,
-            seed_rank_offset=self._seed_rank_offset,
             conv_section_dims=tuple(self.conv_section_dims),
             conv_state_layout=conv_state_layout,
         )
@@ -740,11 +733,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def intermediate_conv_states(self) -> torch.Tensor | None:
         state = self._speculative_state
         return state.intermediate_conv if state is not None else None
-
-    @override
-    def get_replay_state_update_metadata(self) -> ReplayStateUpdateMetadata | None:
-        state = self._speculative_state
-        return state.get_replay_metadata() if state is not None else None
 
     @override
     def mamba_layer_cache(self, layer_idx: int) -> MambaLayerCache:
