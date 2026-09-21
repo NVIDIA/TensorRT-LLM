@@ -93,6 +93,23 @@
     },
     {
       "allowed_values": [
+        "tile",
+        "cluster",
+        "swizzle",
+        "cta_order",
+        "split_k"
+      ],
+      "capture_policy": "tuple[literal]",
+      "kind": "categorical",
+      "path": "autotuner_nvmmh_config.fields"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "autotuner_nvmmh_config.max_tactics"
+    },
+    {
+      "allowed_values": [
         "pytorch"
       ],
       "capture_policy": "literal",
@@ -1476,6 +1493,11 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "sparse_attention_config.use_self_sampling_topk"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.uses_spcompress"
     },
     {
       "capture_policy": "int|none",

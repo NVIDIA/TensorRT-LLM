@@ -29,6 +29,10 @@ def comma_separated_floats(s):
     return [float(x) for x in s.split(",")]
 
 
+def comma_separated_strings(s):
+    return [value.strip() for value in s.split(",") if value.strip()]
+
+
 # Parse cmdline
 parser = argparse.ArgumentParser()
 parser.add_argument("config_path", type=str)
@@ -93,6 +97,10 @@ group = parser.add_mutually_exclusive_group()
 group.add_argument("--enable-autotuner", action="store_true", dest="enable_autotuner")
 group.add_argument("--no-enable-autotuner", action="store_false", dest="enable_autotuner")
 parser.set_defaults(enable_autotuner=None)
+# NVMMH policy is configured through YAML.
+parser.set_defaults(
+    autotuner_nvmmh=None, autotuner_nvmmh_fields=None, autotuner_nvmmh_max_tactics=None
+)
 group = parser.add_mutually_exclusive_group()
 group.add_argument("--use-cuda-graph", action="store_true", dest="use_cuda_graph")
 group.add_argument("--no-use-cuda-graph", action="store_false", dest="use_cuda_graph")
@@ -169,6 +177,8 @@ if args.use_low_precision_moe_combine is None:
     args.use_low_precision_moe_combine = False
 if args.enable_autotuner is None:
     args.enable_autotuner = True
+if isinstance(args.autotuner_nvmmh_fields, str):
+    args.autotuner_nvmmh_fields = comma_separated_strings(args.autotuner_nvmmh_fields)
 if args.use_cuda_graph is None:
     args.use_cuda_graph = False
 if (args.replay_start_iter is None) != (args.replay_stop_iter is None):
@@ -224,7 +234,13 @@ attn_workspace = torch.empty((0,), device="cuda", dtype=torch.int8)
 logger.info("Layer-wise benchmarks: Create KV cache manager  ... Done")
 
 # Create other global objects
-AutoTuner.get().clear_cache()
+tuner = AutoTuner.get()
+tuner.configure_nvmmh(
+    enabled=args.autotuner_nvmmh,
+    fields=args.autotuner_nvmmh_fields,
+    max_tactics=args.autotuner_nvmmh_max_tactics,
+)
+tuner.clear_cache()
 capture_stream = torch.cuda.Stream()
 mark_ranges()
 
