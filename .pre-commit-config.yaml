@@ -1646,7 +1646,7 @@ repos:
         pass_filenames: false
     -   id: openengine-bindings-check
         name: verify generated OpenEngine bindings are in sync
-        entry: python scripts/generate_openengine_protos.py --check --tool-env-root build/openengine-proto-tools
+        entry: python3 scripts/generate_openengine_protos.py --check --tool-env-root build/openengine-proto-tools
         language: system
         pass_filenames: false
         files: ^(constraints\.txt|requirements-(build-)?openengine\.txt|scripts/generate_openengine_protos\.py|tensorrt_llm/grpc/openengine/(proto/|_generated/))

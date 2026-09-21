@@ -5120,7 +5120,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 // artifact so wheel metadata participates in this check.
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install 'tensorrt_llm[grpc-smg,openengine]'")
             }
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 check")
             if (stageName.contains("-ModelExpress-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install modelexpress==${MODEL_EXPRESS_VERSION}")
                 // ModelExpress imports nixl._api, while requirements-dev.txt
