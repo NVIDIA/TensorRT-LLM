@@ -3152,6 +3152,26 @@ class TestNemotron35SuperVLToolParserFactory:
         assert resolve_auto_tool_parser(str(model_dir)) == "qwen3_coder"
 
 
+@pytest.mark.parametrize("model_type", [
+    "qwen3_5",
+    "qwen3_5_text",
+    "qwen3_5_moe",
+    "qwen3_5_moe_text",
+    "qwen4_exp",
+    "qwen4_exp_text",
+])
+def test_auto_detect_qwen3_5_and_qwen3_8_tool_parser(tmp_path, model_type):
+    """Qwen3.5 and Qwen3.8 use the Qwen3-Coder XML tool-call format."""
+    from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+        resolve_auto_tool_parser
+    model_dir = tmp_path / model_type
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps({"model_type": model_type}))
+
+    assert resolve_auto_tool_parser(str(model_dir)) == "qwen3_coder"
+
+
 # ============================================================================
 # Integration Tests
 # ============================================================================

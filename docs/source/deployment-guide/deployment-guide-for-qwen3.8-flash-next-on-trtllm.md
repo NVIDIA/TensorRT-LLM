@@ -148,12 +148,12 @@ Block reuse stays on only if `mamba_state_config` sets at least one snapshot pla
 ```shell
 trtllm-serve <model_path_or_hf_id> \
   --host 0.0.0.0 --port 8000 \
-  --reasoning_parser qwen3_5 \
-  --tool_parser qwen3 \
+  --reasoning_parser auto \
+  --tool_parser auto \
   --config ${EXTRA_LLM_API_FILE}
 ```
 
-The chat template pre-injects a `<think>` block, so reasoning starts at the beginning of the response and the `qwen3_5` reasoning parser applies. This architecture is not in the parser auto-detection table, so pass both parsers explicitly. Thinking is controlled per request through `chat_template_kwargs`, for example `{"chat_template_kwargs": {"enable_thinking": false}}` to answer directly, or `{"chat_template_kwargs": {"enable_thinking": true, "reasoning_effort": "xhigh"}}` for a longer trace.
+Auto-detection selects the `qwen3_5` reasoning parser and the `qwen3_coder` tool parser. The reasoning parser reads the prefilled `<think>` or `</think>` marker from the rendered prompt, so thinking remains controlled per request through `chat_template_kwargs`, for example `{"chat_template_kwargs": {"enable_thinking": false}}` to answer directly, or `{"chat_template_kwargs": {"enable_thinking": true, "reasoning_effort": "xhigh"}}` for a longer trace.
 
 ### Disaggregated Serving
 

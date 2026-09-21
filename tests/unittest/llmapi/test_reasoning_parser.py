@@ -531,8 +531,8 @@ def test_resolved_mode_overrides_whatever_the_caller_sent(
 
 
 @pytest.mark.parametrize("parser", [
-    "deepseek-r1", "deepseek_v4", "qwen3", "qwen3_5", "minimax_m2",
-    "minimax_m3", "nemotron-v3", "nano-v3", "gemma4", "kimi_k2", "kimi_k25"
+    "deepseek-r1", "deepseek_v4", "qwen3", "minimax_m2", "minimax_m3",
+    "nemotron-v3", "nano-v3", "gemma4", "kimi_k2", "kimi_k25"
 ])
 def test_resolve_prefilled_thinking_requires_opt_in(parser: str) -> None:
     """Parsers that have not opted in must never be resolved from the prompt.
@@ -550,26 +550,37 @@ def test_resolve_prefilled_thinking_requires_opt_in(parser: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("prompt_tail", "model_output", "content", "reasoning_content"), [
-        (R1_START, f"hidden{R1_END}visible", "visible", "hidden"),
-        (R1_END, "visible", "visible", ""),
+    ("parser", "prompt_tail", "model_output", "content", "reasoning_content"), [
+        ("poolside_v1", R1_START, f"hidden{R1_END}visible", "visible",
+         "hidden"),
+        ("poolside_v1", R1_END, "visible", "visible", ""),
+        ("qwen3_5", R1_START, f"hidden{R1_END}visible", "visible", "hidden"),
+        ("qwen3_5", R1_END, "visible", "visible", ""),
     ])
-def test_poolside_v1_mode_resolved_from_prompt(prompt_tail: str,
-                                               model_output: str, content: str,
-                                               reasoning_content: str) -> None:
+def test_reasoning_mode_resolved_from_prompt(parser: str, prompt_tail: str,
+                                             model_output: str, content: str,
+                                             reasoning_content: str) -> None:
     """Mirror the server path: resolve from the prompt, then parse.
 
     A request that sends no chat template kwargs must still land in the mode
     the template actually rendered.
     """
     prompt = f"<user>hi</user>\n<assistant>{prompt_tail}"
-    thinking = ReasoningParserFactory.resolve_prefilled_thinking(
-        "poolside_v1", prompt)
+    thinking = ReasoningParserFactory.resolve_prefilled_thinking(parser, prompt)
     reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
-        "poolside_v1", {"enable_thinking": thinking})
+        parser, {"enable_thinking": thinking})
     result = reasoning_parser.parse(model_output)
     assert result.content == content
     assert result.reasoning_content == reasoning_content
+
+
+def test_qwen3_5_without_resolved_mode_preserves_reasoning_default() -> None:
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser("qwen3_5")
+
+    result = reasoning_parser.parse(f"hidden{R1_END}visible")
+
+    assert result.content == "visible"
+    assert result.reasoning_content == "hidden"
 
 
 TOOL_CALL = "<tool_call>"
@@ -885,6 +896,24 @@ def test_auto_detect_qwen3_no_tokenizer_config(tmp_path):
 
     result = resolve_auto_reasoning_parser(model_dir)
     assert result == "qwen3"
+
+
+@pytest.mark.parametrize("model_type", [
+    "qwen3_5",
+    "qwen3_5_text",
+    "qwen3_5_moe",
+    "qwen3_5_moe_text",
+    "qwen4_exp",
+    "qwen4_exp_text",
+])
+def test_auto_detect_qwen3_5_and_qwen3_8(tmp_path, model_type):
+    """Qwen3.5 and Qwen3.8 configs use the prefilled-thinking parser."""
+    model_dir = str(tmp_path / model_type)
+    os.makedirs(model_dir)
+    _write_config(model_dir, model_type)
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result == "qwen3_5"
 
 
 def test_auto_detect_deepseek_r1(tmp_path):

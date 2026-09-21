@@ -198,15 +198,6 @@ class IdentityReasoningParser(BaseReasoningParser):
 
 @register_reasoning_parser("deepseek-r1", reasoning_at_start=True)
 @register_reasoning_parser("qwen3")
-# Qwen3.5 (and forced-thinking Qwen3 variants) use a chat template that
-# pre-injects `<think>\n` into the assistant prompt prefix, so the model
-# output begins inside the reasoning block with no opening tag to search
-# for. That requires `reasoning_at_start=True`. The existing `qwen3` key
-# keeps `reasoning_at_start=False` for back-compat, and `parse()` is
-# binary on this flag (it either requires `<think>` to be present in the
-# output, or assumes the output begins at the start of reasoning) - so
-# the two behaviors must be registered under separate keys.
-@register_reasoning_parser("qwen3_5", reasoning_at_start=True)
 @register_reasoning_parser("minimax_m2", reasoning_at_start=True)
 @register_reasoning_parser("minimax_m2_append_think", reasoning_at_start=True)
 class DeepSeekR1Parser(BaseReasoningParser):
@@ -359,6 +350,33 @@ class DeepSeekV4ReasoningParser(BaseReasoningParser):
         return self._parser.finish()
 
 
+@register_reasoning_parser("qwen3_5")
+class Qwen35ReasoningParser(DeepSeekV4ReasoningParser):
+    """Qwen3.5 and Qwen3.8 parser for prefilled reasoning markers.
+
+    These models pre-inject either ``<think>`` or ``</think>`` into the
+    assistant prompt. The rendered marker selects the mode when available.
+    Without a rendered prompt, preserve the original Qwen3.5 behavior and
+    assume that generation starts inside the reasoning block.
+    """
+
+    resolves_thinking_from_prompt = True
+
+    def __init__(
+        self,
+        *,
+        chat_template_kwargs: Optional[dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(chat_template_kwargs=chat_template_kwargs)
+        kwargs = chat_template_kwargs or {}
+        if kwargs.get("thinking") is None and kwargs.get(
+                "enable_thinking") is None:
+            self._parser = DeepSeekR1Parser(
+                reasoning_at_start=True,
+                chat_template_kwargs=chat_template_kwargs,
+            )
+
+
 @register_reasoning_parser("poolside_v1", "laguna")
 class PoolsideV1ReasoningParser(DeepSeekV4ReasoningParser):
     """Poolside Laguna models, which prefill the marker the same way.
@@ -437,9 +455,13 @@ class MiniMaxM3ReasoningParser(DeepSeekR1Parser):
 MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "qwen3": "qwen3",
     "qwen3_moe": "qwen3",
-    "qwen3_5": "qwen3",
-    "qwen3_5_moe": "qwen3",
+    "qwen3_5": "qwen3_5",
+    "qwen3_5_text": "qwen3_5",
+    "qwen3_5_moe": "qwen3_5",
+    "qwen3_5_moe_text": "qwen3_5",
     "qwen3_next": "qwen3",
+    "qwen4_exp": "qwen3_5",
+    "qwen4_exp_text": "qwen3_5",
     "deepseek_v3": "deepseek-r1",
     "deepseek_v32": "deepseek-r1",
     "laguna": "poolside_v1",
@@ -458,8 +480,6 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
 _QWEN3_MODEL_TYPES = frozenset({
     "qwen3",
     "qwen3_moe",
-    "qwen3_5",
-    "qwen3_5_moe",
     "qwen3_next",
 })
 

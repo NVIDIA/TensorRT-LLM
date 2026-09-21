@@ -151,10 +151,10 @@ Each file assigns expert IDs to 544 global slots for every MoE layer. Repeated e
 Below is an example command to launch the TensorRT LLM server from within the container with the checkpoint that matches the configuration file you selected above.
 
 ```shell
-trtllm-serve <model_path_or_hf_id> --host 0.0.0.0 --port 8000 --reasoning_parser qwen3_5 --tool_parser qwen3 --config ${EXTRA_LLM_API_FILE}
+trtllm-serve <model_path_or_hf_id> --host 0.0.0.0 --port 8000 --reasoning_parser auto --tool_parser auto --config ${EXTRA_LLM_API_FILE}
 ```
 
-Qwen3.8 and Qwen3.5 both use the `qwen3_5` reasoning parser (their chat template pre-injects a `<think>` block, so reasoning starts at the beginning of the response). The `qwen3` tool parser handles the Qwen3 function-call format.
+Auto-detection selects the `qwen3_5` reasoning parser because the chat template pre-injects the thinking marker, and selects the `qwen3_coder` tool parser for the models' `<function=...><parameter=...>` XML function-call format.
 
 After the server is set up, the client can now send prompt requests to the server and receive results.
 

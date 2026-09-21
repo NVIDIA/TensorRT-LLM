@@ -47,8 +47,9 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig, TorchLlmArgs
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr, split_mpi_env
-from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
-                                                  resolve_auto_reasoning_parser)
+from tensorrt_llm.llmapi.reasoning_parser import (
+    MODEL_TYPE_TO_REASONING_PARSER, ReasoningParserFactory,
+    resolve_auto_reasoning_parser)
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
@@ -1385,12 +1386,11 @@ def serve(
     if reasoning_parser == "auto":
         resolved = resolve_auto_reasoning_parser(model)
         if resolved is None:
+            supported_model_types = ", ".join(
+                sorted(MODEL_TYPE_TO_REASONING_PARSER.keys()))
             raise click.BadParameter(
                 f"Cannot auto-detect reasoning parser for model '{model}'. "
-                f"Supported model types for auto-detection: qwen3, qwen3_moe, "
-                f"qwen3_5, qwen3_5_moe, qwen3_next, deepseek_v3 (R1 only), "
-                f"deepseek_v32 (R1 only), deepseek_v4, nemotron_h, gemma4, "
-                f"kimi_k2, kimi_k25. "
+                f"Supported model types for auto-detection: {supported_model_types}. "
                 f"Please specify a parser explicitly: "
                 f"{list(ReasoningParserFactory.keys())}",
                 param_hint="--reasoning_parser")
