@@ -92,12 +92,23 @@ public:
     //! Taken from the world process group when the runtime registered one (TorchDist always does).
     //! Falls back to the group rank, which is still unique within the group that shares an IPC
     //! socket namespace.
+    //!
+    //! Despite the name, neither flavour is unique across the node, and callers must not treat it
+    //! as though it were. The world process group spans one instance rather than the machine, so
+    //! two rollout instances placed on the same node hand out the same world ranks; the fallback
+    //! narrows that to one group. What actually keeps their IPC sockets apart is the name being a
+    //! (rank, unique_op_id) pair: unique_op_id is drawn per allocation and broadcast to the group,
+    //! so it differs between instances even where the ranks repeat. The MPI path carries the same
+    //! caveat -- its world is COMM_SESSION, not MPI_COMM_WORLD.
     [[nodiscard]] int getWorldRank() const override
     {
         auto worldPg = tensorrt_llm::pg_utils::get_world_pg();
         return worldPg ? worldPg->getRank() : mPg->getRank();
     }
 
+    //! Collective: every member has to learn the others' ids, which -- unlike the MPI flavour,
+    //! where the subgroup is built from a known rank list -- are not derivable from the group
+    //! alone. Only runs while a workspace is being created.
     [[nodiscard]] std::vector<int> getWorldRanks() const override
     {
         int const localId = getWorldRank();
