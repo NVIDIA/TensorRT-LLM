@@ -702,6 +702,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         real committed length even though the host packed provisional values.
         Static shapes only; safe under CUDA graph capture.
 
+        ``tokens_per_gen_seq`` is the uniform verify-group width. Non-uniform
+        groups are rejected rather than silently mis-sliced: without the
+        overlap scheduler the extend loop packs a per-request
+        ``1 + get_draft_token_length(request)`` and a request entering with no
+        draft tokens is packed as a single-token generation row instead, so a
+        batch can arrive whose total happens to divide but whose rows do not
+        line up.
+
         Two index bases meet here, and they are not the same:
           * helix_position_offsets / helix_local_slots / helix_kv_bounds are
             GENERATION-RELATIVE -- the packing loops only append for extend
@@ -728,6 +736,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             f"helix spec expects uniform verify groups: {num_gen_tokens} gen "
             f"tokens not divisible by group size {tokens_per_gen_seq}")
         num_gen_seqs = num_gen_tokens // tokens_per_gen_seq
+        # Divisibility alone does not imply uniformity: a batch of mixed group
+        # widths can still divide and would then write the wrong number of
+        # kv_lens_cuda rows with values taken from the wrong tokens.
+        assert num_gen_seqs == self.num_generations, (
+            f"helix spec expects uniform verify groups: {num_gen_tokens} gen "
+            f"tokens over {self.num_generations} generation rows do not all "
+            f"have width {tokens_per_gen_seq}")
         last_bounds = self.helix_kv_bounds[:num_gen_tokens].view(
             num_gen_seqs, tokens_per_gen_seq)[:, -1]
         self.kv_lens_cuda[self.num_contexts:self.num_contexts +
