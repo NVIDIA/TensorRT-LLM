@@ -255,6 +255,9 @@ Qwen/Qwen3.5-397B-A17B:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 95.0
+Qwen/Qwen3.8-27B:
+  - spec_dec_algo: DFlash
+    accuracy: 89.8408
 Qwen/Qwen3.8-2.4T-A95B:
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 93.80

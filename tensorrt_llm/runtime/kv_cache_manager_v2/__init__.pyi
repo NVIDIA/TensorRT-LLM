@@ -306,6 +306,7 @@ class KVCacheEventManager:
         attention_dp_gather: AttentionDpGatherFn | None = None,
         hash_algo: str = ...,
         window_size_by_layer_group: dict[int, int] | None = None,
+        mm_token_id_offset: int | None = None,
     ) -> None: ...
     def add_created_event(
         self,
@@ -578,6 +579,11 @@ class KVCacheManager:
         reuse_scope: ReuseScope | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
     ) -> int: ...
+    def probe_first_new_block_key(
+        self,
+        reuse_scope: ReuseScope | None = None,
+        input_tokens: Sequence[TokenIdExt] | None = None,
+    ) -> bytes | None: ...
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool: ...
     def get_quota(self, cache_level: CacheLevel) -> int: ...
     def get_storage_statistics(self, cache_level: CacheLevel = ...) -> list[StorageStatistics]: ...
