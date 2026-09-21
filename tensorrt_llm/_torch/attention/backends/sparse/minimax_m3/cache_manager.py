@@ -37,7 +37,6 @@ from tensorrt_llm._utils import (
     TensorWrapper,
     binding_to_torch_dtype,
     convert_to_torch_tensor,
-    exact_div,
     prefer_pinned,
 )
 from tensorrt_llm.bindings import DataType
@@ -46,7 +45,7 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
     copy_batch_block_offsets_to_device,
 )
 from tensorrt_llm.logger import logger
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, PageIndexMode
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, PageIndexMode, exact_div
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
 
