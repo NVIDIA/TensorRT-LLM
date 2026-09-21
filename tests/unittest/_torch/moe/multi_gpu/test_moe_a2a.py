@@ -271,6 +271,15 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
                 eplb_stats_num_experts, dtype=torch.int32, device="cuda") +
                                 rank * 1000)
 
+        payload_bytes_per_token = [
+            payload.shape[1] * payload.element_size() for payload in payloads
+        ]
+        actual_cft_dispatch = (
+            moe_a2a.can_use_cft_counted_writes
+            and moe_a2a.use_cft_for_dispatch(max_num_tokens)
+            and all(bytes_per_token % 16 == 0
+                    for bytes_per_token in payload_bytes_per_token))
+
         recv_tensors = moe_a2a.dispatch(
             token_selected_experts,
             payloads,
@@ -279,21 +288,21 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
             expert_id_payload_index=expert_id_payload_index,
             eplb_local_stats=eplb_local_stats)
 
-        # Verify completion flags after dispatch
-        completion_flags_offset = moe_a2a.metainfo[MoeAlltoAll._METAINFO_INDEX[
-            "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX"]].item()
-        completion_flags = moe_a2a.workspace[
-            rank, completion_flags_offset:completion_flags_offset +
-            ep_size * 4].view(torch.int32).cpu()
-        flag_val_offset = moe_a2a.metainfo[
-            MoeAlltoAll._METAINFO_INDEX["FLAG_VAL_OFFSET_INDEX"]].item()
-        expected_flag_val = moe_a2a.workspace[rank,
-                                              flag_val_offset:flag_val_offset +
-                                              4].view(torch.int32).cpu()
-
-        assert torch.all(completion_flags == expected_flag_val), (
-            f"Rank {rank} completion flags: {completion_flags}, expected flag val: {expected_flag_val}"
-        )
+        if not actual_cft_dispatch:
+            completion_flags_offset = moe_a2a.metainfo[
+                MoeAlltoAll._METAINFO_INDEX[
+                    "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX"]].item()
+            completion_flags = moe_a2a.workspace[
+                rank, completion_flags_offset:completion_flags_offset +
+                ep_size * 4].view(torch.int32).cpu()
+            flag_val_offset = moe_a2a.metainfo[
+                MoeAlltoAll._METAINFO_INDEX["FLAG_VAL_OFFSET_INDEX"]].item()
+            expected_flag_val = moe_a2a.workspace[
+                rank,
+                flag_val_offset:flag_val_offset + 4].view(torch.int32).cpu()
+            assert torch.all(completion_flags == expected_flag_val), (
+                f"Rank {rank} completion flags: {completion_flags}, expected flag val: {expected_flag_val}"
+            )
 
         # Read counters and compact routing tensors from workspace
         send_counters_offset = moe_a2a.metainfo[
@@ -760,20 +769,27 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(
         combined_output = _combine(moe_out,
                                    use_low_precision=use_low_precision_combine)
 
-        # Verify completion flags after combine
-        completion_flags_offset = moe_a2a.metainfo[MoeAlltoAll._METAINFO_INDEX[
-            "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX"]].item()
-        completion_flags = moe_a2a.workspace[
-            rank, completion_flags_offset:completion_flags_offset +
-            ep_size * 4].view(torch.int32).cpu()
-        flag_val_offset = moe_a2a.metainfo[
-            MoeAlltoAll._METAINFO_INDEX["FLAG_VAL_OFFSET_INDEX"]].item()
-        expected_flag_val = moe_a2a.workspace[rank,
-                                              flag_val_offset:flag_val_offset +
-                                              4].view(torch.int32).cpu()
-        assert torch.all(completion_flags == expected_flag_val), (
-            f"Rank {rank} completion flags: {completion_flags}, expected flag val: {expected_flag_val}"
-        )
+        wire_bytes_per_token = hidden_size * (1 if use_low_precision_combine
+                                              else moe_out.element_size())
+        actual_cft_combine = (moe_a2a.can_use_cft_counted_writes
+                              and moe_a2a.use_cft_for_combine(max_num_tokens)
+                              and wire_bytes_per_token % 16 == 0)
+
+        if not actual_cft_combine:
+            completion_flags_offset = moe_a2a.metainfo[
+                MoeAlltoAll._METAINFO_INDEX[
+                    "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX"]].item()
+            completion_flags = moe_a2a.workspace[
+                rank, completion_flags_offset:completion_flags_offset +
+                ep_size * 4].view(torch.int32).cpu()
+            flag_val_offset = moe_a2a.metainfo[
+                MoeAlltoAll._METAINFO_INDEX["FLAG_VAL_OFFSET_INDEX"]].item()
+            expected_flag_val = moe_a2a.workspace[
+                rank,
+                flag_val_offset:flag_val_offset + 4].view(torch.int32).cpu()
+            assert torch.all(completion_flags == expected_flag_val), (
+                f"Rank {rank} completion flags: {completion_flags}, expected flag val: {expected_flag_val}"
+            )
 
         return (
             token_selected_experts.cpu(),
