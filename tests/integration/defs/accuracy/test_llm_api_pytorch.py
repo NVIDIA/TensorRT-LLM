@@ -4160,6 +4160,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             assert_acceptance_length("TestGPTOSS::test_dflash",
                                      acceptance_length)
 
+    @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
         "kv_cache_dtype",
