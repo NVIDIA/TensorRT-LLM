@@ -1717,6 +1717,33 @@ def test_top_p_mixed_crossing_and_no_crossing_rows():
     torch.testing.assert_close(probs[1], torch.softmax(no_crossing, -1))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_top_p_near_one_no_crossing_cuda():
+    """Near-1 top_p no-crossing row must complete on CUDA (issue #19485).
+
+    The out-of-bounds scatter only manifests as a device-side assert on
+    CUDA; run the no-crossing edge on device and check normal completion
+    plus the fully renormalized distribution.
+    """
+    top_p = 0.9999999
+    torch.manual_seed(0)
+    candidates = torch.randn(4, 32000, device="cuda")
+    # Select a row that actually stays below top_p on device: fp32
+    # accumulation behavior varies across builds, so pin down the edge
+    # case explicitly instead of assuming a fixed row index triggers it.
+    sorted_candidates, _ = torch.sort(candidates, descending=True, dim=-1)
+    finals = torch.cumsum(torch.softmax(sorted_candidates, dim=-1), dim=-1)[:, -1]
+    below = [i for i in range(candidates.size(0)) if finals[i].item() < top_p]
+    assert below, "seed no longer triggers the edge case"
+    logits = candidates[below]
+    # Must not raise (pre-fix: OOB scatter -> CUDA device-side assert).
+    tokens, probs = top_k_top_p_sampling_batch(logits, temperature=1.0, top_p=top_p)
+    assert tokens.shape == (logits.size(0),)
+    # No crossing -> nothing removed: full-vocabulary distribution, renormalized.
+    torch.testing.assert_close(probs.sum(-1), torch.ones(logits.size(0), device="cuda"))
+    torch.testing.assert_close(probs, torch.softmax(logits, -1))
+
+
 def _nucleus_reference_probs(logits: torch.Tensor, top_p: float) -> torch.Tensor:
     """Independent nucleus-filtering oracle for tests.
 
