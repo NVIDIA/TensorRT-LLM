@@ -494,3 +494,51 @@ def kpool_expand(
         num_warps=4,
     )
     return out
+
+
+@triton.jit
+def _compact_sparse_rows_kernel(
+    Indices,
+    Packed,
+    Lengths,
+    Nonempty,
+    Stride: tl.constexpr,
+    Width: tl.constexpr,
+    OutWidth: tl.constexpr,
+    Block: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col = tl.arange(0, Block)
+    value = tl.load(Indices + row * Stride + col, col < Width, -1)
+    valid = (col < Width) & (value >= 0)
+    destination = tl.cumsum(valid.to(tl.int32)) - 1
+    length = tl.sum(valid.to(tl.int32))
+    tl.store(Packed + row * OutWidth + destination, value, valid)
+    if length == 0:
+        tl.store(Packed + row * OutWidth, 0)
+    tl.store(Lengths + row, tl.maximum(length, 1))
+    tl.store(Nonempty + row, length > 0)
+
+
+def compact_sparse_rows(indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pack nonnegative physical row IDs, preserving order and duplicates.
+
+    Empty rows get one dummy ID and are identified by the returned nonempty mask.
+    The padded tail remains -1, and all outputs have capture-stable shapes.
+    """
+    rows = indices.shape[0]
+    width = triton.cdiv(indices.shape[1], 64) * 64
+    packed = torch.full((rows, width), -1, dtype=torch.int32, device=indices.device)
+    lengths = torch.empty(rows, dtype=torch.int32, device=indices.device)
+    nonempty = torch.empty(rows, dtype=torch.bool, device=indices.device)
+    _compact_sparse_rows_kernel[(rows,)](
+        indices,
+        packed,
+        lengths,
+        nonempty,
+        indices.stride(0),
+        indices.shape[1],
+        width,
+        triton.next_power_of_2(indices.shape[1]),
+    )
+    return packed, lengths, nonempty

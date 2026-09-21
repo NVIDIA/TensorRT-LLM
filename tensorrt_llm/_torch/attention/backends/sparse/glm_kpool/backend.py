@@ -15,11 +15,12 @@
 """GLM-5.3-Flash pool-compressed sparse MLA in the TRTLLM backend family.
 
 The model projects queries and selects pools; this backend owns paged latent
-and indexer state, pool-key updates, and FlashMLA attention. Selection arrives
+and indexer state, pool-key updates, and sparse attention kernels. Selection arrives
 as global latent-cache row IDs in GlmKpoolBackendForwardArgs.topk_rows.
 
 Queries have no rotary component and are absorbed into the 512-wide latent
-space. FlashMLA consumes BF16 rows; FP8 cache rows are gathered and dequantized
+space. Small TP generation batches use native TRTLLM-GEN query heads; other
+shapes use FlashMLA. FP8 cache rows are gathered and dequantized
 in bounded query chunks. Prepared GLM page tables and live TRTLLM lengths
 provide the same cache contract for prefill, decode and verification.
 """
@@ -31,6 +32,8 @@ from dataclasses import dataclass
 
 import torch
 
+from tensorrt_llm._utils import get_sm_version
+
 from ...interface import (
     AttentionForwardArgs,
     AttentionInputType,
@@ -40,6 +43,7 @@ from ...interface import (
 )
 from ...trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from .kernels import gather_fp8_kv_rows, kpool_expand, kpool_score, kpool_update
+from .native_decode import GlmKpoolNativeDecode
 from .params import INDEX_SENTINEL, GlmKpoolSparseParams
 
 
@@ -211,6 +215,7 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         #: ``qk_nope_head_dim``; absorption reassociates the matmuls but the
         #: score scale is unchanged.
         self.softmax_scale = float(sparse_params.qk_nope_head_dim) ** -0.5
+        self._native_decode = GlmKpoolNativeDecode()
 
     @classmethod
     def support_fused_rope(cls) -> bool:
@@ -613,4 +618,23 @@ class GlmKpoolSparseAttention(TrtllmAttention):
             raise ValueError(f"glm_kpool forward is phase-explicit, got {input_type!r}")
         state = self._cache_state(metadata)
         kv_rows, _, _ = latent_pool_rows(state.latent_pool)
-        return self._finalize_output(self._dispatch_sparse_core(q, kv_rows, topk_rows), output)
+        native_supported = (
+            q.is_cuda
+            and q.dtype == kv_rows.dtype == torch.bfloat16
+            and q.shape[1:] == (16, 512)
+            and kv_rows.shape[0] % 32 == 0
+            and get_sm_version() in (100, 103)
+        )
+        if native_supported:
+            # Reserve during prefill/profiling too, before sizing the KV pool.
+            # Scratch is shared through metadata; each backend owns only counters.
+            self._native_decode.prepare_workspace(q, metadata)
+        if (
+            native_supported
+            and input_type == AttentionInputType.generation_only
+            and 1 <= q.shape[0] <= 8
+        ):
+            out = self._native_decode(q, kv_rows, topk_rows, self.softmax_scale, metadata)
+        else:
+            out = self._dispatch_sparse_core(q, kv_rows, topk_rows)
+        return self._finalize_output(out, output)

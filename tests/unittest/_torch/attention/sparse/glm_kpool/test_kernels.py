@@ -416,3 +416,57 @@ def test_fp8_cache_storage_helpers_preserve_coalesced_pages(context):
     torch.testing.assert_close(actual_packed.float().unsqueeze(0), packed)
     assert torch.count_nonzero(storage.float()[[0, 2, 3, 5, 6, 8]]) == 0
     assert torch.count_nonzero(index_pool[:, :, 4:]) == 0
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103), reason="native sparse MLA requires SM100/103"
+)
+@pytest.mark.parametrize("rows,width", [(1, 64), (8, 2052)])
+def test_native_sparse_decode_coalesced_rows_and_graph_replay(rows: int, width: int) -> None:
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.backend import latent_pool_rows
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.native_decode import (
+        GlmKpoolNativeDecode,
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(6810832)
+    # Only the middle subpage belongs to this layer. Other subpages contain NaN
+    # to expose wrong physical addressing instead of accidentally valid values.
+    storage = torch.full((32, 3, 32, 512), float("nan"), dtype=torch.bfloat16, device="cuda")
+    latent = storage[:, 1]
+    latent.copy_(
+        torch.randn(latent.shape, dtype=latent.dtype, device=latent.device, generator=generator)
+    )
+    kv_rows, base, stride = latent_pool_rows(latent)
+    q_storage = torch.randn(rows, 32, 512, dtype=torch.bfloat16, device="cuda", generator=generator)
+    q = q_storage[:, ::2]
+    indices_storage = torch.empty(rows, width + 7, dtype=torch.int32, device="cuda")
+    indices = indices_storage[:, :width]
+    logical = torch.randint(0, 1024, (rows, width), device="cuda", generator=generator)
+    physical = base + (logical // 32) * stride + logical % 32
+    indices.copy_(physical)
+    indices[:, ::5] = -1
+    runner = GlmKpoolNativeDecode()
+    metadata = SimpleNamespace(effective_workspace=torch.empty(0, dtype=torch.int8, device="cuda"))
+    runner.prepare_workspace(q, metadata)
+    scale = 256**-0.5
+    runner(q, kv_rows, indices, scale, metadata)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = runner(q, kv_rows, indices, scale, metadata)
+    for replay in range(3):
+        q.copy_(torch.randn(q.shape, dtype=q.dtype, device=q.device, generator=generator))
+        indices.copy_(physical.roll(replay, dims=1))
+        indices[:, replay::5] = -1
+        if replay == 1:
+            indices[-1] = -1
+        graph.replay()
+        valid = indices >= 0
+        selected = kv_rows[indices.clamp_min(0).long(), 0].float()
+        selected.masked_fill_(~valid[:, :, None], 0)
+        logits = torch.einsum("rhd,rkd->rhk", q.float(), selected) * scale
+        logits.masked_fill_(~valid[:, None, :], float("-inf"))
+        probabilities = torch.nan_to_num(logits.softmax(dim=-1))
+        expected = torch.einsum("rhk,rkd->rhd", probabilities, selected).to(q.dtype)
+        torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
