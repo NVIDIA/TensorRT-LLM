@@ -85,8 +85,8 @@ class StressConfig:
 
     mode: str = _STRESS_MODE_LOG_ONLY
     duration_min: float = 120.0
-    kv_cache_manager: str = "v1"  # v1 | v2  (v2 + CPP is invalid)
-    transceiver: str = "cpp"  # cpp | python
+    kv_cache_manager: str = "v1"  # v1 | v2
+    transceiver: str = "python"
     base_concurrency: int = 64
     client_cancel_rate: float = 0.10
     output_length: int = 512
@@ -140,27 +140,16 @@ class StressConfig:
 
         Raises:
             ValueError: If ``kv_cache_manager`` is not ``"v1"`` or
-                ``"v2"``, if ``transceiver`` is not ``"cpp"`` or
-                ``"python"``, or if the pair ``(v2, cpp)`` is
-                supplied (the C++ transceiver only supports the V1
-                KV cache manager).
+                ``"v2"``, or ``transceiver`` is not ``"python"``.
         """
         if self.mode not in _STRESS_MODES:
             raise ValueError(f"mode must be one of {_STRESS_MODES}, got {self.mode!r}")
-        if self.kv_cache_manager == "v2" and self.transceiver == "cpp":
-            # The C++ transceiver (BindKvCacheTransceiver) only supports
-            # the V1 KV cache manager. V2 must be paired with the Python
-            # transceiver (KvCacheTransceiverV2).
-            raise ValueError(
-                "(kv_cache_manager=v2, transceiver=cpp) is an unsupported "
-                "combination; pair V2 with the Python transceiver."
-            )
         if self.kv_cache_manager not in ("v1", "v2"):
             raise ValueError(
                 f"kv_cache_manager must be 'v1' or 'v2', got {self.kv_cache_manager!r}"
             )
-        if self.transceiver not in ("cpp", "python"):
-            raise ValueError(f"transceiver must be 'cpp' or 'python', got {self.transceiver!r}")
+        if self.transceiver != "python":
+            raise ValueError(f"transceiver must be 'python', got {self.transceiver!r}")
 
     @property
     def is_log_only(self) -> bool:

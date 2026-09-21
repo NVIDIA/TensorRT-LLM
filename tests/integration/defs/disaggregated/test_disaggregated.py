@@ -14,9 +14,9 @@
 # limitations under the License.
 
 import asyncio
+import csv
 import json
 import os
-import platform
 import re
 import secrets
 import shutil
@@ -32,8 +32,8 @@ import numpy as np
 import pytest
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
-from defs.common import (parse_gsm8k_output, resolve_llm_model_path,
-                         wait_for_server)
+from defs.common import (get_ucx_tls, parse_gsm8k_output,
+                         resolve_llm_model_path, wait_for_server)
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
                            skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
 from defs.trt_test_alternative import check_call, check_output, print_info
@@ -65,22 +65,6 @@ class TestConfig:
 
     def __str__(self):
         return self.test_desc
-
-
-def get_ucx_tls():
-    """Get UCX_TLS value based on GPU architecture.
-
-    Pre-Hopper GPUs need cuda_ipc excluded from UCX transports.
-    """
-    sm = get_sm_version()
-    """
-    ON some gb300 cluster,  we need to set `cuda_copy,cuda_ipc,sm,self,tcp` for UCX_TLS
-    """
-    if sm == 103 and "aarch" in platform.machine().lower():
-        return "cuda_copy,cuda_ipc,sm,self,tcp"
-    if sm < 90:
-        return "^cuda_ipc,ib,gdr_copy"
-    return "^ib,gdr_copy"
 
 
 def cleanup_output_files():
@@ -332,8 +316,6 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ngram.yaml",
         "sa":
         f"{test_configs_root}/disagg_config_sa.yaml",
-        "sa_python":
-        f"{test_configs_root}/disagg_config_sa_python.yaml",
         "ctxpp2_genpp2":
         f"{test_configs_root}/disagg_config_ctxpp2_genpp2.yaml",
         "ctxtp2_genpp2":
@@ -346,8 +328,6 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxpp4_genpp4.yaml",
         "ctxpp4_gentp4":
         f"{test_configs_root}/disagg_config_ctxpp4_gentp4.yaml",
-        "deepseek_v3_lite_fp8_mpi":
-        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_mpi.yaml",
         "deepseek_v3_lite_fp8_nixl":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_nixl.yaml",
         "deepseek_v3_lite_fp8_tp1":
@@ -1514,14 +1494,13 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
 
     def extra_endpoints_test(_server_url: str):
         item = get_timing_metrics(perf_metrics_output_dir)
-        # Use helper function to validate all timing metrics comprehensively
-        validate_timing_metrics(item, "perf_metrics test")
+        gen_timing = item["gen_perf_metrics"]["perf_metrics"]["timing_metrics"]
+        # JSONL omits kv_cache_size for zero-byte transfers (e.g. block reuse).
+        assert {"kv_cache_transfer_start",
+                "kv_cache_transfer_end"} <= gen_timing.keys()
+        validate_timing_metrics(item, "Python transceiver perf_metrics test")
 
-    # This test validates the C++ transceiver's timing-metric semantics: the
-    # config pins transceiver_runtime=CPP, and DEFAULT is forced to UCX.
     env = llm_venv._new_env | {
-        "TRTLLM_USE_NIXL_KVCACHE": "0",
-        "TRTLLM_USE_UCX_KVCACHE": "1",
         "UCX_TLS": get_ucx_tls(),
     }
     run_disaggregated_test(disaggregated_example_root,
@@ -1555,16 +1534,12 @@ def test_disaggregated_chat_completion_tool_calls(disaggregated_test_root,
                          indirect=True)
 def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
                                             disaggregated_example_root,
-                                            llama_model_root):
+                                            llama_model_root, tmp_path):
     setup_model_symlink(llm_venv, llama_model_root,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
-    output_path = os.path.join(llm_venv.get_working_directory(), "cache_time")
+    output_path = str(tmp_path / "cache_time")
     env = llm_venv._new_env.copy()
-    # This test validates the C++ transceiver's CSV format: the config pins
-    # transceiver_runtime=CPP, and DEFAULT is forced to UCX.
-    env["TRTLLM_USE_NIXL_KVCACHE"] = "0"
-    env["TRTLLM_USE_UCX_KVCACHE"] = "1"
     env["UCX_TLS"] = get_ucx_tls()
     env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = output_path
     run_disaggregated_test(disaggregated_example_root,
@@ -1573,39 +1548,63 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
                            model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
     assert os.path.isdir(output_path)
-    # The C++ transceiver names timing files "<instanceId>_<rank>_<tag>.csv"
-    # (instanceId is a runtime UUID that disambiguates instances sharing an
-    # output directory), so match by the "_<tag>.csv" suffix instead of a fixed
-    # "rank_0" prefix.
-    send_files = sorted(f for f in os.listdir(output_path)
-                        if f.endswith("_send.csv"))
-    recv_files = sorted(f for f in os.listdir(output_path)
-                        if f.endswith("_recv.csv"))
-    assert send_files, f"no *_send.csv in {output_path}: {os.listdir(output_path)}"
-    assert recv_files, f"no *_recv.csv in {output_path}: {os.listdir(output_path)}"
-    send_file = os.path.join(output_path, send_files[0])
-    recv_file = os.path.join(output_path, recv_files[0])
-    with open(send_file, "r") as f:
-        lines = f.readlines()
-        assert len(lines) > 1
-        assert lines[0].startswith(
-            "RequestID,RequestInfo,Preparation,Preprocess,Transmissions,Postprocess"
-        )
-        assert ",Delay,Duration,Bandwidth(Gbps)" in lines[0]
-        # get a send sample and match the recv
-        sample = lines[1].split(',')
-        assert len(sample) >= 9
-    with open(recv_file, "r") as f:
-        lines = f.readlines()
-        assert len(lines) > 1
-        matched = False
-        for line in lines:
-            sample_recv = line.split(',')
-            if sample_recv[0] == sample[0]:
-                matched = True
-                assert float(sample_recv[1]) <= float(sample[1])
-                break
-        assert matched
+    # Python writes task rows per instance/rank and a separate generation
+    # summary. Match requests across both workers instead of relying on UUIDs.
+    task_rows = []
+    summary_rows = []
+    for filename in sorted(os.listdir(output_path)):
+        if not filename.endswith(".csv"):
+            continue
+        with open(os.path.join(output_path, filename), newline="") as f:
+            reader = csv.DictReader(f)
+            if filename.endswith("_gen_transfer_summary.csv"):
+                assert reader.fieldnames == [
+                    "timestamp", "RequestID", "gen_side_transfer_time(ms)",
+                    "kv_cache_size"
+                ]
+                summary_rows.extend(reader)
+            else:
+                assert reader.fieldnames == [
+                    "timestamp", "task_type", "unique_rid", "peer_rank",
+                    "transfer_size_bytes", "avg_segment_size_bytes",
+                    "transfer_entry_count", "prepare_args_latency_ms",
+                    "queue_latency_ms", "transfer_latency_ms",
+                    "task_latency_ms", "throughput_mbs"
+                ]
+                task_rows.extend(reader)
+
+    send_rows = [row for row in task_rows if row["task_type"] == "KVSendTask"]
+    recv_rows = [row for row in task_rows if row["task_type"] == "KVRecvTask"]
+    assert send_rows, f"No Python send task metrics in {output_path}"
+    assert recv_rows, f"No Python receive task metrics in {output_path}"
+    assert summary_rows, f"No generation transfer summaries in {output_path}"
+    recv_ids = {row["unique_rid"] for row in recv_rows}
+    # Repeated prompts may reuse all blocks. Require an actual transfer among
+    # the matched requests, while permitting zero-byte rows for cache hits.
+    sent_ids = {
+        row["unique_rid"]
+        for row in send_rows if int(row["transfer_size_bytes"]) > 0
+    }
+    summary_ids = {
+        row["RequestID"]
+        for row in summary_rows if int(row["kv_cache_size"]) > 0
+    }
+    assert sent_ids & recv_ids & summary_ids
+    for row in send_rows:
+        assert int(row["transfer_size_bytes"]) >= 0
+        assert int(row["transfer_entry_count"]) >= 0
+        assert float(row["avg_segment_size_bytes"]) >= 0
+        for field in ("prepare_args_latency_ms", "queue_latency_ms",
+                      "transfer_latency_ms", "task_latency_ms",
+                      "throughput_mbs"):
+            assert float(row[field]) >= 0, row
+        assert float(row["task_latency_ms"]) >= float(
+            row["transfer_latency_ms"])
+    for row in recv_rows:
+        assert float(row["task_latency_ms"]) >= 0, row
+    for row in summary_rows:
+        assert float(row["gen_side_transfer_time(ms)"]) >= 0, row
+        assert int(row["kv_cache_size"]) >= 0, row
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
@@ -1674,24 +1673,6 @@ def test_disaggregated_sa(disaggregated_test_root, llm_venv,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     run_disaggregated_test(disaggregated_example_root,
                            "sa",
-                           env=llm_venv._new_env,
-                           model_path=llama_model_root,
-                           cwd=llm_venv.get_working_directory())
-
-
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-def test_disaggregated_sa_python(disaggregated_test_root, llm_venv,
-                                 disaggregated_example_root, llama_model_root):
-    """Spec-split SA (ctx no-spec, gen SA) on the V2 PYTHON transceiver path.
-
-    NIXL + transceiver_runtime PYTHON. The existing test_disaggregated_sa
-    covers this split only on the C++ DEFAULT backend.
-    """
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-    run_disaggregated_test(disaggregated_example_root,
-                           "sa_python",
                            env=llm_venv._new_env,
                            model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
@@ -1785,28 +1766,6 @@ def test_disaggregated_ctxpp4_gentp4(disaggregated_test_root, llm_venv,
                            "ctxpp4_gentp4",
                            env=llm_venv._new_env,
                            model_path=llama_model_root,
-                           cwd=llm_venv.get_working_directory())
-
-
-@skip_no_hopper
-@pytest.mark.skip_less_device(4)
-@pytest.mark.skip(
-    reason="MPI cache transceiver requires shared MPI process group, "
-    "incompatible with service discovery which launches separate subprocesses")
-@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
-                         indirect=True)
-def test_disaggregated_deepseek_v3_lite_fp8_mpi(disaggregated_test_root,
-                                                disaggregated_example_root,
-                                                llm_venv,
-                                                deepseek_v3_model_root):
-    setup_model_symlink(llm_venv, deepseek_v3_model_root,
-                        "DeepSeek-V3-Lite/fp8")
-    env = llm_venv._new_env.copy()
-    env["TRTLLM_USE_MPI_KVCACHE"] = "1"
-    run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp8_mpi",
-                           env=env,
-                           model_path=deepseek_v3_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -2298,7 +2257,6 @@ def get_config_for_benchmark(model_root, backend):
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
                 "backend": backend,
-                "max_tokens_in_buffer": 512,
             },
             "urls": [f"localhost:{get_free_port()}"]
         },
@@ -2311,7 +2269,6 @@ def get_config_for_benchmark(model_root, backend):
             "max_seq_len": 384,
             "cache_transceiver_config": {
                 "backend": backend,
-                "max_tokens_in_buffer": 512,
             },
             "urls": [f"localhost:{get_free_port()}"]
         }
@@ -2821,9 +2778,9 @@ def test_disaggregated_deepseek_v3_lite_bf16_empty_batch(
 def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
                                                disaggregated_example_root,
                                                llm_venv, model_path):
-    """
-    RCCA: https://nvbugspro.nvidia.com/bug/5555681
-    Test to reproduce KV cache buffer overflow bug with long context.
+    """Verify long-context KV cache transfer with the Python transceiver.
+
+    Retains long-context coverage from https://nvbugspro.nvidia.com/bug/5555681.
     """
     models_root = llm_models_root()
     llama4_model_root = os.path.join(models_root, model_path)
@@ -2835,20 +2792,13 @@ def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
                                   disaggregated_example_root,
                                   os.path.dirname(__file__))
 
-    run_disaggregated_aiperf(
-        config_file=config_file,
-        model_path=llama4_model_root,
-        server_start_timeout=1200,
-        input_tokens=128000,
-        output_tokens=100,
-        # This repro intentionally degrades the KV
-        # transfer path (tiny max_tokens_in_buffer vs
-        # 128k inputs), so sporadic request errors are
-        # by-design; keep the test scoped to its
-        # original crash/fatal-log checks.
-        max_error_rate=None,
-        env=llm_venv._new_env,
-        cwd=llm_venv.get_working_directory())
+    run_disaggregated_aiperf(config_file=config_file,
+                             model_path=llama4_model_root,
+                             server_start_timeout=1200,
+                             input_tokens=128000,
+                             output_tokens=100,
+                             env=llm_venv._new_env,
+                             cwd=llm_venv.get_working_directory())
 
 
 @skip_pre_blackwell

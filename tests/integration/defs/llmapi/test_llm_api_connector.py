@@ -1113,18 +1113,10 @@ def test_connector_vswa_reports_page_indices_per_layer_group(
 
 
 def _disagg_transceiver_config(use_kv_cache_manager_v2):
-    """The transceiver each KV cache manager can actually be driven by.
+    """Keep the explicit V2-manager route and exercise defaults for V1.
 
-    `CacheTransceiverCpp` is bound to the V1 `BaseKVCacheManager`, while
-    `KVCacheManagerV2.impl` is the Python V2 core's manager, so V2 can only use
-    the Python transceiver -- which in turn only supports NIXL
-    (kv_cache_transceiver.py, `create_kv_cache_transceiver`). This is spelled
-    out per manager rather than left at the default because
-    `transceiver_runtime` defaults to "auto", and "auto" is resolved from the
-    *model's* preference (llm_utils._resolve_transceiver_runtime_auto), which
-    knows nothing about which cache manager will be built. Qwen2 declares no
-    preference, so the default resolves to the C++ transceiver, which V2 cannot
-    use.
+    Both managers can use the Python transceiver. Normal model loading
+    resolves the V1 case's DEFAULT/auto configuration before creation.
     """
     if use_kv_cache_manager_v2:
         return CacheTransceiverConfig(backend="NIXL",

@@ -44,12 +44,9 @@ kv_cache_config:
   free_gpu_memory_fraction: 0.25
 cache_transceiver_config:
   backend: NIXL
-  # K3 requires the Python V2 transceiver: `auto` resolves to the C++
-  # runtime, which throws at construction for K3's
-  # MixedMambaHybridCacheManager (LinearAttentionMetadata not found).
+  # K3's model preference selects Python during standard auto resolution.
+  # Keep this recipe explicit for MixedMambaHybridCacheManager.
   transceiver_runtime: PYTHON
-  # Must be >= the target max ISL (8192 here).
-  max_tokens_in_buffer: 8448
   # Fabric-VMM bounce buffer, needed for cross-node transfers on NVLink
   # domains: V2 sends pool-to-pool by default, but the KV pool is a
   # plain (non-fabric) allocation, so inter-node cuda_ipc/MNNVL is

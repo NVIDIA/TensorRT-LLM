@@ -101,8 +101,7 @@ worker_config:
       free_gpu_memory_fraction: 0.25
     cache_transceiver_config:
       backend: NIXL
-      transceiver_runtime: PYTHON  # mandatory: C++ path throws for K3
-      max_tokens_in_buffer: 8448
+      transceiver_runtime: PYTHON  # K3's hybrid cache requires Python
       # Fabric-VMM bounce: needed for cross-node V2 transfers on clusters
       # where inter-node cuda_ipc requires fabric allocations (else
       # ~0.4 GB/s host-staged tcp); measured ~455 GB/s/GPU with
@@ -133,7 +132,6 @@ worker_config:
     cache_transceiver_config:
       backend: NIXL
       transceiver_runtime: PYTHON
-      max_tokens_in_buffer: 8448
       # Must match the gen side; see the gen block's comment.
       kv_cache_bounce_size_mb: 1024
     trust_remote_code: true

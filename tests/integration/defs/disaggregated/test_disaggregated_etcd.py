@@ -88,7 +88,6 @@ def start_context_server(config,
 
     server_env = env.copy() if env else os.environ.copy()
     server_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    server_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
     server_env["UCX_TLS"] = get_ucx_tls()
 
     logger.info(f"Starting CONTEXT server on GPU {gpu_id} (port {port})...")
@@ -115,7 +114,6 @@ def start_generation_server(config,
 
     server_env = env.copy() if env else os.environ.copy()
     server_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    server_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
     server_env["UCX_TLS"] = get_ucx_tls()
 
     logger.info(f"Starting GENERATION server on GPU {gpu_id} (port {port})...")
@@ -271,16 +269,14 @@ def create_config_files(config):
     context_config_content = """pytorch_backend_config:
   disable_overlap_scheduler: True
 cache_transceiver_config:
-  backend: "DEFAULT"
-  max_tokens_in_buffer: 2048"""
+  backend: DEFAULT"""
 
     with open(CONTEXT_CONFIG_FILE, 'w') as file:
         file.write(context_config_content)
 
     # Create generation config file
     generation_config_content = """cache_transceiver_config:
-  backend: "DEFAULT"
-  max_tokens_in_buffer: 2048"""
+  backend: DEFAULT"""
 
     with open(GENERATION_CONFIG_FILE, 'w') as file:
         file.write(generation_config_content)
