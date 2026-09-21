@@ -47,6 +47,7 @@ class LocalityDomainPolicy:
                 "bf16_linear",
                 "bf16_bmm",
                 "nvfp4_moe",
+                "mxfp8_moe",
                 "bf16_moe",
             }
         )
@@ -258,10 +259,15 @@ class LocalityDomainExecutionPlanner:
     ) -> PartitionPlan:
         """Decide whether to partition a MoE GroupGemm for locality domain execution.
 
-        MoE locality domain replicates weights on each partition (not partitioned like Linear).
-        Each partition runs the full GroupGemm with inplace output into shared buffers.
+        NVFP4 and BF16 MoE split every expert's FC1 output columns (and the
+        matching FC2 rows) across the partitions; MXFP8 splits the inner
+        channels of the fused FC1+FC2 kernel, both shards accumulating into one
+        output. Each partition runs the full GroupGemm over all local experts.
         """
-        from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+        from tensorrt_llm._torch.cute_dsl_utils import (
+            IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE,
+            IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+        )
         from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
 
         if not self.policy.enabled:
@@ -285,6 +291,11 @@ class LocalityDomainExecutionPlanner:
             and hasattr(quant_config, "quant_mode")
             and quant_config.quant_mode.has_nvfp4()
         )
+        is_mxfp8 = (
+            quant_config is not None
+            and hasattr(quant_config, "quant_mode")
+            and quant_config.quant_mode.has_mxfp8()
+        )
         has_any_quant = (
             quant_config is not None
             and hasattr(quant_config, "quant_mode")
@@ -294,6 +305,15 @@ class LocalityDomainExecutionPlanner:
 
         if is_nvfp4:
             op_name = "nvfp4_moe"
+        elif is_mxfp8:
+            if not IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE:
+                return PartitionPlan(
+                    enabled=False,
+                    reason_if_disabled=(
+                        "MXFP8 locality domain MoE requires the CuTe DSL fused FC12 kernel"
+                    ),
+                )
+            op_name = "mxfp8_moe"
         elif is_bf16:
             op_name = "bf16_moe"
         elif not has_any_quant:
@@ -303,7 +323,8 @@ class LocalityDomainExecutionPlanner:
             )
         else:
             return PartitionPlan(
-                enabled=False, reason_if_disabled="locality domain MoE only supports NVFP4 or BF16"
+                enabled=False,
+                reason_if_disabled="locality domain MoE only supports NVFP4, MXFP8 or BF16",
             )
 
         # Both locality-domain MoE kernels fuse SwiGLU. Staying unpartitioned is

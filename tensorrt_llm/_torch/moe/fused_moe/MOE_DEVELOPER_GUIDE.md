@@ -304,6 +304,75 @@ remains `MEGAMOE_CUTEDSL`. Rubin's smaller token buckets use the genphase
 kernel when supported, otherwise the generic kernel. During warmup, the
 default multi-rank path primes its adaptive buckets with zero-token launches.
 
+The ported CuteDSL kernel sources for `MegaMoECuteDsl` live under
+`tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/` (flattened from the
+upstream `moe_nvfp4_swapab/` + `src/` split). The package is loaded lazily
+by `MegaMoECuteDsl` through `import_kernel()` so the heavyweight kernel
+module only imports when an SM100 GPU with a CUDA 13 Cutlass DSL runtime
+is available.
+
+### Rubin fused FC12 (`cute_dsl_kernels/rubin/moe/`)
+
+`rubin_contiguous_grouped_blockscaled_gemm_fused_fc12.py` (+ its
+`manual_mma_128dp.py` helper) is vendored from the dynamic-kernel-generator
+Rubin MoE examples. It fuses the token gather, FC1 GEMM, SwiGLU, block-scaled
+requantization of the intermediate, FC2 GEMM and the top-k finalize
+(scatter-add) into one persistent kernel and supports NVFP4 and MXFP8
+operands. TensorRT-LLM currently drives it for **MXFP8 only**, through
+`trtllm::cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin`
+(`Sm107Mxfp8FusedFc12MoeRunner` in `custom_ops/cute_dsl_custom_ops.py`) from
+`CuteDslFusedMoE.run_moe_mxfp8`. Kernel ABI facts the adapter relies on:
+
+- Activations: e4m3 `[tokens, hidden]` plus **linear** UE8M0 scales
+  `[tokens, hidden/32]` (`mxfp8_quantize(..., swizzled=False)`); the gather
+  warps read 16-byte scale chunks per row, hence `hidden % 512 == 0`.
+- Weights: e4m3 `[E, 2I, H]` / `[E, H, I]` with block scales in the 128x4
+  swizzled layout produced by `block_scale_interleave` (int32-packed storage,
+  viewed as bytes). FC1 weight and scales are gate/up interleaved at
+  granularity 64 (`MXFP8CuteDslFusedMoEMethod`, applied once per slot after the
+  parent's deferred swizzle).
+- Per-expert `fc1_alpha` / `fc2_alpha` and the FC1 `norm_const` are 1.0 for
+  MXFP8 (all scaling lives in the block scales).
+- The output is accumulated into, so `moe_output_memset_inplace` must run
+  first; the per-launch readiness/scheduler counters are zero-initialized
+  inside the op runner.
+- Tactic = `(mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler,
+  stream_weights, fc2_stream_weights)` with
+  `mma_tiler_m == routing tile_size in {128, 256}`, `mma_n in {128, 256}`,
+  `mma_tiler_k in {128, 256}`, cluster `(cta_group, 1)`, scheduler
+  `l2_atomic` / `static`, and L2 evict-first weight loads for both GEMMs
+  (`stream_weights`) or for FC2 alone (`fc2_stream_weights`; only decoupled
+  for locality-domain shards). Shorter tactics from older caches normalize.
+  The outer `CuteDslFusedMoEMxfp8Runner` tunes the routing tile and the comb
+  checker pins the inner `mma_tiler_m` to it.
+- **Locality domains** (`enable_locality_domains`, `plan_moe` op
+  `mxfp8_moe`): `trtllm::cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin`
+  runs the fused kernel on two compute partitions, each holding half of every
+  expert's inner channels (FC1 weights/scales sliced along N as whole gate/up
+  pairs and 128-row scale atoms, FC2 weights/scales along K; together one copy
+  of the weights, built by `_split_mxfp8_weights_for_locality_domain`). Both
+  shards scatter-add into the shared, pre-zeroed output, so the split is not
+  bitwise equal to the full-GPU kernel. It is a separate autotuned op:
+  `CuteDslFusedMoE.run_moe_mxfp8` profiles it only for shapes passing
+  `CuteDslFusedMoEMxfp8Runner.admits_locality_domain` (at most 2048 rows and
+  ~4096 estimated local routes, the measured neutral point) and uses it for a
+  token count only when the autotuner's recorded time beats the full-GPU op
+  by at least 1% (`_select_mxfp8_locality_domain`); every other shape runs
+  the unchanged full-GPU path. Measured on Rubin at the peak HBM clock with
+  the strict 100+100 SM split (TEP8, 64 local experts): -3 to -15% from 2 to
+  1024 rows (most at 16-32), neutral at 2048, +3 to +22% from 3072 rows up
+  and +20% on DEP4 prefill (hence excluded).
+  The MXFP8 path keeps the full weights resident after sharding so RLHF refit
+  can reload them and rebuild the shards in `post_load_weights`.
+- **DSL build requirement.** The kernel needs a newer internal Cutlass DSL
+  than the bare `rubin_helpers` probe guarantees. `cute_dsl_utils.py` exposes
+  `IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE` (true when `cutlass.memory` and
+  `cutlass.tensor_utils` are importable, i.e. builds like
+  `0.3.0+20260803` / `4.8.0a0+20260821` and newer); `can_implement`,
+  `create_moe` and the op registration all gate on it, so an older build
+  (e.g. `0.3.0+20260518`, which compiles the kernel but miscomputes its MXFP8
+  path) falls back to `CutlassFusedMoE` with a warning instead of running it.
+
 ### Design Documents
 
 | File | Topic |

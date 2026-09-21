@@ -45,6 +45,7 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
     _runner_tactics_match_tile_size,
     cute_dsl_nvfp4_grouped_gemm_ref,
 )
+from tensorrt_llm._torch.moe.fused_moe.impl_contract import MoECommPlan, MoERunContext
 from tensorrt_llm._torch.moe.fused_moe.quantization import interleave_linear_and_gate
 from tensorrt_llm._torch.utils import (
     ActivationType,
@@ -3019,6 +3020,43 @@ def test_rubin_bf16_moe_precomputed_tactic_fake_signatures():
             {"output"},
             id="bf16_fc2",
         ),
+        pytest.param(
+            "cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin",
+            (
+                "input",
+                "fc1_weight_0",
+                "fc1_weight_1",
+                "input_scale",
+                "fc1_weight_scale_0",
+                "fc1_weight_scale_1",
+                "fc1_alpha",
+                "tile_idx_to_group_idx",
+                "tile_idx_to_mn_limit",
+                "permuted_idx_to_expanded_idx",
+                "num_non_exiting_tiles",
+                "fc1_norm_const",
+                "fc2_weight_0",
+                "fc2_weight_1",
+                "fc2_weight_scale_0",
+                "fc2_weight_scale_1",
+                "fc2_alpha",
+                "output",
+                "token_final_scales",
+                "num_experts",
+                "top_k",
+                "num_local_experts",
+                "local_expert_offset",
+                "tile_size",
+                "swiglu_limit",
+            ),
+            {"swiglu_limit": -1.0},
+            {"output"},
+            id="mxfp8_fused_fc12",
+            marks=pytest.mark.skipif(
+                not IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE,
+                reason="MXFP8 fused FC12 MoE requires a CuTe DSL build that supports the fused FC12 kernel",
+            ),
+        ),
     ],
 )
 def test_rubin_moe_locality_domain_composite_schema(
@@ -3902,6 +3940,30 @@ def test_bf16_grouped_gemm_finalize_locality_domain_rubin(top_k: int, ep_size: i
     torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=0.15)
 
 
+def _run_moe_module(backend, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+    """Drive a MoE impl the way ExternalCommMoEScheduler does on one rank.
+
+    The impl owns no routing: apply the routing method, quantize the input on
+    the no-communication path (scale factors stay swizzled), and hand run_moe
+    the no-comm plan.
+    """
+    token_selected_experts, token_final_scales = backend.routing_method.apply(router_logits)
+    x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+    ctx = MoERunContext(
+        x=x_quantized,
+        x_sf=x_sf,
+        token_selected_experts=token_selected_experts.to(torch.int32),
+        token_final_scales=token_final_scales.to(torch.float32),
+        comm_plan=MoECommPlan(
+            input_sf_swizzled=True,
+            enable_alltoall=False,
+            moe_output=None,
+            payload_in_workspace=False,
+        ),
+    )
+    return backend.run_moe(ctx)
+
+
 @pytest.mark.skipif(
     get_sm_version() != 107,
     reason="This test is only supported on Rubin (SM 107) GPUs",
@@ -4012,9 +4074,9 @@ def test_moe_module_locality_domain_correctness_rubin(num_tokens: int, top_k: in
             assert locality_domain_backend.quant_scales.fc2_weight_block.numel() == 0
 
         with torch.inference_mode():
-            base_output = base_backend.forward_chunk(input_tensor, router_logits)
-            locality_domain_output = locality_domain_backend.forward_chunk(
-                input_tensor, router_logits
+            base_output = _run_moe_module(base_backend, input_tensor, router_logits)
+            locality_domain_output = _run_moe_module(
+                locality_domain_backend, input_tensor, router_logits
             )
 
         torch.cuda.synchronize()
@@ -4025,7 +4087,7 @@ def test_moe_module_locality_domain_correctness_rubin(num_tokens: int, top_k: in
     get_sm_version() != 107,
     reason="This test is only supported on Rubin (SM 107) GPUs",
 )
-def test_moe_module_bf16_locality_domain_lifecycle_and_forward_chunk_rubin():
+def test_moe_module_bf16_locality_domain_lifecycle_and_run_moe_rubin():
     _skip_if_no_locality_domain()
 
     from _torch.moe.quantize_utils import get_test_quant_params
@@ -4127,13 +4189,13 @@ def test_moe_module_bf16_locality_domain_lifecycle_and_forward_chunk_rubin():
         assert locality_domain_backend.w3_w1_weight.numel() == 0
         assert locality_domain_backend.w2_weight.numel() == 0
 
-        # Keep the production-shape lifecycle and public forward_chunk
+        # Keep the production-shape lifecycle and run_moe
         # integration here. Broad accuracy, autotune, capture, and outer-tile
         # replay are covered by the unified backend matrix.
         with torch.inference_mode():
-            base_output = base_backend.forward_chunk(input_tensor, router_logits)
-            locality_domain_output = locality_domain_backend.forward_chunk(
-                input_tensor, router_logits
+            base_output = _run_moe_module(base_backend, input_tensor, router_logits)
+            locality_domain_output = _run_moe_module(
+                locality_domain_backend, input_tensor, router_logits
             )
 
         torch.cuda.synchronize()
@@ -4504,6 +4566,35 @@ def test_mxfp8_fused_fc12_moe_rubin(
     torch.cuda.synchronize()
     check(output, "default tactic")
 
+    # 1b. zero_output=True: the op clears the output inside its workspace
+    #     reset launch, so a garbage-filled buffer must give the same result.
+    output_dirty = torch.full(
+        (num_tokens, hidden_size), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    with torch.inference_mode():
+        torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin(
+            output=output_dirty, zero_output=True, **common_kwargs
+        )
+    torch.cuda.synchronize()
+    assert not torch.isnan(output_dirty).any(), "zero_output left rows uncleared"
+    check(output_dirty, "default tactic, zero_output=True")
+    # The finalize's atomic scatter-add order differs between runs, so allow
+    # bf16 rounding noise between the two launches.
+    torch.testing.assert_close(output_dirty.float(), output.float(), rtol=2e-2, atol=2e-2)
+
+    # Raw BF16 input quantizes in the workspace reset. A poisoned scale
+    # placeholder must stay unread and unmodified by the custom op.
+    raw_kwargs = dict(common_kwargs, input=a, input_scale=torch.full_like(a_sf, 255))
+    raw_output = torch.empty_like(output)
+    with torch.inference_mode():
+        torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin(
+            output=raw_output, zero_output=True, **raw_kwargs
+        )
+    torch.cuda.synchronize()
+    check(raw_output, "raw BF16 input, quantize/reset fusion")
+    assert (raw_kwargs["input_scale"] == 255).all()
+    torch.testing.assert_close(raw_output.float(), output.float(), rtol=2e-2, atol=2e-2)
+
     # 2. Every tactic the runner enumerates (small shapes only: each distinct
     #    geometry is a DSL compile).
     if num_experts > 64:
@@ -4531,10 +4622,30 @@ def test_mxfp8_fused_fc12_moe_rubin(
     tactics = runner.get_valid_tactics(inputs, OptimizationProfile())
     assert len(tactics) > 0, f"No valid tactics for tile_size={tile_size}"
     assert all(t[0][0] == tile_size for t in tactics), "mma_tiler_m must equal the routing tile"
+    # Full-GPU runners keep one cache policy for both GEMMs; only locality
+    # domain shards add the cached-FC2 variant under streaming FC1 weights.
+    assert all(t[4] == t[5] for t in tactics), "full-GPU tactics must not decouple FC2"
+    decoupled_runner = Sm107Mxfp8FusedFc12MoeRunner(
+        num_experts,
+        top_k,
+        num_local_experts,
+        0,
+        tile_size,
+        swiglu_limit=swiglu_limit,
+        decouple_fc2_cache_policy=True,
+    )
+    decoupled_tactics = decoupled_runner.get_valid_tactics(inputs, OptimizationProfile())
+    assert set(tactics) < set(decoupled_tactics)
+    assert {t[:4] for t in decoupled_tactics if t[4] and not t[5]} == {
+        t[:4] for t in tactics if t[4]
+    }
     failed = []
     for tactic in tactics:
-        mma_tiler, mma_inst, cluster, scheduler = tactic
-        label = f"mma_tiler={mma_tiler} inst={mma_inst} cluster={cluster} sched={scheduler}"
+        mma_tiler, mma_inst, cluster, scheduler, stream_weights, fc2_stream_weights = tactic
+        label = (
+            f"mma_tiler={mma_tiler} inst={mma_inst} cluster={cluster} sched={scheduler} "
+            f"stream_weights={stream_weights} fc2_stream_weights={fc2_stream_weights}"
+        )
         output.zero_()
         with torch.inference_mode():
             runner.forward(inputs, tactic=tactic)
@@ -4562,8 +4673,588 @@ def test_mxfp8_fused_fc12_tactic_roundtrips_through_autotuner_cache():
 
     runner = Sm107Mxfp8FusedFc12MoeRunner(64, 8, 8, 0, 128)
     tactic = runner._default_tactic()
-    assert tactic == ((128, 128, 128), (128, 128, 64), (1, 1), "l2_atomic")
+    assert tactic == ((128, 128, 128), (128, 128, 64), (1, 1), "l2_atomic", False, False)
     assert ast.literal_eval(repr(tactic)) == tactic
     assert runner._normalize_tactic(json.loads(json.dumps(tactic))) == tactic
     runner_2cta = Sm107Mxfp8FusedFc12MoeRunner(64, 8, 8, 0, 256)
-    assert runner_2cta._default_tactic() == ((256, 128, 128), (256, 128, 64), (2, 1), "l2_atomic")
+    assert runner_2cta._default_tactic() == (
+        (256, 128, 128),
+        (256, 128, 64),
+        (2, 1),
+        "l2_atomic",
+        False,
+        False,
+    )
+    # Both cache policies survive the round trip. Shorter tactics from caches
+    # or precomputed strings normalize: four elements keep the default
+    # policy, five let the FC2 loads follow stream_weights.
+    decoupled = ((128, 256, 256), (128, 256, 64), (1, 1), "static", True, False)
+    assert runner._normalize_tactic(json.loads(json.dumps(decoupled))) == decoupled
+    streamed = ((128, 256, 256), (128, 256, 64), (1, 1), "static", True)
+    assert runner._normalize_tactic(json.loads(json.dumps(streamed))) == streamed + (True,)
+    legacy = ((128, 256, 256), (128, 256, 64), (1, 1), "static")
+    assert runner._normalize_tactic(ast.literal_eval(repr(legacy))) == legacy + (False, False)
+
+
+@pytest.mark.skipif(
+    not IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE,
+    reason="MXFP8 fused FC12 MoE requires a CuTe DSL build that supports the fused FC12 kernel",
+)
+def test_mxfp8_fused_fc12_sparse_gather_selection():
+    """The gather variant is chosen from static shapes, scaled by the rank's expert share.
+
+    Qwen3.5-397B geometry: 512 experts, top-k 10. ``padded_routes`` is the
+    static ``permuted_idx_to_expanded_idx`` length the backend hands the op.
+    """
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import Sm107Mxfp8FusedFc12MoeRunner
+
+    def runner(num_local_experts):
+        return Sm107Mxfp8FusedFc12MoeRunner(512, 10, num_local_experts, 0, 128)
+
+    # EP16 decode: 32 tokens, ~20 local routes spread over ~20 tiles -> sparse.
+    assert runner(32)._use_sparse_gather(num_rows=32, padded_routes=20 * 128)
+    # EP16 mid range, 2048 tokens: ~1280 local routes but heavy per-expert
+    # padding (32 experts x 127 rows) -> still sparse; the old rank-agnostic
+    # rule (tokens * top_k * 2 = 40960) would have kept the static gather.
+    assert runner(32)._use_sparse_gather(num_rows=2048, padded_routes=1280 + 32 * 127)
+    # EP4 prefill, 16384 tokens: routes dominate the padding -> static.
+    assert not runner(128)._use_sparse_gather(
+        num_rows=16384, padded_routes=16384 * 10 // 4 + 128 * 127
+    )
+    # No EP: a single 128-row tile per expert, all full -> static.
+    assert not runner(512)._use_sparse_gather(num_rows=8192, padded_routes=8192 * 10)
+    # The estimate never drops below one route per arriving row (alltoall).
+    assert runner(1)._use_sparse_gather(num_rows=4, padded_routes=128)
+    assert not runner(1)._use_sparse_gather(num_rows=100, padded_routes=128)
+
+
+def test_mxfp8_moe_locality_domain_admission_rule():
+    """The inner-channel split is profiled up to the measured neutral point, never on prefill.
+
+    Qwen3.5-397B geometry (512 experts, top-k 10). ``num_tokens`` is the
+    number of rows this rank processes. Measured at the peak HBM clock with
+    the strict 100+100 SM split: wins from 2 to 1024 rows, neutral at 2048,
+    losses from 3072 rows up.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoEMxfp8Runner
+
+    def admits(num_tokens, num_local_experts):
+        return CuteDslFusedMoEMxfp8Runner.admits_locality_domain(
+            num_tokens, 10, num_local_experts, 512
+        )
+
+    # TEP8 (64 local experts), replicated input: measured wins 2..1024 rows,
+    # neutral at 2048 -> admitted; losses from 3072 up -> not profiled.
+    for tokens in (1, 2, 4, 8, 16, 21, 32, 64, 128, 256, 512, 1024, 2048):
+        assert admits(tokens, 64), tokens
+    for tokens in (3072, 4096, 16384):
+        assert not admits(tokens, 64), tokens
+    # DEP16 after alltoall dispatch (~340 rows) and DEP4 decode (~320 rows)
+    # are now profiled; DEP4 prefill (16K rows) is not.
+    assert admits(337, 32)
+    assert admits(320, 128)
+    assert not admits(16384, 128)
+    # Empty shapes stay on the full path.
+    assert not admits(0, 64)
+    assert admits(1, 64)
+    # With all experts local the estimated route count caps admission at 409
+    # rows (4096 routes); a full expert sweep of 2048 rows is not profiled.
+    assert admits(409, 512)
+    assert not admits(410, 512)
+
+
+@pytest.mark.skipif(
+    not IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE,
+    reason="MXFP8 fused FC12 MoE requires a CuTe DSL build that supports the fused FC12 kernel",
+)
+def test_rubin_mxfp8_fused_fc12_locality_domain_composite_fake_signature():
+    try:
+        from torch._subclasses.fake_tensor import FakeTensorMode
+    except ImportError:
+        pytest.skip("FakeTensorMode is not available")
+
+    op = _get_registered_rubin_moe_op("cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin")
+    with FakeTensorMode():
+        tensors = _make_fake_rubin_moe_tensors(quantized=True)
+        result = op(
+            input=tensors.input,
+            fc1_weight_0=tensors.fc1_weight,
+            fc1_weight_1=tensors.fc1_weight,
+            input_scale=tensors.input_scale,
+            fc1_weight_scale_0=tensors.fc1_weight_scale,
+            fc1_weight_scale_1=tensors.fc1_weight_scale,
+            fc1_alpha=tensors.alpha,
+            tile_idx_to_group_idx=tensors.tile_idx_to_group_idx,
+            tile_idx_to_mn_limit=tensors.tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=tensors.permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=tensors.num_non_exiting_tiles,
+            fc1_norm_const=tensors.global_sf,
+            fc2_weight_0=tensors.fc2_weight,
+            fc2_weight_1=tensors.fc2_weight,
+            fc2_weight_scale_0=tensors.fc2_weight_scale,
+            fc2_weight_scale_1=tensors.fc2_weight_scale,
+            fc2_alpha=tensors.alpha,
+            output=tensors.output,
+            token_final_scales=tensors.token_final_scales,
+            num_experts=1,
+            top_k=1,
+            num_local_experts=1,
+            local_expert_offset=0,
+            tile_size=128,
+        )
+        assert result is None
+
+
+@pytest.mark.skipif(
+    not IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE,
+    reason="MXFP8 fused FC12 MoE requires a CuTe DSL build that supports the fused FC12 kernel",
+)
+def test_rubin_mxfp8_fused_fc12_locality_domain_composite_owns_concurrent_tuning(monkeypatch):
+    """The composite tunes one decoupled-policy runner concurrently and launches shard-specific weights."""
+    composite_op = getattr(
+        cute_dsl_custom_ops, "cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin", None
+    )
+    if composite_op is None:
+        pytest.skip("internal CuteDSL Rubin MoE composite op is not registered")
+
+    runner_instances = []
+    tune_calls = []
+    leaf_calls = []
+    chosen_tactic = ((128, 128, 128), (128, 128, 64), (1, 1), "l2_atomic", True, False)
+
+    class FakeOpRunner:
+        def __init__(self, *args, **kwargs):
+            self.init_call = (args, kwargs)
+            runner_instances.append(self)
+
+        def get_tuning_config(self):
+            return "tuning-config"
+
+    class FakeRuntime:
+        def __init__(self, num_partitions: int):
+            self.num_partitions = num_partitions
+
+    class FakeConcurrentRunner:
+        def __init__(self, launch_partition):
+            self.launch_partition = launch_partition
+
+        def __call__(self, inputs, *, tactic):
+            for partition_id in range(2):
+                self.launch_partition(partition_id, inputs, tactic)
+
+    def fake_tune(op_name, op_runner, runtime, num_partitions, launch_partition, inputs, cfg):
+        tune_calls.append((op_name, op_runner, runtime, num_partitions, inputs, cfg))
+        return FakeConcurrentRunner(launch_partition), chosen_tactic
+
+    def fake_leaf_op(*args, **kwargs):
+        leaf_calls.append(kwargs)
+
+    monkeypatch.setattr(cute_dsl_custom_ops, "Sm107Mxfp8FusedFc12MoeRunner", FakeOpRunner)
+    monkeypatch.setattr(cute_dsl_custom_ops, "LocalityDomainRuntime", FakeRuntime)
+    monkeypatch.setattr(cute_dsl_custom_ops, "tune_locality_domain_concurrent", fake_tune)
+    monkeypatch.setattr(
+        torch.ops.trtllm, "cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin", fake_leaf_op
+    )
+
+    def shard(shape, dtype=torch.float8_e4m3fn):
+        return torch.empty(shape, dtype=dtype, device="cuda")
+
+    fc1_w = [shard((2, 512, 1024)) for _ in range(2)]
+    fc1_s = [shard((2, 512, 32), torch.uint8) for _ in range(2)]
+    fc2_w = [shard((2, 1024, 256)) for _ in range(2)]
+    fc2_s = [shard((2, 1024, 8), torch.uint8) for _ in range(2)]
+    output = torch.zeros(4, 1024, dtype=torch.bfloat16, device="cuda")
+    meta = torch.empty(1, dtype=torch.int32, device="cuda")
+    composite_op(
+        input=shard((4, 1024)),
+        fc1_weight_0=fc1_w[0],
+        fc1_weight_1=fc1_w[1],
+        input_scale=shard((4, 32), torch.uint8),
+        fc1_weight_scale_0=fc1_s[0],
+        fc1_weight_scale_1=fc1_s[1],
+        fc1_alpha=torch.ones(2, device="cuda"),
+        tile_idx_to_group_idx=meta,
+        tile_idx_to_mn_limit=meta,
+        permuted_idx_to_expanded_idx=torch.empty(128, dtype=torch.int32, device="cuda"),
+        num_non_exiting_tiles=meta,
+        fc1_norm_const=torch.ones(1, device="cuda"),
+        fc2_weight_0=fc2_w[0],
+        fc2_weight_1=fc2_w[1],
+        fc2_weight_scale_0=fc2_s[0],
+        fc2_weight_scale_1=fc2_s[1],
+        fc2_alpha=torch.ones(2, device="cuda"),
+        output=output,
+        token_final_scales=torch.ones(4, 2, device="cuda"),
+        num_experts=16,
+        top_k=2,
+        num_local_experts=2,
+        local_expert_offset=0,
+        tile_size=128,
+    )
+
+    assert len(runner_instances) == 1
+    args, kwargs = runner_instances[0].init_call
+    assert args == (16, 2, 2, 0, 128)
+    assert kwargs["decouple_fc2_cache_policy"] is True
+    assert kwargs["zero_output"] is False
+    assert len(tune_calls) == 1
+    op_name, op_runner, runtime, num_partitions, inputs, cfg = tune_calls[0]
+    assert op_name.endswith("::locality_domain")
+    assert op_runner is runner_instances[0]
+    assert runtime.num_partitions == 2 and num_partitions == 2
+    assert cfg == "tuning-config"
+    assert inputs[1] is fc1_w[0] and inputs[10] is fc2_w[0]
+    # Both partitions launch the single-partition op with their own shards,
+    # the precomputed tactic, and without clearing the shared output.
+    assert len(leaf_calls) == 2
+    for partition_id, call in enumerate(leaf_calls):
+        assert call["fc1_weight"] is fc1_w[partition_id]
+        assert call["fc1_weight_scale"] is fc1_s[partition_id]
+        assert call["fc2_weight"] is fc2_w[partition_id]
+        assert call["fc2_weight_scale"] is fc2_s[partition_id]
+        assert call["output"] is output
+        assert call["zero_output"] is False
+        assert call["precomputed_tactic"] == repr(chosen_tactic)
+
+
+def _split_mxfp8_fused_fc12_shards(w31_kernel, w31_sf_kernel, w2_q, w2_sf_kernel):
+    """Slice kernel-layout MXFP8 weights the way CuteDslFusedMoE shards them.
+
+    Weights slice directly (FC1 along N, FC2 along K). The swizzled scales are
+    unswizzled, sliced like their weights and swizzled again per shard.
+    """
+    sf_vec = 32
+    num_experts, hidden, inner = w2_q.shape
+    half = inner // 2
+    fc1_n = w31_kernel.size(1)
+    w31_sf_linear = unswizzle_sf(w31_sf_kernel, fc1_n, hidden, sf_vec).view(
+        num_experts, fc1_n, hidden // sf_vec
+    )
+    w2_sf_linear = unswizzle_sf(w2_sf_kernel, hidden, inner, sf_vec).view(
+        num_experts, hidden, inner // sf_vec
+    )
+    shards = []
+    for pid in range(2):
+        n = slice(pid * 2 * half, (pid + 1) * 2 * half)
+        k = slice(pid * half, (pid + 1) * half)
+        sk = slice(pid * half // sf_vec, (pid + 1) * half // sf_vec)
+        shards.append(
+            dict(
+                fc1_weight=w31_kernel[:, n].contiguous(),
+                fc1_weight_scale=swizzle_sf(
+                    w31_sf_linear[:, n].contiguous(), 2 * half, hidden, sf_vec
+                ).view(num_experts, 2 * half, hidden // sf_vec),
+                fc2_weight=w2_q[:, :, k].contiguous(),
+                fc2_weight_scale=swizzle_sf(
+                    w2_sf_linear[:, :, sk].contiguous(), hidden, half, sf_vec
+                ).view(num_experts, hidden, half // sf_vec),
+            )
+        )
+    return shards
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107 or not IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE,
+    reason="MXFP8 fused FC12 MoE requires Rubin (SM107) with a CuTe DSL build that supports the fused FC12 kernel",
+)
+@pytest.mark.parametrize(
+    "num_tokens,top_k,ep_size,hidden_size,interm_size,num_experts",
+    [
+        (128, 2, 1, 1024, 512, 16),
+        # Qwen3.5-397B expert geometry, TEP8-shaped decode.
+        (32, 10, 8, 4096, 1024, 512),
+    ],
+)
+def test_mxfp8_fused_fc12_locality_domain_op_matches_full_gpu(
+    num_tokens: int,
+    top_k: int,
+    ep_size: int,
+    hidden_size: int,
+    interm_size: int,
+    num_experts: int,
+):
+    """The inner-channel split across two locality domains reproduces the full-GPU op.
+
+    The shards slice the kernel-layout FC1 weights and scales along N (whole
+    gate/up pairs and 128-row scale atoms) and the FC2 weights and scales
+    along K, exactly as ``CuteDslFusedMoE._split_mxfp8_weights_for_locality_domain``
+    does, then both accumulate into one pre-zeroed output. FC2's accumulation
+    order changes, so the comparison uses the MoE tolerances, not bitwise
+    equality.
+    """
+    _skip_if_no_locality_domain()
+    torch.manual_seed(0)
+    tile_size = 128
+    sf_vec_size = 32
+    num_local_experts = num_experts // ep_size
+
+    routing_logits = torch.randn(num_tokens, num_experts, device="cuda")
+    token_final_scales, token_selected_experts = routing_logits.topk(top_k, dim=-1)
+    token_selected_experts = token_selected_experts.to(torch.int32)
+    token_final_scales = token_final_scales.softmax(dim=-1).to(torch.float32)
+    token_selected_experts[0, 0] = 0
+    (
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        _,
+        permuted_idx_to_expanded_idx,
+        _,
+        num_non_exiting_tiles,
+    ) = torch.ops.trtllm.moe_sort(
+        token_selected_experts=token_selected_experts,
+        token_final_scales=token_final_scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=0,
+        local_num_experts=num_local_experts,
+        tile_tokens_dim=tile_size,
+    )
+
+    a = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
+    a_q, a_sf = torch.ops.trtllm.mxfp8_quantize(a, False, alignment=128)
+    a_sf = a_sf.view(num_tokens, hidden_size // sf_vec_size)
+    a_deq = _mxfp8_dequant(a_q, a_sf)
+    w31 = torch.randn(
+        num_local_experts, 2 * interm_size, hidden_size, dtype=torch.bfloat16, device="cuda"
+    ) / (hidden_size**0.5)
+    w2 = torch.randn(
+        num_local_experts, hidden_size, interm_size, dtype=torch.bfloat16, device="cuda"
+    ) / (interm_size**0.5)
+    w31_q, w31_sf = _mxfp8_quant_weights(w31)
+    w2_q, w2_sf = _mxfp8_quant_weights(w2)
+    w31_kernel = interleave_linear_and_gate(w31_q.view(torch.uint8), group_size=64, dim=1).view(
+        torch.float8_e4m3fn
+    )
+    w31_sf_kernel = swizzle_sf(
+        interleave_linear_and_gate(w31_sf, group_size=64, dim=1),
+        2 * interm_size,
+        hidden_size,
+        sf_vec_size,
+    ).view(num_local_experts, 2 * interm_size, hidden_size // sf_vec_size)
+    w2_sf_kernel = swizzle_sf(w2_sf, hidden_size, interm_size, sf_vec_size).view(
+        num_local_experts, hidden_size, interm_size // sf_vec_size
+    )
+    unit_alpha = torch.ones(num_local_experts, dtype=torch.float32, device="cuda")
+    unit_norm_const = torch.ones(1, dtype=torch.float32, device="cuda")
+    out_ref = _mxfp8_fused_fc12_reference(
+        a_deq,
+        w31_q,
+        w31_sf,
+        w2_q,
+        w2_sf,
+        token_final_scales,
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx,
+        num_non_exiting_tiles,
+        tile_size,
+        top_k,
+        float("inf"),
+    )
+    common = dict(
+        input=a_q,
+        input_scale=a_sf,
+        fc1_alpha=unit_alpha,
+        tile_idx_to_group_idx=tile_idx_to_group_idx,
+        tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+        num_non_exiting_tiles=num_non_exiting_tiles,
+        fc1_norm_const=unit_norm_const,
+        fc2_alpha=unit_alpha,
+        token_final_scales=token_final_scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        local_expert_offset=0,
+        tile_size=tile_size,
+        swiglu_limit=-1.0,
+    )
+
+    full = torch.zeros(num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
+    with torch.inference_mode():
+        torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin(
+            fc1_weight=w31_kernel,
+            fc1_weight_scale=w31_sf_kernel,
+            fc2_weight=w2_q,
+            fc2_weight_scale=w2_sf_kernel,
+            output=full,
+            **common,
+        )
+    torch.cuda.synchronize()
+
+    shards = _split_mxfp8_fused_fc12_shards(w31_kernel, w31_sf_kernel, w2_q, w2_sf_kernel)
+    # Weight shards are exact slices of the kernel-layout tensors; the FC1
+    # scale shards are the swizzle of the row halves, i.e. byte halves of the
+    # swizzled tensor (whole 128-row atoms).
+    assert torch.equal(
+        torch.cat([s["fc1_weight"] for s in shards], dim=1).view(torch.uint8),
+        w31_kernel.view(torch.uint8),
+    )
+    assert torch.equal(torch.cat([s["fc1_weight_scale"] for s in shards], dim=1), w31_sf_kernel)
+    split = torch.zeros(num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
+    AutoTuner.get().clear_cache()
+    with torch.inference_mode():
+        torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin(
+            fc1_weight_0=shards[0]["fc1_weight"],
+            fc1_weight_1=shards[1]["fc1_weight"],
+            fc1_weight_scale_0=shards[0]["fc1_weight_scale"],
+            fc1_weight_scale_1=shards[1]["fc1_weight_scale"],
+            fc2_weight_0=shards[0]["fc2_weight"],
+            fc2_weight_1=shards[1]["fc2_weight"],
+            fc2_weight_scale_0=shards[0]["fc2_weight_scale"],
+            fc2_weight_scale_1=shards[1]["fc2_weight_scale"],
+            output=split,
+            **common,
+        )
+    torch.cuda.synchronize()
+
+    for out, label in ((full, "full GPU"), (split, "locality domain split")):
+        out_f32 = out.float()
+        match = torch.isclose(out_f32, out_ref, rtol=1e-1, atol=1e-1).sum().item() / out_ref.numel()
+        cos = torch.nn.functional.cosine_similarity(
+            out_f32.flatten(), out_ref.flatten(), dim=0
+        ).item()
+        assert match >= 0.95 and cos >= 0.99, f"{label}: match={match:.4f} cosine={cos:.5f}"
+    torch.testing.assert_close(split.float(), full.float(), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(
+    not IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE,
+    reason="MXFP8 fused FC12 MoE requires a CuTe DSL build that supports the fused FC12 kernel",
+)
+def test_mxfp8_moe_tuning_buckets_cover_decode_shapes():
+    """The MXFP8 MoE tuning buckets must not depend on the warmup forward's token count.
+
+    The engine's autotuner warmup runs one forward at whatever token count the
+    KV cache allows. With ``tune_max_num_tokens`` the module anchors its
+    power-of-two token buckets to the saturation token count, so decode shapes
+    (a few tokens per DP rank) are profiled regardless of that warmup shape.
+    Profile generation only reads tensor shapes, so this runs on CPU tensors.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoEMxfp8Runner
+
+    num_experts, top_k, hidden = 128, 10, 4096
+    warmup_tokens = 3  # an odd shape: last_positive_power_of_2(3) == 2
+
+    def profiled_token_counts(tune_max_num_tokens):
+        runner = CuteDslFusedMoEMxfp8Runner(
+            forward_impl=None,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_experts,
+            local_expert_offset=0,
+            tune_max_num_tokens=tune_max_num_tokens,
+        )
+        inputs = [
+            torch.empty(warmup_tokens, hidden, dtype=torch.float8_e4m3fn),
+            torch.empty(warmup_tokens, top_k, dtype=torch.int32),
+            torch.empty(warmup_tokens, top_k, dtype=torch.float32),
+            torch.empty(warmup_tokens, hidden // 32, dtype=torch.uint8),
+            torch.empty(warmup_tokens, hidden, dtype=torch.bfloat16),
+        ]
+        profiles = AutoTuner.get()._optimization_profiles(runner.get_tuning_config(), inputs)
+        return {p.get_opt_shapes()[0][0] for p in profiles}
+
+    anchored = profiled_token_counts(tune_max_num_tokens=8192)
+    assert {1, 2, 4, 8, 32, 128, 1024, 8192} <= anchored, anchored
+
+    # Without the anchor only the warmup shape's buckets exist; keep this as
+    # documentation of the failure mode the anchor prevents.
+    unanchored = profiled_token_counts(tune_max_num_tokens=None)
+    assert 4 not in unanchored and 8 not in unanchored, unanchored
+
+
+@pytest.mark.parametrize("hidden", [2048, 4096, 7168])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mxfp8_local_input_quantization_deferred(monkeypatch, hidden, dtype):
+    """Only local computation may defer quantization; communication needs bytes.
+
+    The cutoff is an element count, so the largest deferred row count follows
+    from the hidden size rather than being tied to one model.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoEMxfp8Runner
+
+    backend = SimpleNamespace(
+        has_nvfp4=False,
+        has_mxfp8=True,
+        hidden_size=hidden,
+        scaling_vector_size=32,
+        quant_method=SimpleNamespace(BLOCK_SIZE=32, weight_alignment=512),
+        _locality_domain_runtime=None,
+        MXFP8_FUSED_INPUT_QUANT_MAX_ELEMENTS=CuteDslFusedMoE.MXFP8_FUSED_INPUT_QUANT_MAX_ELEMENTS,
+    )
+    backend._fuses_mxfp8_input_quant = CuteDslFusedMoE._fuses_mxfp8_input_quant.__get__(backend)
+    backend._mxfp8_full_gpu_path_selected = CuteDslFusedMoE._mxfp8_full_gpu_path_selected.__get__(
+        backend
+    )
+    max_rows = CuteDslFusedMoE.MXFP8_FUSED_INPUT_QUANT_MAX_ELEMENTS // hidden
+    scale_cols = hidden // 32
+    calls = []
+
+    def native_quantize(tensor, swizzled, alignment):
+        calls.append((tensor, swizzled, alignment))
+        return (
+            torch.empty_like(tensor, dtype=torch.float8_e4m3fn),
+            torch.empty((tensor.size(0), scale_cols), dtype=torch.uint8),
+        )
+
+    monkeypatch.setattr(torch.ops.trtllm, "mxfp8_quantize", native_quantize)
+    for rows in (0, 1, max_rows):
+        x = torch.empty((rows, hidden), dtype=dtype)
+        raw, sf = CuteDslFusedMoE.quantize_input(backend, x, post_quant_comm=False)
+        assert raw is x and sf.shape == (rows, scale_cols) and sf.dtype == torch.uint8
+    assert not calls
+    x = torch.empty((max_rows, hidden), dtype=dtype)
+    quantized, sf = CuteDslFusedMoE.quantize_input(backend, x, post_quant_comm=True)
+    assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 1
+    assert calls[0][0] is x and calls[0][1:] == (False, 512)
+    assert sf.shape == (max_rows, scale_cols)
+    # Locality domains: the fusion stacks on the full-GPU path only. No
+    # recorded decision -> separate launch (the split may still be profiled);
+    # decision "split" -> separate launch; decision "full GPU" -> fused;
+    # outside the static admission rule -> fused (the split never runs).
+    backend._locality_domain_runtime = object()
+    backend.routing_method = SimpleNamespace(experts_per_token=10)
+    backend.expert_size_per_partition = 64
+    backend.num_slots = 512
+    backend._mxfp8_locality_domain_decisions = {}
+    small = torch.empty((8, hidden), dtype=dtype)
+    quantized, _ = CuteDslFusedMoE.quantize_input(backend, small, post_quant_comm=False)
+    assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 2
+    backend._mxfp8_locality_domain_decisions[8] = True
+    quantized, _ = CuteDslFusedMoE.quantize_input(backend, small, post_quant_comm=False)
+    assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 3
+    backend._mxfp8_locality_domain_decisions[8] = False
+    raw, _ = CuteDslFusedMoE.quantize_input(backend, small, post_quant_comm=False)
+    assert raw is small and len(calls) == 3
+    assert not CuteDslFusedMoEMxfp8Runner.admits_locality_domain(
+        CuteDslFusedMoEMxfp8Runner.LOCALITY_DOMAIN_MAX_TOKENS + 1, 10, 64, 512
+    )
+    if (CuteDslFusedMoEMxfp8Runner.LOCALITY_DOMAIN_MAX_TOKENS + 1) * hidden <= (
+        CuteDslFusedMoE.MXFP8_FUSED_INPUT_QUANT_MAX_ELEMENTS
+    ):
+        outside = torch.empty(
+            (CuteDslFusedMoEMxfp8Runner.LOCALITY_DOMAIN_MAX_TOKENS + 1, hidden), dtype=dtype
+        )
+        raw, _ = CuteDslFusedMoE.quantize_input(backend, outside, post_quant_comm=False)
+        assert raw is outside and len(calls) == 3
+    backend._locality_domain_runtime = None
+    larger = torch.empty((max_rows + 1, hidden), dtype=dtype)
+    quantized, _ = CuteDslFusedMoE.quantize_input(backend, larger, post_quant_comm=False)
+    assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 4
+    # Non-contiguous rows cannot be vector-loaded by the reset kernel.
+    strided = torch.empty((2, hidden * 2), dtype=dtype)[:, :hidden]
+    quantized, _ = CuteDslFusedMoE.quantize_input(backend, strided, post_quant_comm=False)
+    assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 5
+
+
+def test_mxfp8_input_quantization_tuning_cache_isolation():
+    """Changing activation dtype must not reuse prequantized timing decisions."""
+    for locality in (False, True):
+        keys = {
+            CuteDslFusedMoE._mxfp8_tuner_key(dtype, locality)
+            for dtype in (torch.float8_e4m3fn, torch.bfloat16, torch.float16)
+        }
+        assert len(keys) == 3
+    assert CuteDslFusedMoE._mxfp8_decision_key(8, torch.float8_e4m3fn) == 8
+    assert CuteDslFusedMoE._mxfp8_decision_key(8, torch.bfloat16) != 8
