@@ -1050,6 +1050,101 @@ class TestResourceManager(unittest.TestCase):
         finally:
             kv_cache_manager.shutdown()
 
+    @staticmethod
+    def _create_beam_search_kv_cache_manager(max_beam_width: int,
+                                             max_batch_size: int = 1):
+        # 32 blocks of 8 tokens.
+        return KVCacheManager(
+            kv_cache_config=KvCacheConfig(max_tokens=256,
+                                          enable_block_reuse=False),
+            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+            CacheType.SELF,
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=128,
+            tokens_per_block=8,
+            max_seq_len=256,
+            max_batch_size=max_batch_size,
+            max_beam_width=max_beam_width,
+            mapping=Mapping(),
+        )
+
+    def test_dummy_request_block_count_matches_beam_search_allocation(self):
+        """Prompt-covered blocks are shared among beams; the partial last
+        block is allocated once per beam."""
+        beam_width = 4
+        kv_cache_manager = self._create_beam_search_kv_cache_manager(beam_width)
+        try:
+            total_free = kv_cache_manager.get_num_free_blocks()
+            for request_id, token_num in enumerate([1, 8, 9, 100, 128]):
+                requests = kv_cache_manager.add_dummy_requests(
+                    [request_id], [token_num],
+                    is_gen=True,
+                    max_beam_width=beam_width)
+                self.assertIsNotNone(requests)
+                used_blocks = (total_free -
+                               kv_cache_manager.get_num_free_blocks())
+                self.assertEqual(
+                    used_blocks,
+                    kv_cache_manager._get_num_blocks_for_dummy_request(
+                        token_num, 0, beam_width), f"token_num={token_num}")
+                kv_cache_manager.free_resources(requests[0])
+        finally:
+            kv_cache_manager.shutdown()
+
+    def test_get_num_available_tokens_accounts_for_beam_width(self):
+        """Every length up to the reported capacity must fit with beam
+        search, including lengths that are not block aligned."""
+        beam_width = 4
+        kv_cache_manager = self._create_beam_search_kv_cache_manager(beam_width)
+        try:
+            self.assertEqual(kv_cache_manager.get_num_free_blocks(), 32)
+            self.assertEqual(
+                kv_cache_manager.get_num_available_tokens(
+                    token_num_upper_bound=1024), 256)
+            capacity = kv_cache_manager.get_num_available_tokens(
+                token_num_upper_bound=1024, max_beam_width=beam_width)
+            # 32 free blocks minus one per-beam tail block for each beam.
+            self.assertEqual(capacity, (32 - beam_width + 1) * 8 - 1)
+            for token_num in range(1, capacity + 1):
+                requests = kv_cache_manager.add_dummy_requests(
+                    [0], [token_num], is_gen=True, max_beam_width=beam_width)
+                self.assertIsNotNone(requests, f"token_num={token_num}")
+                kv_cache_manager.free_resources(requests[0])
+            self.assertEqual(kv_cache_manager.get_num_free_blocks(), 32)
+        finally:
+            kv_cache_manager.shutdown()
+
+    def test_add_dummy_requests_beam_search_returns_none_when_pool_too_small(
+            self):
+        """Dummy requests that cannot fit with beam search are skipped
+        instead of failing inside the block manager, and nothing leaks."""
+        beam_width = 4
+        kv_cache_manager = self._create_beam_search_kv_cache_manager(
+            beam_width, max_batch_size=16)
+        try:
+            total_free = kv_cache_manager.get_num_free_blocks()
+            # 31 shared blocks plus one tail block per beam: 35 > 32.
+            self.assertIsNone(
+                kv_cache_manager.add_dummy_requests([0], [255],
+                                                    is_gen=True,
+                                                    max_beam_width=beam_width))
+            # One per-beam block per request: 9 * 4 = 36 > 32.
+            self.assertIsNone(
+                kv_cache_manager.add_dummy_requests(list(range(9)),
+                                                    is_gen=True,
+                                                    max_beam_width=beam_width))
+            self.assertEqual(kv_cache_manager.get_num_free_blocks(), total_free)
+            # 8 * 4 = 32 blocks fits exactly.
+            requests = kv_cache_manager.add_dummy_requests(
+                list(range(8)), is_gen=True, max_beam_width=beam_width)
+            self.assertIsNotNone(requests)
+            self.assertEqual(kv_cache_manager.get_num_free_blocks(), 0)
+            for request in requests:
+                kv_cache_manager.free_resources(request)
+        finally:
+            kv_cache_manager.shutdown()
+
     def test_add_dummy_requests_failure_frees_partial_allocation(self):
         """A partial add_dummy_requests failure must free every block it
         allocated (TRTLLM-14903): leaked blocks on the minimal pool built for

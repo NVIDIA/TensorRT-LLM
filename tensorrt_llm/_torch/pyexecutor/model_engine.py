@@ -3335,14 +3335,16 @@ class PyTorchModelEngine(ModelEngine):
         available_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=max_seq_len,
             batch_size=batch_size,
-            max_num_draft_tokens=_kv_draft)
+            max_num_draft_tokens=_kv_draft,
+            max_beam_width=self.max_beam_width)
 
         # Also consider draft KV cache capacity when it exists
         if draft_kv_cache_manager is not None:
             draft_available_tokens = draft_kv_cache_manager.get_num_available_tokens(
                 batch_size=batch_size,
                 token_num_upper_bound=max_seq_len,
-                max_num_draft_tokens=_kv_draft)
+                max_num_draft_tokens=_kv_draft,
+                max_beam_width=self.max_beam_width)
             available_tokens = min(available_tokens, draft_available_tokens)
 
         token_num = max(
