@@ -20,6 +20,8 @@ import time
 import pytest
 import torch
 
+from tensorrt_llm._torch.auto_deploy.llm_args import \
+    LlmArgs as AutoDeployLlmArgs
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.llmapi.llm_utils import CachedModelLoader, ModelLoader
 from tensorrt_llm.llmapi.utils import AsyncQueue
@@ -68,6 +70,15 @@ def test_cached_model_loader_returns_model_dir(tmp_path):
     model_dir = CachedModelLoader(llm_args)()
 
     assert model_dir == tmp_path
+
+
+@pytest.mark.cpu_only
+def test_cached_model_loader_returns_none_for_autodeploy(tmp_path):
+    llm_args = AutoDeployLlmArgs(model=str(tmp_path))
+
+    model_dir = CachedModelLoader(llm_args)()
+
+    assert model_dir is None
 
 
 @pytest.mark.cpu_only
