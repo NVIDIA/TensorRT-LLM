@@ -45,6 +45,7 @@ from _torch.moe.kimi_k3_ref_moe.kimi_k3_moe_block import KimiK3SparseMoeBlock
 from utils.util import check_accuracy
 
 import tensorrt_llm._torch.models.modeling_kimi_linear as modeling_kimi_linear
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_kimi_linear import KimiK3MoEGate, KimiK3MoERuntime
 from tensorrt_llm._torch.moe.fused_moe.communication import CommunicationFactory
@@ -1721,8 +1722,10 @@ def _swiglu_reference_moe(x, router_logits, routing_method, w1, w2, w3, alpha, b
         pytest.param(
             "CUTEDSL_FC12",
             marks=pytest.mark.skipif(
-                not torch.cuda.is_available() or get_sm_version() != 107,
-                reason="FC12 requires Rubin (SM107)",
+                not torch.cuda.is_available()
+                or get_sm_version() != 107
+                or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+                reason="FC12 requires Rubin (SM107) with CuTe DSL Rubin support",
             ),
         ),
     ],
