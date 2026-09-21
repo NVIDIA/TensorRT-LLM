@@ -513,6 +513,13 @@ def dspark_attention_forward(
     assert start_pos > 0, "DSpark draft attention runs at generation (start_pos > 0)"
     b, block, _ = x.shape
     rd = rope_head_dim
+    # Host-int slices run off the end of the table silently, unlike the batched
+    # path's gathers: a short blk_freqs drops RoPE from the block tail and shows
+    # up only as lower acceptance. Fail loudly instead.
+    assert start_pos + block < freqs_cis.shape[0], (
+        f"DSpark RoPE table holds {freqs_cis.shape[0]} entries, short of the "
+        f"{start_pos + block + 1} the block at start_pos {start_pos} needs"
+    )
     main_freqs = freqs_cis[start_pos : start_pos + 1]
     blk_freqs = freqs_cis[start_pos + 1 : start_pos + 1 + block]
 
