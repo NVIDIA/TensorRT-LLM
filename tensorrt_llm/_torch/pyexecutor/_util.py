@@ -445,14 +445,20 @@ def get_mla_context_workspace_kv_len_cap(
         max_num_tokens,
         max_seq_len,
         enable_chunked_prefill,
-        workspace_is_chunked_prefill_bounded=True):
+        workspace_is_chunked_prefill_bounded=True,
+        chunked_workspace_profiled=True,
+        require_chunked_workspace_profile=True):
     """Max summed attended-KV length covered by the context-MLA workspace reserve.
 
     KV-cache reuse can grow this workspace beyond the fresh-prefill profiling
     floor. Chunked prefill normally prevents that by staging one bounded KV
     chunk per launch. An implementation that consumes the complete attended
     prefix sets ``workspace_is_chunked_prefill_bounded=False`` and receives the
-    same reservation and scheduler admission protection as cache reuse.
+    same reservation and scheduler admission protection as cache reuse. A
+    bounded chunk must also be exercised by profiling before dropping its
+    reservation (``chunked_workspace_profiled``) when
+    ``require_chunked_workspace_profile`` is enabled. Older hardware keeps
+    the existing backend-declared reserve policy without this new requirement.
 
     Otherwise the default (no override) is the never-stall worst case ``min(max_batch_size, max_num_tokens)
     * max_seq_len``: at most that many context requests run in a step, each attending at most ``max_seq_len``
@@ -462,7 +468,10 @@ def get_mla_context_workspace_kv_len_cap(
     """
     workspace_can_exceed_profile = (
         kv_cache_config.enable_block_reuse and not enable_chunked_prefill) or (
-            enable_chunked_prefill and not workspace_is_chunked_prefill_bounded)
+            enable_chunked_prefill and
+            (not workspace_is_chunked_prefill_bounded or
+             (require_chunked_workspace_profile
+              and not chunked_workspace_profiled)))
     if not workspace_can_exceed_profile:
         return None
     worst_case = min(max_batch_size, max_num_tokens) * max_seq_len
@@ -776,6 +785,7 @@ class KvCacheCreator:
         self._max_batch_size = max_batch_size
         self._net_max_seq_len = net_max_seq_len
         self._dummy_reqs = None
+        self._mla_chunked_profile_length: int | None = None
         self._dummy_encoder_inputs: List[MultimodalParams] = []
         self._profiling_stage_data = profiling_stage_data
         self._is_disagg = is_disagg
@@ -1019,6 +1029,42 @@ class KvCacheCreator:
         )
         return int(available_kv_mem)
 
+    def _get_mla_chunked_profile_length(self, input_seq_len: int) -> int | None:
+        """Length needed to profile two full cached-KV chunks with a full query."""
+        model_config = self._model_engine.model.model_config
+        # Skip-softmax preserves dense MLA. DSA-style hooks can switch to
+        # absorption before this request reaches a full cached-KV chunk.
+        if (not is_mla(model_config.pretrained_config)
+                or model_config.attn_backend != "TRTLLM"
+                or getattr(model_config.sparse_attention_config, "algorithm",
+                           None) not in (None, "skip_softmax")):
+            return None
+        # Beam search and speculative decoding use this same dense context
+        # path. Their extra KV capacity is accounted for by
+        # _get_token_num_for_estimation; neither needs a separate exclusion.
+        features = self._model_engine.attn_runtime_features
+        if not features.chunked_prefill or features.chunk_size <= 0:
+            return None
+        # MLA.forward_context uses full-gather on Hopper even when scheduler
+        # chunking is enabled. Only the SM100+ path bounds cached-KV staging.
+        if get_sm_version() < 100:
+            return None
+
+        kv_chunk_tokens = (features.chunk_size *
+                           features.chunked_prefill_buffer_batch_size)
+        # The previous loop's K/V tensors can remain live while the next
+        # chunk is expanded. Exercise two full cached-KV chunks in one forward
+        # to include this overlap, alongside a full query budget. Round the
+        # prefix up to a scheduler-step boundary so the final query is full.
+        cached_tokens = (ceil_div(2 * kv_chunk_tokens, self._max_num_tokens) *
+                         self._max_num_tokens)
+        profile_length = cached_tokens + self._max_num_tokens
+        if profile_length > input_seq_len:
+            # A short-context workload may fill the KV chunk through fan-out;
+            # a single long request cannot cover that case. Keep its reserve.
+            return None
+        return profile_length
+
     def _create_dummy_context_requests(
             self, input_seq_len: int) -> List[trtllm.Request]:
         # Keep the LLM dummy text-only so it can always fill max_num_tokens.
@@ -1028,8 +1074,18 @@ class KvCacheCreator:
         max_num_tokens = self._max_num_tokens
         max_beam_width = self._max_beam_width
 
-        input_seq_len = min(max_num_tokens, input_seq_len)
-        remaining_tokens = max_num_tokens
+        self._mla_chunked_profile_length = self._get_mla_chunked_profile_length(
+            input_seq_len)
+        if self._mla_chunked_profile_length is not None:
+            input_seq_len = self._mla_chunked_profile_length
+            remaining_tokens = input_seq_len
+            logger.info(
+                "Profiling chunked MLA with a cached prefix: "
+                f"prompt length {input_seq_len}, query budget {max_num_tokens}."
+            )
+        else:
+            input_seq_len = min(max_num_tokens, input_seq_len)
+            remaining_tokens = max_num_tokens
         while remaining_tokens > 0:
             input_seq_len = min(input_seq_len, remaining_tokens)
             input_tokens = torch.randint(low=0,
@@ -1498,17 +1554,34 @@ class KvCacheCreator:
         # covers exactly reserve/w tokens of summed attended KV; that count is carried to the KV manager as
         # the scheduler's admission cap so it never re-derives the cap from pool layout (which V2
         # overstates). No cap or w == 0 -> no-op.
-        w_bytes_per_token = get_attention_workspace_bytes_per_token(
-            self._model_engine.model.model_config, self._mapping)
+        # A completed chunk-aware profiling run already prices the cached-KV
+        # staging buffers in the measured peak. Do not subtract an additional
+        # workspace reserve or install an attended-KV admission cap for it.
+        profiled_mla_chunks = (py_executor is not None and not self._skip_est
+                               and self._mla_chunked_profile_length is not None)
+        w_bytes_per_token = (0 if profiled_mla_chunks else
+                             get_attention_workspace_bytes_per_token(
+                                 self._model_engine.model.model_config,
+                                 self._mapping))
         workspace_is_chunked_prefill_bounded = True
         if w_bytes_per_token > 0:
             workspace_is_chunked_prefill_bounded = (
                 get_attention_workspace_is_chunked_prefill_bounded(
                     self._model_engine.model.model_config))
         kv_len_cap = get_mla_context_workspace_kv_len_cap(
-            self._kv_cache_config, self._max_batch_size, self._max_num_tokens,
-            self._max_seq_len, self._llm_args.enable_chunked_prefill,
-            workspace_is_chunked_prefill_bounded)
+            self._kv_cache_config,
+            self._max_batch_size,
+            self._max_num_tokens,
+            self._max_seq_len,
+            self._llm_args.enable_chunked_prefill,
+            workspace_is_chunked_prefill_bounded,
+            chunked_workspace_profiled=profiled_mla_chunks,
+            # Chunk-aware profiling is SM100+ only. Preserve Hopper's existing
+            # backend-declared policy rather than adding a new reserve/cap to
+            # its dense full-gather path just because it cannot profile chunks.
+            require_chunked_workspace_profile=(
+                w_bytes_per_token > 0 and self._llm_args.enable_chunked_prefill
+                and get_sm_version() >= 100))
         if w_bytes_per_token > 0 and kv_len_cap:
             budget_before = kv_cache_max_memory
             workspace_reserve, self._fp8_ctx_mla_kv_len_cap = (
