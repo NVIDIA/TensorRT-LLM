@@ -254,10 +254,13 @@ The two roles split as follows:
 - **Coordinator** — a single process that owns all cluster state: the ctx/gen routers, worker readiness, and (for the KV-cache-aware router) the single ZMQ event-ingest endpoint. It exposes an internal coordination API (`/select`, `/finish`, `/cluster_info`, `/health`).
 - **Fleet workers** — `num_workers` stateless disaggregated servers that share the public port via `SO_REUSEPORT` (each worker is its own process binding the same port, so the kernel load-balances incoming connections across them by 4-tuple hash). Each holds a lightweight delegating client: it computes the routing key locally (e.g. block hashes) and delegates the placement decision to the coordinator over HTTP. Workers own no routing state, so routing stays globally consistent no matter which worker terminates a connection. Each worker also gets a distinct `process_id` for the [global request ID](#unique-global-request-id).
 
-This is controlled by two fields in the disaggregated config:
+This is controlled by the following fields in the disaggregated config:
 
 - `num_workers` (int, default `1`) — number of disaggregated-server worker processes to run on the public port.
 - `disagg_coordinator_url` (str, optional) — URL of an already-running coordinator. When set, this process starts **no** coordinator and its fleet delegates to that external one.
+- `bind_host` (str, default `0.0.0.0`) — local address for every listener started by this process: the single self-contained server, every public worker in a fleet, and the implicit coordinator. Set it to a specific local address when the listeners must be interface-restricted.
+
+`bind_host` does not rewrite `hostname`, which remains the address advertised to clients and peers. By default, all listeners bind all IPv4 interfaces, so an advertised hostname that resolves locally to an IPv6 address does not affect socket binding.
 
 The three resulting topologies:
 
@@ -282,6 +285,8 @@ backend: pytorch
 # Run 4 stateless disaggregated-server workers on port 8000, with an implicit
 # coordinator started in-process on port 7999 (port - 1).
 num_workers: 4
+# Bind all local listeners on IPv4 while advertising hostname to clients and peers.
+bind_host: 0.0.0.0
 context_servers:
   num_instances: 2
   urls:

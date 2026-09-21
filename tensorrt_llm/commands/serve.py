@@ -2014,8 +2014,11 @@ def disaggregated(
     # Inherited by child processes via env var; used for deduplication at query time.
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_DEPLOYMENT_ID] = uuid.uuid4().hex
 
-    logger.info(f"Reserving disaggregated server address "
-                f"{disagg_cfg.hostname}:{disagg_cfg.port} (pid={os.getpid()})")
+    public_host = disagg_cfg.hostname
+    bind_host = disagg_cfg.effective_bind_host
+    logger.info(f"Reserving disaggregated server address {bind_host}:"
+                f"{disagg_cfg.port} (advertised as {public_host}, "
+                f"pid={os.getpid()})")
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
 
@@ -2064,17 +2067,16 @@ def disaggregated(
         # connections this server accepted refuse a restart for ~60s.
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            s.bind((disagg_cfg.hostname, disagg_cfg.port))
+            s.bind((bind_host, disagg_cfg.port))
             if disagg_cfg.port == 0:
                 disagg_cfg.port = s.getsockname()[1]
         except OSError as e:
             holder = _diagnose_port_in_use(disagg_cfg.port)
-            logger.error(
-                f"Failed to bind disaggregated server socket to "
-                f"{disagg_cfg.hostname}:{disagg_cfg.port} (pid={os.getpid()}): "
-                f"{e}. Current port holder(s): {holder}")
+            logger.error(f"Failed to bind disaggregated server socket to "
+                         f"{bind_host}:{disagg_cfg.port} (pid={os.getpid()}): "
+                         f"{e}. Current port holder(s): {holder}")
             raise RuntimeError(
-                f"Failed to bind socket to {disagg_cfg.hostname}:{disagg_cfg.port}: {e}. "
+                f"Failed to bind socket to {bind_host}:{disagg_cfg.port}: {e}. "
                 f"Port holder(s): {holder}")
 
         _publish_bound_address(report_addr, disagg_cfg.hostname,
@@ -2101,7 +2103,7 @@ def disaggregated(
             gc.disable()
 
         set_lifecycle_phase("serving")
-        uvloop.run(server(disagg_cfg.hostname, disagg_cfg.port, sockets=[s]))
+        uvloop.run(server(bind_host, disagg_cfg.port, sockets=[s]))
 
 
 def _launch_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
@@ -2117,7 +2119,9 @@ def _launch_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
     Returns the list of ``Popen`` handles.
     """
     from tensorrt_llm.llmapi.disagg_utils import disagg_process_id_space
-    public_host, public_port = disagg_cfg.hostname, disagg_cfg.port
+    public_host = disagg_cfg.hostname
+    bind_host = disagg_cfg.effective_bind_host
+    public_port = disagg_cfg.port
     base_env = {
         k: v
         for k, v in os.environ.items()
@@ -2152,7 +2156,8 @@ def _launch_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
     ]
     logger.info(
         f"Launching disagg fleet: {num_workers} SO_REUSEPORT workers on "
-        f"{public_host}:{public_port}, coordinator={coordinator_url}")
+        f"{bind_host}:{public_port} (advertised as {public_host}), "
+        f"coordinator={coordinator_url}")
 
     procid_space = disagg_process_id_space()
     if not 1 <= num_workers <= procid_space:
@@ -2223,6 +2228,26 @@ def _serve_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
                 process.terminate()
 
 
+def _local_coordinator_url(bind_host: str, port: int) -> str:
+    """Build a reachable TCP URL for a coordinator in this process.
+
+    Wildcard listener addresses accept connections but are not valid client
+    destinations. Fleet workers are co-located with the implicit coordinator,
+    so use the matching loopback address for wildcard binds. Explicit bind
+    addresses remain the connection target.
+    """
+    if bind_host == "0.0.0.0":  # nosec B104 - comparison, not binding
+        connect_host = "127.0.0.1"
+    elif bind_host == "::":  # nosec B104 - comparison, not binding
+        connect_host = "::1"
+    else:
+        connect_host = bind_host
+
+    if ":" in connect_host:
+        connect_host = f"[{connect_host}]"
+    return f"http://{connect_host}:{port}"
+
+
 def _serve_coordinator_and_fleet(disagg_cfg, config_file,
                                  metadata_server_config_file,
                                  metadata_server_cfg, request_timeout,
@@ -2237,6 +2262,7 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 
     public_host, public_port = disagg_cfg.hostname, disagg_cfg.port
+    bind_host = disagg_cfg.effective_bind_host
     coord_port = int(
         os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_PORT,
                        public_port - 1))
@@ -2249,8 +2275,8 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
         f"/tmp/trtllm_disagg_coord_{public_port}.sock"  # nosec B108
         if use_uds else None)
     # Fleet points at the UDS when enabled; the TCP port stays up for health.
-    coord_url = f"unix:{coord_uds}" if coord_uds else \
-        f"http://{public_host}:{coord_port}"
+    coord_url = (f"unix:{coord_uds}" if coord_uds else _local_coordinator_url(
+        bind_host, coord_port))
 
     # 1. Launch the delegating fleet pointed at the implicit coordinator we start
     #    below (port-1 for TCP; UDS for the hot path). Workers hold
@@ -2276,14 +2302,14 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
         _client_factory,
         metadata_config=metadata_server_cfg,
         server_start_timeout_secs=server_start_timeout)
-    logger.info(f"Coordinator serving on {public_host}:{coord_port} "
-                f"(uds={coord_uds}) (fleet on public port {public_port})")
+    logger.info(f"Coordinator serving on {bind_host}:{coord_port} "
+                f"(uds={coord_uds}) (fleet on {public_host}:{public_port})")
     set_lifecycle_phase("serving")
 
     async def _serve_and_monitor():
         server_task = asyncio.create_task(
             CoordinatorServer(coordinator)(
-                public_host,
+                bind_host,
                 coord_port,
                 uds=coord_uds,
                 keep_alive_timeout=disagg_cfg.server_keep_alive_timeout))
@@ -2409,7 +2435,9 @@ def _run_fleet_worker_impl():
     """Build and run one fleet worker inside its telemetry boundary."""
     _init_fleet_worker_process()
     server = _build_disagg_server_from_env()
-    host, port = server._config.hostname, server._config.port
+    public_host = server._config.hostname
+    host = server._config.effective_bind_host
+    port = server._config.port
 
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -2423,7 +2451,7 @@ def _run_fleet_worker_impl():
             f"Fleet worker failed to SO_REUSEPORT-bind {host}:{port}: {e}")
     pidx = os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_WORKER_PROCESS_ID, "0")
     logger.info(f"Fleet worker process_id={pidx} bound {host}:{port} "
-                f"(SO_REUSEPORT)")
+                f"(advertised as {public_host}, SO_REUSEPORT)")
     set_lifecycle_phase("serving")
     asyncio.run(server(host, port, sockets=[s]))
 

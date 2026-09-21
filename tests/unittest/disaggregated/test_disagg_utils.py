@@ -1,6 +1,7 @@
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import fields
 
 import pytest
 import yaml
@@ -119,6 +120,8 @@ def test_extract_disagg_cfg(sample_yaml_config):
         True,
         "num_workers":
         4,
+        "bind_host":
+        "0.0.0.0",
         "disagg_coordinator_url":
         "http://coordinator:7999",
     })
@@ -127,7 +130,68 @@ def test_extract_disagg_cfg(sample_yaml_config):
     verify_disagg_config(config, sample_yaml_config)
     assert config.gen_tokids_ctxbytes is True
     assert config.num_workers == 4
+    assert config.bind_host == "0.0.0.0"
+    assert config.effective_bind_host == "0.0.0.0"
     assert config.disagg_coordinator_url == "http://coordinator:7999"
+    assert all("bind_host" not in server.other_args
+               for server in config.server_configs)
+
+
+def test_bind_host_defaults_to_all_ipv4_interfaces():
+    config = extract_disagg_cfg(**get_yaml_config())
+
+    assert config.hostname == "test_host"
+    assert config.bind_host == "0.0.0.0"
+    assert config.effective_bind_host == "0.0.0.0"
+
+
+def test_bind_host_preserves_existing_positional_order():
+    yaml_config = get_yaml_config()
+    config = extract_disagg_cfg(
+        "positional-host",
+        9001,
+        3,
+        4,
+        True,
+        "perf-output",
+        yaml_config["context_servers"],
+        yaml_config["generation_servers"],
+        None,
+        None,
+        None,
+        7,
+        "generation_first",
+        True,
+        True,
+        True,
+        2,
+        "http://coordinator:8998",
+        42,
+        "secret",
+        "X-Parent",
+        "both",
+    )
+
+    assert config.disagg_coordinator_url == "http://coordinator:8998"
+    assert config.server_keep_alive_timeout == 42
+    assert config.internal_request_auth_key == "secret"
+    assert config.conversation_affinity_header_for_subagents == "X-Parent"
+    assert config.subagent_affinity_scope == "both"
+    assert config.bind_host == "0.0.0.0"
+    assert fields(DisaggServerConfig)[-1].name == "bind_host"
+
+
+def test_bind_host_survives_yaml_parser(tmp_path):
+    yaml_config = get_yaml_config()
+    yaml_config["bind_host"] = "127.0.0.1"
+    yaml_file = tmp_path / "bind_config.yaml"
+    with open(yaml_file, "w") as f:
+        yaml.dump(yaml_config, f)
+
+    config = parse_disagg_config_file(yaml_file)
+    assert config.hostname == "test_host"
+    assert config.bind_host == "127.0.0.1"
+    assert config.effective_bind_host == "127.0.0.1"
 
 
 def test_extract_disagg_metrics_controls():
