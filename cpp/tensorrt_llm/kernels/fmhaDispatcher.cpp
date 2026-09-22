@@ -147,6 +147,7 @@ bool FmhaDispatcher::isSupported()
             // Generation-style kernels on long KV can pick MultiCtasKv cubins
             tllmRunnerParams.mMultiCtasKvMode = true;
         }
+        tllmRunnerParams.mUsesSpcompress = mFixedParams.useSpcompress;
 
         foundKernels = mTllmGenFMHARunner->isSupported(tllmRunnerParams);
     }
@@ -304,6 +305,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
             tllmRunnerParams.multiCtasKvScratchPtr = runnerParams.multiCtasKvScratchPtr;
             tllmRunnerParams.multiCtasKvCounterPtr = runnerParams.multiCtasKvCounterPtr;
         }
+        tllmRunnerParams.mUsesSpcompress = mFixedParams.useSpcompress;
 
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }

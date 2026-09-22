@@ -269,3 +269,127 @@ def test_unknown_top_level_fields_are_tolerated():
         prompt_cache_key="k",
     )
     assert request.input == "hi"
+
+
+# ---------------------------------------------------------------------------
+# Explicit null means "unset" (litellm-style clients)
+# ---------------------------------------------------------------------------
+#
+# Item shapes below mirror live traffic from clients that serialize every
+# unset optional as null (content is synthetic).
+
+
+def _echoed_assistant_message_with_nulls():
+    return {
+        "id": "msg_0123456789abcdef",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "phase": None,
+        "content": [
+            {
+                "type": "output_text",
+                "text": "checking the log format first.",
+                "annotations": [],
+                "logprobs": None,
+            }
+        ],
+    }
+
+
+def _echoed_function_call_with_nulls():
+    return {
+        "type": "function_call",
+        "id": "fc_0123456789abcdef",
+        "call_id": "call_0123456789abcdef",
+        "name": "bash",
+        "arguments": '{"command": "ls /app"}',
+        "caller": None,
+        "namespace": None,
+        "status": None,
+        "async_": None,
+    }
+
+
+def test_null_logprobs_on_echoed_output_text_is_unset():
+    """Regression: null logprobs on an echoed output_text part failed validation."""
+    request = ResponsesRequest(
+        model="m",
+        input=[
+            _message_item("user", "q1"),
+            _echoed_assistant_message_with_nulls(),
+            _message_item("user", "q2"),
+        ],
+    )
+    assert len(request.input) == 3
+
+
+def test_null_optionals_on_echoed_function_call_are_unset():
+    request = ResponsesRequest(
+        model="m",
+        input=[
+            _message_item("user", "q"),
+            _echoed_function_call_with_nulls(),
+            {
+                "type": "function_call_output",
+                "call_id": "call_0123456789abcdef",
+                "output": "app.py",
+            },
+        ],
+    )
+    call = request.input[1]
+    call_id = call["call_id"] if isinstance(call, dict) else call.call_id
+    assert call_id == "call_0123456789abcdef"
+
+
+def test_full_multi_turn_echo_with_nulls_round_trips():
+    """System + user + assistant echo + reasoning + function_call + output."""
+    request = ResponsesRequest(
+        model="m",
+        input=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            _message_item("user", "find the last date on each line"),
+            _echoed_assistant_message_with_nulls(),
+            {
+                "id": "rs_0123456789abcdef",
+                "type": "reasoning",
+                "summary": [],
+                "content": [{"type": "reasoning_text", "text": "Need to check the file."}],
+            },
+            _echoed_function_call_with_nulls(),
+            {
+                "type": "function_call_output",
+                "call_id": "call_0123456789abcdef",
+                "output": '{"returncode": 0}',
+            },
+        ],
+    )
+    assert len(request.input) == 6
+
+
+def test_null_top_level_optionals_are_unset():
+    """tool_choice/metadata/temperature: null must mean "use the default"."""
+    request = ResponsesRequest(
+        model="m",
+        input="hi",
+        tool_choice=None,
+        metadata=None,
+        temperature=None,
+        service_tier=None,
+        truncation=None,
+    )
+    assert request.tool_choice == "auto"
+    assert request.metadata is None
+    assert request.service_tier == "auto"
+    assert request.truncation == "disabled"
+
+
+def test_meaningful_values_survive_the_null_scrub():
+    request = ResponsesRequest(
+        model="m",
+        input=[_message_item("user", "q")],
+        temperature=0.25,
+        tool_choice="none",
+    )
+    assert request.temperature == 0.25
+    assert request.tool_choice == "none"

@@ -462,3 +462,136 @@ def test_capture_taps_the_next_layers_aggregated_stream():
         seen[last_idx], _apply_attn_res(h, br[:num_layers], proj_last, norm_last)
     ), "tail used the last layer's weights instead of the output-side ones"
     assert not torch.allclose(seen[last_idx], h), "tail captured the raw prefix sum"
+
+
+@pytest.mark.parametrize("aggregated", [True, False])
+def test_aux_capture_taps_the_selected_stream(monkeypatch, aggregated):
+    """Both KIMI_K3_AUX_ATTN_RES_STREAM conventions must be executed.
+
+    The switch picks which residual value the drafter sees, and a mismatch only
+    lowers acceptance -- nothing raises. The test above stubs the layer and so
+    never runs either branch; this one calls the real layer forward.
+    """
+    pytest.importorskip("fla")
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.models import modeling_kimi_linear as mkl
+
+    monkeypatch.setattr(mkl, "_AUX_ATTN_RES_STREAM_ENABLED", aggregated)
+
+    torch.manual_seed(0)
+    num_tokens, hidden, k_max, num_snapshots = 3, 8, 4, 2
+    proj = torch.nn.Linear(hidden, 1, bias=False, dtype=torch.float32)
+    norm = mkl.KimiK3RMSNorm(hidden, eps=1e-6, dtype=torch.float32)
+    with torch.no_grad():
+        proj.weight.copy_(torch.randn(1, hidden))
+        norm.weight.copy_(torch.randn(hidden) + 1.0)
+
+    prefix_sum = torch.randn(num_tokens, hidden)
+    block_residual = torch.randn(k_max, num_tokens, hidden)
+
+    seen = {}
+    layer = SimpleNamespace(
+        self_attention_res_proj=proj,
+        self_attention_res_norm=norm,
+        # Not a block boundary, so prefix_sum survives to the end of forward.
+        layer_idx=1,
+        attn_res_block_size=4,
+        input_layernorm=lambda h: h,
+        is_kda=True,
+        linear_attn=lambda h, md: torch.zeros_like(h),
+        mlp_res_proj=proj,
+        mlp_res_norm=norm,
+        post_attention_layernorm=lambda h: h,
+        is_moe=False,
+        mlp=lambda h: torch.zeros_like(h),
+    )
+    spec_md = SimpleNamespace(
+        maybe_capture_hidden_states=lambda lid, h, r: seen.__setitem__(lid, h.clone())
+    )
+
+    mkl.KimiLinearDecoderLayer.forward(
+        layer,
+        prefix_sum.clone(),
+        block_residual.clone(),
+        num_snapshots,
+        attn_metadata=SimpleNamespace(),
+        capture=(spec_md, 0),
+    )
+
+    mixture = mkl._apply_attn_res(prefix_sum, block_residual[:num_snapshots], proj, norm)
+    expected, other = (mixture, prefix_sum) if aggregated else (prefix_sum, mixture)
+    torch.testing.assert_close(seen[0], expected)
+    assert not torch.allclose(seen[0], other), (
+        "the tapped tensor did not follow _AUX_ATTN_RES_STREAM_ENABLED"
+    )
+
+
+@pytest.mark.parametrize("aggregated", [True, False])
+def test_aux_capture_tail_follows_the_same_switch(monkeypatch, aggregated):
+    """The final layer has no successor, so the tail recompute must match.
+
+    A tail that ignored the switch would hand the last captured layer a tensor
+    from the other convention -- the one inconsistency the in-loop test cannot
+    see, because the loop never reaches the final layer's tap.
+    """
+    pytest.importorskip("fla")
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.models import modeling_kimi_linear as mkl
+
+    monkeypatch.setattr(mkl, "_AUX_ATTN_RES_STREAM_ENABLED", aggregated)
+
+    torch.manual_seed(1)
+    num_layers, num_tokens, hidden = 3, 2, 8
+    out_proj = torch.nn.Linear(hidden, 1, bias=False, dtype=torch.float32)
+    out_norm = mkl.KimiK3RMSNorm(hidden, eps=1e-6, dtype=torch.float32)
+    with torch.no_grad():
+        out_proj.weight.copy_(torch.randn(1, hidden) * 3.0)
+        out_norm.weight.copy_(torch.randn(hidden) + 1.0)
+
+    class _Layer:
+        def __init__(self, idx):
+            self.layer_idx = idx
+
+        def __call__(self, hidden_states, block_residual, num_snapshots, attn_metadata, capture):
+            block_residual[num_snapshots] = hidden_states * (self.layer_idx + 1)
+            return hidden_states + (self.layer_idx + 1), num_snapshots + 1
+
+    layers = [_Layer(i) for i in range(num_layers)]
+    last_idx = num_layers - 1
+    seen = {}
+    # Only the final layer: the in-loop tap fires for layers[i-1], so this set
+    # leaves the tail as the single capture site.
+    spec_md = SimpleNamespace(
+        _capture_layer_set=frozenset({last_idx}),
+        maybe_capture_hidden_states=lambda lid, h, r: seen.__setitem__(lid, h.clone()),
+    )
+    embeds = torch.randn(num_tokens, hidden, dtype=torch.float32)
+    fake = SimpleNamespace(
+        embed_tokens=lambda ids: embeds,
+        layers=layers,
+        norm=lambda h: h,
+        output_attn_res_proj=out_proj,
+        output_attn_res_norm=out_norm,
+        num_attn_res_snapshots=num_layers,
+    )
+
+    mkl.KimiLinearModel.forward(
+        fake,
+        attn_metadata=SimpleNamespace(num_tokens=num_tokens),
+        input_ids=torch.zeros(num_tokens, dtype=torch.int32),
+        spec_metadata=spec_md,
+    )
+
+    br = torch.empty(num_layers, num_tokens, hidden)
+    h = embeds
+    for i in range(num_layers):
+        br[i] = h * (i + 1)
+        h = h + (i + 1)
+    mixture = mkl._apply_attn_res(h, br[:num_layers], out_proj, out_norm)
+    expected, other = (mixture, h) if aggregated else (h, mixture)
+    torch.testing.assert_close(seen[last_idx], expected)
+    assert not torch.allclose(seen[last_idx], other), (
+        "the tail tensor did not follow _AUX_ATTN_RES_STREAM_ENABLED"
+    )

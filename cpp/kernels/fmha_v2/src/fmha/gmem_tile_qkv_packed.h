@@ -94,84 +94,45 @@ struct Gmem_tile_qkv
 {
 
     // The size of each LDG.
-    enum
-    {
-        BYTES_PER_LDG = 16
-    };
+    static constexpr int BYTES_PER_LDG = 16;
 
     // The number of bits/bytes of element
-    enum
-    {
-        BITS_PER_ELEMENT = BITS_PER_ELEMENT_
-    };
+    static constexpr int BITS_PER_ELEMENT = BITS_PER_ELEMENT_;
 
-    enum
-    {
-        BYTES_PER_ELEMENT = BITS_PER_ELEMENT_ / 8
-    };
+    static constexpr int BYTES_PER_ELEMENT = BITS_PER_ELEMENT_ / 8;
 
     // The size of a row in bytes.
-    enum
-    {
-        BYTES_PER_ROW = COLS * BITS_PER_ELEMENT / 8
-    };
+    static constexpr int BYTES_PER_ROW = COLS * BITS_PER_ELEMENT / 8;
 
     // The number of threads to load a "row" of the matrix.
-    enum
-    {
-        THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_LDG
-    };
+    static constexpr int THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_LDG;
 
     // The valid size of a row in bytes (without paddings).
-    enum
-    {
-        VALID_COLS = VALID_COLS_
-    };
+    static constexpr int VALID_COLS = VALID_COLS_;
 
     // The amount of bytes that are valid per row.
-    enum
-    {
-        VALID_BYTES_PER_ROW = VALID_COLS * BITS_PER_ELEMENT / 8
-    };
+    static constexpr int VALID_BYTES_PER_ROW = VALID_COLS * BITS_PER_ELEMENT / 8;
 
     // The number of "rows" loaded per LDG.
-    enum
-    {
-        ROWS_PER_LDG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW
-    };
+    static constexpr int ROWS_PER_LDG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW;
 
     // The number of rows.
-    enum
-    {
-        ROWS = ROWS_
-    };
+    static constexpr int ROWS = ROWS_;
 
     // The number of LDGs needed to load a chunk of the Q matrix.
-    enum
-    {
-        LDGS = fmha::Div_up<ROWS, ROWS_PER_LDG>::VALUE
-    };
+    static constexpr int LDGS = fmha::Div_up<ROWS, ROWS_PER_LDG>::VALUE;
 
     // The number of predicate registers.
-    enum
-    {
-        PRED_REGS = fmha::Compute_number_of_pred_regs<LDGS>::VALUE
-    };
+    static constexpr int PRED_REGS = fmha::Compute_number_of_pred_regs<LDGS>::VALUE;
 
     // Is it Hopper?
-    enum
-    {
-        IS_HOPPER = std::is_same<typename Traits::Gpu_arch, typename fmha::Hopper>::value == true
-    };
+    static constexpr int IS_HOPPER = std::is_same<typename Traits::Gpu_arch, typename fmha::Hopper>::value == true;
 
     // Make sure we use a single register to store predicates. Do not throw for Hopper for now.
     static_assert(!USE_LDGSTS_ || PRED_REGS == 1 || IS_HOPPER, "");
 
     // We do not use LDGSTS (for the moment).
-    enum
-    {
-        USE_LDGSTS = USE_LDGSTS_
-    };
+    static constexpr int USE_LDGSTS = USE_LDGSTS_;
 
     // Ctor for bert::Fused_multihead_attention_params_v2 class
     template <typename Block_info>
@@ -449,84 +410,45 @@ struct Gmem_tile_q_k_v
 {
 
     // The size of each LDG.
-    enum
-    {
-        BYTES_PER_LDG = 16
-    };
+    static constexpr int BYTES_PER_LDG = 16;
 
     // The number of bits/bytes of element
-    enum
-    {
-        BITS_PER_ELEMENT = BITS_PER_ELEMENT_
-    };
+    static constexpr int BITS_PER_ELEMENT = BITS_PER_ELEMENT_;
 
-    enum
-    {
-        BYTES_PER_ELEMENT = BITS_PER_ELEMENT_ / 8
-    };
+    static constexpr int BYTES_PER_ELEMENT = BITS_PER_ELEMENT_ / 8;
 
     // The size of a row in bytes.
-    enum
-    {
-        BYTES_PER_ROW = COLS * BITS_PER_ELEMENT / 8
-    };
+    static constexpr int BYTES_PER_ROW = COLS * BITS_PER_ELEMENT / 8;
 
     // The number of threads to load a "row" of the matrix.
-    enum
-    {
-        THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_LDG
-    };
+    static constexpr int THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_LDG;
 
     // The valid size of a row in bytes (without paddings).
-    enum
-    {
-        VALID_COLS = VALID_COLS_
-    };
+    static constexpr int VALID_COLS = VALID_COLS_;
 
     // The amount of bytes that are valid per row.
-    enum
-    {
-        VALID_BYTES_PER_ROW = VALID_COLS * BITS_PER_ELEMENT / 8
-    };
+    static constexpr int VALID_BYTES_PER_ROW = VALID_COLS * BITS_PER_ELEMENT / 8;
 
     // The number of "rows" loaded per LDG.
-    enum
-    {
-        ROWS_PER_LDG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW
-    };
+    static constexpr int ROWS_PER_LDG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW;
 
     // The number of rows.
-    enum
-    {
-        ROWS = ROWS_
-    };
+    static constexpr int ROWS = ROWS_;
 
     // The number of LDGs needed to load a chunk of the Q matrix.
-    enum
-    {
-        LDGS = fmha::Div_up<ROWS, ROWS_PER_LDG>::VALUE
-    };
+    static constexpr int LDGS = fmha::Div_up<ROWS, ROWS_PER_LDG>::VALUE;
 
     // The number of predicate registers.
-    enum
-    {
-        PRED_REGS = fmha::Compute_number_of_pred_regs<LDGS>::VALUE
-    };
+    static constexpr int PRED_REGS = fmha::Compute_number_of_pred_regs<LDGS>::VALUE;
 
     // Is it Hopper?
-    enum
-    {
-        IS_HOPPER = std::is_same<typename Traits::Gpu_arch, typename fmha::Hopper>::value == true
-    };
+    static constexpr int IS_HOPPER = std::is_same<typename Traits::Gpu_arch, typename fmha::Hopper>::value == true;
 
     // Make sure we use a single register to store predicates. Do not throw for Hopper for now.
     static_assert(!USE_LDGSTS_ || PRED_REGS == 1 || IS_HOPPER, "");
 
     // We do not use LDGSTS (for the moment).
-    enum
-    {
-        USE_LDGSTS = USE_LDGSTS_
-    };
+    static constexpr int USE_LDGSTS = USE_LDGSTS_;
 
     // Ctor
     // qkv_offset: 0 for Q, 1 for K, 2 for V
@@ -710,84 +632,45 @@ struct Gmem_tile_contiguous_kv
 {
 
     // The size of each LDG.
-    enum
-    {
-        BYTES_PER_LDG = 16
-    };
+    static constexpr int BYTES_PER_LDG = 16;
 
     // The number of bits/bytes of element
-    enum
-    {
-        BITS_PER_ELEMENT = BITS_PER_ELEMENT_
-    };
+    static constexpr int BITS_PER_ELEMENT = BITS_PER_ELEMENT_;
 
-    enum
-    {
-        BYTES_PER_ELEMENT = BITS_PER_ELEMENT_ / 8
-    };
+    static constexpr int BYTES_PER_ELEMENT = BITS_PER_ELEMENT_ / 8;
 
     // The size of a row in bytes.
-    enum
-    {
-        BYTES_PER_ROW = COLS * BITS_PER_ELEMENT / 8
-    };
+    static constexpr int BYTES_PER_ROW = COLS * BITS_PER_ELEMENT / 8;
 
     // The number of threads to load a "row" of the matrix.
-    enum
-    {
-        THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_LDG
-    };
+    static constexpr int THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_LDG;
 
     // The valid size of a row in bytes (without paddings).
-    enum
-    {
-        VALID_COLS = VALID_COLS_
-    };
+    static constexpr int VALID_COLS = VALID_COLS_;
 
     // The amount of bytes that are valid per row.
-    enum
-    {
-        VALID_BYTES_PER_ROW = VALID_COLS * BITS_PER_ELEMENT / 8
-    };
+    static constexpr int VALID_BYTES_PER_ROW = VALID_COLS * BITS_PER_ELEMENT / 8;
 
     // The number of "rows" loaded per LDG.
-    enum
-    {
-        ROWS_PER_LDG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW
-    };
+    static constexpr int ROWS_PER_LDG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW;
 
     // The number of rows.
-    enum
-    {
-        ROWS = ROWS_
-    };
+    static constexpr int ROWS = ROWS_;
 
     // The number of LDGs needed to load a chunk of the Q matrix.
-    enum
-    {
-        LDGS = fmha::Div_up<ROWS, ROWS_PER_LDG>::VALUE
-    };
+    static constexpr int LDGS = fmha::Div_up<ROWS, ROWS_PER_LDG>::VALUE;
 
     // The number of predicate registers.
-    enum
-    {
-        PRED_REGS = fmha::Compute_number_of_pred_regs<LDGS>::VALUE
-    };
+    static constexpr int PRED_REGS = fmha::Compute_number_of_pred_regs<LDGS>::VALUE;
 
     // Is it Hopper?
-    enum
-    {
-        IS_HOPPER = std::is_same<typename Traits::Gpu_arch, typename fmha::Hopper>::value == true
-    };
+    static constexpr int IS_HOPPER = std::is_same<typename Traits::Gpu_arch, typename fmha::Hopper>::value == true;
 
     // Make sure we use a single register to store predicates. Do not throw for Hopper for now.
     static_assert(!USE_LDGSTS_ || PRED_REGS == 1 || IS_HOPPER, "");
 
     // We do not use LDGSTS (for the moment).
-    enum
-    {
-        USE_LDGSTS = USE_LDGSTS_
-    };
+    static constexpr int USE_LDGSTS = USE_LDGSTS_;
 
     // Ctor for bert::Fused_multihead_attention_params_v2 class
     template <typename Block_info>
@@ -1008,90 +891,48 @@ struct Gmem_tile_paged_kv
 {
 
     // The size of each LDG.
-    enum
-    {
-        BYTES_PER_LDG = 16
-    };
+    static constexpr int BYTES_PER_LDG = 16;
 
     // The number of bits/bytes of element
-    enum
-    {
-        BITS_PER_ELEMENT = BITS_PER_ELEMENT_
-    };
+    static constexpr int BITS_PER_ELEMENT = BITS_PER_ELEMENT_;
 
-    enum
-    {
-        BYTES_PER_ELEMENT = BITS_PER_ELEMENT_ / 8
-    };
+    static constexpr int BYTES_PER_ELEMENT = BITS_PER_ELEMENT_ / 8;
 
     // The size of a row in bytes.
-    enum
-    {
-        BYTES_PER_ROW = COLS * BITS_PER_ELEMENT / 8
-    };
+    static constexpr int BYTES_PER_ROW = COLS * BITS_PER_ELEMENT / 8;
 
     // The number of threads to load a "row" of the matrix.
-    enum
-    {
-        THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_LDG
-    };
+    static constexpr int THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_LDG;
 
     // The valid size of a row in bytes (without paddings).
-    enum
-    {
-        VALID_COLS = VALID_COLS_
-    };
+    static constexpr int VALID_COLS = VALID_COLS_;
 
     // The amount of bytes that are valid per row.
-    enum
-    {
-        VALID_BYTES_PER_ROW = VALID_COLS * BITS_PER_ELEMENT / 8
-    };
+    static constexpr int VALID_BYTES_PER_ROW = VALID_COLS * BITS_PER_ELEMENT / 8;
 
     // The number of "rows" loaded per LDG.
-    enum
-    {
-        ROWS_PER_LDG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW
-    };
+    static constexpr int ROWS_PER_LDG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW;
 
     // The number of rows.
-    enum
-    {
-        ROWS = ROWS_
-    };
+    static constexpr int ROWS = ROWS_;
 
     // The number of LDGs needed to load a chunk of the Q matrix.
-    enum
-    {
-        LDGS = fmha::Div_up<ROWS, ROWS_PER_LDG>::VALUE
-    };
+    static constexpr int LDGS = fmha::Div_up<ROWS, ROWS_PER_LDG>::VALUE;
 
     // The number of predicate registers.
-    enum
-    {
-        PRED_REGS = fmha::Compute_number_of_pred_regs<LDGS>::VALUE
-    };
+    static constexpr int PRED_REGS = fmha::Compute_number_of_pred_regs<LDGS>::VALUE;
 
     // Is sliding window attention used ?
-    enum
-    {
-        SLIDING_WINDOW_ATTENTION = SLIDING_WINDOW_ATTENTION_
-    };
+    static constexpr int SLIDING_WINDOW_ATTENTION = SLIDING_WINDOW_ATTENTION_;
 
     // Is it Hopper?
-    enum
-    {
-        IS_HOPPER = std::is_same<typename Traits::Gpu_arch, typename fmha::Hopper>::value == true
-    };
+    static constexpr int IS_HOPPER = std::is_same<typename Traits::Gpu_arch, typename fmha::Hopper>::value == true;
 
     // Make sure we use a single register to store predicates. Do not throw for Hopper for now.
     static_assert(!USE_LDGSTS_ || PRED_REGS == 1 || IS_HOPPER, "");
 
     // We do not use LDGSTS (for the moment).
-    enum
-    {
-        USE_LDGSTS = USE_LDGSTS_
-    };
+    static constexpr int USE_LDGSTS = USE_LDGSTS_;
 
     // Ctor.
     template <typename Block_info>
@@ -1254,79 +1095,43 @@ struct Gmem_tile_q_kv
 {
 
     // The size of each LDG.
-    enum
-    {
-        BYTES_PER_LDG = 16
-    };
+    static constexpr int BYTES_PER_LDG = 16;
 
     // The padded to the next power of 2 number of columns
-    enum
-    {
-        COLS_PADDED = Next_power_of_two<COLS>::VALUE
-    };
+    static constexpr int COLS_PADDED = Next_power_of_two<COLS>::VALUE;
 
     // The padded size of a row in bytes.
-    enum
-    {
-        BYTES_PER_ROW_PADDED = COLS_PADDED * BITS_PER_ELEMENT / 8
-    };
+    static constexpr int BYTES_PER_ROW_PADDED = COLS_PADDED * BITS_PER_ELEMENT / 8;
 
     // The size of a row in bytes.
-    enum
-    {
-        BYTES_PER_ROW = COLS * BITS_PER_ELEMENT / 8
-    };
+    static constexpr int BYTES_PER_ROW = COLS * BITS_PER_ELEMENT / 8;
 
     // The number of threads to load a padded "row" of the matrix.
-    enum
-    {
-        THREADS_PER_ROW_PADDED = BYTES_PER_ROW_PADDED / BYTES_PER_LDG
-    };
+    static constexpr int THREADS_PER_ROW_PADDED = BYTES_PER_ROW_PADDED / BYTES_PER_LDG;
 
     // The number of threads to load a "row" of the matrix.
-    enum
-    {
-        THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_LDG
-    };
+    static constexpr int THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_LDG;
 
     // The number of "rows" loaded per LDG.
-    enum
-    {
-        ROWS_PER_LDG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW_PADDED
-    };
+    static constexpr int ROWS_PER_LDG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW_PADDED;
 
     // The number of rows.
-    enum
-    {
-        ROWS = ROWS_
-    };
+    static constexpr int ROWS = ROWS_;
 
     // The number of LDGs needed to load a chunk of the Q matrix.
-    enum
-    {
-        LDGS = fmha::Div_up<ROWS, ROWS_PER_LDG>::VALUE
-    };
+    static constexpr int LDGS = fmha::Div_up<ROWS, ROWS_PER_LDG>::VALUE;
 
     // The number of predicate registers.
-    enum
-    {
-        PRED_REGS = fmha::Compute_number_of_pred_regs<LDGS>::VALUE
-    };
+    static constexpr int PRED_REGS = fmha::Compute_number_of_pred_regs<LDGS>::VALUE;
 
     // Is it Hopper?
-    enum
-    {
-        IS_HOPPER = std::is_same<typename Traits::Gpu_arch, typename fmha::Hopper>::value == true
-    };
+    static constexpr int IS_HOPPER = std::is_same<typename Traits::Gpu_arch, typename fmha::Hopper>::value == true;
 
     // Make sure we use a single register to store predicates. Do not throw for Hopper for now.
     static_assert(!USE_LDGSTS_ || PRED_REGS == 1 || IS_HOPPER, "");
 
     // We do not use LDGSTS (for the moment).
-    enum
-    {
-        USE_LDGSTS = USE_LDGSTS_
-    };
+    static constexpr int USE_LDGSTS = USE_LDGSTS_;
 
     // Ctor.
     template <typename Params, typename Block_info>
@@ -1455,22 +1260,13 @@ struct Gmem_tile_qkv_interleaved
 {
 
     // The vectorization width for NC/32HW32.
-    enum
-    {
-        VEC = 32
-    };
+    static constexpr int VEC = 32;
 
     // The size of each LDG.
-    enum
-    {
-        BYTES_PER_LDG = 16
-    };
+    static constexpr int BYTES_PER_LDG = 16;
 
     // The size of a row in bytes.
-    enum
-    {
-        BYTES_PER_ROW = VEC * BITS_PER_ELEMENT / 8
-    };
+    static constexpr int BYTES_PER_ROW = VEC * BITS_PER_ELEMENT / 8;
 
     // DEBUG.
     static_assert(BYTES_PER_ROW == 32, "");
@@ -1478,10 +1274,7 @@ struct Gmem_tile_qkv_interleaved
     // END OF DEBUG.
 
     // The number of threads to load a "row" of the matrix.
-    enum
-    {
-        THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_LDG
-    };
+    static constexpr int THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_LDG;
 
     // DEBUG.
     static_assert(THREADS_PER_ROW == 2, "");
@@ -1489,16 +1282,10 @@ struct Gmem_tile_qkv_interleaved
     // END OF DEBUG.
 
     // The number of "rows" loaded per LDG.
-    enum
-    {
-        ROWS_PER_LDG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW
-    };
+    static constexpr int ROWS_PER_LDG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW;
 
     // The number of slices. It is either 1 for DIM_PER_HEAD == 32 and 2 for DIM_PER_HEAD == 64.
-    enum
-    {
-        NUM_SLICES = COLS / VEC
-    };
+    static constexpr int NUM_SLICES = COLS / VEC;
 
     // DEBUG.
     static_assert(NUM_SLICES == 1 || NUM_SLICES == 2, "");
@@ -1506,31 +1293,19 @@ struct Gmem_tile_qkv_interleaved
     // END OF DEBUG.
 
     // The number of rows in a slice.
-    enum
-    {
-        ROWS = ROWS_
-    };
+    static constexpr int ROWS = ROWS_;
 
     // The number of LDGs needed to load a chunk of the Q matrix.
-    enum
-    {
-        LDGS = fmha::Div_up<ROWS * NUM_SLICES, ROWS_PER_LDG>::VALUE
-    };
+    static constexpr int LDGS = fmha::Div_up<ROWS * NUM_SLICES, ROWS_PER_LDG>::VALUE;
 
     // The number of predicate registers.
-    enum
-    {
-        PRED_REGS = fmha::Compute_number_of_pred_regs<LDGS>::VALUE
-    };
+    static constexpr int PRED_REGS = fmha::Compute_number_of_pred_regs<LDGS>::VALUE;
 
     // Make sure we use a single register to store predicates.
     static_assert(PRED_REGS == 1, "");
 
     // Do we use LDGSTS on Ampere?
-    enum
-    {
-        USE_LDGSTS = USE_LDGSTS_
-    };
+    static constexpr int USE_LDGSTS = USE_LDGSTS_;
 
     // Ctor.
     template <typename Params, typename Block_info>

@@ -21,7 +21,7 @@ from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ..attention.mla import MLA
 from ..model_config import ModelConfig, TConfig
 from ..modules.decoder_layer import DecoderLayer
-from ..modules.embedding import Embedding
+from ..modules.embedding import Embedding, get_masked_input_and_mask
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
@@ -92,6 +92,27 @@ def greedy_or_sample(logits: torch.Tensor, temperature: float) -> torch.Tensor:
     return sampled.view(probs.shape[:-1])
 
 
+def markov_prev_embeddings(prev_tokens: torch.Tensor,
+                           markov_w1: torch.Tensor) -> torch.Tensor:
+    """``markov_w1[prev_tokens]`` with out-of-vocab anchors masked to zero.
+
+    The anchor is the last accepted token, which on the one-model rejection path
+    comes from flashinfer's ``chain_speculative_sampling``: it pads non-accepted
+    positions with ``-1`` and returns an out-of-range id for a row whose
+    ``relu(target - draft)`` residual has no mass. Mask like modules/embedding.py
+    does, so such a row contributes no bias instead of tripping a device assert.
+
+    Args:
+        prev_tokens: previous token ids (draft vocab), any shape.
+        markov_w1: [vocab, rank].
+    Returns:
+        ``prev_tokens.shape + (rank,)`` in ``markov_w1``'s dtype.
+    """
+    prev_tokens, invalid = get_masked_input_and_mask(prev_tokens.long(), 0,
+                                                     markov_w1.shape[0])
+    return F.embedding(prev_tokens, markov_w1).masked_fill(invalid, 0)
+
+
 def dspark_markov_step_bias(prev_tokens: torch.Tensor, markov_w1: torch.Tensor,
                             markov_w2: torch.Tensor) -> torch.Tensor:
     """Vanilla Markov head logit bias for one intra-block draft step.
@@ -109,7 +130,7 @@ def dspark_markov_step_bias(prev_tokens: torch.Tensor, markov_w1: torch.Tensor,
     Returns:
         [B, vocab_or_shard] bias in the markov weights' dtype.
     """
-    return F.linear(F.embedding(prev_tokens, markov_w1), markov_w2)
+    return F.linear(markov_prev_embeddings(prev_tokens, markov_w1), markov_w2)
 
 
 def dspark_markov_chain(
@@ -226,7 +247,7 @@ class VanillaMarkov(nn.Module):
                                    bias=False)
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
-        return F.embedding(token_ids.long(), self.markov_w1.weight)
+        return markov_prev_embeddings(token_ids, self.markov_w1.weight)
 
     def project_bias(self,
                      latent_states: torch.Tensor,
@@ -1405,6 +1426,10 @@ def external_drafter_config_kwargs(model_config, spec_config) -> dict:
         spec_config=None,  # Avoid recursive spec-dec
         max_num_tokens=model_config.max_num_tokens,
         moe_max_num_tokens=model_config.moe_max_num_tokens,
+        # The user's value, NOT the engine's: py_executor_creator raises it past
+        # this and never writes back, so drafters read _runtime_position_ceiling.
+        # None sizes position tables from max_position_embeddings: 1M for K3.
+        max_seq_len=model_config.max_seq_len,
     )
     # Only the embedded DSpark draft shares the target's EPLB namespace (its
     # stages are target decoder blocks registered into the target's balancer).
