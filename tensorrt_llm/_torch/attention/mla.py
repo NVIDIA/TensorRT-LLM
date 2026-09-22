@@ -288,6 +288,10 @@ class MLA(nn.Module):
         self.layer_idx_str = str(layer_idx)
         self.dtype = dtype
         self._weights_transformed = False
+        # Context-phase fused FP8-Q gate and its Q placeholder; both are
+        # resolved once in create_weights(), never on the forward path.
+        self._fused_q_fp8_ctx_ok = False
+        self.register_buffer("_fused_q_placeholder", None, persistent=False)
 
         self.hidden_size = hidden_size
         self.num_heads = num_attention_heads
@@ -682,6 +686,7 @@ class MLA(nn.Module):
         if self.mha is not None:
             self.mha.update_quant_config(self.quant_config)
         self.mqa.update_quant_config(self.quant_config)
+        self._fused_q_fp8_ctx_ok = False
 
         # Although we use FP8 MLA for context/generation phase, the output is still in BF16
         self.out_scale = None
@@ -753,6 +758,7 @@ class MLA(nn.Module):
             self.k_b_proj_trans_scale = None
             self.v_b_proj_scale = None
         self._weights_transformed = False
+        self._init_fused_q_fp8_context()
 
     def apply_rope(
         self,
@@ -1705,11 +1711,9 @@ class MLA(nn.Module):
 
         return output
 
-    @functools.cached_property
-    def _fused_q_fp8_ctx_ok(self) -> bool:
-        """Static half of the context-phase fused FP8-Q gate (see
-        `_use_fused_q_fp8_context`). Evaluated once per layer, after weights
-        and the attention backend exist."""
+    def _init_fused_q_fp8_context(self) -> None:
+        """Resolve the static half of the context-phase fused FP8-Q gate (see
+        `_use_fused_q_fp8_context`). Called once from `create_weights()`."""
         ok = (
             os.environ.get("TRTLLM_DISABLE_FUSED_Q_FP8_QUANT", "0") != "1"
             # Independent of use_cute_dsl_bf16_bmm (off by default outside PP):
@@ -1726,21 +1730,23 @@ class MLA(nn.Module):
         if ok:
             # The CuTe epilogue applies no scale, so both writers of the FP8 Q
             # buffer must agree on unit scale (the PyTorch backend never sets
-            # another value; checked once here).
+            # another value; checked once here, at construction time).
             scale = getattr(self.mqa, "kv_scale_orig_quant", None)
             ok = isinstance(scale, torch.Tensor) and bool(torch.all(scale == 1.0).item())
         if ok:
             # The attention op takes Q only for num_tokens / dtype on the fused
             # path; a stride-0 expand of one row satisfies that without a
-            # [num_tokens, heads * 576] bf16 allocation per layer.
+            # [num_tokens, heads * 576] bf16 allocation per layer. Registered
+            # as a (non-persistent) buffer so meta-init / `.to(device)` place
+            # it alongside the weights.
             self._fused_q_placeholder = torch.empty(
                 1,
                 self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim),
                 dtype=self.k_b_proj_trans.dtype,
                 device=self.k_b_proj_trans.device,
             )
+        self._fused_q_fp8_ctx_ok = ok
         logger.info(f"MLA fused FP8-Q (absorbed context) {'enabled' if ok else 'disabled'}")
-        return ok
 
     def _use_fused_q_fp8_context(
         self, attn_metadata: AttentionMetadata, rope_applied_in_python: bool
