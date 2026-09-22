@@ -332,6 +332,14 @@ def initialize_dummy_weights(
         elif torch.is_floating_point(param):
             param.uniform_(low, high, generator=generator)
 
+    # Non-persistent buffers are intentionally absent from state_dict(). Let
+    # modules that need such buffers during dummy execution initialize them
+    # explicitly after the regular state has been populated.
+    for module in model.modules():
+        initialize_dummy_state = getattr(module, "initialize_dummy_state", None)
+        if initialize_dummy_state is not None:
+            initialize_dummy_state(low=low, high=high, seed=seed)
+
 
 def get_rank_model_storage(model):
     total_bytes = 0

@@ -848,6 +848,17 @@ class Step3p7MoE(nn.Module):
         self._clamp_down_proj.copy_(down.to(device=dev, dtype=dt))
         self._clamp_weights_loaded = True
 
+    def initialize_dummy_state(self, low: float, high: float, seed: int) -> None:
+        """Initialize non-persistent clamp buffers for dummy model loading."""
+        if not self._use_python_experts:
+            return
+        for name in self._CLAMP_BUFFER_NAMES:
+            buffer = getattr(self, name)
+            generator = torch.Generator(device=buffer.device)
+            generator.manual_seed(seed)
+            buffer.uniform_(low, high, generator=generator)
+        self._clamp_weights_loaded = True
+
     def _clamp_weight_device(self) -> torch.device:
         dev = self._clamp_gate_proj.device
         if dev.type == "meta":

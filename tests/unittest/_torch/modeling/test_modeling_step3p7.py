@@ -449,6 +449,30 @@ class TestStep3p7Helpers(unittest.TestCase):
                     python_output.assert_called_once()
                     experts.assert_not_called()
 
+    def test_dummy_weights_initialize_nonpersistent_clamp_buffers(self):
+        """Dummy loading initializes the Python clamp path's private buffers."""
+        from tensorrt_llm._torch.models.modeling_step3p7 import Step3p7MoE
+        from tensorrt_llm._torch.pyexecutor.model_loader import initialize_dummy_weights
+
+        moe = Step3p7MoE.__new__(Step3p7MoE)
+        torch.nn.Module.__init__(moe)
+        moe._use_python_experts = True
+        moe._clamp_weights_loaded = False
+        for name in moe._CLAMP_BUFFER_NAMES:
+            moe.register_buffer(name, torch.empty(2, 3), persistent=False)
+
+        model = torch.nn.Module()
+        model.add_module("moe", moe)
+        self.assertEqual(model.state_dict(), {})
+
+        initialize_dummy_weights(model, low=0.25, high=0.5, seed=7)
+
+        self.assertTrue(moe._clamp_weights_loaded)
+        for name in moe._CLAMP_BUFFER_NAMES:
+            buffer = getattr(moe, name)
+            self.assertTrue(torch.all(buffer >= 0.25))
+            self.assertTrue(torch.all(buffer < 0.5))
+
     @parameterized.expand(
         [
             (
