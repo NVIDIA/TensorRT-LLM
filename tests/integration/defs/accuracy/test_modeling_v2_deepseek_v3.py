@@ -19,26 +19,21 @@ test_llm_api_pytorch.py: these gate a parallel implementation, and reading them
 next to the built-in model's tests would invite treating one as a variant of
 the other.
 
-Every test here needs ``TRTLLM_MODELING_V2=require``. Under ``"auto"`` a
-configuration that missed a target's criteria would quietly fall back to the
-built-in implementation, pass, and report the built-in's numbers as the
-target's -- which is the one failure this whole system exists to prevent. The
-one exception is the stock leg of the acceptance gate, which asks for ``"off"``
-on purpose.
+Every test here runs under ``TRTLLM_MODELING_V2=require``, which the case puts
+in place itself -- see ``modeling_v2_env``. Under ``"auto"`` a configuration
+that missed a target's criteria would quietly fall back to the built-in
+implementation, pass, and report the built-in's numbers as the target's --
+which is the one failure this whole system exists to prevent. The one exception
+is the stock leg of the acceptance gate, which asks for ``"off"`` on purpose.
 
-The switch is an environment variable, and worker ranks read it as it stood
-when they started. These targets are multi-rank, so the ranks are already
-running by the time a test body executes: a case cannot choose its own mode, it
-can only assert that the environment it was given is the one it needs, which is
-what ``_require_mode`` does.
+These targets are multi-rank, and the mode has to hold on every rank rather
+than only on the one running the test body; ``modeling_v2_env`` explains why
+that rules out setting the variable directly.
 """
-
-import os
 
 import pytest
 
 from tensorrt_llm import LLM
-from tensorrt_llm._torch._experimental.modeling_v2 import MODELING_V2_ENV
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MTPDecodingConfig
 
@@ -49,6 +44,7 @@ from .accuracy_core import (
     assert_acceptance_length,
     compute_acceptance_length,
 )
+from .modeling_v2_env import modeling_v2_llm_args
 
 # The targets assert their own SM at construction: certification is per GPU
 # architecture, and a receipt from another one says nothing here.
@@ -61,19 +57,6 @@ skip_not_sm103 = pytest.mark.skipif(
 # flexible-extract -- two numbers measuring different things on a checkpoint
 # that does not answer purely in the strict "#### N" form.
 _SCORES_FILTER = {"scores_filter": "exact_match,flexible-extract"}
-
-
-def _require_mode(expected: str) -> None:
-    """Skip unless the ranks were started with the mode this case needs.
-
-    Not a failure: which mode a multi-rank job runs under is a property of how
-    it was launched, so a case that wants the other one has nothing to say. It
-    must not silently measure the wrong system either, which is what reading
-    the variable here rules out.
-    """
-    actual = os.environ.get(MODELING_V2_ENV, "off")
-    if actual != expected:
-        pytest.skip(f"{MODELING_V2_ENV}={actual!r}, this case needs {expected!r}")
 
 
 class TestModelingV2DeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
@@ -106,7 +89,7 @@ class TestModelingV2DeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
 
     @skip_not_sm103
     @pytest.mark.skip_less_device(4)
-    def test_gsm8k_identity_vs_mtp3(self, mocker):
+    def test_gsm8k_identity_vs_mtp3(self, mocker, monkeypatch):
         """The identity accuracy gate, and the gate on MTP not moving it.
 
         Turning MTP on must not move the answers.
@@ -127,14 +110,18 @@ class TestModelingV2DeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS, _SCORES_FILTER)
         task = GSM8K(self.MODEL_NAME)
 
-        _require_mode("require")
-        with LLM(self.MODEL_PATH, **self.DEP4) as llm:
+        # One dict for both legs: the comparison only means anything if the two
+        # engines were built under the same mode.
+        modeling_v2 = modeling_v2_llm_args("require", monkeypatch)
+
+        with LLM(self.MODEL_PATH, **modeling_v2, **self.DEP4) as llm:
             identity = task.evaluate(llm)
 
         with LLM(
             self.MODEL_PATH,
             speculative_config=self.MTP3,
             kv_cache_config=self.MTP3_KV,
+            **modeling_v2,
             **self.DEP4,
         ) as llm:
             mtp3 = task.evaluate(llm)
@@ -151,7 +138,7 @@ class TestModelingV2DeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
     @skip_not_sm103
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("mode", ["require", "off"], ids=["modeling_v2", "stock"])
-    def test_mtp3_acceptance(self, mode, mocker):
+    def test_mtp3_acceptance(self, mode, mocker, monkeypatch):
         """The only gate that can see a miscomputed draft layer.
 
         Rejection sampling makes a wrong draft path *slower*, not wrong: every
@@ -169,20 +156,16 @@ class TestModelingV2DeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
         The anchor is populated from the **stock** leg. Populating it from the
         target's own number would make the gate self-referential.
         """
-        _require_mode(mode)
-        if mode == "off":
-            # Stock cannot boot this checkpoint at dep4 with MTP otherwise:
-            # under attention DP + EP the MoE communication factory lands on
-            # DeepEPLowLatency, whose dispatch takes only NVFP4 uint8 hidden
-            # states, and the MTP layer is bf16 because modelopt excludes
-            # model.layers.61* from quantization. Disabling DeepEP lands on
-            # AllGatherReduceScatter -- which is the strategy the modeling_v2
-            # target implements by hand, so it makes the two comparable rather
-            # than less so. Set in the launching environment, like the switch.
-            assert os.environ.get("TRTLLM_CAN_USE_DEEP_EP") == "0", (
-                "the stock leg needs TRTLLM_CAN_USE_DEEP_EP=0 exported; without "
-                "it stock cannot boot this checkpoint at dep4 with MTP"
-            )
+        # Stock cannot boot this checkpoint at dep4 with MTP otherwise: under
+        # attention DP + EP the MoE communication factory lands on
+        # DeepEPLowLatency, whose dispatch takes only NVFP4 uint8 hidden states,
+        # and the MTP layer is bf16 because modelopt excludes model.layers.61*
+        # from quantization. Disabling DeepEP lands on AllGatherReduceScatter --
+        # which is the strategy the modeling_v2 target implements by hand, so it
+        # makes the two comparable rather than less so. Only this leg needs it:
+        # the target builds that path itself and never consults the factory.
+        # It rides along with the switch because it is read on the ranks too.
+        deep_ep = {"TRTLLM_CAN_USE_DEEP_EP": "0"} if mode == "off" else {}
 
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS, _SCORES_FILTER)
 
@@ -192,6 +175,7 @@ class TestModelingV2DeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
             kv_cache_config=self.MTP3_KV,
             cuda_graph_config=CudaGraphConfig(),
             enable_iter_perf_stats=True,
+            **modeling_v2_llm_args(mode, monkeypatch, **deep_ep),
             **self.DEP4,
         ) as llm:
             task = GSM8K(self.MODEL_NAME)
