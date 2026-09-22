@@ -76,22 +76,13 @@ struct FMHA_kernel_traits_hopper
     static constexpr bool GMMA_V_RF = Traits_o::GMMA_B_RF;
 
     // The number of warpgroups along M dimension
-    enum
-    {
-        WARP_GROUP_M = WARPS_M / 4
-    };
+    static constexpr int WARP_GROUP_M = WARPS_M / 4;
 
     // The number of warpgroups along N dimension
-    enum
-    {
-        WARP_GROUP_N = WARPS_N
-    };
+    static constexpr int WARP_GROUP_N = WARPS_N;
 
     // The number of warpgroups along K dimension
-    enum
-    {
-        WARP_GROUP_K = 1
-    };
+    static constexpr int WARP_GROUP_K = 1;
 
     // The CTA description for the 1st GEMM.
     using Cta_tile_p = typename Traits_p::template Cta_tile<STEP, S, D, WARP_GROUP_M, WARP_GROUP_N, 1>;
@@ -99,94 +90,46 @@ struct FMHA_kernel_traits_hopper
     using Cta_tile_o = typename Traits_o::template Cta_tile<STEP, D, S, WARP_GROUP_M, 1, WARP_GROUP_N>;
 
     // The version.
-    enum
-    {
-        VERSION = VERSION_
-    };
+    static constexpr int VERSION = VERSION_;
 
-    enum
-    {
-        MASK_VERSION = MASK_VERSION_
-    };
+    static constexpr int MASK_VERSION = MASK_VERSION_;
 
     // Whether use causal mask or not.
-    enum
-    {
-        CAUSAL_MASK = MASK_VERSION_ == 3 || MASK_VERSION_ == 4
-    };
+    static constexpr int CAUSAL_MASK = MASK_VERSION_ == 3 || MASK_VERSION_ == 4;
 
     // Whether use the sliding window attention mask or not.
-    enum
-    {
-        SLIDING_WINDOW_ATTENTION = MASK_VERSION_ == 4
-    };
+    static constexpr int SLIDING_WINDOW_ATTENTION = MASK_VERSION_ == 4;
 
     // Whether use the bidirectional sliding window attention mask or not.
-    enum
-    {
-        BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = MASK_VERSION_ == 5
-    };
+    static constexpr int BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = MASK_VERSION_ == 5;
 
     // Do we use LDGSTS for Q, K or V. If not, TMA is used!
-    enum
-    {
-        USE_LDGSTS_Q = (FLAGS & 0x1u) != 0u
-    };
+    static constexpr int USE_LDGSTS_Q = (FLAGS & 0x1u) != 0u;
 
-    enum
-    {
-        USE_LDGSTS_K = (FLAGS & 0x2u) != 0u
-    };
+    static constexpr int USE_LDGSTS_K = (FLAGS & 0x2u) != 0u;
 
-    enum
-    {
-        USE_LDGSTS_V = (FLAGS & 0x4u) != 0u
-    };
+    static constexpr int USE_LDGSTS_V = (FLAGS & 0x4u) != 0u;
 
-    enum
-    {
-        USE_TMA_Q = !USE_LDGSTS_Q
-    };
+    static constexpr int USE_TMA_Q = !USE_LDGSTS_Q;
 
-    enum
-    {
-        USE_TMA_K = !USE_LDGSTS_K
-    };
+    static constexpr int USE_TMA_K = !USE_LDGSTS_K;
 
-    enum
-    {
-        USE_TMA_V = !USE_LDGSTS_V
-    };
+    static constexpr int USE_TMA_V = !USE_LDGSTS_V;
 
     // Do we use one buffer for K and V.
-    enum
-    {
-        SHARE_SMEM_FOR_K_AND_V = 0
-    };
+    static constexpr int SHARE_SMEM_FOR_K_AND_V = 0;
 
     // Do we use the scale max trick.
-    enum
-    {
-        USE_SCALE_MAX = 0
-    };
+    static constexpr int USE_SCALE_MAX = 0;
 
     // Are heads in QKV interleaved, i.e. total x h x 3 x d or total x 3 x h x d.
-    enum
-    {
-        HEADS_INTERLEAVED = (FLAGS & 0x20u) == 0u
-    };
+    static constexpr int HEADS_INTERLEAVED = (FLAGS & 0x20u) == 0u;
 
     // Use BMM1 softcapping scale or not.
-    enum
-    {
-        ENABLE_BMM1_SOFTCAPPING_SCALE = (FLAGS & 0x800) != 0u
-    };
+    static constexpr int ENABLE_BMM1_SOFTCAPPING_SCALE = (FLAGS & 0x800) != 0u;
 
     // Number of matrix for gmem_tile_qkv
-    enum
-    {
-        NUM_QKV_MATS = 3
-    };
+    static constexpr int NUM_QKV_MATS = 3;
 
     // The global memory tile to load Q.
     // Hopefully we don't need to specialize for Hopper.
@@ -201,10 +144,7 @@ struct FMHA_kernel_traits_hopper
     using Gmem_tile_q = typename std::conditional_t<USE_LDGSTS_Q, Gmem_tile_ldgsts_q, Gmem_tile_tma_q>;
 
     // 2 buffers for Q
-    enum
-    {
-        BUFFERS_PER_SMEM_TILE_Q = 2
-    };
+    static constexpr int BUFFERS_PER_SMEM_TILE_Q = 2;
 
     // Q is row major
     using Q_layout = fmha::Row;
@@ -238,10 +178,7 @@ struct FMHA_kernel_traits_hopper
     using Gmem_tile_k = typename std::conditional_t<USE_LDGSTS_K, Gmem_tile_ldgsts_k, Gmem_tile_tma_k>;
 
     // 1 buffers for K
-    enum
-    {
-        BUFFERS_PER_SMEM_TILE_K = 1
-    };
+    static constexpr int BUFFERS_PER_SMEM_TILE_K = 1;
 
     // K is column major
     using K_layout = fmha::Col;
@@ -273,10 +210,7 @@ struct FMHA_kernel_traits_hopper
     using Gmem_tile_v = typename std::conditional_t<USE_LDGSTS_V, Gmem_tile_ldgsts_v, Gmem_tile_tma_v>;
 
     // 1 buffers for V
-    enum
-    {
-        BUFFERS_PER_SMEM_TILE_V = 1
-    };
+    static constexpr int BUFFERS_PER_SMEM_TILE_V = 1;
 
     // V is row major
     using V_layout = fmha::Row;
@@ -307,79 +241,47 @@ struct FMHA_kernel_traits_hopper
     using Smem_tile_o = typename std::conditional_t<NEEDS_SPLIT_K, Smem_tile_o_, fmha::Smem_tile_o_dummy>;
 
     // The amount of shared memory needed to load Q and K.
-    enum
-    {
-        BYTES_PER_SMEM_QK = Smem_tile_q::BYTES_PER_TILE + Smem_tile_k::BYTES_PER_TILE
-    };
+    static constexpr int BYTES_PER_SMEM_QK = Smem_tile_q::BYTES_PER_TILE + Smem_tile_k::BYTES_PER_TILE;
 
     // The extra amount of shared memory needed to load V.
-    enum
-    {
-        BYTES_PER_SMEM_V = SHARE_SMEM_FOR_K_AND_V ? 0u : Smem_tile_v::BYTES_PER_TILE
-    };
+    static constexpr int BYTES_PER_SMEM_V = SHARE_SMEM_FOR_K_AND_V ? 0u : Smem_tile_v::BYTES_PER_TILE;
 
     // The amount of shared memory needed for Q, K and V..
-    enum
-    {
-        BYTES_PER_SMEM_QKV = BYTES_PER_SMEM_QK + BYTES_PER_SMEM_V
-    };
+    static constexpr int BYTES_PER_SMEM_QKV = BYTES_PER_SMEM_QK + BYTES_PER_SMEM_V;
 
     // The amount of shared memory needed to load Q and store O.
     // enum { BYTES_PER_SMEM_QO = Smem_tile_q::BYTES_PER_TILE + Smem_tile_o::BYTES_PER_TILE };
     // For now let's pretend no smem for O matrix. [Timmy]
-    enum
-    {
-        BYTES_PER_SMEM_QO = Smem_tile_q::BYTES_PER_TILE
-    };
+    static constexpr int BYTES_PER_SMEM_QO = Smem_tile_q::BYTES_PER_TILE;
 
     // The amount of over allocated smem to guarantee 1024B alignment.
-    enum
-    {
-        BYTES_FOR_ALIGNMENT = 1024
-    };
+    static constexpr int BYTES_FOR_ALIGNMENT = 1024;
 
     // The size in bytes for each SMEM barrier
-    enum
-    {
-        BYTES_PER_SMEM_BARRIER = 8
-    };
+    static constexpr int BYTES_PER_SMEM_BARRIER = 8;
 
     // The amount of smem used by smem barrier. Only needed if TMA is used.
-    enum
-    {
-        BYTES_FOR_SMEM_BARRIER_Q = USE_LDGSTS_Q == 1 ? 0 : BUFFERS_PER_SMEM_TILE_Q * BYTES_PER_SMEM_BARRIER
-    };
+    static constexpr int BYTES_FOR_SMEM_BARRIER_Q
+        = USE_LDGSTS_Q == 1 ? 0 : BUFFERS_PER_SMEM_TILE_Q * BYTES_PER_SMEM_BARRIER;
 
     // The amount of smem used by smem barrier. Only needed if TMA is used.
     // each smem barrier is 8 bytes, each buffer has 2 barriers
-    enum
-    {
-        BYTES_FOR_SMEM_BARRIER_K = USE_LDGSTS_K == 1 ? 0 : BUFFERS_PER_SMEM_TILE_K * BYTES_PER_SMEM_BARRIER
-    };
+    static constexpr int BYTES_FOR_SMEM_BARRIER_K
+        = USE_LDGSTS_K == 1 ? 0 : BUFFERS_PER_SMEM_TILE_K * BYTES_PER_SMEM_BARRIER;
 
     // The amount of smem used by smem barrier. Only needed if TMA is used.
     // Currently, K and V can share the same barrier.
-    enum
-    {
-        BYTES_FOR_SMEM_BARRIER_V = 0
-    };
+    static constexpr int BYTES_FOR_SMEM_BARRIER_V = 0;
 
     // The amount of smem used by smem barrier. Only needed if TMA is used.
-    enum
-    {
-        BYTES_FOR_SMEM_BARRIER = BYTES_FOR_SMEM_BARRIER_Q + BYTES_FOR_SMEM_BARRIER_K + BYTES_FOR_SMEM_BARRIER_V
-    };
+    static constexpr int BYTES_FOR_SMEM_BARRIER
+        = BYTES_FOR_SMEM_BARRIER_Q + BYTES_FOR_SMEM_BARRIER_K + BYTES_FOR_SMEM_BARRIER_V;
 
     // TODO move those
-    enum
-    {
-        BYTES_FOR_SOFTMAX = WARPS_N == 1 ? 0 : sizeof(float) * WARPS_N * 64
-    };
+    static constexpr int BYTES_FOR_SOFTMAX = WARPS_N == 1 ? 0 : sizeof(float) * WARPS_N * 64;
 
-    enum
-    {
-        BYTES_PER_SMEM_O = WARPS_N == 1 ? 0 : WARPS_N * 64 * D * sizeof(typename Traits_o::Epilogue_type)
-    };
+    static constexpr int BYTES_PER_SMEM_O
+        = WARPS_N == 1 ? 0 : WARPS_N * 64 * D * sizeof(typename Traits_o::Epilogue_type);
 
     static_assert(Smem_tile_o::BYTES_PER_TILE == (int) BYTES_PER_SMEM_O);
 
@@ -389,17 +291,11 @@ struct FMHA_kernel_traits_hopper
     // - Cannot share SMEM K/V
     // - O needs to be separate
     // enum { BYTES_PER_SMEM = fmha::Max<BYTES_PER_SMEM_QKV, BYTES_PER_SMEM_QO>::VALUE
-    enum
-    {
-        BYTES_PER_SMEM
-        = BYTES_PER_SMEM_QKV + BYTES_PER_SMEM_O + BYTES_FOR_SOFTMAX + BYTES_FOR_SMEM_BARRIER + BYTES_FOR_ALIGNMENT
-    };
+    static constexpr int BYTES_PER_SMEM
+        = BYTES_PER_SMEM_QKV + BYTES_PER_SMEM_O + BYTES_FOR_SOFTMAX + BYTES_FOR_SMEM_BARRIER + BYTES_FOR_ALIGNMENT;
 
     // The number of threads.
-    enum
-    {
-        THREADS = Cta_tile_p::THREADS_PER_CTA
-    };
+    static constexpr int THREADS = Cta_tile_p::THREADS_PER_CTA;
 
     // Make sure the number of threads matches both CTAs.
     static_assert((int) THREADS == (int) Cta_tile_o::THREADS_PER_CTA, "");

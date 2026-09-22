@@ -20,6 +20,7 @@ and answers the internal coordination API that the forked worker processes call:
     POST /select   {"role", "routing_key", "req_id", "exclude_server"}
       -> {"server": "host:port", "info": {...}, "req_id": <int|null>}
     POST /finish   {"role", "req_id", "success"}  -> {}
+    POST /renew    {"role", "req_id"}  -> {}
     GET  /cluster_info -> {...}
     GET  /health   -> 200 when ready
     GET  /version
@@ -65,6 +66,7 @@ class CoordinatorServer:
         self.app = FastAPI(lifespan=lifespan)
         self.app.add_api_route("/select", self.select, methods=["POST"])
         self.app.add_api_route("/finish", self.finish, methods=["POST"])
+        self.app.add_api_route("/renew", self.renew, methods=["POST"])
         self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
@@ -134,6 +136,30 @@ class CoordinatorServer:
         if not isinstance(success, bool):
             return self._response({"error": "success must be a boolean"}, status_code=400)
         await self._coordinator.finish(role, req_id, success)
+        return self._response({})
+
+    async def renew(self, raw_req: Request) -> Response:
+        try:
+            body = msgpack.unpackb(await raw_req.body(), raw=False)
+        except Exception as e:
+            return self._response({"error": f"invalid MessagePack body: {e}"}, status_code=400)
+        if not isinstance(body, dict) or "role" not in body or "req_id" not in body:
+            return self._response(
+                {"error": "body must include 'role' and 'req_id'"}, status_code=400
+            )
+        role = body["role"]
+        if role not in ("context", "ctx", "generation", "gen"):
+            return self._response({"error": f"invalid role: {role}"}, status_code=400)
+        req_id = body["req_id"]
+        if not isinstance(req_id, int) or isinstance(req_id, bool):
+            return self._response({"error": "req_id must be an integer"}, status_code=400)
+        try:
+            await self._coordinator.renew(role, req_id)
+        except ValueError as e:
+            return self._response({"error": str(e)}, status_code=503)
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"CoordinatorServer.renew failed: {e}")
+            return self._response({"error": str(e)}, status_code=500)
         return self._response({})
 
     async def cluster_info(self) -> Response:

@@ -1111,6 +1111,16 @@ class KimiK3MoERuntime(nn.Module):
         layer_idx: int,
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
     ):
+        """Build the routed experts and the shared expert for one MoE layer.
+
+        ``cfg`` is the raw ``PretrainedConfig`` rather than anything derived:
+        the SiTU soft-caps and the routed-expert geometry are Kimi K3 fields
+        that ``ModelConfig`` does not carry.
+
+        ``aux_stream_dict`` is shared across every layer of the model, so the
+        streams reached through it are borrowed and must not be synchronized
+        or reassigned here.
+        """
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = cfg.hidden_size
@@ -1167,12 +1177,20 @@ class KimiK3MoERuntime(nn.Module):
                 gate_softcap=situ_beta,
                 linear_softcap=situ_linear_beta,
             ),
-            # A MegaMoE request that silently degraded to CUTLASS would be
-            # benchmarked as if it were MegaMoE, and the decline is easy to
-            # trigger (EP-only, own token / top-k limits). Fail in the resolver
+            # A request that silently degraded to CUTLASS would be benchmarked
+            # as if it were the backend that was asked for, and the decline is
+            # easy to trigger: MegaMoE has its own token / top-k limits and is
+            # EP-only, and CuteDSL declines on activation shape, SM version and
+            # the CuTe DSL dependency. Measured 2026-09-08: a CUTEDSL request
+            # was turned down on every one of the 92 MoE layers, on all 16
+            # ranks, and still produced correct text and a zero exit -- the
+            # only trace was a warning line per layer. Fail in the resolver
             # instead, which reports the rejection trail.
+            #
+            # CUTLASS is absent on purpose: it is the fallback target, so
+            # "degraded to CUTLASS" is not a thing that can happen to it.
             allow_backend_degradation=routed_moe_model_config.moe_backend
-            not in ("MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"),
+            not in ("MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL", "CUTEDSL"),
         )
         self._check_trtllm_situ_quant(
             routed_moe_model_config.moe_backend, routed_quant_config.quant_algo
@@ -1378,16 +1396,20 @@ class KimiK3MoERuntime(nn.Module):
     def _routed_moe_model_config(model_config: ModelConfig) -> ModelConfig:
         """Build a private routed-expert mapping without mutating the shared
         config. Default split is EP-only; see ``_select_moe_tp_ep``."""
+        # Every backend here declares ``ActivationType.SiTu`` in its
+        # ``activation_support``; the list is not a preference order. CUTEDSL
+        # joined once its act-fusion kernel grew the SiTU epilogue.
         supported_backends = {
             "CUTLASS",
             "TRTLLM",
+            "CUTEDSL",
             "MEGAMOE_DEEPGEMM",
             "MEGAMOE_CUTEDSL",
         }
         if model_config.moe_backend not in supported_backends:
             raise ValueError(
                 "Kimi K3 SiTU routed experts only support the CUTLASS, TRTLLM, "
-                "MEGAMOE_DEEPGEMM, and MEGAMOE_CUTEDSL backends; "
+                "CUTEDSL, MEGAMOE_DEEPGEMM, and MEGAMOE_CUTEDSL backends; "
                 f"got {model_config.moe_backend!r}."
             )
         if model_config.moe_load_balancer is not None:
@@ -2149,11 +2171,74 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 "per-request locality of KDA recurrent state."
             )
         if spec_config is not None:
-            raise ValueError(
-                "Kimi K3 helix phase 1 does not support speculative "
-                "decoding (round-robin KV bookkeeping assumes one token "
-                "per decode step)."
-            )
+            # Helix supports only the standalone DSpark drafter (verified on
+            # the V2 superblock ledger); reject everything else loudly rather
+            # than let an unsupported spec mode run silently wrong.
+            if not spec_config.spec_dec_mode.is_dspark():
+                raise ValueError(
+                    "Kimi K3 helix supports speculative decoding only with "
+                    f"DSpark (standalone drafter); got "
+                    f"{spec_config.decoding_type!r}."
+                )
+            # The SpeculationGate acceptance-rate trip permanently disables
+            # speculation mid-flight while enable_spec_decode stays True;
+            # in-flight helix requests then fall into the plain generation
+            # loop whose position math (total_input_len_cp +
+            # py_decoding_iter - 1) is stale once any draft token was
+            # accepted -> silently wrong RoPE positions and KV slots. Reject
+            # the trip wires until that loop is helix-group aware.
+            if (
+                spec_config.acceptance_rate_window_size is not None
+                or spec_config.acceptance_rate_threshold is not None
+            ):
+                raise ValueError(
+                    "Kimi K3 helix does not support the speculation "
+                    "acceptance-rate gate (acceptance_rate_window_size / "
+                    "acceptance_rate_threshold): dynamically disabling "
+                    "speculation mid-flight leaves helix requests on a "
+                    "single-token position formula."
+                )
+            # max_concurrency is the same trip wire by another name: the
+            # drafter re-evaluates should_use_spec_decode on every scheduling
+            # iteration and flips enable_spec_decode off as soon as the active
+            # batch exceeds the cap. In-flight helix requests then take the
+            # plain generation loop, whose position formula counts ITERATIONS
+            # (total_input_len_cp + py_decoding_iter - 1) rather than
+            # committed tokens, so it is stale by however many draft tokens
+            # were accepted -- a wrong RoPE position, and across a ledger page
+            # boundary a KV write to the wrong CP rank. Mirror the drafter's
+            # own "unset" test (Drafter.should_use_spec_decode returns True
+            # when max_concurrency is None) so an unset value is not rejected.
+            if spec_config.max_concurrency is not None:
+                raise ValueError(
+                    "Kimi K3 helix does not support the speculation "
+                    "concurrency cutoff (max_concurrency): disabling "
+                    "speculation above the cap leaves in-flight helix "
+                    "requests on a position formula that assumes one "
+                    "committed token per iteration, which accepted draft "
+                    "tokens break."
+                )
+            # draft_len_schedule is the user-facing alternative to
+            # max_concurrency (llm_args rejects setting both) and reaches the
+            # same end by a route that does not go through
+            # should_use_spec_decode at all: py_executor turns speculation off
+            # directly once the schedule yields draft_len 0 for the active
+            # batch size. Guarding only max_concurrency would leave this door
+            # open. Skip the schedule that llm_args synthesized from
+            # max_concurrency, so a config that set only that field raises the
+            # message above naming the field the user actually wrote.
+            if (
+                spec_config.draft_len_schedule is not None
+                and not spec_config._translated_from_max_concurrency
+            ):
+                raise ValueError(
+                    "Kimi K3 helix does not support the dynamic draft-length "
+                    "schedule (draft_len_schedule): a batch size past the "
+                    "last entry drops the draft length to 0 and turns "
+                    "speculation off mid-run, leaving in-flight helix "
+                    "requests on a position formula that assumes one "
+                    "committed token per iteration."
+                )
         cp = model_config.mapping.cp_size
         repurposed_tp = model_config.mapping.tp_size * cp
         if cfg.num_attention_heads % repurposed_tp != 0:

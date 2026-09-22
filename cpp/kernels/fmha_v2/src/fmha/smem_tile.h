@@ -61,136 +61,73 @@ struct Smem_tile_without_skews
     static constexpr bool USE_TMA = USE_TMA_;
 
     // The size in bits of each element.
-    enum
-    {
-        BITS_PER_ELEMENT = BITS_PER_ELEMENT_
-    };
+    static constexpr int BITS_PER_ELEMENT = BITS_PER_ELEMENT_;
 
     // The size in bytes of a single STS.
-    enum
-    {
-        BYTES_PER_STS = BYTES_PER_STS_
-    };
+    static constexpr int BYTES_PER_STS = BYTES_PER_STS_;
 
     // The number of elements per STS.
-    enum
-    {
-        ELEMENTS_PER_STS = BYTES_PER_STS * 8 / BITS_PER_ELEMENT
-    };
+    static constexpr int ELEMENTS_PER_STS = BYTES_PER_STS * 8 / BITS_PER_ELEMENT;
 
     // To support arbitrary N, we pad some values to a power-of-2.
-    enum
-    {
-        N_WITH_PADDING = Next_power_of_two<LEAD_DIM_ELEMENTS_>::VALUE
-    };
+    static constexpr int N_WITH_PADDING = Next_power_of_two<LEAD_DIM_ELEMENTS_>::VALUE;
 
     // The number of bytes per row without packing of rows.
-    enum
-    {
-        BYTES_PER_ROW_BEFORE_PACKING = N_WITH_PADDING * BITS_PER_ELEMENT / 8
-    };
+    static constexpr int BYTES_PER_ROW_BEFORE_PACKING = N_WITH_PADDING * BITS_PER_ELEMENT / 8;
 
     // The number of bytes per row -- we want at least 128B per row.
-    enum
-    {
-        BYTES_PER_ROW = Max<BYTES_PER_ROW_BEFORE_PACKING, 128>::VALUE
-    };
+    static constexpr int BYTES_PER_ROW = Max<BYTES_PER_ROW_BEFORE_PACKING, 128>::VALUE;
 
     // The number of rows in shared memory (two rows may be packed into a single one).
-    enum
-    {
-        ROWS = M_ * N_ / LEAD_DIM_ELEMENTS_ * BYTES_PER_ROW_BEFORE_PACKING / BYTES_PER_ROW
-    };
+    static constexpr int ROWS = M_ * N_ / LEAD_DIM_ELEMENTS_ * BYTES_PER_ROW_BEFORE_PACKING / BYTES_PER_ROW;
 
     // The number of threads per row.
-    enum
-    {
-        THREADS_PER_ROW_UNBOUNDED = BYTES_PER_ROW / BYTES_PER_STS
-    };
+    static constexpr int THREADS_PER_ROW_UNBOUNDED = BYTES_PER_ROW / BYTES_PER_STS;
 
     // The number of threads per row.
-    enum
-    {
-        THREADS_PER_ROW = Min<Cta_tile::THREADS_PER_CTA, THREADS_PER_ROW_UNBOUNDED>::VALUE
-    };
+    static constexpr int THREADS_PER_ROW = Min<Cta_tile::THREADS_PER_CTA, THREADS_PER_ROW_UNBOUNDED>::VALUE;
 
     // The number of STS per row.
-    enum
-    {
-        STS_PER_ROW = BYTES_PER_ROW / THREADS_PER_ROW / BYTES_PER_STS
-    };
+    static constexpr int STS_PER_ROW = BYTES_PER_ROW / THREADS_PER_ROW / BYTES_PER_STS;
 
     // It must be at least one.
     static_assert(STS_PER_ROW >= 1, "");
 
     // The number of rows written with a single STS.
-    enum
-    {
-        ROWS_PER_STS = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW
-    };
+    static constexpr int ROWS_PER_STS = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW;
 
     // Make sure we write to at least one row per STS. Thanks Dr. Obvious ;)
     static_assert(ROWS_PER_STS >= 1, "");
 
     // The number of STS needed to store all rows.
-    enum
-    {
-        STS_PER_COL = Div_up<ROWS, ROWS_PER_STS>::VALUE
-    };
+    static constexpr int STS_PER_COL = Div_up<ROWS, ROWS_PER_STS>::VALUE;
 
     // The number of STS in total.
-    enum
-    {
-        STS = STS_PER_COL * STS_PER_ROW
-    };
+    static constexpr int STS = STS_PER_COL * STS_PER_ROW;
 
     // The size of one buffer in bytes in shared memory.
-    enum
-    {
-        BYTES_PER_BUFFER = STS * BYTES_PER_STS * Cta_tile::THREADS_PER_CTA
-    };
+    static constexpr int BYTES_PER_BUFFER = STS * BYTES_PER_STS * Cta_tile::THREADS_PER_CTA;
 
     // The number of buffers.
-    enum
-    {
-        BUFFERS_PER_TILE = BUFFERS_PER_TILE_
-    };
+    static constexpr int BUFFERS_PER_TILE = BUFFERS_PER_TILE_;
 
     // The size in bytes of total buffers.
-    enum
-    {
-        BYTES_PER_TILE = BYTES_PER_BUFFER * BUFFERS_PER_TILE
-    };
+    static constexpr int BYTES_PER_TILE = BYTES_PER_BUFFER * BUFFERS_PER_TILE;
 
     // The boundary for smem_read_offset and smem_write_offset increment.
-    enum
-    {
-        BYTES_PER_TILE_INC_BOUNDARY = BYTES_PER_TILE - BYTES_PER_BUFFER
-    };
+    static constexpr int BYTES_PER_TILE_INC_BOUNDARY = BYTES_PER_TILE - BYTES_PER_BUFFER;
 
     // The number of rows that are used for the XOR swizzling to allow fast STS/LDS.
-    enum
-    {
-        ROWS_PER_XOR_PATTERN = ROWS_PER_XOR_PATTERN_
-    };
+    static constexpr int ROWS_PER_XOR_PATTERN = ROWS_PER_XOR_PATTERN_;
 
     // The number of cols that are used for the XOR swizzling to allow fast STS/LDS.
-    enum
-    {
-        COLS_PER_XOR_PATTERN = COLS_PER_XOR_PATTERN_ * 16 / BYTES_PER_STS
-    };
+    static constexpr int COLS_PER_XOR_PATTERN = COLS_PER_XOR_PATTERN_ * 16 / BYTES_PER_STS;
 
     // Use or not predicates
-    enum
-    {
-        USE_PREDICATES = USE_PREDICATES_
-    };
+    static constexpr int USE_PREDICATES = USE_PREDICATES_;
 
     // The bytes of one shmem row
-    enum
-    {
-        BYTES_PER_SHMEM_ROW = 128
-    };
+    static constexpr int BYTES_PER_SHMEM_ROW = 128;
 
     // The type of elements that are stored in shared memory by each thread.
     using Store_type = typename Uint_from_size_in_bytes<BYTES_PER_STS>::Type;
@@ -579,16 +516,10 @@ template <typename Traits, int N>
 struct Rows_per_xor_pattern_volta_a
 {
     // The size in bits.
-    enum
-    {
-        N_IN_BITS = N * Traits::BITS_PER_ELEMENT_A
-    };
+    static constexpr int N_IN_BITS = N * Traits::BITS_PER_ELEMENT_A;
 
     // The number of rows.
-    enum
-    {
-        VALUE = N_IN_BITS <= 256 ? 1 : (N_IN_BITS <= 512 ? 2 : 4)
-    };
+    static constexpr int VALUE = N_IN_BITS <= 256 ? 1 : (N_IN_BITS <= 512 ? 2 : 4);
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -597,22 +528,13 @@ template <int MMAS_K, int MMAS_K_WITH_PADDING>
 struct Compute_reset_mask
 {
     // The potential mask.
-    enum
-    {
-        HALF = MMAS_K_WITH_PADDING / 2
-    };
+    static constexpr int HALF = MMAS_K_WITH_PADDING / 2;
 
     // The remainder.
-    enum
-    {
-        MOD = MMAS_K % HALF
-    };
+    static constexpr int MOD = MMAS_K % HALF;
 
     // The final value.
-    enum
-    {
-        VALUE = (MMAS_K == MOD ? 0 : HALF) | Compute_reset_mask<MOD, HALF>::VALUE
-    };
+    static constexpr int VALUE = (MMAS_K == MOD ? 0 : HALF) | Compute_reset_mask<MOD, HALF>::VALUE;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -620,10 +542,7 @@ struct Compute_reset_mask
 template <int MMAS_K_WITH_PADDING>
 struct Compute_reset_mask<0, MMAS_K_WITH_PADDING>
 {
-    enum
-    {
-        VALUE = 0
-    };
+    static constexpr int VALUE = 0;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -631,10 +550,7 @@ struct Compute_reset_mask<0, MMAS_K_WITH_PADDING>
 template <int MMAS_K>
 struct Compute_reset_mask<MMAS_K, MMAS_K>
 {
-    enum
-    {
-        VALUE = MMAS_K - 1
-    };
+    static constexpr int VALUE = MMAS_K - 1;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -668,10 +584,7 @@ struct Smem_tile_volta_row_a : public Smem_tile_without_skews<Cta_tile, Cta_tile
     using Mma_tile_with_padding = typename Traits::template Mma_tile<Cta_tile_with_padding>;
 
     // The size of a single LDS in bytes.
-    enum
-    {
-        BYTES_PER_LDS = 16
-    };
+    static constexpr int BYTES_PER_LDS = 16;
 
     // Ctor.
     inline __device__ Smem_tile_volta_row_a(void* smem, int tidx)
@@ -778,22 +691,13 @@ struct Smem_tile_volta_row_a : public Smem_tile_without_skews<Cta_tile, Cta_tile
     inline __device__ void reset_read_offset()
     {
         // The number of MMAs in the K dimension.
-        enum
-        {
-            MMAS_K = Mma_tile::MMAS_K
-        };
+        static constexpr int MMAS_K = Mma_tile::MMAS_K;
 
         // The number of MMAs in the K dimension when we include padding.
-        enum
-        {
-            MMAS_K_WITH_PADDING = Mma_tile_with_padding::MMAS_K
-        };
+        static constexpr int MMAS_K_WITH_PADDING = Mma_tile_with_padding::MMAS_K;
 
         // Assemble the mask.
-        enum
-        {
-            MASK = Compute_reset_mask<MMAS_K, MMAS_K_WITH_PADDING>::VALUE
-        };
+        static constexpr int MASK = Compute_reset_mask<MMAS_K, MMAS_K_WITH_PADDING>::VALUE;
 
         // Reset the read offset.
         this->smem_read_offset_ ^= MASK * BYTES_PER_LDS;
@@ -831,16 +735,10 @@ template <typename Traits, int N>
 struct Rows_per_xor_pattern_turing_a
 {
     // The size in bits.
-    enum
-    {
-        N_IN_BITS = N * Traits::BITS_PER_ELEMENT_A
-    };
+    static constexpr int N_IN_BITS = N * Traits::BITS_PER_ELEMENT_A;
 
     // The number of rows.
-    enum
-    {
-        VALUE = N_IN_BITS <= 128 ? 1 : (N_IN_BITS <= 256 ? 2 : (N_IN_BITS <= 512 ? 4 : 8))
-    };
+    static constexpr int VALUE = N_IN_BITS <= 128 ? 1 : (N_IN_BITS <= 256 ? 2 : (N_IN_BITS <= 512 ? 4 : 8));
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -875,10 +773,7 @@ struct Smem_tile_turing_row_a
     using Mma_tile_with_padding = typename Traits::template Mma_tile<Cta_tile_with_padding>;
 
     // The size of a single LDS in bytes.
-    enum
-    {
-        BYTES_PER_LDS = 16
-    };
+    static constexpr int BYTES_PER_LDS = 16;
 
     // Ctor.
     inline __device__ Smem_tile_turing_row_a(void* smem, int tidx)
@@ -988,22 +883,13 @@ struct Smem_tile_turing_row_a
     inline __device__ void reset_read_offset()
     {
         // The number of MMAs in the K dimension.
-        enum
-        {
-            MMAS_K = Mma_tile::MMAS_K
-        };
+        static constexpr int MMAS_K = Mma_tile::MMAS_K;
 
         // The number of MMAs in the K dimension when we include padding.
-        enum
-        {
-            MMAS_K_WITH_PADDING = Mma_tile_with_padding::MMAS_K
-        };
+        static constexpr int MMAS_K_WITH_PADDING = Mma_tile_with_padding::MMAS_K;
 
         // Assemble the mask.
-        enum
-        {
-            MASK = Compute_reset_mask<MMAS_K, MMAS_K_WITH_PADDING>::VALUE
-        };
+        static constexpr int MASK = Compute_reset_mask<MMAS_K, MMAS_K_WITH_PADDING>::VALUE;
 
         // Reset the read offset.
         this->smem_read_offset_ ^= MASK * BYTES_PER_LDS;
@@ -1091,16 +977,10 @@ template <typename Traits, int N>
 struct Rows_per_xor_pattern_ampere_a
 {
     // The size in bits.
-    enum
-    {
-        N_IN_BITS = N * Traits::BITS_PER_ELEMENT_A
-    };
+    static constexpr int N_IN_BITS = N * Traits::BITS_PER_ELEMENT_A;
 
     // The number of rows.
-    enum
-    {
-        VALUE = N_IN_BITS <= 256 ? 2 : (N_IN_BITS <= 512 ? 4 : 8)
-    };
+    static constexpr int VALUE = N_IN_BITS <= 256 ? 2 : (N_IN_BITS <= 512 ? 4 : 8);
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1141,10 +1021,7 @@ struct Smem_tile_ampere_row_a
     using Mma_tile_with_padding = typename Traits::template Mma_tile<Cta_tile_with_padding>;
 
     // The size of a single LDS in bytes.
-    enum
-    {
-        BYTES_PER_LDS = 16
-    };
+    static constexpr int BYTES_PER_LDS = 16;
 
     // Ctor.
     inline __device__ Smem_tile_ampere_row_a(void* smem, int tidx)
@@ -1266,22 +1143,13 @@ struct Smem_tile_ampere_row_a
     inline __device__ void reset_read_offset()
     {
         // The number of MMAs in the K dimension.
-        enum
-        {
-            MMAS_K = Mma_tile::MMAS_K
-        };
+        static constexpr int MMAS_K = Mma_tile::MMAS_K;
 
         // The number of MMAs in the K dimension when we include padding.
-        enum
-        {
-            MMAS_K_WITH_PADDING = Mma_tile_with_padding::MMAS_K
-        };
+        static constexpr int MMAS_K_WITH_PADDING = Mma_tile_with_padding::MMAS_K;
 
         // Assemble the mask.
-        enum
-        {
-            MASK = Compute_reset_mask<MMAS_K, MMAS_K_WITH_PADDING>::VALUE
-        };
+        static constexpr int MASK = Compute_reset_mask<MMAS_K, MMAS_K_WITH_PADDING>::VALUE;
 
         // Reset the read offset.
         this->smem_read_offset_ ^= MASK * BYTES_PER_LDS * 2;
@@ -1460,16 +1328,10 @@ template <typename Traits, int N>
 struct Rows_per_xor_pattern_volta_b
 {
     // The size in bits.
-    enum
-    {
-        N_IN_BITS = N * Traits::BITS_PER_ELEMENT_B
-    };
+    static constexpr int N_IN_BITS = N * Traits::BITS_PER_ELEMENT_B;
 
     // The number of rows.
-    enum
-    {
-        VALUE = N_IN_BITS <= 256 ? 1 : (N_IN_BITS <= 512 ? 2 : 4)
-    };
+    static constexpr int VALUE = N_IN_BITS <= 256 ? 1 : (N_IN_BITS <= 512 ? 2 : 4);
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1503,10 +1365,7 @@ struct Smem_tile_volta_col_b : public Smem_tile_without_skews<Cta_tile, Cta_tile
     using Fragment = Fragment_b<Traits, Col>;
 
     // The size of a single LDS in bytes.
-    enum
-    {
-        BYTES_PER_LDS = 16
-    };
+    static constexpr int BYTES_PER_LDS = 16;
 
     // Ctor.
     inline __device__ Smem_tile_volta_col_b(void* smem, int tidx)
@@ -1615,22 +1474,13 @@ struct Smem_tile_volta_col_b : public Smem_tile_without_skews<Cta_tile, Cta_tile
     inline __device__ void reset_read_offset()
     {
         // The number of MMAs in the K dimension.
-        enum
-        {
-            MMAS_K = Mma_tile::MMAS_K
-        };
+        static constexpr int MMAS_K = Mma_tile::MMAS_K;
 
         // The number of MMAs in the K dimension when we include padding.
-        enum
-        {
-            MMAS_K_WITH_PADDING = Mma_tile_with_padding::MMAS_K
-        };
+        static constexpr int MMAS_K_WITH_PADDING = Mma_tile_with_padding::MMAS_K;
 
         // Assemble the mask.
-        enum
-        {
-            MASK = Compute_reset_mask<MMAS_K, MMAS_K_WITH_PADDING>::VALUE
-        };
+        static constexpr int MASK = Compute_reset_mask<MMAS_K, MMAS_K_WITH_PADDING>::VALUE;
 
         // Reset the read offset.
         this->smem_read_offset_ ^= MASK * BYTES_PER_LDS;
@@ -1668,16 +1518,10 @@ template <typename Traits, int N>
 struct Rows_per_xor_pattern_turing_b
 {
     // The size in bits.
-    enum
-    {
-        N_IN_BITS = N * Traits::BITS_PER_ELEMENT_B
-    };
+    static constexpr int N_IN_BITS = N * Traits::BITS_PER_ELEMENT_B;
 
     // The number of rows.
-    enum
-    {
-        VALUE = N_IN_BITS <= 128 ? 1 : (N_IN_BITS <= 256 ? 2 : (N_IN_BITS <= 512 ? 4 : 8))
-    };
+    static constexpr int VALUE = N_IN_BITS <= 128 ? 1 : (N_IN_BITS <= 256 ? 2 : (N_IN_BITS <= 512 ? 4 : 8));
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1712,10 +1556,7 @@ struct Smem_tile_turing_col_b
     using Mma_tile_with_padding = typename Traits::template Mma_tile<Cta_tile_with_padding>;
 
     // The size of a single LDS in bytes.
-    enum
-    {
-        BYTES_PER_LDS = 16
-    };
+    static constexpr int BYTES_PER_LDS = 16;
 
     // Ctor.
     inline __device__ Smem_tile_turing_col_b(void* smem, int tidx)
@@ -1826,22 +1667,13 @@ struct Smem_tile_turing_col_b
     inline __device__ void reset_read_offset()
     {
         // The number of MMAs in the K dimension.
-        enum
-        {
-            MMAS_K = Mma_tile::MMAS_K
-        };
+        static constexpr int MMAS_K = Mma_tile::MMAS_K;
 
         // The number of MMAs in the K dimension when we include padding.
-        enum
-        {
-            MMAS_K_WITH_PADDING = Mma_tile_with_padding::MMAS_K
-        };
+        static constexpr int MMAS_K_WITH_PADDING = Mma_tile_with_padding::MMAS_K;
 
         // Assemble the mask.
-        enum
-        {
-            MASK = Compute_reset_mask<MMAS_K, MMAS_K_WITH_PADDING>::VALUE
-        };
+        static constexpr int MASK = Compute_reset_mask<MMAS_K, MMAS_K_WITH_PADDING>::VALUE;
 
         // Reset the read offset.
         this->smem_read_offset_ ^= MASK * BYTES_PER_LDS;
@@ -1929,16 +1761,10 @@ template <typename Traits, int N>
 struct Rows_per_xor_pattern_ampere_b
 {
     // The size in bits.
-    enum
-    {
-        N_IN_BITS = N * Traits::BITS_PER_ELEMENT_B
-    };
+    static constexpr int N_IN_BITS = N * Traits::BITS_PER_ELEMENT_B;
 
     // The number of rows.
-    enum
-    {
-        VALUE = N_IN_BITS <= 256 ? 2 : (N_IN_BITS <= 512 ? 4 : 8)
-    };
+    static constexpr int VALUE = N_IN_BITS <= 256 ? 2 : (N_IN_BITS <= 512 ? 4 : 8);
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1979,22 +1805,13 @@ struct Smem_tile_ampere_col_b
     using Mma_tile_with_padding = typename Traits::template Mma_tile<Cta_tile_with_padding>;
 
     // The size of a single LDS in bytes.
-    enum
-    {
-        BYTES_PER_LDS = 16
-    };
+    static constexpr int BYTES_PER_LDS = 16;
 
     // The number of STS per thread
-    enum
-    {
-        STS_PER_THREAD_ = Base::ROWS * Base::THREADS_PER_ROW / Cta_tile::THREADS_PER_CTA
-    };
+    static constexpr int STS_PER_THREAD_ = Base::ROWS * Base::THREADS_PER_ROW / Cta_tile::THREADS_PER_CTA;
 
     // The number of STS per thread must be at least 1.
-    enum
-    {
-        STS_PER_THREAD = Max<1, STS_PER_THREAD_>::VALUE
-    };
+    static constexpr int STS_PER_THREAD = Max<1, STS_PER_THREAD_>::VALUE;
 
     // Ctor.
     inline __device__ Smem_tile_ampere_col_b(void* smem, int tidx)
@@ -2121,22 +1938,13 @@ struct Smem_tile_ampere_col_b
     inline __device__ void reset_read_offset()
     {
         // The number of MMAs in the K dimension.
-        enum
-        {
-            MMAS_K = Mma_tile::MMAS_K
-        };
+        static constexpr int MMAS_K = Mma_tile::MMAS_K;
 
         // The number of MMAs in the K dimension when we include padding.
-        enum
-        {
-            MMAS_K_WITH_PADDING = Mma_tile_with_padding::MMAS_K
-        };
+        static constexpr int MMAS_K_WITH_PADDING = Mma_tile_with_padding::MMAS_K;
 
         // Assemble the mask.
-        enum
-        {
-            MASK = Compute_reset_mask<MMAS_K, MMAS_K_WITH_PADDING>::VALUE
-        };
+        static constexpr int MASK = Compute_reset_mask<MMAS_K, MMAS_K_WITH_PADDING>::VALUE;
 
         // Reset the read offset.
         this->smem_read_offset_ ^= MASK * BYTES_PER_LDS * 2;
@@ -2329,34 +2137,19 @@ struct Smem_tile_ampere_row_b
     using Fragment = Fragment_b<Traits, Row>;
 
     // Can we use LDSM? No if the data type is 32-bit large.
-    enum
-    {
-        USE_LDSMT = Traits::BITS_PER_ELEMENT_B == 16
-    };
+    static constexpr int USE_LDSMT = Traits::BITS_PER_ELEMENT_B == 16;
 
     // The size of a single LDS in bytes.
-    enum
-    {
-        BYTES_PER_LDS = USE_LDSMT ? 16 : 4
-    };
+    static constexpr int BYTES_PER_LDS = USE_LDSMT ? 16 : 4;
 
     // The number of elements per LDS.
-    enum
-    {
-        ELEMENTS_PER_LDS = BYTES_PER_LDS * 8 / Traits::BITS_PER_ELEMENT_B
-    };
+    static constexpr int ELEMENTS_PER_LDS = BYTES_PER_LDS * 8 / Traits::BITS_PER_ELEMENT_B;
 
     // The number of STS per thread
-    enum
-    {
-        STS_PER_THREAD_ = Base::ROWS * Base::THREADS_PER_ROW / Cta_tile::THREADS_PER_CTA
-    };
+    static constexpr int STS_PER_THREAD_ = Base::ROWS * Base::THREADS_PER_ROW / Cta_tile::THREADS_PER_CTA;
 
     // The number of STS per thread must be at least 1.
-    enum
-    {
-        STS_PER_THREAD = Max<1, STS_PER_THREAD_>::VALUE
-    };
+    static constexpr int STS_PER_THREAD = Max<1, STS_PER_THREAD_>::VALUE;
 
     // Ctor.
     inline __device__ Smem_tile_ampere_row_b(void* smem, int tidx)
