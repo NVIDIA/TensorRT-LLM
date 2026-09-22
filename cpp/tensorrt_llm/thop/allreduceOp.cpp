@@ -563,8 +563,28 @@ private:
             inputPtr = windowBuffer0.ptr;
         }
 
+        // Writing the all-reduce result into an NCCL window buffer is not safe
+        // while capturing a CUDA graph: replaying such a graph yields wrong
+        // results (seen on TP=4 GB200 as a non-finite residual and a decode
+        // collapse). A 2x2 ablation showed the output side is solely
+        // responsible -- a window input is harmless. Fall back to a plain
+        // output during capture, as runNCCLAllReduce does; eager calls keep the
+        // full symmetric path.
+        cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+        bool isCapturing = false;
+        if (cudaStreamIsCapturing(stream, &captureStatus) == cudaSuccess)
+        {
+            isCapturing = (captureStatus != cudaStreamCaptureStatusNone);
+        }
+        else
+        {
+            cudaGetLastError(); // don't leak a sticky error to later calls
+        }
+
         // Use window-backed output buffer
-        auto [normOut, windowBuffer1] = createNCCLWindowTensor(rawComm, input.sizes(), input.scalar_type());
+        auto [normOut, windowBuffer1] = isCapturing
+            ? std::make_pair(torch::Tensor(), tensorrt_llm::common::nccl_util::NCCLWindowBuffer())
+            : createNCCLWindowTensor(rawComm, input.sizes(), input.scalar_type());
         torch::Tensor outputTensor = windowBuffer1.isValid() ? normOut : torch::empty_like(inputTensor);
         void* outputPtr = windowBuffer1.isValid() ? windowBuffer1.ptr : outputTensor.data_ptr();
         if (!windowBuffer1.isValid())
