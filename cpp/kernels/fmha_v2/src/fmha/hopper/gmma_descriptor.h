@@ -119,32 +119,20 @@ public:
         Gmma_mode != Gmma_descriptor_mode::SWIZZLE_NONE, "Currently, SWIZZLE_NONE mode is not implemented. \n");
 
     // byte per leading dim (row if TN, column is NT) must be 128
-    enum
-    {
-        BYTES_PER_LEADING_DIM = 128
-    };
+    static constexpr int BYTES_PER_LEADING_DIM = 128;
 
     // bytes per element
-    enum
-    {
-        BYTES_PER_ELEMENT = BITS_PER_ELEMENT / 8
-    };
+    static constexpr int BYTES_PER_ELEMENT = BITS_PER_ELEMENT / 8;
 
     // the number of descriptors per kblock is related to GMMA shape and kblock size
-    enum
-    {
-        NUM_DESCRIPTORS = (Gmma_vector_size == Gmma_descriptor_size::ALL) ? Cta_tile::K / GMMA_K : 1
-    };
+    static constexpr int NUM_DESCRIPTORS = (Gmma_vector_size == Gmma_descriptor_size::ALL) ? Cta_tile::K / GMMA_K : 1;
 
     // the number of descriptors per 128 byte in k dimension (leading dim)
     // NUM_DESCRIPTORS_PER_128B_IN_K is really only needed if leading dim is K
-    enum
-    {
-        NUM_DESCRIPTORS_PER_128B_IN_K
+    static constexpr int NUM_DESCRIPTORS_PER_128B_IN_K
         = (Gmma_mode == Gmma_descriptor_mode::SWIZZLE_128B && Gmma_trans == Gmma_descriptor_transpose::NOTRANS)
-            ? BYTES_PER_LEADING_DIM / ((GMMA_K * BITS_PER_ELEMENT) / 8)
-            : NUM_DESCRIPTORS
-    };
+        ? BYTES_PER_LEADING_DIM / ((GMMA_K * BITS_PER_ELEMENT) / 8)
+        : NUM_DESCRIPTORS;
 
     static constexpr uint32_t BYTES_PER_GMMA_K = GMMA_K * BITS_PER_ELEMENT / 8; // 32B
 
@@ -166,10 +154,7 @@ public:
     static constexpr uint32_t BYTES_PER_DESC_NO_4LSB = BYTES_PER_DESC >> 4;
 
     // the distance to travel back from the last desc to the first desc within a group
-    enum
-    {
-        BYTES_DESC_INC_BOUNDARY_NO_4LSB = BYTES_PER_DESC_NO_4LSB * (Cta_tile::K / GMMA_K - 1)
-    };
+    static constexpr int BYTES_DESC_INC_BOUNDARY_NO_4LSB = BYTES_PER_DESC_NO_4LSB * (Cta_tile::K / GMMA_K - 1);
 
     // set GMMA descriptor mode bits.
     static constexpr uint64_t DESCRIPTOR_MODE_IN_BIT_LOCATION
@@ -365,32 +350,20 @@ public:
         Gmma_mode != Gmma_descriptor_mode::SWIZZLE_NONE, "Currently, SWIZZLE_NONE mode is not implemented. \n");
 
     // byte per leading dim (column if TN, row if NT), must be 128
-    enum
-    {
-        BYTES_PER_LEADING_DIM = 128
-    };
+    static constexpr int BYTES_PER_LEADING_DIM = 128;
 
     // bytes per element
-    enum
-    {
-        BYTES_PER_ELEMENT = BITS_PER_ELEMENT / 8
-    };
+    static constexpr int BYTES_PER_ELEMENT = BITS_PER_ELEMENT / 8;
 
     // the number of descriptors per kblock is related to GMMA shape and kblock size
-    enum
-    {
-        NUM_DESCRIPTORS = (Gmma_vector_size == Gmma_descriptor_size::ALL) ? Cta_tile::K / GMMA_K : 1
-    };
+    static constexpr int NUM_DESCRIPTORS = (Gmma_vector_size == Gmma_descriptor_size::ALL) ? Cta_tile::K / GMMA_K : 1;
 
     // the number of descriptors per 128 byte in k dimension (leading dim)
     // NUM_DESCRIPTORS_PER_128B_IN_K is really only needed if leading dim is K
-    enum
-    {
-        NUM_DESCRIPTORS_PER_128B_IN_K
+    static constexpr int NUM_DESCRIPTORS_PER_128B_IN_K
         = (Gmma_mode == Gmma_descriptor_mode::SWIZZLE_128B && Gmma_trans == Gmma_descriptor_transpose::NOTRANS)
-            ? BYTES_PER_LEADING_DIM / ((GMMA_K * BITS_PER_ELEMENT) / 8)
-            : NUM_DESCRIPTORS
-    };
+        ? BYTES_PER_LEADING_DIM / ((GMMA_K * BITS_PER_ELEMENT) / 8)
+        : NUM_DESCRIPTORS;
 
     static constexpr uint32_t BYTES_PER_GMMA_K = GMMA_K * BITS_PER_ELEMENT / 8; // 32B
 
@@ -412,25 +385,16 @@ public:
     static constexpr uint32_t BYTES_PER_DESC_NO_4LSB = BYTES_PER_DESC >> 4;
 
     // the distance to travel back from the last desc to the first desc within a group
-    enum
-    {
-        BYTES_DESC_INC_BOUNDARY_NO_4LSB = BYTES_PER_DESC_NO_4LSB * (Cta_tile::K / GMMA_K - 1)
-    };
+    static constexpr int BYTES_DESC_INC_BOUNDARY_NO_4LSB = BYTES_PER_DESC_NO_4LSB * (Cta_tile::K / GMMA_K - 1);
 
     // Byte count on tile-K dimension
-    enum
-    {
-        RESET_SMEM = ((Gmma_trans == Gmma_descriptor_transpose::NOTRANS)
-                         && (((Cta_tile::K * BITS_PER_ELEMENT) / (8 * BYTES_PER_LEADING_DIM)) > 1))
-            ? true
-            : false
-    };
+    static constexpr int RESET_SMEM = ((Gmma_trans == Gmma_descriptor_transpose::NOTRANS)
+                                          && (((Cta_tile::K * BITS_PER_ELEMENT) / (8 * BYTES_PER_LEADING_DIM)) > 1))
+        ? true
+        : false;
 
     // Reset bytes per BYTES_PER_LEADING_DIM (128) x tile-N
-    enum
-    {
-        RESET_BYTES_NO_4LSB = (BYTES_PER_LEADING_DIM * Cta_tile::N) / 16
-    };
+    static constexpr int RESET_BYTES_NO_4LSB = (BYTES_PER_LEADING_DIM * Cta_tile::N) / 16;
 
     // set GMMA descriptor mode bits.
     static constexpr uint64_t DESCRIPTOR_MODE_IN_BIT_LOCATION

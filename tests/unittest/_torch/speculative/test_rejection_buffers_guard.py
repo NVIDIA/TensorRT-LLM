@@ -12,6 +12,7 @@ attribute stand-ins (``types.SimpleNamespace``), so they do not construct a full
   ``max_draft_len``, ``draft_probs``, ``batch_slot_ids``, ``full_draft_probs``).
 - ``SpecWorkerBase._rejection_buffers_valid`` only reads its arguments and
   ``spec_metadata`` attributes (no ``self`` use), so it can be called unbound.
+- ``SpecWorkerBase._zero_padding_rows`` is a staticmethod over plain tensors.
 
 Requires CUDA because the buffers are allocated on ``device='cuda'``.
 """
@@ -267,6 +268,76 @@ def test_accept_dispatch_base_when_all_greedy():
     out = w._accept_draft_tokens(logits, draft_tokens, _NUM_CTX, _BATCH, meta)
     assert out == ("base", None)
     assert calls["base"] == 1 and calls["rejection"] == 0
+
+
+# --------------------------------------------------------------------------
+# Padding-row sanitization: SpecWorkerBase._zero_padding_rows keeps the
+# CUDA-graph padding requests' (possibly non-finite) logits out of the
+# rejection kernel. Another staticmethod over plain tensors, same stand-ins.
+# --------------------------------------------------------------------------
+
+_PAD_ROW = 16  # spec_metadata.dummy_slot_row
+_zero = SpecWorkerBase._zero_padding_rows
+
+
+def _pad_meta(slot_ids, dummy_slot_row=_PAD_ROW):
+    ids = None if slot_ids is None else torch.tensor(slot_ids, dtype=torch.long, device="cuda")
+    return types.SimpleNamespace(batch_slot_ids=ids, dummy_slot_row=dummy_slot_row)
+
+
+def _nan_logits(num_rows):
+    # A padding request decodes from uninitialized state; softmax of such a row
+    # is NaN, which is what has to be kept out of the rejection kernel.
+    return torch.full((num_rows, V), float("nan"), device="cuda")
+
+
+@pytest.mark.parametrize("rows_per_request", [1, 3])
+def test_only_padding_rows_are_zeroed(rows_per_request):
+    # Two real requests, then two CUDA-graph padding requests on the shared
+    # dummy row -- the layout pad_batch() produces (padding appended last).
+    n = 2 * rows_per_request
+    real = torch.randn(n, V, device="cuda")
+    logits = torch.cat([real, _nan_logits(n)])
+
+    out = _zero(logits, _pad_meta([0, 1, _PAD_ROW, _PAD_ROW]), 0, 4, rows_per_request)
+
+    torch.testing.assert_close(out[:n], real)
+    assert torch.all(out[n:] == 0.0)
+    assert torch.isnan(logits[n:]).all(), "must not mutate the caller's logits"
+
+
+def test_padding_mask_excludes_context_rows():
+    # Mixed batch: the first num_contexts requests own one logits row each and
+    # are not part of the gen slice this helper is handed.
+    out = _zero(_nan_logits(4), _pad_meta([7, _PAD_ROW, 3]), 1, 3, 2)
+
+    assert torch.all(out[:2] == 0.0)  # the _PAD_ROW request
+    assert torch.isnan(out[2:]).all()  # the real request, untouched
+
+
+# Builders, not built values: the metas hold CUDA tensors, and parametrize
+# arguments are evaluated at import time, before the CUDA skip applies.
+def _pad_case_no_slot_ids():
+    return _pad_meta(None), 2  # rejection buffers never allocated
+
+
+def _pad_case_unpublished_scratch_row():
+    return _pad_meta([0, 1], dummy_slot_row=0), 2  # slot 0 is a live request
+
+
+def _pad_case_unexpected_row_count():
+    return _pad_meta([0, _PAD_ROW]), 3  # does not match the batch
+
+
+@pytest.mark.parametrize(
+    "build_case",
+    [_pad_case_no_slot_ids, _pad_case_unpublished_scratch_row, _pad_case_unexpected_row_count],
+    ids=lambda f: f.__name__.removeprefix("_pad_case_"),
+)
+def test_padding_mask_returns_input_when_layout_is_unrecognized(build_case):
+    meta, num_rows = build_case()
+    logits = torch.randn(num_rows, V, device="cuda")
+    assert _zero(logits, meta, 0, 2, 1) is logits
 
 
 if __name__ == "__main__":

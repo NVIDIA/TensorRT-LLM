@@ -1483,6 +1483,11 @@
       "path": "sparse_attention_config.use_self_sampling_topk"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.uses_spcompress"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "sparse_attention_config.window_size"
@@ -1517,7 +1522,9 @@
       "allowed_values": [
         "VANILLA",
         "TRTLLM",
-        "FA4"
+        "FA4",
+        "AUTO",
+        "CUTEDSL"
       ],
       "capture_policy": "literal",
       "kind": "categorical",

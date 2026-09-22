@@ -102,15 +102,15 @@ pybind11_add_module(deep_gemm_cpp_tllm ${DEEP_GEMM_SOURCES})
 set_target_properties(
   deep_gemm_cpp_tllm
   PROPERTIES CXX_STANDARD_REQUIRED ON
-             CXX_STANDARD 17
+             CXX_STANDARD 20
              CXX_SCAN_FOR_MODULES OFF
              CUDA_SEPARABLE_COMPILATION ON
              LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/deep_gemm_cpp_tllm.version
              INSTALL_RPATH "${TORCH_INSTALL_PREFIX}/lib"
              BUILD_WITH_INSTALL_RPATH TRUE)
 
-target_compile_options(deep_gemm_cpp_tllm PRIVATE ${TORCH_CXX_FLAGS} -std=c++17
-                                                  -O3 -fPIC -Wno-psabi)
+target_compile_options(deep_gemm_cpp_tllm PRIVATE ${TORCH_CXX_FLAGS} -O3 -fPIC
+                                                  -Wno-psabi)
 
 # Extension name definition
 target_compile_definitions(deep_gemm_cpp_tllm

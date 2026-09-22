@@ -194,7 +194,7 @@ private:
     template <std::size_t... is_>
     FT_DEV_CEXPR auto negateImp(std::index_sequence<is_...>) const
     {
-        return Poly<-bias_, decltype(-std::get<is_>(terms))...>{cn<-bias_>, std::tuple{-std::get<is_>(terms)...}};
+        return Poly<-bias_, decltype(-std::get<is_>(terms))...>{cn<-bias_>, std::make_tuple(-std::get<is_>(terms)...)};
     }
 
     template <auto b_, std::size_t... is_>
@@ -432,25 +432,25 @@ operator>>(Ranged<k_, z_, m_> x_, Cn<b_>)
 template <Kind k_, auto z_, auto m_, auto b_>
 FT_DEV_CEXPR auto operator+(Ranged<k_, z_, m_> a_, Cn<b_>)
 {
-    return Poly{cn<b_>, std::tuple{a_}};
+    return Poly{cn<b_>, std::make_tuple(a_)};
 }
 
 template <Kind k_, auto z_, auto m_, auto b_>
 FT_DEV_CEXPR auto operator-(Ranged<k_, z_, m_> a_, Cn<b_>)
 {
-    return Poly{cn<-b_>, std::tuple{a_}};
+    return Poly{cn<-b_>, std::make_tuple(a_)};
 }
 
 template <Kind k_, auto z_, auto m_, auto a_>
 FT_DEV_CEXPR auto operator+(Cn<a_>, Ranged<k_, z_, m_> b_)
 {
-    return Poly{cn<a_>, std::tuple{b_}};
+    return Poly{cn<a_>, std::make_tuple(b_)};
 }
 
 template <Kind k_, auto z_, auto m_, auto a_>
 FT_DEV_CEXPR auto operator-(Cn<a_>, Ranged<k_, z_, m_> b_)
 {
-    return Poly{cn<a_>, std::tuple{-b_}};
+    return Poly{cn<a_>, std::make_tuple(-b_)};
 }
 
 template <auto A_, class... Ts_, auto b_>
@@ -480,37 +480,37 @@ FT_DEV_CEXPR auto operator-(Cn<a_>, Poly<B_, Ts_...> b_)
 template <Kind kA, auto zA, auto mA, Kind kB, auto zB, auto mB>
 FT_DEV_CEXPR auto operator+(Ranged<kA, zA, mA> a_, Ranged<kB, zB, mB> b_)
 {
-    return Poly{cn<false>, std::tuple{a_, b_}};
+    return Poly{cn<false>, std::make_tuple(a_, b_)};
 }
 
 template <Kind kA, auto zA, auto mA, Kind kB, auto zB, auto mB>
 FT_DEV_CEXPR auto operator-(Ranged<kA, zA, mA> a_, Ranged<kB, zB, mB> b_)
 {
-    return Poly{cn<false>, std::tuple{a_, -b_}};
+    return Poly{cn<false>, std::make_tuple(a_, -b_)};
 }
 
 template <auto A_, class... Ts_, Kind k_, auto z_, auto m_>
 FT_DEV_CEXPR auto operator+(Poly<A_, Ts_...> a_, Ranged<k_, z_, m_> b_)
 {
-    return Poly{cn<A_>, std::tuple_cat(a_.terms, std::tuple{b_})};
+    return Poly{cn<A_>, std::tuple_cat(a_.terms, std::make_tuple(b_))};
 }
 
 template <auto A_, class... Ts_, Kind k_, auto z_, auto m_>
 FT_DEV_CEXPR auto operator-(Poly<A_, Ts_...> a_, Ranged<k_, z_, m_> b_)
 {
-    return Poly{cn<A_>, std::tuple_cat(a_.terms, std::tuple{-b_})};
+    return Poly{cn<A_>, std::tuple_cat(a_.terms, std::make_tuple(-b_))};
 }
 
 template <auto B_, class... Ts_, Kind k_, auto z_, auto m_>
 FT_DEV_CEXPR auto operator+(Ranged<k_, z_, m_> a_, Poly<B_, Ts_...> b_)
 {
-    return Poly{cn<B_>, std::tuple_cat(std::tuple{a_}, b_.terms)};
+    return Poly{cn<B_>, std::tuple_cat(std::make_tuple(a_), b_.terms)};
 }
 
 template <auto B_, class... Ts_, Kind k_, auto z_, auto m_>
 FT_DEV_CEXPR auto operator-(Ranged<k_, z_, m_> a_, Poly<B_, Ts_...> b_)
 {
-    return Poly{cn<-B_>, std::tuple_cat(std::tuple{a_}, (-b_).terms)};
+    return Poly{cn<-B_>, std::tuple_cat(std::make_tuple(a_), (-b_).terms)};
 }
 
 template <auto A_, class... TsA, auto B_, class... TsB>

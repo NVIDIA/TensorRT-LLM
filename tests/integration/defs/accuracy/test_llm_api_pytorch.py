@@ -2546,6 +2546,7 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
                  moe_expert_parallel_size=1,
                  kv_cache_config=kv_cache_config,
                  enable_attention_dp=True,
+                 enable_chunked_prefill=True,
                  trust_remote_code=True,
                  speculative_config=None) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
@@ -4159,6 +4160,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             assert_acceptance_length("TestGPTOSS::test_dflash",
                                      acceptance_length)
 
+    @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
         "kv_cache_dtype",
@@ -4468,6 +4470,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           sampling_params=sampling_params,
                           extra_evaluator_kwargs=extra_evaluator_kwargs)
 
+    @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("one_model", [True], ids=["one_model"])
     @pytest.mark.parametrize("v2_kv_cache", [True, False],
@@ -5988,6 +5991,27 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                         expected_quant_algo=QuantAlgo.MIXED_PRECISION,
                         monkeypatch=monkeypatch,
                         mocker=mocker)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(70000)
+    @pytest.mark.skip_less_host_memory(131072)
+    def test_nvfp4_adp4_megamoe_cutedsl_ple_offload(
+            self, monkeypatch: pytest.MonkeyPatch, mocker) -> None:
+        """NVFP4 on four GPUs with attention DP on the fused-comm MegaMoE kernel.
+
+        MegaMoE-CuteDSL serves NVFP4 only, so the MTP layer's FP8 block-scale
+        experts keep this checkpoint on the no-MTP configuration.
+        """
+        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4",
+                        tensor_parallel_size=4,
+                        moe_backend="MEGAMOE_CUTEDSL",
+                        max_draft_len=None,
+                        expected_quant_algo=QuantAlgo.MIXED_PRECISION,
+                        monkeypatch=monkeypatch,
+                        mocker=mocker,
+                        moe_expert_parallel_size=4,
+                        enable_attention_dp=True)
 
 
 @pytest.mark.skip_less_device_memory(80000)
