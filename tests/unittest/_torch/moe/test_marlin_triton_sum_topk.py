@@ -7,6 +7,11 @@ import torch
 
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import sum_topk_expert_outputs
 
+_MARLIN_SM_SKIP = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9),
+    reason="Marlin NVFP4 requires SM89+ (Ada/Hopper)",
+)
+
 
 def _aten_reference(
     expert_outputs: torch.Tensor, num_tokens: int, top_k: int, hidden_size: int, dtype: torch.dtype
@@ -20,7 +25,7 @@ def _aten_reference(
     return result
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@_MARLIN_SM_SKIP
 @pytest.mark.parametrize(
     "num_tokens,top_k,hidden_size",
     [
@@ -56,7 +61,7 @@ def test_triton_sum_topk_matches_aten_scatter_reduce(
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=0.125)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@_MARLIN_SM_SKIP
 def test_noncontiguous_fallback_matches_triton() -> None:
     """Non-contiguous gemm2_out takes the ATen index_add_ path in forward().
 
