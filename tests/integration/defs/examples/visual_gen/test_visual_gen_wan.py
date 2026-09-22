@@ -418,7 +418,7 @@ def test_visual_gen_quickstart(_visual_gen_deps, llm_root, llm_venv):
     scratch_space = conftest.llm_models_root()
     model_src = os.path.join(scratch_space, WAN_T2V_MODEL_SUBPATH)
     if not os.path.isdir(model_src):
-        pytest.skip(
+        pytest.fail(
             f"Model not found: {model_src} "
             f"(set LLM_MODELS_ROOT or place {WAN_T2V_MODEL_SUBPATH} under scratch)"
         )
@@ -440,7 +440,7 @@ def test_visual_gen_api_walkthrough(_visual_gen_deps, llm_root, llm_venv):
     scratch_space = conftest.llm_models_root()
     model_src = os.path.join(scratch_space, WAN_T2V_MODEL_SUBPATH)
     if not os.path.isdir(model_src):
-        pytest.skip(
+        pytest.fail(
             f"Model not found: {model_src} "
             f"(set LLM_MODELS_ROOT or place {WAN_T2V_MODEL_SUBPATH} under scratch)"
         )
@@ -518,7 +518,7 @@ def test_wan_i2v_example(_visual_gen_deps, llm_root, llm_venv):
     scratch_space = conftest.llm_models_root()
     model_path = os.path.join(scratch_space, WAN22_I2V_A14B_NVFP4_MODEL_SUBPATH)
     if not os.path.isdir(model_path):
-        pytest.skip(
+        pytest.fail(
             f"Model not found: {model_path} "
             f"(set LLM_MODELS_ROOT or place {WAN22_I2V_A14B_NVFP4_MODEL_SUBPATH} under models root)"
         )
