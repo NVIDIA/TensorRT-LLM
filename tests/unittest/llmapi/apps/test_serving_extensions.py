@@ -118,3 +118,135 @@ class TestStructuredOutputDispatch:
             assert json.loads(params.structural_tag)["format"]["type"] == "sequence"
         finally:
             serving_extensions._BY_REASONING_PARSER.pop(parser_key, None)
+
+
+class TestOpenAIChatIntegration:
+    """``openai_chat`` runs the model-type hook, and before rendering.
+
+    The dispatch tests above call ``apply_model_chat_extensions`` directly, so
+    they would still pass if ``openai_chat`` dropped the call or moved it past
+    ``async_apply_chat_template``. This drives the real handler on a server
+    built with ``object.__new__`` (the pattern in
+    ``test_openai_chat_disagg_multimodal.py``), with the renderer and engine
+    stubbed.
+    """
+
+    MODEL_KEY = "serving-extensions-chat-model"
+    MARKER = {"serving_extension_ran": True}
+
+    @pytest.fixture
+    def ordering_extension(self):
+        """Extension that logs its turn and stamps ``chat_template_kwargs``."""
+        events: list = []
+        marker = self.MARKER
+
+        @register_serving_extension(model_types=(self.MODEL_KEY,))
+        class OrderingExtension(ServingExtension):
+            def apply_chat_extensions(self, request) -> None:
+                events.append("extension")
+                request.chat_template_kwargs = {
+                    **(request.chat_template_kwargs or {}),
+                    **marker,
+                }
+
+        try:
+            yield events
+        finally:
+            serving_extensions._BY_MODEL_TYPE.pop(self.MODEL_KEY, None)
+
+    @pytest.fixture
+    def chat_client(self, monkeypatch, ordering_extension):
+        """``openai_chat`` on a bare app; returns (client, events, rendered)."""
+        from unittest.mock import AsyncMock
+
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from tensorrt_llm.serve import openai_server
+        from tensorrt_llm.serve.openai_protocol import (
+            ChatCompletionResponse,
+            ChatCompletionResponseChoice,
+            ChatMessage,
+            UsageInfo,
+        )
+        from tensorrt_llm.serve.openai_server import OpenAIServer
+
+        events = ordering_extension
+        rendered: dict = {}
+
+        class _StubModelConfig:
+            # Class attribute: resolve_top_level_model_type reads the type.
+            model_type = TestOpenAIChatIntegration.MODEL_KEY
+            vocab_size = 1024
+
+        async def fake_apply_chat_template(**kwargs) -> str:
+            events.append("render")
+            rendered.update(kwargs)
+            return "rendered prompt"
+
+        monkeypatch.setattr(openai_server, "async_apply_chat_template", fake_apply_chat_template)
+
+        def generate_async(*, inputs, **kwargs):
+            return SimpleNamespace(prompt_token_ids=[1, 2, 3], finished=True)
+
+        server = object.__new__(OpenAIServer)
+        server.model = "test-model"
+        server.allow_request_chat_template = False
+        server.model_config = _StubModelConfig()
+        server.processor = None
+        server.tokenizer = SimpleNamespace(
+            tokenizer=SimpleNamespace(vocab_size=_StubModelConfig.vocab_size)
+        )
+        server.chat_template = None
+        server.tool_parser = None
+        server.tool_call_id_type = "random"
+        server.multimodal_server_config = None
+        server.generator = SimpleNamespace(
+            args=SimpleNamespace(
+                gather_generation_logits=False,
+                reasoning_parser=None,
+                backend="pytorch",
+                guided_decoding_backend=None,
+                num_postprocess_workers=0,
+            ),
+            generate_async=generate_async,
+        )
+        server.await_disconnected = AsyncMock()
+        server._create_chat_response = AsyncMock(
+            return_value=ChatCompletionResponse(
+                id="chatcmpl-serving-extensions-test",
+                model="test-model",
+                choices=[
+                    ChatCompletionResponseChoice(
+                        index=0,
+                        message=ChatMessage(role="assistant", content="ok"),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=UsageInfo(prompt_tokens=3, completion_tokens=1, total_tokens=4),
+            )
+        )
+
+        app = FastAPI()
+        app.add_api_route("/v1/chat/completions", server.openai_chat, methods=["POST"])
+        return TestClient(app), events, rendered
+
+    def test_extension_runs_before_prompt_rendering(self, chat_client) -> None:
+        client, events, rendered = chat_client
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "chat_template_kwargs": {"client_flag": 1},
+                "max_tokens": 4,
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        # Removed call -> ["render"]; moved after rendering -> ["render", "extension"].
+        assert events == ["extension", "render"]
+        # The renderer saw the request the extension mutated, with the
+        # client's own kwargs preserved.
+        assert rendered["chat_template_kwargs"] == {"client_flag": 1, **self.MARKER}
