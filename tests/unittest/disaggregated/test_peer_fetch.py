@@ -74,7 +74,7 @@ class _StubSession:
         self.notified = 0
         self.closed = 0
 
-    def receive(self, chunk):
+    def receive(self, chunk, expected_write_bytes=None):
         if self.raise_on_receive is not None:
             if self.append_before_raising:
                 self._kv_tasks.append(_StubTask(TaskStatus.TRANSFERRING))
