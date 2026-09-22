@@ -1673,7 +1673,7 @@ def getPytestBaseCommandLine(
     // dumps per-process stacks here. Ranks 1..3 are started with MPI_Comm_spawn,
     // so this is the only path that reaches them.
     extraInternalEnv += " TLLM_FORENSICS_DIR=${outputPath}/forensics"
-    extraInternalEnv += " TLLM_FORENSICS_INTERVAL=60"
+    extraInternalEnv += " TLLM_FORENSICS_INTERVAL=15"
     // CBTS stages put cbts_plugin on PYTHONPATH (via ${VAR:-} for set -u safety) plus the marker/config env vars sitecustomize.py reads in subprocesses.
     if (cbtsMode) {
         def cbtsScriptDir = "${llmSrc}/jenkins/scripts/cbts/coverage_utils"

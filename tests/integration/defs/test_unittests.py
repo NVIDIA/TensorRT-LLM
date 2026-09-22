@@ -165,9 +165,15 @@ def _fail_unittests(reason: str, output_xml: str, output_dir: str,
 _FORENSICS_PER_FILE_MAX_BYTES = 64 * 1024
 _FORENSICS_TOTAL_MAX_BYTES = 2 * 1024 * 1024
 
+# Captured on the first call and reused. os.environ["TLLM_FORENSICS_DIR"] is
+# rewritten to the per-lane path below, so re-reading the env var on a later
+# lane in the same process would nest lane2 inside lane1.
+_FORENSICS_BASE = None
+_FORENSICS_BASE_DERIVED = False
 
-def _resolve_forensics_dir(output_dir):
-    """Return the forensics directory, deriving a default if CI did not set one.
+
+def _resolve_forensics_dir(output_dir, lane):
+    """Return this lane's forensics directory, deriving a base if CI set none.
 
     jenkins/L0_Test.groovy exports TLLM_FORENSICS_DIR, but the Jenkins pipeline
     script is configured outside this repository, so a PR cannot prove its own
@@ -176,16 +182,32 @@ def _resolve_forensics_dir(output_dir):
     nothing, and the run comes back green with zero instrumentation, which is
     indistinguishable from "the probe found nothing".
 
+    The base directory is shared by every lane of a stage, and the files are
+    never cleaned up between lanes, so counting a shared directory attributes
+    earlier lanes' processes to the current one: a measured run reported
+    armed=10 for a lane that armed 5 itself. Each lane therefore gets its own
+    subdirectory, which keeps armed/stacks counts per-lane and comparable.
+
     Written back into os.environ so the collector below resolves the same path.
     """
-    existing = os.environ.get("TLLM_FORENSICS_DIR", "").strip()
-    if existing:
-        return existing
-    derived = os.path.join(output_dir, "forensics")
-    os.environ["TLLM_FORENSICS_DIR"] = derived
-    os.environ.setdefault("TLLM_FORENSICS_INTERVAL", "60")
-    print(f"FORENSICS_DIR_DERIVED: {derived} (TLLM_FORENSICS_DIR was unset)")
-    return derived
+    global _FORENSICS_BASE, _FORENSICS_BASE_DERIVED
+    if _FORENSICS_BASE is None:
+        base = os.environ.get("TLLM_FORENSICS_DIR", "").strip()
+        _FORENSICS_BASE_DERIVED = not base
+        _FORENSICS_BASE = base or os.path.join(output_dir, "forensics")
+    lane_dir = os.path.join(_FORENSICS_BASE, lane)
+    os.environ["TLLM_FORENSICS_DIR"] = lane_dir
+    # Short enough that a process which lives only as long as a passing test
+    # still records a stack: the dump loop sleeps before its first dump, so a
+    # 60s interval left all four MPI workers with no stack at all on a healthy
+    # run, and would delay the first frame of a real hang by a full minute.
+    os.environ.setdefault("TLLM_FORENSICS_INTERVAL", "15")
+    if _FORENSICS_BASE_DERIVED:
+        print(
+            f"FORENSICS_DIR_DERIVED: {lane_dir} (TLLM_FORENSICS_DIR was unset)")
+    else:
+        print(f"FORENSICS_DIR_LANE: {lane_dir}")
+    return lane_dir
 
 
 def _print_forensics_dumps():
@@ -423,10 +445,13 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
             # Reaches MPI_Comm_spawn workers: they inherit this environment,
             # and tests/unittest (which holds sitecustomize.py) is already on
             # the PYTHONPATH built above.
-            forensics_dir = _resolve_forensics_dir(output_dir)
+            forensics_dir = _resolve_forensics_dir(output_dir, case_fn)
             env['TLLM_FORENSICS_DIR'] = forensics_dir
+            # _resolve_forensics_dir above already setdefault'd this, so the
+            # fallback is unreachable; it is kept equal to the value there so a
+            # future edit cannot introduce two different default intervals.
             env['TLLM_FORENSICS_INTERVAL'] = os.environ.get(
-                'TLLM_FORENSICS_INTERVAL', '60')
+                'TLLM_FORENSICS_INTERVAL', '15')
             if s3_secret_key:
                 env["S3_SECRET_KEY"] = s3_secret_key
             if num_workers > 1:
