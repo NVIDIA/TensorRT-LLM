@@ -237,7 +237,9 @@ else()
   list(APPEND CUDA_TOOLKIT_COMPONENTS nvrtc_static nvrtc_builtins_static)
 endif()
 
-find_package(CUDAToolkit 11.2 REQUIRED COMPONENTS ${CUDA_TOOLKIT_COMPONENTS})
+# The floor tracks the first toolkit whose nvcc accepts the C++ standard set
+# below; an older one would fail later with a far less obvious message.
+find_package(CUDAToolkit 12.0 REQUIRED COMPONENTS ${CUDA_TOOLKIT_COMPONENTS})
 
 set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 
