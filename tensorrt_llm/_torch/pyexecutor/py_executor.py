@@ -55,6 +55,7 @@ from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import \
 
 from ..disaggregation.base.transfer import get_unique_rid
 from ..disaggregation.kv_cache_transceiver import KvCacheTransceiver
+from ..disaggregation.native.perf_logger import perf_log_manager
 from ..disaggregation.orchestration.admission import \
     DisaggTransferAdmissionController
 from ..disaggregation.orchestration.coordinator import (
@@ -955,6 +956,7 @@ class PyExecutor:
 
         self.kv_cache_transceiver = kv_cache_transceiver
         if kv_cache_transceiver is not None:
+            perf_log_manager.configure_identity(rank=self.global_rank)
             self.hang_detector.register_status_provider(
                 kv_cache_transceiver.get_status_dump)
         cache_transceiver_config = getattr(self.llm_args,
@@ -5986,6 +5988,12 @@ class PyExecutor:
         ]
 
         self.active_requests.extend(validated_requests)
+        if perf_log_manager.lifecycle_enabled:
+            for request in validated_requests:
+                if request.is_disagg_generation_init_state:
+                    perf_log_manager.event("gen_ingress",
+                                           request,
+                                           prompt_len=request.prompt_len)
         return validated_requests
 
     def _add_kv_cache_events(self):
@@ -7152,6 +7160,7 @@ class PyExecutor:
                 req.add_new_token(first_gen_tokens[beam], beam)
 
             self._maybe_prepend_logprobs_and_logits(req, beam_width)
+            perf_log_manager.event("gen_decode_ready", req)
 
     def _update_sampler_state_for_disagg_gen_request(self, req, beam_width,
                                                      first_gen_tokens) -> bool:
@@ -7871,6 +7880,10 @@ class PyExecutor:
     def _free_request_resources(self, request: LlmRequest) -> None:
         """Release execution resources without removing response routing."""
         self.resource_manager.free_resources(request)
+        if request.is_context_only_request:
+            perf_log_manager.event("ctx_kv_released",
+                                   request,
+                                   state=request.state.name)
         self._prefetched_request_ids.discard(request.py_request_id)
         self.disagg.forget_request(request.py_request_id)
 

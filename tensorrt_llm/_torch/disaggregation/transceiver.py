@@ -173,6 +173,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         rank = self._dist.rank
         logger.info(f"KvCacheTransceiverV2 setup: rank={rank} broadcast instance name (collective)")
         self._instance_name = self._broadcast_instance_name()
+        perf_log_manager.configure_identity(rank=rank, instance=self._instance_name)
         logger.info(
             f"KvCacheTransceiverV2 setup: rank={rank} creating TransferWorker "
             "(native NIXL agent init + KV memory registration)"
@@ -989,6 +990,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if close_succeeded:
                 self._recv_sessions.pop(rid, None)
                 self._recv_reqs.pop(rid, None)
+                outcome = (
+                    "completed"
+                    if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+                    else "failed"
+                )
+                perf_log_manager.event("settled", req, side="gen", outcome=outcome, sync=True)
             else:
                 logger.error(
                     f"request_and_receive_sync: retaining rid={rid} because receive "
@@ -1126,13 +1133,21 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         failed = [rid for rid in failed if rid in quiesced]
 
         for rid in cancelled:
+            perf_log_manager.event(
+                "settled", self._send_reqs.get(rid, rid), side="ctx", outcome="cancelled"
+            )
             self._retire_send_session(rid, outcome="cancelled")
 
         for rid in completed:
             req = self._send_reqs[rid]
+            perf_log_manager.event("settled", req, side="ctx", outcome="completed")
             self._retire_send_session(rid, outcome="completed")
             if mark_complete:
                 req.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
+        for rid in failed:
+            perf_log_manager.event(
+                "settled", self._send_reqs.get(rid, rid), side="ctx", outcome="failed"
+            )
         self._close_failed_sessions(self._send_sessions, self._send_reqs, failed, mark_retired=True)
 
         # Sweep orphaned RecvReqInfo entries from ADP broadcast on non-assigned
@@ -1202,6 +1217,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         for rid in cancelled:
             session = self._recv_sessions[rid]
             self._close_session_or_raise(session, rid, "cancelled")
+            perf_log_manager.event("settled", self._recv_reqs[rid], side="gen", outcome="cancelled")
             cancelled_reqs.append(self._recv_reqs[rid])
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
@@ -1229,6 +1245,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 self._apply_aux(session, req)
             self._assert_disagg_history_declared(req)
             self._close_session_or_raise(session, rid, "completed")
+            perf_log_manager.event("settled", req, side="gen", outcome="completed")
             req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
@@ -1236,6 +1253,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             logger.warning(
                 f"Disagg gen transfer FAILED rank={self._dist.rank} "
                 f"rids={failed} gen_need_sync={self._gen_need_sync}"
+            )
+        for rid in failed:
+            perf_log_manager.event(
+                "settled", self._recv_reqs.get(rid, rid), side="gen", outcome="failed"
             )
         self._close_failed_sessions(self._recv_sessions, self._recv_reqs, failed)
 
@@ -1324,6 +1345,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         retry next iteration. Returns True when safe to free KV memory.
         """
         rid = get_unique_rid(req)
+        if rid in self._send_sessions or rid in self._recv_sessions:
+            perf_log_manager.event(
+                "cancel_requested", req, side="ctx" if rid in self._send_sessions else "gen"
+            )
 
         # Not yet started (generation-first wait queue).
         self._wait_reqs.pop(rid, None)
