@@ -427,7 +427,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         old = torch.where(self._position_initialized[slots], self._ctx_len[slots], input_positions)
         # Padding and ADP-idle requests have no persistent decode position.
         # Their shared scratch row must not grow across graph replays.
-        old.masked_fill_(slots == self._scratch_slot, 0)
+        old = old.masked_fill(slots == self._scratch_slot, 0)
         start_pos = old + num_accepted_tokens
         self._ctx_len[slots] = start_pos
         self._valid_len[slots] = torch.clamp(
