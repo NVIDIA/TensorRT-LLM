@@ -116,6 +116,14 @@ def render_chat_request_for_tokenizer(
         for message in messages:
             if message["role"] == "assistant":
                 message.update(_parse_assistant_message_content(message))
+    else:
+        # Native renderers receive the request unnormalized, but strict-parse
+        # requests deliver `tool_calls` as a single-use pydantic
+        # `ValidatorIterator`; materialize it so tokenizers can index it.
+        for message in messages:
+            tool_calls = message.get("tool_calls")
+            if tool_calls is not None and not isinstance(tool_calls, list):
+                message["tool_calls"] = list(tool_calls)
     chat_template_kwargs["tools"] = tools
     chat_template_kwargs["documents"] = request.documents
     if request.chat_template is not None:
