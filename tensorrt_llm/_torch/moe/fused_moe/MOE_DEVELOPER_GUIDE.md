@@ -201,7 +201,7 @@ Still on old path (standalone, with embedded communication):
 | `trtllm_gen/` (+ the `fused_moe_trtllm_gen.py` alias module) | the abstract `TrtllmGenFusedMoEBase` and its leaves (see [TRTLLM-Gen leaves](#trtllm-gen-leaves-fused_moetrtllm_gen)) | SM100/SM103 | Min-latency and high-throughput on Blackwell; also serves unquantized BF16 through FlashInfer, on a gate of its own (`§` under [Quantization Support](#quantization-support)) | `EXTERNAL_COMM` |
 | `fused_moe_deepgemm.py` | `DeepgemmCudaFp8BlockScalesImpl` (aliased as `DeepGemmFusedMoE`) | SM100/SM103/SM107 | FP8 Block Scales on Blackwell/Rubin | `EXTERNAL_COMM` |
 | `fused_moe_densegemm.py` | `DenseGEMMFusedMoE` | SM100/SM103 | NVFP4 min-latency; CuTe DSL dense GEMM packs all experts into one matrix (vs Cutlass per-expert scatter), efficient for small token counts | `EXTERNAL_COMM` |
-| `fused_moe_cute_dsl.py` | `CuteDslFusedMoE` | SM100/SM103 | High throughput NVFP4, generally faster than Cutlass | `EXTERNAL_COMM` |
+| `fused_moe_cute_dsl.py` | `CuteDslFusedMoE` | SM100/SM103/SM107 | High throughput NVFP4, generally faster than Cutlass; BF16 on SM107; MXFP8 (W8A8 e4m3 + UE8M0 1x32) on SM107 and on SM100/SM103 via the fused FC1+SwiGLU+requant+FC2+finalize CuTe DSL kernel (`cute_dsl_kernels/rubin/moe/rubin_contiguous_grouped_blockscaled_gemm_fused_fc12.py` on Rubin, its port `cute_dsl_kernels/blackwell/moe/blackwell_contiguous_grouped_blockscaled_gemm_fused_fc12.py` on Blackwell; one launch per MoE layer, always finalizes in-kernel, SwiGLU only, requires `hidden_size % 512 == 0` and `intermediate_size_per_partition % 128 == 0`) | `EXTERNAL_COMM` |
 | `fused_moe_cute_dsl_b12x.py` | `CuteDslB12xFusedMoE` | SM120/SM121 | NVFP4 hybrid CUTLASS-prefill / FlashInfer NVFP4 MoE decode — best perf on RTX PRO 6000 (SM120) and DGX Spark (SM121); select via the `CUTEDSL` backend path (it heads that family's candidate list, so it wins on SM120/121 when flashinfer is present and yields to `CuteDslFusedMoE` otherwise); single-GPU-shaped topology only — it rejects both `ep_size > 1` and attention-DP, because it has no dispatch/combine kernel and has never been exercised behind a DP allgather | `EXTERNAL_COMM` |
 | `mega_moe/mega_moe_deepgemm.py` | `DeepgemmCudaW4a8Mxfp4Mxfp8Impl` (aliased as `MegaMoEDeepGemm`) | SM100/SM103 | W4A8_MXFP4_MXFP8 via DeepGEMM `fp8_fp4_mega_moe` fused dispatch+GEMM+act+GEMM+combine kernel; requires `hidden_size % 512 == 0` | `FUSED_COMM` |
 | `mega_moe/mega_moe_cute_dsl.py` | `MegaMoECuteDsl` | SM100/SM103/SM107 | NVFP4 fused dispatch+FC1+act+FC2+combine; internally selects Blackwell, Rubin generic or Rubin genphase kernels. Requires CUDA 13 Cutlass DSL and a symmetric-memory provider. Uses uniform activation constants and applies routing weights before FC2 quantization for DeepSeek-V4, after FC2 for other models. | `FUSED_COMM` |
@@ -373,6 +373,44 @@ operands. TensorRT-LLM currently drives it for **MXFP8 only**, through
   (e.g. `0.3.0+20260518`, which compiles the kernel but miscomputes its MXFP8
   path) falls back to `CutlassFusedMoE` with a warning instead of running it.
 
+### Blackwell fused FC12 (`cute_dsl_kernels/blackwell/moe/`)
+
+`blackwell_contiguous_grouped_blockscaled_gemm_fused_fc12.py` (+
+`blackwell_compat.py`) is the SM100/SM103 port of the Rubin kernel above,
+vendored from the dynamic-kernel-generator `mxf8-opt/blackwell-port` branch.
+It keeps the Rubin kernel's `__call__` ABI and every adapter fact listed
+above (linear activation scales, swizzled weight scales, gate/up interleave at
+64, unit alphas / norm const, pre-zeroed accumulated output, routing tile ==
+MMA tile M), so `CuteDslFusedMoE.run_moe_mxfp8` dispatches by SM to
+`trtllm::cute_dsl_mxfp8_fused_fc12_moe_inplace_blackwell`
+(`Sm100Mxfp8FusedFc12MoeRunner`). Differences:
+
+- The Rubin-only 128-datapath SFA descriptor is replaced by standard SM100
+  block-scaled MMA with a shared-memory SFA repack; MXFP8 only.
+- Tile shapes 1CTA 128x128 / 128x256 and 2CTA 256x128 / 256x256 (K tile 128
+  in the tactic space; 256 measured slower on GB300). For the 2CTA 256x256
+  tile FC2 runs 128-wide sub-tiles on a two-stage accumulator so its MMA
+  overlaps the epilogue.
+- The tactic is `(mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler,
+  stream_weights, fc1_prefetch_ktiles, fc2_prefetch_ktiles, sparse_gather)`:
+  the last four are GB300-measured policies (weight L2 evict_first
+  streaming, TMA-warp L2 weight prefetch distances, padded-group skipping in
+  the A gather) that the autotuner picks per token bucket. Decode buckets
+  favour `(True, 2, 2, True)` with 128-wide tiles (5-18% faster than the
+  unpoliced kernel on GB300); prefill favours `(False, 0, 0, False)` with the
+  2CTA 256x256 tile (-24% at 16k tokens/rank vs the decode tile).
+- The op accepts the Rubin op's `zero_output` flag and raw BF16/FP16 input,
+  but the Blackwell kernel's workspace reset fuses neither: the op clears
+  the output with a plain memset and quantizes raw input with
+  `mxfp8_quantize` in separate launches. `CuteDslFusedMoE` therefore keeps
+  the native quantizer on SM100/SM103 (`_fuses_mxfp8_input_quant` is
+  SM107-only) and there is no locality-domain variant.
+- **DSL build requirement.** `cute_dsl_utils.IS_CUTLASS_DSL_FUSED_FC12_BLACKWELL_AVAILABLE`
+  (true when `cutlass.memory`, `cutlass.tensor_utils`,
+  `cutlass.utils.blackwell_helpers` and `cutlass.utils.blockscaled_layout` are
+  importable; no `rubin_helpers` needed, e.g. `4.8.0a0+20260821`) gates
+  `can_implement` (and through it `resolve_moe_impl`) and the op registration.
+
 ### Design Documents
 
 | File | Topic |
@@ -387,6 +425,8 @@ operands. TensorRT-LLM currently drives it for **MXFP8 only**, through
 | `test_moe_backend.py` | Backend unit tests (`run_moe`, `can_implement`, weight loading, numerics); includes `test_cutedsl_mxfp8_fused_fc12_accuracy_ab`, an A/B of the fused MXFP8 FC12 kernel against the MXFP8 reference module and an fp32 oracle with logged error statistics | Active |
 | `test_moe_impl.py` | Identity, registration and resolution-by-`impl_id`, one section per migrated implementation | Active |
 | `test_moe_module.py` | ConfigurableMoE integration tests (Backend × Comm × EPLB) | Active |
+| `test_mxfp8_moe_partial_refit.py` | MXFP8 bucketed-refit contract (swizzle / gate-up interleave applied exactly once) for the Cutlass and CuTe DSL methods; the CuTe DSL cases run on SM107 and SM100/SM103 | Active |
+| `tests/unittest/_torch/thop/parallel/test_cute_dsl_moe.py` | CuTe DSL MoE op-level tests (incl. `test_mxfp8_fused_fc12_moe_rubin` and its Blackwell twin `test_mxfp8_fused_fc12_moe_blackwell`) | Active |
 | `test_fused_moe.py` | Legacy MoE tests | Being replaced, do NOT add new tests here |
 | `test_moe.py` | Legacy TRTLLM backend tests | Being replaced, do NOT add new tests here |
 
@@ -519,7 +559,7 @@ Each backend's `can_implement(p, d)` classmethod declares what it supports. Sour
 | W4A16 MXFP4 | Y (SM90) | Y (SM100/103) | N | N | N | N | N | Y (SM90) | N | N |
 | W4A8 MXFP4 FP8 | Y (SM100/103/107) | Y (SM100/103) | N | N | N | N | N | Y (SM90) | N | N |
 | W4A8 MXFP4 MXFP8 | Y (SM100/103/107/120/121) | Y (SM100/103) | N | N | N | Y (SM100/103, requires `hidden_size % 512 == 0`) | N | N | N | N |
-| W8A8 MXFP8 MXFP8 | Y (SM100/103) | N | N | N | N | N | N | N | N | N |
+| W8A8 MXFP8 MXFP8 | Y (SM100/103) | N | N | N | Y (SM107¶ and SM100/103, fused FC12 kernel; `hidden_size % 512 == 0`, SwiGLU only) | N | N | N | N | N |
 | W4A8 AWQ | Y (SM89/90) | N | N | N | N | N | N | N | N | N |
 | W8A16 | Y (SM80+) | N | N | N | N | N | N | N | N | N |
 | INT4 WoQ (W4AFP8) | N | N | N | N | N | N | N | N | N | N |
