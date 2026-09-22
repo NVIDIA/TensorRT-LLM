@@ -47,7 +47,6 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KVEventsConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime import kv_cache_manager_v2 as kv_cache_manager_v2_runtime
 from tensorrt_llm.runtime.kv_cache_hash import get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     _KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
@@ -1306,21 +1305,13 @@ class KVCacheManagerV2(BaseResourceManager):
                 # Constructing it is side-effect free; start() below binds the socket
                 # and starts the publisher thread once every other check has passed.
                 event_rank = mapping.rank if mapping.enable_attention_dp else 0
-                native_event_sink = (
-                    kv_cache_manager_v2_runtime.StreamingEventSink(
-                        tokens_per_block=self.tokens_per_block,
-                        mm_token_id_offset=vocab_size,
-                    )
-                    if KV_CACHE_MANAGER_V2_BACKEND == "cpp"
-                    else None
-                )
                 self.event_manager = StreamingKVCacheEventManager(
                     kv_events_config,
                     data_parallel_rank=event_rank,
                     block_size=self.tokens_per_block,
                     max_window_size=event_window_size,
                     mm_token_id_offset=vocab_size,
-                    native_event_sink=native_event_sink,
+                    backend=KV_CACHE_MANAGER_V2_BACKEND,
                 )
         elif self.event_buffer_max_size > 0:
             if mapping.enable_attention_dp:
@@ -2441,8 +2432,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # tying with the attention life cycle and being selected as the event target.
         # The buffered manager keeps every layer group, so its windows are unchanged.
 
-        def get_event_window_size(layer_id: int) -> int:
-            layer_config = self.kv_cache_manager_py_config.layers[layer_id]
+        def get_event_window_size(layer_config: object) -> int:
             window_size = getattr(layer_config, "sliding_window_size", None)
             return self.max_seq_len if window_size is None else int(window_size)
 
@@ -2456,7 +2446,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 # keeps this selection backend-independent.
                 if not isinstance(layer_config, AttentionLayerConfig):
                     continue
-            window_sizes[int(layer_group_id)] = get_event_window_size(int(layer_ids[0]))
+            window_sizes[int(layer_group_id)] = get_event_window_size(layer_config)
         return window_sizes
 
     def _format_kv_cache_pool_lifecycle_entry(self, layer_id: LayerId, role: DataRole) -> str:

@@ -1084,7 +1084,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_ro("dropped_events", &kv::StreamingEventStats::droppedEvents);
 
     nb::class_<kv::StreamingEventSink, kv::EventSink>(m, "StreamingEventSink")
-        .def(nb::init<int, int, std::optional<int>>(), nb::arg("tokens_per_block"), nb::arg("max_entries") = 50'000,
+        .def(nb::init<int, std::optional<int>>(), nb::arg("max_entries") = 50'000,
             nb::arg("mm_token_id_offset") = std::nullopt)
         .def(
             "set_target_life_cycle",

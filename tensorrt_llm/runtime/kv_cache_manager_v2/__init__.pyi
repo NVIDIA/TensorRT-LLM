@@ -324,7 +324,6 @@ class StreamingEventStats:
 class StreamingEventSink:
     def __init__(
         self,
-        tokens_per_block: int,
         max_entries: int = ...,
         mm_token_id_offset: int | None = None,
     ) -> None: ...
@@ -587,7 +586,7 @@ class KVCacheManager:
     def __init__(
         self,
         config: KVCacheManagerConfig,
-        event_manager: KVCacheEventManager | None = None,
+        event_manager: KVCacheEventManager | StreamingEventSink | None = None,
         # C++ backend only; the pure-Python backend does not accept this parameter.
         cold_page_codec: IKvCacheColdPageCodec | None = None,
     ) -> None: ...

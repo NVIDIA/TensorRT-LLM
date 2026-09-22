@@ -108,7 +108,7 @@ def test_streaming_sink_supports_real_radix_blocks(monkeypatch: pytest.MonkeyPat
             layers=[],
         )
     )
-    tree = BlockRadixTree(life_cycles, tokens_per_block=4, event_manager=manager)
+    tree = BlockRadixTree(life_cycles, tokens_per_block=4, event_manager=manager.event_sink)
     published: list[KVEventBatch] = []
     monkeypatch.setattr(
         manager._publisher, "publish", lambda batch: published.append(batch) or True
@@ -120,8 +120,8 @@ def test_streaming_sink_supports_real_radix_blocks(monkeypatch: pytest.MonkeyPat
 
         # Exercise wire event production after the page-coverage gate without
         # allocating GPU pages; the radix blocks and sink are real objects.
-        manager._add_full_block(first)
-        manager._add_full_block(second)
+        manager.event_sink._add_full_block(first)
+        manager.event_sink._add_full_block(second)
         manager.flush_iteration_events()
 
         assert len(published) == 1
@@ -157,7 +157,7 @@ def test_streaming_sink_emits_multimodal_keys_across_blocks(
             layers=[],
         )
     )
-    tree = BlockRadixTree(life_cycles, tokens_per_block=4, event_manager=manager)
+    tree = BlockRadixTree(life_cycles, tokens_per_block=4, event_manager=manager.event_sink)
     published: list[KVEventBatch] = []
     monkeypatch.setattr(
         manager._publisher, "publish", lambda batch: published.append(batch) or True
@@ -172,7 +172,7 @@ def test_streaming_sink_emits_multimodal_keys_across_blocks(
         last = Block([1006, digest_b, 1001, 9], continued)
 
         for block in (first, gap, continued, last):
-            manager._add_full_block(block)
+            manager.event_sink._add_full_block(block)
         manager.flush_iteration_events()
 
         decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(published[0]))
@@ -269,12 +269,12 @@ def test_streaming_fast_path_publishes_only_full_max_window_blocks() -> None:
             partial = block(partial_hash, [5, 6], first)
             second = block(second_hash, [5, 6, 7, 8], first)
 
-            manager.add_stored_block_event_from_block(first)
-            manager.add_stored_block_event_from_block(partial)
-            manager.add_stored_life_cycle_event_from_block(second, 1)
-            manager.add_stored_life_cycle_event_from_block(second, 0)
+            manager.event_sink.add_stored_block_event_from_block(first)
+            manager.event_sink.add_stored_block_event_from_block(partial)
+            manager.event_sink.add_stored_life_cycle_event_from_block(second, 1)
+            manager.event_sink.add_stored_life_cycle_event_from_block(second, 0)
             manager.flush_iteration_events()
-            manager.add_removed_event([first_hash, partial_hash, second_hash])
+            manager.event_sink.add_removed_event([first_hash, partial_hash, second_hash])
             manager.flush_iteration_events()
 
             frames = []
@@ -367,13 +367,13 @@ def test_streaming_removals_are_never_dropped_by_the_entry_cap() -> None:
 
         first = block(b"\x01" * 32, [1, 2], root)
         second = block(b"\x02" * 32, [3, 4], first)
-        manager.add_stored_block_event_from_block(first)
-        manager.add_stored_block_event_from_block(second)
+        manager.event_sink.add_stored_block_event_from_block(first)
+        manager.event_sink.add_stored_block_event_from_block(second)
 
         # Both stores fill the entry cap (max_entries=2); the removals must still
         # be emitted rather than dropped, or the consumer treats the blocks as
         # resident forever.
-        manager.add_removed_event([b"\x01" * 32, b"\x02" * 32])
+        manager.event_sink.add_removed_event([b"\x01" * 32, b"\x02" * 32])
         manager.flush_iteration_events()
 
         assert manager.removed_blocks == 2
@@ -525,7 +525,7 @@ def test_partial_target_page_coverage_is_suppressed_until_fully_covered() -> Non
             storage=[lambda: page],
         )
 
-        manager.add_stored_block_event_from_block(block)
+        manager.event_sink.add_stored_block_event_from_block(block)
         manager.flush_iteration_events()
         assert manager.stored_blocks == 0
         assert manager.partial_blocks_suppressed == 1
@@ -533,7 +533,7 @@ def test_partial_target_page_coverage_is_suppressed_until_fully_covered() -> Non
 
         # Once the page covers the whole block, the same block is published.
         page.num_tokens_in_block = 4
-        manager.add_stored_life_cycle_event_from_block(block, 0)
+        manager.event_sink.add_stored_life_cycle_event_from_block(block, 0)
         manager.flush_iteration_events()
         assert manager.stored_blocks == 1
         assert len(published) == 1
@@ -556,11 +556,11 @@ def test_life_cycle_hooks_ignore_none_ids() -> None:
     try:
         # Before set_layer_group_window_sizes(), and with a None id, both hooks are
         # no-ops rather than raising TypeError.
-        manager.add_stored_life_cycle_event_from_block(object(), None)
-        manager.add_removed_life_cycle_event(b"\x01" * 32, None)
+        manager.event_sink.add_stored_life_cycle_event_from_block(object(), None)
+        manager.event_sink.add_removed_life_cycle_event(b"\x01" * 32, None)
         manager.set_layer_group_window_sizes({0: 128})
-        manager.add_stored_life_cycle_event_from_block(object(), None)
-        manager.add_removed_life_cycle_event(b"\x01" * 32, None)
+        manager.event_sink.add_stored_life_cycle_event_from_block(object(), None)
+        manager.event_sink.add_removed_life_cycle_event(b"\x01" * 32, None)
         assert manager.stored_blocks == 0
         assert manager.removed_blocks == 0
     finally:

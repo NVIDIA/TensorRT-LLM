@@ -31,15 +31,10 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
-StreamingEventSink::StreamingEventSink(int tokensPerBlock, int maxEntries, std::optional<int> mmTokenIdOffset)
-    : mTokensPerBlock(tokensPerBlock)
-    , mMaxEntries(maxEntries)
+StreamingEventSink::StreamingEventSink(int maxEntries, std::optional<int> mmTokenIdOffset)
+    : mMaxEntries(maxEntries)
     , mMmTokenIdOffset(mmTokenIdOffset)
 {
-    if (mTokensPerBlock <= 0)
-    {
-        throw std::invalid_argument("tokensPerBlock must be positive");
-    }
     if (mMaxEntries <= 0)
     {
         throw std::invalid_argument("maxEntries must be positive");
@@ -52,6 +47,10 @@ StreamingEventSink::StreamingEventSink(int tokensPerBlock, int maxEntries, std::
 
 void StreamingEventSink::setTargetLifeCycle(LifeCycleId lifeCycle)
 {
+    if (lifeCycle.value() < 0)
+    {
+        throw std::invalid_argument("lifeCycle must be non-negative");
+    }
     std::lock_guard<std::mutex> lock(mMutex);
     mTargetLifeCycle = lifeCycle;
 }
@@ -138,10 +137,6 @@ void StreamingEventSink::addStoredBlockUnlocked(Block const& block)
     {
         return;
     }
-    if (!reserveEntryUnlocked())
-    {
-        return;
-    }
     if (block.prev == nullptr)
     {
         throw std::logic_error("Cannot publish an orphan KV cache block");
@@ -151,10 +146,21 @@ void StreamingEventSink::addStoredBlockUnlocked(Block const& block)
     std::optional<int64_t> parentHash;
     if (block.prev->type() == NodeBase::Type::kBLOCK)
     {
-        parentHash = wireHash(static_cast<Block const*>(block.prev)->key);
+        auto const& parent = *static_cast<Block const*>(block.prev);
+        auto const storedParent = mStoredBlocks.find(parent.key);
+        if (storedParent == mStoredBlocks.end())
+        {
+            recordDroppedEventUnlocked("parent block has not been published");
+            return;
+        }
+        parentHash = storedParent->second;
     }
 
     auto decoded = decodeEventBlock(block, mMmTokenIdOffset);
+    if (!reserveEntryUnlocked())
+    {
+        return;
+    }
 
     mStoredBlocks.emplace(block.key, blockHash);
     if (!mPendingEvents.empty())
@@ -213,16 +219,18 @@ bool StreamingEventSink::reserveEntryUnlocked()
         ++mPendingEntries;
         return true;
     }
+    recordDroppedEventUnlocked("per-iteration safety cap was exceeded");
+    return false;
+}
+
+void StreamingEventSink::recordDroppedEventUnlocked(char const* reason)
+{
     ++mStats.droppedEvents;
     int64_t const dropped = mStats.droppedEvents;
     if (dropped == 1 || (dropped & (dropped - 1)) == 0)
     {
-        TLLM_LOG_WARNING(
-            "Dropping streaming KV events because the per-iteration safety cap was exceeded; "
-            "dropped_events=%" PRId64,
-            dropped);
+        TLLM_LOG_WARNING("Dropping streaming KV store event because %s; dropped_events=%" PRId64, reason, dropped);
     }
-    return false;
 }
 
 int64_t StreamingEventSink::wireHash(Digest const& digest)

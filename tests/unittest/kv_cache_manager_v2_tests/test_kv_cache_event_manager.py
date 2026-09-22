@@ -26,7 +26,6 @@ import pytest
 from tensorrt_llm._torch.pyexecutor.kv_cache_events import StreamingKVCacheEventManager
 from tensorrt_llm._utils import KVCacheEventSerializer
 from tensorrt_llm.llmapi.llm_args import KVEventsConfig
-from tensorrt_llm.runtime import kv_cache_manager_v2 as kv_cache_manager_v2_runtime
 from tensorrt_llm.runtime.kv_cache_hash import (
     KV_CACHE_HASH_ALGO_V1,
     KV_CACHE_HASH_ALGO_V2_SHA256_64,
@@ -282,17 +281,15 @@ def test_native_event_manager_queue_and_stored_coalescing():
 
 @pytest.mark.skipif(not _USING_CPP_BACKEND, reason="requires the native C++ streaming sink")
 def test_native_streaming_sink_to_python_wire_structs(real_block_factory):
-    event_sink = kv_cache_manager_v2_runtime.StreamingEventSink(
-        tokens_per_block=2,
-        max_entries=8,
-    )
     manager = StreamingKVCacheEventManager(
         KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
         data_parallel_rank=0,
         block_size=2,
         max_window_size=128,
-        native_event_sink=event_sink,
+        max_entries=8,
+        backend="cpp",
     )
+    event_sink = manager.event_sink
     manager.start()
     try:
         manager.set_layer_group_window_sizes({0: 128, 1: 64})
@@ -339,19 +336,16 @@ def test_native_streaming_sink_to_python_wire_structs(real_block_factory):
 
 @pytest.mark.skipif(not _USING_CPP_BACKEND, reason="requires the native C++ streaming sink")
 def test_native_streaming_sink_preserves_multimodal_event_data(real_block_factory):
-    event_sink = kv_cache_manager_v2_runtime.StreamingEventSink(
-        tokens_per_block=4,
-        max_entries=8,
-        mm_token_id_offset=1000,
-    )
     manager = StreamingKVCacheEventManager(
         KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
         data_parallel_rank=0,
         block_size=4,
         max_window_size=128,
+        max_entries=8,
         mm_token_id_offset=1000,
-        native_event_sink=event_sink,
+        backend="cpp",
     )
+    event_sink = manager.event_sink
     manager.start()
     try:
         manager.set_layer_group_window_sizes({0: 128})
@@ -399,6 +393,57 @@ def test_native_streaming_sink_preserves_multimodal_event_data(real_block_factor
             [(digest_a.hex(), 6), (digest_b.hex(), 0)],
         ]
         assert manager.stored_blocks == 4
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.skipif(not _USING_CPP_BACKEND, reason="requires the native C++ streaming sink")
+def test_native_streaming_sink_drops_descendants_of_unpublished_parent(real_block_factory):
+    manager = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=2,
+        max_window_size=128,
+        max_entries=1,
+        backend="cpp",
+    )
+    event_sink = manager.event_sink
+    manager.start()
+    try:
+        manager.set_layer_group_window_sizes({0: 128})
+        published = []
+        manager._publisher.publish = lambda batch: published.append(batch) or True
+        make_block = real_block_factory(event_sink, tokens_per_block=2)
+        first = make_block(_token_ids(1, 3), [2])
+        dropped_parent = make_block(_token_ids(3, 5), [2], parent=first)
+        child = make_block(_token_ids(5, 7), [2], parent=dropped_parent)
+
+        _add_streaming_stored_block(event_sink, first)
+        _add_streaming_stored_block(event_sink, dropped_parent)
+        manager.flush_iteration_events()
+        _add_streaming_stored_block(event_sink, child)
+        manager.flush_iteration_events()
+
+        assert len(published) == 1
+        assert published[0].events[0].token_ids == [1, 2]
+        assert manager.stored_blocks == 1
+        assert manager.dropped_events == 2
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.skipif(not _USING_CPP_BACKEND, reason="requires the native C++ streaming sink")
+def test_native_streaming_sink_rejects_negative_life_cycle_id():
+    manager = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=2,
+        max_window_size=128,
+        backend="cpp",
+    )
+    try:
+        with pytest.raises(ValueError, match="lifeCycle must be non-negative"):
+            manager.event_sink.set_target_life_cycle(-1)
     finally:
         manager.shutdown()
 

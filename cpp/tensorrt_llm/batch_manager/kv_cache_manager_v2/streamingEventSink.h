@@ -62,7 +62,7 @@ struct StreamingEventStats
 class StreamingEventSink final : public EventSink
 {
 public:
-    StreamingEventSink(int tokensPerBlock, int maxEntries, std::optional<int> mmTokenIdOffset = std::nullopt);
+    StreamingEventSink(int maxEntries, std::optional<int> mmTokenIdOffset = std::nullopt);
 
     bool needsTokenDigestContext() const override
     {
@@ -84,10 +84,10 @@ private:
     void addStoredBlockUnlocked(Block const& block);
     void addRemovedBlockUnlocked(Digest const& blockKey);
     void addRemovedHashUnlocked(int64_t blockHash);
+    void recordDroppedEventUnlocked(char const* reason);
     [[nodiscard]] bool reserveEntryUnlocked();
     [[nodiscard]] static int64_t wireHash(Digest const& digest);
 
-    int mTokensPerBlock;
     int mMaxEntries;
     std::optional<int> mMmTokenIdOffset;
     std::optional<LifeCycleId> mTargetLifeCycle;
