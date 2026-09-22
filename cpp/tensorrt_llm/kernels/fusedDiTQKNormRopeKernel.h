@@ -72,6 +72,18 @@ void launchFusedDiTQKNormRopeFullDim(void* qkv, // [num_tokens, (Hq+Hk+Hv)*head_
     int cos_seq_per_batch,                      // 0 = flat cos [num_tokens, …]; >0 = cos broadcast over B
     cudaStream_t stream);
 
+// Tensor-parallel full-dim RMSNorm is split around the all-reduce. The first
+// launch writes this rank's FP32 Q/K sums of squares to [num_tokens, 2].
+void launchDiTQKNormRopeFullDimTpPrepare(void const* qkv, float* local_sums, int num_tokens, int num_heads_q,
+    int num_heads_k, int num_heads_v, int head_dim, cudaStream_t stream);
+
+// Consumes all-reduced sums and updates this rank's Q/K shards in place. The
+// global hidden sizes, rather than local shard sizes, are the RMS denominators.
+void launchDiTQKNormRopeFullDimTpApply(void* qkv, float const* global_sums, int num_tokens, int num_heads_q,
+    int num_heads_k, int num_heads_v, int head_dim, int global_q_hidden_size, int global_k_hidden_size, float eps,
+    void const* q_weight, void const* k_weight, void const* cos_emb, void const* sin_emb, bool interleave,
+    bool per_head_cos, bool cos_is_bf16, int cos_heads, int cos_seq_per_batch, cudaStream_t stream);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

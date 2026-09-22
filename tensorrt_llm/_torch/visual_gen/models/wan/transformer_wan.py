@@ -322,11 +322,9 @@ class WanBlock(nn.Module):
         )
 
         # Self-attention with fused QKV. All WAN variants (1.3B 12h, 5B 24h,
-        # 14B 40h) fit the default fused_dit_qk_norm_rope op's full-dim
-        # template now that the num_heads cap is 64 (post-survey 2026-05).
-        # However, this kernel does not support TP due to the cross-head
-        # normalization being a collective op. Thus, we must disable it if
-        # using TP.
+        # 14B 40h) fit the fused full-dim QK norm + RoPE kernels. With TP, the
+        # packed path computes local Q/K statistics, all-reduces both together,
+        # then applies the local weights and RoPE in place.
         # When ulysses_size > 1 AND parallel.async_ulysses is set, switch
         # to SEPARATE_QKV so V/Q/K projections can stream-pipeline through
         # the async ulysses A2A path.
@@ -343,11 +341,11 @@ class WanBlock(nn.Module):
             qkv_mode=_qkv_mode_self,
             qk_norm=True,
             eps=eps,
-            # fuse_qk_norm_rope=True drives the packed kernel on sync (FUSE_QKV)
-            # and the split kernel on async (SEPARATE_QKV via forward_async).
-            # Disabled when TP>1 since the fused kernel lacks cross-rank
-            # all-reduce for the cross-head RMSNorm variance.
-            fuse_qk_norm_rope=(tp_size == 1),
+            # Keep ordinary fusion enabled for single-rank packed and async
+            # Ulysses split-QKV paths. The narrow TP opt-in is only valid for
+            # synchronous packed QKV; TP + async Ulysses remains unfused.
+            fuse_qk_norm_rope=True,
+            fuse_qk_norm_rope_tp=not self._use_async_ulysses,
             config=model_config,
             layer_idx=_layer_idx,
             async_ulysses=self._use_async_ulysses,

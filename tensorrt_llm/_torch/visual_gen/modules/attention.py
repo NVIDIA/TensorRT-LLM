@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from enum import Enum
 from typing import Optional, Tuple
 
@@ -52,6 +55,7 @@ class Attention(nn.Module):
         bias: bool = True,
         interleave: bool = True,
         fuse_qk_norm_rope: Optional[bool] = None,
+        fuse_qk_norm_rope_tp: bool = False,
         config: Optional[DiffusionModelConfig] = None,
         layer_idx: Optional[int] = None,
         module_name: Optional[str] = None,
@@ -84,10 +88,22 @@ class Attention(nn.Module):
         #   - per-head template (FLUX/Cosmos):   q/k_weight.shape == [head_dim]
         #   - full-dim template (LTX-2, WAN):    q/k_weight.shape == [num_heads * head_dim]
         # Full-dim template envelope: num_heads <= 64, head_dim in {64, 128}.
-        self.fuse_qk_norm_rope = fuse_qk_norm_rope if fuse_qk_norm_rope is not None else False
-        assert not (self.fuse_qk_norm_rope and self.tp_size > 1 and qk_norm_mode == "full"), (
-            "fuse_qk_norm_rope + qk_norm_mode='full' + TP>1: fused kernel lacks cross-rank "
-            "all-reduce for cross-head RMSNorm variance. Disable fuse_qk_norm_rope for TP>1."
+        # TP fusion is a separate, narrow opt-in because only the synchronous
+        # packed-QKV full-dim path currently supports the required collective.
+        requested_fusion = fuse_qk_norm_rope if fuse_qk_norm_rope is not None else False
+        if fuse_qk_norm_rope_tp and not requested_fusion:
+            raise ValueError("fuse_qk_norm_rope_tp=True requires fuse_qk_norm_rope=True")
+        if self.tp_size > 1 and requested_fusion and fuse_qk_norm_rope_tp:
+            if not qk_norm:
+                raise ValueError("TP fused QK RMSNorm + RoPE requires qk_norm=True")
+            if qk_norm_mode != "full":
+                raise ValueError("TP fused QK RMSNorm + RoPE requires qk_norm_mode='full'")
+            if self.qkv_mode != QKVMode.FUSE_QKV:
+                raise ValueError("TP fused QK RMSNorm + RoPE requires packed QKV")
+
+        self.fuse_qk_norm_rope_tp = fuse_qk_norm_rope_tp
+        self.fuse_qk_norm_rope = requested_fusion and (
+            self.tp_size == 1 or self.fuse_qk_norm_rope_tp
         )
         self.interleave = interleave
 
@@ -435,9 +451,43 @@ class Attention(nn.Module):
         """
         B, S, D = qkv.shape
         tokens_per_batch = S if num_txt_tokens > 0 else 0
-        assert self.tp_size == 1, "fused_dit_split_norm_rope does not support TP"
+        qkv_2d = qkv.view(B * S, D)
+
+        if self.tp_size > 1:
+            assert self.fuse_qk_norm_rope
+            assert self.fuse_qk_norm_rope_tp
+            assert self.qk_norm_mode == "full"
+            assert self.qkv_mode == QKVMode.FUSE_QKV
+            assert q_add_weight is None and k_add_weight is None
+            assert self.norm_q.allreduce is not None
+            local_sums = torch.ops.trtllm.fused_dit_qk_norm_rope_tp_prepare(
+                qkv_2d,
+                self.local_num_attention_heads,
+                self.local_num_key_value_heads,
+                self.local_num_key_value_heads,
+                self.head_dim,
+            )
+            global_sums = self.norm_q.allreduce(local_sums)
+            torch.ops.trtllm.fused_dit_qk_norm_rope_tp_apply(
+                qkv_2d,
+                global_sums,
+                self.local_num_attention_heads,
+                self.local_num_key_value_heads,
+                self.local_num_key_value_heads,
+                self.head_dim,
+                self.q_dim,
+                self.kv_dim,
+                self.eps,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                freqs_cos,
+                freqs_sin,
+                self.interleave,
+            )
+            return
+
         torch.ops.trtllm.fused_dit_qk_norm_rope(
-            qkv.view(B * S, D),
+            qkv_2d,
             self.num_attention_heads,
             self.num_key_value_heads,
             self.num_key_value_heads,

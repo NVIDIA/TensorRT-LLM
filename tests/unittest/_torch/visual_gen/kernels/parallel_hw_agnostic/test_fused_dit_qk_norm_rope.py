@@ -707,3 +707,90 @@ def test_full_dim_norm_packed_v_unchanged():
         interleave=False,
     )
     torch.testing.assert_close(qkv[:, 2 * hidden :], v_original, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("interleave", [True, False], ids=["interleaved", "rotate_half"])
+def test_full_dim_norm_packed_tp_stages(head_dim, interleave):
+    """Emulate two TP ranks and compare the staged kernels with full-dim reference math."""
+    device = "cuda"
+    torch.random.manual_seed(7)
+    num_tokens = 33
+    num_heads = 5
+    hidden = num_heads * head_dim
+    eps = 1e-6
+
+    qkv = torch.randn(num_tokens, 3 * hidden, dtype=torch.bfloat16, device=device) * 0.5
+    q_weight = torch.randn(hidden, dtype=torch.bfloat16, device=device) * 2.0
+    k_weight = torch.randn(hidden, dtype=torch.bfloat16, device=device) * 2.0
+    half_freqs = torch.randn(num_tokens, head_dim // 2, dtype=torch.float32, device=device)
+    if interleave:
+        freqs = half_freqs.repeat_interleave(2, dim=-1)
+    else:
+        freqs = torch.cat([half_freqs, half_freqs], dim=-1)
+    cos = freqs.cos().contiguous()
+    sin = freqs.sin().contiguous()
+
+    q, k, v = qkv.split(hidden, dim=-1)
+    shards = []
+    local_sums = []
+    for head_start, head_end in ((0, 3), (3, 5)):
+        start = head_start * head_dim
+        end = head_end * head_dim
+        local_heads = head_end - head_start
+        local_qkv = torch.cat([q[:, start:end], k[:, start:end], v[:, start:end]], dim=-1)
+        shards.append((local_qkv, start, end, local_heads))
+        local_sums.append(
+            torch.ops.trtllm.fused_dit_qk_norm_rope_tp_prepare(
+                local_qkv, local_heads, local_heads, local_heads, head_dim
+            )
+        )
+
+    # A real TP execution performs this sum with one FP32 all-reduce.
+    global_sums = local_sums[0] + local_sums[1]
+    for local_qkv, start, end, local_heads in shards:
+        torch.ops.trtllm.fused_dit_qk_norm_rope_tp_apply(
+            local_qkv,
+            global_sums,
+            local_heads,
+            local_heads,
+            local_heads,
+            head_dim,
+            hidden,
+            hidden,
+            eps,
+            q_weight[start:end].contiguous(),
+            k_weight[start:end].contiguous(),
+            cos,
+            sin,
+            interleave,
+        )
+
+    q_parts = []
+    k_parts = []
+    v_parts = []
+    for local_qkv, start, end, _ in shards:
+        local_hidden = end - start
+        local_q, local_k, local_v = local_qkv.split(local_hidden, dim=-1)
+        q_parts.append(local_q)
+        k_parts.append(local_k)
+        v_parts.append(local_v)
+    actual = torch.cat(
+        [torch.cat(q_parts, dim=-1), torch.cat(k_parts, dim=-1), torch.cat(v_parts, dim=-1)],
+        dim=-1,
+    )
+
+    cos_full = cos[:, None, :].expand(-1, num_heads, -1).reshape(num_tokens, hidden)
+    sin_full = sin[:, None, :].expand(-1, num_heads, -1).reshape(num_tokens, hidden)
+    expected = torch_ref_full_dim(
+        qkv,
+        num_heads,
+        head_dim,
+        eps,
+        q_weight,
+        k_weight,
+        cos_full,
+        sin_full,
+        interleave,
+    )
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=5e-3)
