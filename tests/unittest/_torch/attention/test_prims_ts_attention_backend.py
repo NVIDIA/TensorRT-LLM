@@ -387,17 +387,17 @@ def test_prims_ts_fp8_mla_preprocessing(
     calls = []
 
     def run_and_capture(fmha: PrimsTSFmha, params: FmhaParams) -> None:
-        assert params.qkv_input.dtype == torch.bfloat16
+        assert params.query_input.dtype == torch.bfloat16
         assert params.fwd.quant_q_buffer.dtype == torch.uint8
         original_run(fmha, params)
-        eager = params.context_buf.clone()
+        eager = params.output.clone()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             original_run(fmha, params)
-        params.context_buf.zero_()
+        params.output.zero_()
         graph.replay()
         torch.cuda.synchronize()
-        torch.testing.assert_close(params.context_buf, eager, atol=0, rtol=0)
+        torch.testing.assert_close(params.output, eager, atol=0, rtol=0)
         calls.append(params.attn.local_layer_idx)
 
     monkeypatch.setattr(PrimsTSFmha, "run_mla_generation", run_and_capture)
@@ -508,8 +508,8 @@ def test_prims_ts_fp8_mla_scales_and_graph_replay(
         meta=metadata,
         fwd=fwd,
         workspace=workspace,
-        qkv_input=q,
-        context_buf=output,
+        query_input=q,
+        output=output,
         sequence_lengths=seq_lens,
         input_seq_length=1,
         num_tokens=batch_size,
