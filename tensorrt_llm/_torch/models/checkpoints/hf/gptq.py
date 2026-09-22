@@ -52,6 +52,10 @@ def convert_gptq_weights(
         if g_idx.shape != (k,) or not torch.equal(g_idx, expected):
             raise ValueError("GPTQ activation-order/non-contiguous g_idx is not supported")
 
+    # Conversion unpacks the full matrix before TP slicing. Dense temporary
+    # tensors coexist with the packed inputs, which can increase peak host
+    # memory, especially with concurrent loaders or TP ranks.
+    # TP sharding does not reduce these full-matrix conversion temporaries.
     shifts = torch.arange(0, 32, 4, dtype=torch.int32, device=qweight.device)
     unsigned = ((qweight[:, None, :] >> shifts[None, :, None]) & 15).to(torch.int8)
     # Recenter unsigned [0, 15] to signed [-8, 7], then pack along N.

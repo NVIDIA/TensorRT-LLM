@@ -52,6 +52,13 @@ optional `g_idx` happens while loading, before tensor-parallel slicing and
 fusing Q/K/V or gate/up projections. No separate checkpoint conversion is
 required. Tensor-parallel input shards must contain complete quantization groups.
 
+Checkpoint loading can require substantially more host memory than the packed
+weights alone. Conversion fully unpacks each matrix before tensor-parallel
+slicing, so packed inputs and full-matrix temporary tensors coexist. Concurrent
+loaders or TP ranks can increase the aggregate peak host memory. Increasing TP
+size does not reduce these full-matrix conversion temporaries. Provision
+sufficient host memory for checkpoint loading.
+
 Activation-order checkpoints, prepacked Marlin formats, dynamic
 per-layer quantization, selective `modules_in_block_to_quantize`, quantized
 `lm_head`, and partial weight updates are not supported. Modules listed in
