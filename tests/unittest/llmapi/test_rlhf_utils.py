@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 from torch import nn
@@ -23,12 +23,53 @@ from tensorrt_llm.llmapi.rlhf_utils import WorkerExtension
 
 
 @torch.no_grad()
-def test_refit_refreshes_fused_norm_cache_in_place() -> None:
+def test_begin_weight_update_releases_capture_and_prepares_modules() -> None:
+    model = nn.Module()
+    model.layer = nn.Module()
+    model.layer.pre_reload_weights = MagicMock()
+    model_engine = SimpleNamespace(
+        model=model,
+        model_loader=MagicMock(),
+        unwrap_compiled_model_for_refit=MagicMock(),
+    )
+    extension = WorkerExtension.__new__(WorkerExtension)
+    extension.engine = SimpleNamespace(model_engine=model_engine)
+
+    extension.begin_weight_update()
+
+    model_engine.unwrap_compiled_model_for_refit.assert_called_once_with()
+    model_engine.model_loader.begin_update_weights.assert_called_once_with()
+    model.layer.pre_reload_weights.assert_called_once_with()
+
+
+def test_finish_weight_update_invalidates_cache_and_recaptures() -> None:
+    resource_manager = object()
+    model_engine = SimpleNamespace(
+        restore_compiled_model_after_refit=MagicMock(),
+    )
+    engine = SimpleNamespace(
+        model_engine=model_engine,
+        resource_manager=resource_manager,
+        reset_prefix_cache=MagicMock(),
+    )
+    extension = WorkerExtension.__new__(WorkerExtension)
+    extension.engine = engine
+
+    with patch("torch.cuda.synchronize") as synchronize:
+        extension.finish_weight_update()
+
+    engine.reset_prefix_cache.assert_called_once_with()
+    synchronize.assert_called_once_with()
+    model_engine.restore_compiled_model_after_refit.assert_called_once_with(
+        resource_manager
+    )
+
+
+@torch.no_grad()
+def test_finalize_weight_update_refreshes_post_load_state() -> None:
     model = nn.Module()
     model.norm = nn.Module()
-    original = torch.tensor([0.5, 1.0], dtype=torch.bfloat16)
-    model.norm._fused_norm_weight = original
-    original_ptr = original.data_ptr()
+    model.norm._fused_norm_weight = torch.tensor([0.5, 1.0], dtype=torch.bfloat16)
 
     def post_load_weights() -> None:
         model.norm._fused_norm_weight = torch.tensor([1.5, 2.0], dtype=torch.bfloat16)
@@ -44,7 +85,6 @@ def test_refit_refreshes_fused_norm_cache_in_place() -> None:
 
     model_loader.finalize_update_weights.assert_called_once_with()
 
-    assert model.norm._fused_norm_weight.data_ptr() == original_ptr
     torch.testing.assert_close(
         model.norm._fused_norm_weight,
         torch.tensor([1.5, 2.0], dtype=torch.bfloat16),

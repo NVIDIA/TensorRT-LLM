@@ -11,7 +11,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import ClassVar, Dict, List, Optional, Union
+from typing import ClassVar, Dict, List, Optional, Sequence, Union
 
 import torch
 import torch.nn.functional as F
@@ -431,8 +431,9 @@ class LinearMethodBase(ABC):
             raise ValueError(f'unsupported weight mode: {weight_mode}')
 
         kargs = {}
-        if isinstance(self, (UnquantizedLinearMethod,
-                             FP8BlockScalesLinearMethod, NVFP4LinearMethod)):
+        if isinstance(self,
+                      (UnquantizedLinearMethod, FP8BlockScalesLinearMethod,
+                       NVFP4LinearMethod, MXFP8LinearMethod)):
             kargs['allow_partial_loading'] = allow_partial_loading
         load_fn(module, weights, **kargs)
 
@@ -3566,20 +3567,49 @@ class MXFP8LinearMethod(LinearMethodBase):
             weights: List[Dict],
             tp_size: int = 1,
             tp_rank: int = 0,
-            tp_mode: Optional[TensorParallelMode] = None) -> List[torch.Tensor]:
+            tp_mode: Optional[TensorParallelMode] = None,
+            pad_missing: bool = False,
+            module: Optional[Linear] = None,
+            shard_names: Optional[Sequence[Optional[str]]] = None,
+    ) -> List[torch.Tensor]:
+        """Load per-shard UE8M0 block scales.
+
+        ``module`` routes the slice through ``Linear.load_shard`` instead of the
+        bare ``load_weight_shard`` helper, so a shard whose TP split differs
+        from the plain tp_size/tp_rank rule is honoured. Qwen3.5 is exactly that
+        case: with an attention output gate the fused 'q' shard holds
+        ``2 * q_size`` rows, and slicing the scale without the matching
+        ``name=`` gave it half as many rows as the weight
+        ("size of tensor a (256) must match tensor b (128)").
+
+        With ``pad_missing`` the result stays positionally aligned with
+        ``weights`` (a ``None`` per entry that carries no scale), which the
+        partial-loading paths need to map each scale back onto its fused shard.
+        The default keeps the compacted list the full-load callers expect.
+        """
         device = torch.device("cuda")
         scale_name = self._get_scale_name(weights)
         scales = []
-        for w in weights:
+        for index, w in enumerate(weights):
             if scale_name in w:
-                s = load_weight_shard(w[scale_name],
-                                      tp_size,
-                                      tp_rank,
-                                      tp_mode,
-                                      device=device).contiguous()
+                if module is not None:
+                    key = shard_names[index] if shard_names is not None else None
+                    s = module.load_shard(w,
+                                          scale_name,
+                                          device=device,
+                                          name=key)
+                else:
+                    s = load_weight_shard(w[scale_name],
+                                          tp_size,
+                                          tp_rank,
+                                          tp_mode,
+                                          device=device)
+                s = s.contiguous()
                 assert s.dtype == torch.uint8, (
                     f"MXFP8 weight_scale must be uint8 (UE8M0), got {s.dtype}")
                 scales.append(s)
+            elif pad_missing:
+                scales.append(None)
         return scales
 
     def _store_scale(self, module: Linear, scale_2d: torch.Tensor) -> None:
@@ -3590,47 +3620,174 @@ class MXFP8LinearMethod(LinearMethodBase):
         verbatim into the 2D parameter.
         """
         if self.use_cutlass:
-            swizzled = torch.ops.trtllm.block_scale_interleave(scale_2d)
-            copy_weight(module.weight_scale, swizzled)
+            copy_weight(self._raw_scale_buffer(module), scale_2d)
         else:
             copy_weight(module.weight_scale, scale_2d)
 
-    def load_weights_vanilla(self, module: Linear, weights: List[Dict]) -> None:
-        load_weights_vanilla_helper(module, weights)
-        scales = self.load_weight_scales(weights,
-                                         tp_size=module.tp_size,
-                                         tp_rank=module.tp_rank,
-                                         tp_mode=module.tp_mode)
-        assert len(scales) == 1, (
-            f"MXFP8 vanilla load expects exactly one weight scale, got "
-            f"{len(scales)}")
-        self._store_scale(module, scales[0])
+    def _raw_scale_buffer(self, module: Linear) -> torch.Tensor:
+        """Lazily allocated row-major ``[O, K/32]`` staging copy of the scales.
 
-    def load_weights_fused_qkv_linear(self, module: Linear,
-                                      weights: List[Dict]) -> None:
+        The swizzle tiles rows in groups of 128, so an individual fused shard
+        maps to a contiguous run of the 1D swizzled buffer only when its row
+        bounds are 128-aligned -- which q/k/v sizes are not in general (e.g.
+        head_dim=64 GQA). Shards are written into this row-major copy instead,
+        which slices at any alignment, and the swizzle runs once over the whole
+        thing in ``process_weights_after_loading``.
+
+        Allocated on first use and released by that same hook, mirroring the
+        ``tmp_*`` buffers the NVFP4/FP8 MoE methods use: it is only live
+        between the first bucket and the finalize that consumes it. There is no
+        cross-refit state to preserve -- ``pre_reload_weights`` re-creates every
+        parameter empty at the start of a reload, so a refit must deliver all
+        shards anyway.
+        """
+        if not hasattr(module, "tmp_weight_scale_raw"):
+            module.tmp_weight_scale_raw = torch.empty(
+                (module.out_features, module.in_features // self.BLOCK_SIZE),
+                dtype=torch.uint8,
+                device=module.weight_scale.device)
+        return module.tmp_weight_scale_raw
+
+    def _store_scale_shard(self, module: Linear, scale_2d: torch.Tensor,
+                           row_offset: int, row_size: int) -> None:
+        """Write one fused shard's ``[rows, K/32]`` scale.
+
+        MXFP8 blocks span K only, so the out_features axis is 1:1 between
+        weight rows and scale rows and the shard's weight-coordinate
+        offset/size are reused verbatim -- unlike the 128x128 block-scale
+        methods, which remap them through
+        ``remap_fused_shard_indices_by_divisible_factor``.
+
+        Both paths here are plain row-major slices, so any shard bounds work;
+        the swizzle's 128-row tiling is confined to the deferred whole-buffer
+        transform and never constrains an individual shard.
+        """
+        if self.use_cutlass:
+            assert scale_2d.shape[0] == row_size, (
+                f"MXFP8 fused shard scale has {scale_2d.shape[0]} rows but the "
+                f"shard spans {row_size}; the scale was sliced with a different "
+                f"TP rule than the weight")
+            copy_weight_shard(self._raw_scale_buffer(module), scale_2d,
+                              row_offset, row_size)
+        else:
+            copy_weight_shard(module.weight_scale, scale_2d, row_offset,
+                              row_size)
+
+    def process_weights_after_loading(self, module: Linear) -> None:
+        """Apply the deferred scale swizzle exactly once per load sequence.
+
+        Invoked by ``LinearMethodBase.load_weights`` for a full load, and by
+        the RLHF finalize walk (``Linear.process_weights_after_loading``) after
+        a bucketed refit.
+
+        The staging buffer's existence *is* the pending state, so no separate
+        flag is needed: it is absent on the reference path and on modules whose
+        scales were never staged, and releasing it here makes a repeated
+        finalize a no-op (the swizzle is not an involution).
+        """
+        if hasattr(module, "tmp_weight_scale_raw"):
+            swizzled = torch.ops.trtllm.block_scale_interleave(
+                module.tmp_weight_scale_raw).flatten()
+            assert swizzled.numel() == module.weight_scale.numel(), (
+                f"Swizzled scale size {swizzled.numel()} does not match the "
+                f"allocated buffer {module.weight_scale.numel()}")
+            copy_weight(module.weight_scale, swizzled)
+            # Release the staging copy; the next load reallocates it.
+            delattr(module, "tmp_weight_scale_raw")
+        super().process_weights_after_loading(module)
+
+    def _store_fused_scales(self, module: Linear, shard_keys: tuple,
+                            scales: List[Optional[torch.Tensor]],
+                            allow_partial_loading: bool) -> None:
+        if not allow_partial_loading:
+            # Scales share the out_features dim with weights; concatenate along
+            # dim 0 (out_features), same axis the weights are concatenated on.
+            self._store_scale(module, torch.cat(scales, dim=0))
+            return
+        for shard_key, scale in zip(shard_keys, scales):
+            if scale is None:
+                continue
+            assert shard_key in module.fused_weight_shard_indices_mapping, (
+                f"Shard key {shard_key} not found in fused weight shard "
+                f"indices mapping")
+            shard_offset, shard_size = module.fused_weight_shard_indices_mapping[
+                shard_key]
+            self._store_scale_shard(module, scale, shard_offset, shard_size)
+
+    def load_weights_vanilla(self,
+                             module: Linear,
+                             weights: List[Dict],
+                             allow_partial_loading: bool = False) -> None:
+        load_weights_vanilla_helper(module,
+                                    weights,
+                                    allow_partial_loading=allow_partial_loading)
+        scales = self.load_weight_scales(weights, module=module)
+        if not allow_partial_loading:
+            assert len(scales) == 1, (
+                f"MXFP8 vanilla load expects exactly one weight scale, got "
+                f"{len(scales)}")
+        # The vanilla buffer is rewritten wholesale from the incoming scale, so
+        # a bucket carrying only the weight (or only the scale) is fine and a
+        # repeated bucket is idempotent.
+        if scales:
+            self._store_scale(module, scales[0])
+
+    def load_weights_fused_qkv_linear(
+            self,
+            module: Linear,
+            weights: List[Dict],
+            allow_partial_loading: bool = False) -> None:
         q_weight, k_weight, v_weight = load_weights_fused_qkv_helper(
-            module, weights)
-        copy_weight(module.weight, torch.cat((q_weight, k_weight, v_weight)))
+            module, weights, allow_partial_loading=allow_partial_loading)
+        if not allow_partial_loading:
+            copy_weight(module.weight, torch.cat(
+                (q_weight, k_weight, v_weight)))
+        else:
+            for shard_key, weight in zip(('q', 'k', 'v'),
+                                         (q_weight, k_weight, v_weight)):
+                if weight is not None:
+                    assert shard_key in module.fused_weight_shard_indices_mapping, (
+                        f"Shard key {shard_key} not found in fused weight "
+                        f"shard indices mapping")
+                    shard_offset, shard_size = module.fused_weight_shard_indices_mapping[
+                        shard_key]
+                    copy_weight_shard(module.weight, weight, shard_offset,
+                                      shard_size)
 
         scales = self.load_weight_scales(weights,
-                                         tp_size=module.tp_size,
-                                         tp_rank=module.tp_rank,
-                                         tp_mode=module.tp_mode)
-        # Scales share the out_features dim with weights; concatenate along
-        # dim 0 (out_features), same axis the weights are concatenated on.
-        self._store_scale(module, torch.cat(scales, dim=0))
+                                         module=module,
+                                         shard_names=('q', 'k', 'v'),
+                                         pad_missing=allow_partial_loading)
+        self._store_fused_scales(module, ('q', 'k', 'v'), scales,
+                                 allow_partial_loading)
 
-    def load_weights_fused_gate_up_linear(self, module: Linear,
-                                          weights: List[Dict]) -> None:
+    def load_weights_fused_gate_up_linear(
+            self,
+            module: Linear,
+            weights: List[Dict],
+            allow_partial_loading: bool = False) -> None:
         gate_weight, up_weight = load_weights_fused_gate_up_helper(
-            module, weights)
-        copy_weight(module.weight, torch.cat((gate_weight, up_weight)))
+            module, weights, allow_partial_loading=allow_partial_loading)
+        if not allow_partial_loading:
+            copy_weight(module.weight, torch.cat((gate_weight, up_weight)))
+        else:
+            for shard_key, weight in zip(('gate', 'up'),
+                                         (gate_weight, up_weight)):
+                if weight is not None:
+                    assert shard_key in module.fused_weight_shard_indices_mapping, (
+                        f"Shard key {shard_key} not found in fused weight "
+                        f"shard indices mapping")
+                    shard_offset, shard_size = module.fused_weight_shard_indices_mapping[
+                        shard_key]
+                    copy_weight_shard(module.weight, weight, shard_offset,
+                                      shard_size)
 
         scales = self.load_weight_scales(weights,
-                                         tp_size=module.tp_size,
-                                         tp_rank=module.tp_rank,
-                                         tp_mode=module.tp_mode)
-        self._store_scale(module, torch.cat(scales, dim=0))
+                                         module=module,
+                                         shard_names=('gate', 'up'),
+                                         pad_missing=allow_partial_loading)
+        self._store_fused_scales(module, ('gate', 'up'), scales,
+                                 allow_partial_loading)
 
 
 def get_quant_method(quant_config: Optional[QuantConfig] = None):
@@ -4241,7 +4398,7 @@ class Linear(nn.Module):
         weight_mode = self.weights_loading_config.weight_mode
         if not isinstance(self.quant_method,
                           (UnquantizedLinearMethod, FP8BlockScalesLinearMethod,
-                           NVFP4LinearMethod)):
+                           NVFP4LinearMethod, MXFP8LinearMethod)):
             assert allow_partial_loading is False, (
                 f"{type(self.quant_method).__name__} does not support "
                 "allow_partial_loading")

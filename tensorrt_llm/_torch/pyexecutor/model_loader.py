@@ -575,6 +575,42 @@ def _apply_to_buffers_only(model: torch.nn.Module, fn):
                 module._buffers[key] = fn(buf)
 
 
+def _assert_no_compile_wrapper_in_paths(model: torch.nn.Module) -> None:
+    """Fail loudly if a torch.compile wrapper would make this reload a no-op.
+
+    ``load_weights`` matches checkpoint tensors to modules by dotted path
+    (``filter_weights`` is a ``key.startswith(prefix)`` over ``named_modules()``
+    paths). ``torch.compile`` inserts an ``OptimizedModule`` whose child is
+    ``_orig_mod``, so every path under the compiled scope gains ``._orig_mod.``
+    -- e.g. ``llm.model._orig_mod.embed_tokens.weight`` against a checkpoint key
+    of ``llm.model.embed_tokens.weight``. Nothing matches, and because RL refit
+    passes ``allow_partial_loading=True`` the entire compiled subtree is skipped
+    in silence and keeps its pre-refit weights. The engine then generates from
+    stale weights, which looks like degenerate repetition rather than an error.
+
+    This lives in ``reload()`` rather than in a caller because it is the
+    chokepoint every refit path shares: TensorRT-LLM's own
+    ``WorkerExtension.update_weights`` and NeMo-RL's ``NcclExtension``
+    (``update_weights_from_collective`` / ``update_weights_via_ipc_zmq``), which
+    never calls the TensorRT-LLM refit lifecycle at all.
+
+    Callers must unwrap first -- ``model_engine.unwrap_compiled_model_for_refit()``
+    does this via ``_remove_torch_compile()``.
+    """
+    # Escape hatch, for reproducing the pre-guard behaviour on purpose.
+    if os.environ.get("TLLM_REFIT_SKIP_WRAPPER_CHECK") == "1":
+        return
+    for name, _ in model.named_parameters():
+        if "._orig_mod." in name or name.startswith("_orig_mod."):
+            raise RuntimeError(
+                "Refit would silently load nothing: a torch.compile wrapper is still "
+                f"installed, so parameter paths carry '_orig_mod' (e.g. {name!r}) while "
+                "checkpoint keys do not, and allow_partial_loading hides the mismatch. "
+                "Unwrap before loading weights (e.g. "
+                "model_engine.unwrap_compiled_model_for_refit())."
+            )
+
+
 class ModelLoaderMetricNames(Enum):
     TOTAL_MODEL_LOADING_SECONDS = "total_model_loading_seconds"
     CHECKPOINT_PREPARATION_SECONDS = "checkpoint_preparation_seconds"
@@ -1765,6 +1801,7 @@ class ModelLoader:
                 "Cannot reload weights: weight_mapper was not initialized. "
                 "This can happen when the initial load used GMS, MX P2P, or "
                 "VISION_ONLY, which bypass the standard weight mapping path.")
+        _assert_no_compile_wrapper_in_paths(model)
         if not allow_partial_loading:
             self._reset_weights_transformed(model)
         self._call_load_weights(model.load_weights,

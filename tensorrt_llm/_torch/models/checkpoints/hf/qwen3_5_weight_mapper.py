@@ -230,9 +230,75 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                 for name, value in module_weights.items()
             )
             uses_fused_expert_tensors = has_stacked_expert_tensors and not has_per_expert_tensors
+
+            def _stacked_in_linear_orientation(name: str, value) -> bool:
+                # Qwen3.5 BF16 checkpoints stack experts in nn.Linear
+                # orientation: gate_up_proj [E, 2I, H] ([gate; up] blocked
+                # along dim 1) and down_proj [E, H, I].
+                if getattr(value, "ndim", None) != 3:
+                    return False
+                if name == "gate_up_proj":
+                    return value.shape[-2] == 2 * config.moe_intermediate_size and (
+                        value.shape[-1] == config.hidden_size
+                    )
+                return value.shape[-2] == config.hidden_size and (
+                    value.shape[-1] == config.moe_intermediate_size
+                )
+
+            # nn.Linear-orientation stacks already match the destination
+            # w3_w1/w2 layouts, so unfuse them into zero-copy per-expert views
+            # for the VANILLA loader. The previous FUSED_GATE_UP_PROJ path
+            # materialized a transposed copy of the WHOLE stack here (~97% of
+            # the 397B checkpoint's bytes) only for the loader to transpose
+            # each expert straight back -- a pure round trip. Stacks in any
+            # other orientation (e.g. HF batched-matmul [E, H, 2I]) keep the
+            # FUSED path, which expects that layout natively.
+            # Guard: only unfuse pure weight(+bias) stacks. A hypothetical
+            # stacked QUANTIZED checkpoint would carry scale tensors under the
+            # fused names; unfusing the weights while leaving those stacked
+            # would silently drop the scales in VANILLA mode (which looks up
+            # "{e}.w1.weight_scale" etc.), so keep such inputs on the FUSED
+            # path unchanged. No known Qwen3.5 checkpoint hits this today --
+            # ModelOpt exports are per-expert -- this is purely defensive.
+            has_stacked_scales = any("scale" in name for name in module_weights)
+            unfuse_to_vanilla = (
+                uses_fused_expert_tensors
+                and not has_stacked_scales
+                and all(
+                    _stacked_in_linear_orientation(name, value)
+                    for name, value in module_weights.items()
+                    if name in ("gate_up_proj", "down_proj")
+                    and getattr(value, "ndim", None) == 3
+                )
+            )
+
             updated_module_weights = {}
             for weight_name, weight_value in module_weights.items():
                 if has_per_expert_tensors and weight_name in ("gate_up_proj", "down_proj"):
+                    continue
+                if unfuse_to_vanilla and weight_name == "gate_up_proj":
+                    for expert_id in range(weight_value.shape[0]):
+                        gate, up = weight_value[expert_id].chunk(2, dim=0)
+                        updated_module_weights[f"{expert_id}.w1.weight"] = gate
+                        updated_module_weights[f"{expert_id}.w3.weight"] = up
+                    continue
+                if unfuse_to_vanilla and weight_name == "down_proj":
+                    for expert_id in range(weight_value.shape[0]):
+                        updated_module_weights[f"{expert_id}.w2.weight"] = weight_value[expert_id]
+                    continue
+                if unfuse_to_vanilla and weight_name == "gate_up_proj.bias" and (
+                    weight_value.ndim == 2
+                ):
+                    for expert_id in range(weight_value.shape[0]):
+                        gate_bias, up_bias = weight_value[expert_id].chunk(2, dim=0)
+                        updated_module_weights[f"{expert_id}.w1.bias"] = gate_bias
+                        updated_module_weights[f"{expert_id}.w3.bias"] = up_bias
+                    continue
+                if unfuse_to_vanilla and weight_name == "down_proj.bias" and (
+                    weight_value.ndim == 2
+                ):
+                    for expert_id in range(weight_value.shape[0]):
+                        updated_module_weights[f"{expert_id}.w2.bias"] = weight_value[expert_id]
                     continue
                 if weight_name == "gate_up_proj" and weight_value.ndim == 3:
                     if weight_value.shape[-2] == 2 * config.moe_intermediate_size and (
@@ -258,9 +324,9 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                     )
                 updated_module_weights[new_weight_name] = weight_value
             module.weight_loading_mode = (
-                MoEWeightLoadingMode.FUSED_GATE_UP_PROJ
-                if uses_fused_expert_tensors
-                else MoEWeightLoadingMode.VANILLA
+                MoEWeightLoadingMode.VANILLA
+                if (unfuse_to_vanilla or not uses_fused_expert_tensors)
+                else MoEWeightLoadingMode.FUSED_GATE_UP_PROJ
             )
             module.load_weights(
                 weights=[updated_module_weights], allow_partial_loading=allow_partial_loading
