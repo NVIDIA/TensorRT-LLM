@@ -10,11 +10,11 @@ from agent_flow import (
     AgentLayerConfig,
     BackendConfig,
     SessionConfig,
-    require_tool_call_stop_hook,
 )
 from agent_flow.console import print_message, print_rule
 from agent_flow.logger import get_logger
 
+from . import mcpless
 from .progress import (
     BUILD_STAGE,
     PLAN_STAGE,
@@ -24,8 +24,9 @@ from .progress import (
     find_entries,
     init_progress_file,
     latest_entry,
+    record_progress_entry,
 )
-from .prompts import DEFAULT_PROMPTS, PromptBundle
+from .prompts import DEFAULT_PROMPTS, MCP_TOOLS_EXTENSIONS, PromptBundle
 from .state import (
     STAGE_CODER,
     STAGE_PLAN_DRAFTER,
@@ -47,22 +48,6 @@ _PLAN_STAGES = (STAGE_PLAN_DRAFTER, STAGE_PLAN_REVIEWER, STAGE_PLAN_HUMAN)
 _REPLAN_STAGES = (STAGE_REPLAN, STAGE_REPLAN_REVIEWER, STAGE_REPLAN_HUMAN)
 
 
-def _compose_required_tools_hooks(required_tools: list[str]) -> dict | None:
-    """Compose stop hooks that require *every* listed tool to be called.
-
-    ``require_tool_call_stop_hook`` enforces "at least one of the listed
-    names was called". Stacking one such hook per tool — each independent —
-    yields AND semantics: every per-tool hook must allow the stop, so all
-    listed tools must have been called this turn.
-    """
-    if not required_tools:
-        return None
-    merged: dict[str, list] = {"Stop": []}
-    for name in required_tools:
-        merged["Stop"].extend(require_tool_call_stop_hook([name])["Stop"])
-    return merged
-
-
 def _make_agent(
     name: str,
     system_prompt: str,
@@ -73,13 +58,13 @@ def _make_agent(
     session_mode: str = "persistent",
     human_input_enabled: bool = False,
 ) -> AgentLayer:
-    hooks = _compose_required_tools_hooks(required_tools or [])
     return AgentLayer(
         AgentLayerConfig(
             name=name,
             system_prompt=system_prompt,
-            backend=BackendConfig(kind=backend_kind, model=model, tools=tools, hooks=hooks),
+            backend=BackendConfig(kind=backend_kind, model=model, tools=tools),
             session=SessionConfig(mode=session_mode),
+            required_tools=tuple(required_tools or ()),
             human_input_enabled=human_input_enabled,
         )
     )
@@ -107,15 +92,38 @@ class AgentTeamWorkflow:
         acceptance_criteria: str | Path | None = None,
         feedback: str | Path | None = None,
         prompts: PromptBundle | None = None,
+        use_in_process_tools: bool = True,
     ) -> None:
         self.workspace = workspace
+        # Prompt bundles are transport-neutral. The MCP-tool protocol block
+        # is appended per role only when the run actually registers those
+        # tools; under ``--no-mcp-tools`` it is dropped and ``mcpless``
+        # supplies the file-based protocol instead, so no role is ever told
+        # to call a tool it does not have.
         self.prompts = prompts or DEFAULT_PROMPTS
+        if use_in_process_tools:
+            self.prompts = self.prompts.with_extensions(**MCP_TOOLS_EXTENSIONS)
         self.task_path = workspace / "task.yaml"
         self.plan_path = workspace / "plan.md"
         self.acceptance_criteria_path = workspace / "acceptance-criteria.md"
         self.progress_path = workspace / "progress.yaml"
         self.status_path = workspace / "status.md"
         self.state_path = workspace / STATE_FILENAME
+        # Whether roles may register in-process (SDK) MCP tools. Turned off by
+        # ``--no-mcp-tools`` for every role regardless of backend (see
+        # ``mcpless``): each one then runs with ``tools=None`` and
+        # progress/status flow through the backend's built-in file tools plus
+        # orchestrator parsing/injection instead of MCP tools.
+        self.use_in_process_tools = use_in_process_tools
+        # Per-turn handoff files live here in no-in-process-MCP mode.
+        self.turn_dir = workspace / ".turn"
+        if not use_in_process_tools and (plan_human_review_enabled or build_human_review_enabled):
+            raise ValueError(
+                "human review (--plan-human-review / --build-human-review) is "
+                "unsupported with --no-mcp-tools: the ask_human tool requires "
+                "an in-process MCP server. Rerun without those flags, or "
+                "without --no-mcp-tools."
+            )
         self.num_iterations = num_iterations
         self.coder_context_reset_interval = coder_context_reset_interval
         self.reviewer_context_reset_interval = reviewer_context_reset_interval
@@ -256,7 +264,7 @@ class AgentTeamWorkflow:
         # via ``--plan-human-review``) gates the plan-stage human
         # checkpoint; ``build_human_review_enabled`` gates the Coder's
         # mid-build escape hatch.
-        self.plan_drafter = _make_agent(
+        self.plan_drafter = self._build_agent(
             "plan_drafter",
             self.prompts.plan_drafter,
             progress_tools["plan_drafter"],
@@ -265,20 +273,20 @@ class AgentTeamWorkflow:
             backend_kind="codex",
             model=CODEX_DEFAULT_MODEL,
         )
-        self.plan_reviewer = _make_agent(
+        self.plan_reviewer = self._build_agent(
             "plan_reviewer",
             self.prompts.plan_reviewer,
             progress_tools["plan_reviewer"],
             required_tools=["append_plan_reviewer_progress"],
         )
-        self.coder = _make_agent(
+        self.coder = self._build_agent(
             "coder",
             self.prompts.coder,
             progress_tools["coder"] + status_tools["coder"],
             required_tools=["append_coder_progress", "update_status"],
             human_input_enabled=self.build_human_review_enabled,
         )
-        self.reviewer = _make_agent(
+        self.reviewer = self._build_agent(
             "reviewer",
             self.prompts.reviewer,
             progress_tools["reviewer"] + status_tools["reviewer"],
@@ -291,7 +299,7 @@ class AgentTeamWorkflow:
         # narrower (append only, no read_latest_progress, no status.md) so
         # QA can only ground its verdict in task.yaml and
         # acceptance-criteria.md.
-        self.qa = _make_agent(
+        self.qa = self._build_agent(
             "qa",
             self.prompts.qa,
             progress_tools["qa"],
@@ -300,6 +308,103 @@ class AgentTeamWorkflow:
         )
         self._progress_tools = progress_tools
         self._status_tools = status_tools
+
+    def _build_agent(
+        self,
+        name: str,
+        system_prompt: str,
+        tools: list | None,
+        *,
+        required_tools: list[str] | None = None,
+        human_input_enabled: bool = False,
+        session_mode: str = "persistent",
+        backend_kind: str = "claude-code",
+        model: str = CLAUDE_CODE_DEFAULT_MODEL,
+    ) -> AgentLayer:
+        """Construct a role agent, honoring the in-process-tools mode.
+
+        In no-in-process-MCP mode every role runs with ``tools=None``, no
+        required-tool policy, and no ``ask_human`` — so neither backend
+        registers a dynamically configured MCP server. In MCP mode this is a
+        passthrough to ``_make_agent``.
+        """
+        if not self.use_in_process_tools:
+            tools = None
+            required_tools = None
+            human_input_enabled = False
+        return _make_agent(
+            name,
+            system_prompt,
+            tools,
+            required_tools=required_tools,
+            backend_kind=backend_kind,
+            model=model,
+            session_mode=session_mode,
+            human_input_enabled=human_input_enabled,
+        )
+
+    def _invoke_agent(
+        self,
+        role: str,
+        agent,
+        prompt: str,
+        iteration: int,
+        *,
+        replan: bool = False,
+        feedback_triggered: bool = False,
+    ) -> None:
+        """Run one agent turn.
+
+        In MCP mode this is a passthrough (the agent records progress/status
+        via its MCP tools). In no-in-process-MCP mode it prepends a
+        recording-protocol preamble plus inline context, then reads back the
+        handoff file the agent wrote and records it into ``progress.yaml``. A
+        missing or invalid handoff triggers one corrective retry before
+        raising :class:`mcpless.HandoffError`.
+        """
+        if self.use_in_process_tools:
+            agent(prompt)
+            return
+
+        self.turn_dir.mkdir(parents=True, exist_ok=True)
+        handoff = mcpless.handoff_path(self.turn_dir, role)
+        context = mcpless.gather_context(
+            role,
+            progress_path=self.progress_path,
+            status_path=self.status_path,
+            replan=replan,
+            feedback_triggered=feedback_triggered,
+        )
+        preamble = mcpless.build_recording_preamble(role, handoff, self.status_path, context)
+        full_prompt = f"{preamble}\n\n{prompt}"
+
+        corrective = (
+            "\n\n=== RETRY ===\n"
+            "Your previous turn did not leave a valid handoff file. You MUST end "
+            f"this turn by writing `{handoff}` with the exact YAML keys described "
+            "above (and nothing else). Do this now."
+        )
+
+        last_error: Exception | None = None
+        for attempt in (0, 1):
+            if handoff.exists():
+                handoff.unlink()
+            agent(full_prompt if attempt == 0 else full_prompt + corrective)
+            if not handoff.exists():
+                last_error = mcpless.HandoffError(
+                    f"{role} did not write its handoff file {handoff}"
+                )
+                continue
+            try:
+                fields = mcpless.parse_handoff(role, handoff.read_text(encoding="utf-8"))
+            except mcpless.HandoffError as exc:
+                last_error = exc
+                continue
+            record_progress_entry(self.progress_path, role, iteration, fields)
+            return
+
+        assert last_error is not None
+        raise last_error
 
     def __enter__(self) -> "AgentTeamWorkflow":
         return self
@@ -534,7 +639,9 @@ class AgentTeamWorkflow:
         """
         while True:
             if state.stage == STAGE_REPLAN:
-                self._run_plan_drafter(iteration, mode="replan")
+                self._run_plan_drafter(
+                    iteration, mode="replan", feedback_triggered=state.feedback_replan
+                )
                 decision = self._latest_plan_drafter_decision()
 
                 # Hard score-floor enforcement (Q6 B): a low QA score
@@ -575,6 +682,7 @@ class AgentTeamWorkflow:
                     state.done = True
                     state.next_iteration_index = i + 1
                     state.stage = STAGE_CODER
+                    state.feedback_replan = False
                     self._checkpoint(state)
                     print_message(
                         f"[bold green]✔ plan_drafter DONE at iteration {iteration}[/bold green]",
@@ -602,11 +710,14 @@ class AgentTeamWorkflow:
                     )
                 state.next_iteration_index = i + 1
                 state.stage = STAGE_CODER
+                state.feedback_replan = False
                 self._checkpoint(state)
                 return False
 
             if state.stage == STAGE_REPLAN_REVIEWER:
-                self._run_plan_reviewer(iteration, phase="replan")
+                self._run_plan_reviewer(
+                    iteration, phase="replan", feedback_triggered=state.feedback_replan
+                )
                 review_decision = self._latest_plan_reviewer_decision()
                 if review_decision != "APPROVE":
                     print_message(
@@ -627,6 +738,7 @@ class AgentTeamWorkflow:
                     )
                     state.next_iteration_index = i + 1
                     state.stage = STAGE_CODER
+                    state.feedback_replan = False
                     self._checkpoint(state)
                     return False
                 state.stage = STAGE_REPLAN_HUMAN
@@ -639,6 +751,7 @@ class AgentTeamWorkflow:
                     # blocking on ask_human.
                     state.next_iteration_index = i + 1
                     state.stage = STAGE_CODER
+                    state.feedback_replan = False
                     self._checkpoint(state)
                     return False
                 self._run_plan_drafter(iteration, mode="replan_human")
@@ -650,6 +763,7 @@ class AgentTeamWorkflow:
                     )
                     state.next_iteration_index = i + 1
                     state.stage = STAGE_CODER
+                    state.feedback_replan = False
                     self._checkpoint(state)
                     return False
                 # POLISHING / DRAFT_READY / unset / DONE → re-invoke the
@@ -754,6 +868,7 @@ class AgentTeamWorkflow:
                 )
                 state.done = False
                 state.stage = STAGE_REPLAN
+                state.feedback_replan = True
                 self._checkpoint(state)
             if self.preset_plan is not None or self.preset_acceptance_criteria is not None:
                 print_message(
@@ -948,7 +1063,7 @@ class AgentTeamWorkflow:
         if not isinstance(self.coder, AgentLayer):
             return
         self.coder.__exit__(None, None, None)
-        self.coder = _make_agent(
+        self.coder = self._build_agent(
             "coder",
             self.prompts.coder,
             self._progress_tools["coder"] + self._status_tools["coder"],
@@ -960,7 +1075,7 @@ class AgentTeamWorkflow:
         if not isinstance(self.reviewer, AgentLayer):
             return
         self.reviewer.__exit__(None, None, None)
-        self.reviewer = _make_agent(
+        self.reviewer = self._build_agent(
             "reviewer",
             self.prompts.reviewer,
             self._progress_tools["reviewer"] + self._status_tools["reviewer"],
@@ -1029,7 +1144,9 @@ class AgentTeamWorkflow:
 
     # ------------------------------------------------------------------ agents
 
-    def _run_plan_drafter(self, iteration: int, mode: str) -> None:
+    def _run_plan_drafter(
+        self, iteration: int, mode: str, feedback_triggered: bool = False
+    ) -> None:
         """Invoke the PlanDrafter in ``draft`` / ``human`` / ``replan`` / ``replan_human`` mode.
 
         ``replan`` is only used when ``replan_on_qa=True``: it runs after
@@ -1046,6 +1163,13 @@ class AgentTeamWorkflow:
         plan revision — the plan-phase wording ("Plan iteration",
         "proceed to implementation") would misrepresent a run that is
         already mid-build.
+
+        ``feedback_triggered`` (replan mode only) marks a sub-cycle that
+        was forced by ``--trigger-replan-with-feedback`` rather than by a
+        QA verdict: the prompt tells the drafter the QA data may be stale
+        and that fresh human feedback — not the QA verdict — is the turn's
+        driver, so it may preempt in-progress work to act on the feedback
+        immediately.
         """
         self._progress_ctx.current_iteration = iteration
         if mode == "draft":
@@ -1140,12 +1264,30 @@ class AgentTeamWorkflow:
                     "feedback and address every item in this revision "
                     "before deciding again.\n\n"
                 )
+            feedback_note = (
+                "**Feedback-triggered replan**: this replan turn was "
+                "forced by fresh human feedback "
+                "(`--trigger-replan-with-feedback`), NOT by a QA verdict "
+                "— the QA data below predates the feedback and may be "
+                "stale. Call `read_human_feedback` FIRST; the newest "
+                "entry is this turn's driver. Restructure the plan so "
+                "the very next Coder turn acts on that feedback: you may "
+                "preempt in-progress work per your protocol's "
+                "feedback-triggered replan rules (when your prompt "
+                "extension defines them), deciding which preempted work "
+                "is still needed — reschedule it — and which the "
+                "feedback makes obsolete — drop it with justification "
+                "in your `summary`.\n\n"
+                if feedback_triggered
+                else ""
+            )
             prompt = (
                 f"Workspace: {self.workspace}\n"
                 f"Build iteration: {iteration}\n"
                 f"Phase: **replan** (PlanDrafter is re-invoked after every "
                 f"QA turn; decide DONE / POLISHING / DRAFT_READY based on "
                 f"what the build phase actually achieved).\n\n"
+                f"{feedback_note}"
                 f"Latest QA verdict: decision={qa_decision}, "
                 f"weighted_score={score_str}, min_score={min_score_str}.\n"
                 f"Hard rule: if `weighted_score` is below `min_score` (or "
@@ -1187,9 +1329,17 @@ class AgentTeamWorkflow:
             )
         else:
             raise ValueError(f"unknown plan_drafter mode: {mode!r}")
-        self.plan_drafter(prompt)
+        self._invoke_agent(
+            "plan_drafter",
+            self.plan_drafter,
+            prompt,
+            iteration,
+            replan=mode in ("replan", "replan_human"),
+        )
 
-    def _run_plan_reviewer(self, iteration: int, phase: str = "initial") -> None:
+    def _run_plan_reviewer(
+        self, iteration: int, phase: str = "initial", feedback_triggered: bool = False
+    ) -> None:
         """Run the PlanReviewer in initial-plan or replan-review mode.
 
         ``phase="initial"`` is the classic plan-phase review (a fresh
@@ -1199,11 +1349,28 @@ class AgentTeamWorkflow:
         replan turn; the prompt tells the reviewer it is reviewing a
         revision and to watch for unjustified relaxations to the
         acceptance criteria.
+
+        ``feedback_triggered`` (replan phase only) tells the reviewer the
+        revision under review came from a feedback-forced replan turn, so
+        prompt extensions that define feedback-triggered edit rights can
+        apply them instead of treating the preemption as a violation.
         """
         if phase not in ("initial", "replan"):
             raise ValueError(f"unknown plan_reviewer phase: {phase!r}")
         self._progress_ctx.current_iteration = iteration
         iter_label = "Build iteration" if phase == "replan" else "Plan iteration"
+        feedback_note = (
+            "This replan turn was **feedback-triggered** "
+            "(`--trigger-replan-with-feedback`): the PlanDrafter was "
+            "responding to fresh human feedback, not a QA verdict. Call "
+            "`read_human_feedback` to see the feedback the revision must "
+            "serve. Where your prompt extension defines "
+            "feedback-triggered edit rights (e.g. preempting in-progress "
+            "work), judge the revision under those rules; still REJECT "
+            "edits those rules do not allow.\n\n"
+            if (phase == "replan" and feedback_triggered)
+            else ""
+        )
         phase_note = (
             "Phase: **replan review** — the PlanDrafter has just revised "
             "`plan.md` and `acceptance-criteria.md` after a build-phase "
@@ -1213,10 +1380,11 @@ class AgentTeamWorkflow:
             "changes to `acceptance-criteria.md` (deletions, weakenings, "
             "scope reductions). REJECT silent relaxations; demand the "
             "PlanDrafter justify each change in their `summary`.\n\n"
+            f"{feedback_note}"
             if phase == "replan"
             else ""
         )
-        self.plan_reviewer(
+        prompt = (
             f"Workspace: {self.workspace}\n"
             f"{iter_label}: {iteration}\n\n"
             f"{phase_note}"
@@ -1239,10 +1407,17 @@ class AgentTeamWorkflow:
             "actionable items the PlanDrafter must address, naming the "
             "file (`plan.md` or `acceptance-criteria.md`) for each item."
         )
+        self._invoke_agent(
+            "plan_reviewer",
+            self.plan_reviewer,
+            prompt,
+            iteration,
+            feedback_triggered=feedback_triggered,
+        )
 
     def _run_coder(self, iteration: int) -> None:
         self._progress_ctx.current_iteration = iteration
-        self.coder(
+        prompt = (
             f"Workspace: {self.workspace}\n"
             f"Iteration: {iteration}\n\n"
             f"Start by calling `read_status` to load the rolling "
@@ -1268,6 +1443,7 @@ class AgentTeamWorkflow:
             "snapshot — current status, execution path, what's been tried, "
             "what worked, what didn't, pointers for the next step)."
         )
+        self._invoke_agent("coder", self.coder, prompt, iteration)
 
     def _run_reviewer(self, iteration: int) -> None:
         self._progress_ctx.current_iteration = iteration
@@ -1277,7 +1453,7 @@ class AgentTeamWorkflow:
         # modes). The default agent-team Reviewer prompt ignores the
         # line; no behavior change for callers that don't opt in.
         replan_mode = "enabled" if self.replan_on_qa else "disabled"
-        self.reviewer(
+        prompt = (
             f"Workspace: {self.workspace}\n"
             f"Iteration: {iteration}\n"
             f"Replan mode: {replan_mode}.\n\n"
@@ -1311,6 +1487,7 @@ class AgentTeamWorkflow:
             "what was actually tested, and what the Coder must address "
             "next on REJECT)."
         )
+        self._invoke_agent("reviewer", self.reviewer, prompt, iteration)
 
     def _run_qa(self, iteration: int) -> None:
         self._progress_ctx.current_iteration = iteration
@@ -1323,7 +1500,7 @@ class AgentTeamWorkflow:
                 f"Do not pad the score — if the artifact is not yet that "
                 f"good, say REJECT and list the gaps."
             )
-        self.qa(
+        prompt = (
             f"Workspace: {self.workspace}\n"
             f"Iteration: {iteration}\n\n"
             f"Read `{self.task_path}` (the user's stated intent — "
@@ -1357,6 +1534,7 @@ class AgentTeamWorkflow:
             "REJECT sends the work back to the Coder; put the gaps they "
             "must fix in `summary`." + gate_hint
         )
+        self._invoke_agent("qa", self.qa, prompt, iteration)
 
 
 if __name__ == "__main__":

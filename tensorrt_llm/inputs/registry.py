@@ -43,6 +43,7 @@ from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
                          default_hasher, find_mm_token_lengths,
                          hexdigest_to_int32, validate_mm_inputs)
 from .multimodal_data import serialize_item
+from .prefix_token_cache import create_prefix_token_cache
 
 N = TypeVar("N", bound=Type[nn.Module])
 
@@ -160,11 +161,15 @@ class DefaultInputProcessor(InputProcessor):
                  model_path,
                  config,
                  tokenizer,
-                 trust_remote_code: bool = True) -> None:
+                 trust_remote_code: bool = True,
+                 enable_tokenization_cache: bool = False) -> None:
         self.tokenizer = tokenizer
         self.config = config
         self.model_path = model_path
         self.multimodal_hashing_supported = None
+        # None when disabled or the tokenizer cannot support the cache.
+        self._prefix_token_cache = (create_prefix_token_cache(tokenizer)
+                                    if enable_tokenization_cache else None)
 
     def __call__(
         self, inputs: TextPrompt, sampling_params: SamplingParams
@@ -172,6 +177,14 @@ class DefaultInputProcessor(InputProcessor):
         """The default input processor handles only tokenization."""
         if self.tokenizer is None:
             raise ValueError("tokenizer is required to tokenize string prompt")
+        # Only when the tokenizer would be called exactly as the cache calls it.
+        if (self._prefix_token_cache is not None
+                and not sampling_params.add_special_tokens
+                and sampling_params.truncate_prompt_tokens is None):
+            with nvtx_range_debug("tokenize prompt"), nvtx_range_debug(
+                    "prefix cache"):
+                return self._prefix_token_cache.encode(self.tokenizer,
+                                                       inputs["prompt"]), None
         kwargs = {}
         if sampling_params.truncate_prompt_tokens is not None:
             kwargs = dict(truncation=True,
@@ -204,21 +217,6 @@ class DefaultInputProcessor(InputProcessor):
                 # Tiktoken path
                 token_ids = self.tokenizer.encode(
                     inputs["prompt"], allowed_special=toktoken_special_tokens)
-
-        if "query" in inputs:
-            with nvtx_range_debug("tokenize query"):
-                try:
-                    query_token_ids = self.tokenizer.encode(
-                        inputs["query"],
-                        add_special_tokens=sampling_params.add_special_tokens,
-                        **kwargs)
-                except:
-                    # Tiktoken path
-                    query_token_ids = self.tokenizer.encode(
-                        inputs["query"],
-                        allowed_special=toktoken_special_tokens)
-
-            return token_ids, {"query_token_ids": query_token_ids}
 
         return token_ids, None
 
@@ -1117,6 +1115,7 @@ def create_input_processor(
     tokenizer,
     checkpoint_format: Optional[str] = "HF",
     trust_remote_code: bool = True,
+    enable_tokenization_cache: bool = False,
     **kwargs,
 ) -> Union[InputProcessor, BaseMultimodalInputProcessor]:
     """Create an input processor for a specific model.
@@ -1128,6 +1127,9 @@ def create_input_processor(
             config loading; any other value skips HF config loading. Default is "HF".
         trust_remote_code: Whether Hugging Face config/processor loading may run
             model-provided Python code.
+        enable_tokenization_cache: Whether the ``DefaultInputProcessor`` caches
+            the tokenization of recent prompts. Ignored for model-specific
+            (multimodal) input processors.
         **kwargs: Additional arguments passed to input processor constructors
             (e.g., video_pruning_rate for multimodal models).
 
@@ -1188,7 +1190,11 @@ def create_input_processor(
                                            trust_remote_code=trust_remote_code,
                                            **kwargs)
 
-    return DefaultInputProcessor(None, None, tokenizer)
+    return DefaultInputProcessor(
+        None,
+        None,
+        tokenizer,
+        enable_tokenization_cache=enable_tokenization_cache)
 
 
 def _mm_data_to_counts(mm_data: Dict[str, Any]) -> Dict[str, int]:
@@ -1274,7 +1280,7 @@ def maybe_compute_mm_embed_cumsum(
     # `multimodal_hashing_process` already setdefault()ed the cumsum (without
     # this flag) leaves scheduler_v2 reading mm_bidirectional_blocks=None and
     # silently skipping align — which then trips
-    # get_flashinfer_attention_mask's `cached_token_lens == 0` assert on
+    # get_attention_mask's `cached_token_lens == 0` assert on
     # 26B/31B once an image block is split across chunks. Gemma4 sets this
     # per-instance from text_config.use_bidirectional_attention.
     mm_data.setdefault(

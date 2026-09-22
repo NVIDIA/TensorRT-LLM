@@ -15,23 +15,42 @@ class FakeClient(BackendClient):
         tool_calls: list[ToolCallEvent] | None = None,
         error: Exception | None = None,
         usage: UsageInfo | None = None,
+        skills: list[str] | None = None,
+        turns: list[dict] | None = None,
+        context_usage: UsageInfo | None = None,
     ) -> None:
         self.text = text
         self.tool_calls = tool_calls or []
         self.error = error
         self.usage = usage
+        self.skills = skills
+        self.turns = turns
+        self.context_usage = context_usage
         self.messages: list[str] = []
         self.send_count = 0
         self.closed = False
 
+    async def list_available_skills(self) -> list[str] | None:
+        return self.skills
+
+    async def get_context_usage(self) -> UsageInfo | None:
+        return self.context_usage
+
     async def send_message(self, message: str):
         self.messages.append(message)
         self.send_count += 1
-        if self.error is not None:
-            raise self.error
-        for tool_call in self.tool_calls:
-            yield tool_call
-        yield ResultEvent(text=self.text, usage=self.usage)
+        turn = self.turns[min(self.send_count - 1, len(self.turns) - 1)] if self.turns else {}
+        error = turn.get("error", self.error)
+        if error is not None:
+            raise error
+        for event in turn.get("events", turn.get("tool_calls", self.tool_calls)):
+            yield event
+        yield ResultEvent(
+            text=turn.get("text", self.text),
+            usage=turn.get("usage", self.usage),
+            is_error=turn.get("is_error", False),
+            errors=turn.get("errors", []),
+        )
 
 
 class FakeBackend(Backend):
@@ -68,6 +87,9 @@ class FakeBackend(Backend):
             tool_calls=plan.get("tool_calls"),
             error=plan.get("error"),
             usage=plan.get("usage"),
+            skills=plan.get("skills"),
+            turns=plan.get("turns"),
+            context_usage=plan.get("context_usage"),
         )
         client.system_prompt = system_prompt
         client.model = model

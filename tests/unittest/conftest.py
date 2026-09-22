@@ -37,6 +37,7 @@ from utils.util import get_current_process_gpu_memory
 
 from tensorrt_llm._utils import print_all_stacks
 
+# Bootstrap: makes common utilities under tests/ importable.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from integration.defs import test_list_parser
 # Dispatched explicitly (not via pytest_plugins, which pytest forbids in a
@@ -83,6 +84,8 @@ def pytest_configure(config):
         periodic_batch_size = config.getoption("--periodic-batch-size")
         periodic_save_unfinished_test = config.getoption(
             "--periodic-save-unfinished-test", default=False)
+        periodic_hang_traceback = config.getoption("--periodic-hang-traceback",
+                                                   default=False)
         xml_dir = os.path.dirname(periodic_junit_xmlpath)
         if xml_dir:
             os.makedirs(xml_dir, exist_ok=True)
@@ -95,8 +98,8 @@ def pytest_configure(config):
                 'warning': print_warning
             },
             save_unfinished_test=periodic_save_unfinished_test,
+            dump_hang_traceback=periodic_hang_traceback,
         )
-        reporter.pytest_configure(config)
         config.pluginmanager.register(reporter, 'periodic_junit')
         print_info("PeriodicJUnitXML reporter registered (unittest)")
         print_info(f"  XML path: {periodic_junit_xmlpath}")
@@ -210,6 +213,14 @@ def pytest_addoption(parser):
         default=False,
         help=
         "Save unfinished test name to unfinished_test.txt. Only used with --periodic-junit.",
+    )
+    parser.addoption(
+        "--periodic-hang-traceback",
+        action="store_true",
+        default=False,
+        help=
+        "Dump every thread's stack to hang_traceback.txt shortly before a test timeout. "
+        "Only used with --periodic-junit.",
     )
     # S3 upload options — must be registered here so they are recognized when
     # pytest is run with unittest paths (integration test_unittests.py spawns such a run).
@@ -389,8 +400,18 @@ def mpi_pool_executor(request):
     """
     num_workers = request.param
     with MPIPoolExecutor(num_workers) as executor:
-        # make the number of workers visible to tests
-        setattr(executor, "num_workers", num_workers)
+        # mpi4py exposes this as a read-only property in current releases.
+        # Fall back to the requested value for older releases, but reject a
+        # not-yet-populated or mismatched property before a test can submit
+        # zero tasks and pass vacuously.
+        actual_num_workers = getattr(executor, "num_workers", num_workers)
+        if actual_num_workers != num_workers or actual_num_workers <= 0:
+            raise RuntimeError(
+                "MPIPoolExecutor worker count must be positive and match the "
+                f"requested pool size: requested={num_workers}, "
+                f"reported={actual_num_workers}")
+        if not hasattr(executor, "num_workers"):
+            setattr(executor, "num_workers", actual_num_workers)
         yield executor
 
 

@@ -6,7 +6,7 @@ from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import (
 
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3_moe_weight_mapper import Qwen3MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
-from tensorrt_llm._torch.modules.fused_moe.weight_owner import is_moe_weight_owner
+from tensorrt_llm._torch.moe.fused_moe.weight_owner import is_moe_weight_owner
 
 
 @register_mapper("HF", "Qwen3VLMoeForConditionalGeneration")

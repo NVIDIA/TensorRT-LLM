@@ -71,11 +71,11 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from claude_agent_sdk import tool
 from rich.syntax import Syntax
 
 from agent_flow.console import print_layer_panel
 from agent_flow.logger import get_logger
+from agent_flow.tools import tool
 
 PLAN_STAGE = "plan_stage"
 BUILD_STAGE = "build_stage"
@@ -241,6 +241,29 @@ def _append(path: Path, agent: str, entry: dict[str, Any]) -> None:
     data = read_progress(path)
     data[_STAGE_BY_AGENT[agent]].append(entry)
     write_progress(path, data)
+
+
+def record_progress_entry(
+    path: Path, agent: str, iteration: int, fields: dict[str, Any]
+) -> dict[str, Any]:
+    """Stamp, append, and log a progress entry, returning the full entry.
+
+    The orchestrator uses this in no-in-process-MCP mode (``--no-mcp-tools``),
+    where the agent hands its ``summary`` / ``decision`` / ``weighted_score``
+    back through a file instead of the ``append_*_progress`` MCP tool.
+    ``iteration``, ``agent``, and ``timestamp`` are stamped here (not trusted
+    from the agent) so the shared log stays consistent with the MCP-mode path.
+    ``fields`` supplies the role-specific keys in their canonical order.
+    """
+    entry = {
+        "iteration": iteration,
+        "agent": agent,
+        "timestamp": _now_iso(),
+        **fields,
+    }
+    _append(path, agent, entry)
+    _log_progress_write(agent, entry)
+    return entry
 
 
 def _now_iso() -> str:
@@ -732,9 +755,16 @@ def build_progress_tools(
         append_plan_drafter_progress,
         _make_read_tool("plan_drafter"),
     ]
+    plan_reviewer_tools = [
+        append_plan_reviewer_progress,
+        _make_read_tool("plan_reviewer"),
+    ]
     if plan_drafter_replan_on_qa:
         plan_drafter_tools.append(_make_build_read_tool("plan_drafter"))
         plan_drafter_tools.append(_make_human_feedback_tool("plan_drafter"))
+        # The replan PlanReviewer audits feedback-triggered replans, so it
+        # needs the user's direct voice too — same rationale as QA below.
+        plan_reviewer_tools.append(_make_human_feedback_tool("plan_reviewer"))
 
     # QA intentionally does not get `read_latest_progress`: its verdict
     # must be grounded in ``task.yaml`` and the actual code it builds, not
@@ -745,10 +775,7 @@ def build_progress_tools(
     # stays out of reach.
     return {
         "plan_drafter": plan_drafter_tools,
-        "plan_reviewer": [
-            append_plan_reviewer_progress,
-            _make_read_tool("plan_reviewer"),
-        ],
+        "plan_reviewer": plan_reviewer_tools,
         "coder": [
             append_coder_progress,
             _make_read_tool("coder"),

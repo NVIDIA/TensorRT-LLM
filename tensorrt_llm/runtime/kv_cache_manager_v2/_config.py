@@ -200,6 +200,18 @@ class KVCacheManagerConfig:
     If True, we will try to reuse tokens from partially matched blocks.
     """
 
+    reuse_match_backoff: int = 0
+    """
+    Tokens dropped from the tail of every prefix match.
+
+    For a pool whose KV at position i is a function of tokens [0, i] this is 0: a
+    match of m tokens proves all m are reusable. Set it to D when the pool also
+    holds state that reads D tokens ahead -- one-model speculative decoding draft
+    layers -- where a match of m only describes the first m - D positions.
+
+    Applied inside the match so a single tree walk yields the usable depth.
+    """
+
     constraints: list[BatchDesc] = field(default_factory=list)
     """
     A list of step configurations that must always be supported.
@@ -213,8 +225,11 @@ class KVCacheManagerConfig:
 
     initial_pool_ratio: list[float] | None = None
     """
-    User-provided initial memory partitioning between pool groups. When set, this
-    takes precedence over typical_step and constraints for initial sizing.
+    One positive, normalized hot-tier byte-quota weight per layer group. Cold-tier
+    initialization preserves the implied layer-group slot-count proportions while
+    accounting for cold page sizes. When set, this takes precedence over typical_step
+    and constraints for initial ratio selection; constraints remain hot-level feasibility
+    floors.
     """
 
     swa_scratch_reuse: SwaScratchReuseConfig | None = None

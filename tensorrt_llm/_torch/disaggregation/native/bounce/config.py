@@ -25,6 +25,13 @@ _MIB = 1024 * 1024
 
 # Test/advanced overrides for the size gates below (users only tune the bounce size). Read on the
 # generation side, so set them there; unset uses the defaults.
+# - min_bytes gates payloads that carry recurrent (mamba/KDA) state: the fallback cost scales
+#   with bytes, not block count, so the gate is byte-denominated.
+# - min_blocks is the legacy plain-KV gate, kept so existing bounce deployments see no behavior
+#   change.
+# For Kimi K3 the byte gate never rejects: the fixed ~433 MiB per-request KDA payload always
+# clears the 2 MiB default, so arena capacity plus reservation backpressure is the effective
+# admission control.
 _MIN_BYTES_ENV = "TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES"  # byte gate for recurrent-state payloads
 _MIN_BLOCKS_ENV = "TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS"  # block-count gate for plain-KV payloads
 

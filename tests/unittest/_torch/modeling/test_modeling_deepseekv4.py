@@ -13,29 +13,31 @@ import pytest
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-from utils.util import skip_pre_blackwell
+from utils.util import getSMVersion, skip_blackwell_geforce, skip_pre_blackwell
 
 # from utils.util import default_dtype
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.interface import (
+from tensorrt_llm._torch.attention.backends.fmha import FallbackFmha, FlashInferSparseMlaFmha
+from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     PositionalEmbeddingParams,
     RopeParams,
 )
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import (
     DeepseekV4CacheManager,
     DeepseekV4Indexer,
     DeepseekV4TrtllmAttention,
     DeepseekV4TrtllmAttentionMetadata,
 )
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.compressor import Compressor
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import (
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.compressor import Compressor
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module import (
     _fused_q_rope_specs,
     _is_fused_kv_norm_enabled,
     _is_fused_prologue_active,
     _is_fused_q_fp8_quant_enabled,
 )
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.configs.deepseekv4 import DeepseekV4Config
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -44,6 +46,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     DeepseekV4ForCausalLM,
     DeepseekV4Gate,
     DeepseekV4MTP,
+    DeepseekV4WeightLoader,
     _copy_deepseek_v4_fused_a_weight_scale,
     _deepseek_v4_pos_embd_params,
     _normalize_deepseek_v4_nvfp4_mixed_precision_config,
@@ -51,7 +54,6 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     _resolve_enable_fused_hc,
 )
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
-from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import AuxStreamType, model_extra_attrs
@@ -155,7 +157,10 @@ def test_deepseek_v4_fused_hc_default_enabled(monkeypatch):
     assert _resolve_enable_fused_hc(config) is False
 
 
-def test_deepseek_v4_kv_cache_defaults_and_v2_preference():
+def test_deepseek_v4_kv_cache_defaults_and_v2_preference(monkeypatch):
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_deepseekv4.get_sm_version", lambda: 100
+    )
     defaults = DeepseekV4ForCausalLM.get_model_defaults(None)
 
     assert defaults == {
@@ -167,6 +172,38 @@ def test_deepseek_v4_kv_cache_defaults_and_v2_preference():
     assert DeepseekV4ForCausalLM.get_preferred_kv_cache_manager_version() == "V2"
 
 
+def test_deepseek_v4_hopper_uses_fp8_ds_mla_defaults(monkeypatch) -> None:
+    monkeypatch.setattr("tensorrt_llm._torch.models.modeling_deepseekv4.get_sm_version", lambda: 90)
+
+    defaults = DeepseekV4ForCausalLM.get_model_defaults(None)
+
+    assert defaults == {
+        "kv_cache_config": {
+            "dtype": "fp8_ds_mla",
+            "tokens_per_block": 128,
+            "enable_swa_scratch_reuse": True,
+        }
+    }
+
+
+def test_deepseek_v4_fp8_ds_mla_uses_256_token_blocks(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_deepseekv4.get_sm_version", lambda: 100
+    )
+
+    class LlmArgs:
+        kv_cache_config = KvCacheConfig(dtype="fp8_ds_mla")
+
+    defaults = DeepseekV4ForCausalLM.get_model_defaults(LlmArgs())
+
+    assert defaults == {
+        "kv_cache_config": {
+            "tokens_per_block": 256,
+            "enable_swa_scratch_reuse": True,
+        }
+    }
+
+
 def test_deepseek_v4_weight_remap_for_mxfp4_routed_experts():
     weights = {
         "layers.0.ffn.experts.0.w1.weight": torch.tensor([[-1, 2], [3, -4]], dtype=torch.int8),
@@ -176,7 +213,10 @@ def test_deepseek_v4_weight_remap_for_mxfp4_routed_experts():
     remapped = _remap_deepseek_v4_checkpoint_keys(weights, num_hidden_layers=1, kv_lora_rank=448)
 
     assert remapped["model.layers.0.mlp.experts.0.w1.weight"].dtype == torch.uint8
-    assert remapped["model.layers.0.mlp.experts.0.w1.weight_scale"].dtype == torch.uint8
+    canonical_scale = remapped["model.layers.0.mlp.experts.0.w1.weight_scale"]
+    legacy_scale = remapped["model.layers.0.mlp.experts.0.w1.weight_scale_inv"]
+    assert canonical_scale.dtype == torch.uint8
+    assert legacy_scale is canonical_scale
 
 
 def test_deepseek_v4_weight_remap_for_fp8_routed_experts():
@@ -189,6 +229,50 @@ def test_deepseek_v4_weight_remap_for_fp8_routed_experts():
 
     assert "model.layers.0.mlp.experts.0.w1.weight_scale_inv" in remapped
     assert "model.layers.0.mlp.experts.0.w1.weight_scale" not in remapped
+
+
+def test_deepseek_v4_eplb_weight_loader_pages_out_each_moe_layer(monkeypatch):
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+    layer = model.model.layers[0]
+    layer.foo = torch.nn.Module()
+    layer.foo.weight = torch.nn.Parameter(torch.zeros(2))
+    layer.mlp = torch.nn.Module()
+    layer.mlp.experts = torch.nn.Module()
+    layer.mlp.experts.backend = torch.nn.Module()
+    model.config = SimpleNamespace(
+        q_lora_rank=1,
+        num_attention_heads=1,
+        qk_nope_head_dim=1,
+        v_head_dim=1,
+        kv_lora_rank=1,
+        num_hidden_layers=1,
+        num_nextn_predict_layers=0,
+    )
+    model.model_config = SimpleNamespace(
+        mapping=SimpleNamespace(
+            tp_rank=0,
+            tp_size=1,
+            cp_rank=0,
+            cp_size=1,
+            enable_attention_dp=False,
+        ),
+        moe_load_balancer=object(),
+    )
+    weights = {"model.layers.0.foo.weight": torch.tensor([1.0, 2.0])}
+    synchronize_calls = []
+    pageout_calls = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: synchronize_calls.append(None))
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_deepseekv4.pageout_file_backed_regions",
+        lambda path_substring, mode: pageout_calls.append((path_substring, mode)),
+    )
+
+    DeepseekV4WeightLoader(model)._load_weights_impl(weights)
+
+    assert len(synchronize_calls) == 1
+    assert pageout_calls == [(".safetensors", "dontneed")]
 
 
 def test_deepseek_v4_fused_a_weight_scale_rebuilds_fp8_shape():
@@ -389,6 +473,10 @@ def test_deepseek_v4_mla_builds_both_norms_at_the_v4_widths():
             index_n_heads=32, index_head_dim=128, index_topk=512
         ),
     )
+    if getSMVersion() in (120, 121):
+        # SM120/SM121 only support DeepSeek-V4 sparse MLA through the FlashInfer
+        # fp8_ds_mla path; construction raises ValueError with any other dtype.
+        model_config.extra_attrs["kv_cache_dtype"] = "fp8_ds_mla"
     mla = MLA(
         hidden_size=cfg.hidden_size,
         num_attention_heads=cfg.num_attention_heads,
@@ -609,6 +697,7 @@ def test_deepseek_v4_mtp_projection_uses_fp8_quant_config(monkeypatch):
         pretrained_config=config,
         mapping=Mapping(world_size=4, rank=2, tp_size=4),
         quant_config=quant_config,
+        use_cute_dsl_blockscaling_mm=True,
     )
 
     mtp_layer = DeepseekV4MTP(
@@ -627,6 +716,8 @@ def test_deepseek_v4_mtp_projection_uses_fp8_quant_config(monkeypatch):
     assert mtp_layer.h_proj.out_features == config.hidden_size
     assert mtp_layer.e_proj.reduce_output is True
     assert mtp_layer.h_proj.reduce_output is True
+    assert mtp_layer.e_proj.use_cute_dsl_blockscaling_mm is True
+    assert mtp_layer.h_proj.use_cute_dsl_blockscaling_mm is True
     assert mtp_layer.e_proj.weight.dtype is torch.float8_e4m3fn
     assert mtp_layer.h_proj.weight.dtype is torch.float8_e4m3fn
     assert hasattr(mtp_layer.e_proj, "weight_scale")
@@ -836,8 +927,40 @@ def test_deepseek_v4_sparse_ratios_resolve_mtp_layers_from_checkpoint(tmp_path, 
     assert model_config.sparse_attention_config.compress_ratios == [128, 128, 1]
 
 
-def test_deepseek_v4_sanity():
+@pytest.mark.parametrize(
+    "kv_cache_dtype,tokens_per_block,binding_dtype",
+    [
+        pytest.param(
+            "auto",
+            128,
+            tensorrt_llm.bindings.DataType.BF16,
+            marks=skip_blackwell_geforce,
+            id="bf16-kv",
+        ),
+        pytest.param(
+            "fp8_ds_mla",
+            256,
+            tensorrt_llm.bindings.DataType.FP8,
+            marks=pytest.mark.skipif(
+                getSMVersion() not in (120, 121),
+                reason="FlashInfer sparse MLA requires SM 120 or SM 121",
+            ),
+            id="fp8-ds-mla",
+        ),
+    ],
+)
+def test_deepseek_v4_sanity(
+    kv_cache_dtype: str,
+    tokens_per_block: int,
+    binding_dtype: tensorrt_llm.bindings.DataType,
+) -> None:
     config_dict = deepcopy(DEEPSEEK_V4_TINY_CONFIG)
+    if kv_cache_dtype == "fp8_ds_mla":
+        # Sparse MLA coverage does not depend on the MoE intermediate width.
+        # Preserve 256 experts because the real routing kernel requires that
+        # topology, but keep its weights small enough for an RTX Pro 6000D.
+        config_dict["moe_intermediate_size"] = 128
+        config_dict["vocab_size"] = 1024
     config = DeepseekV4Config(**config_dict)
     config.dtype = torch.bfloat16
     config.mapping = Mapping(world_size=1, tp_size=1, rank=0)
@@ -857,11 +980,24 @@ def test_deepseek_v4_sanity():
 
     device = torch.device("cuda")
     # with default_dtype(config.dtype):
-    model_config = ModelConfig(
-        pretrained_config=config, sparse_attention_config=sparse_attn_config, attn_backend="TRTLLM"
+    quant_config = QuantConfig(
+        kv_cache_quant_algo=QuantAlgo.FP8 if kv_cache_dtype == "fp8_ds_mla" else None
     )
+    model_config = ModelConfig(
+        pretrained_config=config,
+        sparse_attention_config=sparse_attn_config,
+        attn_backend="TRTLLM",
+        quant_config=quant_config,
+    )
+    model_config.extra_attrs["kv_cache_dtype"] = kv_cache_dtype
     model = DeepseekV4ForCausalLM(model_config).to(device)
     assert not model.model.layers[0].fusion_config.POST_MOE_FUSION
+    fmha_libs = model.model.layers[0].self_attn.mqa._fmha_manager.fmha_libs
+    if kv_cache_dtype == "fp8_ds_mla":
+        assert any(isinstance(fmha, FlashInferSparseMlaFmha) for fmha in fmha_libs)
+        assert not any(isinstance(fmha, FallbackFmha) for fmha in fmha_libs)
+    else:
+        assert any(isinstance(fmha, FallbackFmha) for fmha in fmha_libs)
 
     context_sequence_length = [3, 2, 5]
     num_contexts = len(context_sequence_length)
@@ -875,7 +1011,6 @@ def test_deepseek_v4_sanity():
     request_ids = list(range(len(sequence_length)))
     token_nums = (torch.tensor(past_seen_tokens) + torch.tensor(sequence_length)).tolist()
     prompt_lens = token_nums[:num_contexts] + past_seen_tokens[num_contexts:]
-    tokens_per_block = 128  # DeepSeek-V4 requirement
     max_new_tokens = 1024
     required_blocks = sum(
         (token_num + max_new_tokens + tokens_per_block - 1) // tokens_per_block
@@ -887,22 +1022,16 @@ def test_deepseek_v4_sanity():
     max_seq_len = num_blocks * tokens_per_block
     batch_size = len(sequence_length)
 
-    if config.dtype == torch.half:
-        kv_cache_dtype = tensorrt_llm.bindings.DataType.HALF
-    elif config.dtype == torch.bfloat16:
-        kv_cache_dtype = tensorrt_llm.bindings.DataType.BF16
-    else:
-        raise ValueError("Invalid dtype")
     mapping = config.mapping
-    kv_cache_config = KvCacheConfig(max_tokens=num_blocks * tokens_per_block)
-    kv_cache_config.max_util_for_resume = 0.1
+    kv_cache_config = KvCacheConfig(
+        dtype=kv_cache_dtype,
+        enable_block_reuse=False,
+        max_tokens=num_blocks * tokens_per_block,
+        event_buffer_max_size=0,
+    )
 
     kv_cache_manager = DeepseekV4CacheManager(
-        kv_cache_config=KvCacheConfig(
-            enable_block_reuse=False,
-            max_tokens=num_blocks * tokens_per_block,
-            event_buffer_max_size=0,
-        ),
+        kv_cache_config=kv_cache_config,
         kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
         num_layers=num_layers,
         num_kv_heads=1,
@@ -911,7 +1040,7 @@ def test_deepseek_v4_sanity():
         max_seq_len=max_seq_len,
         max_batch_size=batch_size,
         mapping=mapping,
-        dtype=kv_cache_dtype,
+        dtype=binding_dtype,
         compressor_dtype=tensorrt_llm.bindings.DataType.FLOAT,
         vocab_size=vocab_size,
         max_num_tokens=max_seq_len * max_batch_size,
@@ -1064,7 +1193,7 @@ def _make_mla(
         rope=RopeParams(dim=QK_ROPE_HEAD_DIM, max_positions=8192),
     )
     with patch(
-        "tensorrt_llm._torch.modules.mla.create_attention",
+        "tensorrt_llm._torch.attention.mla.create_attention",
         side_effect=lambda *a, **kw: _FakeAttention(has_fp8_kv_cache),
     ):
         mla = MLA(

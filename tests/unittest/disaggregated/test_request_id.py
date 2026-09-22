@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Tests for disaggregated request-id handling.
 
 Covers ExecutorRequestQueue._get_request_id and the Receiver's sender_req_id
@@ -72,7 +86,7 @@ def _make_recv_task(ctx_request_id, disagg_request_id, unique_rid=123):
     return SimpleNamespace(
         _params=SimpleNamespace(ctx_request_id=ctx_request_id, disagg_request_id=disagg_request_id),
         _unique_rid=unique_rid,
-        _kv_slice=SimpleNamespace(block_ids_per_layer_groups=[], mamba_state_index=None),
+        _chunk=SimpleNamespace(block_ids_per_layer_groups=[]),
         _aux_slot=None,
         slice_id=0,
     )

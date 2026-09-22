@@ -95,6 +95,12 @@ class WorkflowState:
     plan_next_iteration_index: int = 0
     done: bool = False
     stage: str = STAGE_PLAN_DRAFTER
+    # True while the active replan sub-cycle was forced by
+    # ``--trigger-replan-with-feedback`` (fresh human feedback, not a QA
+    # verdict). Persisted so a crash inside the sub-cycle resumes with
+    # the same feedback-triggered framing; cleared when the sub-cycle
+    # hands back to the coder or terminates the workflow.
+    feedback_replan: bool = False
 
 
 def load_state(path: Path) -> WorkflowState:
@@ -119,6 +125,7 @@ def load_state(path: Path) -> WorkflowState:
         plan_next_iteration_index=int(data.get("plan_next_iteration_index", 0)),
         done=bool(data.get("done", False)),
         stage=stage,
+        feedback_replan=bool(data.get("feedback_replan", False)),
     )
 
 

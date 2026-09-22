@@ -34,7 +34,8 @@ def _import_triton_prefill():
         "..",
         "tensorrt_llm",
         "_torch",
-        "attention_backend",
+        "attention",
+        "backends",
         "triton_prefill.py",
     )
     spec = importlib.util.spec_from_file_location("triton_prefill", os.path.abspath(path))
@@ -744,6 +745,88 @@ class TestTritonPrefillWithPrefix:
         )
 
         torch.testing.assert_close(output, ref, atol=1e-2, rtol=1e-2)
+
+
+def test_paged_cache_tile_cast() -> None:
+    """FP8 prefix attention must not allocate a BF16 copy of the KV pool."""
+    if not torch.cuda.is_available():
+        pytest.skip("This test requires CUDA")
+    if torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("Triton FP8 E4M3 cache loads require SM89 or newer")
+
+    torch.manual_seed(42)
+    device = "cuda"
+    page_size, num_pages, num_heads, num_kv_heads = 16, 128, 4, 2
+    compute_dtype, head_dim = torch.bfloat16, 512
+    extend_lens = [7, 19, 5]
+    prefix_lens = [47, 17, 0]
+    # Noncontiguous physical pages, a shared page, and a partial last page.
+    page_ids = [113, 7, 113, 7, 91]
+    cache = torch.randn(
+        num_pages,
+        2,
+        num_kv_heads,
+        page_size,
+        head_dim,
+        device=device,
+        dtype=compute_dtype,
+    ).to(torch.float8_e4m3fn)
+    q = torch.randn(sum(extend_lens), num_heads, head_dim, device=device, dtype=compute_dtype)
+    k = torch.randn(sum(extend_lens), num_kv_heads, head_dim, device=device, dtype=compute_dtype)
+    v = torch.randn_like(k)
+    output = torch.empty_like(q)
+    masks = [
+        torch.ones(ext, pre + ext, dtype=torch.bool, device=device)
+        for ext, pre in zip(extend_lens, prefix_lens)
+    ]
+    for mask in masks:
+        mask[:, 0] = False
+    kwargs = dict(
+        q=q,
+        k=k,
+        v=v,
+        output=output,
+        kv_cache=cache,
+        qo_indptr=torch.tensor([0, 7, 26, 31], dtype=torch.int32, device=device),
+        prefix_lens=torch.tensor(prefix_lens, dtype=torch.int32, device=device),
+        page_table_indptr=torch.tensor([0, 3, 5, 5], dtype=torch.int32, device=device),
+        page_table_indices=torch.tensor(page_ids, dtype=torch.int32, device=device),
+        page_size=page_size,
+        custom_mask=_flatten_masks(masks),
+        sm_scale=head_dim**-0.5,
+    )
+    triton_prefill_with_custom_mask(**kwargs)  # Compile before measuring.
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    before = torch.cuda.memory_allocated()
+    triton_prefill_with_custom_mask(**kwargs)
+    torch.cuda.synchronize()
+    extra = torch.cuda.max_memory_allocated() - before
+    compute_pool_bytes = cache.numel() * q.element_size()
+    assert extra < compute_pool_bytes // 2
+
+    # Reference uses the quantized cache values, not the pre-quantization input.
+    prefix_k, prefix_v = [], []
+    for ids, length in zip([page_ids[:3], page_ids[3:], []], prefix_lens):
+        pages = cache[ids].to(compute_dtype)
+        prefix_k.append(
+            pages[:, 0].permute(0, 2, 1, 3).reshape(-1, num_kv_heads, head_dim)[:length]
+        )
+        prefix_v.append(
+            pages[:, 1].permute(0, 2, 1, 3).reshape(-1, num_kv_heads, head_dim)[:length]
+        )
+    ref = _sdpa_reference_with_prefix(
+        q,
+        k,
+        v,
+        prefix_k,
+        prefix_v,
+        extend_lens,
+        prefix_lens,
+        mask=masks,
+        sm_scale=head_dim**-0.5,
+    )
+    torch.testing.assert_close(output, ref, atol=1e-2, rtol=1e-2)
 
 
 if __name__ == "__main__":

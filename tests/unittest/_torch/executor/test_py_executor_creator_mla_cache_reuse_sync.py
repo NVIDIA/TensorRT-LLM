@@ -24,6 +24,7 @@ from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, ContextChunkingPolicy
+from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
 pytestmark = pytest.mark.cpu_only
@@ -126,6 +127,8 @@ class _DummyModelEngine:
         *,
         attn_runtime_features,
         kv_cache_quant_algo,
+        attn_backend="TRTLLM",
+        sparse_algorithm=None,
         enable_flash_mla=False,
         max_seq_len=128,
     ):
@@ -134,20 +137,30 @@ class _DummyModelEngine:
         Args:
             attn_runtime_features: AttentionRuntimeFeatures instance.
             kv_cache_quant_algo: Quantization algorithm for KV cache.
+            attn_backend: Attention backend selected for the model.
+            sparse_algorithm: Optional sparse-attention algorithm name.
             enable_flash_mla: Whether to emulate the FlashMLA block-size override.
             max_seq_len: Effective sequence length reported by the model engine.
         """
         self.attn_runtime_features = attn_runtime_features
         self.max_seq_len = max_seq_len
         self.max_num_tokens = 128
-        self.sparse_attention_config = None
+        self.sparse_attention_config = (
+            SimpleNamespace(algorithm=sparse_algorithm) if sparse_algorithm is not None else None
+        )
         self.attn_metadata = None
         self.model = SimpleNamespace(
             model_config=SimpleNamespace(
+                attn_backend=attn_backend,
+                sparse_attention_config=self.sparse_attention_config,
                 enable_flash_mla=enable_flash_mla,
                 is_generation=True,
-                pretrained_config=SimpleNamespace(),
-                quant_config=SimpleNamespace(kv_cache_quant_algo=kv_cache_quant_algo),
+                pretrained_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64),
+                quant_config=QuantConfig(
+                    kv_cache_quant_algo=(
+                        None if kv_cache_quant_algo == QuantAlgo.NO_QUANT else kv_cache_quant_algo
+                    )
+                ),
             ),
             vocab_size_padded=32000,
         )
@@ -200,7 +213,6 @@ def _make_llm_args():
             calibration_file_path=None,
             calibration_layer_indices=None,
         ),
-        sampler_type=None,
         cuda_graph_config=None,
         parallel_config=SimpleNamespace(to_mapping=lambda: SimpleNamespace()),
         get_runtime_sizes=lambda: (1, 128, 128, 4),
@@ -212,6 +224,7 @@ def _run_create_py_executor(
     *,
     sm_version,
     kv_cache_quant_algo,
+    sparse_algorithm=None,
     attn_backend="TRTLLM",
     cache_transceiver_config=None,
     enable_flash_mla=False,
@@ -230,6 +243,7 @@ def _run_create_py_executor(
         monkeypatch: pytest fixture for mocking.
         sm_version: CUDA SM version to simulate (e.g., 89, 90).
         kv_cache_quant_algo: Quantization algorithm to use (e.g., NO_QUANT, INT8).
+        sparse_algorithm: Optional sparse-attention algorithm name.
         attn_backend: Attention backend to configure.
         cache_transceiver_config: Optional transceiver configuration to mutate.
         enable_flash_mla: Whether to emulate the FlashMLA block-size override.
@@ -249,6 +263,8 @@ def _run_create_py_executor(
     fake_mapping = SimpleNamespace(
         rank=0,
         tp_size=1,
+        pp_size=1,
+        has_pp=lambda: False,
         enable_attention_dp=False,
         is_last_pp_rank=lambda: True,
     )
@@ -298,6 +314,8 @@ def _run_create_py_executor(
         return _DummyModelEngine(
             attn_runtime_features=kwargs["attn_runtime_features"],
             kv_cache_quant_algo=kv_cache_quant_algo,
+            attn_backend=attn_backend,
+            sparse_algorithm=sparse_algorithm,
             enable_flash_mla=enable_flash_mla,
             max_seq_len=model_max_seq_len,
         )
@@ -402,19 +420,6 @@ def test_flashinfer_preserves_cache_reuse(monkeypatch):
 
     assert kv_cache_reuse is True
     assert runtime_cache_reuse is True
-
-
-def test_flashinfer_star_attention_disables_cache_reuse(monkeypatch):
-    """Verify Star Attention retains its cache-reuse compatibility guard."""
-    kv_cache_reuse, runtime_cache_reuse, _ = _run_create_py_executor(
-        monkeypatch,
-        sm_version=100,
-        kv_cache_quant_algo=QuantAlgo.NO_QUANT,
-        attn_backend="FLASHINFER_STAR_ATTENTION",
-    )
-
-    assert kv_cache_reuse is False
-    assert runtime_cache_reuse is False
 
 
 def test_default_transceiver_buffer_rounds_up_to_tokens_per_block(monkeypatch):

@@ -29,6 +29,7 @@
 #include <deque>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -46,6 +47,35 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 struct Slot
 {
     CachedCudaEvent readyEvent = CachedCudaEvent::makeNull();
+
+    Slot() = default;
+
+    ~Slot()
+    {
+        KVCM2_CHECK_FATAL_DEBUG_WITH_INFO(
+            !hasValidSlot(), "Slot %zu destroyed without being released", toSizeT(mSlotId.value()));
+    }
+
+    // A slot id has exactly one owner: transferring a Slot empties the source, so it cannot be
+    // released twice. Copying is not available for the same reason.
+    Slot(Slot&& other) noexcept
+        : readyEvent(std::move(other.readyEvent))
+        , mSlotId(std::exchange(other.mSlotId, std::nullopt))
+    {
+    }
+
+    Slot& operator=(Slot&& other) noexcept
+    {
+        if (this != &other)
+        {
+            readyEvent = std::move(other.readyEvent);
+            mSlotId = std::exchange(other.mSlotId, std::nullopt);
+        }
+        return *this;
+    }
+
+    Slot(Slot const&) = delete;
+    Slot& operator=(Slot const&) = delete;
 
     // Mirrors Python @property slot_id: asserts valid, returns unwrapped value.
     [[nodiscard]] SlotId slotId() const
@@ -73,16 +103,26 @@ struct Slot
         return readyEvent.queryComplete();
     }
 
-    // Transfer slot ownership: moves slotId and readyEvent from src to this.
+    // Transfer slot ownership into an empty slot. Overwriting an occupied slot would drop its
+    // id without releasing it, so that is rejected rather than silently allowed by the move.
     void setSlot(Slot& src)
     {
         if (hasValidSlot())
         {
             throw LogicError("Slot::setSlot: already has a valid slot");
         }
-        mSlotId = src.mSlotId;
-        readyEvent = std::move(src.readyEvent);
-        src.mSlotId.reset();
+        *this = std::move(src);
+    }
+
+    // Replace this slot, invalidate replacement, and return the previous slot.
+    [[nodiscard]] Slot exchangeSlot(Slot&& replacement)
+    {
+        TLLM_CHECK(hasValidSlot() && replacement.hasValidSlot());
+        Slot previous;
+        auto replacementId = std::exchange(replacement.mSlotId, std::nullopt);
+        previous.mSlotId = std::exchange(mSlotId, replacementId);
+        previous.readyEvent = std::exchange(readyEvent, std::move(replacement.readyEvent));
+        return previous;
     }
 
 private:
@@ -105,6 +145,13 @@ public:
     [[nodiscard]] SlotCount numSlots() const noexcept
     {
         return mCapacity;
+    }
+
+    // SlotId is signed, so a bare `slot < numSlots()` admits negatives. Both ends are checked
+    // here so no caller has to remember the lower one.
+    [[nodiscard]] bool isValidSlotId(SlotId slot) const noexcept
+    {
+        return slot >= SlotId{0} && slot < numSlots();
     }
 
     Slot allocate();
@@ -174,6 +221,13 @@ public:
 
     virtual SlotCount numSlots() const noexcept = 0;
 
+    // SlotId is signed, so a bare `slot < numSlots()` admits negatives, which then convert to a
+    // huge size_t offset. Both ends are checked here so no caller has to remember the lower one.
+    [[nodiscard]] bool isValidSlotId(SlotId slot) const noexcept
+    {
+        return slot >= SlotId{0} && slot < numSlots();
+    }
+
     size_t numBytes() const noexcept
     {
         return mSlotSize * slotCountToSizeT(numSlots());
@@ -225,6 +279,11 @@ public:
 
     size_t alignedSize(SlotCount numSlots) const noexcept;
 
+    [[nodiscard]] HostMem const* hostMem() const noexcept
+    {
+        return &mHostMem;
+    }
+
 private:
     HostMem mHostMem;
 };
@@ -251,6 +310,11 @@ public:
 
 private:
     int mFd = kBadFileDescriptor;
+    // Tracks the file size, which only resize() changes: the file is created unlinked and owned
+    // solely by this pool, so nothing else can grow or shrink it behind us. Held here because
+    // slotAddress() bounds-checks against it on every call, and querying the file would make that
+    // an lseek per page of a migration.
+    SlotCount mNumSlots{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -338,6 +402,8 @@ class HostPoolGroup : public PoolGroupBase
 {
 public:
     HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList);
+
+    [[nodiscard]] HostMem const* hostMem(PoolIndex poolIndex) const;
 };
 
 class DiskPoolGroup : public PoolGroupBase
@@ -482,8 +548,6 @@ public:
     static size_t grainsForSlots(
         SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t granularity);
 
-    virtual void postResize() {}
-
 protected:
     TypedVec<PoolGroupIndex, std::unique_ptr<PoolGroupBase>> mPoolGroups;
 };
@@ -491,8 +555,8 @@ protected:
 class GpuCacheLevelStorage : public CacheLevelStorage
 {
 public:
-    GpuCacheLevelStorage(
-        StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, size_t physMemSize);
+    GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator& physMemAllocator);
 
     CacheTier cacheTier() const noexcept override
     {
@@ -501,29 +565,18 @@ public:
 
     size_t poolSizeGranularity() const noexcept override
     {
-        return mPhysMemAllocator->physMemSize();
-    }
-
-    void postResize() override
-    {
-        CacheLevelStorage::postResize();
-        mPhysMemAllocator->clear();
-    }
-
-    void destroy() override
-    {
-        CacheLevelStorage::destroy();
-        mPhysMemAllocator->clear();
+        return mPhysMemAllocator.physMemSize();
     }
 
 private:
-    std::unique_ptr<PooledPhysMemAllocator> mPhysMemAllocator;
+    PooledPhysMemAllocator& mPhysMemAllocator;
 };
 
 class HostCacheLevelStorage : public CacheLevelStorage
 {
 public:
-    HostCacheLevelStorage(StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList);
+    HostCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList);
 
     CacheTier cacheTier() const noexcept override
     {
@@ -539,8 +592,8 @@ public:
 class DiskCacheLevelStorage : public CacheLevelStorage
 {
 public:
-    DiskCacheLevelStorage(StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
-        std::string directory);
+    DiskCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory);
 
     CacheTier cacheTier() const noexcept override
     {
@@ -558,6 +611,7 @@ private:
 
 // Factory: create appropriate CacheLevelStorage for a given tier config.
 std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const& tierCfg,
-    StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList);
+    TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
+    PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

@@ -19,8 +19,6 @@ set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 # keep this list sorted alphabetically
 set(SRCS
-    allocateKvCache.cpp
-    assignReqSeqSlots.cpp
     baseTransBuffer.cpp
     blockKey.cpp
     cacheFormatter.cpp
@@ -28,29 +26,19 @@ set(SRCS
     mlaCacheFormatter.cpp
     cacheTransceiver.cpp
     capacityScheduler.cpp
-    createNewDecoderRequests.cpp
     contextProgress.cpp
     contextTransferCoordinator.cpp
     dataTransceiver.cpp
-    decoderBuffers.cpp
     kvCacheManager.cpp
     kvCacheEventManager.cpp
     kvCacheTransferManager.cpp
     kvCacheManagerV2Utils.cpp
     kvCacheManagerV2Utils.cu
     llmRequest.cpp
-    medusaBuffers.cpp
     microBatchScheduler.cpp
-    pauseRequests.cpp
     peftCacheManager.cpp
-    rnnStateManager.cpp
     rnnCacheFormatter.cpp
     rnnCacheTransBuffer.cpp
-    sequenceSlotManager.cpp
-    utils/debugUtils.cpp
-    utils/inflightBatchingUtils.cpp
-    utils/logitsThread.cpp
-    utils/staticThreadPool.cpp
     evictionPolicy.cpp
     cacheTransBuffer.cpp
     agentTree.cpp)
@@ -80,6 +68,10 @@ endif()
 include(${CMAKE_CURRENT_SOURCE_DIR}/kv_cache_manager_v2/CMakeLists.txt)
 list(APPEND SRCS ${KV_CACHE_MANAGER_V2_SRCS})
 
+# Include the KVCM cold-page compression codec bridge sources.
+include(${CMAKE_CURRENT_SOURCE_DIR}/kv_cache_compression/CMakeLists.txt)
+list(APPEND SRCS ${KV_CACHE_COMPRESSION_SRCS})
+
 add_library(${BATCH_MANAGER_STATIC_TARGET} STATIC ${SRCS})
 target_include_directories(
   ${BATCH_MANAGER_STATIC_TARGET}
@@ -91,7 +83,7 @@ target_include_directories(
 
 set_target_properties(
   ${BATCH_MANAGER_STATIC_TARGET}
-  PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
+  PROPERTIES CXX_STANDARD "20" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
              POSITION_INDEPENDENT_CODE ON)
 
 set_property(TARGET ${BATCH_MANAGER_STATIC_TARGET}

@@ -3,8 +3,10 @@
 
 import contextlib
 import functools
+import math
 import os
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from typing import Dict, List, Optional
@@ -61,14 +63,13 @@ class ActivationType(IntEnum):
     Geglu = 6
     SwigluBias = 7
     Relu2 = 8
+    SiTu = 9
 
 
 # TRTLLM-Gen-local activation encoding, kept separate from the shared
-# ActivationType above ON PURPOSE: ActivationType mirrors the cutlass enum in
-# common.h and drives cutlass MoE kernels, whereas SiTu exists only in the
-# trtllm-gen batched-GEMM kernels. Adding SiTu to the shared ActivationType
-# would force a matching cutlass enum member that no cutlass kernel implements.
-# So SiTu stays here (TRTLLM-15177 item 1.2(a): decided keep-backend-local).
+# ActivationType above: ActivationType mirrors the CUTLASS enum in common.h,
+# while ActType_TrtllmGen mirrors the independent batched-GEMM encoding below.
+# SiTu is supported by both backends, but its numeric value is backend-local.
 # Keep this in sync with the ActType enum in
 # cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h
 class ActType_TrtllmGen(IntEnum):
@@ -85,10 +86,11 @@ class ActType_TrtllmGen(IntEnum):
 
 
 # IMPORTANT: when adding a new activation type, please update this function.
-# And make sure it aligned with cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h::isGatedActivation function.
+# And make sure it aligned with cpp/tensorrt_llm/kernels/moe/cutlass/include/moe_gemm_kernels.h::isGatedActivation function.
 def is_gated_activation(activation_type: ActivationType) -> bool:
     return activation_type in [
-        ActivationType.Swiglu, ActivationType.SwigluBias, ActivationType.Geglu
+        ActivationType.Swiglu, ActivationType.SwigluBias, ActivationType.Geglu,
+        ActivationType.SiTu
     ]
 
 
@@ -100,6 +102,22 @@ def set_torch_compiling(enable: bool):
 def is_torch_compiling() -> bool:
     global is_torch_compiling_flag
     return is_torch_compiling_flag
+
+
+@contextlib.contextmanager
+def torch_compiling(enable: bool):
+    """Scope `is_torch_compiling()` to a region, restoring the prior value.
+
+    The flag is a plain module global, not thread- or context-local, so it
+    outlives the engine that set it. Code running a model region outside an
+    engine forward must establish the value rather than inherit it.
+    """
+    prev_enable = is_torch_compiling()
+    set_torch_compiling(enable)
+    try:
+        yield
+    finally:
+        set_torch_compiling(prev_enable)
 
 
 def set_piecewise_running(enable: bool):
@@ -195,6 +213,10 @@ class Fp4QuantizedTensor:
     # needing the un-quantized form (e.g. DSv3.2's DSA indexer at
     # sparse/dsa.py:pre_indexer_proj) can use it without dequantizing FP4.
     unquantized_hidden_states: Optional[torch.Tensor] = None
+    # Reciprocal activation scale (max_raw / 448.0) carried from deferred
+    # dynamic NVFP4 producers for consumer GEMM alpha derivation:
+    # alpha = reciprocal_scale * weight_scale_2.
+    reciprocal_scale: Optional[torch.Tensor] = None
 
     @property
     def shape(self):
@@ -400,21 +422,37 @@ def deep_gemm_gen_tuning_buckets(x: int):
     return buckets
 
 
-def fp4_scale_infer_shape(input_shapes: List[List[int]]):
-    """Calculate the dimensions of the fp4 scale tensor.
-    """
-    out_shape, scale_shape = fp4_utils.get_fp4_shape(input_shapes[0],
-                                                     sf_vec_size=16)
-    return scale_shape * 2
+def fp4_scale_infer_shape(input_shapes: List[List[int]]) -> int:
+    """Calculate the swizzled scale size for a packed FP4 input tensor."""
+    unpacked_shape = list(input_shapes[0])
+    unpacked_shape[-1] *= 2
+    _, scale_shape = fp4_utils.get_fp4_shape(unpacked_shape, sf_vec_size=16)
+    return scale_shape
 
 
-def fp4_unswizzled_scale_infer_shape(input_shapes: List[List[int]]):
-    """Calculate the dimensions of the fp4 scale tensor.
-    """
-    out_shape, scale_shape = fp4_utils.get_fp4_shape(input_shapes[0],
-                                                     sf_vec_size=16,
-                                                     is_swizzled_layout=False)
-    return scale_shape * 2
+def mxfp8_scale_infer_shape(input_shapes: List[List[int]]) -> int:
+    """Calculate the number of bytes in an R128c4 MXFP8 scale tensor."""
+    input_shape = input_shapes[0]
+    m = math.prod(input_shape[:-1])
+    k = input_shape[-1]
+    return pad_up(m, 128) * pad_up(ceil_div(k, 32), 4)
+
+
+def fp4_unswizzled_scale_infer_shape(input_shapes: List[List[int]]) -> int:
+    """Calculate the linear scale size for a packed FP4 input tensor."""
+    unpacked_shape = list(input_shapes[0])
+    unpacked_shape[-1] *= 2
+    _, scale_shape = fp4_utils.get_fp4_shape(
+        unpacked_shape,
+        sf_vec_size=16,
+        is_swizzled_layout=False,
+    )
+    return scale_shape
+
+
+def infer_output_m_shape(input_shapes: List[List[int]]) -> int:
+    """Infer the M dimension of the output tensor from the first input tensor."""
+    return input_shapes[0][0]
 
 
 def fp8_scale_infer_shape(input_shapes: List[List[int]]):
@@ -543,7 +581,32 @@ def split(x: torch.Tensor,
     return torch.split(x, split_size, dim=dim)[idx]
 
 
+@functools.lru_cache(maxsize=1)
+def _fused_relu2_impl() -> (tuple[Callable[[torch.Tensor], torch.Tensor],
+                                  Callable[[torch.Tensor], bool]] | None):
+    """Resolve the fused relu2 kernel once, or None if it is unavailable.
+
+    Kept lazy so importing this module does not pull in Triton, and so a build
+    without a working Triton falls back instead of failing at import time.
+    """
+    if os.environ.get("TRTLLM_FUSED_RELU2", "1") != "1":
+        return None
+    try:
+        from .fused_relu2_triton import fused_relu2, is_eligible
+        return fused_relu2, is_eligible
+    except ImportError:
+        return None
+
+
 def relu2(x: torch.Tensor) -> torch.Tensor:
+    # Fusing the two elementwise passes halves the activation's memory traffic.
+    # Bit-identical to the eager form: both round once from the same fp32
+    # product -- the kernel squares in fp32 before the store, and PyTorch's
+    # eager mul on half types computes in fp32 opmath before rounding.
+    # Set TRTLLM_FUSED_RELU2=0 to disable.
+    impl = _fused_relu2_impl()
+    if impl is not None and impl[1](x):
+        return impl[0](x)
     return torch.square(F.relu(x))
 
 
@@ -727,3 +790,49 @@ def torch_multi_arange(
     seq = seq.repeat_interleave(seq_repeats, output_size=output_length_arg)
     seq = seq.cumsum(0, dtype=ends.dtype)
     return seq
+
+
+# ---------------------------------------------------------------------------
+# Helix CP round-robin ledger
+# ---------------------------------------------------------------------------
+# THE rule, stated once. Under helix context parallelism the KV ledger is a
+# round-robin over CP ranks at page granularity: ledger page b lives on rank
+# b % cp_size, so one "ledger block" spans tokens_per_block * cp_size global
+# token positions and contributes exactly tokens_per_block of them to each
+# rank. For a global prefix of length ``global_len`` this rank therefore owns
+#
+#     full, rem = divmod(global_len, tokens_per_block * cp_size)
+#     full * tokens_per_block + clamp(rem - cp_rank * tokens_per_block,
+#                                     0, tokens_per_block)
+#
+# tokens: every complete ledger block gives it a whole page, and the trailing
+# partial block gives it however much of its own page the remainder reaches.
+# Summed over all ranks this is exactly ``global_len``.
+#
+# Both forms below are that expression and nothing else. Keep them that way:
+# a drift between the scalar host-side packing and the tensor form used to
+# derive the device write slots puts KV on the wrong rank, and only shows up
+# on groups that straddle a page boundary.
+
+
+def helix_local_len(global_len: int, tokens_per_block: int, cp_size: int,
+                    cp_rank: int) -> int:
+    """Scalar form: tokens of the first ``global_len`` owned by ``cp_rank``."""
+    ledger = tokens_per_block * cp_size
+    full, rem = divmod(global_len, ledger)
+    return full * tokens_per_block + min(
+        max(rem - cp_rank * tokens_per_block, 0), tokens_per_block)
+
+
+def helix_local_len_tensor(global_lens: torch.Tensor, tokens_per_block: int,
+                           cp_size: int, cp_rank: int) -> torch.Tensor:
+    """Tensor form of :func:`helix_local_len`, applied elementwise.
+
+    Kept allocation-minimal: this runs on the CUDA-graph capture path, and the
+    ``clamp_`` is in place on the temporary the subtraction just produced.
+    """
+    ledger = tokens_per_block * cp_size
+    full = torch.div(global_lens, ledger, rounding_mode='floor')
+    rem = global_lens - full * ledger
+    return full * tokens_per_block + (rem - cp_rank * tokens_per_block).clamp_(
+        0, tokens_per_block)

@@ -19,8 +19,9 @@ import json
 import logging
 import warnings
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -54,6 +55,29 @@ logger = logging.getLogger(__name__)
 
 
 _FP8_LORA_TMA_ALIGNMENT = 16
+
+
+@lru_cache(maxsize=1)
+def _warn_native_fp8_lora_capability_query_unavailable() -> None:
+    logger.warning(
+        "Native FP8 LoRA capability query is unavailable; adapter weights "
+        "will fall back to the model compute dtype. Check that the "
+        "TensorRT-LLM libraries match the Python package and are loaded."
+    )
+
+
+def _native_fp8_lora_kernels_available(device_capability: Tuple[int, int]) -> bool:
+    kernel_support_query = getattr(torch.ops.trtllm, "lora_grouped_gemm_supports_fp8", None)
+    if kernel_support_query is None:
+        _warn_native_fp8_lora_capability_query_unavailable()
+        return False
+    major, minor = device_capability
+    return kernel_support_query(major * 10 + minor)
+
+
+def supports_native_fp8_lora(device_capability: Tuple[int, int]) -> bool:
+    """Return whether compiled native FP8 LoRA kernels support a CUDA capability."""
+    return _native_fp8_lora_kernels_available(device_capability)
 
 
 def _check_lora_in_out(
@@ -107,7 +131,7 @@ def _validate_fp8_lora_alignment(
             f"{name}={size}" for name, size in misaligned_dimensions.items()
         )
         raise ValueError(
-            f"FP8 LoRA weights on Hopper require rank, input size, and output size "
+            f"FP8 LoRA weights on SM90/SM100 require rank, input size, and output size "
             f"to be multiples of {_FP8_LORA_TMA_ALIGNMENT} for 128-bit TMA alignment. "
             f"Layer {layer_idx} module '{lora_module}' has {formatted_dimensions}. "
             f"Use aligned adapter dimensions or non-FP8 LoRA weights."
@@ -647,7 +671,7 @@ class LoraManager(object):
             rank = int(hf_config["r"])
             rs_lora = bool(hf_config.get("use_rslora", False))
             model_dtype = str_dtype_to_torch(model_config.dtype)
-            supports_native_fp8 = torch.cuda.get_device_capability() == (9, 0)
+            supports_native_fp8 = supports_native_fp8_lora(torch.cuda.get_device_capability())
 
             def get_output_dtype(module_weights):
                 if _is_moe_module_weights(module_weights):
@@ -777,7 +801,7 @@ class LoraManager(object):
                         )
                         if is_dora:
                             raise NotImplementedError(
-                                "DoRA is not supported with FP8 LoRA weights on Hopper"
+                                "DoRA is not supported with FP8 LoRA weights on SM90/SM100"
                             )
 
                     t_in = t_in.cuda().contiguous()
@@ -791,7 +815,7 @@ class LoraManager(object):
                         scale = float(hf_config["lora_alpha"]) / effective_rank
 
                     if use_fp8_kernel:
-                        # Keep weights in FP8 for the native Hopper kernel.
+                        # Keep weights in FP8 for the native SM90/SM100 kernel.
                         # FP8 has no scalar multiply, so scale through BF16.
                         fp8_max = torch.finfo(t_out.dtype).max
                         t_out = (
@@ -800,7 +824,7 @@ class LoraManager(object):
                             .to(t_out.dtype)
                         )
                     else:
-                        # Pre-Hopper kernels require the model compute dtype.
+                        # Other architectures require the model compute dtype.
                         t_in = t_in.to(model_dtype)
                         t_out = t_out.to(model_dtype)
                         t_out = t_out * scale

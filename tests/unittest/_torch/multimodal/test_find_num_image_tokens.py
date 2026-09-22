@@ -6,8 +6,6 @@ from transformers import AutoConfig, AutoTokenizer
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import MultimodalEncoder
-from tensorrt_llm._torch.models.modeling_qwen2vl import \
-    Qwen2VLInputProcessorBase
 from tensorrt_llm._torch.models.modeling_qwen3vl import \
     Qwen3VLInputProcessorBase
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
@@ -31,14 +29,9 @@ example_videos = [
 def multimodal_model_configs():
     """Get multimodal model configurations for testing."""
     model_configs = {
-        'qwen2.5-vl': {
-            'hf_model_dir': 'Qwen/Qwen2.5-VL-3B-Instruct',
-            'model_dir': llm_models_root() / "Qwen2.5-VL-3B-Instruct",
-            'model_type': 'qwen2_5_vl',
-        },
         'qwen3-vl': {
-            'hf_model_dir': 'Qwen/Qwen3-VL-8B-Instruct',
-            'model_dir': llm_models_root() / "Qwen3" / "Qwen3-VL-8B-Instruct",
+            'hf_model_dir': 'Qwen/Qwen3-VL-2B-Instruct',
+            'model_dir': llm_models_root() / "Qwen3" / "Qwen3-VL-2B-Instruct",
             'model_type': 'qwen3_vl',
         },
     }
@@ -46,7 +39,7 @@ def multimodal_model_configs():
 
 
 @pytest.mark.parametrize("model_key", [
-    "qwen2.5-vl",
+    "qwen3-vl",
 ])
 def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
     """Test that get_num_tokens_per_image predicts the correct number of tokens.
@@ -79,8 +72,8 @@ def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
                                                   trust_remote_code=True)
 
         # Create input processor once
-        if model_type == 'qwen2_5_vl':
-            input_processor = Qwen2VLInputProcessorBase(
+        if model_type == 'qwen3_vl':
+            input_processor = Qwen3VLInputProcessorBase(
                 model_path=encoder_model_dir,
                 config=model_config_dict,
                 tokenizer=tokenizer,
@@ -126,7 +119,7 @@ def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
             actual_num_tokens = actual_embedding.shape[0]
 
             # Get predicted number of tokens using get_num_tokens_per_image
-            if model_type == 'qwen2_5_vl':
+            if model_type == 'qwen3_vl':
                 predicted_num_tokens = input_processor.get_num_tokens_per_image(
                     image=test_image)
             else:
@@ -148,7 +141,6 @@ def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
 
 
 @pytest.mark.parametrize("model_key", [
-    "qwen2.5-vl",
     "qwen3-vl",
 ])
 def test_get_num_tokens_per_video(model_key, multimodal_model_configs):
@@ -182,13 +174,7 @@ def test_get_num_tokens_per_video(model_key, multimodal_model_configs):
                                                   trust_remote_code=True)
 
         # Create input processor once
-        if model_type == 'qwen2_5_vl':
-            input_processor = Qwen2VLInputProcessorBase(
-                model_path=encoder_model_dir,
-                config=model_config_dict,
-                tokenizer=tokenizer,
-                trust_remote_code=True)
-        elif model_type == 'qwen3_vl':
+        if model_type == 'qwen3_vl':
             input_processor = Qwen3VLInputProcessorBase(
                 model_path=encoder_model_dir,
                 config=model_config_dict,
@@ -236,15 +222,14 @@ def test_get_num_tokens_per_video(model_key, multimodal_model_configs):
             actual_num_tokens = actual_embedding.shape[0]
 
             # Get predicted number of tokens using get_num_tokens_per_video
-            if model_type == 'qwen2_5_vl':
-                predicted_num_tokens = input_processor.get_num_tokens_per_video(
-                    video=video_data.frames)
-            elif model_type == 'qwen3_vl':
+            if model_type == 'qwen3_vl':
                 processed_inputs = input_processor._preprocess(
                     "dummy", {"video": [video_data]}, {})
                 predicted_num_tokens = input_processor.get_num_tokens_per_video(
                     video=video_data.frames,
                     video_grid_thw=processed_inputs["video_grid_thw"])
+            else:
+                raise ValueError(f"Unsupported model type: {model_type}")
 
             # The key assertion: predicted should match actual
             assert predicted_num_tokens == actual_num_tokens, \

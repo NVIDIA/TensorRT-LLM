@@ -80,22 +80,7 @@ def get_ucx_tls():
         return "cuda_copy,cuda_ipc,sm,self,tcp"
     if sm < 90:
         return "^cuda_ipc,ib,gdr_copy"
-    if sm == 90:
-        # Allow IB on Hopper: KVCacheManagerV2 KV pools are VMM allocations that
-        # CUDA IPC cannot map without fabric handles, so KV transfers need IB
-        # GPUDirect RDMA to avoid falling back to slow non-IPC emulation.
-        return "^gdr_copy"
     return "^ib,gdr_copy"
-
-
-# get_ucx_tls() above allows IB transports on SM90. Some CI clusters inject
-# UCX_IB_ROCE_LOCAL_SUBNET=y container-wide (via enroot); on multi-rail RoCE
-# fabrics with one subnet per rail (e.g. OCI) it makes UCX UD wireup build
-# address handles to cross-rail peers and time out, hanging the workers.
-# Drop it at import time so worker environments (copied from os.environ)
-# fall back to standard GID-based address resolution; no-op when absent.
-if get_sm_version() == 90:
-    os.environ.pop("UCX_IB_ROCE_LOCAL_SUBNET", None)
 
 
 def cleanup_output_files():
@@ -333,8 +318,6 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_overlap_transceiver_runtime_python.yaml",
         "overlap_transceiver_runtime_python_bounce":
         f"{test_configs_root}/disagg_config_overlap_transceiver_runtime_python_bounce.yaml",
-        "python_transceiver_host_offload":
-        f"{test_configs_root}/disagg_config_python_transceiver_host_offload.yaml",
         "tool_calls":
         f"{test_configs_root}/disagg_config_overlap.yaml",
         "perf_metrics":
@@ -433,10 +416,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml",
         "cancel_stress_test":
         f"{test_configs_root}/disagg_config_cancel_stress_test.yaml",
-        "cancel_stress_test_large":
-        f"{test_configs_root}/disagg_config_cancel_stress_test_large.yaml",
-        "llama31_8b":
-        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_llama31_8b.yaml",
+        "qwen3_8b":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_qwen3_8b.yaml",
         "mamba_conc_greater_than_mbs":
         f"{test_configs_root}/disagg_config_mamba_conc_greater_than_mbs.yaml",
         "mamba_bs1_concurrency2":
@@ -617,9 +598,15 @@ def run_client_tests(example_dir,
                         "Using `asyncio` in Python"
                     ]
                 elif "qwen3_32b_fp8" in test_desc:
+                    # https://nvbugs/6566734: the greedy completion of the raw
+                    # asyncio prompt is near-tied between answering the question
+                    # and continuing it; both are valid non-garbage outputs.
                     expected_strings = [
                         "The capital of Germany is Berlin",
-                        "Asyncio in Python is a library"
+                        [
+                            "Asyncio in Python is a library",
+                            "I have read that it is used for asynchronous programming"
+                        ]
                     ]
                 else:
                     expected_strings = [
@@ -1031,8 +1018,8 @@ def run_disaggregated_test(example_dir,
     """Run disaggregated test using service discovery instead of MPI.
 
     If assert_gen_log_contains is set, the generation-worker logs are captured and, after the
-    client tests, at least one of them must contain that substring (used to prove the KV-cache
-    bounce path actually engaged instead of silently falling back to the per-fragment path).
+    client tests, at least one of them must contain that substring (used to prove an intended
+    code path actually engaged instead of silently falling back to another one).
     """
     if mpi_disabled():
         pytest.skip(
@@ -1061,6 +1048,7 @@ def run_disaggregated_test(example_dir,
 
     server_host = config.get("hostname", "localhost")
 
+    success = False
     try:
         server_url = f"http://{server_host}:{server_port}"
 
@@ -1084,7 +1072,7 @@ def run_disaggregated_test(example_dir,
             test_desc,
             num_iters,
             run_env,
-            300,  # timeout
+            server_start_timeout,  # timeout
             prompt_file,
             extra_endpoints_test,
             server_url,
@@ -1094,8 +1082,8 @@ def run_disaggregated_test(example_dir,
         if post_client_test is not None:
             post_client_test(server_url)
         if assert_gen_log_contains is not None:
-            # Fail loudly if the marker is absent: the transfer silently fell back to the
-            # per-fragment path, so the bounce path we meant to exercise never ran.
+            # Fail loudly if the marker is absent: the code path the test means to
+            # exercise never ran and something else silently took its place.
             logs = []
             for w in gen_workers:
                 if w.log_path and os.path.exists(w.log_path):
@@ -1103,11 +1091,16 @@ def run_disaggregated_test(example_dir,
                         logs.append(f.read())
             assert any(assert_gen_log_contains in log for log in logs), (
                 f"expected marker {assert_gen_log_contains!r} in a generation-worker log, "
-                f"but none of {len(logs)} log(s) contained it (bounce did not engage)"
-            )
+                f"but none of {len(logs)} log(s) contained it "
+                f"(the intended code path did not engage)")
+        success = True
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
-        shutil.rmtree(work_dir, ignore_errors=True)
+        # When the marker assertion is active the worker logs are file-based
+        # (save_log=True). Preserve work_dir on the failure path so the first
+        # failures on the newly enabled stages arrive with logs to read.
+        if success or assert_gen_log_contains is None:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
@@ -1309,8 +1302,14 @@ def test_disaggregated_benchmark_gen_only_insufficient_kv(
             results = [f.result(timeout=120) for f in futures]
 
         errors = [r for r in results if isinstance(r, Exception)]
-        assert len(errors) > 0, \
-            "Expected at least one error due to insufficient KV cache"
+        # The executor's fail-fast message must reach a client; any other
+        # exception (connection refused, worker crash) is a different failure.
+        fail_fast_errors = [
+            e for e in errors
+            if "Insufficient KV cache for gen-only benchmark mode" in str(e)
+        ]
+        assert fail_fast_errors, \
+            f"Expected the insufficient-KV fail-fast error, got: {errors!r}"
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -1503,169 +1502,6 @@ def test_disaggregated_overlap_transceiver_runtime_python_bounce(
                            assert_gen_log_contains="[kv-bounce] coalesced")
 
 
-def _verify_python_transceiver_under_host_offload(server_url: str, model: str):
-    """End-to-end check: Python transceiver + ctx-side host offload.
-
-    The fix translates logical block IDs to primary-pool slot indices in
-    `_CacheReuseAdapterV1.get_block_ids` before they reach the disagg
-    sender. Without that translation, once host offload moves blocks
-    around, the sender computes pool pointers from stale block IDs and
-    either reads garbage memory or aborts. This test stresses that path
-    end-to-end:
-
-      1. Send several distinct prompts to fill the (deliberately small)
-         ctx primary pool, committing each to the reuse radix tree.
-      2. Send more prompts, evicting earlier blocks to the host pool.
-      3. Re-issue the earlier prompts. Reuse hits force onboard from host
-         back to primary, and the disagg transfer must read primary slots
-         that no longer match the original block IDs. With the fix, this
-         succeeds; without it, the sender either crashes on a primary
-         assertion or returns nonsense tokens.
-
-    Assertions are deliberately content-agnostic (TinyLlama outputs vary
-    run-to-run): we check that responses are non-empty, the server stays
-    up across the eviction/onboard cycle, and `cached_tokens > 0` on
-    repeats so we know reuse actually fired.
-    """
-    timeout = aiohttp.ClientTimeout(total=180)
-    max_tokens = 16
-    # Workload sizing: ctx-side primary pool = max_tokens(1024) /
-    # tokens_per_block(64) = 16 blocks. Each prompt below tokenizes to
-    # ~200 tokens ≈ 4 KV blocks. We send 6 distinct prompts → ~24 blocks
-    # of primary demand > 16-block primary pool, forcing eviction of an
-    # earlier prefix to host. Replaying earlier prompts (Pass 2) then
-    # forces onboard from host back to primary, and onboard typically
-    # places the block in a *different* primary slot than its block_id.
-    # That divergence is exactly what the disagg pointer-arithmetic fix
-    # has to handle — without the fix, the sender computes
-    # `base + block_id * slot_bytes` and reads the wrong primary slot.
-    _filler = (
-        "This is filler context describing computer systems, distributed "
-        "inference, KV cache management, host memory offload policies, "
-        "block reuse via radix prefix trees, and the disaggregated serving "
-        "architecture used by modern large language model deployments. ")
-    _topics = [
-        "transformer KV cache management",
-        "the disaggregated prefill/decode split",
-        "host (CPU) memory offload trade-offs",
-        "block eviction and onboard cycles",
-        "primary versus secondary KV pools",
-        "radix prefix tree block reuse",
-    ]
-    distinct_prompts = [
-        f"Topic: {topic}. {_filler * 4} Now answer briefly:"
-        for topic in _topics
-    ]
-
-    async def send(session, prompt):
-        payload = {
-            "model": model,
-            "prompt": prompt,
-            "max_tokens": max_tokens,
-            "temperature": 0.0,
-            "ignore_eos": True,
-        }
-        async with session.post(f"{server_url}/v1/completions",
-                                json=payload,
-                                timeout=timeout) as resp:
-            assert resp.status == 200, (
-                f"completions request failed with {resp.status}: "
-                f"{await resp.text()}")
-            return await resp.json()
-
-    def assert_sane(resp, label):
-        choices = resp.get("choices") or []
-        assert choices, f"{label}: response missing 'choices': {resp}"
-        text = choices[0].get("text") or ""
-        assert text.strip(), f"{label}: empty/whitespace text: {resp}"
-        usage = resp.get("usage") or {}
-        assert usage.get("completion_tokens") == max_tokens, (
-            f"{label}: completion_tokens != {max_tokens}; "
-            f"got {usage.get('completion_tokens')}")
-        return text
-
-    async def drive():
-        async with aiohttp.ClientSession() as session:
-            # Pass 1: prime the radix tree with each distinct prompt and
-            # capture the deterministic output (temperature=0).
-            first_texts = []
-            for idx, p in enumerate(distinct_prompts):
-                resp = await send(session, p)
-                first_texts.append(assert_sane(resp, f"pass1[{idx}]"))
-
-            # Pass 2: send all prompts CONCURRENTLY each replay. Concurrent
-            # in-flight prefills hold their KV blocks simultaneously; with
-            # primary capacity smaller than the union of in-flight prompts,
-            # this is the scenario that produces non-trivial alloc/free
-            # interleaving and onboard-to-different-slot for replayed
-            # prompts. Strict serial sends (Pass 1 above) typically alloc
-            # back to original slots and miss the bug.
-            for replay in range(5):
-                results = await asyncio.gather(
-                    *[send(session, p) for p in distinct_prompts])
-                for idx, resp in enumerate(results):
-                    text = assert_sane(resp,
-                                       f"pass2.replay{replay}.prompt{idx}")
-                    usage = resp["usage"]
-                    cached = (usage.get("prompt_tokens_details")
-                              or {}).get("cached_tokens", 0)
-                    print(f"[host_offload_e2e] replay={replay} prompt={idx} "
-                          f"prompt_tokens={usage.get('prompt_tokens')} "
-                          f"cached_tokens={cached}")
-                    # Reuse must hit — otherwise we never exercise onboard
-                    # back from host, which is the path the fix protects.
-                    assert cached > 0, (
-                        f"replay={replay} prompt={idx}: expected reuse "
-                        f"hit (cached_tokens > 0), got usage={usage}")
-                    # Primary regression check: deterministic decoding +
-                    # correct KV must reproduce Pass 1's output bit-for-bit.
-                    assert text == first_texts[idx], (
-                        f"replay={replay} prompt={idx}: output diverged "
-                        f"from Pass 1, indicating wrong KV was read after "
-                        f"offload/onboard.\n"
-                        f"  pass1: {first_texts[idx]!r}\n"
-                        f"  replay: {text!r}")
-
-    asyncio.run(drive())
-
-
-# Plain parametrize (not the `llama_model_root` indirect fixture) so the
-# test ID picks up the `[TinyLlama-1.1B-Chat-v1.0]` suffix that matches
-# the other disagg tests, without forcing LLM_MODELS_ROOT / NFS access —
-# trtllm-serve resolves the HuggingFace id directly.
-@pytest.mark.parametrize("llama_model_root", ["TinyLlama-1.1B-Chat-v1.0"])
-def test_disaggregated_python_transceiver_host_offload(
-        disaggregated_test_root, llm_venv, disaggregated_example_root,
-        llama_model_root):  # noqa: ARG001 — used only for the parametrize label
-    """E2E regression for block_id -> primary-slot translation in the Python disagg cache transceiver.
-
-    See `_verify_python_transceiver_under_host_offload` for what this
-    test proves. The setup pairs the Python transceiver runtime with a
-    ctx-side `host_cache_size` and a deliberately tight primary pool so
-    that prefix reuse is forced through an offload+onboard cycle before
-    each KV transfer.
-
-    Model resolution: trtllm-serve loads the HuggingFace id from the
-    config's `model:` field (TinyLlama/TinyLlama-1.1B-Chat-v1.0) via
-    huggingface_hub on first use. No LLM_MODELS_ROOT / NFS dependency.
-    """
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-    env = llm_venv._new_env.copy()
-    env["UCX_TLS"] = get_ucx_tls()
-
-    def post_client_test(server_url: str):
-        _verify_python_transceiver_under_host_offload(
-            server_url, "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-
-    run_disaggregated_test(disaggregated_example_root,
-                           "python_transceiver_host_offload",
-                           env=env,
-                           model_path=llama_model_root,
-                           cwd=llm_venv.get_working_directory(),
-                           post_client_test=post_client_test)
-
-
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
 def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
@@ -1681,8 +1517,8 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
         # Use helper function to validate all timing metrics comprehensively
         validate_timing_metrics(item, "perf_metrics test")
 
-    # This test validates the C++ transceiver's timing-metric semantics. Force
-    # DEFAULT to UCX so Llama's Python preference falls back to C++.
+    # This test validates the C++ transceiver's timing-metric semantics: the
+    # config pins transceiver_runtime=CPP, and DEFAULT is forced to UCX.
     env = llm_venv._new_env | {
         "TRTLLM_USE_NIXL_KVCACHE": "0",
         "TRTLLM_USE_UCX_KVCACHE": "1",
@@ -1725,8 +1561,8 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
 
     output_path = os.path.join(llm_venv.get_working_directory(), "cache_time")
     env = llm_venv._new_env.copy()
-    # This test validates the C++ transceiver's CSV format. Selecting UCX for
-    # the DEFAULT backend also resolves the automatic runtime to C++.
+    # This test validates the C++ transceiver's CSV format: the config pins
+    # transceiver_runtime=CPP, and DEFAULT is forced to UCX.
     env["TRTLLM_USE_NIXL_KVCACHE"] = "0"
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
     env["UCX_TLS"] = get_ucx_tls()
@@ -2064,10 +1900,9 @@ def test_disaggregated_deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_re
         cwd=llm_venv.get_working_directory())
 
 
-@skip_no_hopper
 @skip_arm
-@skip_no_hopper
-@skip_arm
+@skip_pre_hopper
+@pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
@@ -2081,11 +1916,45 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
     env["TRTLLM_USE_NIXL_KVCACHE"] = "1"
     env["UCX_TLS"] = get_ucx_tls()
     env["UCX_MM_ERROR_HANDLING"] = "y"
+
+    # @skip_pre_hopper (SM >= 90), not @skip_no_hopper (SM == 90): placement is
+    # controlled by the test lists (l0_dgx_h100, l0_dgx_b200 pre_merge,
+    # l0_dgx_b300), which cover Hopper and Blackwell. The old Hopper-only
+    # @skip_no_hopper silently skipped this test on its B200/B300 registrations;
+    # skip_pre_hopper keeps those live while still gating out pre-Hopper.
+    #
+    # On SM100/103 this test doubles as the decode-only smoke for the CuTe DSL
+    # MLA decode FMHA lib: a disagg generation server runs decode-only batches,
+    # and gen TP2 yields the 16 heads/rank the lib's bf16-KV path admits at any
+    # batch size (the fp8 checkpoint keeps a bf16 KV cache), so the lib takes
+    # essentially every gen forward. Require its kernel-compile marker (logged
+    # at INFO) in a generation-worker log: correct client output alone would
+    # not distinguish the CuTe DSL path from a silent fallback to another FMHA
+    # library. TLLM_FMHA_LIBS=-cute_dsl_mla on the generation server is the
+    # documented off switch.
+    gen_env = None
+    assert_gen_log_contains = None
+    # Default readiness budget. On Blackwell (SM100/103) the CuTe DSL MLA decode
+    # JIT and autotuner warmup deterministically push cold-start readiness to
+    # ~370s: every observed B200/B300 run overran the 300s default, so raise it
+    # to the 1200s budget other disagg tests already use (a real hang still
+    # fails at 1200s). H100 registers in ~138s and its 300s-mark failures are
+    # dominated by a separate UCX/NIXL issue, not slow warmup, so keep 300s
+    # there rather than delaying those failures.
+    server_start_timeout = 300
+    if get_sm_version() in (100, 103):
+        gen_env = {"TLLM_LOG_LEVEL": "INFO"}
+        assert_gen_log_contains = "CuteDSL MLA decode: compiling kernel variant"
+        server_start_timeout = 1200
+
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_nixl",
                            env=env,
+                           gen_env=gen_env,
                            model_path=deepseek_v3_model_root,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           assert_gen_log_contains=assert_gen_log_contains,
+                           server_start_timeout=server_start_timeout)
 
 
 @skip_no_hopper
@@ -2329,11 +2198,6 @@ def benchmark_model_root(request):
         model_path = os.path.join(models_root, "DeepSeek-V3-Lite", "fp8")
     elif (request.param == "DeepSeek-V3-Lite-bf16"):
         model_path = os.path.join(models_root, "DeepSeek-V3-Lite", "bf16")
-    elif request.param == "llama-v3-8b-hf":
-        model_path = os.path.join(models_root, "llama-models-v3", "8B")
-    elif request.param == "llama-3.1-8b-instruct-hf-fp8":
-        model_path = os.path.join(models_root, "llama-3.1-model",
-                                  "Llama-3.1-8B-Instruct-FP8")
     else:
         raise ValueError(f"Failed to find the model: {request.param}")
     return model_path
@@ -3026,7 +2890,8 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
                            "gpt_oss_120b_harmony",
                            env=env,
                            model_path=model_dir,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           server_start_timeout=600)
 
 
 @skip_pre_hopper
@@ -4054,11 +3919,8 @@ def test_disaggregated_cancel_large_context_requests(disaggregated_test_root,
 
 
 @pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("llama_model_root", ['llama-3.1-8b-instruct'],
-                         indirect=True)
 def test_disaggregated_logprobs_serving(disaggregated_test_root,
-                                        disaggregated_example_root, llm_venv,
-                                        llama_model_root):
+                                        disaggregated_example_root, llm_venv):
     """Test logprobs via OpenAI API in disaggregated serving with multi-GPU TP.
 
     Covers the RCCA scenario (NVBug 5926823): disaggregated + streaming + logprobs,
@@ -4120,23 +3982,25 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
         logprobs = [item.get("logprob") for item in content]
         return tokens, logprobs
 
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "llama-3.1-model/Llama-3.1-8B-Instruct")
+    model_path = "Qwen3/Qwen3-8B"
+    model_dir = f"{llm_models_root()}/{model_path}"
+    setup_model_symlink(llm_venv, model_dir, model_path)
 
-    config_file = get_test_config("llama31_8b", disaggregated_example_root,
+    config_file = get_test_config("qwen3_8b", disaggregated_example_root,
                                   os.path.dirname(__file__))
 
     env = llm_venv._new_env.copy()
+    env["UCX_TLS"] = get_ucx_tls()
     ctx_workers, gen_workers, disagg_server, work_dir = [], [], None, None
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, env=env,
-                             model_name=llama_model_root,
+                             model_name=model_dir,
                              cwd=llm_venv.get_working_directory(),
                              server_start_timeout=600)
 
     server_host = config.get("hostname", "localhost")
     server_url = f"http://{server_host}:{server_port}"
-    model_name = "llama-3.1-model/Llama-3.1-8B-Instruct"
+    model_name = model_path
     max_tokens = 20
     timeout = aiohttp.ClientTimeout(total=120)
     # Use emoji prompt to also stress-test multi-byte tokenizer handling
@@ -4249,29 +4113,6 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
         terminate(*ctx_workers, *gen_workers, disagg_server)
         if work_dir:
             shutil.rmtree(work_dir, ignore_errors=True)
-
-
-@pytest.mark.skip_less_device(8)
-@skip_pre_blackwell
-@pytest.mark.parametrize("model_path", ['DeepSeek-V3-0324-FP4'])
-def test_disaggregated_cancel_large_context_requests_long(
-        disaggregated_test_root, disaggregated_example_root, llm_venv,
-        model_path):
-    """Test that disaggregated server handles request cancellations gracefully.
-
-    This test sends bursts of requests with large contexts and cancels them
-    during prefill to stress test resource cleanup.
-    """
-    model_dir = f"{llm_models_root()}/{model_path}"
-    setup_model_symlink(llm_venv, model_dir, model_path)
-
-    run_disaggregated_cancel_test(disaggregated_example_root,
-                                  "cancel_stress_test_large",
-                                  env=llm_venv._new_env,
-                                  num_bursts=1000,
-                                  requests_per_burst=32,
-                                  model_path=model_dir,
-                                  cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.skip_less_device(8)

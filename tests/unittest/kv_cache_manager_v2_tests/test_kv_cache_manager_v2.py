@@ -17,6 +17,7 @@ import functools
 import gc
 import hashlib
 import itertools
+import math
 import os
 import random
 import time
@@ -38,6 +39,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         BufferConfig,
         BufferId,
         CacheLevel,
+        CorruptedError,
         CudaStream,
         DataRole,
         DiskCacheTierConfig,
@@ -57,6 +59,10 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         _introspection,
         _KVCache,
         gen_multimodal_cache_key_tokens,
+        num_live_managers,
+        poison_reason,
+        sequence_to_blockchain_keys,
+        take_poison,
     )
     from kv_cache_manager_v2._block_radix_tree import Hasher
     from kv_cache_manager_v2._common import (
@@ -92,6 +98,7 @@ else:
         BufferConfig,
         BufferId,
         CacheLevel,
+        CorruptedError,
         CudaStream,
         DataRole,
         DiskCacheTierConfig,
@@ -111,6 +118,7 @@ else:
         _introspection,
         _KVCache,
         gen_multimodal_cache_key_tokens,
+        sequence_to_blockchain_keys,
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import Hasher
     from tensorrt_llm.runtime.kv_cache_manager_v2._common import (
@@ -162,20 +170,25 @@ requires_python_backend = unittest.skipIf(
     "white-box test over pure-Python KVCacheManagerV2 internals",
 )
 
+requires_cpp_backend = unittest.skipUnless(
+    KV_CACHE_MANAGER_V2_BACKEND == "cpp",
+    "cold-page codec end-to-end test requires the C++ backend",
+)
+
 
 def get_cached_cuda_event_type():
     backend = KV_CACHE_MANAGER_V2_BACKEND
     if backend == "cpp":
         try:
-            from bindings.internal.batch_manager.kv_cache_manager_v2 import CachedCudaEvent
+            from bindings.internal.batch_manager.kv_cache_manager_v2 import _introspection
 
-            return CachedCudaEvent
+            return _introspection.CachedCudaEvent
         except ImportError:
             from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2 import (
-                CachedCudaEvent,
+                _introspection,
             )
 
-            return CachedCudaEvent
+            return _introspection.CachedCudaEvent
 
     if find_spec("kv_cache_manager_v2") is not None:
         from kv_cache_manager_v2._utils import CachedCudaEvent
@@ -258,6 +271,17 @@ class TestTypedSlotIds(unittest.TestCase):
 
 
 class TestCacheLevelStorage(unittest.TestCase):
+    def test_grains_to_slots_rejects_zero_divisors(self) -> None:
+        invalid_inputs = [
+            (1, [0], 16 << 20),
+            (1, [16 << 20], 0),
+        ]
+
+        for grains, slot_sizes, granularity in invalid_inputs:
+            with self.subTest(slot_sizes=slot_sizes, granularity=granularity):
+                with self.assertRaisesRegex((ValueError, RuntimeError), "must be positive"):
+                    _introspection.grains_to_slots(grains, slot_sizes, granularity)
+
     def test_grains_to_slots_refines_proportional_lower_bound(self) -> None:
         granularity = 16 << 20
         slot_size_list = [16_252_928, 4_063_232]
@@ -355,8 +379,13 @@ class TestKVCacheManagerV2(unittest.TestCase):
     def tearDown(self) -> None:
         gc.enable()
         if hasattr(self, "manager"):
-            self.manager.shutdown()
-            del self.manager
+            # Drop the manager even if shutdown() raises, which it does when a test leaves a KV
+            # cache open. Holding on to it would keep the poison latch un-clearable and fail
+            # every later test instead of just this one.
+            try:
+                self.manager.shutdown()
+            finally:
+                del self.manager
 
     def next_token(self) -> TokenIdExt:
         token_id = next(self._token_id_gen)
@@ -390,6 +419,58 @@ class TestKVCacheManagerV2(unittest.TestCase):
         )
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
+
+
+class TestStorageStatistics(TestKVCacheManagerV2):
+    def test_statistics_are_detached_snapshots(self) -> None:
+        self.prepare(8 << 20, 8 << 20, 0, 2, 16, 0, tokens_per_block=4, kv_buf_size=4096)
+
+        def values(stats):
+            return [
+                (
+                    item.slot_sizes,
+                    item.total,
+                    item.free,
+                    item.evictable,
+                    item.available,
+                    item.unavailable,
+                )
+                for item in stats
+            ]
+
+        snapshots = [self.manager.get_storage_statistics(CacheLevel(level)) for level in range(2)]
+        saved = [values(stats) for stats in snapshots]
+        for level, stats in enumerate(snapshots):
+            self.assertTrue(stats)
+            mapping = self.manager.get_life_cycle_pool_group_indices(CacheLevel(level))
+            # Both life cycles have the same slot sizes and share one pool group at each level.
+            self.assertEqual(mapping, [0, 0])
+            self.assertTrue(all(0 <= pool_group < len(stats) for pool_group in mapping))
+            mapping[0] = -1
+            self.assertNotEqual(
+                self.manager.get_life_cycle_pool_group_indices(CacheLevel(level))[0], -1
+            )
+            for item in stats:
+                self.assertEqual(item.total, item.available + item.unavailable)
+                self.assertEqual(item.available, item.free + item.evictable)
+                sizes = item.slot_sizes
+                sizes[0] = 0
+            self.assertEqual(
+                values(self.manager.get_storage_statistics(CacheLevel(level))), saved[level]
+            )
+
+        with TemporaryCudaStream([]) as stream:
+            cache = self.manager.create_kv_cache()
+            try:
+                self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
+                cache.resize(self.manager.tokens_per_block)
+                current = self.manager.get_storage_statistics()
+                self.assertGreater(sum(item.unavailable for item in current), 0)
+                self.assertEqual([values(stats) for stats in snapshots], saved)
+            finally:
+                cache.close()
+        stream.take_finish_event().synchronize()
+        self.assertEqual(values(self.manager.get_storage_statistics()), saved[0])
 
 
 class TestNoBatching(TestKVCacheManagerV2):
@@ -452,6 +533,183 @@ class TestNoBatching(TestKVCacheManagerV2):
         time_taken = toc - tic
         # print(f"Time taken: {time_taken} seconds")
         return time_taken
+
+    def _run_cold_page_codec_round_trip(
+        self,
+        expected_num_pages: int,
+        expected_cold_pages: dict[LayerGroupId, tuple[int, int, int]],
+    ) -> None:
+        """Force one request through cold storage, then validate its promoted KV."""
+        requests: list[TestNoBatching.Request] = []
+        try:
+            first = self.new_request(0, None, 3 * self.cfg.tokens_per_block, 0)
+            requests.append(first)
+            with TemporaryCudaStream([]) as stream_holder:
+                stream = cast(CudaStream, stream_holder.handle)
+                self.assertTrue(first.kv_cache.resume(stream))
+                self.run_request(first, self.cfg.tokens_per_block, True)
+            stream_holder.take_finish_event().synchronize()
+            self.assertEqual(
+                _introspection.active_page_stats(first.kv_cache)[0],
+                [expected_num_pages, 0],
+            )
+            first.kv_cache.suspend()
+            self.manager.get_and_reset_iteration_stats()
+
+            second = self.new_request(1, None, 3 * self.cfg.tokens_per_block, 0)
+            requests.append(second)
+            with TemporaryCudaStream([]) as stream_holder:
+                stream = cast(CudaStream, stream_holder.handle)
+                self.assertTrue(second.kv_cache.resume(stream))
+                self.run_request(second, self.cfg.tokens_per_block, True)
+            stream_holder.take_finish_event().synchronize()
+
+            # Hot storage has exactly one request worth of slots, so every page of the
+            # suspended request must now use the padded cold representation.
+            self.assertEqual(
+                _introspection.active_page_stats(first.kv_cache)[0],
+                [0, expected_num_pages],
+            )
+            offload_stats = self.manager.get_and_reset_iteration_stats()
+            for life_cycle_id, (offload_pages, _, page_bytes) in expected_cold_pages.items():
+                self.assertEqual(offload_stats[life_cycle_id].iter_offload_blocks, offload_pages)
+                self.assertEqual(
+                    offload_stats[life_cycle_id].iter_offload_bytes,
+                    offload_pages * page_bytes,
+                )
+
+            second.kv_cache.close()
+            with TemporaryCudaStream([]) as stream_holder:
+                stream = cast(CudaStream, stream_holder.handle)
+                self.assertTrue(first.kv_cache.resume(stream))
+                self.run_request(first, self.cfg.tokens_per_block, True)
+            stream_holder.take_finish_event().synchronize()
+            self.assertEqual(
+                _introspection.active_page_stats(first.kv_cache)[0],
+                [expected_num_pages, 0],
+            )
+            onboard_stats = self.manager.get_and_reset_iteration_stats()
+            for life_cycle_id, (_, onboard_pages, page_bytes) in expected_cold_pages.items():
+                self.assertEqual(onboard_stats[life_cycle_id].iter_onboard_blocks, onboard_pages)
+                self.assertEqual(
+                    onboard_stats[life_cycle_id].iter_onboard_bytes,
+                    onboard_pages * page_bytes,
+                )
+        finally:
+            for request in requests:
+                if request.kv_cache.status != _KVCache.Status.CLOSED:
+                    request.kv_cache.close()
+            if hasattr(self, "manager"):
+                self.manager.clear_reusable_blocks()
+
+    @requires_cpp_backend
+    def test_cold_codec_merges_lifecycles_from_different_hot_pool_groups(self) -> None:
+        """Padding merges full attention with one of two differently-sized SWA LCs."""
+        unit = 1 << 20
+        self.cfg = KVCacheManagerConfig(
+            tokens_per_block=4,
+            cache_tiers=[
+                GpuCacheTierConfig(quota=24 * unit),
+                GpuCacheTierConfig(quota=64 * unit),
+            ],
+            layers=[
+                AttentionLayerConfig(
+                    layer_id=LayerId(0),
+                    buffers=[BufferConfig(role=Role.KEY, size=4 * unit)],
+                ),
+                AttentionLayerConfig(
+                    layer_id=LayerId(1),
+                    buffers=[BufferConfig(role=Role.KEY, size=2 * unit)],
+                    sliding_window_size=4,
+                    num_sink_tokens=0,
+                ),
+                AttentionLayerConfig(
+                    layer_id=LayerId(2),
+                    buffers=[BufferConfig(role=Role.KEY, size=2 * unit)],
+                    sliding_window_size=8,
+                    num_sink_tokens=0,
+                ),
+            ],
+            initial_pool_ratio=[1 / 3, 1 / 3, 1 / 3],
+            constraints=[BatchDesc(kv_caches=[KVCacheDesc(capacity=12, history_length=0)])],
+            max_util_for_resume=1.0,
+        )
+        self.engine = FakeEngine(self.cfg)
+        codec = _introspection.create_test_padding_cold_page_codec(
+            {0: 4 * unit, 1: 4 * unit, 2: 2 * unit}
+        )
+        self.manager = KVCacheManager(self.cfg, cold_page_codec=codec)
+
+        full_lc, short_swa_lc, long_swa_lc = [
+            self.manager.get_layer_group_id(LayerId(layer_id)) for layer_id in range(3)
+        ]
+        hot_mapping = self.manager.get_life_cycle_pool_group_indices(GPU_LEVEL)
+        cold_mapping = self.manager.get_life_cycle_pool_group_indices(CacheLevel(1))
+        hot_groups = [hot_mapping[lc_id] for lc_id in (full_lc, short_swa_lc, long_swa_lc)]
+        cold_groups = [cold_mapping[lc_id] for lc_id in (full_lc, short_swa_lc, long_swa_lc)]
+        self.assertNotEqual(hot_groups[0], hot_groups[1])
+        self.assertEqual(hot_groups[1], hot_groups[2])
+        self.assertEqual(cold_groups[0], cold_groups[1])
+        self.assertNotEqual(cold_groups[1], cold_groups[2])
+
+        hot_stats = self.manager.get_storage_statistics(GPU_LEVEL)
+        self.assertEqual(hot_stats[hot_groups[0]].total, 3)
+        self.assertEqual(hot_stats[hot_groups[1]].total, 6)
+        self._run_cold_page_codec_round_trip(
+            expected_num_pages=6,
+            expected_cold_pages={
+                full_lc: (3, 3, 4 * unit),
+                short_swa_lc: (3, 1, 4 * unit),
+                long_swa_lc: (3, 2, 2 * unit),
+            },
+        )
+
+    @requires_cpp_backend
+    def test_cold_codec_splits_lifecycles_from_one_hot_pool_group(self) -> None:
+        """Padding one SWA lifecycle splits a shared hot pool group in cold storage."""
+        unit = 1 << 20
+        self.cfg = KVCacheManagerConfig(
+            tokens_per_block=4,
+            cache_tiers=[
+                GpuCacheTierConfig(quota=12 * unit),
+                GpuCacheTierConfig(quota=32 * unit),
+            ],
+            layers=[
+                AttentionLayerConfig(
+                    layer_id=LayerId(0),
+                    buffers=[BufferConfig(role=Role.KEY, size=2 * unit)],
+                ),
+                AttentionLayerConfig(
+                    layer_id=LayerId(1),
+                    buffers=[BufferConfig(role=Role.KEY, size=2 * unit)],
+                    sliding_window_size=8,
+                    num_sink_tokens=0,
+                ),
+            ],
+            initial_pool_ratio=[0.5, 0.5],
+            constraints=[BatchDesc(kv_caches=[KVCacheDesc(capacity=12, history_length=0)])],
+            max_util_for_resume=1.0,
+        )
+        self.engine = FakeEngine(self.cfg)
+        codec = _introspection.create_test_padding_cold_page_codec({0: 2 * unit, 1: 4 * unit})
+        self.manager = KVCacheManager(self.cfg, cold_page_codec=codec)
+
+        full_lc, swa_lc = [
+            self.manager.get_layer_group_id(LayerId(layer_id)) for layer_id in range(2)
+        ]
+        hot_mapping = self.manager.get_life_cycle_pool_group_indices(GPU_LEVEL)
+        cold_mapping = self.manager.get_life_cycle_pool_group_indices(CacheLevel(1))
+        hot_groups = [hot_mapping[lc_id] for lc_id in (full_lc, swa_lc)]
+        cold_groups = [cold_mapping[lc_id] for lc_id in (full_lc, swa_lc)]
+        self.assertEqual(hot_groups[0], hot_groups[1])
+        self.assertNotEqual(cold_groups[0], cold_groups[1])
+
+        hot_stats = self.manager.get_storage_statistics(GPU_LEVEL)
+        self.assertEqual(hot_stats[hot_groups[0]].total, 6)
+        self._run_cold_page_codec_round_trip(
+            expected_num_pages=5,
+            expected_cold_pages={full_lc: (3, 3, 2 * unit), swa_lc: (3, 2, 4 * unit)},
+        )
 
     def run_naive(
         self,
@@ -586,7 +844,7 @@ class TestNoBatching(TestKVCacheManagerV2):
         def overall_utilization() -> float:
             numerator = 0
             denominator = 0
-            for stat in _introspection.storage_statistics(self.manager):
+            for stat in self.manager.get_storage_statistics():
                 slot_size = sum(stat_slot_sizes(stat))
                 numerator += slot_size * stat.unavailable
                 denominator += slot_size * stat.total
@@ -720,9 +978,64 @@ class TestNoBatching(TestKVCacheManagerV2):
         self.assertEqual(kv2.num_committed_tokens, len(prompt))
         kv2.close()
 
-    def test_planned_drop_handle(self) -> None:
+    def test_reuse_match_backoff_trims_the_tail_of_every_match(self) -> None:
+        """A pool holding state that reads D tokens ahead cannot use the last D.
+
+        Set for a one-model speculative decoding draft pool, whose KV at position
+        i is a function of tokens [0, i + D]: a match of m tokens only describes
+        the first m - D positions. Applied inside match(), so probe_reuse and the
+        claim agree and neither needs a second tree walk. Commit is untouched --
+        the blocks are stored in full; only what a later match may use shrinks.
+        """
+        tokens_per_block = 8
+        backoff = 3
+        prompt = [TokenId(i) for i in range(tokens_per_block * 4)]
+        self.manager = KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=tokens_per_block,
+                cache_tiers=[GpuCacheTierConfig(quota=16 << 20)],
+                layers=[
+                    AttentionLayerConfig(
+                        layer_id=LayerId(0),
+                        buffers=[
+                            BufferConfig(role=Role.KEY, size=1024),
+                            BufferConfig(role=Role.VALUE, size=1024),
+                        ],
+                    )
+                ],
+                reuse_match_backoff=backoff,
+            )
+        )
+
+        with TemporaryCudaStream([]) as stream_holder:
+            stream = cast(CudaStream, stream_holder.handle)
+            kv = self.manager.create_kv_cache()
+            self.assertTrue(kv.resume(stream))
+            self.assertTrue(kv.resize(len(prompt), len(prompt)))
+            kv.commit(prompt)
+            self.assertEqual(kv.num_committed_tokens, len(prompt))
+            kv.close()
+        stream_holder.take_finish_event().synchronize()
+
+        # Every other test in this file runs with the default backoff of 0 and
+        # matches the full prompt, so the delta here is the backoff alone. The
+        # trim crosses a block boundary rather than stopping at one.
+        self.assertEqual(self.manager.probe_reuse(None, prompt), len(prompt) - backoff)
+
+        # A match shorter than the backoff collapses to nothing, not negative.
+        self.assertEqual(self.manager.probe_reuse(None, prompt[: backoff - 1]), 0)
+
+        # The claim agrees with the probe: same trim, no second tree walk.
+        kv2 = self.manager.create_kv_cache(input_tokens=prompt)
+        self.assertEqual(kv2.num_committed_tokens, len(prompt) - backoff)
+        kv2.close()
+
+    @parameterized.expand([("backoff_0", 0), ("backoff_1", 1)])
+    def test_planned_drop_handle(self, _case: str, reuse_match_backoff: int) -> None:
         window_size = 8
-        self.prepare(16 << 20, 0, 0, 2, window_size, 0, tokens_per_block=8)
+        self.cfg = create_config(8, 16 << 20, 0, 0, 2, window_size, 0)
+        self.cfg.reuse_match_backoff = reuse_match_backoff
+        self.manager = KVCacheManager(self.cfg)
         long_tokens = [self.next_token() for _ in range(24)]
         short_tokens = long_tokens[:8]
 
@@ -746,18 +1059,24 @@ class TestNoBatching(TestKVCacheManagerV2):
 
         long_handle = plan_drop(long_tokens)
         short_handle = plan_drop(short_tokens)
-        self.assertEqual(self.manager.probe_reuse(None, short_tokens), len(short_tokens))
+        self.assertEqual(
+            self.manager.probe_reuse(None, short_tokens),
+            len(short_tokens) - reuse_match_backoff,
+        )
 
         short_handle.drop()
         self.assertEqual(self.manager.probe_reuse(None, short_tokens), 0)
-        self.assertEqual(self.manager.probe_reuse(None, long_tokens), len(long_tokens))
+        self.assertEqual(
+            self.manager.probe_reuse(None, long_tokens),
+            len(long_tokens) - reuse_match_backoff,
+        )
 
         long_handle.drop()
         # The SWA window is dropped, while older full-attention blocks remain reusable.
         self.assertEqual(
             self.manager.probe_reuse(None, long_tokens), len(long_tokens) - window_size
         )
-        with self.assertRaisesRegex(ValueError, "already been dropped"):
+        with self.assertRaisesRegex(RuntimeError, "already been dropped"):
             long_handle.drop()
 
     @requires_python_backend
@@ -1924,6 +2243,13 @@ class TestResizeQuota(TestKVCacheManagerV2):
             prefetch_counts_before[HOST_LEVEL] + prefetch_counts_before[DISK_LEVEL],
         )
         self.assertEqual(unscheduled_evictable_after[HOST_LEVEL], 0)
+        # The disk-prefetch counter measures what this call moved: every page that was on disk
+        # beforehand, counted the way iterOnboardBlocks/iterOffloadBlocks count.
+        moved_blocks = self.manager.get_and_reset_iteration_disk_prefetch_blocks()
+        self.assertEqual(moved_blocks, prefetch_counts_before[DISK_LEVEL])
+        # Nothing is left on disk now, so a second prefetch moves nothing and counts nothing.
+        self.assertTrue(prefetch_target.prefetch(HOST_LEVEL))
+        self.assertEqual(self.manager.get_and_reset_iteration_disk_prefetch_blocks(), 0)
         # Now both requests can resume
         for kv_cache in kv_cache_lst:
             success = kv_cache.resume(stream)
@@ -2491,7 +2817,9 @@ class TestSSMSupport(unittest.TestCase):
         kv4.resume(stream)
         kv4.close()
 
-    def test_num_tokens_before_hybrid_pruning_isolates_recurrent_truncation(self) -> None:
+    def test_num_reusable_tokens_before_hybrid_pruning_isolates_recurrent_truncation(
+        self,
+    ) -> None:
         """The diagnostic separates a short attention match from recurrent pruning.
 
         Partial reuse is required for the two numbers to differ at all: without
@@ -2518,7 +2846,7 @@ class TestSSMSupport(unittest.TestCase):
         # attention match, is what cut the reuse.
         kv = self.manager.create_kv_cache(input_tokens=prompt[:48])
         self.assertEqual(kv.num_committed_tokens, 32)
-        self.assertEqual(kv._get_num_tokens_before_hybrid_pruning(), 48)
+        self.assertEqual(kv._get_num_reusable_tokens_before_hybrid_pruning(), 48)
         kv.resume(stream)
         kv.close()
 
@@ -2526,9 +2854,174 @@ class TestSSMSupport(unittest.TestCase):
         # collapse onto num_committed_tokens rather than reporting the lookup.
         kv = self.manager.create_kv_cache(input_tokens=prompt[:64])
         self.assertEqual(kv.num_committed_tokens, 64)
-        self.assertEqual(kv._get_num_tokens_before_hybrid_pruning(), 64)
+        self.assertEqual(kv._get_num_reusable_tokens_before_hybrid_pruning(), 64)
         kv.resume(stream)
         kv.close()
+
+    def test_first_new_block_probe_uses_snapshot_after_backoff(self) -> None:
+        """Snapshot pruning determines which already-present block needs recomputation."""
+        cfg = self._make_ssm_config(tokens_per_block=32, enable_partial_reuse=True)
+        cfg.reuse_match_backoff = 1
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        prompt = [self.next_token() for _ in range(64)]
+        kv = self.manager.create_kv_cache()
+        self.assertTrue(kv.resume(stream))
+        kv.capacity = 32
+        kv.commit(prompt[:32])
+        kv.capacity = 64
+        kv.commit(prompt[32:])
+        kv.close()
+
+        # Backoff reduces the attention match to 63; the last eligible SSM
+        # snapshot is at 32. The second full block already has a tree key but
+        # needs new computation, so an absent-key-only probe is insufficient.
+        self.assertEqual(self.manager.probe_reuse(None, prompt), 32)
+        keys = list(sequence_to_blockchain_keys(32, ReuseScope(), prompt))
+        self.assertEqual(self.manager.probe_first_new_block_key(None, prompt), keys[2][1])
+        claimed = self.manager.create_kv_cache(input_tokens=prompt)
+        self.assertEqual(claimed.num_committed_tokens, 32)
+        self.assertTrue(claimed.resume(stream))
+        claimed.close()
+
+    def test_reuse_match_reports_content_divergence_depth(self) -> None:
+        """The raw walk depth locates the fork, even where pruning shortens reuse."""
+        cfg = self._make_ssm_config(tokens_per_block=32, enable_partial_reuse=True)
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        prompt = [self.next_token() for _ in range(96)]
+        kv1 = self.manager.create_kv_cache()
+        kv1.resume(stream)
+        kv1.capacity = 32
+        kv1.commit(prompt[:32])
+        kv1.capacity = 64
+        kv1.commit(prompt[32:64])
+        kv1.close()
+
+        # Duplicate lookup: the whole range matched, so there is no fork and the
+        # divergence depth saturates at the lookup length.
+        duplicate = self.manager.create_kv_cache(input_tokens=prompt[:64])
+        self.assertEqual(duplicate._get_num_reusable_tokens_before_pruning(), 64)
+        self.assertEqual(duplicate._get_num_reusable_tokens_before_hybrid_pruning(), 64)
+        duplicate.resume(stream)
+        duplicate.close()
+
+        # Diverging lookup: content splits after the committed prefix, so the
+        # divergence depth stays below the lookup length.
+        sibling = prompt[:64] + [self.next_token() for _ in range(32)]
+        forked = self.manager.create_kv_cache(input_tokens=sibling)
+        self.assertEqual(forked._get_num_reusable_tokens_before_pruning(), 64)
+        self.assertLess(forked._get_num_reusable_tokens_before_pruning(), len(sibling))
+        forked.resume(stream)
+        forked.close()
+
+        # Snapshot pruning shortens reuse to the last usable SSM snapshot, but
+        # leaves the divergence depth untouched: attention matched all 48.
+        partial = self.manager.create_kv_cache(input_tokens=prompt[:48])
+        self.assertEqual(partial._get_num_reusable_tokens_before_pruning(), 48)
+        self.assertEqual(partial._get_num_reusable_tokens_before_hybrid_pruning(), 48)
+        self.assertEqual(partial.num_committed_tokens, 32)
+        partial.resume(stream)
+        partial.close()
+
+    def test_reuse_match_depths_are_monotonically_ordered(self) -> None:
+        """Pruning only ever shortens: reuse <= hybrid depth <= divergence depth."""
+        cfg = self._make_ssm_config(tokens_per_block=32, enable_partial_reuse=True)
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        prompt = [self.next_token() for _ in range(128)]
+        kv1 = self.manager.create_kv_cache()
+        kv1.resume(stream)
+        for i in range(3):
+            kv1.capacity = 32 * (i + 1)
+            kv1.commit(prompt[32 * i : 32 * (i + 1)])
+        kv1.close()
+
+        for lookup_len in (16, 32, 48, 64, 80, 96, 112, 128):
+            kv = self.manager.create_kv_cache(input_tokens=prompt[:lookup_len])
+            divergence = kv._get_num_reusable_tokens_before_pruning()
+            hybrid = kv._get_num_reusable_tokens_before_hybrid_pruning()
+            self.assertLessEqual(kv.num_committed_tokens, hybrid, msg=f"len={lookup_len}")
+            self.assertLessEqual(hybrid, divergence, msg=f"len={lookup_len}")
+            self.assertLessEqual(divergence, lookup_len, msg=f"len={lookup_len}")
+            kv.resume(stream)
+            kv.close()
+
+    def test_branch_snapshot_at_divergence_unlocks_sibling_reuse(self) -> None:
+        """A snapshot at the fork lets later siblings reuse the shared prefix.
+
+        This is the R1-R3 sequence the branch-snapshot feature targets: R1
+        snapshots only at its own prompt end, which is past the fork and so
+        useless to siblings. R2 snapshots at the divergence depth instead, and
+        R3 then reuses the whole shared prefix.
+        """
+        cfg = self._make_ssm_config(tokens_per_block=32, enable_partial_reuse=True)
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        shared = [self.next_token() for _ in range(64)]
+        r1_prompt = shared + [self.next_token() for _ in range(32)]
+        r2_prompt = shared + [self.next_token() for _ in range(32)]
+        r3_prompt = shared + [self.next_token() for _ in range(32)]
+
+        # R1 commits once, so its only snapshot sits at its prompt end.
+        kv1 = self.manager.create_kv_cache()
+        kv1.resume(stream)
+        kv1.capacity = len(r1_prompt)
+        kv1.commit(r1_prompt)
+        kv1.close()
+
+        # A sibling locates the fork at 64 but reuses nothing: the sole snapshot
+        # is at 96, past the point where the content diverges.
+        probe = self.manager.create_kv_cache(input_tokens=r3_prompt)
+        self.assertEqual(probe._get_num_reusable_tokens_before_pruning(), 64)
+        self.assertEqual(probe._get_num_reusable_tokens_before_hybrid_pruning(), 64)
+        self.assertEqual(probe.num_committed_tokens, 0)
+        probe.resume(stream)
+        probe.close()
+
+        # R2 diverges at the same depth and snapshots there before continuing.
+        kv2 = self.manager.create_kv_cache(input_tokens=r2_prompt)
+        self.assertEqual(kv2._get_num_reusable_tokens_before_pruning(), 64)
+        kv2.resume(stream)
+        kv2.capacity = 64
+        kv2.commit(r2_prompt[:64])
+        kv2.capacity = len(r2_prompt)
+        kv2.commit(r2_prompt[64:])
+        kv2.close()
+
+        # R3 now reuses the full shared prefix instead of re-prefilling it.
+        kv3 = self.manager.create_kv_cache(input_tokens=r3_prompt)
+        self.assertEqual(kv3.num_committed_tokens, 64)
+        kv3.resume(stream)
+        kv3.close()
+
+    def test_reuse_match_divergence_is_zero_without_a_shared_prefix(self) -> None:
+        """A lookup that shares nothing reports a zero divergence depth."""
+        cfg = self._make_ssm_config(tokens_per_block=32, enable_partial_reuse=True)
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        prompt = [self.next_token() for _ in range(64)]
+        kv1 = self.manager.create_kv_cache()
+        kv1.resume(stream)
+        kv1.capacity = 32
+        kv1.commit(prompt[:32])
+        kv1.close()
+
+        unrelated = [self.next_token() for _ in range(64)]
+        kv2 = self.manager.create_kv_cache(input_tokens=unrelated)
+        self.assertEqual(kv2._get_num_reusable_tokens_before_pruning(), 0)
+        self.assertEqual(kv2.num_committed_tokens, 0)
+        kv2.resume(stream)
+        kv2.close()
 
     def test_ssm_planned_drop_targets_latest_snapshot_with_shared_plans(self) -> None:
         """Shared plans drop only their conversation endpoint snapshot."""
@@ -3123,7 +3616,7 @@ class TestInitRatioConfig(unittest.TestCase):
         manager = KVCacheManager(self._make_hybrid_config())
         ssm_lc = _introspection.ssm_life_cycle_id(manager)
         assert ssm_lc is not None
-        ssm_pg = _introspection.pool_group_index(manager, ssm_lc)
+        ssm_pg = manager.get_life_cycle_pool_group_indices()[ssm_lc]
         attn_pg = 1 - ssm_pg
 
         batch = BatchDesc(
@@ -3204,6 +3697,28 @@ class TestInitRatioConfig(unittest.TestCase):
         self.assertAlmostEqual(sum(ratio), 1.0, places=6)
         manager.shutdown()
 
+    def test_initial_ratio_is_per_layer_group_when_hot_group_is_shared(self):
+        config = KVCacheManagerConfig(
+            tokens_per_block=self.TOKENS_PER_BLOCK,
+            cache_tiers=[GpuCacheTierConfig(quota=128 << 20)],
+            layers=[
+                AttentionLayerConfig(
+                    layer_id=LayerId(0),
+                    buffers=[BufferConfig(role=Role.KEY, size=self.PG0_SLOT_SIZE)],
+                    sliding_window_size=self.WINDOW_SIZE,
+                    num_sink_tokens=self.SINK_TOKENS,
+                ),
+                AttentionLayerConfig(
+                    layer_id=LayerId(1),
+                    buffers=[BufferConfig(role=Role.KEY, size=self.PG0_SLOT_SIZE)],
+                ),
+            ],
+            initial_pool_ratio=[0.25, 0.75],
+        )
+        manager = KVCacheManager(config)
+        self.assertEqual(_introspection.current_gpu_ratio(manager), [1.0])
+        manager.shutdown()
+
     @parameterized.expand(
         [
             ("empty", [], "initial_pool_ratio length"),
@@ -3217,6 +3732,16 @@ class TestInitRatioConfig(unittest.TestCase):
         cfg = self._make_config(initial_pool_ratio=ratio)
 
         with self.assertRaisesRegex(ValueError, error):
+            KVCacheManager(cfg)
+
+    @parameterized.expand(
+        [("zero", 0.0), ("negative", -0.1), ("greater_than_one", 1.1), ("nan", math.nan)]
+    )
+    def test_invalid_max_util_for_resume(self, _name: str, max_util_for_resume: float):
+        cfg = self._make_config()
+        cfg.max_util_for_resume = max_util_for_resume
+
+        with self.assertRaisesRegex((ValueError, RuntimeError), "max_util_for_resume must be in"):
             KVCacheManager(cfg)
 
     def test_ratio_slot_count_rounding_matches_python(self):
@@ -3248,8 +3773,7 @@ class TestInitRatioConfig(unittest.TestCase):
             return stat.slot_size
 
         slots_by_size = {
-            tuple(stat_slot_sizes(stat)): stat.total
-            for stat in _introspection.storage_statistics(manager)
+            tuple(stat_slot_sizes(stat)): stat.total for stat in manager.get_storage_statistics()
         }
         self.assertEqual(slots_by_size[(grain - 1,)], 2)
         self.assertEqual(slots_by_size[(grain,)], 3)
@@ -3312,7 +3836,7 @@ class TestInitRatioConfig(unittest.TestCase):
         manager = KVCacheManager(cfg)
 
         # Verify constraint clamping: each pool group has enough slots.
-        stats = _introspection.storage_statistics(manager)
+        stats = manager.get_storage_statistics()
         self.assertGreaterEqual(
             stats[0].total,
             slots_pg0,
@@ -3557,7 +4081,7 @@ class TestInitRatioConfig(unittest.TestCase):
         manager = KVCacheManager(cfg)
 
         # Verify constraint clamping: each pool group has enough slots.
-        stats = _introspection.storage_statistics(manager)
+        stats = manager.get_storage_statistics()
         self.assertGreaterEqual(
             stats[0].total,
             slots_pg0,
@@ -4141,7 +4665,12 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
     TOKENS_PER_BLOCK = 32
     WINDOW_SIZE = 16
 
-    def prepare_partial(self, gpu_quota: int = 64 << 20, window_size: int | None = None) -> None:
+    def prepare_partial(
+        self,
+        gpu_quota: int = 64 << 20,
+        window_size: int | None = None,
+        reuse_match_backoff: int = 0,
+    ) -> None:
         kv_buf_size = 8192
         window_size = self.WINDOW_SIZE if window_size is None else window_size
         self.cfg = KVCacheManagerConfig(
@@ -4166,6 +4695,7 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
             ],
             enable_partial_reuse=True,
             commit_min_snapshot=True,
+            reuse_match_backoff=reuse_match_backoff,
         )
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
@@ -4373,6 +4903,21 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
         # attention lifecycle's reusable prefix.
         self.assertEqual(self.manager.probe_reuse(input_tokens=boundary), len(boundary))
 
+    def test_reuse_backoff_rechecks_swa_coverage_at_final_endpoint(self) -> None:
+        self.prepare_partial(window_size=33, reuse_match_backoff=1)
+        base = [TokenId(i) for i in range(48)]
+        boundary = base + [TokenId(i) for i in range(1000, 1048)]
+
+        self.assertEqual(self.run_turn(base, refcheck=True), 0)
+        self.run_turn(boundary)
+        self.assertEqual(self._tail_coverage(base, self._swa_lc_id), 16)
+
+        # Backing off from 96 to 95 makes block 1's partial SWA page active, but
+        # it only covers 16 of the required 32 tokens. The maximal safe endpoint
+        # is the previously committed 48-token prefix.
+        self.assertEqual(self.manager.probe_reuse(input_tokens=boundary), len(base))
+        self.assertEqual(self.run_turn(boundary, refcheck=True), len(base))
+
     def test_page_coverage_only_grows(self) -> None:
         self.prepare_partial()
         base = [TokenId(i) for i in range(80)]
@@ -4496,7 +5041,7 @@ class TestPoolRebalance(TestKVCacheManagerV2):
         return prompt
 
     def _slot_totals(self) -> list[int]:
-        return [s.total for s in _introspection.storage_statistics(self.manager, GPU_LEVEL)]
+        return [s.total for s in self.manager.get_storage_statistics(GPU_LEVEL)]
 
     def test_adjust_resizes_pool_groups(self) -> None:
         self.prepare_two_pool_groups()
@@ -4635,6 +5180,134 @@ class TestSlotAllocatorShrink(unittest.TestCase):
             allocator.release(s)
 
 
+class TestCachedTokensByTier(TestKVCacheManagerV2):
+    @contextmanager
+    def _tiered_prefix(self):
+        """Three committed blocks of 4 tokens spread over the configured cache levels.
+
+        Per-(block, life cycle) levels are (0,0), (1,0), (1,2), so a match of 11 tokens makes
+        blocks 0 and 1 full reuses and block 2 a partial one, with the two attention life cycles
+        disagreeing on where the pages sit. Yields (tokens, life_cycles).
+        """
+        self.prepare(16 << 20, 16 << 20, 16 << 20, 2, 16, 0, tokens_per_block=4)
+        tokens = [TokenId(i) for i in range(12)]
+        life_cycles = _introspection.attention_life_cycle_ids(self.manager)
+        coverage = [4 if i in life_cycles else 0 for i in range(max(life_cycles) + 1)]
+        blocks = []
+        try:
+            parent = None
+            for ordinal, levels in enumerate(((0, 0), (1, 0), (1, 2))):
+                block = _introspection.make_test_block(
+                    self.manager, tokens[ordinal * 4 : (ordinal + 1) * 4], coverage, parent
+                )
+                blocks.append(block)
+                for life_cycle, level in zip(life_cycles, levels):
+                    if level:
+                        _introspection.set_test_block_page_cache_level(
+                            block, life_cycle, CacheLevel(level)
+                        )
+                parent = block
+            yield tokens, life_cycles
+        finally:
+            # Put every page back on GPU before closing, so teardown does not trip over a block
+            # whose pages were parked on a cold level.
+            for block in blocks:
+                for life_cycle in life_cycles:
+                    _introspection.set_test_block_page_cache_level(block, life_cycle, CacheLevel(0))
+            for block in reversed(blocks):
+                _introspection.close_test_block(block)
+
+    def test_current_residency(self) -> None:
+        with self._tiered_prefix() as (tokens, _):
+            cache = self.manager.create_kv_cache(input_tokens=tokens[:11])
+            try:
+                # Levels 0/1/2 are gpu/host/disk in this fixture's configured tier list.
+                self.assertEqual(list(cache.cached_tokens_by_level), [4, 4, 3])
+                self.assertEqual(cache._get_last_cached_token_level(), 2)
+            finally:
+                cache.close()
+
+    def test_reused_blocks_by_level(self) -> None:
+        """Reuse block counts are split by the cache level each reused page sat on."""
+        with self._tiered_prefix() as (tokens, life_cycles):
+            cache = self.manager.create_kv_cache(input_tokens=tokens[:11])
+            try:
+                cache.commit_pending_stats()
+                by_level = self.manager.get_and_reset_iteration_reused_blocks_by_level()
+
+                # First life cycle: block 0 on level 0, block 1 on level 1 (both full), block 2
+                # on level 1 (partial). Second: blocks 0 and 1 on level 0, block 2 on level 2.
+                self.assertEqual(list(by_level[life_cycles[0]].full), [1, 1, 0])
+                self.assertEqual(list(by_level[life_cycles[0]].partial), [0, 1, 0])
+                self.assertEqual(list(by_level[life_cycles[1]].full), [2, 0, 0])
+                self.assertEqual(list(by_level[life_cycles[1]].partial), [0, 0, 1])
+                # Draining resets the accumulator.
+                self.assertEqual(self.manager.get_and_reset_iteration_reused_blocks_by_level(), {})
+            finally:
+                cache.close()
+
+    def test_iteration_accumulation(self) -> None:
+        """Attribution is staged with the reuse match and committed with the sequence's stats."""
+        with self._tiered_prefix() as (tokens, _):
+            cache = self.manager.create_kv_cache(input_tokens=tokens[:11])
+            try:
+                # Nothing is reported until the sequence's pending stats are committed.
+                self.assertEqual(
+                    list(self.manager.get_and_reset_iteration_cached_tokens_by_level()), []
+                )
+                cache.commit_pending_stats()
+                self.assertEqual(
+                    list(self.manager.get_and_reset_iteration_cached_tokens_by_level()), [4, 4, 3]
+                )
+                # Draining resets the accumulator, and committing again does not re-report the
+                # same match.
+                cache.commit_pending_stats()
+                self.assertEqual(
+                    list(self.manager.get_and_reset_iteration_cached_tokens_by_level()), []
+                )
+            finally:
+                cache.close()
+
+    def test_drop_cached_token_attribution(self) -> None:
+        """Dropping suppresses the whole match, e.g. for a KV cache sizing dry run."""
+        with self._tiered_prefix() as (tokens, _):
+            cache = self.manager.create_kv_cache(input_tokens=tokens[:11])
+            try:
+                cache.drop_cached_token_attribution()
+                cache.commit_pending_stats()
+                self.assertEqual(
+                    list(self.manager.get_and_reset_iteration_cached_tokens_by_level()), []
+                )
+            finally:
+                cache.close()
+
+    def test_drop_partial_block_cached_token_attribution(self) -> None:
+        """Only the trailing partial block stops counting; complete blocks survive."""
+        with self._tiered_prefix() as (tokens, _):
+            # 11 tokens is two full blocks plus a 3-token tail resident on level 2.
+            cache = self.manager.create_kv_cache(input_tokens=tokens[:11])
+            try:
+                cache.drop_partial_block_cached_token_attribution()
+                cache.commit_pending_stats()
+                self.assertEqual(
+                    list(self.manager.get_and_reset_iteration_cached_tokens_by_level()), [4, 4, 0]
+                )
+            finally:
+                cache.close()
+
+    def test_drop_partial_block_keeps_block_aligned_attribution(self) -> None:
+        with self._tiered_prefix() as (tokens, _):
+            cache = self.manager.create_kv_cache(input_tokens=tokens[:8])
+            try:
+                cache.drop_partial_block_cached_token_attribution()
+                cache.commit_pending_stats()
+                self.assertEqual(
+                    list(self.manager.get_and_reset_iteration_cached_tokens_by_level()), [4, 4, 0]
+                )
+            finally:
+                cache.close()
+
+
 @pytest.mark.cpu_only
 class TestBlockKeyHashing(unittest.TestCase):
     """Verify Hasher.update produces bit-identical digests to the per-token reference (no GPU needed)."""
@@ -4669,6 +5342,71 @@ class TestBlockKeyHashing(unittest.TestCase):
         for digest_size in (31, 33):
             with self.subTest(digest_size=digest_size), self.assertRaises(ValueError):
                 gen_multimodal_cache_key_tokens(100, bytes(digest_size), 1)
+
+
+class TestPoison(TestKVCacheManagerV2):
+    """The refusal path taken once KVCM2 records a broken invariant.
+
+    Poisoning is set directly rather than by provoking a real violation, so these exercise the
+    refusal and recovery machinery without depending on a specific bug.
+
+    Each test disposes of its manager itself: leaving one alive would keep the latch
+    un-clearable, and every test after it would then be blamed for this test's poisoning.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        if not hasattr(_introspection, "poison_for_testing"):
+            raise unittest.SkipTest("the poison latch is C++-backend only")
+
+    def _discard_poisoned_manager(self) -> None:
+        del self.manager
+        gc.collect()
+        self.assertEqual(num_live_managers(), 0)
+
+    def test_poisoned_manager_rejects_api_calls(self) -> None:
+        self.prepare(5619712, 0, 0, 8, None, 0)
+        # Held open across the poisoning. Disposal is exempt in two ways, and an open cache is
+        # what separates them: shutdown() must return rather than raise CorruptedError, and it
+        # must skip its cleanup, whose _checkNoLivingKvCaches() this cache would otherwise trip.
+        kv_cache = self.manager.create_kv_cache()
+        _introspection.poison_for_testing("deliberate test poisoning")
+
+        # The refusal names the original violation, not whatever inconsistency the refused call
+        # would have tripped over.
+        with self.assertRaisesRegex(CorruptedError, "deliberate test poisoning"):
+            self.manager.create_kv_cache()
+
+        # A caller that detects corruption still has to be able to tear the manager down.
+        self.manager.shutdown()
+
+        del kv_cache
+        self._discard_poisoned_manager()
+        self.assertIn("deliberate test poisoning", take_poison())
+
+    def test_take_poison_only_clears_once_no_manager_is_alive(self) -> None:
+        self.prepare(5619712, 0, 0, 8, None, 0)
+        # Two managers, so that "every manager is gone" is distinguishable from "a manager is
+        # gone": with only one, an implementation that cleared on any destruction would pass.
+        second = KVCacheManager(self.cfg)
+        _introspection.poison_for_testing("deliberate test poisoning")
+
+        # A live manager skipped its own cleanup when it was poisoned, so clearing now would
+        # resume work on structures known to be inconsistent. The reason is still reported.
+        self.assertEqual(num_live_managers(), 2)
+        self.assertIn("deliberate test poisoning", take_poison())
+        self.assertIsNotNone(poison_reason())
+
+        del second
+        gc.collect()
+        self.assertEqual(num_live_managers(), 1)
+        self.assertIn("deliberate test poisoning", take_poison())
+        self.assertIsNotNone(poison_reason())
+
+        self._discard_poisoned_manager()
+
+        self.assertIn("deliberate test poisoning", take_poison())
+        self.assertIsNone(poison_reason())
 
 
 if __name__ == "__main__":

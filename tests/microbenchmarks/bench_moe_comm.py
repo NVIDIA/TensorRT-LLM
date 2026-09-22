@@ -64,9 +64,9 @@ from torch.autograd import DeviceType
 
 import tensorrt_llm as tllm
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.fused_moe import CutlassFusedMoE, MoE
-from tensorrt_llm._torch.modules.fused_moe.communication import Communication, CommunicationFactory
-from tensorrt_llm._torch.modules.fused_moe.routing import DefaultMoeRoutingMethod
+from tensorrt_llm._torch.moe.fused_moe import CutlassFusedMoE, MoE
+from tensorrt_llm._torch.moe.fused_moe.communication import Communication, CommunicationFactory
+from tensorrt_llm._torch.moe.fused_moe.routing import DefaultMoeRoutingMethod
 from tensorrt_llm._utils import local_mpi_rank, mpi_allgather, mpi_barrier, mpi_rank, mpi_world_size
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -26,6 +27,10 @@ from unittest.mock import Mock
 import pytest
 
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
+from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
+    CtxTransferStatus,
+    GenTransferStatus,
+)
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     TaskStatus,
     TransferWorker,
@@ -39,6 +44,7 @@ from tensorrt_llm.bindings import LlmRequestState
 @dataclass
 class _FakeRequest:
     state: Optional[LlmRequestState] = None
+    py_kv_send_session_retired: bool = False
 
 
 class _FakeTransferWorker:
@@ -58,12 +64,14 @@ class _FakeSession:
         status: SessionStatus = SessionStatus.READY,
         is_completed: bool = False,
         has_failed: bool = False,
+        has_transferring_tasks: bool = False,
     ) -> None:
         self._rid = rid
         self._wait_result = wait_result
         self._status = status
         self._is_completed = is_completed
         self._has_failed = has_failed
+        self._has_transferring_tasks = has_transferring_tasks
         self.blocking_calls: list[bool] = []
         self.closed = False
         self.aux_slot: Optional[int] = 0
@@ -85,6 +93,9 @@ class _FakeSession:
 
     def has_failed(self) -> bool:
         return self._has_failed
+
+    def has_transferring_tasks(self) -> bool:
+        return self._has_transferring_tasks
 
     def close(self) -> None:
         self.closed = True
@@ -140,10 +151,13 @@ def _make_transceiver(
     transceiver._ctx_need_pp_sync = False
     transceiver._transfer_worker = _FakeTransferWorker()
     transceiver._ctx_consensus = lambda local_ids: list(local_ids)
-    transceiver._ctx_consensus_outcome = lambda _to_process, cancelled, failed, completed: (
-        cancelled,
-        failed,
-        completed,
+    transceiver._ctx_consensus_outcome = (
+        lambda _to_process, cancelled, failed, completed, quiesced: (
+            cancelled,
+            failed,
+            completed,
+            quiesced,
+        )
     )
     return transceiver
 
@@ -166,6 +180,7 @@ def _make_tx_session(
     session.receiver_ready = True
     session.kv_tasks = kv_tasks
     session.aux_task = aux_task
+    session._has_last_slice = True
     session.lock = threading.Lock()
     session._closed = False
     session._aux_buffer = None
@@ -189,7 +204,9 @@ def test_context_transfer_status_bounded_poll_keeps_not_ready_session_queued(
         Mock(),
     )
 
-    completed, failed = transceiver.check_context_transfer_status(at_least_request_num=1)
+    status = transceiver.check_context_transfer_status(at_least_request_num=1)
+    assert isinstance(status, CtxTransferStatus)
+    completed, failed = status
 
     assert completed == []
     assert failed == []
@@ -297,9 +314,60 @@ def test_context_transfer_status_zero_budget_processes_task_level_failure() -> N
     assert failed == [13]
     assert session.blocking_calls == [False]
     assert session.closed
-    assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert req.state is None
+    assert req.py_kv_send_session_retired
     assert 13 not in transceiver._send_sessions
     assert 13 not in transceiver._send_reqs
+
+
+@pytest.mark.parametrize(
+    ("status", "has_failed"),
+    [
+        (SessionStatus.CANCELLED, True),
+        (SessionStatus.ERROR, True),
+    ],
+)
+def test_context_transfer_status_retains_terminal_session_during_write(
+    status: SessionStatus,
+    has_failed: bool,
+) -> None:
+    session = _FakeSession(
+        rid=17,
+        wait_result=WaitResult.FAILED,
+        status=status,
+        has_failed=has_failed,
+        has_transferring_tasks=True,
+    )
+    req = _FakeRequest()
+    transceiver = _make_transceiver({17: session}, {17: req})
+
+    completed, failed = transceiver.check_context_transfer_status(at_least_request_num=0)
+
+    assert completed == []
+    assert failed == []
+    assert not session.closed
+    assert transceiver._send_sessions == {17: session}
+    assert transceiver._send_reqs == {17: req}
+    assert req.state is None
+
+
+def test_context_transfer_status_retires_quiesced_cancelled_session() -> None:
+    session = _FakeSession(
+        rid=18,
+        wait_result=WaitResult.FAILED,
+        status=SessionStatus.CANCELLED,
+        has_failed=True,
+    )
+    req = _FakeRequest()
+    transceiver = _make_transceiver({18: session}, {18: req})
+
+    completed, failed = transceiver.check_context_transfer_status(at_least_request_num=0)
+
+    assert completed == []
+    assert failed == []
+    assert session.closed
+    assert 18 not in transceiver._send_sessions
+    assert 18 not in transceiver._send_reqs
 
 
 def test_context_transfer_status_skips_consensus_when_never_sent() -> None:
@@ -350,7 +418,9 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
     transceiver._gen_consensus_outcome = Mock(return_value=([], [], []))
     transceiver._close_failed_sessions = Mock()
 
-    completed, failed, cancelled = transceiver.check_gen_transfer_status(at_least_request_num=0)
+    status = transceiver.check_gen_transfer_status(at_least_request_num=0)
+    assert isinstance(status, GenTransferStatus)
+    completed, failed, cancelled = status
 
     assert completed == []
     assert failed == []
@@ -359,27 +429,26 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
 
 
 def test_consensus_outcome_uses_single_batched_allgather() -> None:
-    # The cancelled/failed/completed id lists are exchanged with ONE allgather
-    # (packed as a list-of-lists) instead of three; verify a single call and that
-    # union (cancelled/failed) + intersection (completed) semantics are preserved.
+    # The outcome and quiescence id lists are exchanged with ONE allgather.
     transceiver = object.__new__(KvCacheTransceiverV2)
     calls: list = []
 
     def fake_allgather(payload):
         calls.append(payload)
-        # rank0 = this rank's [cancelled, failed, completed]; rank1 = a peer rank.
-        return [payload, [[], [99], [7, 8]]]
+        # rank0 = this rank; rank1 = a peer rank.
+        return [payload, [[], [99], [7, 8], [7, 99]]]
 
     to_process = [1, 2, 7, 8, 99]
-    new_cancelled, new_failed, new_completed = transceiver._consensus_outcome(
-        to_process, [1], [2], [7], fake_allgather, True
+    new_cancelled, new_failed, new_completed, new_quiesced = transceiver._consensus_outcome(
+        to_process, [1], [2], [7], fake_allgather, True, [1, 7]
     )
 
     assert len(calls) == 1  # batched: a single allgather, not three
-    assert calls[0] == [[1], [2], [7]]
+    assert calls[0] == [[1], [2], [7], [1, 7]]
     assert new_cancelled == [1]  # union of cancelled across ranks
     assert new_failed == [2, 99]  # union of failed across ranks
     assert new_completed == [7]  # intersection only (8 is completed on the peer only)
+    assert new_quiesced == [7]
 
 
 def test_ctx_tp_consensus_does_not_complete_when_peer_times_out() -> None:
@@ -387,14 +456,17 @@ def test_ctx_tp_consensus_does_not_complete_when_peer_times_out() -> None:
     transceiver._ctx_need_tp_sync = True
     transceiver._ctx_need_pp_sync = False
     transceiver._dist = SimpleNamespace(
-        tp_allgather=lambda payload: [payload, [[], [], []]],
+        tp_allgather=lambda payload: [payload, [[], [], [], []]],
     )
 
-    cancelled, failed, completed = transceiver._ctx_consensus_outcome([21], [], [], [21])
+    cancelled, failed, completed, quiesced = transceiver._ctx_consensus_outcome(
+        [21], [], [], [21], [21]
+    )
 
     assert cancelled == []
     assert failed == []
     assert completed == []
+    assert quiesced == []
 
 
 def test_ctx_pp_consensus_does_not_complete_when_peer_times_out() -> None:
@@ -403,14 +475,17 @@ def test_ctx_pp_consensus_does_not_complete_when_peer_times_out() -> None:
     transceiver._ctx_need_pp_sync = True
     transceiver._dist = SimpleNamespace(
         tp_allgather=Mock(side_effect=AssertionError("TP allgather must be skipped")),
-        pp_allgather=lambda payload: [payload, [[], [], []]],
+        pp_allgather=lambda payload: [payload, [[], [], [], []]],
     )
 
-    cancelled, failed, completed = transceiver._ctx_consensus_outcome([22], [], [], [22])
+    cancelled, failed, completed, quiesced = transceiver._ctx_consensus_outcome(
+        [22], [], [], [22], [22]
+    )
 
     assert cancelled == []
     assert failed == []
     assert completed == []
+    assert quiesced == []
     transceiver._dist.tp_allgather.assert_not_called()
 
 
@@ -440,7 +515,7 @@ def test_ctx_consensus_fastpath_skips_when_idle(monkeypatch) -> None:
     transceiver._dist.allreduce = Mock(return_value=0)
     transceiver._ctx_consensus = Mock(return_value=[])
     transceiver._build_to_process = Mock(return_value=[])
-    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], []))
+    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], [], []))
     transceiver._transfer_worker = _FakeTransferWorker()
     transceiver._close_failed_sessions = Mock()
 
@@ -681,35 +756,45 @@ def test_tx_session_first_send_anchors_deadline_once(monkeypatch) -> None:
         request_id=31,
         params=params,
         sender=sender,
+        prompt_len=8,
         timeout_s=0.25,
         overall_timeout_s=2.0,
     )
 
     assert session._deadline_monotonic_s is None
-    session.send(Mock())
+    session.send(Mock(is_last=False))
     assert session._deadline_monotonic_s == 12.0
 
     clock.advance(0.5)
-    session.send(Mock())
+    session.send(Mock(is_last=False))
     assert session._deadline_monotonic_s == 12.0
     assert sender.dispatch_task.call_count == 2
     session.close()
 
 
-@pytest.mark.parametrize(
-    ("transfer_timeout_ms", "sender_wait_ms", "expected_timeout_s", "expected_slice_s"),
-    [
-        (60_000, 1_000, 60.0, 1.0),
-        (60_000, None, 60.0, None),
-    ],
-)
-def test_transceiver_wires_separate_sender_slice_and_overall_timeout(
-    monkeypatch,
-    transfer_timeout_ms: Optional[int],
-    sender_wait_ms: Optional[int],
-    expected_timeout_s: Optional[float],
-    expected_slice_s: Optional[float],
-) -> None:
+def _make_cache_config(**overrides) -> SimpleNamespace:
+    """SimpleNamespace standing in for CacheTransceiverConfig.
+
+    Every attribute the KvCacheTransceiverV2 constructor reads must be present here.
+    """
+    fields = dict(
+        kv_transfer_timeout_ms=60_000,
+        kv_transfer_poll_interval_ms=5_000,
+        kv_transfer_sender_future_timeout_ms=1_000,
+        kv_cache_bounce_size_mb=0,
+        agent_bounce_buffer_enable=False,
+        agent_bounce_params=None,
+        enable_pipelined_transfer=False,
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def _construct_worker_config(monkeypatch, cache_config) -> TransferWorkerConfig:
+    """Build a KvCacheTransceiverV2 with all collectives/native setup mocked out.
+
+    Returns the TransferWorkerConfig it wired.
+    """
     worker = SimpleNamespace(page_table=None)
     worker_constructor = Mock(return_value=worker)
     monkeypatch.setattr(
@@ -720,9 +805,11 @@ def test_transceiver_wires_separate_sender_slice_and_overall_timeout(
         "tensorrt_llm._torch.disaggregation.transceiver.create_cache_reuse_adapter",
         Mock(return_value=Mock()),
     )
+    # Echo the routed size: None for 0 (off, mirroring the real helper), a sentinel
+    # carrying the size otherwise, so tests can assert which implementation got it.
     monkeypatch.setattr(
         "tensorrt_llm._torch.disaggregation.transceiver.bounce_config_from_size",
-        Mock(return_value=None),
+        Mock(side_effect=lambda size_mb: ("bounce", size_mb) if size_mb > 0 else None),
     )
     monkeypatch.setattr(
         "tensorrt_llm._torch.disaggregation.transceiver.torch.cuda.current_device",
@@ -740,17 +827,17 @@ def test_transceiver_wires_separate_sender_slice_and_overall_timeout(
     )
     monkeypatch.setattr(KvCacheTransceiverV2, "_init_sync_policy", lambda _self: None)
     monkeypatch.setattr(KvCacheTransceiverV2, "_exchange_rank_info", lambda _self: None)
+    # Everything the constructor can reach, not only what it reaches with these values: the
+    # world-size and helix reads sit behind an env check, a monkeypatch and `cp_size == 1`.
     mapping = SimpleNamespace(
         cp_size=1,
+        world_size=1,
+        pp_size=1,
+        has_cp_helix=lambda: False,
+        cp_config={},
         tp_rank=0,
         tp_size=1,
         enable_attention_dp=False,
-    )
-    cache_config = SimpleNamespace(
-        kv_transfer_timeout_ms=transfer_timeout_ms,
-        kv_transfer_poll_interval_ms=5_000,
-        kv_transfer_sender_future_timeout_ms=sender_wait_ms,
-        kv_cache_bounce_size_mb=0,
     )
 
     KvCacheTransceiverV2(
@@ -762,9 +849,62 @@ def test_transceiver_wires_separate_sender_slice_and_overall_timeout(
 
     worker_config = worker_constructor.call_args.args[0]
     assert isinstance(worker_config, TransferWorkerConfig)
+    return worker_config
+
+
+@pytest.mark.parametrize(
+    ("transfer_timeout_ms", "sender_wait_ms", "expected_timeout_s", "expected_slice_s"),
+    [
+        (60_000, 1_000, 60.0, 1.0),
+        (60_000, None, 60.0, None),
+    ],
+)
+def test_transceiver_wires_separate_sender_slice_and_overall_timeout(
+    monkeypatch,
+    transfer_timeout_ms: Optional[int],
+    sender_wait_ms: Optional[int],
+    expected_timeout_s: Optional[float],
+    expected_slice_s: Optional[float],
+) -> None:
+    worker_config = _construct_worker_config(
+        monkeypatch,
+        _make_cache_config(
+            kv_transfer_timeout_ms=transfer_timeout_ms,
+            kv_transfer_sender_future_timeout_ms=sender_wait_ms,
+        ),
+    )
     assert worker_config.tx_timeout_s == expected_slice_s
     assert worker_config.tx_overall_timeout_s == expected_timeout_s
     assert worker_config.rx_timeout_s == expected_timeout_s
+
+
+@pytest.mark.parametrize(
+    ("bounce_size_mb", "agent_enable", "expected_python_bounce", "expected_buffer_size_mb"),
+    [
+        # Shared capacity, Python implementation (default): per-region bounce on, agent off.
+        (384, False, ("bounce", 384), 0),
+        # Shared capacity, C++ agent implementation: the agent bounce buffer gets the size, Python off.
+        (384, True, None, 384),
+        # Size 0 keeps both implementations off.
+        (0, False, None, 0),
+    ],
+)
+def test_transceiver_routes_bounce_capacity_to_one_implementation(
+    monkeypatch,
+    bounce_size_mb: int,
+    agent_enable: bool,
+    expected_python_bounce,
+    expected_buffer_size_mb: int,
+) -> None:
+    worker_config = _construct_worker_config(
+        monkeypatch,
+        _make_cache_config(
+            kv_cache_bounce_size_mb=bounce_size_mb,
+            agent_bounce_buffer_enable=agent_enable,
+        ),
+    )
+    assert worker_config.bounce == expected_python_bounce
+    assert worker_config.agent_buffer_size_mb == expected_buffer_size_mb
 
 
 def test_transceiver_rejects_unset_transfer_timeout() -> None:
@@ -818,7 +958,6 @@ def test_transfer_worker_passes_overall_timeout_to_tx_session(monkeypatch) -> No
         aux_buffer=worker._aux_buffer,
         timeout_s=0.25,
         prompt_len=128,
-        beam_width=1,
         overall_timeout_s=60.0,
     )
 
@@ -951,7 +1090,7 @@ def test_generation_first_tx_session_nonblocking_missing_aux_stays_pending() -> 
     session = _make_tx_session([task], need_aux=True)
 
     assert session.wait_complete(blocking=False) is None
-    assert session.status == SessionStatus.KV_TRANSFERRED
+    assert session.status == SessionStatus.TRANSFERRING
     assert session.exception is None
     assert task.wait_calls == []
 
@@ -987,7 +1126,7 @@ def test_check_context_runs_consensus_after_a_send() -> None:
     transceiver._ever_had_send_session = True
     transceiver._ctx_need_tp_sync = True
     transceiver._ctx_consensus = Mock(return_value=[])
-    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], []))
+    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], [], []))
 
     transceiver.check_context_transfer_status(0)
     transceiver._ctx_consensus.assert_called_once()
@@ -1002,3 +1141,132 @@ def test_prepare_context_requests_skips_consensus_when_nothing_waiting() -> None
 
     transceiver.prepare_context_requests([])
     transceiver._ctx_consensus.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _poll_sessions_for_interval clamp (nvbugs 6647405)
+#
+# The idle executor loop calls check_context_transfer_status(1) on every
+# iteration where no batch is scheduled. The poll's exit condition
+# (completed + failed >= wait_num) can only ever count in-flight sessions, so
+# with _send_sessions empty the target used to be unsatisfiable and the helper
+# slept out the full kv_transfer_sender_future_timeout_ms (default 1000 ms)
+# per idle iteration, delaying scheduling of newly arrived requests.
+# ---------------------------------------------------------------------------
+
+
+def _make_bare_transceiver() -> KvCacheTransceiverV2:
+    """Bare instance; _poll_sessions_for_interval only needs _collect_done."""
+    return object.__new__(KvCacheTransceiverV2)
+
+
+class _PollFakeSession:
+    """Session stub that flips to completed after an optional wall-clock delay."""
+
+    def __init__(self, complete_after_s: Optional[float] = None, failed: bool = False) -> None:
+        self._failed = failed
+        self._complete_at = (
+            time.monotonic() + complete_after_s if complete_after_s is not None else None
+        )
+
+    def is_completed(self) -> bool:
+        return self._complete_at is not None and time.monotonic() >= self._complete_at
+
+    def has_failed(self) -> bool:
+        return self._failed
+
+    def wait_complete(self, blocking: bool = False) -> None:
+        pass
+
+
+class _PumpDrivenSession(_PollFakeSession):
+    """Completes only after wait_complete has been pumped, never by wall clock."""
+
+    def __init__(self, pumps_to_complete: int) -> None:
+        super().__init__()
+        self._pumps_left = pumps_to_complete
+        self._done = False
+
+    def is_completed(self) -> bool:
+        return self._done
+
+    def wait_complete(self, blocking: bool = False) -> None:
+        self._pumps_left -= 1
+        if self._pumps_left <= 0:
+            self._done = True
+
+
+_POLL_INTERVAL_MS = 1000
+
+
+def test_poll_interval_empty_sessions_returns_immediately() -> None:
+    """No in-flight session: the unsatisfiable target must not sleep out the interval."""
+    tc = _make_bare_transceiver()
+    start = time.monotonic()
+    tc._poll_sessions_for_interval({}, {}, 1, _POLL_INTERVAL_MS)
+    assert time.monotonic() - start < 0.1
+
+
+def test_poll_interval_wait_num_clamped_to_session_count() -> None:
+    """A target above len(sessions) waits only for what can actually complete."""
+    tc = _make_bare_transceiver()
+    sessions = {1: _PollFakeSession(complete_after_s=0.05)}
+    start = time.monotonic()
+    tc._poll_sessions_for_interval(sessions, {1: object()}, 2, _POLL_INTERVAL_MS)
+    elapsed = time.monotonic() - start
+    assert elapsed < 0.5
+    assert sessions[1].is_completed()
+
+
+def test_poll_interval_waits_for_inflight_completion() -> None:
+    """An in-flight session is still awaited (the PR #17535 semantics are kept)."""
+    tc = _make_bare_transceiver()
+    sessions = {1: _PollFakeSession(complete_after_s=0.05)}
+    start = time.monotonic()
+    tc._poll_sessions_for_interval(sessions, {1: object()}, 1, _POLL_INTERVAL_MS)
+    elapsed = time.monotonic() - start
+    assert 0.04 <= elapsed < 0.5
+    assert sessions[1].is_completed()
+
+
+def test_poll_interval_deadline_bounds_never_completing_session() -> None:
+    """A session that never completes releases the caller at the deadline."""
+    tc = _make_bare_transceiver()
+    sessions = {1: _PollFakeSession(complete_after_s=None)}
+    start = time.monotonic()
+    tc._poll_sessions_for_interval(sessions, {1: object()}, 1, 100)
+    elapsed = time.monotonic() - start
+    assert 0.09 <= elapsed < 1.0
+
+
+def test_poll_interval_failed_session_counts_toward_target() -> None:
+    """A failed session satisfies the exit condition without waiting."""
+    tc = _make_bare_transceiver()
+    sessions = {1: _PollFakeSession(failed=True)}
+    start = time.monotonic()
+    tc._poll_sessions_for_interval(sessions, {1: object()}, 1, _POLL_INTERVAL_MS)
+    assert time.monotonic() - start < 0.1
+
+
+def test_poll_interval_completed_session_releases_despite_inflight_peer() -> None:
+    """One already-completed session satisfies wait_num=1 even with an in-flight peer."""
+    tc = _make_bare_transceiver()
+    sessions = {
+        1: _PollFakeSession(complete_after_s=0.0),
+        2: _PollFakeSession(complete_after_s=None),
+    }
+    reqs = {1: object(), 2: object()}
+    start = time.monotonic()
+    tc._poll_sessions_for_interval(sessions, reqs, 1, _POLL_INTERVAL_MS)
+    assert time.monotonic() - start < 0.1
+
+
+def test_poll_interval_pump_drives_completion() -> None:
+    """Completion observed only through the wait_complete(blocking=False) pump exits the poll."""
+    tc = _make_bare_transceiver()
+    session = _PumpDrivenSession(pumps_to_complete=3)
+    start = time.monotonic()
+    tc._poll_sessions_for_interval({1: session}, {1: object()}, 1, _POLL_INTERVAL_MS)
+    elapsed = time.monotonic() - start
+    assert elapsed < 0.5
+    assert session.is_completed()

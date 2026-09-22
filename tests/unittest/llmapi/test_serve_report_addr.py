@@ -21,7 +21,6 @@ work are covered here instead.
 
 import os
 import socket
-import sys
 import threading
 import time
 from pathlib import Path
@@ -36,10 +35,8 @@ from tensorrt_llm.commands.serve import _publish_bound_address, disaggregated, l
 
 # The reader half lives with the integration helpers, so both halves of the
 # round trip are exercised together and a change to either side fails here.
-_INTEGRATION_TESTS_DIR = Path(__file__).resolve().parents[2] / "integration"
-if str(_INTEGRATION_TESTS_DIR) not in sys.path:
-    sys.path.insert(0, str(_INTEGRATION_TESTS_DIR))
-from defs.common import wait_for_reported_addr  # noqa: E402
+__extra_import_path__ = ["~/tests/integration"]
+from defs.common import wait_for_reported_addr
 
 pytestmark = pytest.mark.cpu_only
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -134,6 +134,7 @@ constexpr int32_t kSM_90 = 90;
 constexpr int32_t kSM_100 = 100;
 constexpr int32_t kSM_100f = 10100;
 constexpr int32_t kSM_103 = 103;
+constexpr int32_t kSM_107 = 107;
 constexpr int32_t kSM_120 = 120;
 constexpr int32_t kSM_121 = 121;
 

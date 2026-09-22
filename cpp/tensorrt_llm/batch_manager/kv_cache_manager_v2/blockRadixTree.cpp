@@ -17,6 +17,7 @@
 
 #include "kv_cache_manager_v2/blockRadixTree.h"
 #include "kv_cache_manager_v2/common.h"
+#include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/storageManager.h"
 #include "kv_cache_manager_v2/utils/math.h"
@@ -195,9 +196,9 @@ BlockKey Hasher::digest() const
 std::vector<TokenIdExt> genMultimodalCacheKeyTokens(
     int idOffset, std::vector<uint8_t> const& multiModalDataDigest, int numTokens, int tokenOffset)
 {
-    TLLM_CHECK_DEBUG(numTokens > 0);
-    TLLM_CHECK_DEBUG(tokenOffset >= 0);
-    TLLM_CHECK_DEBUG(multiModalDataDigest.size() == kDIGEST_LEN);
+    TLLM_CHECK(numTokens > 0);
+    TLLM_CHECK(tokenOffset >= 0);
+    TLLM_CHECK(multiModalDataDigest.size() == kDIGEST_LEN);
     std::vector<TokenIdExt> result;
     result.reserve(static_cast<size_t>(numTokens));
     for (int i = 0; i < numTokens; ++i)
@@ -324,6 +325,22 @@ Block::Block(BlockKey k, std::vector<TokenIdExt> toks, NodeBase* prevNode)
     // exists to avoid). knownNoDigest=false lets makeKey's update() scan for digests
     // itself — correct regardless of content, so no separate scan is needed here.
     TLLM_CHECK_DEBUG(k == Block::makeKey(prevNode->key, tokens.data(), tokens.size(), /*knownNoDigest=*/false));
+
+    if (eventSink != nullptr && eventSink->needsTokenDigestContext())
+    {
+        if (prevNode->type() == Type::kBLOCK)
+        {
+            mLastTokenDigest = static_cast<Block const*>(prevNode)->getLastTokenDigest();
+        }
+        for (auto iter = tokens.rbegin(); iter != tokens.rend(); ++iter)
+        {
+            if (iter->isDigest())
+            {
+                mLastTokenDigest = std::make_shared<Digest const>(iter->digest());
+                break;
+            }
+        }
+    }
 }
 
 // Delegates to the tree, mirroring Python's RootBlock.num_life_cycles. Defined
@@ -365,12 +382,12 @@ void Block::releasePages()
 
 Block::~Block()
 {
-    releasePages();
+    KVCM2_POISON_ON_EXCEPT([this]() { releasePages(); });
 }
 
 bool Block::isOrphan() const noexcept
 {
-    TLLM_CHECK_DEBUG(prev == nullptr || (prev->next.count(key) == 1 && prev->next.at(key).get() == this));
+    KVCM2_CHECK_FATAL_DEBUG(prev == nullptr || (prev->next.count(key) == 1 && prev->next.at(key).get() == this));
     return prev == nullptr;
 }
 
@@ -480,7 +497,8 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
     // curr when its last shared_ptr is dropped.
     Block* curr
         = pruneStart && pruneStart->type() == NodeBase::Type::kBLOCK ? static_cast<Block*>(pruneStart) : nullptr;
-    while (curr && curr->next.empty() && curr->storage.at(lcIdx) == nullptr)
+    while (curr && curr->next.empty()
+        && std::all_of(curr->storage.begin(), curr->storage.end(), [](auto p) { return p == nullptr; }))
     {
         NodeBase* prevNode = curr->prev;
         BlockKey const currKey = curr->key;
@@ -497,44 +515,52 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
     return detachedBlocks;
 }
 
-// ---------------------------------------------------------------------------
-// addOrGetExistingBlock
-// ---------------------------------------------------------------------------
-
-SharedPtr<Block> addOrGetExistingBlock(NodeBase* prev, std::vector<TokenIdExt> tokens, bool knownNoDigest, bool* isNew)
+SharedPtr<Block> getExistingBlock(NodeBase* prev, BlockKey const& key, TokenIdExt const* tokens, size_t numTokens)
 {
     TLLM_CHECK_DEBUG_WITH_INFO(prev, "prev must not be null");
 
-    // Prev must be a full block if it is a Block (mirrors Python: "prev must be a full block").
-    if (prev->type() == NodeBase::Type::kBLOCK)
-    {
-        TLLM_CHECK_DEBUG_WITH_INFO(static_cast<Block*>(prev)->isFull(), "prev must be a full block");
-    }
+    // Only a full block may be a parent; that is also why returning a covering sibling
+    // below is safe, since only partial blocks can be covered and never become parents.
+    TLLM_CHECK_DEBUG_WITH_INFO(
+        prev->type() != NodeBase::Type::kBLOCK || static_cast<Block*>(prev)->isFull(), "prev must be a full block");
 
     auto& prevNext = prev->next;
-    int const tpb = prev->tokensPerBlock();
-    BlockKey newKey = Block::makeKey(prev->key, tokens.data(), tokens.size(), knownNoDigest);
 
-    // Exact match: return existing block (not new — mirrors Python's UselessBlockError path).
-    auto it = prevNext.find(newKey);
+    // Exact match. On the re-attach path this is another request having re-committed the
+    // same prefix while we were detached; its key is identical, so the chain stays valid.
+    auto it = prevNext.find(key);
     if (it != prevNext.end())
     {
-        if (isNew)
-            *isNew = false;
         return it->second;
     }
 
-    // Useless check: is this block's token prefix covered by a sibling?
-    // Mirrors Python's UselessBlockError — throw with the sibling block.
-    if (static_cast<int>(tokens.size()) < tpb)
+    // Covered by a longer sibling: reuse it rather than insert a redundant shorter node.
+    // A short page on a longer block is well defined -- CommittedPage::numTokensInBlock
+    // records the span and canReplacePage() will not supersede a wider page.
+    if (static_cast<int>(numTokens) < prev->tokensPerBlock())
     {
         for (auto const& [k, sibling] : prevNext)
         {
-            if (sibling->tokens.size() >= tokens.size()
-                && isPrefix(tokens.data(), tokens.size(), sibling->tokens.data(), sibling->tokens.size()))
-                throw UselessBlockError(sibling);
+            if (sibling->tokens.size() >= numTokens
+                && isPrefix(tokens, numTokens, sibling->tokens.data(), sibling->tokens.size()))
+            {
+                return sibling;
+            }
         }
     }
+
+    return nullptr;
+}
+
+void attachBlock(NodeBase* prev, SharedPtr<Block> const& block)
+{
+    TLLM_CHECK_DEBUG_WITH_INFO(prev, "prev must not be null");
+    TLLM_CHECK_DEBUG(block);
+    // Precondition: nothing in the tree supersedes this block, so we cannot shadow a sibling.
+    TLLM_CHECK_DEBUG(getExistingBlock(prev, block->key, block->tokens.data(), block->tokens.size()) == nullptr);
+
+    auto& prevNext = prev->next;
+    auto const& tokens = block->tokens;
 
     // A later turn may extend a partial endpoint to this longer block, replacing the
     // partial sibling. That turn may not have a committable SWA page for this block:
@@ -556,13 +582,12 @@ SharedPtr<Block> addOrGetExistingBlock(NodeBase* prev, std::vector<TokenIdExt> t
     // would already have replaced the shorter one.
     TLLM_CHECK_DEBUG(toRemove.size() <= 1);
 
-    // Create the new block. ordinal, tokensPerBlock, and numLifeCycles are all
-    // derived from prev. Block stores the tokens as a plain vector (moved in).
-    auto block = makeShared<Block>(newKey, std::move(tokens), prev);
-
+    // Redundant for a freshly constructed block; the re-attach path needs it to restore
+    // the link the prune walk cleared.
+    block->prev = prev;
     // Keep the parent attached while covered children are replaced. Adding the replacement
     // first prevents detachNext() from pruning an emptied RootBlock out of the tree.
-    prevNext[newKey] = block;
+    prevNext[block->key] = block;
 
     for (auto const& k : toRemove)
     {
@@ -571,9 +596,53 @@ SharedPtr<Block> addOrGetExistingBlock(NodeBase* prev, std::vector<TokenIdExt> t
         block->adoptPagesFrom(*erasedBlock);
         TLLM_CHECK_DEBUG_WITH_INFO(erasedBlock->isOrphan(), "erased sibling must be orphan after removal");
     }
+}
 
+SharedPtr<Block> addOrGetExistingBlock(NodeBase* prev, std::vector<TokenIdExt> tokens, bool knownNoDigest, bool* isNew)
+{
+    TLLM_CHECK_DEBUG_WITH_INFO(prev, "prev must not be null");
+
+    BlockKey const newKey = Block::makeKey(prev->key, tokens.data(), tokens.size(), knownNoDigest);
+
+    // Query first so a block we would discard is never built. Must precede the move below.
+    if (auto existing = getExistingBlock(prev, newKey, tokens.data(), tokens.size()))
+    {
+        if (isNew)
+            *isNew = false;
+        return existing;
+    }
+
+    // ordinal, tokensPerBlock, and numLifeCycles are all derived from prev.
+    // Block stores the tokens as a plain vector (moved in).
+    auto block = makeShared<Block>(newKey, std::move(tokens), prev);
+    attachBlock(prev, block);
     if (isNew)
         *isNew = true;
+    return block;
+}
+
+SharedPtr<Block> attachOrGetExistingBlock(NodeBase* prev, SharedPtr<Block> block, bool* attached)
+{
+    TLLM_CHECK_DEBUG(block);
+
+    if (auto existing = getExistingBlock(prev, block->key, block->tokens.data(), block->tokens.size()))
+    {
+        // Someone else installed an equivalent block while we held ours (on the re-attach
+        // path, another request re-committed this prefix during our orphan window). Hand
+        // over any pages the winner lacks rather than dropping them: ours are still valid
+        // for the same tokens, and adoptPagesFrom() keeps whichever page covers more.
+        if (existing != block && existing->ordinal() == block->ordinal())
+        {
+            existing->adoptPagesFrom(*block);
+        }
+        if (attached)
+            *attached = false;
+        return existing;
+    }
+
+    attachBlock(prev, block);
+    if (attached)
+        *attached = true;
     return block;
 }
 
@@ -632,8 +701,9 @@ BlockRadixTree::BlockRadixTree(
 
 BlockRadixTree::~BlockRadixTree()
 {
-    // Clear all roots (which will drop all blocks without external owners).
-    mRoots.clear();
+    // Detach blocks leaf-first in O(1) extra space. Dropping mRoots directly would instead
+    // destroy each chain recursively, one frame per block.
+    KVCM2_POISON_ON_EXCEPT([this]() { clear(); });
 }
 
 LifeCycleId BlockRadixTree::numLifeCycles() const noexcept
@@ -718,8 +788,8 @@ int numMatchedTokens(std::vector<BlockRadixTree::MatchResult> const& matched, in
 std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
     ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch) const
 {
-    drainPendingRootErases();
-
+    // Read-only: probeReuse() runs this under a shared lock, so probes may overlap. A root still
+    // awaiting erasure is childless, so it yields no match.
     std::vector<MatchResult> results;
 
     // Lazily compute one key per iteration — no wasted hashing on early miss.
@@ -860,24 +930,54 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
     return matched;
 }
 
+namespace
+{
+// Drop `backoff` tokens off the tail of a match, dropping whole blocks while the backoff
+// outruns them. Only the tail shrinks, so pruneMatch's "leading entries are full blocks"
+// invariant still holds.
+void backOffMatch(std::vector<BlockRadixTree::MatchResult>& matched, int backoff)
+{
+    while (backoff > 0 && !matched.empty())
+    {
+        auto& last = matched.back();
+        if (last.numMatchedTokens > backoff)
+        {
+            last.numMatchedTokens -= backoff;
+            return;
+        }
+        backoff -= last.numMatchedTokens;
+        matched.pop_back();
+    }
+}
+} // namespace
+
 BlockRadixTree::ReuseMatch BlockRadixTree::match(
-    ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch) const
+    ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch, int backoff) const
 {
     auto rawMatched = matchTokenPath(reuseScope, tokens, knownNoDigest, enablePartialMatch);
+    // Content-divergence depth is measured before page or recurrent-snapshot pruning.
+    int const numReusableTokensBeforePruning = numMatchedTokens(rawMatched, mTokensPerBlock);
     auto const ssmLcId = mLifeCycles.ssmLifeCycleId();
+    // Page requirements depend on the final endpoint. Back off before pruning
+    // so SWA coverage and recurrent snapshots are validated at that endpoint.
+    if (backoff > 0)
+    {
+        backOffMatch(rawMatched, backoff);
+    }
     // Diagnostic only: re-prune ignoring recurrent-snapshot availability to get
     // the prefix the attention pages alone support. Only hybrid models pay for
     // the second pass; without an SSM life cycle the two results are identical.
-    std::optional<int> attnOnlyTokens;
+    std::optional<int> numReusableTokensBeforeHybridPruning;
     if (ssmLcId.has_value())
     {
-        attnOnlyTokens = numMatchedTokens(pruneMatch(rawMatched, std::nullopt), mTokensPerBlock);
+        numReusableTokensBeforeHybridPruning = numMatchedTokens(pruneMatch(rawMatched, std::nullopt), mTokensPerBlock);
     }
-    auto const matched = pruneMatch(std::move(rawMatched), ssmLcId);
+    auto matched = pruneMatch(std::move(rawMatched), ssmLcId);
     ReuseMatch result{};
     result.numTokens = numMatchedTokens(matched, mTokensPerBlock);
     result.numLookupTokens = static_cast<int>(tokens.size());
-    result.numTokensBeforeHybridPruning = attnOnlyTokens.value_or(result.numTokens);
+    result.numReusableTokensBeforeHybridPruning = numReusableTokensBeforeHybridPruning.value_or(result.numTokens);
+    result.numReusableTokensBeforePruning = numReusableTokensBeforePruning;
     result.blocks.reserve(BlockOrdinal{static_cast<int>(matched.size())});
     for (auto const& match : matched)
     {

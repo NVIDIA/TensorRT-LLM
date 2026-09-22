@@ -85,23 +85,31 @@ Models that select the V2 manager by default:
 
 | Model | Reason |
 | --- | --- |
-| Hybrid Mamba (NemotronH, Qwen3-Next) | Attention KV and Mamba state pools must be sized together |
+| Hybrid Mamba (NemotronH and its multimodal models, Qwen3-Next) | Attention KV and Mamba state pools must be sized together |
 | DeepSeek-V4 | Sparse attention attaches auxiliary per-layer buffers |
 | GPT-OSS | Sliding window on every other layer (VSWA), so the sliding-window and full-attention pools are sized independently |
 | Gemma3 / Gemma4 (text and multimodal) | Alternating sliding-window and full-attention layers (VSWA); same independent pool sizing |
+| Llama / Llama4 | Uniform KV pool layout; chunked attention does not partition the pools |
 
 Separately, Gemma4 hybrid attention and sparse-attention models are routed to
 V2 unconditionally: their per-layer buffer layouts cannot be represented by V1's
 unified pool, so `use_kv_cache_manager_v2` does not apply to them.
 
-Two-model speculative decoding (for example Eagle3 with
-`eagle3_one_model=False`) is not supported by V2: the draft model runs in a
-separate engine with its own KV cache manager, and V2 sizes both managers from
-the full `max_gpu_total_bytes` budget instead of partitioning it between them.
-Under `auto`, a model default of V2 falls back to V1 for that combination;
-setting `use_kv_cache_manager_v2: true` explicitly raises an error. This
-applies to every model that selects its manager through
-`use_kv_cache_manager_v2`, not just GPT-OSS.
+For a model whose `layer_types` mixes sliding-window and full-attention layers
+and that publishes a single `sliding_window` (GPT-OSS, Gemma3), the V2 manager
+derives one attention window per layer from `layer_types` when
+`max_attention_window` is not set: sliding layers get `sliding_window`, full
+layers get `max_seq_len`, and the two window sizes form two layer groups whose
+pools are sized independently. The derived list is logged at startup. Set
+`max_attention_window` explicitly to override the derivation; a single entry
+restores one full-context pool for every layer. With derived windows,
+`pool_ratio` must carry one entry per layer group (two for such a model). If a
+configured `pool_ratio` does not match the derived group count, the manager
+logs a warning and keeps the single-window default, so existing configurations
+continue to run.
+
+For the native V2 cold-storage representation and codec extension contract, see
+[KVCacheManagerV2 Cold-Page Codec Design](../developer-guide/kv-cache-cold-page-codec.md).
 
 ### Mamba Snapshot Boundaries
 
@@ -139,10 +147,12 @@ This retains snapshots after the first 128 tokens, at the end of the prompt,
 and before the final 32 prompt tokens. Positions outside a particular prompt
 are ignored. Set `avg_seq_len` to the workload's average total sequence length
 so V2 can size the attention KV and Mamba state pools in the right proportion.
+`pool_ratio` contains one positive, normalized cache-tier quota weight per
+layer group in layer-group ID order.
 If neither `avg_seq_len` nor an explicit `pool_ratio` is configured, hybrid
 Mamba models warn and fall back to half of `max_seq_len`, which can produce a
 suboptimal pool split. Exact explicit boundaries currently require
-`MambaHybridCacheManagerV2`, `max_beam_width=1`, and no KV connector. Hybrid
+`MambaHybridCacheManagerV2` and `max_beam_width=1`. Hybrid
 Mamba models select V2 by default (see
 [Selecting the KV Cache Manager](#selecting-the-kv-cache-manager)); set
 `use_kv_cache_manager_v2` to `false` to select the V1 C++
@@ -162,7 +172,7 @@ This isolation is enforced entirely by the block-key hash: the salt is mixed int
 
 When working with multimodal models (e.g., vision-language models), the KV cache system needs to identify which cached blocks correspond to which multimodal inputs (images, videos, etc.). By default, the system uses content-based hashing to generate unique identifiers for each multimodal input. However, this approach has limitations for cache management across sessions, as the same content must be re-processed to generate the same hash.
 
-To enable deterministic cache management, you can provide custom UUID strings for your multimodal data using the `multi_modal_uuids` parameter when creating requests. When provided, these UUIDs are returned in KV cache events instead of computed content hashes, while the cache key itself is computed from **both** the UUID and content together for correctness.
+You can provide custom UUID strings for your multimodal data using the `multi_modal_uuids` parameter when creating requests. Both cache managers compute the item digest from **both** the UUID and content together for correctness. V1 returns the original UUID in the KV cache event's `mm_keys[].hash` field when one is supplied. V2 returns the item digest as a hexadecimal string, including for items with UUIDs.
 
 **Usage Example:**
 
@@ -181,14 +191,16 @@ prompt = TextPrompt(
 
 - **Cache Correctness**: When a UUID is provided, the cache key is computed from both the UUID and content together using `BLAKE3(UUID || Content)`. This ensures different content always produces different cache entries, even with the same UUID.
 - **User Isolation**: Same content with different UUIDs produces different cache entries, enabling per-user or per-session cache isolation.
-- **Stable Event Identifiers**: The original UUID string is preserved and returned in KV cache events via `get_kv_cache_events()`, enabling deterministic external cache management.
+- **Stable Event Identifiers**: `get_kv_cache_events()` returns the original UUID for V1, or the item digest for V2. V2 consumers can use the same digest that appears in its cache-key token sequence.
 - **Partial UUID Support**: You can provide UUIDs for some items and use `None` for others to fall back to content-only hashing.
 - **Cross-Modality Support**: Different modalities (images, videos) can each have their own UUIDs.
 
 **UUID Format:**
 
 - Can be any string (e.g., "image-123", "user-session-img-a", database keys)
-- Original UUID strings are preserved and returned in KV cache events
+- Original UUID strings are preserved in request metadata and returned in V1 KV cache events
+
+V2 derives `mm_keys` directly from the cached token sequence. Each entry identifies a continuous multimodal segment within that block: `hash` is the item's digest, and `start_offset` is the segment's first token offset within the item. An item spanning multiple blocks retains the same digest with increasing offsets. Text may separate segments of the same item. Items are processed in prompt order; one item cannot resume after another item has started. The item digest is distinct from `block_hash`, which also depends on the preceding token sequence.
 
 
 ### Enable Offloading to Host Memory
@@ -199,6 +211,12 @@ When offloading is enabled, the client can prevent specific blocks from being of
 
 Here is an [example](../../../examples/llm-api/llm_kv_cache_offloading.py) to show how to enable host offloading.
 
+KV cache compression can reduce the storage and transfer cost of offloaded
+Pages, or reduce the amount of KV retained by an algorithm. Compression is
+configured separately from `KvCacheConfig`; see
+[KV Cache Compression](kv-cache-compression.md) for the available methods and
+their activation points.
+
 ### Partial Reuse
 
 Partial reuse of a block can happen when some but not all tokens are matched. It is enabled by default, but can be disabled by setting ```enable_partial_reuse``` to False.
@@ -208,6 +226,114 @@ The property ```copy_on_partial_reuse``` specifies whether a block should be cop
 ### Attention Window Size
 
 Property ```max_attention_window``` specifies the maximum attention window size for each layer in the model as a list of integer values. If the length of this list is less than number of layers, the list is repeated as many times as necessary. For instance, if the model has only full attention layers and maximum sequence length is 4096, you can specify this as ```max_attention_window = [4096]```. If the first layer is full attention, the second layer is limited attention with window size 256 and then this repeats for the remaining layers, you specify this as ```max_attention_window = [4096,256]```. This means first layer is full attention, second layer is limited attention, third layer is full attention, fourth layer is limited attention and so on.
+
+### Debugging Aids
+
+Two opt-in environment variables help when a result looks like it came from KV
+pages the request does not own -- a stale page handed over by a previous owner,
+or a page-table slot the attention mask was supposed to cover. Both are off
+unless set, and when unset nothing about allocation, page contents or reported
+block counts changes. Both are diagnostic only: they cost extra work and are
+not meant for production serving. They apply to `KVCacheManagerV2`.
+
+Each accepts the same fill value: `1`, `on`, `true` or `zero` for zeros, `nan`
+for NaN (any uncovered read then fails immediately and visibly rather than
+producing a plausible number), or any number for that constant.
+
+> **Packed NVFP4 (e2m1) limitation.** A packed sub-byte pool cannot store an
+> arbitrary sentinel: every non-zero fill value collapses to the byte pattern
+> `0x7f`. For most packed formats `0x7f` is non-finite, so a `nan`/`inf`
+> sentinel still poisons the page. Packed NVFP4 (e2m1) has no NaN/Inf encoding,
+> so `0x7f` decodes to `+6.0` (the largest finite magnitude) instead. On such a
+> pool the sentinel lands as `6.0` -- still a recognisable out-of-band pattern,
+> but not one that an `isnan`/`isinf` check will flag. Only zero fills carry
+> over exactly for packed e2m1.
+
+- `TRTLLM_KV_GUARD_PAGE` reserves one page that no request can be given, fills
+  it with the chosen pattern, and publishes its per-layer index. Attention
+  backends that have to keep masked-out page-table entries in range park them
+  on this page instead of on page 0, which is a live page belonging to whatever
+  request holds it. The mask still decides the result; what changes is that a
+  masking bug reads a recognisable pattern instead of a stranger's keys and
+  values. Costs one page and one index-mapper slot.
+- `TRTLLM_KV_FRESH_PAGE_FILL` writes the pattern into pages as a request is
+  given them, so a read past what the request itself wrote returns the pattern
+  rather than the previous owner's data. Pages covering the reused/committed
+  prefix are never overwritten. Costs one fill per layer per new allocation
+  plus a device synchronization.
+
+Both announce themselves once at warning level when they take effect, so a log
+shows whether the switch actually did anything.
+
+### KV Cache Events
+
+KV cache events report block **stored**, **removed**, **created** and **updated** operations
+so an external KV-cache-aware router (for example NVIDIA Dynamo) can route a request to the
+engine that already holds its prefix. Two delivery paths are available.
+
+#### Buffered path (default)
+
+Set ```event_buffer_max_size``` to a positive integer and ```enable_block_reuse``` to True.
+Events are buffered per rank, gathered onto rank 0 under attention data parallelism, and
+pulled per iteration through `LLM.get_kv_cache_events()` / `LLM.get_kv_cache_events_async()`,
+or over the `/kv_cache_events` endpoint of `trtllm-serve`.
+
+#### Streaming path (prototype)
+
+Configured with ```kv_cache_config.kv_events_config```. Each rank encodes its own events and
+publishes them directly over a ZeroMQ `PUB` socket from a background thread, so there is no
+rank-0 gather and no per-iteration pull.
+
+```python
+from tensorrt_llm.llmapi import KvCacheConfig, KVEventsConfig
+
+kv_cache_config = KvCacheConfig(
+    enable_block_reuse=True,
+    kv_events_config=KVEventsConfig(
+        enable_kv_cache_events=True,
+        endpoint="tcp://*:5557",
+        replay_endpoint="tcp://*:5657",
+    ),
+)
+```
+
+**Constraints.** The streaming path requires KV cache manager V2 running on its Python
+backend (`TLLM_KV_CACHE_MANAGER_V2_BACKEND=python`); the default `cpp` backend cannot
+consume the Python event sink and raises an error naming this variable. Pipeline
+parallelism and context parallelism are rejected. Events are not published for draft
+models or during KV-cache-size estimation. When streaming is enabled the buffered pull API
+returns an empty list rather than raising.
+
+**Endpoint convention.** Every attention-DP rank binds `base_port + rank` using its
+**global** rank, so `N` ranks occupy `[base_port, base_port + N - 1]` cluster-wide and
+each rank's port is distinct — on a multi-node deployment, rank 8 binds `base_port + 8`
+whichever node it runs on. Co-located engines — for example disaggregated prefill and
+decode on one host — must use base ports at least `N` apart.
+
+```replay_endpoint``` follows the same convention. Because only ranks co-located on one
+host actually contend for a port, and a host holds a contiguous run of ranks, its base
+port must be at least *ranks-per-host* away from ```endpoint```'s rather than `N` away.
+Overlapping ranges are rejected at startup. For `ipc://` and `inproc://` endpoints, which
+have no port, each rank appends a `_dp<rank>` suffix instead.
+
+**Wire format.** Each batch is sent as three ZeroMQ frames: the subscription ```topic```,
+an 8-byte big-endian sequence number, and a msgpack payload
+`[timestamp, [events], data_parallel_rank]`. Each event is a map tagged with a `type` key —
+`BlockStored`, `BlockRemoved` or `AllBlocksCleared` — carrying int64 block hashes derived
+from the V2 radix block keys. This is the format documented for custom router backends; it
+differs from vLLM's positional-array encoding of the individual events, though the batch
+envelope is positional in both.
+
+**Delivery guarantees.** Delivery is best effort, but loss is observable. Every accepted
+batch reserves a sequence number up front, so a batch dropped by a full publisher queue
+(```max_queue_size```) or by a failed send leaves a hole in the sequence. Subscribers must
+treat any gap as lost KV-cache state and resynchronize rather than assuming continuity.
+
+**Replay.** If ```replay_endpoint``` is set, the publisher also binds a `ROUTER` socket. A
+subscriber sends an empty delimiter frame plus an 8-byte big-endian start sequence, and
+receives each retained batch as `[delimiter, topic, seq, payload]`, terminated by a sentinel
+with an empty payload. Only the last ```buffer_steps``` batches are retained, so a replay
+can legitimately start above the requested sequence — that too is a gap.
 
 ### Deprecated Properties
 
