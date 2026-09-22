@@ -271,10 +271,11 @@ def wan22_within_build_reference(tmp_path_factory):
     from whole-build numerics drift: both sides of the comparison shift
     together when bf16 numerics legitimately change (nvbug 6655990).
     """
-    import tensorrt_llm.bindings as tllm_bindings
-
     if torch.cuda.device_count() < 1:
         pytest.skip("Within-build reference generation requires a GPU")
+
+    import tensorrt_llm.bindings as tllm_bindings
+
     model_path = get_checkpoint("Wan2.2-T2V-A14B-Diffusers")
     tllm_site = _validated_tllm_site(
         os.path.dirname(os.path.dirname(os.path.abspath(tllm_bindings.__file__)))

@@ -395,6 +395,8 @@ class TestWanPipelineParallel:
 
     def test_cfg2_attn2d2x1_ulysses2_pvae8(self):
         """world=8, cfg=2, ulysses=2, attn2d=2×1, async_ulysses, parallel_vae=8 vs HF reference."""
+        if torch.cuda.device_count() < 8:
+            pytest.skip(f"Test requires 8 GPUs, only {torch.cuda.device_count()} available")
         assert _ATTN2D_AVAILABLE, (
             "FA4 / flash_attn_combine JIT kernels not available; expected on the Blackwell CI runner"
         )
