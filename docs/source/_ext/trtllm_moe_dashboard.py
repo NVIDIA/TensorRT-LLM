@@ -25,7 +25,7 @@ PAGE_SCRIPTS = (
     "moe_dashboard.js",
 )
 
-PAGE_STYLES = ("moe_dashboard.css", )
+PAGE_STYLES = ("moe_dashboard.css",)
 
 #: Element ids are namespaced with ``moe-`` so they cannot collide with ids the
 #: documentation theme owns; ``moe_dashboard.js`` prepends the prefix in one place.
