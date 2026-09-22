@@ -86,19 +86,34 @@ Developer workflow for code contributions is as follows:
 
 ### PR Submission Policies
 
-The naming of the merge requests in TensorRT-LLM follows the [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/). If the PR includes an API change that might break user code/API usage, consider adding "BREAKING CHANGE" in the title so that reviewers know what to expect. Additionally, if the PR is not related to any bug and task, consider using "chore" or None as the placeholder.
+PR titles in TensorRT-LLM must follow this format, which is enforced in CI by the
+`Check PR Title Format` job in [`.github/workflows/pr-check.yml`](.github/workflows/pr-check.yml):
+
+```
+[JIRA ticket/NVBugs ID/GitHub issue/None][type] Summary
+```
+
+Valid ticket formats:
+* JIRA ticket: `[TRTLLM-1234]`, or `[FOOBAR-123]` for another FOOBAR project
+* NVBugs ID: `[https://nvbugs/1234567]`
+* GitHub issue: `[#1234]`
+* No ticket: `[None]`
+
+Valid types are lowercase: `fix`, `feat`, `perf`, `refactor`, `test`, `doc`, `infra`, `chore`, `ci`, etc.
+
+If the PR includes an API change that might break user code/API usage, add "BREAKING" to the
+title so that reviewers know what to expect, and label the PR `api-breaking` (see
+[Tests and Code Review for Protected APIs](#tests-and-code-review-for-protected-apis)).
 
 [!IMPORTANT]
 For NVIDIA developers, please include the JIRA number or NVBUG ID in the PR title whenever possible. Also, to identify the author of the PR, please ensure that your GitHub account either displays your full name or your NVIDIA account name in the `Name` field of your profile.
 
 Good PR Titles Examples:
-* feat: Add support for starcoder-v2 FP8 base + FP16/BF16 LoRA
-* BREAKING CHANGE: Set default max batch size to 2048
-* chore: Remove version from plugins .so
-* None: Stringized enums for better error msgs
-* fix https://github.com/NVIDIA/TensorRT-LLM/issues/700: a Memory leak issue in C++ runtime
-* [TRTLLM-5516] perf: replicate dummy request for cuda graph padding (**NVIDIAN only**)
-* [nvbug/5334370] fix: Fix one model EAGLE3 (**NVIDIAN only**)
+* `[None][feat] Add support for starcoder-v2 FP8 base + FP16/BF16 LoRA`
+* `[None][chore] Remove version from plugins .so`
+* `[#700][fix] Fix a memory leak issue in C++ runtime`
+* `[TRTLLM-5516][perf] Replicate dummy request for cuda graph padding` (**NVIDIAN only**)
+* `[https://nvbugs/5334370][fix] Fix one model EAGLE3` (**NVIDIAN only**)
 
 
 This is important for tracking and collecting what has been submitted to which release and makes it easier for others to track the bugs or tasks. It could also be helpful when collecting GitHub publish announcement.

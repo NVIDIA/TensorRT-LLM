@@ -22,6 +22,9 @@ Python and C++ codebase with PyTorch and AutoDeploy execution paths.
 - Put a change's rationale and history (why it was made, what it replaces, ticket/PR references) in the PR
   description, not in code comments. Code comments should explain the code as it stands for a future reader,
   not narrate how it got there.
+- Before requesting human review on a PR — and before reviewing or revising one — work through the
+  PR checklist in `.claude/skills/trtllm-pr-checklist/SKILL.md` (Claude Code: `/trtllm-pr-checklist`).
+  Report the outcome; do not silently skip sections.
 - Set `LLM_MODELS_ROOT` env var when running tests that need model weights
 
 ## Common Commands
@@ -136,6 +139,7 @@ Key files:
 1. Set up build environment (see [installation docs](docs/source/installation/))
 2. Make changes following `CODING_GUIDELINES.md`
 3. Test locally with `pytest`
+4. Run the PR checklist (`.claude/skills/trtllm-pr-checklist/SKILL.md`) before requesting review
 
 ## Branching policy and PRs
 
