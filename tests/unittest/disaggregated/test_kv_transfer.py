@@ -1405,9 +1405,10 @@ def test_transfer_worker_v2_with_window(
 def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
     """Verify that only suffix blocks are transferred when gen has a prefix offset.
 
-    Simulates gen-side prefix cache: ctx sends all blocks for [0, request_len),
-    gen only provides the suffix block list. The receiver-side prefix is
-    implicit in the block count; the sender derives dst_start from it.
+    Simulates gen-side prefix cache: ctx offers every ordinal of the prompt,
+    while gen masks the reused prefix ordinals to -1 in its positional table.
+    The sender pairs only the ordinals both sides hold, so the prefix is
+    skipped without any length arithmetic.
     """
     tensorrt_llm.logger.set_level("info")
     tokens_per_block = 8
