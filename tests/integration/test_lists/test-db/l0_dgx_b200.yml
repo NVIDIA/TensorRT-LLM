@@ -40,75 +40,17 @@ l0_dgx_b200:
       backend: pytorch
       orchestrator: mpi
   tests:
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpu_mtp_ar TIMEOUT (60)
-  - accuracy/test_llm_api_pytorch.py::TestLlama4SpeculativeDecoding::test_llama4_eagle3[linear] TIMEOUT (60)
-  - accuracy/test_llm_api_pytorch.py::TestLlama4SpeculativeDecoding::test_llama4_eagle3[dynamic] TIMEOUT (60)
-  - accuracy/test_llm_api_pytorch.py::TestStep3p7SpeculativeDecoding::test_step3p7_mtp TIMEOUT (60)
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4[adp4_cutedsl]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4[tep4_block_reuse]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4_mtp3_gdn_replay_tep4
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4_4gpus_static_eplb[moe_backend=CUTEDSL]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4_4gpus_static_eplb[moe_backend=TRTLLM]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[tep4_latency_moe_trtllm-torch_compile=True]
-  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_nixl[DeepSeek-V3-Lite-fp8]
-  - disaggregated/test_disaggregated.py::test_disaggregated_gpt_oss_120b_harmony[gpt_oss/gpt-oss-120b]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[latency_adp_lmtp_tp4]
-  - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True] TIMEOUT (60)
-  - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=False-overlap_scheduler=True-eval_mode=inferencex]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[pp4-mtp_nextn=0-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False] TIMEOUT (60)
-  - unittest/_torch/modeling/test_modeling_deepseekv4.py
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_auto_dtype TIMEOUT (60)
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_tep_mtp_separate_draft_kv_cache TIMEOUT (60)
-  # Exercise VisualGen worker-failure containment with live CUDA allocations
-  # spread across four local processes.
-  - unittest/_torch/visual_gen/test_executor_lifecycle_multi_gpu.py::test_sigkill_one_worker_contains_real_multi_gpu_group
-  # ------------- NVBug 6025177: trtllm-serve cross-request KV contamination (OpenAI) ---------------
-  - test_e2e.py::test_openai_kv_cache_contamination TIMEOUT (120)
-  # ------------- DSA FP4 indexer (Blackwell-only) ---------------
-  - unittest/_torch/attention/sparse/dsa/test_cpp_custom_ops.py::test_fused_cat_fp4_matches_deepgemm
-  - unittest/_torch/attention/sparse/dsa/test_cpp_custom_ops.py::test_fused_cat_fp4_shape_dispatch
-  - unittest/_torch/attention/sparse/dsa/test_cpp_custom_ops.py::test_fused_cat_fp4_noncontiguous_split
-  - unittest/_torch/attention/sparse/dsa/test_cpp_custom_ops.py::test_fused_cat_fp4_dsv32_prefill_shape
-  - unittest/_torch/attention/sparse/dsa/test_cpp_custom_ops.py::test_cute_dsl_fp8_indexer_q_gemm_rope_fp4_matches_unfused
-  - unittest/_torch/attention/sparse/dsa/test_cpp_custom_ops.py::test_indexer_k_cache_gather_contiguous_fp4
-  - unittest/_torch/attention/sparse/dsa/test_dsa_fp4_indexer.py
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 4
-        lte: 4
-    wildcards:
-      gpu:
-      - '*b200*'
-      linux_distribution_name: ubuntu*
-      cpu: x86_64
-    terms:
-      stage: pre_merge
-      backend: pytorch
-      orchestrator: mpi
-  tests:
-  # ------------- MoE: test_multi_gpu (by backend x quant) ---------------
-  # --- CUTLASS ---
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A8_MXFP4_FP8"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and NVFP4"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A8_MXFP4_MXFP8"
+  # NVBUG 6801108 repro lane (DO NOT MERGE): every other entry in this file's
+  # 4-GPU pre_merge/mpi blocks is removed so the stages run only the hanging
+  # selector. The six selectors below pick the same tests; they differ only as
+  # strings so the list keeps six entries and pytest-split spreads them over
+  # DGX_B200-4_GPUs-PyTorch-{1,2,3}, giving two independent trials per stage.
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W8A16"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and MXFP8 and not W4A8"
-  # --- TRTLLM ---
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and NVFP4 and not W4A8"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and FP8_BLOCK_SCALES"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A8_NVFP4_FP8"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A16_MXFP4"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A8_MXFP4_MXFP8"
-  # --- CUTEDSL (NVFP4 only) ---
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTEDSL"
-  # --- DEEPGEMM (FP8_BLOCK_SCALES only) ---
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "DEEPGEMM and not MEGAMOE_DEEPGEMM"
-  # --- MEGAMOE_DEEPGEMM (W4A8_MXFP4_MXFP8 only) ---
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "MEGAMOE_DEEPGEMM"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "MEGAMOE_CUTEDSL"
-  # ------------- MoE: test_multi_gpu_eplb ---------------
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb -k "not None"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "W8A16 and CUTLASS"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "(CUTLASS) and W8A16"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and (W8A16)"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W8A16 and not NOSUCHTOKENA"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "not NOSUCHTOKENB and CUTLASS and W8A16"
 - condition:
     ranges:
       system_gpu_count:

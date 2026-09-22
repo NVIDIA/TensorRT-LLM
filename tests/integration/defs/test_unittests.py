@@ -162,6 +162,54 @@ def _fail_unittests(reason: str, output_xml: str, output_dir: str,
     raise AssertionError(reason)
 
 
+_FORENSICS_PER_FILE_MAX_BYTES = 64 * 1024
+_FORENSICS_TOTAL_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _print_forensics_dumps():
+    """Surface per-process stack dumps through this process's stdout.
+
+    Ranks 1..3 are started with MPI_Comm_spawn (tests/unittest/sitecustomize.py
+    explains the mechanism), so their own stdout has no collection path and
+    nothing they print is archived. Their dumps only reach CI if a process whose
+    stdout *is* captured reads the files and prints them, which is what this does.
+
+    Called from a finally block because a hang does not end with a clean return:
+    the inner pytest is killed by its own timeout and the exception propagates.
+    """
+    forensics_dir = os.environ.get("TLLM_FORENSICS_DIR", "").strip()
+    if not forensics_dir or not os.path.isdir(forensics_dir):
+        return
+    try:
+        names = sorted(os.listdir(forensics_dir))
+    except OSError as exc:
+        print(f"FORENSICS_COLLECT_FAILED: {exc}")
+        return
+    # Counted separately on purpose: "the probe was installed" (armed-*) must
+    # never be inferred from "a dump exists" (stack-*), or a dead probe would
+    # look identical to a healthy one.
+    armed = [n for n in names if n.startswith("armed-")]
+    stacks = [n for n in names if n.startswith("stack-")]
+    print(f"FORENSICS_COLLECT: armed={len(armed)} stacks={len(stacks)} "
+          f"dir={forensics_dir}")
+    budget = _FORENSICS_TOTAL_MAX_BYTES
+    for name in armed + stacks:
+        if budget <= 0:
+            print("FORENSICS_COLLECT_TRUNCATED: total budget exhausted")
+            break
+        path = os.path.join(forensics_dir, name)
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                content = handle.read(_FORENSICS_PER_FILE_MAX_BYTES)
+        except OSError as exc:
+            print(f"FORENSICS_FILE_UNREADABLE {name}: {exc}")
+            continue
+        budget -= len(content)
+        print(f"----- FORENSICS FILE {name} -----")
+        print(content)
+    print("FORENSICS_COLLECT_END")
+
+
 def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     import pandas as pd
     import pynvml
@@ -374,6 +422,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
             print(f"{'='*60}\n")
             return False
         finally:
+            _print_forensics_dumps()
             if s3_output_module is not None:
                 try:
                     drained = s3_output_module.drain_pending_uploads(
