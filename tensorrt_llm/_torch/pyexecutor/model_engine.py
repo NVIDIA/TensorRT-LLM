@@ -7,7 +7,6 @@ import gc
 import inspect
 import math
 import os
-import time
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
@@ -20,6 +19,7 @@ import torch._dynamo.config
 import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
+from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._utils import (global_mpi_rank, is_trace_enabled,
                                  maybe_pin_memory, nvtx_range, prefer_pinned,
                                  release_gc, trace_func)
@@ -831,11 +831,7 @@ class PyTorchModelEngine(ModelEngine):
         self.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER if is_draft_model else ResourceManagerType.KV_CACHE_MANAGER
         self.lora_model_config: Optional[LoraModelConfig] = None
         self._trtllm_gen_jit_warmup = False
-        # Wall-clock seconds per warmup phase, filled by ``_warmup_phase`` and
-        # reported by ``_log_warmup_summary``.
-        self._warmup_timings: Dict[str, float] = {}
-        self._warmup_purpose = "unspecified"
-        self._warmup_pass = 0
+        self._warmup_timer = _WarmupTimer(self.mapping.rank)
 
         self.cuda_graph_lora_manager: Optional[CudaGraphLoraManager] = None
         self._force_lora_graph_for_capture: Optional[bool] = None
@@ -1436,73 +1432,9 @@ class PyTorchModelEngine(ModelEngine):
             runner.capture_graphs(resource_manager)
             return
 
-        # Every phase below logs its own start/end and duration through
-        # ``_warmup_phase``; the summary is emitted even when a phase raises,
-        # so Python exceptions retain the partial breakdown (not forced kills).
-        self._warmup_timings = {}
-        self._warmup_pass += 1
-        warmup_start = time.perf_counter()
-        try:
+        # Retain a partial summary when a phase raises.
+        with self._warmup_timer:
             self._warmup_scheduled(resource_manager, kv_cache_manager)
-        finally:
-            self._log_warmup_summary(time.perf_counter() - warmup_start)
-
-    @contextmanager
-    def _warmup_phase(self, name: str):
-        """Log start/end of one warmup phase and record its wall-clock time.
-
-        ``name`` should match the ``log_mem_snapshot`` tag of the same phase
-        (``warmup/after_<name>``) so timing and memory logs line up.
-        """
-        logger.info(
-            f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}][purpose={self._warmup_purpose}][pass={self._warmup_pass}] {name}: start"
-        )
-        start = time.perf_counter()
-        completed = False
-        try:
-            yield
-            completed = True
-        finally:
-            elapsed = time.perf_counter() - start
-            self._warmup_timings[name] = self._warmup_timings.get(name,
-                                                                  0.0) + elapsed
-            if completed:
-                logger.info(
-                    f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}][purpose={self._warmup_purpose}][pass={self._warmup_pass}] {name}: done in {elapsed:.1f}s"
-                )
-            else:
-                logger.warning(
-                    f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}][purpose={self._warmup_purpose}][pass={self._warmup_pass}] {name}: failed after {elapsed:.1f}s"
-                )
-
-    # A single phase taking longer than this is reported at WARNING level in
-    # the summary, so a slow JIT/autotune shows up without grepping.
-    _WARMUP_SLOW_PHASE_SEC = 60.0
-
-    def _log_warmup_summary(self, total_sec: float) -> None:
-        """Report local timings subject to the configured logger rank filtering."""
-        if not self._warmup_timings:
-            logger.info(
-                f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}][purpose={self._warmup_purpose}][pass={self._warmup_pass}] summary: total={total_sec:.1f}s (no phases ran)"
-            )
-            return
-        parts = []
-        for name, sec in self._warmup_timings.items():
-            pct = 100.0 * sec / total_sec if total_sec > 0 else 0.0
-            parts.append(f"{name}={sec:.1f}s ({pct:.0f}%)")
-        logger.info(
-            f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}][purpose={self._warmup_purpose}][pass={self._warmup_pass}] summary: total={total_sec:.1f}s | "
-            + ", ".join(parts))
-        slow = {
-            name: sec
-            for name, sec in self._warmup_timings.items()
-            if sec > self._WARMUP_SLOW_PHASE_SEC
-        }
-        if slow:
-            logger.warning(
-                f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}][purpose={self._warmup_purpose}][pass={self._warmup_pass}] slow phases (>"
-                + f"{self._WARMUP_SLOW_PHASE_SEC:.0f}s): " +
-                ", ".join(f"{name}={sec:.1f}s" for name, sec in slow.items()))
 
     def _warmup_scheduled(self, resource_manager: ResourceManager,
                           kv_cache_manager) -> None:
@@ -1512,7 +1444,7 @@ class PyTorchModelEngine(ModelEngine):
         # cuda_graph_config=None flashinfer's sampling kernels would be
         # JIT-built mid-serving.
         self._eager_workspace_reclaimer = None
-        with self._warmup_phase("sampling_module_prewarm"):
+        with self._warmup_timer.phase("sampling_module_prewarm"):
             warmup_sampling_module()
             if self.enable_in_graph_sampling:
                 # The fast tier samples inside the captured graph via a
@@ -1555,17 +1487,17 @@ class PyTorchModelEngine(ModelEngine):
         # Compile the DSv4 indexer-Q CuTe DSL kernels before the first
         # collective-bearing forward, so their JIT cost is not charged against the
         # MoE all-to-all completion-flag deadline.
-        with self._warmup_phase("cute_dsl_indexer_q"):
+        with self._warmup_timer.phase("cute_dsl_indexer_q"):
             self._prewarm_cute_dsl_indexer_q()
         log_mem_snapshot("warmup/after_cute_dsl_indexer_q")
         if not is_enc_dec:
-            with self._warmup_phase("attention_jit"):
+            with self._warmup_timer.phase("attention_jit"):
                 self._run_attention_warmup(resource_manager,
                                            can_run_general_warmup)
 
         if can_run_general_warmup:
             # Specialize torch.compile graphs across the key input shapes before CUDA graph capture.
-            with self._warmup_phase("general"):
+            with self._warmup_timer.phase("general"):
                 warmup_requests_configs = self._agree_warmup_shapes(
                     self._get_full_general_warmup_requests(resource_manager))
                 # Currently graph has not been captured, disable cuda graph for this warmup.
@@ -1584,7 +1516,7 @@ class PyTorchModelEngine(ModelEngine):
         # Helix CP is decode-only and runs into issues with the
         # autotuner warmup's context requests.
         if not is_enc_dec and not self.mapping.has_cp_helix():
-            with self._warmup_phase("autotuner"):
+            with self._warmup_timer.phase("autotuner"):
                 self._run_autotuner_warmup(resource_manager)
             log_mem_snapshot("warmup/after_autotuner")
             # Pre-JIT Mamba SSD multi-seq + HAS_INITSTATES=True Triton kernels
@@ -1592,7 +1524,7 @@ class PyTorchModelEngine(ModelEngine):
             # since MambaHybridCacheManager skips _general_warmup and the
             # default autotuner shape is single-seq / no-initstates. Safe
             # no-op for non-Mamba models.
-            with self._warmup_phase("mamba_hybrid"):
+            with self._warmup_timer.phase("mamba_hybrid"):
                 self._run_mamba_hybrid_warmup(resource_manager)
             log_mem_snapshot("warmup/after_mamba_hybrid")
             # Release the autotuner's exploration-mode intermediates. The
@@ -1608,7 +1540,7 @@ class PyTorchModelEngine(ModelEngine):
         # captures without resizing the workspace.
         # Capture with the steady-state MoE all-to-all budget: the timeout is a
         # launch argument and is baked into every later replay.
-        with self._warmup_phase("cuda_graph_capture"), \
+        with self._warmup_timer.phase("cuda_graph_capture"), \
                 _moe_a2a_steady_state_budget_for_capture():
             with self.cuda_graph_runner.allow_capture():
                 self.cuda_graph_runner.is_warmup_only = True
@@ -1631,7 +1563,7 @@ class PyTorchModelEngine(ModelEngine):
         # warmup. No-op on non-DSA models.
         # Both DSA hooks read attn_metadata, which only a warmup forward
         # creates; build it when every forward above was skipped.
-        with self._warmup_phase("dsa_prewarm"):
+        with self._warmup_timer.phase("dsa_prewarm"):
             self._ensure_dsa_attn_metadata_for_warmup(resource_manager)
             self._warmup_dg_paged_mqa_logits_metadata()
             log_mem_snapshot("warmup/after_dg_paged_mqa_logits_metadata")
@@ -1640,7 +1572,7 @@ class PyTorchModelEngine(ModelEngine):
         if can_run_general_warmup:
             # Pre-populate the memory pool with max-shape allocations to reduce
             # fragmentation at runtime.
-            with self._warmup_phase("memory_pool_prepop"):
+            with self._warmup_timer.phase("memory_pool_prepop"):
                 warmup_requests_configs = self._get_max_shape_warmup_requests(
                     resource_manager)
                 self._general_warmup(resource_manager, warmup_requests_configs)
@@ -1650,7 +1582,7 @@ class PyTorchModelEngine(ModelEngine):
         # empty. Waiting for the first padded step can race KV saturation:
         # once the cache is full, the lazy allocation in _get_padded_batch
         # fails every step and padded batches silently run eager.
-        with self._warmup_phase("preallocate_padding_dummies"):
+        with self._warmup_timer.phase("preallocate_padding_dummies"):
             self.cuda_graph_runner.preallocate_padding_dummies(resource_manager)
         log_mem_snapshot("warmup/after_preallocate_padding_dummies")
 
@@ -2084,15 +2016,15 @@ class PyTorchModelEngine(ModelEngine):
                     logger.info(
                         f"Run warmup with {num_tokens} tokens, include {num_gen_tokens} generation tokens"
                     )
-                    shape_start = time.perf_counter()
-                    self.forward(batch,
-                                 new_tensors_device=None,
-                                 resource_manager=resource_manager)
-                    torch.cuda.synchronize()
-                    logger.info(
-                        f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}][purpose={self._warmup_purpose}][pass={self._warmup_pass}] general shape num_tokens={num_tokens}, "
-                        f"num_gen_tokens={num_gen_tokens}: done in "
-                        f"{time.perf_counter() - shape_start:.1f}s")
+                    with self._warmup_timer.phase(
+                            f"general shape num_tokens={num_tokens}, "
+                            f"num_gen_tokens={num_gen_tokens}",
+                            record=False,
+                            log_start=False):
+                        self.forward(batch,
+                                     new_tensors_device=None,
+                                     resource_manager=resource_manager)
+                        torch.cuda.synchronize()
             except torch.OutOfMemoryError:
                 if self._is_distributed_forward():
                     # Peers are inside the same forward's collectives and
@@ -2200,19 +2132,16 @@ class PyTorchModelEngine(ModelEngine):
                 # also absorbs every first-touch JIT (CuTe DSL GEMM, FMHA
                 # NVRTC grid, ...). Time it per shape so a slow startup can be
                 # attributed without a debugger.
-                logger.info(
-                    f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}][purpose={self._warmup_purpose}][pass={self._warmup_pass}] attention shape num_tokens={num_tokens}, "
-                    f"num_gen_requests={num_gen_requests}: start")
-                shape_start = time.perf_counter()
-                with trtllm_gen_fmha_jit_warmup():
-                    self.forward(batch,
-                                 new_tensors_device=None,
-                                 resource_manager=resource_manager)
-                torch.cuda.synchronize()
-                logger.info(
-                    f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}][purpose={self._warmup_purpose}][pass={self._warmup_pass}] attention shape num_tokens={num_tokens}, "
-                    f"num_gen_requests={num_gen_requests}: done in "
-                    f"{time.perf_counter() - shape_start:.1f}s")
+                with self._warmup_timer.phase(
+                        f"attention shape num_tokens={num_tokens}, "
+                        f"num_gen_requests={num_gen_requests}",
+                        record=False,
+                        log_start=True):
+                    with trtllm_gen_fmha_jit_warmup():
+                        self.forward(batch,
+                                     new_tensors_device=None,
+                                     resource_manager=resource_manager)
+                    torch.cuda.synchronize()
 
     @staticmethod
     def _release_megamoe_profiling_scratch():
@@ -2344,19 +2273,16 @@ class PyTorchModelEngine(ModelEngine):
                                 spec_resource_manager, Eagle3ResourceManager):
                             spec_resource_manager.is_first_draft = True
 
-                        logger.info(
-                            f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}][purpose={self._warmup_purpose}][pass={self._warmup_pass}] autotuner shape num_tokens={num_tokens}, "
-                            f"num_gen_requests={num_gen_requests}: start")
-                        shape_start = time.perf_counter()
-                        self.forward(batch,
-                                     new_tensors_device=None,
-                                     resource_manager=resource_manager)
-                        ran_forward = True
-                        torch.cuda.synchronize()
-                        logger.info(
-                            f"[warmup][pid={os.getpid()}][rank={self.mapping.rank}][purpose={self._warmup_purpose}][pass={self._warmup_pass}] autotuner shape num_tokens={num_tokens}, "
-                            f"num_gen_requests={num_gen_requests}: done in "
-                            f"{time.perf_counter() - shape_start:.1f}s")
+                        with self._warmup_timer.phase(
+                                f"autotuner shape num_tokens={num_tokens}, "
+                                f"num_gen_requests={num_gen_requests}",
+                                record=False,
+                                log_start=True):
+                            self.forward(batch,
+                                         new_tensors_device=None,
+                                         resource_manager=resource_manager)
+                            ran_forward = True
+                            torch.cuda.synchronize()
 
                 if ran_forward and synchronize_trtllm_cache:
                     # pp_recv in AutoTuner choose_one will never be called if there is no tuning op during the forward pass.

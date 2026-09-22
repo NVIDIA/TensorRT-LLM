@@ -968,7 +968,7 @@ def _create_py_executor_impl(
 
     for engine in (model_engine, draft_model_engine):
         if engine is not None:
-            engine._warmup_purpose = "memory_profiling" if estimating_kv_cache else "final_executor"
+            engine._warmup_timer.purpose = "memory_profiling" if estimating_kv_cache else "final_executor"
 
     with allocation_scope(
             ExecutorMemoryType.INIT_EXTRA_RESOURCES
@@ -1046,7 +1046,7 @@ def _create_py_executor_impl(
 
         for engine in (model_engine, draft_model_engine):
             if engine is not None:
-                engine._warmup_purpose = "final_executor"
+                engine._warmup_timer.purpose = "final_executor"
 
         with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES):
 

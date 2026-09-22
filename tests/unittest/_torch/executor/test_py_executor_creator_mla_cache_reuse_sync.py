@@ -139,6 +139,9 @@ class _DummyModelEngine:
             enable_flash_mla: Whether to emulate the FlashMLA block-size override.
             max_seq_len: Effective sequence length reported by the model engine.
         """
+        from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
+
+        self._warmup_timer = _WarmupTimer(rank=0)
         self.attn_runtime_features = attn_runtime_features
         self.max_seq_len = max_seq_len
         self.max_num_tokens = 128
@@ -526,7 +529,7 @@ def test_startup_allocation_phases(monkeypatch, estimate):
             super().build_managers(resources, estimating_kv_cache)
 
         def configure_kv_cache_capacity(self, executor):
-            events.append(("profile", executor.model_engine._warmup_purpose))
+            events.append(("profile", executor.model_engine._warmup_timer.purpose))
 
         def teardown_managers(self, resources):
             events.append(("teardown", None))

@@ -30,6 +30,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheR
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._torch.speculative.utils import update_draft_len
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import (
@@ -308,8 +309,10 @@ class TestWarmupCleanup(unittest.TestCase):
 
         self.assertEqual(model_engine._runner.method_calls, [])
 
+    @pytest.mark.cpu_only
     def test_legacy_warmup_skips_without_kv_cache(self):
         model_engine = object.__new__(PyTorchModelEngine)
+        model_engine._warmup_timer = _WarmupTimer(rank=0)
         model_engine.moe_load_balancer = None
         model_engine.is_warmup = False
         model_engine.enable_in_graph_sampling = False
@@ -389,6 +392,7 @@ class TestWarmupCleanup(unittest.TestCase):
             f"Helix CP should skip all warmup cleanup; got {calls}",
         )
 
+    @pytest.mark.cpu_only
     def test_flashinfer_mxfp8_respects_disabled_global_autotuner(self):
         """The global autotuner switch also disables automatic FlashInfer tuning."""
         calls = []
@@ -422,6 +426,7 @@ class TestWarmupCleanup(unittest.TestCase):
             self.assertEqual(method.backend, "trtllm")
 
             engine = SimpleNamespace(
+                _warmup_timer=_WarmupTimer(rank=0),
                 llm_args=SimpleNamespace(enable_autotuner=False),
                 cuda_graph_runner=SimpleNamespace(enabled=True),
                 model=SimpleNamespace(
@@ -439,6 +444,7 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertFalse(method._flashinfer_autotuned)
         flashinfer_module.autotune.assert_not_called()
 
+    @pytest.mark.cpu_only
     def test_mxfp8_native_and_flashinfer_use_separate_warmup_passes(self):
         """Native and FlashInfer backends each receive an isolated tuning forward."""
         calls = []
@@ -483,6 +489,7 @@ class TestWarmupCleanup(unittest.TestCase):
             self.assertFalse(method.needs_native_autotune)
 
             engine = SimpleNamespace(
+                _warmup_timer=_WarmupTimer(rank=0),
                 llm_args=SimpleNamespace(enable_autotuner=True),
                 cuda_graph_runner=SimpleNamespace(enabled=True),
                 model=SimpleNamespace(
@@ -557,6 +564,7 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertEqual(tuner.setup_distributed_state.call_count, 1)
         tuner.setup_distributed_state.assert_called_with(engine.mapping, engine.dist)
 
+    @pytest.mark.cpu_only
     def test_native_mxfp8_falls_back_after_missing_warmup_batch(self):
         """A missing startup batch latches native MXFP8 to the default tactic."""
         calls = []
@@ -596,6 +604,7 @@ class TestWarmupCleanup(unittest.TestCase):
             os.environ.pop("TLLM_AUTOTUNER_CACHE_PATH", None)
             method = MXFP8LinearMethod()
             engine = SimpleNamespace(
+                _warmup_timer=_WarmupTimer(rank=0),
                 llm_args=SimpleNamespace(enable_autotuner=True),
                 cuda_graph_runner=SimpleNamespace(enabled=True),
                 model=SimpleNamespace(
@@ -665,6 +674,7 @@ class TestWarmupCleanup(unittest.TestCase):
         sync_tactics.assert_not_called()
         engine.forward.assert_not_called()
 
+    @pytest.mark.cpu_only
     def test_flashinfer_mxfp8_rank_mismatch_falls_back_before_warmup(self):
         """TP and PP ranks agree on fallback before the tuning forward."""
         flashinfer_module = ModuleType("flashinfer")
@@ -694,6 +704,7 @@ class TestWarmupCleanup(unittest.TestCase):
             os.environ.pop("TRTLLM_MXFP8_GEMM_BACKEND", None)
             method = MXFP8LinearMethod()
             engine = SimpleNamespace(
+                _warmup_timer=_WarmupTimer(rank=0),
                 llm_args=SimpleNamespace(enable_autotuner=True),
                 cuda_graph_runner=SimpleNamespace(enabled=True),
                 model=SimpleNamespace(
@@ -749,6 +760,7 @@ class TestWarmupCleanup(unittest.TestCase):
         flashinfer_module.autotune.assert_not_called()
         self.assertEqual(engine.forward.call_count, 1)
 
+    @pytest.mark.cpu_only
     def test_native_mxfp8_respects_disabled_global_autotuner(self):
         with (
             patch(
@@ -760,6 +772,7 @@ class TestWarmupCleanup(unittest.TestCase):
             os.environ.pop("TRTLLM_MXFP8_GEMM_BACKEND", None)
             method = MXFP8LinearMethod()
             engine = SimpleNamespace(
+                _warmup_timer=_WarmupTimer(rank=0),
                 llm_args=SimpleNamespace(enable_autotuner=False),
                 cuda_graph_runner=SimpleNamespace(enabled=False),
                 model=SimpleNamespace(modules=lambda: [SimpleNamespace(quant_method=method)]),
@@ -773,92 +786,3 @@ class TestWarmupCleanup(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-@pytest.fixture
-def warmup_timing(monkeypatch):
-    """Exercise the real timing helpers without constructing a GPU engine."""
-    from tensorrt_llm._torch.pyexecutor import model_engine
-
-    engine = SimpleNamespace(
-        mapping=SimpleNamespace(rank=3),
-        _warmup_purpose="memory_profiling",
-        _warmup_pass=1,
-        _warmup_timings={},
-        _WARMUP_SLOW_PHASE_SEC=PyTorchModelEngine._WARMUP_SLOW_PHASE_SEC,
-    )
-    clock = Mock()
-    log = Mock()
-    monkeypatch.setattr(model_engine.time, "perf_counter", clock)
-    monkeypatch.setattr(model_engine, "logger", log)
-    monkeypatch.setattr(model_engine.os, "getpid", lambda: 42)
-    return engine, clock, log
-
-
-@pytest.mark.cpu_only
-def test_warmup_phase_repeated_names(warmup_timing):
-    """Repeated names accumulate and the summary reports identity and percentages."""
-    engine, clock, log = warmup_timing
-    clock.side_effect = [0, 2, 3, 6]
-    for _ in range(2):
-        with PyTorchModelEngine._warmup_phase(engine, "attention"):
-            pass
-    assert engine._warmup_timings == {"attention": 5}
-    PyTorchModelEngine._log_warmup_summary(engine, 10)
-    log.info.assert_any_call(
-        "[warmup][pid=42][rank=3][purpose=memory_profiling][pass=1] "
-        "summary: total=10.0s | attention=5.0s (50%)"
-    )
-    log.warning.assert_not_called()
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("error_type", [ValueError, KeyboardInterrupt])
-def test_warmup_phase_failure_records_elapsed(warmup_timing, error_type):
-    """Preserve elapsed time and the original exception on interrupted warmup."""
-    engine, clock, log = warmup_timing
-    clock.side_effect = [2, 7]
-    error = error_type("warmup failed")
-    with pytest.raises(error_type) as caught:
-        with PyTorchModelEngine._warmup_phase(engine, "attention"):
-            raise error
-    assert caught.value is error
-    assert engine._warmup_timings == {"attention": 5}
-    log.warning.assert_called_once_with(
-        "[warmup][pid=42][rank=3][purpose=memory_profiling][pass=1] attention: failed after 5.0s"
-    )
-    assert not any(": done" in c.args[0] for c in log.info.call_args_list)
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "timings, expected",
-    [
-        ({}, "summary: total=0.0s (no phases ran)"),
-        ({"attention": 0.0}, "summary: total=0.0s | attention=0.0s (0%)"),
-    ],
-)
-def test_warmup_summary_empty_or_zero(warmup_timing, timings, expected):
-    """Empty or zero-duration summaries remain finite and do not warn."""
-    engine, _, log = warmup_timing
-    engine._warmup_timings = timings
-    PyTorchModelEngine._log_warmup_summary(engine, 0)
-    assert log.info.call_args.args[0].endswith(expected)
-    log.warning.assert_not_called()
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("over_threshold", [False, True])
-def test_warmup_slow_phase_warning(warmup_timing, over_threshold):
-    """Warn only when a phase strictly exceeds the slow-phase threshold."""
-    engine, _, log = warmup_timing
-    elapsed = engine._WARMUP_SLOW_PHASE_SEC + int(over_threshold)
-    engine._warmup_timings = {"attention": elapsed}
-    PyTorchModelEngine._log_warmup_summary(engine, elapsed)
-    if over_threshold:
-        log.warning.assert_called_once_with(
-            "[warmup][pid=42][rank=3][purpose=memory_profiling][pass=1] "
-            f"slow phases (>{engine._WARMUP_SLOW_PHASE_SEC:.0f}s): attention={elapsed:.1f}s"
-        )
-    else:
-        log.warning.assert_not_called()
