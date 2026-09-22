@@ -97,7 +97,9 @@ class TestPerLayerHeadDimBasic(unittest.TestCase):
             self.assertEqual(result, [expected])
             raw = list(base_page_indices[: kv_cache.num_blocks])
             for layer_idx in range(mgr.num_local_layers):
-                self.assertEqual(mgr.get_batch_base_page_indices([7], layer_idx), [raw])
+                self.assertEqual(
+                    mgr.get_batch_cache_indices([7], layer_idx, raw_indices=True), [raw]
+                )
                 self.assertEqual(mgr.get_batch_cache_indices([7], layer_idx), [expected])
         finally:
             mgr.shutdown()
@@ -112,11 +114,14 @@ class TestPerLayerHeadDimBasic(unittest.TestCase):
         try:
             mgr.add_dummy_requests([7], [16])
 
-            all_indices = mgr.get_batch_cache_indices([7])
-            requested_indices = mgr.get_batch_cache_indices([7], num_blocks_per_seq=[1])
+            for raw_indices in (False, True):
+                all_indices = mgr.get_batch_cache_indices([7], raw_indices=raw_indices)
+                requested_indices = mgr.get_batch_cache_indices(
+                    [7], num_blocks_per_seq=[1], raw_indices=raw_indices
+                )
 
-            self.assertGreater(len(all_indices[0]), 1)
-            self.assertEqual(requested_indices, [all_indices[0][:1]])
+                self.assertGreater(len(all_indices[0]), 1)
+                self.assertEqual(requested_indices, [all_indices[0][:1]])
         finally:
             mgr.shutdown()
 

@@ -5119,33 +5119,26 @@ class KVCacheManagerV2(BaseResourceManager):
         request_ids: List[int],
         layer_idx: Optional[int] = None,
         num_blocks_per_seq: Optional[Sequence[int]] = None,
+        *,
+        raw_indices: bool = False,
     ) -> List[List[int]]:
+        """Return cache indices for a layer, or pool 0 when no layer is given.
+
+        Set raw_indices for slot-major views that need base slot IDs without
+        page-index scaling or KV aggregation.
+        """
         if layer_idx is None:
             pool_id = 0
-            index_scale = None
+            index_scale = 1 if raw_indices else None
         else:
             pool_id = self.layer_to_pool_mapping_dict[self.layer_offsets[layer_idx]]
-            index_scale = self.get_layer_page_index_scale(layer_idx)
+            index_scale = 1 if raw_indices else self.get_layer_page_index_scale(layer_idx)
         return self._get_batch_cache_indices_by_pool_id(
             request_ids,
             pool_id=pool_id,
-            is_kv_aggregate=True,
+            is_kv_aggregate=not raw_indices,
             num_blocks_per_seq=num_blocks_per_seq,
             index_scale=index_scale,
-        )
-
-    def get_batch_base_page_indices(
-        self, request_ids: List[int], layer_idx: int
-    ) -> List[List[int]]:
-        """Return owned raw slot IDs for a layer's pool, preserving invalid entries.
-
-        Unlike get_batch_cache_indices, these indices do not include the layer's
-        page-index scale or KV aggregation. Slot-major auxiliary cache views use
-        them directly. The max_blocks_per_seq padding is excluded.
-        """
-        pool_id = self.layer_to_pool_mapping_dict[self.layer_offsets[layer_idx]]
-        return self._get_batch_cache_indices_by_pool_id(
-            request_ids, pool_id=pool_id, is_kv_aggregate=False, index_scale=1
         )
 
     def _get_batch_cache_indices_by_pool_id(
