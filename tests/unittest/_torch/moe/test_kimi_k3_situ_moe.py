@@ -45,7 +45,6 @@ from _torch.moe.kimi_k3_ref_moe.kimi_k3_moe_block import KimiK3SparseMoeBlock
 from utils.util import check_accuracy
 
 import tensorrt_llm._torch.models.modeling_kimi_linear as modeling_kimi_linear
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_kimi_linear import KimiK3MoEGate, KimiK3MoERuntime
 from tensorrt_llm._torch.moe.fused_moe.communication import CommunicationFactory
@@ -121,6 +120,45 @@ def test_kimi_situ_betas_must_be_positive(situ_beta, situ_linear_beta):
 
     with pytest.raises(ValueError, match="must be positive"):
         modeling_kimi_linear._resolve_kimi_situ_betas(cfg)
+
+
+@pytest.mark.parametrize(
+    "situ_beta,situ_linear_beta",
+    [
+        (float("nan"), 25.0),
+        (4.0, float("nan")),
+        (float("inf"), 25.0),
+        (4.0, float("inf")),
+        (0.0, 25.0),
+        (-2.0, 25.0),
+    ],
+    ids=["nan_beta", "nan_linear", "inf_beta", "inf_linear", "zero", "negative"],
+)
+def test_cutedsl_kernel_rejects_unusable_situ_betas(situ_beta, situ_linear_beta):
+    """NaN and infinity must be refused, not just zero and negatives.
+
+    The betas fold into the kernel at trace time as ``2/beta`` and
+    ``2*beta``, so a non-finite one is compiled in and comes back as quietly
+    wrong activations. ``<= 0`` does not catch either: every comparison
+    against NaN is false, and an infinity is positive.
+    """
+    pytest.importorskip("cutlass")
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (  # noqa: E501
+        BlockScaledContiguousGatherGroupedGemmKernel,
+    )
+    from tensorrt_llm._torch.utils import ActivationType
+
+    with pytest.raises(ValueError, match="finite and positive"):
+        BlockScaledContiguousGatherGroupedGemmKernel(
+            sf_vec_size=16,
+            mma_tiler_mn=(128, 128),
+            cluster_shape_mn=(1, 1),
+            vectorized_f32=True,
+            topk=8,
+            activation_type=ActivationType.SiTu,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+        )
 
 
 def _init_block_weights(block: KimiK3SparseMoeBlock, seed: int = 1234):
@@ -584,6 +622,116 @@ def test_kimi_k3_routed_config_logs_megamoe_capacity_override(monkeypatch):
     )
 
 
+def test_kimi_k3_allow_list_matches_what_the_backends_declare():
+    """The K3 allow-list must be *exactly* the backends that execute SiTU.
+
+    Both sides are derived, neither is written down here. The expected set
+    comes from each family's own ``activation_support``; the actual set comes
+    from asking the allow-list. A hand-maintained second copy of a capability
+    set is the defect this module exists to catch -- it is how CUTEDSL stayed
+    shut for weeks after its kernel grew the epilogue -- and a test that
+    restates the list has the same defect.
+
+    Checking both directions matters: inclusion alone would pass while the
+    allow-list offered a backend that cannot serve SiTU, which resolves and
+    then fails at construction instead of being declined.
+
+    ``any`` rather than ``all`` over a family: resolution walks family members
+    in ``IMPL_PRIORITY`` order, so a family serves SiTU when one member does.
+    ``CUTEDSL`` is exactly that case -- ``CuteDslB12xFusedMoE`` does not
+    declare it, ``CuteDslFusedMoE`` does.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.moe_resolution import BACKEND_FAMILY
+    from tensorrt_llm._torch.utils import ActivationType
+
+    def admits_situ(name):
+        model_config = ModelConfig(
+            mapping=Mapping(world_size=1, rank=0, tp_size=1),
+            moe_backend=name,
+        )
+        try:
+            KimiK3MoERuntime._routed_moe_model_config(model_config)
+        except ValueError:
+            return False
+        return True
+
+    declares_situ = {
+        name
+        for name, family in BACKEND_FAMILY.items()
+        if any(ActivationType.SiTu in cls.activation_support.kinds for cls in family)
+    }
+    allow_listed = {name for name in BACKEND_FAMILY if admits_situ(name)}
+
+    assert allow_listed == declares_situ, (
+        "Kimi K3's routed-expert allow-list disagrees with the backends' own "
+        f"activation_support.\n"
+        f"  offered but cannot serve SiTU: {sorted(allow_listed - declares_situ)}\n"
+        f"  serves SiTU but not offered:   {sorted(declares_situ - allow_listed)}"
+    )
+    # The set is derived, so guard against it being derived as empty -- that
+    # would satisfy the equality above while testing nothing.
+    assert "CUTEDSL" in declares_situ
+
+
+def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch):
+    """K3 must propagate strict backend selection through create_moe."""
+    from transformers.configuration_utils import PretrainedConfig
+
+    from tensorrt_llm._torch.moe.fused_moe import CutlassFusedMoE
+    from tensorrt_llm._torch.moe.fused_moe.activation import SiTuActivation
+    from tensorrt_llm._torch.moe.fused_moe.interface import MoEEligibility, MoERejectReason
+    from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
+        BACKEND_FAMILY,
+        impl_class_for,
+        resolve_moe_impl,
+    )
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    # Keep the real resolver and K3 caller; only make eligibility deterministic.
+    for backend_cls in BACKEND_FAMILY["CUTEDSL"]:
+        monkeypatch.setattr(
+            backend_cls,
+            "can_implement",
+            classmethod(
+                lambda cls, p, d: MoEEligibility.no(
+                    MoERejectReason.DEP_MISSING, "CuTe DSL unavailable for this test"
+                )
+            ),
+        )
+    monkeypatch.setattr(
+        CutlassFusedMoE, "can_implement", classmethod(lambda cls, p, d: MoEEligibility.ok())
+    )
+    quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+    pretrained_config = PretrainedConfig()
+    pretrained_config.torch_dtype = torch.bfloat16
+    model_config = ModelConfig(
+        pretrained_config=pretrained_config,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1),
+        moe_backend="CUTEDSL",
+        quant_config_dict={"layers.0.mlp.experts": quant_config},
+    )
+    cfg = _K3Config(routed_expert_hidden_size=512, latent_moe_use_norm=True)
+    gate = KimiK3MoEGate(cfg)
+    report = resolve_moe_impl(
+        model_config,
+        override_quant_config=quant_config,
+        activation=SiTuActivation(gate_softcap=4.0, linear_softcap=25.0),
+        routing=gate.routing_method,
+        num_experts=cfg.num_experts,
+        hidden_size=cfg.routed_expert_hidden_size,
+        intermediate_size=cfg.moe_intermediate_size,
+        dtype=torch.bfloat16,
+        allow_degradation=True,
+    )
+    assert report.degraded
+    assert impl_class_for(report) is CutlassFusedMoE
+
+    # Removing CUTEDSL from K3's no-degradation list must fail this assertion.
+    with pytest.raises(ValueError, match="CUTEDSL.*degradation disallowed") as excinfo:
+        KimiK3MoERuntime(model_config, cfg, layer_idx=0, aux_stream_dict={})
+    assert "dep_missing" in str(excinfo.value)
+
+
 def test_kimi_k3_routed_config_rejects_backend_without_situ_support():
     model_config = ModelConfig(
         mapping=Mapping(world_size=1, rank=0, tp_size=1),
@@ -877,8 +1025,16 @@ def _make_routed_moe(
     num_experts=_TP_EXPERTS,
     moe_backend="TRTLLM",
     routed_quant_config=None,
+    gate_softcap=4.0,
+    linear_softcap=25.0,
 ):
-    """Mirror KimiK3MoERuntime's create_moe call on a single-rank mapping."""
+    """Mirror KimiK3MoERuntime's create_moe call on a single-rank mapping.
+
+    The soft-caps are parameters rather than constants so a test can build two
+    layers that differ in nothing else; they are trace-time constants inside
+    the CuteDSL epilogue, so that is the only way to ask whether they reach the
+    kernel cache key.
+    """
     from transformers.configuration_utils import PretrainedConfig
 
     from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE, SiTuActivation, create_moe
@@ -889,8 +1045,8 @@ def _make_routed_moe(
     pretrained_config.hidden_size = _TP_HIDDEN
     pretrained_config.intermediate_size = intermediate_size
     pretrained_config.torch_dtype = torch.bfloat16
-    pretrained_config.activation_situ_beta = 4.0
-    pretrained_config.activation_situ_linear_beta = 25.0
+    pretrained_config.activation_situ_beta = gate_softcap
+    pretrained_config.activation_situ_linear_beta = linear_softcap
     model_config = ModelConfig(
         pretrained_config=pretrained_config,
         mapping=Mapping(),
@@ -913,7 +1069,7 @@ def _make_routed_moe(
         communication_method=None,
         # Mirror KimiK3MoERuntime exactly: one activation for every backend,
         # naming the two soft-caps rather than the ABI registers they land in.
-        activation=SiTuActivation(gate_softcap=4.0, linear_softcap=25.0),
+        activation=SiTuActivation(gate_softcap=gate_softcap, linear_softcap=linear_softcap),
     )
     moe = create_moe(**moe_kwargs).cuda()
     assert isinstance(moe, ConfigurableMoE)
@@ -1214,6 +1370,48 @@ def test_tp16_nvfp4_padded_loaders_preserve_rank_ownership():
     assert torch.count_nonzero(w2_sf_dst[:, 12:].float()) == 0
 
 
+#: The FP4 backends that serve SiTU. The CuteDSL backends additionally need
+#: the matching CuTe DSL wheel, checked inside the test rather than a ``skipif``:
+#: importing ``cute_dsl_utils`` pulls in the DSL package, which appends its own
+#: directory to ``sys.path``, and this repository fails the whole pytest
+#: session when a test file does that at collection time.
+_NVFP4_SITU_BACKENDS = ["CUTLASS", "TRTLLM", "CUTEDSL", "CUTEDSL_FC12"]
+
+
+def _skip_if_backend_unavailable(moe_backend):
+    """Skip a CUTEDSL parametrization when the CuTe DSL wheel is absent.
+
+    Probed here rather than in a ``pytest.mark.skipif``, because the marker
+    is evaluated at collection time and importing ``cute_dsl_utils`` that
+    early puts the wheel's package directory on ``sys.path`` for every other
+    test file in the session.
+    """
+    if moe_backend not in ("CUTEDSL", "CUTEDSL_FC12"):
+        return
+    from tensorrt_llm._torch.cute_dsl_utils import (
+        IS_CUTLASS_DSL_AVAILABLE,
+        IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    )
+
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        pytest.skip("CuteDSL MoE requires the CuTe DSL wheel")
+    sm_version = get_sm_version()
+    if moe_backend == "CUTEDSL_FC12":
+        if sm_version != 107:
+            pytest.skip(f"FC12 SiTU MoE requires Rubin (SM107), got SM{sm_version}")
+        if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+            pytest.skip("FC12 SiTU MoE requires CuTe DSL Rubin support")
+        return
+    # nvfp4_moe_supported admits every SM >= 100, but this integration enables
+    # SiTU only on Blackwell. Match can_implement() rather than exercising an
+    # end-to-end path that has not been enabled on SM107.
+    if sm_version not in (100, 103):
+        pytest.skip(
+            f"CuteDSL SiTU MoE needs the Blackwell act-fusion kernel "
+            f"(SM100/SM103), got SM{sm_version}"
+        )
+
+
 def _make_nvfp4_expert_bank(num_experts, intermediate, hidden, seed=907):
     """Random NVFP4 tensors in ``nvidia/Kimi-K3-NVFP4`` checkpoint layout."""
     gen = torch.Generator().manual_seed(seed)
@@ -1249,13 +1447,16 @@ def _make_nvfp4_expert_bank(num_experts, intermediate, hidden, seed=907):
     return bank
 
 
-def _make_nvfp4_moe(gate, num_experts=_TP_EXPERTS, moe_backend="CUTLASS"):
+def _make_nvfp4_moe(
+    gate, num_experts=_TP_EXPERTS, moe_backend="CUTLASS", gate_softcap=4.0, linear_softcap=25.0
+):
     """NVFP4 + SiTU routed MoE on a supported FP4 backend.
 
     All take the same ``SiTuActivation`` carrier. CUTLASS branches on the
     ``ActivationType`` in its kernels, TRTLLM-Gen selects the fused
-    ``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*`` FC1 cubins, and FC12 specializes its
-    Rubin fused epilogue. The backend is the only variable.
+    ``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*`` FC1 cubins, Blackwell CuteDSL folds
+    the soft-caps into a JIT epilogue, and FC12 specializes its Rubin fused
+    epilogue.
     """
     from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -1265,6 +1466,8 @@ def _make_nvfp4_moe(gate, num_experts=_TP_EXPERTS, moe_backend="CUTLASS"):
         num_experts=num_experts,
         moe_backend=moe_backend,
         routed_quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=_NVFP4_GROUP_SIZE),
+        gate_softcap=gate_softcap,
+        linear_softcap=linear_softcap,
     )
 
 
@@ -1591,6 +1794,69 @@ def _quantize_expert_to_nvfp4(w1, w2, w3, input_scale):
     return out
 
 
+# Derived from the NVFP4 error budget, NOT fitted to a measurement.
+#
+# One NVFP4 round trip of Gaussian data -- the e2m1 grid {0,.5,1,1.5,2,3,4,6}
+# under a per-16 e4m3 block scale -- costs eps = 0.0950 relative L2. Both the
+# model and the kernel agree on that: the checkpoint weights here round-trip at
+# 0.09515 / 0.09510 / 0.09512.
+#
+# Quantization error does not amplify through a dot product of random data, so
+# N independent stages compose as sqrt(N)*eps. With both references built from
+# the dequantized checkpoint the weight stages cancel and three remain: the
+# activation reaching the gate, the activation reaching the up projection --
+# independent because they pass through different weight matrices, and SiTU
+# multiplies them -- and the FC1->FC2 intermediate. So the floor is
+#
+#     sqrt(3) * 0.0950 = 0.1645
+#
+# Measured 2026-09-17 over 6 seeds x {CUTLASS, TRTLLM, CUTEDSL}: 0.1613 to
+# 0.1656, i.e. 0.980 to 1.006 of the prediction, with the norm ratio in
+# 0.9992..1.0035. The budget is confirmed, not calibrated.
+#
+# 0.20 is that floor plus ~21% of engineering headroom against a +-2% spread.
+# It catches a SiTU scaled wrong by >=11.4%, since a scale error s shows up as
+# sqrt(s**2 + 0.1645**2). It also sits under the plain-SwiGLU distance
+# (>=0.2050 measured), though catching that is the ordering assertion's job.
+#
+# IF THIS FIRES, SUSPECT AN EXTRA QUANTIZATION STAGE BEFORE SUSPECTING THE
+# BOUND: sqrt(4)*eps is 0.190 and sqrt(5)*eps is 0.212. The leading digit here
+# is engineering judgement; the exponent is arithmetic. Do not move it.
+_SITU_NVFP4_REL_L2_MAX = 0.20
+
+
+def _dequantize_expert_bank(bank):
+    """The expert weights the kernel actually sees, back in float32.
+
+    A golden built from the ORIGINAL bf16 weights differs from the kernel by
+    the whole 4-bit quantization error -- measured at 54% relative L2 on this
+    configuration, which is an order of magnitude larger than any activation
+    bug it is meant to expose. That leaves only an ordering comparison, and an
+    ordering comparison cannot see a mis-scaled SiTU at all. Reading the
+    checkpoint tensors back instead puts the same weights on both sides, so
+    what remains is the kernel's own arithmetic and an absolute bound becomes
+    meaningful.
+
+    This mirrors ``e2m1_and_ufp8_scale_batches`` in
+    ``tests/unittest/_torch/thop/serial/test_moe.py``; the layout arguments
+    follow ``_quantize_expert_to_nvfp4``, which stores UE4M3 block scales
+    (``sfUseUE8M0=False`` -> ``sfType=1``) already de-swizzled by
+    ``block_scale_interleave_reverse`` (-> ``isSfSwizzledLayout=False``).
+    """
+
+    def deq(name):
+        return torch.ops.tensorrt_llm.e2m1_and_ufp8sf_scale_to_float_v2(
+            bank[f"{name}.weight"].cpu(),
+            bank[f"{name}.weight_scale"].cpu().reshape(-1),
+            bank[f"{name}.weight_scale_2"].cpu().float().reshape(1),
+            _NVFP4_GROUP_SIZE,
+            1,
+            False,
+        ).cuda()
+
+    return deq("w1"), deq("w2"), deq("w3")
+
+
 @nvfp4_moe_supported
 @pytest.mark.parametrize(
     "moe_backend,input_scale",
@@ -1689,16 +1955,23 @@ def test_nvfp4_experts_match_situ_reference(moe_backend, input_scale):
     # to the last failure; the two in fact differ a lot (see the xfail above),
     # and the claim was never measured. The structural guards do not rest on
     # this number at all: they are the BF16 comparison against the same golden
-    # reference and the SiTU-vs-SwiGLU discriminator, both tolerance-free. The
-    # accuracy gate for the real checkpoint is GSM8K.
+    # reference and the SiTU-vs-SwiGLU discriminator, which carries its own
+    # bound. The accuracy gate for the real checkpoint is GSM8K.
     assert cosine > 0.95, f"cosine={cosine.item()}, rel_l2={rel_l2.item()}"
 
 
-def _swiglu_reference_moe(x, router_logits, routing_method, w1, w2, w3, alpha, beta):
-    """Same routing/geometry as the SiTU reference, but CUTLASS's SwigluBias.
+def _plain_swiglu_reference_moe(x, router_logits, routing_method, w1, w2, w3):
+    """Same routing/geometry as the SiTU reference, but plain SwiGLU.
 
-    ``gate*sigmoid(gate*alpha)*(linear+beta)`` -- what the FC1 epilogue would
-    compute if the activation enum did not resolve to SiTu.
+    ``up * silu(gate)`` -- what the FC1 epilogue actually computes when it
+    does not run SiTU. This is the realistic wrong answer, so it is the one
+    worth measuring against: an earlier revision compared with SwigluBias
+    (``gate*sigmoid(gate*alpha)*(up+beta)``), which no epilogue on this path
+    computes, so a genuine SwiGLU fallback sat far from both references and
+    still satisfied a "closer to SiTU" ordering.
+
+    The dequant alpha is already folded into ``g`` and ``u`` here, exactly as
+    the kernel applies it to the accumulator before either epilogue.
     """
     ids, weights = routing_method.apply(router_logits)
     out = torch.zeros_like(x, dtype=torch.float32)
@@ -1708,28 +1981,13 @@ def _swiglu_reference_moe(x, router_logits, routing_method, w1, w2, w3, alpha, b
             e = int(ids[token, slot])
             g = xf[token] @ w1[e].float().t()
             u = xf[token] @ w3[e].float().t()
-            h = g * torch.sigmoid(g * alpha) * (u + beta)
+            h = u * (g * torch.sigmoid(g))
             out[token] += float(weights[token, slot]) * (h @ w2[e].float().t())
     return out
 
 
 @nvfp4_moe_supported
-@pytest.mark.parametrize(
-    "moe_backend",
-    [
-        "CUTLASS",
-        "TRTLLM",
-        pytest.param(
-            "CUTEDSL_FC12",
-            marks=pytest.mark.skipif(
-                not torch.cuda.is_available()
-                or get_sm_version() != 107
-                or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
-                reason="FC12 requires Rubin (SM107) with CuTe DSL Rubin support",
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("moe_backend", _NVFP4_SITU_BACKENDS)
 def test_nvfp4_kernel_actually_applies_situ(moe_backend):
     """Which activation does the QUANTIZED kernel actually run?
 
@@ -1741,22 +1999,46 @@ def test_nvfp4_kernel_actually_applies_situ(moe_backend):
     wrong in exactly the way the GSM8K collapse showed, while every
     shape-and-buffer check stayed green.
 
-    Run for all supported FP4 backends: CUTLASS resolves SiTU through the
+    Run for every FP4 backend, because each reaches SiTU by a different
+    mechanism and so fails differently: CUTLASS resolves it through the
     activation enum, TRTLLM-Gen through a distinct fused-cubin family
-    (``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*``), and FC12 through its Rubin fused
-    epilogue. A silent fallback is a different failure on each, and this
-    comparison is tolerance-free, so it also catches the degenerate all-zero
-    FC1 output, which scores 0 against both references and fails below.
+    (``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*``), Blackwell CuteDSL through
+    soft-caps folded into a JIT-compiled epilogue at trace time, and FC12
+    through its Rubin fused epilogue. The CuteDSL cases are why this test
+    exists: dropping their trace-time activation parameters does not raise --
+    it compiles a SwiGLU kernel and returns plausible numbers.
+
+    The degenerate all-zero FC1 output is caught as well: it scores 0 against
+    both references.
+
+    The weights here are deliberately 6-15x larger than production. Measured
+    from the checkpoint, real g and u have sigma 0.10..0.23 against beta=4, and
+    at that scale SiTU and plain SwiGLU differ by 0.4% -- under the
+    quantization floor, so nothing could be asserted. At the scale used here
+    they differ by 14%.
 
     Reported rather than merely asserted: which reference the kernel is
     closer to is the diagnosis.
     """
+    _skip_if_backend_unavailable(moe_backend)
     num_experts, hidden, inter = _TP_EXPERTS, _TP_HIDDEN, _TP_INTERMEDIATE
     gate = _make_test_gate(num_experts=num_experts)
 
     torch.manual_seed(91)
     x = torch.randn(8, hidden, dtype=torch.bfloat16, device="cuda") * 0.5
-    act_scale = 1.0 if moe_backend == "CUTEDSL_FC12" else float(x.abs().max().float() / (448 * 6))
+    # input_scale=1.0 because that is what inference runs: every one of the
+    # 247296 *.input_scale entries in nvidia/Kimi-K3-NVFP4, across 92 shards,
+    # is exactly 1.0 (scanned 2026-09-17).
+    #
+    # This used to derive amax/(448*6), a value no checkpoint produces. There
+    # the kernel lands systematically 36% short of the golden -- measured norms
+    # 263.02 against 412.49 -- which is the open activation-scale finding
+    # test_nvfp4_experts_match_situ_reference carries as a strict xfail. At
+    # input_scale=1.0 the norms agree to 1.004. So the activation this test
+    # used was both unrepresentative of inference and contaminated by an
+    # unrelated defect, and the cosine assertion could not see the 36% at all,
+    # cosine being scale-invariant.
+    act_scale = 1.0
     w1 = [
         torch.randn(inter, hidden, dtype=torch.bfloat16, device="cuda") * 0.05
         for _ in range(num_experts)
@@ -1800,12 +2082,17 @@ def test_nvfp4_kernel_actually_applies_situ(moe_backend):
             graph.replay()
             torch.testing.assert_close(captured.float(), actual, rtol=0.02, atol=0.02)
 
+    # Both references read the weights BACK OUT of the checkpoint tensors, so
+    # they see the same 4-bit values the kernel was loaded with. Against the
+    # original bf16 weights the quantization error alone is ~54% relative L2,
+    # which swamps every bug this test is for.
+    dq = [_dequantize_expert_bank(b) for b in bank]
+    w1q, w2q, w3q = ([d[i] for d in dq] for i in range(3))
+
     situ = _situ_reference_moe(
-        x, router_logits, gate.routing_method, w1, w2, w3, beta=4.0, linear_beta=25.0
+        x, router_logits, gate.routing_method, w1q, w2q, w3q, beta=4.0, linear_beta=25.0
     )
-    swiglu = _swiglu_reference_moe(
-        x, router_logits, gate.routing_method, w1, w2, w3, alpha=4.0, beta=25.0
-    )
+    swiglu = _plain_swiglu_reference_moe(x, router_logits, gate.routing_method, w1q, w2q, w3q)
 
     def score(ref):
         cos = torch.nn.functional.cosine_similarity(actual.flatten(), ref.flatten(), dim=0)
@@ -1814,30 +2101,124 @@ def test_nvfp4_kernel_actually_applies_situ(moe_backend):
 
     situ_cos, situ_l2 = score(situ)
     swiglu_cos, swiglu_l2 = score(swiglu)
+    # rel_l2**2 == r**2 - 2*r*cos + 1 with r the norm ratio, so printing r and
+    # cosine splits the asserted number into a pure-magnitude and a
+    # pure-direction half: r off with cosine intact is a scaling fault, the
+    # reverse is the wrong activation.
+    norm_ratio = (torch.linalg.vector_norm(actual) / torch.linalg.vector_norm(situ)).item()
     print(
-        f"NVFP4[{moe_backend}] kernel vs SiTU ref:   "
-        f"cosine={situ_cos:.6f} rel_l2={situ_l2:.6f}\n"
-        f"NVFP4[{moe_backend}] kernel vs SwiGLU ref: "
+        f"NVFP4[{moe_backend}] kernel vs SiTU ref:         "
+        f"cosine={situ_cos:.6f} rel_l2={situ_l2:.6f} |k|/|ref|={norm_ratio:.6f}\n"
+        f"NVFP4[{moe_backend}] kernel vs plain SwiGLU ref: "
         f"cosine={swiglu_cos:.6f} rel_l2={swiglu_l2:.6f}"
     )
+    # Which reference it is nearer: the diagnosis. Says what went wrong, not
+    # whether something did -- and being scale-free it accepts a SiTU output
+    # scaled by any constant, so it cannot be the only assertion.
     assert situ_cos > swiglu_cos, (
-        f"the NVFP4 {moe_backend} kernel matches a SwiGLU reference better than "
-        f"the SiTU one (situ={situ_cos:.6f}, swiglu={swiglu_cos:.6f}): the "
+        f"the NVFP4 {moe_backend} kernel matches a plain SwiGLU reference better "
+        f"than the SiTU one (situ={situ_cos:.6f}, swiglu={swiglu_cos:.6f}): the "
         f"quantized path is not applying SiTU"
     )
+    # The gate. rel_l2 rather than cosine because cosine is scale-invariant:
+    # a correct SiTU multiplied by two still scores 1.0, so an epilogue that
+    # applies a scale twice passes the ordering check above untouched.
+    assert situ_l2 < _SITU_NVFP4_REL_L2_MAX, (
+        f"the NVFP4 {moe_backend} kernel is {situ_l2:.6f} relative L2 from the "
+        f"SiTU reference, over the {_SITU_NVFP4_REL_L2_MAX} bound whose floor "
+        f"is sqrt(3)*0.0950 = 0.1645. Both references use the dequantized "
+        f"checkpoint weights, so 4-bit weight error is already cancelled. "
+        f"|k|/|ref|={norm_ratio:.6f} and cosine={situ_cos:.6f} split this: a "
+        f"norm ratio away from 1.0 with cosine intact is a scaling fault, "
+        f"which cosine alone cannot see. If both look right, the residual has "
+        f"gained a quantization stage -- sqrt(4)*0.0950 is 0.190"
+    )
 
-    if moe_backend == "CUTEDSL_FC12":
-        # The unfixed FC12 kernel runs ordinary SwiGLU, not SwiGLU with the
-        # SiTU constants misinterpreted as sigmoid scale / linear bias.
-        plain_swiglu = _swiglu_reference_moe(
-            x, router_logits, gate.routing_method, w1, w2, w3, alpha=1.0, beta=0.0
+
+@nvfp4_moe_supported
+def test_cutedsl_situ_betas_reach_the_kernel_cache_key(monkeypatch):
+    """Each soft-cap must distinguish runner identities and compiled kernels.
+
+    Fix FC1 and outer tactics so beta changes cannot be hidden by another
+    tile's cache entry. Change each cap independently, then change both.
+    References use the same dequantized checkpoint weights as the kernel.
+    """
+    _skip_if_backend_unavailable("CUTEDSL")
+    from tensorrt_llm._torch.autotuner import AutoTuner
+
+    tuner = AutoTuner.get()
+    choose_one = tuner.choose_one
+    identities = set()
+
+    def fixed_tactic(custom_op, runners, tuning_config, inputs, **kwargs):
+        if custom_op == "CuteDslFusedMoE::run_moe_nvfp4":
+            return runners[0], -1
+        if custom_op == "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell":
+            identities.add(runners[0].unique_id())
+            return runners[0], -1
+        return choose_one(custom_op, runners, tuning_config, inputs, **kwargs)
+
+    monkeypatch.setattr(tuner, "choose_one", fixed_tactic)
+    num_experts, hidden, inter = _TP_EXPERTS, _TP_HIDDEN, _TP_INTERMEDIATE
+    gate = _make_test_gate(num_experts=num_experts)
+
+    torch.manual_seed(91)
+    x = torch.randn(8, hidden, dtype=torch.bfloat16, device="cuda") * 0.5
+    w1 = [
+        torch.randn(inter, hidden, dtype=torch.bfloat16, device="cuda") * 0.05
+        for _ in range(num_experts)
+    ]
+    w3 = [
+        torch.randn(inter, hidden, dtype=torch.bfloat16, device="cuda") * 0.05
+        for _ in range(num_experts)
+    ]
+    w2 = [
+        torch.randn(hidden, inter, dtype=torch.bfloat16, device="cuda") * 0.05
+        for _ in range(num_experts)
+    ]
+    bank = [_quantize_expert_to_nvfp4(w1[e], w2[e], w3[e], 1.0) for e in range(num_experts)]
+    dq = [_dequantize_expert_bank(b) for b in bank]
+    w1q, w2q, w3q = ([d[i] for d in dq] for i in range(3))
+    router_logits = gate.compute_logits(x)
+
+    outputs = {}
+    for gate_softcap, linear_softcap in ((4.0, 25.0), (2.0, 25.0), (4.0, 10.0), (2.0, 10.0)):
+        moe = _make_nvfp4_moe(
+            gate,
+            num_experts=num_experts,
+            moe_backend="CUTEDSL",
+            gate_softcap=gate_softcap,
+            linear_softcap=linear_softcap,
         )
-        plain_cos, plain_l2 = score(plain_swiglu)
-        distance_situ = torch.linalg.vector_norm(actual - situ)
-        distance_swiglu = torch.linalg.vector_norm(actual - plain_swiglu)
-        print(f"FC12 plain SwiGLU: cosine={plain_cos:.6f}, rel_l2={plain_l2:.6f}")
-        assert situ_l2 < 0.30
-        assert distance_situ < distance_swiglu
+        _load_nvfp4_bank_for(moe, bank, "CUTEDSL")
+        actual = moe.forward(x, router_logits, all_rank_num_tokens=None).float()
+        expected = _situ_reference_moe(
+            x,
+            router_logits,
+            gate.routing_method,
+            w1q,
+            w2q,
+            w3q,
+            beta=gate_softcap,
+            linear_beta=linear_softcap,
+        )
+        rel_l2 = (
+            torch.linalg.vector_norm(actual - expected) / torch.linalg.vector_norm(expected)
+        ).item()
+        print(f"CUTEDSL SiTU betas=({gate_softcap}, {linear_softcap}): rel_l2={rel_l2:.6f}")
+        assert rel_l2 < _SITU_NVFP4_REL_L2_MAX, (
+            f"betas=({gate_softcap}, {linear_softcap}) gave rel_l2={rel_l2:.6f} against "
+            f"its own SiTU reference. If the first pair passed and this one did not, "
+            f"the kernel compiled for the first betas was reused -- check that "
+            f"unique_id() still carries situ_beta and situ_linear_beta"
+        )
+        outputs[(gate_softcap, linear_softcap)] = actual
+
+    assert len(identities) == len(outputs), "each soft-cap must participate in runner.unique_id()"
+    first = outputs[(4.0, 25.0)]
+    for betas, output in outputs.items():
+        if betas != (4.0, 25.0):
+            assert not torch.allclose(first, output), f"soft-caps {betas} reused the first output"
 
 
 def test_fp8_block_scaled_dequantization():
