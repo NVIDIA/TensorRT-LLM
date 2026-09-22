@@ -1354,10 +1354,7 @@ class NemotronHMTP(nn.Module):
         if (quant_config.quant_algo in (None, QuantAlgo.MIXED_PRECISION)
                 or quant_config.is_module_excluded_from_quantization(
                     sublayer_prefix)):
-            return QuantConfig(
-                quant_algo=None,
-                kv_cache_quant_algo=quant_config.kv_cache_quant_algo,
-            )
+            return quant_config.model_copy(update={"quant_algo": None})
         return quant_config
 
     def forward(
