@@ -85,17 +85,6 @@ def _get_layer_moe_param(config, layer_idx: int, param_name: str):
 
 def _remap_hf_quant_module_name(name: str, num_hidden_layers: int) -> str:
     """Map an HF-checkpoint module name or glob onto the TRT-LLM module tree.
-
-    ``hf_quant_config.json`` names modules the way the HF checkpoint does:
-    ``backbone.layers.N.*`` for the decoder and ``mtp.layers.S.*`` for the MTP
-    head sublayers. TRT-LLM registers the decoder under ``model.layers.N`` and
-    the MTP head under ``model.layers.{num_hidden_layers}.layers.S`` (see
-    ``NemotronHHfWeightMapper.preprocess_weights``), so both ``exclude_modules``
-    and per-layer ``quant_config_dict`` keys need the same rewrite to match.
-
-    ``mtp*`` (modelopt's whole-head exclusion) becomes the head module itself;
-    ``QuantConfig.is_module_excluded_from_quantization`` walks ancestors, so
-    listing the head excludes every module under it.
     """
     name = re.sub(r"(model\.layers\.)?backbone", "model", name)
     mtp_root = f"model.layers.{num_hidden_layers}"
@@ -935,10 +924,6 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
                 and model_config.mapping.tp_size not in [1, 2, 4, 8]):
             raise ValueError("TP has to be either 1, 2, 4 or 8")
 
-        # Rewrite HF checkpoint module names ('backbone.layers.N.*',
-        # 'mtp.layers.S.*') in exclude_modules and quant_config_dict onto the
-        # TRT-LLM module tree so apply_quant_config_exclude_modules() and
-        # apply_layerwise_quant_config() match the modules they describe.
         num_hidden_layers = model_config.pretrained_config.num_hidden_layers
         if model_config.quant_config.exclude_modules is not None:
             model_config.quant_config.exclude_modules = [
@@ -953,6 +938,9 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
         if "*.mixer.conv1d" not in model_config.quant_config.exclude_modules:
             model_config.quant_config.exclude_modules.append("*.mixer.conv1d")
 
+        # Rename quant_config_dict keys from 'backbone.layers.' to 'model.layers.' so that
+        # apply_layerwise_quant_config() can correctly match TRT-LLM module names, which use
+        # 'model.layers.' as root rather than 'backbone.layers.' from the HF checkpoint.
         if model_config.quant_config_dict is not None:
             model_config._frozen = False
             model_config.quant_config_dict = {
@@ -1253,15 +1241,12 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
             residual = None  # Start fresh after fusion
 
         if residual is None:
-            # First sublayer of a step: the pre-norm hidden states become the
-            # residual. The residual-less norm returns a single value: a bf16
-            # tensor, or a Fp4QuantizedTensor with the bf16 normed copy
+            # The residual-less norm returns either a bf16
+            # tensor or a Fp4QuantizedTensor with the bf16 normed copy
             # stashed on it when the norm feeds an NVFP4 mixer.
             residual = hidden_states
             hidden_states = self.norm(hidden_states)
             if self.norm.return_hp_output:
-                # NVFP4 MoE sublayer: the gate needs the bf16 normed value,
-                # which the residual-less path does not return separately.
                 hidden_states = (hidden_states,
                                  hidden_states.unquantized_hidden_states)
         elif self.norm.return_hp_output:
@@ -1319,9 +1304,6 @@ class NemotronHMTP(nn.Module):
             is_start_of_step = step_rel_idx == 0
             is_end_of_step = step_rel_idx == self.pattern_len - 1
 
-            # Path of this sublayer in the TRT-LLM module tree; the weight
-            # mapper and the quant-config rewrite in NemotronHForCausalLM
-            # place checkpoint ``mtp.layers.S.*`` entries under it.
             sublayer_prefix = f"model.layers.{self.layer_idx}.layers.{step_rel_idx}"
             sublayer_quant_config = self._get_mtp_sublayer_quant_config(
                 model_config, sublayer_prefix)

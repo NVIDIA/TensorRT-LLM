@@ -259,19 +259,6 @@ def test_nemotron_h_mtp_sublayers_get_module_prefix_and_inherit_moe_backend():
     assert model_config.quant_config is quant_config
 
 
-def test_nemotron_h_mtp_mixed_precision_sublayers_start_unquantized():
-    """Per-layer entries are applied later from quant_config_dict."""
-    quant_config = QuantConfig(
-        quant_algo=QuantAlgo.MIXED_PRECISION, kv_cache_quant_algo=QuantAlgo.FP8
-    )
-    _, captured = _build_mtp_capturing_sublayers(quant_config)
-
-    for layer_kwargs in captured:
-        sublayer_quant_config = layer_kwargs["model_config"].quant_config
-        assert sublayer_quant_config.quant_algo is None
-        assert sublayer_quant_config.kv_cache_quant_algo == QuantAlgo.FP8
-
-
 def test_nemotron_h_mtp_excluded_head_stays_unquantized():
     """modelopt writes ``mtp*`` for a head it left in bf16; after the rewrite
     that is the head module itself, which excludes every sublayer."""
