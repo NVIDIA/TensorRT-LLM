@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, List, Optional
@@ -44,6 +45,366 @@ _PAGED_ATTENTION_BACKENDS = ("TRTLLM", "FA4")
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DFlashDecodingConfig
     from ..pyexecutor.resource_manager import ResourceManager
+
+
+def compute_dflash_ctx_buffer_bytes(
+    max_batch_size: int,
+    max_ctx_len: int,
+    block_size: int,
+    num_attn_layers: int,
+    num_kv_heads_per_rank: int,
+    head_dim: int,
+    dtype_bytes: int = 2,
+    attention_backend: str = "VANILLA",
+    page_size: int = 32,
+    kv_factor: int = 2,
+    paged: Optional[bool] = None,
+) -> int:
+    """Per-GPU bytes ``_lazy_init_ctx_buffers`` will allocate for the DFlash
+    pooled-context K/V buffers.
+
+    Mirrors the allocation exactly: ``max_batch_size + 1`` slots (one scratch
+    slot for padding/warmup dummies), capacity ``max_ctx_len + block_size``
+    per slot, ``kv_factor`` halves for every drafter attention layer (K and V,
+    so 2; the MLA drafter keeps one latent and no V, so 1). The dense layout
+    holds ``kv_factor`` contiguous ``[slots, L, capacity, Hkv, D]`` tensors;
+    the paged layout holds one ``[L, pages, kv_factor, Hkv, page, D]`` tensor
+    whose per-slot capacity is rounded up to whole pages.
+
+    ``paged`` selects the layout. At runtime the caller passes the resolved
+    ``_ctx_paged`` flag (the backend's kernels are paged, or the drafter opts
+    into pages itself). When ``None`` -- the config-time estimate, which has
+    no drafter to ask -- it falls back to whether ``attention_backend`` is a
+    paged backend.
+    """
+    num_slots = max_batch_size + 1
+    capacity = max_ctx_len + block_size
+    if paged is None:
+        paged = attention_backend in _PAGED_ATTENTION_BACKENDS
+    if paged:
+        pages_per_slot = (capacity + page_size - 1) // page_size
+        capacity = pages_per_slot * page_size
+    per_slot_elems = kv_factor * num_attn_layers * capacity * num_kv_heads_per_rank * head_dim
+    return num_slots * per_slot_elems * dtype_bytes
+
+
+# Per-GPU bytes held by things the weight/KV accounting cannot see: the CUDA
+# context, NCCL buffers, and other non-torch allocations. Observed at ~4 GiB
+# per rank on multi-GPU serves ("Memory used after loading model weights
+# (outside torch)"); a central estimate, not a bound.
+_DFLASH_BUDGET_RUNTIME_OVERHEAD_BYTES = 4 * 1024**3
+
+# Pool-first budget (KV-cache estimation skipped): multiplicative headroom
+# for what still lands between KV-pool commit and the lazy buffer
+# allocation: autotuner/warmup transients and allocator fragmentation
+# (~1.6 GiB consumed between the arena's K and V tensor allocations in live
+# validation), the on-disk-vs-resident weight gap (~9% observed:
+# quantization scales and workspace load with the weights), and rank 0
+# running ~0.7 GiB behind its peers (it hosts the launcher/server process).
+# The reported "largest max_batch_size" must be bootable on the WORST rank,
+# so the estimate errs low. Live validation on a 4-GPU serve
+# (free_gpu_memory_fraction 0.8, max_seq_len 69632): 0.9 and 0.85 OOM'd at
+# the arena allocation itself; 0.80 and 0.75 allocated the arena but died
+# 0.1-0.2 GiB short during post-arena warmup (CUDA graph capture) -- the
+# post-arena consumers are 2-4 GiB and NOT monotone in batch size, so the
+# top of the range is razor-thin everywhere. 0.70 buys ~1.4 GiB of real
+# margin at ~94% of the empirical ceiling. The value reported is still an
+# ESTIMATE of the largest bootable batch size, not a guarantee; the refusal
+# message says so and points at free_gpu_memory_fraction as the robust
+# lever.
+_DFLASH_BUDGET_SAFETY_FACTOR = 0.70
+
+# Arena-first budget (KV-cache estimation runs, the default): additive
+# per-GPU reserve for everything that shares the pre-pool headroom with the
+# arena and is not the KV pool itself: the activation peak of the profiling
+# forward (the arena is allocated inside that forward, so both are resident
+# at once), CUDA-graph capture and autotuner workspaces, and allocator
+# fragmentation. The post-arena consumers measured 2-4 GiB and the
+# fragmentation ~1.6 GiB in the live validation above; 6 GiB covers their
+# sum. Additive rather than a fraction: on a 100+ GiB headroom a 0.7 factor
+# would discard 30+ GiB the arena can actually use, while the consumers it
+# guards against do not scale with headroom.
+_DFLASH_BUDGET_ACTIVATION_RESERVE_BYTES = 6 * 1024**3
+
+_WEIGHT_SHARD_SUFFIXES = (".safetensors", ".bin")
+
+
+def estimate_checkpoint_weight_bytes(checkpoint_dir) -> Optional[int]:
+    """Total bytes of the checkpoint's weight shards on disk, or ``None``.
+
+    Serves as a config-time estimate of the resident weight footprint (summed
+    over ranks): for the quantized checkpoints this validator sees, weights
+    load at their on-disk width, so disk bytes track resident bytes closely.
+    ``None`` when the path is not a local directory or holds no recognizable
+    shards -- callers must treat the estimate as unavailable, not zero.
+    """
+    try:
+        if not checkpoint_dir or not os.path.isdir(checkpoint_dir):
+            return None
+        # Many checkpoints ship BOTH .safetensors and .bin copies of the same
+        # weights; summing both double-counts and shrinks the budget. Prefer
+        # .safetensors when any is present and fall back to .bin only
+        # otherwise. Walk subdirectories so sharded layouts are not missed.
+        for suffix in _WEIGHT_SHARD_SUFFIXES:
+            total = 0
+            for root, _dirs, files in os.walk(checkpoint_dir):
+                for name in files:
+                    if name.endswith(suffix):
+                        path = os.path.join(root, name)
+                        if os.path.isfile(path):
+                            total += os.path.getsize(path)
+            if total:
+                return total
+        return None
+    except OSError:
+        return None
+
+
+def derive_dflash_ctx_memory_budget_bytes(
+    total_device_memory: int,
+    kv_fraction: float,
+    per_rank_weight_bytes: Optional[int] = None,
+    *,
+    arena_before_pool: bool,
+) -> int:
+    """Estimated per-GPU bytes the pooled-context arena can occupy.
+
+    Which memory the arena competes for depends on when it is allocated
+    relative to the KV-cache pool, and ``arena_before_pool`` selects that:
+
+    * ``True`` (KV-cache estimation runs; the default executor path): the
+      arena is allocated inside the estimation forward, BEFORE the pool is
+      sized, and the pool then takes ``kv_fraction`` of whatever is left.
+      The arena only has to fit ``total - runtime overhead - weights``
+      minus a reserve for the activations, CUDA graphs and fragmentation
+      that share that headroom (``_DFLASH_BUDGET_ACTIVATION_RESERVE_BYTES``).
+      ``kv_fraction`` does not bound the arena here; it bounds the pool.
+      A config whose arena fits but leaves the pool too small fails later
+      with a KV-capacity error, which is clear rather than a bare OOM.
+    * ``False`` (estimation skipped: ``TRTLLM_SKIP_KV_CACHE_ESTIMATION``,
+      target ``attn_backend == "VANILLA"``, context parallelism): the pool
+      is sized from post-load free memory without a forward and commits
+      first, so the arena finds ``(1 - kv_fraction)`` of the post-load
+      memory, scaled by ``_DFLASH_BUDGET_SAFETY_FACTOR`` for the warmup
+      transients that land in the same window.
+
+    ``per_rank_weight_bytes`` (estimated; see
+    ``estimate_checkpoint_weight_bytes``) is subtracted when available;
+    without it the bound stays optimistic but is still tightened by the
+    runtime-overhead and reserve/safety terms.
+    """
+    usable = total_device_memory - _DFLASH_BUDGET_RUNTIME_OVERHEAD_BYTES
+    if per_rank_weight_bytes is not None:
+        usable -= per_rank_weight_bytes
+    usable = max(0, usable)
+    if arena_before_pool:
+        return max(0, usable - _DFLASH_BUDGET_ACTIVATION_RESERVE_BYTES)
+    return int((1.0 - kv_fraction) * usable * _DFLASH_BUDGET_SAFETY_FACTOR)
+
+
+def validate_dflash_ctx_buffer_budget(
+    *,
+    max_batch_size: Optional[int],
+    max_num_tokens: Optional[int],
+    max_seq_len: Optional[int],
+    max_draft_len: int,
+    attention_backend: str,
+    draft_config: Optional[dict] = None,
+    tp_size: int = 1,
+    memory_budget_bytes: Optional[int] = None,
+    arena_before_pool: bool = True,
+) -> None:
+    """Config-time checks for failure modes DFlash otherwise hits late.
+
+    Two late failures become errors here, at engine init, before any memory
+    pool commits:
+
+    1. Token budget: every generation request submits ``1 + max_draft_len``
+       tokens to the target per step, so
+       ``max_batch_size * (1 + max_draft_len)`` must fit in
+       ``max_num_tokens``. A violation is not reported at runtime; it
+       corrupts memory at engine init instead.
+    2. Pooled-context K/V buffers: ``_lazy_init_ctx_buffers`` allocates them
+       lazily on the first forward. With KV-cache estimation (the default)
+       that is the estimation forward itself, before the pool is sized;
+       with estimation skipped it is warmup, after the pool has committed.
+       Either way an oversized ``max_batch_size`` dies as a bare CUDA OOM.
+       The buffer capacity is ``min(max_seq_len, max_position_embeddings)``
+       -- the same clamp ``_lazy_init_ctx_buffers`` applies at allocation
+       time, so this estimate matches what it allocates.
+
+    Args:
+        max_batch_size: Configured maximum batch size (``None`` skips both
+            checks).
+        max_num_tokens: Configured token budget per step (``None`` skips the
+            token-budget check).
+        max_seq_len: Configured maximum sequence length; the buffer capacity
+            when set (the drafter's ``max_position_embeddings`` is used only
+            as a fallback).
+        max_draft_len: Draft tokens per step (K).
+        attention_backend: DFlash pooled-context attention backend
+            (``VANILLA`` or ``TRTLLM``).
+        draft_config: The drafter checkpoint's ``config.json`` contents;
+            ``None`` or missing geometry keys skip the buffer check.
+        tp_size: Tensor-parallel size; KV heads are sharded across it.
+        memory_budget_bytes: Per-GPU byte budget the buffers must fit in
+            (``None`` skips the buffer check).
+        arena_before_pool: Which headroom ``memory_budget_bytes`` describes
+            (see ``derive_dflash_ctx_memory_budget_bytes``); only affects
+            the wording and remedy of the refusal.
+
+    Raises:
+        ValueError: On a token-budget violation or when the pooled-context
+            buffers cannot fit the budget, with the fitting value named. For
+            the TRTLLM backend, which normally binds the managed pool but can
+            fall back to the private arena, an over-budget estimate is warned
+            rather than raised.
+    """
+    if max_batch_size is None:
+        return
+
+    K = max_draft_len
+    tokens_per_req = 1 + K
+    if max_num_tokens is not None:
+        tokens_needed = max_batch_size * tokens_per_req
+        if tokens_needed > max_num_tokens:
+            raise ValueError(
+                f"DFlash: max_batch_size ({max_batch_size}) x (1 + max_draft_len "
+                f"({K})) = {tokens_needed} exceeds max_num_tokens "
+                f"({max_num_tokens}). Every generation request submits "
+                "1 + max_draft_len tokens to the target per step, and a "
+                "violated token budget fails at engine init without a clear "
+                f"error. Set max_num_tokens >= {tokens_needed}, or lower "
+                f"max_batch_size to at most {max_num_tokens // tokens_per_req}."
+            )
+
+    draft_config = draft_config or {}
+
+    trained_block_size = draft_config.get("block_size") or (
+        draft_config.get("dflash_config") or {}
+    ).get("block_size")
+    if trained_block_size is not None and K < trained_block_size - 1:
+        logger.warning(
+            f"DFlash: max_draft_len={K} is below the drafter's trained width "
+            f"({trained_block_size - 1}): the non-causal draft block runs "
+            "narrower than it was trained, which changes every draft "
+            "position's prediction and typically lowers acceptance. Set "
+            f"max_draft_len={trained_block_size - 1} to draft at the trained "
+            "width."
+        )
+
+    # The pooled-context buffer capacity is min(max_seq_len,
+    # max_position_embeddings). max_seq_len is often unset at config time (it
+    # is resolved later from the model config and not written back to the args
+    # here), and falling back to the drafter's max_position_embeddings -- often
+    # ~1M -- would size the buffers off a length the serve never reaches and
+    # refuse every batch size. Skip the buffer-fit check in that case; the
+    # token-budget check above still applies.
+    if max_seq_len is None:
+        return
+    if memory_budget_bytes is None:
+        return
+    num_layers = draft_config.get("num_hidden_layers")
+    num_kv_heads = draft_config.get("num_key_value_heads") or draft_config.get(
+        "num_attention_heads"
+    )
+    head_dim = draft_config.get("head_dim")
+    if head_dim is None:
+        hidden_size = draft_config.get("hidden_size")
+        num_heads = draft_config.get("num_attention_heads")
+        if hidden_size is not None and num_heads:
+            head_dim = hidden_size // num_heads
+    if not (num_layers and num_kv_heads and head_dim):
+        return
+
+    # Mirror _lazy_init_ctx_buffers' capacity resolution exactly: it clamps
+    # with min(runtime max_seq_len, drafter max_position_embeddings), so the
+    # config-time estimate here must take the same min or it would approve a
+    # budget the lazy allocation never uses (or vice versa). Sizing off
+    # max_position_embeddings alone made 1M-position drafters refuse batch
+    # sizes their actual serve shape fits with room to spare.
+    _ctx_candidates = [
+        c for c in (max_seq_len, draft_config.get("max_position_embeddings")) if c is not None
+    ]
+    max_ctx = min(_ctx_candidates) if _ctx_candidates else 8192
+    num_kv_heads_per_rank = (num_kv_heads + tp_size - 1) // tp_size
+    # Config-time approximations of the real allocation's inputs: the lazy
+    # allocation reads draft_model.fc.weight.dtype and _draft_block_width()
+    # (both subclass-overridable), whereas here dtype_bytes is derived from
+    # config["torch_dtype"] and the block width is hardcoded to K + 1.
+    dtype_bytes = 4 if draft_config.get("torch_dtype") in ("float32", "float") else 2
+    block_size = K + 1
+
+    required = compute_dflash_ctx_buffer_bytes(
+        max_batch_size,
+        max_ctx,
+        block_size,
+        num_layers,
+        num_kv_heads_per_rank,
+        head_dim,
+        dtype_bytes=dtype_bytes,
+        attention_backend=attention_backend,
+    )
+    if required <= memory_budget_bytes:
+        return
+    per_slot = required // (max_batch_size + 1)
+    fitting = int(memory_budget_bytes // per_slot) - 1  # one slot is scratch
+    gib = 1024**3
+    if arena_before_pool:
+        budget_desc = (
+            f"the estimated {memory_budget_bytes / gib:.2f} GiB left free "
+            "once the model weights and runtime overhead are resident, less "
+            "a reserve for activations and CUDA graphs. These buffers are "
+            "allocated inside the KV-cache estimation forward, before the "
+            "pool is sized (the pool then takes free_gpu_memory_fraction of "
+            "what remains), so an oversized max_batch_size otherwise fails "
+            "there with a bare CUDA OOM."
+        )
+        near_bound_lever = "lower max_batch_size or max_seq_len"
+    else:
+        budget_desc = (
+            f"the estimated {memory_budget_bytes / gib:.2f} GiB left free "
+            "once the model weights are resident and the KV-cache pool "
+            "commits. With KV-cache estimation skipped these buffers are "
+            "allocated lazily during warmup, after the KV cache commits its "
+            "pool, so an oversized max_batch_size otherwise fails late with "
+            "a bare CUDA OOM."
+        )
+        near_bound_lever = "lower kv_cache_config.free_gpu_memory_fraction"
+    remedy = (
+        f"the largest max_batch_size estimated to fit is {fitting} (an "
+        "estimate, not a guarantee: CUDA-graph capture and warmup workspaces "
+        "also draw on the same headroom; if a config near this bound still "
+        f"OOMs, {near_bound_lever})"
+        if fitting >= 1
+        else "no max_batch_size fits; lower max_seq_len or the drafter context"
+    )
+    message = (
+        f"DFlash: the pooled-context K/V buffers for max_batch_size="
+        f"{max_batch_size} need {required / gib:.2f} GiB per GPU, exceeding "
+        f"{budget_desc} Size formula: "
+        "2 (K and V) x (max_batch_size + 1 slots) x num_layers x "
+        "(max_ctx + block_size) x kv_heads_per_rank x head_dim x dtype_bytes "
+        f"= 2 x {max_batch_size + 1} x {num_layers} x ({max_ctx} + "
+        f"{block_size}) x {num_kv_heads_per_rank} x {head_dim} x "
+        f"{dtype_bytes}. With the current settings, {remedy}."
+    )
+    if attention_backend == "TRTLLM":
+        # TRTLLM normally binds the KV-cache manager's paged pool and reserves
+        # no private arena, so this estimate is usually a false alarm and a
+        # hard raise would refuse the common managed-pool config. But the pool
+        # is not guaranteed: when it is unavailable (no draft manager, or an
+        # incompatible pool/block-table) _lazy_init_ctx_buffers falls back to
+        # allocating exactly this private arena. Warn rather than raise so the
+        # managed-pool case is not refused while the fallback OOM is not
+        # silent; skip_ctx_buffer_budget_check suppresses the warning.
+        logger.warning(
+            f"{message} TRTLLM normally uses the managed KV-cache pool and "
+            "never allocates this arena; if warmup instead falls back to the "
+            "private arena, that allocation can exceed the budget and fail."
+        )
+        return
+    raise ValueError(message)
 
 
 def dflash_draft_slot_ids(
@@ -501,12 +862,24 @@ class DFlashWorker(SpecWorkerBase):
         neither the buffer nor the knob that controls it.
         """
         itemsize = torch.tensor([], dtype=dtype).element_size()
-        if self._ctx_paged:
-            page_size = self._ctx_page_size
-            pages_per_slot = (capacity + page_size - 1) // page_size
-            arena = L * num_slots * pages_per_slot * kv_factor * nkv * page_size * hd * itemsize
-        else:
-            arena = kv_factor * num_slots * L * capacity * nkv * hd * itemsize
+        # Reuse the allocation-sizing helper so this runtime check and the
+        # config-time estimate cannot drift. num_slots and capacity are already
+        # resolved here, so feed them directly (max_batch_size = num_slots - 1,
+        # block_size = 0, dtype_bytes = itemsize); kv_factor and the resolved
+        # paged flag carry the drafter-specific layout.
+        arena = compute_dflash_ctx_buffer_bytes(
+            num_slots - 1,
+            capacity,
+            0,
+            L,
+            nkv,
+            hd,
+            dtype_bytes=itemsize,
+            attention_backend=self._dflash_attention_backend,
+            page_size=self._ctx_page_size,
+            kv_factor=kv_factor,
+            paged=self._ctx_paged,
+        )
 
         # mem_get_info() excludes the caching allocator's reserved-but-unused
         # segments, which torch.zeros() below can serve from.
@@ -717,7 +1090,19 @@ class DFlashWorker(SpecWorkerBase):
         # which sizes the arena at hundreds of GiB.
         config = getattr(draft_model, "config", None)
         max_pos = getattr(config, "max_position_embeddings", None) if config else None
-        runtime_max = getattr(attn_metadata, "max_seq_len", None)
+        # Take the served length from the KV cache manager, which every backend
+        # carries on the metadata base class. A `max_seq_len` attribute is only
+        # declared by some metadata classes (TrtllmAttentionMetadata has one --
+        # a wrapper returning this same manager value; the base class and
+        # FlashInferAttentionMetadata do not), so reading the attribute alone
+        # lets max_position_embeddings win the min() below and sizes the arena
+        # for the advertised positions instead of the served length. The
+        # attribute stays as the fallback for no-cache attention, where it is
+        # set by hand and there is no manager to ask.
+        cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
+        runtime_max = getattr(cache_manager, "max_seq_len", None)
+        if runtime_max is None:
+            runtime_max = getattr(attn_metadata, "max_seq_len", None)
         candidates = [c for c in (runtime_max, max_pos) if c is not None]
         self._max_ctx = min(candidates) if candidates else 8192
         # py_executor_creator inflates max_seq_len by at most this much for spec
@@ -1216,9 +1601,18 @@ class DFlashWorker(SpecWorkerBase):
                 ctx_len_updates[slot] = end
                 # Precompute post-norm/post-RoPE K,V for this prefill chunk
                 # so decode iters can read without re-projecting.
-                chunk_k, chunk_v = draft_model.precompute_context_kv(
-                    chunk_proj_cast, chunk_pos[:actual]
-                )
+                #
+                # RoPE positions must be slot-local (cur..end), NOT the
+                # target-forward positions in chunk_pos: gen-time appends and
+                # draft queries number positions from _ctx_len, so the stored
+                # keys must share that numbering. Without KV-block reuse the
+                # two coincide, but on a prefix-cache hit chunk_pos starts at
+                # the reused-token count, which would offset every stored key
+                # from the numbering the queries use (RoPE attention depends
+                # only on position differences, so the uniform slot-local
+                # renumbering is exact).
+                local_pos = torch.arange(cur, end, dtype=torch.long, device="cuda")
+                chunk_k, chunk_v = draft_model.precompute_context_kv(chunk_proj_cast, local_pos)
                 # chunk_k/v: [actual, L, nkv, hd] → [L, actual, nkv, hd]
                 if self._ctx_paged:
                     # Manager block tables are keyed by batch position, the
@@ -1228,7 +1622,7 @@ class DFlashWorker(SpecWorkerBase):
                         chunk_k,
                         chunk_v,
                         torch.full((actual,), row, dtype=torch.long, device="cuda"),
-                        torch.arange(cur, end, dtype=torch.long, device="cuda"),
+                        local_pos,
                     )
                 else:  # VANILLA DFlash backend (FlashAttention)
                     self._ctx_k_buf[slot, :, cur:end] = chunk_k.permute(1, 0, 2, 3)
