@@ -158,7 +158,7 @@ foreach(DEP_IDX RANGE ${DEP_COUNT_MINUS_ONE})
       PATCH_COMMAND
       bash
       -c
-      "patch -p1 --forward --batch -r - -i '${_patch_file}' >/dev/null 2>&1; patch -p1 --reverse --batch --dry-run -i '${_patch_file}' >/dev/null 2>&1 || (echo 'Patch state for ${DEP_NAME} is inconsistent. Remove ${CMAKE_BINARY_DIR}/_deps/${DEP_NAME}-src and reconfigure.' >&2; false)"
+      "patch -p1 --forward --batch -r - -i '${_patch_file}' >/dev/null 2>&1; patch -p1 --reverse --force --dry-run -i '${_patch_file}' >/dev/null 2>&1 || (echo 'Patch state for ${DEP_NAME} is inconsistent. Remove ${CMAKE_BINARY_DIR}/_deps/${DEP_NAME}-src and reconfigure.' >&2; false)"
     )
   endif()
 
