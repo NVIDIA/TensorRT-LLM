@@ -1668,6 +1668,11 @@ def getPytestBaseCommandLine(
     // container is destroyed. Never point this at a bind-mounted / shared path:
     // the AutoTuner cache uses fcntl.lockf, which is unreliable over NFS.
     extraInternalEnv += " TLLM_AUTOTUNER_CACHE_PATH=/tmp/trtllm_autotuner_cache/autotuner_cache.json"
+    // NVBUG 6801108 repro lane (DO NOT MERGE): tests/unittest/sitecustomize.py
+    // dumps per-process stacks here. Ranks 1..3 are started with MPI_Comm_spawn,
+    // so this is the only path that reaches them.
+    extraInternalEnv += " TLLM_FORENSICS_DIR=${outputPath}/forensics"
+    extraInternalEnv += " TLLM_FORENSICS_INTERVAL=60"
     // CBTS stages put cbts_plugin on PYTHONPATH (via ${VAR:-} for set -u safety) plus the marker/config env vars sitecustomize.py reads in subprocesses.
     if (cbtsMode) {
         def cbtsScriptDir = "${llmSrc}/jenkins/scripts/cbts/coverage_utils"
@@ -3067,6 +3072,10 @@ String getTestReuseStagePattern(String stageName) {
 def MULTI_GPU_RUN_WITH_SINGLE = [
     // Add stage patterns here, e.g.:
     // "DGX_H100-2_GPUs-*",
+    // NVBUG 6801108 repro lane (DO NOT MERGE): run the B200 4-GPU MoE stages
+    // inside the single-GPU job so the hang can be reproduced without the
+    // approver-only 'ci: full pre-merge approved' label.
+    "DGX_B200-4_GPUs-PyTorch-*",
 ]
 
 @Field
