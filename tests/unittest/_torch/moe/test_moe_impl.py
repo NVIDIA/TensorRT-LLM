@@ -23,6 +23,8 @@ Tests that merely *use* an implementation, such as weight loading, staged hooks,
 or numerical parity across backends, belong in ``test_moe_backend.py``.
 """
 
+import dataclasses
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -30,8 +32,31 @@ import torch
 from _torch.moe.moe_test_utils import MoeBackendType
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.moe.fused_moe.activation import SwigluActivation
+from tensorrt_llm._torch.moe.fused_moe.activation import SimpleActivation, SwigluActivation
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
+from tensorrt_llm._torch.moe.fused_moe.cutlass import (
+    CUTLASS_LEAVES,
+    CutlassMoELoraMixin,
+    DeepgemmCudaHopperFp8BlockScalesImpl,
+    TrtllmCutlassFp8Impl,
+    TrtllmCutlassMxfp8Impl,
+    TrtllmCutlassNvfp4Impl,
+    TrtllmCutlassUnquantizedImpl,
+    TrtllmCutlassW4a8AwqImpl,
+    TrtllmCutlassW4a8Mxfp4Fp8Impl,
+    TrtllmCutlassW4a8Mxfp4Mxfp8Impl,
+    TrtllmCutlassW4a16Mxfp4Impl,
+    TrtllmCutlassW4a16Nvfp4Impl,
+    TrtllmCutlassW8a16Impl,
+    TrtllmTritonFp8BlockScalesImpl,
+    cutlass_leaf,
+)
+from tensorrt_llm._torch.moe.fused_moe.cutlass.base import FusedMoeOpFlags
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
+    CuteDslB12xNvfp4FusedMoE,
+    CuteDslB12xW4a16Nvfp4FusedMoE,
+)
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import (
     TrtllmCutedslFusedFc12Nvfp4Impl,
 )
@@ -50,7 +75,9 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
     MoEEnvironment,
     MoEProblem,
+    MoERejection,
     MoERejectReason,
+    MoEResolutionReport,
     canonical_quant,
     canonical_routing,
 )
@@ -74,7 +101,12 @@ from tensorrt_llm._torch.moe.fused_moe.mega_moe import (
     MegaMoEDeepGemm,
     TrtllmCutedslMegaMoeNvfp4Impl,
 )
-from tensorrt_llm._torch.moe.fused_moe.moe_resolution import impl_class_for, resolve_moe_impl
+from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
+    BACKEND_FAMILY,
+    IMPL_PRIORITY,
+    impl_class_for,
+    resolve_moe_impl,
+)
 from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV4MoeRoutingMethod, RoutingMethodType
 from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
     FlashinferTrtllmGenBf16Impl,
@@ -84,6 +116,7 @@ from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
     trtllm_gen_leaves_in_resolution_order,
 )
 from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.eligibility import check_flashinfer_provider
+from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 # Everything here is a declaration; the one test that reaches a constructor
@@ -91,17 +124,19 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 # CPU stage collects only files that carry it.
 pytestmark = pytest.mark.cpu_only
 
-# The four ``MoEImplBase`` methods a registered class has to define itself. A
-# leaf defines all four, an abstract parent defines none.
+# The four abstract ``MoEImplBase`` methods; a single-format class defines all
+# four itself.
 _ABSTRACT_METHODS = ("can_implement", "_get_quant_method", "quantize_input", "run_moe")
 
 # =====================================================================
 # Canonical implementation identity
 # =====================================================================
-# The DeepGEMM FP8-block-scales identity, and the four ways a pinned request
-# is refused rather than served by something else: every gate declines, an
+# The DeepGEMM FP8-block-scales identity, the four ways a pinned request is
+# refused rather than served by something else (every gate declines, an
 # unknown token, an id that matches nothing registered, or one that constrains
-# nothing and so would match everything.
+# nothing and so would match everything), and the one property every family
+# shares: a class its backend literal reaches is pinned by the identity it
+# publishes.
 
 _DEEPGEMM_IMPL_ID = "deepgemm.cuda.grouped_gemm.fp8_block_scales"
 
@@ -141,31 +176,6 @@ def test_pinned_deepgemm_rejects_post_silu_clamping():
     assert "post-SiLU clamping" in report.rejected[-1].detail
 
 
-@pytest.mark.parametrize("sm, eligible", [(90, True), (120, False)])
-def test_cutlass_post_silu_clamp_rejects_triton_fallback(sm, eligible):
-    problem = MoEProblem(
-        quant=canonical_quant(QuantAlgo.FP8_BLOCK_SCALES),
-        dtype_act=torch.bfloat16,
-        activation_constants=frozenset({"clamp"}),
-        clamp_after_silu=True,
-    )
-    deployment = MoEDeployment(
-        ep_size=1,
-        tp_size=1,
-        use_dp=False,
-        num_slots=8,
-        env=MoEEnvironment(sm=sm),
-        parallel_size=1,
-    )
-
-    verdict = CutlassFusedMoE.can_implement(problem, deployment)
-
-    assert verdict.eligible is eligible
-    if not eligible:
-        assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
-        assert "Triton fallback" in verdict.detail
-
-
 def test_pinned_identity_fails_hard_where_the_backend_literal_degrades():
     """The two request tracks are meant to differ exactly here."""
     config = _deepgemm_model_config(QuantAlgo.NVFP4)
@@ -173,7 +183,7 @@ def test_pinned_identity_fails_hard_where_the_backend_literal_degrades():
         by_literal = resolve_moe_impl(config)
         by_identity = resolve_moe_impl(config, impl_id=_DEEPGEMM_IMPL_ID)
 
-    assert impl_class_for(by_literal) is CutlassFusedMoE
+    assert impl_class_for(by_literal) is TrtllmCutlassNvfp4Impl
     assert by_literal.degraded
 
     assert by_identity.winner is None
@@ -194,13 +204,15 @@ def test_unknown_identity_token_raises_before_any_candidate_is_asked():
 def test_identity_matching_nothing_registered_raises():
     """Built as a query rather than parsed, to get past the token vocabulary.
 
-    ``fp8`` because plain per-tensor FP8 has no registered MoE implementation,
+    ``w8a8_sq_per_channel`` because SmoothQuant has no MoE implementation,
     which is what makes the query match nothing while staying well-formed
-    (``nvfp4`` is registered by TrtllmCutedslFusedFc12Nvfp4Impl).
+    (``fp8`` and ``nvfp4`` are both registered, by CUTLASS leaves among others).
     """
     with override_moe_environment(_deepgemm_environment()):
         with pytest.raises(ValueError, match="matches no registered implementation"):
-            resolve_moe_impl(_deepgemm_model_config(), impl_id=MoEImplQuery(quant="fp8"))
+            resolve_moe_impl(
+                _deepgemm_model_config(), impl_id=MoEImplQuery(quant="w8a8_sq_per_channel")
+            )
 
 
 @pytest.mark.parametrize("spec", ["*", "*.*.*.*", MoEImplQuery()], ids=["star", "wide", "query"])
@@ -217,11 +229,22 @@ def test_identity_constraining_no_field_is_rejected(spec):
             resolve_moe_impl(_deepgemm_model_config(), impl_id=spec)
 
 
+def test_family_members_are_reachable_by_the_identity_they_publish():
+    """A literal reaches its family without the registry, so nothing else
+    notices a class a pinned ``impl_id`` cannot reach, or one that publishes
+    the identity it inherited from its parent."""
+    for family in BACKEND_FAMILY.values():
+        for impl in family:
+            descriptor = getattr(impl, "descriptor", None)
+            if descriptor is not None:
+                assert MOE_IMPL_REGISTRY.lookup(descriptor.identity) is impl, impl.__name__
+
+
 # =====================================================================
 # MegaMoE DeepGEMM implementation identity
 # =====================================================================
-# The MegaMoE identity, where ``deepgemm`` as a bare provider token matches two
-# leaves, so the disambiguation is exercised rather than assumed.
+# The MegaMoE identity, where ``deepgemm`` as a bare provider token matches
+# several leaves, so the disambiguation is exercised rather than assumed.
 #
 # Problem and deployment are passed explicitly instead of being derived from a
 # ModelConfig: MegaMoE gates on SM, dtype, both TMA alignments, topology, and
@@ -283,11 +306,13 @@ def test_pinned_kernel_token_reaches_the_megamoe_deepgemm_leaf():
 
 
 def test_bare_deepgemm_provider_is_disambiguated_by_the_quant_gates():
-    """One provider token, two leaves, and the gates are what choose.
+    """One provider token, several leaves, and the gates are what choose.
 
     The mega leaf precedes the grouped-GEMM leaf in ``IMPL_PRIORITY``, so
     priority order alone would send both requests below to the mega one. Their
-    ``quant`` segments are disjoint, which is why each lands on its own.
+    ``quant`` segments are disjoint, which is why each lands on its own; the
+    SM90 ``deepgemm.cuda.hopper_grouped_gemm`` leaf shares the grouped-GEMM
+    leaf's quant and declines here on its SM gate.
     """
     deployment = _megamoe_deployment()
     mega = resolve_moe_impl(
@@ -474,11 +499,11 @@ def test_registering_megamoe_cutedsl_leaves_the_backend_literal_path_unchanged()
 # =====================================================================
 # TRTLLM-Gen implementation identity
 # =====================================================================
-# The one backend that does need the abstract parent the DeepGEMM section
-# below does without: eleven identities share one ``__init__``, one
-# ``create_weights`` and one input-preparation path. These tests pin the
-# split -- each leaf declares its own descriptor and all four abstract
-# methods, the parent declares neither, so no request can reach it.
+# Eleven identities over one abstract parent that holds the shared
+# ``__init__``, ``create_weights`` and input preparation. Most formats have a
+# native and a FlashInfer leaf that differ only in provider, so these tests
+# cover which provider a request lands on, and which leaves decline a routing,
+# bias, activation constant or epilogue their cubins do not run.
 
 # The full grid, written out rather than generated, so a leaf that silently
 # stops registering fails here instead of shrinking a computed expectation.
@@ -589,35 +614,6 @@ def test_trtllm_gen_leaf_admits_only_its_own_format(impl_id):
     )
     assert not verdict.eligible
     assert verdict.reject_reason is MoERejectReason.QUANT_UNSUPPORTED
-
-
-def test_a_leaf_refuses_a_layer_whose_format_moved_after_it_was_picked():
-    """Pinned because it is a behaviour change, not because it is desirable.
-
-    Resolution keys on the model-level ``quant_algo``, and
-    ``apply_layerwise_quant_config`` / ``apply_quant_config_exclude_modules``
-    give a layer its own ``quant_config`` afterwards. A leaf *is* its format,
-    so a checkpoint that used to re-derive its quant method and carry on now
-    stops at load, and the message has to carry the diagnosis because the pass
-    that moved the layer has already returned.
-
-    ``__new__`` without ``__init__``: the check reads three attributes and no
-    allocated state, and a real constructor would need a GPU.
-    """
-    moved = TrtllmTrtllmGenNvfp4Impl.__new__(TrtllmTrtllmGenNvfp4Impl)
-    moved.layer_idx = 3
-    moved.quant_config = QuantConfig(quant_algo=None)
-
-    with pytest.raises(ValueError) as excinfo:
-        moved._check_quant_config_is_my_format()
-    message = str(excinfo.value)
-    assert "layer 3" in message
-    assert "module exclusion" in message
-
-    kept = TrtllmTrtllmGenNvfp4Impl.__new__(TrtllmTrtllmGenNvfp4Impl)
-    kept.layer_idx = 3
-    kept.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
-    kept._check_quant_config_is_my_format()
 
 
 def test_trtllm_gen_parent_is_abstract_and_unaddressable():
@@ -1116,7 +1112,7 @@ def test_marlin_literal_picks_the_leaf_that_publishes_the_format(quant_algo, exp
     with override_moe_environment(_marlin_environment()):
         report = resolve_moe_impl(_marlin_model_config(quant_algo))
     assert impl_class_for(report) is expected
-    assert not report.degraded
+    assert report.selected_by == "pinned"
 
 
 @pytest.mark.parametrize(
@@ -1131,6 +1127,441 @@ def test_pinned_marlin_identity_resolves_to_its_leaf(quant_algo, impl_id):
         report = resolve_moe_impl(_marlin_model_config(quant_algo), impl_id=impl_id)
     assert impl_class_for(report).descriptor.identity.canonical() == impl_id
     assert report.selected_by == "pinned"
+
+
+# =====================================================================
+# CUTLASS: one leaf per format
+# =====================================================================
+# The family literal picks a leaf by format and, for ``fp8_block_scales``, by
+# SM; the leaf is then fixed for the layer's lifetime.
+
+
+def _cutlass_model_config(quant_algo=QuantAlgo.NVFP4):
+    cfg = ModelConfig()
+    cfg.moe_backend = "CUTLASS"
+    cfg.quant_config = QuantConfig(quant_algo=quant_algo) if quant_algo else None
+    return cfg
+
+
+_HP = frozenset({torch.float16, torch.bfloat16})
+_HP_FP32 = _HP | {torch.float32}
+_FROM_AMPERE = frozenset(range(80, 125))
+
+# Every CUTLASS leaf's declarations, written out by hand rather than read off
+# the leaves, so one that drifts fails here: the SMs it admits (probed over
+# SM75-124), its activation dtypes, whether its loader takes a gpt-oss / 1-D
+# expert bias, what needs the open-source CUTLASS build, the kernel flags it
+# hands the op, and whether it fuses LoRA.
+_CUTLASS_DECLARATIONS = (
+    pytest.param(
+        TrtllmCutlassUnquantizedImpl,
+        _FROM_AMPERE,
+        _HP,
+        (True, False),
+        (False, False),
+        FusedMoeOpFlags(),
+        True,
+        id="none",
+    ),
+    pytest.param(
+        TrtllmCutlassFp8Impl,
+        frozenset(range(89, 125)),
+        _HP_FP32,
+        (False, False),
+        (False, False),
+        FusedMoeOpFlags(),
+        True,
+        id="fp8",
+    ),
+    pytest.param(
+        DeepgemmCudaHopperFp8BlockScalesImpl,
+        {90},
+        {torch.bfloat16},
+        (False, False),
+        (False, False),
+        FusedMoeOpFlags(use_deepseek_fp8_block_scale=True),
+        False,
+        id="fp8_block_scales-sm90",
+    ),
+    pytest.param(
+        TrtllmTritonFp8BlockScalesImpl,
+        {120},
+        {torch.bfloat16},
+        (False, False),
+        (False, False),
+        FusedMoeOpFlags(),
+        False,
+        id="fp8_block_scales-sm120",
+    ),
+    pytest.param(
+        TrtllmCutlassNvfp4Impl,
+        {100, 103, 107, 120, 121},
+        _HP | {torch.float8_e4m3fn},
+        (True, True),
+        (False, True),
+        FusedMoeOpFlags(),
+        False,
+        id="nvfp4",
+    ),
+    pytest.param(
+        TrtllmCutlassW4a16Nvfp4Impl,
+        _FROM_AMPERE,
+        _HP,
+        (False, False),
+        (False, False),
+        FusedMoeOpFlags(),
+        False,
+        id="w4a16_nvfp4",
+    ),
+    pytest.param(
+        TrtllmCutlassW4a8AwqImpl,
+        {89, 90},
+        _HP,
+        (False, False),
+        (True, False),
+        FusedMoeOpFlags(weight_dtype=torch.quint4x2, use_w4_group_scaling=True),
+        False,
+        id="w4a8_awq",
+    ),
+    pytest.param(
+        TrtllmCutlassW8a16Impl,
+        _FROM_AMPERE,
+        _HP,
+        (False, False),
+        (False, False),
+        FusedMoeOpFlags(use_int8_woq_per_channel=True),
+        False,
+        id="w8a16",
+    ),
+    pytest.param(
+        TrtllmCutlassW4a16Mxfp4Impl,
+        {90},
+        _HP,
+        (True, False),
+        (True, False),
+        FusedMoeOpFlags(weight_dtype=torch.uint8, use_w4_group_scaling=True),
+        False,
+        id="w4a16_mxfp4",
+    ),
+    pytest.param(
+        TrtllmCutlassW4a8Mxfp4Fp8Impl,
+        {100, 103, 107},
+        _HP_FP32,
+        (True, False),
+        (False, False),
+        FusedMoeOpFlags(),
+        False,
+        id="w4a8_mxfp4_fp8",
+    ),
+    pytest.param(
+        TrtllmCutlassW4a8Mxfp4Mxfp8Impl,
+        {100, 103, 107, 120, 121},
+        _HP,
+        (True, False),
+        (True, False),
+        FusedMoeOpFlags(use_mxfp8_act_scaling=True),
+        False,
+        id="w4a8_mxfp4_mxfp8",
+    ),
+    pytest.param(
+        TrtllmCutlassMxfp8Impl,
+        {100, 103, 107},
+        _HP,
+        (True, False),
+        (True, False),
+        FusedMoeOpFlags(use_mxfp8_act_scaling=True, use_mxfp8_weight_scaling=True),
+        False,
+        id="mxfp8",
+    ),
+)
+
+
+def test_cutlass_declarations_cover_every_leaf():
+    assert {case.values[0] for case in _CUTLASS_DECLARATIONS} == set(CUTLASS_LEAVES)
+
+
+@pytest.mark.parametrize(
+    "leaf, sms, dtypes, gptoss, oss_build, flags, fuses_lora", _CUTLASS_DECLARATIONS
+)
+def test_cutlass_leaf_declarations(leaf, sms, dtypes, gptoss, oss_build, flags, fuses_lora):
+    assert {sm for sm in range(75, 125) if leaf.sm_support.accepts(sm)} == set(sms)
+    assert leaf.supported_dtypes == frozenset(dtypes)
+    assert (leaf.supports_gptoss_style, leaf.rejects_gptoss_expert_bias) == gptoss
+    assert (leaf.requires_oss_cutlass_build, leaf.uses_dynamic_fc2_scale) == oss_build
+    assert leaf.FUSED_MOE_OP_FLAGS == flags
+    # The scheduler hands lora_params only to a leaf declaring LoRA support,
+    # and only the mixin consumes them.
+    assert leaf.capabilities.supports_moe_lora is fuses_lora
+    assert issubclass(leaf, CutlassMoELoraMixin) is fuses_lora
+
+    # Taken off the leaf's own descriptor, which the registry returns it for.
+    assert "descriptor" in vars(leaf)
+    assert MOE_IMPL_REGISTRY.lookup(leaf.descriptor.identity) is leaf
+    assert leaf.scheduler_kind is leaf.descriptor.scheduler_kind
+    assert leaf.capabilities is leaf.descriptor.capabilities
+    assert leaf.input_requirement is leaf.descriptor.input_requirement
+    # Concrete, and under the family name create_moe_backend dispatches on.
+    assert not leaf.__abstractmethods__
+    assert issubclass(leaf, CutlassFusedMoE)
+
+
+@pytest.mark.parametrize(
+    "sm, impl_id",
+    [
+        pytest.param(90, "deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales", id="sm90"),
+        pytest.param(120, "trtllm.triton.grouped_gemm.fp8_block_scales", id="sm120"),
+    ],
+)
+def test_cutlass_literal_picks_the_fp8_block_scales_leaf_by_sm(sm, impl_id):
+    """``fp8_block_scales`` is published twice in the family, once per SM."""
+    with override_moe_environment(MoEEnvironment(sm=sm)):
+        report = resolve_moe_impl(
+            _cutlass_model_config(QuantAlgo.FP8_BLOCK_SCALES), dtype=torch.bfloat16
+        )
+    assert impl_class_for(report).descriptor.identity.canonical() == impl_id
+    assert not report.degraded
+
+
+def test_cutlass_leaf_names_the_registered_formats_when_none_serves():
+    assert cutlass_leaf(QuantAlgo.NVFP4) is TrtllmCutlassNvfp4Impl
+    assert cutlass_leaf(QuantAlgo.FP8_BLOCK_SCALES, sm=120) is TrtllmTritonFp8BlockScalesImpl
+    with pytest.raises(
+        ValueError, match="on SM100; registered: .*trtllm.cutlass.grouped_gemm.nvfp4"
+    ):
+        cutlass_leaf(QuantAlgo.FP8_BLOCK_SCALES, sm=100)
+    # Without an explicit sm, the message names the SM the lookup resolved.
+    with override_moe_environment(MoEEnvironment(sm=100)):
+        with pytest.raises(ValueError, match="quant=fp8_block_scales on SM100; registered: "):
+            cutlass_leaf(QuantAlgo.FP8_BLOCK_SCALES)
+    # A format no leaf publishes is not blamed on the SM.
+    with pytest.raises(ValueError, match="quant=w4a8_nvfp4_fp8; registered: "):
+        cutlass_leaf(QuantAlgo.W4A8_NVFP4_FP8, sm=100)
+
+
+def test_degradation_names_the_requested_backends_rejection():
+    """The fallback leaves are asked too, after the requested family; their
+    rejections must not stand in for why the request could not be served."""
+    with override_moe_environment(_deepgemm_environment(sm=90)):
+        report = resolve_moe_impl(_deepgemm_model_config(), dtype=torch.bfloat16)
+
+    assert impl_class_for(report) is DeepgemmCudaHopperFp8BlockScalesImpl
+    assert report.degraded
+    assert report.degraded_from.legacy_backend == DeepgemmCudaFp8BlockScalesImpl.__name__
+    assert report.degraded_from.reason is not MoERejectReason.QUANT_UNSUPPORTED
+
+
+def test_degradation_names_the_first_requested_rejection_not_about_format_or_sm():
+    """In a multi-leaf family most members decline on format or SM alone; the
+    reason worth reporting comes from the highest-priority one that declined
+    for something else."""
+    report = MoEResolutionReport(
+        problem=MagicMock(),
+        deployment=MagicMock(),
+        winner="Fallback",
+        selected_by="heuristic",
+        rejected=(
+            MoERejection("OtherFormat", MoERejectReason.QUANT_UNSUPPORTED),
+            MoERejection("OtherSm", MoERejectReason.SM_UNSUPPORTED),
+            MoERejection("ServesFormat", MoERejectReason.TOPOLOGY_UNSUPPORTED),
+            MoERejection("FallbackLeaf", MoERejectReason.SM_UNSUPPORTED),
+        ),
+        requested_impls=frozenset({"OtherFormat", "OtherSm", "ServesFormat"}),
+    )
+    assert report.degraded_from.legacy_backend == "ServesFormat"
+
+    sm_and_format = dataclasses.replace(report, rejected=report.rejected[:2])
+    assert sm_and_format.degraded_from.legacy_backend == "OtherSm"
+
+    only_format = dataclasses.replace(report, rejected=report.rejected[:1])
+    assert only_format.degraded_from.legacy_backend == "OtherFormat"
+
+
+def test_cutedsl_degradation_is_not_blamed_on_the_sm120_leaf():
+    """The b12x leaves lead the CUTEDSL family and have SM120/121 kernels only.
+
+    On SM100 the NVFP4 one passes its format gate and declines on SM, ahead of
+    the CuteDslFusedMoE rejection that is the actual reason this layer fell back.
+    """
+    cfg = ModelConfig()
+    cfg.moe_backend = MoeBackendType.CUTEDSL.value
+    problem = MoEProblem(
+        quant=canonical_quant(QuantAlgo.NVFP4),
+        # CuteDslFusedMoE's output is hard-wired to bfloat16; Cutlass takes fp16.
+        dtype_act=torch.float16,
+        hidden_size=1024,
+        intermediate_size=1024,
+        num_experts=8,
+        top_k=2,
+        swiglu_gptoss_style=False,
+    )
+    deployment = MoEDeployment(
+        ep_size=1,
+        tp_size=1,
+        parallel_size=1,
+        use_dp=False,
+        num_slots=8,
+        env=MoEEnvironment(sm=100),
+    )
+
+    report = resolve_moe_impl(cfg, problem=problem, deployment=deployment)
+
+    assert impl_class_for(report) is TrtllmCutlassNvfp4Impl
+    assert report.degraded
+    assert (report.rejected[0].legacy_backend, report.rejected[0].reason) == (
+        CuteDslB12xNvfp4FusedMoE.__name__,
+        MoERejectReason.SM_UNSUPPORTED,
+    )
+    assert (report.degraded_from.legacy_backend, report.degraded_from.reason) == (
+        CuteDslFusedMoE.__name__,
+        MoERejectReason.DTYPE_UNSUPPORTED,
+    )
+
+
+# =====================================================================
+# A layer's format is fixed when it is built
+# =====================================================================
+
+
+@pytest.mark.parametrize(
+    "leaf, own_formats, moved_format",
+    [
+        pytest.param(
+            TrtllmTrtllmGenNvfp4Impl,
+            (QuantAlgo.NVFP4, QuantAlgo.NVFP4_AWQ),
+            None,
+            id="trtllm_gen",
+        ),
+        pytest.param(
+            TrtllmCutlassNvfp4Impl, (QuantAlgo.NVFP4, QuantAlgo.NVFP4_AWQ), None, id="cutlass"
+        ),
+        pytest.param(
+            CuteDslB12xNvfp4FusedMoE,
+            (QuantAlgo.NVFP4, QuantAlgo.NVFP4_AWQ),
+            None,
+            id="b12x_nvfp4",
+        ),
+        pytest.param(
+            CuteDslB12xW4a16Nvfp4FusedMoE,
+            (QuantAlgo.W4A16_NVFP4,),
+            QuantAlgo.NVFP4,
+            id="b12x_w4a16_nvfp4",
+        ),
+    ],
+)
+def test_a_leaf_refuses_a_layer_whose_format_moved_after_it_was_picked(
+    leaf, own_formats, moved_format
+):
+    """``create_weights`` refuses a final ``quant_config`` of another format.
+
+    The ``__post_init__`` passes that moved the layer have returned by then, so
+    the message carries the diagnosis. ``__new__`` without ``__init__``: the
+    check reads three attributes and no allocated state, and a real
+    constructor would need a GPU.
+    """
+    moved = leaf.__new__(leaf)
+    moved._weights_created = False
+    moved.layer_idx = 3
+    moved.quant_config = QuantConfig(quant_algo=moved_format)
+    with pytest.raises(ValueError) as excinfo:
+        moved.create_weights()
+    assert "layer 3" in str(excinfo.value)
+    assert "override_quant_config" in str(excinfo.value)
+
+    for quant_algo in own_formats:
+        kept = leaf.__new__(leaf)
+        kept.layer_idx = 3
+        kept.quant_config = QuantConfig(quant_algo=quant_algo)
+        kept._check_quant_config_is_my_format()
+
+
+def test_moe_experts_quant_config_reads_the_layer_entry_then_the_exclusion():
+    """What a model passes to ``create_moe`` as ``override_quant_config``."""
+    from tensorrt_llm._torch.models.modeling_utils import moe_experts_quant_config
+
+    w4a8 = QuantConfig(quant_algo=QuantAlgo.W4A8_AWQ)
+    nvfp4 = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    cfg = SimpleNamespace(
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.MIXED_PRECISION,
+            kv_cache_quant_algo=QuantAlgo.FP8,
+            exclude_modules=["model.layers.2.mlp.experts"],
+        ),
+        quant_config_dict={
+            "model.layers.0.mlp.experts.0.gate_proj": w4a8,
+            "model.layers.2.mlp.experts.0.gate_proj": w4a8,
+            "model.language_model.layers.3.mlp.experts.0.gate_proj": nvfp4,
+        },
+    )
+
+    assert moe_experts_quant_config(cfg, "model.layers.0.mlp.experts") is w4a8
+    assert moe_experts_quant_config(cfg, "model.layers.1.mlp.experts") is None
+    # A text model built inside a multimodal one keys its weights under the
+    # outer namespace; __post_init__ still finds that entry, so this must too.
+    assert moe_experts_quant_config(cfg, "model.layers.3.mlp.experts") is nvfp4
+    excluded = moe_experts_quant_config(cfg, "model.layers.2.mlp.experts")
+    assert excluded.quant_algo is None
+    assert excluded.kv_cache_quant_algo == QuantAlgo.FP8
+
+
+_HOPPER_FP8_BLOCK_SCALES_ID = "deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales"
+_TRITON_FP8_BLOCK_SCALES_ID = "trtllm.triton.grouped_gemm.fp8_block_scales"
+
+
+@pytest.mark.parametrize(
+    "sm, impl_id, activation, rejection",
+    [
+        pytest.param(
+            90,
+            _HOPPER_FP8_BLOCK_SCALES_ID,
+            SwigluActivation(clamp=5.0, clamp_after_silu=True),
+            None,
+            id="hopper-post-silu-clamp",
+        ),
+        pytest.param(
+            120, _TRITON_FP8_BLOCK_SCALES_ID, SwigluActivation(), None, id="triton-plain-swiglu"
+        ),
+        pytest.param(
+            120,
+            _TRITON_FP8_BLOCK_SCALES_ID,
+            SwigluActivation(clamp=5.0),
+            "take no activation clamp",
+            id="triton-clamp",
+        ),
+        pytest.param(
+            120,
+            _TRITON_FP8_BLOCK_SCALES_ID,
+            SwigluActivation(clamp=5.0, clamp_after_silu=True),
+            "post-SiLU clamping",
+            id="triton-post-silu-clamp",
+        ),
+        pytest.param(
+            120,
+            _TRITON_FP8_BLOCK_SCALES_ID,
+            SimpleActivation(ActivationType.Relu2),
+            "does not execute Relu2",
+            id="triton-relu2",
+        ),
+    ],
+)
+def test_fp8_block_scales_leaves_admit_only_what_their_kernel_runs(
+    sm, impl_id, activation, rejection
+):
+    """The SM90 leaf issues the CUTLASS op, which takes every activation constant;
+    the SM120 Triton kernel takes none and runs only gated SiLU / GELU."""
+    with override_moe_environment(MoEEnvironment(sm=sm)):
+        report = resolve_moe_impl(
+            _cutlass_model_config(QuantAlgo.FP8_BLOCK_SCALES),
+            activation=activation,
+            impl_id=impl_id,
+            dtype=torch.bfloat16,
+        )
+
+    if rejection is None:
+        assert impl_class_for(report).descriptor.identity.canonical() == impl_id
+    else:
+        assert report.winner is None
+        assert report.rejected[-1].reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+        assert rejection in report.rejected[-1].detail
 
 
 # =====================================================================
@@ -1178,7 +1609,8 @@ _SINGLE_FORMAT_IMPLS = (
     ),
 )
 
-_IMPLS_ONLY = tuple(pytest.param(case.values[1], id=case.id) for case in _SINGLE_FORMAT_IMPLS)
+# Every class resolution can return is one create_moe_backend has to build.
+_DISPATCHED_IMPLS = tuple(pytest.param(impl, id=impl.__name__) for impl in IMPL_PRIORITY)
 
 
 @pytest.mark.parametrize("legacy, impl, impl_id, scheduler_kind", _SINGLE_FORMAT_IMPLS)
@@ -1226,7 +1658,7 @@ def test_both_entrances_reach_the_same_class_under_one_name():
     assert by_literal.winner == by_pin.winner == "DeepgemmCudaFp8BlockScalesImpl"
 
 
-@pytest.mark.parametrize("impl", _IMPLS_ONLY)
+@pytest.mark.parametrize("impl", _DISPATCHED_IMPLS)
 def test_create_moe_backend_dispatches_the_impl(monkeypatch, impl):
     """Resolution stops at the class; this is where that class gets built.
 
@@ -1322,29 +1754,74 @@ def test_an_identity_reusing_a_token_across_its_own_fields_is_rejected():
         registry.register(_SelfCollidingImpl)
 
 
+def _only_format_mismatches(report: MoEResolutionReport, served_by: type) -> bool:
+    """True when every leaf but ``served_by`` declined only on format."""
+    return all(
+        r.reason is MoERejectReason.QUANT_UNSUPPORTED
+        for r in report.rejected
+        if r.legacy_backend != served_by.__name__
+    )
+
+
+def _rejection_of(report: MoEResolutionReport, impl: type) -> MoERejection:
+    return next(r for r in report.rejected if r.legacy_backend == impl.__name__)
+
+
 @pytest.mark.parametrize("is_oss", [False, True], ids=["internal", "oss"])
 @pytest.mark.parametrize(
-    "activation,quant_algo,sm,reason",
+    "activation,quant_algo,sm,leaf,reason",
     [
-        pytest.param("SiTu", None, 90, MoERejectReason.ACTIVATION_UNSUPPORTED, id="situ"),
-        pytest.param("Relu2", None, 90, MoERejectReason.ACTIVATION_UNSUPPORTED, id="relu2"),
         pytest.param(
-            "Swiglu", QuantAlgo.W4A16_MXFP4, 90, MoERejectReason.QUANT_UNSUPPORTED, id="w4a16_mxfp4"
+            "SiTu",
+            None,
+            90,
+            TrtllmCutlassUnquantizedImpl,
+            MoERejectReason.ACTIVATION_UNSUPPORTED,
+            id="situ",
         ),
         pytest.param(
-            "Swiglu", QuantAlgo.W4A8_AWQ, 90, MoERejectReason.QUANT_UNSUPPORTED, id="w4a8_awq"
+            "Relu2",
+            None,
+            90,
+            TrtllmCutlassUnquantizedImpl,
+            MoERejectReason.ACTIVATION_UNSUPPORTED,
+            id="relu2",
         ),
-        pytest.param("Swiglu", QuantAlgo.MXFP8, 100, MoERejectReason.QUANT_UNSUPPORTED, id="mxfp8"),
+        pytest.param(
+            "Swiglu",
+            QuantAlgo.W4A16_MXFP4,
+            90,
+            TrtllmCutlassW4a16Mxfp4Impl,
+            MoERejectReason.QUANT_UNSUPPORTED,
+            id="w4a16_mxfp4",
+        ),
+        pytest.param(
+            "Swiglu",
+            QuantAlgo.W4A8_AWQ,
+            90,
+            TrtllmCutlassW4a8AwqImpl,
+            MoERejectReason.QUANT_UNSUPPORTED,
+            id="w4a8_awq",
+        ),
+        pytest.param(
+            "Swiglu",
+            QuantAlgo.MXFP8,
+            100,
+            TrtllmCutlassMxfp8Impl,
+            MoERejectReason.QUANT_UNSUPPORTED,
+            id="mxfp8",
+        ),
         pytest.param(
             "Swiglu",
             QuantAlgo.W4A8_MXFP4_MXFP8,
             100,
+            TrtllmCutlassW4a8Mxfp4Mxfp8Impl,
             MoERejectReason.QUANT_UNSUPPORTED,
             id="w4a8_mxfp4_mxfp8",
         ),
     ],
 )
-def test_cutlass_build_mode_resolution(is_oss, activation, quant_algo, sm, reason):
+def test_cutlass_build_mode_resolution(is_oss, activation, quant_algo, sm, leaf, reason):
     report = resolve_moe_impl(
         ModelConfig(moe_backend="CUTLASS"),
         problem=MoEProblem(
@@ -1365,13 +1842,14 @@ def test_cutlass_build_mode_resolution(is_oss, activation, quant_algo, sm, reaso
             env=MoEEnvironment(sm=sm, oss_cutlass_moe=is_oss),
         ),
     )
+    assert _only_format_mismatches(report, served_by=leaf)
     if is_oss:
-        assert impl_class_for(report) is CutlassFusedMoE
-        assert not report.rejected
+        assert impl_class_for(report) is leaf
     else:
         assert report.winner is None
-        assert len(report.rejected) == 1
-        assert report.rejected[0].reason is reason
+        rejection = _rejection_of(report, leaf)
+        assert rejection.reason is reason
+        assert "USING_OSS_CUTLASS_MOE_GEMM=ON" in rejection.detail
         with pytest.raises(ValueError, match="USING_OSS_CUTLASS_MOE_GEMM=ON"):
             impl_class_for(report)
 
@@ -1399,11 +1877,14 @@ def test_cutlass_dynamic_scale_resolution(is_oss: bool, dynamic: bool) -> None:
         ),
         deployment=deployment,
     )
+    assert _only_format_mismatches(report, served_by=TrtllmCutlassNvfp4Impl)
     if dynamic and not is_oss:
         assert report.winner is None
-        assert report.rejected[0].reason is MoERejectReason.QUANT_UNSUPPORTED
+        rejection = _rejection_of(report, TrtllmCutlassNvfp4Impl)
+        assert rejection.reason is MoERejectReason.QUANT_UNSUPPORTED
+        assert "dynamic FC2 scaling" in rejection.detail
     else:
-        assert impl_class_for(report) is CutlassFusedMoE
+        assert impl_class_for(report) is TrtllmCutlassNvfp4Impl
 
 
 @pytest.mark.parametrize("is_oss", [False, True])
@@ -1411,7 +1892,7 @@ def test_cutlass_dynamic_scale_resolution(is_oss: bool, dynamic: bool) -> None:
 def test_cutlass_communication_validation(is_oss: bool, alltoall: bool) -> None:
     from types import SimpleNamespace
 
-    backend = CutlassFusedMoE.__new__(CutlassFusedMoE)
+    backend = TrtllmCutlassUnquantizedImpl.__new__(TrtllmCutlassUnquantizedImpl)
     moe = SimpleNamespace(enable_alltoall=alltoall)
     with override_moe_environment(MoEEnvironment(sm=90, oss_cutlass_moe=is_oss)):
         if alltoall and not is_oss:
@@ -1499,7 +1980,7 @@ def test_cutlass_communication_selection(monkeypatch, is_oss, method, force_sour
         monkeypatch.setattr(communication_factory, name, constructors[name])
     monkeypatch.setattr(communication_factory, "get_wide_ep_ft_options", lambda _: (None, 60, 1))
     moe = SimpleNamespace(
-        backend=CutlassFusedMoE.__new__(CutlassFusedMoE),
+        backend=TrtllmCutlassUnquantizedImpl.__new__(TrtllmCutlassUnquantizedImpl),
         enable_dwdp=False,
         model_config=config,
         num_experts=4,
@@ -1537,8 +2018,10 @@ def test_cutlass_communication_selection(monkeypatch, is_oss, method, force_sour
 @pytest.mark.parametrize("activation", ["Relu2", "Swiglu"])
 @pytest.mark.parametrize("dynamic", [False, True])
 def test_b12x_cutlass_build_mode_resolution(is_oss, sm, quant_algo, activation, dynamic):
-    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
-
+    leaf = {
+        QuantAlgo.NVFP4: CuteDslB12xNvfp4FusedMoE,
+        QuantAlgo.W4A16_NVFP4: CuteDslB12xW4a16Nvfp4FusedMoE,
+    }[quant_algo]
     report = resolve_moe_impl(
         ModelConfig(moe_backend="CUTEDSL"),
         problem=MoEProblem(
@@ -1563,9 +2046,7 @@ def test_b12x_cutlass_build_mode_resolution(is_oss, sm, quant_algo, activation, 
     rejection = not is_oss and quant_algo == QuantAlgo.NVFP4 and (activation == "Relu2" or dynamic)
     if rejection:
         assert report.winner is None
-        b12x_rejection = next(
-            r for r in report.rejected if r.legacy_backend == "CuteDslB12xFusedMoE"
-        )
+        b12x_rejection = _rejection_of(report, leaf)
         expected = (
             MoERejectReason.ACTIVATION_UNSUPPORTED
             if activation == "Relu2"
@@ -1573,17 +2054,15 @@ def test_b12x_cutlass_build_mode_resolution(is_oss, sm, quant_algo, activation, 
         )
         assert b12x_rejection.reason is expected
         assert "USING_OSS_CUTLASS_MOE_GEMM=ON" in b12x_rejection.detail
-        assert "CuteDslB12xFusedMoE" in b12x_rejection.detail
+        assert leaf.__name__ in b12x_rejection.detail
         assert b12x_rejection.detail.startswith("NVFP4 prefill routes through CUTLASS:")
     else:
-        assert impl_class_for(report) is CuteDslB12xFusedMoE
+        assert impl_class_for(report) is leaf
 
 
 @pytest.mark.parametrize("is_oss", [False, True])
 def test_b12x_lora_rejection_is_build_independent(is_oss):
-    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
-
-    verdict = CuteDslB12xFusedMoE.can_implement(
+    verdict = CuteDslB12xNvfp4FusedMoE.can_implement(
         MoEProblem(quant=canonical_quant(QuantAlgo.NVFP4), dtype_act=torch.bfloat16),
         MoEDeployment(
             ep_size=1,
@@ -1597,18 +2076,19 @@ def test_b12x_lora_rejection_is_build_independent(is_oss):
     )
     assert not verdict.eligible
     assert verdict.reject_reason is MoERejectReason.LORA_UNSUPPORTED
-    assert verdict.detail == "CuteDslB12xFusedMoE does not fuse routed-expert LoRA"
+    assert verdict.detail == "CuteDslB12xNvfp4FusedMoE does not fuse routed-expert LoRA"
 
 
-@pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.W4A16_NVFP4, None])
+@pytest.mark.parametrize(
+    "leaf",
+    [CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE],
+    ids=["nvfp4", "w4a16_nvfp4"],
+)
 @pytest.mark.parametrize("num_tokens", [63, 64, 65])
-def test_b12x_cutlass_prefill_routing(quant_algo, num_tokens):
-    from types import SimpleNamespace
-
-    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
-
-    backend = CuteDslB12xFusedMoE.__new__(CuteDslB12xFusedMoE)
+def test_b12x_cutlass_prefill_routing(leaf, num_tokens):
+    """A leaf hands a chunk to CUTLASS only if it also runs the CUTLASS build gate."""
+    backend = leaf.__new__(leaf)
     torch.nn.Module.__init__(backend)
-    backend.quant_config = SimpleNamespace(quant_algo=quant_algo) if quant_algo else None
-    expected = quant_algo == QuantAlgo.NVFP4 and num_tokens >= 64
-    assert backend._route_to_cutlass(torch.empty(num_tokens, 1)) is expected
+    route = getattr(backend, "_route_to_cutlass", None)
+    routed = route is not None and route(torch.empty(num_tokens, 1))
+    assert routed is (leaf._prefill_uses_cutlass and num_tokens >= 64)

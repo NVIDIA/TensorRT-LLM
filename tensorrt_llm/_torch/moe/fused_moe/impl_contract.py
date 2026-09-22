@@ -17,13 +17,13 @@
 import hashlib
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, FrozenSet, List, Optional, Protocol, Tuple
 
 import torch
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.utils import ActivationType
-    from tensorrt_llm.models.modeling_utils import QuantAlgo
+    from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
     from .moe_load_balancer import SingleLayerMoeLoadBalancer
     from .routing import BaseMoeRoutingMethod, RoutingMethodType
@@ -339,6 +339,11 @@ class MoERejectReason(str, Enum):
     NOT_AN_IMPL = "not_an_impl"
 
 
+# Rejections no deployment change can lift: the candidate implements another
+# format, or has no kernel for this SM. They say it was never in the running.
+_NOT_A_CONTENDER = frozenset({MoERejectReason.QUANT_UNSUPPORTED, MoERejectReason.SM_UNSUPPORTED})
+
+
 @dataclass(frozen=True)
 class MoEEligibility:
     """Return value of ``can_implement(problem, deployment)``.
@@ -394,17 +399,51 @@ def check_quant_matches_identity(cls: type, p: "MoEProblem") -> Optional[MoEElig
     return None
 
 
+class _BuiltLayer(Protocol):
+    """What :func:`require_layer_quant_format` reads off an implementation."""
+
+    quant_config: Optional["QuantConfig"]
+    layer_idx: Optional[int]
+
+
+def require_layer_quant_format(impl: _BuiltLayer, expected: str) -> None:
+    """Raise unless ``impl``'s final ``quant_config`` is the format ``expected``.
+
+    A leaf is one format, picked from the layer's quantization when
+    ``create_moe`` runs. The model's ``__post_init__`` passes
+    (``apply_layerwise_quant_config``, ``apply_quant_config_exclude_modules``)
+    can change that format before weights are allocated, and have returned by
+    the time this fires, so the message carries the diagnosis.
+    """
+    quant_config = impl.quant_config
+    actual = normalize_quant(
+        canonical_quant(None if quant_config is None else quant_config.quant_algo)
+    )
+    if actual != expected:
+        raise ValueError(
+            f"{type(impl).__name__} implements quant={expected}, but layer "
+            f"{impl.layer_idx}'s quant_config resolves to {actual}. The "
+            f"implementation was picked when the layer was built; layerwise "
+            f"quantization or a module exclusion changed its format afterwards. "
+            f"Pass the layer's final quantization to create_moe as "
+            f"override_quant_config."
+        )
+
+
 def nvfp4_fc1_row_alignment_rejection(
     p: "MoEProblem", d: "MoEDeployment"
 ) -> Optional[MoEEligibility]:
     """NVFP4 block scales swizzle in 128x4 tiles, so a gated FC1 buffer rounded
     up to that tile splits gate/up at the wrong row. Returns the rejection when
     this shard would be rounded up, else None (unknown shapes abstain).
+
+    ``W4A16_NVFP4`` is answered too: its weights go through the same CUTLASS
+    NVFP4 loader, and the op then splits the dequantized buffer the same way.
     """
     from tensorrt_llm._torch.utils import is_gated_activation
     from tensorrt_llm.models.modeling_utils import QuantAlgo
 
-    if p.quant_algo != QuantAlgo.NVFP4 or p.intermediate_size is None:
+    if p.quant_algo not in (QuantAlgo.NVFP4, QuantAlgo.W4A16_NVFP4) or p.intermediate_size is None:
         return None
     # Non-gated FC1 is one block with no gate/up split, so the rows the loader
     # adds stay a zero tail that the kernel never reads as an operand.
@@ -428,7 +467,7 @@ def nvfp4_fc1_row_alignment_rejection(
         hint = "no moe_tp_size satisfies this for this intermediate_size"
     return MoEEligibility.no(
         MoERejectReason.SHAPE_UNALIGNED,
-        f"NVFP4 MoE requires gated FC1 rows "
+        f"{p.quant} MoE requires gated FC1 rows "
         f"(2 * intermediate_size_per_partition) to be a multiple of 128, but "
         f"moe_tp_size={tp_size} gives {fc1_rows}. {hint}.",
     )
@@ -464,6 +503,9 @@ class MoEResolutionReport:
     eligible: Tuple[str, ...] = ()
     requested: Optional[str] = None  # backend literal, as written
     env_fingerprint: str = ""
+    # Legacy names of the implementations the request named (its backend
+    # family, or the pin's matches); the fallback candidates are not in it.
+    requested_impls: FrozenSet[str] = frozenset()
 
     @property
     def alternatives(self) -> Tuple[str, ...]:
@@ -485,8 +527,21 @@ class MoEResolutionReport:
         """The rejection that caused the substitution, if there was one."""
         if not self.degraded or not self.rejected:
             return None
-        # The last family rejection best explains the fallback.
-        return self.rejected[-1]
+        # Only the requested implementations' rejections explain the fallback;
+        # the fallback candidates are asked after them. Within a multi-leaf
+        # family most members are not contenders for this layer on this host,
+        # so the reported one is the highest-priority requested implementation
+        # that declined for any other reason: the one the request would have
+        # run had that reason not applied. Without one, an SM mismatch still
+        # says more than a format mismatch.
+        requested = [r for r in self.rejected if r.legacy_backend in self.requested_impls]
+        for rejection in requested:
+            if rejection.reason not in _NOT_A_CONTENDER:
+                return rejection
+        for rejection in requested:
+            if rejection.reason is not MoERejectReason.QUANT_UNSUPPORTED:
+                return rejection
+        return requested[0] if requested else self.rejected[-1]
 
     def to_dict(self) -> Dict[str, object]:
         """Serializable form. Field names are part of the artifact format."""

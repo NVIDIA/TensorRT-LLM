@@ -34,9 +34,9 @@ from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..moe.fused_moe import (BaseMoeRoutingMethod, ConfigurableMoE,
-                             CutlassFusedMoE, FusedMoEQuantScalesFP8,
+                             FusedMoEQuantScalesFP8,
                              Llama4RenormalizeMoeRoutingMethod,
-                             MoEWeightLoadingMode)
+                             MoEWeightLoadingMode, cutlass_leaf)
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_llama import Llama4Attention, Llama4DecoderLayer, Llama4MoE
@@ -448,10 +448,11 @@ class Llama4MinLatencyAttention(Llama4Attention):
 class Llama4MinLatencyFusedMoE(ConfigurableMoE):
     """Cutlass MoE layer with a min-latency FP8 fast path.
 
-    Subclasses the wrapper rather than ``CutlassFusedMoE``: the latter is an
-    execution unit (``MoEImplBase``) with no ``forward``, so it can only be
-    reached as ``ConfigurableMoE.backend``. ``moe_cls`` pins that backend
-    because the min-latency op below reads the Cutlass weight layout.
+    Subclasses the wrapper rather than a Cutlass execution unit: those are
+    ``MoEImplBase`` with no ``forward``, so they can only be reached as
+    ``ConfigurableMoE.backend``. ``moe_cls`` pins that backend -- the Cutlass
+    leaf for this layer's format -- because the min-latency op below reads the
+    Cutlass weight layout.
     """
 
     def __init__(
@@ -471,8 +472,11 @@ class Llama4MinLatencyFusedMoE(ConfigurableMoE):
         apply_router_weight_on_input: bool = False,
     ):
 
+        quant_algo = (model_config.quant_config.quant_algo
+                      if model_config.quant_config is not None else None)
+
         super().__init__(
-            moe_cls=CutlassFusedMoE,
+            moe_cls=cutlass_leaf(quant_algo),
             routing_method=routing_method,
             num_experts=num_experts,
             hidden_size=hidden_size,

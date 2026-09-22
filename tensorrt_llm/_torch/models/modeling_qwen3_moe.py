@@ -24,7 +24,8 @@ from ..speculative import SpecMetadata
 from ..utils import AuxStreamType
 from .modeling_qwen3 import Qwen3Attention
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel, EagerFusionConfig, register_auto_model
+from .modeling_utils import (DecoderModel, EagerFusionConfig,
+                             moe_experts_quant_config, register_auto_model)
 
 
 class Qwen3Gate(nn.Module):
@@ -120,6 +121,10 @@ class Qwen3MoE(nn.Module):
             dtype=config.torch_dtype,
             reduce_results=False,
             model_config=model_config,
+            # MIXED_PRECISION's global quant_algo reads as unquantized, so the
+            # experts' own format has to be named here.
+            override_quant_config=moe_experts_quant_config(
+                model_config, f"model.layers.{layer_idx}.mlp.experts"),
             layer_idx=layer_idx,
             weight_loading_mode=self.weight_loading_mode,
         )

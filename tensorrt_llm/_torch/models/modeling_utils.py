@@ -366,6 +366,19 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
                 remove_weights(layer)
 
 
+def _layerwise_moe_quant_config(quant_config_dict: dict[str, QuantConfig],
+                                moe_name: str) -> QuantConfig | None:
+    """The ``quant_config_dict`` entry of the MoE module named ``moe_name``.
+
+    All linear layers inside a MoE share one quant config, so the first key
+    that contains the module name answers for the whole module.
+    """
+    for key, quant_config in quant_config_dict.items():
+        if moe_name in key:
+            return quant_config
+    return None
+
+
 def apply_layerwise_quant_config(
         model_config: ModelConfig,
         named_modules: Iterator[tuple[str, nn.Module]]) -> None:
@@ -375,11 +388,9 @@ def apply_layerwise_quant_config(
             if getattr(module, '_skip_layerwise_quant_config', False):
                 continue
             if isinstance(module, (MoE, VanillaMoE)):
-                for n, q in quant_config_dict.items():
-                    # all linear layers inside FusedMoE share the same quant config
-                    if name in n:
-                        module.quant_config = q
-                        break
+                q = _layerwise_moe_quant_config(quant_config_dict, name)
+                if q is not None:
+                    module.quant_config = q
             elif isinstance(module, Linear):
                 weight_mode = module.weights_loading_config.weight_mode
                 prefix_name = '.'.join(name.split('.')[:-1])
@@ -465,6 +476,39 @@ def apply_quant_config_exclude_modules(
                     # update to their child backend.
                     if hasattr(module, '_weights_created'):
                         module._weights_created = False
+
+
+def moe_experts_quant_config(model_config: ModelConfig,
+                             experts_prefix: str) -> QuantConfig | None:
+    """The final quantization of the MoE experts at ``experts_prefix``.
+
+    A MoE implementation is one format, fixed when ``create_moe`` resolves it,
+    so a model passes this as ``override_quant_config``. It answers what the
+    ``__post_init__`` passes would leave on the layer: the layer's
+    ``quant_config_dict`` entry, found by the same match
+    ``apply_layerwise_quant_config`` uses, then the ``exclude_modules`` match,
+    which wins.
+
+    Args:
+        model_config: The model's configuration.
+        experts_prefix: The experts module name, e.g.
+            ``"model.layers.3.mlp.experts"``.
+
+    Returns:
+        The experts' quantization, or ``None`` when it is the model-level
+        ``quant_config``.
+    """
+    override = None
+    if model_config.quant_config_dict is not None:
+        override = _layerwise_moe_quant_config(model_config.quant_config_dict,
+                                               experts_prefix)
+    global_quant_config = model_config.quant_config
+    if (global_quant_config is not None
+            and global_quant_config.is_module_excluded_from_quantization(
+                experts_prefix)):
+        override = QuantConfig(
+            kv_cache_quant_algo=global_quant_config.kv_cache_quant_algo)
+    return override
 
 
 class PostInitCaller(type):

@@ -5,14 +5,14 @@
 The op-level tests exercise the fused_moe op and _extract_moe_lora_tensors in
 isolation, so they cannot catch a regression where lora_params never reaches
 the routed-expert call in the real model.forward to self.experts to
-CutlassFusedMoE.run_moe path.
+the CUTLASS FP8 leaf's run_moe path.
 
 These CPU-only tests (no GPU or built C++ op required) assert, at each hop,
 that a non-empty lora_params is forwarded:
 
   1. MixtralMoE.forward to the routed self.experts call.
   2. ConfigurableMoE.forward_impl to scheduler.forward.
-  3. ExternalCommMoEScheduler._build_run_context to the CutlassFusedMoE
+  3. ExternalCommMoEScheduler._build_run_context to the CUTLASS leaf
      run_moe context, and not to backends that cannot carry LoRA.
 """
 
@@ -37,7 +37,7 @@ from tensorrt_llm._torch.models.modeling_step3p7 import (
     Step3p7MoE,
 )
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.cutlass import TrtllmCutlassFp8Impl
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import ExternalCommMoEScheduler
 from tensorrt_llm._torch.peft.lora.layer import LoraModuleType
@@ -593,12 +593,12 @@ def _build_run_context(scheduler):
 
 
 def test_scheduler_threads_lora_params_to_cutlass_run_context():
-    """The run context handed to CutlassFusedMoE.run_moe must carry
+    """The run context handed to the CUTLASS FP8 leaf's run_moe must carry
     lora_params."""
-    ctx = _build_run_context(_make_external_comm_scheduler(CutlassFusedMoE))
+    ctx = _build_run_context(_make_external_comm_scheduler(TrtllmCutlassFp8Impl))
 
     assert ctx.lora_params is _LORA_PARAMS_SENTINEL, (
-        "Scheduler dropped lora_params before CutlassFusedMoE.run_moe; "
+        "Scheduler dropped lora_params before the CUTLASS FP8 leaf's run_moe; "
         "routed-expert MoE LoRA would be silently disabled."
     )
 
@@ -627,7 +627,7 @@ def _moe_lora_params_for_layer(layer_idx):
 def test_cutlass_moe_lora_active_detects_layer_modules():
     """_moe_lora_active is the predicate the multi-chunk guard relies on: True
     only when this layer has a routed-expert MoE LoRA module."""
-    backend = CutlassFusedMoE.__new__(CutlassFusedMoE)
+    backend = TrtllmCutlassFp8Impl.__new__(TrtllmCutlassFp8Impl)
     backend.layer_idx = 3
 
     assert backend._moe_lora_active(_moe_lora_params_for_layer(3)) is True
@@ -641,7 +641,7 @@ def test_scheduler_rejects_multichunk_with_moe_lora():
     """The ConfigurableMoE scheduler must reject multi-chunk execution when
     routed-expert MoE LoRA is active, with an actionable message rather than a
     deep C++ kernel failure."""
-    backend = CutlassFusedMoE.__new__(CutlassFusedMoE)
+    backend = TrtllmCutlassFp8Impl.__new__(TrtllmCutlassFp8Impl)
     backend.layer_idx = 0
 
     moe = SimpleNamespace(

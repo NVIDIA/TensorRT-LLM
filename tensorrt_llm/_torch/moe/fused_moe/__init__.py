@@ -5,6 +5,7 @@ from .activation import (ACTIVATION_PAYLOAD, DEFAULT_MOE_ACTIVATION,
 from .configurable_moe import ConfigurableMoE
 from .create_moe import (MoEImplClass, create_moe, resolve_moe_cls,
                          resolve_moe_impl)
+from .cutlass import cutlass_leaf, find_cutlass_leaf
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from .fused_moe_cute_dsl_fc12 import (CuteDslFc12FusedMoE,
@@ -52,6 +53,8 @@ __all__ = [
     "TrtllmCutedslFusedFc12Nvfp4Impl",
     "CuteDslFusedMoE",
     "CutlassFusedMoE",
+    "cutlass_leaf",
+    "find_cutlass_leaf",
     "DeepSeekV3MoeRoutingMethod",
     "DefaultMoeRoutingMethod",
     "FusedMoEQuantScalesFP8",

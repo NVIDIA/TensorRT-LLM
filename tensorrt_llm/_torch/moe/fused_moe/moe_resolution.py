@@ -34,10 +34,10 @@ from .activation import (
     SwigluActivation,
     activation_constant_names,
 )
+from .cutlass import CUTLASS_LEAVES
 from .fused_moe_cute_dsl import CuteDslFusedMoE
-from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+from .fused_moe_cute_dsl_b12x import CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE
 from .fused_moe_cute_dsl_fc12 import TrtllmCutedslFusedFc12Nvfp4Impl
-from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepgemmCudaFp8BlockScalesImpl
 from .fused_moe_densegemm import TrtllmCutedslDenseGemmNvfp4Impl
 from .fused_moe_triton import TritonFusedMoE
@@ -99,7 +99,9 @@ MoEImplClass = type[MoE] | type[MoEImplBase] | type[VanillaMoE]
 # ``DeepGemmFusedMoE`` / ``MegaMoEDeepGemm`` / ``MegaMoECuteDsl`` aliases, so
 # what is ranked here reads the same as what a resolution report prints.
 IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
-    CuteDslB12xFusedMoE,  # SM120/121 NVFP4 decode only -- narrowest, so first
+    # The SM120/121 b12x leaves, one format each -- narrowest, so first.
+    CuteDslB12xNvfp4FusedMoE,
+    CuteDslB12xW4a16Nvfp4FusedMoE,
     DeepgemmCudaW4a8Mxfp4Mxfp8Impl,  # ahead of plain CuteDSL / DeepGEMM: better perf when eligible
     TrtllmCutedslMegaMoeNvfp4Impl,
     CuteDslFusedMoE,
@@ -127,7 +129,7 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     MarlinCudaNvfp4Impl,
     MarlinCudaW4a16Nvfp4Impl,
     TritonFusedMoE,
-    CutlassFusedMoE,  # widest coverage, hence the fallback
+    *CUTLASS_LEAVES,  # widest coverage between them, hence the fallback
     VanillaMoE,  # reference implementation, never preferred
 )
 
@@ -135,10 +137,14 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
 # ``moe_backend`` literal and a pinned identity reach the same class for the
 # DeepGEMM families, so a run reports one name either way.
 BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
-    "CUTLASS": frozenset({CutlassFusedMoE}),
+    # Includes the two ``fp8_block_scales`` leaves, whose technique is not
+    # ``cutlass``: the literal serves FP8 block scales on SM90 and SM120.
+    "CUTLASS": frozenset(CUTLASS_LEAVES),
     "VANILLA": frozenset({VanillaMoE}),
     "MARLIN": frozenset({MarlinCudaNvfp4Impl, MarlinCudaW4a16Nvfp4Impl}),
-    "CUTEDSL": frozenset({CuteDslB12xFusedMoE, CuteDslFusedMoE}),
+    "CUTEDSL": frozenset(
+        {CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE, CuteDslFusedMoE}
+    ),
     "CUTEDSL_FC12": frozenset({TrtllmCutedslFusedFc12Nvfp4Impl}),
     "DEEPGEMM": frozenset({DeepgemmCudaFp8BlockScalesImpl}),
     "DENSEGEMM": frozenset({TrtllmCutedslDenseGemmNvfp4Impl}),
@@ -187,8 +193,9 @@ def backend_family_of(impl_cls: MoEImplClass) -> Optional[str]:
     return None
 
 
-# Widest coverage; default degradation target.
-FALLBACK_IMPL: MoEImplClass = CutlassFusedMoE
+# Default degradation target: the Cutlass leaves, whose coverage is the
+# widest between them.
+FALLBACK_IMPLS: Tuple[MoEImplClass, ...] = CUTLASS_LEAVES
 
 
 def _legacy_backend_name(impl_cls: MoEImplClass) -> str:
@@ -411,8 +418,9 @@ def _candidates_for(backend: str) -> List[MoEImplClass]:
     if family is None:
         raise ValueError(f"Unsupported moe backend: {backend}")
     candidates = [impl_cls for impl_cls in IMPL_PRIORITY if impl_cls in family]
-    if FALLBACK_IMPL not in family and normalized not in NO_FALLBACK_BACKENDS:
-        candidates.append(FALLBACK_IMPL)
+    # A request for CUTLASS already holds every fallback leaf.
+    if family.isdisjoint(FALLBACK_IMPLS) and normalized not in NO_FALLBACK_BACKENDS:
+        candidates.extend(FALLBACK_IMPLS)
     return candidates
 
 
@@ -639,6 +647,7 @@ def resolve_moe_impl(
         selected_by=selected_by,
         requested=requested,
         env_fingerprint=deployment.env.fingerprint(),
+        requested_impls=frozenset(_legacy_backend_name(impl_cls) for impl_cls in requested_impls),
     )
 
     location = "" if layer_idx is None else f" [layer_idx={layer_idx}]"

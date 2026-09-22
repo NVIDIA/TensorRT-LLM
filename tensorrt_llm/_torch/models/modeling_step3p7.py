@@ -794,11 +794,14 @@ class Step3p7MoE(nn.Module):
             model_config=model_config,
             layer_idx=layer_idx,
             weight_loading_mode=MoEWeightLoadingMode.VANILLA,
+            # When the Python path owns these experts the backend kernel never
+            # runs them, so it is not asked for a clamp it would not apply;
+            # kernels without clamp support (SM120 FP8 block scales) can then
+            # still hold the weights the Python path dequantizes. The Python
+            # path is kept fail-closed below if those weights cannot be
+            # materialized.
             activation=SwigluActivation(
-                clamp=self._routed_swiglu_limit,
-                # Derive the backend mode from the expert dispatch decision.
-                # The Python path applies the same order directly and is kept
-                # fail-closed below if its weights cannot be materialized.
+                clamp=None if self._use_python_experts else self._routed_swiglu_limit,
                 clamp_after_silu=(
                     self._routed_swiglu_limit is not None and not self._use_python_experts
                 ),

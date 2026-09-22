@@ -3797,7 +3797,7 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
     Inherits the full CUTLASS NVFP4 weight pipeline (cat + pad +
     block_scale_interleave) so the backend's
     hybrid prefill path can continue to consume the standard CUTLASS
-    NVFP4 GroupGEMM layout via the inherited ``CutlassFusedMoE.run_moe``.
+    NVFP4 GroupGEMM layout via the inherited ``TrtllmCutlassNvfp4Impl.run_moe``.
 
     On top of that base layout, ``transform_weights`` materialises the
     b12x-specific weight tensors: SF un-normalization (multiply per-block

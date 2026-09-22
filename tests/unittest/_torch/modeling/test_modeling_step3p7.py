@@ -401,7 +401,9 @@ class TestStep3p7Helpers(unittest.TestCase):
 
                 routing_method = create_moe.call_args.kwargs["routing_method"]
                 activation = create_moe.call_args.kwargs["activation"]
-                self.assertEqual(activation.clamp, 1.0)
+                # The backend runs these experts only under MoE LoRA; otherwise
+                # the Python path applies the clamp and the backend gets none.
+                self.assertEqual(activation.clamp, 1.0 if moe_lora_enabled else None)
                 self.assertEqual(activation.clamp_after_silu, moe_lora_enabled)
                 if moe_lora_enabled:
                     allocate_clamp_buffers.assert_not_called()
