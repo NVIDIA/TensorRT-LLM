@@ -80,6 +80,7 @@ class ServerRole(IntEnum):
     MM_ENCODER = 2
     VISUAL_GEN = 3
     EMBEDDING = 4
+    RERANK = 5
 
 
 @dataclass

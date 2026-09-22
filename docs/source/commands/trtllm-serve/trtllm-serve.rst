@@ -24,6 +24,8 @@ The ``metrics`` endpoint provides runtime-iteration statistics such as GPU memor
 
 For encoder-only models (BERT-style classifiers, reward models, text-embedding models), the ``trtllm-serve embeddings`` subcommand starts a server that exposes an OpenAI-compatible ``/v1/embeddings`` endpoint with native dynamic batching. See :doc:`Embeddings <../../features/embeddings>` for details.
 
+For cross-encoder reranking models (currently the Qwen3-Reranker family), the ``trtllm-serve rerank`` subcommand starts a server that exposes ``/rerank``, ``/v1/rerank``, and the Cohere-compatible ``/v2/rerank`` endpoints with native dynamic batching. See :doc:`Reranking <../../features/reranking>` for details.
+
 Starting a Server
 -----------------
 

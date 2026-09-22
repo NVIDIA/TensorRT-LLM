@@ -66,6 +66,9 @@ if TYPE_CHECKING:
     # Type-only: the visual_gen tree is imported lazily inside the VisualGen
     # code paths so plain LLM serving never pays its import cost.
     from tensorrt_llm.visual_gen.args import VisualGenArgs
+    # Type-only: transformers is imported lazily inside the rerank routing
+    # functions so plain LLM serving never pays its import cost.
+    from transformers import PreTrainedTokenizerBase
 
 # Global variable to store the Popen object of the child process
 _child_p_global: Optional[subprocess.Popen] = None
@@ -861,6 +864,137 @@ def launch_embedding_server(
                           tool_parser=None,
                           embedding_max_queue_delay=max_queue_delay,
                           embedding_max_queue_size=max_queue_size)
+    asyncio.run(server(host, port))
+
+
+# HF causal-LM architecture -> TRT-LLM reranking architecture. The rerank
+# subcommand declares reranking intent (cf. _EMBEDDING_ARCH_MAP above); this
+# maps known cross-encoder decoder backbones onto their yes/no-logit-diff
+# scoring wrapper class. To support another reranker family, add its HF
+# architecture here and a matching `*ForTextReranking` model class (see
+# Qwen3ForTextReranking in modeling_qwen3.py).
+_RERANK_ARCH_MAP = {
+    "Qwen3ForCausalLM": "Qwen3ForTextReranking",
+}
+
+
+def _resolve_rerank_architecture_override(
+        model: str,
+        trust_remote_code: bool,
+        revision: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Return a `model_kwargs` architecture override for a known reranker.
+
+    Returns `None` to leave the model's declared architecture unchanged (e.g.
+    a checkpoint that already declares `Qwen3ForTextReranking` itself).
+    Mirrors `_resolve_embedding_architecture_override`: Qwen3-Reranker ships as
+    `Qwen3ForCausalLM` (a causal decoder); overriding `architectures` flips
+    both the model-class selection and the encoder-vs-generation routing.
+    """
+    try:
+        from transformers import AutoConfig
+        hf_config = AutoConfig.from_pretrained(
+            model, trust_remote_code=trust_remote_code, revision=revision)
+        architectures = getattr(hf_config, "architectures", None) or []
+    except Exception as e:  # noqa: BLE001 - config read is best-effort
+        logger.warning(
+            f"Could not read model config for rerank routing ({model}): {e}")
+        return None
+
+    if not architectures:
+        return None
+    target = _RERANK_ARCH_MAP.get(architectures[0])
+    if target is None:
+        return None
+
+    logger.info(f"Rerank routing: overriding architecture "
+               f"{architectures[0]} -> {target}")
+    return {"architectures": [target]}
+
+
+def _resolve_rerank_token_ids(tokenizer: "PreTrainedTokenizerBase",
+                              model: str) -> Dict[str, int]:
+    """Return the `reranking_token_true_id`/`reranking_token_false_id` override.
+
+    Qwen3ForTextReranking scores `yes_logit - no_logit` at just those two
+    vocab rows (see modeling_qwen3.py) and has no tokenizer access itself to
+    resolve them, so the CLI resolves them once at server startup from the
+    same tokenizer used to build each rerank prompt.
+
+    Raises:
+        click.ClickException: if the tokenizer does not map "yes"/"no" to
+            single known token ids.
+    """
+    token_true_id = tokenizer.convert_tokens_to_ids("yes")
+    token_false_id = tokenizer.convert_tokens_to_ids("no")
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    if (token_true_id is None or token_false_id is None
+            or token_true_id == unk_id or token_false_id == unk_id):
+        raise click.ClickException(
+            f"{model}'s tokenizer does not map \"yes\"/\"no\" to single known "
+            "token ids; trtllm-serve rerank currently requires a tokenizer "
+            "where both are single tokens (as in the Qwen3 tokenizer).")
+
+    logger.info(f"Rerank routing: yes/no token ids = "
+               f"{token_true_id}/{token_false_id}")
+    return {
+        "reranking_token_true_id": token_true_id,
+        "reranking_token_false_id": token_false_id,
+    }
+
+
+def launch_rerank_server(
+    host: str,
+    port: int,
+    llm_args: dict,
+    max_queue_delay: float,
+    max_queue_size: int,
+    metadata_server_cfg: Optional[MetadataServerConfig] = None,
+):
+    model = llm_args["model"]
+    llm_args.pop("build_config", None)
+    # encode_only is forced on below; drop any value coming from --config to avoid
+    # a duplicate keyword argument.
+    llm_args.pop("encode_only", None)
+    trust_remote_code = llm_args.get("trust_remote_code", False)
+    revision = llm_args.get("revision")
+
+    model_kwargs = dict(llm_args.get("model_kwargs") or {})
+
+    arch_override = _resolve_rerank_architecture_override(
+        model, trust_remote_code, revision)
+    if arch_override is not None:
+        if "architectures" in model_kwargs:
+            # A user-supplied model_kwargs.architectures (e.g. via --config) wins;
+            # log so the suppressed auto-remap isn't a silent surprise.
+            logger.info(
+                "Rerank routing: keeping user-supplied model_kwargs "
+                f"architectures={model_kwargs['architectures']} (auto-remap "
+                f"to {arch_override['architectures']} suppressed).")
+        else:
+            model_kwargs["architectures"] = arch_override["architectures"]
+
+    from transformers import AutoTokenizer
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model, trust_remote_code=trust_remote_code, revision=revision)
+    except Exception as e:  # noqa: BLE001 - surfaced as a ClickException below
+        raise click.ClickException(
+            f"Could not load tokenizer for rerank routing ({model}): {e}")
+    model_kwargs.update(_resolve_rerank_token_ids(tokenizer, model))
+
+    llm_args["model_kwargs"] = model_kwargs
+
+    # Encoder-only (rerank) serving uses the synchronous llm.encode() fast path
+    # (no KV cache / sampler / scheduler), coalesced behind the dynamic batcher.
+    llm = PyTorchLLM(encode_only=True, **llm_args)
+
+    server = OpenAIServer(generator=llm,
+                          model=model,
+                          server_role=ServerRole.RERANK,
+                          metadata_server_cfg=metadata_server_cfg,
+                          tool_parser=None,
+                          rerank_max_queue_delay=max_queue_delay,
+                          rerank_max_queue_size=max_queue_size)
     asyncio.run(server(host, port))
 
 
@@ -1915,6 +2049,145 @@ def serve_embedding(
                             max_queue_size, metadata_server_cfg)
 
 
+@click.command("rerank")
+@click.argument("model", type=str)
+@click.option("--host",
+              type=str,
+              default="localhost",
+              help="Hostname of the server.")
+@click.option("--port", type=int, default=8000, help="Port of the server.")
+@click.option('--log_level',
+              type=click.Choice(severity_map.keys()),
+              default='info',
+              help="The logging level.")
+@click.option("--max_batch_size",
+              type=int,
+              default=_LLM_ARGS_FIELDS["max_batch_size"].default,
+              help="Maximum batch size coalesced into a single encode() call.")
+@click.option(
+    "--max_num_tokens",
+    type=int,
+    default=8192,
+    help="Maximum number of batched input tokens in each encode() call.")
+@click.option(
+    "--max_queue_delay",
+    type=click.FloatRange(min=0.0),
+    default=0.005,
+    help="Dynamic-batching hold window in seconds: how long an incoming request "
+    "waits for others to join its batch before being dispatched (mirrors Triton's "
+    "max_queue_delay_microseconds).")
+@click.option(
+    "--max_queue_size",
+    type=click.IntRange(min=1),
+    default=2048,
+    help="Maximum number of in-flight queued requests; further requests are "
+    "rejected with HTTP 429 (mirrors Triton's max_queue_size).")
+@click.option("--trust_remote_code",
+              is_flag=True,
+              default=False,
+              help="Flag for HF transformers.")
+@click.option(
+    "--config",
+    "--extra_llm_api_options",
+    "extra_llm_api_options",
+    type=str,
+    default=None,
+    help="Path to a YAML configuration file. Explicit CLI flags take precedence "
+    "over values in this file.")
+@click.option("--hf_revision",
+              "--revision",
+              "revision",
+              type=str,
+              default=None,
+              help="The revision to use for the HuggingFace model "
+              "(branch name, tag name, or commit id).")
+@click.option("--metadata_server_config_file",
+              type=str,
+              default=None,
+              help="Path to metadata server config file")
+@click.option("--telemetry/--no-telemetry",
+              default=True,
+              help="Enable or disable anonymous usage telemetry collection.")
+def serve_rerank(
+    model: str,
+    host: str,
+    port: int,
+    log_level: str,
+    max_batch_size: int,
+    max_num_tokens: int,
+    max_queue_delay: float,
+    max_queue_size: int,
+    trust_remote_code: bool,
+    extra_llm_api_options: Optional[str],
+    revision: Optional[str],
+    metadata_server_config_file: Optional[str],
+    telemetry: bool,
+):
+    """Run an OpenAI-compatible /rerank, /v1/rerank, /v2/rerank server for
+    cross-encoder reranking models (currently the Qwen3-Reranker family).
+
+    Coalesces concurrent requests with a dynamic batcher and serves them through
+    the synchronous llm.encode() fast path (no KV cache / sampler / scheduler).
+    Single-GPU only: the command does not expose tensor/pipeline parallelism.
+
+    MODEL: model name | HF checkpoint path
+    """
+    logger.set_level(log_level)
+
+    explicit_cli_keys = collect_explicit_cli_keys(exclude=("config", ))
+
+    # Single-GPU, encode-only: tensor_parallel_size is fixed to 1 and not exposed as a
+    # flag (the in-process encode path has no multi-GPU worker proxy). gpus_per_node is
+    # auto-detected by get_llm_args; free_gpu_memory_fraction is omitted because the
+    # encode path allocates no KV cache. All remain settable via --config if needed.
+    llm_args, _ = get_llm_args(model=model,
+                               max_batch_size=max_batch_size,
+                               max_num_tokens=max_num_tokens,
+                               trust_remote_code=trust_remote_code,
+                               revision=revision,
+                               tensor_parallel_size=1,
+                               telemetry=telemetry,
+                               explicit_cli_keys=explicit_cli_keys)
+
+    extra_dict = {}
+    if extra_llm_api_options is not None:
+        with open(extra_llm_api_options, 'r') as f:
+            extra_dict = yaml.safe_load(f)
+        if extra_dict is None:
+            extra_dict = {}
+        elif not isinstance(extra_dict, dict):
+            raise ValueError("Configuration file root must be a mapping.")
+    _command_telemetry.apply_raw_config_telemetry_opt_out(
+        extra_dict,
+        usage_context=_telemetry_config.UsageContext.CLI_SERVE,
+        component="server",
+        explicit_cli_telemetry="telemetry" in explicit_cli_keys,
+    )
+    llm_args = update_llm_args_with_extra_dict(
+        llm_args, extra_dict, explicit_cli_keys=explicit_cli_keys)
+
+    _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
+
+    # The CLI does not expose TP/PP/CP, but a --config YAML could still set them. Reject
+    # that explicitly rather than hang: the in-process encode-only path cannot shard.
+    effective_tp = llm_args.get("tensor_parallel_size") or 1
+    effective_pp = llm_args.get("pipeline_parallel_size") or 1
+    effective_cp = llm_args.get("context_parallel_size") or 1
+    if effective_tp > 1 or effective_pp > 1 or effective_cp > 1:
+        raise click.BadParameter(
+            "The rerank server is single-GPU only; multi-GPU (TP/PP/CP) is not "
+            f"supported yet. Got tensor_parallel_size={effective_tp}, "
+            f"pipeline_parallel_size={effective_pp}, "
+            f"context_parallel_size={effective_cp} from --config.",
+            param_hint="config")
+
+    metadata_server_cfg = parse_metadata_server_config_file(
+        metadata_server_config_file)
+
+    launch_rerank_server(host, port, llm_args, max_queue_delay, max_queue_size,
+                         metadata_server_cfg)
+
+
 @click.command("disaggregated")
 @stability_option(
     "-c",
@@ -2751,7 +3024,8 @@ main = DefaultGroup(
         "disaggregated": disaggregated,
         "disaggregated_mpi_worker": disaggregated_mpi_worker,
         "mm_embedding_serve": serve_encoder,
-        "embeddings": serve_embedding
+        "embeddings": serve_embedding,
+        "rerank": serve_rerank
     })
 
 if __name__ == "__main__":

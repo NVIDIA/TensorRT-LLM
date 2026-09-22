@@ -416,6 +416,71 @@ class EmbeddingResponse(OpenAIBaseModel):
         description="Token usage for the request.")
 
 
+class RerankDocument(OpenAIBaseModel):
+    text: str = Field(description="The document text.")
+
+
+# Cohere's /v2/rerank accepts documents as either plain strings or
+# {"text": ...} objects; TRT-LLM's /rerank and /v1/rerank aliases share this
+# request/response shape for client compatibility.
+RerankDocumentType = Union[str, RerankDocument]
+
+
+class RerankRequest(OpenAIBaseModel):
+    model: str = Field(description="The model to use for reranking.")
+    query: str = Field(
+        description="The search query to score each document against.")
+    documents: List[RerankDocumentType] = Field(
+        min_length=1,
+        description="Candidate documents to rerank, as plain strings or "
+        "Cohere-style {\"text\": ...} objects.")
+    top_n: Optional[PositiveInt] = Field(
+        default=None,
+        description="Number of top-scoring documents to return. Defaults to "
+        "all documents, sorted by descending relevance_score.")
+    return_documents: bool = Field(
+        default=False,
+        description="Whether to include each document's text in the "
+        "response results.")
+    instruction: Optional[str] = Field(
+        default=None,
+        description="TRT-LLM extension: overrides the Qwen3-Reranker task "
+        "instruction embedded in the scoring prompt (default: a generic "
+        "web-search-retrieval instruction).")
+
+    @staticmethod
+    def document_text(document: RerankDocumentType) -> str:
+        return document if isinstance(document, str) else document.text
+
+
+class RerankResult(OpenAIBaseModel):
+    index: int = Field(
+        description=
+        "Index of this document in the request's `documents` list.")
+    relevance_score: float = Field(
+        description="The reranking score; higher means more relevant.")
+    document: Optional[RerankDocument] = Field(
+        default=None,
+        description="The document text; only present when "
+        "`return_documents=True`.")
+
+
+class RerankUsageInfo(OpenAIBaseModel):
+    total_tokens: int = Field(
+        default=0,
+        description="Total tokens consumed across all (query, document) "
+        "pairs scored for this request.")
+
+
+class RerankResponse(OpenAIBaseModel):
+    id: str = Field(default_factory=lambda: f"rerank-{str(uuid.uuid4().hex)}")
+    model: str = Field(description="The model used for reranking.")
+    results: List[RerankResult] = Field(
+        description="Reranked documents, sorted by descending "
+        "relevance_score and truncated to `top_n` if set.")
+    usage: RerankUsageInfo = Field(description="Token usage for the request.")
+
+
 def _response_format_to_guided_decoding_params(
     response_format: Optional[ResponseFormat],
     reasoning_parser: Optional[str] = None,

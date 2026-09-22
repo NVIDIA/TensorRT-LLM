@@ -99,11 +99,13 @@ from tensorrt_llm.serve.openai_protocol import (
     EmbeddingResponse, EmbeddingResponseData, EmbeddingUsageInfo, ErrorResponse,
     ImageEditRequest, ImageGenerationRequest, ImageGenerationResponse,
     ImageObject, MemoryUpdateRequest, ModelCard, ModelList, PromptTokensDetails,
-    ResponseFormat, ResponsesRequest, ResponsesResponse, StartProfileRequest,
-    StreamOptions, TokenizeRequest, TokenizeResponse, UpdateWeightsRequest,
-    UsageInfo, ensure_request_chat_template_allowed, to_llm_conversation_params,
-    to_llm_disaggregated_params)
+    RerankDocument, RerankRequest, RerankResponse, RerankResult,
+    RerankUsageInfo, ResponseFormat, ResponsesRequest, ResponsesResponse,
+    StartProfileRequest, StreamOptions, TokenizeRequest, TokenizeResponse,
+    UpdateWeightsRequest, UsageInfo, ensure_request_chat_template_allowed,
+    to_llm_conversation_params, to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
+from tensorrt_llm.serve.rerank_utils import build_rerank_prompt_token_ids
 from tensorrt_llm.serve.perf_metrics import (PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
                                              build_request_metrics_record)
@@ -714,6 +716,8 @@ class OpenAIServer(_VideoRoutesMixin):
             allow_request_chat_template: bool = False,
             embedding_max_queue_delay: float = 0.005,
             embedding_max_queue_size: int = 2048,
+            rerank_max_queue_delay: float = 0.005,
+            rerank_max_queue_size: int = 2048,
             input_processor_workers: int = 8,
             media_load_workers: int = 8,
             internal_disagg_auth_key: Optional[str] = None,
@@ -731,6 +735,9 @@ class OpenAIServer(_VideoRoutesMixin):
         self._embedding_max_queue_delay = embedding_max_queue_delay
         self._embedding_max_queue_size = embedding_max_queue_size
         self.embedding_batcher: Optional[EncodeBatcher] = None
+        self._rerank_max_queue_delay = rerank_max_queue_delay
+        self._rerank_max_queue_size = rerank_max_queue_size
+        self.rerank_batcher: Optional[EncodeBatcher] = None
         self.tool_parser = tool_parser
         self.metadata_server = create_metadata_server(metadata_server_cfg)
         self.disagg_cluster_config = disagg_cluster_config
@@ -885,11 +892,15 @@ class OpenAIServer(_VideoRoutesMixin):
                     logger.info(
                         "Started background iteration stats collector task")
 
-            # Start the encode dynamic batcher (embedding server only). It must be
-            # started inside the running event loop, hence here rather than __init__.
+            # Start the encode dynamic batcher (embedding/rerank server only). It
+            # must be started inside the running event loop, hence here rather
+            # than __init__.
             if self.embedding_batcher is not None:
                 await self.embedding_batcher.start()
                 logger.info("Started encode dynamic batcher")
+            if self.rerank_batcher is not None:
+                await self.rerank_batcher.start()
+                logger.info("Started rerank dynamic batcher")
 
             yield
 
@@ -897,6 +908,9 @@ class OpenAIServer(_VideoRoutesMixin):
             if self.embedding_batcher is not None:
                 await self.embedding_batcher.shutdown()
                 logger.info("Stopped encode dynamic batcher")
+            if self.rerank_batcher is not None:
+                await self.rerank_batcher.shutdown()
+                logger.info("Stopped rerank dynamic batcher")
 
             # Stop background iteration stats collector
             if self._iteration_stats_collector_task is not None:
@@ -953,6 +967,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 "server")
             self._init_embedding_batcher()
             self.register_embedding_routes()
+        elif self.server_role is ServerRole.RERANK:
+            assert getattr(self.generator.args, "encode_only", False), (
+                "generator must be an encode_only=True LLM for the rerank "
+                "server")
+            self._init_rerank_batcher()
+            self.register_rerank_routes()
         else:
             self.register_routes()
 
@@ -1319,12 +1339,12 @@ class OpenAIServer(_VideoRoutesMixin):
         )
 
     def _check_health(self) -> bool:
-        # An embedding server's requests flow through the batcher worker; if it
-        # has exited the engine is up but every /v1/embeddings request hangs, so
-        # report unhealthy rather than a misleading 200.
-        batcher = self.embedding_batcher
-        if batcher is not None and not batcher.is_alive():
-            return False
+        # An embedding/rerank server's requests flow through the batcher
+        # worker; if it has exited the engine is up but every request hangs,
+        # so report unhealthy rather than a misleading 200.
+        for batcher in (self.embedding_batcher, self.rerank_batcher):
+            if batcher is not None and not batcher.is_alive():
+                return False
         if hasattr(self.generator, '_check_health'):
             return self.generator._check_health()
         return True
@@ -1639,6 +1659,113 @@ class OpenAIServer(_VideoRoutesMixin):
             response = EmbeddingResponse(model=request.model,
                                          data=data,
                                          usage=usage)
+            return JSONResponse(content=response.model_dump())
+        except Exception as e:
+            # Unexpected fault (not a client error): surface as 500, not 400.
+            logger.error(traceback.format_exc())
+            return self.create_error_response(
+                str(e),
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def _init_rerank_batcher(self):
+        """Create the encode dynamic batcher for the rerank server.
+
+        Mirrors `_init_embedding_batcher`: coalesces concurrent /rerank
+        requests into a single `llm.encode()` call, running the synchronous
+        encode() in the default executor so the event loop stays responsive.
+        """
+
+        def encode_fn(token_ids_batch):
+            # token_ids_batch: list of pre-tokenized (query, document) prompts.
+            # encode() returns one EncoderOutput per item (the yes/no logit
+            # diff from Qwen3ForTextReranking), in input order.
+            return self.generator.encode(token_ids_batch)
+
+        # See _init_embedding_batcher: source batch limits from the resolved
+        # encoder engine rather than args, which encode() itself validates
+        # against and which aren't written back onto LlmArgs.
+        engine = self.generator._encoder_executor.model_engine
+        self._rerank_max_seq_len = engine.max_seq_len
+        self.rerank_batcher = EncodeBatcher(
+            encode_fn,
+            max_batch_size=engine.batch_size,
+            max_queue_delay=self._rerank_max_queue_delay,
+            max_queue_size=self._rerank_max_queue_size,
+            max_num_tokens=engine.max_num_tokens,
+            max_seq_len=engine.max_seq_len,
+        )
+
+    def register_rerank_routes(self):
+        self.app.add_api_route("/health", self.health, methods=["GET"])
+        self.app.add_api_route("/version", self.version, methods=["GET"])
+        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
+        # /rerank, /v1/rerank, and the Cohere-compatible /v2/rerank share one
+        # request/response shape, so clients written against any of the three
+        # paths work unmodified.
+        for path in ("/rerank", "/v1/rerank", "/v2/rerank"):
+            self.app.add_api_route(path, self.openai_rerank, methods=["POST"])
+
+    async def openai_rerank(self, request: RerankRequest,
+                            raw_request: Request) -> Response:
+        try:
+            # `documents` is `Field(min_length=1)` on RerankRequest, so an
+            # empty list is already rejected as a 400 before this handler runs.
+            try:
+                token_ids_list = [
+                    build_rerank_prompt_token_ids(
+                        self.tokenizer,
+                        request.query,
+                        RerankRequest.document_text(document),
+                        self._rerank_max_seq_len,
+                        instruction=request.instruction,
+                    ) for document in request.documents
+                ]
+            except ValueError as e:
+                return self.create_error_response(
+                    str(e), status_code=HTTPStatus.BAD_REQUEST)
+
+            try:
+                # Validate every input's length up front so an oversize item
+                # fails the whole request before any item is enqueued —
+                # otherwise gather() cancels the awaiters but their
+                # already-queued inputs still run encode() (wasted GPU work).
+                for token_ids in token_ids_list:
+                    self.rerank_batcher.validate_input(token_ids)
+                results = await asyncio.gather(*[
+                    self.rerank_batcher.submit(token_ids)
+                    for token_ids in token_ids_list
+                ])
+            except InputTooLongError as e:
+                return self.create_error_response(
+                    str(e), status_code=HTTPStatus.BAD_REQUEST)
+            except QueueFullError as e:
+                return self.create_error_response(
+                    str(e), status_code=HTTPStatus.TOO_MANY_REQUESTS)
+
+            scored = [(idx, encoder_output.logits.flatten().item())
+                     for idx, encoder_output in enumerate(results)]
+            scored.sort(key=lambda pair: pair[1], reverse=True)
+            if request.top_n is not None:
+                scored = scored[:request.top_n]
+
+            rerank_results = []
+            for idx, score in scored:
+                document = None
+                if request.return_documents:
+                    document = RerankDocument(
+                        text=RerankRequest.document_text(
+                            request.documents[idx]))
+                rerank_results.append(
+                    RerankResult(index=idx,
+                                relevance_score=score,
+                                document=document))
+
+            num_prompt_tokens = sum(len(t) for t in token_ids_list)
+            usage = RerankUsageInfo(total_tokens=num_prompt_tokens)
+            response = RerankResponse(model=request.model,
+                                      results=rerank_results,
+                                      usage=usage)
             return JSONResponse(content=response.model_dump())
         except Exception as e:
             # Unexpected fault (not a client error): surface as 500, not 400.
