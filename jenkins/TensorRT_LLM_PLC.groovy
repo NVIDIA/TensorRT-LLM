@@ -406,11 +406,8 @@ def pulseMalwareScanContainer(llmRepo, ref) {
         def containerTagMap = new JsonSlurper().parseText(output)
         imageTags["release_amd64"] = [image: containerTagMap["NGC Release Image amd64"], platform: "linux/amd64"]
         imageTags["release_arm64"] = [image: containerTagMap["NGC Release Image arm64"], platform: "linux/arm64"]
-
-        def baseImage = sh(script: "grep -m1 '^ARG BASE_IMAGE=' docker/Dockerfile.multi | cut -d= -f2", returnStdout: true).trim()
-        def baseTag = sh(script: "grep -m1 '^ARG BASE_TAG=' docker/Dockerfile.multi | cut -d= -f2", returnStdout: true).trim()
-        imageTags["base_amd64"] = [image: "${baseImage}:${baseTag}", platform: "linux/amd64"]
-        imageTags["base_arm64"] = [image: "${baseImage}:${baseTag}", platform: "linux/arm64"]
+        imageTags["devel_amd64"] = [image: containerTagMap["NGC Devel Image amd64"], platform: "linux/amd64"]
+        imageTags["devel_arm64"] = [image: containerTagMap["NGC Devel Image arm64"], platform: "linux/arm64"]
 
         sh "command -v jq >/dev/null || (apt-get update -y && apt-get install -y jq)"
         withCredentials([
@@ -457,7 +454,7 @@ def pulseMalwareScanContainer(llmRepo, ref) {
                 echo "Scanning ${key}: ${entry.image} (${entry.platform}) -> ${outputDir}"
                 trtllm_utils.llmRetry(3, "pulse-malware-scanner-cli scan ${entry.image}", {
                     sh(
-                        script: "pulse-malware-scanner-cli -n \$NSPECT_ID image-scan --image-ref ${entry.image} --output-dir=${outputDir} --tenant=general-access",
+                        script: "pulse-malware-scanner-cli -n \$NSPECT_ID image-scan --image-ref ${entry.image} --output-dir=${outputDir} --wait-sec=300 --tenant=general-access",
                         label: "Scan ${entry.image}"
                     )
                 })
