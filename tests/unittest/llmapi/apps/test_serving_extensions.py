@@ -14,6 +14,7 @@
 # limitations under the License.
 """Contract tests for the per-model serving-extension registry."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -121,24 +122,39 @@ class TestStructuredOutputDispatch:
 
 
 class TestBuiltinExtensions:
-    """The in-tree Kimi K3 and gpt-oss extensions resolve through the registry.
+    """The in-tree Kimi K3 and gpt-oss extensions resolve through the registry."""
 
-    The lookups below go through the public dispatch functions only, so they
-    also cover the lazy import of ``tensorrt_llm.serve.extensions`` that
-    populates the registry when nothing has imported ``openai_server``.
-    """
+    @pytest.fixture
+    def clean_registry(self, monkeypatch):
+        """Registry as if nothing had consulted it: empty tables, built-ins not yet imported.
 
-    def test_kimi_k3_resolves_to_kimi_extension(self) -> None:
+        Earlier tests (or the concrete imports below) populate the registry as
+        a side effect, so without this the lookups would pass even if
+        ``_load_builtin_extensions`` stopped importing the built-in package.
+        The package is also dropped from ``sys.modules`` so the lookup can only
+        succeed through the lazy import; monkeypatch restores everything after.
+        """
+        monkeypatch.setattr(serving_extensions, "_builtins_loaded", False)
+        monkeypatch.setattr(serving_extensions, "_BY_MODEL_TYPE", {})
+        monkeypatch.setattr(serving_extensions, "_BY_REASONING_PARSER", {})
+        for name in [
+            mod for mod in sys.modules if mod.startswith(serving_extensions._BUILTINS_PACKAGE)
+        ]:
+            monkeypatch.delitem(sys.modules, name)
+
+    def test_kimi_k3_resolves_to_kimi_extension(self, clean_registry) -> None:
+        hook = structured_output_format_for("kimi_k3")
+
         from tensorrt_llm.serve.extensions.kimi_k3 import KimiK3ServingExtension
 
-        assert isinstance(serving_extensions._BY_MODEL_TYPE["kimi_k3"], KimiK3ServingExtension)
-        hook = structured_output_format_for("kimi_k3")
         assert isinstance(hook.__self__, KimiK3ServingExtension)
+        assert isinstance(serving_extensions._BY_MODEL_TYPE["kimi_k3"], KimiK3ServingExtension)
 
-    def test_gpt_oss_resolves_to_gpt_oss_extension(self) -> None:
+    def test_gpt_oss_resolves_to_gpt_oss_extension(self, clean_registry) -> None:
+        hook = structured_output_format_for("gpt_oss")
+
         from tensorrt_llm.serve.extensions.gpt_oss import GptOssServingExtension
 
-        hook = structured_output_format_for("gpt_oss")
         assert isinstance(hook.__self__, GptOssServingExtension)
         # gpt-oss has no chat-side preprocessing.
         assert "gpt_oss" not in serving_extensions._BY_MODEL_TYPE
