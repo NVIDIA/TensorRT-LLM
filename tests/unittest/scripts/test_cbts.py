@@ -46,7 +46,7 @@ sys.path.insert(0, str(CBTS_ROOT / "coverage_utils"))
 
 from blocks import Stage, YAMLIndex  # noqa: E402
 from compact_db import write_leaf_database  # noqa: E402
-from python_change_analysis import analyze_python_changes  # noqa: E402
+from python_change_analysis import ImportTarget, analyze_python_changes  # noqa: E402
 from repository_reference import RepositoryReferenceIndex  # noqa: E402
 from rules._helpers import iter_diff_deleted_post_lines, iter_diff_post_line_numbers  # noqa: E402
 from rules.base import PRInputs  # noqa: E402
@@ -418,6 +418,36 @@ def test_replaced_effectful_assignment_remains_fail_closed() -> None:
     assert analysis.limitation == "unresolved import replacement"
 
 
+def test_same_module_import_from_replacement_resolves_consumers_and_targets() -> None:
+    source = "from .helpers import new_helper, stable\n\ndef consumer():\n    return new_helper()\n"
+    diff = (
+        "@@ -1,4 +1,4 @@\n"
+        "-from .helpers import old_helper, stable\n"
+        "+from .helpers import new_helper, stable\n"
+        " \n"
+        " def consumer():\n"
+        "-    return old_helper()\n"
+        "+    return new_helper()\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"old_helper", "new_helper"}
+    assert analysis.binding_consumers == {"consumer"}
+    assert analysis.old_import_targets == {ImportTarget("helpers", 1, "old_helper")}
+    assert analysis.new_import_targets == {ImportTarget("helpers", 1, "new_helper")}
+
+
+def test_import_from_replacement_from_different_module_remains_fail_closed() -> None:
+    source = "from .new_helpers import helper\n"
+    diff = "@@ -1 +1 @@\n-from .old_helpers import helper\n+from .new_helpers import helper\n"
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "unresolved import replacement"
+
+
 @pytest.mark.parametrize("body", ("", "# explanatory comment"))
 def test_added_module_noop_line_is_ignored(body: str) -> None:
     source = f"VALUE = 521\n{body}\n"
@@ -595,6 +625,36 @@ class _FakeDB:
         return set()
 
 
+class _ImportReplacementDB(_FakeDB):
+    def __init__(self) -> None:
+        self.rows_by_symbol = {
+            ("tensorrt_llm/pkg/helpers.py", "old_helper"): {"A10-PyTorch-1/test_old"},
+            ("tensorrt_llm/pkg/helpers.py", "new_helper"): {"A10-PyTorch-1/test_new"},
+            ("tensorrt_llm/pkg/consumer.py", "consumer"): {"A10-PyTorch-1/test_consumer"},
+        }
+
+    def tests_touching_func(self, path: str, qualname: str) -> set[str]:
+        return set(self.rows_by_symbol.get((path, qualname), set()))
+
+    def tests_touching_file(self, path: str) -> set[str]:
+        return {
+            test
+            for (row_path, _), tests in self.rows_by_symbol.items()
+            if row_path == path
+            for test in tests
+        }
+
+    def known_by_family(self) -> dict[str, set[str]]:
+        return {
+            "A10-PyTorch": {
+                "test_old",
+                "test_new",
+                "test_consumer",
+                "test_unrelated",
+            }
+        }
+
+
 def test_selector_uses_local_caller_rows_for_no_data_import_consumer() -> None:
     path = "tensorrt_llm/example.py"
     source = (
@@ -615,6 +675,95 @@ def test_selector_uses_local_caller_rows_for_no_data_import_consumer() -> None:
     assert result.skippable == {"A10-PyTorch": {"test_unrelated"}}
     assert result.no_data_funcs == ["tensorrt_llm/example.py::helper"]
     assert result.caller_bounded_funcs == ["tensorrt_llm/example.py::helper"]
+
+
+def _write_import_replacement_files(
+    tmp_path: Path,
+    *,
+    include_old_binding: bool = True,
+    include_new_helper: bool = True,
+) -> tuple[str, str]:
+    package = tmp_path / "tensorrt_llm/pkg"
+    package.mkdir(parents=True)
+    old_binding = "old_helper = object()\n" if include_old_binding else ""
+    new_helper = "\ndef new_helper():\n    return 2\n" if include_new_helper else ""
+    (package / "helpers.py").write_text(f"{old_binding}{new_helper}")
+    (package / "consumer.py").write_text(
+        "from .helpers import new_helper\n\ndef consumer():\n    return new_helper()\n"
+    )
+    path = "tensorrt_llm/pkg/consumer.py"
+    diff = (
+        "@@ -1,4 +1,4 @@\n"
+        "-from .helpers import old_helper\n"
+        "+from .helpers import new_helper\n"
+        " \n"
+        " def consumer():\n"
+        "-    return old_helper()\n"
+        "+    return new_helper()\n"
+    )
+    return path, diff
+
+
+def test_selector_ignores_old_binding_rows_and_uses_new_function_and_consumer_rows(
+    tmp_path: Path,
+) -> None:
+    path, diff = _write_import_replacement_files(tmp_path)
+    selector = CoverageSelector(
+        _ImportReplacementDB(),
+        tmp_path,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert result.ok
+    assert result.impacted == {"A10-PyTorch": {"test_new", "test_consumer"}}
+    assert result.skippable == {"A10-PyTorch": {"test_old", "test_unrelated"}}
+
+
+def test_selector_declines_missing_old_static_binding(tmp_path: Path) -> None:
+    path, diff = _write_import_replacement_files(tmp_path, include_old_binding=False)
+    selector = CoverageSelector(
+        _ImportReplacementDB(),
+        tmp_path,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert not result.ok
+    assert "old import target is not a static binding" in result.reason
+
+
+def test_selector_declines_missing_imported_function(tmp_path: Path) -> None:
+    path, diff = _write_import_replacement_files(tmp_path, include_new_helper=False)
+    selector = CoverageSelector(
+        _ImportReplacementDB(),
+        tmp_path,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert not result.ok
+    assert "import target is not a static function" in result.reason
+
+
+def test_selector_allows_new_imported_function_without_coverage(tmp_path: Path) -> None:
+    path, diff = _write_import_replacement_files(tmp_path)
+    db = _ImportReplacementDB()
+    db.rows_by_symbol[("tensorrt_llm/pkg/helpers.py", "new_helper")] = set()
+    selector = CoverageSelector(
+        db,
+        tmp_path,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert result.ok
+    assert result.impacted == {"A10-PyTorch": {"test_consumer"}}
+    assert result.skippable == {"A10-PyTorch": {"test_old", "test_new", "test_unrelated"}}
 
 
 def test_selector_declines_when_changed_binding_has_external_reference() -> None:

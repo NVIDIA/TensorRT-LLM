@@ -30,6 +30,15 @@ class _Scope:
     sig_attr: str
 
 
+@dataclass(frozen=True, order=True)
+class ImportTarget:
+    """A statically named binding imported from one module."""
+
+    module: str
+    level: int
+    name: str
+
+
 @dataclass
 class PythonChangeFacts:
     """Static facts about changed module bindings and local dependencies."""
@@ -39,6 +48,8 @@ class PythonChangeFacts:
     callers: dict[str, set[str]]
     limitation: str = ""
     callable_escapes: set[str] = field(default_factory=set)
+    new_import_targets: set[ImportTarget] = field(default_factory=set)
+    old_import_targets: set[ImportTarget] = field(default_factory=set)
 
 
 def _substatements(node: ast.stmt):
@@ -182,6 +193,54 @@ def _module_binding_names(node: ast.stmt, future_annotations: bool) -> set[str] 
     return None
 
 
+def _import_from_bindings(node: ast.stmt) -> dict[str, str] | None:
+    """Return ``{local name: source name}`` for a static ``from`` import."""
+    if not isinstance(node, ast.ImportFrom) or node.module is None:
+        return None
+    if any(alias.name == "*" for alias in node.names):
+        return None
+    bindings = {alias.asname or alias.name: alias.name for alias in node.names}
+    return bindings if len(bindings) == len(node.names) else None
+
+
+def _import_from_replacement(
+    node: ast.stmt, deleted: list[str]
+) -> tuple[set[str], set[ImportTarget], set[ImportTarget]] | None:
+    """Describe a same-module static ``from``-import replacement."""
+    current = _import_from_bindings(node)
+    if current is None or not isinstance(node, ast.ImportFrom):
+        return None
+    try:
+        old_tree = ast.parse("\n".join(deleted))
+    except SyntaxError:
+        return None
+    if len(old_tree.body) != 1 or not isinstance(old_tree.body[0], ast.ImportFrom):
+        return None
+    old_node = old_tree.body[0]
+    previous = _import_from_bindings(old_node)
+    if previous is None or old_node.module != node.module or old_node.level != node.level:
+        return None
+
+    changed_locals = {
+        local
+        for local in previous.keys() | current.keys()
+        if previous.get(local) != current.get(local)
+    }
+    old_targets = {
+        ImportTarget(node.module, node.level, source_name)
+        for local in changed_locals
+        for source_name in (previous.get(local),)
+        if source_name is not None
+    }
+    new_targets = {
+        ImportTarget(node.module, node.level, source_name)
+        for local in changed_locals
+        for source_name in (current.get(local),)
+        if source_name is not None
+    }
+    return changed_locals, old_targets, new_targets
+
+
 def _safe_added_function(
     node: ast.stmt, future_annotations: bool
 ) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
@@ -317,8 +376,9 @@ def analyze_python_changes(
     """Describe low-risk import-time bindings and their local references.
 
     Literal assignments (including literal replacements), plain function
-    declarations, and newly added builtin-module imports are represented.
-    Unsupported syntax is returned as an unresolved fact for policy callers.
+    declarations, newly added builtin-module imports, and same-module static
+    ``ImportFrom`` replacements are represented. Unsupported syntax is returned
+    as an unresolved fact for policy callers.
     """
     try:
         tree = ast.parse(source)
@@ -339,6 +399,8 @@ def analyze_python_changes(
     binding_names: set[str] = set()
     deleted_binding_names: set[str] = set()
     direct_consumers: set[str] = set()
+    new_import_targets: set[ImportTarget] = set()
+    old_import_targets: set[ImportTarget] = set()
     for line in sorted(import_lines):
         if _attribute(line, scopes) != "<module>":
             return PythonChangeFacts(set(), set(), {}, "class/signature import change")
@@ -349,6 +411,15 @@ def analyze_python_changes(
         if added_function is not None and line not in deleted_lines:
             binding_names.add(added_function.name)
             direct_consumers.add(added_function.name)
+            continue
+        if isinstance(node, ast.ImportFrom) and line in deleted_lines:
+            replacement = _import_from_replacement(node, deleted_lines[line])
+            if replacement is None:
+                return PythonChangeFacts(set(), set(), {}, "unresolved import replacement")
+            changed_locals, old_targets, new_targets = replacement
+            binding_names.update(changed_locals)
+            old_import_targets.update(old_targets)
+            new_import_targets.update(new_targets)
             continue
         names = _module_binding_names(node, future_annotations) if node is not None else None
         if node is None and line in deleted_lines:
@@ -392,6 +463,7 @@ def analyze_python_changes(
         for qualname, fact in facts.items()
         if (
             fact.nested_loaded
+            | fact.calls
             | {name for name in fact.loaded if name not in fact.bound or name in fact.globals}
         )
         & binding_names
@@ -443,4 +515,6 @@ def analyze_python_changes(
         consumers,
         callers,
         callable_escapes=callable_escapes,
+        new_import_targets=new_import_targets,
+        old_import_targets=old_import_targets,
     )
