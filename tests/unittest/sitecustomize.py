@@ -60,7 +60,7 @@ import sys
 
 _ENV_DIR = "TLLM_FORENSICS_DIR"
 _ENV_INTERVAL = "TLLM_FORENSICS_INTERVAL"
-_DEFAULT_INTERVAL = 60.0
+_DEFAULT_INTERVAL = 15.0
 
 
 def _process_role(orig_argv):
