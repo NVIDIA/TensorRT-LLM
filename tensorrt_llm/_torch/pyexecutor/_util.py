@@ -1649,6 +1649,28 @@ class KvCacheCreator:
                 f"max_gpu_total_bytes={self._max_gpu_total_bytes_in / (GB):.2f} GiB is provided. New max memory is {kv_cache_max_memory / (GB):.2f} GiB"
             )
 
+        if self._is_kv_cache_manager_v2 and self._max_kv_tokens_in is None:
+            # The max_tokens block above restores the user's value, which is
+            # None here, so V2 would size purely from max_gpu_total_bytes. That
+            # cap is a byte budget for the TARGET's per-token footprint. A
+            # one-model speculative-decoding draft manager reading the same
+            # config has a much smaller per-token footprint (it scales with
+            # num_local_layers), so the same byte cap lets it claim the whole
+            # budget a second time -> OOM. build_managers splits
+            # max_gpu_total_bytes per manager when it can, but that split is
+            # skipped during estimation and bails out whenever
+            # _get_target_and_draft_cache_costs cannot model the costs, and
+            # those are exactly the paths this backstops.
+            #
+            # Deriving max_tokens from the FINAL budget (after the
+            # max_gpu_total_bytes clamp just above) mirrors V1: V2's quota
+            # becomes min(max_gpu_total_bytes, max_tokens * bytes_per_token),
+            # which is a no-op for the target and picks the layer-scaled budget
+            # for the draft. Hence the placement here rather than in the
+            # max_tokens block, which runs before that clamp.
+            self._kv_cache_config.max_tokens = (self._get_kv_size_per_token(
+            ).tokens_for_budget(kv_cache_max_memory))
+
         logger.info(
             f"Estimated max memory in KV cache : {kv_cache_max_memory / (GB):.2f} GiB"
         )
