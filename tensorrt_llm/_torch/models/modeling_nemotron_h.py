@@ -1253,13 +1253,18 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
             residual = None  # Start fresh after fusion
 
         if residual is None:
-            # A zero residual makes the fused add+norm return the pre-norm
-            # hidden states as the new residual, which is what the first
-            # sublayer of a step needs.
-            residual = torch.zeros_like(hidden_states)
-        if self.norm.return_hp_output:
-            # NVFP4 MoE sublayer: the norm also returns the bf16 normed value
-            # for the MoE gate, packed alongside the quantized activation.
+            # First sublayer of a step: the pre-norm hidden states become the
+            # residual. The residual-less norm returns a single value: a bf16
+            # tensor, or a Fp4QuantizedTensor with the bf16 normed copy
+            # stashed on it when the norm feeds an NVFP4 mixer.
+            residual = hidden_states
+            hidden_states = self.norm(hidden_states)
+            if self.norm.return_hp_output:
+                # NVFP4 MoE sublayer: the gate needs the bf16 normed value,
+                # which the residual-less path does not return separately.
+                hidden_states = (hidden_states,
+                                 hidden_states.unquantized_hidden_states)
+        elif self.norm.return_hp_output:
             hidden_states, residual, high_precision_normed_output = self.norm(
                 hidden_states, residual)
             hidden_states = (hidden_states, high_precision_normed_output)
