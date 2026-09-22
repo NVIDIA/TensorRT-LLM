@@ -247,7 +247,6 @@ unittest/_torch/attention/sparse/dsa/test_req_idx_per_token.py::test_on_update_k
 unittest/_torch/attention/test_attention_backends.py::test_attention_backend[qwen2_0_5b_gqa_hd64-ctx-bf16-HND-p32-v1] SKIP (https://nvbugs/6641268)
 unittest/_torch/executor/kv_cache/test_kv_cache_budget_split.py::TestExternalDrafterKvDtype SKIP (https://nvbugs/6800223)
 unittest/_torch/executor/kv_cache/test_kv_cache_budget_split.py::TestSplitGpuBudgetForDraft SKIP (https://nvbugs/6800223)
-unittest/_torch/executor/kv_cache/test_kv_cache_budget_split.py::TestSplitGpuBudgetForDraft::test_target_cost_uses_derived_layer_type_windows SKIP (https://nvbugs/6800223)
 unittest/_torch/executor/kv_cache/test_kv_cache_v2_vocab_size.py::test_branch_only_enables_multimodal_keys_when_needed[dense-encoder_disable_noop] SKIP (https://nvbugs/6818710)
 unittest/_torch/executor/kv_cache/test_kv_cache_v2_vocab_size.py::test_branch_only_enables_multimodal_keys_when_needed[dense-multimodal] SKIP (https://nvbugs/6818710)
 unittest/_torch/executor/kv_cache/test_kv_cache_v2_vocab_size.py::test_branch_only_enables_multimodal_keys_when_needed[dense-text_only] SKIP (https://nvbugs/6818710)
