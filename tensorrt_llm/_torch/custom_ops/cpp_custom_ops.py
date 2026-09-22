@@ -15,11 +15,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
 
 def _register_fake():
-    """Register the meta ("fake") kernels for the trtllm C++ custom ops.
-
-    Each entry mirrors one op's output shapes and dtypes without touching data,
-    which is what torch.compile and export need to trace through the op.
-    """
 
     @torch.library.register_fake("trtllm::allreduce")
     def allreduce(
@@ -410,10 +405,9 @@ def _register_fake():
           conv_state_v: torch.Tensor, a_log: torch.Tensor, g: torch.Tensor,
           dt_bias: torch.Tensor, beta: torch.Tensor, onorm_g: torch.Tensor,
           onorm_weight: torch.Tensor, ssm_state_indices: Optional[torch.Tensor],
-          cu_seqlens: torch.Tensor, state: torch.Tensor, apply_onorm: bool,
-          update_conv_cache: bool, use_lower_bound: bool,
-          apply_beta_sigmoid: bool, lower_bound: float, scale: float,
-          onorm_eps: float, output: torch.Tensor) -> None:
+          state: torch.Tensor, apply_onorm: bool, update_conv_cache: bool,
+          use_lower_bound: bool, apply_beta_sigmoid: bool, lower_bound: float,
+          scale: float, onorm_eps: float, output: torch.Tensor) -> None:
         # Inplace-only: the kernel writes into ``output``, so there is nothing
         # to allocate and nothing to return.
         return None
@@ -1351,10 +1345,7 @@ def _register_fake():
           cp_rank,
           cp_size,
           zero_kv_mask=None):
-        """Exchanged tensors keep the shape and dtype of their inputs.
-
-        zero_kv_mask only changes the values the sender writes, never a shape.
-        """
+        # Returns outputs with same shapes as inputs
         return partial_o.new_empty(partial_o.shape), softmax_stats.new_empty(
             softmax_stats.shape)
 

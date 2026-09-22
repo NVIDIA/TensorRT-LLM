@@ -245,7 +245,11 @@ std::tuple<torch::Tensor, torch::Tensor> alltoall_helix_native(torch::Tensor par
         TORCH_CHECK(mask.numel() > 0 && entry_count % mask.numel() == 0, "zero_kv_mask numel (", mask.numel(),
             ") must divide the all-to-all entry count (", entry_count, ")");
         params.zeroKvMask = reinterpret_cast<uint8_t const*>(mask.data_ptr());
-        params.zeroKvMaskDivisor = entry_count / mask.numel();
+        // entry_count can legitimately be 0 for an empty batch, in which case
+        // the kernel never indexes the mask; keep the divisor positive so the
+        // launch-side contract still holds.
+        int const divisor = static_cast<int>(entry_count / mask.numel());
+        params.zeroKvMaskDivisor = divisor > 0 ? divisor : 1;
     }
 
     // Launch kernel
