@@ -395,8 +395,9 @@ class TestWanPipelineParallel:
 
     def test_cfg2_attn2d2x1_ulysses2_pvae8(self):
         """world=8, cfg=2, ulysses=2, attn2d=2×1, async_ulysses, parallel_vae=8 vs HF reference."""
-        if not _ATTN2D_AVAILABLE:
-            pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
+        assert _ATTN2D_AVAILABLE, (
+            "FA4 / flash_attn_combine JIT kernels not available; expected on the Blackwell CI runner"
+        )
         run_test_in_distributed(
             world_size=8,
             test_fn=_logic_wan_cfg2_attn2d2x1_ulysses2_pvae8,

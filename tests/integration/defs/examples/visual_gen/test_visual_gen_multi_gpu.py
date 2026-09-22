@@ -202,11 +202,9 @@ def _distributed_worker(rank, world_size, backend, test_fn, port, kwargs, tllm_s
 
 
 def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool = True, **kwargs):
-    try:
-        import tensorrt_llm.bindings as tllm_bindings
-        from tensorrt_llm._utils import get_free_port
-    except ImportError:
-        pytest.skip("Required modules not available")
+    import tensorrt_llm.bindings as tllm_bindings
+    from tensorrt_llm._utils import get_free_port
+
     if use_cuda and torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
     backend = "nccl" if use_cuda else "gloo"
@@ -273,10 +271,8 @@ def wan22_within_build_reference(tmp_path_factory):
     from whole-build numerics drift: both sides of the comparison shift
     together when bf16 numerics legitimately change (nvbug 6655990).
     """
-    try:
-        import tensorrt_llm.bindings as tllm_bindings
-    except ImportError:
-        pytest.skip("Required modules not available")
+    import tensorrt_llm.bindings as tllm_bindings
+
     if torch.cuda.device_count() < 1:
         pytest.skip("Within-build reference generation requires a GPU")
     model_path = get_checkpoint("Wan2.2-T2V-A14B-Diffusers")
