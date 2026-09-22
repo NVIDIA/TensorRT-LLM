@@ -225,8 +225,17 @@ class HttpClusterStorageServer(ClusterStorage):
         # Total time this event loop was unable to serve requests, excluded
         # from the clock TTLs are measured on (see _service_now).
         self._unserviceable_sec = 0.0
+        self._outage_sample_deadline: Optional[float] = None
         if server:
             self.add_routes(server)
+
+    def _settle_outage_sample(self, now: float) -> None:
+        """Account for an overdue event-loop probe exactly once."""
+        deadline = self._outage_sample_deadline
+        if deadline is None or now < deadline:
+            return
+        self._unserviceable_sec += now - deadline
+        self._outage_sample_deadline = None
 
     def _service_now(self) -> float:
         """Monotonic time minus however long this loop could not serve requests.
@@ -239,7 +248,12 @@ class HttpClusterStorageServer(ClusterStorage):
         still expires, because the clock only pauses while nobody could have
         been served.
         """
-        return key_time() - self._unserviceable_sec
+        now = key_time()
+        # A queued request may run before the sleeping expiry task resumes.
+        # Settle its overdue probe here so no TTL operation can observe the
+        # stale service clock in that scheduling window.
+        self._settle_outage_sample(now)
+        return now - self._unserviceable_sec
 
     def add_routes(self, server: FastAPI):
         server.add_api_route("/set", jsonify(self._set), methods=["POST"])
@@ -261,6 +275,7 @@ class HttpClusterStorageServer(ClusterStorage):
         if self._check_expired_task:
             self._check_expired_task.cancel()
             self._check_expired_task = None
+            self._outage_sample_deadline = None
 
     async def set(self,
                   key: str,
@@ -373,8 +388,9 @@ class HttpClusterStorageServer(ClusterStorage):
         while remaining > 0:
             slice_sec = min(self._OUTAGE_SAMPLE_SEC, remaining)
             before = key_time()
+            self._outage_sample_deadline = before + slice_sec
             await asyncio.sleep(slice_sec)
-            self._unserviceable_sec += max(0.0, key_time() - before - slice_sec)
+            self._settle_outage_sample(key_time())
             remaining -= slice_sec
 
     async def _check_expired(self):

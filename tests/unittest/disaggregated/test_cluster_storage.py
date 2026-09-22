@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from tensorrt_llm.serve.cluster_storage import (
     HttpClusterStorageServer, StorageItem, WatchEvent, WatchEventType,
     create_cluster_storage, create_cluster_storage_client, is_loopback_host,
-    validate_http_cluster_storage_scope)
+    jsonify, validate_http_cluster_storage_scope)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -230,7 +230,7 @@ class TestClusterStorage:
                     ]) == {WatchEventType.DELETE, WatchEventType.SET}
 
 
-def http_server_storage(port):
+def http_server_storage(port, expire_block_sec=0):
     cluster_storage = HttpClusterStorageServer("", "")
 
     @contextlib.asynccontextmanager
@@ -240,6 +240,15 @@ def http_server_storage(port):
         await cluster_storage.stop()
 
     app = FastAPI(lifespan=lifespan)
+    if expire_block_sec > 0:
+
+        async def blocked_expire(key: str, ttl: int) -> bool:
+            # Block inside the real HTTP request's event loop so its TTL read
+            # is ordered before the overdue expiry-sweep continuation.
+            time.sleep(expire_block_sec)
+            return await cluster_storage.expire(key, ttl)
+
+        app.add_api_route("/expire", jsonify(blocked_expire), methods=["GET"])
     cluster_storage.add_routes(app)
     server = Server(
         uvicorn.Config(app=app, host="localhost", port=port, log_level="info"))
@@ -317,3 +326,31 @@ async def test_expiry_does_not_charge_the_storage_own_outage():
         assert await storage.get(key) is None
     finally:
         await storage.stop()
+
+
+@pytest.mark.asyncio
+async def test_queued_http_refresh_settles_outage_before_ttl_operations(
+        unused_tcp_port):
+    """A queued HTTP refresh must settle a storage-loop outage first."""
+    ttl, block_sec = 2, 2.5
+    server, storage = http_server_storage(unused_tcp_port,
+                                          expire_block_sec=block_sec)
+
+    with server.run_in_thread():
+        client = create_cluster_storage_client(
+            f"http://localhost:{unused_tcp_port}", "test")
+        try:
+            key = gen_key("queued_outage_key")
+            assert await client.set(key, "worker", ttl=ttl)
+
+            # The /expire handler blocks the uvicorn/storage loop past the
+            # current TTL, then refreshes before the queued sweep can resume.
+            assert await client.expire(key, ttl)
+            assert await client.get(key) == "worker"
+
+            # A refresh made with the stale wall clock would extend this TTL
+            # by the outage duration a second time.
+            await asyncio.sleep(ttl + storage._check_expired_interval + 0.5)
+            assert await client.get(key) is None
+        finally:
+            await client._session.close()
