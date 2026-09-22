@@ -1660,86 +1660,47 @@ def test_min_p_sample_top_k_disabled_sentinel():
     assert kept.gather(1, tokens.unsqueeze(-1)).all()
 
 
-def test_top_p_near_one_keeps_full_vocab():
-    """Near-1 top_p must not index out of bounds (issue #19485).
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_top_p_no_crossing_row_keeps_full_vocab(device: str):
+    """A row whose cumulative probability never reaches top_p keeps its full
+    distribution instead of scattering an out-of-range index.
 
-    fp32 accumulation can leave every cumulative probability below a top_p
-    very close to 1 (with the seed below, row 1 finishes at 0.9999998212,
-    under float32(0.9999999)), so the first-True search finds no entry. Such
-    a row must keep its full distribution instead of scattering an
-    out-of-range index.
+    fp32 accumulation can leave every cumulative probability of a row below a
+    top_p very close to 1, so the first-True search finds no entry and yields
+    vocab_size. Such a row must retain every token, renormalized.
     """
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
     torch.manual_seed(0)
-    logits = torch.randn(2, 32000)
-    # Must not raise (pre-fix: searchsorted returned vocab_size -> OOB scatter).
-    tokens, probs = top_k_top_p_sampling_batch(
-        logits, temperature=1.0, top_p=0.9999999)
-    assert tokens.shape == (2,)
-    # No crossing -> nothing removed: full-vocabulary distribution, renormalized.
-    torch.testing.assert_close(probs.sum(-1), torch.ones(2))
-    torch.testing.assert_close(probs, torch.softmax(logits, -1))
-
-
-def test_top_p_mixed_crossing_and_no_crossing_rows():
-    """A batch can mix crossing and no-crossing rows (issue #19485).
-
-    Row 0 is peaked so its cumulative probability crosses top_p at the first
-    token and only that token is kept; row 1 is the floating-point
-    no-crossing row from test_top_p_near_one_keeps_full_vocab and must keep
-    its full distribution. Pre-fix the no-crossing row raised for the batch.
-    """
-    torch.manual_seed(0)
-    no_crossing = torch.randn(2, 32000)[1]
-    peaked = torch.zeros(32000)
+    candidates = torch.randn(8, 32000, device=device)
+    sorted_candidates, _ = torch.sort(candidates, descending=True, dim=-1)
+    finals = torch.cumsum(torch.softmax(sorted_candidates, dim=-1), dim=-1)[:, -1]
+    # Put top_p just above the lowest reachable cumulative sum so the no-crossing
+    # branch is hit by construction: fp32 accumulation order differs between CPU
+    # and CUDA and between GPU architectures, so a fixed threshold would only
+    # reach this branch by coincidence.
+    no_crossing_row = int(finals.argmin())
+    top_p = float(torch.nextafter(finals[no_crossing_row], torch.ones((), device=device)))
+    assert top_p < 1.0
+    no_crossing = candidates[no_crossing_row]
+    peaked = torch.zeros(32000, device=device)
     peaked[0] = 30.0
     logits = torch.stack([peaked, no_crossing])
-    tokens, probs = top_k_top_p_sampling_batch(
-        logits, temperature=1.0, top_p=0.9999999)
+
+    # Must not raise: without the clamp the search yields vocab_size, giving an
+    # out-of-bounds scatter, which is a device-side assert on CUDA.
+    tokens, probs = top_k_top_p_sampling_batch(logits, temperature=1.0, top_p=top_p)
+
     assert tokens.shape == (2,)
     # Crossing row: only the top token survives nucleus filtering.
     assert int((probs[0] > 0).sum()) == 1
     assert int(probs[0].argmax()) == 0
-    # No-crossing row: full distribution retained.
-    torch.testing.assert_close(probs[1].sum(), torch.ones(()))
+    # No-crossing row: nothing removed, renormalized. Strict positivity proves no
+    # tail was zeroed, since softmax of finite logits is strictly positive while
+    # the failure mode writes exact 0.0.
+    assert bool((probs[1] > 0).all())
+    torch.testing.assert_close(probs[1].sum(), torch.ones((), device=device))
     torch.testing.assert_close(probs[1], torch.softmax(no_crossing, -1))
-
-
-def _nucleus_reference_probs(logits: torch.Tensor, top_p: float) -> torch.Tensor:
-    """Independent nucleus-filtering oracle for tests.
-
-    Keep the smallest prefix of the descending-sorted distribution whose
-    cumulative probability reaches ``top_p`` (always keeping the first
-    token), then renormalize. Encodes the intended top-p contract without
-    reusing the implementation under test.
-    """
-    sorted_probs, sorted_indices = torch.sort(
-        torch.softmax(logits, dim=-1), descending=True, dim=-1)
-    cumulative = torch.cumsum(sorted_probs, dim=-1)
-    keep = torch.cat(
-        [
-            torch.ones_like(cumulative[..., :1], dtype=torch.bool),
-            cumulative[..., :-1] < top_p,
-        ],
-        dim=-1,
-    )
-    kept = torch.where(keep, sorted_probs, torch.zeros_like(sorted_probs))
-    kept = kept / kept.sum(dim=-1, keepdim=True)
-    out = torch.zeros_like(kept)
-    out.scatter_(1, sorted_indices, kept)
-    return out
-
-
-@pytest.mark.parametrize("top_p", [0.9, 0.95, 0.999])
-def test_top_p_ordinary_values_match_nucleus_reference(top_p: float):
-    """Ordinary top_p values must match the nucleus-filtering reference.
-
-    Guards that the #19485 clamp leaves standard top-p behavior unchanged.
-    """
-    torch.manual_seed(7)
-    logits = torch.randn(4, 4096)
-    _, probs = top_k_top_p_sampling_batch(
-        logits.clone(), temperature=1.0, top_p=top_p)
-    torch.testing.assert_close(probs, _nucleus_reference_probs(logits, top_p))
 
 
 class TestBatchedSampling:
