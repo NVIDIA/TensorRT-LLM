@@ -38,6 +38,8 @@ DISAGG_GEN_TRANS_IN_PROGRESS = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRE
 CONTEXT_INIT = LlmRequestState.CONTEXT_INIT.value  # 10
 GEN_IN_PROGRESS = LlmRequestState.GENERATION_IN_PROGRESS.value  # 13
 GEN_TO_COMPLETE = LlmRequestState.GENERATION_TO_COMPLETE.value  # 14
+DISAGG_CTX_TRANS_IN_PROGRESS = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS.value  # 21
+DISAGG_CTX_COMPLETE = LlmRequestState.DISAGG_CONTEXT_COMPLETE.value  # 22
 
 
 # ---------------------------------------------------------------------------
@@ -1585,6 +1587,55 @@ class TestDeadlockDetection:
 
         for _ in range(5):
             sched.schedule_request(reqs, {0})
+
+    @pytest.mark.parametrize(
+        "holder_state",
+        [DISAGG_CTX_TRANS_IN_PROGRESS, DISAGG_CTX_COMPLETE, DISAGG_GEN_TRANS_IN_PROGRESS],
+    )
+    def test_a_pending_transfer_holding_pages_is_not_a_deadlock(self, holder_state):
+        """A context server's pool can be full of sends that have not landed.
+
+        Those requests are past the schedulable states, so they never reach
+        the scheduled lists, and the new context requests they block cannot
+        allocate. Without this the detector would call that a deadlock well
+        before the transfer's own timeout has anything to say.
+        """
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: False,
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        sched._DEADLOCK_STALL_ITERS = 3
+        reqs = [
+            make_ctx_request(0, 100, is_first_context_chunk=False),
+            make_filtered_request(1, state_value=holder_state),
+        ]
+
+        for _ in range(sched._DEADLOCK_STALL_ITERS + 2):
+            sched.schedule_request(reqs, set())
+
+        assert sched._stalled_schedules == 0
+
+    def test_a_deadlock_behind_a_finished_transfer_is_still_reported(self):
+        """The reprieve lasts only as long as the transfer does."""
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: False,
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        sched._DEADLOCK_STALL_ITERS = 3
+        blocked = make_ctx_request(0, 100, is_first_context_chunk=False)
+        sending = make_filtered_request(1, state_value=DISAGG_CTX_TRANS_IN_PROGRESS)
+
+        for _ in range(5):
+            sched.schedule_request([blocked, sending], set())
+
+        # The send landed and the executor reaped it, but the pool is still
+        # full, so the stall is now the scheduler's to report.
+        for _ in range(sched._DEADLOCK_STALL_ITERS - 1):
+            sched.schedule_request([blocked], set())
+        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+            sched.schedule_request([blocked], set())
 
 
 # ===========================================================================

@@ -1458,6 +1458,19 @@ class KVCacheV2Scheduler(RequestScheduler):
     # PEFT budget, IndexMapper slots) clear long before.
     _DEADLOCK_STALL_ITERS = 1000
 
+    # States in which an in-flight KV transfer still owns pages it is about to
+    # release: a context-only request sending its cache once prefill finished,
+    # one whose send landed and which the executor has yet to reap, and a
+    # generation request receiving a cache. None of them are schedulable, so
+    # the capacity they are about to return is invisible to `made_progress`.
+    _TRANSFER_HOLDING_STATE_VALUES = frozenset(
+        {
+            LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS.value,
+            LlmRequestState.DISAGG_CONTEXT_COMPLETE.value,
+            LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS.value,
+        }
+    )
+
     def _detect_deadlock(
         self,
         active_requests: RequestList,
@@ -1492,6 +1505,16 @@ class KVCacheV2Scheduler(RequestScheduler):
         )
         if num_gen_candidates == 0 and num_ctx_candidates == 0:
             # Legitimately idle: nothing to schedule.
+            self._stalled_schedules = 0
+            return
+
+        # Waiting on a transfer is not a deadlock: the pages it holds come
+        # back when it lands. This matters on a context server, where a pool
+        # filled by asynchronous sends blocks every new CONTEXT_INIT request
+        # while nothing the scheduler can see makes progress. A send that
+        # never lands is the transfer layer's timeout to report, not a
+        # scheduling failure, so the count resets rather than merely pausing.
+        if any(req.state_value in self._TRANSFER_HOLDING_STATE_VALUES for req in active_requests):
             self._stalled_schedules = 0
             return
 
