@@ -166,6 +166,28 @@ _FORENSICS_PER_FILE_MAX_BYTES = 64 * 1024
 _FORENSICS_TOTAL_MAX_BYTES = 2 * 1024 * 1024
 
 
+def _resolve_forensics_dir(output_dir):
+    """Return the forensics directory, deriving a default if CI did not set one.
+
+    jenkins/L0_Test.groovy exports TLLM_FORENSICS_DIR, but the Jenkins pipeline
+    script is configured outside this repository, so a PR cannot prove its own
+    groovy edit is the version that runs. Without a fallback that uncertainty
+    becomes a single point of failure: no env var means sitecustomize installs
+    nothing, and the run comes back green with zero instrumentation, which is
+    indistinguishable from "the probe found nothing".
+
+    Written back into os.environ so the collector below resolves the same path.
+    """
+    existing = os.environ.get("TLLM_FORENSICS_DIR", "").strip()
+    if existing:
+        return existing
+    derived = os.path.join(output_dir, "forensics")
+    os.environ["TLLM_FORENSICS_DIR"] = derived
+    os.environ.setdefault("TLLM_FORENSICS_INTERVAL", "60")
+    print(f"FORENSICS_DIR_DERIVED: {derived} (TLLM_FORENSICS_DIR was unset)")
+    return derived
+
+
 def _print_forensics_dumps():
     """Surface per-process stack dumps through this process's stdout.
 
@@ -398,6 +420,13 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     def run_command(cmd, num_workers=1):
         try:
             env = {'PYTHONPATH': build_pythonpath()}
+            # Reaches MPI_Comm_spawn workers: they inherit this environment,
+            # and tests/unittest (which holds sitecustomize.py) is already on
+            # the PYTHONPATH built above.
+            forensics_dir = _resolve_forensics_dir(output_dir)
+            env['TLLM_FORENSICS_DIR'] = forensics_dir
+            env['TLLM_FORENSICS_INTERVAL'] = os.environ.get(
+                'TLLM_FORENSICS_INTERVAL', '60')
             if s3_secret_key:
                 env["S3_SECRET_KEY"] = s3_secret_key
             if num_workers > 1:
