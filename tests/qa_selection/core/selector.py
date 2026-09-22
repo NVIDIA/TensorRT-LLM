@@ -28,8 +28,8 @@ Marker precedence, reproducing the fixtures that consume each one:
     skip_less_device_memory    every level
     skip_less_host_memory      not evaluated
 
-A reason string with no rule keeps the test and is recorded in
-`Decision.unknown_skipif`; `strict_unknown` raises instead.
+A reason string with no rule keeps the test. The table is curated, so its
+silence is a decision, not a gap: nothing is recorded and nothing is reported.
 """
 
 from dataclasses import dataclass, field
@@ -37,10 +37,6 @@ from typing import Any, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from .machines import MachineProfile
 from .rules import SkipRuleTable, default_rule_table
-
-
-class UnknownSkipRuleError(LookupError):
-    """A skipif reason string has no rule, under strict handling."""
 
 
 @dataclass(frozen=True)
@@ -91,7 +87,6 @@ class Decision:
     nodeid: str
     selected: bool
     blockers: Tuple[str, ...]
-    unknown_skipif: Tuple[str, ...]
 
 
 def default_mpi_world_size(profile: MachineProfile) -> int:
@@ -113,51 +108,38 @@ class Selector:
         profile: MachineProfile,
         rules: Optional[SkipRuleTable] = None,
         mpi_world_size: Optional[int] = None,
-        strict_unknown: bool = False,
     ) -> None:
         self.profile = profile
         self.rules = rules if rules is not None else default_rule_table()
         self.mpi_world_size = (
             mpi_world_size if mpi_world_size is not None else default_mpi_world_size(profile)
         )
-        self.strict_unknown = strict_unknown
 
     def decide(self, test: CollectedTest) -> Decision:
         """Return the selection decision for one test, listing every blocker."""
-        skipif_blockers, unknown = self.skipif_blockers(test)
-        if unknown and self.strict_unknown:
-            raise UnknownSkipRuleError(
-                f"{test.nodeid}: no rule for skipif reason(s) "
-                f"{', '.join(repr(reason) for reason in unknown)}; "
-                f"add them to tests/qa_selection/core/rules.json"
-            )
-
-        blockers = skipif_blockers + self.resource_blockers(test)
+        blockers = self.skipif_blockers(test) + self.resource_blockers(test)
         return Decision(
             nodeid=test.nodeid,
             selected=not blockers,
             blockers=tuple(blockers),
-            unknown_skipif=tuple(unknown),
         )
 
-    def skipif_blockers(self, test: CollectedTest) -> Tuple[List[str], List[str]]:
-        """Evaluate every skipif at every level; one match drops the test."""
-        blockers: List[str] = []
-        unknown: List[str] = []
+    def skipif_blockers(self, test: CollectedTest) -> List[str]:
+        """Evaluate every skipif at every level; one match drops the test.
 
+        A mark the table has no rule for is passed over in silence, whether it
+        carries no `reason=` at all or a reason the table declines to encode.
+        Both are skips this layer has no opinion about, so both keep the test.
+        """
+        blockers: List[str] = []
         for mark in test.iter_markers("skipif"):
             # args[0] is the frozen condition: it describes the collecting host,
             # never the target, and is never read.
             reason = mark.skipif_reason
-            if reason is None:
-                # Unkeyable, not unknown: no rule could ever name this mark.
-                continue
-            if reason not in self.rules:
-                unknown.append(reason)
-            elif self.rules[reason].blocks(self.profile):
+            rule = self.rules.get(reason)
+            if rule is not None and rule.blocks(self.profile):
                 blockers.append(reason)
-
-        return blockers, unknown
+        return blockers
 
     def resource_blockers(self, test: CollectedTest) -> List[str]:
         """Apply the resource markers, each in its production precedence."""

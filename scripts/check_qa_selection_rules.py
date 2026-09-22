@@ -21,8 +21,11 @@ what a reworded reason is now and hand back the replacement.
 
 A rule whose decorator is gone, or whose reason has drifted from it, is an
 error: either way the rule can never match a collected mark again, and its
-tests ship to every machine. A decorator with no rule is only reported -- the
-table is curated, not an inventory.
+tests ship to every machine.
+
+Every statement this check makes is about a rule the table declares. A
+decorator with no rule is not one: the table is curated, not an inventory, so
+its silence about a decorator is already the whole answer and needs no report.
 
 Decorators are read with `ast`, never imported.
 """
@@ -242,14 +245,9 @@ class RuleTableDriftCheck:
     def run(self) -> Tuple[int, str]:
         """Return (exit status, message); only a rule that cannot match is an error."""
         faults = self.faults()
-        uncurated = sorted(set(self.scanner.named) - self.rules.decorators)
-        report = faults.report_lines() + self.uncurated_lines(uncurated)
-
+        report = faults.report_lines()
         if not report:
-            return 0, (
-                f"qa_selection: {len(self.rules)} rules, "
-                f"{len(self.scanner.named)} skip decorators, no drift"
-            )
+            return 0, f"qa_selection: {len(self.rules)} rules, no drift"
         return (1 if faults else 0), "\n".join(report).strip()
 
     def faults(self) -> RuleFaults:
@@ -268,23 +266,6 @@ class RuleTableDriftCheck:
             elif decorator.reason != rule.reason:
                 faults.drifted.append((rule, decorator))
         return faults
-
-    def uncurated_lines(self, uncurated: List[str]) -> List[str]:
-        """Decorators with no rule: kept for every machine, by design."""
-        if not uncurated:
-            return []
-        report = [
-            "",
-            f"{len(uncurated)} decorator(s) with no rule (reported, not an error).",
-            "The table is curated, not an inventory: these are kept for every machine",
-            "and reported as an unknown reason at selection time. Add a rule to",
-            f"{RepoPaths.RULES_FILE} if the target machine can decide one:",
-        ]
-        report += [
-            f"  {self.scanner.named[name].location}\n    reason={self.scanner.named[name].reason!r}"
-            for name in uncurated
-        ]
-        return report
 
 
 def main(argv: List[str] = None) -> int:

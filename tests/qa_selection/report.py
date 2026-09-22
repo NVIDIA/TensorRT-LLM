@@ -33,7 +33,6 @@ import pytest
 from .collection import Selection
 from .core.allocation import Assignment, GpuDemand, Ladder
 from .core.machines import MachineProfile
-from .core.selector import CollectedTest
 
 
 class NodeIds:
@@ -96,12 +95,10 @@ class Outcome:
     required_gpus_from: Tuple[str, ...]
     rung: Optional[int]
     unassignable: bool
-    unknown_reasons: Tuple[str, ...]
-    unkeyable_skipif: int
 
     @classmethod
-    def of(cls, assignment: Assignment, view: CollectedTest) -> "Outcome":
-        """One assignment, plus the one fact only the collected view carries."""
+    def of(cls, assignment: Assignment) -> "Outcome":
+        """One assignment, flattened into the fields the record writes."""
         return cls(
             nodeid=assignment.nodeid,
             selected=assignment.decision.selected,
@@ -110,18 +107,7 @@ class Outcome:
             required_gpus_from=assignment.demand.required_gpus_from,
             rung=assignment.rung,
             unassignable=assignment.unassignable,
-            unknown_reasons=assignment.decision.unknown_skipif,
-            unkeyable_skipif=cls.unkeyable_skipif_of(view),
         )
-
-    @staticmethod
-    def unkeyable_skipif_of(view: CollectedTest) -> int:
-        """How many of this test's `skipif` marks carry no `reason=`.
-
-        A keyless mark can be given no rule, so it is not an unknown reason. It
-        never blocks: the test stays selected.
-        """
-        return sum(1 for mark in view.iter_markers("skipif") if mark.skipif_reason is None)
 
     def to_mapping(self) -> Dict[str, object]:
         """This outcome as the record's JSON object."""
@@ -133,8 +119,6 @@ class Outcome:
             "required_gpus_from": list(self.required_gpus_from),
             "rung": self.rung,
             "unassignable": self.unassignable,
-            "unknown_reasons": list(self.unknown_reasons),
-            "unkeyable_skipif": self.unkeyable_skipif,
         }
 
 
@@ -159,10 +143,7 @@ class SelectionReport:
             ladder=request.ladder,
             target_rung=request.target_rung,
             source_revision=SourceRevision.of(rootdir),
-            outcomes=tuple(
-                Outcome.of(assignment, view)
-                for assignment, view in zip(selection.assignments, selection.views)
-            ),
+            outcomes=tuple(Outcome.of(assignment) for assignment in selection.assignments),
         )
 
     @property
@@ -204,26 +185,6 @@ class SelectionReport:
         return tuple(outcome for outcome in self.feasible if outcome.unassignable)
 
     @property
-    def unknown_reasons(self) -> Dict[str, List[str]]:
-        """Skipif reasons with no rule, each with the tests carrying it.
-
-        Kept, not deselected: an undecidable reason fails open.
-        """
-        found: Dict[str, List[str]] = {}
-        for outcome in self.outcomes:
-            for reason in outcome.unknown_reasons:
-                found.setdefault(reason, []).append(outcome.nodeid)
-        return found
-
-    @property
-    def unkeyable_skipif(self) -> List[str]:
-        """Tests carrying a `skipif` with no `reason=` at all.
-
-        Reported apart from `unknown_reasons`: no rule can name these.
-        """
-        return [outcome.nodeid for outcome in self.outcomes if outcome.unkeyable_skipif]
-
-    @property
     def unclassified_rung(self) -> int:
         """Where a consumer routes an identifier this run never collected.
 
@@ -241,8 +202,6 @@ class SelectionReport:
             "deselected": len(self.outcomes) - len(self.feasible),
             "live": len(self.live),
             "unassignable": len(self.unassignable),
-            "unknown_reasons": sum(len(ids) for ids in self.unknown_reasons.values()),
-            "unkeyable_skipif": len(self.unkeyable_skipif),
             "unclassified": 0,
         }
 
@@ -258,8 +217,6 @@ class SelectionReport:
             "nodeid_form": NodeIds.FORM,
             "counts": self.counts,
             "rungs": {str(rung): len(outcomes) for rung, outcomes in self.rungs.items()},
-            "unknown_reasons": self.unknown_reasons,
-            "unkeyable_skipif": self.unkeyable_skipif,
             "unclassified": {"route_to_rung": self.unclassified_rung, "nodeids": []},
             "tests": [outcome.to_mapping() for outcome in self.outcomes],
         }
@@ -366,7 +323,7 @@ class TerminalSummary:
         ]
         if report.ladder is not None:
             lines.append(cls.line("rungs", cls.rung_counts(report)))
-        lines += cls.population_lines(report)
+        lines += cls.unassignable_line(report)
         lines += [cls.line("written", path) for path in output.written]
         return lines
 
@@ -392,17 +349,13 @@ class TerminalSummary:
         return "  ".join(f"{rung}: {len(outcomes)}" for rung, outcomes in report.rungs.items())
 
     @classmethod
-    def population_lines(cls, report: SelectionReport) -> List[str]:
-        """The unresolved populations, each with the fix it calls for.
+    def unassignable_line(cls, report: SelectionReport) -> List[str]:
+        """The one unresolved population a reader can act on, when it has members.
 
-        Printed only when non-empty, and never merged: each has its own fix.
+        A skipif the rule table has no rule for is not among them: the table is
+        curated, so keeping the test is already the whole answer.
         """
-        counts = report.counts
-        populations = [
-            ("unassignable", counts["unassignable"], "demand exceeds every rung"),
-            ("unknown", counts["unknown_reasons"], "skipif reason has no rule in core/rules.json"),
-            ("unkeyable", counts["unkeyable_skipif"], "skipif carries no reason="),
-        ]
-        return [
-            cls.line(name, f"{count}  -- {advice}") for name, count, advice in populations if count
-        ]
+        count = report.counts["unassignable"]
+        if not count:
+            return []
+        return [cls.line("unassignable", f"{count}  -- demand exceeds every rung")]
