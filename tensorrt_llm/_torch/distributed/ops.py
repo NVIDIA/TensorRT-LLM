@@ -543,14 +543,19 @@ class HelixAllToAllNative:
 
         return HelixAllToAllNative._cache[mapping]
 
-    def alltoall_native(self, partial_o: torch.Tensor,
-                        softmax_stats: torch.Tensor):
+    def alltoall_native(self,
+                        partial_o: torch.Tensor,
+                        softmax_stats: torch.Tensor,
+                        zero_kv_mask: Optional[torch.Tensor] = None):
         """
         Perform all-to-all data exchange.
 
         Args:
             partial_o: Tensor with shape [..., cp_size, kv_lora_rank], dtype half.
             softmax_stats: Tensor with shape [..., cp_size, 2], dtype float32.
+            zero_kv_mask: Optional bool mask over the entry dimension, True
+                where this rank owns no KV. The sender rewrites those rows to a
+                no-op contribution, so the caller must not sanitize them itself.
 
         Returns:
             Tuple of (partial_o_out, softmax_stats_out) with same shapes as inputs.
@@ -561,6 +566,7 @@ class HelixAllToAllNative:
             self.workspace_tensor,
             self.mapping.cp_rank,
             self.mapping.cp_size,
+            zero_kv_mask,
         )
 
         return partial_o_out, softmax_stats_out

@@ -1175,3 +1175,82 @@ class TestExternalDrafterKvDtype:
         assert c._speculative_config.spec_dec_mode == SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
 
         assert c._get_draft_kv_model_config() is draft_model_config
+
+
+class TestMambaEffectiveTpSize:
+    """The sharding rule shared by the mamba pool allocator and the budget.
+
+    ``mamba_cache_manager`` and ``MambaKVCacheParams.get_states_bytes_per_layer``
+    must agree here, or the budget split withholds per-rank bytes the allocator
+    never uses.
+    """
+
+    @staticmethod
+    def _mapping(*, tp_size: int, cp_size: int, helix: bool, attention_dp: bool) -> SimpleNamespace:
+        return SimpleNamespace(
+            tp_size=tp_size,
+            cp_size=cp_size,
+            enable_attention_dp=attention_dp,
+            has_cp_helix=lambda: helix,
+        )
+
+    @pytest.mark.parametrize(
+        "tp_size,cp_size,helix,attention_dp,expected",
+        [
+            # Attention-DP replicates the state on every rank, and takes
+            # precedence over both of the sharded cases below.
+            (8, 1, False, True, 1),
+            (8, 4, True, True, 1),
+            # Helix repurposes the CP ranks as plain TP for recurrent state.
+            (2, 8, True, False, 16),
+            (1, 16, True, False, 16),
+            # Standard TP: a non-helix mesh never shards state across CP.
+            (8, 1, False, False, 8),
+            (8, 4, False, False, 8),
+            (1, 1, False, False, 1),
+        ],
+    )
+    def test_sharding_rule(self, tp_size, cp_size, helix, attention_dp, expected) -> None:
+        from tensorrt_llm._torch.pyexecutor.config_utils import mamba_effective_tp_size
+
+        mapping = self._mapping(
+            tp_size=tp_size, cp_size=cp_size, helix=helix, attention_dp=attention_dp
+        )
+
+        assert mamba_effective_tp_size(mapping) == expected
+
+    def test_budget_sizing_uses_the_shared_rule(self) -> None:
+        """``get_states_bytes_per_layer`` must not re-derive the TP degree."""
+        import torch
+
+        from tensorrt_llm._torch.pyexecutor.config_utils import (
+            MambaKVCacheParams,
+            mamba_effective_tp_size,
+        )
+
+        params = MambaKVCacheParams(
+            state_size=128,
+            conv_kernel=4,
+            num_heads=128,
+            n_groups=8,
+            head_dim=64,
+            mamba_layer_mask=[True],
+            target_full_attention_layer_mask=[False],
+            num_mamba_layers=1,
+            num_draft_layers=0,
+            dtype=torch.float16,
+            mamba_ssm_cache_dtype=None,
+        )
+        helix = self._mapping(tp_size=2, cp_size=8, helix=True, attention_dp=False)
+        assert mamba_effective_tp_size(helix) == 16
+        plain_tp16 = self._mapping(tp_size=16, cp_size=1, helix=False, attention_dp=False)
+        replicated = self._mapping(tp_size=2, cp_size=8, helix=True, attention_dp=True)
+
+        # Helix sizes the per-rank state as plain TP=tp*cp ...
+        assert params.get_states_bytes_per_layer(helix) == params.get_states_bytes_per_layer(
+            plain_tp16
+        )
+        # ... and attention-DP keeps the whole unsharded state per rank.
+        assert params.get_states_bytes_per_layer(
+            replicated
+        ) == 16 * params.get_states_bytes_per_layer(helix)

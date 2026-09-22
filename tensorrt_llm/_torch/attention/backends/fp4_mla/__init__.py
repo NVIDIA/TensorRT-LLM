@@ -614,7 +614,6 @@ def configure_fp4_mla_device_page_table(
         and int(getattr(metadata, "beam_width", 1)) == 1
         and not bool(getattr(metadata, "is_spec_dec_tree", False))
         and not bool(getattr(metadata, "locality_domain_enabled", False))
-        and not bool(getattr(metadata, "enable_helix", False))
         and int(getattr(kv_cache_manager, "tokens_per_block", 0) or 0) == FP4_MLA_TOKENS_PER_BLOCK
         and max_page_capacity > 0
         and page_index_scale > 0
@@ -1300,10 +1299,14 @@ def rebuild_fp4_mla_disagg_imported_cache(
         or not callable(getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None))
     ):
         return False
-    if not isinstance(prompt_len, int) or prompt_len <= 0:
+    if not isinstance(prompt_len, int) or prompt_len < 0:
         raise ValueError(
-            f"FP4 MLA disaggregated import needs a positive prompt_len, got {prompt_len}."
+            f"FP4 MLA disaggregated import needs a nonnegative prompt_len, got {prompt_len}."
         )
+    # Helix assigns whole pages round-robin, so a rank may own no prompt pages.
+    # There are no process-local V sidecars to rebuild on that rank.
+    if prompt_len == 0:
+        return True
 
     page_size = int(kv_cache_manager.tokens_per_block)
     if page_size != FP4_MLA_TOKENS_PER_BLOCK:
@@ -1778,6 +1781,8 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     q_sf_out: torch.Tensor,
     v_packed_base: Optional[torch.Tensor],
     v_page_offset: int,
+    helix_position_offsets: Optional[torch.Tensor],
+    helix_is_inactive_rank: Optional[torch.Tensor],
 ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     num_contexts = metadata.num_contexts
     num_seqs = metadata.num_seqs
@@ -1820,6 +1825,59 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     num_hp_pages = pool.shape[0]
 
     max_gen_len = num_tokens // num_gen
+    use_helix = helix_position_offsets is not None or helix_is_inactive_rank is not None
+    use_helix_local_slots = use_helix and bool(getattr(metadata, "_helix_spec_tokens_valid", False))
+    if use_helix:
+        if helix_position_offsets is None or helix_is_inactive_rank is None:
+            raise RuntimeError(
+                "FP4 MLA Helix requires both position-offset and inactive-rank metadata."
+            )
+        if max_gen_len != 1 and not use_helix_local_slots:
+            raise NotImplementedError(
+                "FP4 MLA multi-token Helix requires speculative per-token metadata."
+            )
+        if (
+            helix_position_offsets.dtype != torch.int32
+            or helix_position_offsets.device != latent_cache.device
+            or helix_position_offsets.ndim != 1
+            or helix_position_offsets.numel() < num_tokens
+            or not helix_position_offsets.is_contiguous()
+        ):
+            raise ValueError(
+                "FP4 MLA Helix position offsets must be a contiguous same-device "
+                "int32 tensor covering every generation token."
+            )
+        if (
+            helix_is_inactive_rank.dtype != torch.bool
+            or helix_is_inactive_rank.device != latent_cache.device
+            or helix_is_inactive_rank.ndim != 1
+            or helix_is_inactive_rank.numel() < num_gen
+            or not helix_is_inactive_rank.is_contiguous()
+        ):
+            raise ValueError(
+                "FP4 MLA Helix inactive-rank metadata must be a contiguous "
+                "same-device bool tensor covering every generation sequence."
+            )
+        if use_helix_local_slots:
+            helix_local_slots = getattr(metadata, "helix_local_slots", None)
+            if (
+                not isinstance(helix_local_slots, torch.Tensor)
+                or helix_local_slots.dtype != torch.int32
+                or helix_local_slots.device != latent_cache.device
+                or helix_local_slots.ndim != 1
+                or helix_local_slots.numel() < num_tokens
+                or not helix_local_slots.is_contiguous()
+            ):
+                raise ValueError(
+                    "FP4 MLA speculative Helix local slots must be a contiguous "
+                    "same-device int32 tensor covering every generation token."
+                )
+        else:
+            helix_local_slots = helix_position_offsets
+    else:
+        helix_position_offsets = kv_lens_gen
+        helix_local_slots = kv_lens_gen
+        helix_is_inactive_rank = gen_lens_gen
     _validate_fp4_mla_hp_generation_width(hp_pool_size, max_gen_len)
     max_rewind_len = hp_pool_size - HP_BLOCK_SIZE
     page_ids = _fp4_mla_generation_page_ids(metadata, num_gen)
@@ -1933,6 +1991,9 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
             q_sf_output,
             kv_lens_gen,
             gen_lens_gen,
+            helix_position_offsets,
+            helix_local_slots,
+            helix_is_inactive_rank,
             page_ids,
             hp_page_ids,
             metadata.paged_kv_indptr_decode,
@@ -1971,6 +2032,8 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
             K_RESIDUAL_D=FP4_MLA_K_RESIDUAL_DIM,
             STORE_K_RESIDUAL=store_k_residual,
             FUSE_ROPE_CACHE_STORE=True,
+            USE_HELIX=use_helix,
+            USE_HELIX_LOCAL_SLOTS=use_helix_local_slots,
             WRITE_V_PACKED=write_v_packed,
             MAX_GEN_TILES=max_gen_tiles_variant,
             ROPE_DIM=rope_dim,
@@ -2025,6 +2088,8 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
             metadata.page_size,
             write_v_packed,
             store_k_residual,
+            use_helix,
+            use_helix_local_slots,
             tuple(q1_variants),
             multi_token_tiles,
             tuple(kv_cache.stride()),
@@ -2306,6 +2371,8 @@ def scatter_fp4_mla_kv_cache(
     q_pe: Optional[torch.Tensor] = None,
     q_rope_out: Optional[torch.Tensor] = None,
     q_quant_input: Optional[torch.Tensor] = None,
+    helix_position_offsets: Optional[torch.Tensor] = None,
+    helix_is_inactive_rank: Optional[torch.Tensor] = None,
     q_context: Optional[torch.Tensor] = None,
     q_nope_head_dim: Optional[int] = None,
 ) -> bool:
@@ -2423,6 +2490,11 @@ def scatter_fp4_mla_kv_cache(
     else:
         if q_context is not None or q_nope_head_dim is not None:
             raise ValueError("FP4 MLA generation cache update does not accept context Q tensors.")
+        if (helix_position_offsets is None) != (helix_is_inactive_rank is None):
+            raise ValueError(
+                "FP4 MLA Helix position-offset and inactive-rank metadata "
+                "must be provided together."
+            )
         if not all(arg is not None for arg in generation_inputs):
             raise ValueError(
                 "FP4 MLA generation requires rotary_cos_sin, q_pe, q_rope_out, "
@@ -2561,6 +2633,8 @@ def scatter_fp4_mla_kv_cache(
             q_sf_out=q_sf_out,
             v_packed_base=v_packed_base,
             v_page_offset=v_page_offset,
+            helix_position_offsets=helix_position_offsets,
+            helix_is_inactive_rank=helix_is_inactive_rank,
         )
         v_pack_page_ids = _fp4_mla_generation_page_ids(
             metadata, metadata.num_seqs - metadata.num_contexts
@@ -3882,6 +3956,7 @@ def run_fp4_mla_attention_decode(
     prequantized_q: torch.Tensor,
     prequantized_q_sf: torch.Tensor,
     q_batch_capacity: int,
+    softmax_stats_tensor: Optional[torch.Tensor] = None,
 ) -> None:
     """Run MLA decode with FP4 QK and FP4 PV tensor-core matmuls.
 
@@ -3929,6 +4004,43 @@ def run_fp4_mla_attention_decode(
         raise ValueError("FP4 MLA attention output batch dimensions do not match.")
 
     backend = _fp4_mla_attention_backend()
+    helix_spec_tokens_valid = bool(getattr(metadata, "_helix_spec_tokens_valid", False))
+    helix_kv_bounds = None
+    if softmax_stats_tensor is not None:
+        if backend != _FP4_MLA_CUTEDSL_BACKEND:
+            raise NotImplementedError(
+                "FP4 MLA Helix softmax stats require the cutedsl attention backend."
+            )
+        if query_len_per_seq != 1 and not helix_spec_tokens_valid:
+            raise NotImplementedError(
+                "FP4 MLA multi-token Helix requires speculative per-token metadata."
+            )
+        expected_stats_shape = (num_queries, num_heads, 2)
+        if (
+            softmax_stats_tensor.shape != expected_stats_shape
+            or softmax_stats_tensor.dtype != torch.float32
+            or softmax_stats_tensor.device != q.device
+            or not softmax_stats_tensor.is_contiguous()
+        ):
+            raise ValueError(
+                "FP4 MLA Helix requires contiguous same-device float32 softmax "
+                f"stats with shape {expected_stats_shape}."
+            )
+        if helix_spec_tokens_valid:
+            helix_kv_bounds = getattr(metadata, "helix_kv_bounds", None)
+            if (
+                not isinstance(helix_kv_bounds, torch.Tensor)
+                or helix_kv_bounds.dtype != torch.int32
+                or helix_kv_bounds.device != q.device
+                or helix_kv_bounds.ndim != 1
+                or helix_kv_bounds.numel() < num_queries
+                or not helix_kv_bounds.is_contiguous()
+            ):
+                raise ValueError(
+                    "FP4 MLA speculative Helix KV bounds must be a contiguous "
+                    "same-device int32 tensor covering every query token."
+                )
+            helix_kv_bounds = helix_kv_bounds[:num_queries]
     if getattr(metadata, "fp4_mla_v_scale_pool", None) is None:
         raise RuntimeError(
             "FP4 MLA attention decode requires the auxiliary V scale pool to be allocated."
@@ -4131,6 +4243,15 @@ def run_fp4_mla_attention_decode(
                 )
 
         kernel_output = output
+        kernel_softmax_stats = None
+        if softmax_stats_tensor is not None:
+            kernel_softmax_stats = _ensure_workspace_tensor(
+                metadata,
+                "_fp4_mla_cutedsl_softmax_stats_buf",
+                (2, num_queries, physical_heads),
+                dtype=torch.float32,
+                device=output.device,
+            )
         if num_heads < physical_heads:
             kernel_output = _ensure_workspace_tensor(
                 metadata,
@@ -4161,9 +4282,15 @@ def run_fp4_mla_attention_decode(
             v_page_offset=v_page_offset,
             q_batch_capacity=q_batch_capacity,
             partition_runtime_valid_k=bool(getattr(metadata, "is_cuda_graph", False)),
+            softmax_row_max=(None if kernel_softmax_stats is None else kernel_softmax_stats[0]),
+            softmax_row_sum=(None if kernel_softmax_stats is None else kernel_softmax_stats[1]),
+            helix_kv_bounds=helix_kv_bounds,
         )
         if kernel_output is not output:
             output.copy_(kernel_output[:, :num_heads])
+        if kernel_softmax_stats is not None:
+            softmax_stats_tensor[..., 0].copy_(kernel_softmax_stats[0, :, :num_heads])
+            softmax_stats_tensor[..., 1].copy_(kernel_softmax_stats[1, :, :num_heads])
         return
 
     total_p_rows = num_queries * max_pages * num_heads
