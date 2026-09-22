@@ -148,14 +148,15 @@ stages.
 
 | Model-engine metric | Scope |
 |---------------------|-------|
-| `sampling_warmup_seconds` | Warm up sampling kernels before serving. |
+| `sampling_warmup_seconds` | Warm up sampling kernels and run `torch.compile()` on sampling operators. |
 | `attention_warmup_seconds` | Warm up the attention backend and kernels. |
 | `general_warmup_seconds` | Warm up general input shapes and release temporary workspaces. |
 | `autotuner_warmup_seconds` | Run kernel autotuning warmup. |
 | `mamba_hybrid_warmup_seconds` | Warm up Mamba hybrid kernels, when applicable. |
 | `gen_cuda_graph_warmup_seconds` | Run the warmup-only pass for generation and mixed encoder-decoder CUDA graphs, including LoRA autotuning and pipeline-parallel cache synchronization and cleanup. |
 | `gen_cuda_graph_capture_seconds` | Capture generation and mixed encoder-decoder CUDA graphs for serving. |
-| `ctx_cuda_graph_capture_seconds` | Capture configured prefill CUDA graphs, when applicable. |
+| `ctx_cuda_graph_warmup_seconds` | Warm up prefill forwards before CUDA graph capture. |
+| `ctx_cuda_graph_capture_seconds` | Capture prefill CUDA graphs. |
 | `post_ctx_cuda_graph_capture_warmup_seconds` | Warm up prefill logits buffers with many requests after CUDA graph capture. |
 | `dg_paged_mqa_warmup_seconds` | Warm up DeepGEMM paged-MQA metadata, when applicable. |
 | `cute_dsl_radix_topk_warmup_seconds` | Warm up the CuTe DSL radix top-k kernel, when applicable. |

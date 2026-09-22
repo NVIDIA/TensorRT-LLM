@@ -14,7 +14,7 @@ import contextlib
 import os
 import sys
 import unittest
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from collections.abc import Iterator
 from dataclasses import dataclass
 from types import ModuleType, SimpleNamespace
@@ -28,8 +28,9 @@ import tensorrt_llm._torch.pyexecutor.model_engine as model_engine_module
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8GemmRunner
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
-from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM, timing_metric
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunner
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -713,7 +714,7 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertEqual(model_engine._runner.method_calls, [])
 
     @pytest.mark.cpu_only
-    def test_legacy_warmup_skips_without_kv_cache(self):
+    def test_legacy_warmup_skips_without_kv_cache(self) -> None:
         model_engine = object.__new__(PyTorchModelEngine)
         model_engine._warmup_timer = _WarmupTimer(rank=0)
         model_engine._metrics = {}
@@ -722,21 +723,62 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine.enable_in_graph_sampling = False
         model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
         model_engine._runner = None
+        model_engine.model = SimpleNamespace(config=SimpleNamespace(vocab_size=128))
+        model_engine.dtype = torch.float16
+        model_engine._cuda_graph_batch_sizes = [1, 4]
         resource_manager = Mock()
         resource_manager.get_resource_manager.return_value = None
+        events = []
+
+        @contextlib.contextmanager
+        def record_metric_scope(name: str, metrics: dict[str, float]) -> Iterator[None]:
+            events.append(("enter", name))
+            with timing_metric(name, metrics):
+                yield
+            events.append(("exit", name))
 
         with (
             patch(
-                "tensorrt_llm._torch.pyexecutor.model_engine.warmup_sampling_module"
+                "tensorrt_llm._torch.pyexecutor.model_engine.timing_metric",
+                side_effect=record_metric_scope,
+            ),
+            patch(
+                "tensorrt_llm._torch.pyexecutor.model_engine.warmup_sampling_module",
+                side_effect=lambda: events.append("sampling"),
             ) as warmup_sampling,
+            patch(
+                "tensorrt_llm._torch.pyexecutor.model_engine.warmup_sample_from_logits_op",
+                side_effect=lambda *args: events.append("in_graph_sampling"),
+            ) as warmup_in_graph_sampling,
             _capture_tllm_logs() as logs,
         ):
-            model_engine.warmup(resource_manager)
+            for enabled in (False, True):
+                with self.subTest(enable_in_graph_sampling=enabled):
+                    events.clear()
+                    warmup_sampling.reset_mock()
+                    warmup_in_graph_sampling.reset_mock()
+                    model_engine.enable_in_graph_sampling = enabled
+                    model_engine._eager_workspace_reclaimer = object()
+                    model_engine._warmup_impl(resource_manager)
+                    self.assertEqual(
+                        events,
+                        [("enter", "sampling_warmup_seconds"), "sampling"]
+                        + (["in_graph_sampling"] if enabled else [])
+                        + [("exit", "sampling_warmup_seconds")],
+                    )
+                    self.assertIsNone(model_engine._eager_workspace_reclaimer)
+                    warmup_sampling.assert_called_once_with()
+                    if enabled:
+                        warmup_in_graph_sampling.assert_called_once_with(
+                            128, torch.device("cuda"), torch.float16, [1, 4]
+                        )
+                    else:
+                        warmup_in_graph_sampling.assert_not_called()
 
         self.assertTrue(
             any("Skipping warm up as no KV Cache manager allocated." in log for log in logs)
         )
-        warmup_sampling.assert_called_once_with()
+        self.assertGreaterEqual(model_engine.metrics["sampling_warmup_seconds"], 0)
 
     def test_encoder_decoder_encoder_warmup_delegates_runner_lifecycle(self):
         model_engine = object.__new__(PyTorchModelEngine)
@@ -887,25 +929,129 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine = object.__new__(PyTorchModelEngine)
         model_engine.prefill_cuda_graph_backend = PrefillCudaGraphBackend.PIECEWISE
         model_engine._torch_compile_enabled = True
-        model_engine._torch_compile_piecewise_cuda_graph = False
-        model_engine._prefill_cuda_graph_num_tokens = []
-        model_engine._metrics = {}
+        model_engine._torch_compile_piecewise_cuda_graph = True
+        model_engine._prefill_cuda_graph_num_tokens = [4, 8]
+        model_engine._metrics = defaultdict(float)
+        resource_manager = object()
+        events = []
+        scopes = []
+        warmup_metric = "ctx_cuda_graph_warmup_seconds"
+        capture_metric = "ctx_cuda_graph_capture_seconds"
+        post_metric = "post_ctx_cuda_graph_capture_warmup_seconds"
 
-        with patch.object(
-            model_engine,
-            "no_cuda_graph",
-            return_value=contextlib.nullcontext(),
+        @contextlib.contextmanager
+        def record_metric_scope(name: str, metrics: dict[str, float]) -> Iterator[None]:
+            scopes.append(name)
+            try:
+                with timing_metric(name, metrics):
+                    yield
+            finally:
+                scopes.pop()
+
+        def forward(batch: tuple[int, bool], **kwargs: object) -> torch.Tensor:
+            events.append((batch, tuple(scopes)))
+            return torch.empty(1)
+
+        with (
+            patch.object(model_engine, "no_cuda_graph", side_effect=contextlib.nullcontext),
+            patch.object(
+                model_engine,
+                "_create_warmup_request",
+                side_effect=lambda rm, tokens, gen, least_requests=True: (tokens, least_requests),
+            ),
+            patch.object(
+                model_engine,
+                "_release_batch_context",
+                side_effect=lambda batch, rm: contextlib.nullcontext(batch),
+            ),
+            patch.object(model_engine, "_assert_all_tp_ranks_have_warmup_batch"),
+            patch.object(model_engine, "forward", side_effect=forward),
+            patch(
+                "tensorrt_llm._torch.pyexecutor.model_engine.timing_metric",
+                side_effect=record_metric_scope,
+            ),
+            patch(
+                "tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner.timing_metric",
+                side_effect=record_metric_scope,
+            ),
+            patch("tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner.BreakableCUDAGraph"),
+            patch(
+                "tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner.make_weak_ref",
+                side_effect=lambda value: value,
+            ),
+            patch("torch.cuda.Stream"),
+            patch("torch.cuda.current_stream"),
+            patch("torch.cuda.stream", side_effect=lambda stream: contextlib.nullcontext()),
+            patch("torch.cuda.graph_pool_handle", return_value=(1, 2)),
+            patch(
+                "torch.cuda.synchronize", side_effect=lambda: events.append(("sync", tuple(scopes)))
+            ),
+            patch("torch.cuda.empty_cache"),
+            patch("gc.collect"),
+            patch("time.perf_counter", side_effect=iter(range(100))),
         ):
-            model_engine._capture_prefill_cuda_graphs(object())
+            for backend in (PrefillCudaGraphBackend.PIECEWISE, PrefillCudaGraphBackend.BREAKABLE):
+                with self.subTest(backend=backend):
+                    events.clear()
+                    model_engine._metrics.clear()
+                    model_engine.prefill_cuda_graph_backend = backend
+                    model_engine._torch_compile_piecewise_cuda_graph = (
+                        backend == PrefillCudaGraphBackend.PIECEWISE
+                    )
+                    model_engine.breakable_cuda_graph_runner = (
+                        BreakableCUDAGraphRunner(torch.nn.Identity())
+                        if backend == PrefillCudaGraphBackend.BREAKABLE
+                        else None
+                    )
+                    model_engine._capture_prefill_cuda_graphs(resource_manager)
+                    warmup_steps = 3 if backend == PrefillCudaGraphBackend.PIECEWISE else 2
+                    warmup_scope = (
+                        BreakableCUDAGraphRunner.CUDA_GRAPH_WARMUP_METRIC
+                        if backend == PrefillCudaGraphBackend.BREAKABLE
+                        else warmup_metric
+                    )
+                    capture_scope = (
+                        BreakableCUDAGraphRunner.CUDA_GRAPH_CAPTURE_METRIC
+                        if backend == PrefillCudaGraphBackend.BREAKABLE
+                        else capture_metric
+                    )
+                    expected = []
+                    for tokens in (8, 4):
+                        expected.extend([((tokens, True), (warmup_scope,))] * warmup_steps)
+                        expected.extend(
+                            [
+                                ("sync", (warmup_scope,)),
+                                ((tokens, True), (capture_scope,)),
+                                ("sync", (capture_scope,)),
+                            ]
+                        )
+                    for tokens in (8, 4):
+                        expected.extend(
+                            [((tokens, False), (post_metric,)), ("sync", (post_metric,))]
+                        )
+                    self.assertEqual(events, expected)
+                    self.assertEqual(
+                        model_engine.metrics.keys(), {warmup_metric, capture_metric, post_metric}
+                    )
+                    self.assertTrue(all(value >= 0 for value in model_engine.metrics.values()))
+                    self.assertEqual(model_engine.metrics[warmup_metric], 2.0)
+                    self.assertEqual(model_engine.metrics[capture_metric], 2.0)
+                    if backend == PrefillCudaGraphBackend.BREAKABLE:
+                        runner = model_engine.breakable_cuda_graph_runner
+                        self.assertEqual(runner.metrics, {warmup_scope: 1.0, capture_scope: 1.0})
+                        self.assertIsNot(runner.metrics, model_engine.metrics)
 
-        self.assertEqual(
-            model_engine.metrics.keys(),
-            {
-                "ctx_cuda_graph_capture_seconds",
-                "post_ctx_cuda_graph_capture_warmup_seconds",
-            },
-        )
-        self.assertTrue(all(value >= 0 for value in model_engine.metrics.values()))
+                        runner.clear()
+                        model_engine._metrics.clear()
+                        with patch.object(
+                            model_engine, "forward", side_effect=RuntimeError("warmup failed")
+                        ):
+                            with self.assertRaisesRegex(RuntimeError, "warmup failed"):
+                                model_engine._capture_prefill_cuda_graphs(resource_manager)
+                        self.assertEqual(runner.metrics, {warmup_scope: 1.0})
+                        self.assertEqual(model_engine.metrics, {})
+                        self.assertFalse(runner.is_warming_up)
+                        self.assertFalse(runner.is_capturing)
 
     def test_empty_cache_fires_immediately_after_autotuner(self):
         """Change 1 placement: empty_cache must be the call right after

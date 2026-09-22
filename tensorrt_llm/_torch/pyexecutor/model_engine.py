@@ -9,6 +9,7 @@ import math
 import os
 import weakref
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from contextlib import contextmanager
 from typing import (Any, Callable, Dict, Iterator, List, Optional, Sequence,
                     Tuple, Type, Union, cast)
@@ -49,6 +50,7 @@ from ..attention.backends.trtllm import TrtllmAttentionMetadata
 from ..attention.backends.utils import get_attention_backend
 from ..autotuner import AutoTuner, autotune
 from ..compilation.backend import Backend
+from ..compilation.piecewise_optimizer import PiecewiseRunner
 from ..compilation.utils import capture_piecewise_cuda_graph
 from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
@@ -384,7 +386,7 @@ class PyTorchModelEngine(ModelEngine):
     ):
         _configure_deep_gemm_pdl()
 
-        self._metrics: dict[str, float] = {}
+        self._metrics: dict[str, float] = defaultdict(float)
         self.forward_pass_callable = None
         self._cleanup_done = False
         self._runner: Optional[Union[ModelRunner, PackedModelRunner]] = None
@@ -3108,7 +3110,7 @@ class PyTorchModelEngine(ModelEngine):
                         self.runtime_draft_len = saved_runtime_draft_len
 
     def _capture_prefill_cuda_graphs(self, resource_manager: ResourceManager):
-        """Capture prefill CUDA graphs, then warm up logits buffer allocations.
+        """Warm up and capture prefill CUDA graphs, timing each phase separately.
 
         After capture, run prefill batches with many requests to warm up
         logits buffers outside the captured model body. This post-capture
@@ -3127,37 +3129,52 @@ class PyTorchModelEngine(ModelEngine):
         capture_context = (capture_piecewise_cuda_graph(True)
                            if self._torch_compile_piecewise_cuda_graph else
                            contextlib.nullcontext())
-        with timing_metric("ctx_cuda_graph_capture_seconds", self._metrics):
-            with capture_context, self.no_cuda_graph():
-                for num_tokens in prefill_cuda_graph_num_tokens:
-                    warmup_request = self._create_warmup_request(
-                        resource_manager, num_tokens, 0)
-                    with self._release_batch_context(warmup_request,
-                                                     resource_manager) as batch:
-                        self._assert_all_tp_ranks_have_warmup_batch(
-                            batch, num_tokens)
-                        if batch is None:
-                            continue
+        with capture_context, self.no_cuda_graph():
+            for num_tokens in prefill_cuda_graph_num_tokens:
+                warmup_request = self._create_warmup_request(
+                    resource_manager, num_tokens, 0)
+                with self._release_batch_context(warmup_request,
+                                                 resource_manager) as batch:
+                    self._assert_all_tp_ranks_have_warmup_batch(
+                        batch, num_tokens)
+                    if batch is None:
+                        continue
 
-                        logger.info(
-                            f"Run prefill CUDA graph capture for num tokens={num_tokens}"
-                        )
-                        if self.breakable_cuda_graph_runner is not None:
-                            self.breakable_cuda_graph_runner.capture(
-                                num_tokens, lambda: self.forward(
-                                    batch,
-                                    new_tensors_device=None,
-                                    resource_manager=resource_manager))
-                        else:
-                            # Run a few times to ensure torch.compile capture.
-                            for _ in range(4):
+                    logger.info(
+                        f"Run prefill CUDA graph capture for num tokens={num_tokens}"
+                    )
+                    if self.breakable_cuda_graph_runner is not None:
+                        runner = self.breakable_cuda_graph_runner
+                        runner.capture(
+                            num_tokens, lambda: self.forward(
+                                batch,
+                                new_tensors_device=None,
+                                resource_manager=resource_manager))
+                        self._metrics[
+                            "ctx_cuda_graph_warmup_seconds"] += runner.metrics.get(
+                                BreakableCUDAGraphRunner.
+                                CUDA_GRAPH_WARMUP_METRIC, 0.0)
+                        self._metrics[
+                            "ctx_cuda_graph_capture_seconds"] += runner.metrics.get(
+                                BreakableCUDAGraphRunner.
+                                CUDA_GRAPH_CAPTURE_METRIC, 0.0)
+                    else:
+                        with timing_metric("ctx_cuda_graph_warmup_seconds",
+                                           self._metrics):
+                            for _ in range(PiecewiseRunner.WARMUP_STEPS):
                                 self.forward(batch,
                                              new_tensors_device=None,
                                              resource_manager=resource_manager)
+                            torch.cuda.synchronize()
+                        with timing_metric("ctx_cuda_graph_capture_seconds",
+                                           self._metrics):
+                            self.forward(batch,
+                                         new_tensors_device=None,
+                                         resource_manager=resource_manager)
+                            torch.cuda.synchronize()
 
-                        torch.cuda.synchronize()
-                        gc.collect()
-                        torch.cuda.empty_cache()
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
         # The logits allocations grow with the number of requests and are not
         # part of the captured model body. Warm up the largest request count so
