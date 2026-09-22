@@ -119,7 +119,9 @@ def test_l2_atomic_descriptor_bounds():
         ("N", (128, (coordinate_count_limit + 1) * 128, 1)),
         ("L", (128, 128, coordinate_count_limit + 1)),
     ):
-        with pytest.raises(ValueError, match=mode):
+        # The message names the phase and the offending mode, e.g.
+        # "FC1 M tile count 65537 exceeds the L2 atomic descriptor limit 65536".
+        with pytest.raises(ValueError, match=rf"FC1 {mode} tile count \d+ exceeds"):
             fused_fc12.validate_l2_atomic_descriptor_bounds(
                 phase="FC1",
                 gemm_shape=out_of_bounds_shape,
@@ -470,6 +472,15 @@ _EXPECTED_STAGED_STRIDES = {
     (256, 128): (16_384, 2_048),
     (256, 256): (40_960, 20_480),
 }
+# Only the 2-CTA 256x256 geometry aliases the FC2 C buffer onto the FC1
+# operand tail; test_cute_dsl_moe.py::test_nvfp4_fc12_fused_rubin_matches_two_op_path
+# checks that path numerically on a Rubin device.
+_EXPECTED_OVERLAY = {
+    (128, 128): False,
+    (128, 256): False,
+    (256, 128): False,
+    (256, 256): True,
+}
 
 
 def _check_constructed_smem_views() -> None:
@@ -495,6 +506,7 @@ def _check_constructed_smem_views() -> None:
         kernel.fc1_c_layout = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR
         kernel.fc2_c_layout = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR
         kernel._setup_attributes()
+        assert kernel.overlay_fc2_c_on_fc1_ab_tail == _EXPECTED_OVERLAY[(tile_m, tile_n)]
         assert kernel.fc1_b_smem_layout_staged.outer.stride[-1] == b_stride
         assert kernel.fc2_b_smem_layout_staged.outer.stride[-1] == b_stride
         assert kernel.fc1_sfb_smem_layout_staged.stride[-1] == sfb_stride

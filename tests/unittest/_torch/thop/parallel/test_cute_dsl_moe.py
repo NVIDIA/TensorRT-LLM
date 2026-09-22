@@ -3701,6 +3701,197 @@ def test_rubin_moe_locality_domain_composite_owns_concurrent_tuning(
             )
 
 
+def _fc12_fused_rubin_tactic(tile_size: int, mma_n: int) -> str:
+    """The fused FC12 runner's tactic for a routing tile and an N tile.
+
+    Mirrors ``Sm107BlockScaledContiguousGroupedGemmFusedFc12Runner.get_valid_tactics``:
+    MMA M equals the routing tile, the cluster M is ``tile_size // 128`` and K
+    is fixed (tiler 256, instruction 128).
+    """
+    return repr(((tile_size, mma_n, 256), (tile_size, mma_n, 128), (tile_size // 128, 1)))
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported on Rubin (SM 107) GPUs",
+)
+@pytest.mark.parametrize("mma_n", [256, 128], ids=["overlay", "no_overlay"])
+def test_nvfp4_fc12_fused_rubin_matches_two_op_path(mma_n: int):
+    """Fused FC1+FC2 against the standalone FC1 and FC2 ops at a fixed geometry.
+
+    ``mma_n=256`` with the 2-CTA 256-row tile is the configuration whose shared
+    memory aliases the FC2 C block-reduce buffer onto the drained FC1 operand
+    tail (``overlay_fc2_c_on_fc1_ab_tail``; see test_fc12_smem_contract.py), so
+    an aliasing or reuse-ordering bug shows up as wrong FC2 values here while
+    the stage/offset contracts still hold. ``mma_n=128`` keeps separate regions
+    and is the control. The problem is sized so every persistent CTA processes
+    several FC2 tiles. The standalone ops are checked against float references
+    in their own tests above; both paths quantize FC1 with the same scale, so
+    only the FC2 accumulation order may differ and the comparison is tight.
+    """
+    sf_vec_size = 16
+    tile_size = 256
+    num_tokens = 4096
+    num_experts = 8
+    top_k = 2
+    hidden_size = 2048
+    interm_size = 1536
+    fc1_n = 2 * interm_size
+
+    torch.manual_seed(0)
+    routing_logits = torch.randn(num_tokens, num_experts, device="cuda")
+    token_final_scales, token_selected_experts = routing_logits.topk(top_k, dim=-1)
+    token_selected_experts = token_selected_experts.to(torch.int32)
+    token_final_scales = token_final_scales.softmax(dim=-1).to(torch.float32)
+    (
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        expanded_idx_to_permuted_idx,
+        permuted_idx_to_expanded_idx,
+        _total_num_padded_tokens,
+        num_non_exiting_tiles,
+    ) = torch.ops.trtllm.moe_sort(
+        token_selected_experts=token_selected_experts,
+        token_final_scales=token_final_scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        tile_tokens_dim=tile_size,
+    )
+    # More FC2 tiles than 2-CTA clusters on the device, so every persistent
+    # CTA owns several FC2 tiles and reuses its C buffer.
+    num_clusters = torch.cuda.get_device_properties(0).multi_processor_count // 2
+    assert num_non_exiting_tiles.item() * (hidden_size // mma_n) > num_clusters
+
+    # Integer-valued activations and weights (FC1 rows are [up | gate]) so the
+    # FP4 quantization of the inputs is exact, as in the other NVFP4 op tests.
+    a = torch.randint(-5, 5, (num_tokens, hidden_size), dtype=torch.int32, device="cuda").to(
+        torch.bfloat16
+    )
+    b1 = torch.randint(
+        -5, 5, (num_experts, fc1_n, hidden_size), dtype=torch.int32, device="cuda"
+    ).to(torch.bfloat16)
+    b2 = torch.randint(
+        -5, 5, (num_experts, hidden_size, interm_size), dtype=torch.int32, device="cuda"
+    ).to(torch.bfloat16)
+    # FC1 output scale from a float probe of one expert; both kernel paths use
+    # the same value, so it only has to keep the FP4 output in range.
+    probe = a[:512].float() @ b1[0].float().T
+    probe_up, probe_gate = probe.chunk(2, dim=-1)
+    fc1_absmax = (probe_up * torch.nn.functional.silu(probe_gate)).abs().max()
+    global_sf = 2 * fc1_absmax / (448 * 6)
+    global_sf_tensor = torch.tensor([1 / global_sf], dtype=torch.float32, device="cuda")
+
+    a_global_sf = a.abs().max().float() / (448 * 6)
+    b1_global_sf = b1.abs().amax(dim=(1, 2)).float() / (448 * 6)
+    b2_global_sf = b2.abs().amax(dim=(1, 2)).float() / (448 * 6)
+    a, a_sf = torch.ops.trtllm.fp4_quantize(a, 1 / a_global_sf, sf_vec_size, False)
+    a = a.view(torch.float4_e2m1fn_x2)
+    a_sf_unswizzled = unswizzle_sf(a_sf, (num_tokens + 127) // 128 * 128, hidden_size)[:num_tokens]
+    b1, b1_sf = torch.ops.trtllm.fp4_quantize(b1, 1 / b1_global_sf, sf_vec_size, False)
+    b1_sf = b1_sf.view(num_experts, fc1_n, hidden_size // sf_vec_size)
+    b2, b2_sf = torch.ops.trtllm.fp4_quantize(b2, 1 / b2_global_sf, sf_vec_size, False)
+    b2 = b2.view(torch.float4_e2m1fn_x2)
+    b2_sf = b2_sf.view(num_experts, hidden_size, interm_size // sf_vec_size)
+    fc1_alpha = a_global_sf * b1_global_sf
+    fc2_alpha = global_sf * b2_global_sf
+
+    # FC1 weights in the interleaved layout both kernels read.
+    b1_kernel = interleave_linear_and_gate(b1, group_size=64, dim=1).view(torch.float4_e2m1fn_x2)
+    b1_sf_kernel = swizzle_sf(
+        interleave_linear_and_gate(
+            unswizzle_sf(b1_sf, fc1_n, hidden_size).view(
+                num_experts, fc1_n, hidden_size // sf_vec_size
+            ),
+            group_size=64,
+            dim=1,
+        ),
+        fc1_n,
+        hidden_size,
+    ).view(num_experts, fc1_n, hidden_size // sf_vec_size)
+
+    # Reference: the standalone FC1 act-fusion op followed by the standalone
+    # FC2 finalize op (the two-op CUTEDSL backend path).
+    fc1_c, fc1_c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+        a,
+        b1_kernel,
+        a_sf_unswizzled,
+        b1_sf_kernel,
+        fc1_alpha,
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx,
+        num_non_exiting_tiles,
+        global_sf_tensor,
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_experts,
+        local_expert_offset=0,
+        tile_size=tile_size,
+        output_tensor=None,
+        output_sf_tensor=None,
+        scaling_vector_size=sf_vec_size,
+        activation_type=int(ActivationType.Swiglu),
+    )
+    out_two_op = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_rubin(
+        fc1_c,
+        b2,
+        fc1_c_sf,
+        b2_sf,
+        fc2_alpha,
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx,
+        num_non_exiting_tiles,
+        token_final_scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_experts,
+        local_expert_offset=0,
+        tile_size=tile_size,
+        output_dtype=torch.bfloat16,
+        scaling_vector_size=sf_vec_size,
+    )
+
+    out_fused = torch.zeros(num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
+    torch.ops.trtllm.cute_dsl_nvfp4_fc12_fused_rubin(
+        input=a,
+        fc1_weight=b1_kernel,
+        input_scale=a_sf_unswizzled.view(torch.uint8),
+        fc1_weight_scale=b1_sf_kernel.view(torch.uint8),
+        fc1_alpha=fc1_alpha,
+        tile_idx_to_group_idx=tile_idx_to_group_idx,
+        tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+        num_non_exiting_tiles=num_non_exiting_tiles,
+        global_sf=global_sf_tensor,
+        fc2_weight=b2,
+        fc2_weight_scale=b2_sf.view(torch.uint8),
+        fc2_alpha=fc2_alpha,
+        output=out_fused,
+        token_final_scales=token_final_scales,
+        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_experts,
+        local_expert_offset=0,
+        tile_size=tile_size,
+        swiglu_limit=float("inf"),
+        ep_size=1,
+        enable_alltoall=False,
+        scaling_vector_size=sf_vec_size,
+        precomputed_tactic=_fc12_fused_rubin_tactic(tile_size, mma_n),
+    )
+
+    assert torch.isfinite(out_fused).all()
+    # Guard against both paths degenerating to zeros, which would make the
+    # comparison below vacuous.
+    assert out_two_op.abs().mean() > 0
+    match = torch.isclose(out_fused, out_two_op, rtol=1.6e-2, atol=1e-5).float().mean()
+    assert match > 0.999, f"fused vs two-op match ratio {match:.5f}"
+
+
 @pytest.mark.skipif(
     get_sm_version() != 107,
     reason="This test is only supported on Rubin (SM 107) GPUs",
