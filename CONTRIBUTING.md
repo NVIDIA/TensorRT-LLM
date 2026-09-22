@@ -101,8 +101,9 @@ Valid ticket formats:
 
 Valid types are lowercase: `fix`, `feat`, `perf`, `refactor`, `test`, `doc`, `infra`, `chore`, `ci`, etc.
 
-If the PR includes an API change that might break user code/API usage, add "BREAKING" to the
-title so that reviewers know what to expect, and label the PR `api-breaking` (see
+If the PR includes an API change that might break user code/API usage, start the summary with
+`BREAKING:` (for example, `[None][feat] BREAKING: Remove the deprecated foo argument`) so that
+reviewers know what to expect, and label the PR `api-breaking` (see
 [Tests and Code Review for Protected APIs](#tests-and-code-review-for-protected-apis)).
 
 [!IMPORTANT]
@@ -158,15 +159,13 @@ Some APIs are committed to be stable; breaking changes to these APIs should be a
 This repo contains an [API stability testsuite](./tests/unittest/api_stability) to protect committed APIs (currently including the core components of LLM API). If your PR brings breaking changes to the protected APIs, the API stability tests will fail, reporting errors like:
 
 ```txt
-def test_signature(self):
-        snapshot = ClassSnapshot.from_inspect(self.TEST_CLASS)
-        try:
-            snapshot.assert_equal(self.reference)
-        except AssertionError as e:
->           raise AssertionError(self.error_msg) from e
-E           AssertionError: API stability validation failed. This is probably because you changed LLM's APIs, please ask for reviews from the code owners.
+E           AssertionError: API validation failed because you changed LLM's APIs, please ask for reviews from the code owners.
+```
 
-tests/api_stability/test_api_stability.py:241: AssertionError
+Changing a *committed* API reports instead:
+
+```txt
+E           AssertionError: API validation failed because you changed LLM's committed APIs, please ask for approval.
 ```
 
 As the error message suggests, please ask for reviews from the code owners of the corresponding APIs.

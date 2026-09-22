@@ -261,7 +261,10 @@ A test that CI never executes provides zero protection.
   hardware the test actually needs.
 - Confirm which stage will pick it up:
   `python scripts/test_to_stage_mapping.py --tests "<test_name>"`
-- Unit tests under `tests/unittest/` run in pre-merge CI automatically.
+- Unit tests under `tests/unittest/` are not collected automatically either: CI
+  runs them only through `unittest/...` bridge entries in the test-db lists. Make
+  sure an existing entry covers the test file or its parent directory, or add
+  one. See `tests/AGENTS.md` and `tests/README.md`.
 - If you must waive a known failure, add it to
   `tests/integration/test_lists/waives.txt` **with an NVBug link** — never a
   bare waive.
@@ -311,11 +314,18 @@ These fail CI or review if missed:
   `python3 scripts/generate_llm_args_golden_manifest.py` and commit
   `tensorrt_llm/usage/llm_args_golden_manifest.json`. New fields require
   telemetry/privacy CODEOWNER approval.
-- **API stability** — `tests/unittest/api_stability` protects committed LLM API
-  signatures. If reference files change, classify with the `api-compatible` or
-  `api-breaking` label; `api-breaking` also requires `BREAKING` in the title.
-  Request review from the API code owners. See
-  `docs/source/developer-guide/api-change.md`.
+- **API stability** — `tests/unittest/api_stability` protects the LLM API
+  (`references_committed/` for the committed surface, `references/` for the
+  non-committed one) and the `trtllm-serve` CLI and HTTP surface
+  (`test_serve_cli.py`, `test_serve_api.py`). The `Check LLM API Compatibility
+  Label` job fires on changes to either reference directory,
+  `tensorrt_llm/llmapi/llm_args.py`, or
+  `tensorrt_llm/usage/llm_args_golden_manifest.json` — including the manifest
+  the bullet above tells you to commit. Apply exactly one of `api-compatible` or
+  `api-breaking`; `api-breaking` additionally requires `BREAKING` in the title
+  (the check is case-sensitive; `[None][feat] BREAKING: ...` is the placement
+  that satisfies both title checks). Request review from the API code owners.
+  See `docs/source/developer-guide/api-change.md`.
 - **Narrow exception handling** — no bare `except:`.
 - **pre-commit** — run `pre-commit run --all-files` before committing. Hooks
   rewrite files in place; re-stage and commit again. Respect the Group A / Group
@@ -360,6 +370,11 @@ Format (enforced in CI by the `Check PR Title Format` job in
 - Examples: `[TRTLLM-5516][perf] Optimize CUDA graph padding`,
   `[https://nvbugs/5334370][fix] Fix one-model EAGLE3`,
   `[None][chore] Minor clean-up`
+
+- Breaking LLM API change: put `BREAKING:` at the start of the summary —
+  `[None][feat] BREAKING: Remove the deprecated foo argument`. `[BREAKING]` as a
+  bracket tag fails the title-format check, and a lowercase `[breaking]` type
+  fails the `api-breaking` title check, which is case-sensitive.
 
 A title that does not match is rejected by CI before review starts.
 
