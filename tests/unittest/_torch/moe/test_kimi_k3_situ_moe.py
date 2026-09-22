@@ -555,7 +555,17 @@ def test_kimi_k3_moe_split_selection() -> None:
     assert KimiK3MoERuntime._select_moe_tp_ep(tep) == (4, 2)
 
 
-@pytest.mark.parametrize("backend", ["CUTLASS", "TRTLLM", "MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"])
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "CUTLASS",
+        "TRTLLM",
+        "CUTEDSL",
+        "CUTEDSL_FC12",
+        "MEGAMOE_DEEPGEMM",
+        "MEGAMOE_CUTEDSL",
+    ],
+)
 def test_kimi_k3_routed_config_preserves_explicit_backend(backend):
     model_config = ModelConfig(
         mapping=Mapping(world_size=1, rank=0, tp_size=1),
@@ -673,7 +683,8 @@ def test_kimi_k3_allow_list_matches_what_the_backends_declare():
     assert "CUTEDSL" in declares_situ
 
 
-def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch):
+@pytest.mark.parametrize("backend", ["CUTEDSL", "CUTEDSL_FC12"])
+def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch, backend):
     """K3 must propagate strict backend selection through create_moe."""
     from transformers.configuration_utils import PretrainedConfig
 
@@ -688,7 +699,7 @@ def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch):
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
     # Keep the real resolver and K3 caller; only make eligibility deterministic.
-    for backend_cls in BACKEND_FAMILY["CUTEDSL"]:
+    for backend_cls in BACKEND_FAMILY[backend]:
         monkeypatch.setattr(
             backend_cls,
             "can_implement",
@@ -707,7 +718,7 @@ def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch):
     model_config = ModelConfig(
         pretrained_config=pretrained_config,
         mapping=Mapping(world_size=1, rank=0, tp_size=1),
-        moe_backend="CUTEDSL",
+        moe_backend=backend,
         quant_config_dict={"layers.0.mlp.experts": quant_config},
     )
     cfg = _K3Config(routed_expert_hidden_size=512, latent_moe_use_norm=True)
@@ -726,8 +737,8 @@ def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch):
     assert report.degraded
     assert impl_class_for(report) is CutlassFusedMoE
 
-    # Removing CUTEDSL from K3's no-degradation list must fail this assertion.
-    with pytest.raises(ValueError, match="CUTEDSL.*degradation disallowed") as excinfo:
+    # Removing either backend from K3's no-degradation list must fail this assertion.
+    with pytest.raises(ValueError, match=rf"{backend}.*degradation disallowed") as excinfo:
         KimiK3MoERuntime(model_config, cfg, layer_idx=0, aux_stream_dict={})
     assert "dep_missing" in str(excinfo.value)
 

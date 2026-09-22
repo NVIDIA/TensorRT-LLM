@@ -1190,7 +1190,12 @@ class KimiK3MoERuntime(nn.Module):
             # CUTLASS is absent on purpose: it is the fallback target, so
             # "degraded to CUTLASS" is not a thing that can happen to it.
             allow_backend_degradation=routed_moe_model_config.moe_backend
-            not in ("MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL", "CUTEDSL"),
+            not in (
+                "MEGAMOE_DEEPGEMM",
+                "MEGAMOE_CUTEDSL",
+                "CUTEDSL",
+                "CUTEDSL_FC12",
+            ),
         )
         self._check_trtllm_situ_quant(
             routed_moe_model_config.moe_backend, routed_quant_config.quant_algo
