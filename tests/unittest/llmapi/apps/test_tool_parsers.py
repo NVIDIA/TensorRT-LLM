@@ -3195,6 +3195,32 @@ def test_auto_detect_qwen3_8_tool_parser_matches_output(tmp_path, sample_tools):
     assert json.loads(result.calls[0].parameters) == {"location": "Paris"}
 
 
+@pytest.mark.parametrize(("chat_template", "expected"), [
+    ("If you choose to call a function ONLY reply in the following format:\n"
+     "<tool_call>\n<function=example_function_name>\n"
+     "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+     "</function>\n</tool_call>", "qwen3_coder"),
+    ("<tool_call>\n{\"name\": <function-name>, "
+     "\"arguments\": <args-json-object>}\n</tool_call>", "qwen3"),
+])
+def test_auto_detect_qwen3_tool_format_from_chat_template(
+        tmp_path, chat_template, expected):
+    """Qwen3-Coder is a `qwen3_moe` checkpoint like plain Qwen3.
+
+    The two were trained on incompatible tool-call formats, so the chat
+    template is the only thing that tells them apart.
+    """
+    from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+        resolve_auto_tool_parser
+    model_dir = tmp_path / "qwen3_moe"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_moe"}))
+    (model_dir / "chat_template.jinja").write_text(chat_template)
+
+    assert resolve_auto_tool_parser(str(model_dir)) == expected
+
+
 # ============================================================================
 # Integration Tests
 # ============================================================================

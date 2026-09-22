@@ -322,4 +322,4 @@ See the [`TorchLlmArgs` API reference](https://nvidia.github.io/TensorRT-LLM/llm
 * If online EPLB is enabled, wait for the configured observation and migration period before measuring steady state, and retain logs that show completed layer updates.
 * If the container fails to start, verify that the NVIDIA Container Toolkit is properly installed.
 * For connection issues, make sure the server port (`8000` in this guide) is not being used by another application.
-* Reasoning is controlled with `--reasoning_parser qwen3_5`. To toggle thinking per request, pass `enable_thinking` through `chat_template_kwargs` in the request body, for example `{"chat_template_kwargs": {"enable_thinking": true}}` (set it to `false` to disable reasoning).
+* Reasoning is handled by the auto-detected `qwen3_5` parser. To toggle thinking per request, pass `enable_thinking` through `chat_template_kwargs` in the request body, for example `{"chat_template_kwargs": {"enable_thinking": true}}` (set it to `false` to disable reasoning).

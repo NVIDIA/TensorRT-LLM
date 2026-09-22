@@ -550,23 +550,29 @@ def test_resolve_prefilled_thinking_requires_opt_in(parser: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("parser", "prompt_tail", "model_output", "content", "reasoning_content"), [
-        ("poolside_v1", R1_START, f"hidden{R1_END}visible", "visible",
-         "hidden"),
-        ("poolside_v1", R1_END, "visible", "visible", ""),
-        ("qwen3_5", R1_START, f"hidden{R1_END}visible", "visible", "hidden"),
-        ("qwen3_5", R1_END, "visible", "visible", ""),
-    ])
+    ("parser", "prompt_tail", "expected_thinking", "model_output", "content",
+     "reasoning_content"), [
+         ("poolside_v1", R1_START, True, f"hidden{R1_END}visible", "visible",
+          "hidden"),
+         ("poolside_v1", R1_END, False, "visible", "visible", ""),
+         ("qwen3_5", R1_START, True, f"hidden{R1_END}visible", "visible",
+          "hidden"),
+         ("qwen3_5", R1_END, False, "visible", "visible", ""),
+     ])
 def test_reasoning_mode_resolved_from_prompt(parser: str, prompt_tail: str,
+                                             expected_thinking: bool,
                                              model_output: str, content: str,
                                              reasoning_content: str) -> None:
     """Mirror the server path: resolve from the prompt, then parse.
 
     A request that sends no chat template kwargs must still land in the mode
-    the template actually rendered.
+    the template actually rendered. The resolved mode is asserted separately
+    because both parsers default to thinking, so the parse result alone would
+    still pass if resolution stopped recognizing the marker.
     """
     prompt = f"<user>hi</user>\n<assistant>{prompt_tail}"
     thinking = ReasoningParserFactory.resolve_prefilled_thinking(parser, prompt)
+    assert thinking is expected_thinking
     reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
         parser, {"enable_thinking": thinking})
     result = reasoning_parser.parse(model_output)
@@ -883,6 +889,49 @@ def test_auto_detect_qwen3_forced_non_thinking(tmp_path):
     os.makedirs(model_dir)
     _write_config(model_dir, "qwen3_moe")
     _write_tokenizer_config(model_dir, _FORCED_NON_THINKING_TEMPLATE)
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result is None
+
+
+# Instruct Qwen checkpoints mention <think> to re-render reasoning kept in the
+# conversation history, but leave the generation prompt empty.
+_HISTORY_ONLY_THINKING_TEMPLATE = (
+    "{%- for message in messages %}"
+    "{{- '<|im_start|>assistant\\n<think>\\n' + message.reasoning_content"
+    "  + '\\n</think>\\n\\n' + message.content }}"
+    "{%- endfor %}"
+    "{%- if add_generation_prompt %}"
+    "{{- '<|im_start|>assistant\\n' }}"
+    "{%- endif %}")
+
+
+def test_auto_detect_qwen3_template_from_jinja_file(tmp_path):
+    """The template may live in chat_template.jinja instead of the tokenizer.
+
+    Quantized Qwen3 checkpoints are re-saved by a `transformers` version that
+    writes the template to its own file and leaves `chat_template` null, and
+    reading only the tokenizer config would take that for a model with no
+    reasoning at all.
+    """
+    model_dir = str(tmp_path / "Qwen3-32B-FP8")
+    os.makedirs(model_dir)
+    _write_config(model_dir, "qwen3")
+    with open(os.path.join(model_dir, "tokenizer_config.json"), "w") as f:
+        json.dump({"chat_template": None}, f)
+    with open(os.path.join(model_dir, "chat_template.jinja"), "w") as f:
+        f.write(_HYBRID_TEMPLATE)
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result == "qwen3"
+
+
+def test_auto_detect_qwen3_ignores_think_outside_generation_prompt(tmp_path):
+    """Only a <think> in the generation prompt means the model always reasons."""
+    model_dir = str(tmp_path / "Qwen3-Next-80B-A3B-Instruct")
+    os.makedirs(model_dir)
+    _write_config(model_dir, "qwen3_next")
+    _write_tokenizer_config(model_dir, _HISTORY_ONLY_THINKING_TEMPLATE)
 
     result = resolve_auto_reasoning_parser(model_dir)
     assert result is None

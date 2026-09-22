@@ -17,6 +17,8 @@ import json
 from pathlib import Path
 from typing import Optional, Type
 
+from tensorrt_llm.llmapi.hf_chat_template import read_chat_template
+
 from .base_tool_parser import BaseToolParser
 from .deepseekv3_parser import DeepSeekV3Parser
 from .deepseekv4_parser import DeepSeekV4Parser
@@ -35,8 +37,13 @@ from .qwen3_tool_parser import Qwen3ToolParser
 
 MODEL_TYPE_TO_TOOL_PARSER: dict[str, str] = {
     "qwen2": "qwen3",
+    "qwen2_moe": "qwen3",
+    "qwen2_vl": "qwen3",
+    "qwen2_5_vl": "qwen3",
     "qwen3": "qwen3",
     "qwen3_moe": "qwen3",
+    "qwen3_vl": "qwen3",
+    "qwen3_vl_moe": "qwen3",
     "qwen3_5": "qwen3_coder",
     "qwen3_5_text": "qwen3_coder",
     "qwen3_5_moe": "qwen3_coder",
@@ -65,6 +72,23 @@ MODEL_TYPE_TO_TOOL_PARSER: dict[str, str] = {
 }
 
 
+# The marker the Qwen3-Coder XML format writes for every call; the Hermes JSON
+# format Qwen3 uses carries the function name inside a JSON object instead.
+_QWEN_XML_TOOL_CALL_MARKER = "<function="
+
+
+def _resolve_qwen_tool_parser(model: str, default: str) -> str:
+    """Promote a checkpoint whose template asks for Qwen3-Coder XML calls.
+
+    Qwen3-Coder is a `qwen3_moe` checkpoint like plain Qwen3, so `model_type`
+    cannot tell the XML format from the Hermes JSON one; only the chat
+    template, which spells out the format the model was trained to emit, can.
+    """
+    if _QWEN_XML_TOOL_CALL_MARKER in read_chat_template(model):
+        return "qwen3_coder"
+    return default
+
+
 def resolve_auto_tool_parser(model: str) -> Optional[str]:
     """Resolve 'auto' tool parser by reading the model's HF config."""
     config_path = Path(model) / "config.json"
@@ -75,7 +99,10 @@ def resolve_auto_tool_parser(model: str) -> Optional[str]:
         config = json.load(f)
 
     model_type = config.get("model_type", "")
-    return MODEL_TYPE_TO_TOOL_PARSER.get(model_type)
+    parser = MODEL_TYPE_TO_TOOL_PARSER.get(model_type)
+    if parser is not None and model_type.startswith("qwen"):
+        return _resolve_qwen_tool_parser(model, parser)
+    return parser
 
 
 class ToolParserFactory:

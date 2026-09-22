@@ -404,6 +404,6 @@ Complete initialization, CUDA graph capture, and warmup before measuring; the fi
 * If block reuse appears to have no effect, check the effective LLM arguments for `enable_block_reuse`. The runtime turns it off when `kv_cache_config.mamba_state_config` configures no snapshot placement, because the recurrent state cannot be restored from attention blocks alone.
 * If a disaggregated worker fails to start with a KV cache manager V2 error, check that both workers set `cache_transceiver_config.backend: NIXL` and `transceiver_runtime: PYTHON`.
 * If MTP output is empty or incorrect, confirm that the checkpoint contains its MTP weights and that `max_draft_len` is configured identically on every rank.
-* If reasoning content is not separated from the answer, confirm that the server was started with `--reasoning_parser qwen3_5`; this architecture is not auto-detected.
+* If reasoning content is not separated from the answer, check the startup log for the line reporting the auto-detected reasoning parser. It should read `qwen3_5`; if the checkpoint ships a modified chat template, pass `--reasoning_parser qwen3_5` explicitly.
 * If the container fails to start, verify that the NVIDIA Container Toolkit is properly installed.
 * For connection issues, make sure the server port (`8000` in this guide) is not being used by another application.

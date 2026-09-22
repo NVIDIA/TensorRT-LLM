@@ -49,7 +49,7 @@ from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr, split_mpi_env
 from tensorrt_llm.llmapi.reasoning_parser import (
     MODEL_TYPE_TO_REASONING_PARSER, ReasoningParserFactory,
-    resolve_auto_reasoning_parser)
+    is_auto_reasoning_parser_supported, resolve_auto_reasoning_parser)
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
@@ -1385,7 +1385,14 @@ def serve(
 
     if reasoning_parser == "auto":
         resolved = resolve_auto_reasoning_parser(model)
-        if resolved is None:
+        if resolved is not None:
+            logger.info(f"Auto-detected reasoning parser: {resolved}")
+        elif is_auto_reasoning_parser_supported(model):
+            # An Instruct checkpoint emits no reasoning block, so "no parser"
+            # is the detected answer rather than a detection failure.
+            logger.info(f"Model '{model}' emits no reasoning content; serving "
+                        f"without a reasoning parser.")
+        else:
             supported_model_types = ", ".join(
                 sorted(MODEL_TYPE_TO_REASONING_PARSER.keys()))
             raise click.BadParameter(
@@ -1394,7 +1401,6 @@ def serve(
                 f"Please specify a parser explicitly: "
                 f"{list(ReasoningParserFactory.keys())}",
                 param_hint="--reasoning_parser")
-        logger.info(f"Auto-detected reasoning parser: {resolved}")
         reasoning_parser = resolved
     if "--revision" in sys.argv:
         logger.warning("--revision is deprecated, use --hf_revision instead.")
