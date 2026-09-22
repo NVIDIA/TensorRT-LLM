@@ -1953,6 +1953,28 @@ def getCommonParameters()
     ]
 }
 
+// Looks for a completed /LLM/helpers/PLCScanningSetup pre-merge source-code-scan
+// build that already ran against this exact commit hash, so a retriggered
+// pipeline (e.g. a manual "/bot run" rerun with no new commits pushed) can
+// reuse that result instead of re-running the scan.
+def findCachedPLCSourceScanResult(commit) {
+    def plcJob = Jenkins.instance.getItemByFullName("LLM/helpers/PLCScanningSetup")
+    if (!plcJob) {
+        return null
+    }
+    for (build in plcJob.getBuilds()) {
+        if (build.isBuilding() || build.result == null) {
+            continue
+        }
+        if (trtllm_utils.isBuildWithParameter(build, 'ref', commit) &&
+            trtllm_utils.isBuildWithParameter(build, 'scanMode', 'pre_merge') &&
+            trtllm_utils.isBuildWithParameter(build, 'runSourceCodeScanning', 'true')) {
+            return [result: build.result.toString(), url: build.absoluteUrl]
+        }
+    }
+    return null
+}
+
 def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64", additionalParameters = [:]) {
     def parameters = getCommonParameters()
     // Build a local copy to avoid racey growth from shared parallel mutations.
@@ -2074,28 +2096,37 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             repoUrlKey = "tensorrt_llm_internal"
                         }
                     }
-                    echo "Triggering OSS Compliance (PLC) scan for ref: ${ref}"
+                    def logger = new Logger(pipeline)
                     try {
-                        def params = [
-                            string(name: 'ref', value: env.gitlabCommit),
-                            string(name: 'repoUrlKey', value: repoUrlKey),
-                            string(name: 'forkOwner', value: ''),
-                            string(name: 'postMergePipelineName', value: ''),
-                            string(name: 'postMergeBuildNumber', value: ''),
-                            string(name: 'scanMode', value: 'pre_merge'),
-                            string(name: 'runSourceCodeScanning', value: 'true'),
-                            string(name: 'runContainerScanning', value: 'false'),
-                            string(name: 'runSonarQube', value: 'false'),
-                        ]
-                        def logger = new Logger(pipeline)
-                        def handle = build(
-                            job: "/LLM/helpers/PLCScanningSetup",
-                            parameters: params,
-                            propagate: false
-                        )
-                        if (handle.result == "UNSTABLE") {
+                        def cached = findCachedPLCSourceScanResult(env.gitlabCommit)
+                        def handleResult
+                        if (cached) {
+                            echo "Commit ${env.gitlabCommit} unchanged since a prior PLC source-code scan; reusing its result: ${cached.result}"
+                            echo "Reused PLC scan pipeline: ${cached.url}"
+                            handleResult = cached.result
+                        } else {
+                            echo "Triggering OSS Compliance (PLC) scan for ref: ${ref}"
+                            def params = [
+                                string(name: 'ref', value: env.gitlabCommit),
+                                string(name: 'repoUrlKey', value: repoUrlKey),
+                                string(name: 'forkOwner', value: ''),
+                                string(name: 'postMergePipelineName', value: ''),
+                                string(name: 'postMergeBuildNumber', value: ''),
+                                string(name: 'scanMode', value: 'pre_merge'),
+                                string(name: 'runSourceCodeScanning', value: 'true'),
+                                string(name: 'runContainerScanning', value: 'false'),
+                                string(name: 'runSonarQube', value: 'false'),
+                            ]
+                            def handle = build(
+                                job: "/LLM/helpers/PLCScanningSetup",
+                                parameters: params,
+                                propagate: false
+                            )
+                            handleResult = handle.result
+                        }
+                        if (handleResult == "UNSTABLE") {
                             logger.log("OSS Compliance Check downstream job is UNSTABLE, ignoring")
-                        } else if (handle.result != "SUCCESS") {
+                        } else if (handleResult != "SUCCESS") {
                             error "Downstream job did not succeed"
                         }
                     } catch (InterruptedException e) {
