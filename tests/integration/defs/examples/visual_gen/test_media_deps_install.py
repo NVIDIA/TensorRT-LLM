@@ -12,17 +12,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""CPU coverage for the VisualGen ffmpeg install helper.
 
-import os
+This runs the real apt install (no mock) so it verifies the deps install
+actually works end-to-end — the bounded/retried command really makes the
+``ffmpeg`` CLI available. It needs network + apt but no GPU or model.
+"""
+
+import shutil
+
+from defs.examples.visual_gen.conftest import install_ffmpeg_via_apt
 
 
-def get_flashinfer_environment() -> tuple[str | None, str | None]:
-    """Return every worker's FlashInfer paths exactly once."""
-    # Keep importing this pickling helper from initializing MPI in the parent.
-    from mpi4py import MPI
-
-    MPI.COMM_WORLD.barrier()
-    return (
-        os.environ.get("FLASHINFER_WORKSPACE_BASE"),
-        os.environ.get("FLASHINFER_CUBIN_DIR"),
-    )
+def test_install_ffmpeg_via_apt_installs_ffmpeg():
+    """Running the helper leaves the ffmpeg CLI available on PATH."""
+    install_ffmpeg_via_apt()
+    assert shutil.which("ffmpeg") is not None

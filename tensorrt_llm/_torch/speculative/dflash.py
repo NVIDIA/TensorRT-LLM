@@ -149,15 +149,23 @@ class DFlashSpecMetadata(SpecMetadata):
             # O(1) lookups for is_layer_capture() and maybe_capture_hidden_states()
             self._capture_layer_set = frozenset(self.layers_to_capture)
             self._layer_to_idx = {lid: i for i, lid in enumerate(self.layers_to_capture)}
-            self.captured_hidden_states = torch.empty(
-                (self.max_num_tokens, self.hidden_size * self.num_capture_layers),
-                dtype=self.dtype,
-                device="cuda",
-            )
-            logger.info(
-                f"DFlash: capturing hidden states from layers {self.layers_to_capture}, "
-                f"buffer shape {self.captured_hidden_states.shape}"
-            )
+            # Graph metadata is shallow-copied and initialized for each bucket.
+            # Keep the full token-budget scratch buffer shared: model forwards
+            # and their consumers are ordered on the same execution stream.
+            expected_shape = (self.max_num_tokens, self.hidden_size * self.num_capture_layers)
+            if (
+                self.captured_hidden_states is None
+                or self.captured_hidden_states.shape != expected_shape
+                or self.captured_hidden_states.dtype != self.dtype
+                or self.captured_hidden_states.device != self.batch_indices_cuda.device
+            ):
+                self.captured_hidden_states = torch.empty(
+                    expected_shape, dtype=self.dtype, device=self.batch_indices_cuda.device
+                )
+                logger.info(
+                    f"DFlash: capturing hidden states from layers {self.layers_to_capture}, "
+                    f"buffer shape {self.captured_hidden_states.shape}"
+                )
         else:
             self.num_capture_layers = 0
             self._capture_layer_set = frozenset()

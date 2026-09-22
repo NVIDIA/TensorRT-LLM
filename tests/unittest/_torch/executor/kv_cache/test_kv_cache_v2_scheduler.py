@@ -3265,6 +3265,100 @@ class TestPrefixAwareSkip:
         out = sched.schedule_request(reqs, set())
         assert ids(out.context_requests) == [0]
 
+    @pytest.mark.parametrize("remaining_tokens", [0, 1, 63])
+    def test_token_budget_exhaustion_avoids_pending_prefix_probes(
+        self, remaining_tokens: int
+    ) -> None:
+        """After one chunk fills the budget, pending prompts need no radix walks."""
+        reqs = [make_ctx_request(0, 64)] + [make_ctx_request(i, 128) for i in range(1, 20)]
+        mgr = self._keyed_manager({i: str(i).encode() for i in range(20)})
+        sched = make_scheduler(
+            mgr, max_num_tokens=64 + remaining_tokens, ctx_chunk_config=(None, 64)
+        )
+
+        out = sched.schedule_request(reqs, set())
+
+        assert ids(out.context_requests) == [0]
+        mgr.probe_first_new_block_key.assert_called_once_with(reqs[0])
+        mgr.prepare_context.assert_called_once_with(reqs[0])
+
+    def test_generation_exhausts_context_budget_before_any_probe(self) -> None:
+        mgr = self._keyed_manager({1: b"a", 2: b"b"})
+        sched = make_scheduler(mgr, max_num_tokens=1, ctx_chunk_config=(None, 64))
+        reqs = [make_gen_request(0), make_ctx_request(1, 128), make_ctx_request(2, 128)]
+
+        out = sched.schedule_request(reqs, set())
+
+        assert ids(out.generation_requests) == [0]
+        assert not out.context_requests
+        mgr.probe_first_new_block_key.assert_not_called()
+        mgr.prepare_context.assert_not_called()
+
+    @pytest.mark.parametrize("policy", [None, ContextChunkingPolicy.FORCE_CHUNK])
+    def test_unlimited_chunk_budget_still_probes_and_schedules(
+        self, policy: ContextChunkingPolicy | None
+    ) -> None:
+        mgr = self._keyed_manager({0: b"a", 1: b"b"})
+        sched = make_scheduler(mgr, max_num_tokens=None, ctx_chunk_config=(policy, 64))
+        reqs = [make_ctx_request(0, 128), make_ctx_request(1, 128)]
+
+        out = sched.schedule_request(reqs, set())
+
+        assert ids(out.context_requests) == [0, 1]
+        assert [req.context_chunk_size for req in reqs] == [128, 128]
+        assert mgr.probe_first_new_block_key.call_args_list == [call(req) for req in reqs]
+        assert mgr.prepare_context.call_args_list == [call(req) for req in reqs]
+
+    def test_budget_skip_preserves_existing_context_claim(self) -> None:
+        mgr = self._keyed_manager({1: b"a", 2: b"b"})
+        sched = make_scheduler(mgr, max_num_tokens=1, ctx_chunk_config=(None, 64))
+        req = make_ctx_request(1, 128, prompt_len=192)
+        req.context_current_position = 64
+        req.context_chunk_size = 64
+        cache = mgr.kv_cache_map[req.py_request_id]
+
+        out = sched.schedule_request([make_gen_request(0), req, make_ctx_request(2, 128)], set())
+
+        assert ids(out.generation_requests) == [0]
+        assert not out.context_requests
+        mgr.probe_first_new_block_key.assert_not_called()
+        mgr.prepare_context.assert_not_called()
+        mgr.free_resources.assert_not_called()
+        mgr.suspend_request.assert_not_called()
+        assert mgr.kv_cache_map[req.py_request_id] is cache
+        assert cache.is_active
+        assert not cache.mock_calls
+        assert req.context_current_position == 64
+        assert req.context_remaining_length == 128
+        assert req.context_chunk_size == 64
+        assert req.is_first_context_chunk
+        assert not req.mock_calls
+
+    def test_small_context_budget_still_allows_encoder_request(self) -> None:
+        mgr = self._keyed_manager({0: b"a", 1: b"b"})
+        sched = make_encoder_scheduler(mgr, max_num_tokens=16, ctx_chunk_config=(None, 64))
+        reqs = [make_ctx_request(0, 128), make_ctx_request(1, 128), make_encoder_request(2, 16)]
+
+        out = sched.schedule_request(reqs, set())
+
+        assert not out.context_requests
+        assert ids(out.encoder_requests) == [2]
+        mgr.probe_first_new_block_key.assert_not_called()
+
+    def test_force_chunk_probes_when_budget_is_smaller_than_chunk_unit(self) -> None:
+        mgr = self._keyed_manager({0: b"a", 1: b"b"})
+        sched = make_scheduler(
+            mgr, max_num_tokens=16, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64)
+        )
+        reqs = [make_ctx_request(0, 16), make_ctx_request(1, 16)]
+        reqs[0].expect_snapshot_points = [16]
+
+        out = sched.schedule_request(reqs, set())
+
+        assert ids(out.context_requests) == [0]
+        assert reqs[0].context_chunk_size == 16
+        mgr.probe_first_new_block_key.assert_called_once_with(reqs[0])
+
     def test_scheduled_chunk_continuation_defers_later_duplicate(self):
         """A continuation that is not yet in flight registers once scheduled, so
         a duplicate examined after it still defers."""

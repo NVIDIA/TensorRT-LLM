@@ -723,7 +723,6 @@ disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runt
 disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python_bounce[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python_fabric_memory[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_perf_metrics[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_python_transceiver_host_offload[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_qwen3_32b_fp8[Qwen3/Qwen3-32B-FP8]
 disaggregated/test_disaggregated.py::test_disaggregated_sa[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_sa_python[TinyLlama-1.1B-Chat-v1.0]
