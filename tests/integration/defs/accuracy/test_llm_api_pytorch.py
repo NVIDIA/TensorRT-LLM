@@ -7412,8 +7412,14 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         else:
             max_seq_len = 4096
             max_batch_size = 256 if attention_dp else 512
+        cuda_graph_max_batch_size = 64 if (inferencex or attention_dp) else 128
         piecewise_kwargs = {}
         if piecewise:
+            # With ADP's 64 query heads, at most 32 requests keep MSA's
+            # short-query plans (up to 32 tokens/request) within 65536.
+            # The 2K/4K many-request warmups then use the long-prefill path.
+            max_batch_size = 32
+            cuda_graph_max_batch_size = max_batch_size
             # Cover the entire scheduler token budget so these evaluations
             # exercise captured prefill, rather than falling back above the
             # capture ceiling. Generation-only steps still take the eager
@@ -7439,7 +7445,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 speculative_config=spec_config,
                 cuda_graph_config=CudaGraphConfig(
                     enable_padding=True,
-                    max_batch_size=64 if (inferencex or attention_dp) else 128,
+                    max_batch_size=cuda_graph_max_batch_size,
                 ),
                 disable_overlap_scheduler=not overlap_scheduler,
                 enable_attention_dp=attention_dp,
