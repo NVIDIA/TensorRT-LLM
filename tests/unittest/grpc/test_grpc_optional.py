@@ -199,6 +199,7 @@ def test_serve_openengine_missing_grpc_shows_install_hint(
     monkeypatch.setattr(builtins, "__import__", import_without_grpc)
 
     monkeypatch.setattr(serve_module, "get_llm_args", lambda **_: ({}, None))
+    monkeypatch.setattr(serve_module, "get_is_diffusion_only_model", lambda _model: False)
     monkeypatch.setattr(serve_module, "collect_explicit_cli_keys", lambda **_: set())
     monkeypatch.setattr(
         serve_module,
