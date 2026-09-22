@@ -73,6 +73,217 @@ def test_disabled_emit_event_does_no_diagnostic_work(monkeypatch: pytest.MonkeyP
     unexpected_call.assert_not_called()
 
 
+def test_disabled_request_helpers_do_not_inspect_inputs(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", False)
+    unexpected_call = MagicMock(side_effect=AssertionError("disabled diagnostics did work"))
+    monkeypatch.setattr(diagnostics, "get_request_id", unexpected_call)
+    monkeypatch.setattr(diagnostics, "get_request_id_scope", unexpected_call)
+    monkeypatch.setattr(diagnostics, "emit_event", unexpected_call)
+    monkeypatch.setattr(diagnostics, "capture_timestamp", unexpected_call)
+
+    class _OpaqueInput:
+        def __getattribute__(self, name: str) -> object:
+            return unexpected_call(name)
+
+    # Record inspection even if the helper's error isolation swallows the
+    # spy's exception before any other patched diagnostic function is reached.
+    request = _OpaqueInput()
+    dist = _OpaqueInput()
+
+    diagnostics.emit_request_event("gen_ingress", request, side="gen", dist=dist)
+    diagnostics.emit_transfer_timeout(
+        "transfer_timeout_started", request, side="gen", dist=dist, timeout_ms=1000
+    )
+
+    unexpected_call.assert_not_called()
+
+
+def test_request_helper_preserves_identity_rank_and_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    emit = MagicMock()
+    monkeypatch.setattr(diagnostics, "emit_event", emit)
+    request = SimpleNamespace(
+        request_id=17,
+        py_request_id=42,
+        py_disaggregated_params=SimpleNamespace(disagg_request_id=99),
+    )
+    dist = SimpleNamespace(rank=3, tp_rank=1, pp_rank=0, cp_rank=2, dp_rank=7)
+
+    diagnostics.emit_request_event(
+        "gen_ingress",
+        request,
+        side="gen",
+        dist=dist,
+        rank=5,
+        timestamp=(100, 200),
+        prompt_tokens=256,
+    )
+
+    emit.assert_called_once_with(
+        "gen_ingress",
+        side="gen",
+        request_id=99,
+        request_id_scope="run",
+        local_request_id=42,
+        rank=5,
+        rank_info=None,
+        timestamp=(100, 200),
+        prompt_tokens=256,
+        tp_rank=1,
+        pp_rank=0,
+        cp_rank=2,
+    )
+
+
+def test_request_helper_preserves_rank_info_without_inventing_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    emit = MagicMock()
+    monkeypatch.setattr(diagnostics, "emit_event", emit)
+    request = SimpleNamespace(request_id=17, py_request_id=42, py_disaggregated_params=None)
+    rank_info = SimpleNamespace(instance_name="gen", instance_rank=3)
+
+    diagnostics.emit_request_event(
+        "gen_receive_requested", request, side="gen", rank_info=rank_info, slice_id=0
+    )
+
+    emit.assert_called_once_with(
+        "gen_receive_requested",
+        side="gen",
+        request_id=42,
+        request_id_scope="process",
+        local_request_id=42,
+        rank=None,
+        rank_info=rank_info,
+        timestamp=None,
+        slice_id=0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("disagg_id", "ctx_id", "expected_id", "expected_scope"),
+    [
+        (99, 7, 99, "run"),
+        (0, 7, 0, "run"),
+        (None, 7, 7, "process"),
+        (None, 0, 0, "process"),
+        (None, None, 41, "process"),
+    ],
+)
+def test_request_identity_matches_transport_without_promoting_local_ids(
+    monkeypatch: pytest.MonkeyPatch,
+    disagg_id: int | None,
+    ctx_id: int | None,
+    expected_id: int,
+    expected_scope: str,
+) -> None:
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    emit = MagicMock()
+    monkeypatch.setattr(diagnostics, "emit_event", emit)
+    request = SimpleNamespace(
+        request_id=41,
+        py_request_id=41,
+        py_disaggregated_params=SimpleNamespace(disagg_request_id=disagg_id, ctx_request_id=ctx_id),
+    )
+
+    diagnostics.emit_request_event("gen_receive_start", request, side="gen")
+
+    assert emit.call_args.kwargs["request_id"] == expected_id
+    assert emit.call_args.kwargs["request_id_scope"] == expected_scope
+    assert emit.call_args.kwargs["local_request_id"] == 41
+    assert request.request_id == request.py_request_id == 41
+
+
+@pytest.mark.parametrize("failure", ["identity", "request", "rank", "emit"])
+def test_request_helper_isolates_metadata_and_emission_failures(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    emit = MagicMock(
+        side_effect=RuntimeError("broken diagnostic sink") if failure == "emit" else None
+    )
+    monkeypatch.setattr(diagnostics, "emit_event", emit)
+    request = SimpleNamespace(request_id=17, py_disaggregated_params=None)
+    if failure != "request":
+        request.py_request_id = 42
+    dist = SimpleNamespace(rank=3, tp_rank=1, pp_rank=0, cp_rank=2)
+    if failure == "rank":
+        del dist.tp_rank
+    if failure == "identity":
+        monkeypatch.setattr(
+            diagnostics, "get_request_id", MagicMock(side_effect=RuntimeError("missing identity"))
+        )
+
+    diagnostics.emit_request_event("gen_ingress", request, side="gen", dist=dist)
+
+    assert emit.call_count == (1 if failure == "emit" else 0)
+
+
+@pytest.mark.parametrize("event", ["transfer_timeout_started", "transfer_timeout_observed"])
+def test_timeout_helper_observes_without_changing_deadline(
+    monkeypatch: pytest.MonkeyPatch, event: str
+) -> None:
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    emit = MagicMock()
+    monkeypatch.setattr(diagnostics, "emit_event", emit)
+    request = SimpleNamespace(
+        request_id=17,
+        py_request_id=42,
+        py_disaggregated_params=None,
+        py_kv_transfer_start_time=1.25,
+        state=SimpleNamespace(name="DISAGG_GENERATION_TRANS_IN_PROGRESS"),
+    )
+    dist = SimpleNamespace(rank=3, tp_rank=1, pp_rank=0, cp_rank=2)
+
+    diagnostics.emit_transfer_timeout(
+        event,
+        request,
+        side="gen",
+        dist=dist,
+        timeout_ms=1000,
+        elapsed_ms=1500,
+        cancellation_requested=True,
+    )
+
+    emit.assert_called_once_with(
+        event,
+        side="gen",
+        request_id=42,
+        request_id_scope="process",
+        local_request_id=42,
+        rank=3,
+        rank_info=None,
+        timestamp=None,
+        tp_rank=1,
+        pp_rank=0,
+        cp_rank=2,
+        timeout_ms=1000,
+        timeout_owner="pyexecutor",
+        timer_start_monotonic_ns=1_250_000_000,
+        state="DISAGG_GENERATION_TRANS_IN_PROGRESS",
+        elapsed_ms=1500,
+        cancellation_requested=True,
+    )
+    assert request.py_kv_transfer_start_time == 1.25
+    assert request.state.name == "DISAGG_GENERATION_TRANS_IN_PROGRESS"
+
+
+def test_timeout_helper_isolates_invalid_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    emit = MagicMock()
+    monkeypatch.setattr(diagnostics, "emit_event", emit)
+    request = SimpleNamespace(py_kv_transfer_start_time=None)
+
+    diagnostics.emit_transfer_timeout(
+        "transfer_timeout_started", request, side="gen", dist=SimpleNamespace(), timeout_ms=1000
+    )
+
+    emit.assert_not_called()
+
+
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork support")
 def test_forked_child_replaces_inherited_diagnostic_sink(monkeypatch: pytest.MonkeyPatch) -> None:
     run_uuid = str(uuid.uuid4())
@@ -583,14 +794,16 @@ def test_scheduler_kv_admission_guard_avoids_telemetry_state_inspection(
         ScheduleAction,
     )
 
+    inspection = MagicMock(side_effect=AssertionError("disabled diagnostics inspected state"))
+
     class _OpaqueRequest:
         @property
         def py_request_id(self) -> int:
-            raise AssertionError("disabled diagnostics inspected the request")
+            return inspection("py_request_id")
 
         @property
         def prompt_len(self) -> int:
-            raise AssertionError("disabled diagnostics inspected the request")
+            return inspection("prompt_len")
 
     class _KVCacheManager:
         def prepare_disagg_gen_init(self, _request: _OpaqueRequest) -> bool:
@@ -598,7 +811,7 @@ def test_scheduler_kv_admission_guard_avoids_telemetry_state_inspection(
 
         @property
         def kv_cache_map(self) -> dict[int, object]:
-            raise AssertionError("disabled diagnostics inspected the KV cache map")
+            return inspection("kv_cache_map")
 
     monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", False)
     scheduler = object.__new__(KVCacheV2Scheduler)
@@ -609,6 +822,7 @@ def test_scheduler_kv_admission_guard_avoids_telemetry_state_inspection(
 
     assert action is ScheduleAction.SCHEDULED
     assert tokens == 0
+    inspection.assert_not_called()
 
 
 def test_scheduler_kv_admission_continues_when_diagnostic_inspection_fails(

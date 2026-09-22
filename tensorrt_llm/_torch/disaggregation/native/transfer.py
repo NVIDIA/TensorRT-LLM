@@ -213,6 +213,21 @@ class WriteMeta:
     receiver_slice_id: int = 0
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
+    # Snapshot for this descriptor; a task's per-peer timer may be reused by a later dispatch.
+    transfer_bytes: Optional[int] = None
+
+
+def _capture_transfer_bytes(
+    sizes: np.ndarray, timer: Optional[PerfTimer], peer_rank: int
+) -> Optional[int]:
+    """Share one payload-size measurement without enabling performance logging."""
+    if timer is not None:
+        transfer_bytes = int(sizes.sum())
+        timer.record_transfer_sizes(peer_rank, transfer_bytes, int(sizes.size))
+        return transfer_bytes
+    with disagg_diagnostics.suppress_diagnostic_errors():
+        return int(sizes.sum())
+    return None
 
 
 class MessageType:
@@ -827,6 +842,9 @@ class Sender(SenderBase):
                             "ctx_all_receivers_ready",
                             side="ctx",
                             request_id=unique_rid,
+                            request_id_scope=disagg_diagnostics.get_request_id_scope(
+                                tx_session._base_args.params
+                            ),
                             local_request_id=tx_session.request_id,
                             rank_info=self._registrar.self_rank_info,
                             expected_receivers=expected_count,
@@ -866,23 +884,47 @@ class Sender(SenderBase):
                 task.status = TaskStatus.TRANSFERRING
             return True
 
+    def _emit_kv_transfer_event(
+        self,
+        event: str,
+        write_meta: WriteMeta,
+        *,
+        worker_queue_index: Optional[int] = None,
+        include_transfer_entries: bool = False,
+        outcome: Optional[str] = None,
+    ) -> None:
+        """Emit descriptor-local evidence without affecting transfer execution."""
+        with disagg_diagnostics.suppress_diagnostic_errors():
+            if write_meta.meta_type != WriteMetaType.KV or write_meta.src_ptrs.size == 0:
+                return
+            fields: dict[str, disagg_diagnostics.DiagnosticValue] = {}
+            if worker_queue_index is not None:
+                fields.update(
+                    is_last_slice=write_meta.is_last_slice, worker_queue_index=worker_queue_index
+                )
+            if include_transfer_entries:
+                fields["transfer_entries"] = int(write_meta.sizes.size)
+            if outcome is not None:
+                fields["outcome"] = outcome
+            disagg_diagnostics.emit_event(
+                event,
+                side="ctx",
+                request_id=write_meta.unique_rid,
+                request_id_scope=disagg_diagnostics.get_request_id_scope(write_meta.task._params),
+                rank_info=self._registrar.self_rank_info,
+                slice_id=write_meta.slice_id,
+                peer_rank=write_meta.peer_rank,
+                receiver_slice_id=write_meta.receiver_slice_id,
+                transfer_bytes=write_meta.transfer_bytes,
+                **fields,
+            )
+
     def _enqueue(self, write_meta: WriteMeta):
         thread_idx = hash((write_meta.unique_rid, write_meta.peer_rank)) % self._num_threads
         if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
-            with disagg_diagnostics.suppress_diagnostic_errors():
-                if write_meta.meta_type == WriteMetaType.KV and write_meta.src_ptrs.size > 0:
-                    disagg_diagnostics.emit_event(
-                        "ctx_transfer_queued",
-                        side="ctx",
-                        request_id=write_meta.unique_rid,
-                        rank_info=self._registrar.self_rank_info,
-                        slice_id=write_meta.slice_id,
-                        peer_rank=write_meta.peer_rank,
-                        receiver_slice_id=write_meta.receiver_slice_id,
-                        is_last_slice=write_meta.is_last_slice,
-                        transfer_bytes=int(write_meta.sizes.sum()),
-                        worker_queue_index=thread_idx,
-                    )
+            self._emit_kv_transfer_event(
+                "ctx_transfer_queued", write_meta, worker_queue_index=thread_idx
+            )
         # Route by (unique_rid, peer_rank) so that:
         # - Same peer's slices stay ordered on one thread (is_last_slice correctness)
         # - Different peers can run on different threads (better load balancing)
@@ -1006,23 +1048,9 @@ class Sender(SenderBase):
                         logger.warning(f"failed to send transfer rejection: {e}")
                     continue
                 if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
-                    with disagg_diagnostics.suppress_diagnostic_errors():
-                        if (
-                            write_meta.meta_type == WriteMetaType.KV
-                            and write_meta.src_ptrs.size > 0
-                        ):
-                            disagg_diagnostics.emit_event(
-                                "ctx_worker_dequeued",
-                                side="ctx",
-                                request_id=write_meta.unique_rid,
-                                rank_info=self._registrar.self_rank_info,
-                                slice_id=write_meta.slice_id,
-                                peer_rank=write_meta.peer_rank,
-                                receiver_slice_id=write_meta.receiver_slice_id,
-                                is_last_slice=write_meta.is_last_slice,
-                                transfer_bytes=int(write_meta.sizes.sum()),
-                                worker_queue_index=thread_idx,
-                            )
+                    self._emit_kv_transfer_event(
+                        "ctx_worker_dequeued", write_meta, worker_queue_index=thread_idx
+                    )
                 try:
                     if write_meta.meta_type == WriteMetaType.AUX:
                         logger.debug(
@@ -1211,25 +1239,12 @@ class Sender(SenderBase):
         submitted_and_completed = False
         backend_submitted = False
         submission_callback: Optional[Callable[[], None]] = None
-        diagnostic_transfer_bytes = None
         if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
-            with disagg_diagnostics.suppress_diagnostic_errors():
-                diagnostic_transfer_bytes = int(write_meta.sizes.sum())
 
             def emit_submitted() -> None:
                 nonlocal backend_submitted
                 backend_submitted = True
-                with disagg_diagnostics.suppress_diagnostic_errors():
-                    disagg_diagnostics.emit_event(
-                        "ctx_backend_submitted",
-                        side="ctx",
-                        request_id=write_meta.unique_rid,
-                        rank_info=self._registrar.self_rank_info,
-                        slice_id=write_meta.slice_id,
-                        peer_rank=write_meta.peer_rank,
-                        receiver_slice_id=write_meta.receiver_slice_id,
-                        transfer_bytes=diagnostic_transfer_bytes,
-                    )
+                self._emit_kv_transfer_event("ctx_backend_submitted", write_meta)
 
             submission_callback = emit_submitted
         if write_meta.src_ptrs.size > 0:
@@ -1261,18 +1276,9 @@ class Sender(SenderBase):
                 timer.record_transfer_start(write_meta.peer_rank)
             try:
                 if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
-                    with disagg_diagnostics.suppress_diagnostic_errors():
-                        disagg_diagnostics.emit_event(
-                            "ctx_backend_submit_start",
-                            side="ctx",
-                            request_id=write_meta.unique_rid,
-                            rank_info=self._registrar.self_rank_info,
-                            slice_id=write_meta.slice_id,
-                            peer_rank=write_meta.peer_rank,
-                            receiver_slice_id=write_meta.receiver_slice_id,
-                            transfer_bytes=diagnostic_transfer_bytes,
-                            transfer_entries=int(write_meta.sizes.size),
-                        )
+                    self._emit_kv_transfer_event(
+                        "ctx_backend_submit_start", write_meta, include_transfer_entries=True
+                    )
 
                 transfer_finished, last_status = self._submit_transfer(
                     task,
@@ -1310,23 +1316,12 @@ class Sender(SenderBase):
         if timer:
             timer.record_transfer_end(write_meta.peer_rank)
         if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
-            with disagg_diagnostics.suppress_diagnostic_errors():
-                if (
-                    write_meta.src_ptrs.size > 0
-                    and backend_submitted
-                    and agent_result != AgentResult.IN_DOUBT
-                ):
-                    disagg_diagnostics.emit_event(
-                        "ctx_backend_complete",
-                        side="ctx",
-                        request_id=write_meta.unique_rid,
-                        rank_info=self._registrar.self_rank_info,
-                        slice_id=write_meta.slice_id,
-                        peer_rank=write_meta.peer_rank,
-                        receiver_slice_id=write_meta.receiver_slice_id,
-                        transfer_bytes=diagnostic_transfer_bytes,
-                        outcome=("completed" if agent_result == AgentResult.SUCCESS else "failed"),
-                    )
+            if backend_submitted and agent_result != AgentResult.IN_DOUBT:
+                self._emit_kv_transfer_event(
+                    "ctx_backend_complete",
+                    write_meta,
+                    outcome=("completed" if agent_result == AgentResult.SUCCESS else "failed"),
+                )
 
         # Attested written bytes: only what was actually submitted to the
         # agent AND completed. The receiver checks the per-slice sum against
@@ -1684,7 +1679,9 @@ class Sender(SenderBase):
 
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)
-            timer.record_transfer_sizes(peer_ri.instance_rank, int(kv_sizes.sum()), dst_frags.size)
+        transfer_bytes = None
+        if timer is not None or disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            transfer_bytes = _capture_transfer_bytes(kv_sizes, timer, peer_ri.instance_rank)
 
         return WriteMeta(
             task=task,
@@ -1700,6 +1697,7 @@ class Sender(SenderBase):
             slice_id=task.slice_id,
             receiver_slice_id=req_info.slice_id if req_info.slice_id is not None else 0,
             is_last_slice=task._chunk.is_last,
+            transfer_bytes=transfer_bytes,
         )
 
     def _build_aux_write_meta(self, task: AuxSendTask, req_info: RecvReqInfo) -> WriteMeta:
@@ -1955,17 +1953,10 @@ class Sender(SenderBase):
             return
         # _sessions_lock prevents a race between session lookup and req_info save.
         # session.lock atomically saves peer info and snapshots tasks against send().
+        received_timestamp = None
         if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
             with disagg_diagnostics.suppress_diagnostic_errors():
-                disagg_diagnostics.emit_event(
-                    "ctx_request_data_received",
-                    side="ctx",
-                    request_id=info.unique_rid,
-                    rank_info=self._registrar.self_rank_info,
-                    slice_id=info.slice_id,
-                    peer_rank=info.instance_rank,
-                    peer_instance=info.instance_name,
-                )
+                received_timestamp = disagg_diagnostics.capture_timestamp()
         with self._sessions_lock:
             session = self._get_session(info.unique_rid)
             fenced = (
@@ -1974,11 +1965,28 @@ class Sender(SenderBase):
             )
             if session is None and not fenced:
                 self._save_peer_req_info(info)
-                return
+        if received_timestamp is not None:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                disagg_diagnostics.emit_event(
+                    "ctx_request_data_received",
+                    side="ctx",
+                    request_id=info.unique_rid,
+                    request_id_scope=(
+                        disagg_diagnostics.get_request_id_scope(session._base_args.params)
+                        if session is not None
+                        else "unknown"
+                    ),
+                    rank_info=self._registrar.self_rank_info,
+                    slice_id=info.slice_id,
+                    peer_rank=info.instance_rank,
+                    peer_instance=info.instance_name,
+                    timestamp=received_timestamp,
+                )
         if fenced:
             self._queue_session_quiescence(info.unique_rid, info.instance_name, info.instance_rank)
             return
-        assert session is not None
+        if session is None:
+            return
         with session.lock:
             with self._sessions_lock:
                 if self._get_session(info.unique_rid) is not session or session._closed:
@@ -2012,6 +2020,9 @@ class Sender(SenderBase):
                     "ctx_all_receivers_ready",
                     side="ctx",
                     request_id=info.unique_rid,
+                    request_id_scope=disagg_diagnostics.get_request_id_scope(
+                        session._base_args.params
+                    ),
                     local_request_id=session.request_id,
                     rank_info=self._registrar.self_rank_info,
                     expected_receivers=expected_transfers,
@@ -3232,6 +3243,7 @@ class Receiver(ReceiverBase):
                             "gen_request_data_sent",
                             side="gen",
                             request_id=receiver_req.unique_rid,
+                            request_id_scope=disagg_diagnostics.get_request_id_scope(task._params),
                             rank_info=self._registrar.self_rank_info,
                             slice_id=receiver_req.slice_id,
                             peer_rank=rank,
@@ -3292,6 +3304,7 @@ class Receiver(ReceiverBase):
                             "gen_request_data_sent",
                             side="gen",
                             request_id=receiver_req.unique_rid,
+                            request_id_scope=disagg_diagnostics.get_request_id_scope(task._params),
                             rank_info=self._registrar.self_rank_info,
                             slice_id=receiver_req.slice_id,
                             peer_rank=rank,
@@ -3473,6 +3486,11 @@ class Receiver(ReceiverBase):
                     "gen_writer_result_received",
                     side="gen",
                     request_id=unique_rid,
+                    request_id_scope=(
+                        disagg_diagnostics.get_request_id_scope(session._base_args.params)
+                        if session is not None
+                        else "unknown"
+                    ),
                     rank_info=self._registrar.self_rank_info,
                     slice_id=receiver_slice_id,
                     peer_rank=peer_rank,
@@ -4015,6 +4033,7 @@ class RxSession(RxSessionBase):
                                 "gen_destination_complete",
                                 side="gen",
                                 request_id=self.disagg_request_id,
+                                request_id_scope=disagg_diagnostics.get_request_id_scope(task._params),
                                 local_request_id=self.request_id,
                                 rank_info=ri,
                                 slice_id=receiver_slice_id,
