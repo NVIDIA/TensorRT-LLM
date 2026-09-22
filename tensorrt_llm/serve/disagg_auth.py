@@ -137,7 +137,8 @@ def build_subagent_affinity_headers(
 ) -> dict[str, str]:
     """Authenticate the edge's affinity hint for a context or generation worker."""
     affinity_id = get_request_subagent_affinity_id(request)
-    if affinity_id is None or role not in (ServerRole.CONTEXT, ServerRole.GENERATION):
+    affinity_id = None if affinity_id is None else affinity_id.strip()
+    if not affinity_id or role not in (ServerRole.CONTEXT, ServerRole.GENERATION):
         return {}
     if not key:
         raise ValueError("Subagent affinity requires internal_request_auth_key")
@@ -153,7 +154,14 @@ def validate_subagent_affinity(
     role: ServerRole | None,
     headers: Mapping[str, str] | None,
 ) -> str | None:
-    """Return an authenticated worker routing hint; ignore it on aggregated servers."""
+    """Authenticate a worker routing hint, inferring an absent role from the request."""
+    if role is None and request.disaggregated_params is not None:
+        # Standalone workers may serve CTX/GEN requests without --server_role.
+        # This identifies which signature to verify; it does not authorize the hint.
+        role = {
+            "context_only": ServerRole.CONTEXT,
+            "generation_only": ServerRole.GENERATION,
+        }.get(request.disaggregated_params.request_type)
     if headers is None or role is None or role not in (ServerRole.CONTEXT, ServerRole.GENERATION):
         return None
     affinity_id = extract_subagent_affinity_id_from_headers(headers)

@@ -30,7 +30,13 @@ Set the same `internal_request_auth_key` on the edge and its context/generation
 workers. A combined disaggregated launch propagates this key to its workers;
 independently launched workers need it in their own configuration. Forwarding
 sub-agent affinity requires this key, even while KV-transfer authentication still
-permits a missing key with a transitional warning.
+permits a missing key with a transitional warning. The edge rejects an affinity
+configuration without an internal key at startup.
+
+Workers may omit `--server_role`: when no role is configured, affinity
+validation infers context or generation from `disaggregated_params.request_type`.
+The inferred role selects the signature to verify; a valid signature is still
+required. An explicitly configured role takes precedence.
 
 On the context workers, enable conversation affinity in your existing attention-DP
 configuration:
@@ -104,8 +110,10 @@ in `x-trtllm-subagent-affinity-auth`. Context/generation workers validate the
 signature before placing the key in `SchedulingParams.subagent_affinity_id` for
 the conversation-aware ADP router. The signature binds the hint to the worker
 role, model, child's conversation ID, request type, and disaggregated request ID.
-Aggregated servers ignore the affinity header and retain ordinary conversation
-routing. Worker requests carrying unsigned or invalid affinity are rejected.
+Ordinary aggregated requests with neither a configured worker role nor a
+context/generation request type ignore the affinity header and retain ordinary
+conversation routing. Worker requests carrying unsigned or invalid affinity are
+rejected, including requests sent to workers without an explicit role.
 
 The child's conversation ID continues to identify its own history throughout this
 path. The internal affinity field is excluded from the serialized request body;

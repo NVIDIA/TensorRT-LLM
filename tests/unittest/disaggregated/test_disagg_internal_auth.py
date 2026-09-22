@@ -231,7 +231,8 @@ def _make_affinity_request(role: ServerRole) -> ChatCompletionRequest:
 
 
 @pytest.mark.parametrize("role", [ServerRole.CONTEXT, ServerRole.GENERATION])
-def test_worker_affinity_survives_wire_roundtrip(role: ServerRole) -> None:
+@pytest.mark.parametrize("configured_role", [False, True])
+def test_worker_affinity_survives_wire_roundtrip(role: ServerRole, configured_role: bool) -> None:
     request = _make_affinity_request(role)
     headers = build_subagent_affinity_headers("secret", request, role)
     wire_request = ChatCompletionRequest.model_validate_json(
@@ -239,7 +240,7 @@ def test_worker_affinity_survives_wire_roundtrip(role: ServerRole) -> None:
     )
     assert wire_request.conversation_params.subagent_affinity_id is None
     server = object.__new__(OpenAIServer)
-    server.server_role = role
+    server.server_role = role if configured_role else None
     server._internal_disagg_auth_key = "secret"
 
     scheduling = server._get_scheduling_params(wire_request, SimpleNamespace(headers=headers))
@@ -265,10 +266,76 @@ def test_aggregated_worker_ignores_affinity_header(key: str | None) -> None:
 
 @pytest.mark.parametrize("role", [ServerRole.CONTEXT, ServerRole.GENERATION])
 @pytest.mark.parametrize("key", [None, "secret"])
-def test_worker_rejects_unsigned_affinity(role: ServerRole, key: str | None) -> None:
+@pytest.mark.parametrize("configured_role", [False, True])
+def test_worker_rejects_unsigned_affinity(
+    role: ServerRole, key: str | None, configured_role: bool
+) -> None:
     request = _make_affinity_request(role)
     with pytest.raises(ValueError, match="auth"):
-        validate_subagent_affinity(key, request, role, {SUBAGENT_AFFINITY_HEADER: "parent"})
+        validate_subagent_affinity(
+            key, request, role if configured_role else None, {SUBAGENT_AFFINITY_HEADER: "parent"}
+        )
+
+
+@pytest.mark.parametrize("role", [ServerRole.CONTEXT, ServerRole.GENERATION])
+def test_inferred_role_rejects_tampered_affinity(role: ServerRole) -> None:
+    request = _make_affinity_request(role)
+    headers = build_subagent_affinity_headers("secret", request, role)
+    headers[SUBAGENT_AFFINITY_HEADER] = "other-parent"
+    with pytest.raises(ValueError, match="Invalid internal subagent"):
+        validate_subagent_affinity("secret", request, None, headers)
+
+
+@pytest.mark.parametrize("role", [ServerRole.CONTEXT, ServerRole.GENERATION])
+def test_configured_worker_role_takes_precedence(role: ServerRole) -> None:
+    request = _make_affinity_request(role)
+    headers = build_subagent_affinity_headers("secret", request, role)
+    other_role = ServerRole.GENERATION if role == ServerRole.CONTEXT else ServerRole.CONTEXT
+    with pytest.raises(ValueError, match="Invalid internal subagent"):
+        validate_subagent_affinity("secret", request, other_role, headers)
+
+
+@pytest.mark.parametrize(
+    "role", [ServerRole.MM_ENCODER, ServerRole.VISUAL_GEN, ServerRole.EMBEDDING]
+)
+def test_explicit_non_worker_role_does_not_infer_affinity(role: ServerRole) -> None:
+    request = _make_affinity_request(ServerRole.CONTEXT)
+    headers = build_subagent_affinity_headers("secret", request, ServerRole.CONTEXT)
+    assert validate_subagent_affinity("secret", request, role, headers) is None
+
+
+def test_generation_role_accepts_signed_conditional_bypass() -> None:
+    request = _make_affinity_request(ServerRole.GENERATION)
+    request.disaggregated_params = None
+    headers = build_subagent_affinity_headers("secret", request, ServerRole.GENERATION)
+    assert validate_subagent_affinity("secret", request, ServerRole.GENERATION, headers) == "parent"
+    assert validate_subagent_affinity("secret", request, None, headers) is None
+
+
+@pytest.mark.parametrize("request_type", ["context_and_generation", "unknown"])
+def test_role_inference_ignores_non_worker_request_types(request_type: str) -> None:
+    request = _make_affinity_request(ServerRole.CONTEXT)
+    request.disaggregated_params.request_type = request_type
+    assert (
+        validate_subagent_affinity(None, request, None, {SUBAGENT_AFFINITY_HEADER: "parent"})
+        is None
+    )
+
+
+@pytest.mark.parametrize("affinity_id", [" parent ", "\tparent\t"])
+def test_affinity_normalized_before_signing(affinity_id: str) -> None:
+    request = _make_affinity_request(ServerRole.CONTEXT)
+    request.conversation_params.subagent_affinity_id = affinity_id
+    headers = build_subagent_affinity_headers("secret", request, ServerRole.CONTEXT)
+    assert headers[SUBAGENT_AFFINITY_HEADER] == "parent"
+    assert validate_subagent_affinity("secret", request, None, headers) == "parent"
+
+
+@pytest.mark.parametrize("affinity_id", ["", " \t "])
+def test_blank_affinity_not_forwarded(affinity_id: str) -> None:
+    request = _make_affinity_request(ServerRole.CONTEXT)
+    request.conversation_params.subagent_affinity_id = affinity_id
+    assert build_subagent_affinity_headers(None, request, ServerRole.CONTEXT) == {}
 
 
 @pytest.mark.parametrize(

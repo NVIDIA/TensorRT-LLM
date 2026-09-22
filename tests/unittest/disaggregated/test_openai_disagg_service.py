@@ -409,12 +409,14 @@ async def test_subagent_body_id_and_affinity_at_router_dispatch(
 @pytest.mark.parametrize("scope", ["context", "both"])
 @pytest.mark.parametrize("handler_name", ["openai_chat", "chat_harmony"])
 @pytest.mark.parametrize("affinity_enabled", [False, True])
+@pytest.mark.parametrize("configured_role", [False, True])
 async def test_subagent_affinity_http_worker_adp_placement(
     monkeypatch: pytest.MonkeyPatch,
     schedule_style: str,
     scope: str,
     handler_name: str,
     affinity_enabled: bool,
+    configured_role: bool,
 ) -> None:
     """Exercise transport and worker ingestion with real two-rank routing.
 
@@ -466,7 +468,7 @@ async def test_subagent_affinity_http_worker_adp_placement(
             return SimpleNamespace(prompt_token_ids=[1, 2, 3])
 
         server = object.__new__(OpenAIServer)
-        server.server_role = role
+        server.server_role = role if configured_role else None
         server._internal_disagg_auth_key = auth_key
         server.allow_request_chat_template = False
         server.generator = SimpleNamespace(
@@ -501,6 +503,10 @@ async def test_subagent_affinity_http_worker_adp_placement(
             body = msgspec.msgpack.decode(await http_request.read())
             assert "subagent_affinity_id" not in body["conversation_params"]
             request = ChatCompletionRequest.model_validate(body)
+            assert (
+                request.disaggregated_params.schedule_style
+                == DisaggScheduleStyle[schedule_style.upper()]
+            )
             raw_request = Request({"type": "http", "headers": http_request.raw_headers})
             response = await getattr(server, handler_name)(request, raw_request)
             return web.Response(
