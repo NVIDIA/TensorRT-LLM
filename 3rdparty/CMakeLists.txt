@@ -145,19 +145,20 @@ foreach(DEP_IDX RANGE ${DEP_COUNT_MINUS_ONE})
 
   if(DEP_PATCH_FILE AND NOT DEP_PATCH_FILE STREQUAL "")
     set(_patch_file "${CMAKE_CURRENT_SOURCE_DIR}/${DEP_PATCH_FILE}")
-    # Apply forward unconditionally: --forward skips the hunks that are already
-    # in place, so this converges whether the source tree is pristine, fully
-    # patched, or carries an older revision of this patch file. Then decide on a
-    # dry-run: a hunk that genuinely does not fit reports FAILED, whereas one
-    # that is already applied only reports "previously applied". Rejects are not
-    # a usable signal here -- --forward writes a .rej for the latter case too.
+    # Apply forward first: that converges a pristine tree and is a no-op on a
+    # fully patched one, and -r - discards the rejects patch writes for hunks
+    # already in place. Then decide on the reverse dry-run, which succeeds if
+    # and only if every hunk is present, whatever state the tree started in. The
+    # forward run cannot serve as the signal: it skips a file whose hunks are
+    # partly applied, and a missing target reports neither a failure token nor a
+    # distinguishable status.
     list(
       APPEND
       FETCH_ARGS
       PATCH_COMMAND
       bash
       -c
-      "patch -p1 --forward --batch -i '${_patch_file}' >/dev/null 2>&1; if patch -p1 --forward --batch --dry-run -i '${_patch_file}' 2>&1 | grep -q FAILED; then echo 'Patch state for ${DEP_NAME} is inconsistent. Remove ${CMAKE_BINARY_DIR}/_deps/${DEP_NAME}-src and reconfigure.' >&2; false; fi"
+      "patch -p1 --forward --batch -r - -i '${_patch_file}' >/dev/null 2>&1; patch -p1 --reverse --batch --dry-run -i '${_patch_file}' >/dev/null 2>&1 || (echo 'Patch state for ${DEP_NAME} is inconsistent. Remove ${CMAKE_BINARY_DIR}/_deps/${DEP_NAME}-src and reconfigure.' >&2; false)"
     )
   endif()
 
