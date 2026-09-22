@@ -14,6 +14,8 @@ from tensorrt_llm._torch.pyexecutor import model_engine as model_engine_module
 from tensorrt_llm._torch.pyexecutor import py_executor as py_executor_module
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _StandInMambaCacheManager:
     """Concrete stand-in for the abstract Mamba cache-manager type check."""

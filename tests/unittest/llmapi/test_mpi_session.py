@@ -538,6 +538,7 @@ def _global_executor_state():
     (MPINodeState._global_comm_executor, MPINodeState._global_mpi_pool) = saved
 
 
+@pytest.mark.cpu_only
 def test_server_close_releases_the_global_comm_executor(_global_executor_state):
     """The server's final shutdown must close the shared COMM_WORLD executor.
 
@@ -563,6 +564,7 @@ def test_server_close_releases_the_global_comm_executor(_global_executor_state):
     assert MPINodeState._global_mpi_pool is None
 
 
+@pytest.mark.cpu_only
 def test_server_close_escalates_to_abort_when_the_join_wedges(
         _global_executor_state):
     """A worker stranded in a collective must not block teardown forever."""
@@ -583,6 +585,7 @@ def test_server_close_escalates_to_abort_when_the_join_wedges(
     _wait_closer_thread_gone()
 
 
+@pytest.mark.cpu_only
 def test_server_close_escalates_to_abort_when_exit_raises(
         _global_executor_state):
     """Escalate to abort when the executor's ``__exit__`` raises.
@@ -606,6 +609,7 @@ def test_server_close_escalates_to_abort_when_exit_raises(
     assert MPINodeState._global_comm_executor is None
 
 
+@pytest.mark.cpu_only
 def test_server_close_is_a_noop_without_a_global_executor(
         _global_executor_state):
     from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionServer
