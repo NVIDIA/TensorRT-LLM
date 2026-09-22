@@ -146,7 +146,6 @@ full:GB200/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_
 full:GB200/accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3VL::test_auto_dtype[forced_chunked_prefill] SKIP (https://nvbugs/6801098)
 full:GB200/accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3_5_35B_A3B_VL::test_fp8_prequantized SKIP (https://nvbugs/6776338)
 full:GB200/disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/6799208)
-full:GB200/llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[eager] SKIP (https://nvbugs/6758594)
 full:GB200/test_e2e.py::test_multi_nodes_eval[DeepSeek-R1/DeepSeek-R1-0528-FP4-tp16-mmlu] SKIP (https://nvbugs/6812288)
 full:GB200/test_e2e.py::test_multi_nodes_eval[MiniMax-M3-tp16-mmlu] SKIP (https://nvbugs/6813020)
 full:GB300/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_first[adp-mtp2] SKIP (https://nvbugs/6295740)
