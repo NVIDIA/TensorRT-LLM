@@ -145,13 +145,11 @@ foreach(DEP_IDX RANGE ${DEP_COUNT_MINUS_ONE})
 
   if(DEP_PATCH_FILE AND NOT DEP_PATCH_FILE STREQUAL "")
     set(_patch_file "${CMAKE_CURRENT_SOURCE_DIR}/${DEP_PATCH_FILE}")
-    # Apply forward first: that converges a pristine tree and is a no-op on a
-    # fully patched one, and -r - discards the rejects patch writes for hunks
-    # already in place. Then decide on the reverse dry-run, which succeeds if
-    # and only if every hunk is present, whatever state the tree started in. The
-    # forward run cannot serve as the signal: it skips a file whose hunks are
-    # partly applied, and a missing target reports neither a failure token nor a
-    # distinguishable status.
+    # Try applying the patch; --forward skips patches already applied and
+    # -r - discards rejects. The forward exit status alone cannot distinguish
+    # an already-patched tree from a failure.
+    # Require a reverse dry-run to succeed. --force keeps this check in reverse
+    # mode instead of automatically switching direction for an unapplied patch.
     list(
       APPEND
       FETCH_ARGS
