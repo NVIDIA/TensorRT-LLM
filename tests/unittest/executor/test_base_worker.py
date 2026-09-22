@@ -26,6 +26,7 @@ model_path = llm_models_root() / default_model_name
 
 @pytest.mark.cpu_only
 def test_get_startup_metrics_promotes_model_engine_stages() -> None:
+    """Verify startup metrics promote saved engine stages while retaining executor metrics."""
     worker = object.__new__(BaseWorker)
     worker._is_pytorch_backend = True
     worker.engine = SimpleNamespace(
