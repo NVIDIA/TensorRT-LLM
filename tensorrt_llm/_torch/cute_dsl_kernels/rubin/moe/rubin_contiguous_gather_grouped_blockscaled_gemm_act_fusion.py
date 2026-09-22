@@ -106,6 +106,50 @@ def fclip_xorsign(
     )
 
 
+@cute.jit
+def store_output_halves(source: cute.Tensor, destination: cute.Tensor, first_half: cutlass.Int32):
+    """Store the first/second register halves at their logical output positions.
+
+    The N64 output is contiguous per thread. Preserve the destination iterator
+    (including any SMEM swizzle) and select only the destination half; register
+    indices remain compile-time constants.
+    """
+    source = cute.coalesce(source)
+    destination = cute.coalesce(destination)
+    assert cute.rank(source.layout) == 1 and source.layout.stride == 1
+    assert cute.rank(destination.layout) == 1 and destination.layout.stride == 1
+    assert cute.size(source) == cute.size(destination)
+    assert cute.size(source) % 2 == 0
+    half = cute.make_layout(cute.size(source) // 2)
+    source_halves = cute.logical_divide(source, half)
+    destination_halves = cute.logical_divide(destination, half)
+    for slot in cutlass.range_constexpr(2):
+        cute.autovec_copy(
+            source_halves[(None, slot)],
+            destination_halves[(None, slot ^ first_half)],
+        )
+
+
+@cute.jit
+def store_sfc_word(source: cute.Tensor, destination: cute.Tensor, first_half: cutlass.Int32):
+    """Store four FP8 scales as one word in logical output-column order.
+
+    The source scales stay in First/Second (load) order for quantization; only
+    the stored value swaps its 16-bit halves when First is the high half.
+    """
+    source = cute.coalesce(source)
+    destination = cute.coalesce(destination)
+    assert source.element_type.width == destination.element_type.width == 8
+    assert cute.rank(source.layout) == 1 and source.layout.stride == 1
+    assert cute.rank(destination.layout) == 1 and destination.layout.stride == 1
+    assert cute.size(source) == cute.size(destination) == 4
+    source_word = cute.recast_tensor(source, cutlass.Uint32)[0]
+    destination_word = cute.recast_tensor(destination, cutlass.Uint32)
+    # PRMT selectors: 0x3210 keeps bytes [0,1,2,3]; 0x1032 gives [2,3,0,1].
+    selector = cutlass.Int32(0x3210) ^ (first_half * 0x2222)
+    destination_word[0] = cutlass.Uint32(cute.arch.prmt(source_word, source_word, selector))
+
+
 def sigmoid_f32(
     a: Union[float, cutlass.Float32], fastmath: bool = False
 ) -> Union[float, cutlass.Float32]:
@@ -154,9 +198,9 @@ Compute:
   C   = up * silu(gate) or relu(acc)^2                    # selected activation
   + optional NVFP4 quantization (generates SFC) when c_dtype == Float4E2M1FN.
 
-Shapes: A is M×K×1; B is N×K×L (L = num experts). SwiGLU uses interleaved
-[up, gate] weights at granularity=64 and produces M×(N/2)×1; Relu2 uses
-plain weights and produces M×N×1. SFA/SFB layouts follow BlockScaledBasicChunk.
+Shapes: A is M×K×1; B is N×K×L (L = num experts). Gated activations use
+interleaved [gate, up] weights at granularity=16 (B and SFB share the N order)
+and produce M×(N/2)×1; Relu2 uses plain weights and produces M×N×1. SFA/SFB layouts follow BlockScaledBasicChunk.
 token_id_mapping drives the row gather for A/SFA; token_id == -1 marks padding.
 
 Within a tile, valid_m varies per group; padding rows are handled at load:
@@ -193,8 +237,8 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
             merged ab_pipeline (no relay warp needed).
         SFA is always loaded via CpAsync128.CG, then reorganized into SFA
         TMEM by transform warps via LDS + STTM (sfa_transform_pipeline).
-      - Gated epilogue (SwiGLU or SiTU): C = up * silu(gate), where up/gate come from
-        interleaved accumulator at granularity=64 → output N is halved.
+      - Gated epilogue (SwiGLU or SiTU): C = up * silu(gate), where gate/up are
+        decoded from the [gate16, up16] accumulator groups → output N is halved.
       - Optional NVFP4 quant: when c_dtype == Float4E2M1FN, the epilogue
         also generates SFC and quantizes the output.
 
@@ -535,6 +579,17 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
         # 32-bit alignment). (128, 64) works for all configs.
         self.epi_tile = (128, 64)
         self.epi_tile_n = cute.size(self.epi_tile[1])
+        # Gated N256 tiles without B reuse keep two overlapping accumulator
+        # slots. On the contiguous NVFP4/sf16 output path the epilogue reads
+        # the shared TMEM columns first and releases the slot after that single
+        # load; other output layouts keep the two-load release protocol.
+        self.use_first_second_release = (
+            self.is_gated
+            and self.use_overlap_accum
+            and self.c_layout == utils.LayoutEnum.ROW_MAJOR
+            and self.c_dtype == cutlass.Float4E2M1FN
+            and self.sf_vec_size == 16
+        )
         self.epi_tile_cnt = (
             self.cta_tile_shape_mnk_c[0] // cute.size(self.epi_tile[0]),
             self.cta_tile_shape_mnk_c[1] // cute.size(self.epi_tile[1]),
@@ -786,13 +841,13 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
 
         This method performs FC1 layer computation:
         1. GEMM: acc = alpha * (SFA * A[token_ids]) * (SFB * B)
-        2. SwiGLU: C = up * silu(gate), where up/gate are extracted from interleaved acc (granularity=64)
+        2. SwiGLU: C = up * silu(gate), where gate/up are decoded from interleaved acc (granularity=16)
         3. Optional Quant: When c_dtype is Float4E2M1FN, generates SFC and quantizes output
 
         Data loading:
         - A and SFA are loaded using CpAsync instructions with token-based gather
         - B and SFB are loaded using TMA instructions with multicast
-        - B weights are interleaved: [up_0:64, gate_64:128, up_128:192, gate_192:256, ...]
+        - B and SFB use matching [gate16, up16] pairs along N
 
         Execution steps:
         1. Setup static attributes before smem/grid computation
@@ -2885,8 +2940,8 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
             (
                 tiled_copy_t2r,
                 tTR_tAcc_base,
-                tTR_rAcc_up,
-                tTR_rAcc_gate,
+                tTR_rPackedFirst,
+                tTR_rPackedSecond,
             ) = self.epilog_tmem_copy_and_partition(
                 epi_tidx, tCtAcc_transformed, tCgC_for_epi, epi_tile, use_2cta_instrs
             )
@@ -2897,7 +2952,9 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
             tRS_sC = None
             bSG_sC = None
             bSG_gC_partitioned = None
-            tTR_rC = cute.make_rmem_tensor(tTR_rAcc_up.shape, self.c_dtype)
+            # One logical output fragment has the shape of one packed load
+            # fragment: two packed chunks become gate/up, then one C.
+            tTR_rC = cute.make_rmem_tensor(tTR_rPackedFirst.shape, self.c_dtype)
             tiled_copy_r2s, tRS_rC, tRS_sC = epilogue_smem_copy_and_partition(
                 self, tiled_copy_t2r, tTR_rC, epi_tidx, sC
             )
@@ -3006,8 +3063,14 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
                     reverse_subtile = (
                         cutlass.Boolean(True) if acc_stage_index == 0 else cutlass.Boolean(False)
                     )
+                    # Slot 0 reads its N64 chunks in reverse, slot 1 forward;
+                    # keep that direction before release advances the phase.
+                    first_half = cutlass.Int32(0)
+                    if cutlass.const_expr(self.use_first_second_release):
+                        first_half = cutlass.Int32(reverse_subtile)
                 else:
                     acc_stage_index = acc_consumer_state.index
+                    first_half = cutlass.Int32(0)
 
                 # Set tensor memory buffer for current tile
                 # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
@@ -3029,24 +3092,26 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
                 #
                 acc_pipeline.consumer_wait(acc_consumer_state)
 
-                # Activation epilogue. SwiGLU consumes interleaved [up, gate]
-                # accumulator subtiles and halves N; Relu2 consumes each
-                # accumulator subtile directly and preserves N.
+                # Activation epilogue. A gated activation (SwiGLU / SiTU)
+                # consumes two consecutive N64 accumulator chunks per N64
+                # output subtile, each packed [gate16, up16, gate16, up16],
+                # decodes them into logical gate/up fragments and halves N;
+                # Relu2 consumes each accumulator subtile directly and
+                # preserves N.
                 #   tTR_tAcc: (T2R, T2R_M, T2R_N, EPI_M, EPI_N, STAGE), sliced on STAGE.
                 #   bSG_gC:   ((ATOM_V, REST_V), EPI_M, EPI_N, loopM, loopN, loopL).
-                interleave_granularity = 64
-                gate_offset = interleave_granularity // self.epi_tile_n
                 epi_m_cnt = cute.size(tTR_tAcc.shape, mode=[3])
                 acc_n_subtile_cnt = cute.size(tTR_tAcc.shape, mode=[4])
                 out_n_subtile_cnt = acc_n_subtile_cnt // 2 if self.is_gated else acc_n_subtile_cnt
+                if cutlass.const_expr(self.use_first_second_release):
+                    assert epi_m_cnt == 1, (
+                        "single-load release requires all CTA rows in one epilogue subtile"
+                    )
 
                 for epi_m_idx in cutlass.range(epi_m_cnt):
                     for out_n_idx in cutlass.range(out_n_subtile_cnt):
-                        # Map output N subtile → acc N subtile. Each
-                        # interleave block of 2*gate_offset subtiles is
-                        # [up*gate_offset, gate*gate_offset]. acc[0] in
-                        # overlap mode iterates in reverse (consume high-col
-                        # overlap region first).
+                        # acc[0] in overlap mode iterates in reverse (consume
+                        # the high-col overlap region first).
                         if cutlass.const_expr(self.use_overlap_accum):
                             real_out_n_idx = (
                                 (out_n_subtile_cnt - 1 - out_n_idx)
@@ -3055,37 +3120,76 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
                             )
                         else:
                             real_out_n_idx = out_n_idx
-                        if cutlass.const_expr(self.is_gated):
-                            block_idx = real_out_n_idx // gate_offset
-                            within_block = real_out_n_idx % gate_offset
-                            up_n_subtile = block_idx * 2 * gate_offset + within_block
-                            gate_n_subtile = (
-                                block_idx * 2 * gate_offset + gate_offset + within_block
-                            )
-                        else:
-                            up_n_subtile = real_out_n_idx
                         #
                         # Load accumulator from tensor memory buffer to register
                         #
-                        tTR_tAcc_mn_up = tTR_tAcc[(None, None, None, epi_m_idx, up_n_subtile)]
-
-                        cute.copy(tiled_copy_t2r, tTR_tAcc_mn_up, tTR_rAcc_up)
                         if cutlass.const_expr(self.is_gated):
-                            tTR_tAcc_mn_gate = tTR_tAcc[
-                                (None, None, None, epi_m_idx, gate_n_subtile)
+                            # Output N64 subtile -> its two packed N64 chunks.
+                            # First/Second denote load order, not logical
+                            # lo/hi: select the TMEM address, never the
+                            # register destination.
+                            tTR_tAcc_mn_first = tTR_tAcc[
+                                (None, None, None, epi_m_idx, 2 * real_out_n_idx + first_half)
                             ]
-                            cute.copy(tiled_copy_t2r, tTR_tAcc_mn_gate, tTR_rAcc_gate)
+                            tTR_tAcc_mn_second = tTR_tAcc[
+                                (
+                                    None,
+                                    None,
+                                    None,
+                                    epi_m_idx,
+                                    2 * real_out_n_idx + (first_half ^ 1),
+                                )
+                            ]
+                            cute.copy(tiled_copy_t2r, tTR_tAcc_mn_first, tTR_rPackedFirst)
+                            if cutlass.const_expr(self.use_first_second_release):
+                                # Slots [0,256) and [192,448) share [192,256).
+                                # On the first output subtile, slot 0's high
+                                # half and slot 1's low half cover exactly
+                                # those 64 columns: wait for that load and
+                                # release; the next MMA cannot overwrite the
+                                # remaining, nonshared half.
+                                if out_n_idx == 0:
+                                    cute.arch.fence_view_async_tmem_load()
+                                    with cute.arch.elect_one():
+                                        acc_pipeline.consumer_release(acc_consumer_state)
+                                    acc_consumer_state.advance()
+                            cute.copy(tiled_copy_t2r, tTR_tAcc_mn_second, tTR_rPackedSecond)
+                        else:
+                            tTR_tAcc_mn_up = tTR_tAcc[(None, None, None, epi_m_idx, real_out_n_idx)]
+                            cute.copy(tiled_copy_t2r, tTR_tAcc_mn_up, tTR_rPackedFirst)
 
-                        # Overlap mode: after iter 0 the up/gate LDTM has
-                        # covered cols 192..255 (reverse for acc[0], forward
-                        # for acc[1]). Fence + early-release so MMA can write
-                        # the next stage into the overlap region without racing.
-                        if cutlass.const_expr(self.use_overlap_accum):
+                        # Overlap mode with the two-load protocol: after iter 0
+                        # the LDTMs have covered cols 192..255 (reverse for
+                        # acc[0], forward for acc[1]). Fence + early-release so
+                        # MMA can write the next stage into the overlap region
+                        # without racing.
+                        if cutlass.const_expr(
+                            self.use_overlap_accum and not self.use_first_second_release
+                        ):
                             if out_n_idx == 0:
                                 cute.arch.fence_view_async_tmem_load()
                                 with cute.arch.elect_one():
                                     acc_pipeline.consumer_release(acc_consumer_state)
                                 acc_consumer_state.advance()
+
+                        # The two load buffers become the logical up/gate
+                        # fragments; a non-gated activation reads First as-is.
+                        tTR_rAcc_up = tTR_rPackedFirst
+                        tTR_rAcc_gate = tTR_rPackedSecond
+                        if cutlass.const_expr(self.is_gated):
+                            # Snapshot the packed values before overwriting
+                            # the buffers. Packed axes: (channel within N16,
+                            # gate/up, group); compute axes: (channel within
+                            # N16, group, load slot).
+                            packed_first = tTR_rPackedFirst.load().reshape((16, 2, 2))
+                            packed_second = tTR_rPackedSecond.load().reshape((16, 2, 2))
+                            gate_up_layout = cute.make_layout((16, 2, 2))
+                            gate = cute.make_tensor(tTR_rAcc_gate.iterator, gate_up_layout)
+                            up = cute.make_tensor(tTR_rAcc_up.iterator, gate_up_layout)
+                            gate[None, None, 0].store(packed_first[None, 0, None])
+                            gate[None, None, 1].store(packed_second[None, 0, None])
+                            up[None, None, 0].store(packed_first[None, 1, None])
+                            up[None, None, 1].store(packed_second[None, 1, None])
 
                         acc_vec_up = tTR_rAcc_up.load()
                         tCompute = cute.make_rmem_tensor(acc_vec_up.shape, self.acc_dtype)
@@ -3183,7 +3287,12 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
 
                             # Store SFC to gmem.
                             # TODO: predicate (cute.elem_less)
-                            cute.autovec_copy(tCrSFC, tCgSFC)
+                            if cutlass.const_expr(self.use_first_second_release):
+                                # Restore logical order in one packed store;
+                                # tCrSFC itself stays in load order.
+                                store_sfc_word(tCrSFC, tCgSFC, first_half)
+                            else:
+                                cute.autovec_copy(tCrSFC, tCgSFC)
 
                             # Quantize output and convert to c_dtype.
                             # TODO: need to add f8x2 -> f32x2 conversion
@@ -3236,11 +3345,20 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
                         num_prev_subtiles = num_prev_subtiles + 1
                         c_buffer = num_prev_subtiles % self.num_c_stage
 
-                        cute.copy(
-                            tiled_copy_r2s,
-                            tRS_rC,
-                            tRS_sC[(None, None, None, c_buffer)],
-                        )
+                        if cutlass.const_expr(self.use_first_second_release):
+                            # Restore canonical column order ahead of the
+                            # unchanged N64 TMA store.
+                            store_output_halves(
+                                tRS_rC,
+                                tRS_sC[(None, None, None, c_buffer)],
+                                first_half,
+                            )
+                        else:
+                            cute.copy(
+                                tiled_copy_r2s,
+                                tRS_rC,
+                                tRS_sC[(None, None, None, c_buffer)],
+                            )
                         # Fence and barrier to make sure shared memory store is visible to TMA store
                         cute.arch.fence_proxy(
                             "async.shared",
@@ -3507,11 +3625,11 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
         :param use_2cta_instrs: Whether use_2cta_instrs is enabled
         :type use_2cta_instrs: bool
 
-        :return: A tuple containing (tiled_copy_t2r, tTR_tAcc, tTR_rAcc_up, tTR_rAcc_gate) where:
+        :return: A tuple containing (tiled_copy_t2r, tTR_tAcc, tTR_rPackedFirst, tTR_rPackedSecond) where:
             - tiled_copy_t2r: The tiled copy operation for tmem to register copy(t2r)
             - tTR_tAcc: The partitioned accumulator tensor
-            - tTR_rAcc_up: The partitioned accumulator tensor for acc up
-            - tTR_rAcc_gate: The partitioned accumulator tensor for acc gate
+            - tTR_rPackedFirst: First loaded N64 chunk (two gate16/up16 pairs when gated)
+            - tTR_rPackedSecond: Second loaded N64 chunk (two gate16/up16 pairs when gated)
         :rtype: Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor, cute.Tensor]
         """
         # Make tiledCopy for tensor memory load (Rubin uses transformed layout)
@@ -3545,14 +3663,14 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
         tTR_gC = thr_copy_t2r.partition_D(gC_mnl_epi)
 
         # (T2R, T2R_M, T2R_N)
-        tTR_rAcc_up = cute.make_rmem_tensor(
+        tTR_rPackedFirst = cute.make_rmem_tensor(
             tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
         )
         # (T2R, T2R_M, T2R_N)
-        tTR_rAcc_gate = cute.make_rmem_tensor(
+        tTR_rPackedSecond = cute.make_rmem_tensor(
             tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
         )
-        return tiled_copy_t2r, tTR_tAcc, tTR_rAcc_up, tTR_rAcc_gate
+        return tiled_copy_t2r, tTR_tAcc, tTR_rPackedFirst, tTR_rPackedSecond
 
     def epilog_smem_copy_and_partition(
         self,
@@ -4779,7 +4897,7 @@ def run(
 
     if not skip_ref_check:
         print("Verifying results...")
-        interleave_granularity = 64
+        interleave_granularity = 16
         n_out = n // 2
 
         gemm_result = torch.empty((1, valid_m, n), dtype=torch.float32)
@@ -4797,8 +4915,8 @@ def run(
         assert n % (2 * interleave_granularity) == 0
         ref = torch.empty((1, valid_m, n_out), dtype=torch.float32)
         for n_block in range(0, n, 2 * interleave_granularity):
-            up_result = gemm_result[0, :, n_block : n_block + interleave_granularity]
-            gate_result = gemm_result[
+            gate_result = gemm_result[0, :, n_block : n_block + interleave_granularity]
+            up_result = gemm_result[
                 0,
                 :,
                 n_block + interleave_granularity : n_block + 2 * interleave_granularity,
