@@ -2094,6 +2094,19 @@ class GvrMainKernel:
                 _st_s_v2_u32(stg_b + pm * cutlass.Int32(8), C.u32_of_f32(xm), cutlass.Uint32(itm))
             itm = itm + cutlass.Int32(BLK)
 
+    @cute.jit
+    def _bm_prefetch(self, bmax, row64, c0, c1, tidx, skip_pre):
+        if skip_pre != cutlass.Int32(0):
+            pj0 = c0 >> cutlass.Int32(3)
+            pj1 = (c1 + cutlass.Int32(7)) >> cutlass.Int32(3)
+            nl = ((pj1 - pj0) * cutlass.Int32(4) + cutlass.Int32(127)) >> cutlass.Int32(7)
+            if tidx < nl:
+                C._prefetch_l2(
+                    bmax.iterator.toint()
+                    + row64 * cutlass.Int64(bmax.shape[1]) * cutlass.Int64(4)
+                    + cutlass.Int64(pj0 * cutlass.Int32(4) + tidx * cutlass.Int32(128))
+                )
+
     # ------------------------------------------------------------------
     # kernel
     # ------------------------------------------------------------------
@@ -2141,7 +2154,11 @@ class GvrMainKernel:
         if cutlass.const_expr(self.split):
             part = bx
         lane = tidx & cutlass.Int32(31)
-        if cutlass.const_expr(self.pdl):
+        # PDL: varlen decode waits right before its first logits / block_max
+        # read (kv_lens is complete before the producer scorer starts); the
+        # other modes wait at entry.
+        pdl_late = bool(self.pdl and self.varlen and not self.prefill)
+        if cutlass.const_expr(self.pdl and not pdl_late):
             cute.arch.griddepcontrol_wait()  # before the first global read
 
         # ================= per-row varlen prologue (varlen mode only) =========
@@ -2419,16 +2436,8 @@ class GvrMainKernel:
                     if c1 > c0:
                         skip_pre = cutlass.Int32(1)
             # L2-prefetch this segment's block maxima (consumed after the line is known)
-            if skip_pre != cutlass.Int32(0):
-                pj0 = c0 >> cutlass.Int32(3)
-                pj1 = (c1 + cutlass.Int32(7)) >> cutlass.Int32(3)
-                nl = ((pj1 - pj0) * cutlass.Int32(4) + cutlass.Int32(127)) >> cutlass.Int32(7)
-                if tidx < nl:
-                    C._prefetch_l2(
-                        bmax.iterator.toint()
-                        + row64 * cutlass.Int64(bmax.shape[1]) * cutlass.Int64(4)
-                        + cutlass.Int64(pj0 * cutlass.Int32(4) + tidx * cutlass.Int32(128))
-                    )
+            if cutlass.const_expr(not pdl_late):
+                self._bm_prefetch(bmax, row64, c0, c1, tidx, skip_pre)
 
         if tidx == cutlass.Int32(0):
             s_scal[0] = cutlass.Int32(0)  # s_bufn
@@ -2556,6 +2565,10 @@ class GvrMainKernel:
                     s_lad[3] = TGT2
                     if cutlass.const_expr(self.prefill):
                         s_lead[0] = lead
+            if cutlass.const_expr(pdl_late):
+                cute.arch.griddepcontrol_wait()  # first logits / block_max access follows
+                if cutlass.const_expr(self.block_skip):
+                    self._bm_prefetch(bmax, row64, c0, c1, tidx, skip_pre)
             # Register-free L2 hints for the first U-batch of this CTA's own
             # P3 slice (clamped in-row): the data P3 touches first starts
             # flowing while warp0 walks the chain. Short rows clamp every
