@@ -71,7 +71,11 @@ def _meta_safe_cast_dtype(module: nn.Module, dtype: torch.dtype) -> None:
             continue
         child._apply(_cast)
     for name, param in module.named_parameters(recurse=False):
-        param.data = _cast(param.data)
+        # Pass the parameter, not param.data: reading .data detaches, and
+        # MetaInitMode rejects aten.detach on a meta tensor, so casting the
+        # module's own parameters under meta init raised MetaInitException
+        # before _cast ever got to its is_meta branch.
+        param.data = _cast(param)
 
 
 def _stage_state_rows(ssm_pool: torch.Tensor, slot_indices: torch.Tensor) -> torch.Tensor:
