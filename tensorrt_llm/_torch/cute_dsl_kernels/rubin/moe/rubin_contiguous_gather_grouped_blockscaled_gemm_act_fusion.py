@@ -84,7 +84,12 @@ def fclip_xorsign(
     loc=None,
     ip=None,
 ) -> cutlass.Float32:
-    """Clip to ``[-limit, limit]`` with PTX ``min.xorsign.abs.f32``."""
+    """Clip to ``[-limit, limit]`` with PTX ``min.NaN.xorsign.abs.f32``.
+
+    The ``.NaN`` variant propagates a NaN operand instead of returning the
+    finite one, matching ``torch.clamp`` and the NaN-preserving ``fmin`` used
+    by the quantization path.
+    """
     return cutlass.Float32(
         llvm.inline_asm(
             T.f32(),
@@ -92,7 +97,7 @@ def fclip_xorsign(
                 cutlass.Float32(a).ir_value(loc=loc, ip=ip),
                 cutlass.Float32(limit).ir_value(loc=loc, ip=ip),
             ],
-            "min.xorsign.abs.f32 $0, $1, $2;",
+            "min.NaN.xorsign.abs.f32 $0, $1, $2;",
             "=f,f,f",
             has_side_effects=False,
             is_align_stack=False,
@@ -3317,8 +3322,8 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
                 )
                 if cutlass.const_expr(self.has_swiglu_limit):
                     acc_vec_gate_alpha = (
-                        fmin(acc_vec_gate_alpha[0], self.swiglu_limit),
-                        fmin(acc_vec_gate_alpha[1], self.swiglu_limit),
+                        fmin(acc_vec_gate_alpha[0], self.swiglu_limit, nan=True),
+                        fmin(acc_vec_gate_alpha[1], self.swiglu_limit, nan=True),
                     )
                     acc_vec_up_alpha = (
                         fclip_xorsign(acc_vec_up_alpha[0], self.swiglu_limit),
@@ -3359,7 +3364,7 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
                 acc_vec_up_alpha = acc_vec_up[i] * cutlass.Float32(alpha_val)
                 acc_vec_gate_alpha = acc_vec_gate[i] * cutlass.Float32(alpha_val)
                 if cutlass.const_expr(self.has_swiglu_limit):
-                    acc_vec_gate_alpha = fmin(acc_vec_gate_alpha, self.swiglu_limit)
+                    acc_vec_gate_alpha = fmin(acc_vec_gate_alpha, self.swiglu_limit, nan=True)
                     acc_vec_up_alpha = fclip_xorsign(acc_vec_up_alpha, self.swiglu_limit)
                 tCompute[i] = acc_vec_up_alpha * silu_f32(acc_vec_gate_alpha, fastmath=True)
 

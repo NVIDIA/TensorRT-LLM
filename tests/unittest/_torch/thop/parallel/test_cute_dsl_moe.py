@@ -1589,6 +1589,162 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
 
 
 @pytest.mark.skipif(
+    not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    reason="the installed CuTe DSL package has no Rubin (SM107) helpers",
+)
+@pytest.mark.parametrize(
+    "activation_type,situ_kwargs",
+    [
+        (ActivationType.Relu2, {}),
+        (ActivationType.SiTu, dict(situ_beta=SITU_BETA, situ_linear_beta=SITU_LINEAR_BETA)),
+    ],
+    ids=["relu2", "situ"],
+)
+def test_rubin_act_fusion_kernel_rejects_finite_swiglu_limit_for_non_swiglu(
+    activation_type, situ_kwargs
+):
+    # Host-only: the constructor validates its arguments before any DSL work,
+    # so this pins the guard without a GPU.
+    from tensorrt_llm._torch.cute_dsl_kernels.rubin.moe.rubin_contiguous_gather_grouped_blockscaled_gemm_act_fusion import (  # noqa: E501
+        Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel as Kernel,
+    )
+
+    kwargs = dict(
+        sf_vec_size=16,
+        mma_inst_shape=(128, 128, 128),
+        mma_tiler=(128, 128, 256),
+        cluster_shape_mn=(1, 1),
+        vectorized_f32=True,
+        topk=1,
+        activation_type=activation_type,
+        **situ_kwargs,
+    )
+    with pytest.raises(ValueError, match="swiglu_limit applies to ActivationType.Swiglu only"):
+        Kernel(swiglu_limit=1.0, **kwargs)
+    # No limit, and the op-level "disabled" sentinel, both construct.
+    assert not Kernel(**kwargs).has_swiglu_limit
+    assert not Kernel(swiglu_limit=-1.0, **kwargs).has_swiglu_limit
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    reason="This test requires an SM 107 GPU and Rubin CuTe DSL helpers",
+)
+@pytest.mark.parametrize("swiglu_limit", [1.0, float("inf")], ids=["clamp", "no_clamp"])
+def test_nvfp4_gather_grouped_gemm_act_fusion_rubin_propagates_nan_through_clamp(swiglu_limit):
+    """A NaN accumulator must reach the output, clamp or not.
+
+    FP4 has no NaN encoding, so the NaN is injected through one E4M3 block
+    scale of one token's activation row. Every accumulator column of that row
+    becomes NaN; with the SwiGLU clamp enabled the gate and up clamps must
+    propagate it (``fmin.NaN`` / ``min.NaN.xorsign.abs``) rather than turn it
+    into ``+-limit``, so the row's output block scales are NaN while every
+    other row stays finite.
+    """
+    sf_vec_size = 16
+    tile_size = 128
+    num_tokens = 128
+    hidden_size = 512
+    interm_size = 512
+    weight_n = 2 * interm_size
+    nan_token = 37
+
+    torch.manual_seed(0)
+    token_selected_experts = torch.zeros(num_tokens, 1, dtype=torch.int32, device="cuda")
+    token_final_scales = torch.ones(num_tokens, 1, dtype=torch.float32, device="cuda")
+    (
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        _expanded_idx_to_permuted_idx,
+        permuted_idx_to_expanded_idx,
+        total_num_padded_tokens,
+        num_non_exiting_tiles,
+    ) = torch.ops.trtllm.moe_sort(
+        token_selected_experts=token_selected_experts,
+        token_final_scales=token_final_scales,
+        num_experts=1,
+        top_k=1,
+        local_expert_offset=0,
+        local_num_experts=1,
+        tile_tokens_dim=tile_size,
+    )
+    max_num_permuted_tokens = permuted_idx_to_expanded_idx.size(0)
+    num_valid_permuted_tokens = total_num_padded_tokens.item()
+
+    a = torch.randint(-5, 5, (num_tokens, hidden_size), dtype=torch.int32, device="cuda").to(
+        torch.bfloat16
+    )
+    b = torch.randint(-5, 5, (1, weight_n, hidden_size), dtype=torch.int32, device="cuda").to(
+        torch.bfloat16
+    )
+    probe = a.float() @ b[0].float().T
+    probe_up, probe_gate = probe.chunk(2, dim=-1)
+    if swiglu_limit != float("inf"):
+        probe_gate = probe_gate.clamp(max=swiglu_limit)
+        probe_up = probe_up.clamp(min=-swiglu_limit, max=swiglu_limit)
+    global_sf = 2 * (probe_up * torch.nn.functional.silu(probe_gate)).abs().max() / (448 * 6)
+    global_sf_tensor = torch.tensor([1 / global_sf], dtype=torch.float32, device="cuda")
+
+    a_global_sf = a.abs().max().float() / (448 * 6)
+    b_global_sf = b.abs().amax(dim=(1, 2)).float() / (448 * 6)
+    a, a_sf = torch.ops.trtllm.fp4_quantize(a, 1 / a_global_sf, sf_vec_size, False)
+    a = a.view(torch.float4_e2m1fn_x2)
+    a_sf_unswizzled = unswizzle_sf(a_sf, num_tokens, hidden_size)[:num_tokens].contiguous()
+    # E4M3 NaN (0x7F) in the first K block of the chosen token's scale row.
+    a_sf_unswizzled.view(torch.uint8).view(num_tokens, -1)[nan_token, 0] = 0x7F
+    b, b_sf = torch.ops.trtllm.fp4_quantize(b, 1 / b_global_sf, sf_vec_size, False)
+    b_sf = b_sf.view(1, weight_n, hidden_size // sf_vec_size)
+    alpha = a_global_sf * b_global_sf
+    b_kernel = interleave_linear_and_gate(b, group_size=64, dim=1).view(torch.float4_e2m1fn_x2)
+    b_sf_kernel = swizzle_sf(
+        interleave_linear_and_gate(
+            unswizzle_sf(b_sf, weight_n, hidden_size).view(1, weight_n, hidden_size // sf_vec_size),
+            group_size=64,
+            dim=1,
+        ),
+        weight_n,
+        hidden_size,
+    ).view(1, weight_n, hidden_size // sf_vec_size)
+
+    _c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+        a,
+        b_kernel,
+        a_sf_unswizzled,
+        b_sf_kernel,
+        alpha,
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx,
+        num_non_exiting_tiles,
+        global_sf_tensor,
+        num_experts=1,
+        top_k=1,
+        num_local_experts=1,
+        local_expert_offset=0,
+        tile_size=tile_size,
+        output_tensor=None,
+        output_sf_tensor=None,
+        scaling_vector_size=sf_vec_size,
+        activation_type=int(ActivationType.Swiglu),
+        swiglu_limit_scalar=swiglu_limit,
+    )
+
+    c_sf_rows = (
+        unswizzle_sf(c_sf, max_num_permuted_tokens, interm_size, sf_vec_size)
+        .view(torch.uint8)
+        .view(max_num_permuted_tokens, -1)
+    )
+    # E4M3 NaN is exponent and mantissa all ones, either sign.
+    is_nan = (c_sf_rows & 0x7F) == 0x7F
+    permuted_idx = permuted_idx_to_expanded_idx[:num_valid_permuted_tokens]
+    nan_rows = (permuted_idx == nan_token).nonzero().flatten()
+    assert nan_rows.numel() == 1
+    assert is_nan[nan_rows].all(), "the NaN accumulator row did not reach the output scales"
+    other_rows = ((permuted_idx != nan_token) & (permuted_idx != -1)).nonzero().flatten()
+    assert not is_nan[other_rows].any(), "NaN leaked into rows without a NaN input"
+
+
+@pytest.mark.skipif(
     get_sm_version() != 107,
     reason="This test is only supported on SM 107 (Rubin) GPUs",
 )
@@ -3587,6 +3743,7 @@ def test_rubin_moe_locality_domain_composite_owns_concurrent_tuning(
                     "output_sf_tensor": torch.empty((2,), dtype=torch.uint8),
                     "scaling_vector_size": 16,
                     "activation_type": int(ActivationType.Swiglu),
+                    "swiglu_limit_scalar": 1.0,
                 }
             )
     else:
@@ -3638,12 +3795,13 @@ def test_rubin_moe_locality_domain_composite_owns_concurrent_tuning(
     runner_args, runner_kwargs = runner_instances[0].init_call
     if quantized and is_fc1:
         assert runner_args == (1, 1, 1, 0, 128, 16)
-        # The disabled sentinels canonicalize (None / +inf) before the runner sees them.
+        # The disabled SiTu sentinels canonicalize to None before the runner
+        # sees them; a finite SwiGLU limit is forwarded unchanged.
         assert runner_kwargs == {
             "activation_type": ActivationType.Swiglu,
             "situ_beta": None,
             "situ_linear_beta": None,
-            "swiglu_limit_scalar": float("inf"),
+            "swiglu_limit_scalar": 1.0,
         }
     elif quantized:
         assert runner_args == (1, 1, 1, 0, 128, torch.bfloat16, 16)
@@ -3682,6 +3840,8 @@ def test_rubin_moe_locality_domain_composite_owns_concurrent_tuning(
         assert all(
             kwargs["output_tensor"] is call_kwargs["output_tensor"] for _, kwargs in leaf_calls
         )
+        if quantized:
+            assert all(kwargs["swiglu_limit_scalar"] == 1.0 for _, kwargs in leaf_calls)
         assert not memset_calls
         assert execution_order == ["tune", "launch"]
     else:
@@ -3725,6 +3885,64 @@ def test_rubin_moe_locality_domain_composite_owns_concurrent_tuning(
             assert all(
                 kwargs["activation_type"] == int(ActivationType.Swiglu) for _, kwargs in leaf_calls
             )
+
+
+@pytest.mark.parametrize("locality_domain", [False, True], ids=["leaf", "locality_domain"])
+def test_rubin_nvfp4_fc1_ops_reject_nan_swiglu_limit(locality_domain: bool):
+    # The Python implementation is exercised directly on CPU tensors: both ops
+    # canonicalize the clamp before constructing the runner, so no GPU work runs.
+    op_name = (
+        "cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_locality_domain_inplace_rubin"
+        if locality_domain
+        else "cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin"
+    )
+    op = getattr(cute_dsl_custom_ops, op_name, None)
+    if op is None:
+        pytest.skip("public Rubin CuTe DSL MoE op is not registered")
+
+    weight = torch.empty((1, 8, 4), dtype=torch.uint8)
+    weight_scale = torch.empty((1, 8, 1), dtype=torch.uint8)
+    call_kwargs = {
+        "input": torch.empty((2, 4), dtype=torch.uint8),
+        "input_scale": torch.empty((2,), dtype=torch.uint8),
+        "alpha": torch.empty((1,), dtype=torch.float32),
+        "tile_idx_to_group_idx": torch.empty((1,), dtype=torch.int32),
+        "tile_idx_to_mn_limit": torch.empty((1,), dtype=torch.int32),
+        "permuted_idx_to_expanded_idx": torch.empty((2,), dtype=torch.int32),
+        "num_non_exiting_tiles": torch.empty((1,), dtype=torch.int32),
+        "global_sf": torch.empty((1,), dtype=torch.float32),
+        "num_experts": 1,
+        "top_k": 1,
+        "num_local_experts": 1,
+        "local_expert_offset": 0,
+        "tile_size": 128,
+        "scaling_vector_size": 16,
+        "activation_type": int(ActivationType.Swiglu),
+        "swiglu_limit_scalar": float("nan"),
+    }
+    if locality_domain:
+        call_kwargs.update(
+            {
+                "weight_0": weight,
+                "weight_1": weight,
+                "weight_scale_0": weight_scale,
+                "weight_scale_1": weight_scale,
+                "output_tensor": torch.empty((2, 8), dtype=torch.uint8),
+                "output_sf_tensor": torch.empty((2,), dtype=torch.uint8),
+            }
+        )
+    else:
+        call_kwargs.update(
+            {
+                "weight": weight,
+                "weight_scale": weight_scale,
+                "output_tensor": None,
+                "output_sf_tensor": None,
+            }
+        )
+
+    with pytest.raises(ValueError, match="must not be NaN"):
+        op._init_fn(**call_kwargs)
 
 
 @pytest.mark.skipif(
