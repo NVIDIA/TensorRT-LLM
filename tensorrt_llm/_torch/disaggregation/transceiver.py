@@ -565,13 +565,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         allgather: Callable,
         need_sync: bool,
         locally_quiesced=None,
+        locally_verified=None,
     ):
         # CANCELLED/FAILED on any rank → global; COMPLETED only when ALL ranks agree.
-        # Quiescence, when requested, also requires agreement from every rank.
+        # Quiescence and write-verification, when requested, also require
+        # agreement from every rank.
         # Batch the id lists into one allgather to cut the per-step collective count.
         local_outcome = [list(cancelled), list(failed), list(completed)]
         if locally_quiesced is not None:
             local_outcome.append(list(locally_quiesced))
+        if locally_verified is not None:
+            local_outcome.append(list(locally_verified))
         if not need_sync:
             packed = [local_outcome]
         else:
@@ -590,14 +594,23 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         new_completed = [
             rid for rid in to_process if rid in global_completed and rid not in terminal
         ]
+        result = [new_cancelled, new_failed, new_completed]
+        idx = 3
         if locally_quiesced is not None:
-            all_quiesced = [p[3] for p in packed]
+            all_quiesced = [p[idx] for p in packed]
+            idx += 1
             global_quiesced = self._intersection(all_quiesced, n)
-            new_quiesced = [rid for rid in to_process if rid in global_quiesced]
-            return new_cancelled, new_failed, new_completed, new_quiesced
-        return new_cancelled, new_failed, new_completed
+            result.append([rid for rid in to_process if rid in global_quiesced])
+        if locally_verified is not None:
+            # Per-rank reuse trees stay consistent only if every rank admits
+            # the same tokens, so a request counts as write-verified only
+            # when EVERY rank verified its local shard.
+            all_verified = [p[idx] for p in packed]
+            global_verified = self._intersection(all_verified, n)
+            result.append({rid for rid in to_process if rid in global_verified})
+        return tuple(result)
 
-    def _gen_consensus_outcome(self, to_process, cancelled, failed, completed):
+    def _gen_consensus_outcome(self, to_process, cancelled, failed, completed, locally_verified):
         # A failure/cancellation may be global, but reuse is safe only after
         # every participating rank has drained its local physical accessor.
         locally_retirable = []
@@ -605,20 +618,24 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             session = self._recv_sessions[rid]
             if not self._ownership_blocks_retirement(session):
                 locally_retirable.append(rid)
-        new_cancelled, new_failed, new_completed, globally_retirable = self._consensus_outcome(
-            to_process,
-            cancelled,
-            failed,
-            completed,
-            self._gen_allgather,
-            self._gen_need_sync,
-            locally_retirable,
+        new_cancelled, new_failed, new_completed, globally_retirable, verified = (
+            self._consensus_outcome(
+                to_process,
+                cancelled,
+                failed,
+                completed,
+                self._gen_allgather,
+                self._gen_need_sync,
+                locally_retirable,
+                locally_verified,
+            )
         )
         retirable = set(globally_retirable)
         return (
             [rid for rid in new_cancelled if rid in retirable],
             [rid for rid in new_failed if rid in retirable],
             new_completed,
+            verified,
         )
 
     def _ctx_consensus_outcome(self, to_process, cancelled, failed, completed, locally_quiesced):
@@ -960,13 +977,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             fetches = self._open_peer_source(req)
             # Same submission the asynchronous entry makes; what differs is who waits. The session
             # underneath is read back for the blocking wait, the auxiliary buffer and the close.
-            fetches.fetch(extent)
+            fetches.fetch(extent, expected_write_bytes=self._chunk_num_bytes(extent.local))
             session = self._legacy_session(fetches)
             self._recv_sessions[rid] = session
             self._recv_reqs[rid] = req
             result = session.wait_complete(blocking=True)
 
             if result == WaitResult.COMPLETED:
+                # Verified-range reuse admission (local verdict; this
+                # blocking path has no cross-rank outcome consensus).
+                req.py_kv_transfer_verified = session.kv_write_verified()
                 # KV-transfer timing setters deferred to #15871 (clock-source consistency); size only.
                 req.set_kv_cache_size(
                     self._chunk_num_bytes(extent.local) * self._kv_size_rank_factor
@@ -1032,7 +1052,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             )
             return
         extent = self._create_cache_extent(req)
-        req.py_kv_cache_xfer_bytes = self._chunk_num_bytes(extent.local) * self._kv_size_rank_factor
+        chunk_bytes = self._chunk_num_bytes(extent.local)
+        req.py_kv_cache_xfer_bytes = chunk_bytes * self._kv_size_rank_factor
         fetches = self._open_peer_source(req)
         # Claimed to be transferring only once there is something to transfer: a builder that
         # raises above leaves the request where it was, not in a state nothing advances.
@@ -1043,7 +1064,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         try:
             # The handle that comes back is the contract's answer about this piece. What retires
             # the request is the sweep over the session tables, as it was before.
-            fetches.fetch(extent)
+            fetches.fetch(extent, expected_write_bytes=chunk_bytes)
         except Exception:
             # No session means no publication and nothing the sweep could ever pair the request
             # with, so the registration made here is undone here and the request goes terminal.
@@ -1193,9 +1214,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 failed.append(rid)
             # else: None — KV done but aux still in flight; re-poll next cycle
 
+        # Verified-range reuse admission: a rid qualifies only when this
+        # rank's session attests full write coverage of the published
+        # destination bytes (see RxSession.kv_write_verified).
+        locally_verified = [
+            rid for rid in completed if self._recv_sessions[rid].kv_write_verified()
+        ]
+
         # All ranks must agree on per-rid outcome to avoid req.state divergence.
-        cancelled, failed, completed = self._gen_consensus_outcome(
-            to_process, cancelled, failed, completed
+        cancelled, failed, completed, verified = self._gen_consensus_outcome(
+            to_process, cancelled, failed, completed, locally_verified
         )
 
         cancelled_reqs = []
@@ -1223,6 +1251,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         for rid in completed:
             session = self._recv_sessions[rid]
             req = self._recv_reqs[rid]
+            # Stamp the write-verification verdict on the request before the
+            # session is closed and dropped: commit_blocks_for_reuse runs
+            # later (batch preparation) and gates reuse admission on it.
+            req.py_kv_transfer_verified = rid in verified
             # transfer_end already stamped at completion detection above.
             req.set_kv_cache_size(getattr(req, "py_kv_cache_xfer_bytes", 0))
             if self._need_aux_transfer(req):
@@ -1454,6 +1486,22 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return True
 
     def commit_blocks_for_reuse(self, req) -> None:
+        # Verified-range admission (fail-closed): commit the received range
+        # to the reuse tree only when every published destination byte has
+        # attested write coverage on every rank. Transfer SUCCESS alone is
+        # not proof the destination pages were written — a false-success
+        # would otherwise admit never-written pages under the prompt's token
+        # hashes and reuse would re-serve the poisoned prefix. Skipping the
+        # commit never affects the request itself: generation proceeds
+        # normally, the blocks just stay out of the reuse tree.
+        if not getattr(req, "py_kv_transfer_verified", False):
+            logger.warning(
+                "Skipping KV block reuse admission for request "
+                f"{req.py_request_id}: the received range is not verified as "
+                "written (attested bytes did not cover the published "
+                "destination on every rank)"
+            )
+            return
         self._reuse_adapter.commit_blocks_for_reuse(req)
 
     def get_context_state(self):

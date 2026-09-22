@@ -1035,6 +1035,7 @@ class Sender(SenderBase):
 
         agent_result = AgentResult.SUCCESS
         send_slot_id = None
+        submitted_and_completed = False
         if write_meta.src_ptrs.size > 0:
             try:
                 request, send_slot_id = build_send_request(
@@ -1070,6 +1071,7 @@ class Sender(SenderBase):
                     task, write_meta.peer_rank, request
                 )
                 if transfer_finished:
+                    submitted_and_completed = True
                     del request
                 if not transfer_finished:
                     agent_result = AgentResult.IN_DOUBT if owned else AgentResult.FAILED
@@ -1108,7 +1110,19 @@ class Sender(SenderBase):
             if send_slot_id is not None and agent_result == AgentResult.SUCCESS
             else None
         )
-        transfer_size = timer.get_transfer_size(write_meta.peer_rank) if timer else 0
+        # Attested written bytes: only what was actually submitted to the
+        # agent AND completed. The receiver checks the per-slice sum against
+        # the byte total of its published destinations before admitting the
+        # transferred range to KV block reuse (verified-range admission), so
+        # this must reflect the completed submission, never intent — gate on
+        # submitted_and_completed, not on agent_result, so a SUCCESS message
+        # that did not come from a completed submit attests zero bytes.
+        # Matches the perf timer's transfer-size accounting (kv_sizes.sum()
+        # recorded in _build_kv_write_meta) but is populated even with perf
+        # logging off.
+        transfer_size = 0
+        if submitted_and_completed and agent_result == AgentResult.SUCCESS:
+            transfer_size = int(write_meta.sizes.sum())
         result_msg = _make_kv_result_msg(
             self._instance_rank,
             write_meta.unique_rid,
@@ -2227,6 +2241,7 @@ class KVRecvTask:
         slice_id: int,
         params: DisaggregatedParams,
         aux_slot: Optional[int],
+        expected_write_bytes: Optional[int] = None,
     ):
         self._event = threading.Event()
         self.slice_id = slice_id
@@ -2234,6 +2249,12 @@ class KVRecvTask:
         self.expected_transfers = 0
         # One terminal result per writer rank, keyed by the rank the result frame carries.
         self._writer_reports: dict[int, bool] = {}
+        # Verified-range admission accounting: the receiver-computed byte
+        # total the writers must cover for this piece, and the bytes the
+        # writers attested as actually submitted-and-completed. None means
+        # "unknown" and the task can never become write-verified.
+        self.expected_write_bytes = expected_write_bytes
+        self.verified_write_bytes = 0
 
         self._unique_rid = unique_rid
         self._chunk = chunk
@@ -2269,6 +2290,20 @@ class KVRecvTask:
     def wait(self, timeout: Optional[float] = None) -> bool:
         """Block until terminal state. Returns True if done, False on timeout."""
         return self._event.wait(timeout=timeout)
+
+    @property
+    def write_verified(self) -> bool:
+        """True when every published destination byte has attested write coverage.
+
+        Strict equality: an over-count (more attested bytes than published)
+        indicates duplicated or misrouted writes and is as disqualifying as a
+        missing write.
+        """
+        return (
+            self.status == TaskStatus.TRANSFERRED
+            and self.expected_write_bytes is not None
+            and self.verified_write_bytes == self.expected_write_bytes
+        )
 
     @property
     def is_done(self) -> bool:
@@ -3096,11 +3131,11 @@ class RxSession(RxSessionBase):
                 f"RxSession {self.disagg_request_id} became terminal before publication"
             )
 
-    def receive(self, chunk: Chunk) -> None:
+    def receive(self, chunk: Chunk, expected_write_bytes: Optional[int] = None) -> None:
         if self.transfer_start_time is None:
             self.transfer_start_time = tensorrt_llm.bindings.global_steady_clock_now()
         if self._enforce_physical_ownership:
-            task = self.prepare_receive(chunk)
+            task = self.prepare_receive(chunk, expected_write_bytes=expected_write_bytes)
             if task is not None:
                 self.dispatch_prepared_receive(task)
             return
@@ -3112,11 +3147,14 @@ class RxSession(RxSessionBase):
             slice_id,
             params,
             aux_slot=self.aux_slot,
+            expected_write_bytes=expected_write_bytes,
         )
         self._kv_tasks.append(task)
         self._receiver.dispatch_task(task)
 
-    def prepare_receive(self, chunk: Chunk) -> Optional[KVRecvTask]:
+    def prepare_receive(
+        self, chunk: Chunk, expected_write_bytes: Optional[int] = None
+    ) -> Optional[KVRecvTask]:
         """Create an unpublished task under the cancellation linearization lock."""
         with self.lock:
             if self._closed or self._terminal_status is not None:
@@ -3128,10 +3166,25 @@ class RxSession(RxSessionBase):
                 len(self._kv_tasks),
                 params,
                 aux_slot=self.aux_slot,
+                expected_write_bytes=expected_write_bytes,
             )
             task.begin_publication()
             self._kv_tasks.append(task)
             return task
+
+    def kv_write_verified(self) -> bool:
+        """True when every KV task's published destination bytes are attested written.
+
+        This is the admission predicate for verified-range KV block reuse: a
+        session whose writers merely reported SUCCESS without covering the
+        published byte range (skipped, partial, or misrouted writes) is not
+        verified, and the received range must not be committed to the reuse
+        tree. An empty session (nothing received) is never verified.
+        """
+        with self.lock:
+            if not self._kv_tasks:
+                return False
+            return all(task.write_verified for task in self._kv_tasks)
 
     def dispatch_prepared_receive(self, task: KVRecvTask) -> None:
         try:
@@ -3238,6 +3291,11 @@ class RxSession(RxSessionBase):
                         return
             self.kv_cache_size_bytes += transfer_size
             if status == AgentResult.SUCCESS:
+                # Verified-range accounting: transfer_size is the sender's
+                # attestation of destination bytes actually submitted and
+                # completed for this chunk (0 unless the write completed).
+                task.verified_write_bytes += transfer_size
+
                 from .bounce import scatter_write_result
 
                 on_done = None

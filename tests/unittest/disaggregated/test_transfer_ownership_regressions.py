@@ -530,8 +530,8 @@ def test_failed_receive_consensus_waits_for_every_rank_to_drain() -> None:
         side_effect=[
             [[], []],
             [
-                [[], [rid], [], [rid]],
-                [[], [], [], []],
+                [[], [rid], [], [rid], []],
+                [[], [], [], [], []],
             ],
         ]
     )
@@ -547,8 +547,8 @@ def test_failed_receive_consensus_waits_for_every_rank_to_drain() -> None:
         side_effect=[
             [[rid], [rid]],
             [
-                [[], [rid], [], [rid]],
-                [[], [rid], [], [rid]],
+                [[], [rid], [], [rid], []],
+                [[], [rid], [], [rid], []],
             ],
         ]
     )
@@ -1133,6 +1133,7 @@ def test_completed_session_is_not_reported_retired_when_close_refuses() -> None:
         is_completed=Mock(return_value=True),
         has_failed=Mock(return_value=False),
         wait_complete=Mock(return_value=WaitResult.COMPLETED),
+        kv_write_verified=Mock(return_value=True),
         close=Mock(return_value=False),
     )
     transceiver = object.__new__(KvCacheTransceiverV2)
@@ -2482,7 +2483,7 @@ def test_fp4_mla_bridge_roots_send_and_receive_requests_before_admission() -> No
 
     recv_tasks = []
 
-    def receive_after_rooting(_chunk: Chunk) -> None:
+    def receive_after_rooting(_chunk: Chunk, expected_write_bytes=None) -> None:
         assert receiver._recv_reqs[rid] is recv_req
         recv_tasks.append(SimpleNamespace(status=None, _exception=None))
 
