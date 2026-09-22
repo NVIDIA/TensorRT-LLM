@@ -4,7 +4,6 @@
 from typing import Dict, Optional
 
 from tensorrt_llm._torch.disaggregation import diagnostics as disagg_diagnostics
-from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm.logger import logger
@@ -123,11 +122,10 @@ class AsyncTransferManager:
                     if self.should_store_blocks and request.is_context_only_request:
                         assert transfer_metadata.block_id is not None
                         mapping = getattr(self.kv_cache_manager, "mapping", None)
-                        disagg_diagnostics.emit_event(
+                        disagg_diagnostics.emit_request_event(
                             "ctx_source_unpinned",
+                            request,
                             side="ctx",
-                            request_id=get_unique_rid(request),
-                            local_request_id=request.py_request_id,
                             rank=getattr(mapping, "rank", None),
                             source_kv_reuse_pinned=False,
                             state=request.state.name,

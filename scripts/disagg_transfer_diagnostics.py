@@ -5,7 +5,8 @@
 
 The runtime writes compact JSON objects after ``[DISAGG_TRANSFER_DIAG]``. This
 tool tolerates unrelated and malformed log lines. Requests are correlated across
-processes only with a shared run UUID; otherwise analysis stays process-local.
+processes only with a shared run UUID and explicit run-scoped request identity;
+fallback or unknown request identities stay process-local.
 Durations require matching run/process UUIDs, host, and PID. Legacy records
 without a process UUID remain readable but cannot establish safe timing.
 
@@ -27,7 +28,7 @@ from bisect import bisect_left
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Literal, Sequence
 from uuid import UUID
 
 DIAGNOSTICS_LOG_PREFIX = "[DISAGG_TRANSFER_DIAG] "
@@ -51,6 +52,7 @@ _TIMELINE_FIELDS = (
     "cp_rank",
     "dp_rank",
     "local_request_id",
+    "request_id_scope",
     "outcome",
     "policy",
     "slice_id",
@@ -573,7 +575,24 @@ def _identity_issues(record: Event) -> list[str]:
                 field == "run_uuid" and record.get("run_uuid_status") == "invalid"
             )
             issues.append(f"{'invalid' if invalid else 'missing'}_{field}")
+    if record.get("request_id") is not None:
+        scope = record.get("request_id_scope")
+        if scope is None:
+            issues.append("missing_request_id_scope")
+        elif scope == "unknown":
+            issues.append("unknown_request_id_scope")
+        elif scope not in ("run", "process"):
+            issues.append("invalid_request_id_scope")
     return issues
+
+
+def _request_id_scope(record: Event) -> Literal["run", "process", "unknown"]:
+    scope = record.get("request_id_scope")
+    if scope == "run":
+        return "run"
+    if scope == "process":
+        return "process"
+    return "unknown"
 
 
 def _clock_domain(record: Event) -> ClockDomain | None:
@@ -1032,14 +1051,20 @@ def _request_group_key(event: _ParsedEvent) -> tuple[str, str, str, str]:
     record = event.record
     process_uuid = _uuid_value(record.get("process_uuid"))
     run_uuid = _uuid_value(record.get("run_uuid"))
+    request_scope = _request_id_scope(record)
     if process_uuid is None:
         # Even records from one input file can span restarts. Keep unidentified
         # records separate instead of manufacturing a request from reused IDs.
         scope, identity = "unverified", str(event.line_number)
-    elif run_uuid is not None:
+    elif run_uuid is not None and request_scope == "run":
         scope, identity = "run", run_uuid
     else:
-        scope, identity = "process", repr((process_uuid, record.get("host"), record.get("pid")))
+        # Numeric fallback IDs belong to one process, not the whole launch.
+        # Keep declared and unknown namespaces separate even without a run UUID.
+        scope, identity = (
+            "process",
+            repr((run_uuid, process_uuid, record.get("host"), record.get("pid"), request_scope)),
+        )
     return scope, identity, *_request_sort_key(record["request_id"])
 
 
@@ -1092,6 +1117,7 @@ def _summarize_request(
     return {
         "request_id": request_id,
         "run_uuid": _uuid_value(events[0].record.get("run_uuid")),
+        "request_id_scope": _request_id_scope(events[0].record),
         "correlation_scope": _request_group_key(events[0])[0],
         "identity_issues": sorted(
             {issue for event in events for issue in _identity_issues(event.record)}
@@ -1268,9 +1294,13 @@ def analyze(parse_result: ParseResult) -> dict[str, object]:
     ]
     return {
         "identity_semantics": {
-            "requests": "Join across processes only by a shared run_uuid and request_id.",
+            "requests": (
+                "Join across processes only by a shared run_uuid and request_id "
+                "with explicit request_id_scope=run."
+            ),
             "process_local": (
-                "Without a valid run_uuid, correlate only within one process_uuid, host and PID."
+                "Fallback or unknown request IDs, or IDs without a valid run_uuid, "
+                "correlate only within one run/process UUID, host, PID and request-ID scope."
             ),
             "unverified": (
                 "Without a valid process_uuid, retain individual records "

@@ -15,6 +15,9 @@ from fake_dist import FakeDistGroup
 
 from tensorrt_llm._torch.disaggregation import diagnostics as disagg_diagnostics
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_module
+from tensorrt_llm._torch.disaggregation.orchestration.admission import (
+    DisaggTransferAdmissionController,
+)
 from tensorrt_llm.bindings import LlmRequestState
 
 pytestmark = pytest.mark.cpu_only
@@ -62,6 +65,7 @@ def _assert_trace(diagnostics: tuple[bool, Mock], expected: list[tuple[str, int]
     assert [(call.args[0], call.kwargs["rank"]) for call in calls] == expected
     for call in calls:
         assert call.kwargs["request_id"] == 7007
+        assert call.kwargs["request_id_scope"] == "run"
         assert call.kwargs["local_request_id"] == 7
         assert call.kwargs["side"] == "ctx"
 
@@ -113,7 +117,7 @@ def test_idle_error_cleanup_waits_for_last_owner(diagnostics) -> None:
     _assert_trace(diagnostics, [("ctx_send_ready", 0)])
 
     h.coordinator.release_transfer(req)
-    h.coordinator.check_transfer_errors("context requests")
+    h.coordinator._check_transfer_errors("context requests")
 
     assert not h.in_transfer(req)
     assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
@@ -212,3 +216,95 @@ def test_timeout_observation_and_idle_cancellation_preserve_trace(diagnostics, c
         assert started["timeout_owner"] == observed["timeout_owner"] == "pyexecutor"
         assert started["timeout_ms"] == observed["timeout_ms"] == 1000
         assert observed["elapsed_ms"] == 2000.0
+
+
+@pytest.mark.parametrize("bypass", [False, True])
+def test_admission_diagnostics_preserve_admitted_batch_and_kv_rollback(
+    diagnostics, bypass: bool
+) -> None:
+    controller = DisaggTransferAdmissionController(max_tokens_in_buffer=32, tokens_per_block=32)
+    h = _harness(
+        FakeDistGroup(world_size=1, tp_size=1),
+        admission_controller=controller,
+        is_kv_manager_v2=True,
+        consumes_transfer_buffer=not bypass,
+    )
+    candidates = [
+        TransferRequest(
+            rid,
+            prompt_len=32,
+            is_context_only_request=False,
+            state=LlmRequestState.DISAGG_GENERATION_INIT,
+            py_disaggregated_params=SimpleNamespace(disagg_request_id=7000 + rid),
+        )
+        for rid in (7, 8)
+    ]
+    h.active.extend(candidates)
+
+    admitted, waiting_for_progress = h.coordinator.admit(candidates)
+
+    assert admitted == (candidates if bypass else candidates[:1])
+    assert waiting_for_progress is False
+    assert h.effects.reverted == ([] if bypass else [candidates[1:]])
+    assert h.effects.prepared == []
+    assert h.transceiver.call_log == []
+    assert all(req.state == LlmRequestState.DISAGG_GENERATION_INIT for req in candidates)
+    enabled, emit = diagnostics
+    if not enabled:
+        emit.assert_not_called()
+        return
+    window_events = [
+        call for call in emit.call_args_list if call.args[0] == "gen_transfer_window_result"
+    ]
+    assert window_events
+    assert window_events[0].kwargs["policy"] == ("bypassed" if bypass else "enforced")
+    assert window_events[0].kwargs["request_id"] == 7007
+    assert window_events[0].kwargs["request_id_scope"] == "run"
+    rollback_events = [call for call in emit.call_args_list if call.args[0] == "gen_kv_rollback"]
+    assert len(rollback_events) == (0 if bypass else 1)
+    if rollback_events:
+        assert rollback_events[0].kwargs["request_id"] == 7008
+        assert rollback_events[0].kwargs["reason"] == "transfer_window"
+
+
+@pytest.mark.parametrize("synchronous", [False, True])
+def test_receive_diagnostics_preserve_preparation_poll_and_timeout_boundaries(
+    diagnostics, monkeypatch, clock, synchronous: bool
+) -> None:
+    if synchronous:
+        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+    h = _harness(FakeDistGroup(world_size=1, tp_size=1), kv_transfer_timeout_ms=1000)
+    request = TransferRequest(
+        7,
+        is_context_only_request=False,
+        state=LlmRequestState.DISAGG_GENERATION_INIT,
+        py_disaggregated_params=SimpleNamespace(disagg_request_id=7007),
+    )
+    h.active.append(request)
+
+    h.coordinator.receive_gen_init([request])
+
+    assert h.effects.prepared == [[request]]
+    assert h.effects.reverted == []
+    assert h.effects.failed == []
+    if synchronous:
+        assert h.transceiver.call_log == ["request_and_receive_sync:7"]
+        assert request.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+        assert request.py_kv_transfer_start_time is None
+    else:
+        assert h.transceiver.call_log == [
+            "request_and_receive_async:7",
+            "check_gen_transfer_status:0",
+        ]
+        assert request.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        assert request.py_kv_transfer_start_time == clock["t"]
+    enabled, emit = diagnostics
+    if synchronous or not enabled:
+        emit.assert_not_called()
+    else:
+        assert emit.call_count == 1
+        assert emit.call_args.args == ("transfer_timeout_started",)
+        assert emit.call_args.kwargs["request_id"] == 7007
+        assert emit.call_args.kwargs["request_id_scope"] == "run"
+        assert emit.call_args.kwargs["side"] == "gen"
+        assert emit.call_args.kwargs["timer_start_monotonic_ns"] == int(clock["t"] * 1_000_000_000)

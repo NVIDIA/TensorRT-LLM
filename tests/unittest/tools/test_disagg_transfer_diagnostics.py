@@ -37,6 +37,7 @@ def _event(
         "schema_version": 1,
         "event": name,
         "request_id": request_id,
+        "request_id_scope": "run",
         "side": side,
         **_domain(host, pid),
         "monotonic_ns": monotonic_ns,
@@ -1057,3 +1058,18 @@ def test_cli_reads_files_and_emits_json(tmp_path: Path, capfd: pytest.CaptureFix
     result = json.loads(capfd.readouterr().out)
     assert result["summary"]["request_count"] == 1
     assert result["requests"][0]["request_id"] == 5
+
+
+def test_cli_writes_json_to_output_file(tmp_path: Path, capfd: pytest.CaptureFixture[str]) -> None:
+    log = tmp_path / "worker.log"
+    log.write_text(_event("gen_ingress", 5, 100), encoding="utf-8")
+    output = tmp_path / "report.json"
+
+    assert main([str(log), "--output", str(output)]) == 0
+
+    contents = output.read_text(encoding="utf-8")
+    assert contents.endswith("\n")
+    result = json.loads(contents)
+    assert result["summary"]["request_count"] == 1
+    assert result["requests"][0]["request_id"] == 5
+    assert capfd.readouterr().out == ""
