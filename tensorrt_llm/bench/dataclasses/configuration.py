@@ -8,9 +8,8 @@ from pydantic import (BaseModel, Field, PositiveFloat, field_validator,
                       model_validator)
 
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm.llmapi import (BatchingType, CapacitySchedulerPolicy,
-                                 ContextChunkingPolicy, DynamicBatchConfig,
-                                 ExtendedRuntimePerfKnobConfig, KvCacheConfig,
+from tensorrt_llm.llmapi import (CapacitySchedulerPolicy, ContextChunkingPolicy,
+                                 DynamicBatchConfig, KvCacheConfig,
                                  SchedulerConfig)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_options
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
@@ -41,36 +40,19 @@ class RuntimeConfig(BaseModel):
         model = self.model_path or self.model
 
         llm_args = {
-            "scheduler_config":
-            self.settings_config.get_scheduler_config(),
-            "model":
-            model,
-            "skip_tokenizer_init":
-            True,
-            "pipeline_parallel_size":
-            self.mapping["pp_size"],
-            "tensor_parallel_size":
-            self.mapping["tp_size"],
-            "gpus_per_node":
-            self.mapping["gpus_per_node"],
-            "moe_expert_parallel_size":
-            self.mapping["moe_ep_size"],
-            "moe_cluster_parallel_size":
-            self.mapping["moe_cluster_size"],
-            "trust_remote_code":
-            True,
-            "enable_chunked_prefill":
-            self.settings_config.chunking,
-            "extended_runtime_perf_knob_config":
-            self.performance_options.get_perf_config(),
-            "decoding_config":
-            self.decoding_config.get_decoding_config(),
-            "batching_type":
-            BatchingType.INFLIGHT,
-            "max_batch_size":
-            self.settings_config.max_batch_size,
-            "max_num_tokens":
-            self.settings_config.max_num_tokens,
+            "scheduler_config": self.settings_config.get_scheduler_config(),
+            "model": model,
+            "skip_tokenizer_init": True,
+            "pipeline_parallel_size": self.mapping["pp_size"],
+            "tensor_parallel_size": self.mapping["tp_size"],
+            "gpus_per_node": self.mapping["gpus_per_node"],
+            "moe_expert_parallel_size": self.mapping["moe_ep_size"],
+            "moe_cluster_parallel_size": self.mapping["moe_cluster_size"],
+            "trust_remote_code": True,
+            "enable_chunked_prefill": self.settings_config.chunking,
+            "decoding_config": self.decoding_config.get_decoding_config(),
+            "max_batch_size": self.settings_config.max_batch_size,
+            "max_num_tokens": self.settings_config.max_num_tokens,
         }
 
         backend_config_map = {
@@ -115,18 +97,7 @@ class RuntimeConfig(BaseModel):
 
 @dataclass
 class PerformanceOptions:
-    cuda_graphs: bool = False
-    multi_block_mode: bool = True
-    cuda_graph_cache_size: int = 1000
     pytorch_config: Dict[str, Any] = Field(default_factory=dict)
-
-    def get_perf_config(self) -> ExtendedRuntimePerfKnobConfig:
-        config = ExtendedRuntimePerfKnobConfig()
-        config.cuda_graph_mode = self.cuda_graphs
-        config.multi_block_mode = self.multi_block_mode
-        config.cuda_graph_cache_size = self.cuda_graph_cache_size
-
-        return config
 
     def get_pytorch_perf_config(self):
         return self.pytorch_config

@@ -100,23 +100,6 @@ class GeneralExecSettings(BaseModel):
         return self.model_path or self.model
 
 
-def ignore_trt_only_args(kwargs: dict, backend: str):
-    """Ignore TensorRT-only arguments for non-TensorRT backends.
-
-    Args:
-        kwargs: Dictionary of keyword arguments to be passed to the LLM constructor.
-        backend: The backend type.
-    """
-    trt_only_args = [
-        "batching_type",
-        "normalize_log_probs",
-        "extended_runtime_perf_knob_config",
-    ]
-    for arg in trt_only_args:
-        if kwargs.pop(arg, None):
-            logger.warning(f"Ignore {arg} for {backend} backend.")
-
-
 def get_llm(runtime_config: RuntimeConfig, kwargs: dict):
     """Create and return an appropriate LLM instance based on the backend configuration.
 
@@ -128,9 +111,6 @@ def get_llm(runtime_config: RuntimeConfig, kwargs: dict):
         An instance of the appropriate LLM class for the specified backend.
     """
     llm_cls = PyTorchLLM
-
-    if runtime_config.backend is not None:
-        ignore_trt_only_args(kwargs, runtime_config.backend)
 
     if runtime_config.iteration_log is not None:
         kwargs["enable_iter_perf_stats"] = True

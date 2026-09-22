@@ -18,6 +18,7 @@ from unittest import mock
 
 import pytest
 
+from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, ReportUtility, StatsKeeper
 from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
 from tensorrt_llm.bench.utils import VALID_QUANT_ALGOS
@@ -38,6 +39,44 @@ class _FakeTokenizer:
 
     def encode(self, text, **kwargs):
         return list(range(len(text.split())))
+
+
+def _benchmark_runtime_config(backend: str) -> RuntimeConfig:
+    return RuntimeConfig(
+        model="model",
+        sw_version="test",
+        settings_config={"max_batch_size": 8, "max_num_tokens": 128},
+        mapping={
+            "pp_size": 1,
+            "tp_size": 1,
+            "gpus_per_node": 1,
+            "moe_ep_size": 1,
+            "moe_cluster_size": 1,
+        },
+        decoding_config={},
+        performance_options={
+            "pytorch_config": {
+                "cuda_graph_config": {"batch_sizes": [1, 2]},
+                "disable_overlap_scheduler": True,
+            },
+        },
+        backend=backend,
+    )
+
+
+@pytest.mark.parametrize("backend", ["pytorch", "_autodeploy"])
+def test_runtime_config_omits_legacy_trt_args(backend):
+    llm_args = _benchmark_runtime_config(backend).get_llm_args()
+
+    assert "extended_runtime_perf_knob_config" not in llm_args
+    assert "batching_type" not in llm_args
+
+
+def test_runtime_config_preserves_pytorch_performance_options():
+    llm_args = _benchmark_runtime_config("pytorch").get_llm_args()
+
+    assert llm_args["cuda_graph_config"] == {"batch_sizes": [1, 2]}
+    assert llm_args["disable_overlap_scheduler"] is True
 
 
 def test_format_startup_metrics() -> None:
