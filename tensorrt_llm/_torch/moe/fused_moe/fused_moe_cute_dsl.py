@@ -1573,6 +1573,9 @@ class CuteDslFusedMoE(MoEImplBase):
         moe_output: Optional[torch.Tensor] = None,
         enable_alltoall: bool = False,
         tile_size: int = 128,
+        recv_expert_count: Optional[torch.Tensor] = None,
+        deep_ep_expert_capacity: Optional[int] = None,
+        use_count_native_expert_metadata: bool = False,
         overlap_moe_output_memset: bool = True,
     ) -> torch.Tensor:
         """locality domain path: half-weight children, shared output buffers, fork/join.
@@ -1581,6 +1584,12 @@ class CuteDslFusedMoE(MoEImplBase):
         same tuned tactic and write directly into their strided regions of the
         shared FC1/FC2 output buffers.
         """
+        # Runner.forward passes these to whichever forward_impl it holds;
+        # can_use_deep_ep_direct_metadata() excludes locality domain.
+        if use_count_native_expert_metadata:
+            raise NotImplementedError(
+                "Count-native DeepEP expert metadata is not supported by the "
+                "locality-domain NVFP4 MoE path.")
         output_dtype = torch.bfloat16
         num_partitions = self._locality_domain_plan.num_partitions
         shards = self._locality_domain_weight_shards
