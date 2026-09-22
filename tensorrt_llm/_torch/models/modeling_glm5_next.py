@@ -55,7 +55,6 @@ from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
-from ..moe.fused_moe.fp32_router_gemm import fp32_router_gemm
 from ..pyexecutor.config_utils import unwrap_glm5_next_text_config
 from ..utils import AuxStreamType
 from .checkpoints.hf.glm5_next_weight_mapper import (
@@ -1449,16 +1448,6 @@ class Glm5NextGate(DeepseekV3Gate):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         flat = hidden_states.reshape(-1, self.hidden_size)
-        if (
-            flat.is_cuda
-            and flat.dtype == torch.bfloat16
-            and self.weight.dtype == torch.float32
-            and self.weight.shape == (288, 4096)
-            and self.weight.is_contiguous()
-            and flat.stride(-1) == 1
-            and 1 <= flat.shape[0] <= 8
-        ):
-            return fp32_router_gemm(flat, self.weight)
         return torch.nn.functional.linear(flat.float(), self.weight)
 
 
