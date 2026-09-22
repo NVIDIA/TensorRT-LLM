@@ -2376,11 +2376,17 @@ class OpenAIServer(_VideoRoutesMixin):
             if mm_data:
                 try:
                     mm_metadata = None
+                    processed_mm_data = None
                     if isinstance(generate_inputs, dict):
+                        processed_mm_data = generate_inputs.get("multi_modal_data")
+                    elif hasattr(generate_inputs, "multimodal_params") and generate_inputs.multimodal_params is not None:
+                        processed_mm_data = getattr(generate_inputs.multimodal_params, "multimodal_data", None)
+
+                    if processed_mm_data is not None:
                         from tensorrt_llm.inputs.registry import \
                             get_multimodal_encoder_item_metadata
-                        mm_metadata = get_multimodal_encoder_item_metadata(
-                            generate_inputs.get("multi_modal_data"))
+                        mm_metadata = get_multimodal_encoder_item_metadata(processed_mm_data)
+
                     if mm_metadata is not None:
                         modality_totals = {}
                         for (modality,
@@ -2403,10 +2409,8 @@ class OpenAIServer(_VideoRoutesMixin):
                             mm_token_lengths = find_mm_token_lengths(
                                 mm_data,
                                 proc,
-                                multimodal_data=generate_inputs.get(
-                                    "multi_modal_data") if isinstance(
-                                        generate_inputs, dict) else prompt.get(
-                                            "multi_modal_data"))
+                                multimodal_data=processed_mm_data if processed_mm_data is not None else prompt.get(
+                                    "multi_modal_data"))
                             if mm_token_lengths:
                                 if "image" in mm_token_lengths:
                                     postproc_args.image_tokens = sum(

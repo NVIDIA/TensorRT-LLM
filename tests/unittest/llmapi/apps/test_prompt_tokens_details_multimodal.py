@@ -113,6 +113,7 @@ class TestPostprocessHandlersMultimodalUsage:
 
     def test_chat_response_post_processor_with_modality_tokens(self):
         args = ChatPostprocArgs(
+            role="assistant",
             model="qwen-vl",
             num_prompt_tokens=1500,
             image_tokens=576,
@@ -131,6 +132,7 @@ class TestPostprocessHandlersMultimodalUsage:
 
     def test_chat_response_text_only_exclude_none_serialization(self):
         args = ChatPostprocArgs(
+            role="assistant",
             model="llama-3",
             num_prompt_tokens=50,
         )
@@ -144,6 +146,7 @@ class TestPostprocessHandlersMultimodalUsage:
 
     def test_chat_stream_post_processor_final_usage_chunk(self):
         args = ChatPostprocArgs(
+            role="assistant",
             model="qwen-vl",
             num_prompt_tokens=1200,
             image_tokens=600,
@@ -462,6 +465,9 @@ class TestOpenAIServerMultimodalTokenCollection:
         """
         server = object.__new__(OpenAIServer)
         server.model = "test-model"
+        server.allow_request_chat_template = False
+        server.tool_parser = None
+        server.tool_call_id_type = "random"
         server.processor = MagicMock()
         server.model_config = None
         server.multimodal_server_config = None
@@ -525,6 +531,7 @@ class TestOpenAIServerMultimodalTokenCollection:
             }
 
             resp = await server.openai_chat(request, raw_request=None)
+            assert resp.status_code == 200
             body = json.loads(resp.body.decode())
             details = body["usage"]["prompt_tokens_details"]
 
@@ -537,6 +544,9 @@ class TestOpenAIServerMultimodalTokenCollection:
         """Verify that generator.input_processor is prioritized over server.processor."""
         server = object.__new__(OpenAIServer)
         server.model = "test-model"
+        server.allow_request_chat_template = False
+        server.tool_parser = None
+        server.tool_call_id_type = "random"
         hf_processor = MagicMock(name="hf_processor")
         trt_processor = MagicMock(name="trt_processor")
         server.processor = hf_processor
@@ -585,7 +595,8 @@ class TestOpenAIServerMultimodalTokenCollection:
             mock_template.return_value = "rendered text"
             mock_find_mm.return_value = {"image": [576]}
 
-            await server.openai_chat(request, raw_request=None)
+            resp = await server.openai_chat(request, raw_request=None)
+            assert resp.status_code == 200
 
             # Assert that find_mm_token_lengths was called with trt_processor, not hf_processor
             mock_find_mm.assert_called_once()
@@ -601,6 +612,9 @@ class TestOpenAIServerMultimodalTokenCollection:
         """
         server = object.__new__(OpenAIServer)
         server.model = "test-model"
+        server.allow_request_chat_template = False
+        server.tool_parser = None
+        server.tool_call_id_type = "random"
         server.processor = MagicMock()
         server.model_config = None
         server.multimodal_server_config = None
@@ -662,6 +676,7 @@ class TestOpenAIServerMultimodalTokenCollection:
             mock_template.return_value = "rendered text"
 
             resp = await server.openai_chat(request, raw_request=None)
+            assert resp.status_code == 200
             body = json.loads(resp.body.decode())
             details = body["usage"]["prompt_tokens_details"]
 
@@ -673,10 +688,15 @@ class TestOpenAIServerMultimodalTokenCollection:
     @pytest.mark.asyncio
     async def test_chat_multimodal_token_collection_from_preprocessed_item_metadata(self):
         """Verify deriving token counts from preprocessed MultimodalEncoderItemMetadata post-preprocess."""
+        from tensorrt_llm.inputs.multimodal import MultimodalParams
         from tensorrt_llm.inputs.registry import MultimodalEncoderItemMetadata
+        from tensorrt_llm.llmapi.llm import PreprocessedInputs
 
         server = object.__new__(OpenAIServer)
         server.model = "test-model"
+        server.allow_request_chat_template = False
+        server.tool_parser = None
+        server.tool_call_id_type = "random"
         server.processor = MagicMock()
         server.model_config = None
         server.multimodal_server_config = None
@@ -693,12 +713,14 @@ class TestOpenAIServerMultimodalTokenCollection:
         )
 
         def mock_preprocess(prompt, sampling_params, disaggregated_params):
-            return {
-                "prompt_token_ids": [1, 2, 3],
-                "multi_modal_data": {
-                    "multimodal_encoder_item_metadata": item_metadata
-                }
-            }
+            return PreprocessedInputs(
+                prompt_token_ids=[1, 2, 3],
+                multimodal_params=MultimodalParams(
+                    multimodal_data={
+                        "multimodal_encoder_item_metadata": item_metadata
+                    }
+                ),
+            )
 
         generator = MagicMock()
         generator.preprocess = mock_preprocess
@@ -750,6 +772,7 @@ class TestOpenAIServerMultimodalTokenCollection:
             mock_template.return_value = "rendered text"
 
             resp = await server.openai_chat(request, raw_request=None)
+            assert resp.status_code == 200
             body = json.loads(resp.body.decode())
             details = body["usage"]["prompt_tokens_details"]
 
