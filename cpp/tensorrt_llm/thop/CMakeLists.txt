@@ -136,6 +136,8 @@ add_library(
 # th_common with target_sources() so the list stays next to the files.
 add_subdirectory(moe)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
+target_include_directories(th_common
+                           PRIVATE ${TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR})
 target_link_libraries(
   th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
                     ${SHARED_TARGET} pg_utils)

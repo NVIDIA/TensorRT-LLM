@@ -3,7 +3,7 @@
 """Every op a target names has to exist in the build it is running against.
 
 A target reads private engine surface: custom ops registered under
-``torch.ops.trtllm`` and one pybind entry point. With no version pin, nothing
+``torch.ops.trtllm`` and the native ``AttentionOp`` class. With no version pin, nothing
 declares which build it was written for -- so the only thing that can tell you
 the surface moved is running against it.
 
@@ -62,15 +62,17 @@ def test_every_declared_op_exists(name, module):
 
 @pytest.mark.parametrize("name,module", list(_target_modules()), ids=_target_ids())
 def test_the_pybind_attention_entry_point_exists(name, module):
-    """``thop.attention`` is reached through the bindings, not torch.ops.
-
-    Separate from the loop above because a missing pybind symbol fails in a
-    different way -- an ImportError or an AttributeError on the module object
-    rather than a missing torch.ops entry -- and both targets go through it.
-    """
+    """FallbackFmha dispatches both targets through the native AttentionOp methods."""
     from tensorrt_llm.bindings.internal import thop
 
-    assert hasattr(thop, "attention"), (
-        f"{name} calls the attention op through tensorrt_llm.bindings.internal"
-        f".thop.attention, which this build does not expose"
-    )
+    for symbol in ("AttentionOp", "StaticAttentionConfig", "FmhaParams"):
+        assert hasattr(thop, symbol), f"{name} requires thop.{symbol}"
+    for method in (
+        "get_attention_workspace_size",
+        "run_context",
+        "run_generation",
+        "run_mla_generation",
+    ):
+        assert callable(getattr(thop.AttentionOp, method, None)), (
+            f"{name} requires thop.AttentionOp.{method}"
+        )

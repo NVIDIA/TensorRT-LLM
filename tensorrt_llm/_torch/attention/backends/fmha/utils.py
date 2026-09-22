@@ -122,6 +122,52 @@ def get_trtllm_gen_context_workspace_size(
     return int(layout["total_size"])
 
 
+# The trtllm-gen kernels index the counters in groups of eight.
+_MULTI_CTAS_KV_COUNTER_ALIGNMENT = 8
+
+
+def get_multi_ctas_kv_counter_size(
+    num_heads: int,
+    max_num_sequences: int,
+    multi_processor_count: int,
+) -> int:
+    """Bytes the trtllm-gen multi-CTA KV counter needs.
+
+    One counter per head per decoder sequence, floored at the SM count for the kernels
+    that split a single head across blocks, then rounded up to the group size.
+    """
+    num_counters = max(num_heads * max_num_sequences, multi_processor_count)
+    aligned_num_counters = (
+        (num_counters + _MULTI_CTAS_KV_COUNTER_ALIGNMENT - 1)
+        // _MULTI_CTAS_KV_COUNTER_ALIGNMENT
+        * _MULTI_CTAS_KV_COUNTER_ALIGNMENT
+    )
+    return aligned_num_counters * torch.int32.itemsize
+
+
+def get_multi_ctas_kv_counter(
+    counter: Optional[torch.Tensor],
+    device: torch.device,
+    num_heads: int,
+    max_num_sequences: int,
+) -> torch.Tensor:
+    """Return a zeroed counter buffer, reusing `counter` when it already fits.
+
+    The buffer is per FMHA library, not shared: two libraries running different phases
+    of one batch each need their own, and the kernels reset it at the end of a launch.
+    Generation consumers dereference it without a null check, so a library dispatching a
+    generation phase must supply one.
+    """
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    size = get_multi_ctas_kv_counter_size(
+        num_heads, max_num_sequences, get_multi_processor_count_for_device(index)
+    )
+    if counter is None or counter.device != device or counter.numel() < size:
+        counter = torch.empty(size, dtype=torch.uint8, device=device)
+    counter.zero_()
+    return counter
+
+
 @lru_cache(maxsize=None)
 def get_multi_processor_count_for_device(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count

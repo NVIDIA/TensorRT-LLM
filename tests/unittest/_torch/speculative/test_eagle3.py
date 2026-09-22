@@ -54,6 +54,38 @@ from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
                                  KvCacheConfig, MoeConfig, MTPDecodingConfig)
 
 
+@pytest.mark.parametrize(
+    "worker_type", [Eagle3OneModelDynamicTreeWorker, MTPEagleDynamicTreeWorker])
+def test_dynamic_tree_restores_position_offsets_query_length(
+        worker_type) -> None:
+    worker = object.__new__(worker_type)
+    offsets = torch.arange(32, dtype=torch.int32)
+    metadata = SimpleNamespace(
+        num_seqs=2,
+        prepare_for_spec_dec=MagicMock(),
+        restore_from_spec_dec=MagicMock(),
+        on_update=MagicMock(),
+        kv_lens_cuda=torch.full((2, ), 16, dtype=torch.int32),
+        spec_decoding_position_offsets=offsets,
+        spec_decoding_query_len=3,
+        spec_decoding_generation_lengths=torch.full((2, ), 3,
+                                                    dtype=torch.int32),
+        spec_decoding_packed_mask=torch.zeros((2, 8, 1), dtype=torch.int32),
+    )
+    worker._prepare_attn_metadata_for_spec_dec(metadata)
+    offsets.fill_(7)
+    metadata.spec_decoding_query_len = 5
+    metadata.spec_decoding_generation_lengths.fill_(5)
+    worker._restore_attn_metadata_from_spec_dec(metadata)
+
+    assert metadata.spec_decoding_position_offsets is offsets
+    torch.testing.assert_close(offsets, torch.arange(32, dtype=torch.int32))
+    assert metadata.spec_decoding_query_len == 3
+    assert metadata.spec_decoding_generation_lengths.tolist() == [3, 3]
+    metadata.restore_from_spec_dec.assert_called_once()
+    metadata.on_update.assert_called_once()
+
+
 def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
     """Refresh DSA mappings after switching to the draft cache."""
     events = []

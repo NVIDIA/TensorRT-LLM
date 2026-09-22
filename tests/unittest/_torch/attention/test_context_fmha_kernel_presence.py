@@ -11,7 +11,7 @@ so a configuration with no compiled kernel silently falls back to the unfused
 path, which attends to the current chunk only and then overwrites the cached
 prefix.
 
-``get_attention_op`` refuses that combination after initialization. This module
+The ``AttentionOp`` constructor refuses that combination after initialization. This module
 covers the ``fused_context_fmha_kernel_exists`` diagnostic that reports what the
 running build actually contains, including the case that matters most: that the
 lookup is able to answer "no". Every test here calls into the native kernel
@@ -22,9 +22,11 @@ skip.
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.fmha.interface import StaticAttentionConfig
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal import thop
+from tensorrt_llm.functional import PositionEmbeddingType
 
 # The paged-KV context FMHA kernels are generated for 32-token pages.
 _TOKENS_PER_BLOCK = 32
@@ -44,6 +46,31 @@ pytestmark = pytest.mark.skipif(_NO_GPU, reason=_NO_GPU_REASON)
 
 def _is_sm100_family() -> bool:
     return 100 <= get_sm_version() < 110
+
+
+@pytest.mark.parametrize(
+    "head_size,position_embedding_type,error",
+    [
+        (96, PositionEmbeddingType.learned_absolute, "requires a fused context FMHA kernel"),
+        (64, PositionEmbeddingType.relative, "not supported with relative position embedding"),
+    ],
+    ids=["missing-kernel", "relative-position"],
+)
+def test_attention_op_rejects_unfused_paged_context(head_size, position_embedding_type, error):
+    if not _is_sm100_family():
+        pytest.skip("the unsupported head-size case targets the SM100-family dispatcher")
+    config = StaticAttentionConfig(
+        num_heads=1,
+        num_kv_heads=1,
+        head_size=head_size,
+        tokens_per_block=_TOKENS_PER_BLOCK,
+        type=DataType.BF16,
+        use_kv_cache=True,
+        paged_context_fmha=True,
+        position_embedding_type=position_embedding_type,
+    )
+    with pytest.raises(RuntimeError, match=error):
+        thop.AttentionOp(config.to_thop_config())
 
 
 @pytest.mark.parametrize(

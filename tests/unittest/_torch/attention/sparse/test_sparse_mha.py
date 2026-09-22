@@ -285,7 +285,7 @@ def create_generation_inputs(scenario: MhaGenerationScenario) -> MhaGenerationIn
                 dtype=torch.int32,
                 device=device,
             )
-            metadata.update_position_offsets_for_cpp(scenario.max_query_len)
+            metadata.spec_decoding_query_len = scenario.max_query_len
             metadata.spec_decoding_param_prepare_for_blackwell()
         metadata.prepare()
         cleanup.pop_all()
@@ -340,7 +340,7 @@ def reference_generation_attention(
     sparse_attn_indices: torch.Tensor,
     scenario: MhaGenerationScenario,
 ) -> torch.Tensor:
-    """Compute page-sparse MHA from equivalent request-local token indices."""
+    """Compute page-sparse MHA in FP32 from request-local token indices."""
     outputs = []
     query_offset = 0
     for request_idx in range(scenario.batch_size):
@@ -354,7 +354,7 @@ def reference_generation_attention(
                 ),
             ],
             dim=0,
-        )
+        ).float()
         v_full = torch.cat(
             [
                 v_history,
@@ -363,10 +363,10 @@ def reference_generation_attention(
                 ),
             ],
             dim=0,
-        )
+        ).float()
         for query_idx in range(scenario.query_len):
             packed_query_idx = query_offset + query_idx
-            q_token = q[packed_query_idx].view(scenario.num_heads, scenario.head_dim)
+            q_token = q[packed_query_idx].view(scenario.num_heads, scenario.head_dim).float()
             head_outputs = []
             for head_idx in range(scenario.num_heads):
                 token_indices = sparse_attn_indices[head_idx, packed_query_idx]
@@ -378,7 +378,7 @@ def reference_generation_attention(
                 )
                 attention_probs = torch.nn.functional.softmax(
                     attention_scores, dim=-1, dtype=torch.float32
-                ).to(scenario.dtype)
+                )
                 head_outputs.append(torch.matmul(attention_probs, v_sparse))
             outputs.append(torch.cat(head_outputs, dim=0))
         query_offset += scenario.query_len
@@ -592,14 +592,13 @@ def _run_page_sparse_mha(scenario: PageSparseMhaScenario) -> None:
         uses_fp8 = (
             attention_scenario.kvcache_dtype == torch.float8_e4m3fn or attention_scenario.fp8_output
         )
-        output_for_comparison = output.float() if uses_fp8 else output
-        if attention_scenario.fp8_output:
-            reference_output = reference_output.to(torch.float8_e4m3fn)
-        reference_for_comparison = reference_output.float() if uses_fp8 else reference_output
+        # Keep the reference unquantized: rounding it to FP8 can amplify small
+        # kernel errors across a rounding boundary into a full FP8 step.
+        output_for_comparison = output.float()
         assert torch.isfinite(output_for_comparison).all()
         torch.testing.assert_close(
             output_for_comparison,
-            reference_for_comparison,
+            reference_output,
             atol=FP8_ATOL if uses_fp8 else ATOL,
             rtol=FP8_RTOL if uses_fp8 else RTOL,
         )

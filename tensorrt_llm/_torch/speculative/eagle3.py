@@ -479,7 +479,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # clone calls) cannot turn the cleanup restore into AttributeError.
         self._saved_packed_mask = None
         self._saved_position_offsets = None
-        self._saved_position_offsets_cpp = None
+        self._saved_spec_decoding_query_len = None
         self._saved_generation_lengths = None
 
     @property
@@ -503,11 +503,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         if attn_metadata.spec_decoding_position_offsets is not None:
             self._saved_position_offsets = attn_metadata.spec_decoding_position_offsets.clone(
             )
-            self._saved_position_offsets_cpp = (
-                attn_metadata.spec_decoding_position_offsets_cpp)
+            self._saved_spec_decoding_query_len = (
+                attn_metadata.spec_decoding_query_len)
         else:
             self._saved_position_offsets = None
-            self._saved_position_offsets_cpp = None
+            self._saved_spec_decoding_query_len = None
         if attn_metadata.spec_decoding_generation_lengths is not None:
             self._saved_generation_lengths = attn_metadata.spec_decoding_generation_lengths[:batch_size].clone(
             )
@@ -524,10 +524,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         if self._saved_position_offsets is not None:
             attn_metadata.spec_decoding_position_offsets.copy_(
                 self._saved_position_offsets)
-            attn_metadata.spec_decoding_position_offsets_cpp = (
-                self._saved_position_offsets_cpp)
+            attn_metadata.spec_decoding_query_len = (
+                self._saved_spec_decoding_query_len)
             self._saved_position_offsets = None
-            self._saved_position_offsets_cpp = None
+            self._saved_spec_decoding_query_len = None
         if self._saved_generation_lengths is not None:
             batch_size = self._saved_generation_lengths.shape[0]
             attn_metadata.spec_decoding_generation_lengths[:batch_size].copy_(
