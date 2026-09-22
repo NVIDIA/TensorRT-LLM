@@ -26,7 +26,7 @@ Provides:
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -48,6 +48,9 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, PageIndexMode
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 
 class MiniMaxM3SparseIndexCache:
@@ -273,25 +276,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         sparse_index_dim: Optional[int] = None,
         **kwargs,
     ):
-        # Linear Eagle3 verification is a causal multi-token append and is
-        # compatible with the NVFP4 data+scale pools below. Dynamic-tree
-        # acceptance is different: its relocation op currently copies only
-        # the packed K/V bytes, not the per-16-element NVFP4 scale bytes. A
-        # relocated token would therefore pair new data with stale scales and
-        # silently corrupt attention. Reject that configuration until the
-        # relocation op accepts and moves the scale pools as well.
-        spec_config = kwargs.get("spec_config")
-        if (
-            kwargs.get("dtype") == DataType.NVFP4
-            and spec_config is not None
-            and getattr(spec_config, "use_dynamic_tree", False)
-        ):
-            raise NotImplementedError(
-                "MiniMax-M3 NVFP4 KV cache supports linear Eagle3, but not "
-                "dynamic-tree Eagle: accepted-token relocation does not yet "
-                "move NVFP4 K/V block scales."
-            )
-
         # Resolve M3 sparse-layer metadata from explicit kwargs first, then
         # from the executor's ``sparse_attention_config`` keyword, then from
         # the M3 checkpoint convention (layers 0..2 dense, 3..N-1 sparse,
@@ -393,6 +377,21 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                     dtype=torch_dtype,
                     device=device,
                 )
+
+    def _validate_speculative_config(self, spec_config: DecodingBaseConfig | None) -> None:
+        # Dynamic-tree relocation moves packed K/V bytes without their NVFP4
+        # block scales, which would pair accepted tokens with stale scales.
+        # Linear Eagle3 appends tokens without this relocation.
+        if (
+            self.dtype == DataType.NVFP4
+            and spec_config is not None
+            and getattr(spec_config, "use_dynamic_tree", False)
+        ):
+            raise NotImplementedError(
+                "MiniMax-M3 NVFP4 KV cache supports linear Eagle3, but not "
+                "dynamic-tree Eagle: accepted-token relocation does not yet "
+                "move NVFP4 K/V block scales."
+            )
 
     def _build_cache_config(self, config):
         """Use NVFP4 only on MSA sparse layers and FP8 on dense/Eagle layers.

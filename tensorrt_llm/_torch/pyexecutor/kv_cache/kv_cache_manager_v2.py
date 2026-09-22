@@ -122,6 +122,7 @@ from ..scheduler import ScheduledRequests
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 KV_CACHE_ITERATION_STATS_DELTA_FIELDS = _KV_CACHE_ITERATION_STATS_DELTA_FIELDS
 KV_CACHE_ITERATION_STATS_REUSE_FIELDS = (
@@ -1149,6 +1150,7 @@ class KVCacheManagerV2(BaseResourceManager):
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
+        self._validate_speculative_config(spec_config)
         self.is_disagg = is_disagg
         self.kv_connector_manager = kv_connector_manager
         # Filled on first use; the layer grouping does not change after init.
@@ -1758,6 +1760,13 @@ class KVCacheManagerV2(BaseResourceManager):
         if isinstance(self.event_manager, StreamingKVCacheEventManager):
             self.event_manager.start()
             logger.info("Streaming KV event fast path reuses V2 radix block hashes")
+
+    def _validate_speculative_config(self, spec_config: Optional["DecodingBaseConfig"]) -> None:
+        """Validate speculative decoding after dtype resolution, before cache setup.
+
+        Overrides may use ``self.dtype`` and ``spec_config``; other cache state
+        has not been initialized yet. The base manager adds no restrictions.
+        """
 
     def _iter_guard_candidate_buffers(self) -> Iterable[Tuple[int, torch.Tensor]]:
         """Yield ``(layer_idx, buffer)`` pairs a guard page can be parked on.

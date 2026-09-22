@@ -38,6 +38,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager impo
     shared_draft_layer_count,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
+from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
@@ -442,17 +443,57 @@ def test_draft_subpage_view_rejects_multiple_local_layers(via_accessor: bool) ->
     assert manager._draft_subpage_view_obj is None
 
 
-def test_nvfp4_manager_rejects_dynamic_tree_eagle_before_allocation():
-    class _DynamicTreeConfig:
-        use_dynamic_tree = True
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("manager_cls", [KVCacheManagerV2, MiniMaxM3KVCacheManagerV2])
+@pytest.mark.parametrize("dtype", [None, DataType.HALF, DataType.FP8, DataType.NVFP4])
+@pytest.mark.parametrize("spec_mode", ["none", "linear", "dynamic"])
+def test_speculative_validation_precedes_cache_setup(
+    monkeypatch: pytest.MonkeyPatch,
+    manager_cls: type[KVCacheManagerV2],
+    dtype: DataType | None,
+    spec_mode: str,
+) -> None:
+    class CacheSetupReached(Exception):
+        pass
 
-    try:
-        MiniMaxM3KVCacheManagerV2(
-            dtype=DataType.NVFP4,
-            spec_config=_DynamicTreeConfig(),
+    setup = Mock(spec_set=kv_cache_manager_v2.get_pp_layers, side_effect=CacheSetupReached)
+    monkeypatch.setattr(kv_cache_manager_v2, "get_pp_layers", setup)
+    spec_config = (
+        None
+        if spec_mode == "none"
+        else Eagle3DecodingConfig(
+            max_draft_len=3,
+            speculative_model="unused",
+            use_dynamic_tree=spec_mode == "dynamic",
+            dynamic_tree_max_topK=2 if spec_mode == "dynamic" else None,
         )
-    except NotImplementedError as error:
-        assert "supports linear Eagle3" in str(error)
-        assert "block scales" in str(error)
+    )
+    manager = manager_cls.__new__(manager_cls)
+    dtype_kwargs = {} if dtype is None else {"dtype": dtype}
+    reject = (
+        manager_cls is MiniMaxM3KVCacheManagerV2
+        and dtype == DataType.NVFP4
+        and spec_mode == "dynamic"
+    )
+    with pytest.raises(
+        NotImplementedError if reject else CacheSetupReached,
+        match="does not yet move NVFP4 K/V block scales" if reject else None,
+    ):
+        manager.__init__(
+            KvCacheConfig(max_tokens=256, enable_block_reuse=False),
+            CacheType.SELF,
+            num_layers=4,
+            num_kv_heads=2,
+            head_dim=128,
+            tokens_per_block=128,
+            max_seq_len=256,
+            max_batch_size=2,
+            mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+            spec_config=spec_config,
+            **dtype_kwargs,
+        )
+    assert manager.dtype == (DataType.HALF if dtype is None else dtype)
+    if reject:
+        setup.assert_not_called()
     else:
-        raise AssertionError("expected NVFP4 dynamic-tree Eagle to be rejected")
+        setup.assert_called_once()
