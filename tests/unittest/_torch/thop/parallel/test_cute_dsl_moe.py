@@ -1333,8 +1333,8 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
         scaling_vector_size=sf_vec_size,
         activation_type=activation_type,
         swiglu_limit_scalar=swiglu_limit,
-        situ_beta=SITU_BETA if is_situ else -1.0,
-        situ_linear_beta=SITU_LINEAR_BETA if is_situ else -1.0,
+        situ_beta=SITU_BETA if is_situ else None,
+        situ_linear_beta=SITU_LINEAR_BETA if is_situ else None,
     )
 
     # Verify output (only compare valid tokens, skip padding tokens where permuted_idx_to_expanded_idx == -1)

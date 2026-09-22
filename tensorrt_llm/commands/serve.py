@@ -2275,7 +2275,8 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
         disagg_cfg,
         _client_factory,
         metadata_config=metadata_server_cfg,
-        server_start_timeout_secs=server_start_timeout)
+        server_start_timeout_secs=server_start_timeout,
+        request_timeout_secs=request_timeout)
     logger.info(f"Coordinator serving on {public_host}:{coord_port} "
                 f"(uds={coord_uds}) (fleet on public port {public_port})")
     set_lifecycle_phase("serving")

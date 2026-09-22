@@ -361,7 +361,8 @@ semantic directories compile into `kernels_src`.
 | `cpp/tensorrt_llm/kernels/moe/loadBalance/` | EPLB device kernels (host side: `runtime/moeLoadBalancer/`) | `kernels_src` |
 | `cpp/tensorrt_llm/kernels/moe/routing/` | Custom routing kernels | `kernels_src` |
 | `cpp/tensorrt_llm/kernels/moe/utils/` | `moe_align_block_size` and other small helpers | `kernels_src` |
-| `cpp/tensorrt_llm/thop/moe/` | All `torch.ops.trtllm` MoE ops; `moeOp.cpp` holds the primary `TORCH_LIBRARY(trtllm)` block | `th_common` |
+| `cpp/tensorrt_llm/thop/moe/{cutlass,trtllmGen,cuteDsl,marlin}/` | `torch.ops.trtllm` MoE ops grouped by the backend they serve; `cutlass/moeOp.cpp` holds the primary `TORCH_LIBRARY(trtllm)` block. `marlin/` exists only here: the op is MoE-only, its kernel stays in `kernels/marlin/` | `th_common` |
+| `cpp/tensorrt_llm/thop/moe/{communication,loadBalance,routing,utils}/` | `torch.ops.trtllm` MoE ops grouped by role, same names as the `kernels/moe/` directories they wrap | `th_common` |
 | `cpp/tensorrt_llm/runtime/moeLoadBalancer/`, `nanobind/runtime/moeBindings.*` | EPLB host runtime and its Python binding | `runtime_src`, nanobind module |
 | `cpp/tests/unit_tests/kernels/moe/` | gtests (`mixtureOfExpertsTest`, `routingKernelsTest`, ...) | per-test executables |
 

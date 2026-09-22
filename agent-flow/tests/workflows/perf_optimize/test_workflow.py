@@ -2725,7 +2725,8 @@ def test_all_agents_use_claude_code_backend_with_scoped_sessions(tmp_path):
             layer = getattr(workflow, role)
             assert layer.config.backend.kind == "claude-code", role
             assert layer.config.backend.model == CLAUDE_CODE_DEFAULT_MODEL, role
-            assert layer.config.backend.hooks is not None, role
+            assert layer.config.required_tools == (f"append_{role}_progress",), role
+            assert layer.config.backend.hooks is None, role
             # The judges are stateless (fresh eyes per verdict); the
             # optimizer's persistent session is additionally reset per
             # item by the orchestrator (covered by

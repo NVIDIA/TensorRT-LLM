@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,6 +14,8 @@
 # limitations under the License.
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -480,6 +482,41 @@ class TestHelixZeroKvMask(unittest.TestCase):
     seq_lens_cuda. This matters when a sequence spans multiple tokens (e.g.
     speculative decoding), where num_tokens != num_seqs.
     """
+
+    def test_mla_skips_generic_mask_when_per_token_bounds_are_valid(self):
+        from tensorrt_llm._torch.attention.mla import MLA
+
+        num_tokens = 3
+        num_heads = 2
+        kv_lora_rank = 4
+        helix_kv_bounds = torch.tensor([0, 5, 0], dtype=torch.int32)
+        attn_metadata = SimpleNamespace(
+            helix_kv_bounds=helix_kv_bounds,
+            _helix_spec_tokens_valid=True,
+            num_contexts=0,
+            num_generations=1,
+        )
+        attn_backend = Mock()
+        attn_backend.forward.return_value = torch.empty(num_tokens, num_heads * kv_lora_rank)
+        mla = SimpleNamespace(
+            mapping=SimpleNamespace(has_cp_helix=lambda: True),
+            num_heads_tp=num_heads,
+            num_heads_tp_cp=num_heads,
+            kv_lora_rank=kv_lora_rank,
+            aux_stream=None,
+            ln_events=None,
+        )
+        q = torch.empty(num_tokens, 1)
+
+        with (
+            patch("tensorrt_llm._torch.attention.mla._helix_zero_kv_mask") as generic_mask,
+            patch("tensorrt_llm._torch.attention.mla._helix_post_process") as post_process,
+        ):
+            MLA._attn_forward_gen(mla, attn_backend, q, q, q, None, attn_metadata)
+
+        generic_mask.assert_not_called()
+        actual_mask = post_process.call_args.kwargs["zero_kv_mask"]
+        torch.testing.assert_close(actual_mask, helix_kv_bounds == 0)
 
     def test_single_token_per_seq(self):
         # Plain decode: one token per sequence, so per-seq == per-token.

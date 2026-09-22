@@ -27,7 +27,7 @@ from strenum import StrEnum
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
-from tensorrt_llm._torch.utils import maybe_compile
+from tensorrt_llm._torch.utils import helix_local_len, maybe_compile
 from tensorrt_llm._utils import (
     TensorWrapper,
     binding_to_torch_dtype,
@@ -3251,10 +3251,15 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _helix_local_len(self, global_len: int) -> int:
         """Tokens of the first ``global_len`` owned by this CP rank
-        (continuation round-robin: page b lives on rank b %% cp)."""
-        phys = self.tokens_per_block
-        full, rem = divmod(global_len, self._ledger_tokens_per_block)
-        return full * phys + min(max(rem - self._helix_cp_rank * phys, 0), phys)
+        (continuation round-robin: page b lives on rank b %% cp).
+
+        The rule itself lives in ``_torch.utils.helix_local_len`` so the host
+        packing in model_engine and the tensor form in the attention metadata
+        cannot drift from it.
+        """
+        return helix_local_len(
+            global_len, self.tokens_per_block, self._helix_cp_size, self._helix_cp_rank
+        )
 
     def _set_helix_rank_fields(self, req: LlmRequest) -> None:
         """Derive the per-rank helix fields from the global position.
@@ -3264,8 +3269,20 @@ class KVCacheManagerV2(BaseResourceManager):
         from ``py_decoding_iter``: the sampler advances that counter after
         scheduling under the overlap loop, so a schedule-time read is one
         step behind and would repeat the first decode position, overwriting
-        the first generated token's KV. Assumes one new token per step
-        (draft-token modes are rejected under helix).
+        the first generated token's KV.
+
+        The counter advances by one per successful allocation, so ``pos`` is
+        exact only while each iteration commits exactly one token. Under
+        speculation an iteration can commit ``1 + accepted`` tokens and this
+        estimate falls behind, taking ``py_helix_is_inactive_rank`` and
+        ``seqlen_this_rank_cp`` with it. That is tolerable today only because
+        the speculative path never reads these fields: ``_helix_pack_extend``
+        in model_engine rebuilds the global position from
+        ``total_input_len_cp`` plus the rank-invariant generated count. A
+        request that falls back to the plain generation loop mid-run (a step
+        that yields no draft tokens) would read a stale value -- advancing the
+        counter by the committed token count is the fix, and needs the
+        acceptance count to be available at schedule time.
         """
         step = req.py_helix_decode_group_index + 1
         pos = req.total_input_len_cp + step - 1

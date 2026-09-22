@@ -347,11 +347,15 @@ if(ENABLE_MULTI_DEVICE)
   add_definitions("-DOMPI_SKIP_MPICXX")
 endif()
 
-# C++17
-set(CMAKE_CXX_STANDARD 17)
+# C++20 is required by the PyTorch headers starting with torch 2.14.
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CUDA_STANDARD ${CMAKE_CXX_STANDARD})
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+# C++20 makes CMake scan the sources for module imports, which needs a scanner
+# the build images do not ship. Nothing here uses modules, so skip the scan.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 
 if(UNIX)
   set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -fno-inline")
@@ -483,10 +487,10 @@ endif()
 
 if((WIN32))
   if((MSVC_VERSION GREATER_EQUAL 1914))
-    # MSVC does not apply the correct __cplusplus version per the C++ standard
-    # by default. This is required for compiling CUTLASS 3.0 kernels on windows
-    # with C++-17 constexpr enabled. The 2017 15.7 MSVC adds /Zc:__cplusplus to
-    # set __cplusplus to 201703 with std=c++17. See
+    # MSVC does not report the correct __cplusplus version per the C++ standard
+    # by default, which the CUTLASS kernels rely on to enable their constexpr
+    # paths. /Zc:__cplusplus makes it follow the standard it is compiling
+    # against. See
     # https://learn.microsoft.com/en-us/cpp/build/reference/zc-cplusplus for
     # more info.
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Zc:__cplusplus")
