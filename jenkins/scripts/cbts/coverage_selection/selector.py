@@ -15,11 +15,13 @@
 
 from __future__ import annotations
 
+import ast
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from python_change_analysis import (
+    ImportTarget,
     PythonChangeFacts,
     analyze_python_changes,
     closure_attributed_qualnames,
@@ -162,6 +164,24 @@ class CoverageSelector:
                         )
                         return impacted, sorted(no_data), sorted(caller_bounded), no_diff, why
                     if not import_resolved:
+                        target_tests, target_limitation = self._import_target_impact(
+                            cf,
+                            dependencies.old_import_targets,
+                            dependencies.new_import_targets,
+                        )
+                        if target_limitation:
+                            why = (
+                                f"import-executed change, no sound bound: {path}::{qualname} "
+                                f"({target_limitation})"
+                            )
+                            return (
+                                impacted,
+                                sorted(no_data),
+                                sorted(caller_bounded),
+                                no_diff,
+                                why,
+                            )
+                        impacted |= target_tests
                         external = self._external_references(cf, dependencies.changed_bindings)
                         if external:
                             why = (
@@ -215,6 +235,101 @@ class CoverageSelector:
                     if bounded:
                         caller_bounded.add(f"{cf}::{qualname}")
         return impacted, sorted(no_data), sorted(caller_bounded), no_diff, None
+
+    def _import_target_impact(
+        self,
+        defining_path: str,
+        old_targets: set[ImportTarget],
+        new_targets: set[ImportTarget],
+    ) -> tuple[set[str], str | None]:
+        """Validate old bindings and return available tests for new functions."""
+        impacted: set[str] = set()
+        for target in sorted(old_targets):
+            resolved, limitation = self._resolve_import_target(
+                defining_path, target, require_function=False
+            )
+            if limitation:
+                return set(), limitation
+            assert resolved is not None
+
+        for target in sorted(new_targets):
+            resolved, limitation = self._resolve_import_target(
+                defining_path, target, require_function=True
+            )
+            if limitation:
+                return set(), limitation
+            assert resolved is not None
+            target_path, target_name = resolved
+            impacted |= self.db.tests_touching_func(target_path, target_name)
+        return impacted, None
+
+    def _resolve_import_target(
+        self,
+        defining_path: str,
+        target: ImportTarget,
+        *,
+        require_function: bool,
+    ) -> tuple[tuple[str, str] | None, str | None]:
+        """Resolve a relative import to one repository-level binding."""
+        module_parts = list(Path(defining_path).with_suffix("").parts)
+        is_package = bool(module_parts and module_parts[-1] == "__init__")
+        if is_package:
+            module_parts.pop()
+        package_parts = module_parts if is_package else module_parts[:-1]
+        if target.level:
+            trim = target.level - 1
+            if trim > len(package_parts):
+                return None, f"import target escapes repository package: {target.name}"
+            resolved_parts = package_parts[: len(package_parts) - trim]
+        else:
+            resolved_parts = []
+        resolved_parts.extend(target.module.split("."))
+        if not resolved_parts:
+            return None, f"unresolved import target module: {target.name}"
+
+        module_path = "/".join(resolved_parts)
+        candidates = (f"{module_path}.py", f"{module_path}/__init__.py")
+        available = [
+            (candidate, source)
+            for candidate in candidates
+            if (source := self._read_source(candidate)) is not None
+        ]
+        if len(available) != 1:
+            return None, f"unresolved import target module: {'.'.join(resolved_parts)}"
+        target_path, source = available[0]
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return None, f"unparsable import target: {target_path}"
+        functions = {
+            node.name
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        bindings = set(functions)
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                bindings.add(node.name)
+            elif isinstance(node, ast.Assign) or (
+                isinstance(node, ast.AnnAssign) and node.value is not None
+            ):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                bindings.update(item.id for item in targets if isinstance(item, ast.Name))
+            elif isinstance(node, ast.Import):
+                bindings.update(
+                    alias.asname or alias.name.partition(".")[0] for alias in node.names
+                )
+            elif isinstance(node, ast.ImportFrom):
+                bindings.update(
+                    alias.asname or alias.name for alias in node.names if alias.name != "*"
+                )
+        if target.name not in bindings:
+            kind = "static function" if require_function else "static binding"
+            prefix = "import target" if require_function else "old import target"
+            return None, f"{prefix} is not a {kind}: {target_path}::{target.name}"
+        if require_function and target.name not in functions:
+            return None, f"import target is not a static function: {target_path}::{target.name}"
+        return (canon(target_path), target.name), None
 
     def _qualname_impact(
         self,
