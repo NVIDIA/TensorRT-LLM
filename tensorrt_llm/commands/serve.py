@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import atexit
 import contextlib
@@ -32,6 +47,10 @@ from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._utils import mpi_rank, set_prometheus_multiproc_dir
 from tensorrt_llm.commands import _telemetry as _command_telemetry
+from tensorrt_llm.commands._config_overrides import (ConfigOverride,
+                                                     ConfigOverrideError,
+                                                     apply_config_overrides,
+                                                     parse_config_overrides)
 from tensorrt_llm.commands._serve_stability import stability_option
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
                                          get_is_diffusion_only_model)
@@ -162,6 +181,15 @@ def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
                              "Must be a class or an async function.")
 
 
+def _get_llm_args_class(backend: str):
+    if backend == "_autodeploy":
+        from tensorrt_llm._torch.auto_deploy.llm_args import \
+            LlmArgs as AutoDeployLlmArgs
+
+        return AutoDeployLlmArgs
+    return TorchLlmArgs
+
+
 def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
     """
     Check if a parameter should be explicitly included in llm_args.
@@ -198,12 +226,7 @@ def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
            for s in cli_derived_fields.get(param_name, ())):
         return True
 
-    if backend == "_autodeploy":
-        from tensorrt_llm._torch.auto_deploy.llm_args import \
-            LlmArgs as AutoDeployLlmArgs
-        llm_args_class = AutoDeployLlmArgs
-    else:
-        llm_args_class = TorchLlmArgs
+    llm_args_class = _get_llm_args_class(backend)
 
     field_info = llm_args_class.model_fields.get(param_name)
     if not field_info:
@@ -221,6 +244,64 @@ def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
 # CLI/API defaults are sourced from the TorchLlmArgs field defaults so they stay
 # in lock-step with the args class and can't drift.
 _LLM_ARGS_FIELDS = TorchLlmArgs.model_fields
+_MISSING_CONFIG_OVERRIDE = object()
+
+
+def _config_value_at_path(config: Dict[str, Any],
+                          target_path: tuple[str, ...]) -> Any:
+    value: Any = config
+    for component in target_path:
+        if not isinstance(value, dict) or component not in value:
+            return _MISSING_CONFIG_OVERRIDE
+        value = value[component]
+    return value
+
+
+def _expand_autodeploy_config_overrides(
+        overrides: tuple[ConfigOverride, ...]) -> tuple[ConfigOverride, ...]:
+    from tensorrt_llm._torch.auto_deploy.llm_args import \
+        _TRANSFORMS_SHORTCUT_LOOKUP
+
+    expanded = list(overrides)
+    override_patch = apply_config_overrides({}, overrides)
+    for shortcut, transform_paths in _TRANSFORMS_SHORTCUT_LOOKUP.items():
+        alias_paths = [(shortcut, )] + [("transforms", *path.split("."))
+                                        for path in transform_paths]
+        writes = [(path, value) for path in alias_paths
+                  if (value := _config_value_at_path(override_patch, path)
+                      ) is not _MISSING_CONFIG_OVERRIDE]
+        if len(writes) > 1:
+            conflicting_paths = " and ".join(f"'{'.'.join(path)}'"
+                                             for path, _ in writes)
+            raise ConfigOverrideError(
+                f"AutoDeploy configuration paths {conflicting_paths} refer "
+                "to the same setting and cannot be used together.")
+        if writes and writes[0][0] != (shortcut, ):
+            expanded.append(ConfigOverride((shortcut, ), writes[0][1]))
+    return tuple(expanded)
+
+
+def _parse_config_overrides(assignments: Sequence[str],
+                            backend: str) -> tuple[ConfigOverride, ...]:
+    try:
+        overrides = parse_config_overrides(
+            assignments,
+            allowed_roots=_get_llm_args_class(backend).model_fields,
+        )
+        if backend == "_autodeploy":
+            overrides = _expand_autodeploy_config_overrides(overrides)
+        return overrides
+    except ConfigOverrideError as error:
+        raise click.BadParameter(str(error), param_hint="--set") from error
+
+
+def _apply_config_overrides(
+        config: Dict[str, Any],
+        overrides: Sequence[ConfigOverride]) -> Dict[str, Any]:
+    try:
+        return apply_config_overrides(config, overrides)
+    except ConfigOverrideError as error:
+        raise click.BadParameter(str(error), param_hint="--set") from error
 
 
 def get_llm_args(
@@ -1143,8 +1224,17 @@ def launch_visual_gen_server(
     type=str,
     default=None,
     help="Path to a YAML configuration file. Explicit CLI flags take precedence "
-    "over values in this file. Can be specified as either --config or "
-    "--extra_llm_api_options.",
+    "over values in this file, while --set overrides both. Can be specified "
+    "as either --config or --extra_llm_api_options.",
+    status="prototype")
+@stability_option(
+    "--set",
+    "config_overrides",
+    type=str,
+    multiple=True,
+    help="Override a canonical LlmArgs path as PATH=YAML_VALUE. Repeatable; "
+    "applied after --config and dedicated CLI flags. Not supported for "
+    "startup, telemetry, environment, server-only, or VisualGen settings.",
     status="prototype")
 @stability_option("--reasoning_parser",
                   type=click.Choice(["auto"] +
@@ -1322,6 +1412,7 @@ def serve(
     trust_remote_code: bool,
     revision: Optional[str],
     extra_llm_api_options: Optional[str],
+    config_overrides: tuple[str, ...],
     reasoning_parser: Optional[str],
     tool_parser: Optional[str],
     metadata_server_config_file: Optional[str],
@@ -1408,7 +1499,30 @@ def serve(
             raise e
 
     explicit_cli_keys = collect_explicit_cli_keys(
-        exclude=("extra_llm_api_options", "config"))
+        exclude=("extra_llm_api_options", "config", "config_overrides"))
+
+    is_visual_gen = (enable_visual_gen or visual_gen_args is not None
+                     or get_is_diffusion_only_model(model))
+    raw_llm_args_extra_dict = {}
+    if not is_visual_gen and extra_llm_api_options is not None:
+        with open(extra_llm_api_options, 'r') as f:
+            raw_llm_args_extra_dict = yaml.safe_load(f)
+        if raw_llm_args_extra_dict is None:
+            raw_llm_args_extra_dict = {}
+        elif not isinstance(raw_llm_args_extra_dict, dict):
+            raise ValueError("Configuration file root must be a mapping.")
+    if not is_visual_gen:
+        _command_telemetry.apply_raw_config_telemetry_opt_out(
+            raw_llm_args_extra_dict,
+            usage_context=_telemetry_config.UsageContext.CLI_SERVE,
+            component="server",
+            explicit_cli_telemetry="telemetry" in explicit_cli_keys,
+        )
+    if config_overrides and is_visual_gen:
+        raise click.BadParameter(
+            "--set configures LlmArgs and is not supported by VisualGen.",
+            param_hint="--set")
+    parsed_config_overrides = _parse_config_overrides(config_overrides, backend)
 
     def _serve_llm():
         nonlocal server_role, allow_request_chat_template
@@ -1445,28 +1559,29 @@ def serve(
             agent_types=agent_types,
             explicit_cli_keys=explicit_cli_keys)
 
-        llm_args_extra_dict = {}
-        if extra_llm_api_options is not None:
-            with open(extra_llm_api_options, 'r') as f:
-                llm_args_extra_dict = yaml.safe_load(f)
-            if llm_args_extra_dict is None:
-                llm_args_extra_dict = {}
-            elif not isinstance(llm_args_extra_dict, dict):
-                raise ValueError("Configuration file root must be a mapping.")
-        _command_telemetry.apply_raw_config_telemetry_opt_out(
-            llm_args_extra_dict,
-            usage_context=_telemetry_config.UsageContext.CLI_SERVE,
-            component="server",
-            explicit_cli_telemetry="telemetry" in explicit_cli_keys,
-        )
+        llm_args_extra_dict = dict(raw_llm_args_extra_dict)
         extra_allow_request_chat_template = _pop_bool_config_option(
             llm_args_extra_dict, "allow_request_chat_template")
         allow_request_chat_template = (allow_request_chat_template
                                        or extra_allow_request_chat_template)
         internal_disagg_auth_key = _pop_optional_str_config_option(
             llm_args_extra_dict, "internal_request_auth_key")
+        # Apply to the raw mapping first so a higher-precedence override can
+        # replace an invalid YAML value before nested config construction.
+        llm_args_extra_dict = _apply_config_overrides(llm_args_extra_dict,
+                                                      parsed_config_overrides)
+        set_top_level_fields = {
+            override.path[0]
+            for override in parsed_config_overrides if len(override.path) == 1
+        }
+        merge_explicit_cli_keys = explicit_cli_keys - set_top_level_fields
         llm_args = update_llm_args_with_extra_dict(
-            llm_args, llm_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
+            llm_args,
+            llm_args_extra_dict,
+            explicit_cli_keys=merge_explicit_cli_keys)
+        # Reapply to the effective mapping so --set remains the final source
+        # even when an explicit convenience flag targets the same nested field.
+        llm_args = _apply_config_overrides(llm_args, parsed_config_overrides)
 
         _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
 
@@ -1504,7 +1619,9 @@ def serve(
             media_io_kwargs=parsed_media_io_kwargs)
 
         if grpc:
-            if num_serve_frontends != 1:
+            effective_num_serve_frontends = llm_args.get(
+                "num_serve_frontends", num_serve_frontends)
+            if effective_num_serve_frontends != 1:
                 raise click.UsageError(
                     "--num_serve_frontends must be 1 when --grpc is enabled.")
 
@@ -1596,8 +1713,6 @@ def serve(
         launch_visual_gen_server(host, port, model, parsed_visual_gen_args,
                                  metadata_server_cfg, middleware)
 
-    is_visual_gen = (enable_visual_gen or visual_gen_args is not None
-                     or get_is_diffusion_only_model(model))
     # Only the OpenAI HTTP path publishes the bound address. Fail loudly rather
     # than leaving a launcher waiting forever on a file nobody writes.
     if report_addr and (grpc or is_visual_gen):

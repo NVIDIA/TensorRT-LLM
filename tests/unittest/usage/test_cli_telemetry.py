@@ -401,6 +401,85 @@ class TestSerializedTerminationKinds:
         assert captured_exit_payloads == []
 
     @pytest.mark.parametrize(
+        "assignment",
+        [
+            "telemetry_config.disabled=false",
+            "unknown_config.enabled=true",
+            "max_batch_size=[",
+        ],
+    )
+    def test_serve_no_telemetry_precedes_invalid_set(
+        self,
+        captured_exit_payloads,
+        assignment,
+    ):
+        """An invalid generic telemetry override cannot bypass early opt-out."""
+        from tensorrt_llm.commands.serve import main as serve_main
+
+        with (
+            patch(
+                "tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+                return_value=False,
+            ),
+            pytest.raises(SystemExit) as raised,
+        ):
+            serve_main(
+                args=[
+                    "dummy/model",
+                    "--no-telemetry",
+                    "--set",
+                    assignment,
+                ],
+                prog_name="trtllm-serve",
+            )
+
+        assert raised.value.code == 2
+        assert captured_exit_payloads == []
+
+    @pytest.mark.parametrize(
+        "assignment",
+        [
+            "telemetry_config.disabled=false",
+            "unknown_config.enabled=true",
+            "max_batch_size=[",
+        ],
+    )
+    def test_serve_yaml_opt_out_precedes_invalid_set(
+        self,
+        tmp_path,
+        captured_exit_payloads,
+        assignment,
+    ):
+        """The YAML opt-out is applied before generic override validation."""
+        from tensorrt_llm.commands.serve import main as serve_main
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "telemetry_config:\n  disabled: true\n",
+            encoding="utf-8",
+        )
+        with (
+            patch(
+                "tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+                return_value=False,
+            ),
+            pytest.raises(SystemExit) as raised,
+        ):
+            serve_main(
+                args=[
+                    "dummy/model",
+                    "--config",
+                    str(config_path),
+                    "--set",
+                    assignment,
+                ],
+                prog_name="trtllm-serve",
+            )
+
+        assert raised.value.code == 2
+        assert captured_exit_payloads == []
+
+    @pytest.mark.parametrize(
         ("args", "expected"),
         [
             pytest.param(

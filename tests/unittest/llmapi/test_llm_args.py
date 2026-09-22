@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import Annotated, Any, ClassVar, Literal, get_args, get_origin
 from unittest.mock import patch
 
+import click
 import pydantic_core
 import pytest
 import torch
@@ -32,7 +33,9 @@ from tensorrt_llm._torch.models.modeling_gemma3 import Gemma3ForCausalLM
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.virtual_memory import RestoreMode
-from tensorrt_llm.commands.serve import get_llm_args, is_non_default_or_required
+from tensorrt_llm.commands.serve import (_parse_config_overrides, get_llm_args,
+                                         is_non_default_or_required)
+from tensorrt_llm.commands.serve import main as serve_main
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy, SchedulerConfig
 # fmt: off
 from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
@@ -3165,6 +3168,24 @@ class TestServeDefaults:
         assert "video_pruning_rate" not in llm_args
         assert llm_args["multimodal_config"].video_pruning_rate == 0.5
 
+    def test_serve_explicit_video_pruning_rate_wins_over_yaml(self):
+        llm_args, _ = get_llm_args(
+            model=llama_model_path,
+            backend="pytorch",
+            video_pruning_rate=0.4,
+            explicit_cli_keys={"video_pruning_rate"},
+        )
+
+        merged = update_llm_args_with_extra_dict(
+            llm_args,
+            {"multimodal_config": {
+                "video_pruning_rate": 0.5
+            }},
+            explicit_cli_keys={"video_pruning_rate"},
+        )
+
+        assert merged["multimodal_config"].video_pruning_rate == 0.4
+
     def test_serve_backend_specific_configs(self):
         # PyTorch backend: build_config / scheduler_config stay None and are
         # filtered out.
@@ -3195,20 +3216,15 @@ class TestServeDefaults:
     def test_serve_generation_config_cli_over_yaml_precedence(self,
                                                               tmp_path) -> None:
         """YAML wins when CLI omits the mode; an explicit CLI mode wins otherwise."""
-        from unittest import mock
-
-        from tensorrt_llm.commands.serve import main as serve_main
-
         config_path = tmp_path / "config.yaml"
         config_path.write_text("generation_config: auto\n", encoding="utf-8")
 
         with (
-                mock.patch(
-                    "tensorrt_llm.commands.serve.get_is_diffusion_only_model",
-                    return_value=False),
-                mock.patch("tensorrt_llm.commands.serve.device_count",
-                           return_value=1),
-                mock.patch("tensorrt_llm.commands.serve.launch_server") as
+                patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+                      return_value=False),
+                patch("tensorrt_llm.commands.serve.device_count",
+                      return_value=1),
+                patch("tensorrt_llm.commands.serve.launch_server") as
                 mock_launch_server,
         ):
             serve_main(
@@ -3235,6 +3251,145 @@ class TestServeDefaults:
 
             assert mock_launch_server.call_args.args[2][
                 "generation_config"] == "auto"
+
+    def test_serve_set_wins_over_yaml_and_dedicated_cli(self, tmp_path) -> None:
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "multimodal_config:\n  video_pruning_rate: 0.5\n", encoding="utf-8")
+        argument_orders = [
+            [
+                "--video_pruning_rate", "0.4", "--set",
+                "multimodal_config.video_pruning_rate=0.6"
+            ],
+            [
+                "--set", "multimodal_config.video_pruning_rate=0.6",
+                "--video_pruning_rate", "0.4"
+            ],
+        ]
+
+        with (
+                patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+                      return_value=False),
+                patch("tensorrt_llm.commands.serve.device_count",
+                      return_value=1),
+                patch("tensorrt_llm.commands.serve.launch_server") as
+                mock_launch_server,
+        ):
+            for extra_args in argument_orders:
+                serve_main(
+                    args=[
+                        "dummy/model", "--config",
+                        str(config_path), *extra_args
+                    ],
+                    standalone_mode=False,
+                )
+                multimodal_config = mock_launch_server.call_args.args[2][
+                    "multimodal_config"]
+                assert multimodal_config["video_pruning_rate"] == 0.6
+                mock_launch_server.reset_mock()
+
+    @pytest.mark.parametrize(
+        ("assignment", "expected_paths"),
+        [
+            (
+                "transforms.compile_model.backend=torch-simple",
+                [
+                    ("transforms", "compile_model", "backend"),
+                    ("compile_backend", ),
+                ],
+            ),
+            (
+                "transforms={compile_model: {backend: torch-simple}}",
+                [("transforms", ), ("compile_backend", )],
+            ),
+            ("compile_backend=torch-simple", [("compile_backend", )]),
+        ],
+    )
+    def test_serve_set_expands_autodeploy_aliases(
+            self, assignment: str, expected_paths: list[tuple[str,
+                                                              ...]]) -> None:
+        overrides = _parse_config_overrides((assignment, ), "_autodeploy")
+
+        assert [override.path for override in overrides] == expected_paths
+        assert overrides[-1].value == "torch-simple"
+
+    @pytest.mark.parametrize(
+        "assignments",
+        [
+            (
+                "compile_backend=torch-simple",
+                "transforms.compile_model.backend=torch-compile",
+            ),
+            (
+                "transforms.insert_cached_attention.backend=triton",
+                "transforms.transformers_replace_cached_attn.backend=flashinfer",
+            ),
+            ("transforms={insert_cached_attention: {backend: triton}, "
+             "transformers_replace_cached_attn: {backend: flashinfer}}", ),
+        ],
+    )
+    def test_serve_set_rejects_autodeploy_alias_collisions(
+            self, assignments: tuple[str, ...]) -> None:
+        with pytest.raises(click.BadParameter, match="same setting"):
+            _parse_config_overrides(assignments, "_autodeploy")
+
+    def test_serve_set_rejects_visual_gen(self) -> None:
+        with (
+                patch("tensorrt_llm.commands.serve.launch_server") as
+                mock_launch_server,
+                patch("tensorrt_llm.commands.serve.launch_visual_gen_server") as
+                mock_launch_visual_gen_server,
+                pytest.raises(click.BadParameter, match="VisualGen"),
+        ):
+            serve_main(
+                args=[
+                    "dummy/model", "--enable_visual_gen", "--set",
+                    "max_batch_size=8"
+                ],
+                standalone_mode=False,
+            )
+
+        mock_launch_server.assert_not_called()
+        mock_launch_visual_gen_server.assert_not_called()
+
+    def test_serve_set_reserved_value_is_redacted(self) -> None:
+        sentinel = "do-not-print-this-secret"
+        with (
+                patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+                      return_value=False),
+                pytest.raises(click.BadParameter) as raised,
+        ):
+            serve_main(
+                args=[
+                    "dummy/model", "--set", f"env_overrides.API_KEY={sentinel}"
+                ],
+                standalone_mode=False,
+            )
+
+        assert sentinel not in str(raised.value)
+
+    def test_serve_set_grpc_checks_effective_frontend_count(self) -> None:
+        with (
+                patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+                      return_value=False),
+                patch("tensorrt_llm.commands.serve.device_count",
+                      return_value=1),
+                pytest.raises(click.UsageError,
+                              match="num_serve_frontends must be 1"),
+        ):
+            serve_main(
+                args=[
+                    "dummy/model", "--grpc", "--set", "num_serve_frontends=2"
+                ],
+                standalone_mode=False,
+            )
+
+    def test_serve_set_does_not_capture_misspelled_options(self) -> None:
+        with pytest.raises(click.NoSuchOption):
+            serve_main(
+                args=["dummy/model", "--max_bach_size", "8"],
+                standalone_mode=False,
+            )
 
     def test_serve_is_non_default_or_required_helper(self):
         # Test always_include parameters
