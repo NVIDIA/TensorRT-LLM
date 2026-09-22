@@ -120,6 +120,18 @@ class TestCachedKvTokenLogging(unittest.TestCase):
     def test_padding_only(self) -> None:
         self.check_counts([7, 7], (([self.padding, self.padding], 1), ), [], 14)
 
+    def test_uncovered_rows_are_not_silently_counted_as_padding(self) -> None:
+        with self.assertRaises(AssertionError):
+            self.engine._record_cached_kv_tokens_per_req([100, 200],
+                                                         (([self.real], 1), ))
+        self.assertEqual(self.engine.iter_states, {})
+
+    def test_beam_rows_cannot_exceed_available_counts(self) -> None:
+        with self.assertRaises(AssertionError):
+            self.engine._record_cached_kv_tokens_per_req(
+                [100, 101, 200], (([self.real, self.real], 2), ))
+        self.assertEqual(self.engine.iter_states, {})
+
     def test_steady_batch_clears_previous_padding(self) -> None:
         self.engine.iter_states['cached_kv_tokens_cuda_graph_padding'] = 7
         self.check_counts([100, 200], (), [100, 200], 0)
