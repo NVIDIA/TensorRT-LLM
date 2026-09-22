@@ -10770,38 +10770,52 @@ if IS_CUTLASS_DSL_AVAILABLE:
     #  CuTE DSL FP4 Paged MQA Logits (Blackwell SM100)                   #
     # ------------------------------------------------------------------ #
 
-    # Dynamic (work-stealing) tile scheduling of the FP4 scorer.
-    # TRTLLM_DSL_FP4_DYN_SCHED: "auto" (dynamic iff a state buffer is passed),
-    # "1" (always; a per-device buffer is allocated on demand), "0" (never).
-    # TRTLLM_DSL_FP4_DYN_CHUNK / _NMIN override the pairs-per-chunk and the
-    # regime floor (pairs per CTA) without recompiling.
+    # Tail-only work-stealing schedule of the FP4 scorer (fp4_paged_mqa_logits
+    # dynamic_sched), opt-in. TRTLLM_DSL_FP4_DYN_SCHED: "auto" (default: the
+    # stealing build only when the caller passes a state buffer, dyn_state=,
+    # and the launch envelope B x max_context_len holds >= max(NMIN, HOST_NMIN)
+    # tile pairs per CTA), "1" (the stealing build for every launch whose
+    # envelope holds >= NMIN pairs per CTA; a per-(device, stream) buffer is
+    # allocated on demand), "0" (never). An explicit dyn_nmin= argument
+    # replaces both floors. In the stealing build the kernel itself walks the
+    # static range when the actual rows hold fewer than NMIN pairs per CTA.
+    # Launches sharing a state buffer must be stream-ordered.
+    # TRTLLM_DSL_FP4_DYN_CHUNK / _NMIN / _HOST_NMIN / _TAIL override the pairs
+    # per chunk, the two floors (pairs per CTA) and the donation shift
+    # (donated pairs per CTA = range >> TAIL) without recompiling.
     _FP4_DYN_MODE = os.environ.get("TRTLLM_DSL_FP4_DYN_SCHED", "auto")
     _FP4_DYN_CHUNK = int(os.environ.get("TRTLLM_DSL_FP4_DYN_CHUNK", "16"))
-    _FP4_DYN_NMIN = int(os.environ.get("TRTLLM_DSL_FP4_DYN_NMIN", "64"))
+    _FP4_DYN_NMIN = int(os.environ.get("TRTLLM_DSL_FP4_DYN_NMIN", "384"))
+    _FP4_DYN_HOST_NMIN = int(
+        os.environ.get("TRTLLM_DSL_FP4_DYN_HOST_NMIN", "640"))
+    _FP4_DYN_TAIL = int(os.environ.get("TRTLLM_DSL_FP4_DYN_TAIL", "2"))
+    if not 0 <= _FP4_DYN_TAIL <= 15:
+        raise ValueError(
+            f"TRTLLM_DSL_FP4_DYN_TAIL={_FP4_DYN_TAIL} must be in [0, 15]")
     # TRTLLM_DSL_FP4_KV_STAGES: KV TMA pipeline depth of the FP4 scorer; unset =
-    # 5 for the static schedule, 6 for the work-stealing build (each measured
-    # optimum on distinct real rows; deeper pipelines lose 2-7 %)
+    # 5 for both builds (measured optimum on distinct real rows; the tail-only
+    # stealing build walks its range head like the static one)
     _FP4_KV_STAGES_ENV = os.environ.get("TRTLLM_DSL_FP4_KV_STAGES")
 
     def _fp4_kv_stages(dynamic_sched):
         if _FP4_KV_STAGES_ENV:
             return int(_FP4_KV_STAGES_ENV)
-        return 6 if dynamic_sched else 5
+        return 5
 
     _FP4_DYN_B_CAP = 1024
-    _FP4_DYN_RING = 128
+    _FP4_DYN_RING = 64
     _FP4_DYN_CHUNK_MAX = _FP4_DYN_RING // 2 - 4
     if not 1 <= _FP4_DYN_CHUNK <= _FP4_DYN_CHUNK_MAX:
         raise ValueError(
             f"TRTLLM_DSL_FP4_DYN_CHUNK={_FP4_DYN_CHUNK} must be in "
             f"[1, {_FP4_DYN_CHUNK_MAX}]")
-    # "1" forces the dynamic build (state buffer allocated on demand); any
-    # other mode only goes dynamic when the caller passes a state buffer
     _FP4_DYN_FORCE = _FP4_DYN_MODE == "1"
     _fp4_dyn_state_cache: dict = {}
 
     def fp4_dyn_state_words(num_sms: int) -> int:
-        """int32 words of the scheduler state: arrival, 8 mask words, counters."""
+        """int32 words of the scheduler state: [0] arrival, [64, 64 +
+        roundup32(num_sms)) per-range claim counters; the words between are
+        unused."""
         return 64 + (num_sms + 31) // 32 * 32
 
     def build_fp4_dyn_state(num_sms: int,
@@ -11339,22 +11353,28 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cand_idx_out = None
                 cand_cur_out = None
 
-            # Dynamic scheduling: the kernel self-resets the state words, so a
-            # per-(device, stream) buffer serves every launch; B > 1024
-            # (prefix-table cap) and candidate emission keep the static
-            # schedule.
+            # Tail-only work stealing, opt-in (a caller-passed state buffer or
+            # TRTLLM_DSL_FP4_DYN_SCHED=1): the kernel self-resets the state
+            # words, so a per-(device, stream) buffer serves every launch;
+            # B > 1024 (prefix-table cap) and candidate emission keep the
+            # static schedule.
             dynamic_sched = False
             has_dyn_state = False
             if (dyn_state is not None or _FP4_DYN_FORCE or dyn_chunk is not None
                     or dyn_nmin is not None):
-                if dyn_nmin is None:
+                if dyn_nmin is not None:
+                    host_floor = dyn_nmin
+                else:
                     dyn_nmin = _FP4_DYN_NMIN
-                # upper bound on tile pairs; below the regime floor the kernel
-                # would only walk its static range, so use the static build
+                    host_floor = dyn_nmin if _FP4_DYN_FORCE else max(
+                        dyn_nmin, _FP4_DYN_HOST_NMIN)
+                # upper bound on tile pairs of the launch envelope; below the
+                # host floor the stealing build has nothing to balance, so use
+                # the static build
                 pairs_ub = B * ((max_context_len + 255) // 256)
                 if (_FP4_DYN_MODE != "0" and B <= _FP4_DYN_B_CAP
                         and not (emit_cand or emit_cand_bucketed)
-                        and pairs_ub >= dyn_nmin * num_sms):
+                        and pairs_ub >= host_floor * num_sms):
                     if dyn_state is None and _FP4_DYN_FORCE:
                         dyn_state = _fp4_dyn_state_cached(num_sms, q.device)
                     dynamic_sched = dyn_state is not None
@@ -11370,6 +11390,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 assert 1 <= dyn_chunk <= _FP4_DYN_CHUNK_MAX, (
                     f"dyn_chunk={dyn_chunk} must be in [1, {_FP4_DYN_CHUNK_MAX}]"
                 )
+                # kernel word: bits 0-7 pairs per chunk, bits 8-15 tail shift
+                dyn_chunk = dyn_chunk | (_FP4_DYN_TAIL << 8)
 
             # PDL launch attribute + griddepcontrol trigger for the top-k that
             # follows; same shape gate as the top-k's dependent launch

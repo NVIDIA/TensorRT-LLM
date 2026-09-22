@@ -993,8 +993,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
-        # FP4 DSL scorer dynamic-schedule state (arrival, exhausted mask,
-        # per-range claim counters); the kernel restores the zeros it uses.
+        # FP4 DSL scorer work-stealing state (arrival word, per-range claim
+        # counters); the kernel restores the zeros it uses.
         # One buffer per process: launches that share it must be stream-ordered.
         self.dsl_dyn_state = None
         if _DSL_FP4_USE_DYN:

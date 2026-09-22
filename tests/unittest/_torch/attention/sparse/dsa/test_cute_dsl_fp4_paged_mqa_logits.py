@@ -759,6 +759,161 @@ def test_cute_dsl_fp4_paged_mqa_logits_block_meta(
         assert bm[row, written_hi * 4 :].isnan().all(), f"stray block_max write: {tag}"
 
 
+# ---------------------------------------------------------------------------
+# Tail-only work stealing (dynamic_sched build) against the static build.
+# ---------------------------------------------------------------------------
+
+
+def _skewed_schedule(context_lens: torch.Tensor, num_sms: int, heavy: int, light: int):
+    """Schedule row in the deep_gemm layout ([num_sms + 1, 2] int32 of
+    (row, 256-token pair within the row), last entry (B, 0)) that hands the
+    even CTAs `heavy` and the odd CTAs `light` shares of the pairs: the light
+    CTAs run out of work while the heavy ones still hold unclaimed donation
+    chunks, so cross-CTA steals happen on every launch."""
+    pairs = ((context_lens.cpu().to(torch.int64) + 255) // 256).clamp(min=1)
+    prefix = torch.zeros(pairs.numel() + 1, dtype=torch.int64)
+    prefix[1:] = pairs.cumsum(0)
+    total = int(prefix[-1])
+    weights = torch.tensor(
+        [heavy if i % 2 == 0 else light for i in range(num_sms)], dtype=torch.float64
+    )
+    cuts = torch.round(weights.cumsum(0) / weights.sum() * total).to(torch.int64)
+    starts = torch.cat([torch.zeros(1, dtype=torch.int64), cuts[:-1]])
+    meta = torch.zeros((num_sms + 1, 2), dtype=torch.int32)
+    for i in range(num_sms):
+        p = int(starts[i])
+        r = int(torch.searchsorted(prefix, torch.tensor(p), right=True)) - 1
+        meta[i, 0] = r
+        meta[i, 1] = p - int(prefix[r])
+    meta[num_sms, 0] = pairs.numel()
+    return meta.to(context_lens.device)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("emit_block_meta", [False, True])
+def test_cute_dsl_fp4_paged_mqa_logits_dyn_sched(monkeypatch, emit_block_meta):
+    """The tail-only work-stealing build (dyn_state passed, dyn_nmin=1) must
+    reproduce the static build bit for bit and leave its state buffer
+    all-zero, at a shape whose donation regions hold several chunks (32 rows
+    of ~64k compressed positions, ~55 pairs per CTA): (a) the deep_gemm
+    schedule with half of every range donated in 4-pair chunks, (b) a skewed
+    schedule (heavy/light CTAs 3:1) under the default quarter-range donation
+    and 16-pair chunks, where the light CTAs finish first and steal the heavy
+    CTAs' partial last chunks, (c) the skewed schedule with whole ranges
+    donated in 3-pair chunks (chunks cross row boundaries), then (c) captured
+    in a CUDA graph and replayed twice."""
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops as CO
+
+    torch.manual_seed(11)
+    torch.cuda.manual_seed(11)
+    batch_size, next_n, num_heads, head_dim, phys_block_kv = 32, 1, 64, 128, 64
+    avg_ctx = 65536
+    max_model_len = avg_ctx * 2
+    device = "cuda"
+
+    context_lens = torch.randint(
+        int(0.7 * avg_ctx), int(1.3 * avg_ctx) + 1, (batch_size,), dtype=torch.int32, device=device
+    )
+    num_blocks_per_seq = ceil_div_tensor(context_lens, phys_block_kv)
+    num_total_blocks = int(num_blocks_per_seq.sum().item()) + batch_size * 2
+    max_blocks_per_seq = int(num_blocks_per_seq.max().item())
+    block_table = torch.zeros((batch_size, max_blocks_per_seq), dtype=torch.int32, device=device)
+    pool = torch.randperm(num_total_blocks, device=device, dtype=torch.int32)
+    off = 0
+    for i, n_blks in enumerate(num_blocks_per_seq.tolist()):
+        block_table[i, :n_blks] = pool[off : off + n_blks]
+        off += n_blks
+
+    q = torch.randn((batch_size, next_n, num_heads, head_dim), device=device, dtype=torch.bfloat16)
+    kv_cache = torch.randn(
+        (num_total_blocks, phys_block_kv, 1, head_dim), device=device, dtype=torch.bfloat16
+    )
+    weights = torch.randn((batch_size * next_n, num_heads), device=device, dtype=torch.float32)
+    q_packed, sf_q_packed = per_token_cast_to_fp4(
+        q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
+    )
+    q_fp4 = q_packed.view(torch.uint8).view(batch_size, next_n, num_heads, head_dim // 2)
+    sf_q = sf_q_packed.view(torch.int32).view(batch_size, next_n, num_heads)
+    kv_fused, _ = kv_cache_cast_to_fp4(kv_cache)
+    del kv_cache, q_packed
+
+    num_sms = deep_gemm.get_num_sms()
+    sched_dg = deep_gemm.get_paged_mqa_logits_metadata(context_lens.unsqueeze(-1), 64, num_sms)
+    sched_skew = _skewed_schedule(context_lens, num_sms, heavy=3, light=1)
+    nb_pad = align(max_model_len, 256) // 128
+    lens = context_lens.tolist()
+
+    def run(schedule_meta, block_max, **dyn):
+        kwargs = dict(emit_block_meta=True, emit_hit_stats=False, block_max_out=block_max)
+        if not emit_block_meta:
+            kwargs = {}
+        out = CO.CuteDSLFP4PagedMQALogitsRunner.forward(
+            q_fp4,
+            sf_q,
+            kv_fused,
+            weights,
+            context_lens,
+            block_table,
+            schedule_meta,
+            max_model_len,
+            num_epi_subtiles=1,
+            epi_dtype=torch.float32,
+            output_dtype=torch.bfloat16,
+            **kwargs,
+            **dyn,
+        )
+        return out[0] if emit_block_meta else out
+
+    def new_block_max():
+        if not emit_block_meta:
+            return None
+        return torch.zeros((batch_size * next_n, nb_pad * 4), dtype=torch.float32, device=device)
+
+    def check(tag, logits, block_max):
+        torch.cuda.synchronize()
+        for row in range(batch_size):
+            assert torch.equal(logits[row, : lens[row]], ref[row, : lens[row]]), (
+                f"{tag}: logits differ from the static build in row {row}"
+            )
+        if emit_block_meta:
+            assert torch.equal(block_max, ref_bm), f"{tag}: block_max differs from the static build"
+        assert int(torch.count_nonzero(dyn_state)) == 0, f"{tag}: state buffer not restored"
+
+    # Static build reference (independent of the env's opt-in).
+    monkeypatch.setattr(CO, "_FP4_DYN_MODE", "0")
+    monkeypatch.setattr(CO, "_FP4_DYN_FORCE", False)
+    ref_bm = new_block_max()
+    ref = run(sched_dg, ref_bm)
+    torch.cuda.synchronize()
+
+    # Stealing build: opted in through the caller's state buffer; dyn_nmin=1
+    # makes both the host and the kernel floor trivially met.
+    monkeypatch.setattr(CO, "_FP4_DYN_MODE", "auto")
+    dyn_state = CO.build_fp4_dyn_state(num_sms, device)
+    arms = [
+        ("dg tail1 chunk4", sched_dg, 1, 4),
+        ("skewed tail2 chunk16", sched_skew, 2, 16),
+        ("skewed tail0 chunk3", sched_skew, 0, 3),
+    ]
+    for tag, sched, tail, chunk in arms:
+        monkeypatch.setattr(CO, "_FP4_DYN_TAIL", tail)
+        bm = new_block_max()
+        out = run(sched, bm, dyn_state=dyn_state, dyn_chunk=chunk, dyn_nmin=1)
+        check(tag, out, bm)
+
+    # CUDA graph: the capture and two replays of the maximal-stealing arm.
+    monkeypatch.setattr(CO, "_FP4_DYN_TAIL", 0)
+    bm_g = new_block_max()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        out_g = run(sched_skew, bm_g, dyn_state=dyn_state, dyn_chunk=3, dyn_nmin=1)
+    torch.cuda.synchronize()
+    assert int(torch.count_nonzero(dyn_state)) == 0, "capture left the state buffer dirty"
+    for i in range(2):
+        g.replay()
+        check(f"graph replay {i}", out_g, bm_g)
+
+
 @skip_not_sm100
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("next_n", [1, 2, 3])

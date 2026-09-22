@@ -69,12 +69,14 @@ except ImportError:
     HAS_FAST_HADAMARD = False
 
 _DG_SCHEDULE_BLOCK_KV = 64
-# Dynamic (work-stealing) scheduling of the FP4 DSL scorer: on when
-# TRTLLM_DSL_FP4_DYN_SCHED=1; "auto" follows _DSL_FP4_DYN_DEFAULT_ON.
+# Tail-only work stealing in the FP4 DSL scorer: on when
+# TRTLLM_DSL_FP4_DYN_SCHED=1; "auto" follows _DSL_FP4_DYN_DEFAULT_ON. When on,
+# the metadata owns the scheduler state buffer and every decode launch passes
+# it (the runner still applies its shape floors, see cute_dsl_custom_ops).
 # Off by default: the build is chosen at CUDA-graph capture from the engine's
-# max sequence length, and the dynamic build's low-work regime (actual
-# contexts far below the envelope) costs 2-7 % against the static kernel at
-# 64k-256k, B32-128 (cold B200). Opt in with TRTLLM_DSL_FP4_DYN_SCHED=1.
+# max sequence length, and launches whose rows are far below that envelope
+# pay the scheduler's fixed cost (+3 % at 256k B128, +7 % at 64k B128 under a
+# 1M envelope, cold B200) for -1 % at 1M B128/B256.
 _DSL_FP4_DYN_DEFAULT_ON = False
 _DSL_FP4_DYN_SCHED = os.environ.get("TRTLLM_DSL_FP4_DYN_SCHED", "auto")
 _DSL_FP4_USE_DYN = _DSL_FP4_DYN_SCHED == "1" or (

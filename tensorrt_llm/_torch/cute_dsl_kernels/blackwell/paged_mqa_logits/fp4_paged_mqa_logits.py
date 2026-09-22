@@ -201,23 +201,8 @@ def _red_global_add_f32(addr_i64, fval, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _red_global_or_b32(addr_i64, ival, *, loc=None, ip=None):
-    llvm.inline_asm(
-        None,
-        [addr_i64.ir_value(loc=loc, ip=ip), ival.ir_value(loc=loc, ip=ip)],
-        "red.global.or.b32 [$0], $1;",
-        "l,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
 def _ld_relaxed_gpu_s32(addr_i64, *, loc=None, ip=None):
-    """L1-bypassing load of a word other CTAs mutate (scheduler mask)."""
+    """L1-bypassing load of a word other CTAs mutate (claim counters)."""
     return cutlass.Int32(
         llvm.inline_asm(
             T.i32(),
@@ -695,16 +680,22 @@ class FP4MQALogitsKernel:
         # q-transition/loop end, so `claimed` over-approximates the true
         # count (counts[r][0] exact).
         self.CAND_WIN = 8
-        # dynamic_sched: local-first work stealing over the DG ranges. TMA
-        # warp 0 claims C-pair chunks (own range first, then other CTAs'
-        # ranges) and publishes row segments {row|flag<<16, kv0, n_pairs,
-        # ctx} into a smem ring every role consumes in order. The regime is
-        # decided per launch from the inputs (total_pairs >= nmin * num_ctas);
-        # below it every CTA walks exactly its DG range. Global state lives in
-        # a caller-owned int32 buffer [0]=arrival, [32..40)=exhausted mask,
-        # [64..64+NC)=per-range claim counters, restored to zero by the last
-        # arriving CTA. Under PDL the kernel-entry griddepcontrol.wait orders
-        # the first claim after the previous grid's reset of these words.
+        # dynamic_sched: tail-only work stealing over the DG ranges. Every
+        # CTA walks the head of its range unchanged; the last
+        # (range >> tail_shift) pairs form its donation region, split into
+        # C-pair chunks claimed through one global counter per range (owner
+        # first, just in time, then any CTA that ran out of work). TMA warp 0
+        # publishes row segments {row|flag<<16, kv0, n_pairs, ctx} into a
+        # smem ring every role consumes in order. The regime is decided per
+        # launch from the inputs (total_pairs >= nmin * num_ctas); below it
+        # every CTA walks exactly its DG range. A thief scans every range's
+        # claim counter and takes a chunk of a range that still holds many
+        # (one atomic per probe). Global state lives in a caller-owned int32
+        # buffer [0]=arrival, [64..64+NC)=per-range claim counters, restored
+        # to zero by the last arriving CTA; launches sharing a buffer must be
+        # stream-ordered.
+        # Under PDL the kernel-entry griddepcontrol.wait orders the first
+        # claim after the previous grid's reset of these words.
         self.dynamic_sched = dynamic_sched
         # pdl: launch with the programmatic-dependent-launch attribute and
         # wait at kernel entry before any role's first input read; default
@@ -722,7 +713,7 @@ class FP4MQALogitsKernel:
         self.prod_regs, self.math_regs = (56, 224) if dynamic_sched else (24, 240)
         assert ring_depth >= 16 and ring_depth % 2 == 0
         assert b_cap % 32 == 0 and b_cap <= 1024
-        assert num_sms <= 256, "dynamic scheduler mask covers 256 CTAs"
+        assert num_sms <= 256, "dynamic scheduler encodes CTA ids in 8 bits"
         assert not (dynamic_sched and (emit_cand or emit_cand_bucketed)), (
             "dynamic_sched is incompatible with candidate emission (per-segment "
             "CAND_WIN flushes inflate `claimed` against cand_cap)"
@@ -964,7 +955,7 @@ class FP4MQALogitsKernel:
         cand_idx_t: cute.Tensor = None,  # bucketed: [num_rows, 2*segA+capC] int32 SoA
         cand_cur: cute.Tensor = None,  # bucketed: [num_rows, 4] int32 cursors, zeroed
         dyn_state: cute.Tensor = None,  # dynamic_sched: int32 [>= 64 + roundup32(num_sms)]
-        dyn_chunk: cutlass.Int32 = 16,  # pairs per chunk (<= ring_depth/2 - 4)
+        dyn_chunk: cutlass.Int32 = 16,  # bits 0-7 pairs per chunk (<= ring_depth/2 - 4), bits 8-15 tail shift
         dyn_nmin: cutlass.Int32 = 64,  # dynamic regime iff total_pairs >= nmin * num_ctas
     ):
         # Derive KV data and SF views from the fused uint8 buffer.
@@ -1139,6 +1130,7 @@ class FP4MQALogitsKernel:
         num_ctas = self.num_sms
         ring_d = self.ring_depth if self.dynamic_sched else 1
         b_cap = self.b_cap if self.dynamic_sched else 1
+        nc_d = (self.num_sms + 31) // 32 * 32 if self.dynamic_sched else 0
 
         @cute.struct
         class SharedStorage:
@@ -1153,10 +1145,11 @@ class FP4MQALogitsKernel:
             # value carried across the role split is spilled function-wide)
             sched_state: cute.struct.MemRange[cutlass.Int32, 4]
             # dynamic_sched: ring entries, pair-prefix / ctx tables, fetcher state
+            # (64 words) + per-range donation table (2 words per range)
             ring_ent: cute.struct.MemRange[cutlass.Int32, ring_d * 4]
             sched_P: cute.struct.MemRange[cutlass.Int32, b_cap + 1]
             sched_ctx: cute.struct.MemRange[cutlass.Int32, b_cap]
-            sched_ctl: cute.struct.MemRange[cutlass.Int32, 64]
+            sched_ctl: cute.struct.MemRange[cutlass.Int32, 64 + 2 * nc_d]
 
         self.kernel(
             tiled_mma,
@@ -1360,10 +1353,10 @@ class FP4MQALogitsKernel:
 
     # ---- dynamic_sched helpers (warp-collective; all lanes of one warp call) ----
     # sched_ctl words: 0 mode (0 own, 1 steal, 2 finished, 3 static-tail),
-    # 1/2 own range [s, e) flat pairs, 3 own chunk limit, 4 steal cursor,
+    # 1/2 own donation region [t, e) flat pairs, 3 own chunk limit,
     # 6/7 pending segment [pf0, pf1), 8 pending first-of-chunk flag,
     # 9 chunks published (incl. terminal), 10 chunks popped by the fetcher,
-    # 12..15 (start_q, start_kvh, end_q, end_kvh), 16..18 ring producer
+    # 12 donation table built, 13/14 scan reductions, 16..18 ring producer
     # (count, index, phase), 32..63 strip totals (prologue scratch).
 
     @cute.jit
@@ -1446,13 +1439,54 @@ class FP4MQALogitsKernel:
 
     @cute.jit
     def _dyn_claim(
-        self, ring, ring_ent, s_P, s_ctl, mScheduleMeta, dyn_base, sm_idx, lane_idx, chunk
+        self,
+        ring,
+        ring_ent,
+        s_P,
+        s_rng,
+        s_ctl,
+        mScheduleMeta,
+        dyn_base,
+        sm_idx,
+        lane_idx,
+        chunk,
+        tail_sh,
     ):
-        """Claim the next chunk (own range, then steal) into the pending
-        segment, or publish the terminal entry after the arrival."""
+        """One claim probe (at most one global atomic): the next own donation
+        chunk (mode 0), else a chunk of a rich range (mode 1: the first range
+        in ring order after sm_idx among those holding at least half of the
+        maximum unclaimed chunks; a lost race leaves that counter past its
+        limit, so the range drops out of later scans). With nothing left
+        anywhere: arrive (the last arriver restores the zeros) and publish
+        the terminal entry."""
         num_ctas = cutlass.const_expr(self.num_sms)
-        NC = cutlass.const_expr((self.num_sms + 31) // 32 * 32)
+        NW = cutlass.const_expr((self.num_sms + 31) // 32)
         mode = s_ctl[0]
+        if s_ctl[12] == cutlass.Int32(0) and mode != cutlass.Int32(3):
+            # donation table [end, size) per range, built at this CTA's first
+            # claim (its own range still has two chunks of work queued); own
+            # and out-of-range entries get size 0
+            qs_v = cute.make_rmem_tensor(NW, cutlass.Int32)
+            ks_v = cute.make_rmem_tensor(NW, cutlass.Int32)
+            qe_v = cute.make_rmem_tensor(NW, cutlass.Int32)
+            ke_v = cute.make_rmem_tensor(NW, cutlass.Int32)
+            for i in cutlass.range_constexpr(NW):
+                vc = min(lane_idx + cutlass.Int32(32 * i), cutlass.Int32(num_ctas - 1))
+                qs_v[i] = mScheduleMeta[(vc, 0)]
+                ks_v[i] = mScheduleMeta[(vc, 1)]
+                qe_v[i] = mScheduleMeta[(vc + cutlass.Int32(1), 0)]
+                ke_v[i] = mScheduleMeta[(vc + cutlass.Int32(1), 1)]
+            for i in cutlass.range_constexpr(NW):
+                v = lane_idx + cutlass.Int32(32 * i)
+                e_v = s_P[qe_v[i]] + ke_v[i]
+                d_v = (e_v - s_P[qs_v[i]] - ks_v[i]) >> tail_sh
+                if v >= cutlass.Int32(num_ctas) or v == sm_idx:
+                    d_v = cutlass.Int32(0)
+                s_rng[v * 2] = e_v
+                s_rng[v * 2 + 1] = d_v
+            cute.arch.sync_warp()
+            if lane_idx == cutlass.Int32(0):
+                s_ctl[12] = cutlass.Int32(1)
         got = cutlass.Int32(0)
         pf0 = cutlass.Int32(0)
         pf1 = cutlass.Int32(0)
@@ -1471,97 +1505,65 @@ class FP4MQALogitsKernel:
                 pf0 = s0 + k * chunk
                 pf1 = min(pf0 + chunk, e0)
                 got = cutlass.Int32(1)
-                if k == lim - cutlass.Int32(1) and lane_idx == cutlass.Int32(0):
-                    _red_global_or_b32(
-                        dyn_base + cutlass.Int64(32 + (sm_idx >> 5)) * cutlass.Int64(4),
-                        cutlass.Int32(1) << (sm_idx & cutlass.Int32(31)),
-                    )
             else:
-                if lane_idx == cutlass.Int32(0):
-                    _red_global_or_b32(
-                        dyn_base + cutlass.Int64(32 + (sm_idx >> 5)) * cutlass.Int64(4),
-                        cutlass.Int32(1) << (sm_idx & cutlass.Int32(31)),
-                    )
                 mode = cutlass.Int32(1)
         go_done = cutlass.Int32(0)
         if mode == cutlass.Int32(1) and got == cutlass.Int32(0):
-            cur = s_ctl[4]
-            nbits = cutlass.Int32(num_ctas) - lane_idx * cutlass.Int32(32)
-            valid = cutlass.Int32(0)
-            if nbits >= cutlass.Int32(32):
-                valid = cutlass.Int32(-1)
-            else:
-                if nbits > cutlass.Int32(0):
-                    valid = (cutlass.Int32(1) << nbits) - cutlass.Int32(1)
-            searching = cutlass.Int32(1)
-            while searching == cutlass.Int32(1):
-                mw = cutlass.Int32(0)
-                if lane_idx < cutlass.Int32(8):
-                    mw = _ld_relaxed_gpu_s32(
-                        dyn_base + cutlass.Int64(32 + lane_idx) * cutlass.Int64(4)
-                    )
-                free_l = (mw ^ cutlass.Int32(-1)) & valid
-                cw = cur >> 5
-                cb = cur & cutlass.Int32(31)
-                hi_l = free_l
-                if lane_idx < cw:
-                    hi_l = cutlass.Int32(0)
-                if lane_idx == cw:
-                    hi_l = free_l & (
-                        ((cutlass.Int32(1) << cb) - cutlass.Int32(1)) ^ cutlass.Int32(-1)
-                    )
-                b1 = cute.arch.vote_ballot_sync(hi_l != cutlass.Int32(0))
-                b2 = cute.arch.vote_ballot_sync(free_l != cutlass.Int32(0))
-                if b2 == cutlass.Int32(0):
-                    searching = cutlass.Int32(0)
-                    go_done = cutlass.Int32(1)
-                else:
-                    bsel = b2
-                    wsel = free_l
-                    if b1 != cutlass.Int32(0):
-                        bsel = b1
-                        wsel = hi_l
-                    l_star = cutlass.Int32(cute.arch.clz(cute.arch.brev(bsel)))
-                    word = cute.arch.shuffle_sync(wsel, l_star)
-                    v = l_star * cutlass.Int32(32) + cutlass.Int32(
-                        cute.arch.clz(cute.arch.brev(word))
-                    )
-                    old = cutlass.Int32(0)
-                    if lane_idx == cutlass.Int32(0):
-                        old = _atom_global_add_s32(
-                            dyn_base + cutlass.Int64(64 + v) * cutlass.Int64(4), cutlass.Int32(1)
-                        )
-                    old = cute.arch.shuffle_sync(old, cutlass.Int32(0))
-                    q_s = mScheduleMeta[(v, 0)]
-                    kvh_s = mScheduleMeta[(v, 1)]
-                    q_e = mScheduleMeta[(v + cutlass.Int32(1), 0)]
-                    kvh_e = mScheduleMeta[(v + cutlass.Int32(1), 1)]
-                    s_v = s_P[q_s] + kvh_s
-                    e_v = s_P[q_e] + kvh_e
-                    lim_v = (e_v - s_v + chunk - cutlass.Int32(1)) // chunk
-                    k = old + cutlass.Int32(1)
-                    if k < lim_v:
-                        pf0 = s_v + k * chunk
-                        pf1 = min(pf0 + chunk, e_v)
-                        got = cutlass.Int32(1)
-                        searching = cutlass.Int32(0)
-                        cur = v
-                        if k == lim_v - cutlass.Int32(1) and lane_idx == cutlass.Int32(0):
-                            _red_global_or_b32(
-                                dyn_base + cutlass.Int64(32 + (v >> 5)) * cutlass.Int64(4),
-                                cutlass.Int32(1) << (v & cutlass.Int32(31)),
-                            )
-                    else:
-                        if lane_idx == cutlass.Int32(0):
-                            _red_global_or_b32(
-                                dyn_base + cutlass.Int64(32 + (v >> 5)) * cutlass.Int64(4),
-                                cutlass.Int32(1) << (v & cutlass.Int32(31)),
-                            )
-                        cur = v + cutlass.Int32(1)
-                        if cur >= cutlass.Int32(num_ctas):
-                            cur = cutlass.Int32(0)
+            # lane l scans ranges v = l + 32 i
+            cnt = cute.make_rmem_tensor(NW, cutlass.Int32)
+            for i in cutlass.range_constexpr(NW):
+                vc = min(lane_idx + cutlass.Int32(32 * i), cutlass.Int32(num_ctas - 1))
+                cnt[i] = _ld_relaxed_gpu_s32(dyn_base + cutlass.Int64(64 + vc) * cutlass.Int64(4))
+            rem_max = cutlass.Int32(0)
+            for i in cutlass.range_constexpr(NW):
+                v = lane_idx + cutlass.Int32(32 * i)
+                rem = (
+                    (s_rng[v * 2 + 1] + chunk - cutlass.Int32(1)) // chunk
+                    - cutlass.Int32(1)
+                    - cnt[i]
+                )
+                rem_max = max(rem_max, rem)
+            for k in cutlass.range_constexpr(5):
+                rem_max = max(rem_max, cute.arch.shuffle_sync_bfly(rem_max, 1 << k))
             if lane_idx == cutlass.Int32(0):
-                s_ctl[4] = cur
+                s_ctl[13] = rem_max
+            cute.arch.sync_warp()
+            rem_max = s_ctl[13]
+            if rem_max <= cutlass.Int32(0):
+                go_done = cutlass.Int32(1)
+            else:
+                thr = (rem_max + cutlass.Int32(1)) >> 1
+                pick = cutlass.Int32(0x7FFFFFFF)
+                for i in cutlass.range_constexpr(NW):
+                    v = lane_idx + cutlass.Int32(32 * i)
+                    rem = (
+                        (s_rng[v * 2 + 1] + chunk - cutlass.Int32(1)) // chunk
+                        - cutlass.Int32(1)
+                        - cnt[i]
+                    )
+                    if rem >= thr:
+                        dist = (v - sm_idx - cutlass.Int32(1)) & cutlass.Int32(0xFF)
+                        pick = min(pick, (dist << 8) | v)
+                for k in cutlass.range_constexpr(5):
+                    pick = min(pick, cute.arch.shuffle_sync_bfly(pick, 1 << k))
+                if lane_idx == cutlass.Int32(0):
+                    s_ctl[14] = pick
+                cute.arch.sync_warp()
+                v = s_ctl[14] & cutlass.Int32(0xFF)
+                old = cutlass.Int32(0)
+                if lane_idx == cutlass.Int32(0):
+                    old = _atom_global_add_s32(
+                        dyn_base + cutlass.Int64(64 + v) * cutlass.Int64(4), cutlass.Int32(1)
+                    )
+                e_v = s_rng[v * 2]
+                d_v = s_rng[v * 2 + 1]
+                lim_v = (d_v + chunk - cutlass.Int32(1)) // chunk
+                old = cute.arch.shuffle_sync(old, cutlass.Int32(0))
+                k = old + cutlass.Int32(1)
+                if k < lim_v:
+                    pf0 = e_v - d_v + k * chunk
+                    pf1 = min(pf0 + chunk, e_v)
+                    got = cutlass.Int32(1)
         if got == cutlass.Int32(1):
             if lane_idx == cutlass.Int32(0):
                 s_ctl[0] = mode
@@ -1580,11 +1582,7 @@ class FP4MQALogitsKernel:
                 cute.arch.fence_acq_rel_gpu()
                 if lane_idx == cutlass.Int32(0):
                     _st_global_s32(dyn_base, cutlass.Int32(0))
-                if lane_idx < cutlass.Int32(8):
-                    _st_global_s32(
-                        dyn_base + cutlass.Int64(32 + lane_idx) * cutlass.Int64(4), cutlass.Int32(0)
-                    )
-                for _j in cutlass.range_constexpr(NC // 32):
+                for _j in cutlass.range_constexpr(NW):
                     _st_global_s32(
                         dyn_base + cutlass.Int64(64 + 32 * _j + lane_idx) * cutlass.Int64(4),
                         cutlass.Int32(0),
@@ -1612,6 +1610,7 @@ class FP4MQALogitsKernel:
         ring_ent,
         s_P,
         s_ctx,
+        s_rng,
         s_ctl,
         mScheduleMeta,
         dyn_base,
@@ -1620,19 +1619,28 @@ class FP4MQALogitsKernel:
         lane_idx,
         cons_count,
         chunk,
+        tail_sh,
     ):
         """Claim the next chunk when the pending range is drained and fewer
         than two chunks are claimed ahead of the fetcher's pops; then drain.
-        Returns 1 while a further step can make progress (pending range not
-        drained, or another claim allowed), 0 when the caller may skip the
-        step until its next pop."""
+        Returns 1 while a further step can make progress."""
         mode = s_ctl[0]
         pf0 = s_ctl[6]
         pf1 = s_ctl[7]
         ahead = s_ctl[9] - s_ctl[10]
         if pf0 == pf1 and mode != cutlass.Int32(2) and ahead < cutlass.Int32(2):
             self._dyn_claim(
-                ring, ring_ent, s_P, s_ctl, mScheduleMeta, dyn_base, sm_idx, lane_idx, chunk
+                ring,
+                ring_ent,
+                s_P,
+                s_rng,
+                s_ctl,
+                mScheduleMeta,
+                dyn_base,
+                sm_idx,
+                lane_idx,
+                chunk,
+                tail_sh,
             )
         self._dyn_drain(ring, ring_ent, s_P, s_ctx, s_ctl, batch_size, lane_idx, cons_count)
         need = cutlass.Int32(0)
@@ -1786,13 +1794,14 @@ class FP4MQALogitsKernel:
 
         lane_idx = tidx % 32
         left = cutlass.Int32(0)
-        fneed = cutlass.Int32(1)
+        trig = cutlass.Int32(-1)
         ring = None
         ring_cons = None
         ring_ent = None
         s_P = None
         s_ctx = None
         s_ctl = None
+        s_rng = None
         if cutlass.const_expr(self.dynamic_sched):
             D_RING = self.ring_depth
             B_CAP = self.b_cap
@@ -1803,6 +1812,10 @@ class FP4MQALogitsKernel:
             s_P = cute.make_tensor(storage.sched_P.data_ptr(), cute.make_layout((B_CAP + 1,)))
             s_ctx = cute.make_tensor(storage.sched_ctx.data_ptr(), cute.make_layout((B_CAP,)))
             s_ctl = cute.make_tensor(storage.sched_ctl.data_ptr(), cute.make_layout((64,)))
+            s_rng = cute.make_tensor(
+                storage.sched_ctl.data_ptr() + 64,
+                cute.make_layout((2 * ((self.num_sms + 31) // 32 * 32),)),
+            )
             if batch_size > cutlass.Int32(B_CAP):
                 _trap()
             # P[r] = pairs of rows < r: warp w scans strips w, w+12, w+24 of 32 rows
@@ -2233,28 +2246,29 @@ class FP4MQALogitsKernel:
             q_row = cutlass.Int32(-1)
             dyn_base = cutlass.Int64(0)
             chunk_c = cutlass.Int32(1)
+            tail_sh = cutlass.Int32(0)
 
             if cutlass.const_expr(self.dynamic_sched):
                 dyn_base = mDynState.iterator.toint()
-                chunk_c = dyn_chunk
+                chunk_c = dyn_chunk & cutlass.Int32(0xFF)
+                tail_sh = dyn_chunk >> 8
                 own_s = s_P[next_q_idx] + (next_kv_idx >> 1)
                 own_e = s_P[end_q_idx] + (end_kv_idx >> 1)
                 total_pairs = s_P[batch_size]
-                lim_i = (own_e - own_s + chunk_c - cutlass.Int32(1)) // chunk_c
+                # donation region [own_t, own_e); the head [own_s, own_t) plus
+                # chunk 0 is this CTA's initial pending segment
+                own_t = own_e - ((own_e - own_s) >> tail_sh)
+                lim_i = (own_e - own_t + chunk_c - cutlass.Int32(1)) // chunk_c
                 dyn_on = total_pairs >= dyn_nmin * cutlass.Int32(self.num_sms)
                 if lane_idx == cutlass.Int32(0):
-                    s_ctl[1] = own_s
+                    s_ctl[1] = own_t
                     s_ctl[2] = own_e
                     s_ctl[3] = lim_i
-                    cur0 = sm_idx + cutlass.Int32(1)
-                    if cur0 >= cutlass.Int32(self.num_sms):
-                        cur0 = cutlass.Int32(0)
-                    s_ctl[4] = cur0
                     mode0 = cutlass.Int32(3)
                     pf1_0 = own_e
                     if dyn_on:
                         mode0 = cutlass.Int32(0)
-                        pf1_0 = min(own_s + chunk_c, own_e)
+                        pf1_0 = min(own_t + chunk_c, own_e)
                     s_ctl[0] = mode0
                     s_ctl[6] = own_s
                     s_ctl[7] = pf1_0
@@ -2264,6 +2278,7 @@ class FP4MQALogitsKernel:
                         cpub0 = cutlass.Int32(0)
                     s_ctl[9] = cpub0
                     s_ctl[10] = cutlass.Int32(0)
+                    s_ctl[12] = cutlass.Int32(0)
                 cute.arch.sync_warp()
                 need_first = s_ctl[16] == ring_cons.count
                 while need_first:
@@ -2272,6 +2287,7 @@ class FP4MQALogitsKernel:
                         ring_ent,
                         s_P,
                         s_ctx,
+                        s_rng,
                         s_ctl,
                         mScheduleMeta,
                         dyn_base,
@@ -2280,6 +2296,7 @@ class FP4MQALogitsKernel:
                         lane_idx,
                         ring_cons.count,
                         chunk_c,
+                        tail_sh,
                     )
                     need_first = s_ctl[16] == ring_cons.count
                 re0, re1, re2, re3 = self._ring_pop(ring, ring_cons, ring_ent, lane_idx)
@@ -2289,6 +2306,11 @@ class FP4MQALogitsKernel:
                 left = re2
                 next_num_kv = (re3 + cutlass.Int32(127)) >> 7
                 has_work = re2 > cutlass.Int32(0)
+                # one scheduler step per segment, two chunks (or half the
+                # segment) before its end
+                trig = left - (chunk_c + chunk_c)
+                if trig < (left >> 1):
+                    trig = left >> 1
                 if lane_idx == cutlass.Int32(0):
                     s_ctl[10] = s_ctl[10] + (re0 >> 16)
                 cute.arch.sync_warp()
@@ -2447,36 +2469,33 @@ class FP4MQALogitsKernel:
 
                 if cutlass.const_expr(self.dynamic_sched):
                     left = left - cutlass.Int32(1)
-                    popping = cutlass.Int32(0)
-                    if left <= cutlass.Int32(0):
-                        popping = cutlass.Int32(1)
-                    # one scheduler step when flagged; at a segment end spin until the next entry is published
-                    run = fneed
-                    if popping == cutlass.Int32(1) and s_ctl[16] == ring_cons.count:
-                        run = cutlass.Int32(1)
-                    ran = run
-                    while run == cutlass.Int32(1):
-                        fneed = self._fetch_step(
-                            ring,
-                            ring_ent,
-                            s_P,
-                            s_ctx,
-                            s_ctl,
-                            mScheduleMeta,
-                            dyn_base,
-                            batch_size,
-                            sm_idx,
-                            lane_idx,
-                            ring_cons.count,
-                            chunk_c,
-                        )
-                        run = cutlass.Int32(0)
-                        if popping == cutlass.Int32(1) and s_ctl[16] == ring_cons.count:
-                            run = cutlass.Int32(1)
-                    if popping == cutlass.Int32(0):
-                        next_kv_idx = kv_idx + NUM_MATH_WG
-                        # Q one entry ahead: the next published entry's row, in run order
-                        if ran == cutlass.Int32(1) and s_ctl[16] > ring_cons.count:
+                    if left == trig:
+                        # claim ahead (at most two probes) and publish; then Q
+                        # for the entry after the current one if it is visible
+                        k_it = cutlass.Int32(0)
+                        go = cutlass.Int32(1)
+                        while go == cutlass.Int32(1):
+                            need = self._fetch_step(
+                                ring,
+                                ring_ent,
+                                s_P,
+                                s_ctx,
+                                s_rng,
+                                s_ctl,
+                                mScheduleMeta,
+                                dyn_base,
+                                batch_size,
+                                sm_idx,
+                                lane_idx,
+                                ring_cons.count,
+                                chunk_c,
+                                tail_sh,
+                            )
+                            k_it = k_it + cutlass.Int32(1)
+                            go = cutlass.Int32(0)
+                            if need == cutlass.Int32(1) and k_it < cutlass.Int32(2):
+                                go = cutlass.Int32(1)
+                        if s_ctl[16] > ring_cons.count:
                             nb_e = ring_cons.index * 4
                             n_row = ring_ent[nb_e] & cutlass.Int32(0xFFFF)
                             n_cnt = ring_ent[nb_e + 2]
@@ -2498,7 +2517,29 @@ class FP4MQALogitsKernel:
                                 )
                                 q_prod_state.advance()
                                 q_row = n_row
+                    if left > cutlass.Int32(0):
+                        next_kv_idx = kv_idx + NUM_MATH_WG
                     else:
+                        # segment end: publish (claim or terminal) until an entry is visible, then pop it
+                        empty = s_ctl[16] == ring_cons.count
+                        while empty:
+                            self._fetch_step(
+                                ring,
+                                ring_ent,
+                                s_P,
+                                s_ctx,
+                                s_rng,
+                                s_ctl,
+                                mScheduleMeta,
+                                dyn_base,
+                                batch_size,
+                                sm_idx,
+                                lane_idx,
+                                ring_cons.count,
+                                chunk_c,
+                                tail_sh,
+                            )
+                            empty = s_ctl[16] == ring_cons.count
                         re0, re1, re2, re3 = self._ring_pop(ring, ring_cons, ring_ent, lane_idx)
                         ring_cons.advance()
                         next_q_idx = re0 & cutlass.Int32(0xFFFF)
@@ -2507,7 +2548,9 @@ class FP4MQALogitsKernel:
                         next_num_kv = (re3 + cutlass.Int32(127)) >> 7
                         has_work = re2 > cutlass.Int32(0)
                         kv_blk_ptr = cutlass.Int32(32)
-                        fneed = cutlass.Int32(1)
+                        trig = left - (chunk_c + chunk_c)
+                        if trig < (left >> 1):
+                            trig = left >> 1
                         if lane_idx == cutlass.Int32(0):
                             s_ctl[10] = s_ctl[10] + (re0 >> 16)
                         cute.arch.sync_warp()
