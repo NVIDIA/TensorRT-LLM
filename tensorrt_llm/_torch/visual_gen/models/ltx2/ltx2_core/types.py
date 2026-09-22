@@ -18,7 +18,11 @@ class VideoPixelShape(NamedTuple):
 
 
 class SpatioTemporalScaleFactors(NamedTuple):
-    """Spatiotemporal downscaling between pixel and VAE latent grid."""
+    """Spatiotemporal downscaling between pixel and VAE latent grid.
+
+    Field order matches the (frame/time, height, width) axis layout used by
+    latent tensors and meshgrid coordinates elsewhere in the codebase.
+    """
 
     time: int
     height: int
