@@ -152,7 +152,6 @@ SOURCE_DIR        ?= $(shell readlink -f ..)
 CODE_DIR          ?= /code/tensorrt_llm
 EXTRA_VOLUMES     ?=
 CCACHE_DIR        ?= $(CODE_DIR)/cpp/.ccache
-CONAN_DIR         ?= $(CODE_DIR)/cpp/.conan
 USER_CACHE_DIR    ?= $(shell readlink -f "${HOME_DIR}/.cache")
 RUN_CMD           ?=
 CONTAINER_NAME    ?= tensorrt_llm
@@ -176,7 +175,6 @@ endif
     		$(if $(and $(filter 1,$(LOCAL_USER)),$(shell [ -w "$(USER_CACHE_DIR)" ] && echo 1)),--volume $(USER_CACHE_DIR):/home/$(USER_NAME)/.cache:rw) \
     		--env "CCACHE_DIR=$(CCACHE_DIR)" \
     		--env "CCACHE_BASEDIR=$(CODE_DIR)" \
-    		--env "CONAN_HOME=$(CONAN_DIR)" \
     		--workdir $(WORK_DIR) \
     		--hostname $(shell hostname)-$* \
     		--name $(CONTAINER_NAME)-$*-$(USER_NAME) \

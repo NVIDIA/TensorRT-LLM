@@ -99,20 +99,17 @@ With `--build_root <dir>` set, the following default under `<dir>` instead of th
 
 | State | Location under `<dir>` | Individual override |
 |-------|------------------------|---------------------|
-| CMake build directory (objects, `_deps` downloads, conan output) | `cpp-build*` | `--build_dir` |
+| CMake build directory (objects and `_deps` downloads) | `cpp-build*` | `--build_dir` |
 | Build virtual environment | `venv-<python version>` | run inside an activated venv, or `--no-venv` |
 | Wheel staging tree and `*.egg-info` | `wheel-staging` | `TRTLLM_WHEEL_STAGING_DIR` |
 | ccache directory (with `--use_ccache`) | `ccache` | `CCACHE_DIR` |
 | Intermediate extension-module objects | `kv_cache_manager_v2-temp` | — |
-
-Conan's `cpp/CMakeUserPresets.json` convenience file is also skipped in this mode, since it would reference the (possibly ephemeral) out-of-tree build directory.
 
 Only final artifacts are still written into the checkout: `tensorrt_llm/libs`, `tensorrt_llm/include`, Python bindings and stubs, generated FMHA kernel sources, the configured `cpp/include/tensorrt_llm/executor/version.h`, and the `.whl` output directory (`--dist_dir`).
 
 Related knobs for shared-storage workflows:
 
 - `CCACHE_DIR`: point at persistent storage so compile results survive container or job restarts even when `<dir>` is ephemeral (for example, node-local `/tmp`).
-- `CONAN_HOME`: conan's download cache defaults to `~/.conan2`; relocate it if your home directory is small or slow.
 - `--use-3rdparty-cache`: cache FetchContent git clones as bare repos under `TRTLLM_FETCHCONTENT_CACHE` (defaults to `3rdparty/.cache_3rdparty`), avoiding repeated full clones after a clean.
 
 Plain local-disk builds are unaffected: without `--build_root`, all paths behave as before.

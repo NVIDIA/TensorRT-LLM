@@ -43,7 +43,6 @@ docker run --rm -it --ipc=host --ulimit memlock=-1 --ulimit stack=67108864  \
            --gpus=all \
            --env "CCACHE_DIR=/code/tensorrt_llm/cpp/.ccache" \
            --env "CCACHE_BASEDIR=/code/tensorrt_llm" \
-           --env "CONAN_HOME=/code/tensorrt_llm/cpp/.conan" \
            --workdir /code/tensorrt_llm \
            --tmpfs /tmp:exec \
            --volume .:/code/tensorrt_llm \
