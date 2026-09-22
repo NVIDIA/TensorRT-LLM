@@ -3684,3 +3684,62 @@ class TestTopPDecay:
         # TopPDecayHandler.validate_request resolves the sampling params -- and
         # with them the beam width -- before it checks whether decay is active.
         self._make_sampler().validate_request(request)
+
+
+class TestTopPSamplingNearOneRegression:
+    """Regression test for issue #19485.
+
+    A top_p very close to 1.0 can cause the FP32 cumulative probability sum to
+    stay below top_p for an entire row, making ``torch.searchsorted`` return
+    ``vocab_size`` (out-of-bounds). The clamp fix ensures all tokens are
+    retained for that row instead of triggering a CUDA device-side assert.
+    """
+
+    def test_top_p_near_one_does_not_raise(self) -> None:
+        """Verify that top_p=0.9999999 does not trigger an OOB index error.
+
+        When FP32 cumulative probability stays below top_p for an entire
+        row, the clamp fix must retain the full vocabulary for that row
+        (all probabilities positive) rather than producing an out-of-bounds
+        scatter index.
+        """
+        logits_gen = torch.Generator(device="cpu").manual_seed(0)
+        logits = torch.randn(2, 32000, device="cpu", generator=logits_gen)
+        top_p = 0.9999999
+        from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
+            top_k_top_p_sampling_batch,
+        )
+
+        # Verify the precondition: at least one row's FP32 cumulative
+        # probability must stay below top_p, otherwise this test would pass
+        # vacuously without exercising the edge case.
+        sorted_logits, _ = torch.sort(logits, descending=True, dim=-1)
+        cumulative_probs = torch.cumsum(
+            torch.softmax(sorted_logits, dim=-1), dim=-1
+        )
+        edge_case_rows = cumulative_probs[:, -1] < top_p
+        assert edge_case_rows.any(), "test inputs do not trigger the edge case"
+
+        # Before the fix this raised an IndexError on CPU (CUDA device-side
+        # assert on GPU) because searchsorted returned vocab_size for a row
+        # whose cumulative probability never reached top_p.
+        sampling_gen = torch.Generator(device="cpu").manual_seed(1)
+        tokens, probs = top_k_top_p_sampling_batch(
+            logits, temperature=1.0, top_p=top_p, generator=sampling_gen
+        )
+        assert tokens.shape == (2,)
+        assert probs.shape == (2, 32000)
+        # Probabilities must form valid distributions (non-negative, summing
+        # to ~1). Top-p filtering intentionally zeros tokens outside the
+        # nucleus for normal rows, so the >= 0 check applies globally.
+        assert (probs >= 0).all()
+        row_sums = probs.sum(dim=-1)
+        assert torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-5)
+        # Edge-case rows whose cumulative probability never reached top_p
+        # must retain the full vocabulary: every token probability must be
+        # positive, proving the clamp fix kept all tokens.
+        assert (probs[edge_case_rows] > 0).all(), (
+            "edge-case rows should retain the full vocabulary"
+        )
+
+

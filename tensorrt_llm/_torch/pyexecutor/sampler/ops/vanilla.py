@@ -105,6 +105,12 @@ def top_k_top_p_sampling_batch(
             right=False,
             out_int32=True,
         )
+        # When FP32 cumulative probability never reaches top_p (e.g. top_p
+        # very close to 1.0), searchsorted returns vocab_size which is OOB.
+        # Clamping to the last valid index keeps all tokens for that row:
+        # the mask entry there is already False, so the scatter below is a
+        # no-op and nothing gets filtered out.
+        last_index_to_keep = last_index_to_keep.clamp(max=vocab_size - 1)
         mask_to_remove.scatter_(
             1,
             last_index_to_keep,
