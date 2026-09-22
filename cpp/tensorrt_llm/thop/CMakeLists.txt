@@ -108,32 +108,13 @@ add_th_common_family(
   tinygemm2.cpp)
 
 # TODO: th_common_moe does not compile with USING_OSS_CUTLASS_MOE_GEMM=OFF
-# because moeUtilOp.cpp depends on OSS-specific MoE utility types and function
-# signatures.
-add_th_common_family(
-  th_common_moe
-  moe/cuteDslMoeUtilsOp.cpp
-  moe/marlinNvfp4MoeMM.cpp
-  fusedTopkSoftmax.cpp
-  llama4MinLatency.cpp
-  moe/moeOp.cpp
-  moe/moeUtilOp.cpp
-  moe/moeGateOp.cpp
-  moe/moeCommOp.cpp
-  moe/moeAlltoAllOp.cpp
-  moe/moeLoadBalanceOp.cpp
-  moe/moeAlignOp.cpp
-  moe/megaMoePrepareOp.cpp
-  moe/mxFp4BlockScaleMoe.cpp
-  moe/fp8BlockScaleMoe.cpp
-  moe/fp8PerTensorScaleMoe.cpp
-  moe/fp4BlockScaleMoe.cpp
-  noAuxTcOp.cpp
-  dsv3RouterGemmOp.cpp
-  moe/customMoeRoutingOp.cpp)
+# because moe/utils/moeUtilOp.cpp depends on OSS-specific MoE utility types and
+# function signatures.
+add_th_common_family(th_common_moe fusedTopkSoftmax.cpp llama4MinLatency.cpp
+                     noAuxTcOp.cpp dsv3RouterGemmOp.cpp)
 
 # MoE torch ops live in moe/<backend|role>/; that directory adds them to
-# th_common with target_sources() so the list stays next to the files.
+# th_common_moe with target_sources() so the list stays next to the files.
 add_subdirectory(moe)
 
 add_th_common_family(
