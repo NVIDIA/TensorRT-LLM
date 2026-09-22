@@ -87,6 +87,13 @@ and running the check.
 or the run-time environment get none, and a `pytest.skip()` raised in a body or a fixture
 leaves no mark to read. All of them still skip on the node, as today.
 
+**The table is a scope statement, so what it omits is not reported.** A `skipif` with no rule —
+whatever its reason, declared in the conftest or written inline at a test, and including one
+carrying no `reason=` at all — keeps the test for every machine. That is the whole answer, so
+selection gives it no count and no line, and the drift check says nothing about it either. What
+*is* reported is drift in the rules that exist: a reason reworded out from under one is an error
+at commit time.
+
 **Marker precedence mirrors the suite's**, inconsistency included: `skipif` and
 `skip_less_device_memory` are read at every level, the other three resource markers only at the
 closest. So a method asking for 2 GPUs replaces its class's 8, while one asking for 80000 MiB
