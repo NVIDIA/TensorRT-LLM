@@ -21,7 +21,7 @@ On B200, this design delivers **5.05× geometric-mean speedup over TensorRT LLM 
 
 **The operator contract.** Given FP32 indexer scores and valid-row metadata, Top-K returns unordered INT32 positions for sparse attention's KV selection. With finite scores and at least $K$ entries, it selects an exact value multiset through $K$ distinct indices; ties can choose different positions. [Enablement](#enable-gvr-v2) lists hardware, shape, and configuration requirements.
 
-[The original GVR blog](blog21_Temporal_Correlation_Meets_Sparse_Attention.md) described a temporal shortcut: the previous decode step's selected indices predict the next step's winners. Experience with V1 exposed two limits: hint quality varies sharply, and maintaining the hint couples selection to the serving framework. V2 makes the current row the source of the guess, targeting **a stronger performance floor and better average latency**, while enabling **one selection core for prefill and decode**. The **Guess–Verify–Refine** exactness contract remains.
+[The original GVR blog](https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog21_Temporal_Correlation_Meets_Sparse_Attention.html) described a temporal shortcut: the previous decode step's selected indices predict the next step's winners. Experience with V1 exposed two limits: hint quality varies sharply, and maintaining the hint couples selection to the serving framework. V2 makes the current row the source of the guess, targeting **a stronger performance floor and better average latency**, while enabling **one selection core for prefill and decode**. The **Guess–Verify–Refine** exactness contract remains.
 
 **Table of Contents**
 
@@ -530,4 +530,4 @@ Implementation milestones:
 - [PR #18702: self-sampling prefill](https://github.com/NVIDIA/TensorRT-LLM/pull/18702).
 - [PR #19076: register-plan tuning, a unified crossing-bin gate, sampled prefill plans, and SM-aware B200/B300 dispatch](https://github.com/NVIDIA/TensorRT-LLM/pull/19076).
 
-For the surrounding model pipeline, see [Sparse Attention in TensorRT LLM](blog17_Sparse_Attention_in_TensorRT-LLM.md) and [DeepSeek-V4 on NVIDIA Blackwell](blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.md).
+For the surrounding model pipeline, see [Sparse Attention in TensorRT LLM](https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html) and [DeepSeek-V4 on NVIDIA Blackwell](https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html).
