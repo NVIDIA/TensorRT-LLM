@@ -4760,8 +4760,9 @@ def test_mxfp8_fused_fc12_tactic_roundtrips_through_autotuner_cache():
 
 
 @pytest.mark.skipif(
-    not IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE,
-    reason="MXFP8 fused FC12 MoE requires a CuTe DSL build that supports the fused FC12 kernel",
+    get_sm_version() != 107 or not IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE,
+    reason="Sm107Mxfp8FusedFc12MoeRunner constructs on Rubin (SM107) only, with a CuTe DSL build "
+    "that supports the fused FC12 kernel",
 )
 def test_mxfp8_fused_fc12_sparse_gather_selection():
     """The gather variant is chosen from static shapes, scaled by the rank's expert share.

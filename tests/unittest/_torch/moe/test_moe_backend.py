@@ -48,6 +48,7 @@ from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile, autotu
 from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import _select_explicit_fallback_tactic
 from tensorrt_llm._torch.cute_dsl_utils import (
     IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE,
+    IS_CUTLASS_DSL_FUSED_FC12_BLACKWELL_AVAILABLE,
     IS_CUTLASS_DSL_RUBIN_AVAILABLE,
 )
 from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
@@ -3302,12 +3303,19 @@ def test_cutedsl_mxfp8_fused_fc12_accuracy_ab(
     """
     backend_type = MoeBackendType.CUTEDSL
     # Same gate as CuteDslFusedMoE.can_implement for MXFP8: the fused FC1+FC2
-    # kernel needs Rubin and a CuTE DSL internal build with the fused FC12
-    # submodules.
-    if get_sm_version() != 107:
-        pytest.skip(f"CuteDslFusedMoE MXFP8 requires SM107 (Rubin), got SM{get_sm_version()}")
-    if not IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE:
-        pytest.skip("MXFP8 on SM107 requires a CuTE DSL internal build with the fused FC12 kernel")
+    # kernel needs Rubin with a CuTE DSL internal build that has the fused FC12
+    # submodules, or SM100/SM103 with the Blackwell port's helpers.
+    sm = get_sm_version()
+    if sm == 107:
+        if not IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE:
+            pytest.skip(
+                "MXFP8 on SM107 requires a CuTE DSL internal build with the fused FC12 kernel"
+            )
+    elif sm in (100, 103):
+        if not IS_CUTLASS_DSL_FUSED_FC12_BLACKWELL_AVAILABLE:
+            pytest.skip("MXFP8 on SM100/SM103 requires a CuTe DSL build with the Blackwell helpers")
+    else:
+        pytest.skip(f"CuteDslFusedMoE MXFP8 requires SM107 or SM100/SM103, got SM{sm}")
     dtype = torch.bfloat16
     skip_if_insufficient_gpu_memory(num_experts, hidden_size, intermediate_size, dtype)
 
