@@ -95,12 +95,16 @@ def test_every_encoder_limit_attribute_is_recognized(limit_attr):
     assert creator._get_cross_kv_cache_layout() == (6, 8, 64, 1500)
 
 
-def test_max_input_len_is_the_fallback_without_an_encoder_limit():
-    """No encoder limit in the config: a positive max_input_len sizes the pool."""
+@pytest.mark.parametrize("max_input_len", [512, 1024, 2048])
+def test_max_input_len_is_the_fallback_without_an_encoder_limit(max_input_len):
+    """No encoder limit in the config: a positive max_input_len sizes the pool,
+    ahead of both the engine's max_seq_len and an explicit fallback."""
     config = dict(num_hidden_layers=6, num_attention_heads=8, hidden_size=512)
-    creator = _creator(config, max_seq_len=4096, max_input_len=1024)
+    creator = _creator(config, max_seq_len=4096, max_input_len=max_input_len)
 
-    assert creator._get_cross_kv_cache_layout()[3] == 1024
+    assert creator._get_cross_kv_cache_layout()[3] == max_input_len
+    assert creator._get_cross_kv_cache_layout(fallback_max_seq_len=2048)[3] == max_input_len
+    assert creator._get_cross_kv_cache_layout(fallback_max_seq_len=256)[3] == max_input_len
 
 
 @pytest.mark.parametrize("max_input_len", [None, 0, -1, "1024"])
