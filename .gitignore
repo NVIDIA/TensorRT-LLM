@@ -58,6 +58,7 @@ tensorrt_llm/flash_mla
 tensorrt_llm/flash_mla_cpp_tllm.*.so
 tensorrt_llm/flash_mla_cpp_tllm.pyi
 /3rdparty/fmha_sm100/
+/3rdparty/nccl_extensions/
 tensorrt_llm/runtime/kv_cache_manager_v2/**/*.so
 **/*__mypyc*.so
 tensorrt_llm/scripts
@@ -132,3 +133,6 @@ tests/integration/defs/stress_test/artifacts/
 # (run_eval_kimi_k3.sbatch --parallel tep and --dflash rewrites)
 examples/kimi_k3/.eval_tep_runtime.*.yaml
 examples/kimi_k3/.eval_dflash_runtime.*.yaml
+
+# Media a VisualGen server generates, when it is started from the checkout
+trtllm_generated/

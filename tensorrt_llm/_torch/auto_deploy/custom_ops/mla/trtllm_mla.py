@@ -39,7 +39,7 @@ Phase-specific details:
 - **Decode** (``attention_input_type=generation_only``):
   Uses weight absorption: ``q_absorbed = q_nope @ W_kn``, then
   ``fused_q = [q_absorbed | q_pe]``. Calls ``thop.attention`` with
-  ``is_fused_qkv=True`` and ``head_size=gen_head_size``. Output is in latent space
+  ``is_fused_qkv=False`` and ``head_size=gen_head_size``. Output is in latent space
   and projected back to ``v_head_dim`` via ``W_v``.
 
 Mixed batches (both prefill and decode tokens present) dispatch the prefill and
@@ -1725,7 +1725,7 @@ def _handle_decode_impl(
         q_pe_flat,  # q_pe
         planner.block_ids_per_seq,  # block_ids_per_seq
         None,  # attention_sinks
-        True,  # is_fused_qkv
+        False,  # is_fused_qkv
         True,  # update_kv_cache
         1,  # predicted_tokens_per_seq
         0,  # layer_idx (constant: decode bucket)

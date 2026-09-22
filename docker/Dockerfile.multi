@@ -68,16 +68,17 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
 
 # Install constraints after install.sh so cleanup() doesn't delete the file mid-RUN
 COPY constraints.txt /tmp/constraints.txt
-# constraints.txt is also consumed as a pip constraint file, which forbids extras.
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ -n "$GITHUB_MIRROR" ]; then \
       export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
     fi && \
+    # numpy is deliberately absent from this list: the base image's scipy and pandas import
+    # it, and constraints.txt no longer carries a pin that would put it back.
     pip3 uninstall -y tornado black nbconvert pillow nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base \
-        nvidia-cutlass-dsl-libs-core nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13 numpy wandb || true && \
+        nvidia-cutlass-dsl-libs-core nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13 wandb || true && \
     # Remove any leftover namespace dirs or dist-info that pip missed
     rm -rf $(python3 -c "import site; print(site.getsitepackages()[0])")/nvidia_cutlass_dsl* && \
-    pip3 install -r /tmp/constraints.txt "nvidia-cutlass-dsl[cu13]==4.8.0.dev0" && \
+    pip3 install -r /tmp/constraints.txt && \
     rm /tmp/constraints.txt
 
 # Install UCX, NIXL, etcd
@@ -91,7 +92,6 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_ucx.sh && \
     GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_nixl.sh && \
     bash /opt/docker/common/install_etcd.sh && \
-    GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_fa4.sh && \
     rm -rf /root/.cache/uv/archive-v0 && \
     # WAR against https://github.com/advisories/GHSA-58pv-8j8x-9vj2
     rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/jaraco.context-5.3.0.dist-info && \
@@ -103,6 +103,12 @@ ARG TRT_LLM_VER
 ARG TARGETARCH
 ENV TRT_LLM_GIT_COMMIT=${GIT_COMMIT} \
     TRT_LLM_VERSION=${TRT_LLM_VER}
+
+# Allow MPI/PRTE to run as root inside the container
+ENV OMPI_ALLOW_RUN_AS_ROOT=1 \
+    OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
+    PRTE_ALLOW_RUN_AS_ROOT=1 \
+    PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1
 
 # Generate OSS attribution file for devel image
 RUN --mount=type=bind,source=scripts/generate_container_oss_attribution.sh,target=/tmp/gen_attribution.sh \
@@ -130,12 +136,6 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
         bash /opt/docker/common/install_mooncake.sh; \
     fi && \
     bash /opt/docker/common/install_ci.sh
-
-# Allow MPI/PRTE to run as root inside the container
-ENV OMPI_ALLOW_RUN_AS_ROOT=1 \
-    OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
-    PRTE_ALLOW_RUN_AS_ROOT=1 \
-    PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1
 
 FROM ${DEVEL_IMAGE} AS wheel
 WORKDIR /src/tensorrt_llm

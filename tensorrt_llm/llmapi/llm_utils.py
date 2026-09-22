@@ -25,11 +25,12 @@ from ..quantization.modelopt_config import (is_modelopt_quant_config,
                                             warn_if_inline_diverges)
 # yapf: disable
 from .llm_args import (CalibConfig, CudaGraphConfig, DecodeCudaGraphConfig,
-                       DraftTargetDecodingConfig, Eagle3DecodingConfig,
-                       EagleDecodingConfig, EncodeCudaGraphConfig,
-                       KvCacheConfig, KVEventsConfig, LlmArgs,
-                       MTPDecodingConfig, NGramDecodingConfig, SchedulerConfig,
-                       TorchLlmArgs, UserProvidedDecodingConfig, _ModelWrapper,
+                       DFlashDecodingConfig, DraftTargetDecodingConfig,
+                       Eagle3DecodingConfig, EagleDecodingConfig,
+                       EncodeCudaGraphConfig, KvCacheConfig, KVEventsConfig,
+                       LlmArgs, MTPDecodingConfig, NGramDecodingConfig,
+                       SchedulerConfig, TorchLlmArgs,
+                       UserProvidedDecodingConfig, _ModelWrapper,
                        _ParallelConfig, update_llm_args_with_extra_dict,
                        update_llm_args_with_extra_options)
 # yapf: enable
@@ -432,6 +433,15 @@ class CachedModelLoader:
                     None)
                 if resolve_from_checkpoint is not None:
                     resolve_from_checkpoint()
+                # The DFlash buffer-fit check reads the drafter geometry from
+                # the same config.json, so for a hub repo id the validation
+                # pass only covered the token budget. Re-run it now that the
+                # checkpoint is local; a local path was fully checked at
+                # validation time and is not re-run.
+                if (isinstance(self.llm_args, TorchLlmArgs)
+                        and isinstance(self.llm_args.speculative_config,
+                                       DFlashDecodingConfig)):
+                    self.llm_args._validate_dflash_ctx_budget()
 
         # AutoDeploy doesn't use ModelLoader
         if self.llm_args.backend == "_autodeploy":

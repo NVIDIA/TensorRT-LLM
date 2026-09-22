@@ -142,13 +142,14 @@ statically checkable without runtime signature inspection.
 
 Ordinary sparse variants use `attention_output_hidden_size` and the shared
 output allocation. DeepSeek-V4's fused epilogue instead uses the optional
-output-preparation hook to create one token-major O-LoRA output tensor. Its
-context- and generation-phase helpers allocate the private FP8 attention and
-scale buffers, then write the O-LoRA result into the corresponding token range.
-The shared MLA custom-op contract exposes exactly one mutable output tensor;
-`_create_outputs()` keeps that tensor in a single-entry list through forward
-and output projection. Phase-specific scratch buffers remain inside the
-DeepSeek-V4 algorithm module and do not widen the generic hook facade.
+output-preparation hook to create one token-major O-LoRA-sized output tensor.
+Its context- and generation-phase helpers allocate the private FP8 attention
+and scale buffers, run both O-LoRA projections, and write the final hidden
+states into the leading columns of that tensor. The shared MLA custom-op
+contract exposes exactly one mutable output tensor; `_create_outputs()` keeps
+that tensor in a single-entry list through forward and output projection.
+Phase-specific scratch buffers remain inside the DeepSeek-V4 algorithm module
+and do not widen the generic hook facade.
 
 Sparse prediction inputs stay out of shared MLA APIs. Algorithm modules wrap
 their module-to-backend inputs in a `SparseBackendForwardArgs` subclass and
@@ -257,6 +258,7 @@ The core contract is:
   - `support_fused_rope()`
   - `support_fused_qkv()`
   - `support_mla()`
+  - `support_fp4_kv_cache()`
 - `runtime_workspace_bytes_per_token(model_config, mapping)` — the memory-accounting
   contract (default `0`); see below
 - `runtime_workspace_is_chunked_prefill_bounded(model_config)` — whether
@@ -398,8 +400,8 @@ independently with `is_supported(..., phase=...)`; a phased library accepts only
 phases backed by its corresponding `run_*()` entry point.
 
 `Fmha` owns both entry points. Libraries declare shared capabilities through
-class attributes, such as `supports_skip_correction` and
-`supports_block_sparse_inputs`, and override only
+class attributes, such as `supports_skip_correction`, `supports_block_sparse_inputs`,
+and `supports_fp4_mla`, and override only
 `_is_available()` and `_is_supported()` for implementation-specific checks.
 `is_available()` rejects unsupported static capabilities before calling
 `_is_available()`. `is_supported()` provides the same boundary for shared
@@ -420,8 +422,15 @@ The FMHA package is split by role:
   selection caching.
 - `fmha/phased.py` defines `PhasedFmha`, shared phase splitting, and the
   context/generation and MHA/MLA entry points.
+  Each phase's `FmhaParams` carries packed QKV in `qkv_input` or separate Q
+  in `query_input`, with the other field set to `None`. Separate K/V remain
+  in `key_input`/`value_input`, and `output` holds the phase's output view.
+  MLA uses `query_input` with `is_fused_qkv=False`.
 - `fmha/combined.py` composes different context and generation implementations
   for non-MLA mixed batches.
+- `fmha/fp4_mla.py` implements FP4 MLA using FP8 context attention with FP4
+  cache updates and FP4 no-dequant decode. It uses KV Cache Manager V2;
+  batch state, cache storage, and kernels live in `fp4_mla/`.
 - `fmha/triton_custom_mask.py` implements the Triton custom-mask context phase.
   Custom-mask data applies to context requests; for mixed batches,
   `TrtllmAttention` can pair it with a later causal-generation provider through

@@ -201,6 +201,7 @@ def make_manager(connector, num_extra_kv_tokens=0, is_draft=False):
     manager = object.__new__(KVCacheManagerV2)
     manager.kv_connector_manager = connector
     manager.is_draft = is_draft
+    manager.is_estimating_kv_cache = False
     manager.tokens_per_block = TOKENS_PER_BLOCK
     manager.num_extra_kv_tokens = num_extra_kv_tokens
     manager.kv_cache_map = {}

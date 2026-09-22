@@ -2,7 +2,7 @@
 
 `agent-flow` is a torch-like framework for composing agent-backed layers.
 Each layer implements `forward`, and each `AgentLayer.forward` performs one
-Claude Code or Codex SDK execution. Modules can be composed directly or used
+logical Claude Code or Codex invocation. Modules can be composed directly or used
 to build small orchestration harnesses.
 
 ## Prerequisites
@@ -65,6 +65,70 @@ Run it directly:
 ```bash
 python examples/quick_start.py
 ```
+
+## Backend behavior
+
+Define custom tools with `from agent_flow import tool`. Both backends accept
+these definitions and existing Claude SDK tool objects. Python shorthand and
+`TypedDict` inputs are normalized to JSON Schema. Explicit JSON Schemas are
+normalized to the root object shape MCP tools require (a string `type`, a
+`properties` key, and a root `$ref` moved into `allOf`) so both backends
+advertise the same schema. Resource links and embedded text resources become
+readable tool output; image results retain their MIME type. Unsupported result
+types return explicit tool errors.
+
+Declare required calls on the layer, independently of its backend:
+
+```python
+config = AgentLayerConfig(
+    backend=BackendConfig(kind="codex", model=CODEX_DEFAULT_MODEL, tools=tools),
+    required_tools=("append_reviewer_progress", "update_status"),
+)
+```
+
+Every listed tool must be attempted by the root agent during that invocation.
+If calls are missing, the framework sends one corrective SDK turn on the same
+session, including for stateless layers. It requests only the remaining calls.
+If they are still missing, `RequiredToolCallError` fails the invocation. This
+policy counts attempts, not successful writes; tool handlers and workflow
+validation remain responsible for the outputs. Token accounting includes both
+turns, while context occupancy remains the final snapshot.
+
+`BackendConfig.extra_mcp_servers` adds STDIO or HTTP MCP servers to one session.
+Codex translates these into thread configuration without editing global config.
+`AgentLayerConfig.disallowed_tools` removes matching framework tools and maps
+supported native controls, including shell, web search, image tools, and
+`mcp__SERVER__TOOL` exclusions. Codex rejects names it cannot enforce, such as a
+generic `Write` ban. Tool exclusions are distinct from filesystem permissions.
+
+Native hooks remain backend-specific. Claude accepts its SDK callback objects.
+For Codex, configure and trust native hooks through Codex itself; per-client
+hook injection is rejected because its trust cannot be verified. Prefer
+`required_tools` for workflow progress/status requirements on either backend.
+Claude receives tool annotations; Codex dynamic tools have no equivalent native
+annotation fields.
+
+Codex reports subagent activity, structured rate limits, cache-write tokens, and
+current context usage after a turn. `UsageInfo.estimated_thread_cost_usd` is an
+optional cumulative estimate, separate from reported `cost_usd`. Codex has no
+pre-input context query or resolved available-agent inventory API; inspection
+does not send a `ping` or another model turn to approximate either.
+
+The adapters target the SDK versions pinned in `pyproject.toml`. The Codex
+transport uses the SDK's public process/request APIs and one isolated
+notification observer to include child turns and account events. This observer
+is covered by transport tests against the pinned SDK.
+
+## Tests
+
+```bash
+pip install -e '.[test]'
+python -m pytest tests
+pre-commit run -a
+```
+
+Live Claude context-budget checks require local account configuration and are
+opt-in: `python -m pytest tests --run-live-backends -m live_backend`.
 
 ## Workflows
 
