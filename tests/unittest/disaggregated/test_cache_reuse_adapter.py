@@ -489,6 +489,22 @@ class TestAdapterBlockOrdinals:
         ordinals = _CacheReuseAdapterV1(mgr).get_block_ordinals(self._v1_req(), 0, _lg(window=512))
         np.testing.assert_array_equal(ordinals, [10, 11, 12, 13])
 
+    def test_v1_masks_logical_swa_prefix_even_with_zero_front_removed(self):
+        # reuse off / no speculation: addSequenceBatch allocates the whole
+        # prompt up front and adjustBlocksIfNeeded (physical detach) only runs
+        # during generation, so get_num_front_blocks_removed reads 0 here even
+        # though the prompt has already outgrown a 2-block (64-token) window.
+        chain = [10, 11, 12, 13, 14, 15, 16]  # 7 blocks * 32 tpb = 224-token prompt
+        req = _FakeReq(prompt_len=224)
+        req.py_request_id = 1
+        req.py_beam_width = 1
+        mgr = self._V1Mgr([chain], front_removed=0)
+        ordinals = _CacheReuseAdapterV1(mgr).get_block_ordinals(req, 0, _lg(window=64))
+        # Only the last 2 blocks (64 tokens) are within the window.
+        np.testing.assert_array_equal(ordinals, [-1, -1, -1, -1, -1, 15, 16])
+        # Evicted-looking ids must not be sent through primary-pool translation.
+        assert mgr.translated == [[15, 16]]
+
     def test_v1_fully_evicted_chain_is_all_holes(self):
         mgr = self._V1Mgr([[10, 11]], front_removed=5)
         ordinals = _CacheReuseAdapterV1(mgr).get_block_ordinals(self._v1_req(), 0, _lg(window=512))
