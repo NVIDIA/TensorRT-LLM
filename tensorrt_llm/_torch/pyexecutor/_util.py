@@ -230,6 +230,20 @@ def get_kv_cache_manager_cls(
         # the shared hybrid transceiver validation below: the Python NIXL
         # transceiver selects the Mixed manager, whose KDA recurrent/conv
         # states transfer through the bounce buffer.
+        # Helix x speculation bookkeeping (per-token verify groups on the
+        # superblock ledger, py_helix_decode_group_index advancement) exists
+        # only in KVCacheManagerV2. The V1-family hybrid managers account
+        # helix decode one token per iteration and have no helix-x-spec
+        # path, so a default (V1) resolution would run silently wrong.
+        if (model_config.mapping is not None
+                and model_config.mapping.has_cp_helix()
+                and model_config.spec_config is not None and not use_v2):
+            raise ValueError(
+                "Helix with speculative decoding requires "
+                "kv_cache_config.use_kv_cache_manager_v2=True; the V1-family "
+                "hybrid managers do not implement per-token verify-group "
+                "bookkeeping.")
+
         if is_kimi_linear(config) and not use_v2 and not is_disagg:
             if kv_cache_config.enable_block_reuse:
                 logger.info(
@@ -445,14 +459,20 @@ def get_mla_context_workspace_kv_len_cap(
         max_num_tokens,
         max_seq_len,
         enable_chunked_prefill,
-        workspace_is_chunked_prefill_bounded=True):
+        workspace_is_chunked_prefill_bounded=True,
+        chunked_workspace_profiled=True,
+        require_chunked_workspace_profile=True):
     """Max summed attended-KV length covered by the context-MLA workspace reserve.
 
     KV-cache reuse can grow this workspace beyond the fresh-prefill profiling
     floor. Chunked prefill normally prevents that by staging one bounded KV
     chunk per launch. An implementation that consumes the complete attended
     prefix sets ``workspace_is_chunked_prefill_bounded=False`` and receives the
-    same reservation and scheduler admission protection as cache reuse.
+    same reservation and scheduler admission protection as cache reuse. A
+    bounded chunk must also be exercised by profiling before dropping its
+    reservation (``chunked_workspace_profiled``) when
+    ``require_chunked_workspace_profile`` is enabled. Older hardware keeps
+    the existing backend-declared reserve policy without this new requirement.
 
     Otherwise the default (no override) is the never-stall worst case ``min(max_batch_size, max_num_tokens)
     * max_seq_len``: at most that many context requests run in a step, each attending at most ``max_seq_len``
@@ -462,7 +482,10 @@ def get_mla_context_workspace_kv_len_cap(
     """
     workspace_can_exceed_profile = (
         kv_cache_config.enable_block_reuse and not enable_chunked_prefill) or (
-            enable_chunked_prefill and not workspace_is_chunked_prefill_bounded)
+            enable_chunked_prefill and
+            (not workspace_is_chunked_prefill_bounded or
+             (require_chunked_workspace_profile
+              and not chunked_workspace_profiled)))
     if not workspace_can_exceed_profile:
         return None
     worst_case = min(max_batch_size, max_num_tokens) * max_seq_len
@@ -776,6 +799,7 @@ class KvCacheCreator:
         self._max_batch_size = max_batch_size
         self._net_max_seq_len = net_max_seq_len
         self._dummy_reqs = None
+        self._mla_chunked_profile_length: int | None = None
         self._dummy_encoder_inputs: List[MultimodalParams] = []
         self._profiling_stage_data = profiling_stage_data
         self._is_disagg = is_disagg
@@ -887,6 +911,7 @@ class KvCacheCreator:
                                 kv_cache_config: Optional[KvCacheConfig] = None,
                                 *,
                                 is_draft: bool = False,
+                                mapping=None,
                                 **extra_kwargs) -> CacheCost:
         kv_cache_config = (kv_cache_config if kv_cache_config is not None else
                            self._kv_cache_config)
@@ -903,7 +928,7 @@ class KvCacheCreator:
         return CacheCost.from_raw(
             manager_cls.get_cache_size_per_token(
                 model_config,
-                self._mapping,
+                mapping if mapping is not None else self._mapping,
                 tokens_per_block=self._tokens_per_block,
                 max_seq_len=self._max_seq_len,
                 max_batch_size=self._max_batch_size,
@@ -956,14 +981,33 @@ class KvCacheCreator:
         *,
         use_separate_draft_kv_cache: bool,
     ) -> Optional[CacheCost]:
-        """Return the draft manager's standalone cache cost, if it has one."""
+        """Return the draft manager's standalone cache cost, if it has one.
+
+        Under helix CP the drafter is dense rather than helix-sharded, so it is
+        costed with the same repurposed mapping runtime construction uses, then
+        the slope is multiplied by cp_size to express it per rank-LOCAL target
+        token (the target stores only every cp_size-th page per rank).
+        Intercepts are per-request rank-local bytes and stay unscaled.
+        """
+        draft_mapping = self._mapping
+        helix_cp_scale = 1
+        if self._mapping.has_cp_helix():
+            draft_mapping = self._mapping.repurpose_helix_cp_to_tp()
+            helix_cp_scale = self._mapping.cp_size
+
+        def scaled(cost: CacheCost) -> CacheCost:
+            return CacheCost(slope=cost.slope * helix_cp_scale,
+                             intercept=cost.intercept)
+
         if self._draft_model_engine is not None:
             draft_model_config = self._draft_model_engine.model.model_config
             draft_kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
                 self._draft_model_engine, kv_cache_config)
-            return self._per_manager_cache_cost(draft_kv_cache_manager_cls,
-                                                draft_model_config,
-                                                kv_cache_config)
+            return scaled(
+                self._per_manager_cache_cost(draft_kv_cache_manager_cls,
+                                             draft_model_config,
+                                             kv_cache_config,
+                                             mapping=draft_mapping))
         if use_separate_draft_kv_cache:
             # One-model draft with separate KV cache layout.
             # Pass num_layers explicitly since the HF config may report a
@@ -971,7 +1015,10 @@ class KvCacheCreator:
             # (e.g. EAGLE3: config says 1, runtime uses 4).
             # For PP, draft layers are only on the last rank (see
             # get_pp_layers), so only that rank should include draft cost.
-            effective_draft_config = self._get_effective_draft_config()
+            # _get_draft_kv_model_config(), not _get_effective_draft_config():
+            # the cost charged here must be the cost of the pool that
+            # _create_one_model_draft_kv_cache_manager actually allocates.
+            effective_draft_config = self._get_draft_kv_model_config()
             draft_kv_cache_config = self._get_one_model_draft_kv_cache_config(
                 kv_cache_config, self._max_seq_len)
             # Resolve draft manager class from draft config — may differ
@@ -986,18 +1033,22 @@ class KvCacheCreator:
                 draft_kv_cache_config)
             if self._speculative_config.spec_dec_mode.is_external_drafter():
                 # External drafter: layers start from 0, normal PP distribution
-                return self._per_manager_cache_cost(draft_kv_cache_manager_cls,
-                                                    effective_draft_config,
-                                                    draft_kv_cache_config,
-                                                    is_draft=True)
+                return scaled(
+                    self._per_manager_cache_cost(draft_kv_cache_manager_cls,
+                                                 effective_draft_config,
+                                                 draft_kv_cache_config,
+                                                 mapping=draft_mapping,
+                                                 is_draft=True))
             elif self._mapping.is_last_pp_rank():
                 # EAGLE3/MTP: draft layers only on last PP rank
-                return self._per_manager_cache_cost(
-                    draft_kv_cache_manager_cls,
-                    effective_draft_config,
-                    draft_kv_cache_config,
-                    num_layers=self._get_num_draft_layers(),
-                    is_draft=True)
+                return scaled(
+                    self._per_manager_cache_cost(
+                        draft_kv_cache_manager_cls,
+                        effective_draft_config,
+                        draft_kv_cache_config,
+                        mapping=draft_mapping,
+                        num_layers=self._get_num_draft_layers(),
+                        is_draft=True))
         return None
 
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
@@ -1019,6 +1070,42 @@ class KvCacheCreator:
         )
         return int(available_kv_mem)
 
+    def _get_mla_chunked_profile_length(self, input_seq_len: int) -> int | None:
+        """Length needed to profile two full cached-KV chunks with a full query."""
+        model_config = self._model_engine.model.model_config
+        # Skip-softmax preserves dense MLA. DSA-style hooks can switch to
+        # absorption before this request reaches a full cached-KV chunk.
+        if (not is_mla(model_config.pretrained_config)
+                or model_config.attn_backend != "TRTLLM"
+                or getattr(model_config.sparse_attention_config, "algorithm",
+                           None) not in (None, "skip_softmax")):
+            return None
+        # Beam search and speculative decoding use this same dense context
+        # path. Their extra KV capacity is accounted for by
+        # _get_token_num_for_estimation; neither needs a separate exclusion.
+        features = self._model_engine.attn_runtime_features
+        if not features.chunked_prefill or features.chunk_size <= 0:
+            return None
+        # MLA.forward_context uses full-gather on Hopper even when scheduler
+        # chunking is enabled. Only the SM100+ path bounds cached-KV staging.
+        if get_sm_version() < 100:
+            return None
+
+        kv_chunk_tokens = (features.chunk_size *
+                           features.chunked_prefill_buffer_batch_size)
+        # The previous loop's K/V tensors can remain live while the next
+        # chunk is expanded. Exercise two full cached-KV chunks in one forward
+        # to include this overlap, alongside a full query budget. Round the
+        # prefix up to a scheduler-step boundary so the final query is full.
+        cached_tokens = (ceil_div(2 * kv_chunk_tokens, self._max_num_tokens) *
+                         self._max_num_tokens)
+        profile_length = cached_tokens + self._max_num_tokens
+        if profile_length > input_seq_len:
+            # A short-context workload may fill the KV chunk through fan-out;
+            # a single long request cannot cover that case. Keep its reserve.
+            return None
+        return profile_length
+
     def _create_dummy_context_requests(
             self, input_seq_len: int) -> List[trtllm.Request]:
         # Keep the LLM dummy text-only so it can always fill max_num_tokens.
@@ -1028,8 +1115,18 @@ class KvCacheCreator:
         max_num_tokens = self._max_num_tokens
         max_beam_width = self._max_beam_width
 
-        input_seq_len = min(max_num_tokens, input_seq_len)
-        remaining_tokens = max_num_tokens
+        self._mla_chunked_profile_length = self._get_mla_chunked_profile_length(
+            input_seq_len)
+        if self._mla_chunked_profile_length is not None:
+            input_seq_len = self._mla_chunked_profile_length
+            remaining_tokens = input_seq_len
+            logger.info(
+                "Profiling chunked MLA with a cached prefix: "
+                f"prompt length {input_seq_len}, query budget {max_num_tokens}."
+            )
+        else:
+            input_seq_len = min(max_num_tokens, input_seq_len)
+            remaining_tokens = max_num_tokens
         while remaining_tokens > 0:
             input_seq_len = min(input_seq_len, remaining_tokens)
             input_tokens = torch.randint(low=0,
@@ -1498,17 +1595,34 @@ class KvCacheCreator:
         # covers exactly reserve/w tokens of summed attended KV; that count is carried to the KV manager as
         # the scheduler's admission cap so it never re-derives the cap from pool layout (which V2
         # overstates). No cap or w == 0 -> no-op.
-        w_bytes_per_token = get_attention_workspace_bytes_per_token(
-            self._model_engine.model.model_config, self._mapping)
+        # A completed chunk-aware profiling run already prices the cached-KV
+        # staging buffers in the measured peak. Do not subtract an additional
+        # workspace reserve or install an attended-KV admission cap for it.
+        profiled_mla_chunks = (py_executor is not None and not self._skip_est
+                               and self._mla_chunked_profile_length is not None)
+        w_bytes_per_token = (0 if profiled_mla_chunks else
+                             get_attention_workspace_bytes_per_token(
+                                 self._model_engine.model.model_config,
+                                 self._mapping))
         workspace_is_chunked_prefill_bounded = True
         if w_bytes_per_token > 0:
             workspace_is_chunked_prefill_bounded = (
                 get_attention_workspace_is_chunked_prefill_bounded(
                     self._model_engine.model.model_config))
         kv_len_cap = get_mla_context_workspace_kv_len_cap(
-            self._kv_cache_config, self._max_batch_size, self._max_num_tokens,
-            self._max_seq_len, self._llm_args.enable_chunked_prefill,
-            workspace_is_chunked_prefill_bounded)
+            self._kv_cache_config,
+            self._max_batch_size,
+            self._max_num_tokens,
+            self._max_seq_len,
+            self._llm_args.enable_chunked_prefill,
+            workspace_is_chunked_prefill_bounded,
+            chunked_workspace_profiled=profiled_mla_chunks,
+            # Chunk-aware profiling is SM100+ only. Preserve Hopper's existing
+            # backend-declared policy rather than adding a new reserve/cap to
+            # its dense full-gather path just because it cannot profile chunks.
+            require_chunked_workspace_profile=(
+                w_bytes_per_token > 0 and self._llm_args.enable_chunked_prefill
+                and get_sm_version() >= 100))
         if w_bytes_per_token > 0 and kv_len_cap:
             budget_before = kv_cache_max_memory
             workspace_reserve, self._fp8_ctx_mla_kv_len_cap = (
@@ -1701,10 +1815,18 @@ class KvCacheCreator:
         """
         if not self._is_kv_cache_manager_v2:
             return False
-        if not getattr(self._kv_cache_manager_cls,
-                       "_supports_reuse_match_backoff", False):
+        lookahead = draft_prompt_lookahead(self._speculative_config)
+        if lookahead is None:
             return False
-        return draft_prompt_lookahead(self._speculative_config) is not None
+        if lookahead > 0 and not getattr(self._kv_cache_manager_cls,
+                                         "_supports_reuse_match_backoff",
+                                         False):
+            # The opt-out is about backing the match off by `lookahead` tokens,
+            # which a specialized commit/history protocol (recurrent snapshots,
+            # DSA) cannot express. A zero span asks for no backoff at all, so
+            # every backoff-sized path stays a no-op and the pairing is safe.
+            return False
+        return True
 
     def _get_effective_draft_config(self) -> ModelConfig:
         """
@@ -1722,6 +1844,53 @@ class KvCacheCreator:
         # model's config describes the correct KV cache layout for the draft
         # layers as well.
         return self._model_engine.model.model_config
+
+    def _get_draft_kv_model_config(self) -> ModelConfig:
+        """The draft ModelConfig describing the KV pool as it is ALLOCATED.
+
+        The args-level ``kv_cache_config.dtype`` sync stamps the TARGET's fp8 KV
+        algo onto every loaded model, including a standalone drafter. The drafter
+        stores and reads its pool in its weights dtype (DFlash validates a bf16 pool
+        and otherwise falls back to the max_seq_len-dense private arena, which OOMs at
+        long context), so the pool dtype must follow the drafter.
+
+        Every consumer of draft KV bytes must go through here. If the budget split
+        and the allocation read different dtypes, the split charges fp8 bytes for a
+        bf16 pool and the draft manager gets HALF the target's tokens. The capacity
+        scheduler admits on the target pool alone, so past ~50% target utilization it
+        raises "Draft KV cache context resize failed", fatal to every rank.
+        """
+        effective_draft_config = self._get_effective_draft_config()
+        # Narrower than is_external_drafter(), matching
+        # _should_create_separate_draft_kv_cache. PARD and DRAFT_TARGET_ONE_MODEL
+        # reach here too and can carry a genuine fp8 KV algo of their own, which
+        # dtype="auto" keeps; dropping it would allocate bf16 under attention
+        # modules that still read and write fp8.
+        spec_dec_mode = self._speculative_config.spec_dec_mode
+        if not (spec_dec_mode.is_dflash() or spec_dec_mode.is_dspark()):
+            return effective_draft_config
+        quant_config = getattr(effective_draft_config, "quant_config", None)
+        if quant_config is None or not quant_config.quant_mode.has_fp8_kv_cache(
+        ):
+            return effective_draft_config
+        logger.info(
+            "External drafter KV pool keeps the drafter dtype; dropping "
+            "the fp8 KV quant algo inherited from the target.")
+        neutral_quant = copy.copy(quant_config)
+        neutral_quant.kv_cache_quant_algo = None
+        # QuantConfig.quant_mode and .layer_quant_mode are both cached_property
+        # and the copy carries the already-computed caches, so BOTH must be
+        # dropped for the mutation to take: _create_kv_cache_manager reads
+        # quant_mode off this copy, and layer_quant_mode is the pair's other
+        # half, stale in the same way.
+        neutral_quant.__dict__.pop("quant_mode", None)
+        neutral_quant.__dict__.pop("layer_quant_mode", None)
+        # No _frozen dance: ModelConfig.__setattr__ exempts quant_config by
+        # name, and restoring _frozen to True would freeze a copy whose source
+        # may not have been frozen.
+        effective_draft_config = copy.copy(effective_draft_config)
+        effective_draft_config.quant_config = neutral_quant
+        return effective_draft_config
 
     def _get_num_draft_layers(self) -> int:
         """Return the actual number of draft KV cache layers.
@@ -1779,8 +1948,11 @@ class KvCacheCreator:
         spec_dec_layer_mask = self._get_one_model_draft_layer_mask()
 
         # Get the effective draft config (explicit draft_config if available,
-        # otherwise fall back to target model config for MTP).
-        effective_draft_config = self._get_effective_draft_config()
+        # otherwise fall back to target model config for MTP), with the
+        # target's inherited fp8 KV algo dropped for a standalone drafter. The
+        # budget split in _get_kv_size_per_token resolves it through the SAME
+        # helper, so the bytes/token it charges match the pool allocated here.
+        effective_draft_config = self._get_draft_kv_model_config()
 
         kv_cache_config = (kv_cache_config_override if kv_cache_config_override
                            is not None else self._kv_cache_config)
@@ -1825,12 +1997,20 @@ class KvCacheCreator:
         # the sparse_attention_config. Get it from effective_draft_config which
         # falls back to the target model's config for MTP mode.
         sparse_attn_config = effective_draft_config.sparse_attention_config
+        # Under helix the standalone drafter is built against the repurposed
+        # mapping (CP ranks become TP ranks) and every rank keeps its full
+        # drafter KV, so its paged manager needs the CP-free mapping: the
+        # round-robin ledger applies to the TARGET KV alone, and
+        # KVCacheManagerV2 rejects is_draft x helix outright.
+        draft_mapping = self._mapping
+        if draft_mapping.has_cp_helix():
+            draft_mapping = draft_mapping.repurpose_helix_cp_to_tp()
         return _create_kv_cache_manager(
             model_engine=None,
             max_cuda_graph_batch_size=self._model_engine.
             _max_cuda_graph_batch_size,
             kv_cache_manager_cls=draft_kv_cache_manager_cls,
-            mapping=self._mapping,
+            mapping=draft_mapping,
             kv_cache_config=draft_kv_config,
             tokens_per_block=self._tokens_per_block,
             max_seq_len=max_seq_len,
@@ -2734,13 +2914,14 @@ def _create_kv_cache_manager(
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
         manager_extra_kwargs[
             "disable_overlap_scheduler"] = disable_overlap_scheduler
-        # V2 builds the block-reuse cache key of a multimodal token run from
-        # the vocabulary size. Resolve it here rather than per-branch: the
-        # manager needs it whenever block reuse can meet multimodal input,
-        # whichever branch below builds it, and a branch that omits it leaves
-        # the key generator to be called with None on the first image request.
-        manager_extra_kwargs["vocab_size"] = resolve_vocab_size(config)
-        if (manager_extra_kwargs["vocab_size"] is None
+        # Vocab size also enables multimodal event decoding and its per-block
+        # digest scan. Leave it unset for text-only engines. Without an engine
+        # (e.g. separate one-model draft caches), preserve config resolution:
+        # a text sub-config alone cannot identify a multimodal deployment.
+        needs_multimodal_keys = model_engine is None or model_engine.is_multimodal
+        manager_extra_kwargs["vocab_size"] = (resolve_vocab_size(config) if
+                                              needs_multimodal_keys else None)
+        if (needs_multimodal_keys and manager_extra_kwargs["vocab_size"] is None
                 and kv_cache_config.enable_block_reuse):
             logger.warning(
                 "Could not resolve vocab_size from the model config; "

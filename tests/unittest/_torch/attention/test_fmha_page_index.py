@@ -231,7 +231,7 @@ def test_flashinfer_generation_uses_phase_batch_size_for_padded_cross_batch(
         fwd=forward_args,
         workspace=torch.empty(0, dtype=torch.uint8),
         qkv_input=torch.empty((batch_size, 2, 4)),
-        context_buf=output,
+        output=output,
         sequence_lengths=torch.ones(batch_size, dtype=torch.int32),
         input_seq_length=1,
         num_tokens=batch_size,
@@ -287,6 +287,10 @@ def _cute_dsl_mla_helix_support(
         is_spec_dec_tree=False,
         is_spec_dec_dynamic_tree=False,
         helix_position_offsets=torch.zeros(batch_size, dtype=torch.int32),
+        # Multi-token decode under helix is admitted only when the speculative
+        # verify-group buffers are armed; unarmed is what this contract test
+        # exercises.
+        _helix_spec_tokens_valid=False,
         kv_cache_manager=SimpleNamespace(
             get_buffers=lambda _layer_idx: torch.empty(0, dtype=torch.bfloat16)
         ),

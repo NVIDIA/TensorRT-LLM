@@ -23,7 +23,10 @@ from fmha_test_utils import FakeAttention
 from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 from tensorrt_llm._torch.attention.backends.fmha.interface import Fmha, FmhaPhase
 from tensorrt_llm._torch.attention.backends.fmha.registry import FMHA_LIBS
-from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionForwardArgs,
+    AttentionInputType,
+)
 from tensorrt_llm._torch.attention.backends.sparse.params import (
     BlockSparseForwardInputs,
     SparseRuntimeParams,
@@ -41,6 +44,79 @@ class _MinimalFmha(Fmha):
         forward_args: AttentionForwardArgs,
     ) -> None:
         pass
+
+
+@pytest.mark.parametrize("initial_fused_qkv", [False, True])
+@pytest.mark.parametrize(
+    "input_type,sparse",
+    [
+        (AttentionInputType.context_only, False),
+        (AttentionInputType.context_only, True),
+        (AttentionInputType.generation_only, False),
+    ],
+)
+def test_mla_forward_clears_fused_qkv_before_fmha_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    input_type: AttentionInputType,
+    sparse: bool,
+    initial_fused_qkv: bool,
+) -> None:
+    sparse_params = SparseRuntimeParams(
+        sparse_attn_indices=torch.zeros(1, dtype=torch.int32) if sparse else None
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.attention.backends.trtllm.prepare_sparse_runtime_params",
+        lambda *args: sparse_params,
+    )
+    attn = Mock(spec=TrtllmAttention)
+    attn.sparse_params = None
+    attn.is_mla_enable = True
+    attn.num_heads = 2
+    attn.kv_lora_rank = 8
+    attn.qk_nope_head_dim = 4
+    attn.qk_rope_head_dim = 2
+    attn.print_skip_softmax_stat = False
+    attn.kv_scale_orig_quant = None
+    attn.kv_scale_quant_orig = None
+    attn.get_local_layer_idx.return_value = 0
+    attn._ensure_rope_table_size = Mock()
+    fmha = Mock()
+    attn._fmha_manager = Mock()
+    attn._fmha_manager.select.return_value = fmha
+
+    metadata = Mock(spec=TrtllmAttentionMetadata)
+    metadata.is_cross = False
+    metadata.enable_flash_mla = False
+    metadata.spec_bl_tree_first_sparse_mask_offset_kv = None
+    metadata.spec_decoding_bl_tree_mask = None
+    metadata.max_context_q_len_override = None
+    metadata.kv_cache_manager = None
+    lengths = torch.ones(1, dtype=torch.int32)
+    metadata.kv_lens_cuda_runtime = lengths
+    metadata.kv_lens_runtime = lengths
+    metadata.prompt_lens_cuda_runtime = lengths
+    metadata.prompt_lens_cpu_runtime = lengths
+    metadata.host_request_types_runtime = lengths
+    metadata.max_seq_len = 8
+
+    has_kv = input_type == AttentionInputType.context_only and not sparse
+    q_head_dim = (attn.qk_nope_head_dim if has_kv else attn.kv_lora_rank) + attn.qk_rope_head_dim
+    q = torch.empty((1, attn.num_heads * q_head_dim))
+    k = torch.empty_like(q) if has_kv else None
+    v = torch.empty_like(q) if has_kv else None
+    forward_args = AttentionForwardArgs(
+        output=torch.empty_like(q),
+        attention_input_type=input_type,
+        is_fused_qkv=initial_fused_qkv,
+    )
+
+    output = TrtllmAttention.forward(attn, q, k, v, metadata, forward_args)
+
+    attn._fmha_manager.select.assert_called_once_with(attn, q, k, v, metadata, forward_args)
+    fmha.forward.assert_called_once_with(q, k, v, metadata, forward_args)
+    assert not forward_args.is_fused_qkv
+    assert forward_args.update_kv_cache
+    assert output is forward_args.output
 
 
 @pytest.mark.parametrize("fmha_cls", FMHA_LIBS.values(), ids=FMHA_LIBS.keys())

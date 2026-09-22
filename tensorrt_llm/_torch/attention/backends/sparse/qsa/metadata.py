@@ -46,6 +46,13 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        # Draft-loop state; set by the speculative driver, read by the indexer.
+        self.qsa_in_mtp_draft_loop = False
+        self.qsa_indexer_skip_topk = False
+        self.qsa_mtp_num_accepted: Optional[torch.Tensor] = None
+        self.qsa_shared_topk_indices: Optional[torch.Tensor] = None
+        self.qsa_shared_topk_visible_blocks: Optional[torch.Tensor] = None
+        self.qsa_shared_topk_captured_slots: set[int] = set()
         if not isinstance(self.kv_cache_manager, QSAMambaHybridCacheManagerV2):
             raise TypeError("QSA sparse attention requires QSAMambaHybridCacheManagerV2")
         if not isinstance(self.sparse_metadata_params, QSASparseMetadataParams):
@@ -150,6 +157,50 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
         )
         self.qsa_topk_row_starts.zero_()
 
+        # One captured selection per sparse layer and request, reused by the
+        # MTP draft loop. The layer axis is required because each layer runs
+        # its own indexer projection over its own index-K cache, so their
+        # selections differ. ``shared_topk_visible_blocks`` records how many
+        # compressed groups were complete when the row was captured, so the
+        # reuse can tell which groups formed afterwards.
+        if self.sparse_metadata_params.mtp_index_share:
+            num_slots = len(self.kv_cache_manager.qsa_shared_topk_slots)
+            self.qsa_shared_topk_indices = self.get_empty(
+                buffers,
+                (
+                    num_slots,
+                    self.max_num_sequences,
+                    self.sparse_metadata_params.block_topk,
+                ),
+                cache_name="qsa_shared_topk_indices",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            self.qsa_shared_topk_visible_blocks = self.get_empty(
+                buffers,
+                (num_slots, self.max_num_sequences),
+                cache_name="qsa_shared_topk_visible_blocks",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+
+    def set_skip_topk(self, skip: bool) -> None:
+        """Mark a draft step that reuses the captured selection."""
+        self.qsa_indexer_skip_topk = skip
+
+    def set_in_mtp_draft_loop(self, active: bool) -> None:
+        """Bracket the MTP draft loop so the indexer captures once and reuses."""
+        self.qsa_in_mtp_draft_loop = active
+        # Readiness is per layer slot, not global: a layer may reuse only the
+        # row it captured itself, and the layers do not all capture in the same
+        # pass. A loop whose first step is a context pass captures nothing, so
+        # the next step captures layer by layer.
+        self.qsa_shared_topk_captured_slots.clear()
+
+    def set_mtp_num_accepted(self, num_accepted: Optional[torch.Tensor]) -> None:
+        """Supply the per-request accepted counts used to pick the capture row."""
+        self.qsa_mtp_num_accepted = num_accepted
+
     def _refresh_qsa_token_mapping(self) -> None:
         """Map packed rows to requests, logical positions, and causal limits."""
         num_seqs = self.num_seqs
@@ -243,6 +294,17 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
         # Page allocation is unchanged within the step, so only the row mapping
         # depends on the updated lengths.
         self._refresh_qsa_token_mapping()
+
+    def update_for_spec_dec(self) -> None:
+        """Refresh the row mapping after a draft step repacks the batch.
+
+        The first draft step rewrites seq_lens from one row per accepted token
+        to a single row per request and advances kv_lens_cuda in place, so the
+        packed-row mapping built during prepare() no longer describes the rows
+        the next draft step attends over.
+        """
+        super().update_for_spec_dec()
+        self.on_update_kv_lens()
 
 
 __all__ = ["QSAAttentionMetadata"]

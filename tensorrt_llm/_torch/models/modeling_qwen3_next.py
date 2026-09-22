@@ -301,6 +301,10 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             layer_idx=layer_idx,
             weight_loading_mode=weight_loading_mode,
             override_quant_config=expert_quant_config,
+            # A MegaMoE request that degraded to CUTLASS would still be
+            # measured as MegaMoE, so report the rejection trail instead.
+            allow_backend_degradation=moe_model_config.moe_backend
+            not in ("MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"),
         )
 
         self.shared_expert = GatedMLP(
