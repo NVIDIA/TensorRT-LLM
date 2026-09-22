@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # GSM8K under the InferenceX protocol (GSM8KInferenceX in accuracy_core.py).
-# accuracy: mean of the published InferenceX vLLM B200 FP4 rows run with thinking enabled
-# (inferencex.semianalysis.com/api/v1/evaluations, 2026-08). threshold: explicit floor
+# FP8-KV accuracy: mean of the published InferenceX vLLM B200 FP4 rows run
+# with thinking enabled (inferencex.semianalysis.com/api/v1/evaluations, 2026-08).
+# NVFP4-KV accuracy: measured TRT-LLM result below. Thresholds are explicit floors
 # (InferenceX's own gate is 90.0).
 nvidia/MiniMax-M3-NVFP4:
   # MSA path, FP8 KV cache, one-model Eagle3, thinking_mode enabled (rows: 97.27, 96.74).
@@ -11,9 +12,10 @@ nvidia/MiniMax-M3-NVFP4:
     spec_dec_algo: Eagle3
     accuracy: 97.0
     threshold: 94.0
-  # Same InferenceX protocol and acceptance floor with hybrid NVFP4 KV storage.
+  # Measured MSA hybrid NVFP4 KV + Eagle3 on 4 B200 GPUs (TP4/EP4), 2026-09-22.
+  # Thinking enabled; full 1319-sample split. Retain the validated 94% floor.
   - quant_algo: MIXED_PRECISION
     kv_cache_quant_algo: NVFP4
     spec_dec_algo: Eagle3
-    accuracy: 97.0
+    accuracy: 96.664
     threshold: 94.0

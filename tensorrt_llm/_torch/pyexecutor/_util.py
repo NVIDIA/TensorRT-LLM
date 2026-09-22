@@ -24,7 +24,6 @@ import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
                                  is_sm_100f, prefer_pinned,
                                  str_dtype_to_binding, torch_dtype_to_str)
-from tensorrt_llm.bindings import DataType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 # isort: off
@@ -1931,9 +1930,8 @@ class KvCacheCreator:
         max_attention_window = (None if estimating_kv_cache else
                                 self._get_draft_max_attention_window(
                                     max_seq_len, kv_cache_config))
-        draft_config = kv_cache_config.model_copy(
+        return kv_cache_config.model_copy(
             update={"max_attention_window": max_attention_window})
-        return draft_config
 
     def _create_one_model_draft_kv_cache_manager(
         self,
@@ -1962,9 +1960,6 @@ class KvCacheCreator:
             kv_cache_config,
             max_seq_len,
             estimating_kv_cache=estimating_kv_cache)
-        draft_kv_cache_dtype_override = (str_dtype_to_binding(
-            draft_kv_config.dtype) if draft_kv_config.dtype
-                                         != kv_cache_config.dtype else None)
         draft_kv_config.max_attention_window = (
             _expand_attention_window_pattern_to_global_layers(
                 draft_kv_config.max_attention_window,
@@ -2017,7 +2012,6 @@ class KvCacheCreator:
             kv_cache_manager_cls=draft_kv_cache_manager_cls,
             mapping=draft_mapping,
             kv_cache_config=draft_kv_config,
-            kv_cache_dtype_override=draft_kv_cache_dtype_override,
             tokens_per_block=self._tokens_per_block,
             max_seq_len=max_seq_len,
             max_batch_size=self._max_batch_size,
@@ -2743,8 +2737,7 @@ def _create_kv_cache_manager(
         cold_page_codec_provider: Optional[object] = None,
         kv_events_config: Optional[KVEventsConfig] = None,
         joint_kv_cache_reuse: bool = False,
-        max_cuda_graph_batch_size: Optional[int] = None,
-        kv_cache_dtype_override: Optional[DataType] = None) -> KVCacheManager:
+        max_cuda_graph_batch_size: Optional[int] = None) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -2883,8 +2876,6 @@ def _create_kv_cache_manager(
         kv_cache_dtype = tensorrt_llm.bindings.DataType.NVFP4
     else:
         kv_cache_dtype = str_dtype_to_binding(torch_dtype_to_str(dtype))
-    if kv_cache_dtype_override is not None:
-        kv_cache_dtype = kv_cache_dtype_override
 
     # Use provided num_layers if available, otherwise use config.
     # When layer_mask is set (e.g., KV sharing), num_layers for the cache

@@ -7559,8 +7559,11 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             assert steps > 0, "no speculative iterations recorded"
             chat_rate = accepted / drafted
             chat_length = 1 + accepted / steps
-            # Reference: the MHA drafter card (Inferact/MiniMax-M3-EAGLE3)
+            # FP8 reference: the MHA drafter card (Inferact/MiniMax-M3-EAGLE3)
             # reports 0.839 / 3.518; the GQA head measures 0.838 / 3.515 here.
+            # NVFP4 KV: TP4/EP4 B200 default/InferenceX probes on 2026-09-22
+            # measured 0.832/3.497 and 0.835/3.506. Retain 0.78/3.3 as
+            # regression floors with margin for batch/scheduling variation.
             print(
                 f"MiniMax-M3 Eagle3 chat-GSM8K acceptance (KV={kv_dtype}): rate="
                 f"{chat_rate:.3f}, mean acceptance length="
@@ -7570,8 +7573,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             min_length = 3.3 if kv_dtype == "nvfp4" else 3.4
             assert chat_rate > min_rate, \
                 f"Eagle3 chat-GSM8K acceptance rate too low: {chat_rate:.3f} " \
-                f"(threshold {min_rate}, reference 0.839 from the drafter card)"
+                f"(threshold {min_rate}, KV={kv_dtype})"
             assert chat_length > min_length, \
                 f"Eagle3 chat-GSM8K acceptance length too low: " \
-                f"{chat_length:.3f} (threshold {min_length}, reference 3.518 from " \
-                f"the drafter card)"
+                f"{chat_length:.3f} (threshold {min_length}, KV={kv_dtype})"
