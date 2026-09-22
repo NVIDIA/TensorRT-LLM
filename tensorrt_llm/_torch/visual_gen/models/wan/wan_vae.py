@@ -371,6 +371,21 @@ class WanCausalConv3d(nn.Conv3d):
         if any(padding):
             x = F.pad(x, padding)
         x = _channels_last_3d_if_needed(x)
+        if type(self) is WanCausalConv3d and self.padding_mode == "zeros":
+            from .cudnn_conv_bias import try_conv_bias
+
+            fused = try_conv_bias(
+                x,
+                self.weight,
+                self.bias,
+                self.stride,
+                self.padding if spatial_padding is None else (0, *spatial_padding),
+                self.dilation,
+                self.groups,
+                training=self.training,
+            )
+            if fused is not None:
+                return _channels_last_3d_if_needed(fused)
         if spatial_padding is None:
             x = super().forward(x)
         else:
@@ -389,6 +404,21 @@ class WanCausalConv3d(nn.Conv3d):
 class WanConv2d(nn.Conv2d):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = _channels_last_2d_if_needed(x)
+        if type(self) is WanConv2d and self.padding_mode == "zeros":
+            from .cudnn_conv_bias import try_conv_bias
+
+            fused = try_conv_bias(
+                x,
+                self.weight,
+                self.bias,
+                self.stride,
+                self.padding,
+                self.dilation,
+                self.groups,
+                training=self.training,
+            )
+            if fused is not None:
+                return _channels_last_2d_if_needed(fused)
         x = super().forward(x)
         return _channels_last_2d_if_needed(x)
 
