@@ -21,19 +21,24 @@ several engines, one that has to survive a restart, or one whose capacity comes
 from nodes that run no connector.
 """
 
+import contextlib
 import json
 import os
 import signal
 import tempfile
-import threading
 import time
 from typing import Optional
 
 import click
 
 import tensorrt_llm.usage as usage
+from tensorrt_llm.commands import _telemetry as _command_telemetry
 from tensorrt_llm.logger import logger
 from tensorrt_llm.usage.config import UsageContext
+
+#: How long a donor with heartbeats turned off sleeps between wakeups. Only
+#: the signal that ends the command interrupts it, so the value is arbitrary.
+_IDLE_POLL_SECONDS = 60.0
 
 #: Both commands sit in the telemetry-aware `trtllm-serve` group, so they have
 #: to offer the same opt-out the group documents.
@@ -60,22 +65,32 @@ def _apply_cli_telemetry(telemetry: bool) -> None:
     )
 
 
-def _until_signalled() -> threading.Event:
-    """An event that SIGINT and SIGTERM set.
+@contextlib.contextmanager
+def _signal_handoff():
+    """Turn SIGINT and SIGTERM into the exit the telemetry boundary expects.
 
     Both commands hold a resource, a child process or a mounted segment, whose
     release is in a `finally`. Default SIGTERM handling would skip it, leaving
     the master unreaped or the pool advertising memory that has gone.
+
+    `raise_signal_exit` unwinds those context managers and carries the signal
+    number out to `trtllm-serve`'s boundary, which is what classifies the exit
+    as a signal. A handler that only set a flag and let the command return
+    normally would be reported as a clean pre-model exit instead, and taking
+    `threading.Event`'s lock from inside a synchronous handler is unsafe on
+    its own.
+
+    Wrap this around the resource so the log line below follows the release.
     """
-    stopping = threading.Event()
-
-    def stop(signum, _frame):
-        logger.info(f"mooncake-store: signal {signum} received, shutting down")
-        stopping.set()
-
     for received in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(received, stop)
-    return stopping
+        signal.signal(received, _command_telemetry.raise_signal_exit)
+    try:
+        yield
+    except _command_telemetry.SignalExit as stopping:
+        # Logged here rather than in the handler, which must not take the
+        # logging lock.
+        logger.info(f"mooncake-store: signal {stopping.signal_number} received, shut down")
+        raise
 
 
 @click.command("mooncake_master")
@@ -158,8 +173,7 @@ def mooncake_master(
         or tempfile.mkdtemp(prefix="trtllm-mooncake-master-")
     )
 
-    stopping = _until_signalled()
-    with running_master(pool, run_dir, address_file=address_file) as master:
+    with _signal_handoff(), running_master(pool, run_dir, address_file=address_file) as master:
         logger.info(
             f"mooncake-store: this master owns the pool until this command "
             f"stops; address {master.address}, log {master.log_path}, metrics "
@@ -167,14 +181,15 @@ def mooncake_master(
         )
         started = time.monotonic()
         announced = started
-        while not stopping.is_set():
+        # Left for a signal to end, which raises through the sleep below.
+        while True:
             if (code := master.process.poll()) is not None:
                 # The pool is gone once the master dies, and every client is
                 # about to start failing.
                 raise click.ClickException(
                     f"mooncake_master exited with code {code}. See {master.log_path}"
                 )
-            stopping.wait(1.0)
+            time.sleep(1.0)
             now = time.monotonic()
             # Distinguishes a dead master from a dead fabric.
             if heartbeat_seconds > 0 and now - announced >= heartbeat_seconds:
@@ -317,15 +332,19 @@ def mooncake_donor(
     resolved = resolve_master_address(master, master_timeout())
     wait_for_master(resolved)
 
-    stopping = _until_signalled()
-    with donate_segment(
-        resolved,
-        donating,
-        protocol=protocol or raw.get("protocol", "rdma"),
-        device_name=device_name or raw.get("device_name", "") or "",
-        metadata_server=(metadata_server or raw.get("metadata_server") or DEFAULT_METADATA_SERVER),
-        local_buffer_size=buffer_size,
-    ) as host:
+    with (
+        _signal_handoff(),
+        donate_segment(
+            resolved,
+            donating,
+            protocol=protocol or raw.get("protocol", "rdma"),
+            device_name=device_name or raw.get("device_name", "") or "",
+            metadata_server=(
+                metadata_server or raw.get("metadata_server") or DEFAULT_METADATA_SERVER
+            ),
+            local_buffer_size=buffer_size,
+        ) as host,
+    ):
         if ready_file:
             with open(ready_file, "w") as handle:
                 handle.write(f"{host} {donating}\n")
@@ -336,15 +355,16 @@ def mooncake_donor(
             )
 
         # Idle by design: a put or get here would make this node a traffic
-        # client, which is what donation exists to avoid.
+        # client, which is what donation exists to avoid. Left for a signal to
+        # end, which raises through the sleep below.
         started = time.monotonic()
-        while not stopping.is_set():
+        while True:
             if heartbeat_seconds <= 0:
-                stopping.wait()
+                time.sleep(_IDLE_POLL_SECONDS)
                 continue
-            if not stopping.wait(heartbeat_seconds):
-                logger.info(
-                    f"mooncake-store: {host} still lending "
-                    f"{donating / 1024**3:.1f}GiB to the pool at {master} "
-                    f"after {(time.monotonic() - started) / 60:.0f}m"
-                )
+            time.sleep(heartbeat_seconds)
+            logger.info(
+                f"mooncake-store: {host} still lending "
+                f"{donating / 1024**3:.1f}GiB to the pool at {master} "
+                f"after {(time.monotonic() - started) / 60:.0f}m"
+            )
