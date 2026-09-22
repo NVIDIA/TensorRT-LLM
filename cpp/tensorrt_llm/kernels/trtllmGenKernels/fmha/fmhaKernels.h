@@ -654,12 +654,25 @@ private:
         // Device the sweep was registered for. The fingerprint already includes it;
         // kept here so the verify pass only picks up sweeps for the current device.
         int mDeviceId;
+        // The kernel instance that registered this sweep. The registry is shared
+        // across all TllmGenFmhaKernel objects on the same device (different dtypes
+        // / attention configs); without this, one instance's verify pass could
+        // consume another's entry and mark it verified without ever checking it.
+        TllmGenFmhaKernel const* mKernelInstance;
     };
+
+    // All three singletons below are intentionally leaked (heap-allocated, never
+    // destroyed). The async warmup worker is also leaked, and a queued background
+    // task can use any of these at any time during process teardown. C++ destroys
+    // function-local statics in reverse construction order, so a non-leaked
+    // static mutex or counter could be destroyed before the factory's kernels,
+    // leaving the destructor's drain() waiting on a task that touches destroyed
+    // state. Leaking keeps them alive for the remainder of the process.
 
     static std::mutex& getJITWarmupRegistryMutex()
     {
-        static std::mutex sMutex;
-        return sMutex;
+        static auto* sMutex = new std::mutex();
+        return *sMutex;
     }
 
     static std::unordered_map<uint64_t, JITWarmupConfig>& getJITWarmupRegistry()
@@ -671,8 +684,8 @@ private:
     // Number of configs in kBackgroundDone state (cheap gate for the verify pass).
     static std::atomic<int>& getNumUnverifiedJITWarmups()
     {
-        static std::atomic<int> sCount{0};
-        return sCount;
+        static auto* sCount = new std::atomic<int>(0);
+        return *sCount;
     }
 
     // Registers a warmup configuration; returns true if an identical sweep was
@@ -690,6 +703,7 @@ private:
         config.mParams = params;
         config.mState = initialState;
         config.mDeviceId = tensorrt_llm::common::getDevice();
+        config.mKernelInstance = this;
         registry.emplace(fingerprint, std::move(config));
         return false;
     }
@@ -725,9 +739,13 @@ private:
         {
             return;
         }
-        // Only verify sweeps registered for the current device: the sweep re-runs on
-        // this thread, and compiled modules load into the current device's context.
+        // Only verify sweeps registered for the current device AND kernel
+        // instance: the sweep re-runs on this thread through this kernel's
+        // table, and compiled modules load into the current device's context.
+        // Without the instance filter, one kernel (e.g. fp8) could consume
+        // another's (e.g. bf16) entry and mark it verified without checking it.
         int const currentDevice = tensorrt_llm::common::getDevice();
+        TllmGenFmhaKernel const* const currentInstance = this;
         while (true)
         {
             uint64_t fingerprint = 0;
@@ -736,9 +754,10 @@ private:
                 std::lock_guard<std::mutex> lock(getJITWarmupRegistryMutex());
                 auto& registry = getJITWarmupRegistry();
                 auto it = std::find_if(registry.begin(), registry.end(),
-                    [currentDevice](auto const& entry) {
+                    [currentDevice, currentInstance](auto const& entry) {
                         return entry.second.mState == JITWarmupState::kBackgroundDone
-                            && entry.second.mDeviceId == currentDevice;
+                            && entry.second.mDeviceId == currentDevice
+                            && entry.second.mKernelInstance == currentInstance;
                     });
                 if (it == registry.end())
                 {
