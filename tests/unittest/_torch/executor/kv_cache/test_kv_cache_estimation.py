@@ -350,6 +350,8 @@ def test_regression_without_fix_would_overcount():
     wrong = tp * 3 * tpb  # 768  (all duplicates summed)
     assert result == correct
     assert result != wrong
+
+
 def test_integrated_gpu_estimation_ignores_affine_intercept():
     """Unified-memory estimation must not clamp to zero just because the
     recurrent-state fixed cost exceeds the mem_get_info-derived budget."""
@@ -374,8 +376,6 @@ def test_integrated_gpu_estimation_ignores_affine_intercept():
         ),
     ):
         assert c._get_token_num_for_estimation() == 64
-
-
 
 
 @pytest.mark.parametrize(
