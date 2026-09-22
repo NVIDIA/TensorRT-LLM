@@ -10,9 +10,12 @@
  *
  * Ported from the standalone MoE Perf Dashboard (moe-perf-analysis/web/index.html).
  * Two deliberate departures from that original:
- *   1. Colour comes from the theme's --pst-color-* variables instead of a private
- *      palette, so the widget follows the documentation's light/dark switch rather
- *      than the OS preference.
+ *   1. Surfaces and copy follow the documentation theme (--pst-color-*) so the
+ *      widget tracks the page's light/dark switch. Accent, winner, and warning
+ *      colours come from the NVIDIA 2026 Light annotation palette used in the
+ *      MoE Perf Guide slides, not from PyData's success/warning tokens — those
+ *      are a teal and a GitHub orange that do not sit next to the NVIDIA-green
+ *      option cards.
  *   2. The controls sit in a bar across the top instead of a fixed left rail — a
  *      full-height rail has nowhere to stand inside a documentation column.
  */
@@ -24,6 +27,16 @@
    which puts them outside #moe-dashboard's inheritance. */
 #moe-dashboard,
 .multi-panel {
+  /* NVIDIA 2026 Light annotation palette (same family as the MoE Perf Guide
+     slides): lime #76B900 for chrome, ink #548800 for green text, wash #F1F7E8
+     for the winning row, amber #EF9100 / #FFF7E7 for warnings. Surfaces and
+     copy still come from the documentation theme so light/dark follows the page. */
+  --nv-green:      var(--nv-color-green, #76b900);
+  --nv-green-ink:  #548800;
+  --nv-green-wash: #f1f7e8;
+  --nv-amber:      #ef9100;
+  --nv-amber-wash: #fff7e7;
+
   --bg:            transparent;
   --panel:         var(--pst-color-on-background);
   /* The shaded strips — card header and table header — take the theme's own table
@@ -35,19 +48,30 @@
   --line-strong:   var(--pst-color-text-muted);
   --text:          var(--pst-color-text-base);
   --muted:         var(--pst-color-text-muted);
-  --accent:        var(--pst-color-primary);
-  --accent-weak:   var(--pst-color-primary-bg);
-  --best:          var(--pst-color-success);
-  --best-weak:     var(--pst-color-success-bg);
-  --best-line:     var(--pst-color-success);
-  --warn:          var(--pst-color-warning);
-  --warn-weak:     var(--pst-color-warning-bg);
-  --warn-line:     var(--pst-color-warning);
+  --accent:        var(--nv-green);
+  --accent-weak:   var(--nv-green-wash);
+  /* Same colour the documentation sidebar uses for the current page
+     (`nav.bd-links .current > a` → --pst-color-primary, weight 600). */
+  --best:          var(--pst-color-primary);
+  --best-weak:     var(--nv-green-wash);
+  --best-line:     var(--nv-green);
+  --warn:          var(--nv-amber);
+  --warn-weak:     var(--nv-amber-wash);
+  --warn-line:     var(--nv-amber);
   --shadow:        0 1px 2px var(--pst-color-shadow), 0 6px 18px -8px var(--pst-color-shadow);
   --radius:        8px;
   --radius-sm:     6px;
   --mono:          ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
                    "Liberation Mono", monospace;
+}
+
+/* Slide ink is specified for a white page. On the dark documentation theme the
+   lime itself is the readable green, and the washes become translucent overlays. */
+html[data-theme="dark"] #moe-dashboard,
+html[data-theme="dark"] .multi-panel {
+  --nv-green-ink:  var(--nv-green);
+  --nv-green-wash: color-mix(in srgb, var(--nv-green) 18%, transparent);
+  --nv-amber-wash: color-mix(in srgb, var(--nv-amber) 16%, transparent);
 }
 
 /* Browser surfaces we did not draw still carry the design. */
@@ -282,7 +306,7 @@
 #moe-dashboard .topn tbody tr:last-child th, #moe-dashboard .topn tbody tr:last-child td { border-bottom: 0; }
 #moe-dashboard .topn th {
   font-size: 11px; font-weight: 500; letter-spacing: .04em;
-  text-transform: uppercase; color: var(--muted);
+  text-transform: uppercase; color: var(--text);
   background: var(--panel);
 }
 /* PORTED: colour must be stated here, not inherited. The documentation theme
@@ -298,24 +322,29 @@
   width: 1%; color: var(--muted); font-size: 13px; font-weight: 500;
   font-variant-numeric: tabular-nums; text-align: right;
 }
-#moe-dashboard .topn .detail { color: var(--muted); font-size: 13px; }
+#moe-dashboard .topn .detail { color: var(--text); }
 #moe-dashboard .topn .num { font-variant-numeric: tabular-nums; text-align: right; }
-#moe-dashboard .topn .metric { font-weight: 600; }
 
-/* The winner never rides on colour alone: a tinted row, a green rank, a green
-   metric, and the word "fastest" in the comparison column — four channels, of
-   which three survive with colour removed. */
-#moe-dashboard .topn tr.best td, #moe-dashboard .topn tr.best th { background: var(--best-weak); }
-#moe-dashboard .topn tr.best:hover td, #moe-dashboard .topn tr.best:hover th { background: var(--best-weak); }
-#moe-dashboard .topn tr.best .rank { color: var(--best); }
-#moe-dashboard .topn tr.best .metric { color: var(--best); }
+/* The winning row is the same signal as the sidebar's current page: primary
+   colour at weight 600. The table itself stays a flat white field — no zebra,
+   no wash — so the type is the only mark. */
+#moe-dashboard .topn tr.best td,
+#moe-dashboard .topn tr.best th {
+  color: var(--best);
+  font-weight: 600;
+}
+#moe-dashboard .topn tr.best .rank,
+#moe-dashboard .topn tr.best .detail,
+#moe-dashboard .topn tr.best .metric,
+#moe-dashboard .topn tr.best .delta-num {
+  color: var(--best);
+}
 
-/* vs fastest: the number alone. */
+/* vs fastest: the number alone, same colour as the rest of the row. */
 #moe-dashboard .delta-num {
   font-variant-numeric: tabular-nums; font-size: 13px;
-  text-align: right; color: var(--muted);
+  text-align: right; color: var(--text);
 }
-#moe-dashboard tr.best .delta-num { color: var(--best); font-weight: 600; }
 
 #moe-dashboard .card-empty { padding: 22px 14px; color: var(--muted); font-size: 13px; }
 
@@ -354,8 +383,8 @@
   /* width:1% from the table rule survives into a flex row it no longer suits and
      leaves the rank value hugging its label while every sibling right-aligns. */
 #moe-dashboard .topn .rank { width: auto; text-align: right; font-size: 13px; }
-#moe-dashboard .topn tr.best td, #moe-dashboard .topn tr.best th { background: none; }
-#moe-dashboard .topn tbody tr.best { background: var(--best-weak); }
+#moe-dashboard .topn tr.best td, #moe-dashboard .topn tr.best th { background: none; color: var(--best); }
+#moe-dashboard .topn tbody tr.best { background: none; color: var(--best); }
 }
 @media (prefers-reduced-motion: reduce) {
 #moe-dashboard, #moe-dashboard * { transition-duration: .01ms !important; animation-duration: .01ms !important; }
@@ -539,3 +568,47 @@
    no local batch is chosen, so matching the bare class would reserve the gap on
    every render. */
 #moe-dashboard .status-bar:has(.merge-toggle:not([hidden])) { margin: 0 0 10px; }
+
+/* ------------------------------------------------ results: PPT annotation --- */
+/* Result cards keep the NVIDIA-green leading edge of the Guide's recommended
+   panels. The table inside is a flat white field: black headers, no zebra,
+   last two columns the same colour as the rest. The winning row is marked the
+   same way the sidebar marks the current page — --pst-color-primary at 600. */
+#moe-dashboard .card {
+  border: 1px solid var(--pst-color-shadow);
+  border-left: 4px solid var(--nv-green);
+}
+
+#moe-dashboard .card-head {
+  background: var(--nv-green-wash);
+}
+
+#moe-dashboard .topn th {
+  color: var(--text);
+  font-weight: 500;
+  background: var(--panel);
+}
+
+#moe-dashboard .topn tbody tr:hover td,
+#moe-dashboard .topn tbody tr:hover th {
+  background: var(--panel-hover);
+}
+
+#moe-dashboard .topn tr.best td,
+#moe-dashboard .topn tr.best th,
+#moe-dashboard .topn tr.best:hover td,
+#moe-dashboard .topn tr.best:hover th {
+  background: var(--panel);
+  color: var(--best);
+}
+
+@media (max-width: 700px) {
+  #moe-dashboard .topn tr.best td,
+  #moe-dashboard .topn tr.best th {
+    background: none;
+  }
+  #moe-dashboard .topn tbody tr.best {
+    background: none;
+    color: var(--best);
+  }
+}
