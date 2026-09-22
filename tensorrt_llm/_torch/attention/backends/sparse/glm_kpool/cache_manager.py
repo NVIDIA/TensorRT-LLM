@@ -82,7 +82,9 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
                 f"glm5_next sparse layers span V2 layer groups {sorted(pools)}; "
                 "the slot-indexed latent/index views require a single group"
             )
-        return self.get_batch_base_page_indices(list(request_ids), layer_idx=local_layers[0])
+        return self.get_batch_cache_indices(
+            list(request_ids), layer_idx=local_layers[0], raw_indices=True
+        )
 
     def get_latent_state_buffer(self, layer_idx: int) -> torch.Tensor | None:
         """Return a slot-major [slots, tokens_per_block, num_kv_heads, head_dim] view.
