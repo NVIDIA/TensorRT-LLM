@@ -21,7 +21,6 @@ from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkin
 from tensorrt_llm.logger import logger
 
 from ...disaggregation import diagnostics as disagg_diagnostics
-from ...disaggregation.base.transfer import get_unique_rid
 from ..llm_request import (
     LlmRequest,
     LlmRequestState,
@@ -782,37 +781,40 @@ class KVCacheV2Scheduler(RequestScheduler):
         # would also require draft KV transfer and history_length=prompt_len.
         prepared = self.kv_cache_manager.prepare_disagg_gen_init(req)
         if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
-            with disagg_diagnostics.suppress_diagnostic_errors():
-                kv_cache = self.kv_cache_manager.kv_cache_map.get(req.py_request_id)
-                capacity_tokens = getattr(kv_cache, "capacity", None)
-                history_tokens = getattr(kv_cache, "history_length", None)
-                capacity_block_equivalent = (
-                    (capacity_tokens + self.tokens_per_block - 1) // self.tokens_per_block
-                    if capacity_tokens is not None and self.tokens_per_block > 0
-                    else None
-                )
-                prompt_tokens = getattr(req, "total_input_len_cp", None)
-                if prompt_tokens is None:
-                    prompt_tokens = req.prompt_len
-                disagg_diagnostics.emit_event(
-                    "gen_kv_admission_result",
-                    side="gen",
-                    request_id=get_unique_rid(req),
-                    local_request_id=req.py_request_id,
-                    rank=self.kv_cache_manager.mapping.rank,
-                    outcome="admitted" if prepared else "deferred",
-                    reason=None if prepared else "kv_or_index_capacity",
-                    prompt_tokens=prompt_tokens,
-                    tokens_per_block=self.tokens_per_block,
-                    cache_present=kv_cache is not None,
-                    capacity_tokens=capacity_tokens,
-                    history_tokens=history_tokens,
-                    capacity_block_equivalent=capacity_block_equivalent,
-                )
+            self._emit_disagg_kv_admission_result(req, prepared)
         if not prepared:
             logger.debug("prepare_disagg_gen_init failed for request %s", req.py_request_id)
             return ScheduleAction.SKIP, 0
         return ScheduleAction.SCHEDULED, 0
+
+    def _emit_disagg_kv_admission_result(self, req: LlmRequest, prepared: bool) -> None:
+        """Observe the completed allocation attempt without affecting scheduling."""
+        with disagg_diagnostics.suppress_diagnostic_errors():
+            kv_cache = self.kv_cache_manager.kv_cache_map.get(req.py_request_id)
+            capacity_tokens = getattr(kv_cache, "capacity", None)
+            history_tokens = getattr(kv_cache, "history_length", None)
+            capacity_block_equivalent = (
+                (capacity_tokens + self.tokens_per_block - 1) // self.tokens_per_block
+                if capacity_tokens is not None and self.tokens_per_block > 0
+                else None
+            )
+            prompt_tokens = getattr(req, "total_input_len_cp", None)
+            if prompt_tokens is None:
+                prompt_tokens = req.prompt_len
+            disagg_diagnostics.emit_request_event(
+                "gen_kv_admission_result",
+                req,
+                side="gen",
+                rank=self.kv_cache_manager.mapping.rank,
+                outcome="admitted" if prepared else "deferred",
+                reason=None if prepared else "kv_or_index_capacity",
+                prompt_tokens=prompt_tokens,
+                tokens_per_block=self.tokens_per_block,
+                cache_present=kv_cache is not None,
+                capacity_tokens=capacity_tokens,
+                history_tokens=history_tokens,
+                capacity_block_equivalent=capacity_block_equivalent,
+            )
 
     def _try_schedule_context(
         self, req: LlmRequest, budget: BudgetTracker

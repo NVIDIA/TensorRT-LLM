@@ -28,6 +28,7 @@ def _event(
         "schema_version": 1,
         "event": name,
         "request_id": request_id,
+        "request_id_scope": "run",
         "side": side,
         "host": host,
         "pid": pid,

@@ -245,23 +245,14 @@ class DisaggTransferCoordinator:
                 )
                 if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
                     with disagg_diagnostics.suppress_diagnostic_errors():
-                        disagg_diagnostics.emit_event(
+                        disagg_diagnostics.emit_transfer_timeout(
                             "transfer_timeout_observed",
+                            req,
                             side="ctx" if kind == "context" else "gen",
-                            request_id=get_unique_rid(req),
-                            local_request_id=req.py_request_id,
-                            rank=self._dist.rank,
+                            dist=self._dist,
                             elapsed_ms=elapsed_ms,
                             timeout_ms=timeout_ms,
-                            timeout_owner="pyexecutor",
-                            timer_start_monotonic_ns=int(
-                                req.py_kv_transfer_start_time * 1_000_000_000
-                            ),
-                            state=req.state.name,
                             cancellation_requested=cancel_enabled,
-                            tp_rank=self._dist.tp_rank,
-                            pp_rank=self._dist.pp_rank,
-                            cp_rank=self._dist.cp_rank,
                         )
                 req.py_kv_transfer_timed_out = True
 
@@ -296,42 +287,7 @@ class DisaggTransferCoordinator:
         if not (self._transfer_window_is_active() and fitting_gen_init):
             if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED and fitting_gen_init:
                 with disagg_diagnostics.suppress_diagnostic_errors():
-                    if controller is None or not controller.enabled():
-                        policy = "disabled"
-                    elif transfer_window_bypass_eligible(
-                        self._transceiver, self._dist, self._is_kv_manager_v2
-                    ):
-                        policy = "bypassed"
-                    else:
-                        policy = "inactive"
-                    legacy_result = None
-                    if policy == "bypassed":
-                        try:
-                            legacy_result = controller.select(
-                                self._registry.active_requests(), fitting_gen_init
-                            )
-                        except Exception:
-                            # Counterfactual diagnostics must never affect the
-                            # actual bypass decision.
-                            pass
-                    self._emit_disagg_transfer_window_results(
-                        fitting_gen_init,
-                        fitting_gen_init,
-                        policy=policy,
-                        controller=controller,
-                        legacy_admitted_requests=(
-                            legacy_result.admitted_requests if legacy_result is not None else None
-                        ),
-                        legacy_active_transfer_blocks=(
-                            legacy_result.active_transfer_blocks if legacy_result is not None else None
-                        ),
-                        legacy_admitted_transfer_blocks=(
-                            legacy_result.admitted_transfer_blocks if legacy_result is not None else None
-                        ),
-                        legacy_limited_by_budget=(
-                            legacy_result.limited_by_budget if legacy_result is not None else None
-                        ),
-                    )
+                    self._emit_unrestricted_transfer_window_results(fitting_gen_init)
             return fitting_gen_init, False
 
         admission_result = controller.select(self._registry.active_requests(), fitting_gen_init)
@@ -363,6 +319,47 @@ class DisaggTransferCoordinator:
             admission_result.admitted_requests,
             admission_result.is_blocked_by_active_transfers(),
         )
+
+    def _emit_unrestricted_transfer_window_results(self, candidates: List[LlmRequest]) -> None:
+        """Observe an unrestricted decision and its optional legacy-budget counterfactual."""
+        if not disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            return
+        with disagg_diagnostics.suppress_diagnostic_errors():
+            controller = self._admission_controller
+            if controller is None or not controller.enabled():
+                policy = "disabled"
+            elif transfer_window_bypass_eligible(
+                self._transceiver, self._dist, self._is_kv_manager_v2
+            ):
+                policy = "bypassed"
+            else:
+                policy = "inactive"
+            legacy_result = None
+            if policy == "bypassed":
+                try:
+                    legacy_result = controller.select(self._registry.active_requests(), candidates)
+                except Exception:
+                    # Counterfactual diagnostics must never affect the
+                    # actual bypass decision.
+                    pass
+            self._emit_disagg_transfer_window_results(
+                candidates,
+                candidates,
+                policy=policy,
+                controller=controller,
+                legacy_admitted_requests=(
+                    legacy_result.admitted_requests if legacy_result is not None else None
+                ),
+                legacy_active_transfer_blocks=(
+                    legacy_result.active_transfer_blocks if legacy_result is not None else None
+                ),
+                legacy_admitted_transfer_blocks=(
+                    legacy_result.admitted_transfer_blocks if legacy_result is not None else None
+                ),
+                legacy_limited_by_budget=(
+                    legacy_result.limited_by_budget if legacy_result is not None else None
+                ),
+            )
 
     def _emit_disagg_transfer_window_results(
         self,
@@ -398,12 +395,11 @@ class DisaggTransferCoordinator:
                     if tokens_per_block > 0
                     else None
                 )
-                disagg_diagnostics.emit_event(
+                disagg_diagnostics.emit_request_event(
                     "gen_transfer_window_result",
+                    request,
                     side="gen",
-                    request_id=get_unique_rid(request),
-                    local_request_id=request.py_request_id,
-                    rank=self._dist.rank,
+                    dist=self._dist,
                     outcome="admitted" if request.py_request_id in admitted_ids else "deferred",
                     policy=policy,
                     prompt_tokens=prompt_tokens,
@@ -419,9 +415,6 @@ class DisaggTransferCoordinator:
                     legacy_active_transfer_blocks=legacy_active_transfer_blocks,
                     legacy_admitted_transfer_blocks=legacy_admitted_transfer_blocks,
                     legacy_limited_by_budget=legacy_limited_by_budget,
-                    tp_rank=self._dist.tp_rank,
-                    pp_rank=self._dist.pp_rank,
-                    cp_rank=self._dist.cp_rank,
                 )
 
     def revert_deferred_gen_init(
@@ -449,16 +442,12 @@ class DisaggTransferCoordinator:
             if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
                 with disagg_diagnostics.suppress_diagnostic_errors():
                     for request in deferred_requests:
-                        disagg_diagnostics.emit_event(
+                        disagg_diagnostics.emit_request_event(
                             "gen_kv_rollback",
+                            request,
                             side="gen",
-                            request_id=get_unique_rid(request),
-                            local_request_id=request.py_request_id,
-                            rank=self._dist.rank,
+                            dist=self._dist,
                             reason=reason,
-                            tp_rank=self._dist.tp_rank,
-                            pp_rank=self._dist.pp_rank,
-                            cp_rank=self._dist.cp_rank,
                         )
 
     def _transfer_window_is_active(self) -> bool:
@@ -505,19 +494,12 @@ class DisaggTransferCoordinator:
                     req.py_kv_transfer_start_time = timeout_start
                     if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
                         with disagg_diagnostics.suppress_diagnostic_errors():
-                            disagg_diagnostics.emit_event(
+                            disagg_diagnostics.emit_transfer_timeout(
                                 "transfer_timeout_started",
+                                req,
                                 side="gen",
-                                request_id=get_unique_rid(req),
-                                local_request_id=req.py_request_id,
-                                rank=self._dist.rank,
+                                dist=self._dist,
                                 timeout_ms=self._transceiver.kv_transfer_timeout_ms,
-                                timeout_owner="pyexecutor",
-                                timer_start_monotonic_ns=int(timeout_start * 1_000_000_000),
-                                state=req.state.name,
-                                tp_rank=self._dist.tp_rank,
-                                pp_rank=self._dist.pp_rank,
-                                cp_rank=self._dist.cp_rank,
                             )
 
         self.reap_gen_receives(0)
@@ -603,20 +585,16 @@ class DisaggTransferCoordinator:
                 self._transfers.start_transfer(req)
                 if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
                     with disagg_diagnostics.suppress_diagnostic_errors():
-                        disagg_diagnostics.emit_event(
+                        disagg_diagnostics.emit_request_event(
                             "ctx_send_ready",
+                            req,
                             side="ctx",
-                            request_id=get_unique_rid(req),
-                            local_request_id=req.py_request_id,
-                            rank=self._dist.rank,
+                            dist=self._dist,
                             prompt_tokens=req.prompt_len,
                             state=req.state.name,
                             source_kv_request_owned=True,
                             source_kv_reuse_pinned=self._transfers.should_store_blocks,
                             timeout_expected=self._transceiver.kv_transfer_timeout_ms is not None,
-                            tp_rank=self._dist.tp_rank,
-                            pp_rank=self._dist.pp_rank,
-                            cp_rank=self._dist.cp_rank,
                         )
                 self._transceiver.respond_and_send_async(req)
                 # Bridge validation can reject before a transfer session exists.
@@ -630,19 +608,15 @@ class DisaggTransferCoordinator:
                     self.release_transfer(req)
                     if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
                         with disagg_diagnostics.suppress_diagnostic_errors():
-                            disagg_diagnostics.emit_event(
+                            disagg_diagnostics.emit_request_event(
                                 "ctx_transfer_settled",
+                                req,
                                 side="ctx",
-                                request_id=get_unique_rid(req),
-                                local_request_id=req.py_request_id,
-                                rank=self._dist.rank,
+                                dist=self._dist,
                                 instance=getattr(self._transceiver, "_instance_name", None),
                                 outcome="failed",
                                 session_status=None,
                                 resources_drained=True,
-                                tp_rank=self._dist.tp_rank,
-                                pp_rank=self._dist.pp_rank,
-                                cp_rank=self._dist.cp_rank,
                                 dp_rank=getattr(self._dist, "dp_rank", None),
                             )
                     continue
@@ -651,19 +625,12 @@ class DisaggTransferCoordinator:
                     req.py_kv_transfer_start_time = timeout_start
                     if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
                         with disagg_diagnostics.suppress_diagnostic_errors():
-                            disagg_diagnostics.emit_event(
+                            disagg_diagnostics.emit_transfer_timeout(
                                 "transfer_timeout_started",
+                                req,
                                 side="ctx",
-                                request_id=get_unique_rid(req),
-                                local_request_id=req.py_request_id,
-                                rank=self._dist.rank,
+                                dist=self._dist,
                                 timeout_ms=self._transceiver.kv_transfer_timeout_ms,
-                                timeout_owner="pyexecutor",
-                                timer_start_monotonic_ns=int(timeout_start * 1_000_000_000),
-                                state=req.state.name,
-                                tp_rank=self._dist.tp_rank,
-                                pp_rank=self._dist.pp_rank,
-                                cp_rank=self._dist.cp_rank,
                             )
             elif (
                 self._transceiver.pipeline_transfer_enabled
@@ -874,23 +841,14 @@ class DisaggTransferCoordinator:
             if elapsed_ms > timeout_ms and not request.py_kv_transfer_timed_out:
                 if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
                     with disagg_diagnostics.suppress_diagnostic_errors():
-                        disagg_diagnostics.emit_event(
+                        disagg_diagnostics.emit_transfer_timeout(
                             "transfer_timeout_observed",
+                            request,
                             side="gen",
-                            request_id=get_unique_rid(request),
-                            local_request_id=request.py_request_id,
-                            rank=self._dist.rank,
+                            dist=self._dist,
                             elapsed_ms=elapsed_ms,
                             timeout_ms=timeout_ms,
-                            timeout_owner="pyexecutor",
-                            timer_start_monotonic_ns=int(
-                                request.py_kv_transfer_start_time * 1_000_000_000
-                            ),
-                            state=request.state.name,
                             cancellation_requested=True,
-                            tp_rank=self._dist.tp_rank,
-                            pp_rank=self._dist.pp_rank,
-                            cp_rank=self._dist.cp_rank,
                         )
                 logger.warning(
                     f"Requesting cancellation for generation request "

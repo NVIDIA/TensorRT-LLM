@@ -8,10 +8,17 @@ targeted diagnostic run. Standard and performance runs leave it unset, making
 each instrumented edge a module-attribute check with no clock read, request
 inspection, serialization, or log emission.
 
+``RequestPerfMetrics`` and transceiver ``perf_logger`` remain the owners of
+aggregate performance reports. These events cover additional lifecycle
+boundaries using local monotonic timestamps; enabling diagnostics does not
+enable either aggregate collector or replace its timing semantics.
+
 For cross-process correlation, set
 ``TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS_RUN_ID`` to the same UUID for all CTX and
 GEN workers in one diagnostic launch. Use a new UUID for each launch. An unset
-or invalid value limits analysis to individual process lifetimes.
+or invalid value limits analysis to individual process lifetimes. Cross-process
+joins also require an explicit disaggregated request ID; fallback IDs are local
+to an engine and remain process-scoped even with a shared run UUID.
 """
 
 from __future__ import annotations
@@ -29,7 +36,11 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Iterator, Optional, TypeAlias
 
 if TYPE_CHECKING:
+    from tensorrt_llm import DisaggregatedParams
     from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+    from tensorrt_llm._torch.distributed.communicator import Distributed
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+    from tensorrt_llm.mapping import Mapping
 
 _DIAGNOSTICS_ENV = "TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS"
 _DIAGNOSTICS_RUN_ID_ENV = "TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS_RUN_ID"
@@ -65,6 +76,88 @@ def suppress_diagnostic_errors() -> Iterator[None]:
 def capture_timestamp() -> DiagnosticTimestamp:
     """Capture one local event boundary before publishing shared state."""
     return time.monotonic_ns(), time.time_ns()
+
+
+def get_request_id_scope(params: DisaggregatedParams | None) -> str:
+    """Only explicit disaggregated IDs support cross-worker correlation."""
+    return "run" if params is not None and params.disagg_request_id is not None else "process"
+
+
+def get_request_id(request: LlmRequest) -> int | None:
+    """Match the native session identity for diagnostics, not local table lookup."""
+    params = request.py_disaggregated_params
+    if params is not None:
+        if params.disagg_request_id is not None:
+            return params.disagg_request_id
+        if params.ctx_request_id is not None:
+            return params.ctx_request_id
+    return request.py_request_id
+
+
+def emit_request_event(
+    event: str,
+    request: LlmRequest,
+    *,
+    side: str,
+    dist: Distributed | Mapping | None = None,
+    rank: int | None = None,
+    rank_info: RankInfo | None = None,
+    timestamp: DiagnosticTimestamp | None = None,
+    **details: DiagnosticValue,
+) -> None:
+    """Emit request identity and rank metadata without exposing diagnostic failures.
+
+    Keep the caller-side enabled guard and protect any custom field construction
+    with ``suppress_diagnostic_errors``. Request and rank inspection happens here
+    only after diagnostics are enabled; importing this module remains lightweight.
+    """
+    if not DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+        return
+    with suppress_diagnostic_errors():
+        if dist is not None:
+            if rank is None:
+                rank = dist.rank
+            details.update(tp_rank=dist.tp_rank, pp_rank=dist.pp_rank, cp_rank=dist.cp_rank)
+        emit_event(
+            event,
+            side=side,
+            request_id=get_request_id(request),
+            request_id_scope=get_request_id_scope(request.py_disaggregated_params),
+            local_request_id=request.py_request_id,
+            rank=rank,
+            rank_info=rank_info,
+            timestamp=timestamp,
+            **details,
+        )
+
+
+def emit_transfer_timeout(
+    event: str,
+    request: LlmRequest,
+    *,
+    side: str,
+    dist: Distributed,
+    timeout_ms: int | None,
+    **details: DiagnosticValue,
+) -> None:
+    """Observe the existing executor deadline without starting or changing it."""
+    if not DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+        return
+    with suppress_diagnostic_errors():
+        timeout_start = request.py_kv_transfer_start_time
+        if timeout_start is None:
+            return
+        emit_request_event(
+            event,
+            request,
+            side=side,
+            dist=dist,
+            timeout_ms=timeout_ms,
+            timeout_owner="pyexecutor",
+            timer_start_monotonic_ns=int(timeout_start * 1_000_000_000),
+            state=request.state.name,
+            **details,
+        )
 
 
 @functools.lru_cache(maxsize=1)

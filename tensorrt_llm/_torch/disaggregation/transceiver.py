@@ -783,10 +783,22 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     ) -> None:
         """Report a transfer only after its session has been physically retired."""
         with disagg_diagnostics.suppress_diagnostic_errors():
+            request_id_scope = "unknown"
+            if req is not None:
+                rid = disagg_diagnostics.get_request_id(req)
+                request_id_scope = disagg_diagnostics.get_request_id_scope(
+                    req.py_disaggregated_params
+                )
+            elif session is not None:
+                rid = session.disagg_request_id
+                request_id_scope = disagg_diagnostics.get_request_id_scope(
+                    session._base_args.params
+                )
             disagg_diagnostics.emit_event(
                 f"{side}_transfer_settled",
                 side=side,
                 request_id=rid,
+                request_id_scope=request_id_scope,
                 local_request_id=(req.py_request_id if req is not None else None),
                 rank=self._mapping.rank,
                 instance=self._instance_name,
@@ -796,6 +808,23 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 tp_rank=self._mapping.tp_rank,
                 pp_rank=self._mapping.pp_rank,
                 cp_rank=self._mapping.cp_rank,
+                dp_rank=self._dp_rank,
+            )
+
+    def _emit_receive_start(
+        self, req: LlmRequest, transfer_bytes: int, *, timeout_expected: bool
+    ) -> None:
+        """Record the receive publication boundary using existing payload metadata."""
+        with disagg_diagnostics.suppress_diagnostic_errors():
+            disagg_diagnostics.emit_request_event(
+                "gen_receive_start",
+                req,
+                side="gen",
+                dist=self._mapping,
+                instance=self._instance_name,
+                slice_id=0,
+                transfer_bytes=transfer_bytes,
+                timeout_expected=timeout_expected,
                 dp_rank=self._dp_rank,
             )
 
@@ -992,21 +1021,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     diagnostic_transfer_bytes = (
                         self._chunk_num_bytes(extent.local) * self._kv_size_rank_factor
                     )
-                    disagg_diagnostics.emit_event(
-                        "gen_receive_start",
-                        side="gen",
-                        request_id=rid,
-                        local_request_id=req.py_request_id,
-                        rank=self._mapping.rank,
-                        instance=self._instance_name,
-                        slice_id=0,
-                        transfer_bytes=diagnostic_transfer_bytes,
-                        timeout_expected=False,
-                        tp_rank=self._mapping.tp_rank,
-                        pp_rank=self._mapping.pp_rank,
-                        cp_rank=self._mapping.cp_rank,
-                        dp_rank=self._dp_rank,
-                    )
+                    self._emit_receive_start(req, diagnostic_transfer_bytes, timeout_expected=False)
             receive_started = True
             # Same submission the asynchronous entry makes; what differs is who waits. The session
             # underneath is read back for the blocking wait, the auxiliary buffer and the close.
@@ -1102,20 +1117,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         try:
             if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
                 with disagg_diagnostics.suppress_diagnostic_errors():
-                    disagg_diagnostics.emit_event(
-                        "gen_receive_start",
-                        side="gen",
-                        request_id=rid,
-                        local_request_id=req.py_request_id,
-                        rank=self._mapping.rank,
-                        instance=self._instance_name,
-                        slice_id=0,
-                        transfer_bytes=req.py_kv_cache_xfer_bytes,
+                    self._emit_receive_start(
+                        req,
+                        req.py_kv_cache_xfer_bytes,
                         timeout_expected=self.kv_transfer_timeout_ms is not None,
-                        tp_rank=self._mapping.tp_rank,
-                        pp_rank=self._mapping.pp_rank,
-                        cp_rank=self._mapping.cp_rank,
-                        dp_rank=self._dp_rank,
                     )
             # The handle that comes back is the contract's answer about this piece. What retires
             # the request is the sweep over the session tables, as it was before.
@@ -1451,17 +1456,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 ):
                     if rid not in sessions:
                         continue
-                    disagg_diagnostics.emit_event(
+                    disagg_diagnostics.emit_request_event(
                         "transfer_cancel_requested",
+                        req,
                         side=side,
-                        request_id=rid,
-                        local_request_id=req.py_request_id,
-                        rank=self._mapping.rank,
+                        dist=self._mapping,
                         instance=self._instance_name,
                         session_status=sessions[rid].status.value,
-                        tp_rank=self._mapping.tp_rank,
-                        pp_rank=self._mapping.pp_rank,
-                        cp_rank=self._mapping.cp_rank,
                         dp_rank=self._dp_rank,
                     )
 

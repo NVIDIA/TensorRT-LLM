@@ -27,7 +27,8 @@ import tensorrt_llm._torch.disaggregation.native.transfer as transfer_module
 import tensorrt_llm._torch.disaggregation.transceiver as python_transceiver_module
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation import diagnostics, kv_cache_transceiver
-from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus, WaitResult
+from tensorrt_llm._torch.disaggregation.base import CacheExtent, Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     Receiver,
@@ -52,11 +53,13 @@ from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 pytestmark = pytest.mark.cpu_only
 
 
-def _disagg_request(local_id: int, canonical_id: int, prompt_len: int = 65) -> SimpleNamespace:
+def _disagg_request(
+    local_id: int, canonical_id: int | None, prompt_len: int = 65
+) -> SimpleNamespace:
     return SimpleNamespace(
         py_request_id=local_id,
         request_id=local_id,
-        py_disaggregated_params=SimpleNamespace(disagg_request_id=canonical_id),
+        py_disaggregated_params=DisaggregatedParams(disagg_request_id=canonical_id),
         prompt_len=prompt_len,
     )
 
@@ -67,6 +70,38 @@ def _diagnostic_transceiver() -> KvCacheTransceiverV2:
     transceiver._instance_name = "diagnostic-test"
     transceiver._dp_rank = 2
     return transceiver
+
+
+def _extent(request_id: int) -> CacheExtent:
+    return CacheExtent(
+        name=request_id,
+        local=Chunk(
+            block_ids_per_layer_groups=[],
+            kind_per_layer_group=[],
+            token_range=TokenRange(start=0, end=0),
+            is_last=True,
+        ),
+    )
+
+
+def _coordinator(
+    *,
+    controller=None,
+    active_requests=(),
+    consumes_transfer_buffer: bool = False,
+) -> DisaggTransferCoordinator:
+    return DisaggTransferCoordinator(
+        transceiver=SimpleNamespace(consumes_transfer_buffer=consumes_transfer_buffer),
+        transfer_manager=None,
+        kv_cache_manager=None,
+        dist=SimpleNamespace(rank=4, tp_rank=1, pp_rank=0, cp_rank=0, pp_size=1),
+        effects=SimpleNamespace(revert_ctx_alloc=Mock()),
+        registry=SimpleNamespace(active_requests=lambda: list(active_requests)),
+        enable_attention_dp=False,
+        force_terminate_ctx_for_partial_reuse=False,
+        admission_controller=controller,
+        is_kv_manager_v2=True,
+    )
 
 
 @pytest.mark.parametrize("diagnostic_mode", ["disabled", "enabled", "failing"])
@@ -226,9 +261,11 @@ def test_sender_reports_worker_dequeue_before_transfer_preparation(
 ) -> None:
     task_queue = queue.Queue()
     write_meta = SimpleNamespace(
+        task=SimpleNamespace(_params=DisaggregatedParams(disagg_request_id=1010)),
         meta_type=transfer_module.WriteMetaType.KV,
         src_ptrs=SimpleNamespace(size=1),
-        sizes=SimpleNamespace(sum=lambda: 4096),
+        sizes=SimpleNamespace(sum=Mock(side_effect=AssertionError("must reuse descriptor size"))),
+        transfer_bytes=4096,
         unique_rid=1010,
         slice_id=2,
         peer_rank=3,
@@ -268,10 +305,12 @@ def test_sender_reports_worker_dequeue_before_transfer_preparation(
     ]
     event = operations[0][1]
     assert event["request_id"] == 1010
+    assert event["request_id_scope"] == "run"
     assert event["slice_id"] == 2
     assert event["peer_rank"] == 3
     assert event["worker_queue_index"] == 0
     assert event["transfer_bytes"] == 4096
+    write_meta.sizes.sum.assert_not_called()
 
 
 def test_gen_ingress_uses_full_cp_prompt_length(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -334,8 +373,11 @@ def test_scheduler_emits_admitted_and_deferred_kv_admission_results(
     assert admitted_event.kwargs == {
         "side": "gen",
         "request_id": 1011,
+        "request_id_scope": "run",
         "local_request_id": 11,
         "rank": 3,
+        "rank_info": None,
+        "timestamp": None,
         "outcome": "admitted",
         "reason": None,
         "prompt_tokens": 257,
@@ -452,31 +494,24 @@ def test_gen_timeout_start_and_observation_share_request_identity(
     transceiver.kv_transfer_timeout_ms = 100
     transceiver.request_and_receive_async.side_effect = start_receive
 
-    executor = object.__new__(PyExecutor)
-    executor.kv_cache_transceiver = transceiver
-    executor.global_rank = 4
-    executor.dist = SimpleNamespace(tp_rank=1, pp_rank=0, cp_rank=0)
-    executor._is_disagg_gen_only_no_context_benchmark = Mock(return_value=False)
-    executor._uses_async_disagg_gen_transfer = Mock(return_value=True)
-    executor._disagg_coordinator = SimpleNamespace(reap_gen_receives=Mock())
-
     coordinator = DisaggTransferCoordinator(
         transceiver=transceiver,
         transfer_manager=SimpleNamespace(requests_in_transfer=lambda: {}),
         kv_cache_manager=None,
         dist=SimpleNamespace(rank=4, tp_rank=1, pp_rank=0, cp_rank=0),
-        effects=None,
+        effects=SimpleNamespace(prepare_gen_resources=Mock()),
         registry=SimpleNamespace(active_requests=lambda: [request]),
         enable_attention_dp=False,
         force_terminate_ctx_for_partial_reuse=False,
-        delegates=None,
     )
+    coordinator.reap_gen_receives = Mock()
 
     emit_event = Mock()
     monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
     monkeypatch.setattr(diagnostics, "emit_event", emit_event)
     monkeypatch.setattr(
-        "tensorrt_llm._torch.pyexecutor.py_executor.time.monotonic",
+        coordinator_module.time,
+        "monotonic",
         lambda: 10.0,
     )
     monkeypatch.setattr(
@@ -485,9 +520,11 @@ def test_gen_timeout_start_and_observation_share_request_identity(
         lambda: False,
     )
 
-    executor._recv_disagg_gen_cache([request])
-    # py_executor and coordinator import the same time module, so advance the
-    # shared clock only after the receive path records its start timestamp.
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
+    coordinator.receive_gen_init([request])
+    coordinator._effects.prepare_gen_resources.assert_called_once_with([request])
+    coordinator.reap_gen_receives.assert_called_once_with(0)
     monkeypatch.setattr(coordinator_module.time, "monotonic", lambda: 10.2)
     coordinator.check_transfer_timeouts()
 
@@ -509,7 +546,10 @@ def test_gen_timeout_start_and_observation_share_request_identity(
     assert observed["cancellation_requested"] is False
 
 
-def test_gen_decode_ready_uses_full_cp_prompt_length(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("preparation_succeeds", [False, True])
+def test_gen_decode_ready_requires_successful_handoff_and_uses_full_cp_prompt_length(
+    monkeypatch: pytest.MonkeyPatch, preparation_succeeds: bool
+) -> None:
     request = _disagg_request(22, 2022, prompt_len=1)
     request.total_input_len_cp = 257
     request.is_disagg_generation_transmission_complete = True
@@ -522,13 +562,21 @@ def test_gen_decode_ready_uses_full_cp_prompt_length(monkeypatch: pytest.MonkeyP
     executor.resource_manager = SimpleNamespace(
         resource_managers={ResourceManagerType.SEQ_SLOT_MANAGER: seq_slot_manager},
     )
-    executor._setup_sampler_step = Mock()
+
+    def prepare_sampler(_requests) -> None:
+        if not preparation_succeeds:
+            request.state = LlmRequestState.DISAGG_TRANS_ERROR
+            request.is_disagg_generation_transmission_complete = False
+
+    executor._setup_sampler_step = Mock(side_effect=prepare_sampler)
     executor.model_engine = SimpleNamespace(enable_spec_decode=False)
-    executor.kv_cache_transceiver = None
+    executor.kv_cache_transceiver = SimpleNamespace(commit_blocks_for_reuse=Mock())
     executor._update_sampler_state_for_disagg_gen_request = Mock(return_value=True)
     executor._maybe_prepend_logprobs_and_logits = Mock()
     executor.global_rank = 4
     executor.dist = SimpleNamespace(tp_rank=1, pp_rank=0, cp_rank=3)
+    executor._disagg_coordinator = _coordinator()
+    executor._disagg_coordinator._transceiver = executor.kv_cache_transceiver
 
     emit_event = Mock()
     monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
@@ -538,10 +586,18 @@ def test_gen_decode_ready_uses_full_cp_prompt_length(monkeypatch: pytest.MonkeyP
         SimpleNamespace(generation_requests=[request]),
     )
 
+    executor._setup_sampler_step.assert_called_once()
+    if not preparation_succeeds:
+        emit_event.assert_not_called()
+        executor.kv_cache_transceiver.commit_blocks_for_reuse.assert_not_called()
+        request.add_new_token.assert_not_called()
+        assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+        return
     event = emit_event.call_args
     assert event.args == ("gen_decode_ready",)
     assert event.kwargs["prompt_tokens"] == 257
     assert event.kwargs["cp_rank"] == 3
+    executor.kv_cache_transceiver.commit_blocks_for_reuse.assert_called_once_with(request)
     request.add_new_token.assert_called_once_with(7, 0)
 
 
@@ -581,7 +637,6 @@ def test_ctx_send_ready_and_timeout_start_follow_transfer_handoff(
         registry=SimpleNamespace(canceled_request_ids=lambda: []),
         enable_attention_dp=False,
         force_terminate_ctx_for_partial_reuse=False,
-        delegates=None,
     )
 
     def emit_event(event: str, **kwargs) -> None:
@@ -651,7 +706,6 @@ def test_ctx_send_continues_when_diagnostic_preparation_fails(
         registry=SimpleNamespace(canceled_request_ids=lambda: []),
         enable_attention_dp=False,
         force_terminate_ctx_for_partial_reuse=False,
-        delegates=None,
     )
 
     monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
@@ -710,7 +764,6 @@ def test_bridge_validation_rejection_emits_failed_ctx_settlement_after_release(
         registry=SimpleNamespace(canceled_request_ids=lambda: []),
         enable_attention_dp=False,
         force_terminate_ctx_for_partial_reuse=False,
-        delegates=None,
     )
     coordinator.release_transfer = lambda req: operations.append(("release", req))
 
@@ -743,7 +796,7 @@ def test_bridge_validation_rejection_emits_failed_ctx_settlement_after_release(
     [
         (
             WaitResult.COMPLETED,
-            SessionStatus.FULLY_TRANSFERRED,
+            SessionStatus.TRANSFERRED,
             "completed",
             LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
         ),
@@ -765,11 +818,17 @@ def test_sync_receive_emits_start_and_terminal_settlement(
     operations = []
     session = SimpleNamespace(
         status=session_status,
-        receive=Mock(side_effect=lambda _slice: operations.append("receive")),
+        _kv_tasks=[],
         wait_complete=Mock(side_effect=lambda blocking: operations.append("wait") or wait_result),
         has_transferring_tasks=Mock(return_value=False),
         close=Mock(side_effect=lambda: operations.append("close") or True),
     )
+
+    def receive(_chunk: Chunk) -> None:
+        operations.append("receive")
+        session._kv_tasks.append(SimpleNamespace(status=TaskStatus.TRANSFERRED))
+
+    session.receive = Mock(side_effect=receive)
     request = _disagg_request(41, 4041)
     request.state = LlmRequestState.DISAGG_GENERATION_INIT
     request.set_kv_cache_size = Mock()
@@ -778,8 +837,8 @@ def test_sync_receive_emits_start_and_terminal_settlement(
     transceiver._recv_sessions = {}
     transceiver._recv_reqs = {}
     transceiver._transfer_worker = SimpleNamespace(create_rx_session=Mock(return_value=session))
-    transceiver._create_kv_slice = Mock(return_value=KVSlice(is_last_slice=True))
-    transceiver._slice_num_bytes = Mock(return_value=64)
+    transceiver._create_cache_extent = Mock(return_value=_extent(4041))
+    transceiver._chunk_num_bytes = Mock(return_value=64)
     transceiver._kv_size_rank_factor = 2
     transceiver._need_aux_transfer = Mock(return_value=False)
     transceiver._assert_disagg_history_declared = Mock()
@@ -835,9 +894,15 @@ def test_sync_receive_does_not_report_settlement_while_close_is_refused(
 ) -> None:
     session = SimpleNamespace(
         status=SessionStatus.ERROR,
-        receive=Mock(side_effect=RuntimeError("receive failed")),
+        _kv_tasks=[],
+        wait_complete=Mock(side_effect=RuntimeError("receive failed")),
         has_transferring_tasks=Mock(return_value=True),
         close=Mock(return_value=False),
+    )
+    session.receive = Mock(
+        side_effect=lambda _chunk: session._kv_tasks.append(
+            SimpleNamespace(status=TaskStatus.TRANSFERRING)
+        )
     )
     request = _disagg_request(44, 4044)
     request.state = LlmRequestState.DISAGG_GENERATION_INIT
@@ -846,8 +911,8 @@ def test_sync_receive_does_not_report_settlement_while_close_is_refused(
     transceiver._recv_sessions = {}
     transceiver._recv_reqs = {}
     transceiver._transfer_worker = SimpleNamespace(create_rx_session=Mock(return_value=session))
-    transceiver._create_kv_slice = Mock(return_value=KVSlice(is_last_slice=True))
-    transceiver._slice_num_bytes = Mock(return_value=64)
+    transceiver._create_cache_extent = Mock(return_value=_extent(4044))
+    transceiver._chunk_num_bytes = Mock(return_value=64)
     transceiver._kv_size_rank_factor = 2
 
     emit_event = Mock()
@@ -858,6 +923,8 @@ def test_sync_receive_does_not_report_settlement_while_close_is_refused(
         transceiver.request_and_receive_sync(request)
 
     assert [call.args[0] for call in emit_event.call_args_list] == ["gen_receive_start"]
+    session.wait_complete.assert_called_once_with(blocking=True)
+    session.close.assert_called_once_with()
     assert transceiver._recv_sessions == {4044: session}
     assert transceiver._recv_reqs == {4044: request}
 
@@ -867,6 +934,8 @@ def test_sync_receive_disabled_diagnostics_preserves_receive_failure_order(
 ) -> None:
     session = SimpleNamespace(
         receive=Mock(side_effect=RuntimeError("receive failed")),
+        fail_admission=Mock(),
+        _kv_tasks=[],
         close=Mock(return_value=True),
     )
     request = _disagg_request(45, 4045)
@@ -876,20 +945,181 @@ def test_sync_receive_disabled_diagnostics_preserves_receive_failure_order(
     transceiver._recv_sessions = {}
     transceiver._recv_reqs = {}
     transceiver._transfer_worker = SimpleNamespace(create_rx_session=Mock(return_value=session))
-    kv_slice = KVSlice(is_last_slice=True)
-    transceiver._create_kv_slice = Mock(return_value=kv_slice)
-    transceiver._slice_num_bytes = Mock(side_effect=AssertionError("must not size before receive"))
+    extent = _extent(4045)
+    transceiver._create_cache_extent = Mock(return_value=extent)
+    transceiver._chunk_num_bytes = Mock(side_effect=AssertionError("must not size before receive"))
 
     monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", False)
 
     with pytest.raises(RuntimeError, match="receive failed"):
         transceiver.request_and_receive_sync(request)
 
-    session.receive.assert_called_once_with(kv_slice)
-    transceiver._slice_num_bytes.assert_not_called()
+    transceiver._create_cache_extent.assert_called_once_with(request)
+    session.receive.assert_called_once_with(extent.local)
+    session.fail_admission.assert_called_once()
+    transceiver._chunk_num_bytes.assert_not_called()
     assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
     assert transceiver._recv_sessions == {}
     assert transceiver._recv_reqs == {}
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_async_receive_extent_failure_does_not_start_or_report_transfer(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    request = _disagg_request(46, 4046)
+    request.state = LlmRequestState.DISAGG_GENERATION_INIT
+    request.set_kv_cache_transfer_start = Mock()
+    transceiver = _diagnostic_transceiver()
+    transceiver._validate_bridge_req = Mock(return_value=True)
+    transceiver._recv_sessions = {}
+    transceiver._recv_reqs = {}
+    transceiver._create_cache_extent = Mock(side_effect=RuntimeError("extent build failed"))
+    transceiver._open_peer_source = Mock(side_effect=AssertionError("must not open a peer source"))
+    emit_event = Mock()
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", enabled)
+    monkeypatch.setattr(diagnostics, "emit_event", emit_event)
+    monkeypatch.setattr(
+        python_transceiver_module.tensorrt_llm.bindings, "global_steady_clock_now", lambda: 0
+    )
+
+    with pytest.raises(RuntimeError, match="extent build failed"):
+        transceiver.request_and_receive_async(request)
+
+    assert request.state == LlmRequestState.DISAGG_GENERATION_INIT
+    assert transceiver._recv_sessions == {}
+    assert transceiver._recv_reqs == {}
+    transceiver._open_peer_source.assert_not_called()
+    emit_event.assert_not_called()
+
+
+def test_fallback_identity_matches_session_without_changing_local_table_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _disagg_request(41, None)
+    request.py_disaggregated_params.ctx_request_id = 7
+    request.state = LlmRequestState.DISAGG_GENERATION_INIT
+    request.set_kv_cache_transfer_start = Mock()
+    manager = SimpleNamespace(
+        prepare_disagg_gen_init=Mock(return_value=True),
+        kv_cache_map={41: SimpleNamespace(capacity=65, history_length=64)},
+        mapping=SimpleNamespace(rank=4),
+    )
+    scheduler = object.__new__(KVCacheV2Scheduler)
+    scheduler.kv_cache_manager = manager
+    scheduler.tokens_per_block = 32
+    coordinator = _coordinator()
+    session = SimpleNamespace(
+        disagg_request_id=7,
+        _base_args=SimpleNamespace(params=request.py_disaggregated_params),
+        _kv_tasks=[],
+        status=SessionStatus.INIT,
+        has_transferring_tasks=Mock(return_value=False),
+        close=Mock(return_value=True),
+    )
+    session.receive = Mock(
+        side_effect=lambda _chunk: session._kv_tasks.append(
+            SimpleNamespace(status=TaskStatus.TRANSFERRING)
+        )
+    )
+    session.cancel = Mock(side_effect=lambda: setattr(session, "status", SessionStatus.CANCELLED))
+    transceiver = _diagnostic_transceiver()
+    transceiver._validate_bridge_req = Mock(return_value=True)
+    transceiver._send_sessions = {}
+    transceiver._recv_sessions = {}
+    transceiver._recv_reqs = {}
+    transceiver._wait_reqs = {}
+    transceiver._transfer_worker = SimpleNamespace(create_rx_session=Mock(return_value=session))
+    transceiver._create_cache_extent = Mock(return_value=_extent(41))
+    transceiver._chunk_num_bytes = Mock(return_value=64)
+    transceiver._kv_size_rank_factor = 2
+    transceiver.kv_transfer_timeout_ms = 100
+    emit_event = Mock()
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    monkeypatch.setattr(diagnostics, "emit_event", emit_event)
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    monkeypatch.setattr(
+        python_transceiver_module.tensorrt_llm.bindings, "global_steady_clock_now", lambda: 0
+    )
+
+    assert scheduler._try_schedule_disagg_gen_init(request, None) == (ScheduleAction.SCHEDULED, 0)
+    assert coordinator.admit([request]) == ([request], False)
+    transceiver.request_and_receive_async(request)
+
+    manager.prepare_disagg_gen_init.assert_called_once_with(request)
+    transceiver._create_cache_extent.assert_called_once_with(request)
+    assert transceiver._recv_sessions == {41: session}
+    assert transceiver._recv_reqs == {41: request}
+    assert transceiver.cancel_request(request) is True
+    assert transceiver._recv_sessions == {}
+    assert transceiver._recv_reqs == {}
+    session.cancel.assert_called_once_with()
+    session.close.assert_called_once_with()
+    assert [call.args[0] for call in emit_event.call_args_list] == [
+        "gen_kv_admission_result",
+        "gen_transfer_window_result",
+        "gen_receive_start",
+        "transfer_cancel_requested",
+        "gen_transfer_settled",
+    ]
+    for call in emit_event.call_args_list:
+        assert call.kwargs["request_id"] == 7
+        assert call.kwargs["local_request_id"] == 41
+        assert call.kwargs["request_id_scope"] == "process"
+    assert emit_event.call_args_list[0].kwargs["capacity_tokens"] == 65
+    assert emit_event.call_args_list[-1].kwargs["resources_drained"] is True
+
+
+@pytest.mark.parametrize(
+    ("disagg_request_id", "ctx_request_id", "expected_id", "expected_scope"),
+    [(7007, 7, 7007, "run"), (None, 7, 7, "process")],
+)
+def test_session_only_settlement_uses_session_identity_and_scope(
+    monkeypatch: pytest.MonkeyPatch,
+    disagg_request_id: int | None,
+    ctx_request_id: int,
+    expected_id: int,
+    expected_scope: str,
+) -> None:
+    session = SimpleNamespace(
+        disagg_request_id=expected_id,
+        _base_args=SimpleNamespace(
+            params=DisaggregatedParams(
+                disagg_request_id=disagg_request_id, ctx_request_id=ctx_request_id
+            )
+        ),
+        status=SessionStatus.TRANSFERRED,
+        has_transferring_tasks=Mock(return_value=False),
+    )
+    emit_event = Mock()
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    monkeypatch.setattr(diagnostics, "emit_event", emit_event)
+
+    _diagnostic_transceiver()._emit_transfer_settled("gen", 41, None, session, "completed")
+
+    emit_event.assert_called_once()
+    assert emit_event.call_args.args == ("gen_transfer_settled",)
+    fields = emit_event.call_args.kwargs
+    assert fields["request_id"] == expected_id
+    assert fields["request_id_scope"] == expected_scope
+    assert fields["local_request_id"] is None
+    assert fields["resources_drained"] is True
+
+
+def test_settlement_without_request_or_session_reports_unknown_identity_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    emit_event = Mock()
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    monkeypatch.setattr(diagnostics, "emit_event", emit_event)
+
+    _diagnostic_transceiver()._emit_transfer_settled("gen", 41, None, None, "failed")
+
+    emit_event.assert_called_once()
+    assert emit_event.call_args.args == ("gen_transfer_settled",)
+    assert emit_event.call_args.kwargs["request_id"] == 41
+    assert emit_event.call_args.kwargs["request_id_scope"] == "unknown"
+    assert emit_event.call_args.kwargs["local_request_id"] is None
 
 
 @pytest.mark.parametrize("side", ("ctx", "gen"))
@@ -985,20 +1215,15 @@ def test_bypassed_transfer_window_reports_legacy_budget_counterfactual(
         max_tokens_in_buffer=64,
         tokens_per_block=32,
     )
-    executor = object.__new__(PyExecutor)
-    executor.active_requests = [active]
-    executor.global_rank = 4
-    executor.dist = SimpleNamespace(tp_rank=1, pp_rank=0, cp_rank=0)
-    executor._is_disagg_gen_only_no_context_benchmark = Mock(return_value=False)
-    executor._get_disagg_transfer_admission_controller = Mock(return_value=controller)
-    executor._disagg_transfer_window_is_active = Mock(return_value=False)
-    executor._is_disagg_transfer_window_bypass_eligible = Mock(return_value=True)
+    coordinator = _coordinator(controller=controller, active_requests=[active])
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
 
     emit_event = Mock()
     monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
     monkeypatch.setattr(diagnostics, "emit_event", emit_event)
 
-    admitted, wait_for_progress = executor._apply_disagg_transfer_admission(candidates)
+    admitted, wait_for_progress = coordinator.admit(candidates)
 
     assert admitted == candidates
     assert wait_for_progress is False
@@ -1024,15 +1249,14 @@ def test_transfer_window_result_uses_full_cp_prompt_length(
         max_tokens_in_buffer=512,
         tokens_per_block=32,
     )
-    executor = object.__new__(PyExecutor)
-    executor.global_rank = 4
-    executor.dist = SimpleNamespace(tp_rank=1, pp_rank=0, cp_rank=3)
+    coordinator = _coordinator(controller=controller)
+    coordinator._dist.cp_rank = 3
 
     emit_event = Mock()
     monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
     monkeypatch.setattr(diagnostics, "emit_event", emit_event)
 
-    executor._emit_disagg_transfer_window_results(
+    coordinator._emit_disagg_transfer_window_results(
         [request],
         [request],
         policy="enforced",
@@ -1057,14 +1281,12 @@ def test_disabled_diagnostics_do_not_evaluate_bypass_counterfactual(
     controller.select.side_effect = AssertionError(
         "disabled diagnostics evaluated the legacy transfer window"
     )
-    executor = object.__new__(PyExecutor)
-    executor.active_requests = []
-    executor._is_disagg_gen_only_no_context_benchmark = Mock(return_value=False)
-    executor._get_disagg_transfer_admission_controller = Mock(return_value=controller)
-    executor._disagg_transfer_window_is_active = Mock(return_value=False)
+    coordinator = _coordinator(controller=controller)
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
     monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", False)
 
-    admitted, wait_for_progress = executor._apply_disagg_transfer_admission([candidate])
+    admitted, wait_for_progress = coordinator.admit([candidate])
 
     assert admitted == [candidate]
     assert wait_for_progress is False
@@ -1083,19 +1305,15 @@ def test_diagnostic_preparation_failure_does_not_change_bypassed_admission(
     controller = Mock()
     controller.enabled.return_value = True
     controller.select.return_value = _BrokenLegacyResult()
-    executor = object.__new__(PyExecutor)
-    executor.active_requests = []
-    executor._is_disagg_gen_only_no_context_benchmark = Mock(return_value=False)
-    executor._get_disagg_transfer_admission_controller = Mock(return_value=controller)
-    executor._disagg_transfer_window_is_active = Mock(return_value=False)
-    executor._is_disagg_transfer_window_bypass_eligible = Mock(return_value=True)
+    coordinator = _coordinator(controller=controller)
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
     monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
 
-    admitted, wait_for_progress = executor._apply_disagg_transfer_admission([candidate])
+    admitted, wait_for_progress = coordinator.admit([candidate])
 
     assert admitted == [candidate]
     assert wait_for_progress is False
-    executor._is_disagg_transfer_window_bypass_eligible.assert_called_once_with()
     controller.select.assert_called_once_with([], [candidate])
 
 
@@ -1108,10 +1326,10 @@ def test_transfer_window_helper_contains_diagnostic_preparation_failure(
             raise RuntimeError("diagnostic request inspection failed")
 
     candidate = _OpaqueCandidate()
-    executor = object.__new__(PyExecutor)
+    coordinator = _coordinator()
     monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
 
-    executor._emit_disagg_transfer_window_results(
+    coordinator._emit_disagg_transfer_window_results(
         [candidate],
         [candidate],
         policy="bypassed",
@@ -1129,26 +1347,20 @@ def test_admission_rollback_continues_when_diagnostic_emission_fails(
         max_tokens_in_buffer=32,
         tokens_per_block=32,
     )
-    executor = object.__new__(PyExecutor)
-    executor.active_requests = []
-    executor._is_disagg_gen_only_no_context_benchmark = Mock(return_value=False)
-    executor._get_disagg_transfer_admission_controller = Mock(return_value=controller)
-    executor._disagg_transfer_window_is_active = Mock(return_value=True)
-    executor._emit_disagg_transfer_window_results = Mock(
-        side_effect=RuntimeError("diagnostics failed")
-    )
-    executor._revert_deferred_disagg_gen_init_alloc = Mock()
+    coordinator = _coordinator(controller=controller, consumes_transfer_buffer=True)
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    emit_event = Mock(side_effect=RuntimeError("diagnostics failed"))
+    monkeypatch.setattr(diagnostics, "emit_event", emit_event)
     monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
 
-    admitted, wait_for_progress = executor._apply_disagg_transfer_admission(candidates)
+    admitted, wait_for_progress = coordinator.admit(candidates)
 
     assert admitted == [candidates[0]]
     assert wait_for_progress is False
-    executor._revert_deferred_disagg_gen_init_alloc.assert_called_once_with(
-        candidates,
-        [candidates[0]],
-        reason="transfer_window",
-    )
+    coordinator._effects.revert_ctx_alloc.assert_called_once_with([candidates[1]])
+    assert emit_event.call_args_list[0].args == ("gen_transfer_window_result",)
+    assert emit_event.call_args_list[-1].args == ("gen_kv_rollback",)
+    assert emit_event.call_args_list[-1].kwargs["reason"] == "transfer_window"
 
 
 def test_pp_reconciliation_emits_rollback_after_releasing_kv(
@@ -1157,11 +1369,10 @@ def test_pp_reconciliation_emits_rollback_after_releasing_kv(
     admitted = _disagg_request(33, 3033)
     deferred = _disagg_request(34, 3034)
     operations = []
-    executor = object.__new__(PyExecutor)
-    executor._is_kv_manager_v2 = True
-    executor._revert_ctx_alloc = lambda requests: operations.append(("revert", requests))
-    executor.global_rank = 4
-    executor.dist = SimpleNamespace(tp_rank=1, pp_rank=2, cp_rank=3)
+    coordinator = _coordinator()
+    coordinator._effects.revert_ctx_alloc = lambda requests: operations.append(("revert", requests))
+    coordinator._dist.pp_rank = 2
+    coordinator._dist.cp_rank = 3
 
     def emit_event(event: str, **kwargs) -> None:
         operations.append((event, kwargs))
@@ -1169,7 +1380,7 @@ def test_pp_reconciliation_emits_rollback_after_releasing_kv(
     monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
     monkeypatch.setattr(diagnostics, "emit_event", emit_event)
 
-    executor._revert_deferred_disagg_gen_init_alloc(
+    coordinator.revert_deferred_gen_init(
         [admitted, deferred],
         [admitted],
     )
@@ -1192,7 +1403,7 @@ def test_ctx_settlement_continues_when_diagnostic_emission_fails(
         status=SessionStatus.READY,
         has_transferring_tasks=Mock(return_value=False),
     )
-    request = SimpleNamespace(py_request_id=4)
+    request = _disagg_request(4, request_id)
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._ever_had_send_session = True
     transceiver._ctx_need_tp_sync = False
@@ -1251,7 +1462,7 @@ def test_ctx_settlement_continues_when_diagnostic_session_snapshot_is_stale(
         status=SessionStatus.READY,
         has_transferring_tasks=Mock(return_value=False),
     )
-    request = SimpleNamespace(py_request_id=6)
+    request = _disagg_request(6, request_id)
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._ever_had_send_session = True
     transceiver._ctx_need_tp_sync = False
@@ -1302,10 +1513,8 @@ def test_gen_settlement_continues_when_diagnostic_emission_fails(
         kv_cache_size_bytes=0,
         has_transferring_tasks=Mock(return_value=False),
     )
-    request = SimpleNamespace(
-        py_request_id=5,
-        set_kv_cache_size=Mock(),
-    )
+    request = _disagg_request(5, request_id)
+    request.set_kv_cache_size = Mock()
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._ever_had_recv_session = True
     transceiver._gen_need_sync = False
@@ -1498,7 +1707,7 @@ def test_native_writer_result_precedes_local_destination_completion(
     receiver._enforce_physical_ownership = True
     receiver._sessions = {}
     receiver._sessions_lock = threading.Lock()
-    receiver._pre_cancelled_rids = set()
+    receiver._pre_cancelled_rids = {}
     receiver._shutdown = False
     receiver._bounce = Mock()
     receiver._bounce.is_bounced.return_value = False
@@ -1526,7 +1735,7 @@ def test_native_writer_result_precedes_local_destination_completion(
         lambda: 0,
     )
 
-    session.receive(KVSlice(is_last_slice=True))
+    session.receive(_extent(request_id).local)
     destination_timestamp_captured = threading.Event()
     destination_timestamp = (123_000, 456_000)
 

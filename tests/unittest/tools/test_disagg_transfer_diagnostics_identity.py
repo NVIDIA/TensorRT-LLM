@@ -29,6 +29,7 @@ def _event(
         "schema_version": 1,
         "event": name,
         "request_id": request_id,
+        "request_id_scope": "run",
         "side": side,
         "host": "node-a",
         "pid": 17,
@@ -271,3 +272,189 @@ def test_invalid_string_request_id_is_not_coerced_into_valid_run_group() -> None
     assert result["requests"][0]["request_id"] == 7
     assert result["requests"][0]["event_count"] == 2
     assert _ownership_durations(result["requests"][0]) == [2.0]
+
+
+def test_explicit_canonical_scope_preserves_cross_process_correlation() -> None:
+    result = analyze_lines(
+        _ownership_pair(request_id_scope="run")
+        + [
+            _event(
+                "gen_receive_start",
+                side="gen",
+                pid=18,
+                process_uuid=_PROCESS_B,
+                request_id_scope="run",
+            ),
+            _event(
+                "gen_transfer_settled",
+                4_000_000,
+                side="gen",
+                pid=18,
+                process_uuid=_PROCESS_B,
+                request_id_scope="run",
+                outcome="completed",
+            ),
+        ]
+    )
+
+    assert len(result["requests"]) == 1
+    request = result["requests"][0]
+    assert request["correlation_scope"] == request["request_id_scope"] == "run"
+    assert request["identity_issues"] == []
+    assert request["sides"] == ["ctx", "gen"]
+    assert {duration["phase"] for duration in request["durations"]} == {
+        "ctx_source_kv_request_ownership",
+        "gen_receive_lifetime",
+    }
+
+
+def test_shared_run_does_not_join_equal_fallback_ids_on_different_workers() -> None:
+    result = analyze_lines(
+        _ownership_pair(request_id_scope="process")
+        + _ownership_pair(request_id_scope="process", process_uuid=_PROCESS_B, host="node-b")
+    )
+
+    assert len(result["requests"]) == 2
+    for request in result["requests"]:
+        assert request["request_id"] == 7
+        assert request["run_uuid"] == _RUN_A
+        assert request["correlation_scope"] == request["request_id_scope"] == "process"
+        assert len(request["participants"]) == 1
+        assert _ownership_durations(request) == [2.0]
+
+
+def test_fallback_transport_id_preserves_gen_process_local_timing() -> None:
+    result = analyze_lines(
+        [
+            _event(
+                "gen_receive_start",
+                side="gen",
+                local_request_id=42,
+                request_id_scope="process",
+            ),
+            _event(
+                "gen_transfer_settled",
+                4_000_000,
+                side="gen",
+                local_request_id=42,
+                request_id_scope="process",
+                outcome="completed",
+            ),
+        ]
+    )
+
+    assert len(result["requests"]) == 1
+    request = result["requests"][0]
+    assert request["request_id"] == 7
+    assert request["correlation_scope"] == "process"
+    assert request["identity_issues"] == []
+    assert request["durations"][0]["phase"] == "gen_receive_lifetime"
+    assert request["durations"][0]["duration_ms"] == 3.0
+    assert all(event["local_request_id"] == 42 for event in request["timeline"])
+
+
+@pytest.mark.parametrize("run_uuid", [_RUN_A, None])
+def test_canonical_and_fallback_namespaces_do_not_join_equal_ids(
+    run_uuid: str | None,
+) -> None:
+    result = analyze_lines(
+        _ownership_pair(request_id_scope="run", run_uuid=run_uuid)
+        + _ownership_pair(request_id_scope="process", run_uuid=run_uuid)
+    )
+
+    assert len(result["requests"]) == 2
+    assert {request["request_id_scope"] for request in result["requests"]} == {"run", "process"}
+    assert all(request["event_count"] == 2 for request in result["requests"])
+    assert all(_ownership_durations(request) == [2.0] for request in result["requests"])
+
+
+def test_missing_scope_stays_local_without_inheriting_canonical_provenance() -> None:
+    legacy_lines = []
+    for process_uuid in (_PROCESS_A, _PROCESS_B):
+        for line in _ownership_pair(process_uuid=process_uuid):
+            record = json.loads(line.removeprefix(DIAGNOSTICS_LOG_PREFIX))
+            record.pop("request_id_scope")
+            legacy_lines.append(f"{DIAGNOSTICS_LOG_PREFIX}{json.dumps(record)}\n")
+
+    result = analyze_lines(_ownership_pair() + legacy_lines)
+
+    assert len(result["requests"]) == 3
+    canonical = next(
+        request for request in result["requests"] if request["request_id_scope"] == "run"
+    )
+    assert canonical["event_count"] == 2
+    unknown = [
+        request for request in result["requests"] if request["request_id_scope"] == "unknown"
+    ]
+    assert len(unknown) == 2
+    for request in unknown:
+        assert request["correlation_scope"] == "process"
+        assert request["identity_issues"] == ["missing_request_id_scope"]
+        assert _ownership_durations(request) == [2.0]
+        assert len(request["participants"]) == 1
+
+
+def test_sessionless_wire_result_cannot_claim_canonical_or_fallback_identity() -> None:
+    result = analyze_lines(
+        _ownership_pair(request_id_scope="run")
+        + _ownership_pair(request_id_scope="process")
+        + [
+            _event(
+                "gen_writer_result_received",
+                5_000_000,
+                side="gen",
+                request_id_scope="unknown",
+                session_found=False,
+                peer_rank=0,
+                slice_id=0,
+                outcome="success",
+            )
+        ]
+    )
+
+    assert len(result["requests"]) == 3
+    unknown = next(
+        request for request in result["requests"] if request["request_id_scope"] == "unknown"
+    )
+    assert unknown["correlation_scope"] == "process"
+    assert unknown["identity_issues"] == ["unknown_request_id_scope"]
+    assert unknown["event_count"] == 1
+    assert unknown["durations"] == []
+    assert unknown["timeline"][0]["request_id_scope"] == "unknown"
+    assert unknown["timeline"][0]["session_found"] is False
+
+
+def test_process_scoped_ids_remain_separate_across_run_uuids() -> None:
+    result = analyze_lines(
+        [
+            _event("ctx_send_ready", request_id_scope="process"),
+            _event(
+                "ctx_source_kv_released",
+                3_000_000,
+                request_id_scope="process",
+                run_uuid=_RUN_B,
+            ),
+        ]
+    )
+
+    assert len(result["requests"]) == 2
+    assert all(request["correlation_scope"] == "process" for request in result["requests"])
+    assert all(request["durations"] == [] for request in result["requests"])
+
+
+@pytest.mark.parametrize("request_id_scope", ["global", False, 42])
+def test_invalid_request_scope_is_reported_without_cross_process_join(
+    request_id_scope: object,
+) -> None:
+    result = analyze_lines(
+        _ownership_pair(request_id_scope=request_id_scope)
+        + _ownership_pair(request_id_scope=request_id_scope, process_uuid=_PROCESS_B)
+    )
+
+    assert result["summary"]["malformed_diagnostic_lines"] == 0
+    assert len(result["requests"]) == 2
+    for request in result["requests"]:
+        assert request["request_id_scope"] == "unknown"
+        assert request["correlation_scope"] == "process"
+        assert request["identity_issues"] == ["invalid_request_id_scope"]
+        assert _ownership_durations(request) == [2.0]
