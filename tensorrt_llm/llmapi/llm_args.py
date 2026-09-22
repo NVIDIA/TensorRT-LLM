@@ -3113,18 +3113,18 @@ class DSparkDecodingConfig(DecodingBaseConfig):
 
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
 
-    attention_backend: Literal["VANILLA", "TRTLLM"] = Field(
-        default="VANILLA",
+    attention_backend: Literal["AUTO", "VANILLA", "TRTLLM", "CUTEDSL"] = Field(
+        default="AUTO",
         description=
-        "Attention backend for the pooled-context cross-attention of a "
-        "standalone DSpark drafter (one shipped as its own checkpoint rather "
-        "than inside the target's mtp.* namespace). Ignored by the embedded "
-        "DeepSeek-V4-Pro draft, which uses its own captured-context attention. "
-        "This is independent of the backend used to construct the drafter's "
-        "standard attention modules. TRTLLM requires FlashInfer and an NVIDIA "
-        "Blackwell GPU with SM100 or SM103, and uses generated FMHA kernels "
-        "with a private paged context cache; VANILLA uses FlashAttention with "
-        "a contiguous cache.")
+        "Block-decode attention backend for a standalone DSpark drafter (one "
+        "shipped as its own checkpoint, not inside the target's mtp.* "
+        "namespace). Ignored by the embedded DeepSeek-V4-Pro draft. Independent "
+        "of the backend that builds the drafter's own attention modules.\n\n"
+        "AUTO resolves per drafter family and is right unless you are pinning a "
+        "kernel: a GQA backbone degrades when its kernel is missing, an MLA one "
+        "raises. TRTLLM needs FlashInfer and SM100/SM103. CUTEDSL is MLA-only "
+        "and needs a cute-dsl MLA decode taking per-token kv_bounds that is not "
+        "upstream yet. Which kernel each name selects: MLADSparkForCausalLM.")
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
@@ -5665,6 +5665,16 @@ class TorchLlmArgs(BaseLlmArgs):
         description="Disable the overlap scheduler.",
         status="beta")
 
+    enable_return_routed_experts: bool = Field(
+        default=False,
+        description=
+        "Router Replay (R3): capture per-token pre-EPLB logical top-k MoE expert "
+        "ids so they can be returned on outputs (per request via "
+        "SamplingParams.return_routed_experts), for train/inference routing "
+        "alignment in MoE reinforcement learning. Zero overhead when disabled. "
+        "Separated-routing MoE backends only.",
+        status="beta")
+
     moe_config: MoeConfig = Field(default_factory=MoeConfig,
                                   description="MoE config.",
                                   status="beta")
@@ -6431,6 +6441,22 @@ class TorchLlmArgs(BaseLlmArgs):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
 
             if isinstance(self.speculative_config, DFlashDecodingConfig):
+                if (self.cache_transceiver_config is not None
+                        and self.cache_transceiver_config.backend is not None):
+                    # The transceiver moves the target KV cache, but the
+                    # drafter's context is built from target hidden states
+                    # during prefill and is not transferred with it, so a
+                    # generation server drafts without the prompt. Drafts are
+                    # verified against the target, so this costs acceptance
+                    # rather than correctness: warn, do not reject.
+                    logger.warning(
+                        "DFlash acceptance is degraded under disaggregated "
+                        "serving: the cache transceiver moves the target KV "
+                        "cache, but the drafter's context is built during "
+                        "prefill and is not transferred, so a generation "
+                        "server drafts without the prompt context. Output is "
+                        "unaffected; expect a lower acceptance rate than the "
+                        "same configuration run aggregated.")
                 assert self.speculative_config.max_draft_len > 0, "DFlash max_draft_len must be > 0"
                 # A Hugging Face repo id is not readable yet; CachedModelLoader
                 # calls this again after the drafter is downloaded.

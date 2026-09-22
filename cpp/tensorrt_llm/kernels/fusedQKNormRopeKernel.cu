@@ -449,6 +449,11 @@ __global__ void minimaxM3Fp8QKNormRopeKVInsertKernel(__nv_bfloat16 const* qkvInp
     float sumSquares = 0.0F;
     constexpr int kVecSize = kMinimaxM3ElemsPerThread * sizeof(__nv_bfloat16) / 4;
     using VecT = typename tensorrt_llm::common::packed_as<uint, kVecSize>::type;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    // qkvInput is the QKV GEMM's output, so wait here rather than at entry and
+    // let the index arithmetic above overlap the GEMM's tail.
+    cudaGridDependencySynchronize();
+#endif
     VecT const packedInput = *reinterpret_cast<VecT const*>(qkvInput + inputOffset);
 #pragma unroll
     for (int i = 0; i < kVecSize; ++i)
@@ -595,6 +600,11 @@ __global__ void minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 const
         + laneId * kMinimaxM3ElemsPerThread;
     constexpr int kVecSize = kMinimaxM3ElemsPerThread * sizeof(__nv_bfloat16) / 4;
     using VecT = typename tensorrt_llm::common::packed_as<uint, kVecSize>::type;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    // packedInput is the fused QKV GEMM's output, so wait before the first load
+    // of it rather than at entry.
+    cudaGridDependencySynchronize();
+#endif
     VecT const packed = *reinterpret_cast<VecT const*>(packedInput + inputOffset);
 
     float elements[kMinimaxM3ElemsPerThread];
@@ -979,12 +989,11 @@ void launchMinimaxM3Fp8QKNormRopeKVInsert(void const* qkv_input, void* q_output,
     constexpr int kWarpsPerBlock = kBlockSize / 32;
     int const totalWarps = num_tokens * (num_heads_q + num_heads_k + num_heads_v);
     int const gridSize = common::divUp(totalWarps, kWarpsPerBlock);
-    minimaxM3Fp8QKNormRopeKVInsertKernel<<<gridSize, kBlockSize, 0, stream>>>(
-        static_cast<__nv_bfloat16 const*>(qkv_input), static_cast<__nv_fp8_e4m3*>(q_output),
+    common::launchWithPdlWhenEnabled("minimaxM3Fp8QKNormRopeKVInsert", minimaxM3Fp8QKNormRopeKVInsertKernel, gridSize,
+        kBlockSize, 0, stream, static_cast<__nv_bfloat16 const*>(qkv_input), static_cast<__nv_fp8_e4m3*>(q_output),
         static_cast<__nv_fp8_e4m3*>(kv_cache), out_cache_loc, page_stride, plane_stride, head_stride, token_stride,
         num_pages, num_tokens, num_heads_q, num_heads_k, num_heads_v, eps, static_cast<__nv_bfloat16 const*>(q_weight),
         static_cast<__nv_bfloat16 const*>(k_weight), base, position_ids);
-    TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
 void launchMinimaxM3Fp8QKVIndexerNormRopeKVInsert(void const* packed_input, void* q_output, void* index_q_output,
@@ -1007,7 +1016,8 @@ void launchMinimaxM3Fp8QKVIndexerNormRopeKVInsert(void const* packed_input, void
     int const slotsPerToken = num_heads_q + 2 * num_heads_kv + num_heads_index + 1;
     int const totalWarps = num_tokens * slotsPerToken;
     int const gridSize = common::divUp(totalWarps, kWarpsPerBlock);
-    minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel<<<gridSize, kBlockSize, 0, stream>>>(
+    common::launchWithPdlWhenEnabled("minimaxM3Fp8QKVIndexerNormRopeKVInsert",
+        minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel, gridSize, kBlockSize, 0, stream,
         static_cast<__nv_bfloat16 const*>(packed_input), static_cast<__nv_fp8_e4m3*>(q_output),
         static_cast<__nv_fp8_e4m3*>(index_q_output), static_cast<__nv_fp8_e4m3*>(kv_cache),
         static_cast<__nv_fp8_e4m3*>(index_k_cache), out_cache_loc, kv_page_stride, kv_plane_stride, kv_head_stride,
@@ -1015,7 +1025,6 @@ void launchMinimaxM3Fp8QKVIndexerNormRopeKVInsert(void const* packed_input, void
         num_heads_index, eps, static_cast<__nv_bfloat16 const*>(q_weight), static_cast<__nv_bfloat16 const*>(k_weight),
         static_cast<__nv_bfloat16 const*>(index_q_weight), static_cast<__nv_bfloat16 const*>(index_k_weight),
         rotary_cos_sin, position_ids);
-    TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
 void launchMinimaxM3Nvfp4QKVIndexerNormRopeKVInsert(void const* packed_input, void* q_output, void* index_q_output,

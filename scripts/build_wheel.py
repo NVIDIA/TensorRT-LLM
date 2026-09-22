@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
+import json
 import os
 import platform
 import re
@@ -117,6 +119,96 @@ def get_build_dir(build_dir, build_type, build_root=None, out_of_tree=False):
     else:
         build_dir = Path(build_dir).resolve()
     return build_dir
+
+
+# Records the fingerprint of the cmake configure arguments used by the last
+# configure of a build dir, so a later invocation with different arguments
+# reconfigures instead of silently building the old configuration.
+CONFIGURE_FINGERPRINT_FILENAME = ".cmake_configure_args.sha256"
+
+
+def _cmake_define_name(arg: str) -> Optional[str]:
+    """Cache-variable name of a ``-D`` define, or ``None`` for other arguments.
+
+    Handles ``-DKEY=value``, ``-DKEY:TYPE=value``, and the surrounding quotes
+    that ``--extra-cmake-vars`` expansion adds (``"-DKEY=value"``).
+    """
+    token = arg.strip().strip('"')
+    if not token.startswith("-D"):
+        return None
+    name = token[2:].split("=", 1)[0].split(":", 1)[0]
+    return name or None
+
+
+def configure_args_fingerprint(args: Sequence[str]) -> str:
+    """Stable sha256 hex digest over the configure-affecting cmake arguments.
+
+    cmake applies repeated ``-DKEY=value`` definitions in order (the last one
+    wins), so the fingerprint is taken over the *effective* configuration: for
+    each cache variable only its last ``-D`` definition is kept, and the
+    remaining (non-``-D``) arguments are order-insensitive. Reordering distinct
+    flags then fingerprints the same (as it should), while two lists whose
+    winning value for some key differs fingerprint differently -- otherwise the
+    stale-configuration guard could miss a real configuration change (e.g. via
+    ``--extra-cmake-vars`` passing the same key twice).
+
+    The canonical list is JSON-serialized rather than newline-joined so that an
+    argument whose value contains a newline can't collide with the separator
+    (cmake flags/paths don't today, but the JSON form removes the ambiguity).
+    """
+    effective = {}
+    others = []
+    for arg in args:
+        name = _cmake_define_name(arg)
+        if name is None:
+            others.append(arg)
+        else:
+            effective[name] = arg  # last definition of a key wins, as in cmake
+    canonical = sorted(effective.values()) + sorted(others)
+    payload = json.dumps(canonical, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def stored_configure_fingerprint(build_dir) -> Optional[str]:
+    """Fingerprint recorded by the last cmake configure, or None.
+
+    None also covers build dirs created before fingerprints were recorded;
+    ``configure_reason`` turns that into a one-time reconfigure so a marker
+    gets recorded.
+    """
+    fingerprint_file = Path(build_dir) / CONFIGURE_FINGERPRINT_FILENAME
+    if not fingerprint_file.exists():
+        return None
+    return fingerprint_file.read_text().strip() or None
+
+
+def configure_reason(build_dir, configure_fingerprint: str, *,
+                     first_build: bool, configure_cmake: bool,
+                     configure_only: bool, clean: bool) -> Optional[str]:
+    """Why a fingerprint change requires a cmake reconfigure, or None.
+
+    Explicit modes (clean, first build, ``--configure_cmake``,
+    ``--configure_only``) configure on their own, so this returns None and
+    leaves them to the caller. Otherwise it compares the recorded fingerprint
+    against the current arguments:
+
+    - No recorded fingerprint on an already-configured build dir means the dir
+      predates fingerprinting; reconfigure once so a marker gets recorded.
+      Without this, the first flag change on such a dir would silently build
+      the old configuration.
+    - A recorded fingerprint that differs means the configure-affecting
+      arguments changed.
+    """
+    if clean or first_build or configure_cmake or configure_only:
+        return None
+    stored = stored_configure_fingerprint(build_dir)
+    if stored is None:
+        return ("no cmake configure fingerprint recorded; "
+                "reconfiguring once to record one")
+    if stored != configure_fingerprint:
+        return (f"cmake arguments changed since last configure "
+                f"({stored[:8]} -> {configure_fingerprint[:8]}); reconfiguring")
+    return None
 
 
 def clear_folder(folder_path):
@@ -831,7 +923,6 @@ def main(*,
          out_of_tree: bool = False,
          use_3rdparty_cache: bool = False,
          fast_build: bool = False,
-         cpp_only: bool = False,
          install: bool = False,
          skip_building_wheel: bool = False,
          linking_install_binary: bool = False,
@@ -952,8 +1043,10 @@ def main(*,
             expanded_args += var.split(";")
 
         extra_cmake_vars = ["\"-D{}\"".format(var) for var in expanded_args]
-        # Don't include duplicate conditions
-        cmake_def_args.extend(set(extra_cmake_vars))
+        # Drop exact-duplicate conditions while preserving order, so that when
+        # the same key is passed twice cmake's last-wins semantics stay
+        # deterministic (a set() would reorder them arbitrarily).
+        cmake_def_args.extend(dict.fromkeys(extra_cmake_vars))
 
     if nccl_root is not None:
         cmake_def_args.append(f"-DNCCL_ROOT={nccl_root}")
@@ -1018,31 +1111,23 @@ def main(*,
                 "-- BOLT: Forcing NVRTC_DYNAMIC_LINKING=ON (static NVIDIA libs lack relocations)"
             )
 
-    targets = ["tensorrt_llm"]
+    targets = [
+        "tensorrt_llm", "th_common", "bindings", "deep_ep", "deep_gemm",
+        "pg_utils", "flash_mla"
+    ]
     build_nccl_extensions_enabled = has_sm90_or_newer(cuda_architectures)
-
-    if cpp_only:
-        build_pyt = "OFF"
-        build_deep_ep = "OFF"
-        build_nccl_extensions = "OFF"
-        build_deep_gemm = "OFF"
-        build_flash_mla = "OFF"
+    if build_nccl_extensions_enabled:
+        targets.append("nccl_extensions_wheel")
     else:
-        targets.extend([
-            "th_common", "bindings", "deep_ep", "deep_gemm", "pg_utils",
-            "flash_mla"
-        ])
-        if build_nccl_extensions_enabled:
-            targets.append("nccl_extensions_wheel")
-        else:
-            print(
-                "WARNING: NCCL-EP requires SM90+ and will not be embedded in this wheel "
-                f"(CUDA architectures: {cuda_architectures}).")
-        build_pyt = "ON"
-        build_deep_ep = "ON"
-        build_nccl_extensions = "ON" if build_nccl_extensions_enabled else "OFF"
-        build_deep_gemm = "ON"
-        build_flash_mla = "ON"
+        print(
+            "WARNING: NCCL-EP requires SM90+ and will not be embedded in this wheel "
+            f"(CUDA architectures: {cuda_architectures}).")
+
+    build_pyt = "ON"
+    build_deep_ep = "ON"
+    build_nccl_extensions = "ON" if build_nccl_extensions_enabled else "OFF"
+    build_deep_gemm = "ON"
+    build_flash_mla = "ON"
 
     if micro_benchmarks:
         targets.append("micro_benchmarks")
@@ -1067,6 +1152,47 @@ def main(*,
         cmake_def_args.append(
             f"-DTRTLLM_VERSION_H_INCLUDE_DIR={build_dir}/generated-include")
 
+    # Fingerprint the configure-affecting arguments so a flag change (e.g.
+    # --cuda_architectures, --nvrtc_dynamic_linking, --extra-cmake-vars) on
+    # an already-configured build dir forces a reconfigure instead of
+    # silently building the old configuration. The source directory is
+    # included because an explicit build_dir can be reused across checkouts
+    # (shared build_root, --no_venv) with every other argument equal while
+    # -S changes. The conan toolchain path is excluded: it is derived from
+    # build_dir and constant per build dir.
+    #
+    # The arguments are listed in the same order the configure command below
+    # passes them (built-in definitions, then cmake_def_args, then the
+    # generator and source). cmake applies repeated -D definitions left to
+    # right, so a user override in cmake_def_args (e.g. --extra-cmake-vars
+    # BUILD_PYT=OFF) must come after the built-in default for the fingerprint's
+    # last-wins to match the configuration cmake actually caches.
+    configure_fingerprint = configure_args_fingerprint([
+        f'-DCMAKE_BUILD_TYPE="{build_type}"',
+        f'-DBUILD_PYT="{build_pyt}"',
+        f'-DBUILD_DEEP_EP="{build_deep_ep}"',
+        f'-DBUILD_DEEP_GEMM="{build_deep_gemm}"',
+        f'-DBUILD_FLASH_MLA="{build_flash_mla}"',
+        f'-DNVTX_DISABLE="{disable_nvtx}"',
+        f'-DBUILD_MICRO_BENCHMARKS={build_micro_benchmarks}',
+        f'-DBUILD_WHEEL_TARGETS="{";".join(targets)}"',
+        f'-DPython_EXECUTABLE={venv_python}',
+        f'-DINTERNAL_CUTLASS_KERNELS_PATH={internal_cutlass_kernels_root}',
+        cmake_cuda_architectures,
+    ] + cmake_def_args + [
+        cmake_generator,
+        f'-S "{source_dir}"',
+    ])
+    reason = configure_reason(build_dir,
+                              configure_fingerprint,
+                              first_build=first_build,
+                              configure_cmake=configure_cmake,
+                              configure_only=configure_only,
+                              clean=clean)
+    if reason is not None:
+        print(reason)
+        configure_cmake = True
+
     with working_directory(build_dir):
         if clean or first_build or configure_cmake or configure_only:
             # Conan writes a CMakeUserPresets.json convenience file next to
@@ -1076,8 +1202,12 @@ def main(*,
             conan_extra_args = (
                 " -c tools.cmake.cmaketoolchain:user_presets=False"
                 if build_root is not None else "")
+            # Pin the standard Conan builds against: the profile it detects
+            # follows the compiler default, which lags behind what cpp/
+            # CMakeLists.txt asks for. Extensions are off there, hence "20"
+            # rather than "gnu20".
             build_run(
-                f"\"{venv_conan}\" install --build=missing --no-remote --output-folder={build_dir}/conan -s 'build_type={build_type}'{conan_extra_args} {source_dir}"
+                f"\"{venv_conan}\" install --build=missing --no-remote --output-folder={build_dir}/conan -s 'build_type={build_type}' -s:a compiler.cppstd=20{conan_extra_args} {source_dir}"
             )
             cmake_def_args.append(
                 f"-DCMAKE_TOOLCHAIN_FILE={build_dir}/conan/conan_toolchain.cmake"
@@ -1097,6 +1227,9 @@ def main(*,
             print("CMake Configure command: ")
             print(cmake_configure_command)
             build_run(cmake_configure_command)
+            (build_dir /
+             CONFIGURE_FINGERPRINT_FILENAME).write_text(configure_fingerprint +
+                                                        "\n")
 
         if configure_only:
             return
@@ -1111,7 +1244,7 @@ def main(*,
         build_run(cmake_build_command)
 
     nccl_extensions_wheel = None
-    if not cpp_only and build_nccl_extensions_enabled:
+    if build_nccl_extensions_enabled:
         nccl_extensions_wheels = sorted(
             (build_dir / "tensorrt_llm" / "nccl_extensions" /
              "dist").glob("nccl_extensions*.whl"))
@@ -1120,10 +1253,6 @@ def main(*,
                 "Expected exactly one source-built nccl-extensions wheel, found "
                 f"{len(nccl_extensions_wheels)}")
         nccl_extensions_wheel = nccl_extensions_wheels[0]
-
-    if cpp_only:
-        assert not install, "Installing is not supported for cpp_only builds"
-        return
 
     if out_of_tree:
         # Assemble the wheel in an out-of-tree staging project; the checkout
@@ -1403,106 +1532,101 @@ def main(*,
     if scripts_dir.exists():
         clear_folder(scripts_dir)
 
-    if not cpp_only:
+    def get_binding_lib(subdirectory, name):
+        binding_build_dir = (build_dir / "tensorrt_llm" / subdirectory)
+        if on_windows:
+            binding_lib = list(binding_build_dir.glob(f"{name}.*.pyd"))
+        else:
+            binding_lib = list(binding_build_dir.glob(f"{name}.*.so"))
 
-        def get_binding_lib(subdirectory, name):
-            binding_build_dir = (build_dir / "tensorrt_llm" / subdirectory)
-            if on_windows:
-                binding_lib = list(binding_build_dir.glob(f"{name}.*.pyd"))
-            else:
-                binding_lib = list(binding_build_dir.glob(f"{name}.*.so"))
+        assert len(
+            binding_lib
+        ) == 1, f"Exactly one binding library should be present: {binding_lib}"
+        return binding_lib[0]
 
-            assert len(
-                binding_lib
-            ) == 1, f"Exactly one binding library should be present: {binding_lib}"
-            return binding_lib[0]
+    binding_lib_dir = get_binding_lib("nanobind", "bindings")
+    binding_lib_file_name = binding_lib_dir.name
+    install_file(binding_lib_dir, pkg_dir)
 
-        binding_lib_dir = get_binding_lib("nanobind", "bindings")
-        binding_lib_file_name = binding_lib_dir.name
-        install_file(binding_lib_dir, pkg_dir)
+    with (build_dir / "tensorrt_llm" / "deep_ep" /
+          "cuda_architectures.txt").open() as f:
+        deep_ep_cuda_architectures = f.read().strip().strip(";")
+    if not deep_ep_cuda_architectures and deep_ep_dir.exists():
+        if deep_ep_dir.is_symlink():
+            deep_ep_dir.unlink()
+        else:
+            rmtree(deep_ep_dir)
+    if deep_ep_cuda_architectures:
+        install_file(get_binding_lib("deep_ep", "deep_ep_cpp_tllm"), pkg_dir)
+        install_tree(
+            build_dir / "tensorrt_llm" / "deep_ep" / "python" / "deep_ep",
+            deep_ep_dir)
+        (lib_dir / "nvshmem").mkdir(exist_ok=True)
+        install_file(
+            build_dir / "tensorrt_llm/deep_ep/nvshmem-build/License.txt",
+            lib_dir / "nvshmem")
+        install_file(
+            build_dir /
+            "tensorrt_llm/deep_ep/nvshmem-build/src/lib/nvshmem_bootstrap_uid.so.3",
+            lib_dir / "nvshmem")
+        install_file(
+            build_dir /
+            "tensorrt_llm/deep_ep/nvshmem-build/src/lib/nvshmem_transport_ibgda.so.103",
+            lib_dir / "nvshmem")
 
-        with (build_dir / "tensorrt_llm" / "deep_ep" /
-              "cuda_architectures.txt").open() as f:
-            deep_ep_cuda_architectures = f.read().strip().strip(";")
-        if not deep_ep_cuda_architectures and deep_ep_dir.exists():
-            if deep_ep_dir.is_symlink():
-                deep_ep_dir.unlink()
-            else:
-                rmtree(deep_ep_dir)
-        if deep_ep_cuda_architectures:
-            install_file(get_binding_lib("deep_ep", "deep_ep_cpp_tllm"),
-                         pkg_dir)
-            install_tree(
-                build_dir / "tensorrt_llm" / "deep_ep" / "python" / "deep_ep",
-                deep_ep_dir)
-            (lib_dir / "nvshmem").mkdir(exist_ok=True)
-            install_file(
-                build_dir / "tensorrt_llm/deep_ep/nvshmem-build/License.txt",
-                lib_dir / "nvshmem")
-            install_file(
-                build_dir /
-                "tensorrt_llm/deep_ep/nvshmem-build/src/lib/nvshmem_bootstrap_uid.so.3",
-                lib_dir / "nvshmem")
-            install_file(
-                build_dir /
-                "tensorrt_llm/deep_ep/nvshmem-build/src/lib/nvshmem_transport_ibgda.so.103",
-                lib_dir / "nvshmem")
+    install_file(get_binding_lib("deep_gemm", "deep_gemm_cpp_tllm"), pkg_dir)
+    install_tree(
+        build_dir / "tensorrt_llm" / "deep_gemm" / "python" / "deep_gemm",
+        deep_gemm_dir)
 
-        install_file(get_binding_lib("deep_gemm", "deep_gemm_cpp_tllm"),
+    with (build_dir / "tensorrt_llm" / "flash_mla" /
+          "cuda_architectures.txt").open() as f:
+        flash_mla_cuda_architectures = f.read().strip().strip(";")
+    if flash_mla_cuda_architectures:
+        install_file(get_binding_lib("flash_mla", "flash_mla_cpp_tllm"),
                      pkg_dir)
         install_tree(
-            build_dir / "tensorrt_llm" / "deep_gemm" / "python" / "deep_gemm",
-            deep_gemm_dir)
+            build_dir / "tensorrt_llm" / "flash_mla" / "python" / "flash_mla",
+            pkg_dir / "flash_mla")
 
-        with (build_dir / "tensorrt_llm" / "flash_mla" /
-              "cuda_architectures.txt").open() as f:
-            flash_mla_cuda_architectures = f.read().strip().strip(";")
-        if flash_mla_cuda_architectures:
-            install_file(get_binding_lib("flash_mla", "flash_mla_cpp_tllm"),
-                         pkg_dir)
-            install_tree(
-                build_dir / "tensorrt_llm" / "flash_mla" / "python" /
-                "flash_mla", pkg_dir / "flash_mla")
+    # Stage the FetchContent-patched MSA package for setup.py packaging.
+    msa_src = build_dir / "_deps" / "msa-src" / "python" / "fmha_sm100"
+    cutlass_src = build_dir / "_deps" / "cutlass-src"
+    msa_dst = wheel_project_dir / "3rdparty" / "fmha_sm100"
+    if not (msa_src / "cute" / "interface.py").is_file():
+        raise FileNotFoundError(
+            f"MSA package missing at {msa_src}; CMake FetchContent for msa "
+            "did not populate the expected sources.")
+    if msa_dst.is_symlink():
+        msa_dst.unlink()
+    elif msa_dst.exists():
+        rmtree(msa_dst)
+    msa_dst.mkdir(parents=True)
+    for python_source in msa_src.glob("*.py"):
+        install_file(python_source, msa_dst)
+    for source_dir, relative_dir in (
+        (msa_src / "csrc", Path("csrc")),
+        (msa_src / "cute", Path("cute")),
+        (cutlass_src / "include", Path("cutlass/include")),
+        (cutlass_src / "tools/util/include",
+         Path("cutlass/tools/util/include")),
+    ):
+        (msa_dst / relative_dir).parent.mkdir(parents=True, exist_ok=True)
+        install_tree(
+            source_dir,
+            msa_dst / relative_dir,
+        )
+    install_file(cutlass_src / "LICENSE.txt", msa_dst / "cutlass")
 
-        # Stage the FetchContent-patched MSA package for setup.py packaging.
-        msa_src = build_dir / "_deps" / "msa-src" / "python" / "fmha_sm100"
-        cutlass_src = build_dir / "_deps" / "cutlass-src"
-        msa_dst = wheel_project_dir / "3rdparty" / "fmha_sm100"
-        if not (msa_src / "cute" / "interface.py").is_file():
-            raise FileNotFoundError(
-                f"MSA package missing at {msa_src}; CMake FetchContent for msa "
-                "did not populate the expected sources.")
-        if msa_dst.is_symlink():
-            msa_dst.unlink()
-        elif msa_dst.exists():
-            rmtree(msa_dst)
-        msa_dst.mkdir(parents=True)
-        for python_source in msa_src.glob("*.py"):
-            install_file(python_source, msa_dst)
-        for source_dir, relative_dir in (
-            (msa_src / "csrc", Path("csrc")),
-            (msa_src / "cute", Path("cute")),
-            (cutlass_src / "include", Path("cutlass/include")),
-            (cutlass_src / "tools/util/include",
-             Path("cutlass/tools/util/include")),
-        ):
-            (msa_dst / relative_dir).parent.mkdir(parents=True, exist_ok=True)
-            install_tree(
-                source_dir,
-                msa_dst / relative_dir,
-            )
-        install_file(cutlass_src / "LICENSE.txt", msa_dst / "cutlass")
-
-        if not skip_stubs:
-            with working_directory(pkg_dir):
-                if on_windows:
-                    generate_python_stubs_windows(venv_python, pkg_dir, lib_dir)
-                else:  # on linux
-                    generate_python_stubs_linux(
-                        venv_python, bool(deep_ep_cuda_architectures),
-                        bool(flash_mla_cuda_architectures),
-                        nixl_root is not None or mooncake_root is not None,
-                        binding_lib_file_name)
+    if not skip_stubs:
+        with working_directory(pkg_dir):
+            if on_windows:
+                generate_python_stubs_windows(venv_python, pkg_dir, lib_dir)
+            else:  # on linux
+                generate_python_stubs_linux(
+                    venv_python, bool(deep_ep_cuda_architectures),
+                    bool(flash_mla_cuda_architectures), nixl_root is not None
+                    or mooncake_root is not None, binding_lib_file_name)
 
     build_kv_cache_manager_v2(wheel_project_dir,
                               venv_python,
@@ -1655,11 +1779,6 @@ def add_arguments(parser: ArgumentParser):
         help=
         "Number of parallel jobs for compilation (default: number of CPUs available to this process, respecting affinity)"
     )
-    parser.add_argument(
-        "--cpp_only",
-        "-l",
-        action="store_true",
-        help="Only build the C++ library without Python dependencies")
     parser.add_argument(
         "--extra-cmake-vars",
         "-D",

@@ -1,3 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 import argparse
 import json
 import os
@@ -182,6 +183,14 @@ def main():
         import importlib
         models_module = importlib.import_module('tensorrt_llm._torch.models')
         model_class = getattr(models_module, args.auto_model_name)
+        if not all(
+                callable(getattr(model_class, hook, None))
+                for hook in ("lora_config", "lora_request")):
+            raise ValueError(
+                f"--load_lora requires {args.auto_model_name} to provide both "
+                "lora_config() and lora_request(). For external adapters, "
+                "use the LLM API with an explicit LoraConfig and per-prompt "
+                "LoRARequest objects.")
         lora_config = model_class.lora_config(args.model_dir)
         # For stability - explicitly set the LoRA GPU cache & CPU cache to have space for 2 adapters
         lora_config.max_loras = 2

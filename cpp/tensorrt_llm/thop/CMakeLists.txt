@@ -31,13 +31,6 @@ endif()
 add_library(th_utils STATIC thUtils.cpp)
 set_property(TARGET th_utils PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET th_utils PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-# Newer Torch headers (e.g. ATen/native/cuda/Resize.h) compare ArrayRef against
-# OptionalArrayRef in the reverse order, relying on C++20's automatic generation
-# of the reversed comparison operator. th_utils/th_common only contain host .cpp
-# sources, so scope the bump to these targets instead of the repo-wide C++17
-# standard.
-set_target_properties(th_utils PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
-                                                          ON)
 # Declare the dependency on the main shared library explicitly so consumers
 # (e.g. thUtilsTest) place it after th_utils on the link line; this was
 # previously satisfied transitively via the removed TensorRT plugin target.
@@ -54,13 +47,11 @@ add_library(
   asyncUlyssesOp.cpp
   attentionOp.cpp
   causalConv1dOp.cpp
-  moe/cuteDslMoeUtilsOp.cpp
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
   cublasFp4ScaledMM.cpp
   cudaNvfp4MM.cpp
   marlinNvfp4MM.cpp
-  moe/marlinNvfp4MoeMM.cpp
   marlinRepack.cpp
   cudaScaledMM.cpp
   fmhaPackMaskOp.cpp
@@ -100,20 +91,8 @@ add_library(
   llama4MinLatency.cpp
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
-  moe/moeOp.cpp
-  moe/moeUtilOp.cpp
-  moe/moeGateOp.cpp
-  moe/moeCommOp.cpp
-  moe/moeAlltoAllOp.cpp
-  moe/moeLoadBalanceOp.cpp
-  moe/moeAlignOp.cpp
-  moe/megaMoePrepareOp.cpp
-  moe/mxFp4BlockScaleMoe.cpp
   mxFp8Quantize.cpp
   mxfp8Gemm.cpp
-  moe/fp8BlockScaleMoe.cpp
-  moe/fp8PerTensorScaleMoe.cpp
-  moe/fp4BlockScaleMoe.cpp
   noAuxTcOp.cpp
   fusedCatFp4Op.cpp
   fusedCatFp8Op.cpp
@@ -130,7 +109,6 @@ add_library(
   reducescatterOp.cpp
   relativeAttentionBiasOp.cpp
   dsv3RouterGemmOp.cpp
-  moe/customMoeRoutingOp.cpp
   localityDomainAllocator.cpp
   mamba2MTPSSMCacheOp.cpp
   selectiveScanOp.cpp
@@ -153,9 +131,11 @@ add_library(
   inplaceSliceCopyOp.cpp
   mhcOp.cpp
   compressorOp.cpp)
+
+# MoE torch ops live in moe/<backend|role>/; that directory adds them to
+# th_common with target_sources() so the list stays next to the files.
+add_subdirectory(moe)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
-set_target_properties(th_common PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
-                                                           ON)
 target_link_libraries(
   th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
                     ${SHARED_TARGET} pg_utils)
