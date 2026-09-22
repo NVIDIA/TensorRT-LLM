@@ -458,26 +458,27 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             tile_size = tactic
         else:
             tile_size = 128
-        recv_expert_count = None
         forward_inputs = inputs
+        # Only run_moe_nvfp4_impl takes these; omitting them when they carry no
+        # information keeps the locality-domain impl callable through here.
+        count_native_kwargs = {}
         if self.use_direct_expert_metadata:
-            recv_expert_count = inputs[-1]
             forward_inputs = inputs[:-1]
             num_rows = forward_inputs[0].size(0)
             if num_rows % self.num_local_experts != 0:
                 raise ValueError(
                     "Expert-major input rows must be divisible by the number "
                     "of local experts")
-            deep_ep_expert_capacity = num_rows // self.num_local_experts
-        else:
-            deep_ep_expert_capacity = None
+            count_native_kwargs = dict(
+                recv_expert_count=inputs[-1],
+                deep_ep_expert_capacity=num_rows // self.num_local_experts,
+                use_count_native_expert_metadata=True,
+            )
         return self.forward_impl(
             *forward_inputs,
             enable_alltoall=self.enable_alltoall,
             tile_size=tile_size,
-            recv_expert_count=recv_expert_count,
-            deep_ep_expert_capacity=deep_ep_expert_capacity,
-            use_count_native_expert_metadata=self.use_direct_expert_metadata)
+            **count_native_kwargs)
 
     @AutoTuner.TacticsCapture.register_runner_tactic_comb_checker
     @staticmethod
@@ -1573,9 +1574,6 @@ class CuteDslFusedMoE(MoEImplBase):
         moe_output: Optional[torch.Tensor] = None,
         enable_alltoall: bool = False,
         tile_size: int = 128,
-        recv_expert_count: Optional[torch.Tensor] = None,
-        deep_ep_expert_capacity: Optional[int] = None,
-        use_count_native_expert_metadata: bool = False,
         overlap_moe_output_memset: bool = True,
     ) -> torch.Tensor:
         """locality domain path: half-weight children, shared output buffers, fork/join.
@@ -1584,12 +1582,6 @@ class CuteDslFusedMoE(MoEImplBase):
         same tuned tactic and write directly into their strided regions of the
         shared FC1/FC2 output buffers.
         """
-        # Runner.forward passes these to whichever forward_impl it holds;
-        # can_use_deep_ep_direct_metadata() excludes locality domain.
-        if use_count_native_expert_metadata:
-            raise NotImplementedError(
-                "Count-native DeepEP expert metadata is not supported by the "
-                "locality-domain NVFP4 MoE path.")
         output_dtype = torch.bfloat16
         num_partitions = self._locality_domain_plan.num_partitions
         shards = self._locality_domain_weight_shards
