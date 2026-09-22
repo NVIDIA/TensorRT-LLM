@@ -38,6 +38,7 @@ l0_cpu:
   # runs -m cpu_only, so this entry contributes only the 3 marked files under attention/.
   - unittest/_torch/attention
   - unittest/_torch/cute_dsl/test_kimi_k3_kda_ptx_patch.py
+  - unittest/_torch/compilation/test_auto_multi_stream.py
   - unittest/_torch/compilation/test_remove_copy_pass.py::test_remove_copy_preserves_minimax_producer_outputs
   - unittest/_torch/distributed
   - unittest/_torch/executor
