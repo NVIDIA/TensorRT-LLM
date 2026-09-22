@@ -1267,7 +1267,7 @@ class TestGraphCaptureConcurrencyWarning:
     """
 
     # The default no-padding capture set for max_batch_size=256:
-    # every batch <= 31 is exactly captured, above that only sparse sizes.
+    # every batch in 1..32 is exactly captured, above that only sparse sizes.
     NO_PADDING_SIZES_256 = list(range(1, 32)) + [32, 64, 128, 256]
 
     def _creator(self, *, capture_sizes, padding, total=1_000, max_batch_size=100):
