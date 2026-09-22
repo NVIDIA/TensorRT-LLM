@@ -208,6 +208,16 @@ def test_modelopt_fp8_excluded_linear_attention_falls_back_to_bf16() -> None:
         _HIDDEN,
     )
     assert out[f"{_ATTN_PREFIX}.in_proj_qkvz.weight"].dtype == torch.bfloat16
+    packed_weight = out[f"{_ATTN_PREFIX}.in_proj_qkvz.weight"]
+    qkv_rows = _Q_ROWS * 2 + _V_ROWS
+    torch.testing.assert_close(
+        packed_weight[:qkv_rows].float(),
+        torch.full((qkv_rows, _HIDDEN), 2.0),
+    )
+    torch.testing.assert_close(
+        packed_weight[qkv_rows:].float(),
+        torch.full((_V_ROWS, _HIDDEN), 4.0),
+    )
     # The scalar per-projection scales are consumed by the bf16 fallback before
     # split projections are packed; no fused FP8 scales should be synthesized.
     for name in (
