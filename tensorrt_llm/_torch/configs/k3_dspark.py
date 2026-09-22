@@ -13,16 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
+from transformers.configuration_utils import PretrainedConfig
 
 
-def get_flashinfer_environment() -> tuple[str | None, str | None]:
-    """Return every worker's FlashInfer paths exactly once."""
-    # Keep importing this pickling helper from initializing MPI in the parent.
-    from mpi4py import MPI
-
-    MPI.COMM_WORLD.barrier()
-    return (
-        os.environ.get("FLASHINFER_WORKSPACE_BASE"),
-        os.environ.get("FLASHINFER_CUBIN_DIR"),
-    )
+# The MLA-backboned DSpark drafter (Inferact/Kimi-K3-DSpark) ships a config.json
+# with model_type "k3_dspark", no auto_map and no modeling code, so
+# AutoConfig.from_pretrained cannot resolve it. Same workaround as LagunaConfig:
+# the fields are plain attributes, and MLADSparkForCausalLM reads them directly.
+class K3DsparkConfig(PretrainedConfig):
+    model_type = "k3_dspark"

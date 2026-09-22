@@ -82,33 +82,18 @@ struct Kernel_traits
 {
 
     // The step size in query sequence dimension (M of BMM1 and BMM2).
-    enum
-    {
-        STEP_Q = STEP_Q_
-    };
+    static constexpr int STEP_Q = STEP_Q_;
 
     // The step size in key/value sequence dimension (N of BMM1 and K of BMM2).
-    enum
-    {
-        STEP_KV = STEP_KV_
-    };
+    static constexpr int STEP_KV = STEP_KV_;
 
     // The valid head dimension.
-    enum
-    {
-        VALID_D = D_
-    };
+    static constexpr int VALID_D = D_;
 
-    enum
-    {
-        VALID_DV = (DV_ == 0 ? D_ : DV_)
-    };
+    static constexpr int VALID_DV = (DV_ == 0 ? D_ : DV_);
 
     // Bootstrap GMMA_K from dummy Instruction_traits where FP16/BF16 K = 16, FP8 K = 32.
-    enum
-    {
-        GMMA_K = Instruction_traits<STEP_Q, STEP_KV, 0, false, false>::GMMA_K
-    };
+    static constexpr int GMMA_K = Instruction_traits<STEP_Q, STEP_KV, 0, false, false>::GMMA_K;
 
     // The instruction traits for the BMM1.
     using Traits_p = Instruction_traits<STEP_Q, STEP_KV, GMMA_K, false, false>;
@@ -117,221 +102,115 @@ struct Kernel_traits
     using Element_data_type = typename Traits_p::A_type;
 
     // The bytes per element.
-    enum
-    {
-        ELEMENT_BYTES = sizeof(Element_data_type)
-    };
+    static constexpr int ELEMENT_BYTES = sizeof(Element_data_type);
 
     // The padded head dimension.
-    enum
-    {
-        D = std::min<int>(Round_up<VALID_D, 128 / ELEMENT_BYTES>::VALUE, Next_power_of_two<VALID_D>::VALUE)
-    };
+    static constexpr int D
+        = std::min<int>(Round_up<VALID_D, 128 / ELEMENT_BYTES>::VALUE, Next_power_of_two<VALID_D>::VALUE);
 
-    enum
-    {
-        DV = std::min<int>(Round_up<VALID_DV, 128 / ELEMENT_BYTES>::VALUE, Next_power_of_two<VALID_DV>::VALUE)
-    };
+    static constexpr int DV
+        = std::min<int>(Round_up<VALID_DV, 128 / ELEMENT_BYTES>::VALUE, Next_power_of_two<VALID_DV>::VALUE);
 
     // The number of smem buffers for Q tiles.
-    enum
-    {
-        Q_BUFFERS = Q_BUFFERS_
-    };
+    static constexpr int Q_BUFFERS = Q_BUFFERS_;
 
     // The number of smem buffers for K, and V tiles.
-    enum
-    {
-        KV_BUFFERS = KV_BUFFERS_
-    };
+    static constexpr int KV_BUFFERS = KV_BUFFERS_;
 
     // Whether read from paged kv buffers or not.
-    enum
-    {
-        PAGED_KV_INPUT = INPUT_LAYOUT_ == 2
-    };
+    static constexpr int PAGED_KV_INPUT = INPUT_LAYOUT_ == 2;
 
     // Whether Q and KV is in separate buffer, which means we need to consider different Q and KV lengths.
-    enum
-    {
-        SEPARATE_Q_KV_BUFFER = INPUT_LAYOUT_ > 0
-    };
+    static constexpr int SEPARATE_Q_KV_BUFFER = INPUT_LAYOUT_ > 0;
 
     // Whether use UTMASTG in epilogue. This is always false for FP16/BF16 at the moment.
-    enum
-    {
-        USE_TMA_STORE = 0
-    };
+    static constexpr int USE_TMA_STORE = 0;
 
     // SageAttention needs fp8 input
-    enum
-    {
-        SAGE_ATTENTION = SAGE_BLOCK_SIZE_Q_ > 0 || SAGE_BLOCK_SIZE_K_ > 0 || SAGE_BLOCK_SIZE_V_ > 0
-    };
+    static constexpr int SAGE_ATTENTION = SAGE_BLOCK_SIZE_Q_ > 0 || SAGE_BLOCK_SIZE_K_ > 0 || SAGE_BLOCK_SIZE_V_ > 0;
 
-    enum
-    {
-        SAGE_BLOCK_SIZE_Q = SAGE_BLOCK_SIZE_Q_
-    };
+    static constexpr int SAGE_BLOCK_SIZE_Q = SAGE_BLOCK_SIZE_Q_;
 
-    enum
-    {
-        SAGE_BLOCK_SIZE_K = SAGE_BLOCK_SIZE_K_
-    };
+    static constexpr int SAGE_BLOCK_SIZE_K = SAGE_BLOCK_SIZE_K_;
 
-    enum
-    {
-        SAGE_BLOCK_SIZE_V = SAGE_BLOCK_SIZE_V_
-    };
+    static constexpr int SAGE_BLOCK_SIZE_V = SAGE_BLOCK_SIZE_V_;
 
     // Whether the dma group transposes the v tile explicitly.
-    enum
-    {
-        DMA_GROUP_TRANSPOSE_V
-        = (std::is_same<Element_data_type, fmha::e4m3_t>::value || std::is_same<Element_data_type, fmha::e5m2_t>::value)
-    };
+    static constexpr int DMA_GROUP_TRANSPOSE_V = (std::is_same<Element_data_type, fmha::e4m3_t>::value
+        || std::is_same<Element_data_type, fmha::e5m2_t>::value);
 
     // The number of smem scratch buffer for staging V transpose for Hopper QGMMA
-    enum
-    {
-        V_SCRATCH_BUFFERS = DMA_GROUP_TRANSPOSE_V ? 1 : 0
-    };
+    static constexpr int V_SCRATCH_BUFFERS = DMA_GROUP_TRANSPOSE_V ? 1 : 0;
 
     // The number of compute warpgroups (128 threads per warpgroup).
-    enum
-    {
-        NUM_COMPUTE_GROUPS = NUM_COMPUTE_GROUPS_
-    };
+    static constexpr int NUM_COMPUTE_GROUPS = NUM_COMPUTE_GROUPS_;
 
     // The number of data warpgroups (TMA).
-    enum
-    {
-        DMA2COMPUTE_DEPTH = DMA2COMPUTE_DEPTH_
-    };
+    static constexpr int DMA2COMPUTE_DEPTH = DMA2COMPUTE_DEPTH_;
 
     // The number of ctas per cluster.
-    enum
-    {
-        CTAS_PER_CGA = 1
-    };
+    static constexpr int CTAS_PER_CGA = 1;
 
     // The total number of threads per block,
-    enum
-    {
-        THREADS = 128 + NUM_COMPUTE_GROUPS * 128
-    };
+    static constexpr int THREADS = 128 + NUM_COMPUTE_GROUPS * 128;
 
     // The number of warps in the M dimension.
-    enum
-    {
-        WARPS_M = 4
-    };
+    static constexpr int WARPS_M = 4;
 
     // The number of warpgroups in the M dimensions.
-    enum
-    {
-        WARP_GROUP_M = WARPS_M / 4
-    };
+    static constexpr int WARP_GROUP_M = WARPS_M / 4;
 
     // The number of warps in the N dimension.
-    enum
-    {
-        WARPS_N = 1
-    };
+    static constexpr int WARPS_N = 1;
 
     // The number of warpgroups in the N dimension.
-    enum
-    {
-        WARP_GROUP_N = WARPS_N
-    };
+    static constexpr int WARP_GROUP_N = WARPS_N;
 
     // The number of warpgroups in the K dimension.
-    enum
-    {
-        WARP_GROUP_K = 1
-    };
+    static constexpr int WARP_GROUP_K = 1;
 
     // The attention mask type: padding (0), causal (1), sliding_or_chunked_attention (2),
     // bidirectional_sliding_window_attention (3), custom_mask (4).
-    enum
-    {
-        CAUSAL_MASK = (ATTENTION_MASK_TYPE_ == 1 || ATTENTION_MASK_TYPE_ == 2)
-    };
+    static constexpr int CAUSAL_MASK = (ATTENTION_MASK_TYPE_ == 1 || ATTENTION_MASK_TYPE_ == 2);
 
-    enum
-    {
-        SLIDING_OR_CHUNKED_ATTENTION = ATTENTION_MASK_TYPE_ == 2 || ATTENTION_MASK_TYPE_ == 3
-    };
+    static constexpr int SLIDING_OR_CHUNKED_ATTENTION = ATTENTION_MASK_TYPE_ == 2 || ATTENTION_MASK_TYPE_ == 3;
 
-    enum
-    {
-        BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = ATTENTION_MASK_TYPE_ == 3
-    };
+    static constexpr int BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = ATTENTION_MASK_TYPE_ == 3;
 
     // Is head interleaved ?
     // (head_interleaved means input [bxs, h, 3, d], otherwise [bx3, 3, h, d]).
-    enum
-    {
-        HEADS_INTERLEAVED = HEADS_INTERLEAVED_
-    };
+    static constexpr int HEADS_INTERLEAVED = HEADS_INTERLEAVED_;
 
     // Are we applying alibi bias (drop FMA optimizations for accuracy reasons).
-    enum
-    {
-        APPLY_ALIBI = APPLY_ALIBI_
-    };
+    static constexpr int APPLY_ALIBI = APPLY_ALIBI_;
 
     // Are we save the softmax stats?
-    enum
-    {
-        RETURN_SOFTMAX_STATS = RETURN_SOFTMAX_STATS_
-    };
+    static constexpr int RETURN_SOFTMAX_STATS = RETURN_SOFTMAX_STATS_;
 
     // Are we applying softcapping scale for qk products ?
-    enum
-    {
-        ENABLE_BMM1_SOFTCAPPING_SCALE = ENABLE_BMM1_SOFTCAPPING_SCALE_
-    };
+    static constexpr int ENABLE_BMM1_SOFTCAPPING_SCALE = ENABLE_BMM1_SOFTCAPPING_SCALE_;
 
     // Use the custom mask input ( attention_mask_type == 4.)
-    enum
-    {
-        USE_CUSTOM_MASK = ATTENTION_MASK_TYPE_ == 4
-    };
+    static constexpr int USE_CUSTOM_MASK = ATTENTION_MASK_TYPE_ == 4;
 
     // Are we enabling skip softmax attention feature?
-    enum
-    {
-        ENABLE_SKIP_SOFTMAX = ENABLE_SKIP_SOFTMAX_
-    };
+    static constexpr int ENABLE_SKIP_SOFTMAX = ENABLE_SKIP_SOFTMAX_;
 
     static_assert(!USE_CUSTOM_MASK || STEP_KV == 64 || STEP_KV == 128 || STEP_KV == 256, "Not implemented!");
 
     // Apply the exp2f optimization (fuse bmm1_scale and -max into FMAs).
     // Performance degradation when enabled exp2f tricks with dense mask.
     // with softcapping scale, exp2f optimization cannot work.
-    enum
-    {
-        EXP2F_OPTIMIZATION = !APPLY_ALIBI && !ENABLE_BMM1_SOFTCAPPING_SCALE
-    };
+    static constexpr int EXP2F_OPTIMIZATION = !APPLY_ALIBI && !ENABLE_BMM1_SOFTCAPPING_SCALE;
 
     // Enable mutex to overlap mma and softmax ?
-    enum
-    {
-        ENABLE_MUTEX = ENABLE_MUTEX_
-    };
+    static constexpr int ENABLE_MUTEX = ENABLE_MUTEX_;
 
     // The tile scheduling mode: static (0), dynamic (1)
-    enum
-    {
-        SCHEDULING_MODE = SCHEDULING_MODE_
-    };
+    static constexpr int SCHEDULING_MODE = SCHEDULING_MODE_;
 
     // The bytes of head dimension.
-    enum
-    {
-        D_BYTES = D * ELEMENT_BYTES
-    };
+    static constexpr int D_BYTES = D * ELEMENT_BYTES;
 
     // Split D into multiple groups in order to match the TMA swizzle mode (128B).
     // 1. BMM1: we split D into multiple K groups.
@@ -339,57 +218,33 @@ struct Kernel_traits
     //          but only have one MMA_N as we can use leading_dim_offset to handle this.
 
     // The number of head_dimension groups.
-    enum
-    {
-        D_GROUPS = fmha::Div_up<D_BYTES, 128>::VALUE
-    };
+    static constexpr int D_GROUPS = fmha::Div_up<D_BYTES, 128>::VALUE;
 
     // The head_dimension per group.
-    enum
-    {
-        D_PER_GROUP = D / D_GROUPS
-    };
+    static constexpr int D_PER_GROUP = D / D_GROUPS;
 
     static_assert(D_GROUPS * D_PER_GROUP == D);
 
     // The head_dimension bytes per group
-    enum
-    {
-        D_BYTES_PER_GROUP = D_BYTES / D_GROUPS
-    };
+    static constexpr int D_BYTES_PER_GROUP = D_BYTES / D_GROUPS;
 
     // The bytes of head dimension of V.
-    enum
-    {
-        DV_BYTES = DV * ELEMENT_BYTES
-    };
+    static constexpr int DV_BYTES = DV * ELEMENT_BYTES;
 
     // The number of head_dimension groups of V.
-    enum
-    {
-        DV_GROUPS = fmha::Div_up<DV_BYTES, 128>::VALUE
-    };
+    static constexpr int DV_GROUPS = fmha::Div_up<DV_BYTES, 128>::VALUE;
 
     // QGMMA: BMM2 will be split into multiple K groups as we explicitly transpose v (128 * D) in the smem.
     // HGMMA: BMM2 will load from row-major (K * N) smem_v, so we don't need to explicitly split K.
     static constexpr auto BMM2_LEADING_DIM_BYTES = ELEMENT_BYTES == 1 ? 128 : STEP_KV * ELEMENT_BYTES;
 
-    enum
-    {
-        BMM2_K_GROUPS = fmha::Div_up<STEP_KV * ELEMENT_BYTES, BMM2_LEADING_DIM_BYTES>::VALUE
-    };
+    static constexpr int BMM2_K_GROUPS = fmha::Div_up<STEP_KV * ELEMENT_BYTES, BMM2_LEADING_DIM_BYTES>::VALUE;
 
     // The K dimension per group
-    enum
-    {
-        BMM2_K_PER_GROUP = fmha::Div_up<STEP_KV, BMM2_K_GROUPS>::VALUE
-    };
+    static constexpr int BMM2_K_PER_GROUP = fmha::Div_up<STEP_KV, BMM2_K_GROUPS>::VALUE;
 
     // The K dimension bytes per group
-    enum
-    {
-        BMM2_K_BYTES_PER_GROUP = ELEMENT_BYTES * BMM2_K_PER_GROUP * BMM2_K_GROUPS
-    };
+    static constexpr int BMM2_K_BYTES_PER_GROUP = ELEMENT_BYTES * BMM2_K_PER_GROUP * BMM2_K_GROUPS;
 
     // Set GMMA descriptor mode based on the head_size.
     static constexpr auto GMMA_DESC_MODE = (D_BYTES_PER_GROUP > 64 ? fmha::Gmma_descriptor_mode::SWIZZLE_128B
@@ -403,10 +258,7 @@ struct Kernel_traits
     static constexpr int SKIP_SOFTMAX_BARRIER_ID = 0x3;
 
     // How many threads get involved in the dma group.
-    enum
-    {
-        NUM_THREADS_IN_DMA_GROUP = DMA_GROUP_TRANSPOSE_V ? 128 : (PAGED_KV_INPUT ? 1 : 32)
-    };
+    static constexpr int NUM_THREADS_IN_DMA_GROUP = DMA_GROUP_TRANSPOSE_V ? 128 : (PAGED_KV_INPUT ? 1 : 32);
 
     // The instruction traits for the BMM2.
     // FP16/BF16 K = 16, FP8 K = 32.
@@ -466,12 +318,9 @@ struct Kernel_traits
     using Buffer_v_scratch_t = cuda::std::array<Element_data_type, DV * STEP_KV * V_SCRATCH_BUFFERS>;
 
     // The smem bytes of q, k, v tiles.
-    enum
-    {
-        SMEM_BYTES_Q = sizeof(Buffer_q_t),
-        SMEM_BYTES_K = sizeof(Buffer_k_t),
-        SMEM_BYTES_V = sizeof(Buffer_v_t),
-    };
+    static constexpr int SMEM_BYTES_Q = sizeof(Buffer_q_t);
+    static constexpr int SMEM_BYTES_K = sizeof(Buffer_k_t);
+    static constexpr int SMEM_BYTES_V = sizeof(Buffer_v_t);
 
     // The reader/writer (consumer/producer) barriers.
     using Circular_buffer_kv_reader = typename CircularBuffer<KV_BUFFERS, CTAS_PER_CGA>::Reader;
@@ -556,10 +405,7 @@ struct Kernel_traits
         }
     };
 
-    enum
-    {
-        BYTES_PER_SMEM = sizeof(Shared)
-    };
+    static constexpr int BYTES_PER_SMEM = sizeof(Shared);
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -621,15 +467,9 @@ struct Kernel_traits_Hopper_qgmma_e4m3_fp32
         SCHEDULING_MODE_, INPUT_LAYOUT_, USE_TMA_STORE_, ENABLE_BMM1_SOFTCAPPING_SCALE_, RETURN_SOFTMAX_STATS_,
         ENABLE_SKIP_SOFTMAX_, OutputType, SAGE_BLOCK_SIZE_Q_, SAGE_BLOCK_SIZE_K_, SAGE_BLOCK_SIZE_V_>;
 
-    enum
-    {
-        USE_TMA_STORE = USE_TMA_STORE_
-    };
+    static constexpr int USE_TMA_STORE = USE_TMA_STORE_;
 
-    enum
-    {
-        O_BUFFERS = USE_TMA_STORE ? 1 : 0
-    };
+    static constexpr int O_BUFFERS = USE_TMA_STORE ? 1 : 0;
 
     // Inherit Traits_o, Cta_tile_o, Smem_tile_q.
     using Traits_o = typename Base::Traits_o;
@@ -740,10 +580,7 @@ struct Kernel_traits_Hopper_qgmma_e4m3_fp32
         }
     };
 
-    enum
-    {
-        BYTES_PER_SMEM = sizeof(Shared)
-    };
+    static constexpr int BYTES_PER_SMEM = sizeof(Shared);
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
