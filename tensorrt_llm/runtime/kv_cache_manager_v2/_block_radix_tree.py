@@ -620,6 +620,11 @@ class Block:
         # check if consecutive available blocks is sufficient for window_size. (TRTLLM-8802)
         # But for simplicity, we leave it for now.
         curr = start
+        # Only detach blocks with no live page in ANY life cycle: a childless tip
+        # that lost this life cycle's page may still hold live pages of other life
+        # cycles; detaching it would orphan the committed chain of an in-flight
+        # sequence. Mirrors Block::clearStaleBlocksAfterPageUnlink in
+        # cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/blockRadixTree.cpp.
         while (
             (
                 isinstance(curr, Block)
