@@ -733,15 +733,18 @@ def test_attention_mla_cute_dsl_autotune(v2_kv_cache: bool) -> None:
 
     kernel_keys = list(CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache)
     assert kernel_keys, "tuning-mode pass compiled no CuTe DSL MLA kernels"
-    # Tactic layout: unique_id + (out_dtype, mma_qk, mma_pv, split_kv,
-    # is_persistent); both tactic elements chosen by the tuner must have
-    # been exercised during profiling.
-    persistent_variants = {key[-1] for key in kernel_keys}
+    # Kernel-cache key layout: unique_id + (out_dtype, mma_qk, mma_pv,
+    # split_kv, is_persistent, has_kv_bounds). The trailing has_kv_bounds
+    # separates the helix per-token-bounds kernel variant from the plain one
+    # and is not a tuner tactic, so index the two tactic elements from the
+    # end past it. Both tactic elements chosen by the tuner must have been
+    # exercised during profiling.
+    persistent_variants = {key[-2] for key in kernel_keys}
     assert persistent_variants == {
         True, False
     }, (f"expected both is_persistent tactic candidates to be profiled, "
         f"got {persistent_variants}")
-    split_kv_variants = {key[-2] for key in kernel_keys}
+    split_kv_variants = {key[-3] for key in kernel_keys}
     assert split_kv_variants, "no split_kv tactic variant was profiled"
 
     # Serving-mode pass: tuned tactics must be reused as-is -- any new

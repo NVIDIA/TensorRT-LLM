@@ -29,6 +29,16 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_events import (
     validate_streaming_support,
 )
 from tensorrt_llm.llmapi.llm_args import KVEventsConfig
+from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
+    Block,
+    BlockRadixTree,
+    ReuseScope,
+)
+from tensorrt_llm.runtime.kv_cache_manager_v2._config import (
+    GpuCacheTierConfig,
+    KVCacheManagerConfig,
+)
+from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import LifeCycleRegistry
 
 _ZMQ_SETUP_ATTEMPTS = 4
 _RECEIVE_TIMEOUT_MS = 2_000
@@ -81,6 +91,52 @@ def _run_on_fresh_port(scenario: Callable[[int], None]) -> None:
             if exc.errno != zmq.EADDRINUSE:
                 raise
     pytest.fail(f"ZeroMQ setup failed after {_ZMQ_SETUP_ATTEMPTS} attempts")
+
+
+def test_streaming_sink_supports_real_radix_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Real radix construction must accept the streaming sink's capability hooks."""
+    manager = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=4,
+        max_window_size=128,
+    )
+    life_cycles = LifeCycleRegistry(
+        KVCacheManagerConfig(
+            tokens_per_block=4,
+            cache_tiers=[GpuCacheTierConfig(quota=4096)],
+            layers=[],
+        )
+    )
+    tree = BlockRadixTree(life_cycles, tokens_per_block=4, event_manager=manager)
+    published: list[KVEventBatch] = []
+    monkeypatch.setattr(
+        manager._publisher, "publish", lambda batch: published.append(batch) or True
+    )
+    try:
+        root = tree.add_or_get_existing(ReuseScope())
+        first = Block([1, 2, 3, 4], root)
+        second = Block([5, 6, 7, 8], first)
+
+        # Exercise wire event production after the page-coverage gate without
+        # allocating GPU pages; the radix blocks and sink are real objects.
+        manager._add_full_block(first)
+        manager._add_full_block(second)
+        manager.flush_iteration_events()
+
+        assert len(published) == 1
+        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(published[0]))
+        assert len(decoded[1]) == 1
+        stored = decoded[1][0]
+        assert stored["type"] == "BlockStored"
+        assert stored["token_ids"] == [1, 2, 3, 4, 5, 6, 7, 8]
+        assert stored["parent_block_hash"] is None
+        assert stored["block_size"] == 4
+        assert len(stored["block_hashes"]) == 2
+        assert manager.stored_blocks == 2
+    finally:
+        tree.clear()
+        manager.shutdown()
 
 
 def test_streaming_fast_path_publishes_only_full_max_window_blocks() -> None:

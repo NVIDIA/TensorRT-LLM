@@ -135,7 +135,7 @@ SCHED_CONFIGS = [
         },
         id="guaranteed-no-chunked",
     ),
-    # ── Pure-Python scheduler (parity with C++ path) ─────────────────────────
+    # ── Explicit Python scheduler preference (V2 still selects its scheduler) ──
     pytest.param(
         {
             "kv_cache_config": {"max_tokens": 200000},
@@ -592,7 +592,13 @@ def _stage_debug_context(
 
 
 def _write_config(tmp_path: Path, cfg: dict[str, object], name: str = "config.yml") -> str:
-    """Serialise *cfg* to YAML in *tmp_path* and return the file path."""
+    """Write a serving config that explicitly exercises KV cache manager V2."""
+    kv_cache_config = cfg["kv_cache_config"]
+    assert isinstance(kv_cache_config, dict)
+    cfg = {
+        **cfg,
+        "kv_cache_config": {**kv_cache_config, "use_kv_cache_manager_v2": True},
+    }
     path = str(tmp_path / name)
     with open(path, "w") as f:
         yaml.dump(cfg, f)
@@ -620,9 +626,10 @@ def _run_lmbenchmark(
 ) -> int:
     """Run the LMBenchmark multi-round-qa script and return the exit code.
 
-    stdout and stderr are drained in background threads so that the main
-    watchdog loop can run deadline / server-log / /health checks on a fixed
-    cadence regardless of how chatty the benchmark is.  A blocking readline
+    stdout and stderr are saved beside the output CSV and drained in
+    background threads so that the main watchdog loop can run deadline /
+    server-log / /health checks on a fixed cadence regardless of how chatty
+    the benchmark is.  A blocking readline
     in the main loop would otherwise stall indefinitely when the benchmark
     goes quiet (which is exactly what happens when the server stalls),
     defeating the point of the watchdog.
@@ -657,6 +664,9 @@ def _run_lmbenchmark(
         str(duration),
     ]
     print_info(f"Running LMBenchmark: {' '.join(cmd)}")
+    stdout_log = Path(output_csv).with_suffix(".stdout.log")
+    stderr_log = Path(output_csv).with_suffix(".stderr.log")
+    print_info(f"Full LMBenchmark logs: stdout={stdout_log}, stderr={stderr_log}")
 
     t_start = time.time()
     benchmark_debug_context = _stage_debug_context(debug_context, port, server_log, output_csv)
@@ -683,14 +693,18 @@ def _run_lmbenchmark(
 
     def _drain_stdout() -> None:
         try:
-            for line in iter(proc.stdout.readline, ""):
-                stdout_q.put(line)
+            with stdout_log.open("w", buffering=1) as log_f:
+                for line in iter(proc.stdout.readline, ""):
+                    log_f.write(line)
+                    stdout_q.put(line)
         finally:
             stdout_q.put(None)  # EOF sentinel
 
     def _drain_stderr() -> None:
-        for line in iter(proc.stderr.readline, ""):
-            stderr_lines.append(line)
+        with stderr_log.open("w", buffering=1) as log_f:
+            for line in iter(proc.stderr.readline, ""):
+                log_f.write(line)
+                stderr_lines.append(line)
 
     stdout_thread = threading.Thread(target=_drain_stdout, daemon=True)
     stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
@@ -1027,7 +1041,7 @@ def ensure_lmbenchmark(llm_venv: PythonVenvRunnerImpl) -> PythonVenvRunnerImpl:
 
 
 class TestServePrefixAwareScheduling:
-    """E2E: trtllm-serve with shared prefixes.
+    """E2E: trtllm-serve with KV cache manager V2 and shared prefixes.
 
     Tests prefix-aware scheduling under shared-prefix workloads that
     originally triggered the total_num_tokens > max_num_tokens over-admission

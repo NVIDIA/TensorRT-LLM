@@ -62,6 +62,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         gen_multimodal_cache_key_tokens,
         num_live_managers,
         poison_reason,
+        sequence_to_blockchain_keys,
         take_poison,
     )
     from kv_cache_manager_v2._block_radix_tree import Hasher
@@ -119,6 +120,7 @@ else:
         _introspection,
         _KVCache,
         gen_multimodal_cache_key_tokens,
+        sequence_to_blockchain_keys,
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import Hasher
     from tensorrt_llm.runtime.kv_cache_manager_v2._common import (
@@ -2857,6 +2859,33 @@ class TestSSMSupport(unittest.TestCase):
         self.assertEqual(kv._get_num_reusable_tokens_before_hybrid_pruning(), 64)
         kv.resume(stream)
         kv.close()
+
+    def test_first_new_block_probe_uses_snapshot_after_backoff(self) -> None:
+        """Snapshot pruning determines which already-present block needs recomputation."""
+        cfg = self._make_ssm_config(tokens_per_block=32, enable_partial_reuse=True)
+        cfg.reuse_match_backoff = 1
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        prompt = [self.next_token() for _ in range(64)]
+        kv = self.manager.create_kv_cache()
+        self.assertTrue(kv.resume(stream))
+        kv.capacity = 32
+        kv.commit(prompt[:32])
+        kv.capacity = 64
+        kv.commit(prompt[32:])
+        kv.close()
+
+        # Backoff reduces the attention match to 63; the last eligible SSM
+        # snapshot is at 32. The second full block already has a tree key but
+        # needs new computation, so an absent-key-only probe is insufficient.
+        self.assertEqual(self.manager.probe_reuse(None, prompt), 32)
+        keys = list(sequence_to_blockchain_keys(32, ReuseScope(), prompt))
+        self.assertEqual(self.manager.probe_first_new_block_key(None, prompt), keys[2][1])
+        claimed = self.manager.create_kv_cache(input_tokens=prompt)
+        self.assertEqual(claimed.num_committed_tokens, 32)
+        self.assertTrue(claimed.resume(stream))
+        claimed.close()
 
     def test_reuse_match_reports_content_divergence_depth(self) -> None:
         """The raw walk depth locates the fork, even where pruning shortens reuse."""

@@ -15,6 +15,7 @@
 
 import functools
 import math
+import os
 import weakref
 from typing import Dict, Optional, cast
 
@@ -287,6 +288,10 @@ class MLA(nn.Module):
         self.layer_idx_str = str(layer_idx)
         self.dtype = dtype
         self._weights_transformed = False
+        # Context-phase fused FP8-Q gate and its Q placeholder; both are
+        # resolved once in create_weights(), never on the forward path.
+        self._fused_q_fp8_ctx_ok = False
+        self.register_buffer("_fused_q_placeholder", None, persistent=False)
 
         self.hidden_size = hidden_size
         self.num_heads = num_attention_heads
@@ -681,6 +686,7 @@ class MLA(nn.Module):
         if self.mha is not None:
             self.mha.update_quant_config(self.quant_config)
         self.mqa.update_quant_config(self.quant_config)
+        self._fused_q_fp8_ctx_ok = False
 
         # Although we use FP8 MLA for context/generation phase, the output is still in BF16
         self.out_scale = None
@@ -752,6 +758,7 @@ class MLA(nn.Module):
             self.k_b_proj_trans_scale = None
             self.v_b_proj_scale = None
         self._weights_transformed = False
+        self._init_fused_q_fp8_context()
 
     def apply_rope(
         self,
@@ -794,14 +801,30 @@ class MLA(nn.Module):
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
 
-            # MLA processes only the generation token slice here, so build the
-            # mask from the generation sequence range [num_contexts, num_seqs).
-            zero_kv_mask = _helix_zero_kv_mask(
-                attn_metadata,
-                partial_o.shape[0],
-                seq_start=attn_metadata.num_contexts,
-                num_seqs=attn_metadata.num_generations,
-            )
+            helix_kv_bounds = getattr(attn_metadata, "helix_kv_bounds", None)
+            # helix_kv_bounds is non-None only on TrtllmAttentionMetadata,
+            # where _helix_spec_tokens_valid is a declared field.
+            if helix_kv_bounds is not None and attn_metadata._helix_spec_tokens_valid:
+                # Speculative verify groups: KV ownership is per-TOKEN. A rank
+                # owning only the tail page of a group has zero visible KV for
+                # the group's leading tokens while its per-sequence kv_len is
+                # nonzero, so the per-sequence mask above misses those rows.
+                # Their decode rows are fully masked with a finite sentinel,
+                # making partial_o an average over (possibly uninitialized)
+                # pool values; the combine multiplies by corr = 0 and
+                # 0 * NaN would poison the token on every CP rank — sanitize
+                # by the per-token bound instead.
+                zero_kv_mask = helix_kv_bounds[: partial_o.shape[0]] == 0
+            else:
+                # MLA processes only the generation token slice here, so build
+                # the mask from [num_contexts, num_seqs). Skip this expansion
+                # when the more precise per-token bounds above are valid.
+                zero_kv_mask = _helix_zero_kv_mask(
+                    attn_metadata,
+                    partial_o.shape[0],
+                    seq_start=attn_metadata.num_contexts,
+                    num_seqs=attn_metadata.num_generations,
+                )
             return _helix_post_process(
                 partial_o,
                 softmax_stats,
@@ -1704,6 +1727,61 @@ class MLA(nn.Module):
 
         return output
 
+    def _init_fused_q_fp8_context(self) -> None:
+        """Resolve the static half of the context-phase fused FP8-Q gate (see
+        `_use_fused_q_fp8_context`). Called once from `create_weights()`."""
+        ok = (
+            os.environ.get("TRTLLM_DISABLE_FUSED_Q_FP8_QUANT", "0") != "1"
+            # Independent of use_cute_dsl_bf16_bmm (off by default outside PP):
+            # this path is a memory-traffic win, not a GEMM-kernel preference.
+            and IS_CUTLASS_DSL_AVAILABLE
+            and is_sm_100f()
+            # Layout the C++ RoPE kernel instantiates kOutputFp8Q for on this path
+            # (mlaKernels.cu); the CuTe bmm itself has no shape requirement.
+            and self.kv_lora_rank == 512
+            and self.qk_rope_head_dim == 64
+            and self.k_b_proj_trans.dtype == torch.bfloat16
+            and bool(getattr(self.mqa, "has_fp8_kv_cache", False))
+        )
+        if ok:
+            # The CuTe epilogue applies no scale, so both writers of the FP8 Q
+            # buffer must agree on unit scale (the PyTorch backend never sets
+            # another value; checked once here, at construction time).
+            scale = getattr(self.mqa, "kv_scale_orig_quant", None)
+            ok = isinstance(scale, torch.Tensor) and bool(torch.all(scale == 1.0).item())
+        if ok:
+            # The attention op takes Q only for num_tokens / dtype on the fused
+            # path; a stride-0 expand of one row satisfies that without a
+            # [num_tokens, heads * 576] bf16 allocation per layer. Registered
+            # as a (non-persistent) buffer so meta-init / `.to(device)` place
+            # it alongside the weights.
+            self._fused_q_placeholder = torch.empty(
+                1,
+                self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim),
+                dtype=self.k_b_proj_trans.dtype,
+                device=self.k_b_proj_trans.device,
+            )
+        self._fused_q_fp8_ctx_ok = ok
+        logger.info(f"MLA fused FP8-Q (absorbed context) {'enabled' if ok else 'disabled'}")
+
+    def _use_fused_q_fp8_context(
+        self, attn_metadata: AttentionMetadata, rope_applied_in_python: bool
+    ) -> bool:
+        """Context-phase fused FP8-Q for the absorbed MLA path.
+
+        The FP8 FMHA reads Q as FP8 [tokens, heads, kv_lora + rope]. Instead of
+        a bf16 Q plus a standalone quantize pass, the CuTe-DSL bmm stores FP8
+        nope columns and the RoPE kernel (kOutputFp8Q) stores FP8 rope columns
+        into one buffer; the C++ op then skips invokeMLAContextFp8Quantize.
+        Requires RoPE fused in the kernel and a context-only batch (generation
+        still reads the bf16 Q). TRTLLM_DISABLE_FUSED_Q_FP8_QUANT=1 disables it.
+        """
+        return (
+            not rope_applied_in_python
+            and self._fused_q_fp8_ctx_ok
+            and attn_metadata.num_generations == 0
+        )
+
     def forward_absorption_context(
         self,
         q: torch.Tensor,
@@ -1722,7 +1800,31 @@ class MLA(nn.Module):
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
 
-        if hasattr(self, "k_b_proj_trans"):
+        if not hasattr(self, "k_b_proj_trans"):
+            raise RuntimeError("MLA absorption requires k_b_proj_trans")
+        # RoPE on q_pe happened (or will happen) outside the attention kernel.
+        rope_applied_in_python = (
+            q_rope_applied or self.apply_rotary_emb or self.kv_cache_dtype == "fp8_ds_mla"
+        )
+
+        fused_q_fp8 = None
+        if self._use_fused_q_fp8_context(attn_metadata, rope_applied_in_python):
+            # FP8 Q written once: nope columns by the bmm epilogue, rope columns
+            # by the RoPE kernel (kOutputFp8Q). The attention op still takes a
+            # bf16 Q for num_tokens / dtype; nothing reads it, so pass a view.
+            fused_q_fp8 = q.new_empty(
+                [num_tokens, self.num_heads_tp, self.kv_lora_rank + self.qk_rope_head_dim],
+                dtype=torch.float8_e4m3fn,
+            )
+            torch.ops.trtllm.cute_dsl_bf16_bmm_fp8out_blackwell(
+                q_nope.transpose(0, 1),  # [heads, tokens, qk_nope_head_dim]
+                self.k_b_proj_trans,  # [heads, kv_lora_rank, qk_nope_head_dim]
+                fused_q_fp8[..., : self.kv_lora_rank].transpose(
+                    0, 1
+                ),  # [heads, tokens, kv_lora_rank]
+            )
+            fused_q = self._fused_q_placeholder.expand(num_tokens, -1)
+        else:
             # fused_q contains 1) the result of the following bmm with shape [num_tokens, num_heads, kv_lora_rank]
             # 2) rope(q_pe) with shape [num_tokens, num_heads, qk_rope_head_dim]. rope is applied inside AttentionOp
             fused_q = torch.empty(
@@ -1767,7 +1869,7 @@ class MLA(nn.Module):
                     f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}."
                 )
 
-            if self.kv_cache_dtype == "fp8_ds_mla" or self.apply_rotary_emb or q_rope_applied:
+            if rope_applied_in_python:
                 fused_q[..., self.kv_lora_rank :] = q_pe
             fused_q = fused_q.view(
                 [
@@ -1775,8 +1877,6 @@ class MLA(nn.Module):
                     self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim),
                 ]
             )
-        else:
-            raise RuntimeError("MLA absorption requires k_b_proj_trans")
 
         attn_out_latent = self._attn_forward_gen(
             self.mqa,
@@ -1789,6 +1889,10 @@ class MLA(nn.Module):
             out_scale=self.out_scale,
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by applyMLARopeAndAssignQKVKernelOptContext
+            # fused FP8-Q path only (both None otherwise): the C++ op skips
+            # invokeMLAContextFp8Quantize when both are set.
+            quant_q_buffer=fused_q_fp8,
+            quant_scale_qkv=self.mqa.kv_scale_orig_quant if fused_q_fp8 is not None else None,
             **kwargs,
         )
         fused_q = None

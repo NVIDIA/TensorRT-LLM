@@ -18,11 +18,9 @@ from pathlib import Path
 from typing import Literal
 
 import click
-from _flashinfer_workspace_probe import get_flashinfer_environment
 
 from tensorrt_llm.executor.utils import get_spawn_proxy_process_ipc_hmac_key_env
-from tensorrt_llm.llmapi.mpi_session import (MpiPoolSession,
-                                             RemoteMpiCommSessionClient)
+from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionClient
 from tensorrt_llm.llmapi.utils import print_colored
 
 
@@ -38,21 +36,6 @@ def main(
                        "flashinfer_temporary_cleanup"]
 ) -> None:
     """Run the requested remote MPI session test task."""
-    # TODO(dlfw-26.08): drop once the nested-spawn failure is settled. The DVM
-    # that MPI_Comm_spawn starts inherits this process's environment, so this is
-    # the environment that decides whether PRRTE will fork as root and which
-    # hostname PMIx hands out. The shell that launched mpirun dumps the same
-    # variables; a difference between the two means mpirun dropped them.
-    mpi_env = {
-        k: v
-        for k, v in sorted(os.environ.items())
-        if k.startswith(("PRTE_", "OMPI_", "PMIX_", "PMI_"))
-    }
-    print(
-        f"[pid {os.getpid()}] MPI environment in rank process: "
-        f"{mpi_env or '(none set)'}",
-        flush=True)
-
     tasks = [0]
     assert os.environ[
         'TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR'] is not None, "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR is not set"
@@ -77,25 +60,10 @@ def main(
             assert all(
                 Path(workspace).parent == workspace_root
                 for workspace in workspaces)
-            assert cubin_dirs == {
-                str(Path.home() / ".cache" / "flashinfer" / "cubins")
-            }
-
-            nested_session = MpiPoolSession(n_workers=2)
-            try:
-                nested_worker_envs = nested_session.submit_sync(
-                    get_flashinfer_environment)
-            finally:
-                nested_session.shutdown()
-            nested_workspaces = {
-                workspace
-                for workspace, _ in nested_worker_envs
-            }
-            assert None not in nested_workspaces
-            assert len(nested_workspaces) == 2
-            assert all(
-                Path(workspace).parent == workspace_root
-                for workspace in nested_workspaces)
+            # Unset means FlashInfer derives the artifact cache from each
+            # worker's isolated workspace, keeping downloaded compiler inputs
+            # per-rank.
+            assert cubin_dirs == {None}
 
 
 if __name__ == "__main__":

@@ -384,7 +384,17 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "enable_return_routed_experts"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "enable_speculative_beam_history_d2h"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "enable_tokenization_cache"
     },
     {
       "capture_policy": "bool",
@@ -926,6 +936,7 @@
         "AUTO",
         "CUTLASS",
         "CUTEDSL",
+        "CUTEDSL_FC12",
         "TRTLLM",
         "DEEPGEMM",
         "DENSEGEMM",
@@ -1308,6 +1319,11 @@
       "path": "sparse_attention_config.enable_heuristic_topk"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.fuse_qkv_index_projection"
+    },
+    {
       "allowed_values": [
         "triton",
         "msa"
@@ -1497,6 +1513,11 @@
       "path": "sparse_attention_config.use_self_sampling_topk"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.uses_spcompress"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "sparse_attention_config.window_size"
@@ -1531,7 +1552,9 @@
       "allowed_values": [
         "VANILLA",
         "TRTLLM",
-        "FA4"
+        "FA4",
+        "AUTO",
+        "CUTEDSL"
       ],
       "capture_policy": "literal",
       "kind": "categorical",
@@ -1584,11 +1607,6 @@
       "capture_policy": "literal",
       "kind": "categorical",
       "path": "speculative_config.eagle3_model_arch"
-    },
-    {
-      "capture_policy": "list[list[int]]|none",
-      "kind": "value",
-      "path": "speculative_config.eagle_choices"
     },
     {
       "capture_policy": "bool",
@@ -1675,6 +1693,7 @@
         "AUTO",
         "CUTLASS",
         "CUTEDSL",
+        "CUTEDSL_FC12",
         "TRTLLM",
         "DEEPGEMM",
         "DENSEGEMM",

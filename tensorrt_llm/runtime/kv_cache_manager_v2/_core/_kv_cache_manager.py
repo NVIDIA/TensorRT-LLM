@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterator, cast
 
 from .. import rawref
-from .._block_radix_tree import BlockRadixTree, ReuseMatch, ReuseScope
+from .._block_radix_tree import Block, BlockRadixTree, ReuseMatch, ReuseScope, RootBlock
 from .._common import (
     BAD_PAGE_INDEX,
     GPU_LEVEL,
@@ -517,6 +517,36 @@ class KVCacheManager:
         if input_tokens is None:
             input_tokens = ()
         return self._match_reuse(reuse_scope, input_tokens).num_tokens
+
+    def probe_first_new_block_key(
+        self,
+        reuse_scope: ReuseScope | None = None,
+        input_tokens: Sequence[TokenIdExt] | None = None,
+    ) -> bytes | None:
+        """Return the first full block's key past the currently reusable prefix.
+
+        Read-only and advisory, like ``probe_reuse``. Reuse the preceding full
+        block's key from the same fresh match instead of rehashing the prefix.
+        """
+        if reuse_scope is None:
+            reuse_scope = ReuseScope()
+        assert type(reuse_scope) is ReuseScope
+        if input_tokens is None:
+            return None
+        match = self._match_reuse(reuse_scope, input_tokens)
+        block_index = match.num_tokens // self.tokens_per_block
+        begin = block_index * self.tokens_per_block
+        end = begin + self.tokens_per_block
+        if end > len(input_tokens):
+            return None
+        # Use the final, pruned match. Its last block can be partial and have a
+        # different suffix; only a full predecessor has the query's exact key.
+        previous_key = (
+            RootBlock.make_key(reuse_scope)
+            if block_index == 0
+            else match.blocks[block_index - 1].key
+        )
+        return Block.make_key(previous_key, input_tokens[begin:end])
 
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool:
         """

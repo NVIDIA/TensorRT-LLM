@@ -25,12 +25,11 @@ import torch
 
 import tensorrt_llm.bindings
 from tensorrt_llm import logger
+from tensorrt_llm._torch.disaggregation.base import CacheExtent, CacheKind, Chunk, TokenRange
 from tensorrt_llm._torch.disaggregation.base.agent import use_pure_python_transfer_agent
 from tensorrt_llm._torch.disaggregation.base.transfer import (
-    KVSlice,
     RxSessionBase,
     SessionStatus,
-    TokenRange,
     TxSessionBase,
     WaitResult,
     get_unique_rid,
@@ -43,13 +42,14 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
 from tensorrt_llm._torch.disaggregation.native.bounce import (
     config_from_size as bounce_config_from_size,
 )
+from tensorrt_llm._torch.disaggregation.native.fetch import PeerFetch
 from tensorrt_llm._torch.disaggregation.native.perf_logger import perf_log_manager
+from tensorrt_llm._torch.disaggregation.native.publish import PeerPublish
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     create_cache_reuse_adapter,
 )
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
 from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_physical_pool,
     get_pool_view_num_layers,
@@ -63,7 +63,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     MambaHybridCacheManager,
     MambaHybridCacheManagerV2,
 )
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, KVCacheManager
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.bindings import DataType, LlmRequestState
@@ -242,7 +242,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # The transfer worker is already live by this point.
             self._transfer_worker.shutdown()
             raise
-        # _slice_num_bytes() is this rank's KV shard, so scale by tp_size to get the request total (kv_cache_size),
+        # _chunk_num_bytes() is this rank's KV shard, so scale by tp_size to get the request total (kv_cache_size),
         # except under attention DP where the local count already is the total.
         # Helix CP ranks hold disjoint block sets, so they scale the request
         # total the same way TP shards do (metric only).
@@ -319,8 +319,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"init={status_counts[SessionStatus.INIT]}",
                 f"ready_to_transfer={status_counts[SessionStatus.READY]}",
                 f"transferring={status_counts[SessionStatus.TRANSFERRING]}",
-                f"kv_transferred={status_counts[SessionStatus.KV_TRANSFERRED]}",
-                f"fully_transferred={status_counts[SessionStatus.FULLY_TRANSFERRED]}",
+                f"transferred={status_counts[SessionStatus.TRANSFERRED]}",
                 f"error={status_counts[SessionStatus.ERROR]}",
                 f"cancelled={status_counts[SessionStatus.CANCELLED]}",
                 f"unknown={status_counts['unknown']}",
@@ -379,20 +378,34 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return self._kv_cache_manager.mamba_cache_index[req.py_request_id]
         return None
 
-    def _create_kv_slice(self, req: LlmRequest) -> KVSlice:
-        """Create a KV slice covering the request's whole prompt."""
+    def _create_chunk(self, req: LlmRequest) -> Chunk:
+        """Just the blocks, for the callers that have no use for the rest of the extent."""
+        return self._describe_local(req)
+
+    def _create_cache_extent(self, req: LlmRequest) -> CacheExtent:
+        """This request's whole prompt as the sole piece of a transfer, under the name it is
+        registered by."""
+        rid = get_unique_rid(req)
+        assert rid is not None
+        return CacheExtent(name=rid, local=self._describe_local(req))
+
+    def _describe_local(self, req: LlmRequest) -> Chunk:
+        """The blocks this rank holds, one list per layer group.
+
+        Every paged group gets ``ceil(prompt_len / tpb)`` entries indexed by block ordinal: the
+        local pool slot, or -1 where this side has nothing there. Eviction and allocation state
+        come straight from the cache manager (``get_block_ordinals``), so ctx and gen never have
+        to agree on *when* a block left the window -- the sender simply pairs the ordinals both
+        sides still hold. The only request-derived bound is prompt_len, which drops the
+        speculative tail and the ctx first-token block (num_extra_kv_tokens slots are not
+        transferred; both sides use prompt_len, so the ranges stay consistent). On the receiver
+        the already-cached prefix is masked so the sender skips it. A STATE group carries one
+        slot, or nothing when this rank has none.
+        """
         adapter = self._reuse_adapter
         tpb = adapter.tokens_per_block
         assert self._page_table is not None
         layer_groups = self._page_table.layer_groups
-        # The transfer covers prompt_len tokens; num_extra_kv_tokens slots
-        # (speculative decoding) are not transferred. In the previously added
-        # support for ctx disabling speculative decoding while gen enables it,
-        # both sides currently use prompt_len as the transfer range, so the
-        # ranges stay consistent.
-        # TODO: the accuracy impact of not transferring num_extra_kv_tokens
-        # on MTP and other speculative decoding paths is currently unclear;
-        # revisit whether these extra KV slots need to be transferred.
         prompt_blocks = (req.prompt_len + tpb - 1) // tpb
 
         is_gen_only = req.is_generation_only_request
@@ -402,78 +415,46 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else [0] * len(layer_groups)
         )
 
+        empty = np.array([], dtype=np.int64)
         groups = []
+        kinds = [lg.kind for lg in layer_groups]
         for idx, lg in enumerate(layer_groups):
             if lg.kind == CacheKind.STATE:
                 slot = self._get_mamba_slot_for_request(req)
-                groups.append(
-                    np.array([slot], dtype=np.int64)
-                    if slot is not None
-                    else np.array([], dtype=np.int64)
-                )
-                continue
-            block_ids = adapter.get_block_ids(req, idx, lg)
-            window_size = lg.sliding_window_size
-
-            if window_size is not None:
-                draft_len = get_draft_token_length(req) if is_gen_only else 0
-                allocated_blocks = (
-                    req.prompt_len
-                    + draft_len
-                    + self._kv_cache_manager.num_extra_kv_tokens
-                    + tpb
-                    - 1
-                ) // tpb
-                if block_ids.size > allocated_blocks:
-                    block_ids = block_ids[:allocated_blocks]
-                # Current PyExecutor cache managers disable KV-cache token sinks,
-                # so SWA block lists contain an evictable prompt prefix followed
-                # by the speculative scratch tail. If token sinks are enabled,
-                # this must use block-ordinal metadata to preserve the sink prefix.
-                # Remove scratch before trimming stale prompt blocks; otherwise a
-                # boundary-crossing allocation can displace initialized prompt KV.
-                scratch_blocks = max(0, allocated_blocks - prompt_blocks)
-                if scratch_blocks > 0:
-                    if req.py_beam_width != 1:
-                        raise ValueError("speculative scratch blocks require beam_width == 1")
-                    block_ids = (
-                        block_ids[:-scratch_blocks]
-                        if scratch_blocks < block_ids.size
-                        else np.array([], dtype=np.int64)
-                    )
-                # Drop stale blocks the manager may still expose (V1 pre-eviction).
-                stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
-                expected_valid = max(0, prompt_blocks - stale_end)
-                if block_ids.size > expected_valid:
-                    block_ids = (
-                        block_ids[-expected_valid:]
-                        if expected_valid > 0
-                        else np.array([], dtype=np.int64)
-                    )
-                # Skip reused blocks that remain after stale-prefix pruning.
-                cache_skip = max(0, cached_per_lg[idx] // tpb - stale_end)
+                group = np.array([slot], dtype=np.int64) if slot is not None else empty
             else:
-                # Drop the speculative scratch tail; only prompt_len is transferred.
-                if block_ids.size > prompt_blocks:
-                    block_ids = block_ids[:prompt_blocks]
-                cache_skip = cached_per_lg[idx] // tpb
+                # Block lists carry beam 0 only (beam-search attention reads
+                # prompt positions through beam 0's block table), so the
+                # positional path applies to every beam width.
+                ordinals = adapter.get_block_ordinals(req, idx, lg)
+                group = self._positional_window(ordinals, prompt_blocks, cached_per_lg[idx] // tpb)
+            groups.append(group)
 
-            if cache_skip > 0:
-                block_ids = (
-                    block_ids[cache_skip:]
-                    if cache_skip < block_ids.size
-                    else np.array([], dtype=np.int64)
-                )
-
-            groups.append(block_ids)
-
-        return KVSlice(
-            is_last_slice=True,
+        return Chunk(
             block_ids_per_layer_groups=groups,
+            kind_per_layer_group=kinds,
+            token_range=TokenRange(start=0, end=req.prompt_len),
+            is_last=True,
         )
 
-    def _slice_num_bytes(self, slice: KVSlice) -> int:
-        """Local-rank KV bytes covered by a slice (sum of num_valid_blocks * pool.slot_bytes), enough to populate
+    @staticmethod
+    def _positional_window(
+        ordinals: np.ndarray, prompt_blocks: int, cached_blocks: int
+    ) -> np.ndarray:
+        """Fit a manager block table into the prompt's ordinal range.
+
+        Pads with -1 when fewer blocks are allocated than the prompt spans
+        (incremental ctx allocation), truncates the speculative / first-token
+        tail, and masks the receiver's cached prefix.
+        """
+        window = np.full(prompt_blocks, -1, dtype=np.int64)
+        n = min(int(ordinals.size), prompt_blocks)
+        window[:n] = ordinals[:n]
+        window[: min(cached_blocks, prompt_blocks)] = -1
+        return window
+
+    def _chunk_num_bytes(self, chunk: Chunk) -> int:
+        """Local-rank KV bytes covered by a chunk (sum of num_valid_blocks * pool.slot_bytes), enough to populate
         kv_cache_size and unblock the perf-metric timestamps that gate on it.
 
         Counterpart accounting: the bounce reserve sizing (bounce/impl.py block_bytes_per_group)
@@ -485,7 +466,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if pt is None:
             return 0
         total = 0
-        for lg_id, block_ids in enumerate(slice.block_ids_per_layer_groups):
+        for lg_id, block_ids in enumerate(chunk.block_ids_per_layer_groups):
             if block_ids is None or block_ids.size == 0:
                 continue
             n = int((block_ids >= 0).sum())
@@ -856,11 +837,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """Whether req's send session was torn down before its last slice."""
         return req.py_kv_send_session_retired and get_unique_rid(req) not in self._send_sessions
 
-    def _build_prefill_chunk(
+    def _build_prefill_extent(
         self,
         req: LlmRequest,
-    ) -> Optional[KVSlice]:
-        """Build a slice for completed prefill blocks, or None."""
+    ) -> Optional[CacheExtent]:
+        """Build an extent for completed prefill blocks, or None."""
         assert req.py_beam_width == 1, "beam_width > 1 is not supported for chunked KV transfer"
         rid = get_unique_rid(req)
         assert rid is not None
@@ -880,8 +861,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if chunk_end <= chunk_start and not is_last_chunk:
             return None
 
-        base_slice = self._create_kv_slice(req)
-        all_block_ids = base_slice.block_ids_per_layer_groups
+        whole = self._describe_local(req)
+        all_block_ids = whole.block_ids_per_layer_groups
         chunk_block_ids = []
         assert self._page_table is not None
         for lg, block_ids in zip(self._page_table.layer_groups, all_block_ids):
@@ -889,23 +870,25 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if window_size is not None and window_size < req.prompt_len:
                 # SWA pages can leave the active window between chunks. Defer
                 # the group and send its complete final active window at once.
-                chunk_block_ids.append(block_ids if is_last_chunk else block_ids[:0])
+                chunk_block_ids.append(block_ids if is_last_chunk else np.full_like(block_ids, -1))
             else:
-                # _build_kv_write_meta derives the chunk's start token from list length
-                # (total_blocks - len), which only agrees with the slice below
-                # once the group covers the chunk end.
-                assert block_ids.size >= chunk_end, (
-                    f"layer group holds {block_ids.size} blocks, fewer than the "
-                    f"chunk end {chunk_end}; cannot address chunk "
-                    f"[{chunk_start}, {chunk_end}) by position"
-                )
-                chunk_block_ids.append(block_ids[chunk_start:chunk_end])
-        if not is_last_chunk and not any(block_ids.size for block_ids in chunk_block_ids):
+                # Positional: keep the chunk's ordinals, blank everything else.
+                chunk = np.full_like(block_ids, -1)
+                chunk[chunk_start:chunk_end] = block_ids[chunk_start:chunk_end]
+                chunk_block_ids.append(chunk)
+        if not is_last_chunk and not any((ids >= 0).any() for ids in chunk_block_ids):
             return None
-        return KVSlice(
-            is_last_slice=is_last_chunk,
-            block_ids_per_layer_groups=chunk_block_ids,
-            token_range=TokenRange(start=chunk_start * tpb, end=chunk_end * tpb),
+        # The block window is rounded up; the span this piece delivers is not. Every reader below
+        # rounds back to blocks, and a recurrent-state group reads the end as an exact checkpoint.
+        chunk_end_token = min(chunk_end * tpb, req.prompt_len) if is_last_chunk else chunk_end * tpb
+        return CacheExtent(
+            name=rid,
+            local=Chunk(
+                block_ids_per_layer_groups=chunk_block_ids,
+                kind_per_layer_group=whole.kind_per_layer_group,
+                token_range=TokenRange(start=chunk_start * tpb, end=chunk_end_token),
+                is_last=is_last_chunk,
+            ),
         )
 
     @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")
@@ -937,14 +920,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 return
         try:
             if self.pipeline_transfer_enabled:
-                slice = self._build_prefill_chunk(req)
-                if slice is None:
+                extent = self._build_prefill_extent(req)
+                if extent is None:
                     return
             else:
-                slice = self._create_kv_slice(req)
-            session.send(slice)
+                extent = self._create_cache_extent(req)
+            chunk = extent.local
+            # The handle that comes back is the contract's answer about this piece. What retires
+            # the request is the sweep over the session tables, as it was before.
+            PeerPublish(session, req).publish(extent)
 
-            if slice.is_last_slice:
+            if chunk.is_last:
                 self._finalize_send(req, session)
                 if not bridge_enabled:
                     # Preserve the legacy pipelined-transfer state boundary:
@@ -968,17 +954,23 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return
         req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
         session = None
+        fetches = None
         try:
-            session = self._transfer_worker.create_rx_session(req)
+            extent = self._create_cache_extent(req)
+            fetches = self._open_peer_source(req)
+            # Same submission the asynchronous entry makes; what differs is who waits. The session
+            # underneath is read back for the blocking wait, the auxiliary buffer and the close.
+            fetches.fetch(extent)
+            session = self._legacy_session(fetches)
             self._recv_sessions[rid] = session
             self._recv_reqs[rid] = req
-            kv_slice = self._create_kv_slice(req)
-            session.receive(kv_slice)
             result = session.wait_complete(blocking=True)
 
             if result == WaitResult.COMPLETED:
                 # KV-transfer timing setters deferred to #15871 (clock-source consistency); size only.
-                req.set_kv_cache_size(self._slice_num_bytes(kv_slice) * self._kv_size_rank_factor)
+                req.set_kv_cache_size(
+                    self._chunk_num_bytes(extent.local) * self._kv_size_rank_factor
+                )
                 if self._need_aux_transfer(req):
                     self._apply_aux(session, req)
                 self._assert_disagg_history_declared(req)
@@ -989,6 +981,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req.state = LlmRequestState.DISAGG_TRANS_ERROR
             raise
         finally:
+            # The adapter opens the session before it submits, so a submission that raises leaves
+            # one to close while the local above is still unassigned; read it back off the adapter.
+            if session is None and fetches is not None:
+                session = self._legacy_session(fetches)
             close_succeeded = session is None or session.close() is not False
             if close_succeeded:
                 self._recv_sessions.pop(rid, None)
@@ -998,6 +994,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     f"request_and_receive_sync: retaining rid={rid} because receive "
                     "resources remain active"
                 )
+
+    def _open_peer_source(self, req: LlmRequest) -> PeerFetch:
+        """The paired backend: pull this request's cache from the worker that ran its context."""
+        return PeerFetch(self._transfer_worker, req)
+
+    @staticmethod
+    def _legacy_session(fetches: PeerFetch):
+        """The native session under the adapter, for the sweep that retires it and for the
+        auxiliary buffer.
+
+        Named as the escape hatch it is: both jobs are the reason the contract does not cover
+        everything here yet.
+        """
+        return fetches.session
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_async")
     def request_and_receive_async(self, req: LlmRequest) -> None:
@@ -1021,24 +1031,32 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"request_and_receive_async: rid={rid} already has a recv session, skipping"
             )
             return
+        extent = self._create_cache_extent(req)
+        req.py_kv_cache_xfer_bytes = self._chunk_num_bytes(extent.local) * self._kv_size_rank_factor
+        fetches = self._open_peer_source(req)
+        # Claimed to be transferring only once there is something to transfer: a builder that
+        # raises above leaves the request where it was, not in a state nothing advances.
         req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
-        session = self._transfer_worker.create_rx_session(req)
-        self._recv_sessions[rid] = session
-        bridge_enabled = getattr(self, "_fp4_mla_bridge_enabled", False)
-        if bridge_enabled:
-            # Root the destination before publication/admission can escape.
-            self._recv_reqs[rid] = req
+        # Root the destination before publication can escape. Registering only on success leaves a
+        # failed publication as a session the sweep can see but cannot pair with a request.
+        self._recv_reqs[rid] = req
         try:
-            kv_slice = self._create_kv_slice(req)
-            req.py_kv_cache_xfer_bytes = self._slice_num_bytes(kv_slice) * self._kv_size_rank_factor
-            session.receive(kv_slice)
-        except Exception as error:
-            if bridge_enabled:
-                cast(Any, session).fail_admission(error)
+            # The handle that comes back is the contract's answer about this piece. What retires
+            # the request is the sweep over the session tables, as it was before.
+            fetches.fetch(extent)
+        except Exception:
+            # No session means no publication and nothing the sweep could ever pair the request
+            # with, so the registration made here is undone here and the request goes terminal.
+            if self._legacy_session(fetches) is None:
+                del self._recv_reqs[rid]
+                req.state = LlmRequestState.DISAGG_TRANS_ERROR
             raise
-        else:
-            if not bridge_enabled:
-                self._recv_reqs[rid] = req
+        finally:
+            # The session exists even when publication failed, and the legacy sweep owns it.
+            # TODO: An idle bounce reservation is not handed back on the failure path.
+            session = self._legacy_session(fetches)
+            if session is not None:
+                self._recv_sessions[rid] = session
 
     def check_context_transfer_status(
         self, at_least_request_num: Optional[int], mark_complete: bool = False
@@ -1404,6 +1422,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # The Python bounce reserves a receiver region for the whole request, not per chunk.
         # The C++ transfer-agent bounce (agent_bounce_buffer_enable) stages each transfer request
         # independently below the Python layer, so a pipelined chunk is just another request.
+        # TODO: This only sees the local config, so a chunking sender and a bouncing receiver pass.
         if cfg.kv_cache_bounce_size_mb != 0 and not cfg.agent_bounce_buffer_enable:
             blockers.append(
                 f"the Python bounce buffer (kv_cache_bounce_size_mb="
@@ -1411,6 +1430,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             )
         if isinstance(self._kv_cache_manager, (MambaHybridCacheManager, MambaHybridCacheManagerV2)):
             blockers.append("a Mamba/hybrid cache manager")
+        # Refused for the configuration, not for the piece: the per-chunk guard downstream only sees
+        # a piece short of the whole prompt, so a prompt that fits one chunk would slip past it.
+        if self._mapping.cp_size > 1:
+            blockers.append(f"context parallelism (cp_size={self._mapping.cp_size})")
         # Policies other than all_reusable defer the whole prompt's commit to the final
         # chunk. Committing a prefix block that a concurrent request already committed
         # rebases it onto that request's page and frees ours, which an earlier chunk's
