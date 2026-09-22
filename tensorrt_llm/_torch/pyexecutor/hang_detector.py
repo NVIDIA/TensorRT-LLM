@@ -348,11 +348,15 @@ class HangDetector:
     """
 
     def __init__(
-        self, timeout: Optional[int] = None, on_detected: Optional[Callable[[], None]] = None
-    ):
+        self,
+        timeout: Optional[int] = None,
+        on_detected: Optional[Callable[[], None]] = None,
+        report_context: Optional[str] = None,
+    ) -> None:
         self.timeout = timeout if timeout is not None else 300
         assert self.timeout > 0, "timeout must be greater than 0"
         self.on_detected = on_detected or (lambda: None)
+        self.report_context = report_context
         self.task = None
         self.loop = None
         self.loop_thread = None
@@ -450,7 +454,19 @@ class HangDetector:
 
         # All diagnostics are best-effort: nothing may prevent on_detected()
         # (hard-kill propagation) from firing.
-        _best_effort_log_error(f"Hang detected after {self.timeout} seconds.")
+        if self.report_context is None:
+            report_message = f"Hang detected after {self.timeout} seconds."
+        else:
+            report_message = (
+                f"{self.report_context}: no checkpoint for {self.timeout} seconds; "
+                "dumping all thread stacks."
+            )
+        _best_effort_log_error(report_message)
+        try:
+            print_all_stacks()
+        except Exception:  # noqa: BLE001 - stack dump must not block hard kill
+            pass
+
         for provider in status_providers:
             try:
                 status = provider()
@@ -460,10 +476,6 @@ class HangDetector:
                 _best_effort_log_error(
                     f"HangDetector: status provider failed with {type(error).__name__}: {error}"
                 )
-        try:
-            print_all_stacks()
-        except Exception:  # noqa: BLE001 - stack dump must not block hard kill
-            pass
 
         # Set _detected last so observers (and tests) see it only once
         # diagnostics are done and on_detected is about to fire.

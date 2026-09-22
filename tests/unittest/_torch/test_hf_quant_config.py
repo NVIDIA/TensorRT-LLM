@@ -56,7 +56,8 @@ def test_load_hf_quant_config_parses_nvfp4_with_kv_cache_scheme():
     )
 
     quant_config, layer_quant_config = ModelConfig.load_hf_quant_config(
-        hf_quant_config, moe_backend="CUTLASS")
+        hf_quant_config, moe_backend="CUTLASS"
+    )
 
     assert layer_quant_config is None
     assert quant_config.quant_algo == QuantAlgo.NVFP4
@@ -82,40 +83,20 @@ def test_load_hf_gptq_config(group_size, checkpoint_format):
     assert config.quant_algo == QuantAlgo.W4A16_GPTQ
     assert config.group_size == group_size
     assert config.has_zero_point
-    assert config.exclude_modules == [
-        "model.layers.0.self_attn.o_proj", "lm_head"
-    ]
+    assert config.exclude_modules == ["model.layers.0.self_attn.o_proj", "lm_head"]
     assert per_layer is None
 
 
 @pytest.mark.parametrize(
     "override,error",
     [
-        ({
-            "bits": 8
-        }, "bits=4"),
-        ({
-            "group_size": 32
-        }, "group_size"),
-        ({
-            "desc_act": True
-        }, "desc_act"),
-        ({
-            "checkpoint_format": "marlin"
-        }, "checkpoint_format"),
-        ({
-            "dynamic": {
-                ".*": {
-                    "bits": 8
-                }
-            }
-        }, "dynamic"),
-        ({
-            "modules_in_block_to_quantize": [["q_proj"]]
-        }, "modules_in_block"),
-        ({
-            "lm_head": True
-        }, "lm_head"),
+        ({"bits": 8}, "bits=4"),
+        ({"group_size": 32}, "group_size"),
+        ({"desc_act": True}, "desc_act"),
+        ({"checkpoint_format": "marlin"}, "checkpoint_format"),
+        ({"dynamic": {".*": {"bits": 8}}}, "dynamic"),
+        ({"modules_in_block_to_quantize": [["q_proj"]]}, "modules_in_block"),
+        ({"lm_head": True}, "lm_head"),
     ],
 )
 def test_load_hf_gptq_config_rejects_unsupported(override, error):
@@ -126,35 +107,38 @@ def test_load_hf_gptq_config_rejects_unsupported(override, error):
 
 
 @pytest.mark.parametrize("from_model_kwargs", [False, True])
-@pytest.mark.parametrize("kv_dtype", ["auto", "fp8"])
-def test_llm_api_loads_gptq_config(tmp_path, from_model_kwargs, kv_dtype):
+@pytest.mark.parametrize(
+    "kv_dtype,existing_kv_quant_algo",
+    [
+        ("auto", None),
+        ("auto", QuantAlgo.FP8),
+        ("auto", QuantAlgo.NVFP4),
+        ("fp8", QuantAlgo.FP8),
+    ],
+)
+def test_llm_api_loads_gptq_config(tmp_path, from_model_kwargs, kv_dtype, existing_kv_quant_algo):
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig, TorchLlmArgs
     from tensorrt_llm.llmapi.llm_utils import ModelLoader
 
-    hf_config = {
-        "quant_method": "gptq",
-        "bits": 4,
-        "group_size": 128,
-        "desc_act": False
-    }
+    hf_config = {"quant_method": "gptq", "bits": 4, "group_size": 128, "desc_act": False}
     kwargs = {"quantization_config": hf_config} if from_model_kwargs else None
     if not from_model_kwargs:
-        (tmp_path / "config.json").write_text(
-            json.dumps({"quantization_config": hf_config}))
+        (tmp_path / "config.json").write_text(json.dumps({"quantization_config": hf_config}))
     args = TorchLlmArgs(
         model=str(tmp_path),
         gpus_per_node=1,
         model_kwargs=kwargs,
         kv_cache_config=KvCacheConfig(dtype=kv_dtype),
     )
+    if kv_dtype == "auto":
+        args.quant_config.kv_cache_quant_algo = existing_kv_quant_algo
     loader = ModelLoader(args)
     assert loader._update_from_hf_quant_config() is True
     assert args.quant_config.quant_algo == QuantAlgo.W4A16_GPTQ
     assert args.quant_config.group_size == 128
     assert args.quant_config.has_zero_point
     assert args.quant_config.exclude_modules == ["lm_head"]
-    assert args.quant_config.kv_cache_quant_algo == (QuantAlgo.FP8 if kv_dtype
-                                                     == "fp8" else None)
+    assert args.quant_config.kv_cache_quant_algo == existing_kv_quant_algo
 
 
 @pytest.mark.parametrize("from_model_kwargs", [False, True])
@@ -162,18 +146,124 @@ def test_llm_api_rejects_gptq_activation_order(tmp_path, from_model_kwargs):
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
     from tensorrt_llm.llmapi.llm_utils import ModelLoader
 
-    hf_config = {
-        "quant_method": "gptq",
-        "bits": 4,
-        "group_size": 128,
-        "desc_act": True
-    }
+    hf_config = {"quant_method": "gptq", "bits": 4, "group_size": 128, "desc_act": True}
     kwargs = {"quantization_config": hf_config} if from_model_kwargs else None
     if not from_model_kwargs:
-        (tmp_path / "config.json").write_text(
-            json.dumps({"quantization_config": hf_config}))
-    args = TorchLlmArgs(model=str(tmp_path),
-                        gpus_per_node=1,
-                        model_kwargs=kwargs)
+        (tmp_path / "config.json").write_text(json.dumps({"quantization_config": hf_config}))
+    args = TorchLlmArgs(model=str(tmp_path), gpus_per_node=1, model_kwargs=kwargs)
     with pytest.raises(ValueError, match="desc_act"):
         ModelLoader(args)._update_from_hf_quant_config()
+
+
+def _modelopt_hf_quant_config(
+    quant_algo: str, group_size: int | None = None, **quantization_overrides: object
+) -> dict:
+    """Mimic a ModelOpt ``hf_quant_config.json`` (producer + quantization)."""
+    quantization = {
+        "quant_algo": quant_algo,
+        "kv_cache_quant_algo": None,
+        "group_size": group_size,
+        "exclude_modules": ["lm_head"],
+    }
+    quantization.update(quantization_overrides)
+    return {
+        "producer": {"name": "modelopt", "version": "0.47.0rc0"},
+        "quantization": quantization,
+    }
+
+
+@pytest.mark.parametrize(
+    ("quant_algo", "group_size"),
+    [
+        ("W4A16_NVFP4", 16),
+        # ModelOpt's nvfp4_*_weight_only recipes may export 32-element blocks,
+        # which the weight-only dequantization path supports.
+        ("W4A16_NVFP4", 32),
+        ("W4A16_NVFP4", None),
+        ("NVFP4", 16),
+        ("NVFP4", None),
+        ("NVFP4_ARC", 16),
+    ],
+)
+def test_modelopt_quant_config_accepts_supported_nvfp4_group_sizes(
+    quant_algo: str, group_size: int | None
+) -> None:
+    quant_config, layer_quant_config = ModelConfig.load_hf_quant_config(
+        _modelopt_hf_quant_config(quant_algo, group_size), moe_backend="CUTLASS"
+    )
+
+    assert layer_quant_config is None
+    assert quant_config.quant_algo == QuantAlgo(quant_algo)
+    assert quant_config.group_size == group_size
+
+
+@pytest.mark.parametrize(
+    ("quant_algo", "group_size"),
+    [
+        # W4A4 NVFP4 GEMMs are hardware-bound to 16-element scale blocks.
+        ("NVFP4", 32),
+        ("NVFP4_ARC", 32),
+        # The weight-only path dequantizes in software but only knows 16 and 32.
+        ("W4A16_NVFP4", 64),
+        ("W4A16_NVFP4", 128),
+    ],
+)
+def test_modelopt_quant_config_rejects_unsupported_nvfp4_group_size(
+    quant_algo: str, group_size: int
+) -> None:
+    with pytest.raises(ValueError, match=f"group_size={group_size}.*{quant_algo}"):
+        ModelConfig.load_hf_quant_config(
+            _modelopt_hf_quant_config(quant_algo, group_size), moe_backend="CUTLASS"
+        )
+
+
+def test_modelopt_mixed_precision_validates_per_layer_nvfp4_group_size() -> None:
+    quantized_layers = {
+        "model.layers.0.mlp.down_proj": {"quant_algo": "W4A16_NVFP4", "group_size": 32},
+        "model.layers.0.self_attn.o_proj": {"quant_algo": "FP8"},
+    }
+
+    quant_config, layer_quant_config = ModelConfig.load_hf_quant_config(
+        _modelopt_hf_quant_config("MIXED_PRECISION", quantized_layers=quantized_layers),
+        moe_backend="CUTLASS",
+    )
+
+    assert quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+    assert layer_quant_config["model.layers.0.mlp.down_proj"].group_size == 32
+    assert layer_quant_config["model.layers.0.self_attn.o_proj"].quant_algo == QuantAlgo.FP8
+
+    quantized_layers["model.layers.0.mlp.gate_proj"] = {"quant_algo": "NVFP4", "group_size": 32}
+    with pytest.raises(ValueError, match=r"for layer 'model\.layers\.0\.mlp\.gate_proj'"):
+        ModelConfig.load_hf_quant_config(
+            _modelopt_hf_quant_config("MIXED_PRECISION", quantized_layers=quantized_layers),
+            moe_backend="CUTLASS",
+        )
+
+
+@pytest.mark.parametrize(
+    "layer_name",
+    [
+        "model.language_model.layers.0.mlp.experts",
+        "model.layers.0.mlp.experts.0.gate_proj",
+    ],
+)
+def test_modelopt_rejects_32_element_nvfp4_experts_before_backend_selection(
+    layer_name: str,
+) -> None:
+    with pytest.raises(ValueError, match="only supported by the dense W4A16_NVFP4 Linear path"):
+        ModelConfig.load_hf_quant_config(
+            _modelopt_hf_quant_config(
+                "MIXED_PRECISION",
+                quantized_layers={layer_name: {"quant_algo": "W4A16_NVFP4", "group_size": 32}},
+            ),
+            moe_backend="CUTLASS",
+        )
+
+
+@pytest.mark.parametrize("group_size", [None, 16, 32, 128])
+def test_modelopt_preserves_w4a8_nvfp4_fp8_group_size(group_size: int | None) -> None:
+    quant_config, _ = ModelConfig.load_hf_quant_config(
+        _modelopt_hf_quant_config("W4A8_NVFP4_FP8", group_size), moe_backend="TRTLLM"
+    )
+    assert quant_config.quant_algo == QuantAlgo.W4A8_NVFP4_FP8
+    assert quant_config.group_size == group_size

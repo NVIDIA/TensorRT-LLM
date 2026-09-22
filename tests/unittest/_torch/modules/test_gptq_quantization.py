@@ -131,7 +131,8 @@ def test_gptq_linear(dtype, group_size, checkpoint_format, tp_mode):
     k, n = 384, 384
     raw, reference = _checkpoint(k, n, group_size, dtype, checkpoint_format)
     mapper = _mapper(checkpoint_format)
-    x = torch.randn(7, k, device="cuda", dtype=dtype)
+    rng = torch.Generator(device="cpu").manual_seed(0)
+    x = torch.randn(7, k, generator=rng, dtype=dtype).cuda()
     tp_size = 1 if tp_mode is None else 2
     results = []
     for rank in range(tp_size):
@@ -197,7 +198,8 @@ def test_gptq_fused_linear(weight_mode, dtype, checkpoint_format):
     }
     weights = mapper.apply_callbacks(linear, fused_name, ["block"], checkpoint)
     linear.load_weights(weights)
-    x = torch.randn(3, 256, device="cuda", dtype=dtype)
+    rng = torch.Generator(device="cpu").manual_seed(0)
+    x = torch.randn(3, 256, generator=rng, dtype=dtype).cuda()
     expected = x.float() @ torch.cat(refs, dim=1).cuda()
     expected += torch.cat([raw["bias"] for raw in raws]).float().cuda()
     torch.testing.assert_close(
@@ -232,7 +234,8 @@ def test_gptq_qkv_tp_replicates_kv_group_parameters(rank):
     ).cuda()
     weights = mapper.apply_callbacks(linear, "qkv_proj", ["block"], checkpoint)
     linear.load_weights(weights)
-    x = torch.randn(4, k, device="cuda", dtype=dtype)
+    rng = torch.Generator(device="cpu").manual_seed(0)
+    x = torch.randn(4, k, generator=rng, dtype=dtype).cuda()
     refs = [data[0][1][:, rank * 128 : (rank + 1) * 128], data[1][1], data[2][1]]
     biases = [
         data[0][0]["bias"][rank * 128 : (rank + 1) * 128],
@@ -243,11 +246,23 @@ def test_gptq_qkv_tp_replicates_kv_group_parameters(rank):
     torch.testing.assert_close(linear(x).float(), expected, rtol=0.005, atol=0.03)
 
 
+@pytest.mark.cpu_only
+def test_gptq_partial_loading_rejected():
+    """Partial updates must fail before converting or copying GPTQ weights."""
+    raw, _ = _checkpoint(256, 256, 128, torch.float16, "gptq")
+    linear = Linear(256, 256, dtype=torch.float16, quant_config=_quant_config(128))
+    with pytest.raises(ValueError, match="GPTQ does not support partial weight loading"):
+        _mapper("gptq").handle_special_instance_module(
+            linear, "o_proj", raw, allow_partial_loading=True
+        )
+
+
 def test_gptq_cuda_graph():
     raw, _ = _checkpoint(256, 256, 128, torch.float16, "gptq")
     linear = Linear(256, 256, dtype=torch.float16, quant_config=_quant_config(128)).cuda()
     _mapper("gptq").handle_special_instance_module(linear, "o_proj", raw)
-    x = torch.randn(4, 256, device="cuda", dtype=torch.float16)
+    rng = torch.Generator(device="cpu").manual_seed(0)
+    x = torch.randn(4, 256, generator=rng, dtype=torch.float16).cuda()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -283,7 +298,8 @@ def test_gptq_model_weight_loader():
         checkpoint.update({f"{name}.{key}": value for key, value in raw.items()})
         reference[name], biases[name] = ref.cuda(), raw["bias"].float().cuda()
     _load_weights_impl_v2(model, checkpoint, _mapper("gptq"))
-    x = torch.randn(2, 256, device="cuda", dtype=torch.float16)
+    rng = torch.Generator(device="cpu").manual_seed(0)
+    x = torch.randn(2, 256, generator=rng, dtype=torch.float16).cuda()
     qkv_ref = torch.cat(
         [x.float() @ reference[name] + biases[name] for name in ("q_proj", "k_proj", "v_proj")],
         dim=-1,

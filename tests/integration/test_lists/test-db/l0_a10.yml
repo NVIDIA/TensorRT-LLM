@@ -55,6 +55,7 @@ l0_a10:
   - unittest/_torch/models/test_qwen3next_moe_allreduce_guard.py
   - unittest/_torch/weight_sharing
   - unittest/inputs/test_multimodal_input_processor.py
+  - unittest/inputs/test_prefix_token_cache.py
   - unittest/others/test_cache_transceiver_precheck_config.py
   - unittest/others/test_cache_transceiver_precheck_run.py
   - unittest/others/test_lora_manager.py
@@ -130,7 +131,6 @@ l0_a10:
   - test_e2e.py::test_openai_responses_entrypoint
   - test_e2e.py::test_openai_completions_example[pytorch]
   - test_e2e.py::test_openai_chat_example[pytorch] TIMEOUT (90)
-  - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-]
   - test_e2e.py::test_trtllm_bench_invalid_token_pytorch[TinyLlama-1.1B-Chat-v1.0-TinyLlama-1.1B-Chat-v1.0]
   # visual_gen
   - unittest/_torch/visual_gen/test_profiler.py

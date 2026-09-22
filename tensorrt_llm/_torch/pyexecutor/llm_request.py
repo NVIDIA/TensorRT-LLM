@@ -907,6 +907,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logits_chunk_size: int = 8,
             logprobs_mode: LogprobMode = LogprobMode.RAW,
             logprobs_simple_format: bool = False,
+            return_routed_experts: bool = False,
             **kwargs):
         self.py_sampling_strategy: "Strategy | None" = None
 
@@ -1018,6 +1019,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_num_logprobs = num_logprobs
         self.py_return_log_probs = return_log_probs
         self.py_logprobs_simple_format = logprobs_simple_format
+        # Router Replay: attach routed_experts to this request's output.
+        self.py_return_routed_experts = return_routed_experts
         self.py_return_context_logits = return_context_logits
         self.py_return_generation_logits = return_generation_logits
         self.py_return_logits_device_memory = return_logits_device_memory
@@ -1563,7 +1566,6 @@ def executor_request_to_llm_request(
         sampling_config=sampling_config,
         is_streaming=executor_request.streaming,
         end_id=executor_request.end_id,
-        pad_id=executor_request.pad_id,
         embedding_bias=executor_request.embedding_bias,
         stop_words_list=stop_words_list,
         position_ids=position_ids,
@@ -1588,7 +1590,6 @@ def executor_request_to_llm_request(
         py_lora_path=getattr(executor_request, "py_lora_path", None),
         mrope_rotary_cos_sin=mrope_rotary_cos_sin,
         mrope_position_deltas=mrope_position_deltas,
-        lookahead_config=None,
         return_log_probs=executor_request.output_config.return_log_probs,
         num_logprobs=getattr(executor_request, "py_num_logprobs", 0),
         return_context_logits=executor_request.output_config.
@@ -1603,11 +1604,8 @@ def executor_request_to_llm_request(
         ] if executor_request.output_config.additional_model_outputs is not None
         else None,
         draft_tokens=getattr(executor_request, "draft_tokens", None),
-        draft_logits=None,
         exclude_input_from_output=executor_request.output_config.
         exclude_input_from_output,
-        logits_post_processor=None,
-        apply_logits_post_processor_batched=False,
         guided_decoding_params=executor_request.guided_decoding_params,
         py_logits_post_processors=getattr(executor_request,
                                           "py_logits_post_processors", None),
@@ -1632,6 +1630,8 @@ def executor_request_to_llm_request(
                               LogprobMode.RAW),
         logprobs_simple_format=getattr(executor_request,
                                        "py_logprobs_simple_format", False),
+        return_routed_experts=getattr(executor_request,
+                                      "py_return_routed_experts", False),
     )
 
     # Bad-words list for the TorchSampler path, kept in its native

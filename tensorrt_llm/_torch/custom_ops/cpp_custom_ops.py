@@ -405,10 +405,9 @@ def _register_fake():
           conv_state_v: torch.Tensor, a_log: torch.Tensor, g: torch.Tensor,
           dt_bias: torch.Tensor, beta: torch.Tensor, onorm_g: torch.Tensor,
           onorm_weight: torch.Tensor, ssm_state_indices: Optional[torch.Tensor],
-          cu_seqlens: torch.Tensor, state: torch.Tensor, apply_onorm: bool,
-          update_conv_cache: bool, use_lower_bound: bool,
-          apply_beta_sigmoid: bool, lower_bound: float, scale: float,
-          onorm_eps: float, output: torch.Tensor) -> None:
+          state: torch.Tensor, apply_onorm: bool, update_conv_cache: bool,
+          use_lower_bound: bool, apply_beta_sigmoid: bool, lower_bound: float,
+          scale: float, onorm_eps: float, output: torch.Tensor) -> None:
         # Inplace-only: the kernel writes into ``output``, so there is nothing
         # to allocate and nothing to return.
         return None
@@ -843,6 +842,43 @@ def _register_fake():
         weight_bias: float,
     ) -> List[torch.Tensor]:
         return outputs
+
+    @torch.library.register_fake("trtllm::fused_sample_from_logits")
+    def _(
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        min_ps: torch.Tensor,
+        seed: Optional[torch.Tensor] = None,
+        offset: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return logits.new_empty((logits.shape[0], ), dtype=torch.int32)
+
+    @torch.library.register_fake("trtllm::fused_sample_from_logits_with_probs")
+    def _(
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        min_ps: torch.Tensor,
+        seed: Optional[torch.Tensor] = None,
+        offset: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return (
+            logits.new_empty((logits.shape[0], ), dtype=torch.int32),
+            logits.new_empty(logits.shape, dtype=torch.float32),
+        )
+
+    @torch.library.register_fake("trtllm::fused_compute_probs_from_logits")
+    def _(
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        min_ps: torch.Tensor,
+    ) -> torch.Tensor:
+        return logits.new_empty(logits.shape, dtype=torch.float32)
 
     @torch.library.register_fake(
         "trtllm::mtp_sampling_and_accepted_draft_tokens_op")
@@ -1303,7 +1339,12 @@ def _register_fake():
         ]
 
     @torch.library.register_fake("trtllm::alltoall_helix_native")
-    def _(partial_o, softmax_stats, workspace, cp_rank, cp_size):
+    def _(partial_o,
+          softmax_stats,
+          workspace,
+          cp_rank,
+          cp_size,
+          zero_kv_mask=None):
         # Returns outputs with same shapes as inputs
         return partial_o.new_empty(partial_o.shape), softmax_stats.new_empty(
             softmax_stats.shape)
@@ -1734,3 +1775,13 @@ def _register_fake():
         out_shape = shape if shape is not None else list(like.shape)
         dtype = out_dtype if out_dtype is not None else like.dtype
         return like.new_empty(out_shape, dtype=dtype), output_buffer_kind
+
+    @torch.library.register_fake("trtllm::allocate_output_with_nccl_window")
+    def _(like: torch.Tensor,
+          output_buffer_kind: int,
+          group: Optional[List[int]],
+          shape: Optional[List[int]] = None,
+          out_dtype: Optional[torch.dtype] = None):
+        out_shape = shape if shape is not None else list(like.shape)
+        dtype = out_dtype if out_dtype is not None else like.dtype
+        return like.new_empty(out_shape, dtype=dtype), output_buffer_kind, 0
