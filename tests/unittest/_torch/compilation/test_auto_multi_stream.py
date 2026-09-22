@@ -27,6 +27,8 @@ import pytest
 import torch
 from torch.fx import Graph, GraphModule, Node
 
+# Register the MoE op referenced by the scheduler's cost model.
+import tensorrt_llm._torch.moe.fused_moe.interface  # noqa: F401
 from tensorrt_llm._torch.compilation.multi_stream.auto_multi_stream import (
     MultiStreamDAG,
     multi_stream_schedule,
