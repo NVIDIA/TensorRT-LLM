@@ -35,7 +35,8 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..distributed import Distributed
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
-                           get_spec_resource_manager)
+                           get_spec_resource_manager,
+                           should_use_separate_draft_kv_cache)
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     compute_max_num_sequences, create_py_executor_instance,
@@ -189,6 +190,24 @@ class _ExecutorMemoryMonitor:
                     free_gpu_memory_bytes_pre=free_gpu_memory_bytes_pre,
                     free_gpu_memory_bytes_post=free_gpu_memory_bytes_post,
                 ))
+
+
+def _flashinfer_one_engine_spec_supported(attn_backend: str,
+                                          spec_config) -> bool:
+    """Whether this speculation is qualified on the FlashInfer target backend.
+
+    DFlash remains unqualified regardless of its draft attention backend or
+    cache ownership. Its VANILLA and FA4 backends own private context buffers,
+    but that does not establish FlashInfer serving-scale qualification.
+
+    Other speculative modes are admitted when they do not need a separate
+    draft KV cache manager.
+    """
+    if spec_config is None or attn_backend != "FLASHINFER":
+        return True
+    if spec_config.spec_dec_mode.is_dflash():
+        return False
+    return not should_use_separate_draft_kv_cache(spec_config)
 
 
 def _set_model_engines_cache_reuse(model_engines, cache_reuse: bool):
@@ -440,12 +459,18 @@ def _create_py_executor_impl(
             )
             llm_args.disable_overlap_scheduler = True
 
-    if (spec_config is not None and llm_args.attn_backend == "FLASHINFER"
-            and spec_config.spec_dec_mode.use_one_engine()
-            and not spec_config._use_shared_kv_cache):
+    if not _flashinfer_one_engine_spec_supported(llm_args.attn_backend,
+                                                 spec_config):
+        if spec_config.spec_dec_mode.is_dflash():
+            raise ValueError(
+                "FLASHINFER target attention is not qualified for DFlash, "
+                "regardless of the draft attention backend or cache ownership. "
+                "Use TRTLLM target attention for DFlash.")
         raise ValueError(
-            "FLASHINFER attention backend supports one-engine speculative "
-            "decoding only when the draft model shares the target KV cache.")
+            f"FLASHINFER target attention is not qualified for "
+            f"{spec_config.spec_dec_mode.name}: this one-engine speculative "
+            "mode needs a separate draft KV cache manager, which FLASHINFER "
+            "does not support. Use TRTLLM target attention.")
 
     if mm_encoder_only:
         llm_args.mm_encoder_only = True
