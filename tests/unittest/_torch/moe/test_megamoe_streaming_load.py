@@ -52,7 +52,10 @@ class _StreamingMoEModule(nn.Module):
     """Minimal single-rank module for the quant-method load path."""
 
     def __init__(self, weight_loading_mode: MoEWeightLoadingMode) -> None:
+        from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+
         super().__init__()
+        self.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
         self.num_experts = NUM_EXPERTS
         self.hidden_size = HIDDEN_SIZE
         self.intermediate_size_per_partition = INTERMEDIATE_SIZE

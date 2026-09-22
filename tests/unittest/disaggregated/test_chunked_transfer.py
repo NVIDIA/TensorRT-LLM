@@ -25,12 +25,8 @@ import numpy as np
 import pytest
 
 from tensorrt_llm import DisaggregatedParams
-from tensorrt_llm._torch.disaggregation.base.transfer import (
-    KVSlice,
-    SessionStatus,
-    TokenRange,
-    WaitResult,
-)
+from tensorrt_llm._torch.disaggregation.base import CacheExtent, CacheKind, Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     KVSendTask,
@@ -39,9 +35,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     Sender,
     TaskStatus,
     TxSession,
-    project_blocks_to_global_chunk,
 )
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState, LlmRequestType
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
@@ -86,9 +80,11 @@ def _make_tx_session(num_slices: int, rid: int = 42, prompt_len: int = 8, **kwar
         **kwargs,
     )
     for i in range(num_slices):
-        s = KVSlice(
-            is_last_slice=(i == num_slices - 1),
+        s = Chunk(
             block_ids_per_layer_groups=[[i]],
+            kind_per_layer_group=[CacheKind.PAGED],
+            token_range=TokenRange(start=0, end=prompt_len),
+            is_last=(i == num_slices - 1),
         )
         session.send(s)
     return session
@@ -104,76 +100,28 @@ def _make_rx_session(num_slices: int, rid: int = 42, prompt_len: int = 8) -> RxS
         prompt_len=prompt_len,
     )
     for i in range(num_slices):
-        s = KVSlice(
-            is_last_slice=(i == num_slices - 1),
+        s = Chunk(
             block_ids_per_layer_groups=[[i]],
+            kind_per_layer_group=[CacheKind.PAGED],
+            token_range=TokenRange(start=0, end=prompt_len),
+            is_last=(i == num_slices - 1),
         )
         session.receive(s)
     return session
 
 
 # ---------------------------------------------------------------------------
-# Global chunk projection tests
+# Sender write-meta over positional block tables
 # ---------------------------------------------------------------------------
 
 
-def test_chunk_projection_noops_when_chunk_is_outside_short_layer_group():
-    """A shared chunk cursor past a short layer group's resident range is a no-op."""
-    block_ids = np.array([10, 11, 12], dtype=np.int64)
-
-    projected_ids = project_blocks_to_global_chunk(
-        block_ids,
-        chunk_block_offset=4,
-        chunk_block_count=4,
-        resident_block_end=3,
-    )
-
-    assert projected_ids.size == 0
-
-
-@pytest.mark.parametrize(
-    "resident_block_end,chunk_block_offset,expected",
-    [
-        (16, 0, np.arange(16, dtype=np.int64)),
-        (32, 16, np.arange(16, 32, dtype=np.int64)),
-    ],
-    ids=["first_chunk", "later_chunk"],
-)
-def test_chunk_projection_maps_incrementally_allocated_source(
-    resident_block_end, chunk_block_offset, expected
-):
-    """Source blocks end at the current chunk, not at the full prompt."""
-    block_ids = np.arange(resident_block_end, dtype=np.int64)
-
-    projected_ids = project_blocks_to_global_chunk(
-        block_ids,
-        chunk_block_offset=chunk_block_offset,
-        chunk_block_count=16,
-        resident_block_end=resident_block_end,
-    )
-
-    assert np.array_equal(projected_ids, expected)
-
-
-def test_chunk_projection_maps_prefix_reuse_suffix_by_overlap():
-    """Destination suffixes are matched by overlap, not by raw chunk-offset indexing."""
-    block_ids = np.array([104, 105, 106, 107], dtype=np.int64)
-
-    first_chunk = project_blocks_to_global_chunk(
-        block_ids,
-        chunk_block_offset=0,
-        chunk_block_count=4,
-        resident_block_end=8,
-    )
-    second_chunk = project_blocks_to_global_chunk(
-        block_ids,
-        chunk_block_offset=4,
-        chunk_block_count=4,
-        resident_block_end=8,
-    )
-
-    assert first_chunk.size == 0
-    assert np.array_equal(second_chunk, block_ids)
+def _positional(total: int, **at) -> np.ndarray:
+    """Build a positional block table: ``start`` -> slots placed from that ordinal."""
+    table = np.full(total, -1, dtype=np.int64)
+    for start, slots in at.items():
+        s = int(start.lstrip("o"))
+        table[s : s + len(slots)] = slots
+    return table
 
 
 _PROJECTION_TPB = 8
@@ -244,14 +192,17 @@ def _make_projection_sender() -> Sender:
 
 
 def _make_projection_task(slice_id: int = 1) -> KVSendTask:
+    # Chunk [4, 8) of an 8-block prompt. Group 1 is a short (windowed) group
+    # that only holds ordinals 5..7.
     return KVSendTask(
-        KVSlice(
-            is_last_slice=True,
+        Chunk(
             block_ids_per_layer_groups=[
-                np.array([4, 5, 6, 7], dtype=np.int64),
-                np.array([10, 11, 12], dtype=np.int64),
+                _positional(8, o4=[4, 5, 6, 7]),
+                _positional(8, o5=[10, 11, 12]),
             ],
+            kind_per_layer_group=[CacheKind.PAGED, CacheKind.PAGED],
             token_range=_projection_token_range(4, 8),
+            is_last=True,
         ),
         _make_params(),
         slice_id=slice_id,
@@ -265,16 +216,16 @@ def _make_projection_req_info(slice_id=None) -> RecvReqInfo:
         instance_name="decode",
         instance_rank=0,
         block_ids_per_layer_groups=[
-            np.array([104, 105, 106, 107], dtype=np.int64),
-            np.array([200, 201, 202], dtype=np.int64),
+            _positional(8, o4=[104, 105, 106, 107]),
+            _positional(8, o5=[200, 201, 202]),
         ],
         unique_rid=42,
         slice_id=slice_id,
     )
 
 
-def test_build_kv_write_meta_projects_asymmetric_layer_group_chunk():
-    """A short layer group's suffix blocks transfer with the overlapping global chunk."""
+def test_build_kv_write_meta_pairs_holes_by_ordinal():
+    """Each group pairs only the ordinals both tables hold; -1 entries are skipped."""
     sender = _make_projection_sender()
 
     write_meta = sender._build_kv_write_meta(_make_projection_task(), _make_projection_req_info())
@@ -300,13 +251,14 @@ def test_final_swa_slice_keeps_the_receivers_complete_active_window():
         6 * _PROJECTION_TPB
     )
     task = KVSendTask(
-        KVSlice(
-            is_last_slice=True,
+        Chunk(
             block_ids_per_layer_groups=[
-                np.arange(2, 8, dtype=np.int64),
-                np.array([], dtype=np.int64),
+                _positional(8, o2=np.arange(2, 8)),
+                _positional(8),
             ],
+            kind_per_layer_group=[CacheKind.PAGED, CacheKind.PAGED],
             token_range=_projection_token_range(6, 8),
+            is_last=True,
         ),
         _make_params(),
         slice_id=1,
@@ -317,8 +269,8 @@ def test_final_swa_slice_keeps_the_receivers_complete_active_window():
         instance_name="decode",
         instance_rank=0,
         block_ids_per_layer_groups=[
-            np.arange(102, 108, dtype=np.int64),
-            np.array([], dtype=np.int64),
+            _positional(8, o2=np.arange(102, 108)),
+            _positional(8),
         ],
         unique_rid=42,
     )
@@ -329,34 +281,32 @@ def test_final_swa_slice_keeps_the_receivers_complete_active_window():
     assert np.array_equal(write_meta.dst_ptrs, np.arange(102, 108, dtype=np.int64))
 
 
-def test_whole_prompt_chunk_addresses_like_a_monolithic_slice():
-    """A whole-prompt chunk has monolithic addressing."""
-    sender = _make_projection_sender()
-    src_per_group = [
-        np.arange(8, dtype=np.int64),
-        np.array([10, 11, 12], dtype=np.int64),
-    ]
-
-    def task_for(token_range):
-        return KVSendTask(
-            KVSlice(
-                is_last_slice=True,
-                block_ids_per_layer_groups=src_per_group,
-                token_range=token_range,
-            ),
-            _make_params(),
-            slice_id=0,
-            prompt_len=64,
-        )
-
-    chunked = sender._build_kv_write_meta(
-        task_for(_projection_token_range(0, 8)), _make_projection_req_info()
+def _projection_task_for(start_block: int, end_block: int) -> KVSendTask:
+    """A send task whose positional source table holds exactly the chunk's ordinals."""
+    return KVSendTask(
+        Chunk(
+            block_ids_per_layer_groups=[
+                _positional(8, **{f"o{start_block}": np.arange(start_block, end_block)}),
+                _positional(8, o5=[10, 11, 12]),
+            ],
+            kind_per_layer_group=[CacheKind.PAGED, CacheKind.PAGED],
+            token_range=_projection_token_range(start_block, end_block),
+            is_last=True,
+        ),
+        _make_params(),
+        slice_id=0,
+        prompt_len=_PROJECTION_PROMPT_TOKENS,
     )
-    monolithic = sender._build_kv_write_meta(task_for(None), _make_projection_req_info())
 
-    assert np.array_equal(chunked.src_ptrs, monolithic.src_ptrs)
-    assert np.array_equal(chunked.dst_ptrs, monolithic.dst_ptrs)
-    assert np.array_equal(chunked.sizes, monolithic.sizes)
+
+def test_context_parallelism_is_refused_only_for_a_piece_short_of_the_prompt():
+    """The guard only fires for a piece short of the whole prompt; a sole whole-prompt piece passes."""
+    sender = _make_projection_sender()
+    sender._registrar.self_rank_info = SimpleNamespace(cp_size=2, cp_rank=0)
+
+    sender._build_kv_write_meta(_projection_task_for(0, 8), _make_projection_req_info())
+    with pytest.raises(ValueError, match="context parallelism"):
+        sender._build_kv_write_meta(_projection_task_for(4, 8), _make_projection_req_info())
 
 
 def test_build_kv_write_meta_tracks_sender_and_receiver_slice_ids():
@@ -406,19 +356,19 @@ def test_process_kv_agent_result_rejects_unknown_receiver_slice_id():
 
 
 def test_tx_session_status_init_until_all_transferred():
-    """TxSession status is not KV_TRANSFERRED until ALL tasks complete."""
+    """TxSession status is not TRANSFERRED until ALL tasks complete."""
     session = _make_tx_session(3)
     session.receiver_ready = True
     assert session.status == SessionStatus.TRANSFERRING or session.status == SessionStatus.READY
 
     session.kv_tasks[0].status = TaskStatus.TRANSFERRED
-    assert session.status != SessionStatus.KV_TRANSFERRED
+    assert session.status != SessionStatus.TRANSFERRED
 
     session.kv_tasks[1].status = TaskStatus.TRANSFERRED
-    assert session.status != SessionStatus.KV_TRANSFERRED
+    assert session.status != SessionStatus.TRANSFERRED
 
     session.kv_tasks[2].status = TaskStatus.TRANSFERRED
-    assert session.status == SessionStatus.KV_TRANSFERRED
+    assert session.status == SessionStatus.TRANSFERRED
 
 
 def test_tx_session_intermediate_slice_cannot_complete_session():
@@ -430,14 +380,16 @@ def test_tx_session_intermediate_slice_cannot_complete_session():
         prompt_len=8,
     )
     session.send(
-        KVSlice(
-            is_last_slice=False,
+        Chunk(
             block_ids_per_layer_groups=[[0]],
+            kind_per_layer_group=[CacheKind.PAGED],
+            token_range=TokenRange(start=0, end=8),
+            is_last=False,
         )
     )
     session.kv_tasks[0].complete()
 
-    assert session.status != SessionStatus.KV_TRANSFERRED
+    assert session.status != SessionStatus.TRANSFERRED
     assert not session.is_completed()
 
 
@@ -469,7 +421,7 @@ def test_rx_session_status_follows_its_single_task():
     assert session.status == SessionStatus.TRANSFERRING
 
     session._kv_tasks[0].status = TaskStatus.TRANSFERRED
-    assert session.status == SessionStatus.KV_TRANSFERRED
+    assert session.status == SessionStatus.TRANSFERRED
 
 
 def test_rx_session_process_aux_completes_at_expected_transfers():
@@ -497,14 +449,22 @@ def test_rx_session_wait_complete_reports_task_outcome():
 # ---------------------------------------------------------------------------
 
 
-def _make_respond_transceiver(session, kv_slice, *, pipelined=True):
+def _make_respond_transceiver(session, chunk, *, pipelined=True):
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
     transceiver = object.__new__(KvCacheTransceiverV2)
+    # A send session appends one task per chunk and the caller reads the new one back by
+    # position, so a double whose send() leaves the list empty has nothing at that position.
+    session.kv_tasks = []
+    session.send = MagicMock(side_effect=lambda _chunk: session.kv_tasks.append(MagicMock()))
+    # Both builders hand back an extent. The pipelined one answers None for a piece worth
+    # deferring, which is what a caller passing chunk=None is asking for.
+    extent = None if chunk is None else CacheExtent(name=42, local=chunk)
     transceiver._enable_pipelined_transfer = pipelined
     transceiver._get_or_create_send_session = MagicMock(return_value=session)
-    transceiver._build_prefill_chunk = MagicMock(return_value=kv_slice)
-    transceiver._create_kv_slice = MagicMock(return_value=kv_slice)
+    transceiver._build_prefill_extent = MagicMock(return_value=extent)
+    transceiver._create_chunk = MagicMock(return_value=chunk)
+    transceiver._create_cache_extent = MagicMock(return_value=extent)
     transceiver._finalize_send = MagicMock()
     return transceiver
 
@@ -525,7 +485,7 @@ def test_pipelined_transfer_allows_pipeline_parallelism_at_initialization():
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
     transceiver = object.__new__(KvCacheTransceiverV2)
-    transceiver._mapping = SimpleNamespace(pp_size=2)
+    transceiver._mapping = SimpleNamespace(pp_size=2, cp_size=1)
     transceiver._kv_cache_manager = MagicMock()
     cache_transceiver_config = CacheTransceiverConfig(
         backend="NIXL",
@@ -540,7 +500,7 @@ def test_pipelined_transfer_rejects_bounce_buffer():
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
     transceiver = object.__new__(KvCacheTransceiverV2)
-    transceiver._mapping = SimpleNamespace(pp_size=1)
+    transceiver._mapping = SimpleNamespace(pp_size=1, cp_size=1)
     transceiver._kv_cache_manager = MagicMock()
     cache_transceiver_config = CacheTransceiverConfig(
         backend="NIXL",
@@ -564,7 +524,7 @@ def test_pipelined_transfer_allows_agent_bounce_buffer():
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
     transceiver = object.__new__(KvCacheTransceiverV2)
-    transceiver._mapping = SimpleNamespace(pp_size=1)
+    transceiver._mapping = SimpleNamespace(pp_size=1, cp_size=1)
     transceiver._kv_cache_manager = MagicMock()
     cache_transceiver_config = CacheTransceiverConfig(
         backend="NIXL",
@@ -582,7 +542,7 @@ def test_pipelined_transfer_rejects_mamba_cache_manager():
     from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 
     transceiver = object.__new__(KvCacheTransceiverV2)
-    transceiver._mapping = SimpleNamespace(pp_size=1)
+    transceiver._mapping = SimpleNamespace(pp_size=1, cp_size=1)
     transceiver._kv_cache_manager = MagicMock(spec=MambaHybridCacheManager)
     cache_transceiver_config = CacheTransceiverConfig(
         backend="NIXL",
@@ -593,6 +553,47 @@ def test_pipelined_transfer_rejects_mamba_cache_manager():
         ValueError,
         match="not supported with a Mamba/hybrid cache manager",
     ):
+        KvCacheTransceiverV2._resolve_pipelined_transfer(transceiver, cache_transceiver_config)
+
+
+def test_the_last_chunk_reports_the_prompt_end_not_the_block_end():
+    """The block window rounds up; what the piece delivers does not.
+
+    A recurrent-state group reads the end as an exact checkpoint, so an end past the prompt is a
+    different token than the one that was sent.
+    """
+    tpb = _REUSE_TPB
+    prompt_len = 3 * tpb - 1
+
+    chunk = _build_prefill_chunk_tokens_for(
+        prepopulated_tokens=0,
+        chunk_start_pos=0,
+        chunk_end_pos=prompt_len,
+        resident_blocks=3,
+        prompt_len=prompt_len,
+    )
+
+    assert chunk.is_last
+    assert chunk.token_range.end == prompt_len
+
+
+def test_pipelined_transfer_rejects_context_parallelism():
+    """Refused for the configuration, not for the piece.
+
+    The per-chunk guard downstream only sees a piece short of the whole prompt, so a prompt that
+    fits one chunk would otherwise reach a projection that has no answer under CP.
+    """
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._mapping = SimpleNamespace(pp_size=1, cp_size=2)
+    transceiver._kv_cache_manager = MagicMock()
+    cache_transceiver_config = CacheTransceiverConfig(
+        backend="NIXL",
+        enable_pipelined_transfer=True,
+    )
+
+    with pytest.raises(ValueError, match="context parallelism"):
         KvCacheTransceiverV2._resolve_pipelined_transfer(transceiver, cache_transceiver_config)
 
 
@@ -808,11 +809,12 @@ def test_pipelined_last_chunk_sends_and_finalizes():
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
     session = MagicMock()
-    session.kv_tasks = []
 
-    last_slice = KVSlice(
-        is_last_slice=True,
+    last_slice = Chunk(
         block_ids_per_layer_groups=[np.array([0, 1], dtype=np.int64)],
+        kind_per_layer_group=[CacheKind.PAGED],
+        token_range=TokenRange(start=0, end=8),
+        is_last=True,
     )
 
     transceiver = _make_respond_transceiver(session, last_slice)
@@ -828,8 +830,8 @@ def test_pipelined_last_chunk_sends_and_finalizes():
 
     KvCacheTransceiverV2.respond_and_send_async(transceiver, request)
 
-    transceiver._build_prefill_chunk.assert_called_once_with(request)
-    transceiver._create_kv_slice.assert_not_called()
+    transceiver._build_prefill_extent.assert_called_once_with(request)
+    transceiver._create_cache_extent.assert_not_called()
     session.send.assert_called_once_with(last_slice)
     transceiver._finalize_send.assert_called_once_with(request, session)
     assert request.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
@@ -840,9 +842,11 @@ def test_non_pipelined_transfer_builds_whole_slice():
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
     session = MagicMock()
-    whole_slice = KVSlice(
-        is_last_slice=True,
+    whole_slice = Chunk(
         block_ids_per_layer_groups=[np.array([0, 1], dtype=np.int64)],
+        kind_per_layer_group=[CacheKind.PAGED],
+        token_range=TokenRange(start=0, end=8),
+        is_last=True,
     )
     transceiver = _make_respond_transceiver(session, whole_slice, pipelined=False)
     request = SimpleNamespace(
@@ -856,8 +860,8 @@ def test_non_pipelined_transfer_builds_whole_slice():
 
     KvCacheTransceiverV2.respond_and_send_async(transceiver, request)
 
-    transceiver._create_kv_slice.assert_called_once_with(request)
-    transceiver._build_prefill_chunk.assert_not_called()
+    transceiver._create_cache_extent.assert_called_once_with(request)
+    transceiver._build_prefill_extent.assert_not_called()
     session.send.assert_called_once_with(whole_slice)
     transceiver._finalize_send.assert_called_once_with(request, session)
 
@@ -867,11 +871,12 @@ def test_pipelined_non_last_chunk_does_not_finalize():
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
     session = MagicMock()
-    session.kv_tasks = []
 
-    mid_slice = KVSlice(
-        is_last_slice=False,
+    mid_slice = Chunk(
         block_ids_per_layer_groups=[np.array([0, 1], dtype=np.int64)],
+        kind_per_layer_group=[CacheKind.PAGED],
+        token_range=TokenRange(start=0, end=4),
+        is_last=False,
     )
 
     transceiver = _make_respond_transceiver(session, mid_slice)
@@ -887,8 +892,8 @@ def test_pipelined_non_last_chunk_does_not_finalize():
 
     KvCacheTransceiverV2.respond_and_send_async(transceiver, request)
 
-    transceiver._build_prefill_chunk.assert_called_once_with(request)
-    transceiver._create_kv_slice.assert_not_called()
+    transceiver._build_prefill_extent.assert_called_once_with(request)
+    transceiver._create_cache_extent.assert_not_called()
     session.send.assert_called_once_with(mid_slice)
     transceiver._finalize_send.assert_not_called()
 
@@ -898,7 +903,6 @@ def test_pipelined_chunk_without_a_complete_block_is_not_sent():
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
     session = MagicMock()
-    session.kv_tasks = []
 
     transceiver = _make_respond_transceiver(session, None)
 
@@ -913,8 +917,8 @@ def test_pipelined_chunk_without_a_complete_block_is_not_sent():
 
     KvCacheTransceiverV2.respond_and_send_async(transceiver, request)
 
-    transceiver._build_prefill_chunk.assert_called_once_with(request)
-    transceiver._create_kv_slice.assert_not_called()
+    transceiver._build_prefill_extent.assert_called_once_with(request)
+    transceiver._create_cache_extent.assert_not_called()
     session.send.assert_not_called()
     transceiver._finalize_send.assert_not_called()
 
@@ -957,9 +961,14 @@ def test_pipelined_multiple_chunks_use_real_builder_and_tx_session():
     transceiver._send_reqs = {}
     transceiver._ever_had_send_session = False
     transceiver._transfer_worker = SimpleNamespace(create_tx_session=lambda _req: session)
+
+    def _unexpected_get_block_ids(_req, _idx, _lg):
+        raise AssertionError("context-side transfer must use get_block_ordinals, not get_block_ids")
+
     transceiver._reuse_adapter = SimpleNamespace(
         tokens_per_block=tokens_per_block,
-        get_block_ids=lambda _req, _idx, _lg: source_block_ids,
+        get_block_ids=_unexpected_get_block_ids,
+        get_block_ordinals=lambda _req, _idx, _lg: source_block_ids,
     )
     transceiver._page_table = SimpleNamespace(
         layer_groups=[SimpleNamespace(kind=CacheKind.PAGED, sliding_window_size=None)]
@@ -989,15 +998,16 @@ def test_pipelined_multiple_chunks_use_real_builder_and_tx_session():
     request.context_remaining_length = 0
     transceiver.respond_and_send_async(request)
 
-    assert [task._slice.token_range for task in session.kv_tasks] == [
+    assert [task._chunk.token_range for task in session.kv_tasks] == [
         TokenRange(start=0, end=2 * tokens_per_block),
         TokenRange(start=2 * tokens_per_block, end=4 * tokens_per_block),
     ]
-    assert [task._slice.block_ids_per_layer_groups[0].tolist() for task in session.kv_tasks] == [
-        [0, 1],
-        [2, 3],
+    # Positional tables: each chunk blanks the ordinals outside its range.
+    assert [task._chunk.block_ids_per_layer_groups[0].tolist() for task in session.kv_tasks] == [
+        [0, 1, -1, -1],
+        [-1, -1, 2, 3],
     ]
-    assert [task._slice.is_last_slice for task in session.kv_tasks] == [False, True]
+    assert [task._chunk.is_last for task in session.kv_tasks] == [False, True]
     assert transceiver._send_sessions == {rid: session}
     assert transceiver._send_reqs == {rid: request}
     assert request.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
@@ -1025,11 +1035,14 @@ def _build_prefill_chunk_tokens_for(
     resident_blocks=None,
     sliding_window_size=_REUSE_TOTAL_BLOCKS * _REUSE_TPB,
     source_block_ids=None,
+    prompt_len=None,
 ):
-    """Drive the real _build_prefill_chunk for one chunk, in token coordinates.
+    """Drive the real _build_prefill_extent for one chunk, in token coordinates.
 
-    ``resident_blocks`` is how many blocks the mocked ``_create_kv_slice`` hands
-    back, and defaults to the block holding ``chunk_end_pos``.
+    The mocked ``_describe_local`` hands back a positional table over the whole
+    prompt: ordinals ``[0, resident_blocks)`` are allocated (slot == ordinal),
+    the rest are -1 holes. ``resident_blocks`` defaults to the block holding
+    ``chunk_end_pos``. ``source_block_ids`` overrides the whole table.
 
     ``sliding_window_size`` defaults to a full-attention layer as the V1
     extractor actually builds one: its groups come from max_attention_window_vec
@@ -1043,14 +1056,18 @@ def _build_prefill_chunk_tokens_for(
     if resident_blocks is None:
         resident_blocks = (chunk_end_pos + _REUSE_TPB - 1) // _REUSE_TPB
     if source_block_ids is None:
-        source_block_ids = np.arange(resident_blocks, dtype=np.int64)
-    base_slice = KVSlice(
+        source_block_ids = np.full(_REUSE_TOTAL_BLOCKS, -1, dtype=np.int64)
+        source_block_ids[:resident_blocks] = np.arange(resident_blocks)
+    whole = Chunk(
         block_ids_per_layer_groups=[np.asarray(source_block_ids, dtype=np.int64)],
+        kind_per_layer_group=[CacheKind.PAGED],
+        token_range=TokenRange(start=0, end=resident_blocks * _REUSE_TPB),
+        is_last=True,
     )
 
     transceiver = MagicMock()
     transceiver._kv_cache_manager.tokens_per_block = _REUSE_TPB
-    transceiver._create_kv_slice.return_value = base_slice
+    transceiver._describe_local = MagicMock(return_value=whole)
     transceiver._page_table = SimpleNamespace(
         layer_groups=[
             SimpleNamespace(kind=CacheKind.PAGED, sliding_window_size=sliding_window_size)
@@ -1061,12 +1078,13 @@ def _build_prefill_chunk_tokens_for(
     req = MagicMock()
     req.py_disaggregated_params = DisaggregatedParams(disagg_request_id=42)
     req.py_beam_width = 1
-    req.prompt_len = _REUSE_TOTAL_BLOCKS * _REUSE_TPB
+    req.prompt_len = _REUSE_TOTAL_BLOCKS * _REUSE_TPB if prompt_len is None else prompt_len
     req.prepopulated_prompt_len = prepopulated_tokens
     req.py_last_context_chunk = (chunk_start_pos, chunk_end_pos)
     req.context_remaining_length = req.prompt_len - chunk_end_pos
 
-    return KvCacheTransceiverV2._build_prefill_chunk(transceiver, req)
+    extent = KvCacheTransceiverV2._build_prefill_extent(transceiver, req)
+    return None if extent is None else extent.local
 
 
 def _build_prefill_chunk_for(
@@ -1075,7 +1093,7 @@ def _build_prefill_chunk_for(
     chunk_end_block,
     resident_blocks=None,
 ):
-    """Drive the real _build_prefill_chunk for one block-aligned chunk."""
+    """Drive the real _build_prefill_extent for one block-aligned chunk."""
     return _build_prefill_chunk_tokens_for(
         prepopulated_tokens=prepopulated_blocks * _REUSE_TPB,
         chunk_start_pos=chunk_start_block * _REUSE_TPB,
@@ -1086,15 +1104,15 @@ def _build_prefill_chunk_for(
 
 def test_build_prefill_chunk_rounds_unaligned_non_final_end_down():
     """An unaligned non-final end stops at the last block it finished computing."""
-    kv_slice = _build_prefill_chunk_tokens_for(
+    chunk = _build_prefill_chunk_tokens_for(
         prepopulated_tokens=0,
         chunk_start_pos=0,
         chunk_end_pos=6,
     )
 
-    assert kv_slice.is_last_slice is False
-    assert kv_slice.token_range == _reuse_token_range(0, 1)
-    assert np.array_equal(kv_slice.block_ids_per_layer_groups[0], np.arange(1, dtype=np.int64))
+    assert chunk.is_last is False
+    assert chunk.token_range == _reuse_token_range(0, 1)
+    assert np.array_equal(chunk.block_ids_per_layer_groups[0], _positional(8, o0=[0]))
 
 
 def test_unaligned_chunk_boundaries_tile_block_space_exactly():
@@ -1117,7 +1135,7 @@ def test_unaligned_chunk_boundaries_tile_block_space_exactly():
     covered = [set(range(start, end)) for start, end in block_spans]
     assert set().union(*covered) == set(range(_REUSE_TOTAL_BLOCKS))
     assert sum(len(c) for c in covered) == _REUSE_TOTAL_BLOCKS
-    assert slices[-1].is_last_slice is True
+    assert slices[-1].is_last is True
 
 
 @pytest.mark.parametrize(
@@ -1152,14 +1170,14 @@ def test_swa_blocks_are_deferred_until_the_complete_final_window():
         chunk_end_pos=_REUSE_TOTAL_BLOCKS * _REUSE_TPB,
         resident_blocks=_REUSE_TOTAL_BLOCKS,
         sliding_window_size=16,
-        source_block_ids=np.arange(4, _REUSE_TOTAL_BLOCKS),
+        source_block_ids=_positional(8, o4=np.arange(4, _REUSE_TOTAL_BLOCKS)),
     )
 
     assert first_slice is None
-    assert final_slice.is_last_slice is True
+    assert final_slice.is_last is True
     assert np.array_equal(
         final_slice.block_ids_per_layer_groups[0],
-        np.arange(4, _REUSE_TOTAL_BLOCKS, dtype=np.int64),
+        _positional(8, o4=np.arange(4, _REUSE_TOTAL_BLOCKS)),
     )
 
 
@@ -1177,7 +1195,7 @@ def test_window_covering_the_whole_prompt_streams_like_full_attention(window_tok
     window alone would hold every V1 group back to the last chunk and silently
     disable pipelining. All three spellings must behave identically.
     """
-    kv_slice = _build_prefill_chunk_tokens_for(
+    chunk = _build_prefill_chunk_tokens_for(
         prepopulated_tokens=0,
         chunk_start_pos=0,
         chunk_end_pos=16,
@@ -1185,34 +1203,34 @@ def test_window_covering_the_whole_prompt_streams_like_full_attention(window_tok
         sliding_window_size=window_tokens,
     )
 
-    assert kv_slice is not None
-    assert kv_slice.is_last_slice is False
-    assert np.array_equal(kv_slice.block_ids_per_layer_groups[0], np.arange(4, dtype=np.int64))
+    assert chunk is not None
+    assert chunk.is_last is False
+    assert np.array_equal(chunk.block_ids_per_layer_groups[0], _positional(8, o0=np.arange(4)))
 
 
 def test_unaligned_reuse_prefix_still_extends_first_chunk_to_block_zero():
     """A partial-block reuse hit leaves the first chunk unaligned at both ends."""
-    kv_slice = _build_prefill_chunk_tokens_for(
+    chunk = _build_prefill_chunk_tokens_for(
         prepopulated_tokens=6,
         chunk_start_pos=6,
         chunk_end_pos=14,
     )
 
-    assert kv_slice.token_range == _reuse_token_range(0, 3)
-    assert np.array_equal(kv_slice.block_ids_per_layer_groups[0], np.arange(3, dtype=np.int64))
+    assert chunk.token_range == _reuse_token_range(0, 3)
+    assert np.array_equal(chunk.block_ids_per_layer_groups[0], _positional(8, o0=np.arange(3)))
 
 
 def test_first_chunk_covers_ctx_prefix_reuse():
     """The reused prefix is resident but no chunk spans it, so slice 0 extends to block 0."""
-    kv_slice = _build_prefill_chunk_for(
+    chunk = _build_prefill_chunk_for(
         prepopulated_blocks=3,
         chunk_start_block=3,
         chunk_end_block=6,
     )
 
-    assert kv_slice.token_range == _reuse_token_range(0, 6)
-    assert np.array_equal(kv_slice.block_ids_per_layer_groups[0], np.arange(6, dtype=np.int64))
-    assert kv_slice.is_last_slice is False
+    assert chunk.token_range == _reuse_token_range(0, 6)
+    assert np.array_equal(chunk.block_ids_per_layer_groups[0], _positional(8, o0=np.arange(6)))
+    assert chunk.is_last is False
 
 
 @pytest.mark.parametrize(
@@ -1228,18 +1246,19 @@ def test_only_the_first_chunk_extends_to_block_zero(
     prepopulated_blocks, chunk_start_block, chunk_end_block, expected_start_block
 ):
     """Chunks past the first keep their own start; without reuse nothing changes."""
-    kv_slice = _build_prefill_chunk_for(
+    chunk = _build_prefill_chunk_for(
         prepopulated_blocks=prepopulated_blocks,
         chunk_start_block=chunk_start_block,
         chunk_end_block=chunk_end_block,
         resident_blocks=_REUSE_TOTAL_BLOCKS,
     )
 
-    assert kv_slice.token_range == _reuse_token_range(expected_start_block, chunk_end_block)
-    assert np.array_equal(
-        kv_slice.block_ids_per_layer_groups[0],
-        np.arange(expected_start_block, chunk_end_block, dtype=np.int64),
+    assert chunk.token_range == _reuse_token_range(expected_start_block, chunk_end_block)
+    expected = np.full(_REUSE_TOTAL_BLOCKS, -1, dtype=np.int64)
+    expected[expected_start_block:chunk_end_block] = np.arange(
+        expected_start_block, chunk_end_block
     )
+    assert np.array_equal(chunk.block_ids_per_layer_groups[0], expected)
 
 
 def test_single_chunk_with_reuse_degenerates_to_monolithic_slice():
@@ -1247,19 +1266,19 @@ def test_single_chunk_with_reuse_degenerates_to_monolithic_slice():
 
     The chunk still spans [0, total_blocks), which _build_kv_write_meta addresses
     exactly as an unpipelined write — see
-    test_whole_prompt_chunk_addresses_like_a_monolithic_slice.
+    test_build_kv_write_meta_pairs_holes_by_ordinal.
     """
-    kv_slice = _build_prefill_chunk_for(
+    chunk = _build_prefill_chunk_for(
         prepopulated_blocks=3,
         chunk_start_block=3,
         chunk_end_block=_REUSE_TOTAL_BLOCKS,
         resident_blocks=_REUSE_TOTAL_BLOCKS,
     )
 
-    assert kv_slice.is_last_slice is True
-    assert kv_slice.token_range == _reuse_token_range(0, _REUSE_TOTAL_BLOCKS)
+    assert chunk.is_last is True
+    assert chunk.token_range == _reuse_token_range(0, _REUSE_TOTAL_BLOCKS)
     assert np.array_equal(
-        kv_slice.block_ids_per_layer_groups[0],
+        chunk.block_ids_per_layer_groups[0],
         np.arange(_REUSE_TOTAL_BLOCKS, dtype=np.int64),
     )
 
@@ -1376,7 +1395,6 @@ def _make_send_kv_coordinator(canceled_req_ids, active_requests=()):
         ),
         enable_attention_dp=False,
         force_terminate_ctx_for_partial_reuse=False,
-        delegates=MagicMock(),
     )
     return coordinator, transceiver, transfer_manager
 

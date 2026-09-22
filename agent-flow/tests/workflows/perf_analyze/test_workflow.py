@@ -479,8 +479,9 @@ def test_all_agents_use_claude_code_backend(tmp_path):
         ):
             assert layer.config.backend.kind == "claude-code"
             assert layer.config.backend.model == CLAUDE_CODE_DEFAULT_MODEL
-            # Each role is gated by a required-tool stop hook.
-            assert layer.config.backend.hooks is not None
+            # Each role must record progress through the shared policy.
+            assert layer.config.required_tools == (f"append_{layer.config.name.lower()}_progress",)
+            assert layer.config.backend.hooks is None
     finally:
         workflow.close()
 
