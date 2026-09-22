@@ -350,8 +350,12 @@ operands. TensorRT-LLM currently drives it for **MXFP8 only**, through
   runs the fused kernel on two compute partitions, each holding half of every
   expert's inner channels (FC1 weights/scales sliced along N as whole gate/up
   pairs and 128-row scale atoms, FC2 weights/scales along K; together one copy
-  of the weights, built by `_split_mxfp8_weights_for_locality_domain`). Both
-  shards scatter-add into the shared, pre-zeroed output, so the split is not
+  of the weights, built by `_split_mxfp8_weights_for_locality_domain`). One
+  parent reset launch on the caller's stream clears both partitions'
+  synchronization workspaces, the shared output (`zero_output`, dense case)
+  and quantizes raw BF16/FP16 input once before the fork, so the split pays
+  the same single reset as the full-GPU op and the shards launch GEMM-only.
+  Both shards scatter-add into the shared output, so the split is not
   bitwise equal to the full-GPU kernel. It is a separate autotuned op:
   `CuteDslFusedMoE.run_moe_mxfp8` profiles it only for shapes passing
   `CuteDslFusedMoEMxfp8Runner.admits_locality_domain` (at most 2048 rows and

@@ -1207,25 +1207,6 @@ class CuteDslFusedMoE(MoEImplBase):
     # routes are equal, so prefill-sized inputs keep the native launch.
     MXFP8_FUSED_INPUT_QUANT_MAX_ELEMENTS = 1 << 24
 
-    def _mxfp8_full_gpu_path_selected(self, num_tokens: int) -> bool:
-        """Whether ``run_moe_mxfp8`` will run the full-GPU op for this row count.
-
-        Without locality domains it always does. With them, the inner-channel
-        split runs only for row counts inside the static admission rule whose
-        recorded autotuner decision favours it. A row count with no recorded
-        decision yet may still profile the split on its first forward, so it
-        keeps the separate quantize launch until the decision exists; raw
-        activations therefore never reach the split shards. The lookup is a
-        host-side dict read that is baked into the CUDA graph per bucket.
-        """
-        if self._locality_domain_runtime is None:
-            return True
-        if not CuteDslFusedMoEMxfp8Runner.admits_locality_domain(
-                num_tokens, self.routing_method.experts_per_token,
-                self.expert_size_per_partition, self.num_slots):
-            return True
-        return self._mxfp8_locality_domain_decisions.get(num_tokens) is False
-
     def _fuses_mxfp8_input_quant(self, x: torch.Tensor) -> bool:
         """Whether ``x`` is quantized inside the fused FC12 workspace reset.
 
@@ -1282,12 +1263,9 @@ class CuteDslFusedMoE(MoEImplBase):
             x_row = x.shape[0]
             sf_vec_size = self.quant_method.BLOCK_SIZE
             # Communication keeps the separate quantizer (E4M3 travels on
-            # the wire). With locality domains the fusion is used only where
-            # the full-GPU op is known to run; the split shards keep the
-            # separate launch until their concurrent quantize/reset path is
-            # benchmarked.
-            if (not post_quant_comm and self._fuses_mxfp8_input_quant(x)
-                    and self._mxfp8_full_gpu_path_selected(x_row)):
+            # the wire). Locally, both the full-GPU op and the locality-domain
+            # split quantize inside their (single) workspace-reset launch.
+            if not post_quant_comm and self._fuses_mxfp8_input_quant(x):
                 # Defer local input quantization to the FC12 workspace reset.
                 # This tensor carries shape metadata for the op/autotuner;
                 # the runner owns the actual scale scratch and never reads it.
@@ -1765,12 +1743,11 @@ class CuteDslFusedMoE(MoEImplBase):
             tuning_config,
             inputs,
         )
-        # Raw (unquantized) activations mean quantize_input already
-        # determined that the full-GPU op runs for this row count; the split
-        # shards never receive them (see _mxfp8_full_gpu_path_selected).
+        # Raw (unquantized) activations are quantized by the split's parent
+        # reset launch just like by the full-GPU op's reset, so both paths
+        # accept them; the decision is keyed per input dtype.
         if (self._locality_domain_runtime is not None
                 and self._locality_domain_weight_shards is not None
-                and x.dtype == torch.float8_e4m3fn
                 and self._mxfp8_locality_domain_decisions.get(
                     self._mxfp8_decision_key(x.size(0), x.dtype), True)
                 and CuteDslFusedMoEMxfp8Runner.admits_locality_domain(
@@ -1885,8 +1862,10 @@ class CuteDslFusedMoE(MoEImplBase):
 
         Each shard holds half of every expert's inner channels (FC1 columns
         as whole gate/up pairs, FC2 rows of K) and both scatter-add their
-        partial FC2 result into the shared ``moe_output``, which the memset
-        below clears first. Routing metadata is shared. The split changes
+        partial FC2 result into the shared ``moe_output``, which the op's
+        parent reset launch clears first (dense case). Routing metadata is
+        shared and raw activations are quantized by that same launch. The
+        split changes
         the BF16 accumulation order relative to the full-GPU kernel.
         """
         effective_top_k = token_selected_experts.size(1)
@@ -1904,9 +1883,11 @@ class CuteDslFusedMoE(MoEImplBase):
             tile_tokens_dim=tile_size,
         )
 
-        # Both shards accumulate into moe_output concurrently, so the op
-        # cannot clear it inside its own reset launch; use the backend
-        # memset (overlapped on the aux stream when available).
+        # Same rule as run_moe_mxfp8_impl: in the dense case the op's parent
+        # reset launch clears the whole output for both shards before the
+        # fork; alltoall with ep > top_k keeps the sparse row memset.
+        zero_output_in_kernel = (not enable_alltoall
+                                 or self.mapping.moe_ep_size <= effective_top_k)
         memset_kwargs = dict(
             input=moe_output,
             tile_idx_to_mn_limit=tile_idx_to_mn_limit,
@@ -1918,7 +1899,9 @@ class CuteDslFusedMoE(MoEImplBase):
             ep_size=self.mapping.moe_ep_size,
             enable_alltoall=enable_alltoall,
         )
-        if self._has_moe_output_memset_aux_stream():
+        if zero_output_in_kernel:
+            pass
+        elif self._has_moe_output_memset_aux_stream():
             memset_stream = self._moe_output_memset_run_stream()
             self.event_dict[EventType.Main].record()
             moe_output.record_stream(memset_stream)
@@ -1963,6 +1946,7 @@ class CuteDslFusedMoE(MoEImplBase):
             local_expert_offset=slot_start,
             tile_size=tile_size,
             swiglu_limit=swiglu_limit,
+            zero_output=zero_output_in_kernel,
         )
         return moe_output
 
