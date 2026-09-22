@@ -150,7 +150,7 @@ def signal_on_idle(monkeypatch, number: int) -> None:
 
     The handler runs at the next bytecode boundary in the main thread, so the
     loop here only has to give the interpreter one. It bounds the wait rather
-    than blocking, so a handler that never fires fails the test instead of
+    than blocking, so a handler that never fires fails the test rather than
     hanging it.
     """
 
@@ -171,8 +171,8 @@ def test_a_signal_is_reported_once_and_still_releases_what_was_held(
 ):
     """The signal reaches the boundary, and the resource is still given up.
 
-    A handler that only set a flag would let the command return normally,
-    which the boundary reads as a clean exit before any model was loaded.
+    A command that returned normally instead would be reported as a clean
+    exit before any model was loaded.
     """
     signal_on_idle(monkeypatch, number)
 

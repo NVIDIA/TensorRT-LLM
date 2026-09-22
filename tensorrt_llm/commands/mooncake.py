@@ -74,13 +74,10 @@ def _signal_handoff():
     the master unreaped or the pool advertising memory that has gone.
 
     `raise_signal_exit` unwinds those context managers and carries the signal
-    number out to `trtllm-serve`'s boundary, which is what classifies the exit
-    as a signal. A handler that only set a flag and let the command return
-    normally would be reported as a clean pre-model exit instead, and taking
-    `threading.Event`'s lock from inside a synchronous handler is unsafe on
-    its own.
+    number out to `trtllm-serve`, which is what reports the exit as a signal
+    rather than as a clean one.
 
-    Wrap this around the resource so the log line below follows the release.
+    Wrap this around the resource so the log below follows the release.
     """
     for received in (signal.SIGINT, signal.SIGTERM):
         signal.signal(received, _command_telemetry.raise_signal_exit)
@@ -181,7 +178,6 @@ def mooncake_master(
         )
         started = time.monotonic()
         announced = started
-        # Left for a signal to end, which raises through the sleep below.
         while True:
             if (code := master.process.poll()) is not None:
                 # The pool is gone once the master dies, and every client is
@@ -355,8 +351,7 @@ def mooncake_donor(
             )
 
         # Idle by design: a put or get here would make this node a traffic
-        # client, which is what donation exists to avoid. Left for a signal to
-        # end, which raises through the sleep below.
+        # client, which is what donation exists to avoid.
         started = time.monotonic()
         while True:
             if heartbeat_seconds <= 0:

@@ -452,14 +452,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         def preempt_for_pages(req: LlmRequest) -> bool:
             """Free pages for `req` by giving up one started request.
 
-            A success ends the phase 2 loop rather than only skipping `req`.
-            The pages are reserved for the request that paid a re-prefill for
-            them: letting a later, smaller context request take them instead
-            would leave `req` blocked and force it to preempt again on the
-            next pass, which can repeat indefinitely while the scheduler
-            still looks like it is making progress. The cost of holding them
-            is one iteration of admission, a couple of milliseconds, against
-            a whole prefill replayed for nothing.
+            A success ends the phase 2 loop, reserving the pages for the
+            request that paid a re-prefill for them. Letting a later context
+            request take them instead would leave `req` to preempt again on
+            the next pass, repeating without ever admitting it. The cost is
+            one iteration of admission.
             """
             protected = {r.py_request_id for r in scheduled_gen}
             protected.update(r.py_request_id for r in scheduled_ctx)
@@ -1472,10 +1469,9 @@ class KVCacheV2Scheduler(RequestScheduler):
     _DEADLOCK_STALL_ITERS = 1000
 
     # States in which an in-flight KV transfer still owns pages it is about to
-    # release: a context-only request sending its cache once prefill finished,
-    # one whose send landed and which the executor has yet to reap, and a
-    # generation request receiving a cache. None of them are schedulable, so
-    # the capacity they are about to return is invisible to `made_progress`.
+    # release: a context-only request sending its cache after prefill, one
+    # whose send landed and which the executor has yet to reap, and a
+    # generation request receiving a cache.
     _TRANSFER_HOLDING_STATE_VALUES = frozenset(
         {
             LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS.value,
@@ -1521,12 +1517,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             self._stalled_schedules = 0
             return
 
-        # Waiting on a transfer is not a deadlock: the pages it holds come
-        # back when it lands. This matters on a context server, where a pool
-        # filled by asynchronous sends blocks every new CONTEXT_INIT request
-        # while nothing the scheduler can see makes progress. A send that
-        # never lands is the transfer layer's timeout to report, not a
-        # scheduling failure, so the count resets rather than merely pausing.
+        # Waiting on a transfer is not a deadlock: the pages come back when it
+        # lands. None of those states are schedulable, so a context server
+        # whose pool is full of pending sends shows no progress here at all. A
+        # send that never lands is the transfer layer's timeout to report.
         if any(req.state_value in self._TRANSFER_HOLDING_STATE_VALUES for req in active_requests):
             self._stalled_schedules = 0
             return

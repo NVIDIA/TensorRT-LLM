@@ -1426,20 +1426,15 @@ class TestContextPreemption:
         assert ids(out.context_requests) == []
 
     def test_freed_pages_are_reserved_for_the_request_that_preempted(self):
-        """No later context request may spend them first.
-
-        Otherwise the request that paid a re-prefill for the pages stays
-        blocked and preempts again next pass, which can repeat without ever
-        admitting it while the scheduler still looks like it is progressing.
-        """
+        """No later context request may spend them first."""
         mgr = make_kv_cache_manager(
             resize_context_fn=_out_of_pages_for(0),
             has_cache_tier_below_gpu=False,
         )
         sched = make_scheduler(mgr, max_num_tokens=1000)
         blocked = make_ctx_request(0, 100)
-        # Would fit in what the preemption releases, and is only behind
-        # `blocked` by arrival order.
+        # Fits in what the preemption releases, and is only behind `blocked`
+        # in arrival order.
         later = make_ctx_request(1, 10)
         victim = make_ctx_request(99, 100, is_first_context_chunk=False)
 
@@ -1651,9 +1646,8 @@ class TestDeadlockDetection:
         """A context server's pool can be full of sends that have not landed.
 
         Those requests are past the schedulable states, so they never reach
-        the scheduled lists, and the new context requests they block cannot
-        allocate. Without this the detector would call that a deadlock well
-        before the transfer's own timeout has anything to say.
+        the scheduled lists, and the context requests they block cannot
+        allocate. The transfer's own timeout covers a send that never lands.
         """
         mgr = make_kv_cache_manager(
             resize_context_fn=lambda req, n: False,
