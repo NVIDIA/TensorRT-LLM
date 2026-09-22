@@ -64,6 +64,30 @@ def test_auto_serves_a_model_that_needs_no_reasoning_parser(tmp_path, monkeypatc
     assert captured["reasoning_parser"] is None
 
 
+def test_auto_detects_from_a_hugging_face_id(tmp_path, monkeypatch):
+    """`auto` has to work when the model is a hub id, not a path.
+
+    The deployment guides pass `<model_path_or_hf_id>`, and detection only
+    knows how to read a directory, so the metadata is fetched first.
+    """
+    captured = {}
+
+    def _fake_get_llm_args(**kwargs):
+        captured.update(kwargs)
+        raise _ReachedLaunch
+
+    snapshot = _write_model(tmp_path, "snapshot", "qwen3_5", "")
+    monkeypatch.setattr(
+        "tensorrt_llm.commands.utils.download_hf_partial", lambda model, allow_patterns: snapshot
+    )
+    monkeypatch.setattr("tensorrt_llm.commands.serve.get_llm_args", _fake_get_llm_args)
+
+    result = CliRunner().invoke(serve, ["Qwen/Qwen3.8-27B", "--reasoning_parser", "auto"])
+
+    assert isinstance(result.exception, _ReachedLaunch), result.output
+    assert captured["reasoning_parser"] == "qwen3_5"
+
+
 def test_auto_rejects_an_unrecognized_model(tmp_path):
     model = _write_model(tmp_path, "SomeUnknownModel", "unknown_type", "")
 

@@ -926,6 +926,24 @@ def test_auto_detect_qwen3_template_from_jinja_file(tmp_path):
     assert result == "qwen3"
 
 
+def test_auto_detect_qwen3_unreadable_template_falls_through(tmp_path):
+    """An undecodable template file must not abort detection.
+
+    The three candidate files are tried in order, so a corrupt one has to be
+    treated like a missing one; otherwise a single bad byte takes the server
+    down at startup.
+    """
+    model_dir = str(tmp_path / "Qwen3-32B")
+    os.makedirs(model_dir)
+    _write_config(model_dir, "qwen3")
+    with open(os.path.join(model_dir, "chat_template.jinja"), "wb") as f:
+        f.write(b"\xff\xfe not utf-8")
+    _write_tokenizer_config(model_dir, _HYBRID_TEMPLATE)
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result == "qwen3"
+
+
 def test_auto_detect_qwen3_ignores_think_outside_generation_prompt(tmp_path):
     """Only a <think> in the generation prompt means the model always reasons."""
     model_dir = str(tmp_path / "Qwen3-Next-80B-A3B-Instruct")

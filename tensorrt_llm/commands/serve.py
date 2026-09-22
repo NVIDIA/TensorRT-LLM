@@ -34,7 +34,8 @@ from tensorrt_llm._utils import mpi_rank, set_prometheus_multiproc_dir
 from tensorrt_llm.commands import _telemetry as _command_telemetry
 from tensorrt_llm.commands._serve_stability import stability_option
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
-                                         get_is_diffusion_only_model)
+                                         get_is_diffusion_only_model,
+                                         resolve_parser_detection_dir)
 from tensorrt_llm.executor.utils import MAX_NUM_FRONTENDS, LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi import KvCacheConfig
@@ -1369,8 +1370,12 @@ def serve(
             "no longer supported. This option will be removed in a future release."
         )
 
+    if "auto" in (tool_parser, reasoning_parser):
+        # `model` may be a Hugging Face id; detection reads a directory.
+        detection_dir = resolve_parser_detection_dir(model)
+
     if tool_parser == "auto":
-        resolved = resolve_auto_tool_parser(model)
+        resolved = resolve_auto_tool_parser(detection_dir)
         if resolved is None:
             supported_model_types = ", ".join(
                 sorted(MODEL_TYPE_TO_TOOL_PARSER.keys()))
@@ -1384,10 +1389,10 @@ def serve(
         tool_parser = resolved
 
     if reasoning_parser == "auto":
-        resolved = resolve_auto_reasoning_parser(model)
+        resolved = resolve_auto_reasoning_parser(detection_dir)
         if resolved is not None:
             logger.info(f"Auto-detected reasoning parser: {resolved}")
-        elif is_auto_reasoning_parser_supported(model):
+        elif is_auto_reasoning_parser_supported(detection_dir):
             # An Instruct checkpoint emits no reasoning block, so "no parser"
             # is the detected answer rather than a detection failure.
             logger.info(f"Model '{model}' emits no reasoning content; serving "

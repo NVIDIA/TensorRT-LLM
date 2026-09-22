@@ -41,18 +41,31 @@ def read_chat_template(model: str) -> str:
         path = model_dir / name
         if not path.is_file():
             continue
-        template = (
-            path.read_text(encoding="utf-8")
-            if path.suffix == ".jinja"
-            else _read_json_chat_template(path)
-        )
+        read = _read_jinja_chat_template if path.suffix == ".jinja" else _read_json_chat_template
+        template = read(path)
         if template:
             return template
     return ""
 
 
+def _read_jinja_chat_template(path: Path) -> str:
+    """Return the contents of a standalone template file, or "" if unreadable.
+
+    A file that cannot be read or decoded is treated like a missing one so the
+    next candidate still gets a chance, rather than aborting the server.
+    """
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
 def _read_json_chat_template(path: Path) -> str:
-    """Return the `chat_template` string of a JSON file, or "" if absent."""
+    """Return the `chat_template` string of a JSON file, or "" if absent.
+
+    `ValueError` also covers the `UnicodeDecodeError` an undecodable file
+    raises, so both readers fall through the same way.
+    """
     try:
         with open(path, encoding="utf-8") as f:
             config = json.load(f)
