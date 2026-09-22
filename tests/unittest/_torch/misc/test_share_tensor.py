@@ -100,9 +100,14 @@ class TestShareTensor(unittest.TestCase):
         set_sharing_strategy("file_descriptor")
         try:
             container = SharedTensorContainer.from_tensor(self.ref_tensor)
+
+            def fail_serialization(_storage):
+                self.assertEqual(get_sharing_strategy(), "file_system")
+                raise RuntimeError("serialization failed")
+
             with mock.patch(
                     "tensorrt_llm._torch.shared_tensor.shared_tensor.reduce_storage",
-                    side_effect=RuntimeError("serialization failed")):
+                    side_effect=fail_serialization):
                 with self.assertRaisesRegex(RuntimeError,
                                             "serialization failed"):
                     container.dump_to_dict()
