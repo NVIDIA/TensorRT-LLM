@@ -75,7 +75,7 @@ class Glm5NextMamba2Metadata(KimiK3MambaMetadata):
             cu.append(cu[-1] + length)
         self.glm_ctx_cu_seqlens = cu
 
-        width = int(getattr(manager, "max_blocks_per_seq", 0)) or 1
+        width = manager.max_blocks_per_seq
         self._glm_ensure_tables(width)
         pages = manager.get_batch_slot_tables(list(request_ids)[:batch])
         staging = self._glm_block_tables_cpu

@@ -159,18 +159,14 @@ def glm5_next_tp_reduces(mapping: Mapping | None) -> bool:
     replicated attention / dense weights, so nothing is reduced there (the
     fused MoE does its own dispatch/combine from ``all_rank_num_tokens``).
     """
-    return (
-        mapping is not None
-        and int(getattr(mapping, "tp_size", 1) or 1) > 1
-        and not bool(getattr(mapping, "enable_attention_dp", False))
-    )
+    return mapping is not None and mapping.tp_size > 1 and not mapping.enable_attention_dp
 
 
 def glm5_next_attention_mapping(mapping: Mapping | None) -> Mapping | None:
     """The Mapping the attention projections shard over: the model's, or a
     TP=1 view of it under attention DP (heads replicated per rank) -- the
     same remap :class:`~tensorrt_llm._torch.attention.mla.MLA` applies."""
-    if mapping is None or not getattr(mapping, "enable_attention_dp", False):
+    if mapping is None or not mapping.enable_attention_dp:
         return mapping
     return Mapping(
         world_size=mapping.pp_size * mapping.tp_size,
@@ -361,7 +357,7 @@ def build_glm5_next_runtime_context(attn_metadata: AttentionMetadata) -> Glm5Nex
             "glm5_next requires prepared glm_block_tables; call attn_metadata.prepare() "
             "with Glm5NextMamba2Metadata before eager execution or CUDA graph capture"
         )
-    live_lengths = getattr(attn_metadata, "kv_lens_cuda", None)
+    live_lengths = attn_metadata.kv_lens_cuda
     if live_lengths is None:
         raise ValueError("glm5_next requires prepared attn_metadata.kv_lens_cuda")
     batch = int(attn_metadata.seq_lens.shape[0])
@@ -432,7 +428,7 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
         # ``model.layers.45.*`` keys are placed by the same exact loader, the
         # same projection swap, and the same per-owner materialization.
         self.mtp_layers: tuple[nn.Module, ...] = ()
-        spec_config = getattr(model_config, "spec_config", None)
+        spec_config = model_config.spec_config
         if spec_config is not None and spec_config.spec_dec_mode.is_mtp_one_model():
             mtp_layers = tuple(self.draft_model.mtp_layers)
             if len(mtp_layers) != 1:
@@ -514,6 +510,11 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
     def get_preferred_kv_cache_manager_version(cls, pretrained_config=None) -> str:
         """Use V2 for the shared latent-KV, pool-indexer and recurrent-state cache."""
         return "V2"
+
+    @classmethod
+    def get_preferred_transceiver_runtime(cls, pretrained_config=None) -> str:
+        """Use Python NIXL to transfer the hybrid cache, including recurrent state."""
+        return "PYTHON"
 
     # -- whole-model materialization --------------------------------------
 
@@ -712,11 +713,9 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
         for fused_path, parts in fused_groups.items():
             dest_mod = named_modules[fused_path]
             groups = [parts[i] for i in sorted(parts)]
-            if (
-                isinstance(dest_mod, Linear)
-                and getattr(dest_mod.weights_loading_config, "weight_mode", None) is not None
-                and dest_mod.weights_loading_config.weight_mode.name == ("FUSED_GATE_UP_LINEAR")
-            ):
+            if isinstance(
+                dest_mod, Linear
+            ) and dest_mod.weights_loading_config.weight_mode.name == ("FUSED_GATE_UP_LINEAR"):
                 # GatedMLP: the Linear shards each half over this rank's
                 # intermediate range and stacks them [gate; up] itself.
                 dest_mod.load_weights(groups)
@@ -913,8 +912,8 @@ class Glm5NextIndexer(nn.Module):
         self.layer_idx = layer_idx
         self.hidden_size = int(config.hidden_size)
         self.total_n_heads = int(config.index_n_heads)
-        self.tp_size = int(getattr(mapping, "tp_size", 1) or 1)
-        self.tp_rank = int(getattr(mapping, "tp_rank", 0) or 0)
+        self.tp_size = mapping.tp_size if mapping is not None else 1
+        self.tp_rank = mapping.tp_rank if mapping is not None else 0
         if self.total_n_heads % self.tp_size:
             raise ValueError(
                 f"glm5_next indexer has {self.total_n_heads} scoring heads, not "
@@ -1008,8 +1007,8 @@ class Glm5NextSparseAttention(nn.Module):
         self.layer_idx = layer_idx
         self.hidden_size = int(config.hidden_size)
         self.total_num_heads = int(config.num_attention_heads)
-        self.tp_size = int(getattr(attn_mapping, "tp_size", 1) or 1)
-        self.tp_rank = int(getattr(attn_mapping, "tp_rank", 0) or 0)
+        self.tp_size = attn_mapping.tp_size if attn_mapping is not None else 1
+        self.tp_rank = attn_mapping.tp_rank if attn_mapping is not None else 0
         if self.total_num_heads % self.tp_size:
             raise ValueError(
                 f"glm5_next sparse MLA has {self.total_num_heads} heads, not divisible "
@@ -1739,7 +1738,7 @@ class Glm5NextDecoderLayer(DecoderLayer):
         post, comb, collapsed = self.hc_ffn.pre_mapping(hidden_states)
         # ADP ranks may have different phase mixes; every rank calls MoE once.
         mlp_out = self.run_mlp(
-            self.post_attention_layernorm(collapsed), getattr(metadata, "all_rank_num_tokens", None)
+            self.post_attention_layernorm(collapsed), metadata.all_rank_num_tokens
         )
         return self.hc_ffn.post_mapping(mlp_out, residual, post, comb)
 
@@ -1884,7 +1883,7 @@ class Glm5NextModel(DecoderModel):
                 norm_weight=layer.post_attention_layernorm.weight,
                 norm_eps=layer.post_attention_layernorm.variance_epsilon,
             )
-            mlp_out = layer.run_mlp(x, getattr(runtime_ctx.metadata, "all_rank_num_tokens", None))
+            mlp_out = layer.run_mlp(x, runtime_ctx.metadata.all_rank_num_tokens)
             if layer_idx + 1 < num_layers:
                 nxt = self.layers[layer_idx + 1]
                 residual, post, comb, x = nxt.hc_attn.fused_hc(
