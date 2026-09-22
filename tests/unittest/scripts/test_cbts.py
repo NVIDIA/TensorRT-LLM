@@ -180,11 +180,25 @@ def test_docs_rule_routes_changes_to_docs_and_complete_cpu_suite() -> None:
 
 
 def test_docs_rule_falls_back_when_cpu_suite_cannot_be_resolved() -> None:
-    result = DocsRule(YAMLIndex(), {}).apply(PRInputs(changed_files=["README.md"], diffs={}))
+    result = DocsRule(YAMLIndex(), {}).apply(
+        PRInputs(changed_files=["docs/source/index.rst"], diffs={})
+    )
 
     assert result is not None
     assert result.scope is None
     assert not result.affected_stages
+
+
+def test_docs_rule_routes_non_docs_markdown_to_docs_build_only() -> None:
+    result = DocsRule(YAMLIndex(), {}).apply(
+        PRInputs(changed_files=["README.md", "examples/eagle/guide.rst"], diffs={})
+    )
+
+    assert result is not None
+    assert result.handled_files == {"README.md", "examples/eagle/guide.rst"}
+    assert result.affected_stages == {DOCS_STAGE}
+    assert result.scope == "docsonly"
+    assert not result.block_filters
 
 
 def test_markdown_is_not_out_of_scope() -> None:
@@ -236,13 +250,13 @@ def test_docs_rule_combines_with_other_targeted_rules() -> None:
     )
 
     assert result.scope == "testsonly"
-    assert result.affected_stages == _CPU_STAGE_NAMES | {DOCS_STAGE, AGENT_FLOW_STAGE}
+    assert result.affected_stages == {DOCS_STAGE, AGENT_FLOW_STAGE}
     assert _combine_scopes(["docsonly", "noop"]) == "docsonly"
 
 
 def test_docs_stage_matches_jenkins_stage_key() -> None:
     groovy = (REPO_ROOT / "jenkins/L0_Test.groovy").read_text()
-    assert f'"{DOCS_STAGE}"' in groovy
+    assert f'"{DOCS_STAGE}": [docBuildSpec, {{' in groovy
 
 
 class CoverageArtifactTest(unittest.TestCase):
