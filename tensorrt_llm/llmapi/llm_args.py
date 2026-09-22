@@ -6560,8 +6560,10 @@ class TorchLlmArgs(BaseLlmArgs):
                         "unaffected; expect a lower acceptance rate than the "
                         "same configuration run aggregated.")
                 assert self.speculative_config.max_draft_len > 0, "DFlash max_draft_len must be > 0"
-                # A Hugging Face repo id is not readable yet; CachedModelLoader
-                # calls this again after the drafter is downloaded.
+                # A Hugging Face repo id is not readable yet: both calls below
+                # then run without the drafter's config.json (the budget check
+                # covers only the token budget), and CachedModelLoader repeats
+                # both after the drafter is downloaded.
                 self.speculative_config.resolve_from_checkpoint()
                 self._validate_dflash_ctx_budget()
 

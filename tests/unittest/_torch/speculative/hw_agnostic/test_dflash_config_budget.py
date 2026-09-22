@@ -367,3 +367,81 @@ class TestLlmArgsWiring:
         reported = float(re.search(r"estimated ([0-9.]+) GiB", message).group(1))
         no_weight_bound = derive_dflash_ctx_memory_budget_bytes(100 * GIB, 0.8, None)
         assert reported < no_weight_bound / GIB
+
+
+class TestHubIdRevalidation:
+    """A Hub repo id has no readable config.json at validation time.
+
+    The buffer-fit check then has no drafter geometry and only the token
+    budget is checked, so CachedModelLoader must re-run the budget check
+    once the drafter is downloaded. A local path is fully checked at
+    validation time and must not be checked twice.
+    """
+
+    def _loader(self, tmp_path, speculative_model):
+        from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig, KvCacheConfig, TorchLlmArgs
+        from tensorrt_llm.llmapi.llm_utils import CachedModelLoader
+
+        args = TorchLlmArgs.model_construct(
+            model="unused",
+            speculative_config=DFlashDecodingConfig(
+                max_draft_len=7, speculative_model=speculative_model
+            ),
+            max_batch_size=32,
+            max_num_tokens=8192,
+            max_seq_len=8192,
+            tensor_parallel_size=4,
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.8),
+        )
+        # A string workspace avoids creating a TemporaryDirectory.
+        return CachedModelLoader(args, llm_build_stats=None, workspace=str(tmp_path))
+
+    def test_hub_id_budget_checked_after_download(self, tmp_path):
+        from types import SimpleNamespace
+
+        from tensorrt_llm.llmapi import llm_args as llm_args_module
+        from tensorrt_llm.llmapi.llm_utils import CachedModelLoader
+
+        drafter_dir = tmp_path / "drafter"
+        drafter_dir.mkdir()
+        (drafter_dir / "config.json").write_text(json.dumps(DRAFT_CONFIG))
+        loader = self._loader(tmp_path, speculative_model="hf-org/dflash-drafter")
+
+        # A device too small for 33 slots at max_seq_len 8192 (~1.3 GiB): the
+        # re-run must refuse the batch on the downloaded drafter's geometry.
+        fake_props = SimpleNamespace(total_memory=5 * GIB)
+        with (
+            patch.object(
+                CachedModelLoader, "_download_hf_model_if_needed", return_value=drafter_dir
+            ) as mock_download,
+            patch.object(llm_args_module.torch.cuda, "is_available", return_value=True),
+            patch.object(
+                llm_args_module.torch.cuda, "get_device_properties", return_value=fake_props
+            ),
+        ):
+            with pytest.raises(ValueError, match="max_batch_size estimated to fit"):
+                loader()
+        mock_download.assert_called_once()
+        assert loader.llm_args.speculative_config.speculative_model == drafter_dir
+
+    def test_local_path_is_not_checked_twice(self, tmp_path):
+        from tensorrt_llm.llmapi import llm_utils as llm_utils_module
+        from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+        drafter_dir = tmp_path / "drafter"
+        drafter_dir.mkdir()
+        (drafter_dir / "config.json").write_text(json.dumps(DRAFT_CONFIG))
+        loader = self._loader(tmp_path, speculative_model=str(drafter_dir))
+
+        class _Stop(Exception):
+            pass
+
+        # ModelLoader is constructed right after the speculative-model step;
+        # stopping there bounds the test to the code under test.
+        with (
+            patch.object(TorchLlmArgs, "_validate_dflash_ctx_budget") as mock_budget,
+            patch.object(llm_utils_module, "ModelLoader", side_effect=_Stop),
+        ):
+            with pytest.raises(_Stop):
+                loader()
+        mock_budget.assert_not_called()
