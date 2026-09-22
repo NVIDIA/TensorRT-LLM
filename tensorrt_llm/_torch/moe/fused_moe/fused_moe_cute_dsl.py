@@ -1318,7 +1318,11 @@ class CuteDslFusedMoE(MoEImplBase):
         if self.activation_type == ActivationType.SiTu:
             gather_act_kwargs["situ_beta"] = self.act_alpha
             gather_act_kwargs["situ_linear_beta"] = self.act_beta
-        gather_act_kwargs["swiglu_limit_scalar"] = self.act_clamp
+        # The clamp is a SwiGLU-only constant: Relu2 layers materialize
+        # act_clamp as +inf, and the kernels reject a finite limit on any
+        # other activation, so only SwiGLU layers forward it.
+        if self.activation_type == ActivationType.Swiglu:
+            gather_act_kwargs["swiglu_limit_scalar"] = self.act_clamp
 
         x, x_sf = gather_act_op(**gather_act_kwargs)
 
@@ -1713,7 +1717,8 @@ class CuteDslFusedMoE(MoEImplBase):
             output_sf_tensor=fc1_out_sf,
             scaling_vector_size=self.scaling_vector_size,
             activation_type=self.activation_type,
-            swiglu_limit_scalar=self.act_clamp,
+            swiglu_limit_scalar=(self.act_clamp if self.activation_type
+                                 == ActivationType.Swiglu else float("inf")),
         )
 
         fc1_out_sf_merged = fc1_out_sf

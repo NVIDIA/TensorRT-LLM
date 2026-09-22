@@ -141,6 +141,10 @@ def _validate_16_byte_aligned_dense_tensor(tensor: torch.Tensor,
 
 
 def _canonicalize_swiglu_limit_scalar(swiglu_limit_scalar: float) -> float:
+    if math.isnan(swiglu_limit_scalar):
+        raise ValueError(
+            "swiglu_limit_scalar must not be NaN; pass a negative value or "
+            "+inf to disable the clamp.")
     return float("inf") if swiglu_limit_scalar < 0 else swiglu_limit_scalar
 
 
