@@ -47,9 +47,13 @@ class DocsRule(Rule):
     def _cpu_block_filters(self) -> dict[tuple[str, int], dict[str, set[str]]]:
         """Keep every entry in every CPU test-db block.
 
-        Docs changes run the complete CPU suite, not a consumer subset. Using
-        each entry's own canonical target and raw text preserves `-k` variants
-        through Layer 3's normal subtree and keyword filtering.
+        Tests read files under ``docs/`` directly: model-loader validation
+        parses ``docs/source/features/model-express.md``, and telemetry tests
+        import ``docs/source/_ext/llmapi_config_telemetry.py``. Until those
+        consumers have a complete explicit inventory, changes under ``docs/``
+        conservatively run the complete CPU suite. Using each entry's own
+        canonical target and raw text preserves `-k` variants through Layer
+        3's normal subtree and keyword filtering.
         """
         block_filters: dict[tuple[str, int], dict[str, set[str]]] = {}
         for block in self.yaml_index.blocks:
@@ -67,6 +71,19 @@ class DocsRule(Rule):
         claimed = {path for path in pr.changed_files if is_docs_path(path)}
         if not claimed:
             return None
+
+        if not any(path.startswith(_DOCS_PREFIX) for path in claimed):
+            return RuleResult(
+                handled_files=claimed,
+                affected_stages={DOCS_STAGE},
+                scope="docsonly",
+                sanity_relevant=False,
+                perfsanity_relevant=False,
+                reason=(
+                    f"docs: {len(claimed)} Markdown/reStructuredText file(s) outside "
+                    f"{_DOCS_PREFIX} → {DOCS_STAGE}"
+                ),
+            )
 
         block_filters = self._cpu_block_filters()
         cpu_stages = resolve_affected_stages(block_filters, self.yaml_index, self._stages_by_yaml)

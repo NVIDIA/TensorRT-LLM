@@ -49,7 +49,7 @@ Ten rules, registered in `main.py::RULE_CLASSES`:
 | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**` (excl. docs) |
 | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs) |
 | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. docs) |
-| `DocsRule` | `docsonly` | `docs/**`, `**/*.md`, `**/*.rst` → `CPU-Build_Docs` plus the complete `l0_cpu` suite |
+| `DocsRule` | `docsonly` | `docs/**` → `CPU-Build_Docs` plus complete `l0_cpu`; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
 | `OutOfScopeRule` | `noop` | `.github/CODEOWNERS`, QA / dev test lists, `.test_durations`, `microbenchmarks/` (image suffixes intentionally not claimed — image fixtures cannot be distinguished from doc diagrams by location, so image edits fall back to baseline) |
 
 See `rules/README.md` for per-rule logic.
@@ -66,7 +66,7 @@ See `rules/README.md` for per-rule logic.
 | `modelingv2only` | `ModelingV2Rule` fired solo: PR only touches the modeling_v2 subtree (`tensorrt_llm/_torch/_experimental/modeling_v2/**`; excl. docs, which are a fifth of the subtree — every catalog entry carries a contract document). Narrows to blocks containing modeling_v2 test entries (`unittest/_torch/modeling_v2/`, `test_modeling_v2_*`). No outward-facing fallback is needed: nothing imports the subtree unless `TRTLLM_MODELING_V2` is set, and its one caller outside the subtree (`_torch/models/modeling_auto.py`) is left unclaimed, so touching the shared resolver falls back to baseline. |
 | `agentflowonly` | `AgentFlowRule` fired solo: PR only touches `agent-flow/**` source or test files (excl. docs). Runs `CPU-AgentFlow-UnitTest`. |
 | `openengineonly` | `OpenEngineRule` fired solo: PR only touches `tensorrt_llm/grpc/openengine/**` source files (excl. docs). Narrows to the registered OpenEngine unit tests: the stub-based ones on the always-run `CPU-Generic-*` stages, plus `test_capability_conformance.py` on `A10-PyTorch-*`, which needs a GPU. |
-| `docsonly` | `DocsRule` fired solo: documentation changes run the dedicated `CPU-Build_Docs` Doxygen/Sphinx stage and the complete `l0_cpu` suite on the matching `CPU-Generic-*` stages. |
+| `docsonly` | `DocsRule` fired solo: all documentation changes run `CPU-Build_Docs`; changes under `docs/**` also run the complete `l0_cpu` suite on matching `CPU-Generic-*` stages. Docs-only orchestration skips the SBSA track, so its resolved ARM stage is not launched. |
 | `testsonly` | Multiple rules from the testsonly family fired (`waiveonly`, `testdefonly`, `testlistonly`, `visualgenonly`, `specdeconly`, `modelingv2only`, `agentflowonly`, `openengineonly`, `docsonly`); their narrows union. |
 | `noop` | Rule(s) fired but determined no test stages need to run (QA-only path, removals-only test list, all-miss waives, in-namespace .py with no covering YAML entry). Layer 2 still applies. |
 | `null` (fallback) | A rule cannot decide, scopes don't combine, or there are unhandled files. Groovy defers to baseline filter chain. |
