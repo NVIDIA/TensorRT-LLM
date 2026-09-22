@@ -1660,55 +1660,69 @@ def test_min_p_sample_top_k_disabled_sentinel():
     assert kept.gather(1, tokens.unsqueeze(-1)).all()
 
 
+def _near_one_no_crossing_logits(
+    vocab_size: int, device: str = "cpu", head: int = 0
+) -> torch.Tensor:
+    """Deterministic logits whose fp32 cumulative stays below near-1 top_p.
+
+    One head logit at 0 with every other logit at -25: after softmax the
+    head holds ~0.999998 (below float32(0.9999999)) while each tail is
+    ~1e-11, so every tail addition into the near-1 cumulative is absorbed
+    by fp32 rounding, on both the CPU sequential scan and the CUDA blocked
+    parallel scan. No seed or row search is involved.
+    """
+    logits = torch.full((vocab_size,), -25.0, device=device)
+    logits[head] = 0.0
+    return logits
+
+
 def test_top_p_near_one_keeps_full_vocab():
     """Near-1 top_p must not index out of bounds (issue #19485).
 
-    fp32 accumulation can leave every cumulative probability below a top_p
-    very close to 1 (with the seed below, at least one row finishes under
-    float32(0.9999999)), so the first-True search finds no entry. Such
-    a row must keep its full distribution instead of scattering an
-    out-of-range index.
+    The rows below are constructed so fp32 accumulation leaves every
+    cumulative probability below float32(0.9999999), so the first-True
+    search finds no entry. Such a row must keep its full distribution
+    instead of scattering an out-of-range index.
     """
     top_p = 0.9999999
-    torch.manual_seed(0)
-    logits = torch.randn(2, 32000)
-    # Precondition: at least one row must actually stay below top_p,
-    # otherwise this test would pass vacuously without exercising the edge.
+    vocab_size = 128000
+    logits = torch.stack(
+        [
+            _near_one_no_crossing_logits(vocab_size, head=0),
+            _near_one_no_crossing_logits(vocab_size, head=7),
+        ]
+    )
     sorted_logits, _ = torch.sort(logits, descending=True, dim=-1)
     finals = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)[:, -1]
-    assert bool((finals < top_p).any()), "seed no longer triggers the edge case"
+    no_crossing = finals < top_p
+    # Sanity check on the deterministic construction, never a row search.
+    assert bool(no_crossing.any()), "construction no longer stays below top_p"
     # Must not raise (pre-fix: searchsorted returned vocab_size -> OOB scatter).
     tokens, probs = top_k_top_p_sampling_batch(logits, temperature=1.0, top_p=top_p)
     assert tokens.shape == (2,)
     # No crossing -> nothing removed: full-vocabulary distribution, renormalized.
     torch.testing.assert_close(probs.sum(-1), torch.ones(2))
-    torch.testing.assert_close(probs, torch.softmax(logits, -1))
+    torch.testing.assert_close(probs[no_crossing], torch.softmax(logits, -1)[no_crossing])
 
 
 def test_top_p_mixed_crossing_and_no_crossing_rows():
     """A batch can mix crossing and no-crossing rows (issue #19485).
 
     Row 0 is peaked so its cumulative probability crosses top_p at the first
-    token and only that token is kept; row 1 is a floating-point
-    no-crossing row selected below and must keep its full distribution.
+    token and only that token is kept; row 1 is a deterministic
+    floating-point no-crossing row and must keep its full distribution.
     Pre-fix the no-crossing row raised for the batch.
     """
     top_p = 0.9999999
-    torch.manual_seed(0)
-    candidates = torch.randn(4, 32000)
-    # Select a row that actually stays below top_p: fp32 accumulation
-    # behavior varies across builds, so pin down the edge case explicitly
-    # instead of assuming a fixed row index triggers it.
-    sorted_candidates, _ = torch.sort(candidates, descending=True, dim=-1)
-    finals = torch.cumsum(torch.softmax(sorted_candidates, dim=-1), dim=-1)[:, -1]
-    # Tensor predicate: matches the sampler's float32 comparison boundary,
-    # where .item() would compare in float64 against the Python threshold.
-    below = torch.where(finals < top_p)[0].tolist()
-    assert below, "seed no longer triggers the edge case"
-    no_crossing = candidates[below[0]]
-    peaked = torch.zeros(32000)
+    vocab_size = 128000
+    peaked = torch.zeros(vocab_size)
     peaked[0] = 30.0
-    logits = torch.stack([peaked, no_crossing])
+    logits = torch.stack([peaked, _near_one_no_crossing_logits(vocab_size)])
+    sorted_logits, _ = torch.sort(logits, descending=True, dim=-1)
+    finals = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)[:, -1]
+    no_crossing = finals < top_p
+    # Both paths must be present: row 0 crosses, row 1 does not.
+    assert no_crossing.tolist() == [False, True]
     tokens, probs = top_k_top_p_sampling_batch(logits, temperature=1.0, top_p=top_p)
     assert tokens.shape == (2,)
     # Crossing row: only the top token survives nucleus filtering.
@@ -1716,7 +1730,7 @@ def test_top_p_mixed_crossing_and_no_crossing_rows():
     assert int(probs[0].argmax()) == 0
     # No-crossing row: full distribution retained.
     torch.testing.assert_close(probs[1].sum(), torch.ones(()))
-    torch.testing.assert_close(probs[1], torch.softmax(no_crossing, -1))
+    torch.testing.assert_close(probs[1], torch.softmax(logits[1], -1))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -1724,32 +1738,32 @@ def test_top_p_near_one_no_crossing_cuda():
     """Near-1 top_p no-crossing row must complete on CUDA (issue #19485).
 
     The out-of-bounds scatter only manifests as a device-side assert on
-    CUDA; run the no-crossing edge on device and check normal completion
-    plus the fully renormalized distribution.
+    CUDA; run the deterministic no-crossing construction on device and
+    check normal completion plus the fully renormalized distribution.
     """
     top_p = 0.9999999
-    torch.manual_seed(0)
-    candidates = torch.randn(4, 32000, device="cuda")
-    # Select a row that actually stays below top_p on device: fp32
-    # accumulation behavior varies across builds, so pin down the edge
-    # case explicitly instead of assuming a fixed row index triggers it.
-    sorted_candidates, _ = torch.sort(candidates, descending=True, dim=-1)
-    finals = torch.cumsum(torch.softmax(sorted_candidates, dim=-1), dim=-1)[:, -1]
-    # Tensor predicate: matches the sampler's float32 comparison boundary,
-    # where .item() would compare in float64 against the Python threshold.
-    below = torch.where(finals < top_p)[0].tolist()
-    assert below, "seed no longer triggers the edge case"
-    logits = candidates[below]
+    vocab_size = 128000
+    logits = torch.stack(
+        [
+            _near_one_no_crossing_logits(vocab_size, "cuda", head=0),
+            _near_one_no_crossing_logits(vocab_size, "cuda", head=7),
+        ]
+    )
+    sorted_logits, _ = torch.sort(logits, descending=True, dim=-1)
+    finals = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)[:, -1]
+    no_crossing = finals < top_p
+    # Sanity check on the deterministic construction, never a row search.
+    assert bool(no_crossing.any()), "construction no longer stays below top_p"
     # Must not raise (pre-fix: OOB scatter -> CUDA device-side assert).
     tokens, probs = top_k_top_p_sampling_batch(logits, temperature=1.0, top_p=top_p)
-    assert tokens.shape == (logits.size(0),)
+    assert tokens.shape == (2,)
     # No crossing -> nothing removed: full-vocabulary distribution, renormalized.
     # Strict positivity proves no tail was zeroed: softmax of finite logits is
     # strictly positive, while the failure mode writes exact 0.0, so this
     # detects zeroed tails with no tolerance, unlike the closeness checks.
     assert bool((probs > 0).all())
-    torch.testing.assert_close(probs.sum(-1), torch.ones(logits.size(0), device="cuda"))
-    torch.testing.assert_close(probs, torch.softmax(logits, -1))
+    torch.testing.assert_close(probs.sum(-1), torch.ones(2, device="cuda"))
+    torch.testing.assert_close(probs[no_crossing], torch.softmax(logits, -1)[no_crossing])
 
 
 def _nucleus_reference_probs(logits: torch.Tensor, top_p: float) -> torch.Tensor:
