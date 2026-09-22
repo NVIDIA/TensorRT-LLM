@@ -29,6 +29,8 @@ from tensorrt_llm.bench.utils.data import (
 )
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _FakeTokenizer:
     """Minimal tokenizer stub for testing create_dataset_from_stream."""
@@ -140,9 +142,6 @@ def test_int8_not_offered_as_bench_quant_choice() -> None:
     # INT8 is unsupported by the build path, so it must not be advertised as a
     # trtllm-bench --quantization choice (issue #7091).
     assert f"{QuantAlgo.INT8}" not in get_args(VALID_QUANT_ALGOS)
-
-
-pytestmark = pytest.mark.cpu_only
 
 
 @pytest.mark.parametrize(
