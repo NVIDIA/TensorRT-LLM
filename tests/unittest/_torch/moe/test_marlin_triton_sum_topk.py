@@ -25,6 +25,15 @@ def _aten_reference(
     return result
 
 
+def _fp32_reference(
+    expert_outputs: torch.Tensor, num_tokens: int, top_k: int, hidden_size: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """FP32 reduce-then-cast reference — enforces that the kernel accumulates in FP32."""
+    if num_tokens == 0:
+        return torch.empty((0, hidden_size), dtype=dtype, device=expert_outputs.device)
+    return expert_outputs.float().reshape(num_tokens, top_k, hidden_size).sum(dim=1).to(dtype)
+
+
 @_MARLIN_SM_SKIP
 @pytest.mark.parametrize(
     "num_tokens,top_k,hidden_size",
@@ -40,25 +49,30 @@ def _aten_reference(
 def test_triton_sum_topk_matches_aten_scatter_reduce(
     num_tokens: int, top_k: int, hidden_size: int
 ) -> None:
-    """Triton FP32-accumulate combine matches BF16 ATen index_add_ within BF16 tolerance.
+    """Triton kernel accumulates in FP32 and matches both a FP32 and a BF16 ATen reference.
 
-    The Triton kernel accumulates in FP32 before storing BF16, which is more
-    numerically stable than BF16 index_add_ but produces a slightly different
-    result. The tolerance (rtol=2e-2, atol=0.125) covers the worst-case BF16
-    rounding gap between the two accumulation orders.
+    Two assertions:
+    1. FP32 contract: actual must match the FP32-reduce-then-cast reference within
+       a narrow BF16-level tolerance (rtol=1e-3, atol=0.01). A regression that
+       accumulates in BF16 would diverge from this reference and fail.
+    2. Fallback parity: actual must also match the BF16 ATen index_add_ reference
+       within the wider BF16 rounding gap (rtol=2e-2, atol=0.125).
     """
     torch.manual_seed(0)
     expert_outputs = torch.randn(
         (num_tokens * top_k, hidden_size), dtype=torch.bfloat16, device="cuda"
     )
 
-    expected = _aten_reference(expert_outputs, num_tokens, top_k, hidden_size, torch.bfloat16)
     actual = sum_topk_expert_outputs(expert_outputs, num_tokens, top_k, hidden_size, torch.bfloat16)
 
     assert actual.shape == (num_tokens, hidden_size)
     assert actual.dtype == torch.bfloat16
     if num_tokens > 0:
-        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=0.125)
+        fp32_ref = _fp32_reference(expert_outputs, num_tokens, top_k, hidden_size, torch.bfloat16)
+        torch.testing.assert_close(actual, fp32_ref, rtol=1e-3, atol=0.01)
+
+        aten_ref = _aten_reference(expert_outputs, num_tokens, top_k, hidden_size, torch.bfloat16)
+        torch.testing.assert_close(actual, aten_ref, rtol=2e-2, atol=0.125)
 
 
 @_MARLIN_SM_SKIP
