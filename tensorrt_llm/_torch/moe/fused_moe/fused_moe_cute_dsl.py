@@ -341,6 +341,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                  output_dtype: torch.dtype = torch.bfloat16,
                  scaling_vector_size: int = 16,
                  use_direct_expert_metadata: bool = False,
+                 use_locality_domain: bool = False,
                  workload_identity: Optional[Tuple] = None):
         super().__init__()
         self.forward_impl = forward_impl
@@ -351,6 +352,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.enable_finalize_fusion = enable_finalize_fusion
         self.enable_alltoall = enable_alltoall
         self.use_direct_expert_metadata = use_direct_expert_metadata
+        self.use_locality_domain = use_locality_domain
 
         assert output_dtype == torch.bfloat16
         self.output_dtype = output_dtype
@@ -458,22 +460,24 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             tile_size = tactic
         else:
             tile_size = 128
+        recv_expert_count = None
         forward_inputs = inputs
-        # Only run_moe_nvfp4_impl takes these; omitting them when they carry no
-        # information keeps the locality-domain impl callable through here.
-        count_native_kwargs = {}
         if self.use_direct_expert_metadata:
+            recv_expert_count = inputs[-1]
             forward_inputs = inputs[:-1]
             num_rows = forward_inputs[0].size(0)
             if num_rows % self.num_local_experts != 0:
                 raise ValueError(
                     "Expert-major input rows must be divisible by the number "
                     "of local experts")
-            count_native_kwargs = dict(
-                recv_expert_count=inputs[-1],
-                deep_ep_expert_capacity=num_rows // self.num_local_experts,
-                use_count_native_expert_metadata=True,
-            )
+            deep_ep_expert_capacity = num_rows // self.num_local_experts
+        else:
+            deep_ep_expert_capacity = None
+        # The locality-domain impl does not take the count-native arguments.
+        count_native_kwargs = {} if self.use_locality_domain else dict(
+            recv_expert_count=recv_expert_count,
+            deep_ep_expert_capacity=deep_ep_expert_capacity,
+            use_count_native_expert_metadata=self.use_direct_expert_metadata)
         return self.forward_impl(
             *forward_inputs,
             enable_alltoall=self.enable_alltoall,
@@ -1138,6 +1142,7 @@ class CuteDslFusedMoE(MoEImplBase):
             enable_alltoall=enable_alltoall,
             workload_identity=workload_identity,
             use_direct_expert_metadata=use_direct_expert_metadata,
+            use_locality_domain=use_locality_domain,
         )
 
         if use_direct_expert_metadata:
