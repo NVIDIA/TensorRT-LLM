@@ -120,6 +120,121 @@ class TestStructuredOutputDispatch:
             serving_extensions._BY_REASONING_PARSER.pop(parser_key, None)
 
 
+class TestBuiltinExtensions:
+    """The in-tree Kimi K3 and gpt-oss extensions resolve through the registry.
+
+    The lookups below go through the public dispatch functions only, so they
+    also cover the lazy import of ``tensorrt_llm.serve.extensions`` that
+    populates the registry when nothing has imported ``openai_server``.
+    """
+
+    def test_kimi_k3_resolves_to_kimi_extension(self) -> None:
+        from tensorrt_llm.serve.extensions.kimi_k3 import KimiK3ServingExtension
+
+        assert isinstance(serving_extensions._BY_MODEL_TYPE["kimi_k3"], KimiK3ServingExtension)
+        hook = structured_output_format_for("kimi_k3")
+        assert isinstance(hook.__self__, KimiK3ServingExtension)
+
+    def test_gpt_oss_resolves_to_gpt_oss_extension(self) -> None:
+        from tensorrt_llm.serve.extensions.gpt_oss import GptOssServingExtension
+
+        hook = structured_output_format_for("gpt_oss")
+        assert isinstance(hook.__self__, GptOssServingExtension)
+        # gpt-oss has no chat-side preprocessing.
+        assert "gpt_oss" not in serving_extensions._BY_MODEL_TYPE
+
+    def test_kimi_param_policy_applies_via_generic_dispatch(self, monkeypatch) -> None:
+        from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+        monkeypatch.setenv("TRTLLM_KIMI_PARAM_POLICY", "1")
+        messages = [{"role": "user", "content": "hi"}]
+
+        request = ChatCompletionRequest(model="m", messages=messages, top_p=1.0)
+        apply_model_chat_extensions(request, "kimi_k3")
+        assert request.top_p == 0.95
+
+        with pytest.raises(ValueError, match="n is fixed at 1"):
+            apply_model_chat_extensions(
+                ChatCompletionRequest(model="m", messages=messages, n=2), "kimi_k3"
+            )
+
+        # Other model types are untouched by the Kimi policy.
+        request = ChatCompletionRequest(model="m", messages=messages, top_p=1.0, n=2)
+        apply_model_chat_extensions(request, "llama")
+        assert (request.top_p, request.n) == (1.0, 2)
+
+    def test_kimi_chat_kwargs_derived_via_generic_dispatch(self) -> None:
+        from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+        request = ChatCompletionRequest(
+            model="m",
+            messages=[{"role": "user", "content": "hi"}],
+            thinking={"type": "enabled", "effort": "high"},
+            stream=True,
+        )
+        apply_model_chat_extensions(request, "kimi_k3")
+        assert request.chat_template_kwargs == {"thinking": True, "thinking_effort": "high"}
+        assert request.stream_options is not None
+        assert request.stream_options.include_usage is True
+
+    def test_gpt_oss_structured_output_triggers_on_final_channel(self) -> None:
+        import json
+
+        from tensorrt_llm.serve.openai_protocol import (
+            ResponseFormat,
+            _response_format_to_guided_decoding_params,
+        )
+
+        params = _response_format_to_guided_decoding_params(
+            ResponseFormat(type="json_schema", json_schema={"schema": {"type": "object"}}),
+            reasoning_parser="gpt_oss",
+            chat_template_kwargs=None,
+        )
+        fmt = json.loads(params.structural_tag)["format"]
+        final = "<|start|>assistant<|channel|>final<|message|>"
+        assert fmt == {
+            "type": "triggered_tags",
+            "triggers": [final],
+            "tags": [
+                {
+                    "begin": final,
+                    "content": {"type": "json_schema", "json_schema": {"type": "object"}},
+                    "end": "",
+                }
+            ],
+            "stop_after_first": True,
+        }
+
+    @pytest.mark.parametrize(
+        ("chat_template_kwargs", "expect_tag"),
+        [(None, True), ({"thinking": True}, True), ({"thinking": False}, False)],
+    )
+    def test_kimi_structured_output_follows_thinking_mode(
+        self, chat_template_kwargs, expect_tag
+    ) -> None:
+        import json
+
+        from tensorrt_llm.serve.openai_protocol import (
+            ResponseFormat,
+            _response_format_to_guided_decoding_params,
+        )
+
+        params = _response_format_to_guided_decoding_params(
+            ResponseFormat(type="json_object"),
+            reasoning_parser="kimi_k3",
+            chat_template_kwargs=chat_template_kwargs,
+        )
+        if not expect_tag:
+            assert params.structural_tag is None
+            assert params.json_object is True
+            return
+        fmt = json.loads(params.structural_tag)["format"]
+        assert fmt["type"] == "triggered_tags"
+        assert fmt["triggers"] == ["<|open|>response<|sep|>"]
+        assert fmt["tags"][0]["end"] == "<|close|>response<|sep|>"
+        assert fmt["stop_after_first"] is True
+
+
 class TestOpenAIChatIntegration:
     """``openai_chat`` runs the model-type hook, and before rendering.
 

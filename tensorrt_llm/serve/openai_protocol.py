@@ -493,48 +493,6 @@ def _response_format_to_guided_decoding_params(
         stag_format = extension_format(content, chat_template_kwargs)
         if stag_format is None:
             return guided_decoding_params
-    elif reasoning_parser == "gpt_oss":
-        # Trigger user constraint by final channel
-        stag_format = {
-            "type":
-            "triggered_tags",
-            "triggers": ["<|start|>assistant<|channel|>final<|message|>"],
-            "tags": [
-                {
-                    "begin": "<|start|>assistant<|channel|>final<|message|>",
-                    "content": content,
-                    "end": "",
-                },
-            ],
-            "stop_after_first":
-            True,
-        }
-    elif reasoning_parser == "kimi_k3":
-        # K3 XTML: the generation prompt already ends inside the channel the
-        # model starts in. In thinking mode (the default) the response channel
-        # opens mid-generation, so trigger the user constraint on it
-        # (mirrors the gpt_oss final-channel handling). In non-thinking mode
-        # the prompt ends inside <|open|>response<|sep|>, the trigger would
-        # never be generated, and the raw grammar applies from the first
-        # generated token instead.
-        thinking = (chat_template_kwargs or {}).get("thinking",
-                                                    True) is not False
-        if not thinking:
-            return guided_decoding_params
-        stag_format = {
-            "type":
-            "triggered_tags",
-            "triggers": ["<|open|>response<|sep|>"],
-            "tags": [
-                {
-                    "begin": "<|open|>response<|sep|>",
-                    "content": content,
-                    "end": "<|close|>response<|sep|>",
-                },
-            ],
-            "stop_after_first":
-            True,
-        }
     else:
         # Force thinking and then trigger user constraint
         parser = ReasoningParserFactory.create_reasoning_parser(

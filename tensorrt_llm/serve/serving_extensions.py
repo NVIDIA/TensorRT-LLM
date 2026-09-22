@@ -22,8 +22,16 @@ to ``openai_protocol.py`` / ``openai_server.py``. Lookups are keyed two ways:
   (:func:`apply_model_chat_extensions`), and
 - by reasoning-parser name for structured-output placement
   (:func:`structured_output_format_for`).
+
+Built-in extensions live in :mod:`tensorrt_llm.serve.extensions`; importing
+that package registers them. Both lookup functions import it on first use so
+the registry is populated wherever it is consulted (``openai_protocol`` reaches
+it from ``to_sampling_params`` without going through ``openai_server``). The
+import is deferred to call time because the built-ins import
+``openai_protocol``, which imports this module.
 """
 
+import importlib
 from typing import Any, Callable, Dict, Iterable, Optional
 
 
@@ -57,6 +65,17 @@ class ServingExtension:
 
 _BY_MODEL_TYPE: Dict[str, ServingExtension] = {}
 _BY_REASONING_PARSER: Dict[str, ServingExtension] = {}
+_BUILTINS_PACKAGE = "tensorrt_llm.serve.extensions"
+_builtins_loaded = False
+
+
+def _load_builtin_extensions() -> None:
+    """Import the built-in extension package once so it self-registers."""
+    global _builtins_loaded
+    if _builtins_loaded:
+        return
+    _builtins_loaded = True
+    importlib.import_module(_BUILTINS_PACKAGE)
 
 
 def register_serving_extension(
@@ -83,6 +102,7 @@ def register_serving_extension(
 
 def apply_model_chat_extensions(request, model_type: Optional[str]) -> None:
     """Run the registered chat-request preprocessing hook, if any."""
+    _load_builtin_extensions()
     extension = _BY_MODEL_TYPE.get(model_type) if model_type else None
     if extension is not None:
         extension.apply_chat_extensions(request)
@@ -92,5 +112,6 @@ def structured_output_format_for(
     reasoning_parser: Optional[str],
 ) -> Optional[Callable[[Dict[str, Any], Optional[Dict[str, Any]]], Optional[Dict[str, Any]]]]:
     """Structured-output hook registered for ``reasoning_parser``, or None."""
+    _load_builtin_extensions()
     extension = _BY_REASONING_PARSER.get(reasoning_parser) if reasoning_parser else None
     return None if extension is None else extension.structured_output_format
