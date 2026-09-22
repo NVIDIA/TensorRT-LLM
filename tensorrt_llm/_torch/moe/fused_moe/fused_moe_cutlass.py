@@ -370,6 +370,8 @@ class CutlassFusedMoE(MoEImplBase):
         self.tune_max_num_tokens = min(
             self.moe_max_num_tokens,
             16384 * self.num_slots // routing_method.get_experts_per_token(),
+            # A forward can never present more tokens than this.
+            default_moe_max_num_tokens,
         )
         self.has_been_profiled = False
         self.has_been_profiled_min_latency = False

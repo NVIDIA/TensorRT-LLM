@@ -88,6 +88,9 @@ class PostprocWorker:
         should_abort: bool = False
         finish_reason: Optional[str] = None
         num_generated_tokens: Optional[int] = None
+        decoding_iter: int = 0
+        avg_decoded_tokens_per_iter: Optional[float] = None
+        cached_tokens: int = 0
 
     def __init__(
         self,
@@ -237,8 +240,9 @@ class PostprocWorker:
                 self._records.pop(client_id, None)
                 return
             try:
-                is_final = inp.rsp.result.is_final if is_llm_response(
-                    inp.rsp) else True
+                response_result = inp.rsp.result if is_llm_response(
+                    inp.rsp) else None
+                is_final = response_result.is_final if response_result else True
                 res, metrics, perf_metrics, disaggregated_params = await self._handle_input(
                     inp)
                 record = self._records.get(client_id)
@@ -264,6 +268,13 @@ class PostprocWorker:
                         should_abort=should_abort,
                         finish_reason=finish_reason,
                         num_generated_tokens=num_generated_tokens,
+                        decoding_iter=getattr(response_result, "decoding_iter",
+                                              0),
+                        avg_decoded_tokens_per_iter=getattr(
+                            response_result, "avg_decoded_tokens_per_iter",
+                            None),
+                        cached_tokens=getattr(response_result, "cached_tokens",
+                                              0),
                     ))
                 if is_final:
                     self._records.pop(client_id, None)
