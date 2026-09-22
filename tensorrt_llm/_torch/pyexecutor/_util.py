@@ -2095,15 +2095,17 @@ class KvCacheCreator:
 
         self_kv_cache_config = base_kv_cache_config.model_copy()
         cross_kv_cache_config = base_kv_cache_config.model_copy()
-        if (cross_kv_cache_config.enable_block_reuse
+        if (base_kv_cache_config.enable_block_reuse
                 and self._encoder_input_is_features()):
-            # Cross blocks are keyed on encoder token ids; a feature-driven
-            # encoder has none, so reuse can never hit and the C++ scheduler
-            # must not be asked for a cross prefix-reuse summary.
+            # Decoder self-KV is conditioned on the encoder output, while
+            # cross-KV is keyed on encoder token ids. Feature-driven encoders
+            # provide neither reusable token ids nor an input discriminator,
+            # so neither pool can safely reuse blocks between requests.
             logger.info(
-                "Disabling block reuse for the cross-KV cache: the encoder "
-                "takes feature tensors, so requests carry no encoder tokens "
-                "to key cross blocks on.")
+                "Disabling block reuse for the self- and cross-KV caches: "
+                "the encoder takes feature tensors, so requests carry no "
+                "encoder tokens or input discriminator to key cache entries.")
+            self_kv_cache_config.enable_block_reuse = False
             cross_kv_cache_config.enable_block_reuse = False
         split_any_budget = False
 

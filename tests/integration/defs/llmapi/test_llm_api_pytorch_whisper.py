@@ -249,12 +249,12 @@ _BEAM_SEARCH_CASES = [
 ]
 
 
-def test_whisper_pytorch_block_reuse_enabled(monkeypatch):
-    """Greedy transcription with KV block reuse explicitly enabled.
+def test_whisper_pytorch_block_reuse_requested(monkeypatch):
+    """Greedy transcription when KV block reuse is requested.
 
     Whisper requests carry encoder features, not encoder token ids, so the
-    cross-KV pool has nothing to key reuse on; the executor must still admit
-    and run them (https://nvbugs/6713231). Batch 2 co-schedules two
+    executor disables reuse for both KV pools and must still admit and run
+    them (https://nvbugs/6713231). Batch 2 co-schedules two
     encoder-init requests, the shape that reached the unguarded cross-reuse
     lookup in the C++ capacity scheduler.
     """
