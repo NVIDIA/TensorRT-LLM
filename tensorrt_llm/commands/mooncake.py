@@ -31,7 +31,33 @@ from typing import Optional
 
 import click
 
+import tensorrt_llm.usage as usage
 from tensorrt_llm.logger import logger
+from tensorrt_llm.usage.config import UsageContext
+
+#: Both commands sit in the telemetry-aware `trtllm-serve` group, so they have
+#: to offer the same opt-out the group documents.
+_telemetry_option = click.option(
+    "--telemetry/--no-telemetry",
+    default=True,
+    help="Enable or disable anonymous usage telemetry collection.",
+)
+
+
+def _apply_cli_telemetry(telemetry: bool) -> None:
+    """Honor --no-telemetry for a command that reads no config of its own.
+
+    The group already applies the flag it finds in argv, so this matters when
+    the command is reached through its callback rather than through the CLI.
+    """
+    if telemetry:
+        return
+    usage.apply_usage_session_config(
+        {"disabled": True},
+        default_usage_context=UsageContext.CLI_SERVE.value,
+        component="server",
+        lifecycle_phase="config_validation",
+    )
 
 
 def _until_signalled() -> threading.Event:
@@ -98,6 +124,7 @@ def _until_signalled() -> threading.Event:
     show_default=True,
     help="Interval between liveness lines. 0 disables them.",
 )
+@_telemetry_option
 def mooncake_master(
     rpc_port: int,
     metrics_port: int,
@@ -105,12 +132,15 @@ def mooncake_master(
     address_file: Optional[str],
     run_dir: Optional[str],
     heartbeat_seconds: int,
+    telemetry: bool,
 ):
     """Run a mooncake_master for as long as this command runs.
 
     A single server with a pool of its own should set
     `mooncake_store.launch_master` instead.
     """
+    _apply_cli_telemetry(telemetry)
+
     # Imported lazily so other subcommands and --help do not pay for the
     # connector package.
     from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import running_master
@@ -223,6 +253,7 @@ def mooncake_master(
     show_default=True,
     help="Interval between liveness lines. 0 disables them.",
 )
+@_telemetry_option
 def mooncake_donor(
     master_server_address: Optional[str],
     segment_size: str,
@@ -233,12 +264,15 @@ def mooncake_donor(
     local_buffer_size: Optional[str],
     ready_file: Optional[str],
     heartbeat_seconds: int,
+    telemetry: bool,
 ):
     """Lend this node's host memory to a Mooncake pool, for as long as it runs.
 
     Running this on the generation nodes puts their memory into the pool while
     leaving those engines connector-free.
     """
+    _apply_cli_telemetry(telemetry)
+
     from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import (
         DEFAULT_DONOR_LOCAL_BUFFER_SIZE,
         donate_segment,
