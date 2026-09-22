@@ -129,7 +129,7 @@ def glm5_next_is_quantized(model_config: ModelConfig[PretrainedConfig]) -> bool:
 
     Unquantized modules are also supported for component construction.
     """
-    quant = getattr(model_config, "quant_config", None)
+    quant = model_config.quant_config
     if quant is None or quant.quant_algo is None:
         return False
     if quant.quant_algo != QuantAlgo.FP8_BLOCK_SCALES:

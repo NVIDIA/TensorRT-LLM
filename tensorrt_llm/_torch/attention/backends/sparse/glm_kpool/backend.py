@@ -223,13 +223,13 @@ class GlmKpoolSparseAttention(TrtllmAttention):
                 "metadata (TrtllmAttentionMetadata); got None. The backend derives "
                 "its cache pools, block tables, and visible lengths from it."
             )
-        manager = getattr(metadata, "kv_cache_manager", None)
+        manager = metadata.kv_cache_manager
         if manager is None:
             raise ValueError(
                 "glm_kpool metadata has no kv_cache_manager; the hybrid "
                 "KVCacheManagerV2 owns the latent/indexer pools"
             )
-        mamba_metadata = getattr(metadata, "mamba_metadata", None)
+        mamba_metadata = metadata.mamba_metadata
         if mamba_metadata is None or mamba_metadata is False:
             raise ValueError(
                 "glm_kpool requires prepared metadata: call metadata.prepare() "
@@ -254,7 +254,7 @@ class GlmKpoolSparseAttention(TrtllmAttention):
                 "glm_kpool requires prepared glm_block_tables; call metadata.prepare() "
                 "with Glm5NextMamba2Metadata before eager execution or CUDA graph capture"
             )
-        kv_lens = getattr(metadata, "kv_lens_cuda", None)
+        kv_lens = metadata.kv_lens_cuda
         if kv_lens is None:
             raise ValueError("glm_kpool requires prepared metadata.kv_lens_cuda")
         return _GlmKpoolCacheState(
@@ -602,21 +602,24 @@ class GlmKpoolSparseAttention(TrtllmAttention):
             raise ValueError(f"glm_kpool forward is phase-explicit, got {input_type!r}")
         state = self._cache_state(metadata)
         kv_rows, _, _ = latent_pool_rows(state.latent_pool)
+        num_query_tokens, num_query_heads, head_dim = q.shape
+        num_cache_rows = kv_rows.shape[0]
         native_supported = (
             q.is_cuda
             and q.dtype == kv_rows.dtype == torch.bfloat16
-            and q.shape[1:] == (16, 512)
-            and kv_rows.shape[0] % 32 == 0
+            and (num_query_heads, head_dim) == (16, 512)
+            and num_cache_rows % 32 == 0
             and get_sm_version() in (100, 103)
         )
         if native_supported:
-            # Reserve during prefill/profiling too, before sizing the KV pool.
-            # Scratch is shared through metadata; each backend owns only counters.
+            # Reserve shared scratch and per-layer counters during prefill/profiling,
+            # even though only small generation batches use the native kernel.
+            # Deferring this allocation to decode would miss it in KV-cache sizing.
             self._native_decode.prepare_workspace(q, metadata)
         if (
             native_supported
             and input_type == AttentionInputType.generation_only
-            and 1 <= q.shape[0] <= 8
+            and 1 <= num_query_tokens <= 8
         ):
             out = self._native_decode(q, kv_rows, topk_rows, self.softmax_scale, metadata)
         else:

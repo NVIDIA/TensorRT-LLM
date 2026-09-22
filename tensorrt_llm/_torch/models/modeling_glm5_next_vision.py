@@ -87,7 +87,7 @@ _VISION_WEIGHT_PREFIX = "model.visual"
 def _image_encoder_cuda_graph_config(
     model_config: ModelConfig[PretrainedConfig],
 ) -> Optional["MultimodalEncoderCudaGraphConfig"]:
-    mm_config = getattr(model_config, "multimodal_config", None)
+    mm_config = model_config.multimodal_config
     if mm_config is None or mm_config.encoder_cuda_graph is None:
         return None
     unknown = set(mm_config.encoder_cuda_graph) - {"image"}
@@ -109,14 +109,14 @@ def _text_dtype(model_config: ModelConfig[PretrainedConfig]) -> torch.dtype:
 
 def _require_trtllm_vision_backend(model_config: ModelConfig[PretrainedConfig], where: str) -> None:
     """Require full-mask TRTLLM vision attention without sparse backend wrappers."""
-    backend = getattr(model_config, "attn_backend", None)
+    backend = model_config.attn_backend
     if not isinstance(backend, str) or backend.upper() != "TRTLLM":
         raise ValueError(
             f"{where}: the glm5_next vision tower supports only the TRTLLM "
             f"attention backend, got attn_backend={backend!r}. There is no "
             "VANILLA/FlashInfer/SDPA vision attention path."
         )
-    if getattr(model_config, "sparse_attention_config", None) is not None:
+    if model_config.sparse_attention_config is not None:
         raise ValueError(
             f"{where}: the glm5_next vision tower runs plain full-mask TRTLLM "
             "attention; a sparse_attention_config would swap in a sparse "
@@ -130,7 +130,7 @@ def _create_linear_weights(*modules: nn.Module) -> None:
     module that deferred its weights (``skip_create_weights_in_init``)."""
     for module in modules:
         for sub in module.modules():
-            if isinstance(sub, Linear) and not getattr(sub, "_weights_created", True):
+            if isinstance(sub, Linear) and not sub._weights_created:
                 sub.create_weights()
 
 
@@ -1067,6 +1067,10 @@ class Glm5NextVLM(MultimodalModelMixin, PreTrainedModel):
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config=None) -> str:
         return Glm5NextForCausalLM.get_preferred_kv_cache_manager_version(pretrained_config)
+
+    @classmethod
+    def get_preferred_transceiver_runtime(cls, pretrained_config=None) -> str:
+        return Glm5NextForCausalLM.get_preferred_transceiver_runtime(pretrained_config)
 
     @property
     def mamba_metadata_cls(self):
