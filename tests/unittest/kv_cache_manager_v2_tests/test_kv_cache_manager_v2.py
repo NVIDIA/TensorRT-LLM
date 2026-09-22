@@ -364,6 +364,43 @@ def create_config(
     )
 
 
+@requires_cpp_backend
+class TestSparseBufferConfig(unittest.TestCase):
+    def test_flag_defaults_and_copy(self):
+        self.assertFalse(BufferConfig("key", 4096).is_sparse)
+        buffer = BufferConfig("key", 4096, 2, is_sparse=True)
+        copied = deepcopy(buffer)
+        self.assertTrue(copied.is_sparse)
+        self.assertEqual(copied.tokens_per_block_override, 2)
+        buffer.is_sparse = False
+        self.assertTrue(copied.is_sparse)
+
+    def test_requires_host_at_level_one(self):
+        layer = AttentionLayerConfig(0, [BufferConfig("key", 4096, is_sparse=True)])
+        gpu = GpuCacheTierConfig(4 << 20)
+        for tiers in ([gpu], [gpu, gpu], [gpu, DiskCacheTierConfig(4 << 20, "/tmp")]):
+            with self.subTest(tiers=tiers):
+                with self.assertRaisesRegex(ValueError, "level 1.*HOST_MEM"):
+                    KVCacheManagerConfig(tokens_per_block=4, cache_tiers=tiers, layers=[layer])
+        config = KVCacheManagerConfig(
+            tokens_per_block=4,
+            cache_tiers=[gpu, HostCacheTierConfig(4 << 20)],
+            layers=[layer],
+        )
+        self.assertTrue(config.layers[0].buffers[0].is_sparse)
+
+    def test_rejects_mixed_layer_buffers(self):
+        layer = AttentionLayerConfig(
+            0, [BufferConfig("key", 4096, is_sparse=True), BufferConfig("value", 4096)]
+        )
+        with self.assertRaisesRegex(ValueError, "cannot share an attention layer lifecycle"):
+            KVCacheManagerConfig(
+                tokens_per_block=4,
+                cache_tiers=[GpuCacheTierConfig(4 << 20), HostCacheTierConfig(4 << 20)],
+                layers=[layer],
+            )
+
+
 class TestKVCacheManagerV2(unittest.TestCase):
     engine: FakeEngine
     cfg: KVCacheManagerConfig

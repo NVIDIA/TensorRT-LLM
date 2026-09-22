@@ -77,16 +77,21 @@ LifeCycleId = NewType("LifeCycleId", int)
 LayerGroupId: TypeAlias = LifeCycleId
 
 class AttnLifeCycle:
-    """The attention life cycle, keyed by its sliding-window and sink-token shape."""
+    """The attention life cycle, keyed by its window, sink-token shape, and sparsity."""
 
     @staticmethod
     def make(
-        window_size: int | None, num_sink_tokens: int | None, tokens_per_block: int
+        window_size: int | None,
+        num_sink_tokens: int | None,
+        tokens_per_block: int,
+        is_sparse: bool = False,
     ) -> "AttnLifeCycle": ...
     @property
     def window_size(self) -> int | None: ...
     @property
     def num_sink_blocks(self) -> int: ...
+    @property
+    def is_sparse(self) -> bool: ...
     def get_stale_range(self, history_length: int, tokens_per_block: int) -> HalfOpenRange: ...
 
 CacheLevel = NewType("CacheLevel", int)
@@ -241,6 +246,8 @@ class BufferConfig:
     Because lock location is a per-buffer rule and a page is one slot shared by every
     buffer of its lifecycle, a sparse buffer requires a lifecycle of its own; sharing one
     with a non-sparse buffer raises from the ``KVCacheManager`` constructor.
+    All buffers in one attention layer must agree on ``is_sparse``. Sparse buffers are
+    not supported for SSM layers.
 
     The buffer still has a GPU-tier pool, but for a sparse buffer it also carries scratch,
     in the manner of SWA scratch reuse: the per-layer pure-history pages a step actually

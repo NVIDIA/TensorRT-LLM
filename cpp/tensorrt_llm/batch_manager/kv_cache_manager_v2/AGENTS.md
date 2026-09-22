@@ -68,6 +68,11 @@ may have sliding-window and sink-token rules; SSM lifecycles represent a
 recurrent-state checkpoint. A pool-group index is a storage-layout index and is
 not interchangeable with a layer ID or lifecycle ID.
 
+Attention lifecycle identity also includes `isSparse`. All buffers in one
+attention layer must agree on this flag. Sparse buffers require `HOST_MEM` at
+level 1 and are invalid for SSM layers. Sparse and dense GPU pools stay separate
+even when their slot sizes match; compatible sparse buffers still coalesce.
+
 `StorageManager` coordinates GPU, host, and disk cache levels. It allocates
 slots, schedules pages for eviction, migrates pages between levels, and resizes
 pools. `CopyEngine` performs the actual batched transfers; C++ code calls it

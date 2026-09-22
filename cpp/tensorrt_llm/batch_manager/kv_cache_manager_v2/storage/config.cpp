@@ -24,6 +24,7 @@
 #include <map>
 #include <stdexcept>
 #include <unordered_set>
+#include <utility>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -204,13 +205,15 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         slotGroups.push_back(std::move(var));
     }
 
-    // Merge SlotDescVariants that share the same slotSizeList.
-    // Key: tuple of sizes (sorted desc).
-    std::map<std::vector<size_t>, std::vector<SlotDescVariant>> poolGroupsBySizes;
+    // Keep sparse and dense lifecycles in separate GPU pools even when slot sizes match.
+    using PoolGroupKey = std::pair<std::vector<size_t>, bool>;
+    std::map<PoolGroupKey, std::vector<SlotDescVariant>> poolGroupsBySizes;
     for (auto& sg : slotGroups)
     {
         auto sizes = sg.slotSizeList();
-        poolGroupsBySizes[sizes.raw()].push_back(std::move(sg));
+        auto const* attn = std::get_if<AttnLifeCycle>(&registry.getLifeCycle(sg.lifeCycleId));
+        bool const isSparse = attn != nullptr && attn->isSparse;
+        poolGroupsBySizes[{sizes.raw(), isSparse}].push_back(std::move(sg));
     }
 
     StorageConfig out;
