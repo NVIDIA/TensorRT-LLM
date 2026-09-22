@@ -2988,10 +2988,9 @@ class KVCacheManagerV2(BaseResourceManager):
                             buffers=buffers,
                             sliding_window_size=layer.sliding_window_size,
                             num_sink_tokens=layer.num_sink_tokens,
+                            cache_domain=layer.cache_domain,
                         )
                     )
-                    if hasattr(layer, "cache_domain"):
-                        layers[-1].cache_domain = layer.cache_domain
                 else:
                     layers.append(SsmLayerConfig(layer_id=layer_id, buffers=buffers))
 
@@ -3154,20 +3153,12 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
     def get_layer_cache_dtype(self, layer_idx: int) -> DataType:
-        if self.draft_layout is None:
-            return self.dtype
-        if self._is_standalone_draft_layer(self.layer_offsets[layer_idx]):
+        if layer_idx in self.draft_layer_ids:
             return DataType.BF16 if self.draft_layout.dtype == torch.bfloat16 else DataType.HALF
         return self.dtype
 
     def get_layer_kv_factor(self, layer_idx: int) -> int:
-        if self.draft_layout is None:
-            return self.kv_factor
-        return (
-            self.draft_layout.kv_factor
-            if self._is_standalone_draft_layer(self.layer_offsets[layer_idx])
-            else self.kv_factor
-        )
+        return self.draft_layout.kv_factor if layer_idx in self.draft_layer_ids else self.kv_factor
 
     def get_draft_buffers(self, local_layer_idx: int, kv_layout: str = "HND") -> torch.Tensor:
         """View authoritative draft pages with their independent geometry."""

@@ -26,6 +26,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -63,15 +64,8 @@ struct AttnLifeCycle
 
     bool operator<(AttnLifeCycle const& o) const noexcept
     {
-        if (windowSize != o.windowSize)
-        {
-            return windowSize < o.windowSize;
-        }
-        if (numSinkBlocks != o.numSinkBlocks)
-        {
-            return numSinkBlocks < o.numSinkBlocks;
-        }
-        return cacheDomain < o.cacheDomain;
+        return std::tie(windowSize, numSinkBlocks, cacheDomain)
+            < std::tie(o.windowSize, o.numSinkBlocks, o.cacheDomain);
     }
 
     static AttnLifeCycle make(

@@ -2116,14 +2116,13 @@ class DFlashWorker(SpecWorkerBase):
             bonus = gen_accepted_tokens.gather(1, bonus_idx).squeeze(1).long()
 
             ctx_len_gen = self._ctx_len[slots]
+            ctx_position_gen = ctx_len_gen
             if self._has_unified_draft_cache():
                 allocated = dflash_allocated_ctx_limit(
                     self._ctx_block_counts[gen_rows_out], self._ctx_page_size, block_size
                 ).clamp(max=self._max_ctx)
                 if torch.any(ctx_len_gen + gen_num_accepted > allocated).item():
                     raise ValueError("Unified DSpark accepted history exceeds the drafter context")
-            ctx_position_gen = ctx_len_gen
-            if self._has_unified_draft_cache():
                 ctx_position_gen = torch.tensor(
                     [
                         self._req_ctx_pos.get(request_id, 0)
