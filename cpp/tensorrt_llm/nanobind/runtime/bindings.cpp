@@ -158,7 +158,20 @@ void initBindings(nb::module_& m)
         .def("get_uc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getUCBuffer,
             nb::call_guard<nb::gil_scoped_release>())
         .def("get_mc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getMCBuffer,
-            nb::call_guard<nb::gil_scoped_release>());
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("checkpoint_prepare", &tensorrt_llm::runtime::McastGPUBuffer::checkpointPrepare,
+            "Internal, experimental hook; the caller must establish engine-wide quiescence before invoking it.",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("checkpoint_restore", &tensorrt_llm::runtime::McastGPUBuffer::checkpointRestore,
+            nb::arg("mpi_comm_fortran_handle"),
+            "Internal, experimental hook; the restored communicator must have the original ordered membership and "
+            "the engine must remain quiescent. A successful restore retains an owned communicator duplicate.",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("checkpoint_restore_complete", &tensorrt_llm::runtime::McastGPUBuffer::checkpointRestoreComplete,
+            nb::arg("local_protocol_reset_succeeded"),
+            "Collectively publish or abort a pending internal MNNVL restore after protocol reset.",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("is_mapped", &tensorrt_llm::runtime::McastGPUBuffer::isMapped);
 
     nb::enum_<tensorrt_llm::kernels::AllReduceFusionOp>(m, "AllReduceFusionOp")
         .value("NONE", tensorrt_llm::kernels::AllReduceFusionOp::NONE)
@@ -300,27 +313,5 @@ void initBindingsEarly(nb::module_& m)
         .def(nb::init<tr::BufferManager::CudaStreamPtr, bool>(), nb::arg("stream"), nb::arg("trim_pool") = false,
             nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("stream", &tr::BufferManager::getStream);
-
-    nb::class_<tr::SpeculativeDecodingMode>(m, "SpeculativeDecodingMode")
-        .def(nb::init<tr::SpeculativeDecodingMode::UnderlyingType>(), nb::arg("state"))
-        .def_static("NoneType", &tr::SpeculativeDecodingMode::None)
-        .def_static("DraftTokensExternal", &tr::SpeculativeDecodingMode::DraftTokensExternal)
-        .def_static("Medusa", &tr::SpeculativeDecodingMode::Medusa)
-        .def_static("Eagle", &tr::SpeculativeDecodingMode::Eagle)
-        .def_static("LookaheadDecoding", &tr::SpeculativeDecodingMode::LookaheadDecoding)
-        .def_static("ExplicitDraftTokens", &tr::SpeculativeDecodingMode::ExplicitDraftTokens)
-        .def_prop_ro("is_none", &tr::SpeculativeDecodingMode::isNone)
-        .def_prop_ro("is_draft_tokens_external", &tr::SpeculativeDecodingMode::isDraftTokensExternal)
-        .def_prop_ro("is_medusa", &tr::SpeculativeDecodingMode::isMedusa)
-        .def_prop_ro("is_eagle", &tr::SpeculativeDecodingMode::isEagle)
-        .def_prop_ro("is_lookahead_decoding", &tr::SpeculativeDecodingMode::isLookaheadDecoding)
-        .def_prop_ro("is_explicit_draft_tokens", &tr::SpeculativeDecodingMode::isExplicitDraftTokens)
-        .def_prop_ro("updates_position_ids", &tr::SpeculativeDecodingMode::updatesPositionIds)
-        .def_prop_ro("requires_attention_mask", &tr::SpeculativeDecodingMode::requiresAttentionMask)
-        .def_prop_ro("predicts_draft_tokens", &tr::SpeculativeDecodingMode::predictsDraftTokens)
-        .def_prop_ro("needs_kv_cache_rewind", &tr::SpeculativeDecodingMode::needsKVCacheRewind)
-        .def_prop_ro("variable_draft_length", &tr::SpeculativeDecodingMode::variableDraftLength)
-        .def_prop_ro("has_draft_logits", &tr::SpeculativeDecodingMode::hasDraftLogits)
-        .def_prop_ro("needs_decoder_prologue", &tr::SpeculativeDecodingMode::needsDecoderPrologue);
 }
 } // namespace tensorrt_llm::nanobind::runtime

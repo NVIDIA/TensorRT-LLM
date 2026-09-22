@@ -15,12 +15,12 @@
 """MegaMoE CuteDSL NVFP4 backend.
 
 ConfigurableMoE-compatible MoE backend wrapping the ported
-``Sm100MegaMoEKernel`` (fused dispatch + FC1 + activation + FC2 +
+architecture-specific MegaMoE kernels (fused dispatch + FC1 + activation + FC2 +
 combine) from
-``tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4``. The kernel is
+``tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe``. The kernel is
 invoked through the standard CuteDSL TunableRunner / torch op pattern;
 the runner + op live in
-``tensorrt_llm/_torch/custom_ops/cute_dsl_megamoe_custom_op.py``. This
+``tensorrt_llm/_torch/moe/custom_ops/cute_dsl_megamoe_custom_op.py``. This
 file only owns:
 
   * capability gating (``can_implement``)
@@ -70,6 +70,7 @@ from __future__ import annotations
 
 import os
 import socket
+import time
 import weakref
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
@@ -85,7 +86,7 @@ import torch.distributed as dist
 from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
     megamoe_activation_sf_bytes_per_row,
 )
-from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantAlgo
@@ -94,6 +95,12 @@ from ....autotuner import AutoTuner
 from ....cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ....model_config import ModelConfig
 from ....utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
+from ..activation import (
+    DEFAULT_MOE_ACTIVATION,
+    ActivationParamShape,
+    MoEActivation,
+    MoEActivationSupport,
+)
 from ..impl_base import MoEImplBase, apply_moe_impl_construction_state
 from ..impl_contract import (
     MoEDeployment,
@@ -101,8 +108,10 @@ from ..impl_contract import (
     MoEProblem,
     MoERejectReason,
     MoERunContext,
+    MoEStaticCapability,
 )
 from ..impl_environment import MoEDep
+from ..impl_identity import MoEImplDescriptor, MoEImplId, register_moe_impl
 from ..interface import MoESchedulerKind, MoEWeightLoadingMode, _reject
 from ..quantization import NVFP4MegaMoECuteDslMethod
 from ..routing import BaseMoeRoutingMethod
@@ -111,6 +120,7 @@ __all__ = [
     "MegaMoECuteDsl",
     "MegaMoeCuteDslUnavailable",
     "MegaMoECuteDslWeightView",
+    "TrtllmCutedslMegaMoeNvfp4Impl",
     "is_megamoe_cute_dsl_runtime_available",
 ]
 
@@ -122,11 +132,14 @@ __all__ = [
 
 class MegaMoeCuteDslUnavailable(RuntimeError):
     """Raised when the active environment cannot import the symbols required by
-    the ported ``Sm100MegaMoEKernel`` (cu13 Cutlass DSL + cute_nvgpu MMA
+    the active MegaMoE kernel (cu13 Cutlass DSL + cute_nvgpu MMA
     atoms / cutlass._mlir APIs used by sym_buffer)."""
 
 
-_RUNTIME_PROBE_CACHE: Optional[Union[bool, str]] = None
+_RUNTIME_PROBE_CACHE: Dict[int, Union[bool, str]] = {}
+
+_MEGAMOE_PRIME_LADDER = os.environ.get("MEGAMOE_PRIME_LADDER", "1") == "1"
+_MEGAMOE_PRIMED_LADDERS: set = set()
 
 
 def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
@@ -135,29 +148,27 @@ def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
 
     Stricter than ``IS_CUTLASS_DSL_AVAILABLE``, which only confirms that
     ``cutlass`` / ``cutlass.cute`` import cleanly. The MegaMoE kernel
-    ABI also requires ``cutlass.torch.from_dlpack``, ``cutlass._mlir``
-    APIs used by ``sym_buffer.py``, the ``cute_nvgpu`` MMA atoms used
-    by ``kernel_fc12.py``, and the async-copy helpers used by
-    ``dispatch_kernel.py``. PR
-    https://github.com/NVIDIA/TensorRT-LLM/pull/14354 pins
-    ``nvidia-cutlass-dsl[cu13]==4.6.1``; version 4.5.0 was the first release
-    that shipped all of them, and older wheels return ``(False, reason)``.
+    ABI also requires ``cutlass.torch.from_dlpack``, ``cutlass._mlir``,
+    ``cute_nvgpu`` MMA atoms, and async-copy helpers. SM107 additionally
+    requires ``cutlass.utils.rubin_helpers``. Older builds return
+    ``(False, reason)``.
 
     Returns ``(True, None)`` on success or ``(False, reason)`` with an
     actionable message. The result is cached for the process lifetime.
     """
-    global _RUNTIME_PROBE_CACHE
-    if _RUNTIME_PROBE_CACHE is True:
+    sm_version = get_sm_version() if torch.cuda.is_available() else -1
+    cached = _RUNTIME_PROBE_CACHE.get(sm_version)
+    if cached is True:
         return True, None
-    if isinstance(_RUNTIME_PROBE_CACHE, str):
-        return False, _RUNTIME_PROBE_CACHE
+    if isinstance(cached, str):
+        return False, cached
 
     if not IS_CUTLASS_DSL_AVAILABLE:
         reason = (
             "Cutlass DSL is not importable on this environment; install "
             "nvidia-cutlass-dsl[cu13] to enable MegaMoECuteDsl."
         )
-        _RUNTIME_PROBE_CACHE = reason
+        _RUNTIME_PROBE_CACHE[sm_version] = reason
         return False, reason
 
     try:
@@ -181,7 +192,7 @@ def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
             f"ImportError={e!r}. Install nvidia-cutlass-dsl[cu13]>=4.5.0 "
             f"(see PR #14354)."
         )
-        _RUNTIME_PROBE_CACHE = reason
+        _RUNTIME_PROBE_CACHE[sm_version] = reason
         return False, reason
 
     try:
@@ -191,29 +202,60 @@ def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
             f"MegaMoECuteDsl requires cutlass.cute.nvgpu.tcgen05 + cpasync; "
             f"missing {e!r}. Install a Blackwell-capable cutlass-dsl wheel."
         )
-        _RUNTIME_PROBE_CACHE = reason
+        _RUNTIME_PROBE_CACHE[sm_version] = reason
         return False, reason
 
+    if sm_version == 107:
+        try:
+            try:
+                import cutlass.memory as cutlass_memory
+            except ImportError:
+                import cutlass.utils as cutlass_memory
+            import cutlass.utils.rubin_helpers as rubin_helpers
+
+            if not hasattr(rubin_helpers, "make_blockscaled_trivial_tiled_mma"):
+                raise ImportError(
+                    "cutlass.utils.rubin_helpers lacks make_blockscaled_trivial_tiled_mma"
+                )
+            if not hasattr(cutlass_memory, "get_smem_capacity_in_bytes"):
+                raise ImportError("Cutlass DSL lacks get_smem_capacity_in_bytes")
+            if cutlass_memory.get_smem_capacity_in_bytes("sm_107") <= 0:
+                raise ValueError("invalid SM107 shared-memory capacity")
+            if cute.arch.get_max_tmem_alloc_cols("sm_107") <= 0:
+                raise ValueError("invalid SM107 tensor-memory capacity")
+        except (
+            AttributeError,
+            ImportError,
+            KeyError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as e:
+            reason = (
+                f"MegaMoECuteDsl on SM107 requires Rubin support in the "
+                f"Cutlass DSL wheel; missing {e!r}. Use a Rubin-capable "
+                f"Cutlass DSL build."
+            )
+            _RUNTIME_PROBE_CACHE[sm_version] = reason
+            return False, reason
+
     try:
-        # mega_moe_cute_dsl.py lives at
-        # tensorrt_llm/_torch/moe/fused_moe/mega_moe/mega_moe_cute_dsl.py;
-        # four dots take us back to tensorrt_llm._torch where
-        # cute_dsl_kernels.mega_moe_nvfp4 is registered.
-        from ....cute_dsl_kernels.mega_moe_nvfp4 import (  # noqa: F401
-            Nvfp4BlockSize,
-            SfPaddingBlock,
-            to_blocked,
+        from ....cute_dsl_kernels.cutedsl_megamoe import (  # noqa: F401
+            BlackwellInferenceMegaMoE,
+            RubinInferenceGenphaseMegaMoE,
+            RubinInferenceLocalMegaMoE,
+            RubinInferenceMegaMoE,
         )
     except ImportError as e:
         reason = (
             f"Ported MegaMoE NVFP4 kernel package failed to import: "
             f"{e!r}. Verify tensorrt_llm/_torch/cute_dsl_kernels/"
-            f"mega_moe_nvfp4 is in the install tree."
+            f"cutedsl_megamoe is in the install tree."
         )
-        _RUNTIME_PROBE_CACHE = reason
+        _RUNTIME_PROBE_CACHE[sm_version] = reason
         return False, reason
 
-    _RUNTIME_PROBE_CACHE = True
+    _RUNTIME_PROBE_CACHE[sm_version] = True
     return True, None
 
 
@@ -256,7 +298,7 @@ class MegaMoECuteDslWeightView:
 
     The kernel reads these as local-only (NOT through symmetric heap);
     placement is unconstrained CUDA memory. Shapes match the
-    ``Sm100MegaMoEKernel.__call__`` ABI.
+    MegaMoE kernel ABI.
 
     ``fc31_alpha`` / ``fc2_alpha`` / ``fc1_norm_const`` are per-expert
     NVFP4 scale tensors consumed by the kernel ABI.
@@ -315,7 +357,7 @@ class _MegaMoeBuffers:
     combine_output: torch.Tensor  # (max_T, top_k, hidden) bf16
     shared_workspace: torch.Tensor  # (shared_ws_bytes,) uint8
     peer_offsets: List[int]  # length == world_size; [0] for single-rank
-    topk_idx_local: torch.Tensor  # (max_T, top_k) int64, always-local
+    topk_idx_local: torch.Tensor  # (max_T, top_k), int32 on Rubin, otherwise int64
 
 
 # ---------------------------------------------------------------------------
@@ -323,10 +365,20 @@ class _MegaMoeBuffers:
 # ---------------------------------------------------------------------------
 
 
-class MegaMoECuteDsl(MoEImplBase):
-    """MoE backend wrapping the ported MegaMoE CuteDSL NVFP4 fused kernel.
+@register_moe_impl
+class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
+    """``trtllm.cutedsl.mega_moe.nvfp4``.
 
-    Capability gate (``can_implement``): SM100 family + NVFP4 +
+    MoE backend wrapping the exported MegaMoE CuteDSL NVFP4 fused kernels;
+    ``MegaMoECuteDsl`` below is an alias onto this class.
+
+    The per-architecture kernel variants dispatch inside this one identity,
+    because architecture is not an id segment: all four segments hold whichever
+    kernel runs. The class name carries its ``kernel_name`` segment because
+    ``CuteDslFusedMoE``'s ``trtllm.cutedsl.grouped_gemm.nvfp4`` will differ from
+    this id in that field alone.
+
+    Capability gate (``can_implement``): SM100/103/107 + NVFP4 +
     bfloat16 activation + CUDA 13 Cutlass DSL runtime present.
 
     Topology source-of-truth: :meth:`_acquire_buffers`.
@@ -343,16 +395,40 @@ class MegaMoECuteDsl(MoEImplBase):
         allocated (e.g. ``torch.distributed`` not initialised).
     """
 
+    descriptor = MoEImplDescriptor(
+        identity=MoEImplId("trtllm", "cutedsl", "mega_moe", "nvfp4"),
+        # Kernel owns dispatch + GEMM1 + SwiGLU + GEMM2 + combine via the
+        # CuteDSL three-stage dispatch primitives + NVLink barrier; the
+        # scheduler must skip host-side comm and lockstep every chunk.
+        scheduler_kind=MoESchedulerKind.FUSED_COMM,
+        # Static and dynamic EPLB both work: see ``_supports_load_balancer``
+        # below for why the MegaMoE-format derived parameters migrate
+        # atomically.
+        capabilities=MoEStaticCapability(supports_eplb=True),
+        doc="MegaMoE CuteDSL fused NVFP4 kernels: NVFP4 weights and activations, SM100/103/107.",
+    )
+
+    # Read off the descriptor, not restated, so the published contract and the
+    # one the scheduler reads cannot drift apart.
+    scheduler_kind = descriptor.scheduler_kind
+
+    capabilities = descriptor.capabilities
+
+    input_requirement = descriptor.input_requirement
+
     _SUPPORTED_ACTIVATION_DTYPES = frozenset({torch.bfloat16})
+
+    # The elementwise function and its constants are codegen-time literals, so
+    # only a uniform per-layer value is representable.
+    activation_support = MoEActivationSupport(
+        kinds=frozenset({ActivationType.Swiglu, ActivationType.SwigluBias, ActivationType.SiTu}),
+        alpha_beta=ActivationParamShape.UNIFORM_SCALAR,
+        limit=ActivationParamShape.UNIFORM_SCALAR,
+    )
 
     # Legal combine wire formats; must stay in sync with
     # ``CombineFormat.parse`` in the kernel package's token_comm.py.
     _SUPPORTED_COMBINE_FORMATS = frozenset({"bf16", "32e4m3xe8m0", "16e2m1xbf16"})
-
-    # Kernel owns dispatch + GEMM1 + SwiGLU + GEMM2 + combine via the
-    # CuteDSL three-stage dispatch primitives + NVLink barrier; the
-    # scheduler must skip host-side comm and lockstep every chunk.
-    scheduler_kind = MoESchedulerKind.FUSED_COMM
 
     # ------------------------------------------------------------------
     # Capability gating
@@ -361,10 +437,16 @@ class MegaMoECuteDsl(MoEImplBase):
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
         """Check static eligibility; runtime providers and tensor values are validated later."""
-        if not is_sm_100f(d.env.sm):
+        is_minimax_swiglu_bias = (
+            p.swiglu_gptoss_style
+            and p.activation_type == ActivationType.SwigluBias
+            and p.bias is False
+            and p.activation_constants == frozenset({"alpha", "beta", "clamp"})
+        )
+        if not is_sm_100f(d.env.sm) and d.env.sm != 107:
             return _reject(
                 MoERejectReason.SM_UNSUPPORTED,
-                f"MegaMoECuteDsl requires SM100 family (SM100 or SM103); got SM{d.env.sm}.",
+                f"MegaMoECuteDsl requires SM100, SM103 or SM107; got SM{d.env.sm}.",
             )
         if p.dtype_act not in cls._SUPPORTED_ACTIVATION_DTYPES:
             return _reject(
@@ -372,10 +454,11 @@ class MegaMoECuteDsl(MoEImplBase):
                 f"MegaMoECuteDsl supports activations in "
                 f"{cls._SUPPORTED_ACTIVATION_DTYPES}, got {p.dtype_act}.",
             )
-        if p.swiglu_gptoss_style:
+        if p.swiglu_gptoss_style and not is_minimax_swiglu_bias:
             return _reject(
                 MoERejectReason.ACTIVATION_UNSUPPORTED,
-                "MegaMoECuteDsl does not support swiglu_gptoss_style.",
+                "MegaMoECuteDsl supports MiniMax-style SwigluBias without "
+                "expert bias, but not the GPT-OSS expert-bias package.",
             )
         if p.quant_algo != QuantAlgo.NVFP4:
             return _reject(
@@ -411,10 +494,12 @@ class MegaMoECuteDsl(MoEImplBase):
         # The fused path also requires the ``trtllm::cute_dsl_megamoe_nvfp4_*``
         # custom ops to be registered (strict import of every kernel symbol in
         # cute_dsl_megamoe_custom_op).
-        if p.activation_type != ActivationType.Swiglu:
+        if p.activation_type not in cls.activation_support.kinds:
+            supported = ", ".join(sorted(a.name for a in cls.activation_support.kinds))
             return _reject(
                 MoERejectReason.ACTIVATION_UNSUPPORTED,
-                f"MegaMoECuteDsl only supports ActivationType.Swiglu (got {p.activation}).",
+                f"MegaMoECuteDsl does not support activation {p.activation}; "
+                f"supported: {supported}",
             )
         if d.tp_size != 1:
             return _reject(
@@ -432,9 +517,18 @@ class MegaMoECuteDsl(MoEImplBase):
                 f"MegaMoECuteDsl requires num_slots ({d.num_slots}) "
                 f"divisible by ep_size ({d.ep_size}).",
             )
+        # The fused kernel returns a globally combined routed output. MiniMax-M3
+        # accounts for that when composing routed and shared experts; the other
+        # current model wrappers would apply a second AllReduce under TEP.
+        if d.parallel_size > 1 and not d.use_dp and not is_minimax_swiglu_bias:
+            return _reject(
+                MoERejectReason.TOPOLOGY_UNSUPPORTED,
+                "MegaMoECuteDsl supports TEP only for bias-free MiniMax-style "
+                "SwigluBias; other model compositions would reduce its already-global "
+                "routed output twice.",
+            )
         # ADP wider than EP would need an outer allgather + reducescatter
-        # wrapper that this backend does not have. Unlike MegaMoEDeepGemm, TEP
-        # itself is fine here, so only the attention-DP case is constrained.
+        # wrapper that this backend does not have.
         if d.use_dp and d.parallel_size > 1 and d.ep_size != d.parallel_size:
             return _reject(
                 MoERejectReason.TOPOLOGY_UNSUPPORTED,
@@ -467,13 +561,7 @@ class MegaMoECuteDsl(MoEImplBase):
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
         init_load_balancer: bool = False,
-        activation_type: ActivationType = ActivationType.Swiglu,
-        swiglu_limit: Optional[torch.Tensor] = None,
-        # ``activation=None`` infers Kimi K3 SiTU from the pretrained config and
-        # otherwise defaults to SwiGLU. Mirrors MegaMoEDeepGemm.
-        activation: Optional[str] = None,
-        situ_beta: Optional[float] = None,
-        situ_linear_beta: Optional[float] = None,
+        activation: MoEActivation = DEFAULT_MOE_ACTIVATION,
         **kwargs,
     ) -> None:
         # ``aux_stream_dict`` is accepted for ``create_moe_backend`` signature
@@ -493,8 +581,7 @@ class MegaMoECuteDsl(MoEImplBase):
             aux_stream_dict=None,
             weight_loading_mode=weight_loading_mode,
             layer_idx=layer_idx,
-            activation_type=activation_type,
-            swiglu_limit=swiglu_limit,
+            activation=activation,
             init_load_balancer=init_load_balancer,
         )
 
@@ -505,30 +592,13 @@ class MegaMoECuteDsl(MoEImplBase):
                 "MegaMoECuteDsl does not support apply_router_weight_on_input; "
                 "the fused kernel applies routing weights on the MoE output."
             )
-        # ``ActivationType.Swiglu`` describes the gated FC1 tensor geometry shared
-        # by SwiGLU and SiTU; the elementwise function is selected by
-        # ``activation`` below. Same reasoning as MegaMoEDeepGemm.
-        if activation_type != ActivationType.Swiglu:
-            raise ValueError(
-                f"MegaMoECuteDsl only supports ActivationType.Swiglu (got {activation_type})."
-            )
-        activation, situ_beta, situ_linear_beta = self._resolve_activation_config(
-            model_config,
-            activation=activation,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
-        )
-        self.activation = activation
-        self.situ_beta = situ_beta
-        self.situ_linear_beta = situ_linear_beta
         self.apply_router_weight_on_input = apply_router_weight_on_input
 
-        # topk-score application point. v2 default is the deepgemm graph
-        # (apply_topk_in_fc1=True): the fused kernel folds the topk score into
-        # the SwiGLU output before the fc1-out NVFP4 quant. Kept as an internal
-        # backend constant until the transformers route is GPU-validated and
-        # promoted to MoeConfig.
-        self.apply_topk_in_fc1 = True
+        # Preserve V4's pre-quantization routing weights; other models apply them after FC2.
+        self.apply_topk_in_fc1 = "DeepseekV4ForCausalLM" in (
+            getattr(model_config.pretrained_config, "architectures", None) or ()
+        )
+        self._topk_idx_dtype = torch.int32 if get_sm_version() == 107 else torch.int64
 
         # Cross-rank combine wire format is selected with
         # MEGAMOE_COMBINE_FORMAT (default bf16). It MUST be rank-identical:
@@ -547,18 +617,6 @@ class MegaMoECuteDsl(MoEImplBase):
         # MERGE lockstep sweep). Must be set identically on ALL ranks (it
         # gates collective tuning behavior).
         self.tactic_autotune = os.environ.get("MEGAMOE_TACTIC_AUTOTUNE", "0") == "1"
-
-        # SwiGLU clamp: map the model-provided per-layer ``swiglu_limit`` tensor
-        # to the kernel's codegen-time scalar ``gate_up_clamp``. The MegaMoE
-        # kernel clamps the post-fc1_alpha real gate/up, so the model value is
-        # used directly (NO trtllm-gen-style div_(fc31_alpha) normalization).
-        # Reject non-uniform / per-expert clamp: the kernel bakes one constant.
-        self.gate_up_clamp = self._resolve_gate_up_clamp(swiglu_limit)
-        if self.activation == "situ" and self.gate_up_clamp is not None:
-            raise ValueError(
-                "MegaMoECuteDsl SiTU does not support a gate/up clamp; "
-                "drop swiglu_limit for SiTU checkpoints."
-            )
 
         # Buffer sizing. MoE layers execute serially per forward; one pool
         # sized to the worst-case per-rank tokens covers every layer. The
@@ -583,6 +641,7 @@ class MegaMoECuteDsl(MoEImplBase):
         # Per-bucket symmetric providers (bucket -> MegaMoeSymmMemProvider);
         # filled in ``create_weights`` on the multi-rank EP path.
         self._symm_providers = {}
+        self._genphase_direct_input_buckets: set[int] = set()
         # Lockstep per-chunk cross-rank max for the NEXT run_moe (set via
         # ``set_adaptive_launch_tokens``); ``None`` -> full bucket.
         self._active_launch_max_tokens: Optional[int] = None
@@ -639,95 +698,23 @@ class MegaMoECuteDsl(MoEImplBase):
     # Topology
     # ------------------------------------------------------------------
     @staticmethod
-    def _resolve_activation_config(
-        model_config,
-        *,
-        activation: Optional[str],
-        situ_beta: Optional[float],
-        situ_linear_beta: Optional[float],
-    ):
-        """Resolve the elementwise activation and its SiTU constants.
-
-        ``activation=None`` infers SiTU from ``activation_situ_beta`` in the
-        pretrained config (Kimi K3 sets it) and otherwise selects SwiGLU. Kept
-        byte-for-byte equivalent to ``MegaMoEDeepGemm._resolve_activation_config``
-        so the two MegaMoE backends cannot disagree about the same checkpoint.
-        """
-        pretrained_config = getattr(model_config, "pretrained_config", None)
-        text_config = getattr(pretrained_config, "text_config", None)
-        cfg_beta = getattr(pretrained_config, "activation_situ_beta", None)
-        cfg_lbeta = getattr(pretrained_config, "activation_situ_linear_beta", None)
-        if cfg_beta is None:
-            cfg_beta = getattr(text_config, "activation_situ_beta", None)
-        if cfg_lbeta is None:
-            cfg_lbeta = getattr(text_config, "activation_situ_linear_beta", None)
-        if activation is None:
-            activation = "situ" if cfg_beta is not None else "swiglu"
-        activation = activation.lower()
-        if activation not in ("swiglu", "situ"):
-            raise ValueError(
-                f"MegaMoECuteDsl activation must be 'swiglu' or 'situ'; got {activation!r}."
-            )
-        if activation == "swiglu":
-            if situ_beta is not None or situ_linear_beta is not None:
-                raise ValueError("SiTU beta parameters require activation='situ'.")
-            return activation, None, None
-        situ_beta = cfg_beta if situ_beta is None else situ_beta
-        situ_linear_beta = cfg_lbeta if situ_linear_beta is None else situ_linear_beta
-        if situ_beta is None or situ_linear_beta is None:
-            raise ValueError(
-                "MegaMoECuteDsl SiTU requires activation_situ_beta and "
-                "activation_situ_linear_beta in the pretrained config, or explicit "
-                "situ_beta and situ_linear_beta arguments."
-            )
-        if situ_beta <= 0 or situ_linear_beta <= 0:
-            raise ValueError("MegaMoECuteDsl SiTU beta parameters must be positive.")
-        return activation, float(situ_beta), float(situ_linear_beta)
-
-    @staticmethod
-    def _resolve_gate_up_clamp(
-        swiglu_limit: Optional[torch.Tensor],
-    ) -> Optional[float]:
-        """Reduce a per-layer ``swiglu_limit`` tensor to a single codegen-time
-        ``gate_up_clamp`` float, or ``None`` when no clamp is configured.
-
-        The MegaMoE kernel bakes ``gate_up_clamp`` into the compiled kernel as
-        one scalar, so only a uniform (per-layer) clamp is representable.
-        Non-uniform / per-expert clamp is rejected with a clear ``ValueError``
-        rather than silently using one element. GPT-OSS-style clamp is rejected
-        earlier in ``can_implement`` via ``swiglu_gptoss_style``.
-        """
-        if swiglu_limit is None:
-            return None
-        if not isinstance(swiglu_limit, torch.Tensor):
-            # Accept a plain python scalar for robustness.
-            return float(swiglu_limit)
-        flat = swiglu_limit.detach().reshape(-1)
-        if flat.numel() == 0:
-            return None
-        first = flat[0]
-        if flat.numel() > 1 and not torch.allclose(flat, first.expand_as(flat), rtol=1e-5, atol=0):
-            raise ValueError(
-                "MegaMoECuteDsl only supports a uniform (per-layer) "
-                "swiglu_limit because the kernel bakes gate_up_clamp as a "
-                "codegen-time scalar; got a non-uniform / per-expert "
-                f"swiglu_limit with values {flat.cpu().tolist()}."
-            )
-        return float(first.item())
-
-    @staticmethod
     def _resolve_maxt_buckets(max_num_tokens: int) -> List[int]:
         """Resolve the adaptive ``max_tokens_per_rank`` bucket ladder.
 
-        MUST be a pure function of ``max_num_tokens`` so every EP rank derives
-        the identical ladder (divergence breaks the cross-rank NVLink barrier):
-        {256, 1024, 4096} rungs below the per-rank cap plus the cap itself.
+        Every EP rank derives the same architecture-specific ladder (divergence
+        breaks the cross-rank NVLink barrier). Rubin adds generation-phase
+        rungs through 1024; Blackwell keeps the existing 256/1024/4096 ladder.
         Kept small -- each rung multiplies the compile/capture/memory surface.
         """
         full = int(max_num_tokens)
         if full <= 0:
             full = 4096
-        cand = {b for b in (256, 1024, 4096) if b < full}
+        rungs = (
+            (32, 64, 128, 192, 256, 384, 512, 1024, 4096)
+            if get_sm_version() == 107
+            else (256, 1024, 4096)
+        )
+        cand = {b for b in rungs if b < full}
         cand.add(full)
         return sorted(cand)
 
@@ -971,6 +958,15 @@ class MegaMoECuteDsl(MoEImplBase):
         """
         return self._symm_providers.get(self._maxt_buckets[-1])
 
+    def _use_in_kernel_fc2_reduce(self, max_tokens_per_rank: int) -> bool:
+        if get_sm_version() != 107 or self.combine_format != "bf16":
+            return False
+        from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
+            _sm107_use_in_kernel_fc2_reduce,
+        )
+
+        return _sm107_use_in_kernel_fc2_reduce(max_tokens_per_rank, self.apply_topk_in_fc1)
+
     def _alloc_symm_provider(self):
         """Build-time symmetric provider allocation. See ``create_weights``.
 
@@ -983,7 +979,7 @@ class MegaMoECuteDsl(MoEImplBase):
         """
         from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
             get_megamoe_symm_provider,
-            query_megamoe_shared_workspace_bytes,
+            query_megamoe_kernel_properties,
         )
 
         if self._ep_pg is None:
@@ -996,7 +992,10 @@ class MegaMoECuteDsl(MoEImplBase):
         full_T = self._maxt_buckets[-1]
         self._profiling_scratch_provider_ref = None
         for max_T in self._maxt_buckets:
-            shared_workspace_bytes = query_megamoe_shared_workspace_bytes(
+            (
+                shared_workspace_bytes,
+                supports_direct_inputs,
+            ) = query_megamoe_kernel_properties(
                 world_size=self.ep_size,
                 num_topk=top_k,
                 num_experts_per_rank=int(self.expert_size_per_partition),
@@ -1006,9 +1005,23 @@ class MegaMoECuteDsl(MoEImplBase):
                     self.expand_intermediate_size_per_partition
                 ),
                 max_tokens_per_rank=max_T,
-                in_kernel_fc2_reduce=False,
+                apply_topk_in_fc1=bool(self.apply_topk_in_fc1),
+                gate_up_clamp=self.act_clamp,
+                swiglu_alpha=(
+                    self.act_alpha if self.activation_type is ActivationType.SwigluBias else None
+                ),
+                swiglu_beta=(
+                    self.act_beta if self.activation_type is ActivationType.SwigluBias else None
+                ),
+                situ_beta=(self.act_alpha if self.activation_type is ActivationType.SiTu else None),
+                situ_linear_beta=(
+                    self.act_beta if self.activation_type is ActivationType.SiTu else None
+                ),
+                in_kernel_fc2_reduce=self._use_in_kernel_fc2_reduce(max_T),
                 combine_format=self.combine_format,
             )
+            if supports_direct_inputs:
+                self._genphase_direct_input_buckets.add(max_T)
             provider = get_megamoe_symm_provider(
                 process_group=self._ep_pg,
                 world_size=self.ep_size,
@@ -1086,6 +1099,9 @@ class MegaMoECuteDsl(MoEImplBase):
         super().transform_weights()
 
     def cache_derived_state(self) -> None:
+        # A weights-removed reader runs materialize -> this hook and never
+        # ``post_load_weights``, so the guard cannot move there: this is the
+        # only place that pass can bind the quant method.
         if self.quant_method is None:
             self.create_weights()
         super().cache_derived_state()
@@ -1180,11 +1196,10 @@ class MegaMoECuteDsl(MoEImplBase):
     ) -> torch.Tensor:
         """Run the fused MegaMoE CuteDSL kernel on pre-quantized inputs.
 
-        Casts ``token_selected_experts`` to ``int64`` (the scheduler keeps
-        ``int32`` for the EPLB stats kernel; the MegaMoE kernel reads
-        ``topk_idx`` as Int64) and delegates the staging + kernel launch
-        to :meth:`_run_moe`, which returns the reduced ``(T, hidden)``
-        output.
+        Keeps the scheduler's ``int32`` token-selected experts on SM107 and
+        delegates the staging + kernel launch to :meth:`_run_moe`, which
+        returns the reduced ``(T, hidden)`` output. Other architectures keep
+        the existing ``int64`` kernel ABI.
         """
         del workspace  # The symmetric buffer is this backend's own workspace.
         x = ctx.x
@@ -1223,13 +1238,13 @@ class MegaMoECuteDsl(MoEImplBase):
         top_k = int(token_selected_experts.shape[-1])
         device = x.device
 
-        topk_idx_i64 = token_selected_experts.to(torch.int64).contiguous()
+        topk_idx = token_selected_experts.to(self._topk_idx_dtype).contiguous()
         topk_weights_f32 = token_final_scales.to(torch.float32).contiguous()
 
         return self._run_moe(
             x=x,
             x_sf=x_sf,
-            topk_idx=topk_idx_i64,
+            topk_idx=topk_idx,
             topk_weights=topk_weights_f32,
             weight_view=weight_view,
             num_tokens=num_tokens,
@@ -1269,7 +1284,12 @@ class MegaMoECuteDsl(MoEImplBase):
         # ``topk_idx`` defaults to -1 so dispatch_prep skips padded tail
         # rows (``if expert_id >= Int32(0):`` in dispatch_kernel.py).
         staging = {
-            "topk_idx": torch.full((max_T, top_k), -1, dtype=torch.int64, device=device),
+            "topk_idx": torch.full(
+                (max_T, top_k),
+                -1,
+                dtype=self._topk_idx_dtype,
+                device=device,
+            ),
         }
         if self.ep_size == 1:
             sf_bytes_per_row = megamoe_activation_sf_bytes_per_row(hidden)
@@ -1296,10 +1316,10 @@ class MegaMoECuteDsl(MoEImplBase):
             # Shared-workspace probe lives behind ``IS_MEGAMOE_OP_AVAILABLE``
             # in cute_dsl_megamoe_custom_op so the import stays lazy.
             from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
-                query_megamoe_shared_workspace_bytes,
+                query_megamoe_kernel_properties,
             )
 
-            shared_bytes = query_megamoe_shared_workspace_bytes(
+            shared_bytes, supports_direct_inputs = query_megamoe_kernel_properties(
                 world_size=1,
                 num_topk=top_k,
                 num_experts_per_rank=int(self.expert_size_per_partition),
@@ -1309,9 +1329,23 @@ class MegaMoECuteDsl(MoEImplBase):
                     self.expand_intermediate_size_per_partition
                 ),
                 max_tokens_per_rank=max_T,
-                in_kernel_fc2_reduce=False,
+                apply_topk_in_fc1=bool(self.apply_topk_in_fc1),
+                gate_up_clamp=self.act_clamp,
+                swiglu_alpha=(
+                    self.act_alpha if self.activation_type is ActivationType.SwigluBias else None
+                ),
+                swiglu_beta=(
+                    self.act_beta if self.activation_type is ActivationType.SwigluBias else None
+                ),
+                situ_beta=(self.act_alpha if self.activation_type is ActivationType.SiTu else None),
+                situ_linear_beta=(
+                    self.act_beta if self.activation_type is ActivationType.SiTu else None
+                ),
+                in_kernel_fc2_reduce=self._use_in_kernel_fc2_reduce(max_T),
                 combine_format=self.combine_format,
             )
+            if supports_direct_inputs:
+                self._genphase_direct_input_buckets.add(max_T)
             # zeros (not empty): the leading counter prefix is an atomic-add
             # target the kernel only tail-resets for the NEXT launch, so the
             # FIRST launch needs it pre-zeroed (one-time; cached per bucket).
@@ -1393,6 +1427,7 @@ class MegaMoECuteDsl(MoEImplBase):
         topk_weights: torch.Tensor,
         num_tokens: int,
         top_k: int,
+        stage_activation: bool,
     ) -> None:
         """Copy live rows of the user-domain inputs into the kernel's
         pre-allocated buffers and refresh the padded tail.
@@ -1423,8 +1458,9 @@ class MegaMoECuteDsl(MoEImplBase):
             bufs.topk_idx_local[num_tokens:last_T].fill_(-1)
         if num_tokens > 0:
             bufs.topk_idx_local[:num_tokens].copy_(topk_idx, non_blocking=True)
-            bufs.activation[:num_tokens].copy_(x.view(torch.uint8), non_blocking=True)
-            bufs.activation_sf[:num_tokens].copy_(x_sf.view(torch.uint8), non_blocking=True)
+            if stage_activation:
+                bufs.activation[:num_tokens].copy_(x.view(torch.uint8), non_blocking=True)
+                bufs.activation_sf[:num_tokens].copy_(x_sf.view(torch.uint8), non_blocking=True)
             bufs.topk_weights[:num_tokens, :top_k].copy_(topk_weights, non_blocking=True)
         if num_tokens < max_T:
             bufs.topk_weights[num_tokens:max_T, :top_k].zero_()
@@ -1495,6 +1531,10 @@ class MegaMoECuteDsl(MoEImplBase):
                     return provider.get_regions()
 
                 scratch_factory = _deferred_scratch_factory
+        in_kernel_fc2_reduce = self._use_in_kernel_fc2_reduce(launch_max_T)
+        if in_kernel_fc2_reduce and num_tokens > 0:
+            combine_output[:num_tokens].zero_()
+
         set_active_megamoe_profiling_scratch(
             scratch_provider.get_regions()
             if (scratch_provider is not None and world_size > 1)
@@ -1529,12 +1569,16 @@ class MegaMoECuteDsl(MoEImplBase):
                 max_tokens_per_rank=int(launch_max_T),
                 peer_offsets=peer_offsets,
                 apply_topk_in_fc1=bool(self.apply_topk_in_fc1),
-                gate_up_clamp=self.gate_up_clamp,
-                situ_beta=self.situ_beta,
-                situ_linear_beta=self.situ_linear_beta,
-                # Keep the deterministic standalone TopkReduce until form-B
-                # has dedicated GPU correctness and performance coverage.
-                in_kernel_fc2_reduce=False,
+                gate_up_clamp=self.act_clamp,
+                swiglu_alpha=(
+                    self.act_alpha if self.activation_type is ActivationType.SwigluBias else None
+                ),
+                swiglu_beta=(
+                    self.act_beta if self.activation_type is ActivationType.SwigluBias else None
+                ),
+                act_alpha=(self.act_alpha if self.activation_type is ActivationType.SiTu else None),
+                act_beta=(self.act_beta if self.activation_type is ActivationType.SiTu else None),
+                in_kernel_fc2_reduce=in_kernel_fc2_reduce,
                 combine_format=self.combine_format,
                 tactic_autotune=bool(self.tactic_autotune),
                 num_tokens=num_tokens,
@@ -1549,6 +1593,89 @@ class MegaMoECuteDsl(MoEImplBase):
         # The kernel already collapsed the top-k axis into the (T, 1, hidden)
         # output (TopkReduce form-A / REDG form-B); just drop the singleton.
         return combine_output[:num_tokens].squeeze(1).to(output_dtype)
+
+    def _prime_ladder(
+        self,
+        *,
+        live_T: int,
+        weight_view: MegaMoECuteDslWeightView,
+        top_k: int,
+        hidden: int,
+        device,
+        output_dtype: torch.dtype,
+    ) -> None:
+        """Warm-up: launch every other adaptive bucket once with zero live tokens.
+
+        Each bucket owns a compiled kernel, a local workspace and a one-time
+        barrier fence; serving never autotunes this op, so without this the
+        first chunk landing in a new bucket pays ``cute.compile`` inside a
+        serving iteration on every EP rank at once. Zero live tokens is the
+        existing scheduler-invariant path (``topk_idx == -1`` everywhere); the
+        ladder, the tuning-mode gate and the done-set are rank-identical.
+        """
+        key = (
+            tuple(self._maxt_buckets),
+            self.ep_size,
+            hidden,
+            int(self.intermediate_size_per_partition),
+            int(self.expert_size_per_partition),
+            top_k,
+            self.combine_format,
+            self.act_clamp,
+            self.act_alpha,
+            self.act_beta,
+            self.apply_topk_in_fc1,
+            str(device),
+            output_dtype,
+        )
+        if key in _MEGAMOE_PRIMED_LADDERS:
+            return
+        t0 = time.perf_counter()
+        primed = []
+        for max_T in self._maxt_buckets:
+            if max_T == live_T:
+                continue
+            bufs = self._acquire_buffers(
+                top_k=top_k,
+                hidden=hidden,
+                device=device,
+                output_dtype=output_dtype,
+                launch_max_T=max_T,
+            )
+            self._stage_inputs(
+                bufs=bufs,
+                x=None,
+                x_sf=None,
+                topk_idx=None,
+                topk_weights=None,
+                num_tokens=0,
+                top_k=top_k,
+                stage_activation=False,
+            )
+            self._launch_megamoe_kernel(
+                activation=bufs.activation,
+                activation_sf=bufs.activation_sf,
+                topk_idx=bufs.topk_idx_local,
+                topk_weights=bufs.topk_weights[:, :top_k],
+                weight_view=weight_view,
+                combine_output=bufs.combine_output,
+                shared_workspace=bufs.shared_workspace,
+                world_size=self.ep_size,
+                local_rank=self.ep_rank,
+                top_k=top_k,
+                hidden=hidden,
+                peer_offsets=bufs.peer_offsets,
+                num_tokens=0,
+                output_dtype=output_dtype,
+                launch_max_T=max_T,
+            )
+            primed.append(max_T)
+        _MEGAMOE_PRIMED_LADDERS.add(key)
+        if self.ep_rank == 0:
+            logger.info(
+                f"[MegaMoECuteDsl] primed adaptive buckets {primed} (live bucket "
+                f"{live_T}) in {time.perf_counter() - t0:.1f}s"
+            )
 
     def _run_moe(
         self,
@@ -1571,7 +1698,9 @@ class MegaMoECuteDsl(MoEImplBase):
         ``set_adaptive_launch_tokens``), capped at ``max_num_tokens``. Live
         tokens fill the first ``num_tokens`` rows and the tail is masked via
         ``topk_idx == -1`` (skipped by dispatch_kernel) and zero
-        ``topk_weights`` (combine stale-data guard).
+        ``topk_weights`` (combine stale-data guard). An exact-size genphase
+        bucket can consume the caller's inputs directly because it has no
+        padded tail and only reads its routing inputs locally.
 
         ``FusedCommMoEScheduler`` invariant 7 forces every EP rank to
         cross the NVLink barrier even with zero local tokens; only
@@ -1595,6 +1724,21 @@ class MegaMoECuteDsl(MoEImplBase):
         if num_tokens == 0 and self.ep_size == 1:
             return torch.empty((0, hidden), dtype=output_dtype, device=device)
 
+        if (
+            self.ep_size > 1
+            and not self.tactic_autotune
+            and _MEGAMOE_PRIME_LADDER
+            and AutoTuner.get().is_tuning_mode
+        ):
+            self._prime_ladder(
+                live_T=launch_max_T,
+                weight_view=weight_view,
+                top_k=top_k,
+                hidden=hidden,
+                device=device,
+                output_dtype=output_dtype,
+            )
+
         bufs = self._acquire_buffers(
             top_k=top_k,
             hidden=hidden,
@@ -1602,20 +1746,47 @@ class MegaMoECuteDsl(MoEImplBase):
             output_dtype=output_dtype,
             launch_max_T=launch_max_T,
         )
-        self._stage_inputs(
-            bufs=bufs,
-            x=x,
-            x_sf=x_sf,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
-            num_tokens=num_tokens,
-            top_k=top_k,
+        use_direct_inputs = (
+            self.ep_size > 1
+            and not self.tactic_autotune
+            and num_tokens == launch_max_T
+            and launch_max_T in self._genphase_direct_input_buckets
+            and x.shape == bufs.activation.shape
+            and x_sf.shape == bufs.activation_sf.shape
+            and x.is_contiguous()
+            and x_sf.is_contiguous()
         )
+        use_direct_routing_inputs = (
+            use_direct_inputs
+            and topk_idx.shape == (launch_max_T, top_k)
+            and topk_weights.shape == (launch_max_T, top_k)
+            and topk_idx.dtype == self._topk_idx_dtype
+            and topk_weights.dtype == torch.float32
+            and topk_idx.device == device
+            and topk_weights.device == device
+            and topk_idx.is_contiguous()
+            and topk_weights.is_contiguous()
+            and topk_idx.data_ptr() % 16 == 0
+            and topk_weights.data_ptr() % 16 == 0
+        )
+        if not use_direct_routing_inputs:
+            self._stage_inputs(
+                bufs=bufs,
+                x=x,
+                x_sf=x_sf,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
+                num_tokens=num_tokens,
+                top_k=top_k,
+                stage_activation=not use_direct_inputs,
+            )
         return self._launch_megamoe_kernel(
-            activation=bufs.activation,
-            activation_sf=bufs.activation_sf,
-            topk_idx=bufs.topk_idx_local,
-            topk_weights=bufs.topk_weights[:, :top_k],
+            activation=x if use_direct_inputs else bufs.activation,
+            activation_sf=x_sf if use_direct_inputs else bufs.activation_sf,
+            topk_idx=topk_idx if use_direct_routing_inputs else bufs.topk_idx_local,
+            topk_weights=(
+                topk_weights if use_direct_routing_inputs else bufs.topk_weights[:, :top_k]
+            ),
             weight_view=weight_view,
             combine_output=bufs.combine_output,
             shared_workspace=bufs.shared_workspace,
@@ -1628,3 +1799,7 @@ class MegaMoECuteDsl(MoEImplBase):
             output_dtype=output_dtype,
             launch_max_T=launch_max_T,
         )
+
+
+# An alias, not a base class, so there is no second class to keep in step.
+MegaMoECuteDsl = TrtllmCutedslMegaMoeNvfp4Impl

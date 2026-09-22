@@ -19,7 +19,6 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/envUtils.h"
-#include "tensorrt_llm/kernels/heuristicTopKDecode.h"
 #include "tensorrt_llm/kernels/noAuxTcKernels.h"
 #include <algorithm>
 #include <cfloat>
@@ -718,105 +717,19 @@ constexpr int kMaxBlocksPerRowDecode = 10;
 // one full histogram pass worth of columns.
 constexpr int kDecodeMinColsPerSubBlock = kNumBins;
 
-// Scheme X bound calculator — shared between fp32 and bf16/fp16 dispatchers.
-// Caches hardware attrs (SM count, L2 capacity) and the small-N threshold
-// once per process via std::call_once. Per-call cost is just two reads
-// from cached static variables plus a small arithmetic block, no syscalls.
-struct SchemeXBounds
-{
-    int smCount;
-    int l2Bytes;
-    int kBsWave;
-    int kBsL2;
-    int kBsLarge;
-    int kSeqSmall;
-};
-
-// Uniform small-N lower bound for the Heuristic GVR path across all K.
-// Aligns the GVR routing boundary with the Radix multi-CTA split-work
-// threshold (maxByCols = N / kDecodeMinColsPerSubBlock(=2048) ≥ 2 at
-// N ≥ 4096), so the dispatcher's algorithmic-handoff point is consistent:
-// below 4096 the Radix path resolves to single-CTA insertion-sort and GVR
-// is not attempted; at or above 4096 GVR may be considered.
-// DSv4 swe-bench synth sweeps on B200/B300 (V3.2-Q19c protocol, May 2026):
-//   N=4K cells across K ∈ {512, 1024, 2048} all win — GVR R/H bf16 = 3.07×
-//   (K=512) / 2.57× (K=1024) / 1.34× (K=2048).
-//   N=2K cells across the same 9 (K × dtype) combos all show GVR R/H < 1
-//   (0.55× – 0.84×), justifying 4K as the floor.
-inline int kSeqSmallDefaultForK(int /*topK*/)
-{
-    return 4096;
-}
-
-inline SchemeXBounds getSchemeXBounds(int numColumns, int bytesPerElem, int topK)
+// Cached device SM count for the wave-aware blocks-per-row dispatch below.
+inline int getDeviceSmCount()
 {
     static std::once_flag sOnce;
     static int sSm = 0;
-    static int sL2 = 0;
-    // -----------------------------------------------------------------------
-    // Diagnostic / tuning escape-hatch env overrides. Both are OFF by default
-    // and the K-aware / hardware-derived defaults below are expected to be
-    // optimal for production. Use only for microbenchmarks, regression
-    // bisection, or workload-specific tuning where the defaults are clearly
-    // suboptimal.
-    //
-    //   TRTLLM_HEURISTIC_NMIN (valid range [1024, 200000])
-    //     Overrides `kSeqSmall` (Heuristic small-N threshold) for ALL K.
-    //     Lower risk: only shifts a perf threshold; the kernel still
-    //     produces an exact top-K either way. Setting it too low routes
-    //     more N → Heuristic and may be slower than the fallback for
-    //     small N; correctness is preserved.
-    //
-    //   TRTLLM_HEURISTIC_BSMAX (valid range [1, 65536])
-    //     Overrides `kBsLarge` (BS upper bound for Heuristic) past the
-    //     hardware-derived min(kBsWave, kBsL2). Higher risk: bypasses
-    //     L2/occupancy safety bounds, so heuristic may run in working-set
-    //     ranges where it has not been tuned (L2 thrash, suboptimal grid
-    //     configs). Primary use is indexer microbenchmarks that need a
-    //     BS-scaling comparison against the Radix path on identical inputs.
-    // -----------------------------------------------------------------------
-    // sNMinEnv > 0 iff TRTLLM_HEURISTIC_NMIN is set to a valid value. When set,
-    // it overrides the per-K default for ALL K.
-    static int sNMinEnv = 0;
-    static int sBsMax = 0;
     std::call_once(sOnce,
         []()
         {
             int dev = 0;
             cudaGetDevice(&dev);
             cudaDeviceGetAttribute(&sSm, cudaDevAttrMultiProcessorCount, dev);
-            cudaDeviceGetAttribute(&sL2, cudaDevAttrL2CacheSize, dev);
-            char const* env = std::getenv("TRTLLM_HEURISTIC_NMIN");
-            if (env != nullptr)
-            {
-                int const v = std::atoi(env);
-                sNMinEnv = (v >= 1024 && v <= 200000) ? v : 0;
-            }
-            char const* env_bsmax = std::getenv("TRTLLM_HEURISTIC_BSMAX");
-            if (env_bsmax != nullptr)
-            {
-                int const v = std::atoi(env_bsmax);
-                sBsMax = (v >= 1 && v <= 65536) ? v : 0;
-            }
         });
-
-    SchemeXBounds b;
-    b.smCount = sSm;
-    b.l2Bytes = sL2;
-    b.kBsWave = (sSm > 0) ? (sSm * 3 - sSm / 8) : 426;
-    b.kBsL2 = (sL2 > 0 && numColumns > 0)
-        ? static_cast<int>(static_cast<int64_t>(sL2) * 9 / 10 / (static_cast<int64_t>(numColumns) * bytesPerElem))
-        : b.kBsWave;
-    b.kBsLarge = std::min(b.kBsWave, b.kBsL2 > 0 ? b.kBsL2 : b.kBsWave);
-    if (sBsMax > 0)
-    {
-        // BSMAX env override bypasses the hardware-derived L2/occupancy bound
-        // (see the BSMAX section in the call_once block above for risk notes).
-        b.kBsLarge = sBsMax;
-    }
-    // NMIN env override (if set) wins over the per-K default for ALL K.
-    b.kSeqSmall = (sNMinEnv > 0) ? sNMinEnv : kSeqSmallDefaultForK(topK);
-    return b;
+    return sSm;
 }
 
 } // namespace
@@ -838,12 +751,8 @@ int computeIndexerTopKDecodeBlocksPerRow(int numRows, int numColumns, int splitW
 
     // Query the actual SM count from the driver so the dispatch tracks the
     // hardware rather than a baked-in target (H100=132, B200=148, …).
-    // topK=0: blocks-per-row computation is K-agnostic; kSeqSmall is uniform
-    // 4096 across K, so the topK arg is unused for the kSeqSmall lookup as
-    // well, and only smCount/kBsWave/kBsL2 are consumed here.
-    auto const bounds = getSchemeXBounds(numColumns, /*bytesPerElem=*/4, /*topK=*/0);
-    TLLM_CHECK_WITH_INFO(bounds.smCount > 0, "indexerTopK: failed to query device SM count");
-    int const smCount = bounds.smCount;
+    int const smCount = getDeviceSmCount();
+    TLLM_CHECK_WITH_INFO(smCount > 0, "indexerTopK: failed to query device SM count");
     int const maxByCols = std::max(1, numColumns / kDecodeMinColsPerSubBlock);
     int const maxBp = std::min(maxByCols, kMaxBlocksPerRowDecode);
 
@@ -889,110 +798,9 @@ int computeIndexerTopKDecodeBlocksPerRow(int numRows, int numColumns, int splitW
 
 void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indices, float* outLogitsAux,
     int* outIndicesAux, int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0,
-    int const stride1, int const next_n, int const topK, int const* preIdx, int const preIdxStride,
-    int const preIdxCount, float* heuristicScratch, int const compressRatio, cudaStream_t const stream)
+    int const stride1, int const next_n, int const topK, int const compressRatio, cudaStream_t const stream)
 {
     constexpr int kNumThreadsPerBlock = 512;
-    int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : kDefaultSplitWorkThreshold;
-
-    // ========================================================================
-    // Small-N dispatch axis.
-    //
-    // GVR Heuristic Top-K has a *fixed* per-launch overhead from Phase-1
-    // (preIdx stats reduction over M=2048) and Phase-4 (2048-bin histogram
-    // snap), totaling ~11 µs regardless of N. For small N (≤16K), this
-    // fixed cost dominates and the kernel loses to the existing
-    // insertion-sort/radix path. Empirically (random data, B200 BS=1):
-    //   N=8192   : Heuristic 16.5 µs vs Radix 11.2 µs (radix 1.47× faster)
-    //   N=16384  : Heuristic 21.9 µs vs Radix 22.0 µs (parity)
-    //   N=32768  : Heuristic 26.1 µs vs Radix 32.9 µs (heuristic 1.26× faster)
-    //   N=131072 : Heuristic 43.4 µs vs Radix 76.1 µs (heuristic 1.75× faster)
-    //
-    // Route N < kSeqSmall to the existing Radix/Insertion path (which itself
-    // splits at kSortingAlgorithmThreshold=12288). kSeqSmall is set at the
-    // empirical crossover point.
-    //
-    // ========================================================================
-    // Architecture-derived BS-threshold dispatch — jointly bounded by
-    // occupancy AND L2 cache capacity.
-    //
-    // Two physical constraints bound when the per-row heuristic kernel
-    // remains faster than a radix streaming kernel:
-    //
-    //   (A) Occupancy bound — 3·SM − SM/8 (wave geometry + setup margin)
-    //        Each CTA uses ~58 KB SMEM (fixed, independent of N), so B200's
-    //        228 KB dynamic SMEM allows max 3 CTA/SM. Above 3·SM rows per
-    //        launch, tail-wave imbalance causes stragglers. The -SM/8 margin
-    //        (~1/8 wave) covers CTA setup + L2 ingestion overhead.
-    //        On B200(148 SM): 3×148 − 18 = 426.
-    //
-    //   (B) L2 cache bound — 0.9·L2 / (4·N) per-CTA logits fit
-    //        Each CTA streams its row (N×4B) through L2 per Phase-2 iter.
-    //        With num_concurrent_CTAs × N × 4B > L2, eviction dominates.
-    //        On B200(126 MB L2) with N=70K: 0.9·126MB/(4·70690) ≈ 440,
-    //        which is ~ equal to (A)=426 — the two constraints cross over
-    //        near the SWE-Bench data point.
-    //        For N > 73K the L2 bound tightens below (A) and must take
-    //        over; e.g. N=128K → kBsL2=238, N=196K → kBsL2=155.
-    //
-    // Dispatch threshold = min(kBsWave, kBsL2), still data-agnostic (only
-    // queries hardware attrs). At N≈70K both bounds produce ~426, so the
-    // L2 axis is a no-op there; for larger N it auto-tightens the threshold.
-    //
-    // Small-N lower bound `kSeqSmall` is uniform 4096 across all K (see
-    // kSeqSmallDefaultForK). 4K is the dispatcher's algorithmic-handoff
-    // point: below 4096 the Radix path resolves to single-CTA insertion-sort
-    // (maxByCols = N/2048 = 1 → bp=1; useRadixSort = N≥12288 = false), and
-    // GVR is empirically slower than insertion-sort below 4K across all
-    // K ∈ {512, 1024, 2048} × dtype ∈ {fp32, bf16, fp16} (R/H ∈ [0.55, 0.84]
-    // at N=2K; DSv4 V3.2-Q19c synth sweeps May 2026). Configurable via
-    // TRTLLM_HEURISTIC_NMIN env (>=1024), which overrides the default.
-    // ========================================================================
-    auto const bounds = getSchemeXBounds(numColumns, /*bytesPerElem=*/4, topK);
-    int const kBsWave = bounds.kBsWave;
-    int const kBsL2 = bounds.kBsL2;
-    int const kBsLarge = bounds.kBsLarge;
-    int const kSeqSmall = bounds.kSeqSmall;
-
-    bool const isSupportedTopK = (topK == 512 || topK == 1024 || topK == 2048);
-    // compressRatio == 1: DSv3.2 indexer (no compressor).
-    // compressRatio == 4: DSv4 indexer (overlap compressor); logits/preIdx in
-    //   compressed-token-index space. Kernel handles N = actual_kv_len/cr and
-    //   forces preIdxOffset=0 internally for cr != 1.
-    bool const compressRatioOk = (compressRatio == 1 || compressRatio == 4);
-    bool const canUseHeuristic = compressRatioOk && preIdx != nullptr && stride1 == 1 && isSupportedTopK
-        && preIdxCount == topK && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold
-        && numColumns >= kSeqSmall && heuristicScratch != nullptr && numRows < kBsLarge;
-
-    // Optional env-gated dispatch trace (set TRTLLM_SCHEMEX_DEBUG=1 to enable)
-    {
-        static std::once_flag sDebugOnceFlag;
-        static bool sDebug = false;
-        std::call_once(sDebugOnceFlag,
-            []()
-            {
-                char const* env = std::getenv("TRTLLM_SCHEMEX_DEBUG");
-                sDebug = (env != nullptr && env[0] == '1');
-            });
-        if (sDebug)
-        {
-            fprintf(stderr,
-                "[Scheme X] numRows=%d numColumns=%d kBsWave=%d kBsL2=%d kBsLarge=%d kSeqSmall=%d smCount=%d "
-                "L2=%dMB -> %s path%s\n",
-                numRows, numColumns, kBsWave, kBsL2, kBsLarge, kSeqSmall, bounds.smCount,
-                bounds.l2Bytes / (1024 * 1024), canUseHeuristic ? "Heuristic" : "Radix",
-                (numColumns < kSeqSmall) ? " (small-N route)" : "");
-        }
-    }
-
-    if (canUseHeuristic)
-    {
-        launchHeuristicTopKDecode(logits, seqLens, preIdx, indices, heuristicScratch, stride0, next_n, topK,
-            preIdxStride, preIdxCount, numRows, compressRatio, stream);
-        sync_check_cuda_error(stream);
-        return;
-    }
-
     int const blocksPerRow = computeIndexerTopKDecodeBlocksPerRow(numRows, numColumns, splitWorkThreshold);
 
     cudaLaunchAttribute attrs[1];
@@ -1052,13 +860,7 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
 // ============================================================================
 // bf16 / fp16 dispatcher overloads
 // ============================================================================
-// Reuses the BS-threshold + small-N dispatch axes (kBsLarge, kSeqSmall) from
-// the fp32 dispatcher, except kBsL2 uses sizeof(InputT) bytes/element instead
-// of 4 — L2 footprint is half, so bf16/fp16 path remains valid for larger BS
-// than fp32 at the same N.
-//
-// Fallback chain when GVR-Heuristic preconditions are not met (preIdx
-// missing, BS too large, or numColumns < kSeqSmall):
+// Dispatch chain:
 //   numColumns < kSortingAlgorithmThreshold (12288)            → insertion sort
 //   kSortingAlgorithmThreshold ≤ numColumns < splitWorkThreshold → radix sort
 //   numColumns ≥ splitWorkThreshold (200K default)             → unsupported
@@ -1078,8 +880,7 @@ namespace
 template <typename InputT>
 void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
     int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n, int const topK,
-    int const* preIdx, int const preIdxStride, int const preIdxCount, InputT* heuristicScratch, int const compressRatio,
-    cudaStream_t const stream)
+    int const compressRatio, cudaStream_t const stream)
 {
     static_assert(std::is_same_v<InputT, __nv_bfloat16> || std::is_same_v<InputT, __half>,
         "invokeIndexerTopKDecodeDtype is for bf16/fp16 only");
@@ -1087,25 +888,7 @@ void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int*
     constexpr int kNumThreadsPerBlock = 512;
     int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : kDefaultSplitWorkThreshold;
 
-    // bf16/fp16: bytes_per_element = sizeof(InputT) = 2 → kBsL2 doubles vs fp32.
-    // K-aware kSeqSmall — see fp32 dispatcher for rationale.
-    auto const bounds = getSchemeXBounds(numColumns, /*bytesPerElem=*/static_cast<int>(sizeof(InputT)), topK);
-    int const kBsLarge = bounds.kBsLarge;
-    int const kSeqSmall = bounds.kSeqSmall;
-
-    bool const isSupportedTopK = (topK == 512 || topK == 1024 || topK == 2048);
-    // See fp32 path: cr==1 (V3.2) and cr==4 (V4 indexer) are both supported.
-    bool const compressRatioOk = (compressRatio == 1 || compressRatio == 4);
-    bool const canUseHeuristic = compressRatioOk && preIdx != nullptr && stride1 == 1 && isSupportedTopK
-        && preIdxCount == topK && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold
-        && numColumns >= kSeqSmall && heuristicScratch != nullptr && numRows < kBsLarge;
-
-    if (canUseHeuristic)
-    {
-        launchHeuristicTopKDecode(logits, seqLens, preIdx, indices, heuristicScratch, stride0, next_n, topK,
-            preIdxStride, preIdxCount, numRows, compressRatio, stream);
-    }
-    else if (numColumns < kSortingAlgorithmThreshold)
+    if (numColumns < kSortingAlgorithmThreshold)
     {
         // Insertion sort path — InputT propagated; histogram/sort run on float keys.
         auto* kernel_instance = &topKPerRowDecode<kNumThreadsPerBlock, /*useRadixSort=*/false,
@@ -1161,20 +944,18 @@ void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int*
 
 void invokeIndexerTopKDecode(__nv_bfloat16 const* logits, int const* seqLens, int* indices,
     int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0, int const stride1,
-    int const next_n, int const topK, int const* preIdx, int const preIdxStride, int const preIdxCount,
-    __nv_bfloat16* heuristicScratch, int const compressRatio, cudaStream_t const stream)
+    int const next_n, int const topK, int const compressRatio, cudaStream_t const stream)
 {
     invokeIndexerTopKDecodeDtype<__nv_bfloat16>(logits, seqLens, indices, splitWorkThreshold, numRows, numColumns,
-        stride0, stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch, compressRatio, stream);
+        stride0, stride1, next_n, topK, compressRatio, stream);
 }
 
 void invokeIndexerTopKDecode(__half const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
     int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n, int const topK,
-    int const* preIdx, int const preIdxStride, int const preIdxCount, __half* heuristicScratch, int const compressRatio,
-    cudaStream_t const stream)
+    int const compressRatio, cudaStream_t const stream)
 {
     invokeIndexerTopKDecodeDtype<__half>(logits, seqLens, indices, splitWorkThreshold, numRows, numColumns, stride0,
-        stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch, compressRatio, stream);
+        stride1, next_n, topK, compressRatio, stream);
 }
 
 void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int const* rowEnds, int* indices,
@@ -1197,17 +978,6 @@ void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int con
     }
 
     sync_check_cuda_error(stream);
-}
-
-bool canIndexerTopKDecodeUseGvr(int numRows, int numColumns, int topK, int bytesPerElem)
-{
-    bool const isSupportedTopK = (topK == 512 || topK == 1024 || topK == 2048);
-    if (!isSupportedTopK)
-    {
-        return false;
-    }
-    auto const bounds = getSchemeXBounds(numColumns, bytesPerElem, topK);
-    return numColumns >= bounds.kSeqSmall && numColumns < kDefaultSplitWorkThreshold && numRows < bounds.kBsLarge;
 }
 
 } // namespace kernels

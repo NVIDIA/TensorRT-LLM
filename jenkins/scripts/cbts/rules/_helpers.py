@@ -91,14 +91,14 @@ def iter_diff_changes(diff: str) -> Iterator[tuple[str, str]]:
 
 
 def iter_diff_post_line_numbers(diff: str) -> set[int]:
-    """Post-PR line numbers (1-indexed) touched by `+` or `-` lines.
+    """Post-PR line numbers touched by non-blank, non-comment `+` or `-` lines.
 
     `+` lines mark their own line; `-` lines anchor at the next post-PR
     line. Hunk headers reset the cursor; context lines advance it.
     """
     out: set[int] = set()
     new_line = 0
-    for line in diff.splitlines():
+    for line in strip_noop_diff_lines(diff).splitlines():
         m = _HUNK_HEADER_RE.match(line)
         if m is not None:
             new_line = int(m.group(1))
@@ -112,6 +112,25 @@ def iter_diff_post_line_numbers(diff: str) -> set[int]:
         elif sign == "-":
             out.add(new_line)
         else:
+            new_line += 1
+    return out
+
+
+def iter_diff_deleted_post_lines(diff: str) -> dict[int, list[str]]:
+    """Return non-blank, non-comment deleted lines grouped by post-image anchor."""
+    out: dict[int, list[str]] = {}
+    new_line = 0
+    for line in strip_noop_diff_lines(diff).splitlines():
+        m = _HUNK_HEADER_RE.match(line)
+        if m is not None:
+            new_line = int(m.group(1))
+            continue
+        if not line or line.startswith(("+++", "---")):
+            continue
+        sign = line[0]
+        if sign == "-":
+            out.setdefault(new_line, []).append(line[1:])
+        elif sign in (" ", "+"):
             new_line += 1
     return out
 

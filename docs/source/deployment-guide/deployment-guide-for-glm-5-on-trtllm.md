@@ -39,9 +39,16 @@ The following checkpoints are available:
 
 > **Note on checkpoint naming:** For GLM-5.3 the base repository (`zai-org/GLM-5.3`) contains the FP8 weights and the BF16 weights live in the `-BF16` repository. This is the reverse of GLM-5 and GLM-5.2, where the base repositories ([zai-org/GLM-5](https://huggingface.co/zai-org/GLM-5), [zai-org/GLM-5.2](https://huggingface.co/zai-org/GLM-5.2)) are BF16 and the FP8 weights live in the `-FP8` repositories ([zai-org/GLM-5-FP8](https://huggingface.co/zai-org/GLM-5-FP8), [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8)). Check the `quantization_config` in the checkpoint's `config.json` if in doubt.
 
+Pick a host directory for the checkpoints and make sure your user can write to it. Use
+this same directory for the `-v <host_models_dir>:/models` mount in the `docker run`
+step below, so that the checkpoint appears at `/models/GLM-5.3` inside the container.
+
 ```bash
+export HOST_MODELS_DIR=/path/to/your/models
+mkdir -p "$HOST_MODELS_DIR"
+
 git lfs install
-git clone https://huggingface.co/zai-org/GLM-5.3 /models/GLM-5.3
+git clone https://huggingface.co/zai-org/GLM-5.3 "$HOST_MODELS_DIR/GLM-5.3"
 ```
 
 ## MoE Backend Support Matrix
@@ -66,7 +73,7 @@ docker run --rm -it \
     --ipc=host \
     --gpus all \
     -p 8000:8000 \
-    -v /path/to/your/models:/models \
+    -v "$HOST_MODELS_DIR":/models \
     --name tensorrt_llm \
     nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc25 \
     /bin/bash

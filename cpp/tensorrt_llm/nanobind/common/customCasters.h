@@ -19,8 +19,8 @@
 
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/common/optionalRef.h"
+#include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
-#include "tensorrt_llm/runtime/samplingConfig.h"
 #include "tensorrt_llm/runtime/torch.h"
 #include "tensorrt_llm/runtime/torchView.h"
 

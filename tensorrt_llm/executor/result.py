@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import dataclasses
 import json
@@ -125,6 +128,7 @@ class CompletionOutput:
         token_ids_diff (List[int]): Newly generated token ids.
         logprobs_diff (TokenLogprobs | SimpleTokenLogprobs): Logprobs of newly generated tokens.
         text_diff (str): Newly generated tokens.
+        routed_experts (Optional[torch.Tensor]): Per-token pre-EPLB logical top-k MoE expert ids (Router Replay / R3), or None when not requested.
     """
     index: int
     text: str = ""
@@ -154,9 +158,48 @@ class CompletionOutput:
     # the result of result_handler passed to postprocess workers
     _postprocess_result: Any = None
 
+    def __getstate__(self) -> dict:
+        # _incremental_states holds a tokenizers.DecodeStream (a Rust object,
+        # not picklable) used for process-local incremental detokenization.
+        # Receivers never need it, so drop it when this output crosses a
+        # process boundary — e.g. a PostprocWorker streaming a raw
+        # CompletionOutput (no postproc_params) back over IPC.
+        # Built explicitly from __slots__ (walking the MRO) rather than via
+        # object.__getstate__, which does not exist on Python 3.10.
+        state = {
+            name: getattr(self, name)
+            for klass in type(self).__mro__
+            for name in getattr(klass, "__slots__", ()) if hasattr(self, name)
+        }
+        state["_incremental_states"] = None
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        for name, value in state.items():
+            object.__setattr__(self, name, value)
+
     @property
     def length(self) -> int:
         return len(self.token_ids)
+
+    @property
+    def routed_experts(self) -> Optional[torch.Tensor]:
+        """Per-token pre-EPLB logical top-k MoE expert ids (Router Replay / R3).
+
+        Shape ``[seq_len - 1, num_moe_layers, top_k]`` when requested via
+        ``SamplingParams.return_routed_experts`` (with the engine-level
+        ``enable_return_routed_experts``); ``None`` otherwise. Surfaced from
+        ``additional_generation_outputs["routed_experts"]``.
+        """
+        outs = self.additional_generation_outputs
+        if not outs or "routed_experts" not in outs:
+            return None
+        val = outs["routed_experts"]
+        if isinstance(val, (list, tuple)):
+            if not val:
+                return None
+            return val[0] if len(val) == 1 else torch.cat(list(val), dim=0)
+        return val
 
     @property
     def text_diff(self) -> str:

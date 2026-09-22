@@ -13,7 +13,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend.trtllm import TrtllmAttentionMetadata
+from ..attention.backends.trtllm import TrtllmAttentionMetadata
 from ..distributed import Distributed
 from ..memory_buffer_utils import Buffers, get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
@@ -27,6 +27,7 @@ from .llm_request import LlmRequest, get_draft_token_length
 from .resource_manager import (BaseResourceManager, ResourceManager,
                                ResourceManagerType)
 from .sampler import SampleStateTensors
+from .sampler.sampler_common import SampleType
 from .scheduler import ScheduledRequests
 
 # A large prime number used for dummy request IDs to avoid collisions
@@ -38,12 +39,23 @@ CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
 ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM = 2
 
 
+def get_mrope_dummy_seq_slot(max_num_tokens: int, pp_size: int) -> int:
+    """Cache slot index reserved for MRoPE dummy/no-delta requests."""
+    return max_num_tokens * pp_size
+
+
 class KeyType(NamedTuple):
     batch_size: int
     draft_len: int
     is_first_draft: bool
     short_seq_len_mode: bool = False
     is_all_greedy_sample: bool = True
+    # Sampling tier captured into this graph. FULL means the graph carries no
+    # sampling at all and the sampler runs eagerly after the forward, which is
+    # what every graph holds unless enable_in_graph_sampling is set; FAST means the
+    # sampling kernels are part of the graph. The two record different kernel
+    # sequences, so they cannot share a graph.
+    sample_type: SampleType = SampleType.FULL
     # Primarily used for mixed batches of encoder-decoder models.
     num_contexts: int = 0
     context_query_len: int = 0
@@ -125,6 +137,7 @@ class CUDAGraphRunnerConfig:
     dynamic_draft_len_mapping: Optional[Dict[int, int]] = None
     sparse_attention_config: Optional[BaseSparseAttentionConfig] = None
     enable_encoder_decoder_mixed_cuda_graph: bool = False
+    enable_in_graph_sampling: bool = False
 
 
 class CUDAGraphRunner:
@@ -151,6 +164,13 @@ class CUDAGraphRunner:
         self.is_encoder_decoder = config.is_encoder_decoder
         self.enable_encoder_decoder_mixed_cuda_graph = (
             config.enable_encoder_decoder_mixed_cuda_graph)
+        self.enable_in_graph_sampling = config.enable_in_graph_sampling
+        # Set by the engine while capturing an in-graph sampling tier pass.
+        self._capture_sample_type: Optional[SampleType] = None
+        # Resolves a runtime batch to its tier; registered by the engine so the
+        # graph runner does not need to know about the sampler.
+        self._sample_type_resolver: Optional[Callable[
+            [ScheduledRequests, Optional[SampleType]], SampleType]] = None
 
         self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
         self.graph_outputs: Dict[KeyType,
@@ -244,6 +264,22 @@ class CUDAGraphRunner:
                 or (self.enable_encoder_decoder_mixed_cuda_graph
                     and self._is_mixed_encoder_decoder_batch(batch)))
 
+    def _gather_adp_graph_batch_info(self, batch: ScheduledRequests,
+                                     can_run_cuda_graph: bool,
+                                     sample_type: SampleType):
+        """Return ``[(can_run_cuda_graph, batch_size, sample_type)]`` per TP rank.
+
+        One fixed-size exchange, entered by every rank unconditionally. The
+        sampling tier rides along because it is part of the graph key: ranks
+        that resolved different tiers would otherwise replay different graphs.
+        """
+        gathered = self.config.dist.tp_allgather_int64(
+            [bool(can_run_cuda_graph), batch.batch_size, sample_type.value])
+        flags = gathered[:, 0].astype(bool).tolist()
+        sizes = gathered[:, 1].tolist()
+        tiers = gathered[:, 2].tolist()
+        return list(zip(flags, sizes, tiers))
+
     def _get_seq_len_mode(
         self,
         batch: ScheduledRequests,
@@ -318,6 +354,7 @@ class CUDAGraphRunner:
         promoted_context_request_ids: frozenset[int] = frozenset(),
         peft_cache_data_type: Optional[torch.dtype] = None,
         use_lora_graph: bool = False,
+        forced_sample_type: Optional[SampleType] = None,
     ) -> Optional[KeyType]:
         batch_size = batch.batch_size
 
@@ -334,6 +371,14 @@ class CUDAGraphRunner:
         is_all_greedy_sample = bool(
             getattr(spec_metadata, "is_all_greedy_sample", True))
 
+        # Sampling tier this graph must contain. Only meaningful when the fast
+        # sampler is enabled; otherwise it stays FULL so every batch shares one
+        # graph and sampling runs eagerly after the forward, as before.
+        # Under attention DP the caller has already agreed a tier across ranks.
+        sample_type = (forced_sample_type if forced_sample_type is not None
+                       else self._resolve_sample_type(
+                           batch, promoted_context_request_ids))
+
         if self.config.is_draft_model and spec_resource_manager is not None and isinstance(
                 spec_resource_manager, Eagle3ResourceManager):
             # If 'is_first_draft' is True, even with tree decoding, the length of draft_len will only be 'max_draft_len', not 'max_total_draft_token'.
@@ -344,6 +389,7 @@ class CUDAGraphRunner:
                           is_first_draft=spec_resource_manager.is_first_draft,
                           short_seq_len_mode=short_seq_len_mode,
                           is_all_greedy_sample=is_all_greedy_sample,
+                          sample_type=sample_type,
                           peft_cache_data_type=peft_cache_data_type,
                           use_lora_graph=use_lora_graph)
         else:
@@ -372,12 +418,54 @@ class CUDAGraphRunner:
                           is_first_draft=False,
                           short_seq_len_mode=short_seq_len_mode,
                           is_all_greedy_sample=is_all_greedy_sample,
+                          sample_type=sample_type,
                           num_contexts=num_contexts,
                           context_query_len=context_query_len,
                           num_encoder_tokens=num_encoder_tokens,
                           peft_cache_data_type=peft_cache_data_type,
                           use_lora_graph=use_lora_graph)
         return key
+
+    def set_capture_sample_type(self,
+                                sample_type: Optional[SampleType]) -> None:
+        """Pin the tier captured by the current pass; None restores runtime resolution."""
+        self._capture_sample_type = sample_type
+
+    def register_sample_type_resolver(
+        self,
+        resolver: Optional[Callable[[ScheduledRequests, Optional[SampleType]],
+                                    SampleType]]
+    ) -> None:
+        """Register how a runtime batch maps to its sampling tier."""
+        self._sample_type_resolver = resolver
+
+    def _resolve_sample_type(
+        self,
+        batch: ScheduledRequests,
+        promoted_context_request_ids: frozenset[int] = frozenset()
+    ) -> SampleType:
+        """Sampling tier the graph for this batch must contain.
+
+        FULL when in-graph sampling is off, so the key -- and the graphs it
+        selects -- match the pre-tier engine.
+
+        Only resolves; the buffers the in-graph step reads are staged later, by
+        the engine, once it has settled which batch the forward runs on. The
+        tier has to be known here because it is part of the key that decides
+        which graph is replayed.
+        """
+        if not self.config.enable_in_graph_sampling or self._sample_type_resolver is None:
+            return SampleType.FULL
+        # A promoted final-context row is a generation request in the execution
+        # view but not in the batch the sampler is handed, so those steps are
+        # staged FULL and sampled eagerly. Resolve FULL too, or the key would
+        # ask for a FAST graph whose sampling kernels then never run.
+        if promoted_context_request_ids:
+            return SampleType.FULL
+        # During a capture pass the tier is pinned, so the graph records that
+        # tier's kernels rather than the one the all-dummy warmup batch would
+        # resolve to on its own.
+        return self._sample_type_resolver(batch, self._capture_sample_type)
 
     def _get_compatible_mixed_encoder_decoder_key(self,
                                                   key: KeyType) -> KeyType:
@@ -459,9 +547,17 @@ class CUDAGraphRunner:
         is_mixed_encoder_decoder = self._is_mixed_encoder_decoder_batch(batch)
         can_run_cuda_graph = self._can_run_cuda_graph_batch(batch)
         batch_size = batch.batch_size
+        # The sampling tier joins the graph key, so it has to agree across the
+        # attention-DP ranks or they would replay different graphs -- the same
+        # reason can_run_cuda_graph and batch_size are all-gathered here. Ranks
+        # see different batches (an idle one resolves FULL), so fall back to
+        # FULL for the whole group unless every rank picked the same tier.
+        forced_sample_type: Optional[SampleType] = None
         if self.enabled and self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
-            graph_batch_info = self.config.dist.tp_allgather(
-                [can_run_cuda_graph, batch_size], small_payload=True)
+            local_sample_type = self._resolve_sample_type(
+                batch, promoted_context_request_ids)
+            graph_batch_info = self._gather_adp_graph_batch_info(
+                batch, can_run_cuda_graph, local_sample_type)
             all_can_run_cuda_graph = all(rank_info[0]
                                          for rank_info in graph_batch_info)
             all_batch_sizes_equal = all(rank_info[1] == graph_batch_info[0][1]
@@ -469,6 +565,10 @@ class CUDAGraphRunner:
 
             if not all_can_run_cuda_graph or not all_batch_sizes_equal:
                 return None, None, None
+
+            forced_sample_type = (local_sample_type if all(
+                rank_info[2] == graph_batch_info[0][2]
+                for rank_info in graph_batch_info) else SampleType.FULL)
 
         if not self.enabled or not can_run_cuda_graph:
             return None, None, None
@@ -485,7 +585,8 @@ class CUDAGraphRunner:
         key = self.get_graph_key(batch, new_tensors_device,
                                  spec_resource_manager, spec_metadata,
                                  promoted_context_request_ids,
-                                 peft_cache_data_type, use_lora_graph)
+                                 peft_cache_data_type, use_lora_graph,
+                                 forced_sample_type)
         if key is None:
             return None, None, None
         if is_mixed_encoder_decoder:
@@ -627,15 +728,6 @@ class CUDAGraphRunner:
             "spec_metadata": initial_inputs.get("spec_metadata", None),
         }
 
-        def _setup_spec_decoding_and_forward(key: KeyType, forward_fn: Callable,
-                                             capture_inputs: Dict[str, Any]):
-            is_first_draft = key.is_first_draft
-            needs_kv_cache_recompute = True if enable_spec_decode and self.config.spec_config.spec_dec_mode.needs_kv_cache_recompute(
-            ) else False
-            if is_first_draft and self.config.is_draft_model and needs_kv_cache_recompute:
-                capture_inputs['attn_metadata'].use_spec_decoding = True
-            return forward_fn(capture_inputs)
-
         output = None
         with with_multi_stream(True), piecewise_cuda_graph(False):
             # We have to do a warmup run to initialize PyTorch's internal
@@ -644,8 +736,7 @@ class CUDAGraphRunner:
             # This also lets us initialize states in the attn_metadata and
             # resize the shared attention workspace before any graph is captured.
             for _ in range(self.WARMUP_STEPS):
-                output = _setup_spec_decoding_and_forward(
-                    key, forward_fn, capture_inputs)
+                output = forward_fn(capture_inputs)
                 if postprocess_fn is not None:
                     postprocess_fn(capture_inputs)
                 _restore_spec_decode_capture_state(attn_metadata,
@@ -659,8 +750,7 @@ class CUDAGraphRunner:
             # setup/capture; release its reference before entering.
             output = None
             with torch.cuda.graph(graph, pool=self.memory_pool):
-                output = _setup_spec_decoding_and_forward(
-                    key, forward_fn, capture_inputs)
+                output = forward_fn(capture_inputs)
             if postprocess_fn is not None:
                 postprocess_fn(capture_inputs)
             _restore_spec_decode_capture_state(attn_metadata,
@@ -686,20 +776,59 @@ class CUDAGraphRunner:
 
         input_ids = current_inputs["input_ids"]
         seqlen = input_ids.shape[0]
+        expected_num_tokens = self._get_num_tokens_for_key(key)
+        if seqlen != expected_num_tokens:
+            raise ValueError(
+                f"replay() got {seqlen} tokens for key {key}, but the graph "
+                f"was captured for {expected_num_tokens} tokens. A shorter "
+                "input_ids leaves the tail of the static input buffer stale.")
         static_tensors["input_ids"][:seqlen].copy_(input_ids)
 
         position_ids = current_inputs["position_ids"]
         if self.config.use_mrope:
+            expected_position_ids_shape = (3, 1, seqlen)
+            if tuple(position_ids.shape) != expected_position_ids_shape:
+                raise ValueError(
+                    f"replay() got position_ids of shape {tuple(position_ids.shape)} "
+                    f"for key {key}, but expected {expected_position_ids_shape}. "
+                    "torch.Tensor.copy_() silently broadcasts mismatched shapes, "
+                    "which would corrupt the static input buffer.")
             static_tensors["position_ids"][:, :, :seqlen].copy_(position_ids)
             mrope_delta_read_seq_slots = current_inputs.get(
                 'mrope_delta_read_seq_slots')
+            num_slots = key.batch_size * self.max_beam_width
             if mrope_delta_read_seq_slots is not None:
+                if mrope_delta_read_seq_slots.shape[0] != num_slots:
+                    raise ValueError(
+                        f"replay() got {mrope_delta_read_seq_slots.shape[0]} "
+                        f"mrope_delta_read_seq_slots for key {key}, but the graph "
+                        f"was captured for {num_slots} "
+                        "mrope_delta_read_seq_slots.")
                 static_tensors[
                     'mrope_delta_read_seq_slots'][:mrope_delta_read_seq_slots.
                                                   shape[0]].copy_(
                                                       mrope_delta_read_seq_slots,
                                                       non_blocking=True)
+            else:
+                # Omission means every slot reads the dummy seq slot's
+                # permanently-zero delta (model_engine.py's mrope_dummy_seq_slot
+                # fast path). Fill explicitly instead of leaving stale values.
+                logger.debug(
+                    "replay() got no mrope_delta_read_seq_slots for a "
+                    "use_mrope graph; filling the static buffer with the "
+                    "dummy seq slot instead of copying real values.")
+                mrope_dummy_seq_slot = get_mrope_dummy_seq_slot(
+                    self.config.max_num_tokens, self.config.mapping.pp_size)
+                static_tensors['mrope_delta_read_seq_slots'][:num_slots].fill_(
+                    mrope_dummy_seq_slot)
         else:
+            expected_position_ids_shape = (1, seqlen)
+            if tuple(position_ids.shape) != expected_position_ids_shape:
+                raise ValueError(
+                    f"replay() got position_ids of shape {tuple(position_ids.shape)} "
+                    f"for key {key}, but expected {expected_position_ids_shape}. "
+                    "torch.Tensor.copy_() silently broadcasts mismatched shapes, "
+                    "which would corrupt the static input buffer.")
             static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
 
         num_encoder_tokens = key.num_encoder_tokens
@@ -729,16 +858,51 @@ class CUDAGraphRunner:
 
         return output_ref
 
+    def _max_padded_batch_size(self) -> int:
+        """Largest padded batch size ``_get_padded_batch`` may choose.
+
+        ``max_supported_batch_size`` bounds the captured graphs; the engine's
+        own ``batch_size`` bounds concurrent requests, and the padded size is
+        exactly ``padding_size + batch.batch_size``, so both apply to the
+        padded size itself.
+        """
+        return min(self.max_supported_batch_size, self.config.batch_size)
+
     def _get_padded_batch(self, batch: ScheduledRequests,
                           resource_manager: ResourceManager,
                           runtime_draft_len: int) -> int:
+        """Pads ``batch.generation_requests`` up to a captured graph size.
+
+        Returns the number of appended dummy rows; the caller strips exactly
+        that many entries off the *end* of the list afterwards.
+
+        Dummy rows are deliberately tail-only.  Inserting a dummy at the front
+        would mis-associate every real request with another request's output,
+        because three separate consumers hard-code "the generation rows start
+        at index 0":
+          * ``ModelEngine._prepare_tp_inputs`` skips the input_ids of
+            CUDA-graph dummies and blits the overlap scheduler's tokens at
+            ``input_ids_cuda[num_tokens:...]``, which only lines up with the
+            per-row position_ids while every dummy sits after every real row;
+          * ``TorchSampler`` reads generation logits as ``raw_logits_cuda[:
+            len(generation_requests)]`` (and via request offsets that start at
+            zero), against the batch with the padding already stripped;
+          * ``ModelEngine._execute_logit_post_processors`` walks the padded
+            batch with a row offset starting at zero.
+        Offsetting all three is a change to the output association, not to
+        padding, so it does not belong here.
+        """
         can_run_cuda_graph = self._can_run_cuda_graph_batch(batch)
         batch_size = batch.batch_size
         new_batch_size = batch_size
 
         if self.enabled and self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
-            graph_batch_info = self.config.dist.tp_allgather(
-                [can_run_cuda_graph, batch_size], small_payload=True)
+            # Padding only agrees on eligibility and batch size; the tier slot
+            # is unused here. It is still sent so both per-iteration exchanges
+            # share one fixed-size payload, and a constant keeps this path from
+            # resolving a tier for a batch it is about to change.
+            graph_batch_info = self._gather_adp_graph_batch_info(
+                batch, can_run_cuda_graph, SampleType.FULL)
             all_can_run_cuda_graph = all(rank_info[0]
                                          for rank_info in graph_batch_info)
             if all_can_run_cuda_graph:
@@ -907,8 +1071,7 @@ class CUDAGraphRunner:
         max batch size 1, every batch already matches a graph size and no
         padding dummy is ever needed.
         """
-        max_unpadded_batch_size = min(self.config.batch_size,
-                                      self.max_supported_batch_size)
+        max_unpadded_batch_size = self._max_padded_batch_size()
         for batch_size in range(1, max_unpadded_batch_size + 1):
             padded = self._round_up_batch_size_with_draft_len(
                 batch_size, runtime_draft_len)
@@ -1193,8 +1356,8 @@ class EncoderCUDAGraphRunner:
 
         # Replays served from a captured feature graph. A populated `graphs`
         # only proves capture happened; both `pad_batch` and the shape checks
-        # in `_maybe_forward_encoder_graph` can route every request to the
-        # eager encoder without emptying it, so tests need this to tell a
+        # in `EncoderMixin._prepare_encoder_feature_graph_inputs` can route requests
+        # to the eager encoder without emptying it, so tests need this to tell a
         # working graph path from a silent eager fallback.
         self.num_feature_replays = 0
 
@@ -1718,7 +1881,7 @@ class EncoderCUDAGraphRunner:
             return None, None
 
         if "multi_item_part_lens" in inputs:
-            # See model_engine.py for more details
+            # Per-request scoring metadata cannot share captured graph state.
             logger.warning_once(
                 "Encoder CUDA graph does not support multi-item scoring; "
                 "falling back to eager.",

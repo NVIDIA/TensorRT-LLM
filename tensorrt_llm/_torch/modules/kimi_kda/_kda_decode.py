@@ -85,7 +85,6 @@ def run_kda_decode_fusion_cuda(
     onorm_weight: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     ssm_state_indices: torch.Tensor | None = None,
-    cu_seqlens: torch.Tensor | None = None,
     scale: float = 128**-0.5,
     onorm_eps: float = 1e-5,
     lower_bound: float | None = None,
@@ -133,7 +132,11 @@ def run_kda_decode_fusion_cuda(
         )
     if ssm_state_indices is None and not state.is_contiguous():
         raise ValueError("state must be contiguous because it is updated in place")
-    if out is not None:
+    if out is None:
+        # The op is inplace-only and never allocates, so supply a buffer here.
+        # Hot decode paths pass a persistent one instead.
+        out = x_q.new_empty((B, 1, HV, 128))
+    else:
         _require_cuda_bf16("out", out)
         if not out.is_contiguous():
             raise ValueError("out must be contiguous")
@@ -182,15 +185,6 @@ def run_kda_decode_fusion_cuda(
                 "[slots, 3 * dim, width] conv states"
             )
 
-    if cu_seqlens is None:
-        cu_seqlens = torch.arange(B + 1, dtype=torch.int32, device=device)
-    else:
-        if not cu_seqlens.is_cuda or cu_seqlens.dtype is not torch.int32:
-            raise TypeError("cu_seqlens must be a CUDA int32 tensor")
-        if tuple(cu_seqlens.shape) != (B + 1,):
-            raise ValueError("cu_seqlens must have shape [B + 1]")
-        cu_seqlens = cu_seqlens.contiguous()
-
     args = (
         _as_token_rows(x_q),
         _as_token_rows(x_k),
@@ -211,7 +205,6 @@ def run_kda_decode_fusion_cuda(
         _as_token_rows(onorm_g),
         onorm_weight.contiguous(),
         ssm_state_indices,
-        cu_seqlens,
         state,
     )
 
@@ -226,4 +219,5 @@ def run_kda_decode_fusion_cuda(
         float(scale),
         float(onorm_eps),
     )
-    return torch.ops.trtllm.kda_decode(*args, *launch_args, output=out)
+    torch.ops.trtllm.kda_decode(*args, *launch_args, output=out)
+    return out

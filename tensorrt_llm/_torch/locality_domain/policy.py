@@ -254,6 +254,7 @@ class LocalityDomainExecutionPlanner:
         moe_backend: str = "CUTEDSL",
         use_fused_finalize: bool = True,
         dtype_activation: torch.dtype = torch.bfloat16,
+        activation: str = "Swiglu",
     ) -> PartitionPlan:
         """Decide whether to partition a MoE GroupGemm for locality domain execution.
 
@@ -303,6 +304,14 @@ class LocalityDomainExecutionPlanner:
         else:
             return PartitionPlan(
                 enabled=False, reason_if_disabled="locality domain MoE only supports NVFP4 or BF16"
+            )
+
+        # Both locality-domain MoE kernels fuse SwiGLU. Staying unpartitioned is
+        # the right answer for any other activation, not an error.
+        if activation != "Swiglu":
+            return PartitionPlan(
+                enabled=False,
+                reason_if_disabled=f"locality domain MoE fuses SwiGLU only, got {activation}",
             )
 
         if op_name not in self.policy.allowed_ops:

@@ -39,7 +39,7 @@ Phase-specific details:
 - **Decode** (``attention_input_type=generation_only``):
   Uses weight absorption: ``q_absorbed = q_nope @ W_kn``, then
   ``fused_q = [q_absorbed | q_pe]``. Calls ``thop.attention`` with
-  ``is_fused_qkv=True`` and ``head_size=gen_head_size``. Output is in latent space
+  ``is_fused_qkv=False`` and ``head_size=gen_head_size``. Output is in latent space
   and projected back to ``v_head_dim`` via ``W_v``.
 
 Mixed batches (both prefill and decode tokens present) dispatch the prefill and
@@ -60,7 +60,7 @@ from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import GraphModule, Node
 
-from tensorrt_llm._torch.attention_backend.interface import (
+from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
     PositionEmbeddingType,
     RopeParams,
@@ -1142,7 +1142,7 @@ def _handle_prefill_thop_cached_kv(
     """Cache-reused / chunked-prefill MLA attention.
 
     Mirrors ``MLA.forward_context_with_chunked_prefill`` from the main
-    PyTorch backend (``tensorrt_llm/_torch/modules/attention.py``).  Required
+    PyTorch backend (``tensorrt_llm/_torch/attention/attention.py``).  Required
     when any prefill seq has ``host_past_kv > 0`` — the fresh-prefill kernel
     path misbehaves under that config because it would re-RoPE/append the
     new tokens via ``invokeMLARopeContext`` while the FMHA expects K/V to
@@ -1213,6 +1213,7 @@ def _handle_prefill_thop_cached_kv(
         host_kv_cache_pool_pointers,
         planner.host_pool_mapping,
         planner.kv_scale_orig_quant,
+        0,  # residual_dim
         _CONTEXT_LAYER_OFFSET,
         tokens_per_block,
         max_context_length,
@@ -1667,6 +1668,7 @@ def _handle_decode_impl(
         host_kv_cache_pool_mapping,
         planner.kv_scale_orig_quant,
         planner.kv_scale_quant_orig,
+        None,  # kv_cache_scale_orig_quant
         None,  # out_scale
         planner.block_ids_per_seq,
         [None, None],  # mla_tensor_params (helix)
@@ -1675,6 +1677,7 @@ def _handle_decode_impl(
         num_heads,
         num_kv_heads,
         gen_head_size,
+        0,  # residual_dim
         tokens_per_block,
         max_context_length,  # attention_window_size
         1,  # beam_width
@@ -1722,7 +1725,7 @@ def _handle_decode_impl(
         q_pe_flat,  # q_pe
         planner.block_ids_per_seq,  # block_ids_per_seq
         None,  # attention_sinks
-        True,  # is_fused_qkv
+        False,  # is_fused_qkv
         True,  # update_kv_cache
         1,  # predicted_tokens_per_seq
         0,  # layer_idx (constant: decode bucket)

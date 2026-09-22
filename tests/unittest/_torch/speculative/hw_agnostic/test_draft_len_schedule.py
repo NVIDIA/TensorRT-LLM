@@ -13,19 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import sys
-
 import pytest
 import torch
+from utils.llm_data import llm_models_root
+from utils.util import similar
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.speculative.utils import get_draft_len_for_batch_size
 from tensorrt_llm.llmapi import DraftTargetDecodingConfig, KvCacheConfig, NGramDecodingConfig
-
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from utils.llm_data import llm_models_root
-from utils.util import similar
 
 
 # # ============================================================================
@@ -65,7 +60,10 @@ def test_correctness_across_batch_sizes(
     max_draft_len = max(schedule.values())  # Use max from schedule
 
     kv_cache_config = KvCacheConfig(
-        enable_block_reuse=False, enable_partial_reuse=False, max_tokens=1024
+        enable_block_reuse=False,
+        enable_partial_reuse=False,
+        max_tokens=1024,
+        use_kv_cache_manager_v2=True,
     )
 
     llm_common_config = dict(
@@ -222,7 +220,10 @@ def test_draft_len_schedule_functionality(
     max_batch_size = 7
 
     kv_cache_config = KvCacheConfig(
-        enable_block_reuse=False, enable_partial_reuse=False, max_tokens=1024
+        enable_block_reuse=False,
+        enable_partial_reuse=False,
+        max_tokens=1024,
+        use_kv_cache_manager_v2=True,
     )
 
     llm_common_config = dict(

@@ -21,6 +21,8 @@ llm_spark_perf:
   - perf/test_perf.py::test_perf[nemotron_3_nano_omni_nvfp4-serve-pytorch-streaming-float4-maxbs:1-input_output_len:32768,1024-reqs:1-con:1]
   # Nemotron-3-Nano-Omni-30B NVFP4: image benchmark (1526x1024 image + ISL 2048)
   - perf/test_perf.py::test_perf[nemotron_3_nano_omni_nvfp4_image-serve-pytorch-streaming-float4-maxbs:1-input_output_len:2048,1024-reqs:1-con:1]
+  - perf/test_perf.py::test_perf[nemotron_3.5_lightning_30b_nvfp4_mtp-serve-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:2048,256-kv_cache_dtype:fp8-reqs:1-con:1]
+  - perf/test_perf.py::test_perf[nemotron_3.5_lightning_30b_bf16_mtp-serve-pytorch-streaming-bfloat16-maxbs:1-maxnt:8192-input_output_len:2048,256-kv_cache_dtype:fp8-reqs:1-con:1]
   - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4-serve-pytorch-streaming-float4-maxbs:8-maxnt:4096-input_output_len:2048,256-kv_cache_dtype:fp8-reqs:1-con:1]
   - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4_mtp-serve-pytorch-streaming-float4-maxbs:8-maxnt:4096-input_output_len:2048,256-kv_cache_dtype:fp8-reqs:1-con:1]
   - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4-serve-pytorch-streaming-float4-maxbs:8-maxnt:4096-input_output_len:8192,512-kv_cache_dtype:fp8-reqs:1-con:1]
@@ -38,12 +40,10 @@ llm_spark_perf:
   - perf/test_perf.py::test_perf[qwen3_30b_a3b-bench-pytorch-streaming-bfloat16-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
   - perf/test_perf.py::test_perf[qwen3_32b_fp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
   - perf/test_perf.py::test_perf[qwen3_32b-bench-pytorch-streaming-bfloat16-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
-  - perf/test_perf.py::test_perf[gemma_3_27b_it-bench-pytorch-streaming-bfloat16-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
-  - perf/test_perf.py::test_perf[gemma_3_27b_it_fp8-bench-pytorch-streaming-float8-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
-  - perf/test_perf.py::test_perf[gemma_3_27b_it_fp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
-  - perf/test_perf.py::test_perf[gemma_3_12b_it-bench-pytorch-streaming-bfloat16-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
-  - perf/test_perf.py::test_perf[gemma_3_12b_it_fp8-bench-pytorch-streaming-float8-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
-  - perf/test_perf.py::test_perf[gemma_3_12b_it_fp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
+  - perf/test_perf.py::test_perf[gemma_4_26b_a4b_nvfp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
+  # Qwen3.6-35B-A3B NVFP4: baseline and the same checkpoint with MTP drafting
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,256-reqs:1-con:1]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4_mtp-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,256-reqs:1-con:1]
 # ===============================================================================
 # 2: Multi-GPU (2 GPUs) Spark perf cases with multinode support
 # ===============================================================================

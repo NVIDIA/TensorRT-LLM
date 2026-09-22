@@ -17,13 +17,13 @@
 import datetime
 import gc
 import importlib
+import importlib.util
 import logging
 import os
 import platform
 import re
 import shutil
 import subprocess as sp
-import sys
 import tempfile
 import time
 import urllib.request
@@ -74,10 +74,7 @@ DEBUG_CI_STORAGE = os.environ.get("DEBUG_CI_STORAGE", False)
 
 
 def _get_s3_output():
-    tests_root = Path(__file__).resolve().parents[2]
-    tests_root_str = str(tests_root)
-    if tests_root_str not in sys.path:
-        sys.path.append(tests_root_str)
+    # tests/ is on the path via the pythonpath entry in pytest.ini.
     return importlib.import_module("test_common.s3_output")
 
 
@@ -455,6 +452,26 @@ def llm_venv(request, llm_root, custom_user_workspace):
             shutil.rmtree(workspace_dir, ignore_errors=True)
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _auto_install_media_deps(llm_venv):
+    """Ensure OpenCV is available for video multimodal tests.
+
+    Uses ``opencv-python-headless`` already on the system when present. Otherwise
+    set ``TRTLLM_AUTO_INSTALL_MEDIA_DEPS=1`` to install it.
+    """
+    if importlib.util.find_spec("cv2") is not None:
+        return
+    if os.environ.get("TRTLLM_AUTO_INSTALL_MEDIA_DEPS", "0") != "1":
+        # TODO remove autouse once callers that need OpenCV depend on this
+        # fixture explicitly, and replace this warning with an error.
+        print_warning(
+            "OpenCV (cv2) is not installed, which is required for some tests.\n"
+            "You may need to install opencv-python-headless manually, or set "
+            "TRTLLM_AUTO_INSTALL_MEDIA_DEPS=1 to auto-install.")
+        return
+    llm_venv.run_cmd(["-m", "pip", "install", "opencv-python-headless"])
+
+
 @pytest.fixture(scope="session")
 @cached_in_llm_models_root("gpt-next/megatron_converted_843m_tp1_pp1.nemo",
                            True)
@@ -573,20 +590,6 @@ def llm_replit_code_v1_5_3b_model_root():
 
 
 @pytest.fixture(scope="module")
-@cached_in_llm_models_root("gpt2", True)
-def llm_gpt2_model_root():
-    "Get gpt2 model root"
-    raise RuntimeError("gpt2 must be cached")
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("gpt2-medium", True)
-def llm_gpt2_medium_model_root():
-    "Get gpt2 medium model root"
-    raise RuntimeError("gpt2-medium must be cached")
-
-
-@pytest.fixture(scope="module")
 @cached_in_llm_models_root("GPT-2B-001_bf16_tp1.nemo", True)
 def llm_gpt2_next_model_root():
     "get gpt-2b-001_bf16_tp1.nemo"
@@ -677,18 +680,6 @@ def llama_model_root(request):
     if request.param == "TinyLlama-1.1B-Chat-v1.0":
         llama_model_root = os.path.join(models_root, "llama-models-v2",
                                         "TinyLlama-1.1B-Chat-v1.0")
-    elif request.param == "llama-3.1-8b":
-        llama_model_root = os.path.join(models_root, "llama-3.1-model",
-                                        "Meta-Llama-3.1-8B")
-    elif request.param == "llama-3.1-8b-instruct-hf-fp8":
-        llama_model_root = os.path.join(models_root, "llama-3.1-model",
-                                        "Llama-3.1-8B-Instruct-FP8")
-    elif request.param == "llama-3.1-8b-instruct":
-        llama_model_root = os.path.join(models_root, "llama-3.1-model",
-                                        "Llama-3.1-8B-Instruct")
-    elif request.param == "llama-3.1-8b-hf-nvfp4":
-        llama_model_root = os.path.join(models_root, "nvfp4-quantized",
-                                        "Meta-Llama-3.1-8B")
     assert os.path.exists(
         llama_model_root
     ), f"{llama_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
@@ -1562,6 +1553,17 @@ def pytest_addoption(parser):
         "Only used with --periodic-junit.",
     )
     parser.addoption(
+        "--periodic-unfinished-test-path",
+        action="store",
+        default=None,
+        help="Override the unfinished_test.txt location (default: alongside "
+        "--periodic-junit-xmlpath). Use this to make a rerun attempt that writes "
+        "its results XML elsewhere still share the original attempt's "
+        "unfinished_test.txt, so a crash during the rerun itself is recorded in "
+        "the same place the caller checks for unresolved crashes. Only used "
+        "with --periodic-save-unfinished-test.",
+    )
+    parser.addoption(
         "--periodic-hang-traceback",
         action="store_true",
         default=False,
@@ -1702,6 +1704,8 @@ def pytest_configure(config):
         periodic_batch_size = config.getoption("--periodic-batch-size")
         periodic_save_unfinished_test = config.getoption(
             "--periodic-save-unfinished-test", default=False)
+        periodic_unfinished_test_path = config.getoption(
+            "--periodic-unfinished-test-path", default=None)
         periodic_hang_traceback = config.getoption("--periodic-hang-traceback",
                                                    default=False)
 
@@ -1721,11 +1725,11 @@ def pytest_configure(config):
                 'warning': print_warning
             },
             save_unfinished_test=periodic_save_unfinished_test,
+            unfinished_test_path=periodic_unfinished_test_path,
             dump_hang_traceback=periodic_hang_traceback,
         )
 
-        # Configure and register the reporter
-        reporter.pytest_configure(config)
+        # Registration replays the historic pytest_configure hook.
         config.pluginmanager.register(reporter, 'periodic_junit')
 
         print_info("PeriodicJUnitXML reporter registered")

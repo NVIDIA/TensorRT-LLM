@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager as KVCacheManagerV1
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -62,6 +62,7 @@ class _StatsRequest:
     draft_tokens: list[int] = field(default_factory=list)
     state: LlmRequestState = LlmRequestState.GENERATION_IN_PROGRESS
     context_current_position: int = 0
+    py_connector_served_position: int = 0
     context_chunk_size: int = 0
     expect_snapshot_points: list[int] = field(default_factory=list)
     prepopulated_prompt: tuple[int, int] | None = None
@@ -97,6 +98,7 @@ class _StatsRequest:
 
     def set_prepopulated_prompt_len(self, length: int, tokens_per_block: int) -> None:
         self.prepopulated_prompt = (length, tokens_per_block)
+        self.context_current_position = length
 
     @property
     def prepopulated_prompt_len(self) -> int:

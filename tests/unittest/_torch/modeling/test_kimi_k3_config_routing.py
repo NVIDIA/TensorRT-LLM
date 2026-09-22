@@ -84,10 +84,12 @@ class TestIsKimiK3MultimodalConfig(unittest.TestCase):
         self.assertFalse(is_kimi_k3_multimodal_config(cfg))
 
 
-def _vision_model_config(tp_size, enable_attention_dp):
+def _vision_model_config(tp_size, enable_attention_dp, cp_size=1):
     """Minimal stand-in exposing the mapping fields the predicate reads."""
     return SimpleNamespace(
-        mapping=SimpleNamespace(tp_size=tp_size, enable_attention_dp=enable_attention_dp)
+        mapping=SimpleNamespace(
+            tp_size=tp_size, enable_attention_dp=enable_attention_dp, cp_size=cp_size
+        )
     )
 
 
@@ -107,6 +109,14 @@ class TestVisionRequiresReplication(unittest.TestCase):
 
     def test_attention_dp_always_replicates(self):
         self.assertTrue(_vision_requires_replication(_vision_model_config(16, True), num_heads=16))
+
+    def test_helix_cp_requires_replication(self):
+        # Helix carries its parallelism in cp with tp_size=1; the tower has no
+        # context-parallel form, so any cp > 1 must replicate even when
+        # num_heads % tp_size == 0.
+        self.assertTrue(
+            _vision_requires_replication(_vision_model_config(1, False, cp_size=8), num_heads=12)
+        )
 
 
 def _load_config_from_dict(cfg: dict[str, Any]) -> PretrainedConfig:

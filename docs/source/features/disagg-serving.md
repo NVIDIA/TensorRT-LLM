@@ -17,6 +17,9 @@
 For the internals of the component that actually moves the KV blocks, see
 [Introduction to KV Cache Transmission](../developer-guide/kv-transfer.md).
 
+For placing sub-agents with their parent while retaining independent conversation
+histories, see [Sub-agent Routing](subagent-routing.md).
+
 ## Motivation
 
 LLM inference has two stages: context (prefill) and generation (decode) phases. The context phase computes KV cache for prompt tokens whereas the generation phase generates tokens one by one using cached values. These phases have different compute characteristics.
@@ -154,7 +157,9 @@ cache_transceiver_config:
 
 `kv_transfer_timeout_ms` bounds how long a request may wait for its KV cache before it is cancelled and cleaned up. The default is `60000`.
 
-`kv_cache_bounce_size_mb` is `0` by default, which sends each KV block separately. Setting it to a positive size coalesces a request's blocks into one contiguous buffer of that many MiB per direction and issues a single NIXL write, which helps when a request's blocks are scattered. It requires fabric (MNNVL) memory.
+`kv_cache_bounce_size_mb` is `0` by default, which sends each KV block separately. Setting it to a positive size enables a bounce buffer, which helps when a request's blocks are scattered. With the default Python implementation this is one contiguous buffer of that many MiB per direction and a single NIXL write per request; the C++ implementation (next paragraph) instead uses one buffer shared by both directions and chunked writes. The default Python implementation is designed for fabric (MNNVL) memory; the C++ implementation falls back to `cudaMalloc` where fabric memory is unavailable.
+
+`agent_bounce_buffer_enable` (default `false`) switches to the C++ transfer-agent bounce implementation, which uses one buffer of `kv_cache_bounce_size_mb` MiB shared by send and receive (prefer a power of two; the usable capacity rounds down to one). By default it engages only for KV writes with many small descriptors (at least 1024, averaging at most 16 KiB), i.e. head-mismatch layouts such as context TP != generation TP or DP; head-matched layouts (MLA, symmetric TP) stay on the standard NIXL path unless `agent_bounce_params` relaxes the gate (lower `min_descriptor_count`, where `0` means no minimum; raise `max_average_descriptor_size`, e.g. `4MB`; `max_average_descriptor_size: 0` routes every outbound write to standard NIXL, acting as an outbound gate off switch — it disables outbound routing only: the arena is still allocated, the handshake still advertised and inbound transfers still served; set `agent_bounce_buffer_enable: false` to turn the feature off). Set it consistently on the context and generation workers; in particular `request_timeout_ms` and the effective chunk cap must match on both sides, otherwise the pair falls back to standard NIXL with a WARNING when the peer is loaded (transfers are then routed silently). The compared chunk cap is the effective one, min(`max_chunk_size`, the arena's usable capacity): `kv_cache_bounce_size_mb` matters only when its usable capacity (rounded down to a power of two) is below `max_chunk_size`; both sides must then clamp to the same chunk cap, otherwise the pair falls back to standard NIXL.
 
 For example, you could launch two context servers and one generation server as follows:
 
@@ -263,7 +268,7 @@ The three resulting topologies:
 | any | set | **No** coordinator starts here; a fleet of `num_workers` delegating servers points at the external `disagg_coordinator_url`. |
 
 ```{note}
-The fleet is most useful with a *stateful* router (`kv_cache_aware`, `conversation`) where placement must be globally consistent — that decision is delegated to the coordinator. With a *stateless* router (`round_robin`, `load_balancing`) each worker simply places locally and no coordinator round-trip occurs.
+The fleet delegates `load_balancing`, `kv_cache_aware`, and `conversation` routing to the coordinator, so their placement and in-flight load state are globally consistent across workers. `round_robin` remains local to each worker and does not make a coordinator round-trip.
 ```
 
 #### Example: implicit coordinator + 4-worker fleet
@@ -336,6 +341,8 @@ TRT-LLM uses some environment variables to control the behavior of disaggregated
 * `TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP`: If set to `1`, the generation worker will not overlap KV cache transfer with model inference. The default value is `0`.
 
 * `TRTLLM_NIXL_KVCACHE_BACKEND`: Selects the transport NIXL itself uses. Valid values are `UCX` (default) and `LIBFABRIC`; an unsupported value logs a warning and falls back to `UCX`. `LIBFABRIC` additionally requires a NIXL build carrying the libfabric plugin — see the [disaggregated serving examples](source:examples/disaggregated/README.md).
+
+* `TRTLLM_GPU_KEEPALIVE`: If set to `1`, a generation worker that is waiting at the benchmark fill gate (`TLLM_BENCHMARK_REQ_QUEUES_SIZE`) keeps a resident warp on every SM in ~100 ms chunks instead of idling through the wait, so GPU-activity metrics do not read idle while the context tier fills it. The work is drained when the gate opens and never overlaps a forward pass. The default value is `0`.
 
 There are some other useful environment variables that may help when encountering failures or performance issues.
 

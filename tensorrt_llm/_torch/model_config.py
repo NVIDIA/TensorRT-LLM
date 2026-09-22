@@ -29,9 +29,11 @@ import torch
 import transformers
 from transformers.utils import HF_MODULES_CACHE
 
+from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     get_kimi_linear_num_attention_layers, get_qwen3_hybrid_num_attention_layers,
-    is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid, load_pretrained_config)
+    is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp,
+    load_pretrained_config)
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
@@ -49,6 +51,9 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.modelopt_config import (
     canonicalize_quant_algo, is_modelopt_quant_config,
     read_modelopt_quant_config, warn_if_inline_diverges)
+from tensorrt_llm.quantization.utils.fp4_utils import (
+    NVFP4_SF_VEC_SIZE, W4A16_NVFP4_LINEAR_SF_VEC_SIZES,
+    nvfp4_scaling_vector_size)
 
 if TYPE_CHECKING:
     from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
@@ -58,6 +63,9 @@ if TYPE_CHECKING:
                                               SpeculativeConfig)
 
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
+
+# Python's errno module omits Linux's EBADHANDLE value.
+_LINUX_EBADHANDLE = 521
 
 _DEEPSEEK_V4_ARCHITECTURES = {"DeepseekV4ForCausalLM"}
 _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT = "layers.0.ffn.experts.0.w1.weight"
@@ -83,7 +91,7 @@ def _is_lock_infra_error(exc: BaseException) -> bool:
         # (the post-EEXIST is_dir() recheck sees a stale attribute cache).
         # An un-creatable lock dir is broken infra, not contention.
         return exc.errno in (errno.EACCES, errno.EPERM, errno.ENOLCK,
-                             errno.ESTALE, errno.EEXIST)
+                             errno.ESTALE, errno.EEXIST, _LINUX_EBADHANDLE)
     return False
 
 
@@ -156,7 +164,7 @@ def hf_remote_code_lock(timeout: int = 10) -> Iterator[None]:
     try:
         is_filler = _try_take_lock(lock)
     except (PermissionError, OSError) as e:
-        # Broken lock infra (perms / NFS ENOLCK/ESTALE): retry on a tempdir lock.
+        # Broken lock infra (permissions or NFS errors): retry on a tempdir lock.
         if not _is_lock_infra_error(e):
             raise
         tmp_dir = Path(tempfile.gettempdir())
@@ -242,6 +250,9 @@ class ModelConfig(Generic[TConfig]):
     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None
 
     attn_backend: str = 'TRTLLM'
+    # Effective threshold requested for trtllm-gen MLA skip-correction. Zero
+    # disables the optimization; hardware support is resolved by the backend.
+    skip_correction_threshold: float = 0.0
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
     # IF true, disables FC2+finalize fusion in CUTLASS MoE backend
     moe_disable_finalize_fusion: bool = False
@@ -273,6 +284,10 @@ class ModelConfig(Generic[TConfig]):
     use_cute_dsl_blockscaling_bmm: bool = False
     use_cute_dsl_bf16_bmm: bool = False
     use_cute_dsl_bf16_gemm: bool = False
+
+    # locality domain execution policy (controls partitioned linear/MoE execution)
+    locality_domain_policy: LocalityDomainPolicy = field(
+        default_factory=LocalityDomainPolicy)
 
     _frozen: bool = field(default=False, init=False, repr=False)
 
@@ -310,6 +325,14 @@ class ModelConfig(Generic[TConfig]):
         super().__setattr__(key, value)
 
     def __post_init__(self):
+        if self.pretrained_config and self.sparse_attention_config:
+            # Sparse geometry can come from the checkpoint. Resolve it once so
+            # cache allocation, CUDA-graph routing, and model layers all read
+            # the same concrete values.
+            self.sparse_attention_config = (
+                self.sparse_attention_config._resolve_checkpoint_defaults(
+                    self.pretrained_config))
+
         if self.pretrained_config:
             self.is_encoder_decoder = self.is_encoder_decoder_model(
                 self.pretrained_config)
@@ -347,6 +370,8 @@ class ModelConfig(Generic[TConfig]):
             self._moe_max_num_tokens_is_default = self.moe_max_num_tokens is None
         if self.moe_max_num_tokens is None:
             self.moe_max_num_tokens = self.max_num_tokens * self.mapping.dp_size
+
+        self.extra_attrs["locality_domain_policy"] = self.locality_domain_policy
 
     def is_moe_max_num_tokens_default(self) -> bool:
         """Whether ``moe_max_num_tokens`` was derived rather than configured.
@@ -515,6 +540,36 @@ class ModelConfig(Generic[TConfig]):
             moe_backend)
 
     @staticmethod
+    def _validate_nvfp4_group_size(quant_config: QuantConfig,
+                                   layer_name: Optional[str] = None) -> None:
+        """Reject NVFP4-family ``group_size`` values no kernel can consume.
+
+        ModelOpt records the scale block width in ``quantization.group_size``.
+        The W4A4 NVFP4 GEMMs are hardware-bound to 16-element blocks, while the
+        weight-only W4A16_NVFP4 path dequantizes in software and also accepts
+        the 32-element blocks that ModelOpt's ``nvfp4_*_weight_only`` recipes
+        may export. Any other width would only surface as a scale-shape
+        mismatch deep inside weight loading, so fail here with the value.
+        """
+        group_size = nvfp4_scaling_vector_size(quant_config)
+        if quant_config.quant_algo == QuantAlgo.W4A16_NVFP4:
+            supported = W4A16_NVFP4_LINEAR_SF_VEC_SIZES
+        elif quant_config.quant_algo in (QuantAlgo.NVFP4, QuantAlgo.NVFP4_ARC):
+            supported = (NVFP4_SF_VEC_SIZE, )
+        else:
+            return
+        if layer_name is not None and "experts" in layer_name.split("."):
+            supported = (NVFP4_SF_VEC_SIZE, )
+        if group_size not in supported:
+            where = f" for layer '{layer_name}'" if layer_name else ""
+            raise ValueError(
+                f"hf_quant_config.json declares group_size={group_size}{where} "
+                f"with quant_algo={quant_config.quant_algo.name}, but "
+                f"TensorRT-LLM supports {'/'.join(map(str, supported))}-element "
+                "NVFP4 scale blocks for this algorithm (32-element blocks are "
+                "only supported by the dense W4A16_NVFP4 Linear path).")
+
+    @staticmethod
     def _build_modelopt_quant_config(json_quant_configs, checkpoint_dir,
                                      moe_backend):
         """Build (quant_config, layer_quant_config) from a normalized modelopt 'quantization' inner dict.
@@ -586,6 +641,7 @@ class ModelConfig(Generic[TConfig]):
                 config.quant_algo = QuantAlgo(
                     canonicalize_quant_algo(layer_cfg['quant_algo']))
                 config.group_size = layer_cfg.get('group_size', None)
+                ModelConfig._validate_nvfp4_group_size(config, layer)
                 # AWQ-specific extras emitted by modelopt per-layer.
                 if 'has_zero_point' in layer_cfg:
                     config.has_zero_point = layer_cfg['has_zero_point']
@@ -596,6 +652,7 @@ class ModelConfig(Generic[TConfig]):
         elif quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
             if quant_config.group_size is None:
                 quant_config.group_size = 128
+        ModelConfig._validate_nvfp4_group_size(quant_config)
 
         if (moe_backend == 'TRTLLM'
                 and quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
@@ -994,6 +1051,8 @@ class ModelConfig(Generic[TConfig]):
                 q_split_threshold = sparse_attention_config.q_split_threshold
                 indexer_rope_interleave = sparse_attention_config.indexer_rope_interleave
                 enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
+                use_self_sampling_topk = sparse_attention_config.use_self_sampling_topk
+                use_gvr_emission = sparse_attention_config.use_gvr_emission
                 indexer_k_dtype = sparse_attention_config.indexer_k_dtype
             else:
                 index_n_heads = pretrained_config.index_n_heads
@@ -1007,6 +1066,8 @@ class ModelConfig(Generic[TConfig]):
                 q_split_threshold = 8192
                 indexer_rope_interleave = False
                 enable_heuristic_topk = False
+                use_self_sampling_topk = True
+                use_gvr_emission = False
                 default_sparse_attention_config = DeepSeekV4SparseAttentionConfig(
                 )
                 indexer_k_dtype = default_sparse_attention_config.indexer_k_dtype
@@ -1023,6 +1084,8 @@ class ModelConfig(Generic[TConfig]):
             indexer_config['q_split_threshold'] = q_split_threshold
             indexer_config['indexer_rope_interleave'] = indexer_rope_interleave
             indexer_config['enable_heuristic_topk'] = enable_heuristic_topk
+            indexer_config['use_self_sampling_topk'] = use_self_sampling_topk
+            indexer_config['use_gvr_emission'] = use_gvr_emission
             indexer_config['indexer_k_dtype'] = indexer_k_dtype
             return indexer_config
 
@@ -1060,6 +1123,8 @@ class ModelConfig(Generic[TConfig]):
                         use_cute_dsl_paged_mqa_logits = sparse_attention_config.use_cute_dsl_paged_mqa_logits
                         q_split_threshold = sparse_attention_config.q_split_threshold
                         enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
+                        use_self_sampling_topk = sparse_attention_config.use_self_sampling_topk
+                        use_gvr_emission = sparse_attention_config.use_gvr_emission
                         indexer_k_dtype = sparse_attention_config.indexer_k_dtype
                         index_share_for_mtp_iteration = sparse_attention_config.index_share_for_mtp_iteration
                     else:
@@ -1072,6 +1137,8 @@ class ModelConfig(Generic[TConfig]):
                         use_cute_dsl_paged_mqa_logits = False
                         q_split_threshold = 8192
                         enable_heuristic_topk = False
+                        use_self_sampling_topk = True
+                        use_gvr_emission = False
                         indexer_k_dtype = "fp8"
                         index_share_for_mtp_iteration = None
                     kwargs[
@@ -1088,6 +1155,8 @@ class ModelConfig(Generic[TConfig]):
                             q_split_threshold=q_split_threshold,
                             indexer_rope_interleave=indexer_rope_interleave,
                             enable_heuristic_topk=enable_heuristic_topk,
+                            use_self_sampling_topk=use_self_sampling_topk,
+                            use_gvr_emission=use_gvr_emission,
                             indexer_k_dtype=indexer_k_dtype,
                             index_share_for_mtp_iteration=
                             index_share_for_mtp_iteration)
@@ -1356,8 +1425,7 @@ class ModelConfig(Generic[TConfig]):
     ) -> "ModelConfigCpp":
         """
         This method is used to construct the bindings config for the model.
-        Currently it adheres to gptJsonConfig.cpp::createModelConfig, which assumes
-        that an engine has been created.
+        Currently it assumes that an engine has been created.
 
         Args:
             tokens_per_block: The number of tokens per block. Please note that in PyTorch flow tokens_per_block is not available in the model config, instead it is defined in the executor config.
@@ -1521,14 +1589,14 @@ class ModelConfig(Generic[TConfig]):
 
         Pure model property: independent of which KV cache manager will run.
         For non-hybrid models this equals num_hidden_layers. For hybrid Mamba
-        models (Nemotron-hybrid, Qwen3-hybrid) it returns only the attention
+        models (Nemotron-hybrid, Qwen3-hybrid, Qwen4-Exp) it returns only the attention
         count derived from the layer pattern; mamba layers are reported by
         ``get_num_mamba_layers``.
         """
         cfg = self.pretrained_config
         if is_nemotron_hybrid(cfg):
             return cfg.hybrid_override_pattern.count("*")
-        if is_qwen3_hybrid(cfg):
+        if is_qwen3_hybrid(cfg) or is_qwen4_exp(cfg):
             return get_qwen3_hybrid_num_attention_layers(cfg)
         if is_kimi_linear(cfg):
             return get_kimi_linear_num_attention_layers(cfg)
@@ -1539,7 +1607,7 @@ class ModelConfig(Generic[TConfig]):
         cfg = self.pretrained_config
         if is_nemotron_hybrid(cfg):
             return cfg.hybrid_override_pattern.count("M")
-        if is_qwen3_hybrid(cfg):
+        if is_qwen3_hybrid(cfg) or is_qwen4_exp(cfg):
             return cfg.num_hidden_layers - get_qwen3_hybrid_num_attention_layers(
                 cfg)
         if is_kimi_linear(cfg):

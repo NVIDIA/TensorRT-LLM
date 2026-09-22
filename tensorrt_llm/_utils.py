@@ -63,7 +63,8 @@ except ImportError:
     has_nvml = False
 # isort: on
 
-from tensorrt_llm.bindings import DataType, LayerType, steady_clock_now
+from tensorrt_llm.bindings import (DataType, LayerType, global_steady_clock_now,
+                                   steady_clock_now)
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.logger import logger
 
@@ -112,10 +113,48 @@ def numpy_to_torch(x):
 def get_steady_clock_now_in_seconds() -> float:
     """Time from the C++ runtime's steady clock, in seconds.
 
-    Shared by the executor and the serving frontends so their perf-metric
-    timestamps are directly comparable.
+    Use this raw clock for elapsed durations. For absolute metrics timestamps
+    and rank-adjusted clock calibration, use AdjustedSteadyClock or
+    get_global_steady_clock_now_in_seconds.
     """
     return steady_clock_now().total_seconds()
+
+
+def get_global_steady_clock_now_in_seconds() -> float:
+    """Time from the runtime's rank-adjusted steady clock, in seconds."""
+    return global_steady_clock_now().total_seconds()
+
+
+class AdjustedSteadyClock:
+    """Steady clock mapped into a shared reference clock domain.
+
+    The C++ runtime first aligns every rank to its rank-0 steady clock. The
+    reference offset then maps that process-wide clock into the frontend or
+    disaggregated-server domain used to combine request metrics.
+    """
+
+    def __init__(
+        self,
+        reference_offset: float = 0,
+        time_source: Callable[[],
+                              float] = get_global_steady_clock_now_in_seconds,
+    ) -> None:
+        self._time_source = time_source
+        self.set_reference_offset(reference_offset)
+
+    def set_reference_offset(self, reference_offset: float) -> None:
+        reference_offset = float(reference_offset)
+        if not math.isfinite(reference_offset):
+            raise ValueError("reference_offset must be finite")
+        self._reference_offset = reference_offset
+
+    def now(self) -> float:
+        """Return current time in the configured reference clock domain."""
+        return self.to_reference_time(self._time_source())
+
+    def to_reference_time(self, timestamp: float) -> float:
+        """Map a rank-adjusted steady-clock timestamp to the reference domain."""
+        return float(timestamp) + self._reference_offset
 
 
 def CUASSERT(cuda_ret):
@@ -433,11 +472,22 @@ def mpi_comm():
     return comm
 
 
-local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
+_local_comm = None
 
 
 def local_mpi_comm():
-    return local_comm
+    # Split lazily instead of at import time. Splitting needs an MPI runtime
+    # that supports it, and `import tensorrt_llm` must not require one: a
+    # CPU-only build container can complete MPI_Init and handle Comm.Dup,
+    # Comm.Split and Create_group, yet still fail Split_type with
+    # MPI_ERR_OTHER — for the portable MPI_COMM_TYPE_SHARED just as much as for
+    # OMPI_COMM_TYPE_HOST — which turned the import itself into a hard error.
+    # Every consumer of this communicator is already lazy, so nothing needs it
+    # before first use.
+    global _local_comm
+    if _local_comm is None:
+        _local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
+    return _local_comm
 
 
 # Global TorchDist instance for Ray orchestrator
@@ -502,7 +552,7 @@ def local_mpi_rank():
 
 
 def local_mpi_size():
-    return local_comm.Get_size() if ENABLE_MULTI_DEVICE else 1
+    return local_mpi_comm().Get_size() if ENABLE_MULTI_DEVICE else 1
 
 
 def default_gpus_per_node():
@@ -521,7 +571,7 @@ def mpi_barrier():
 
 def local_mpi_barrier():
     if ENABLE_MULTI_DEVICE:
-        local_comm.Barrier()
+        local_mpi_comm().Barrier()
 
 
 def mpi_broadcast(obj, root=0):

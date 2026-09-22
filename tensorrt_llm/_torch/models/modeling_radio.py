@@ -16,17 +16,17 @@ from einops import rearrange
 from transformers import PretrainedConfig, PreTrainedModel
 
 from tensorrt_llm._torch import model_config as model_config_lib
-from tensorrt_llm._torch.attention_backend import AttentionMetadata
-from tensorrt_llm._torch.attention_backend import \
+from tensorrt_llm._torch.attention import attention as trtllm_attention
+from tensorrt_llm._torch.attention.backends import AttentionMetadata
+from tensorrt_llm._torch.attention.backends import \
     interface as attention_interface
-from tensorrt_llm._torch.attention_backend import utils as attention_utils
+from tensorrt_llm._torch.attention.backends import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_utils
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import \
     MultimodalEncoderMixin
 from tensorrt_llm._torch.models.multimodal_encoder_graph import (
     EncoderGraphKey, EncoderGraphTensorSpec, EncoderMetadataProvider,
     MultimodalEncoderGraphRunner)
-from tensorrt_llm._torch.modules import attention as trtllm_attention
 from tensorrt_llm._torch.modules import mlp as trtllm_mlp
 from tensorrt_llm._torch.utils import torch_compiling
 from tensorrt_llm._utils import prefer_pinned
@@ -943,7 +943,7 @@ class _VisionEncoderMetadataProvider(EncoderMetadataProvider):
 
     `build` returns a fresh `AttentionMetadata` with `is_cuda_graph=True`; that flag flips
     `AttentionMetadata.seq_lens`'s setter into the in-place `copy_` branch (see
-    `attention_backend/interface.py`), which is what makes subsequent `refresh_in_place` calls safe
+    `attention/backends/interface.py`), which is what makes subsequent `refresh_in_place` calls safe
     to run against captured CUDA graphs.
 
     The runner double-checks via its `data_ptr` stability assertion against `graph_critical_attrs`.
@@ -1159,6 +1159,21 @@ class RADIOVisionModelBase(nn.Module):
         return fmt_feat
 
 
+def split_fused_qkv(name: str, tensor: torch.Tensor) -> Dict[str, torch.Tensor]:
+    """Split a fused ``attn.qkv`` weight or bias into its q/k/v projections.
+
+    The row order here is the only place the fusion order is written down, so
+    anything that builds an ``attn.qkv`` tensor for this loader has to match it.
+    """
+    dim_shape = tensor.shape[0] // 3
+    return {
+        name.replace('attn.qkv.', 'attn.q_proj.'): tensor[:dim_shape],
+        name.replace('attn.qkv.', 'attn.k_proj.'):
+        tensor[dim_shape:2 * dim_shape],
+        name.replace('attn.qkv.', 'attn.v_proj.'): tensor[2 * dim_shape:],
+    }
+
+
 class RADIOVisionModel(PreTrainedModel):
     """Modify from https://huggingface.co/nvidia/C-RADIOv2-H/blob/main/hf_model.py."""
 
@@ -1330,14 +1345,8 @@ class RADIOVisionModel(PreTrainedModel):
         for name in model_weights:
             # Handle with weights and bias for vision transformer's qkv projection.
             if "attn.qkv." in name:
-                q_name = name.replace("attn.qkv.", "attn.q_proj.")
-                k_name = name.replace("attn.qkv.", "attn.k_proj.")
-                v_name = name.replace("attn.qkv.", "attn.v_proj.")
-                dim_shape = model_weights[name].shape[0] // 3
-                converted_weights[q_name] = model_weights[name][:dim_shape]
-                converted_weights[k_name] = model_weights[name][dim_shape:2 *
-                                                                dim_shape]
-                converted_weights[v_name] = model_weights[name][2 * dim_shape:]
+                converted_weights.update(
+                    split_fused_qkv(name, model_weights[name]))
             else:
                 converted_weights[name] = model_weights[name]
         pattern_mapping = {

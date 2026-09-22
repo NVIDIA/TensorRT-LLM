@@ -29,21 +29,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-try:
-    import sys
-    from pathlib import Path
-
-    from tensorrt_llm._torch.distributed import all_to_all_4d
-
-    # Spawn distributed workers via a helper that retries with a fresh master
-    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _visual_gen_dist_utils import spawn_with_retry
-
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
-
+from tensorrt_llm._torch.distributed import all_to_all_4d
 
 # Loop count must comfortably exceed kNumSlots so the ring wraps at least
 # twice. kNumSlots is 3 today; 8 iterations = ~2.67 full rotations.
@@ -265,10 +251,12 @@ def _worker_multi_pg(rank, world_size, port):
 
 
 def _run(world_size: int, test_fn: Callable):
-    if not MODULES_AVAILABLE:
-        pytest.skip("Required modules not available")
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
+    # Spawn distributed workers via a helper that retries with a fresh master
+    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
+    from ._visual_gen_dist_utils import spawn_with_retry
+
     spawn_with_retry(
         lambda port: mp.spawn(
             test_fn,

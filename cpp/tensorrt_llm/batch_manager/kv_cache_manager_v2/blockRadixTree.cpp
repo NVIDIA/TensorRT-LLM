@@ -17,6 +17,7 @@
 
 #include "kv_cache_manager_v2/blockRadixTree.h"
 #include "kv_cache_manager_v2/common.h"
+#include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/storageManager.h"
 #include "kv_cache_manager_v2/utils/math.h"
@@ -195,9 +196,9 @@ BlockKey Hasher::digest() const
 std::vector<TokenIdExt> genMultimodalCacheKeyTokens(
     int idOffset, std::vector<uint8_t> const& multiModalDataDigest, int numTokens, int tokenOffset)
 {
-    TLLM_CHECK_DEBUG(numTokens > 0);
-    TLLM_CHECK_DEBUG(tokenOffset >= 0);
-    TLLM_CHECK_DEBUG(multiModalDataDigest.size() == kDIGEST_LEN);
+    TLLM_CHECK(numTokens > 0);
+    TLLM_CHECK(tokenOffset >= 0);
+    TLLM_CHECK(multiModalDataDigest.size() == kDIGEST_LEN);
     std::vector<TokenIdExt> result;
     result.reserve(static_cast<size_t>(numTokens));
     for (int i = 0; i < numTokens; ++i)
@@ -324,6 +325,22 @@ Block::Block(BlockKey k, std::vector<TokenIdExt> toks, NodeBase* prevNode)
     // exists to avoid). knownNoDigest=false lets makeKey's update() scan for digests
     // itself — correct regardless of content, so no separate scan is needed here.
     TLLM_CHECK_DEBUG(k == Block::makeKey(prevNode->key, tokens.data(), tokens.size(), /*knownNoDigest=*/false));
+
+    if (eventSink != nullptr && eventSink->needsTokenDigestContext())
+    {
+        if (prevNode->type() == Type::kBLOCK)
+        {
+            mLastTokenDigest = static_cast<Block const*>(prevNode)->getLastTokenDigest();
+        }
+        for (auto iter = tokens.rbegin(); iter != tokens.rend(); ++iter)
+        {
+            if (iter->isDigest())
+            {
+                mLastTokenDigest = std::make_shared<Digest const>(iter->digest());
+                break;
+            }
+        }
+    }
 }
 
 // Delegates to the tree, mirroring Python's RootBlock.num_life_cycles. Defined
@@ -365,12 +382,12 @@ void Block::releasePages()
 
 Block::~Block()
 {
-    releasePages();
+    KVCM2_POISON_ON_EXCEPT([this]() { releasePages(); });
 }
 
 bool Block::isOrphan() const noexcept
 {
-    TLLM_CHECK_DEBUG(prev == nullptr || (prev->next.count(key) == 1 && prev->next.at(key).get() == this));
+    KVCM2_CHECK_FATAL_DEBUG(prev == nullptr || (prev->next.count(key) == 1 && prev->next.at(key).get() == this));
     return prev == nullptr;
 }
 
@@ -684,8 +701,9 @@ BlockRadixTree::BlockRadixTree(
 
 BlockRadixTree::~BlockRadixTree()
 {
-    // Clear all roots (which will drop all blocks without external owners).
-    mRoots.clear();
+    // Detach blocks leaf-first in O(1) extra space. Dropping mRoots directly would instead
+    // destroy each chain recursively, one frame per block.
+    KVCM2_POISON_ON_EXCEPT([this]() { clear(); });
 }
 
 LifeCycleId BlockRadixTree::numLifeCycles() const noexcept
@@ -770,8 +788,8 @@ int numMatchedTokens(std::vector<BlockRadixTree::MatchResult> const& matched, in
 std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
     ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch) const
 {
-    drainPendingRootErases();
-
+    // Read-only: probeReuse() runs this under a shared lock, so probes may overlap. A root still
+    // awaiting erasure is childless, so it yields no match.
     std::vector<MatchResult> results;
 
     // Lazily compute one key per iteration — no wasted hashing on early miss.
@@ -912,24 +930,54 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
     return matched;
 }
 
+namespace
+{
+// Drop `backoff` tokens off the tail of a match, dropping whole blocks while the backoff
+// outruns them. Only the tail shrinks, so pruneMatch's "leading entries are full blocks"
+// invariant still holds.
+void backOffMatch(std::vector<BlockRadixTree::MatchResult>& matched, int backoff)
+{
+    while (backoff > 0 && !matched.empty())
+    {
+        auto& last = matched.back();
+        if (last.numMatchedTokens > backoff)
+        {
+            last.numMatchedTokens -= backoff;
+            return;
+        }
+        backoff -= last.numMatchedTokens;
+        matched.pop_back();
+    }
+}
+} // namespace
+
 BlockRadixTree::ReuseMatch BlockRadixTree::match(
-    ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch) const
+    ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch, int backoff) const
 {
     auto rawMatched = matchTokenPath(reuseScope, tokens, knownNoDigest, enablePartialMatch);
+    // Content-divergence depth is measured before page or recurrent-snapshot pruning.
+    int const numReusableTokensBeforePruning = numMatchedTokens(rawMatched, mTokensPerBlock);
     auto const ssmLcId = mLifeCycles.ssmLifeCycleId();
+    // Page requirements depend on the final endpoint. Back off before pruning
+    // so SWA coverage and recurrent snapshots are validated at that endpoint.
+    if (backoff > 0)
+    {
+        backOffMatch(rawMatched, backoff);
+    }
     // Diagnostic only: re-prune ignoring recurrent-snapshot availability to get
     // the prefix the attention pages alone support. Only hybrid models pay for
     // the second pass; without an SSM life cycle the two results are identical.
-    std::optional<int> attnOnlyTokens;
+    std::optional<int> numReusableTokensBeforeHybridPruning;
     if (ssmLcId.has_value())
     {
-        attnOnlyTokens = numMatchedTokens(pruneMatch(rawMatched, std::nullopt), mTokensPerBlock);
+        numReusableTokensBeforeHybridPruning = numMatchedTokens(pruneMatch(rawMatched, std::nullopt), mTokensPerBlock);
     }
-    auto const matched = pruneMatch(std::move(rawMatched), ssmLcId);
+    auto matched = pruneMatch(std::move(rawMatched), ssmLcId);
     ReuseMatch result{};
     result.numTokens = numMatchedTokens(matched, mTokensPerBlock);
     result.numLookupTokens = static_cast<int>(tokens.size());
-    result.numTokensBeforeHybridPruning = attnOnlyTokens.value_or(result.numTokens);
+    result.numReusableTokensBeforeHybridPruning = numReusableTokensBeforeHybridPruning.value_or(result.numTokens);
+    result.numReusableTokensBeforePruning = numReusableTokensBeforePruning;
     result.blocks.reserve(BlockOrdinal{static_cast<int>(matched.size())});
     for (auto const& match : matched)
     {

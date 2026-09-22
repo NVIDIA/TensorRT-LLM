@@ -22,16 +22,28 @@ def _png_bytes() -> bytes:
     return buffer.getvalue()
 
 
-def test_load_reference_images_accepts_pil_path_and_bytes(tmp_path) -> None:
+def test_load_reference_images_accepts_pil_and_bytes(tmp_path) -> None:
     pil_image = PIL.Image.new("L", (64, 64), color=128)
-    image_path = tmp_path / "reference.png"
-    pil_image.save(image_path)
 
-    images = Flux2Pipeline._load_reference_images([pil_image, str(image_path), _png_bytes()])
+    images = Flux2Pipeline._load_reference_images([pil_image, _png_bytes()])
 
-    assert len(images) == 3
+    assert len(images) == 2
     assert all(image.mode == "RGB" for image in images)
-    assert [image.size for image in images] == [(64, 64), (64, 64), (64, 64)]
+    assert [image.size for image in images] == [(64, 64), (64, 64)]
+
+
+def test_load_reference_images_drops_alpha_without_compositing() -> None:
+    """RGBA is converted the way diffusers does it: the alpha channel is
+    dropped, so a fully-transparent pixel keeps its RGB value instead of
+    turning white."""
+    rgba = PIL.Image.new("RGBA", (8, 8), color=(10, 20, 30, 0))
+    buffer = io.BytesIO()
+    rgba.save(buffer, format="PNG")
+
+    (image,) = Flux2Pipeline._load_reference_images([buffer.getvalue()])
+
+    assert image.mode == "RGB"
+    assert image.getpixel((0, 0)) == (10, 20, 30)
 
 
 @pytest.mark.parametrize("image", [[], [object()]])
@@ -71,7 +83,7 @@ def test_prepare_request_resolves_dimensions_and_infer_reuses_images() -> None:
     req = SimpleNamespace(
         prompt=["edit this image"],
         params=SimpleNamespace(
-            image=_png_bytes(),
+            image_reference=[SimpleNamespace(content=_png_bytes())],
             height=None,
             width=None,
             num_inference_steps=1,

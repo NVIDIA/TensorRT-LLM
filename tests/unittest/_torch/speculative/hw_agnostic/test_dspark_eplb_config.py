@@ -64,6 +64,10 @@ def _model_config(lb_config=None, num_hidden_layers=NUM_HIDDEN_LAYERS):
         mapping=object(),
         max_num_tokens=8192,
         moe_max_num_tokens=8192,
+        # Forwarded to the drafter so its position table is sized by what the
+        # runtime serves rather than max_position_embeddings. A real
+        # ModelConfig always carries it, so the helper reads it unguarded.
+        max_seq_len=8192,
         pretrained_config=SimpleNamespace(num_hidden_layers=num_hidden_layers),
     )
 
@@ -147,6 +151,31 @@ def test_external_drafter_kwargs_are_stable_across_modes():
         _model_config(_lb_config(DSPARK_LAYERS)), _spec_config(SpeculativeDecodingMode.DSPARK)
     )
     assert set(dspark) - set(common) == {"moe_load_balancer"}
+
+
+def test_dspark_draft_backend_auto_resolves_on_isolated_copy():
+    quant_config = SimpleNamespace(quant_algo=None)
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
+        sparse_attention_config=None,
+        quant_config_dict=None,
+        quant_config=quant_config,
+        moe_backend="CUTLASS",
+    )
+
+    with patch.object(
+        modeling_dspark.ModelConfig, "resolve_moe_backend", return_value="TRTLLM"
+    ) as resolve_backend:
+        draft_config = modeling_dspark.DSv4DSparkDraftModel._derive_draft_model_config(
+            model_config, NUM_HIDDEN_LAYERS, NUM_STAGES, "AUTO"
+        )
+
+    assert draft_config is not model_config
+    assert draft_config.moe_backend == "TRTLLM"
+    assert model_config.moe_backend == "CUTLASS"
+    resolve_backend.assert_called_once_with(
+        "AUTO", "DeepseekV4ForCausalLM", quant_config=quant_config
+    )
 
 
 # --------------------------------------------------------------------------

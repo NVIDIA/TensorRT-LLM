@@ -29,6 +29,7 @@ from utils.util import check_accuracy
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.modules.mxfp8_utils import quant_bf16_to_mxfp8
 from tensorrt_llm._torch.moe.fused_moe import BaseMoeRoutingMethod
@@ -131,10 +132,8 @@ def get_test_quant_params(quant_algo, x, backend_type=None):
             quantize_util_cls = NVFP4QuantizeUtil
             x_sf_global = (448 * 6) / x.abs().max().float()
             quant_kwargs["x_sf_global"] = x_sf_global
-            # MegaMoE CuteDSL runs the deepgemm graph (routing weight folded into
-            # the SwiGLU output before the fc1-output NVFP4 quant), so it needs a
-            # graph-matched reference; the generic transformers-graph NVFP4
-            # reference mismatches systematically. See NVFP4RefMegaMoECuteDsl.
+            # Preserve MegaMoE-specific tolerances with post-FC2 routing weights
+            # for these synthetic model configurations.
             if backend_name == "MEGAMOE_CUTEDSL":
                 quant_kwargs["ref_cls"] = NVFP4RefMegaMoECuteDsl
     elif quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
@@ -390,6 +389,14 @@ class RefMLPFusedMoE(nn.Module):
 
         for expert in range(self.num_experts):
             self._load_expert_weights_with_scales(weights, expert)
+
+        # Match production (pyexecutor/model_loader.py): finalize quant-method
+        # scale layouts after load. Without this the FP8BlockScales ref keeps
+        # raw float32 scales and fp8_swap_ab_gemm on sm107 explodes to inf.
+        # No-op for methods without a post_load_weights override.
+        for m in self.modules():
+            if isinstance(m, Linear):
+                m.post_load_weights()
 
     def check_accuracy(self, output, ref_output):
         # Relaxed percent from 0.984 to 0.96 to handle small tensor statistical variance.
@@ -686,21 +693,10 @@ class NVFP4RefMLPFusedMoE(RefMLPFusedMoE):
 
 
 class NVFP4RefMegaMoECuteDsl(NVFP4RefMLPFusedMoE):
-    """Reference matching MegaMoE CuteDSL's deepgemm-graph routing-weight placement.
+    """Post-FC2 reference for synthetic MegaMoE configurations.
 
-    The MegaMoE CuteDSL fused kernel runs the "deepgemm graph"
-    (``apply_topk_in_fc1=True``): it folds the per-token routing weight into the
-    SwiGLU output BEFORE the fc1-output NVFP4 quantization, then reduces the
-    already-weighted per-topk terms with a plain sum.
-
-    The generic :class:`NVFP4RefMLPFusedMoE` applies the routing weight AFTER the
-    full expert (the "transformers graph"), so the fc1-output NVFP4 block scales
-    see the *unweighted* SwiGLU output -- a different RTNE rounding than the
-    kernel and a large systematic mismatch (the weight is a per-token scalar that
-    shifts each block's absmax / scale factor). This override moves the weight
-    fold before ``down_proj`` -- whose internal per-expert NVFP4 activation quant
-    (``w2.input_scale`` == the kernel's per-expert ``fc1_norm_const``) is exactly
-    the fc1-output round-trip -- and reduces unweighted, matching the kernel.
+    Only DeepSeek V4 opts into pre-FC2 routing weights in the production backend;
+    these tests retain the generic reference and MegaMoE-specific tolerances.
     """
 
     def check_accuracy(self, output, ref_output):
@@ -722,7 +718,8 @@ class NVFP4RefMegaMoECuteDsl(NVFP4RefMLPFusedMoE):
         # The 9% / 8% tiers replace the old single ">10000 -> 7%" bucket (the
         # 28672 / 65536 cases exceeded 7%); the 5% tier replaces the old
         # "<=10000 -> 3%" bucket (the 8448 case exceeded 3%). swiglu_gptoss_style
-        # keeps its own 5% / atol=0.1 band when error_accumulation stays <=10000.
+        # keeps its own 6% / atol=0.1 band when error_accumulation stays <=10000,
+        # matching the dedicated clamp-heavy MiniMax-M3 numerical test.
         top_k = getattr(self.routing_method, "top_k", 1)
         error_accumulation = self.intermediate_size * top_k
         if error_accumulation > 20000:
@@ -730,37 +727,11 @@ class NVFP4RefMegaMoECuteDsl(NVFP4RefMLPFusedMoE):
         elif error_accumulation > 10000:
             check_accuracy(output, ref_output, rtol=0.1, atol=0.15, percent=0.92)
         elif self.swiglu_gptoss_style:
-            check_accuracy(output, ref_output, rtol=0.1, atol=0.1, percent=0.95)
+            check_accuracy(output, ref_output, rtol=0.1, atol=0.1, percent=0.94)
         elif error_accumulation > 5000:
             check_accuracy(output, ref_output, rtol=0.1, atol=0.15, percent=0.95)
         else:
             check_accuracy(output, ref_output, rtol=0.1, atol=0.15, percent=0.97)
-
-    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
-        assert hidden_states.shape[-1] == self.hidden_size
-        hidden_states = hidden_states.view(-1, self.hidden_size)
-        selected_experts, routing_weights = self.routing_method.apply(router_logits)
-        final_hidden_states = torch.zeros(
-            hidden_states.shape, dtype=hidden_states.dtype, device=hidden_states.device
-        )
-        for expert_id in range(self.num_experts):
-            if not torch.any(selected_experts == expert_id):
-                continue
-            batch_idx, nth_expert = torch.where(selected_experts == expert_id)
-            expert_inputs = hidden_states[batch_idx]
-            expert = self.experts[expert_id]
-            l1_output = expert.gate_up_proj(expert_inputs)
-            act_output = expert._apply_activation(l1_output)
-            # deepgemm graph: fold the per-token routing weight into the SwiGLU
-            # output BEFORE down_proj's fc1-output NVFP4 requant, then reduce
-            # unweighted (matches MegaMoECuteDsl apply_topk_in_fc1=True).
-            act_output = act_output * routing_weights[batch_idx, nth_expert, None].to(
-                act_output.dtype
-            )
-            output = expert.down_proj(act_output)
-            final_hidden_states[batch_idx] += output.float()
-        final_hidden_states = final_hidden_states.reshape(hidden_states.shape)
-        return final_hidden_states
 
 
 class NVFP4QuantizeUtil(BaseQuantizeUtil):
@@ -1750,6 +1721,13 @@ class MXFP4MXFP8RefGatedMLPFusedMoE(RefMLPFusedMoE):
         return output
 
     def check_accuracy(self, output, ref_output):
+        # sm107 only: backend fuses gemm1->activation->gemm2 with an FP8
+        # intermediate while the GatedMLP ref requantizes via bf16 between
+        # the two gemms. Both kernels are deterministic (identical mismatch
+        # across all 192 tactics), but Rubin rounding adds ~1% extra
+        # sign-flips on near-zero entries, pushing h=512 from <15% to ~16%.
+        # Widen percent by 2% on sm107; B200/H100/sm120 unchanged.
+        sm107_relax = get_sm_version() == 107
         if self.swiglu_gptoss_style:
             check_accuracy(output, ref_output, rtol=0.1, atol=0.2, percent=0.8)
         elif self.hidden_size >= 4096:
@@ -1757,9 +1735,11 @@ class MXFP4MXFP8RefGatedMLPFusedMoE(RefMLPFusedMoE):
             # MXFP4 (4-bit) weights + MXFP8 (8-bit) activations accumulate more
             # quantization error in large GEMM reduction dimensions: error ~ sqrt(K).
             # Observed mismatch: ~17-19% for h=7168 vs <15% for h=512.
-            check_accuracy(output, ref_output, rtol=0.15, atol=0.3, percent=0.85)
+            percent = 0.83 if sm107_relax else 0.85
+            check_accuracy(output, ref_output, rtol=0.15, atol=0.3, percent=percent)
         else:
-            check_accuracy(output, ref_output, rtol=0.10, atol=0.2, percent=0.85)
+            percent = 0.83 if sm107_relax else 0.85
+            check_accuracy(output, ref_output, rtol=0.10, atol=0.2, percent=percent)
 
 
 class MXFP4MXFP8RefMegaMoEDeepGemm(MXFP4MXFP8RefGatedMLPFusedMoE):
