@@ -35,17 +35,6 @@ class GlmKpoolSparseParams(SparseParams):
     """Lowered runtime parameters for the GLM k-pool sparse-MLA backend."""
 
     algorithm: Literal["glm_kpool"] = field(init=False, default="glm_kpool")
-    #: Latent (compressed KV) width; also the absorbed query head width and
-    #: the kernel's d_qk == d_v. 512 on this checkpoint.
-    kv_lora_rank: int = 512
-    #: Pre-absorption query/key head width; sets the softmax scale. Fully
-    #: NoPE: there is no rope component on top of it.
-    qk_nope_head_dim: int = 256
-    #: Low-rank query bottleneck width; carried into ``MLAParams`` so the
-    #: backend's MLA identity states the real checkpoint geometry.
-    q_lora_rank: int = 1536
-    #: Per-head value width after the absorbed V projection.
-    v_head_dim: int = 256
     #: Number of key positions the expanded selection may cover.
     index_topk: int = 2048
     #: Members per compressed pool.

@@ -12,12 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GLM hybrid cache manager and persistent sparse-attention metadata.
-
-Kimi KDA metadata handles recurrent state and replay scheduling. GLM adds raw
-slot tables with fixed device addresses plus host prefill schedules. Visible
-lengths come from TRTLLM kv_lens_cuda, including overlap and MTP corrections.
-"""
+"""GLM hybrid cache manager for recurrent, latent KV, and indexer state."""
 
 from __future__ import annotations
 
@@ -25,77 +20,9 @@ from collections.abc import Sequence
 
 import torch
 
-from tensorrt_llm._torch.modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig
-
-
-class Glm5NextMamba2Metadata(KimiK3MambaMetadata):
-    def __init__(self, max_batch_size: int, chunk_size: int, max_num_tokens: int) -> None:
-        super().__init__(max_batch_size, chunk_size, max_num_tokens)
-        from tensorrt_llm._utils import prefer_pinned
-
-        self._glm_pin = prefer_pinned()
-        self.glm_block_tables: torch.Tensor | None = None
-        self._glm_block_tables_cpu: torch.Tensor | None = None
-        self.glm_cached_lens_host: list[int] = []
-        self.glm_ctx_cu_seqlens: list[int] = [0]
-
-    def _glm_ensure_tables(self, width: int) -> None:
-        width = max(1, int(width))
-        if self.glm_block_tables is None:
-            self.glm_block_tables = torch.zeros(
-                self.max_batch_size, width, dtype=torch.long, device="cuda"
-            )
-            self._glm_block_tables_cpu = torch.zeros(
-                self.max_batch_size, width, dtype=torch.long, pin_memory=self._glm_pin
-            )
-        elif self.glm_block_tables.shape[1] < width:
-            raise RuntimeError(
-                "glm5_next block-table buffer would need to grow from "
-                f"{self.glm_block_tables.shape[1]} to {width} pages mid-run; "
-                "captured CUDA graphs would keep reading the old buffer"
-            )
-
-    def prepare(self, attn_metadata) -> None:
-        super().prepare(attn_metadata)
-        manager = attn_metadata.kv_cache_manager
-        kv_params = attn_metadata.kv_cache_params
-        request_ids = attn_metadata.request_ids
-        if (
-            manager is None
-            or not hasattr(manager, "get_batch_slot_tables")
-            or kv_params is None
-            or kv_params.num_cached_tokens_per_seq is None
-            or request_ids is None
-        ):
-            return
-
-        batch = attn_metadata.seq_lens.shape[0]
-        num_contexts = int(attn_metadata.num_contexts)
-        lens = [int(x) for x in attn_metadata.seq_lens[:batch]]
-        cached_src = kv_params.num_cached_tokens_per_seq
-        if isinstance(cached_src, torch.Tensor):
-            cached = [int(x) for x in cached_src[:batch]]
-        else:
-            cached = [int(cached_src[i]) for i in range(batch)]
-
-        self.glm_cached_lens_host = cached
-        cu = [0]
-        for length in lens[:num_contexts]:
-            cu.append(cu[-1] + length)
-        self.glm_ctx_cu_seqlens = cu
-
-        width = int(getattr(manager, "max_blocks_per_seq", 0)) or 1
-        self._glm_ensure_tables(width)
-        pages = manager.get_batch_slot_tables(list(request_ids)[:batch])
-        staging = self._glm_block_tables_cpu
-        staging[:batch].zero_()
-        for row, page_ids in enumerate(pages):
-            if page_ids:
-                staging[row, : len(page_ids)].copy_(torch.as_tensor(page_ids, dtype=torch.long))
-        self.glm_block_tables[:batch].copy_(staging[:batch], non_blocking=True)
 
 
 class Glm5NextCacheManager(MambaHybridCacheManagerV2):
@@ -141,37 +68,21 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
             kv_layout="NHD",
         )
 
-    def _sparse_pool_id(self) -> int:
-        """Require one V2 layer group for the shared sparse-layer block table.
+    def get_batch_slot_tables(self, request_ids: Sequence[int]) -> list[list[int]]:
+        """Return raw slot IDs shared by the sparse layers' latent and indexer views.
 
-        KEY and INDEX_KEY views must use the same raw slot space across sparse layers.
+        PP ranks without local sparse layers return empty rows.
         """
-        pools = {
-            self.layer_to_pool_mapping_dict[self.layer_offsets[layer_id]]
-            for layer_id in self.sparse_layer_ids
-            if layer_id in self.layer_offsets
-        }
+        local_layers = [i for i in self.sparse_layer_ids if i in self.layer_offsets]
+        if not local_layers:
+            return [[] for _ in request_ids]
+        pools = {self.layer_to_pool_mapping_dict[self.layer_offsets[i]] for i in local_layers}
         if len(pools) != 1:
             raise ValueError(
                 f"glm5_next sparse layers span V2 layer groups {sorted(pools)}; "
                 "the slot-indexed latent/index views require a single group"
             )
-        return pools.pop()
-
-    def get_batch_slot_tables(self, request_ids: Sequence[int]) -> list[list[int]]:
-        """Return raw base-slot IDs, without V2's per-layer page-index scaling.
-
-        Both latent and indexer views fold that scaling into their slot stride.
-        PP ranks without local sparse layers return empty rows.
-        """
-        if not any(layer_id in self.layer_offsets for layer_id in self.sparse_layer_ids):
-            return [[] for _ in request_ids]
-        return self._get_batch_cache_indices_by_pool_id(
-            list(request_ids),
-            pool_id=self._sparse_pool_id(),
-            is_kv_aggregate=False,
-            index_scale=1,
-        )
+        return self.get_batch_base_page_indices(list(request_ids), layer_idx=local_layers[0])
 
     def get_latent_state_buffer(self, layer_idx: int) -> torch.Tensor | None:
         """Return a slot-major [slots, tokens_per_block, num_kv_heads, head_dim] view.
