@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import logging
 import os
 import threading
@@ -80,6 +83,7 @@ class ServerRole(IntEnum):
     MM_ENCODER = 2
     VISUAL_GEN = 3
     EMBEDDING = 4
+    RERANK = 5
 
 
 @dataclass

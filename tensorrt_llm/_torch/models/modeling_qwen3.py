@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import copy
 from typing import Optional
 
@@ -18,7 +21,7 @@ from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import TensorParallelMode
+from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
 from .modeling_speculative import SpecDecOneEngineForCausalLM
@@ -363,3 +366,76 @@ class Qwen3ForTextEmbedding(DecoderModelForCausalLM[Qwen3Model, Qwen3Config]):
         pooled = hidden_states[end_indices]
         normalized = torch.nn.functional.normalize(pooled.float(), p=2, dim=-1)
         return normalized.to(pooled.dtype)
+
+
+@register_auto_model("Qwen3ForTextReranking")
+class Qwen3ForTextReranking(DecoderModelForCausalLM[Qwen3Model, Qwen3Config]):
+    """Qwen3-Reranker family exposed as a scalar text-reranking model.
+
+    The published checkpoints are causal language models whose relevance
+    probability is the two-token softmax over ``yes`` and ``no``. A one-row
+    head with ``W_yes - W_no`` produces the equivalent pre-sigmoid logit while
+    avoiding a full vocabulary projection during inference.
+    """
+
+    # Published checkpoints record these values in 1_LogitScore/config.json.
+    _YES_TOKEN_ID = 9693
+    _NO_TOKEN_ID = 2152
+
+    def __init__(self, model_config: ModelConfig[Qwen3Config]) -> None:
+        nn.Module.__init__(self)
+        self.model_config = model_config
+        self.model = Qwen3Model(model_config)
+
+        config = model_config.pretrained_config
+        self.score = Linear(config.hidden_size,
+                            1,
+                            bias=False,
+                            dtype=config.torch_dtype)
+        self.prologue = []
+        self.epilogue = [self.score]
+
+    @classmethod
+    def _derive_score_weight(cls, weights: dict) -> tuple[str, torch.Tensor]:
+        """Build the scalar head from the checkpoint's yes/no token rows."""
+        source_names = (
+            "lm_head.weight",
+            "model.embed_tokens.weight",
+        )
+        for source_name in source_names:
+            if source_name in weights:
+                source = weights[source_name]
+                yes = source[cls._YES_TOKEN_ID:cls._YES_TOKEN_ID + 1]
+                no = source[cls._NO_TOKEN_ID:cls._NO_TOKEN_ID + 1]
+                return source_name, yes - no
+        raise ValueError(
+            "Qwen3 reranker checkpoint must contain lm_head.weight or "
+            "model.embed_tokens.weight for a tied language-model head.")
+
+    def load_weights(self, weights: dict, **kwargs) -> None:
+        source_name, score_weight = self._derive_score_weight(weights)
+        weights["score.weight"] = score_weight
+        # An untied LM head is not otherwise consumed by this model. Releasing
+        # it here keeps peak host memory bounded for the 8B checkpoint.
+        if (source_name == "lm_head.weight"
+                and hasattr(weights, "mark_consumed")):
+            weights.mark_consumed("lm_head")
+        elif source_name == "lm_head.weight":
+            del weights[source_name]
+        super().load_weights(weights, **kwargs)
+
+    def forward(self,
+                attn_metadata: AttentionMetadata,
+                input_ids: torch.IntTensor,
+                position_ids: Optional[torch.IntTensor] = None,
+                inputs_embeds: Optional[torch.FloatTensor] = None,
+                **kwargs) -> torch.Tensor:
+        assert attn_metadata.seq_lens is not None
+
+        hidden_states = self.model(attn_metadata,
+                                   input_ids,
+                                   position_ids=position_ids,
+                                   inputs_embeds=inputs_embeds)
+        logits = self.score(hidden_states)
+        end_indices = torch.cumsum(attn_metadata.seq_lens, dim=0) - 1
+        return logits[end_indices]
