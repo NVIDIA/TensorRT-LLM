@@ -6295,6 +6295,25 @@ class TorchLlmArgs(BaseLlmArgs):
 
         return self
 
+    def _kv_cache_estimation_runs(self) -> bool:
+        """Whether the executor will profile a forward to size the KV pool.
+
+        Mirrors the config-time-knowable conditions of
+        ``KvCacheCreator.try_prepare_estimation``: the
+        ``TRTLLM_SKIP_KV_CACHE_ESTIMATION`` env var, a VANILLA target
+        attention backend, and context parallelism all skip estimation.
+        Encoder-decoder targets also skip it but are only known from the
+        model config at load time; they are treated as estimating here,
+        which errs toward the looser arena budget.
+        """
+        if os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "0") == "1":
+            return False
+        if self.attn_backend == "VANILLA":
+            return False
+        if self.cp_config is not None:
+            return False
+        return True
+
     def _validate_dflash_ctx_budget(self,
                                     memory_budget_bytes: Optional[int] = None
                                     ) -> None:
@@ -6303,20 +6322,23 @@ class TorchLlmArgs(BaseLlmArgs):
         Delegates to ``validate_dflash_ctx_buffer_budget``: the token-budget
         rule (``max_batch_size * (1 + max_draft_len) <= max_num_tokens``) and
         the pooled-context K/V buffer fit, both of which otherwise fail only
-        during warmup, after the KV-cache pool has committed.
+        once the model is loaded and the first forward runs.
 
-        The buffer budget estimates what is free AFTER the KV-cache pool
-        commits. The pool is sized as ``free_gpu_memory_fraction`` of the
-        memory free AFTER model load, so the budget subtracts an estimate of
-        the per-rank weight footprint (checkpoint shard bytes on disk divided
-        across TP x PP ranks) before applying ``(1 - fraction)``; budgeting
-        against the device total would bless a max_batch_size that then OOMs
-        in warmup with half the assumed headroom missing. See
-        ``derive_dflash_ctx_memory_budget_bytes`` for the overhead and safety
-        terms. The check is only enforced when the KV pool is sized by
-        fraction (an explicit ``kv_cache_config.max_tokens`` cap can leave
-        more headroom than the fraction implies) and when a CUDA device is
-        visible. ``memory_budget_bytes`` overrides the derivation (tests).
+        The buffer budget depends on when the arena is allocated relative to
+        the KV-cache pool (``_kv_cache_estimation_runs``). With estimation
+        (the default) the arena is allocated inside the estimation forward,
+        before the pool is sized, so it must fit the device total less the
+        runtime overhead, the estimated per-rank weight footprint (checkpoint
+        shard bytes on disk divided across TP x PP ranks) and a reserve for
+        activations and CUDA graphs; ``free_gpu_memory_fraction`` bounds the
+        pool that is sized afterwards, not the arena. With estimation skipped
+        the pool commits first as ``free_gpu_memory_fraction`` of the
+        post-load memory, and the arena gets ``(1 - fraction)`` of that. See
+        ``derive_dflash_ctx_memory_budget_bytes`` for both forms. The check
+        is only enforced when the KV pool is sized by fraction (an explicit
+        ``kv_cache_config.max_tokens`` cap can leave more headroom than the
+        fraction implies) and when a CUDA device is visible.
+        ``memory_budget_bytes`` overrides the derivation (tests).
         """
         from tensorrt_llm._torch.speculative.dflash import (
             derive_dflash_ctx_memory_budget_bytes,
@@ -6358,6 +6380,7 @@ class TorchLlmArgs(BaseLlmArgs):
                 with open(draft_config_path) as f:
                     draft_config = json.load(f)
 
+        arena_before_pool = self._kv_cache_estimation_runs()
         if spec_cfg.skip_ctx_buffer_budget_check:
             # Opt out of the pooled-context buffer-fit check (the estimate is
             # conservative); the token-budget check above still applies.
@@ -6377,7 +6400,10 @@ class TorchLlmArgs(BaseLlmArgs):
                         self.tensor_parallel_size * self.pipeline_parallel_size)
                     per_rank_weight_bytes = checkpoint_bytes // weight_shards
                 memory_budget_bytes = derive_dflash_ctx_memory_budget_bytes(
-                    total, kv_fraction, per_rank_weight_bytes)
+                    total,
+                    kv_fraction,
+                    per_rank_weight_bytes,
+                    arena_before_pool=arena_before_pool)
 
         validate_dflash_ctx_buffer_budget(
             max_batch_size=self.max_batch_size,
@@ -6388,6 +6414,7 @@ class TorchLlmArgs(BaseLlmArgs):
             draft_config=draft_config,
             tp_size=self.tensor_parallel_size,
             memory_budget_bytes=memory_budget_bytes,
+            arena_before_pool=arena_before_pool,
         )
 
     @model_validator(mode="after")

@@ -93,7 +93,8 @@ def compute_dflash_ctx_buffer_bytes(
 # (outside torch)"); a central estimate, not a bound.
 _DFLASH_BUDGET_RUNTIME_OVERHEAD_BYTES = 4 * 1024**3
 
-# Headroom for what still lands between KV-pool commit and the lazy buffer
+# Pool-first budget (KV-cache estimation skipped): multiplicative headroom
+# for what still lands between KV-pool commit and the lazy buffer
 # allocation: autotuner/warmup transients and allocator fragmentation
 # (~1.6 GiB consumed between the arena's K and V tensor allocations in live
 # validation), the on-disk-vs-resident weight gap (~9% observed:
@@ -111,6 +112,18 @@ _DFLASH_BUDGET_RUNTIME_OVERHEAD_BYTES = 4 * 1024**3
 # message says so and points at free_gpu_memory_fraction as the robust
 # lever.
 _DFLASH_BUDGET_SAFETY_FACTOR = 0.70
+
+# Arena-first budget (KV-cache estimation runs, the default): additive
+# per-GPU reserve for everything that shares the pre-pool headroom with the
+# arena and is not the KV pool itself: the activation peak of the profiling
+# forward (the arena is allocated inside that forward, so both are resident
+# at once), CUDA-graph capture and autotuner workspaces, and allocator
+# fragmentation. The post-arena consumers measured 2-4 GiB and the
+# fragmentation ~1.6 GiB in the live validation above; 6 GiB covers their
+# sum. Additive rather than a fraction: on a 100+ GiB headroom a 0.7 factor
+# would discard 30+ GiB the arena can actually use, while the consumers it
+# guards against do not scale with headroom.
+_DFLASH_BUDGET_ACTIVATION_RESERVE_BYTES = 6 * 1024**3
 
 _WEIGHT_SHARD_SUFFIXES = (".safetensors", ".bin")
 
@@ -150,26 +163,41 @@ def derive_dflash_ctx_memory_budget_bytes(
     total_device_memory: int,
     kv_fraction: float,
     per_rank_weight_bytes: Optional[int] = None,
+    *,
+    arena_before_pool: bool,
 ) -> int:
-    """Estimated per-GPU bytes free AFTER the KV-cache pool commits.
+    """Estimated per-GPU bytes the pooled-context arena can occupy.
 
-    The KV-cache pool is sized as ``kv_fraction`` of the memory free AFTER
-    model load, so what the lazy DFlash buffers can find at warmup is
-    ``(1 - kv_fraction)`` of that post-load memory -- NOT of the device
-    total. Budgeting against the device total is how a validator blesses a
-    max_batch_size that then dies as a bare CUDA OOM in warmup: on a large
-    target, model weights consume half the device, and the "free" the
-    fraction applies to is half of what the total-based bound assumed.
+    Which memory the arena competes for depends on when it is allocated
+    relative to the KV-cache pool, and ``arena_before_pool`` selects that:
+
+    * ``True`` (KV-cache estimation runs; the default executor path): the
+      arena is allocated inside the estimation forward, BEFORE the pool is
+      sized, and the pool then takes ``kv_fraction`` of whatever is left.
+      The arena only has to fit ``total - runtime overhead - weights``
+      minus a reserve for the activations, CUDA graphs and fragmentation
+      that share that headroom (``_DFLASH_BUDGET_ACTIVATION_RESERVE_BYTES``).
+      ``kv_fraction`` does not bound the arena here; it bounds the pool.
+      A config whose arena fits but leaves the pool too small fails later
+      with a KV-capacity error, which is clear rather than a bare OOM.
+    * ``False`` (estimation skipped: ``TRTLLM_SKIP_KV_CACHE_ESTIMATION``,
+      target ``attn_backend == "VANILLA"``, context parallelism): the pool
+      is sized from post-load free memory without a forward and commits
+      first, so the arena finds ``(1 - kv_fraction)`` of the post-load
+      memory, scaled by ``_DFLASH_BUDGET_SAFETY_FACTOR`` for the warmup
+      transients that land in the same window.
 
     ``per_rank_weight_bytes`` (estimated; see
     ``estimate_checkpoint_weight_bytes``) is subtracted when available;
     without it the bound stays optimistic but is still tightened by the
-    runtime-overhead and safety terms.
+    runtime-overhead and reserve/safety terms.
     """
     usable = total_device_memory - _DFLASH_BUDGET_RUNTIME_OVERHEAD_BYTES
     if per_rank_weight_bytes is not None:
         usable -= per_rank_weight_bytes
     usable = max(0, usable)
+    if arena_before_pool:
+        return max(0, usable - _DFLASH_BUDGET_ACTIVATION_RESERVE_BYTES)
     return int((1.0 - kv_fraction) * usable * _DFLASH_BUDGET_SAFETY_FACTOR)
 
 
@@ -183,6 +211,7 @@ def validate_dflash_ctx_buffer_budget(
     draft_config: Optional[dict] = None,
     tp_size: int = 1,
     memory_budget_bytes: Optional[int] = None,
+    arena_before_pool: bool = True,
 ) -> None:
     """Config-time checks for failure modes DFlash otherwise hits late.
 
@@ -195,11 +224,13 @@ def validate_dflash_ctx_buffer_budget(
        ``max_num_tokens``. A violation is not reported at runtime; it
        corrupts memory at engine init instead.
     2. Pooled-context K/V buffers: ``_lazy_init_ctx_buffers`` allocates them
-       lazily during warmup, AFTER KV-cache estimation has committed its
-       pool, so an oversized ``max_batch_size`` dies as a bare CUDA OOM. The
-       buffer capacity is ``min(max_seq_len, max_position_embeddings)`` --
-       the same clamp ``_lazy_init_ctx_buffers`` applies at allocation time,
-       so this estimate matches what it allocates.
+       lazily on the first forward. With KV-cache estimation (the default)
+       that is the estimation forward itself, before the pool is sized;
+       with estimation skipped it is warmup, after the pool has committed.
+       Either way an oversized ``max_batch_size`` dies as a bare CUDA OOM.
+       The buffer capacity is ``min(max_seq_len, max_position_embeddings)``
+       -- the same clamp ``_lazy_init_ctx_buffers`` applies at allocation
+       time, so this estimate matches what it allocates.
 
     Args:
         max_batch_size: Configured maximum batch size (``None`` skips both
@@ -217,6 +248,9 @@ def validate_dflash_ctx_buffer_budget(
         tp_size: Tensor-parallel size; KV heads are sharded across it.
         memory_budget_bytes: Per-GPU byte budget the buffers must fit in
             (``None`` skips the buffer check).
+        arena_before_pool: Which headroom ``memory_budget_bytes`` describes
+            (see ``derive_dflash_ctx_memory_budget_bytes``); only affects
+            the wording and remedy of the refusal.
 
     Raises:
         ValueError: On a token-budget violation or when the pooled-context
@@ -315,22 +349,39 @@ def validate_dflash_ctx_buffer_budget(
     per_slot = required // (max_batch_size + 1)
     fitting = int(memory_budget_bytes // per_slot) - 1  # one slot is scratch
     gib = 1024**3
+    if arena_before_pool:
+        budget_desc = (
+            f"the estimated {memory_budget_bytes / gib:.2f} GiB left free "
+            "once the model weights and runtime overhead are resident, less "
+            "a reserve for activations and CUDA graphs. These buffers are "
+            "allocated inside the KV-cache estimation forward, before the "
+            "pool is sized (the pool then takes free_gpu_memory_fraction of "
+            "what remains), so an oversized max_batch_size otherwise fails "
+            "there with a bare CUDA OOM."
+        )
+        near_bound_lever = "lower max_batch_size or max_seq_len"
+    else:
+        budget_desc = (
+            f"the estimated {memory_budget_bytes / gib:.2f} GiB left free "
+            "once the model weights are resident and the KV-cache pool "
+            "commits. With KV-cache estimation skipped these buffers are "
+            "allocated lazily during warmup, after the KV cache commits its "
+            "pool, so an oversized max_batch_size otherwise fails late with "
+            "a bare CUDA OOM."
+        )
+        near_bound_lever = "lower kv_cache_config.free_gpu_memory_fraction"
     remedy = (
         f"the largest max_batch_size estimated to fit is {fitting} (an "
         "estimate, not a guarantee: CUDA-graph capture and warmup workspaces "
         "also draw on the same headroom; if a config near this bound still "
-        "OOMs, lower kv_cache_config.free_gpu_memory_fraction)"
+        f"OOMs, {near_bound_lever})"
         if fitting >= 1
         else "no max_batch_size fits; lower max_seq_len or the drafter context"
     )
     message = (
         f"DFlash: the pooled-context K/V buffers for max_batch_size="
         f"{max_batch_size} need {required / gib:.2f} GiB per GPU, exceeding "
-        f"the estimated {memory_budget_bytes / gib:.2f} GiB left free once "
-        "the model weights are resident and the KV-cache pool commits. "
-        "These buffers are allocated lazily during warmup, "
-        "after the KV cache commits its pool, so an oversized max_batch_size "
-        "otherwise fails late with a bare CUDA OOM. Size formula: "
+        f"{budget_desc} Size formula: "
         "2 (K and V) x (max_batch_size + 1 slots) x num_layers x "
         "(max_ctx + block_size) x kv_heads_per_rank x head_dim x dtype_bytes "
         f"= 2 x {max_batch_size + 1} x {num_layers} x ({max_ctx} + "
