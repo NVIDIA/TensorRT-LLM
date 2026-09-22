@@ -45,13 +45,14 @@ _PACKAGE = "tensorrt_llm._torch._experimental.modeling_v2"
 #: nothing outside this package has to carry the concept: the only upstream
 #: change modeling_v2 needs is the ``_resolve_class`` hook itself.
 #:
-#: It has to be exported **before the ranks start**, not merely before
-#: ``LLM(...)``. Worker ranks receive the environment as it stood when MPI
-#: initialized, and long-lived ranks under ``trtllm-llmapi-launch`` receive it
-#: once at launch, so a value set later reaches the driver and not them -- and
-#: a driver that resolves a modeling_v2 target while its workers resolve the
-#: built-in is exactly the silent split this package exists to prevent. Export
-#: it in the shell, or before ``import tensorrt_llm``.
+#: Assigning to ``os.environ`` from a script does not set it. Worker ranks
+#: receive the environment as it stood when MPI initialized, and long-lived
+#: ranks under ``trtllm-llmapi-launch`` receive it once at launch, so a value
+#: set later reaches the driver and not them -- and a driver that resolves a
+#: modeling_v2 target while its workers resolve the built-in is exactly the
+#: silent split this package exists to prevent. Two routes do reach the ranks:
+#: export it in the shell before they start, or pass ``LLM(env_overrides={...})``,
+#: which every rank re-applies to its own environment before it builds a model.
 MODELING_V2_ENV = "TRTLLM_MODELING_V2"
 
 # architectures[0] -> routing module, relative to this package.
