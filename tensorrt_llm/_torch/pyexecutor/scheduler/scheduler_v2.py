@@ -450,6 +450,17 @@ class KVCacheV2Scheduler(RequestScheduler):
         preempted_ids: set[int] = set()
 
         def preempt_for_pages(req: LlmRequest) -> bool:
+            """Free pages for `req` by giving up one started request.
+
+            A success ends the phase 2 loop rather than only skipping `req`.
+            The pages are reserved for the request that paid a re-prefill for
+            them: letting a later, smaller context request take them instead
+            would leave `req` blocked and force it to preempt again on the
+            next pass, which can repeat indefinitely while the scheduler
+            still looks like it is making progress. The cost of holding them
+            is one iteration of admission, a couple of milliseconds, against
+            a whole prefill replayed for nothing.
+            """
             protected = {r.py_request_id for r in scheduled_gen}
             protected.update(r.py_request_id for r in scheduled_ctx)
             protected.add(req.py_request_id)
@@ -819,7 +830,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             # proceed, and retry next iteration: a failed resize leaves a
             # first chunk suspended, so the retry has to go back through
             # prepare_context to resume it.
-            preempt_for_pages(req)
+            if preempt_for_pages(req):
+                return ScheduleAction.STOP, 0, False
             return ScheduleAction.SKIP, 0, False
 
         cross_action = self._try_schedule_cross_context(req)
@@ -932,7 +944,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # draft tokens for last chunk.
         if not self._try_allocate_context(req, resize_tokens):
             # Out of pages, as in _try_schedule_context_full.
-            preempt_for_pages(req)
+            if preempt_for_pages(req):
+                return ScheduleAction.STOP, 0, False
             return ScheduleAction.SKIP, 0, False
 
         cross_action = self._try_schedule_cross_context(req)

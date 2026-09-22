@@ -1425,6 +1425,61 @@ class TestContextPreemption:
 
         assert ids(out.context_requests) == []
 
+    def test_freed_pages_are_reserved_for_the_request_that_preempted(self):
+        """No later context request may spend them first.
+
+        Otherwise the request that paid a re-prefill for the pages stays
+        blocked and preempts again next pass, which can repeat without ever
+        admitting it while the scheduler still looks like it is progressing.
+        """
+        mgr = make_kv_cache_manager(
+            resize_context_fn=_out_of_pages_for(0),
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        blocked = make_ctx_request(0, 100)
+        # Would fit in what the preemption releases, and is only behind
+        # `blocked` by arrival order.
+        later = make_ctx_request(1, 10)
+        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+
+        out = sched.schedule_request([blocked, later, victim], set())
+
+        assert ids(out.recompute_paused_requests) == [99]
+        assert ids(out.context_requests) == []
+
+    def test_a_failed_preemption_still_lets_the_pass_continue(self):
+        """With nothing to give up there is no capacity to reserve."""
+        mgr = make_kv_cache_manager(
+            resize_context_fn=_out_of_pages_for(0),
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        # Only first chunks, so there is no preemption victim among them.
+        reqs = [make_ctx_request(0, 100), make_ctx_request(1, 10)]
+
+        out = sched.schedule_request(reqs, set())
+
+        mgr.preempt_request.assert_not_called()
+        assert ids(out.context_requests) == [1]
+
+    def test_generation_scheduled_before_a_preemption_is_unaffected(self):
+        """Phase 1 has already committed, so ending phase 2 costs it nothing."""
+        mgr = make_kv_cache_manager(
+            resize_context_fn=_out_of_pages_for(1),
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        blocked = make_ctx_request(1, 100)
+        later = make_ctx_request(2, 10)
+        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+
+        out = sched.schedule_request([make_gen_request(0), blocked, later, victim], set())
+
+        assert ids(out.generation_requests) == [0]
+        assert ids(out.recompute_paused_requests) == [99]
+        assert ids(out.context_requests) == []
+
     def test_skipped_when_a_cache_tier_exists_below_gpu(self):
         mgr = make_kv_cache_manager(
             resize_context_fn=_out_of_pages_for(0),
