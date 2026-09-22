@@ -642,6 +642,10 @@ class PyExecutor:
             self.kv_cache_manager.event_buffer_max_size > 0 or getattr(
                 self.kv_cache_manager, "streaming_kv_events_enabled", False))
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
+        # Router Replay (R3): SharedRouteCache bound, derived once from the KV
+        # pool token capacity on the first non-warmup step (0 = block reuse off,
+        # -1 = capacity unknown -> the capturer keeps its own fallback bound).
+        self._route_cache_capacity: Optional[int] = None
         # AsyncTransferManager pin/unpin path is V1-only; V2 holds blocks via _KVCache refcount.
         self.enable_partial_reuse_for_disagg = (
             self.enable_kv_cache_reuse
@@ -7416,6 +7420,25 @@ class PyExecutor:
             new_tensors_device: Optional[SampleStateTensors] = None,
             num_accepted_tokens_device: Optional[torch.Tensor] = None):
         ExpertStatistic.set_iter(self.iter_counter)
+        # Router Replay (R3): the capturer is owned by the model engine (None
+        # when the feature is off or for engines that do not support it).
+        route_capture = getattr(self.model_engine, "route_capture", None)
+        if route_capture is not None:
+            route_capture.set_iter(self.iter_counter)
+            if not self.model_engine.is_warmup:
+                if self._route_cache_capacity is None:
+                    if self.enable_kv_cache_reuse:
+                        self._route_cache_capacity = int(
+                            self.get_kv_cache_capacity().get("maxNumTokens",
+                                                             0)) or -1
+                    else:
+                        self._route_cache_capacity = 0
+                cap = self._route_cache_capacity
+                route_capture.prepare(scheduled_requests,
+                                      getattr(
+                                          getattr(self, 'kv_cache_manager',
+                                                  None), 'tokens_per_block', 0),
+                                      shared_capacity=None if cap < 0 else cap)
 
         num_ctx_tokens = sum(req.context_chunk_size
                              for req in scheduled_requests.context_requests)
@@ -7460,9 +7483,15 @@ class PyExecutor:
             torch.cuda.current_stream().wait_stream(self.execution_stream)
 
             self._kv_connector_wait_for_save()
+            if route_capture is not None:
+                route_capture.finish_forward()  # R3: disarm between forwards
 
             return outputs
         except Exception as e:
+            if route_capture is not None:
+                # R3: the forward did not complete -- drop the armed capture so
+                # the next iteration does not inherit this step's layout.
+                route_capture.abort_forward()
             traceback.print_exc()
             error_msg = str(e)
             logger.error(
@@ -8157,6 +8186,11 @@ class PyExecutor:
                 request.update_perf_metrics(self.iter_counter)
 
             request_done = False
+            if request.is_finished:
+                route_capture = getattr(self.model_engine, "route_capture",
+                                        None)
+                if route_capture is not None:
+                    route_capture.attach_routes(request)  # R3: append routes
             should_emit = (request.py_decoding_iter == 1 or request.is_finished
                            or request.py_decoding_iter % self.stream_interval
                            == 0)
@@ -8386,6 +8420,12 @@ class PyExecutor:
         self.kv_cache_manager.reset_reuse_state()
         if self.enable_joint_kv_cache_reuse:
             self.draft_kv_cache_manager.reset_reuse_state()
+        # R3: invalidate cached routes together with the KV reuse state. Guard the
+        # engine lookup too -- minimal executors (unit tests) may have no engine.
+        route_capture = getattr(getattr(self, "model_engine", None),
+                                "route_capture", None)
+        if route_capture is not None:
+            route_capture.clear_shared()
 
     def _handle_guided_decoder_errors(
             self, scheduled_batch: ScheduledRequests,
