@@ -8303,8 +8303,10 @@ class PyExecutor:
 
             request_done = False
             if request.is_finished:
-                route_capture = getattr(self.model_engine, "route_capture",
-                                        None)
+                # Guard the engine lookup -- minimal executors (unit tests)
+                # may have no engine.
+                route_capture = getattr(getattr(self, "model_engine", None),
+                                        "route_capture", None)
                 if route_capture is not None:
                     route_capture.attach_routes(request)  # R3: append routes
             should_emit = (request.py_decoding_iter == 1 or request.is_finished
