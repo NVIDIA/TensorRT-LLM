@@ -62,6 +62,7 @@ from ..moe.expert_statistic import ExpertStatistic
 from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                MoeLoadBalancerIterContext)
 from ..peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
+from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
 from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            get_num_extra_kv_tokens, get_spec_metadata,
                            prepare_attn_metadata_for_draft_replay,
@@ -72,7 +73,7 @@ from ..speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_static_draft_len, update_draft_len
 from ..utils import (get_model_extra_attrs,
-                     get_per_request_prefill_cuda_graph_flag,
+                     get_per_request_prefill_cuda_graph_flag, helix_local_len,
                      set_per_request_prefill_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
 from .breakable_cuda_graph_runner import BreakableCUDAGraphRunner
@@ -399,9 +400,9 @@ class PyTorchModelEngine(ModelEngine):
                             should_enable_scheduler_aware_adp_dummy)
         self._enable_adp_dummy_fixes = should_enable_adp_dummy_fixes(mapping)
         self.dist = dist
+        self.llm_args = llm_args
         if dist is not None:
             ExpertStatistic.create(self.dist.rank)
-        self.llm_args = llm_args
         # Opt-in tiered sampling captured into the forward graph. Off by
         # default: it captures one extra graph per enabled tier, which costs
         # startup time and memory that deployments not bound by sampling
@@ -517,6 +518,19 @@ class PyTorchModelEngine(ModelEngine):
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
             self.model.extra_attrs = {}
+        # Router Replay (R3) capturer owned by this engine (None when disabled or
+        # for draft engines). Registered in the model extra attrs so the MoE
+        # routing hook reaches this engine's capturer during its forward, the
+        # same way ``moe_layers`` is looked up -- no process-wide state.
+        self.route_capture = RouteCapture.create(
+            rank=self.dist.rank if self.dist is not None else 0,
+            model_engine=self,
+            enabled=self.llm_args.enable_return_routed_experts,
+            pp_size=self.mapping.pp_size,
+            is_spec_decode=self.is_spec_decode,
+            is_draft_model=self.is_draft_model)
+        if self.route_capture is not None:
+            self.model.extra_attrs[ROUTE_CAPTURE_ATTR] = self.route_capture
         # Every MM item-scheduling decision -- policy, capability, feature
         # validation, budget resolution -- lives in engine/multimodal.py; the
         # engine only copies back the three budgets that are external contract.
@@ -3841,6 +3855,31 @@ class PyTorchModelEngine(ModelEngine):
                         num_chunked_contexts=num_chunked_ctx_requests,
                     )
 
+        if self.enable_spec_decode and self.mapping.has_cp_helix():
+            # Helix verify groups: the per-token device buffers (write slots,
+            # attention bounds, rank-local kv lens) must be derived on EVERY
+            # spec step, overlap or not -- the append/mask kernels consume
+            # them whenever _helix_spec_tokens_valid is armed. Under overlap
+            # the host packed provisional positions from a stale base, so
+            # first apply the same accepted-count correction position_ids
+            # got above; without overlap the host values are already exact.
+            md = inputs.get('attn_metadata')
+            if (md is not None and md.kv_cache_manager is not None
+                    and getattr(md, '_helix_spec_tokens_valid', False)):
+                helix_gen_tokens = (inputs['input_ids'].shape[0] -
+                                    md.num_ctx_tokens)
+                if not self._disable_overlap_scheduler:
+                    # The kv_lens override in the recompute supersedes the
+                    # generic previous_kv_lens_offsets adjustment above,
+                    # which is not ownership-aware.
+                    md.helix_position_offsets[:helix_gen_tokens] += (
+                        self.previous_pos_id_offsets_cuda[:helix_gen_tokens])
+                md.recompute_helix_spec_buffers(
+                    helix_gen_tokens,
+                    self.get_runtime_tokens_per_gen_step(
+                        self.runtime_draft_len))
+                md.on_update_kv_lens()
+
         if self.guided_decoder is not None:
             self.guided_decoder.token_event.record()
 
@@ -3899,6 +3938,20 @@ class PyTorchModelEngine(ModelEngine):
                         num_chunked_contexts=num_chunked_ctx_requests,
                         restore=True,
                     )
+
+                if (self.mapping.has_cp_helix()
+                        and getattr(inputs['attn_metadata'],
+                                    '_helix_spec_tokens_valid', False)):
+                    # Mirror of the helix position correction in
+                    # _preprocess_inputs (capture symmetry, like position_ids
+                    # above). The recompute's OVERWRITES (slots/bounds/
+                    # kv_lens) need no reversal: every consumer buffer is
+                    # rewritten from host state at the next step's prepare.
+                    inputs[
+                        'attn_metadata'].helix_position_offsets[:previous_batch_tokens] -= (
+                            self.
+                            previous_pos_id_offsets_cuda[:previous_batch_tokens]
+                        )
 
     def _get_all_rank_num_tokens_and_spec_counts(
         self, attn_metadata: AttentionMetadata, spec_metadata: SpecMetadata
@@ -4891,6 +4944,38 @@ class PyTorchModelEngine(ModelEngine):
                 generation_requests.append(request)
         extend_requests += extend_dummy_requests
 
+        # Helix bookkeeping is needed by BOTH the extend (speculative verify
+        # group) and the plain generation packing loops below, so initialize
+        # it ahead of them. Positions are global; KV ownership follows the
+        # round-robin ledger (page b -> rank b % cp); the host-side
+        # provisional packing values come from the one shared definition in
+        # _torch.utils.helix_local_len.
+        helix_is_inactive_rank, helix_position_offsets = [], []
+        helix_owned_new_tokens = []
+        _has_cp_helix = self.mapping.has_cp_helix()
+        if _has_cp_helix and kv_cache_manager is not None:
+            _helix_phys = kv_cache_manager.tokens_per_block
+            _helix_cp_size = self.mapping.cp_size
+            _helix_cp_rank = self.mapping.cp_rank
+
+            def _helix_local_len_host(global_len: int) -> int:
+                return helix_local_len(global_len, _helix_phys, _helix_cp_size,
+                                       _helix_cp_rank)
+
+            def _helix_pack_extend(request, group: int) -> int:
+                # A helix gen worker's token list is the rank-LOCAL
+                # round-robin subset, so max_beam_num_tokens is not a global
+                # base; rebuild it from the global prompt length plus the
+                # rank-invariant generated count. Also repacks position_ids,
+                # which the caller filled from the local base.
+                generated_len = (request.max_beam_num_tokens -
+                                 request.py_prompt_len)
+                base = request.total_input_len_cp + generated_len - 1
+                helix_position_offsets.extend(range(base, base + group))
+                position_ids[-group:] = range(base, base + group)
+                helix_is_inactive_rank.append(False)
+                return base
+
         spec_config = self.spec_config if self.enable_spec_decode else None
         if not self._disable_overlap_scheduler and spec_config is not None:
             assert spec_config.spec_dec_mode.support_overlap_scheduler(
@@ -4960,6 +5045,23 @@ class PyTorchModelEngine(ModelEngine):
                 num_cached_tokens_per_seq.append(
                     past_seen_token_num - request.py_num_compressed_tokens)
                 request.cached_tokens = past_seen_token_num
+                if _has_cp_helix:
+                    # Verify group [base, base+group) in GLOBAL positions.
+                    # On a helix gen worker the request's token list is the
+                    # rank-LOCAL round-robin subset, so max_beam_num_tokens
+                    # (= local_prompt + generated) must NOT be used as a
+                    # global base; reconstruct it from the global prompt
+                    # length plus the (rank-invariant) generated count. This
+                    # branch has no in-flight predecessor, so every value is
+                    # exact (no device correction needed).
+                    group = 1 + num_draft_tokens
+                    base = _helix_pack_extend(request, group)
+                    local_cached = _helix_local_len_host(base)
+                    helix_owned_new_tokens.append(
+                        _helix_local_len_host(base + group) - local_cached)
+                    num_cached_tokens_per_seq[-1] = (
+                        local_cached - request.py_num_compressed_tokens)
+                    request.cached_tokens = local_cached
                 # update batch index
                 request.py_batch_idx = request.py_seq_slot
             else:
@@ -4991,6 +5093,21 @@ class PyTorchModelEngine(ModelEngine):
                     request.py_num_compressed_tokens)
                 request.cached_tokens = (past_seen_token_num +
                                          runtime_tokens_per_gen_step)
+                if _has_cp_helix:
+                    # In-flight predecessor: mirror the non-helix convention
+                    # above -- positions are packed from the stale base (the
+                    # overlap device correction adds the accepted count) and
+                    # KV numbers assume full acceptance (the device recompute
+                    # in recompute_helix_spec_buffers overrides them). The
+                    # base is reconstructed GLOBALLY (see the no-previous
+                    # branch: the token list is rank-local under helix).
+                    group = runtime_tokens_per_gen_step
+                    base = _helix_pack_extend(request, group)
+                    local_full = _helix_local_len_host(base + group)
+                    helix_owned_new_tokens.append(0)
+                    num_cached_tokens_per_seq[-1] = (
+                        local_full - request.py_num_compressed_tokens)
+                    request.cached_tokens = local_full
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend) and spec_config.is_linear_tree:
                     prompt_lengths.append(runtime_tokens_per_gen_step)
@@ -5055,9 +5172,7 @@ class PyTorchModelEngine(ModelEngine):
             # update batch index
             request.py_batch_idx = request.py_seq_slot
 
-        helix_is_inactive_rank, helix_position_offsets = [], []
         # Cache invariant method result to avoid repeated calls per-request
-        _has_cp_helix = self.mapping.has_cp_helix()
         _n_gen = len(generation_requests)
         # One-shot batch-level flag — True iff any generation request actually
         # carries multimodal payload. Lets the strip_mm_data branch below
@@ -5187,6 +5302,12 @@ class PyTorchModelEngine(ModelEngine):
                         helix_is_inactive_rank.append(
                             request.py_helix_is_inactive_rank)
                         helix_position_offsets.append(position_id)
+                        # Keep the per-seq owned-count list aligned when the
+                        # spec path is active in the same batch. Whether the
+                        # list arms the spec path at all is decided once, at
+                        # the update_helix_param call below.
+                        helix_owned_new_tokens.append(
+                            0 if request.py_helix_is_inactive_rank else 1)
 
                 request.cached_tokens = past_seen_token_num
                 for beam in range(beam_width):
@@ -5604,9 +5725,20 @@ class PyTorchModelEngine(ModelEngine):
                                                       num_first_draft]] += accepted_tokens
 
         if self.mapping.has_cp_helix():
+            # A non-None owned-count list is what arms
+            # _helix_spec_tokens_valid, and the per-token slots/bounds that
+            # flag gates are only ever filled by recompute_helix_spec_buffers,
+            # which _preprocess_inputs runs under enable_spec_decode. Gate the
+            # hand-off here, at the single choke point, so no packing loop can
+            # arm the spec path for ordinary helix generation and send its
+            # consumers to uninitialized buffers.
+            helix_spec_active = bool(self.enable_spec_decode
+                                     and helix_owned_new_tokens)
             attn_metadata.update_helix_param(
                 helix_position_offsets=helix_position_offsets,
                 helix_is_inactive_rank=helix_is_inactive_rank,
+                helix_owned_new_tokens=(helix_owned_new_tokens
+                                        if helix_spec_active else None),
             )
 
         if not attn_metadata.is_cuda_graph:

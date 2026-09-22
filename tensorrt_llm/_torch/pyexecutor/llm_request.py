@@ -907,6 +907,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logits_chunk_size: int = 8,
             logprobs_mode: LogprobMode = LogprobMode.RAW,
             logprobs_simple_format: bool = False,
+            return_routed_experts: bool = False,
             **kwargs):
         self.py_sampling_strategy: "Strategy | None" = None
 
@@ -1018,6 +1019,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_num_logprobs = num_logprobs
         self.py_return_log_probs = return_log_probs
         self.py_logprobs_simple_format = logprobs_simple_format
+        # Router Replay: attach routed_experts to this request's output.
+        self.py_return_routed_experts = return_routed_experts
         self.py_return_context_logits = return_context_logits
         self.py_return_generation_logits = return_generation_logits
         self.py_return_logits_device_memory = return_logits_device_memory
@@ -1627,6 +1630,8 @@ def executor_request_to_llm_request(
                               LogprobMode.RAW),
         logprobs_simple_format=getattr(executor_request,
                                        "py_logprobs_simple_format", False),
+        return_routed_experts=getattr(executor_request,
+                                      "py_return_routed_experts", False),
     )
 
     # Bad-words list for the TorchSampler path, kept in its native

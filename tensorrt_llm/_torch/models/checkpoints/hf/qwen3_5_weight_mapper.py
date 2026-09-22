@@ -629,9 +629,14 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         vals = torch.empty((out_features, in_features), dtype=torch.float32)
         vals[:, 0::2] = lut[(weight & 0x0F).long()]
         vals[:, 1::2] = lut[((weight >> 4) & 0x0F).long()]
-        # Per-group (16) scale = block_scale (fp8) * global_scale (fp32).
+        # Per-group scale = block_scale (fp8) * global_scale (fp32); the block
+        # width (16, or 32 for weight-only exports) follows from the scale shape.
+        num_groups = block_scale.shape[-1]
+        assert in_features % num_groups == 0, (
+            f"lm_head weight_scale has {num_groups} groups for {in_features} inputs"
+        )
         scale = (block_scale * global_scale).unsqueeze(-1)
-        vals = vals.view(out_features, in_features // 16, 16) * scale
+        vals = vals.view(out_features, num_groups, in_features // num_groups) * scale
         dequantized = vals.view(out_features, in_features).to(target_dtype).contiguous()
 
         drop = {"lm_head.weight_scale", "lm_head.weight_scale_2", "lm_head.input_scale"}
