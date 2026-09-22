@@ -29,12 +29,18 @@ and that chokepoint; they are CPU-only.
 import json
 from http import HTTPStatus
 
+import pytest
+
 from tensorrt_llm.executor.utils import (
     CONTEXT_LENGTH_EXCEEDED_CODE,
     context_length_exceeded_message,
     is_context_length_exceeded_message,
 )
 from tensorrt_llm.serve.openai_server import OpenAIServer
+
+# The CPU stage collects with `-m cpu_only`; unittest/conftest.py also skips
+# collecting any file that does not contain the cpu_only marker.
+pytestmark = pytest.mark.cpu_only
 
 
 def test_message_matches_openai_wording():
