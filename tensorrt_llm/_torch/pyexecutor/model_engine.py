@@ -4225,21 +4225,9 @@ class PyTorchModelEngine(ModelEngine):
         num_cached_tokens_per_seq: Sequence[int],
         request_groups: Sequence[tuple[Sequence[LlmRequest], int]] = (),
     ) -> None:
-        """Log sequence counts, separating CUDA graph padding from the total.
-
-        Groups follow input packing order and specify rows per request.
-        An empty group list denotes an unpadded steady-generation batch.
-
-        Keep ADP dummies but exclude CUDA graph padding: num_scheduled_requests
-        is captured after ADP padding and before graph padding. Thus the list
-        length matches num_scheduled_requests when max_beam_width is one;
-        generation requests with multiple beams contribute one row per beam.
-
-        Counts are read after attention metadata preparation, matching the
-        cached_kv_tokens total. Sparse backends may adjust them in place, so
-        they need not represent the original cached prefix. RocketKV zeroes
-        context rows and limits the prompt portion of generation rows to
-        prompt_budget while retaining generated history.
+        """Log post-prepare (backend-adjusted) counts in packed order, retaining
+        ADP dummies to match num_scheduled_requests at beam width one and
+        separating CUDA graph padding.
         """
         counts = []
         if request_groups:
