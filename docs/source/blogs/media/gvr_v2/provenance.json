@@ -23,7 +23,7 @@
     "v32_timings.csv.gz": "59bccd05ba685d01ed1ebb34c9a0b15df02d1879f8c16bbaffa2a264f512fd8d",
     "temporal_comparison.csv.gz": "2abdeb8eafa1366be5673c79dfdb938a02716431cf8745f18d3a2fc240a778ca"
   },
-  "scope": "Per-case FP32 cold kernel means with PR #19076 as the GVR V2 reference. GVR V1 (temporal hint, PR #16877) and TensorRT-LLM radix CUDA observations are paired across benchmark runs by workload and batch. All three implementations cover the same 9,746 cases.",
+  "scope": "Per-case FP32 cold kernel means with PR #19076 as the GVR V2 reference. GVR V1 (temporal hint, PR #16877) and TensorRT LLM radix CUDA observations are paired across benchmark runs by workload and batch. All three implementations cover the same 9,746 cases.",
   "roofline_model": {
     "theoretical_bandwidth_tb_s": 8.0,
     "measured_bandwidth_tb_s": 6.912116,

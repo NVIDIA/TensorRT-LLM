@@ -5,17 +5,17 @@ SPDX-License-Identifier: Apache-2.0
 
 # GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K
 
-*A Unified Selection Core for Prefill and Decode in TensorRT-LLM*
+*A Unified Selection Core for Prefill and Decode in TensorRT LLM*
 
-By NVIDIA TensorRT-LLM Team
+By NVIDIA TensorRT LLM Team
 
 Selecting 1,024 INT32 indices from 131,072 FP32 scores writes just **4 KiB of output**, yet one complete read of the scores moves **512 KiB**. Every additional full-row pass pays that input cost again. For a sparse-attention indexer, finding the Top-K boundary can therefore cost far more than emitting the winners.
 
 GVR V2 makes each full-row pass more useful without depending on the previous decode step to predict the current one. **Self-sampling estimates where the current row's Top-K boundary lies; multi-thresholding derives many exact population counts from one classification pass.** Together, they concentrate exact refinement on the small group of scores still competing for the final slots. Removing the Top-K prior also lets prefill and decode share a streaming selection core, with phase differences handled by row adapters.
 
-On B200, this design delivers **5.05× geometric-mean speedup over TensorRT-LLM radix CUDA**, with **1.46× over GVR V1**. Both comparisons use the same 9,746 workloads spanning DeepSeek-V3.2, DeepSeek-V4 Flash, and DeepSeek-V4 Pro indexers.
+On B200, this design delivers **5.05× geometric-mean speedup over TensorRT LLM radix CUDA**, with **1.46× over GVR V1**. Both comparisons use the same 9,746 workloads spanning DeepSeek-V3.2, DeepSeek-V4 Flash, and DeepSeek-V4 Pro indexers.
 
-![Three horizontal bar-chart panels compare GVR V2, GVR V1, and TensorRT-LLM radix CUDA on the same cases per model. GVR V2 is 1.00; shorter bars mean less kernel time.](../media/gvr_v2/speedup.svg)
+![Three horizontal bar-chart panels compare GVR V2, GVR V1, and TensorRT LLM radix CUDA on the same cases per model. GVR V2 is 1.00; shorter bars mean less kernel time.](../media/gvr_v2/speedup.svg)
 
 *Figure 1. Kernel time relative to GVR V2, geometrically averaged over the same workloads within each model; shorter is faster. GVR V1 uses a temporal hint. All three implementations cover the full 9,746-case grid.*
 
@@ -36,8 +36,8 @@ On B200, this design delivers **5.05× geometric-mean speedup over TensorRT-LLM 
 - **[Performance and Roofline Analysis](#performance-and-roofline-analysis)**
   - [Performance Against GVR V1 and Radix CUDA](#performance-against-gvr-v1-and-radix-cuda)
   - [The Roofline Model: Fewer Passes, More Useful Work](#the-roofline-model-fewer-passes-more-useful-work)
-- **[TensorRT-LLM Integration and Takeaways](#tensorrt-llm-integration-and-takeaways)**
-  - [Decode and Prefill in TensorRT-LLM](#decode-and-prefill-in-tensorrt-llm)
+- **[TensorRT LLM Integration and Takeaways](#tensorrt-llm-integration-and-takeaways)**
+  - [Decode and Prefill in TensorRT LLM](#decode-and-prefill-in-tensorrt-llm)
   - [Conclusion](#conclusion)
   - [Further Reading](#further-reading)
 
@@ -90,7 +90,7 @@ V2 calibrates from the **current row**, removing dependence on temporal overlap 
 
 #### A Hint That Crosses Framework Boundaries
 
-V1's prior also has a lifecycle outside the kernel. GVR V1 has no prefill engine: TensorRT-LLM uses radix for prefill and can seed the decode prior from each request's last prefill selection. That phase-dependent history complicates a common selection architecture. V2's current-row calibration removes the Top-K prior dependency, allowing phase differences to stay in dispatch and row-interface adapters. The [integration section](#decode-and-prefill-in-tensorrt-llm) traces the consequences for CUDA Graph preparation and disaggregated serving.
+V1's prior also has a lifecycle outside the kernel. GVR V1 has no prefill engine: TensorRT LLM uses radix for prefill and can seed the decode prior from each request's last prefill selection. That phase-dependent history complicates a common selection architecture. V2's current-row calibration removes the Top-K prior dependency, allowing phase differences to stay in dispatch and row-interface adapters. The [integration section](#decode-and-prefill-in-tensorrt-llm) traces the consequences for CUDA Graph preparation and disaggregated serving.
 
 <div align="center">
 
@@ -333,7 +333,7 @@ The benchmarks use FP32 indexer scores from the three models below on NVIDIA B20
 | Baseline | Geomean speedup | Minimum speedup | GVR V2 faster |
 | :---: | :---: | :---: | :---: |
 | GVR V1 | **1.46×** | 0.689× | 99.57% |
-| TensorRT-LLM radix CUDA dispatch | **5.05×** | 1.34× | 100.00% |
+| TensorRT LLM radix CUDA dispatch | **5.05×** | 1.34× | 100.00% |
 
 </div>
 
@@ -341,11 +341,11 @@ Both comparisons use the same 9,746 cases. The minimum column retains individual
 
 #### The Gains Extend Beyond an Average
 
-The gains over TensorRT-LLM radix CUDA vary with the model and shape. Figure 7 shows V2's speedup across every captured row length and all 11 batch sizes, with one panel per model.
+The gains over TensorRT LLM radix CUDA vary with the model and shape. Figure 7 shows V2's speedup across every captured row length and all 11 batch sizes, with one panel per model.
 
-![Three heatmap panels of GVR V2 speedup over TensorRT-LLM radix CUDA across captured row lengths and all eleven batch sizes, averaged geometrically across all layers in each model.](../media/gvr_v2/radix_cuda_map.svg)
+![Three heatmap panels of GVR V2 speedup over TensorRT LLM radix CUDA across captured row lengths and all eleven batch sizes, averaged geometrically across all layers in each model.](../media/gvr_v2/radix_cuda_map.svg)
 
-*Figure 7. TensorRT-LLM radix CUDA time divided by GVR V2 time, geometrically averaged across layers at each shape. The panels share a 1–21× color scale; 1.0 means equal performance. Row lengths are rounded in the axis labels, and cell labels round to one decimal place.*
+*Figure 7. TensorRT LLM radix CUDA time divided by GVR V2 time, geometrically averaged across layers at each shape. The panels share a 1–21× color scale; 1.0 means equal performance. Row lengths are rounded in the axis labels, and cell labels round to one decimal place.*
 
 The strongest shape-average gains occur around 4K scores at $B=1024$: **19.85× for V4 Flash and 20.18× for V4 Pro** at $N=4{,}099$, and **10.96× for V3.2** at $N=4{,}111$. The Pro result is the largest shape-average speedup in the grid.
 
@@ -363,13 +363,13 @@ All 275 shape averages exceed parity, but layer averaging can hide local regress
 
 #### What Explains the Differences
 
-**TensorRT-LLM radix CUDA.** The baseline uses the production dispatcher, including short-row insertion and long-row split-work paths. V2's **5.05×** advantage is consistent with reducing full-row selection passes and matching execution to the workload.
+**TensorRT LLM radix CUDA.** The baseline uses the production dispatcher, including short-row insertion and long-row split-work paths. V2's **5.05×** advantage is consistent with reducing full-row selection passes and matching execution to the workload.
 
 **GVR V1 (temporal hint).** V1 already combines multiple admission thresholds through pivot/rescue verification. V2 replaces the temporal prior with current-row calibration and couples exact bin counts to crossing-bin refinement. Its **1.46×** gain compares complete implementations, including their execution policies; it does not isolate the contribution of self-sampling alone.
 
 #### Latency Across Row Length and Batch Size
 
-![Cold kernel latency for GVR V2, GVR V1, and TensorRT-LLM radix CUDA versus valid row length, with separate panels for three models and batch sizes 1 and 1024.](../media/gvr_v2/latency.svg)
+![Cold kernel latency for GVR V2, GVR V1, and TensorRT LLM radix CUDA versus valid row length, with separate panels for three models and batch sizes 1 and 1024.](../media/gvr_v2/latency.svg)
 
 *Figure 9. Mean cold kernel time across all captured layers: 21 for Flash, 30 for Pro, and 61 for V3.2. Each row is a model; the columns contrast batch sizes 1 and 1,024. The solid line shows GVR V2; dashed lines show baselines measured in separate runs. Both axes are logarithmic; 1K means 1,024.*
 
@@ -399,7 +399,7 @@ $$
 
 The calibrated limits are **6.912 TB/s** sustained read bandwidth and **37.047 Tcompare/s** semantic comparison throughput. Their **5.36 compare/byte** intersection exceeds the maximum ideal Top-K intensity by over 21×, placing the workload band on Figure 10A's bandwidth slope.
 
-![A two-level roofline: the full B200 hardware model highlights Top-K's narrow bandwidth-limited band; three linear-scale Pareto curve panels compare GVR V2, GVR V1, and TensorRT-LLM radix CUDA at batch 1024, with GVR V2 highlighted in green.](../media/gvr_v2/roofline.svg)
+![A two-level roofline: the full B200 hardware model highlights Top-K's narrow bandwidth-limited band; three linear-scale Pareto curve panels compare GVR V2, GVR V1, and TensorRT LLM radix CUDA at batch 1024, with GVR V2 highlighted in green.](../media/gvr_v2/roofline.svg)
 
 *Figure 10.* A: theoretical and calibrated roofs. B: Pareto curves at $B=1024$, plotting useful throughput $P=BN/t$ against ideal intensity $I=N/[4(N+K)]$. Green highlights V2; the dotted line is the calibrated bandwidth roof. All kernels share $Q_{\min}$; extra work remains in measured time. This measures useful work relative to ideal traffic, not actual DRAM utilization.
 
@@ -422,7 +422,7 @@ It measures efficiency relative to the ideal traffic bound. The table compares *
 | :---: | :---: | :---: | :---: |
 | **GVR V2** | **41.6% / 77.8%** | **39.0% / 68.4%** | **41.5% / 66.5%** |
 | GVR V1 | 26.1% / 63.3% | 25.4% / 58.9% | 27.8% / 51.1% |
-| TensorRT-LLM radix CUDA | 7.7% / 16.9% | 7.8% / 16.4% | 8.3% / 17.8% |
+| TensorRT LLM radix CUDA | 7.7% / 16.9% | 7.8% / 16.4% | 8.3% / 17.8% |
 
 </div>
 
@@ -436,9 +436,9 @@ The full ideal bound is $T_{\mathrm{roof}}=\max(Q_{\min}/\mathrm{BW},W/R_{\mathr
 
 The pass/candidate tradeoff in Figure 5 explains two sources of this gap: another full-row scan adds traffic, while a loose admission threshold adds candidate work even when the scan count stays fixed. V2 uses exact bin populations to restrict the remaining selection to the crossing bin. These costs increase measured time; under the shared minimum-traffic model, they move useful throughput downward at the same intensity. The read-dominated roof is optimistic, especially when $K/N$ is large; the plotted throughput describes useful selection work rather than measured DRAM traffic.
 
-## TensorRT-LLM Integration and Takeaways
+## TensorRT LLM Integration and Takeaways
 
-### Decode and Prefill in TensorRT-LLM
+### Decode and Prefill in TensorRT LLM
 
 The integration follows three boundaries: remove the Top-K prior lifecycle, adapt each phase's row metadata, and prepare launch specializations before graph capture.
 
@@ -454,7 +454,7 @@ V2 derives its bracket from the current scores in both phases, removing the prev
 
 #### One Selection Core, Two Row Interfaces
 
-TensorRT-LLM separates phase-specific row metadata from shared selection logic. The `TopK` module applies the same self-sampling configuration to supported decode and prefill paths, then passes each phase's valid score interval to the selected engine.
+TensorRT LLM separates phase-specific row metadata from shared selection logic. The `TopK` module applies the same self-sampling configuration to supported decode and prefill paths, then passes each phase's valid score interval to the selected engine.
 
 ![Integration diagram: a shared TopK dispatcher feeds decode and prefill row adapters, which reuse GvrMainKernel's streaming selection pipeline; decode also retains register and cluster routes.](../media/gvr_v2/integration.svg)
 
@@ -482,7 +482,7 @@ For decode, [PR #18410](https://github.com/NVIDIA/TensorRT-LLM/pull/18410) repor
 
 #### Enable GVR V2
 
-Use a TensorRT-LLM revision containing [PR #19076](https://github.com/NVIDIA/TensorRT-LLM/pull/19076). The production V2 dispatch requires CUTLASS DSL, datacenter Blackwell SM100/SM103, $K\in\lbrace 512,1024,2048\rbrace$, and indexer compression ratios 1 or 4. Save the following as `gvr_v2.yaml`:
+Use a TensorRT LLM revision containing [PR #19076](https://github.com/NVIDIA/TensorRT-LLM/pull/19076). The production V2 dispatch requires CUTLASS DSL, datacenter Blackwell SM100/SM103, $K\in\lbrace 512,1024,2048\rbrace$, and indexer compression ratios 1 or 4. Save the following as `gvr_v2.yaml`:
 
 ```yaml
 sparse_attention_config:
@@ -530,4 +530,4 @@ Implementation milestones:
 - [PR #18702: self-sampling prefill](https://github.com/NVIDIA/TensorRT-LLM/pull/18702).
 - [PR #19076: register-plan tuning, a unified crossing-bin gate, sampled prefill plans, and SM-aware B200/B300 dispatch](https://github.com/NVIDIA/TensorRT-LLM/pull/19076).
 
-For the surrounding model pipeline, see [Sparse Attention in TensorRT-LLM](blog17_Sparse_Attention_in_TensorRT-LLM.md) and [DeepSeek-V4 on NVIDIA Blackwell](blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.md).
+For the surrounding model pipeline, see [Sparse Attention in TensorRT LLM](blog17_Sparse_Attention_in_TensorRT-LLM.md) and [DeepSeek-V4 on NVIDIA Blackwell](blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.md).

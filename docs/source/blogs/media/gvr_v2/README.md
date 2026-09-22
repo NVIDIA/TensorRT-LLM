@@ -101,7 +101,7 @@ Measurements use NVIDIA B200, FP32 indexer scores, and batch sizes from 1 to 1,0
 
 Each workload/batch case repeats one captured layer/step score row into distinct batch rows. This controls the input distribution and valid width while measuring batch scaling; it is not a heterogeneous batch of independent serving requests. GVR uses `next_n=1` and sets `max_seq_len` to that case's valid row length times its compression ratio. A serving graph may use a larger stable envelope and choose a different execution plan. The bundled grid does not independently benchmark ragged mixed-length batches, MTP, or prefill.
 
-The primary reference is the hint-free GVR V2 `run_varlen` implementation from [PR #19076](https://github.com/NVIDIA/TensorRT-LLM/pull/19076), measured at its [final public revision](https://github.com/NVIDIA/TensorRT-LLM/commit/be1b9885e8df9bf070e8cb68459e24a7119afaa9). Its FP32 comparisons with GVR V1 and TensorRT-LLM radix CUDA match observations from separate runs by workload identity and batch size, with shape metadata checked where available. All three implementations cover the same 9,746 cases. Baseline times are retained as measured; no aggregate correction factor is applied. These comparisons describe the bundled kernel implementations and workloads, rather than the performance of entire serving frameworks.
+The primary reference is the hint-free GVR V2 `run_varlen` implementation from [PR #19076](https://github.com/NVIDIA/TensorRT-LLM/pull/19076), measured at its [final public revision](https://github.com/NVIDIA/TensorRT-LLM/commit/be1b9885e8df9bf070e8cb68459e24a7119afaa9). Its FP32 comparisons with GVR V1 and TensorRT LLM radix CUDA match observations from separate runs by workload identity and batch size, with shape metadata checked where available. All three implementations cover the same 9,746 cases. Baseline times are retained as measured; no aggregate correction factor is applied. These comparisons describe the bundled kernel implementations and workloads, rather than the performance of entire serving frameworks.
 
 The device kernel and host dispatcher at the [main revision audited on September 17, 2026](https://github.com/NVIDIA/TensorRT-LLM/commit/73c70633b2547eedf0c91f85e760aec534f6af84) are byte-identical to those measured for the reference. This establishes source continuity for those files, not a new whole-framework performance measurement.
 
@@ -111,7 +111,7 @@ Figures 1, 3, and 7–10 and their numerical summaries all use this PR #19076 re
 | :--- | :--- |
 | GVR V2 | FP32 scores, valid row lengths, unordered INT32 indices |
 | GVR V1 | Temporal-prior pivot/rescue admission; complete implementation paired by workload and batch |
-| TensorRT-LLM radix CUDA | Production dispatcher, including short-row insertion and long-row split-work paths |
+| TensorRT LLM radix CUDA | Production dispatcher, including short-row insertion and long-row split-work paths |
 
 The GVR V1 implementation reference appears below. Complete build revisions for the historical radix observations are unavailable in the timing export.
 
@@ -154,7 +154,7 @@ The article uses Figure 1 for the model-level comparison. The following table us
 | Baseline | V4 Flash, $K=512$ | V4 Pro, $K=1024$ | V3.2, $K=2048$ |
 | :--- | ---: | ---: | ---: |
 | GVR V1 | 1.53× | 1.54× | 1.37× |
-| TensorRT-LLM radix CUDA | 4.88× | 4.87× | 5.25× |
+| TensorRT LLM radix CUDA | 4.88× | 4.87× | 5.25× |
 
 *Each model column uses the same workloads for both baselines.*
 

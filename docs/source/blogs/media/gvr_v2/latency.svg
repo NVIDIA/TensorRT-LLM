@@ -1826,31 +1826,31 @@ L 768.243437 684.36
   </g>
   <g id="legend_1">
    <g id="line2d_178">
-    <path d="M 230.202813 772.740312
-L 240.202813 772.740312
-L 250.202813 772.740312
+    <path d="M 229.961406 772.740312
+L 239.961406 772.740312
+L 249.961406 772.740312
 " style="fill: none; stroke: #579600; stroke-width: 2.5; stroke-linecap: square"/>
    </g>
    <g id="text_58">
-    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: start" x="258.202813" y="776.240312" transform="rotate(-0 258.202813 776.240312)">GVR V2</text>
+    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: start" x="257.961406" y="776.240312" transform="rotate(-0 257.961406 776.240312)">GVR V2</text>
    </g>
    <g id="line2d_179">
-    <path d="M 316.121563 772.740312
-L 326.121563 772.740312
-L 336.121563 772.740312
+    <path d="M 315.880156 772.740312
+L 325.880156 772.740312
+L 335.880156 772.740312
 " style="fill: none; stroke-dasharray: 9.25,4; stroke-dashoffset: 0; stroke: #386781; stroke-width: 2.5"/>
    </g>
    <g id="text_59">
-    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: start" x="344.121563" y="776.240312" transform="rotate(-0 344.121563 776.240312)">GVR V1</text>
+    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: start" x="343.880156" y="776.240312" transform="rotate(-0 343.880156 776.240312)">GVR V1</text>
    </g>
    <g id="line2d_180">
-    <path d="M 402.040313 772.740312
-L 412.040313 772.740312
-L 422.040313 772.740312
+    <path d="M 401.798906 772.740312
+L 411.798906 772.740312
+L 421.798906 772.740312
 " style="fill: none; stroke-dasharray: 9.25,4; stroke-dashoffset: 0; stroke: #64748b; stroke-width: 2.5"/>
    </g>
    <g id="text_60">
-    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: start" x="430.040313" y="776.240312" transform="rotate(-0 430.040313 776.240312)">TensorRT-LLM radix CUDA</text>
+    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: start" x="429.798906" y="776.240312" transform="rotate(-0 429.798906 776.240312)">TensorRT LLM radix CUDA</text>
    </g>
   </g>
  </g>

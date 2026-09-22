@@ -1638,7 +1638,7 @@ z
    <text style="font-weight: 700; font-size: 18px; font-family: 'DejaVu Sans'; text-anchor: start" x="26.726719" y="20.877187" transform="rotate(-0 26.726719 20.877187)">GVR V2 vs radix CUDA: gains across the full length–batch grid</text>
   </g>
   <g id="text_350">
-   <text style="font-size: 9px; font-family: 'DejaVu Sans'; text-anchor: start" x="51.926719" y="362.16" transform="rotate(-0 51.926719 362.16)">TensorRT-LLM production dispatcher · 1.0× is parity · shared color scale across all three models.</text>
+   <text style="font-size: 9px; font-family: 'DejaVu Sans'; text-anchor: start" x="51.926719" y="362.16" transform="rotate(-0 51.926719 362.16)">TensorRT LLM production dispatcher · 1.0× is parity · shared color scale across all three models.</text>
   </g>
  </g>
  <defs>

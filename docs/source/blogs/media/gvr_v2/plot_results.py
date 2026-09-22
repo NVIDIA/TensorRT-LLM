@@ -34,7 +34,7 @@ MODELS = {
 LABELS = {
     "gvr_v2": "GVR V2",
     "temporal_tiered": "GVR V1",
-    "radix_cuda": "TensorRT-LLM radix CUDA",
+    "radix_cuda": "TensorRT LLM radix CUDA",
 }
 COLORS = {
     "gvr_v2": "#579600",
@@ -1247,7 +1247,7 @@ def main() -> None:
     _candidate_work()
     _algorithm()
     _gpu_sampling()
-    _speedup_map(rows, "radix_cuda", "radix CUDA", "TensorRT-LLM production dispatcher")
+    _speedup_map(rows, "radix_cuda", "radix CUDA", "TensorRT LLM production dispatcher")
     _speedup_map(rows, "temporal_tiered", "GVR V1", "GVR V1 (temporal hint)")
     _latency(rows)
     _roofline(rows)

@@ -1716,31 +1716,31 @@ L 914.04562 443.489435
   </g>
   <g id="legend_2">
    <g id="line2d_66">
-    <path d="M 344.357656 606.191431
-L 354.357656 606.191431
-L 364.357656 606.191431
+    <path d="M 344.11625 606.191431
+L 354.11625 606.191431
+L 364.11625 606.191431
 " style="fill: none; stroke: #579600; stroke-width: 2.5; stroke-linecap: square"/>
    </g>
    <g id="text_55">
-    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: start" x="372.357656" y="609.691431" transform="rotate(-0 372.357656 609.691431)">GVR V2</text>
+    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: start" x="372.11625" y="609.691431" transform="rotate(-0 372.11625 609.691431)">GVR V2</text>
    </g>
    <g id="line2d_67">
-    <path d="M 430.276406 606.191431
-L 440.276406 606.191431
-L 450.276406 606.191431
+    <path d="M 430.035 606.191431
+L 440.035 606.191431
+L 450.035 606.191431
 " style="fill: none; stroke-dasharray: 9.25,4; stroke-dashoffset: 0; stroke: #386781; stroke-width: 2.5"/>
    </g>
    <g id="text_56">
-    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: start" x="458.276406" y="609.691431" transform="rotate(-0 458.276406 609.691431)">GVR V1</text>
+    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: start" x="458.035" y="609.691431" transform="rotate(-0 458.035 609.691431)">GVR V1</text>
    </g>
    <g id="line2d_68">
-    <path d="M 516.195156 606.191431
-L 526.195156 606.191431
-L 536.195156 606.191431
+    <path d="M 515.95375 606.191431
+L 525.95375 606.191431
+L 535.95375 606.191431
 " style="fill: none; stroke-dasharray: 9.25,4; stroke-dashoffset: 0; stroke: #64748b; stroke-width: 2.5"/>
    </g>
    <g id="text_57">
-    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: start" x="544.195156" y="609.691431" transform="rotate(-0 544.195156 609.691431)">TensorRT-LLM radix CUDA</text>
+    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: start" x="543.95375" y="609.691431" transform="rotate(-0 543.95375 609.691431)">TensorRT LLM radix CUDA</text>
    </g>
   </g>
  </g>
