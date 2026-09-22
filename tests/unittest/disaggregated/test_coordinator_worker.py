@@ -33,6 +33,7 @@ while stateless routers never touch the coordinator.
 
 import asyncio
 import json
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -653,6 +654,40 @@ async def test_coordinator_keep_alive_timeout_is_passed_to_uvicorn(
     assert config_factory.call_count == 2  # UDS (hot path) + TCP (health)
     for call in config_factory.call_args_list:
         assert call.kwargs["timeout_keep_alive"] == expected_timeout
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("uds", [None, "/tmp/coord.sock"])
+async def test_coordinator_tcp_listener_uses_the_prebound_socket(monkeypatch, uds):
+    """The TCP listener must serve a socket the caller already bound.
+
+    Letting uvicorn bind the host string makes it resolve the name, and a
+    hostname whose AAAA record is link-local resolves to fe80:: with scope id 0
+    -- an address the kernel always refuses, since only an interface name
+    carries the scope. The standalone server and the fleet workers already
+    hand uvicorn a bound socket; the coordinator has to do the same.
+    """
+    from tensorrt_llm.serve import coordinator_server
+
+    server = object.__new__(CoordinatorServer)
+    server._coordinator = AsyncMock()
+    server.app = object()
+
+    tcp_server = SimpleNamespace(serve=AsyncMock())
+    uds_server = SimpleNamespace(serve=AsyncMock())
+    # uvicorn.Server is constructed UDS first, then TCP.
+    servers = [uds_server, tcp_server] if uds else [tcp_server]
+    monkeypatch.setattr(coordinator_server.uvicorn, "Config", Mock(return_value=object()))
+    monkeypatch.setattr(coordinator_server.uvicorn, "Server", Mock(side_effect=servers))
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    with sock:
+        await server("fe80::ac31:4bff:fee6:2d43", 8332, uds=uds, sockets=[sock])
+
+        tcp_server.serve.assert_awaited_once_with(sockets=[sock])
+        if uds:
+            # The UDS listener binds the path itself and takes no socket.
+            uds_server.serve.assert_awaited_once_with()
 
 
 if __name__ == "__main__":

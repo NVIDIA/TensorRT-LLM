@@ -2252,6 +2252,27 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     coord_url = f"unix:{coord_uds}" if coord_uds else \
         f"http://{public_host}:{coord_port}"
 
+    # Bind the coordinator's TCP socket here rather than letting uvicorn bind the
+    # hostname, so this listener starts the same way as the standalone server and
+    # the fleet workers. uvicorn would resolve the name itself, and a hostname
+    # whose AAAA record is link-local resolves to fe80:: with scope id 0 -- which
+    # the kernel always rejects with "invalid argument", because the scope id can
+    # only be derived from an interface name. Binding AF_INET here also surfaces a
+    # port conflict with the same diagnostics as the other two listeners.
+    coord_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    coord_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        coord_socket.bind((public_host, coord_port))
+    except OSError as e:
+        coord_socket.close()
+        holder = _diagnose_port_in_use(coord_port)
+        logger.error(f"Failed to bind coordinator socket to "
+                     f"{public_host}:{coord_port} (pid={os.getpid()}): {e}. "
+                     f"Current port holder(s): {holder}")
+        raise RuntimeError(
+            f"Failed to bind socket to {public_host}:{coord_port}: {e}. "
+            f"Port holder(s): {holder}")
+
     # 1. Launch the delegating fleet pointed at the implicit coordinator we start
     #    below (port-1 for TCP; UDS for the hot path). Workers hold
     #    CoordinatorClients (no core), so they can't race the ZMQ ingest bind.
@@ -2286,7 +2307,8 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
                 public_host,
                 coord_port,
                 uds=coord_uds,
-                keep_alive_timeout=disagg_cfg.server_keep_alive_timeout))
+                keep_alive_timeout=disagg_cfg.server_keep_alive_timeout,
+                sockets=[coord_socket]))
 
         async def _monitor_fleet():
             while True:
@@ -2314,6 +2336,7 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     try:
         asyncio.run(_serve_and_monitor())
     finally:
+        coord_socket.close()
         for process in fleet:
             if process.poll() is None:
                 process.terminate()

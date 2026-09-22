@@ -32,6 +32,7 @@ the ZMQ ingest bind for centralized mode.
 """
 
 import asyncio
+import socket
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -151,6 +152,7 @@ class CoordinatorServer:
         port: int,
         uds: Optional[str] = None,
         keep_alive_timeout: int = TIMEOUT_KEEP_ALIVE,
+        sockets: Optional[list[socket.socket]] = None,
     ) -> None:
         # Single-process (owns routing state + the centralized ZMQ ingest bind);
         # workers=1 forced so a leaked WEB_CONCURRENCY can't fork it. When ``uds``
@@ -158,6 +160,12 @@ class CoordinatorServer:
         # (avoids the TCP loopback overhead that dominated per-request latency).
         # keep_alive_timeout comes from the disaggregated config's
         # ``server_keep_alive_timeout`` so both listeners are tuned by one key.
+        # ``sockets`` carries a socket the caller already bound, which is how the
+        # other disaggregated listeners start. Letting uvicorn bind ``host``
+        # itself means it resolves the name, and a name whose AAAA record is
+        # link-local resolves to fe80:: with scope id 0 -- an address the kernel
+        # always refuses ("invalid argument"), since the scope id can only come
+        # from an interface name.
         kwargs = dict(workers=1, log_level="info", timeout_keep_alive=keep_alive_timeout)
         if uds:
             # uvicorn.Config binds uds XOR host:port, so run two Servers: UDS for
@@ -170,13 +178,13 @@ class CoordinatorServer:
                 tcp_cfg = uvicorn.Config(self.app, host=host, port=port, lifespan="off", **kwargs)
                 await _asyncio.gather(
                     create_uvicorn_server(uds_cfg).serve(),
-                    create_uvicorn_server(tcp_cfg).serve(),
+                    create_uvicorn_server(tcp_cfg).serve(sockets=sockets),
                 )
             finally:
                 await self._coordinator.stop()
         else:
             config = uvicorn.Config(self.app, host=host, port=port, **kwargs)
-            await create_uvicorn_server(config).serve()
+            await create_uvicorn_server(config).serve(sockets=sockets)
 
 
 def serve_coordinator(host: str, port: int, coordinator: DisaggCoordinatorService) -> None:
