@@ -10793,8 +10793,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         raise ValueError(
             f"TRTLLM_DSL_FP4_DYN_TAIL={_FP4_DYN_TAIL} must be in [0, 15]")
     # TRTLLM_DSL_FP4_KV_STAGES: KV TMA pipeline depth of the FP4 scorer; unset =
-    # 5 for both builds (measured optimum on distinct real rows; the tail-only
-    # stealing build walks its range head like the static one)
+    # 5 for both builds
     _FP4_KV_STAGES_ENV = os.environ.get("TRTLLM_DSL_FP4_KV_STAGES")
 
     def _fp4_kv_stages(dynamic_sched):

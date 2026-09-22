@@ -84,10 +84,9 @@ SKIP_BLOCKS = (
     8192  # block-max skip: 32-position blocks per row the smem skip table covers (1M raw @ cr=4)
 )
 # gvr_main candidate staging capacity (entries) on the single-CTA small arms: eight
-# entries per K of the KPT rung (8*KPT*BLK), never below the historical 4096, capped so
-# MINB CTAs per SM stay inside the 196 KB shared-memory carveout with the compacted-skip
-# engine's static smem (1 KB reserved per CTA; the 228 KB tier leaves 28 KB of L1 and
-# costs the skip scan 15-20 %).  BLK=512: MINB=2, u64 entries; BLK=256: MINB=4, i32
+# entries per K of the KPT rung (8*KPT*BLK), at least 4096, capped so MINB CTAs per SM
+# stay inside the 196 KB shared-memory carveout with the compacted-skip engine's static
+# smem (1 KB reserved per CTA).  BLK=512: MINB=2, u64 entries; BLK=256: MINB=4, i32
 # entries.  Host mirror: gvr_topk_decode_self_sampling_host.scpb_small.
 SCPB_SMALL_CAP = {512: 8192, 256: 5120}
 SCPB_SMALL_MIN = 4096

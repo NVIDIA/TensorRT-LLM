@@ -3143,7 +3143,7 @@ class FP4MQALogitsKernel:
                     # Free ~8 registers for the meta accumulators/fragments;
                     # the epilogue's weight cache sits at the spill edge for
                     # next_n >= 2. next_n == 1 has the headroom and keeps the
-                    # full cache (the cut cost 2 LDS.128 per warp and tile).
+                    # full cache.
                     MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
                     if cutlass.const_expr(self.emit_hit_stats):
                         # Hit accumulators + bitmap word add ~6 more live
@@ -4072,7 +4072,7 @@ class FP4MQALogitsKernel:
                     # Free ~8 registers for the meta accumulators/fragments;
                     # the epilogue's weight cache sits at the spill edge for
                     # next_n >= 2. next_n == 1 has the headroom and keeps the
-                    # full cache (the cut cost 2 LDS.128 per warp and tile).
+                    # full cache.
                     MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
                     if cutlass.const_expr(self.emit_hit_stats):
                         # Hit accumulators + bitmap word add ~6 more live

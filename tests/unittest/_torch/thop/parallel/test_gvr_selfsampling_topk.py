@@ -714,7 +714,7 @@ def test_selfsampling_register_rungs_follow_available_sms() -> None:
             assert baseline["kernel"] == family
             assert ss_host.route(rows, n, n, k, num_sms) == baseline
 
-        # The default preserves the 148-SM B200 behavior exactly.
+        # The default preserves the 148-SM routing exactly.
         for rows in (148, 149, 296, 297):
             assert ss_host.route(rows, 8195, 8256, 1024) == ss_host.route(
                 rows, 8195, 8256, 1024, 148
@@ -2131,7 +2131,7 @@ def test_selfsampling_block_skip_guards():
 
 
 def test_selfsampling_block_skip_useful_families():
-    """The glue arms the skip only where it measured a win: the single-CTA
+    """The glue arms the skip only on the single-CTA
     streaming main at envelopes of >= 512k raw tokens (and the 2-CTA cluster
     family at >= 1M) when the launch writes more than 96 MB of logits; smaller
     launches (L2-resident rows), shorter envelopes, the 4-CTA cluster, the
@@ -2302,11 +2302,11 @@ def test_selfsampling_block_skip_bm_line(rows, msl_c, k, kind, n_valid):
     "rows,k,blk,minb,scpb",
     [
         (128, 1024, 1024, 1, 16384),
-        (296, 64, 512, 2, 4096),  # 8 K < 4096: the historical floor
+        (296, 64, 512, 2, 4096),  # 8 K < 4096: the SCPB_SMALL_MIN floor
         (296, 256, 512, 2, 4096),
-        (296, 512, 512, 2, 4096),  # k <= 512: 8 K = the historical 4096
+        (296, 512, 512, 2, 4096),  # k <= 512: 8 K = SCPB_SMALL_MIN
         (296, 1024, 512, 2, 8192),
-        (297, 64, 256, 4, 4096),  # 8 K < 4096: the historical floor
+        (297, 64, 256, 4, 4096),  # 8 K < 4096: the SCPB_SMALL_MIN floor
         (297, 256, 256, 4, 4096),
         (297, 512, 256, 4, 4096),
         (297, 1024, 256, 4, 5120),  # 8 K = 8192 capped by the 196 KB tier
@@ -2317,11 +2317,10 @@ def test_selfsampling_block_skip_bm_line(rows, msl_c, k, kind, n_valid):
 )
 def test_selfsampling_main_scpb_arms(rows, k, blk, minb, scpb):
     """The single-CTA main arms' staging capacity (8 entries per K of the KPT
-    rung, floored at the historical 4096, capped per arm): host SCAP == kernel
-    SCPB (the sampling ladder and the plan smem are derived from it on both
-    sides), and every engine (skip / dense) keeps its MINB CTAs per SM inside
-    the 196 KB shared-memory carveout (1 KB reserved per CTA): the 228 KB tier
-    leaves 28 KB of L1 and slows the skip scan by 15-20 %."""
+    rung, floored at 4096, capped per arm): host SCAP == kernel SCPB (the
+    sampling ladder and the plan smem are derived from it on both sides), and
+    every engine (skip / dense) keeps its MINB CTAs per SM inside the 196 KB
+    shared-memory carveout (1 KB reserved per CTA)."""
     assert ss_host.SCPB_SMALL_CAP == ss_dev.SCPB_SMALL_CAP
     assert ss_host.SCPB_SMALL_MIN == ss_dev.SCPB_SMALL_MIN == 4096
     n = 262144

@@ -75,8 +75,7 @@ _DG_SCHEDULE_BLOCK_KV = 64
 # it (the runner still applies its shape floors, see cute_dsl_custom_ops).
 # Off by default: the build is chosen at CUDA-graph capture from the engine's
 # max sequence length, and launches whose rows are far below that envelope
-# pay the scheduler's fixed cost (+3 % at 256k B128, +7 % at 64k B128 under a
-# 1M envelope, cold B200) for -1 % at 1M B128/B256.
+# pay the scheduler's fixed cost.
 _DSL_FP4_DYN_DEFAULT_ON = False
 _DSL_FP4_DYN_SCHED = os.environ.get("TRTLLM_DSL_FP4_DYN_SCHED", "auto")
 _DSL_FP4_USE_DYN = _DSL_FP4_DYN_SCHED == "1" or (
@@ -819,8 +818,7 @@ class Indexer(nn.Module):
         # epilogue emits per-32-position maxima and the streaming top-k
         # (single-CTA main, 2-CTA cluster) skips the blocks below its sampled
         # line. Armed per launch geometry (large batch at >= 512k-token
-        # envelopes, where the row scan is bandwidth-bound; see
-        # gvr_topk_decode_self_sampling_host.block_skip_useful).
+        # envelopes; see gvr_topk_decode_self_sampling_host.block_skip_useful).
         self.use_gvr_block_skip = (
             getattr(sparse_params, "use_gvr_block_skip", True)
             and self._use_self_sampling_topk
@@ -848,7 +846,6 @@ class Indexer(nn.Module):
             )
 
             npad = (int(max_seq_len_c) + 255) // 256 * 256  # DSL paged-MQA arena row stride
-            # the engine routes on the device's SM count / architecture too
             num_sms, sm_version = _unpack_device_profile(
                 _device_profile_key(torch.cuda.current_device())
             )
