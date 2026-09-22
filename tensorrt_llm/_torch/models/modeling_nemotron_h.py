@@ -1346,7 +1346,6 @@ class NemotronHMTP(nn.Module):
           head). Partial exclusions inside a quantized sublayer are handled
           per module by ``apply_quant_config_exclude_modules``.
         """
-        from tensorrt_llm.models.modeling_utils import QuantConfig
 
         quant_config = model_config.quant_config
         if quant_config is None:
