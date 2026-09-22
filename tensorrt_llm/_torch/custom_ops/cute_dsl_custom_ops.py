@@ -46,9 +46,8 @@ _CUTEDSL_FC2_N_TILE_SIZE_ENV = "TRTLLM_CUTEDSL_FC2_N_TILE_SIZE"
 _CUTEDSL_FC2_N_TILE_SIZES = (128, 256)
 _CUTEDSL_FC2_DEFAULT_N_TILE_SIZE = 128
 
-# The torch.library schema needs a concrete float, so "unset" is a sentinel
-# rather than ``None``. SiTU betas are required to be positive, so any
-# non-positive value is unambiguously "not provided".
+# Legacy Rubin ops use a float sentinel for absent SiTU soft-caps.
+# The Blackwell act-fusion op accepts Optional[float] directly.
 SITU_BETA_DISABLED = -1.0
 
 
@@ -2454,6 +2453,348 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                 device=input_scale.device)
         return fp4_output, output_sf
 
+    class CuteDSLNVFP4GeluDeferredFP4OutBlackwellRunner(
+            CuteDSLNVFP4SwigluFP4OutBlackwellRunner):
+        """Non-gated GELU(tanh) variant with deferred dynamic FP4 scale finalization."""
+        kernel_cache = dict()
+
+        def __init__(self, use_tvm_ffi: bool = True):
+            super().__init__(use_tvm_ffi, activation_type=ActivationType.Gelu)
+
+        def unique_id(self):
+            return (self.use_tvm_ffi, 'gelu_deferred_fp4out')
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+            **kwargs,
+        ) -> List[Tuple]:
+            a, b, a_sf, b_sf, alpha = inputs[:5]
+            m, k, n = a.shape[0], a.shape[1] * 2, b.shape[0]
+            if m < 128:
+                return []
+            sf_vec_size = 16
+            mma_tiler_mn_candidates = [(128, 128), (128, 256), (256, 128),
+                                       (256, 256)]
+            cluster_shape_mn_candidates = [(1, 1), (2, 1), (1, 2), (2, 2)]
+            use_prefetch_candidates = [True, False]
+
+            valid_tactics = []
+            for mma_tiler_mn in mma_tiler_mn_candidates:
+                for cluster_shape_mn in cluster_shape_mn_candidates:
+                    for use_prefetch in use_prefetch_candidates:
+                        if self.__class__.kernel_class.can_implement(
+                                ab_dtype=cutlass.Float4E2M1FN,
+                                sf_dtype=cutlass.Float8E4M3FN,
+                                sf_vec_size=sf_vec_size,
+                                c_dtype=cutlass.Float4E2M1FN,
+                                mma_tiler_mn=mma_tiler_mn,
+                                cluster_shape_mn=cluster_shape_mn,
+                                m=m,
+                                n=n,
+                                k=k,
+                                l=1,
+                                a_major="k",
+                                b_major="k",
+                                c_major="n",
+                        ):
+                            valid_tactics.append(
+                                (mma_tiler_mn, cluster_shape_mn, use_prefetch))
+
+            return valid_tactics
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic,
+            **kwargs,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            sf_vec_size = 16
+
+            if isinstance(tactic, tuple):
+                mma_tiler_mn, cluster_shape_mn, use_prefetch = tactic
+            else:
+                mma_tiler_mn, cluster_shape_mn, use_prefetch = [
+                    (128, 128),
+                    (1, 1),
+                    False,
+                ]
+
+            bias_tensor = inputs[5] if len(inputs) > 5 else None
+            (a_tensor, b_tensor, a_sf_tensor, b_sf_tensor,
+             alpha_tensor) = inputs[:5]
+            m, k, n = a_tensor.shape[0], a_tensor.shape[1], b_tensor.shape[0]
+            n_out = n
+
+            if bias_tensor is not None:
+                if bias_tensor.numel() != n_out:
+                    raise ValueError(
+                        f"CuteDSL GELU Deferred FP4Out: bias must have {n_out} elements "
+                        f"(n_out), got {bias_tensor.numel()}")
+                bias_tensor = bias_tensor.contiguous()
+
+            cta_m = mma_tiler_mn[0] * cluster_shape_mn[0]
+            padded_m = pad_up(m, cta_m)
+
+            c_tensor = torch.empty(padded_m,
+                                   n_out // 2,
+                                   dtype=a_tensor.dtype,
+                                   device="cuda")
+            raw_sf_tensor = torch.empty(padded_m,
+                                        n_out // sf_vec_size,
+                                        dtype=torch.float32,
+                                        device="cuda")
+
+            real_k = k * 2
+            sf_m = pad_up(m, 128)
+            sf_k = pad_up(real_k // sf_vec_size, 4)
+            sf_n = pad_up(n, 128)
+
+            expected_a_sf_size = sf_m * sf_k
+            expected_b_sf_size = sf_n * sf_k
+
+            if a_sf_tensor.numel() != expected_a_sf_size:
+                raise ValueError(
+                    f"CuteDSL GELU Deferred FP4Out: act scale factor size mismatch. "
+                    f"Expected {expected_a_sf_size}, got {a_sf_tensor.numel()}")
+            if b_sf_tensor.numel() != expected_b_sf_size:
+                raise ValueError(
+                    f"CuteDSL GELU Deferred FP4Out: weight scale factor size mismatch. "
+                    f"Expected {expected_b_sf_size}, got {b_sf_tensor.numel()}")
+
+            a_sf_tensor = a_sf_tensor.reshape(sf_m * sf_k)
+            b_sf_tensor = b_sf_tensor.reshape(sf_n * sf_k)
+
+            kernel_m = m
+            kernel_n = n
+
+            has_bias = bias_tensor is not None
+            if has_bias:
+                if bias_tensor.dtype == torch.bfloat16:
+                    bias_cute_dtype = cutlass.BFloat16
+                elif bias_tensor.dtype == torch.float32:
+                    bias_cute_dtype = cutlass.Float32
+                else:
+                    raise ValueError(
+                        f"CuteDSL GELU Deferred FP4Out: bias must be bf16 or fp32, "
+                        f"got {bias_tensor.dtype}")
+
+            bias_key = bias_tensor.dtype if has_bias else None
+            cache_key = (sf_vec_size, mma_tiler_mn, cluster_shape_mn,
+                         use_prefetch, self.use_tvm_ffi, 'deferred_fp4out',
+                         bias_key)
+            if cache_key not in self.__class__.kernel_cache:
+                a_ptr = self.make_cute_dsl_global_pointer(
+                    a_tensor, cutlass.Float4E2M1FN, 32)
+                b_ptr = self.make_cute_dsl_global_pointer(
+                    b_tensor, cutlass.Float4E2M1FN, 32)
+                a_sf_ptr = self.make_cute_dsl_global_pointer(
+                    a_sf_tensor, cutlass.Float8E4M3FN, 16)
+                b_sf_ptr = self.make_cute_dsl_global_pointer(
+                    b_sf_tensor, cutlass.Float8E4M3FN, 16)
+                c_ptr = self.make_cute_dsl_global_pointer(
+                    c_tensor, cutlass.Float4E2M1FN, 32)
+                raw_sf_ptr = self.make_cute_dsl_global_pointer(
+                    raw_sf_tensor, cutlass.Float32, 4)
+                bias_ptr = self.make_cute_dsl_global_pointer(
+                    bias_tensor, bias_cute_dtype, 4) if has_bias else None
+                alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
+
+                if self.use_tvm_ffi:
+                    stream = cute.runtime.make_fake_stream(
+                        use_tvm_ffi_env_stream=True)
+                else:
+                    torch_stream = torch.cuda.current_stream()
+                    stream = cuda.CUstream(torch_stream.cuda_stream)
+
+                gemm = self.__class__.kernel_class(
+                    sf_vec_size,
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    True,  # vectorized_f32
+                    use_prefetch,
+                    activation_type=self.activation_type,
+                )
+                hardware_info = cutlass.utils.HardwareInfo()
+                max_active_clusters = hardware_info.get_max_active_clusters(
+                    cluster_shape_mn[0] * cluster_shape_mn[1])
+
+                compile_args = [
+                    gemm.wrapper_deferred_fp4out,
+                    kernel_m,
+                    kernel_n,
+                    real_k,
+                    sf_m // 128,
+                    sf_n // 128,
+                    sf_k // 4,
+                    1,  # batch
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_ptr,
+                    raw_sf_ptr,
+                    alpha_cute_tensor,
+                    max_active_clusters,
+                    stream,
+                ]
+                if has_bias:
+                    compile_args.append(bias_ptr)
+
+                compiled_gemm = cute.compile(
+                    *compile_args,
+                    options="--opt-level 2 --enable-tvm-ffi"
+                    if self.use_tvm_ffi else "--opt-level 2",
+                )
+
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            # Launch kernel
+            if self.use_tvm_ffi:
+                tvm_args = [
+                    kernel_m,
+                    kernel_n,
+                    real_k,
+                    sf_m // 128,
+                    sf_n // 128,
+                    sf_k // 4,
+                    a_tensor.data_ptr(),
+                    b_tensor.data_ptr(),
+                    a_sf_tensor.data_ptr(),
+                    b_sf_tensor.data_ptr(),
+                    c_tensor.data_ptr(),
+                    raw_sf_tensor.data_ptr(),
+                    alpha_tensor,
+                ]
+                if has_bias:
+                    tvm_args.append(bias_tensor.data_ptr())
+                compiled_gemm(*tvm_args)
+            else:
+                a_ptr = self.make_cute_dsl_global_pointer(
+                    a_tensor, cutlass.Float4E2M1FN, 32)
+                b_ptr = self.make_cute_dsl_global_pointer(
+                    b_tensor, cutlass.Float4E2M1FN, 32)
+                a_sf_ptr = self.make_cute_dsl_global_pointer(
+                    a_sf_tensor, cutlass.Float8E4M3FN, 16)
+                b_sf_ptr = self.make_cute_dsl_global_pointer(
+                    b_sf_tensor, cutlass.Float8E4M3FN, 16)
+                c_ptr = self.make_cute_dsl_global_pointer(
+                    c_tensor, cutlass.Float4E2M1FN, 32)
+                raw_sf_ptr = self.make_cute_dsl_global_pointer(
+                    raw_sf_tensor, cutlass.Float32, 4)
+                bias_ptr = self.make_cute_dsl_global_pointer(
+                    bias_tensor, bias_cute_dtype, 4) if has_bias else None
+                alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
+
+                torch_stream = torch.cuda.current_stream()
+                stream = cuda.CUstream(torch_stream.cuda_stream)
+
+                call_args = [
+                    kernel_m,
+                    kernel_n,
+                    real_k,
+                    sf_m // 128,
+                    sf_n // 128,
+                    sf_k // 4,
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_ptr,
+                    raw_sf_ptr,
+                    alpha_cute_tensor,
+                    stream,
+                ]
+                if has_bias:
+                    call_args.append(bias_ptr)
+                compiled_gemm(*call_args)
+
+            c_tensor = c_tensor[:m]
+            raw_sf_tensor = raw_sf_tensor[:m]
+            return c_tensor, raw_sf_tensor
+
+    # a/b: fp4, scale: fp8, output: fp4 + raw sf (deferred), fused non-gated GELU(tanh)
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_nvfp4_dense_gemm_gelu_deferred_fp4out_blackwell",
+        mutates_args=(),
+        device_types="cuda")
+    def cute_dsl_nvfp4_dense_gemm_gelu_deferred_fp4out_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        use_tvm_ffi: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """CuteDSL NVFP4 dense GEMM + non-gated GELU(tanh) with deferred FP4 scale finalization.
+
+        Emits scale-invariant packed Float4E2M1FN output C [m, n] and raw FP32 per-16
+        block scales raw_sf [m, n // 16] for subsequent finalization via
+        trtllm::nvfp4_sfc_finalize.
+
+        Args:
+            input: Activation tensor [m, k] in FP4 format (packed)
+            weight: Weight tensor [n, k] in FP4 format (packed). n = intermediate_size.
+            input_scale: Activation scale factors
+            weight_scale: Weight scale factors
+            alpha: GEMM scaling factor
+            bias: Optional per-N bias vector [n] (bf16/fp32, NOT quantized),
+                broadcast over M and added before GELU. None (default) -> no bias.
+            use_tvm_ffi: Whether to use TVM-FFI.
+
+        Returns:
+            Tuple of (fp4_output, raw_sf):
+                fp4_output: [m, n//2] in FP4 packed format
+                raw_sf: [m, n//16] raw block scales (fp32)
+        """
+        if (sm_version := get_sm_version()) not in (100, 103):
+            raise ValueError(
+                f"CuteDSL NVFP4 GELU Deferred FP4Out requires SM 100 or SM 103, "
+                f"but got SM {sm_version}.")
+
+        tuner = AutoTuner.get()
+
+        runner = CuteDSLNVFP4GeluDeferredFP4OutBlackwellRunner(use_tvm_ffi)
+        inputs = [input, weight, input_scale, weight_scale, alpha]
+        if bias is not None:
+            inputs.append(bias)
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_nvfp4_dense_gemm_gelu_deferred_fp4out_blackwell",
+            [runner],
+            runner.__class__.tuning_config,
+            inputs,
+        )
+
+        return runner(inputs, tactic=best_tactic)
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_nvfp4_dense_gemm_gelu_deferred_fp4out_blackwell")
+    def _(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        use_tvm_ffi: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        n = mat_b.shape[-2]
+        n_out = n  # non-gated: output keeps full N
+        sf_vec_size = 16
+        # FP4 output packed: [m, n_out // 2]
+        fp4_shape = list(mat_a.shape)
+        fp4_shape[-1] = n_out // 2
+        fp4_output = mat_a.new_empty(fp4_shape)
+        # Raw scale factors: [m, n_out // 16] float32
+        raw_shape = list(mat_a.shape)
+        raw_shape[-1] = n_out // sf_vec_size
+        raw_sf = mat_a.new_empty(raw_shape, dtype=torch.float32)
+        return fp4_output, raw_sf
+
     class Sm100BlockScaledContiguousGroupedGemmRunner(TunableRunner):
         kernel_class = Sm100BlockScaledContiguousGroupedGemmKernel
         kernel_cache = dict()
@@ -3624,12 +3965,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             """Initialize the runner.
 
             Args:
-                activation_type: ``ActivationType`` for the fused epilogue. Only
+                activation_type: ``ActivationType`` for the fused epilogue.
                     ``Swiglu`` (gated), ``Relu2`` (non-gated) and ``SiTu``
                     (gated) are supported.
                 swiglu_limit_scalar: Uniform clamp limit for SwiGLU. ``+inf`` disables clamp.
-                situ_beta: Gate-side SiTU constant; required for ``SiTu`` only.
-                situ_linear_beta: Linear-side SiTU constant; required for ``SiTu`` only.
+                situ_beta: Gate-side SiTU soft-cap. Required for -- and only
+                    valid with -- ``ActivationType.SiTu``.
+                situ_linear_beta: Linear-side SiTU soft-cap, same rule.
             """
             super().__init__()
             self.activation_type = validate_activation_type(activation_type)
@@ -3663,6 +4005,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
 
         def unique_id(self):
+            """Identity of the compiled kernel, for the autotuner's cache.
+
+            Every entry here is a trace-time constant folded into the kernel,
+            so two runners that differ in any of them are different kernels
+            and must not share a tuning result. That is why the activation
+            soft-caps appear: ``swiglu_limit_scalar`` and the two SiTU betas
+            are baked in as ``const_expr``, not passed at launch.
+            """
             return (
                 self.num_experts,
                 self.top_k,
@@ -4045,8 +4395,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
         expert_counts: Optional[torch.Tensor] = None,
         expert_capacity: int = 0,
-        situ_beta: float = SITU_BETA_DISABLED,
-        situ_linear_beta: float = SITU_BETA_DISABLED,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion.
 
@@ -4054,8 +4404,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         (non-gated) and ``ActivationType.SiTu`` (gated) epilogues; other
         ``ActivationType`` values raise an assertion in the runner.
 
-        ``situ_beta``/``situ_linear_beta`` are only meaningful for
-        ``ActivationType.SiTu``; values <= 0 disable them.
+        ``situ_beta`` / ``situ_linear_beta`` carry the two SiTU soft-caps, and
+        are ``None`` for every other activation. The runner rejects a mismatch
+        against ``activation_type`` in either direction.
         """
         tuner = AutoTuner.get()
         swiglu_limit_scalar = _canonicalize_swiglu_limit_scalar(
@@ -4082,8 +4433,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             activation_type=ActivationType(activation_type),
             swiglu_limit_scalar=swiglu_limit_scalar,
             use_expert_counts=expert_counts is not None,
-            situ_beta=_canonicalize_situ_beta(situ_beta),
-            situ_linear_beta=_canonicalize_situ_beta(situ_linear_beta))
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta)
         inputs = [
             input, weight, input_scale, weight_scale, alpha,
             tile_idx_to_group_idx, tile_idx_to_mn_limit,
@@ -4122,9 +4473,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
         swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
         expert_counts: Optional[torch.Tensor] = None,
         expert_capacity: int = 0,
-        situ_beta: float = SITU_BETA_DISABLED,
-        situ_linear_beta: float = SITU_BETA_DISABLED,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Meta-device shapes for the FC1 output and its block scales.
+
+        A gated activation halves the N it emits, so the interleaved
+        gate/up pair collapses to one value per output element; the extra
+        ``// 2`` on the tensor itself is NVFP4's two values per byte.
+
+        The activation soft-caps are accepted and ignored: they change what
+        the kernel computes, never the shape it returns, but the fake must
+        still mirror the op's schema exactly.
+        """
         if expert_counts is not None:
             helper = GroupedGemmInputsHelper(num_experts, top_k,
                                              num_local_experts,
@@ -11504,7 +11865,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     tensor of shape (H, S_q, B) remains in the workspace.
             """
             (q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o,
-             workspace, softmax_stats) = inputs
+             workspace, softmax_stats) = inputs[:9]
+            # inputs[9] (optional): helix per-token attention bounds of shape
+            # (B * S_q,), int32 — speculative verify groups only.
+            kv_bounds = inputs[9] if len(inputs) > 9 else None
             softmax_scale = float(kwargs.get("softmax_scale", 1.0))
             output_scale = float(kwargs.get("output_scale", 1.0))
 
@@ -11577,12 +11941,33 @@ if IS_CUTLASS_DSL_AVAILABLE:
             split_workspace = workspace_bytes[split_kv_offset:split_kv_offset +
                                               split_kv_size]
 
+            if kv_bounds is not None and AutoTuner.get().is_tuning_mode:
+                # Profiling rebuilds cache_seqs at bucketed sizes but input 9
+                # has no dynamic-dim spec, so kv_bounds arrives at the old
+                # size. Bound values only affect masking depth, not the
+                # tactic space, so any size-consistent dummy will do.
+                if kv_bounds.numel() != batch_size * seq_len_q:
+                    kv_bounds = cache_seqs.repeat_interleave(
+                        seq_len_q).contiguous()
+            if kv_bounds is not None:
+                expected_bounds_shape = (batch_size * seq_len_q, )
+                if (kv_bounds.shape != expected_bounds_shape
+                        or kv_bounds.dtype != torch.int32
+                        or kv_bounds.device != o.device
+                        or not kv_bounds.is_contiguous()):
+                    raise RuntimeError(
+                        "CuteDSLNVMlaDecodeBlackwellRunner requires contiguous "
+                        "int32 kv_bounds on the output device with shape "
+                        f"{expected_bounds_shape}, got shape="
+                        f"{tuple(kv_bounds.shape)}, dtype={kv_bounds.dtype}.")
+
             cache_key = self.unique_id() + (
                 out_dtype,
                 mma_qk_tiler_mn,
                 mma_pv_tiler_mn,
                 split_kv,
                 is_persistent,
+                kv_bounds is not None,
             )
             if cache_key not in CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache:
                 # A compile outside the tuning window stalls the serving loop
@@ -11650,6 +12035,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                 if use_workspace else None)
                 cache_seqs_ct = cute.runtime.from_dlpack(
                     cache_seqs, assumed_align=16).mark_layout_dynamic()
+                kv_bounds_ct = (cute.runtime.from_dlpack(
+                    kv_bounds, assumed_align=4).mark_layout_dynamic()
+                                if kv_bounds is not None else None)
                 # Variable split-KV (block_split_kvs) is not used on this path:
                 block_split_kvs_ct = None
 
@@ -11670,6 +12058,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     workspace_ct,
                     split_kv,
                     cache_seqs_ct,
+                    kv_bounds_ct,
                     block_split_kvs_ct,
                     cutlass.Float32(softmax_scale),
                     cutlass.Float32(output_scale),
@@ -11708,6 +12097,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 (split_kv > 1 and split_workspace.numel() > 0) else None,
                 split_kv,
                 cache_seqs,
+                kv_bounds,
                 None,  # block_split_kvs: var-split path unused (is_var_split_kv False)
                 softmax_scale,
                 output_scale,
@@ -11735,13 +12125,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
         page_size: int,
         softmax_scale: float,
         output_scale: float,
-        # Keep the last two arguments required in the custom-op schema. PyTorch
+        # Keep the trailing arguments required in the custom-op schema. PyTorch
         # elides trailing default-valued arguments before its mutation fallback,
         # while mutates_args retains their positional indices.
         max_batch_size: int,
         softmax_stats: Optional[torch.Tensor],
+        kv_bounds: Optional[torch.Tensor],
     ) -> None:
         """CuTe DSL FP8 MLA decode (Blackwell SM100/SM103).
+
+        kv_bounds: helix speculative verify groups -- per-token rank-local
+        attention bounds of shape (B * seq_len_q,), int32.
         """
         if (sm_version := get_sm_version()) not in (100, 103):
             raise ValueError(
@@ -11760,7 +12154,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         )
         inputs = [
             q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o,
-            workspace, softmax_stats
+            workspace, softmax_stats, kv_bounds
         ]
         tuner = AutoTuner.get()
         _, best_tactic = tuner.choose_one(
@@ -11798,6 +12192,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output_scale: float,
         max_batch_size: int,
         softmax_stats: Optional[torch.Tensor],
+        kv_bounds: Optional[torch.Tensor],
     ) -> None:
         return None
 
@@ -11823,8 +12218,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # See the FP8 op above: these must remain required schema arguments.
         max_batch_size: int,
         softmax_stats: Optional[torch.Tensor],
+        kv_bounds: Optional[torch.Tensor],
     ) -> None:
         """CuTe DSL FP16/BF16 MLA decode (Blackwell SM100/SM103).
+
+        kv_bounds: helix speculative verify groups — per-token rank-local
+        attention bounds of shape (B * seq_len_q,), int32.
         """
         if (sm_version := get_sm_version()) not in (100, 103):
             raise ValueError(
@@ -11860,7 +12259,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         )
         inputs = [
             q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o,
-            workspace, softmax_stats
+            workspace, softmax_stats, kv_bounds
         ]
         tuner = AutoTuner.get()
         _, best_tactic = tuner.choose_one(
@@ -11898,6 +12297,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output_scale: float,
         max_batch_size: int,
         softmax_stats: Optional[torch.Tensor],
+        kv_bounds: Optional[torch.Tensor],
     ) -> None:
         return None
 

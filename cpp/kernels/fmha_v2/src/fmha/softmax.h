@@ -28,10 +28,7 @@ namespace fmha
 
 struct Sum_
 {
-    enum
-    {
-        IS_SUM = 1
-    };
+    static constexpr int IS_SUM = 1;
 
     static inline __device__ float apply(float x, float y)
     {
@@ -43,10 +40,7 @@ struct Sum_
 
 struct Max_
 {
-    enum
-    {
-        IS_SUM = 0
-    };
+    static constexpr int IS_SUM = 0;
 
     static inline __device__ float apply(float x, float y)
     {
@@ -122,25 +116,13 @@ struct Smem_tile_reduce
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // The number of MMAs in M/N dimensions.
-    enum
-    {
-        MMAS_M = Mma_tile::MMAS_M
-    };
+    static constexpr int MMAS_M = Mma_tile::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Mma_tile::MMAS_N
-    };
+    static constexpr int MMAS_N = Mma_tile::MMAS_N;
 
-    enum
-    {
-        WARPS_M = Cta_tile::WARPS_M
-    };
+    static constexpr int WARPS_M = Cta_tile::WARPS_M;
 
-    enum
-    {
-        WARPS_N = Cta_tile::WARPS_N
-    };
+    static constexpr int WARPS_N = Cta_tile::WARPS_N;
 
     static constexpr int ROWS = WARPS_M * MMAS_M * 16;
     static constexpr int COLS = WARPS_N;
@@ -213,45 +195,24 @@ struct Softmax_base
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // The number of MMAs in M/N dimensions.
-    enum
-    {
-        MMAS_M = Mma_tile::MMAS_M
-    };
+    static constexpr int MMAS_M = Mma_tile::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Mma_tile::MMAS_N
-    };
+    static constexpr int MMAS_N = Mma_tile::MMAS_N;
 
     // The number of groups of warp such that we have at most 4 warps writing consecutive elements.
-    enum
-    {
-        GROUPS = fmha::Div_up<Cta_tile::WARPS_N, 4>::VALUE
-    };
+    static constexpr int GROUPS = fmha::Div_up<Cta_tile::WARPS_N, 4>::VALUE;
 
     // The number of elements that we are going to store per row.
-    enum
-    {
-        ELEMENTS_PER_ROW = Cta_tile::WARPS_N / GROUPS
-    };
+    static constexpr int ELEMENTS_PER_ROW = Cta_tile::WARPS_N / GROUPS;
 
     // The number of rows.
-    enum
-    {
-        ROWS = Cta_tile::M * GROUPS
-    };
+    static constexpr int ROWS = Cta_tile::M * GROUPS;
 
     // The total number of elements.
-    enum
-    {
-        ELEMENTS = ROWS * ELEMENTS_PER_ROW
-    };
+    static constexpr int ELEMENTS = ROWS * ELEMENTS_PER_ROW;
 
     // If shared memory is used
-    enum
-    {
-        USE_SHARED_MEMORY = Cta_tile::WARPS_N > 1
-    };
+    static constexpr int USE_SHARED_MEMORY = Cta_tile::WARPS_N > 1;
 
     // DEBUG.
     static_assert(ELEMENTS == Cta_tile::M * Cta_tile::WARPS_N, "");
@@ -259,10 +220,7 @@ struct Softmax_base
     // END OF DEBUG.
 
     // The number of rows per thread.
-    enum
-    {
-        ROWS_PER_THREAD = MMAS_M * 2
-    };
+    static constexpr int ROWS_PER_THREAD = MMAS_M * 2;
 
     // Ctor.
     template <typename Params>
@@ -905,28 +863,16 @@ struct Softmax_hmma : public Softmax_base<Traits, Cta_tile, Kernel_traits>
     using Base = Softmax_base<Traits, Cta_tile, Kernel_traits>;
 
     // The MMAs.
-    enum
-    {
-        MMAS_M = Base::MMAS_M
-    };
+    static constexpr int MMAS_M = Base::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Base::MMAS_N
-    };
+    static constexpr int MMAS_N = Base::MMAS_N;
 
     // Whether we need to skip the softmax due to the sliding-window attention
     // Otherwise, we will get NANs as those tokens are all masked out.
-    enum
-    {
-        SLIDING_WINDOW_ATTENTION = Kernel_traits::SLIDING_WINDOW_ATTENTION
-    };
+    static constexpr int SLIDING_WINDOW_ATTENTION = Kernel_traits::SLIDING_WINDOW_ATTENTION;
 
     // Use BMM1 softcapping scale or not.
-    enum
-    {
-        ENABLE_BMM1_SOFTCAPPING_SCALE = Kernel_traits::ENABLE_BMM1_SOFTCAPPING_SCALE
-    };
+    static constexpr int ENABLE_BMM1_SOFTCAPPING_SCALE = Kernel_traits::ENABLE_BMM1_SOFTCAPPING_SCALE;
 
     // The accumulators.
     using Accumulator = fmha::Fragment_accumulator<Traits>;
@@ -1186,15 +1132,9 @@ struct Softmax_imma : public Softmax_base<Traits, Cta_tile, Kernel_traits>
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // The MMAs.
-    enum
-    {
-        MMAS_M = Base::MMAS_M
-    };
+    static constexpr int MMAS_M = Base::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Base::MMAS_N
-    };
+    static constexpr int MMAS_N = Base::MMAS_N;
 
     // The accumulators.
     using Accumulator = fmha::Fragment_accumulator<Traits>;
@@ -1444,15 +1384,9 @@ struct Softmax_qmma<fmha::Ada_qmma_e4m3_fp32_traits, Cta_tile, Kernel_traits>
     using Base = Softmax_imma<Traits, Cta_tile, Kernel_traits>;
 
     // The MMAs.
-    enum
-    {
-        MMAS_M = Base::MMAS_M
-    };
+    static constexpr int MMAS_M = Base::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Base::MMAS_N
-    };
+    static constexpr int MMAS_N = Base::MMAS_N;
 
     // The accumulators.
     using Accumulator = fmha::Fragment_accumulator<Traits>;
@@ -1596,15 +1530,9 @@ struct Softmax_qmma<fmha::Ada_qmma_e4m3_fp16_traits, Cta_tile, Kernel_traits>
     using Base = Softmax_imma<Traits, Cta_tile, Kernel_traits>;
 
     // The MMAs.
-    enum
-    {
-        MMAS_M = Base::MMAS_M
-    };
+    static constexpr int MMAS_M = Base::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Base::MMAS_N
-    };
+    static constexpr int MMAS_N = Base::MMAS_N;
 
     // The accumulators.
     using Accumulator = fmha::Fragment_accumulator<Traits>;
@@ -1700,57 +1628,30 @@ struct Softmax<fmha::Volta_hmma_fp16_traits, Cta_tile, Kernel_traits>
     using Dst_type = typename Traits::A_type;
 
     // The number of MMAs in M/N dimensions.
-    enum
-    {
-        MMAS_M = Mma_tile::MMAS_M
-    };
+    static constexpr int MMAS_M = Mma_tile::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Mma_tile::MMAS_N
-    };
+    static constexpr int MMAS_N = Mma_tile::MMAS_N;
 
     // The number of groups of warp such that we have at most 2 warps writing consecutive elements.
-    enum
-    {
-        GROUPS = fmha::Div_up<Cta_tile::WARPS_N, 2>::VALUE
-    };
+    static constexpr int GROUPS = fmha::Div_up<Cta_tile::WARPS_N, 2>::VALUE;
 
     // The number of elements that we are going to store per row.
-    enum
-    {
-        ELEMENTS_PER_ROW = Cta_tile::WARPS_N / GROUPS
-    };
+    static constexpr int ELEMENTS_PER_ROW = Cta_tile::WARPS_N / GROUPS;
 
     // The number of rows.
-    enum
-    {
-        ROWS = Cta_tile::M * GROUPS
-    };
+    static constexpr int ROWS = Cta_tile::M * GROUPS;
 
     // The total number of elements.
-    enum
-    {
-        ELEMENTS = ROWS * ELEMENTS_PER_ROW
-    };
+    static constexpr int ELEMENTS = ROWS * ELEMENTS_PER_ROW;
 
     // Use BMM1 softcapping scale or not.
-    enum
-    {
-        ENABLE_BMM1_SOFTCAPPING_SCALE = Kernel_traits::ENABLE_BMM1_SOFTCAPPING_SCALE
-    };
+    static constexpr int ENABLE_BMM1_SOFTCAPPING_SCALE = Kernel_traits::ENABLE_BMM1_SOFTCAPPING_SCALE;
 
     // If shared memory is used
-    enum
-    {
-        USE_SHARED_MEMORY = Cta_tile::WARPS_N > 1
-    };
+    static constexpr int USE_SHARED_MEMORY = Cta_tile::WARPS_N > 1;
 
     // The number of rows per thread.
-    enum
-    {
-        ROWS_PER_THREAD = MMAS_M
-    };
+    static constexpr int ROWS_PER_THREAD = MMAS_M;
 
     // DEBUG.
     static_assert(ELEMENTS == Cta_tile::M * Cta_tile::WARPS_N, "");
@@ -2825,15 +2726,9 @@ struct Softmax_fp32 : public Softmax_hmma<Traits, Cta_tile, Kernel_traits>
     using Fragment_a = fmha::Fragment_a<Traits, fmha::Row>;
 
     // The MMAs.
-    enum
-    {
-        MMAS_M = Base::MMAS_M
-    };
+    static constexpr int MMAS_M = Base::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Base::MMAS_N
-    };
+    static constexpr int MMAS_N = Base::MMAS_N;
 
     // The accumulators.
     using Accumulator = fmha::Fragment_accumulator<Traits>;
@@ -2852,21 +2747,12 @@ struct Softmax_fp32 : public Softmax_hmma<Traits, Cta_tile, Kernel_traits>
 
     // END OF DEBUG.
 
-    enum
-    {
-        WARPS_M = Cta_tile::WARPS_M
-    };
+    static constexpr int WARPS_M = Cta_tile::WARPS_M;
 
-    enum
-    {
-        WARPS_N = Cta_tile::WARPS_N
-    };
+    static constexpr int WARPS_N = Cta_tile::WARPS_N;
 
     // Use BMM1 softcapping scale or not.
-    enum
-    {
-        ENABLE_BMM1_SOFTCAPPING_SCALE = Kernel_traits::ENABLE_BMM1_SOFTCAPPING_SCALE
-    };
+    static constexpr int ENABLE_BMM1_SOFTCAPPING_SCALE = Kernel_traits::ENABLE_BMM1_SOFTCAPPING_SCALE;
 
     using Smem_tile_red = Smem_tile_reduce<Traits, Cta_tile, Kernel_traits>;
     static_assert(Smem_tile_red::ELTS_PER_TILE == Cta_tile::M * WARPS_N);
@@ -3326,15 +3212,9 @@ struct Softmax<fmha::Ada_qmma_e4m3_fp32_traits, Cta_tile, Kernel_traits, true>
     using Base = Softmax_imma<Traits, Cta_tile, Kernel_traits>;
 
     // The MMAs.
-    enum
-    {
-        MMAS_M = Base::MMAS_M
-    };
+    static constexpr int MMAS_M = Base::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Base::MMAS_N
-    };
+    static constexpr int MMAS_N = Base::MMAS_N;
 
     // The accumulators.
     using Accumulator = fmha::Fragment_accumulator<Traits>;
@@ -3516,53 +3396,30 @@ struct Softmax_gmma_base<Traits_, Cta_tile_, Kernel_traits_, 1>
     static_assert(Mma_tile::M_PER_MMA_PER_CTA == 64);
 
     // The number of MMAs in M/N dimensions.
-    enum
-    {
-        MMAS_M = Mma_tile::MMAS_M
-    };
+    static constexpr int MMAS_M = Mma_tile::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Mma_tile::MMAS_N
-    };
+    static constexpr int MMAS_N = Mma_tile::MMAS_N;
 
     // Elements per thread per core matrix.
-    enum
-    {
-        ELTS_PER_THREAD = 2
-    };
+    static constexpr int ELTS_PER_THREAD = 2;
 
     // Core matrix is always 8x4.
-    enum
-    {
-        THREADS_PER_ROW = 4
-    };
+    static constexpr int THREADS_PER_ROW = 4;
 
-    enum
-    {
-        SMEM_BYTES = 0
-    };
+    static constexpr int SMEM_BYTES = 0;
 
     // The number of rows accessed by each thread.
-    enum
-    {
-        ROWS_PER_THREAD = Traits::GMMA_M / (Cta_tile::THREADS_PER_WARP / THREADS_PER_ROW) / Cta_tile::WARPS_M
-    };
+    static constexpr int ROWS_PER_THREAD
+        = Traits::GMMA_M / (Cta_tile::THREADS_PER_WARP / THREADS_PER_ROW) / Cta_tile::WARPS_M;
 
     static_assert(ROWS_PER_THREAD == Mma_tile::ROWS_PER_THREAD);
 
     // The number of columns access by each thread.
     // Note there are 2 elements per reg.
-    enum
-    {
-        COLS_PER_THREAD = Traits::GMMA_N / THREADS_PER_ROW / ELTS_PER_THREAD
-    };
+    static constexpr int COLS_PER_THREAD = Traits::GMMA_N / THREADS_PER_ROW / ELTS_PER_THREAD;
 
     // The number of total elements per thread.
-    enum
-    {
-        TOTAL_ELTS_PER_THREAD = ELTS_PER_THREAD * COLS_PER_THREAD
-    };
+    static constexpr int TOTAL_ELTS_PER_THREAD = ELTS_PER_THREAD * COLS_PER_THREAD;
 
     template <typename Params>
     inline __device__ Softmax_gmma_base(Params const& params, void*, int const, int const)
@@ -3751,15 +3608,9 @@ struct Softmax_gmma_base<Traits, Cta_tile, Kernel_traits, 2>
 
     using Mma_tile = typename Base::Mma_tile;
 
-    enum
-    {
-        BYTES_PER_SMEM = Mma_tile::M_PER_MMA_PER_CTA * Cta_tile::WARPS_N * sizeof(float)
-    };
+    static constexpr int BYTES_PER_SMEM = Mma_tile::M_PER_MMA_PER_CTA * Cta_tile::WARPS_N * sizeof(float);
 
-    enum
-    {
-        ELTS_PER_ROW = 2
-    };
+    static constexpr int ELTS_PER_ROW = 2;
 
     static_assert(Cta_tile::WARPS_N == 2);
     static_assert(Cta_tile::WARPS_M == 4);
@@ -3829,46 +3680,26 @@ struct Softmax<fmha::Hopper_hgmma_fp16_traits<GMMA_M, GMMA_N, GMMA_K, GMMA_A_RF,
     using Mma_tile = typename Base::Mma_tile;
 
     // The number of MMAs in M/N dimensions.
-    enum
-    {
-        MMAS_M = Mma_tile::MMAS_M
-    };
+    static constexpr int MMAS_M = Mma_tile::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Mma_tile::MMAS_N
-    };
+    static constexpr int MMAS_N = Mma_tile::MMAS_N;
 
     // for HGMMA_FP16, there are 2 elements per RF for ACC.
-    enum
-    {
-        ELTS_PER_THREAD = 2
-    };
+    static constexpr int ELTS_PER_THREAD = 2;
 
     // for Hopper HGMMA, each row is held within 4 threads.
-    enum
-    {
-        THREADS_PER_ROW = 4
-    };
+    static constexpr int THREADS_PER_ROW = 4;
 
     // The number of rows accessed by each thread.
-    enum
-    {
-        ROWS_PER_THREAD = Traits::GMMA_M / (Cta_tile::THREADS_PER_WARP / THREADS_PER_ROW) / Cta_tile::WARPS_M
-    };
+    static constexpr int ROWS_PER_THREAD
+        = Traits::GMMA_M / (Cta_tile::THREADS_PER_WARP / THREADS_PER_ROW) / Cta_tile::WARPS_M;
 
     // The number of columns access by each thread.
     // Note there are 2 elements per reg.
-    enum
-    {
-        COLS_PER_THREAD = Traits::GMMA_N / THREADS_PER_ROW / ELTS_PER_THREAD
-    };
+    static constexpr int COLS_PER_THREAD = Traits::GMMA_N / THREADS_PER_ROW / ELTS_PER_THREAD;
 
     // Use BMM1 softcapping scale or not.
-    enum
-    {
-        ENABLE_BMM1_SOFTCAPPING_SCALE = Kernel_traits::ENABLE_BMM1_SOFTCAPPING_SCALE
-    };
+    static constexpr int ENABLE_BMM1_SOFTCAPPING_SCALE = Kernel_traits::ENABLE_BMM1_SOFTCAPPING_SCALE;
 
     // Ctor.
     template <typename Params>
@@ -4012,46 +3843,26 @@ struct Softmax<fmha::Hopper_hgmma_fp32_traits<GMMA_M, GMMA_N, GMMA_K, GMMA_A_RF,
     using Mma_tile = typename Base::Mma_tile;
 
     // The number of MMAs in M/N dimensions.
-    enum
-    {
-        MMAS_M = Mma_tile::MMAS_M
-    };
+    static constexpr int MMAS_M = Mma_tile::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Mma_tile::MMAS_N
-    };
+    static constexpr int MMAS_N = Mma_tile::MMAS_N;
 
     // for HGMMA_FP16, there are 2 elements per RF for ACC.
-    enum
-    {
-        ELTS_PER_THREAD = 2
-    };
+    static constexpr int ELTS_PER_THREAD = 2;
 
     // for Hopper HGMMA, each row is held within 4 threads.
-    enum
-    {
-        THREADS_PER_ROW = 4
-    };
+    static constexpr int THREADS_PER_ROW = 4;
 
     // The number of rows accessed by each thread.
-    enum
-    {
-        ROWS_PER_THREAD = Traits::GMMA_M / (Cta_tile::THREADS_PER_WARP / THREADS_PER_ROW) / Cta_tile::WARPS_M
-    };
+    static constexpr int ROWS_PER_THREAD
+        = Traits::GMMA_M / (Cta_tile::THREADS_PER_WARP / THREADS_PER_ROW) / Cta_tile::WARPS_M;
 
     // The number of columns access by each thread.
     // Note there are 2 elements per reg.
-    enum
-    {
-        COLS_PER_THREAD = Traits::GMMA_N / THREADS_PER_ROW / ELTS_PER_THREAD
-    };
+    static constexpr int COLS_PER_THREAD = Traits::GMMA_N / THREADS_PER_ROW / ELTS_PER_THREAD;
 
     // Use BMM1 softcapping scale or not.
-    enum
-    {
-        ENABLE_BMM1_SOFTCAPPING_SCALE = Kernel_traits::ENABLE_BMM1_SOFTCAPPING_SCALE
-    };
+    static constexpr int ENABLE_BMM1_SOFTCAPPING_SCALE = Kernel_traits::ENABLE_BMM1_SOFTCAPPING_SCALE;
 
     // Ctor.
     template <typename Params>
@@ -4196,46 +4007,26 @@ struct Softmax<fmha::Hopper_hgmma_bf16_traits<GMMA_M, GMMA_N, GMMA_K, GMMA_A_RF,
     using Mma_tile = typename Base::Mma_tile;
 
     // The number of MMAs in M/N dimensions.
-    enum
-    {
-        MMAS_M = Mma_tile::MMAS_M
-    };
+    static constexpr int MMAS_M = Mma_tile::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Mma_tile::MMAS_N
-    };
+    static constexpr int MMAS_N = Mma_tile::MMAS_N;
 
     // for HGMMA_FP16, there are 2 elements per RF for ACC.
-    enum
-    {
-        ELTS_PER_THREAD = 2
-    };
+    static constexpr int ELTS_PER_THREAD = 2;
 
     // for Hopper HGMMA, each row is held within 4 threads.
-    enum
-    {
-        THREADS_PER_ROW = 4
-    };
+    static constexpr int THREADS_PER_ROW = 4;
 
     // The number of rows accessed by each thread.
-    enum
-    {
-        ROWS_PER_THREAD = Traits::GMMA_M / (Cta_tile::THREADS_PER_WARP / THREADS_PER_ROW) / Cta_tile::WARPS_M
-    };
+    static constexpr int ROWS_PER_THREAD
+        = Traits::GMMA_M / (Cta_tile::THREADS_PER_WARP / THREADS_PER_ROW) / Cta_tile::WARPS_M;
 
     // The number of columns access by each thread.
     // Note there are 2 elements per reg.
-    enum
-    {
-        COLS_PER_THREAD = Traits::GMMA_N / THREADS_PER_ROW / ELTS_PER_THREAD
-    };
+    static constexpr int COLS_PER_THREAD = Traits::GMMA_N / THREADS_PER_ROW / ELTS_PER_THREAD;
 
     // Use BMM1 softcapping scale or not.
-    enum
-    {
-        ENABLE_BMM1_SOFTCAPPING_SCALE = Kernel_traits::ENABLE_BMM1_SOFTCAPPING_SCALE
-    };
+    static constexpr int ENABLE_BMM1_SOFTCAPPING_SCALE = Kernel_traits::ENABLE_BMM1_SOFTCAPPING_SCALE;
 
     // Ctor.
     template <typename Params>
@@ -4370,40 +4161,23 @@ struct Softmax_gmma_32bit_8bit_base : public Softmax_gmma_base<Traits, Cta_tile,
     using Mma_tile = typename Base::Mma_tile;
 
     // The number of MMAs in M/N dimensions.
-    enum
-    {
-        MMAS_M = Mma_tile::MMAS_M
-    };
+    static constexpr int MMAS_M = Mma_tile::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Mma_tile::MMAS_N
-    };
+    static constexpr int MMAS_N = Mma_tile::MMAS_N;
 
     // TODO these should be general.
     // Two elts per thread per acc core matrix.
-    enum
-    {
-        ELTS_PER_THREAD = 2
-    };
+    static constexpr int ELTS_PER_THREAD = 2;
 
     // Number of threads per row of the acc core matrix.
-    enum
-    {
-        THREADS_PER_ROW = 4
-    };
+    static constexpr int THREADS_PER_ROW = 4;
 
     // The number of rows accessed by each thread per GMMA.
-    enum
-    {
-        ROWS_PER_THREAD = Traits::GMMA_M / (Cta_tile::THREADS_PER_WARP / THREADS_PER_ROW) / Cta_tile::WARPS_M
-    };
+    static constexpr int ROWS_PER_THREAD
+        = Traits::GMMA_M / (Cta_tile::THREADS_PER_WARP / THREADS_PER_ROW) / Cta_tile::WARPS_M;
 
     // The number of columns access by each thread.
-    enum
-    {
-        COLS_PER_THREAD = Traits::GMMA_N / THREADS_PER_ROW / ELTS_PER_THREAD
-    };
+    static constexpr int COLS_PER_THREAD = Traits::GMMA_N / THREADS_PER_ROW / ELTS_PER_THREAD;
 
     // Check the expected number of accumulator elements.
     static_assert(Accumulator::NUM_ELTS == COLS_PER_THREAD * ROWS_PER_THREAD * ELTS_PER_THREAD);
@@ -4487,14 +4261,11 @@ struct Softmax<fmha::Hopper_qgmma_e4m3_fp32_traits<GMMA_M, GMMA_N, GMMA_K, GMMA_
 
     using Accumulator = typename Base::Accumulator;
 
-    enum
-    {
-        MMAS_M = Base::MMAS_M,
-        MMAS_N = Base::MMAS_N,
-        ROWS_PER_THREAD = Base::ROWS_PER_THREAD,
-        COLS_PER_THREAD = Base::COLS_PER_THREAD,
-        ELTS_PER_THREAD = Base::ELTS_PER_THREAD,
-    };
+    static constexpr int MMAS_M = Base::MMAS_M;
+    static constexpr int MMAS_N = Base::MMAS_N;
+    static constexpr int ROWS_PER_THREAD = Base::ROWS_PER_THREAD;
+    static constexpr int COLS_PER_THREAD = Base::COLS_PER_THREAD;
+    static constexpr int ELTS_PER_THREAD = Base::ELTS_PER_THREAD;
 
     // Ctor.
     template <typename Params>
@@ -4614,14 +4385,11 @@ struct Softmax<fmha::Hopper_igmma_int8_int32_traits<GMMA_M, GMMA_N, GMMA_K, GMMA
 
     using Accumulator = typename Base::Accumulator;
 
-    enum
-    {
-        MMAS_M = Base::MMAS_M,
-        MMAS_N = Base::MMAS_N,
-        ROWS_PER_THREAD = Base::ROWS_PER_THREAD,
-        COLS_PER_THREAD = Base::COLS_PER_THREAD,
-        ELTS_PER_THREAD = Base::ELTS_PER_THREAD,
-    };
+    static constexpr int MMAS_M = Base::MMAS_M;
+    static constexpr int MMAS_N = Base::MMAS_N;
+    static constexpr int ROWS_PER_THREAD = Base::ROWS_PER_THREAD;
+    static constexpr int COLS_PER_THREAD = Base::COLS_PER_THREAD;
+    static constexpr int ELTS_PER_THREAD = Base::ELTS_PER_THREAD;
 
     // Ctor.
     template <typename Params>
@@ -4732,10 +4500,7 @@ struct Softmax_statistics
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // The number of MMAs in the M dimension.
-    enum
-    {
-        MMAS_M = Mma_tile::MMAS_M
-    };
+    static constexpr int MMAS_M = Mma_tile::MMAS_M;
 
     // Ctor.
     template <typename Params, typename Binfo>
