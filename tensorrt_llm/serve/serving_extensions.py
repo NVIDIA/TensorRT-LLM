@@ -74,8 +74,8 @@ def _load_builtin_extensions() -> None:
     global _builtins_loaded
     if _builtins_loaded:
         return
-    _builtins_loaded = True
     importlib.import_module(_BUILTINS_PACKAGE)
+    _builtins_loaded = True
 
 
 def register_serving_extension(
