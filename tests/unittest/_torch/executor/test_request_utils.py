@@ -222,6 +222,10 @@ def test_executor_request_to_llm_request_owns_mrope_data_in_python() -> None:
     torch.testing.assert_close(mrope_config["mrope_rotary_cos_sin"], rotary_cos_sin)
     torch.testing.assert_close(mrope_config["mrope_position_deltas"], position_deltas)
     child_config = llm_request.child_requests[0].py_multimodal_data["mrope_config"]
+    torch.testing.assert_close(child_config["mrope_rotary_cos_sin"], rotary_cos_sin)
+    assert child_config["mrope_rotary_cos_sin"].data_ptr() != rotary_cos_sin.data_ptr()
+    torch.testing.assert_close(child_config["mrope_position_deltas"], position_deltas)
+    assert child_config["mrope_position_deltas"].data_ptr() != position_deltas.data_ptr()
     torch.testing.assert_close(child_config["mrope_position_ids"], position_ids)
     assert child_config["mrope_position_ids"].data_ptr() != position_ids.data_ptr()
 
