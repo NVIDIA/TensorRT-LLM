@@ -4002,7 +4002,7 @@ def generate_files(specs_names):
     # Make sure we have a bin directory.
     if not os.path.exists('bin'):
         os.mkdir('bin')
-    cmd = 'nvcc -I src -Xcompiler -Wno-enum-compare --std=c++17 -o bin/print_traits.exe generated/print_kernel_traits.cu'.split(
+    cmd = 'nvcc -I src -Xcompiler -Wno-enum-compare --std=c++20 -o bin/print_traits.exe generated/print_kernel_traits.cu'.split(
     )
     if 'CUDA_PATH' in os.environ:
         cmd[0] = os.environ['CUDA_PATH'] + '/bin/' + cmd[0]

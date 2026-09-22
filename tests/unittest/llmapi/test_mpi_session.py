@@ -45,6 +45,47 @@ def test_mpi_session_basic():
     assert results == [2, 2, 2, 2], results
 
 
+def flashinfer_environment_probe():
+    """Return this worker's FlashInfer isolation paths."""
+    # Keep importing this from initializing MPI in the submitting process.
+    from mpi4py import MPI
+
+    MPI.COMM_WORLD.barrier()
+    return (
+        os.environ.get("FLASHINFER_WORKSPACE_BASE"),
+        os.environ.get("FLASHINFER_CUBIN_DIR"),
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
+def test_mpi_pool_session_flashinfer_workspace_isolation(monkeypatch):
+    # A singleton spawn reuses OpenMPI's already-running DVM once one exists in
+    # this process, so a spawned worker's HOME can't be relied on to follow a
+    # monkeypatched HOME set here; compare against the real home directory
+    # instead.
+    monkeypatch.delenv("FLASHINFER_WORKSPACE_BASE", raising=False)
+    monkeypatch.delenv("FLASHINFER_CUBIN_DIR", raising=False)
+    monkeypatch.delenv("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", raising=False)
+
+    session = MpiPoolSession(n_workers=2, wait_shutdown=True)
+    try:
+        worker_envs = session.submit_sync(flashinfer_environment_probe)
+    finally:
+        session.shutdown()
+
+    workspaces = {workspace for workspace, _ in worker_envs}
+    cubin_dirs = {cubin_dir for _, cubin_dir in worker_envs}
+    assert None not in workspaces
+    assert len(workspaces) == 2
+    workspace_root = Path.home() / ".cache" / "tensorrt_llm" / "flashinfer"
+    assert all(
+        Path(workspace).parent == workspace_root for workspace in workspaces)
+    # Unset means FlashInfer derives the artifact cache from each worker's
+    # isolated workspace, keeping downloaded compiler inputs per-rank.
+    assert cubin_dirs == {None}
+
+
 def simple_task(x):
     print(f"** simple_task {x} returns {x * 2}\n", "green")
     res = x * 2

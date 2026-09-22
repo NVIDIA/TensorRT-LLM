@@ -254,7 +254,8 @@ class OpenAIDisaggServer:
                 self._config, self._create_client,
                 metadata_config=self._metadata_server_cfg,
                 server_preparation_func=self._sync_server_clock,
-                server_start_timeout_secs=self._server_start_timeout_secs)
+                server_start_timeout_secs=self._server_start_timeout_secs,
+                request_timeout_secs=self._req_timeout_secs)
         self._ctx_router = self._coordinator.ctx_router
         self._gen_router = self._coordinator.gen_router
 

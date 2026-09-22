@@ -1441,6 +1441,27 @@ ResponseInputOutputItem: TypeAlias = Union[ResponseInputItemParam,
 _ID_STRIPPED_ROLES = ("user", "system", "developer")
 
 
+def _drop_explicit_nulls(value, _depth=0):
+    """Recursively drop dict keys whose value is an explicit ``null``.
+
+    On the OpenAI wire an unset optional field is omitted, so an explicit
+    ``null`` carries no information — but the vendored Responses item types
+    validate ``null`` differently from omitted and reject it. Dropping
+    null-valued keys restores the omit-unset wire shape for clients that
+    serialize every unset optional as ``null`` (litellm among them).
+    """
+    if _depth > 12:
+        return value
+    if isinstance(value, dict):
+        return {
+            k: _drop_explicit_nulls(v, _depth + 1)
+            for k, v in value.items() if v is not None
+        }
+    if isinstance(value, list):
+        return [_drop_explicit_nulls(v, _depth + 1) for v in value]
+    return value
+
+
 def _materialize_validator_iterators(value, _depth=0):
     """Recursively replace pydantic ValidatorIterator objects with lists.
 
@@ -1500,6 +1521,10 @@ class ResponsesRequest(OpenAIBaseModel):
         """
         if not isinstance(value, list):
             return value
+
+        # Must run before the per-item shaping below: the item types reject
+        # explicit nulls that mean "unset" (see _drop_explicit_nulls).
+        value = [_drop_explicit_nulls(item) for item in value]
 
         def _with_annotations(part):
             """output_text requires annotations; clients often omit it."""
@@ -1632,6 +1657,20 @@ class ResponsesRequest(OpenAIBaseModel):
         )
         _record_sampling_params_request_fields(self, sampling_params)
         return sampling_params
+
+    @model_validator(mode="before")
+    @classmethod
+    def _null_top_level_fields_mean_unset(cls, data):
+        """Drop explicitly-null top-level fields so they take their defaults.
+
+        Shallow on purpose: ``input`` items are scrubbed recursively by their
+        own validator, and the remaining structured fields are Optional
+        throughout. A null required field (``model``, ``input``) still
+        reports as missing.
+        """
+        if not isinstance(data, dict):
+            return data
+        return {k: v for k, v in data.items() if v is not None}
 
     @model_validator(mode="before")
     @classmethod

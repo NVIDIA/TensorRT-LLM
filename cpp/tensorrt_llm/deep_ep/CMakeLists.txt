@@ -199,8 +199,8 @@ set_target_properties(
   deep_ep_cpp_tllm
   PROPERTIES CXX_STANDARD_REQUIRED ON
              CUDA_STANDARD_REQUIRED ON
-             CXX_STANDARD 17
-             CUDA_STANDARD 17
+             CXX_STANDARD 20
+             CUDA_STANDARD 20
              CUDA_SEPARABLE_COMPILATION ON
              CUDA_ARCHITECTURES "${DEEP_EP_CUDA_ARCHITECTURES}"
              LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/deep_ep_cpp_tllm.version
