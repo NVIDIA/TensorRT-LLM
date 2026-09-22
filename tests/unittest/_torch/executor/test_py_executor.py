@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 import torch
 
+from tensorrt_llm._torch import models as torch_models
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import GenTransferStatus
 from tensorrt_llm._torch.disaggregation.orchestration.admission import (
     DisaggTransferAdmissionController,
@@ -78,6 +79,43 @@ def test_validate_token_id_range_accepts_end_id(end_id) -> None:
 @pytest.mark.parametrize("end_id", [-2, 128])
 def test_validate_token_id_range_rejects_end_id(end_id) -> None:
     model = Mock(spec=DecoderModelForCausalLM)
+    object.__setattr__(model, "lm_head", types.SimpleNamespace(num_embeddings=128))
+    executor = types.SimpleNamespace(model_engine=types.SimpleNamespace(model=model))
+    request = types.SimpleNamespace(py_end_id=end_id)
+
+    with pytest.raises(ValueError, match=rf"EndId \({end_id}\) is not within acceptable range"):
+        PyExecutor._validate_token_id_range(executor, request)
+
+
+@pytest.mark.parametrize(
+    "model_class_name",
+    [
+        "BartForConditionalGeneration",
+        "T5ForConditionalGeneration",
+        "WhisperForConditionalGeneration",
+    ],
+)
+@pytest.mark.parametrize("end_id", [-1, 127])
+def test_validate_token_id_range_accepts_encoder_decoder_end_id(model_class_name, end_id) -> None:
+    model = Mock(spec=getattr(torch_models, model_class_name))
+    object.__setattr__(model, "lm_head", types.SimpleNamespace(num_embeddings=128))
+    executor = types.SimpleNamespace(model_engine=types.SimpleNamespace(model=model))
+    request = types.SimpleNamespace(py_end_id=end_id)
+
+    PyExecutor._validate_token_id_range(executor, request)
+
+
+@pytest.mark.parametrize(
+    "model_class_name",
+    [
+        "BartForConditionalGeneration",
+        "T5ForConditionalGeneration",
+        "WhisperForConditionalGeneration",
+    ],
+)
+@pytest.mark.parametrize("end_id", [-2, 128])
+def test_validate_token_id_range_rejects_encoder_decoder_end_id(model_class_name, end_id) -> None:
+    model = Mock(spec=getattr(torch_models, model_class_name))
     object.__setattr__(model, "lm_head", types.SimpleNamespace(num_embeddings=128))
     executor = types.SimpleNamespace(model_engine=types.SimpleNamespace(model=model))
     request = types.SimpleNamespace(py_end_id=end_id)
