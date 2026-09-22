@@ -25,7 +25,7 @@ The kernel implementation is in:
 - cpp/tensorrt_llm/kernels/moe/utils/moeAlignKernels.h
 
 The torch binding is in:
-- cpp/tensorrt_llm/thop/moe/moeAlignOp.cpp
+- cpp/tensorrt_llm/thop/moe/utils/moeAlignOp.cpp
 """
 
 import torch

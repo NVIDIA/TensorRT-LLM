@@ -4160,6 +4160,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             assert_acceptance_length("TestGPTOSS::test_dflash",
                                      acceptance_length)
 
+    @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
         "kv_cache_dtype",
@@ -4469,6 +4470,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           sampling_params=sampling_params,
                           extra_evaluator_kwargs=extra_evaluator_kwargs)
 
+    @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("one_model", [True], ids=["one_model"])
     @pytest.mark.parametrize("v2_kv_cache", [True, False],

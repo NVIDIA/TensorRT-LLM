@@ -81,6 +81,22 @@ class FallbackFmha(Fmha):
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
         del k, v, phase
+        # A verify group may straddle a page boundary onto two CP ranks, so
+        # its KV ownership is per-token. The fused thop path cannot express
+        # that: its spec-dec mask and the per-sequence helix_is_inactive_rank
+        # gate both assume the new KV entries are the trailing slots of one
+        # rank's kv_len. Reject rather than run it silently wrong; being last
+        # in the library list, this makes dispatch raise.
+        if (
+            metadata.helix_position_offsets is not None
+            and metadata._helix_spec_tokens_valid
+            and metadata.num_generations > 0
+            # Count generation tokens only: in a mixed batch ``q`` also holds
+            # the context tokens, which would otherwise trip this on a batch
+            # that has exactly one query token per generation sequence.
+            and q.shape[0] - metadata.num_ctx_tokens > metadata.num_generations
+        ):
+            return False
         if q is not None and q.dtype == torch.float8_e4m3fn:
             return False
         if forward_args.attention_mask == CustomAttentionMask.CUSTOM:
