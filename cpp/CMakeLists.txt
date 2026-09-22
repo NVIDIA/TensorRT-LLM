@@ -239,7 +239,7 @@ endif()
 
 # The floor tracks the first toolkit whose nvcc accepts the C++ standard set
 # below; an older one would fail later with a far less obvious message.
-find_package(CUDAToolkit 12.0 REQUIRED COMPONENTS ${CUDA_TOOLKIT_COMPONENTS})
+find_package(CUDAToolkit 13.0 REQUIRED COMPONENTS ${CUDA_TOOLKIT_COMPONENTS})
 
 set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 
