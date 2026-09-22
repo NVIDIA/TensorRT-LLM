@@ -172,6 +172,19 @@ function maybe_export_free_tcp_addr_for_spawn_proxy_process {
 tllm_mpi_size=$(mpi_world_size)
 export tllm_mpi_size
 log_stderr "tllm_mpi_size: $tllm_mpi_size"
+
+# The mpi_blacklist below unsets every SLURM_* variable before running the task
+# child, which also destroys the job topology a task needs to place its own roles
+# (e.g. which node hosts a context vs. a generation server). Republish it under a
+# prefix the blacklist does not match, the same way tllm_mpi_size carries the
+# world size across. These describe the SLURM job rather than MPI communicator
+# state, so a task reading them cannot join the launcher's communicator.
+for tllm_slurm_var in SLURM_NODELIST SLURM_NODEID SLURM_PROCID SLURM_NTASKS_PER_NODE; do
+    if [ -n "${!tllm_slurm_var:-}" ]; then
+        export "TLLM_${tllm_slurm_var}=${!tllm_slurm_var}"
+    fi
+done
+
 configure_flashinfer_workspace
 
 unset TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
