@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 from tensorrt_llm._torch.pyexecutor import py_executor_creator
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
     _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS,
     _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS,
@@ -36,6 +37,7 @@ pytestmark = pytest.mark.cpu_only
 
 
 def test_executor_creation_stage_metric_names_are_descriptive():
+    """Verify executor creation stages use the expected public metric names."""
     assert py_executor_creator._ExecutorMemoryMonitor.creation_stage_metric_names == {
         ExecutorMemoryType.SAMPLER: "sampler_creation_seconds",
         ExecutorMemoryType.DRAFTER: "speculative_drafter_creation_seconds",
@@ -383,8 +385,10 @@ def _run_create_py_executor(
     )
 
 
-def test_move_model_engine_metrics_moves_and_clears():
-    py_executor = SimpleNamespace(metrics={})
+def test_move_model_engine_metrics_moves_and_clears() -> None:
+    """Verify main and draft engine metrics are exposed by the executor and cleared at source."""
+    py_executor = object.__new__(PyExecutor)
+    py_executor._metrics = {}
     model_engine = SimpleNamespace(metrics={"total_warmup_seconds": 2.5})
     draft_model_engine = SimpleNamespace(metrics={"total_warmup_seconds": 1.5})
 
@@ -410,7 +414,8 @@ def test_move_model_engine_metrics_moves_and_clears():
     assert draft_model_engine.metrics == {}
 
 
-def test_total_py_executor_creation_metric_finishes_on_error(monkeypatch):
+def test_total_py_executor_creation_metric_finishes_on_success_and_error(monkeypatch) -> None:
+    """Verify creation timing finishes on errors and completed metrics attach on success."""
     captured_metrics = None
 
     @contextmanager
@@ -432,6 +437,24 @@ def test_total_py_executor_creation_metric_finishes_on_error(monkeypatch):
         py_executor_creator.create_py_executor(SimpleNamespace())
 
     assert captured_metrics == {"total_py_executor_creation_seconds": 1.5}
+
+    py_executor = object.__new__(PyExecutor)
+    py_executor._metrics = {"worker_start_seconds": 0.25}
+
+    def _return_executor(*, creation_metrics: dict[str, float], **kwargs: object) -> PyExecutor:
+        assert "total_py_executor_creation_seconds" not in creation_metrics
+        creation_metrics["model_engine_creation_seconds"] = 1.0
+        return py_executor
+
+    monkeypatch.setattr(py_executor_creator, "_create_py_executor", _return_executor)
+    result = py_executor_creator.create_py_executor(SimpleNamespace())
+
+    assert result is py_executor
+    assert result.metrics == {
+        "worker_start_seconds": 0.25,
+        "model_engine_creation_seconds": 1.0,
+        "total_py_executor_creation_seconds": 1.5,
+    }
 
 
 def test_mla_unsupported_sm_fallback_syncs_cache_reuse(monkeypatch):

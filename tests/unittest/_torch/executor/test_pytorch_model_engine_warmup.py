@@ -672,7 +672,9 @@ def _capture_tllm_logs():
 class TestWarmupCleanup(unittest.TestCase):
     """Lock in warmup-cleanup behavior introduced by PR #14609 (Plan B)."""
 
+    @pytest.mark.cpu_only
     def test_no_kv_cache_warmup_delegates_runner_lifecycle(self):
+        """Verify no-KV-cache warmup delegates warmup and graph capture to the runner."""
         model_engine = object.__new__(PyTorchModelEngine)
         model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))
         model_engine.moe_load_balancer = None
@@ -694,7 +696,9 @@ class TestWarmupCleanup(unittest.TestCase):
         )
         warmup_sampling.assert_not_called()
 
+    @pytest.mark.cpu_only
     def test_no_kv_cache_warmup_rejects_allocated_kv_cache(self):
+        """Verify a no-KV-cache runner rejects an allocated KV cache before warmup."""
         model_engine = object.__new__(PyTorchModelEngine)
         model_engine._metrics = {}
         model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))
@@ -714,7 +718,8 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertEqual(model_engine._runner.method_calls, [])
 
     @pytest.mark.cpu_only
-    def test_legacy_warmup_skips_without_kv_cache(self) -> None:
+    def test_legacy_warmup_sampling_and_kv_cache_cleanup(self) -> None:
+        """Verify sampling warmup coverage and KV-cache cleanup timing within total warmup."""
         model_engine = object.__new__(PyTorchModelEngine)
         model_engine._warmup_timer = _WarmupTimer(rank=0)
         model_engine._metrics = {}
@@ -780,6 +785,25 @@ class TestWarmupCleanup(unittest.TestCase):
         )
         self.assertGreaterEqual(model_engine.metrics["sampling_warmup_seconds"], 0)
 
+        kv_cache_manager = Mock()
+        kv_cache_manager.check_invalid_values_in_kv_cache.return_value = False
+        resource_manager.get_resource_manager.return_value = kv_cache_manager
+        model_engine._metrics.clear()
+        with (
+            patch.object(model_engine, "_warmup_impl") as warmup_impl,
+            patch("time.perf_counter", side_effect=[0.0, 2.0, 5.0, 7.0]),
+        ):
+            model_engine.warmup(resource_manager)
+
+        warmup_impl.assert_called_once_with(resource_manager)
+        kv_cache_manager.check_invalid_values_in_kv_cache.assert_called_once_with(
+            fill_with_zero=True
+        )
+        self.assertEqual(
+            model_engine.metrics,
+            {"kv_cache_cleanup_seconds": 3.0, "total_warmup_seconds": 7.0},
+        )
+
     def test_encoder_decoder_encoder_warmup_delegates_runner_lifecycle(self):
         model_engine = object.__new__(PyTorchModelEngine)
         model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=True))
@@ -797,6 +821,7 @@ class TestWarmupCleanup(unittest.TestCase):
 
     @pytest.mark.cpu_only
     def test_cuda_graph_metrics_exclude_piecewise_stages(self) -> None:
+        """Verify generation graph timing excludes prefill and includes LoRA warmup cleanup."""
         model_engine = object.__new__(PyTorchModelEngine)
         model_engine.model = SimpleNamespace(modules=lambda: [])
         model_engine.llm_args = SimpleNamespace(enable_autotuner=True)
@@ -926,6 +951,7 @@ class TestWarmupCleanup(unittest.TestCase):
 
     @pytest.mark.cpu_only
     def test_piecewise_cuda_graph_metrics_are_recorded_separately(self) -> None:
+        """Verify both prefill backends separately time warmup, capture, and post-capture work."""
         model_engine = object.__new__(PyTorchModelEngine)
         model_engine.prefill_cuda_graph_backend = PrefillCudaGraphBackend.PIECEWISE
         model_engine._torch_compile_enabled = True
