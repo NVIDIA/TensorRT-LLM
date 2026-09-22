@@ -99,15 +99,15 @@ The ticket is one of:
 | `[#1234]` | a GitHub issue |
 | `[None]` | no ticket, for example a chore |
 
-The type is lowercase and bracketed: `[fix]`, `[feat]`, `[doc]`, `[infra]`,
-`[chore]`, `[perf]`, `[refactor]`, `[test]`.
+The type is lowercase and bracketed, for example `[fix]`, `[feat]`, `[doc]`,
+`[infra]`, `[chore]`, `[perf]`, `[refactor]`, `[test]`, `[ci]`.
 
 If the PR includes an API change that might break user code or API usage,
 consider saying "BREAKING CHANGE" in the summary so that reviewers know what to
 expect.
 
-[!IMPORTANT]
-For NVIDIA developers, please include the JIRA number or NVBUG ID in the PR title whenever possible. Also, to identify the author of the PR, please ensure that your GitHub account either displays your full name or your NVIDIA account name in the `Name` field of your profile.
+> [!IMPORTANT]
+> For NVIDIA developers, please include the JIRA number or NVBUG ID in the PR title whenever possible. Also, to identify the author of the PR, please ensure that your GitHub account either displays your full name or your NVIDIA account name in the `Name` field of your profile.
 
 Good PR Titles Examples:
 * `[TRTLLM-1234][feat] Add support for starcoder-v2 FP8 base + FP16/BF16 LoRA` (**NVIDIAN only**)
@@ -128,10 +128,10 @@ In the PR description, please consider addressing these points:
 * Potential performance or functional impacts of the changes. If there are risks, please inform the reviewers.
 * Link to the related PRs.
 
-[!IMPORTANT]
-For NVIDIA developers,  please submit feature or bug fixes to the dedicated branch specified in the nvbug
-**Keywords** field. For example, if a bug is reported on the release/v0.20 branch, please submit the fix to
-`release/v0.20` instead of the main branch.
+> [!IMPORTANT]
+> For NVIDIA developers,  please submit feature or bug fixes to the dedicated branch specified in the nvbug
+> **Keywords** field. For example, if a bug is reported on the release/v0.20 branch, please submit the fix to
+> `release/v0.20` instead of the main branch.
 
 Meanwhile, please add the "release blocker" label to any PRs that could potentially cause a release delay.
 
