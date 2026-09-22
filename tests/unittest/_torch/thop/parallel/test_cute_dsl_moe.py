@@ -46,7 +46,10 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
     _runner_tactics_match_tile_size,
     cute_dsl_nvfp4_grouped_gemm_ref,
 )
-from tensorrt_llm._torch.moe.fused_moe.quantization import interleave_linear_and_gate
+from tensorrt_llm._torch.moe.fused_moe.quantization import (
+    interleave_gate_and_linear,
+    interleave_linear_and_gate,
+)
 from tensorrt_llm._torch.utils import (
     ActivationType,
     Fp4QuantizedTensor,
@@ -1477,13 +1480,13 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
     b_kernel = b
     b_sf_kernel = b_sf
     if is_gated:
-        b_kernel = interleave_linear_and_gate(b.view(torch.uint8), group_size=64, dim=1).view(
+        b_kernel = interleave_gate_and_linear(b.view(torch.uint8), group_size=16, dim=1).view(
             torch.float4_e2m1fn_x2
         )
         b_sf_unswizzled = unswizzle_sf(b_sf, weight_n, hidden_size).view(
             num_local_experts, weight_n, hidden_size // sf_vec_size
         )
-        b_sf_unswizzled = interleave_linear_and_gate(b_sf_unswizzled, group_size=64, dim=1)
+        b_sf_unswizzled = interleave_gate_and_linear(b_sf_unswizzled, group_size=16, dim=1)
         b_sf_kernel = swizzle_sf(b_sf_unswizzled, weight_n, hidden_size).view(
             num_local_experts, weight_n, hidden_size // sf_vec_size
         )
@@ -1695,11 +1698,11 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin_propagates_nan_through_clamp
     b, b_sf = torch.ops.trtllm.fp4_quantize(b, 1 / b_global_sf, sf_vec_size, False)
     b_sf = b_sf.view(1, weight_n, hidden_size // sf_vec_size)
     alpha = a_global_sf * b_global_sf
-    b_kernel = interleave_linear_and_gate(b, group_size=64, dim=1).view(torch.float4_e2m1fn_x2)
+    b_kernel = interleave_gate_and_linear(b, group_size=16, dim=1).view(torch.float4_e2m1fn_x2)
     b_sf_kernel = swizzle_sf(
-        interleave_linear_and_gate(
+        interleave_gate_and_linear(
             unswizzle_sf(b_sf, weight_n, hidden_size).view(1, weight_n, hidden_size // sf_vec_size),
-            group_size=64,
+            group_size=16,
             dim=1,
         ),
         weight_n,
@@ -1811,13 +1814,13 @@ def test_nvfp4_gather_grouped_gemm_situ_rubin(tile_size: int):
     b_sf = b_sf.view(num_local_experts, interm_size * 2, hidden_size // sf_vec_size)
     alpha = a_global_sf * b_global_sf
 
-    b_interleaved = interleave_linear_and_gate(b.view(torch.uint8), group_size=64, dim=1).view(
+    b_interleaved = interleave_gate_and_linear(b.view(torch.uint8), group_size=16, dim=1).view(
         torch.float4_e2m1fn_x2
     )
     b_sf_unswizzled = unswizzle_sf(b_sf, interm_size * 2, hidden_size).view(
         num_local_experts, interm_size * 2, hidden_size // sf_vec_size
     )
-    b_sf_unswizzled_interleaved = interleave_linear_and_gate(b_sf_unswizzled, group_size=64, dim=1)
+    b_sf_unswizzled_interleaved = interleave_gate_and_linear(b_sf_unswizzled, group_size=16, dim=1)
     b_sf_interleaved = swizzle_sf(b_sf_unswizzled_interleaved, interm_size * 2, hidden_size).view(
         num_local_experts, interm_size * 2, hidden_size // sf_vec_size
     )
@@ -2032,13 +2035,13 @@ def test_nvfp4_gather_grouped_gemm_swiglu_rubin_small_tokens(
     b_sf = b_sf.view(num_local_experts, interm_size * 2, hidden_size // sf_vec_size)
     alpha = a_global_sf * b_global_sf
 
-    b_interleaved = interleave_linear_and_gate(b.view(torch.uint8), group_size=64, dim=1).view(
+    b_interleaved = interleave_gate_and_linear(b.view(torch.uint8), group_size=16, dim=1).view(
         torch.float4_e2m1fn_x2
     )
     b_sf_unswizzled = unswizzle_sf(b_sf, interm_size * 2, hidden_size).view(
         num_local_experts, interm_size * 2, hidden_size // sf_vec_size
     )
-    b_sf_unswizzled_interleaved = interleave_linear_and_gate(b_sf_unswizzled, group_size=64, dim=1)
+    b_sf_unswizzled_interleaved = interleave_gate_and_linear(b_sf_unswizzled, group_size=16, dim=1)
     b_sf_interleaved = swizzle_sf(b_sf_unswizzled_interleaved, interm_size * 2, hidden_size).view(
         num_local_experts, interm_size * 2, hidden_size // sf_vec_size
     )
@@ -2579,14 +2582,14 @@ def _create_quantized_locality_domain_weights(
     weight_fp4 = weight_fp4.view(torch.float4_e2m1fn_x2)
     weight_sf = weight_sf.view(num_local_experts, interm_size * 2, hidden_size // sf_vec_size)
 
-    weight_interleaved = interleave_linear_and_gate(
-        weight_fp4.view(torch.uint8), group_size=64, dim=1
+    weight_interleaved = interleave_gate_and_linear(
+        weight_fp4.view(torch.uint8), group_size=16, dim=1
     ).view(torch.float4_e2m1fn_x2)
     weight_sf_unswizzled = unswizzle_sf(weight_sf, interm_size * 2, hidden_size).view(
         num_local_experts, interm_size * 2, hidden_size // sf_vec_size
     )
-    weight_sf_unswizzled_interleaved = interleave_linear_and_gate(
-        weight_sf_unswizzled, group_size=64, dim=1
+    weight_sf_unswizzled_interleaved = interleave_gate_and_linear(
+        weight_sf_unswizzled, group_size=16, dim=1
     )
     weight_sf_interleaved = swizzle_sf(
         weight_sf_unswizzled_interleaved, interm_size * 2, hidden_size
@@ -3984,13 +3987,13 @@ def test_nvfp4_fc12_fused_rubin_matches_two_op_path(mma_n: int):
     fc2_alpha = global_sf * b2_global_sf
 
     # FC1 weights in the interleaved layout both kernels read.
-    b1_kernel = interleave_linear_and_gate(b1, group_size=64, dim=1).view(torch.float4_e2m1fn_x2)
+    b1_kernel = interleave_gate_and_linear(b1, group_size=16, dim=1).view(torch.float4_e2m1fn_x2)
     b1_sf_kernel = swizzle_sf(
-        interleave_linear_and_gate(
+        interleave_gate_and_linear(
             unswizzle_sf(b1_sf, fc1_n, hidden_size).view(
                 num_experts, fc1_n, hidden_size // sf_vec_size
             ),
-            group_size=64,
+            group_size=16,
             dim=1,
         ),
         fc1_n,
