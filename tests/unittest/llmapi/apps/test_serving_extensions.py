@@ -141,6 +141,8 @@ class TestBuiltinExtensions:
             mod for mod in sys.modules if mod.startswith(serving_extensions._BUILTINS_PACKAGE)
         ]:
             monkeypatch.delitem(sys.modules, name)
+        parent = sys.modules["tensorrt_llm.serve"]
+        monkeypatch.delattr(parent, "extensions", raising=False)
 
     def test_kimi_k3_resolves_to_kimi_extension(self, clean_registry) -> None:
         hook = structured_output_format_for("kimi_k3")
