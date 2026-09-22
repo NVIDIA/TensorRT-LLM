@@ -1260,11 +1260,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
         speculative_decoding_config = {
-            "decoding_type": "Eagle",
+            "decoding_type": "Eagle3",
             "max_draft_len": 3,
             "speculative_model":
             f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3",
-            "eagle3_one_model": True
         }
         ctx_server_config = {
             "disable_overlap_scheduler": True,
