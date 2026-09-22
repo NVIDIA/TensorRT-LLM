@@ -1131,8 +1131,9 @@ Compute:
   fc2_acc = fc2_alpha * (SFC * C) * (FC2_SFB * FC2_B)
   + optional NVFP4 quantization (generates SFC) when c_dtype == Float4E2M1FN.
 
-Shapes: A is M×K×1; B is N×K×L (L = num experts), interleaved [up, gate] at
-granularity=64; C is M×(N/2)×1 (N halved by SwiGLU). SFA/SFB layouts follow
+Shapes: A is M×K×1; B is N×K×L (L = num experts), with FC1 N ordered as
+[gate16, up16] groups. B and SFB must use the same N order;
+C is M×(N/2)×1 in logical channel order. SFA/SFB layouts follow
 BlockScaledBasicChunk. ``permuted_idx_to_expanded_idx`` is shared by both
 phases: FC1 divides by ``topk`` to recover the receive row, while FC2 also
 uses the remainder to select the route scale.
@@ -1141,7 +1142,7 @@ Within a tile, valid_m varies per group; padding rows are handled at load by
 predicating CpAsync on `abs_row < mn_limit`.
 
 Constraints: A/B share dtype (mxf8 | mxf4 | nvf4); mma_tiler M in {128, 256};
-mma_tiler N in {64, 128, 192, 256}; cluster M/N pow-2, total ≤ 16;
+mma_tiler N in {128, 256}; cluster M/N pow-2, total ≤ 16;
 contiguous dim ≥ 16B aligned (16/32 elems for f8/f4).
 
 For CUDA graph, A/C/SFA/permuted_idx_to_expanded_idx/tile_idx_to_expert_idx can
@@ -1168,8 +1169,8 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
       - A/SFA load: four gather warps issue CpAsync128.CG into a shared
         fc1_a_pipeline. SFA is consumed directly by a Cp128x128b UTCCP in the MMA
         warp using the 128dp_Unique layout.
-      - SwiGLU epilogue: C = up * silu(gate), where up/gate come from
-        interleaved accumulator at granularity=64 → output N is halved.
+      - SwiGLU epilogue: C = up * silu(gate), where up/gate come from the
+        gate16/up16 FC1 weight layout → output N is halved.
       - Optional NVFP4 quant: when c_dtype == Float4E2M1FN, the epilogue
         also generates SFC and quantizes the output.
 
@@ -1189,6 +1190,8 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
     :param topk: Experts selected per token.
     :param swiglu_limit: DS-v4 SwiGLU clamp limit; ``+inf`` disables clamp.
     :param scheduler: Persistent work-ID scheduler: ``static`` or ``l2_atomic``.
+    FC1 B and SFB must already use gate16/up16 order (tile N 128/256).
+    FC1 output remains in logical channel order; FC2 weight layout is unchanged.
     """
 
     def __init__(
@@ -1454,12 +1457,13 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         self.num_mcast_ctas_a = cute.size(self.cluster_layout_vmnk.shape[2])
         self.is_a_mcast = self.num_mcast_ctas_a > 1
 
-        # Fixed epilogue tile (128, 64). SwiGLU halves N, so the default
+        # Logical output tile (128, 64). Each output subtile consumes two
+        # packed N64 accumulator chunks, not separate up64/gate64 chunks.
+        # SwiGLU halves N, so the default
         # SM107_TILES lookup (keyed on full cta_n) can pick epi_tile_n too
         # small (wrong TMA store strides + insufficient SFC for cvt_fptrunc
         # 32-bit alignment). (128, 64) works for all configs.
         self.fc1_epi_tile = (128, 64)
-        self.fc1_epi_tile_n = cute.size(self.fc1_epi_tile[1])
         self.fc1_epi_tile_cnt = (
             self.fc1_cta_tile_shape_mnk_c[0] // cute.size(self.fc1_epi_tile[0]),
             self.fc1_cta_tile_shape_mnk_c[1] // cute.size(self.fc1_epi_tile[1]),
@@ -1964,13 +1968,13 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
 
         This method performs FC1 layer computation:
         1. GEMM: acc = fc1_alpha * (SFA * A[token_ids]) * (SFB * B)
-        2. SwiGLU: C = up * silu(gate), where up/gate are extracted from interleaved acc (granularity=64)
+        2. SwiGLU: C = up * silu(gate), decoded from gate16/up16 accumulator groups
         3. Optional Quant: When c_dtype is Float4E2M1FN, generates SFC and quantizes output
 
         Data loading:
         - A and SFA are loaded using CpAsync instructions with token-based gather
         - B and SFB are loaded using TMA instructions with multicast
-        - B weights are interleaved: [up_0:64, gate_64:128, up_128:192, gate_192:256, ...]
+        - FC1 B and SFB both use gate16/up16 N order
 
         Execution steps:
         1. Setup static attributes before smem/grid computation
@@ -1988,7 +1992,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
 
         :param fc1_a: FC1 input A (MxKx1), gathered with the shared route mapping
         :type fc1_a: cute.Tensor
-        :param fc1_b: FC1 expert weight B (NxKxL), interleaved for SwiGLU
+        :param fc1_b: FC1 expert weight B (NxKxL), in gate16/up16 N order
         :type fc1_b: cute.Tensor
         :param fc1_c: Quantized FC1 SwiGLU output and FC2 input (Mx(N/2)x1)
         :type fc1_c: cute.Tensor
@@ -4615,8 +4619,8 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
             (
                 tiled_copy_t2r,
                 tFC1TR_tAcc_base,
-                tFC1TR_rAcc_up,
-                tFC1TR_rAcc_gate,
+                tFC1TR_rPackedLo,
+                tFC1TR_rPackedHi,
             ) = self.fc1_epilogue_tmem_copy_and_partition(
                 epi_tidx,
                 tCtAcc_transformed,
@@ -4655,7 +4659,9 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
             tFC1RS_sC = None
             bSG_sC = None
             bSG_gC_partitioned = None
-            tFC1TR_rC = cute.make_rmem_tensor(tFC1TR_rAcc_up.shape, self.fc1_c_dtype)
+            # One logical output fragment has the same shape as one packed
+            # load fragment: two packed chunks become gate/up, then one C.
+            tFC1TR_rC = cute.make_rmem_tensor(tFC1TR_rPackedLo.shape, self.fc1_c_dtype)
             tiled_copy_r2s, tFC1RS_rC, tFC1RS_sC = (
                 self.fc1_epilogue_smem_copy_and_partition(
                     tiled_copy_t2r, tFC1TR_rC, epi_tidx, sFC1C
@@ -4785,44 +4791,52 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                 #
                 acc_pipeline.consumer_wait(acc_consumer_state)
 
-                # SwiGLU epilogue. Acc has full N cols with interleaved
-                # [up, gate] at granularity=64; C has N/2 cols. Iterate M and
-                # N output subtiles → up * silu(gate).
+                # Each N64 output subtile consumes two consecutive N64
+                # accumulator chunks, each [gate16, up16, gate16, up16].
                 # tFC1TR_tAcc: (T2R, T2R_M, T2R_N, EPI_M, EPI_N,
                 # STAGE), sliced on STAGE. bSG_gC: ((ATOM_V, REST_V),
                 # EPI_M, EPI_N, loopM, loopN, loopL).
-                interleave_granularity = 64
-                gate_offset = interleave_granularity // self.fc1_epi_tile_n
                 epi_m_cnt = cute.size(tFC1TR_tAcc.shape, mode=[3])
-                acc_n_subtile_cnt = cute.size(tFC1TR_tAcc.shape, mode=[4])
-                out_n_subtile_cnt = (
-                    acc_n_subtile_cnt // 2
-                )  # N/2 output subtiles per M subtile
+                packed_n_chunk_cnt = cute.size(tFC1TR_tAcc.shape, mode=[4])
+                out_n_subtile_cnt = packed_n_chunk_cnt // 2
 
                 for epi_m_idx in cutlass.range(epi_m_cnt):
                     for out_n_idx in cutlass.range(out_n_subtile_cnt):
-                        # Map output N subtile → acc N subtile. Each
-                        # interleave block of 2*gate_offset subtiles is
-                        # [up*gate_offset, gate*gate_offset].
-                        real_out_n_idx = out_n_idx
-                        block_idx = real_out_n_idx // gate_offset
-                        within_block = real_out_n_idx % gate_offset
-                        up_n_subtile = block_idx * 2 * gate_offset + within_block
-                        gate_n_subtile = (
-                            block_idx * 2 * gate_offset + gate_offset + within_block
-                        )
-                        #
-                        # Load accumulator from tensor memory buffer to register
-                        #
-                        tFC1TR_tAcc_mn_up = tFC1TR_tAcc[
-                            (None, None, None, epi_m_idx, up_n_subtile)
+                        # N128 has one output subtile; N256 has two. Each
+                        # reads consecutive low/high halves of its N128 input.
+                        tFC1TR_tAcc_mn_lo = tFC1TR_tAcc[
+                            (None, None, None, epi_m_idx, 2 * out_n_idx)
                         ]
-                        tFC1TR_tAcc_mn_gate = tFC1TR_tAcc[
-                            (None, None, None, epi_m_idx, gate_n_subtile)
+                        tFC1TR_tAcc_mn_hi = tFC1TR_tAcc[
+                            (None, None, None, epi_m_idx, 2 * out_n_idx + 1)
                         ]
 
-                        cute.copy(tiled_copy_t2r, tFC1TR_tAcc_mn_up, tFC1TR_rAcc_up)
-                        cute.copy(tiled_copy_t2r, tFC1TR_tAcc_mn_gate, tFC1TR_rAcc_gate)
+                        cute.copy(tiled_copy_t2r, tFC1TR_tAcc_mn_lo, tFC1TR_rPackedLo)
+                        cute.copy(tiled_copy_t2r, tFC1TR_tAcc_mn_hi, tFC1TR_rPackedHi)
+
+                        # Preserve immutable packed values before reusing the
+                        # two load buffers as logical up64/gate64 destinations.
+                        # These aliases mark the change of meaning; they do
+                        # not allocate another pair of register fragments.
+                        packed_lo = tFC1TR_rPackedLo.load()
+                        packed_hi = tFC1TR_rPackedHi.load()
+                        tFC1TR_rAcc_up = tFC1TR_rPackedLo
+                        tFC1TR_rAcc_gate = tFC1TR_rPackedHi
+                        # Packed axes: (channel within N16, gate/up, group).
+                        # Logical axes: (channel within N16, group, lo/hi).
+                        packed_lo = packed_lo.reshape((16, 2, 2))
+                        packed_hi = packed_hi.reshape((16, 2, 2))
+                        gate_up_layout = cute.make_layout((16, 2, 2))
+                        gate = cute.make_tensor(
+                            tFC1TR_rAcc_gate.iterator, gate_up_layout
+                        )
+                        up = cute.make_tensor(
+                            tFC1TR_rAcc_up.iterator, gate_up_layout
+                        )
+                        gate[None, None, 0].store(packed_lo[None, 0, None])
+                        gate[None, None, 1].store(packed_hi[None, 0, None])
+                        up[None, None, 0].store(packed_lo[None, 1, None])
+                        up[None, None, 1].store(packed_hi[None, 1, None])
 
                         acc_vec_up = tFC1TR_rAcc_up.load()
                         acc_vec_gate = tFC1TR_rAcc_gate.load()
@@ -4932,7 +4946,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                             sfc_subtile_idx_mn = (
                                 tile_info[0] * self.fc1_epi_tile_cnt[0] + epi_m_idx,
                                 tile_info[1] * self.fc1_epi_tile_cnt[1]
-                                + real_out_n_idx,
+                                + out_n_idx,
                             )
                             tCgFC1SFC = tCgFC1SFC_mn[
                                 (
@@ -5095,7 +5109,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                             cute.copy(
                                 tma_atom_fc1_c,
                                 bSG_sC[(None, c_buffer)],
-                                bSG_gC[(None, epi_m_idx, real_out_n_idx)],
+                                bSG_gC[(None, epi_m_idx, out_n_idx)],
                             )
                             # Fence and barrier to make sure shared memory store is visible to TMA store
                             fc1_c_pipeline.producer_commit()
@@ -5313,8 +5327,11 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         use_2cta_instrs: Union[cutlass.Boolean, bool],
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor, cute.Tensor]:
         """
-        Make tiledCopy for tensor memory load, then use it to partition tensor memory
-        (source) and register array (destination).
+        Partition packed gate16/up16 TMEM into N64 load chunks.
+
+        A pair of chunks supplies one logical N64 output subtile. Neither
+        load destination is a gate-only or up-only fragment. The epilogue
+        decodes the packed values into logical gate/up before SwiGLU.
 
         :param tidx: The thread index in epilogue warp groups
         :type tidx: cutlass.Int32
@@ -5328,11 +5345,11 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         :type use_2cta_instrs: bool
 
         :return: A tuple containing tiled_copy_t2r, tFC1TR_tAcc,
-            tFC1TR_rAcc_up, and tFC1TR_rAcc_gate, where:
+            tFC1TR_rPackedLo, and tFC1TR_rPackedHi, where:
             - tiled_copy_t2r: The tiled copy operation for tmem to register copy(t2r)
             - tFC1TR_tAcc: The partitioned accumulator tensor
-            - tFC1TR_rAcc_up: The partitioned accumulator tensor for acc up
-            - tFC1TR_rAcc_gate: The partitioned accumulator tensor for acc gate
+            - tFC1TR_rPackedLo: First packed N64 chunk of an N128 input subtile
+            - tFC1TR_rPackedHi: Second packed N64 chunk of that input subtile
         :rtype: Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor, cute.Tensor]
         """
         # Make tiledCopy for tensor memory load (Rubin uses transformed layout)
@@ -5368,14 +5385,14 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         tFC1TR_gC = thr_copy_t2r.partition_D(gFC1C_mnl_epi)
 
         # (T2R, T2R_M, T2R_N)
-        tFC1TR_rAcc_up = cute.make_rmem_tensor(
+        tFC1TR_rPackedLo = cute.make_rmem_tensor(
             tFC1TR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
         )
         # (T2R, T2R_M, T2R_N)
-        tFC1TR_rAcc_gate = cute.make_rmem_tensor(
+        tFC1TR_rPackedHi = cute.make_rmem_tensor(
             tFC1TR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
         )
-        return tiled_copy_t2r, tFC1TR_tAcc, tFC1TR_rAcc_up, tFC1TR_rAcc_gate
+        return tiled_copy_t2r, tFC1TR_tAcc, tFC1TR_rPackedLo, tFC1TR_rPackedHi
 
     def fc1_epilogue_smem_copy_and_partition(
         self,
