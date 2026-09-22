@@ -27,7 +27,7 @@ from unittest.mock import MagicMock, Mock
 import pytest
 
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
-from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.py_executor import BatchState, PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
 
 pytestmark = pytest.mark.cpu_only
@@ -217,6 +217,17 @@ def test_executor_loop_survives_a_failed_forward(monkeypatch):
 
 def test_executor_loop_overlap_survives_a_failed_forward(monkeypatch):
     executor = _loop_executor(monkeypatch)
+    # A previous batch holding timing events borrowed from the perf pool.
+    # Dropping it on the failed iteration skips _process_iter_stats, which
+    # normally returns them, so the loop must release them itself.
+    prev_start, prev_end = object(), object()
+    executor.previous_batch = BatchState(
+        scheduled_requests=_scheduled_batch(),
+        sample_state=None,
+        gpu_forward_start_event=prev_start,
+        gpu_forward_end_event=prev_end,
+        gpu_forward_events_from_perf_pool=True,
+    )
 
     PyExecutor._executor_loop_overlap(executor)
 
@@ -225,6 +236,11 @@ def test_executor_loop_overlap_survives_a_failed_forward(monkeypatch):
     # The failed iteration must not become a previous batch for the next
     # iteration's bookkeeping.
     assert executor.previous_batch is None
+    # The dropped previous batch's borrowed events went back to the pool
+    # (exactly once: the failed iteration itself borrowed none).
+    executor.perf_manager.release_forward_timing_events.assert_called_once_with(
+        prev_start, prev_end
+    )
     assert executor._event_loop_completed
 
 

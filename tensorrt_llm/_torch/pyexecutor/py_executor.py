@@ -5316,10 +5316,18 @@ class PyExecutor:
                         # batch_outputs['logits'] and taking down every rank.
                         # The previous batch's requests were failed with the
                         # rest of active_requests, so drop it rather than
-                        # updating terminated requests.
+                        # updating terminated requests. Dropping it skips
+                        # _process_iter_stats, which normally returns its
+                        # borrowed timing events to the pool, so return them
+                        # here.
                         can_queue = False
                         can_queue_this_rank = False
                         should_process_previous_batch = False
+                        prev = self.previous_batch
+                        if prev is not None and prev.gpu_forward_events_from_perf_pool:
+                            self.perf_manager.release_forward_timing_events(
+                                prev.gpu_forward_start_event,
+                                prev.gpu_forward_end_event)
                         self.previous_batch = None
                         self.has_previous_draft_tokens = False
                         target_inputs = None

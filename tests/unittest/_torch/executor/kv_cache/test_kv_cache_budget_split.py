@@ -1332,6 +1332,23 @@ class TestGraphCaptureConcurrencyWarning:
 
         assert self._warnings(mocker, c) == []
 
+    def test_no_warning_at_the_warn_factor_boundary(self, mocker):
+        # 48 == 1.5 * 32 sits exactly on the threshold; the check warns only
+        # strictly above it.
+        c = self._creator(capture_sizes=list(range(1, 33)), padding=False, max_batch_size=48)
+
+        assert self._warnings(mocker, c) == []
+
+    def test_warns_one_past_the_warn_factor_boundary(self, mocker):
+        # 49 > 1.5 * 32 is the smallest ceiling that trips the warning.
+        c = self._creator(capture_sizes=list(range(1, 33)), padding=False, max_batch_size=49)
+
+        messages = self._warnings(mocker, c)
+
+        assert len(messages) == 1
+        assert "~49" in messages[0]
+        assert "up to 32" in messages[0]
+
     def test_no_warning_when_graphs_disabled(self, mocker):
         # An empty capture set means no CUDA graphs: all-eager decode is a
         # deliberate posture, not an unnoticed fall-off.
