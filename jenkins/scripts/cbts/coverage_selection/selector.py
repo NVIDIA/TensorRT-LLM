@@ -194,11 +194,13 @@ class CoverageSelector:
                         # A binding that did not exist in the pre-image cannot
                         # be an existing external dependency.  Keep the
                         # repository-wide fail-closed check for every removed
-                        # or rebound name, while bounding a pure import
-                        # addition through its target and local consumers.
+                        # or rebound name, while bounding pure imports and
+                        # declarations through their targets and consumers.
                         external = self._external_references(
                             cf,
-                            dependencies.changed_bindings - dependencies.new_import_bindings,
+                            dependencies.changed_bindings
+                            - dependencies.new_import_bindings
+                            - dependencies.new_declaration_bindings,
                         )
                         if external:
                             why = (
@@ -210,6 +212,7 @@ class CoverageSelector:
                             if (
                                 not self.db.tests_touching_func(cf, consumer)
                                 and "." not in consumer
+                                and consumer not in dependencies.new_declaration_bindings
                                 and self._external_references(cf, {consumer})
                             ):
                                 why = (

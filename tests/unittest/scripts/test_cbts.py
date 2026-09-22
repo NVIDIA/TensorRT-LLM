@@ -701,6 +701,197 @@ def test_plain_function_declaration_with_postponed_annotations_is_safe() -> None
     assert analysis.binding_consumers == {"_helper"}
 
 
+def test_added_module_function_with_safe_definition_expressions_is_resolved() -> None:
+    source = (
+        "from .request import Request\n\n"
+        "def helper(request: Request, retries: int = 1, *, timeout: int | None = None):\n"
+        "    return request\n"
+    )
+    diff = (
+        "@@ -1 +1,4 @@\n"
+        " from .request import Request\n"
+        "+\n"
+        "+def helper(request: Request, retries: int = 1, *, timeout: int | None = None):\n"
+        "+    return request\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"helper"}
+    assert analysis.binding_consumers == {"helper"}
+    assert analysis.new_declaration_bindings == {"helper"}
+
+
+def test_added_method_can_use_earlier_module_class_annotation() -> None:
+    source = (
+        "class Budget:\n"
+        "    pass\n\n"
+        "class Scheduler:\n"
+        "    def existing(self):\n"
+        "        return 0\n\n"
+        "    def has_budget(self, budget: Budget) -> bool:\n"
+        "        return True\n"
+    )
+    diff = (
+        "@@ -1,6 +1,9 @@\n"
+        " class Budget:\n"
+        "     pass\n"
+        " \n"
+        " class Scheduler:\n"
+        "     def existing(self):\n"
+        "         return 0\n"
+        "+\n"
+        "+    def has_budget(self, budget: Budget) -> bool:\n"
+        "+        return True\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"Scheduler.has_budget"}
+
+
+def test_added_function_cannot_use_later_module_binding_annotation() -> None:
+    source = "VALUE = 1\n\ndef helper(value: Later):\n    return value\n\nclass Later:\n    pass\n"
+    diff = (
+        "@@ -1,4 +1,7 @@\n"
+        " VALUE = 1\n"
+        "+\n"
+        "+def helper(value: Later):\n"
+        "+    return value\n"
+        " \n"
+        " class Later:\n"
+        "     pass\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+def test_added_plain_and_builtin_decorated_methods_are_resolved() -> None:
+    source = (
+        "class Example:\n"
+        "    def existing(self):\n"
+        "        return 0\n\n"
+        "    def plain(self, required, option=None):\n"
+        "        return required\n\n"
+        "    @property\n"
+        "    def value(self):\n"
+        "        return 1\n\n"
+        "    @staticmethod\n"
+        "    def static(value):\n"
+        "        return value\n\n"
+        "    @classmethod\n"
+        "    def create(cls):\n"
+        "        return cls()\n"
+    )
+    diff = (
+        "@@ -1,3 +1,18 @@\n"
+        " class Example:\n"
+        "     def existing(self):\n"
+        "         return 0\n"
+        "+\n"
+        "+    def plain(self, required, option=None):\n"
+        "+        return required\n"
+        "+\n"
+        "+    @property\n"
+        "+    def value(self):\n"
+        "+        return 1\n"
+        "+\n"
+        "+    @staticmethod\n"
+        "+    def static(value):\n"
+        "+        return value\n"
+        "+\n"
+        "+    @classmethod\n"
+        "+    def create(cls):\n"
+        "+        return cls()\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {
+        "Example.create",
+        "Example.plain",
+        "Example.static",
+        "Example.value",
+    }
+    assert not analysis.new_declaration_bindings
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    (
+        "@decorate\ndef helper():\n    return 1",
+        "def helper(value=factory()):\n    return value",
+    ),
+)
+def test_added_function_with_effectful_definition_expression_falls_back(
+    declaration: str,
+) -> None:
+    source = f"VALUE = 1\n\n{declaration}\n"
+    added = "\n".join(f"+{line}" for line in declaration.splitlines())
+    diff = f"@@ -1 +1,{len(declaration.splitlines()) + 2} @@\n VALUE = 1\n+\n{added}\n"
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+def test_added_function_with_custom_subscript_annotation_falls_back() -> None:
+    source = "from .types import Custom\n\ndef helper(value: Custom[int]):\n    return value\n"
+    diff = (
+        "@@ -1 +1,4 @@\n"
+        " from .types import Custom\n"
+        "+\n"
+        "+def helper(value: Custom[int]):\n"
+        "+    return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+def test_shadowed_builtin_method_decorator_falls_back() -> None:
+    source = (
+        "property = decorate\n\n"
+        "class Example:\n"
+        "    def existing(self):\n"
+        "        return 0\n\n"
+        "    @property\n"
+        "    def value(self):\n"
+        "        return 1\n"
+    )
+    diff = (
+        "@@ -1,5 +1,9 @@\n"
+        " property = decorate\n"
+        " \n"
+        " class Example:\n"
+        "     def existing(self):\n"
+        "         return 0\n"
+        "+\n"
+        "+    @property\n"
+        "+    def value(self):\n"
+        "+        return 1\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+def test_replaced_module_binding_is_not_treated_as_new_function() -> None:
+    source = "def helper():\n    return 1\n"
+    diff = "@@ -1 +1,2 @@\n-helper = None\n+def helper():\n+    return 1\n"
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
 def test_local_shadow_does_not_create_direct_caller_edge() -> None:
     source = (
         "_VALUE = 521\n"
@@ -956,6 +1147,29 @@ def test_selector_declines_when_changed_binding_has_external_reference() -> None
 
     assert not result.ok
     assert "external binding reference(s)" in result.reason
+
+
+def test_selector_ignores_external_reference_for_pure_new_function() -> None:
+    path = "tensorrt_llm/example.py"
+    source = "VALUE = 1\n\ndef helper():\n    return VALUE\n"
+    diff = "@@ -1 +1,4 @@\n VALUE = 1\n+\n+def helper():\n+    return VALUE\n"
+    checked_bindings: list[set[str]] = []
+
+    def external_references(_path: str, names: set[str]) -> set[str]:
+        checked_bindings.append(names)
+        return names & {"helper"}
+
+    selector = CoverageSelector(
+        _FakeDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=external_references,
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert result.ok
+    assert checked_bindings == [set()]
 
 
 def test_selector_uses_file_fallback_when_consumer_escapes() -> None:
