@@ -47,7 +47,11 @@ from python_change_analysis import (  # noqa: E402
     import_executed_qualnames,
     qualnames_for_lines,
 )
-from rules._helpers import iter_diff_deleted_post_lines, iter_diff_post_line_numbers  # noqa: E402
+from rules._helpers import (  # noqa: E402
+    iter_diff_deleted_post_lines,
+    iter_diff_post_line_numbers,
+    reconstruct_diff_pre_image,
+)
 from selector import CoverageSelector  # noqa: E402
 from touch_db import TouchDB, canon, stage_family  # noqa: E402
 
@@ -129,7 +133,10 @@ def main(argv: list[str] | None = None) -> int:
             impact_files.add(cf)
             continue
         dependencies = analyze_python_changes(
-            src, lines, iter_diff_deleted_post_lines(diffs.get(f, ""))
+            src,
+            lines,
+            iter_diff_deleted_post_lines(diffs.get(f, "")),
+            pre_source=reconstruct_diff_pre_image(src, diffs.get(f, "")),
         )
         import_executed = import_executed_qualnames(src)
         closures = closure_attributed_qualnames(src, lines)

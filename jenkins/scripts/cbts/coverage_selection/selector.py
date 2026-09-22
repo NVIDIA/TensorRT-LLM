@@ -29,7 +29,11 @@ from python_change_analysis import (
     qualnames_for_lines,
 )
 from repository_reference import RepositoryReferenceIndex
-from rules._helpers import iter_diff_deleted_post_lines, iter_diff_post_line_numbers
+from rules._helpers import (
+    iter_diff_deleted_post_lines,
+    iter_diff_post_line_numbers,
+    reconstruct_diff_pre_image,
+)
 from touch_db import (
     _LAUNCH_MARKERS,
     _MIN_FUNCS,
@@ -153,7 +157,12 @@ class CoverageSelector:
                 continue  # comment / blank only: nothing executable changed, so nothing runs
             import_executed = import_executed_qualnames(source)
             closures = closure_attributed_qualnames(source, lines)
-            dependencies = analyze_python_changes(source, lines, iter_diff_deleted_post_lines(diff))
+            dependencies = analyze_python_changes(
+                source,
+                lines,
+                iter_diff_deleted_post_lines(diff),
+                pre_source=reconstruct_diff_pre_image(source, diff),
+            )
             import_resolved = False
             for qualname in sorted(qualnames):  # sorted -> deterministic no_data order
                 if qualname in import_executed:
@@ -182,7 +191,15 @@ class CoverageSelector:
                                 why,
                             )
                         impacted |= target_tests
-                        external = self._external_references(cf, dependencies.changed_bindings)
+                        # A binding that did not exist in the pre-image cannot
+                        # be an existing external dependency.  Keep the
+                        # repository-wide fail-closed check for every removed
+                        # or rebound name, while bounding a pure import
+                        # addition through its target and local consumers.
+                        external = self._external_references(
+                            cf,
+                            dependencies.changed_bindings - dependencies.new_import_bindings,
+                        )
                         if external:
                             why = (
                                 f"import-executed change has external binding reference(s): "

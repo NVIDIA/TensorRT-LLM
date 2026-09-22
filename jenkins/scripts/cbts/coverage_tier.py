@@ -204,7 +204,7 @@ def apply_coverage_tier(
         return None, note
 
     selector = CoverageSelector(db, repo_root, no_data_policy=no_data_policy)
-    cov = selector.decide(residual, pr.diffs)
+    cov = selector.decide(residual, pr.raw_diffs or pr.diffs)
     if not cov.ok:
         return None, f"coverage tier declined: {cov.reason}"
 
