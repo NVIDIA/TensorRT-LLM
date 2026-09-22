@@ -391,6 +391,35 @@ def test_sol_wrapper_compacts_separate_qkv_and_predicts_inside_core(monkeypatch)
 
 @_CPU_ONLY
 @pytest.mark.parametrize(
+    ("params", "layer_idx", "timestep"),
+    (
+        (SolParams(tau=1.0, dense_layers=frozenset({3})), 3, None),
+        (SolParams(tau=1.0, disabled_until_timestep=0.6), 1, torch.tensor([0.9])),
+    ),
+    ids=("dense_layer", "dense_phase"),
+)
+def test_sol_wrapper_fuses_qkv_for_dense_calls(monkeypatch, params, layer_idx, timestep) -> None:
+    """A dense layer or a dense-phase step predicts nothing, so the wrapper hands
+    the core fused QKV: the only dense self-attention layout the TRTLLM kernel serves."""
+    batch_size, seq_len, num_heads = 1, 64, 2
+    q, k, v = (
+        torch.zeros(batch_size, seq_len, num_heads, 128, dtype=torch.bfloat16) for _ in range(3)
+    )
+    backend, predictor = _stub_backend(monkeypatch, params, seq_len=seq_len)
+    backend.layer_idx = layer_idx
+    captured = _stub_core_forward(monkeypatch)
+
+    _forward(backend, q, k, v, attention_mask=PredefinedAttentionMask.FULL, timestep=timestep)
+
+    assert captured["k"] is None and captured["v"] is None
+    assert captured["q"].shape == (batch_size * seq_len, 3 * num_heads * 128)
+    runtime_params = captured["forward_args"].sparse_runtime_params
+    assert getattr(runtime_params, "block_sparse_inputs", None) is None
+    predictor.predict.assert_not_called()
+
+
+@_CPU_ONLY
+@pytest.mark.parametrize(
     ("k", "v", "attention_mask", "message"),
     (
         (None, None, PredefinedAttentionMask.FULL, "separate q, k, and v"),
@@ -1244,7 +1273,9 @@ def test_sol_cuda_graph_phase_is_keyed_without_model_scope(monkeypatch) -> None:
     monkeypatch.setattr(runner, "replay", lambda key, args, kwargs: captured_outputs[key])
     model.forward = runner.wrap(model.forward)
 
-    assert model(q, timestep=torch.tensor(0.8)).shape == (1, 64, 256)
+    # The stubbed core echoes its q: fused QKV in the dense prefix, Q alone in
+    # the sparse phase.
+    assert model(q, timestep=torch.tensor(0.8)).shape == (1, 64, 3 * 256)
     assert model(q, timestep=torch.tensor(0.2)).shape == (1, 64, 256)
     assert ("sparse_attn_phase", 0) in captured_keys[0]
     assert ("sparse_attn_phase", 1) in captured_keys[1]

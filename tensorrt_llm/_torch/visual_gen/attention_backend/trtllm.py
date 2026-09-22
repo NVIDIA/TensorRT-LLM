@@ -359,8 +359,10 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             - does not support SageAttention or block-sparse routes
         - OR separate Q, K, V which:
             - for regular TRTLLM attention, will be fused internally
-            - for SageAttention, block-sparse routes, and backends that reject
-              fused QKV, will be passed to the core as separate tensors
+            - for SageAttention, block-sparse routes, and the sparse calls of
+              backends that reject fused QKV, will be passed to the core as
+              separate tensors; the dense-layer and dense-phase calls of those
+              backends are fused internally like regular attention
 
         Args:
             q: Query tensor [B, S, H, D] or fused QKV [B, S, H_qkv, D]
@@ -387,10 +389,14 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         block_sparse_inputs = (
             sparse_backend_args.block_sparse_inputs if sparse_backend_args is not None else None
         )
+        # A backend that predicts routes inside the core needs separate Q, K and
+        # V only on the calls that run its sparse path. Its dense-layer and
+        # dense-phase calls take the fused path: the TRTLLM kernel serves dense
+        # self-attention from fused QKV only.
         use_separate_qkv = (
             block_sparse_inputs is not None
             or self.quant_attention_config is not None
-            or not self.support_fused_qkv()
+            or (not self.support_fused_qkv() and self.should_use_sparse(timestep))
         )
         if use_separate_qkv and (k is None or v is None):
             raise ValueError("This TRTLLM attention call requires separate q, k, and v tensors.")

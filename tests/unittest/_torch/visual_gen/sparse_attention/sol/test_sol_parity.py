@@ -317,6 +317,39 @@ def test_trtllm_sol_all_exact_routes_match_dense_under_cuda_graph() -> None:
 
 @_REQUIRES_SM100
 @torch.no_grad()
+@pytest.mark.parametrize(
+    ("config_kwargs", "dense_timestep"),
+    (
+        ({"dense_layers": [1]}, None),
+        ({"disabled_until_timestep": 0.6}, 0.9),
+    ),
+    ids=("dense_layer", "dense_phase"),
+)
+def test_trtllm_sol_dense_calls_run_the_fused_dense_kernel(
+    monkeypatch, config_kwargs, dense_timestep
+) -> None:
+    """A dense layer and a dense-phase step match dense attention without a
+    block-sparse launch; a later sparse-phase step of the same backend still
+    routes through the block-sparse FMHA."""
+
+    backend = _trtllm_backend(_sol_config(tau=1.0, **config_kwargs), num_heads=2)
+    calls = _spy_primts_forward(monkeypatch)
+    q, k, v = _gaussian_inputs(20260922, (2, 320, 2, _HEAD_DIM))
+    timestep = None if dense_timestep is None else torch.tensor(dense_timestep, device="cuda")
+
+    dense = _forward_trtllm(backend, q, k, v, timestep=timestep)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(dense, _dense_reference(q, k, v), rtol=2e-2, atol=2e-2)
+    assert calls["n"] == 0
+    if dense_timestep is not None:
+        _forward_trtllm(backend, q, k, v, timestep=torch.tensor(0.2, device="cuda"))
+        torch.cuda.synchronize()
+        assert calls["n"] == 1
+
+
+@_REQUIRES_SM100
+@torch.no_grad()
 @pytest.mark.parametrize("seq_len", [256, 257])
 def test_trtllm_sol_mixed_proxy_routes_match_reference_under_cuda_graph(seq_len: int) -> None:
     """A threshold most blocks miss exercises the proxy path; the output follows the
