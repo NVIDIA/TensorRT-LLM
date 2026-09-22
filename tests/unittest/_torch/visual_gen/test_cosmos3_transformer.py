@@ -874,9 +874,13 @@ class TestRotaryTablePrecision:
     SEQUENCE_LENGTHS = [4096, 6240, 8192, 10336, 16384]
 
     @pytest.fixture(autouse=True)
-    def _require_cuda(self):
+    def _require_tf32_capable_cuda(self):
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
+        # TF32 exists from Ampere on. Below that, allow_tf32=True changes
+        # nothing and the case would pass without covering the regression.
+        if torch.cuda.get_device_capability() < (8, 0):
+            pytest.skip("TF32-capable GPU (SM80+) required")
 
     def _rotary(self) -> Qwen3VLTextRotaryEmbedding:
         pretrained = SimpleNamespace(
@@ -906,8 +910,9 @@ class TestRotaryTablePrecision:
         try:
             rotary = self._rotary().to(DEVICE)
             base = torch.arange(seq_len, dtype=torch.float32, device=DEVICE)
-            # 3D mRoPE ids: temporal axis fps-scaled (fractional), spatial axes integer
-            position_ids = torch.stack([base * 24.0 / 10.0, base, base * 0.5], dim=0)[:, None, :]
+            # Text ids share one integer ramp across all three axes; vision
+            # scales the temporal axis by fps, so that axis can be fractional.
+            position_ids = torch.stack([base * 24.0 / 10.0, base, base], dim=0)[:, None, :]
             probe = torch.empty(0, dtype=torch.float32, device=DEVICE)
 
             cos, sin = rotary(probe, position_ids)
