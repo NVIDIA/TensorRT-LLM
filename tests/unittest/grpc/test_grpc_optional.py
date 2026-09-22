@@ -178,6 +178,8 @@ def test_serve_openengine_missing_grpc_shows_install_hint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The OpenEngine CLI path provides the optional-runtime installation hint."""
+    import tensorrt_llm.commands.serve as serve_module
+
     real_import = builtins.__import__
 
     def import_without_grpc(
@@ -195,8 +197,6 @@ def test_serve_openengine_missing_grpc_shows_install_hint(
     monkeypatch.delitem(sys.modules, "tensorrt_llm.grpc.openengine", raising=False)
     monkeypatch.delitem(sys.modules, "tensorrt_llm.grpc.openengine.server", raising=False)
     monkeypatch.setattr(builtins, "__import__", import_without_grpc)
-
-    import tensorrt_llm.commands.serve as serve_module
 
     monkeypatch.setattr(serve_module, "get_llm_args", lambda **_: ({}, None))
     monkeypatch.setattr(serve_module, "collect_explicit_cli_keys", lambda **_: set())
