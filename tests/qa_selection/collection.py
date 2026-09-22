@@ -297,7 +297,6 @@ class Selection:
 
     request: SelectionRequest
     assignments: Tuple[Assignment, ...]
-    views: Tuple[CollectedTest, ...]
 
     @classmethod
     def of(cls, request: SelectionRequest, items: List[pytest.Item]) -> "Selection":
@@ -306,18 +305,14 @@ class Selection:
         Feasibility is decided first and independently: a `Decision` says the
         test can run on the machine, and the rung says which allocation it
         belongs to.
-
-        The views are kept beside the assignments: the report reads them for
-        one fact no `Decision` carries, a `skipif` with no `reason=`.
         """
         selector = Selector(request.profile)
-        views = tuple(ItemView.of(item) for item in items)
+        views = (ItemView.of(item) for item in items)
         return cls(
             request=request,
             assignments=tuple(
                 Assignment.of(selector.decide(view), view, request.ladder) for view in views
             ),
-            views=views,
         )
 
     def is_live(self, assignment: Assignment) -> bool:

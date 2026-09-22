@@ -1659,7 +1659,7 @@ repos:
         language: script
         pass_filenames: false
     -   id: qa-selection-rules
-        name: Check QA selection rules cover the integration skip decorators
+        name: Check QA selection rules still match the integration skip decorators
         entry: python scripts/check_qa_selection_rules.py
         language: python
         files: ^(tests/integration/defs/.*\.py|tests/qa_selection/core/rules\.(py|json)|scripts/check_qa_selection_rules\.py)$
