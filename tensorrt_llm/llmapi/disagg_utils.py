@@ -1,3 +1,4 @@
+import ipaddress
 import logging
 import os
 import threading
@@ -171,14 +172,13 @@ class DisaggServerConfig():
     conversation_affinity_header_for_subagents: Optional[str] = None
     # Apply parent affinity to context only (default), or context and generation.
     subagent_affinity_scope: Literal['context', 'both'] = 'context'
-    # Local address used by every listener started by this process. hostname
-    # remains the public / advertised address. Keep this field last to preserve
-    # the positional order of the pre-existing dataclass constructor.
-    bind_host: str = "0.0.0.0"  # nosec B104
+    # Optional IPv4 address used by every listener started by this process.
+    # hostname remains the public / advertised address and the bind fallback.
+    bind_host: Optional[str] = None
 
     @property
     def effective_bind_host(self) -> str:
-        return self.bind_host or "0.0.0.0"  # nosec B104
+        return self.bind_host or self.hostname
 
 
 @dataclass
@@ -272,7 +272,7 @@ def extract_disagg_cfg(
         internal_request_auth_key: Optional[str] = None,
         conversation_affinity_header_for_subagents: Optional[str] = None,
         subagent_affinity_scope: Literal['context', 'both'] = 'context',
-        bind_host: str = "0.0.0.0",  # nosec B104
+        bind_host: Optional[str] = None,
         **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
@@ -341,6 +341,16 @@ def extract_disagg_cfg(
     config.gen_strip_message_history = gen_strip_message_history
     config.gen_tokids_ctxbytes = gen_tokids_ctxbytes
     config.num_workers = num_workers
+    if bind_host is not None:
+        if not isinstance(bind_host, str):
+            raise ValueError(
+                f"bind_host must be an IPv4 address, got {bind_host!r}")
+        try:
+            ipaddress.IPv4Address(bind_host)
+        except ipaddress.AddressValueError as error:
+            raise ValueError(
+                f"bind_host must be an IPv4 address, got {bind_host!r}"
+            ) from error
     config.bind_host = bind_host
     config.disagg_coordinator_url = disagg_coordinator_url
     config.server_keep_alive_timeout = validate_config_non_negative_int(

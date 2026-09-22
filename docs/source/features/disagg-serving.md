@@ -258,9 +258,9 @@ This is controlled by the following fields in the disaggregated config:
 
 - `num_workers` (int, default `1`) — number of disaggregated-server worker processes to run on the public port.
 - `disagg_coordinator_url` (str, optional) — URL of an already-running coordinator. When set, this process starts **no** coordinator and its fleet delegates to that external one.
-- `bind_host` (str, default `0.0.0.0`) — local address for every listener started by this process: the single self-contained server, every public worker in a fleet, and the implicit coordinator. Set it to a specific local address when the listeners must be interface-restricted.
+- `bind_host` (optional IPv4 address) — local address for every listener started by this process: the single self-contained server, every public worker in a fleet, and the implicit coordinator. When unset, listeners continue to bind `hostname`, preserving the behavior of existing configurations. Set it to `0.0.0.0` to listen on all IPv4 interfaces while advertising a different `hostname`, or to a specific IPv4 address when listeners must be interface-restricted.
 
-`bind_host` does not rewrite `hostname`, which remains the address advertised to clients and peers. By default, all listeners bind all IPv4 interfaces, so an advertised hostname that resolves locally to an IPv6 address does not affect socket binding.
+`bind_host` does not rewrite `hostname`, which remains the address advertised to clients and peers. Setting `bind_host: 0.0.0.0` also avoids resolving an advertised IPv6-only hostname for the IPv4 listeners.
 
 The three resulting topologies:
 

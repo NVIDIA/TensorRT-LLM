@@ -2062,7 +2062,7 @@ def disaggregated(
     # (c) num_workers==1, no external coordinator: a single disagg server with an
     # in-process (local) coordinator. Pre-bind the socket (validates port), serve.
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = "server_coordinator"
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    with _create_disagg_socket() as s:
         # See launch_server: without this, TIME_WAIT tombstones from the
         # connections this server accepted refuse a restart for ~60s.
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -2228,6 +2228,11 @@ def _serve_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
                 process.terminate()
 
 
+def _create_disagg_socket() -> socket.socket:
+    """Create the IPv4 TCP socket shared by disaggregated listener paths."""
+    return socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+
 def _local_coordinator_url(bind_host: str, port: int) -> str:
     """Build a reachable TCP URL for a coordinator in this process.
 
@@ -2238,13 +2243,8 @@ def _local_coordinator_url(bind_host: str, port: int) -> str:
     """
     if bind_host == "0.0.0.0":  # nosec B104 - comparison, not binding
         connect_host = "127.0.0.1"
-    elif bind_host == "::":  # nosec B104 - comparison, not binding
-        connect_host = "::1"
     else:
         connect_host = bind_host
-
-    if ":" in connect_host:
-        connect_host = f"[{connect_host}]"
     return f"http://{connect_host}:{port}"
 
 
@@ -2439,7 +2439,7 @@ def _run_fleet_worker_impl():
     host = server._config.effective_bind_host
     port = server._config.port
 
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s = _create_disagg_socket()
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     # SO_REUSEPORT: every worker binds the same (host, port); the kernel spreads
     # connections across the workers' accept queues by 4-tuple hash.

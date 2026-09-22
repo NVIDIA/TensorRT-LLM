@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import socket
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock
 
@@ -37,7 +36,7 @@ def _config(**overrides):
     }
     values.update(overrides)
     config = SimpleNamespace(**values)
-    config.effective_bind_host = config.bind_host or "0.0.0.0"
+    config.effective_bind_host = config.bind_host or config.hostname
     return config
 
 
@@ -45,9 +44,7 @@ def _config(**overrides):
     ("bind_host", "expected"),
     [
         ("0.0.0.0", "http://127.0.0.1:8999"),
-        ("::", "http://[::1]:8999"),
         ("192.0.2.10", "http://192.0.2.10:8999"),
-        ("2001:db8::10", "http://[2001:db8::10]:8999"),
     ],
 )
 def test_local_coordinator_url_is_reachable(bind_host, expected):
@@ -75,7 +72,7 @@ def test_single_server_binds_bind_host_and_advertises_hostname(monkeypatch):
     )
     monkeypatch.setattr(serve, "parse_disagg_config_file", Mock(return_value=config))
     monkeypatch.setattr(serve, "parse_metadata_server_config_file", Mock(return_value=None))
-    monkeypatch.setattr(serve.socket, "socket", socket_factory)
+    monkeypatch.setattr(serve, "_create_disagg_socket", socket_factory)
     monkeypatch.setattr(serve, "_publish_bound_address", publish)
     monkeypatch.setattr(serve, "OpenAIDisaggServer", Mock(return_value=server))
     monkeypatch.setattr(serve, "set_lifecycle_phase", Mock())
@@ -95,7 +92,7 @@ def test_single_server_binds_bind_host_and_advertises_hostname(monkeypatch):
         report_addr="bound-address.txt",
     )
 
-    socket_factory.assert_called_once_with(socket.AF_INET, socket.SOCK_STREAM)
+    socket_factory.assert_called_once_with()
     socket_obj.bind.assert_called_once_with(("127.0.0.9", 9000))
     publish.assert_called_once_with("bound-address.txt", "advertised.example", 9000)
     server.assert_called_once_with("127.0.0.9", 9000, sockets=[socket_obj])
@@ -111,7 +108,11 @@ def test_fleet_worker_binds_bind_host(monkeypatch):
 
     monkeypatch.setattr(serve, "_init_fleet_worker_process", Mock())
     monkeypatch.setattr(serve, "_build_disagg_server_from_env", Mock(return_value=server))
-    monkeypatch.setattr(serve.socket, "socket", Mock(return_value=socket_obj))
+    monkeypatch.setattr(
+        serve,
+        "_create_disagg_socket",
+        Mock(return_value=socket_obj),
+    )
     monkeypatch.setattr(serve, "set_lifecycle_phase", Mock())
     run = Mock()
     monkeypatch.setattr(serve.asyncio, "run", run)

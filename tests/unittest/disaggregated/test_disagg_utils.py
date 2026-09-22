@@ -1,7 +1,6 @@
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import fields
 
 import pytest
 import yaml
@@ -137,12 +136,12 @@ def test_extract_disagg_cfg(sample_yaml_config):
                for server in config.server_configs)
 
 
-def test_bind_host_defaults_to_all_ipv4_interfaces():
+def test_bind_host_defaults_to_hostname():
     config = extract_disagg_cfg(**get_yaml_config())
 
     assert config.hostname == "test_host"
-    assert config.bind_host == "0.0.0.0"
-    assert config.effective_bind_host == "0.0.0.0"
+    assert config.bind_host is None
+    assert config.effective_bind_host == "test_host"
 
 
 def test_bind_host_preserves_existing_positional_order():
@@ -177,8 +176,7 @@ def test_bind_host_preserves_existing_positional_order():
     assert config.internal_request_auth_key == "secret"
     assert config.conversation_affinity_header_for_subagents == "X-Parent"
     assert config.subagent_affinity_scope == "both"
-    assert config.bind_host == "0.0.0.0"
-    assert fields(DisaggServerConfig)[-1].name == "bind_host"
+    assert config.bind_host is None
 
 
 def test_bind_host_survives_yaml_parser(tmp_path):
@@ -192,6 +190,25 @@ def test_bind_host_survives_yaml_parser(tmp_path):
     assert config.hostname == "test_host"
     assert config.bind_host == "127.0.0.1"
     assert config.effective_bind_host == "127.0.0.1"
+
+
+def test_null_bind_host_falls_back_to_hostname(tmp_path):
+    yaml_config = get_yaml_config()
+    yaml_config["bind_host"] = None
+    yaml_file = tmp_path / "null_bind_config.yaml"
+    with open(yaml_file, "w") as f:
+        yaml.dump(yaml_config, f)
+
+    config = parse_disagg_config_file(yaml_file)
+    assert config.bind_host is None
+    assert config.effective_bind_host == "test_host"
+
+
+@pytest.mark.parametrize("bind_host",
+                         ["", "localhost", "::", "2001:db8::10", 2130706433])
+def test_bind_host_rejects_non_ipv4_addresses(bind_host):
+    with pytest.raises(ValueError, match="bind_host must be an IPv4 address"):
+        extract_disagg_cfg(**get_yaml_config(), bind_host=bind_host)
 
 
 def test_extract_disagg_metrics_controls():
