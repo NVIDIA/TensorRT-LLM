@@ -190,20 +190,18 @@ class TestBuiltinExtensions:
             reasoning_parser="gpt_oss",
             chat_template_kwargs=None,
         )
+        # Key-wise: the structural-tag model adds defaulted fields on dump.
         fmt = json.loads(params.structural_tag)["format"]
         final = "<|start|>assistant<|channel|>final<|message|>"
-        assert fmt == {
-            "type": "triggered_tags",
-            "triggers": [final],
-            "tags": [
-                {
-                    "begin": final,
-                    "content": {"type": "json_schema", "json_schema": {"type": "object"}},
-                    "end": "",
-                }
-            ],
-            "stop_after_first": True,
-        }
+        assert fmt["type"] == "triggered_tags"
+        assert fmt["triggers"] == [final]
+        assert len(fmt["tags"]) == 1
+        tag = fmt["tags"][0]
+        assert tag["begin"] == final
+        assert tag["end"] == ""
+        assert tag["content"]["type"] == "json_schema"
+        assert tag["content"]["json_schema"] == {"type": "object"}
+        assert fmt["stop_after_first"] is True
 
     @pytest.mark.parametrize(
         ("chat_template_kwargs", "expect_tag"),
