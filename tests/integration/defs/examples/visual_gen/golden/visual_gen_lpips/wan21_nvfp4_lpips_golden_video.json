@@ -22,7 +22,7 @@
   "diffusers_version": "0.39.0",
   "torch_version": "2.12.0a0+5aff3928d8.nv26.05",
   "tensorrt_llm_version": "1.3.0rc21",
-  "tensorrt_llm_commit": "6b45d09c0fe5fd25cad046eb45bb175e025a5399",
+  "tensorrt_llm_commit": "aacb3bd13af3c31d36084b762e0f9443795d9c4c",
   "container_image": "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm@sha256:475999862b896593159f10f486e16a748e7b7abb5cee558932a59ea6fc690d6b",
-  "sha256": "5c8b95d1d1f709f4ad9c4145da47307b99bdf5cd383c1562acf939bde36f9dae"
+  "sha256": "1a6ecefe2cac3c27e02a487a887c33543ae3aae486ab0b148094999d65c830cb"
 }
