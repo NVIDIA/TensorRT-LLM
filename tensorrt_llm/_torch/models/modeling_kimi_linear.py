@@ -1403,13 +1403,15 @@ class KimiK3MoERuntime(nn.Module):
             "CUTLASS",
             "TRTLLM",
             "CUTEDSL",
+            "CUTEDSL_FC12",
             "MEGAMOE_DEEPGEMM",
             "MEGAMOE_CUTEDSL",
         }
         if model_config.moe_backend not in supported_backends:
             raise ValueError(
                 "Kimi K3 SiTU routed experts only support the CUTLASS, TRTLLM, "
-                "CUTEDSL, MEGAMOE_DEEPGEMM, and MEGAMOE_CUTEDSL backends; "
+                "CUTEDSL, CUTEDSL_FC12, MEGAMOE_DEEPGEMM, and "
+                "MEGAMOE_CUTEDSL backends; "
                 f"got {model_config.moe_backend!r}."
             )
         if model_config.moe_load_balancer is not None:
