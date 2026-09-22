@@ -17,6 +17,7 @@ from tensorrt_llm.inputs import chat_template_guard
 from tensorrt_llm.inputs.chat_template_guard import (
     ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS_ENV_VAR,
     ALWAYS_ALLOWED_CHAT_TEMPLATE_KWARGS,
+    UnusedChatTemplateKwargsError,
     validate_chat_template_kwargs,
 )
 from tensorrt_llm.inputs.utils import apply_chat_template
@@ -26,6 +27,14 @@ pytestmark = pytest.mark.cpu_only
 # A minimal template that reads `enable_thinking` but nothing else unusual.
 TEMPLATE_WITH_TOGGLE = (
     "{%- if enable_thinking %}<think>{%- endif %}"
+    "{%- for message in messages %}{{ message['content'] }}{%- endfor %}"
+)
+
+# GLM-style retention control: reads `clear_thinking` but not DeepSeek-V4's
+# `drop_thinking`, which the Anthropic adapter always sends alongside it.
+TEMPLATE_GLM_RETENTION = (
+    "{%- if enable_thinking %}<think>{%- endif %}"
+    "{%- if clear_thinking %}[pruned]{%- endif %}"
     "{%- for message in messages %}{{ message['content'] }}{%- endfor %}"
 )
 
@@ -163,6 +172,40 @@ class TestValidateChatTemplateKwargs:
         with pytest.raises(ValueError, match="disable_reasoning"):
             validate_chat_template_kwargs(TEMPLATE_WITH_TOGGLE, {"disable_reasoning": True})
         validate_chat_template_kwargs(TEMPLATE_WITH_SELF_DEFAULT, {"disable_reasoning": True})
+
+    def test_rejection_is_a_distinct_value_error(self):
+        # Serving layers map this specific failure to HTTP 400; it must stay a
+        # ValueError so existing `except ValueError` handlers keep working.
+        with pytest.raises(UnusedChatTemplateKwargsError) as excinfo:
+            validate_chat_template_kwargs(TEMPLATE_PLAIN, {"disable_reasoning": True})
+        assert isinstance(excinfo.value, ValueError)
+
+    def test_parser_consumed_thinking_keys_are_always_accepted(self):
+        # The reasoning parsers read `enable_thinking` / `thinking` from
+        # chat_template_kwargs after generation, and tests and servers set
+        # them for every model. A template that ignores them is not a no-op.
+        validate_chat_template_kwargs(TEMPLATE_PLAIN, {"enable_thinking": False, "thinking": True})
+
+    def test_injected_keys_are_exempt(self):
+        # The Anthropic adapter sends `clear_thinking` (GLM) and `drop_thinking`
+        # (DeepSeek-V4) together because it cannot know which one the template
+        # reads. Against a GLM-style template only one is referenced.
+        kwargs = {"clear_thinking": False, "drop_thinking": False}
+        with pytest.raises(ValueError, match="drop_thinking"):
+            validate_chat_template_kwargs(TEMPLATE_GLM_RETENTION, dict(kwargs))
+        validate_chat_template_kwargs(
+            TEMPLATE_GLM_RETENTION, dict(kwargs), injected_keys=set(kwargs)
+        )
+
+    def test_injected_keys_do_not_shield_caller_keys(self):
+        with pytest.raises(ValueError) as excinfo:
+            validate_chat_template_kwargs(
+                TEMPLATE_GLM_RETENTION,
+                {"clear_thinking": False, "drop_thinking": False, "disable_reasoning": True},
+                injected_keys={"clear_thinking", "drop_thinking"},
+            )
+        assert "disable_reasoning" in str(excinfo.value)
+        assert "drop_thinking" not in str(excinfo.value)
 
 
 class _FakeJinjaTokenizer:
@@ -312,6 +355,172 @@ class TestRouterPathWiring:
         assert tokenizer.applied_kwargs["reasoning_effort"] == "high"
 
 
+class TestServerInjectedControls:
+    """Controls the server derives from API-level fields must not be rejected.
+
+    The guard exists to catch a caller's chat_template_kwargs the template
+    never reads. Keys the server itself adds (Anthropic `thinking` /
+    `context_management`, Responses `reasoning.effort`) are not the caller's
+    to remove, so the injection sites exempt them; caller keys stay strict.
+    """
+
+    _MESSAGES = [{"role": "user", "content": "hi"}]
+
+    @staticmethod
+    def _anthropic_chat_request():
+        from tensorrt_llm.serve.anthropic_adapter import convert_anthropic_request
+        from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
+
+        return convert_anthropic_request(
+            AnthropicMessagesRequest(
+                model="test-model",
+                max_tokens=4096,
+                messages=[{"role": "user", "content": "hi"}],
+                thinking={"type": "enabled", "budget_tokens": 1024},
+                context_management={"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+            )
+        )
+
+    def test_anthropic_adapter_marks_every_derived_key_as_injected(self):
+        chat_request = self._anthropic_chat_request()
+        assert chat_request.chat_template_kwargs == {
+            "enable_thinking": True,
+            "clear_thinking": False,
+            "drop_thinking": False,
+        }
+        assert chat_request.injected_chat_template_kwargs == sorted(
+            chat_request.chat_template_kwargs
+        )
+
+    def test_anthropic_retention_pair_renders_on_router_path(self):
+        # Regression: a GLM-style template reads `clear_thinking` only, and
+        # the adapter's `drop_thinking` companion used to be rejected as an
+        # unused caller control.
+        from tensorrt_llm.serve.chat_tokenization import render_chat_request_for_tokenizer
+
+        chat_request = self._anthropic_chat_request()
+        tokenizer = _FakeRouterTokenizer(TEMPLATE_GLM_RETENTION)
+        assert render_chat_request_for_tokenizer(chat_request, tokenizer) == "rendered"
+        # Exempt, not pruned: the template ignores the key it does not know.
+        assert tokenizer.applied_kwargs["drop_thinking"] is False
+        assert tokenizer.applied_kwargs["clear_thinking"] is False
+
+    def test_anthropic_retention_pair_renders_on_server_path(self):
+        chat_request = self._anthropic_chat_request()
+        rendered = apply_chat_template(
+            model_type="fake_model_type_for_guard_test",
+            tokenizer=_FakeJinjaTokenizer(TEMPLATE_GLM_RETENTION),
+            processor=None,
+            conversation=list(self._MESSAGES),
+            add_generation_prompt=True,
+            mm_placeholder_counts=[{}],
+            chat_template_kwargs=chat_request.chat_template_kwargs,
+            injected_chat_template_kwargs=chat_request.injected_chat_template_kwargs,
+        )
+        assert rendered == "rendered"
+
+    def test_anthropic_retention_pair_is_rejected_without_the_exemption(self):
+        # Pins that the exemption, not a widened allow-list, is what lets the
+        # pair through: the same kwargs as a plain caller control still fail.
+        from tensorrt_llm.serve.chat_tokenization import render_chat_request_for_tokenizer
+        from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+        chat_request = self._anthropic_chat_request()
+        caller_request = ChatCompletionRequest(
+            model="test-model",
+            messages=list(self._MESSAGES),
+            chat_template_kwargs=dict(chat_request.chat_template_kwargs),
+        )
+        with pytest.raises(UnusedChatTemplateKwargsError, match="drop_thinking"):
+            render_chat_request_for_tokenizer(
+                caller_request, _FakeRouterTokenizer(TEMPLATE_GLM_RETENTION)
+            )
+
+    def test_responses_reasoning_effort_renders_on_template_without_it(self):
+        # `_test_openai_responses.py::test_reasoning_effort` against Qwen3:
+        # the client only asked for reasoning.effort; the server derived
+        # `reasoning_effort` and `thinking`, which a Qwen3 template (reads
+        # `enable_thinking`) never references.
+        from types import SimpleNamespace
+
+        from tensorrt_llm.serve.responses_utils import (
+            reasoning_chat_template_kwargs,
+            reasoning_injected_chat_template_keys,
+        )
+
+        request = SimpleNamespace(
+            chat_template_kwargs=None, reasoning=SimpleNamespace(effort="high")
+        )
+        kwargs = reasoning_chat_template_kwargs(request)
+        assert kwargs == {"reasoning_effort": "high", "thinking": True}
+        assert reasoning_injected_chat_template_keys(request) == {"reasoning_effort", "thinking"}
+        rendered = apply_chat_template(
+            model_type="fake_model_type_for_guard_test",
+            tokenizer=_FakeJinjaTokenizer(TEMPLATE_WITH_TOGGLE),
+            processor=None,
+            conversation=list(self._MESSAGES),
+            add_generation_prompt=True,
+            mm_placeholder_counts=[{}],
+            chat_template_kwargs=kwargs,
+            injected_chat_template_kwargs=reasoning_injected_chat_template_keys(request),
+        )
+        assert rendered == "rendered"
+
+    def test_responses_caller_supplied_effort_stays_strict(self):
+        # A client that passes `reasoning_effort` itself picked that key, so
+        # the guard still judges it against the template.
+        from types import SimpleNamespace
+
+        from tensorrt_llm.serve.responses_utils import (
+            reasoning_chat_template_kwargs,
+            reasoning_injected_chat_template_keys,
+        )
+
+        request = SimpleNamespace(
+            chat_template_kwargs={"reasoning_effort": "high"},
+            reasoning=SimpleNamespace(effort="high"),
+        )
+        injected = reasoning_injected_chat_template_keys(request)
+        assert injected == {"thinking"}
+        with pytest.raises(UnusedChatTemplateKwargsError, match="reasoning_effort"):
+            apply_chat_template(
+                model_type="fake_model_type_for_guard_test",
+                tokenizer=_FakeJinjaTokenizer(TEMPLATE_WITH_TOGGLE),
+                processor=None,
+                conversation=list(self._MESSAGES),
+                add_generation_prompt=True,
+                mm_placeholder_counts=[{}],
+                chat_template_kwargs=reasoning_chat_template_kwargs(request),
+                injected_chat_template_kwargs=injected,
+            )
+
+
+def _chat_request_as_the_server_sees_it(body: dict):
+    """Build a ChatCompletionRequest the way ``openai_server.openai_chat`` ends up with it.
+
+    The server validates the body strictly first. Pydantic validates the
+    OpenAI message TypedDicts lazily, so a tool call whose ``function.arguments``
+    is a JSON object (tau2-bench sends these) passes construction and only
+    fails when ``tool_calls`` is materialized. The server catches that
+    ``ValidationError`` and re-parses the raw JSON body instead
+    (``openai_server.py``, the ``raw_request.json()`` fallback), which hands
+    ``_parse_fallback_tool_calls`` plain dicts to normalize. Mirror both steps
+    so the fixture covers each representation on the path that really serves it.
+    """
+    from pydantic import ValidationError
+
+    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+    try:
+        probe = ChatCompletionRequest(**body)
+        for message in probe.messages:
+            list(dict(message).get("tool_calls") or [])
+    except ValidationError:
+        return ChatCompletionRequest.model_construct(**deepcopy(body))
+    # The probe consumed the single-use lazy iterators; hand back a fresh one.
+    return ChatCompletionRequest(**body)
+
+
 @pytest.fixture
 def synthetic_tokenizer():
     from tokenizers import Tokenizer
@@ -324,12 +533,23 @@ def synthetic_tokenizer():
     return PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]")
 
 
-@pytest.mark.parametrize("arguments", ['{"city": "Paris"}', {"city": "Paris"}])
-def test_router_and_server_tool_call_tokenization_match(synthetic_tokenizer, arguments):
+@pytest.mark.parametrize(
+    ("arguments", "served_via_fallback"),
+    [
+        pytest.param('{"city": "Paris"}', False, id="string_arguments_strict_path"),
+        pytest.param({"city": "Paris"}, True, id="object_arguments_fallback_path"),
+    ],
+)
+def test_router_and_server_tool_call_tokenization_match(
+    synthetic_tokenizer, arguments, served_via_fallback
+):
+    # Both representations of `function.arguments` reach the server: the
+    # OpenAI shape is a JSON string; tau2-bench sends a JSON object, which the
+    # strict request model rejects (lazily) and the server re-parses from the
+    # raw body. The router must tokenize each to the same ids the server does.
     from tensorrt_llm.inputs.utils import MultimodalDataTracker
     from tensorrt_llm.serve.chat_tokenization import tokenize_chat_request_for_serving
     from tensorrt_llm.serve.chat_utils import parse_chat_message_content
-    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 
     template = "{{ messages[0].tool_calls[0].function.arguments.city }}"
     synthetic_tokenizer.chat_template = template
@@ -347,7 +567,10 @@ def test_router_and_server_tool_call_tokenization_match(synthetic_tokenizer, arg
         }
     ]
     original = deepcopy(messages)
-    request = ChatCompletionRequest(model="test-model", messages=messages)
+    request = _chat_request_as_the_server_sees_it({"model": "test-model", "messages": messages})
+    # The strict model keeps `tool_calls` as a lazy pydantic iterator; the raw
+    # fallback hands the plain list through. Pin which path each shape took.
+    assert isinstance(dict(request.messages[0])["tool_calls"], list) is served_via_fallback
     router_tokens = tokenize_chat_request_for_serving(
         request,
         lambda: synthetic_tokenizer,

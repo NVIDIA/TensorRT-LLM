@@ -104,7 +104,11 @@ def render_chat_request_for_tokenizer(
     if template_selection is None:
         template_selection = chat_template_kwargs.get("chat_template")
     template = resolve_hf_chat_template(tokenizer, None, template_selection, tools)
-    validate_chat_template_kwargs(template, chat_template_kwargs)
+    validate_chat_template_kwargs(
+        template,
+        chat_template_kwargs,
+        injected_keys=getattr(request, "injected_chat_template_kwargs", None),
+    )
     messages = [dict(msg) for msg in request.messages]
     if isinstance(template, str):
         # Match the server's assistant metadata normalization without loading

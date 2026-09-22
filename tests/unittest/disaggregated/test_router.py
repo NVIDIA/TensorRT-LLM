@@ -2223,10 +2223,10 @@ def test_tokenize_rejects_kwargs_the_template_never_reads(router_class):
             "content": "hello"
         }],
         chat_template="{{ messages[0].content }}",
-        chat_template_kwargs={"thinking": True},
+        chat_template_kwargs={"disable_reasoning": True},
     )
     with mock.patch.object(router, "_get_tokenizer", return_value=tok):
-        with pytest.raises(ValueError, match="thinking"):
+        with pytest.raises(ValueError, match="disable_reasoning"):
             router._tokenize(request)
     tok.apply_chat_template.assert_not_called()
 

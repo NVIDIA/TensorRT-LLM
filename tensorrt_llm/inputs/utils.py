@@ -7,7 +7,8 @@ import tempfile
 from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Coroutine, Dict, List, Optional, Tuple, TypedDict, Union
+from typing import (Any, Collection, Coroutine, Dict, List, Optional, Tuple,
+                    TypedDict, Union)
 from urllib.parse import urlparse
 
 import numpy as np
@@ -743,8 +744,13 @@ def apply_chat_template(
     chat_template: Optional[str] = None,
     chat_template_kwargs: Optional[dict[str, Any]] = None,
     enable_tokenize: bool = False,
+    injected_chat_template_kwargs: Optional[Collection[str]] = None,
 ) -> (str | List[str]):
     """Apply chat template to the conversation.
+
+    `injected_chat_template_kwargs` names the keys of `chat_template_kwargs`
+    the server derived from API-level fields rather than the caller; the
+    unused-kwargs guard exempts them (see `validate_chat_template_kwargs`).
 
     Uses content-format-driven dispatch:
     - PASSTHROUGH: skip template rendering, just concatenate content strings
@@ -795,7 +801,9 @@ def apply_chat_template(
         raise ValueError(
             "No chat template found for the given tokenizer and tools.")
 
-    validate_chat_template_kwargs(hf_chat_template, chat_template_kwargs)
+    validate_chat_template_kwargs(hf_chat_template,
+                                  chat_template_kwargs,
+                                  injected_keys=injected_chat_template_kwargs)
 
     # Determine content format and prepare conversation accordingly
     content_format = _resolve_content_format(model_type, hf_chat_template)
@@ -836,6 +844,7 @@ async def async_apply_chat_template(
     chat_template: Optional[str] = None,
     chat_template_kwargs: Optional[dict[str, Any]] = None,
     enable_tokenize: bool = False,
+    injected_chat_template_kwargs: Optional[Collection[str]] = None,
 ) -> (str | List[str]):
     """Apply chat template without blocking the event loop."""
     return await asyncio.to_thread(
@@ -851,6 +860,7 @@ async def async_apply_chat_template(
         chat_template=chat_template,
         chat_template_kwargs=chat_template_kwargs,
         enable_tokenize=enable_tokenize,
+        injected_chat_template_kwargs=injected_chat_template_kwargs,
     )
 
 
