@@ -44,6 +44,8 @@ def _materialize_nltk_data(snapshot_dir: str) -> None:
     a download, so the library's own snapshot_download leaves the copies alone.
     """
     root = pathlib.Path(snapshot_dir) / "blocklist" / "nltk_data"
+    if not root.is_dir():
+        return
     copied = 0
     for path in root.rglob("*"):
         if not path.is_symlink():
