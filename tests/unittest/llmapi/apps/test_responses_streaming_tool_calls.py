@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,17 +13,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for Responses API streaming tool call emission (TRTLLM-9605)."""
+"""Unit tests for Responses API streaming tool call emission (TRTLLM-9605).
 
+These drive `_generate_streaming_event` with the real GLM-4.7 reasoning and
+tool parsers rather than with mocked ones. The defect these tests exist for -
+tool-call markup published as the assistant's message - lived entirely in the
+disagreement between what the incremental parser had streamed and what a
+whole-text re-parse concluded afterwards, so a test that mocks the parsers
+cannot see it.
+"""
+
+import json
+import random
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from openai.types.responses.tool import FunctionTool
 
 from tensorrt_llm.serve.responses_utils import (
     ResponsesStreamingEventsHelper,
+    _accumulate_tool_call_fragments,
+    _assembled_tool_calls,
     _generate_streaming_event,
-    _should_send_done_events,
 )
 from tensorrt_llm.serve.tool_parser.core_types import ToolCallItem
 
@@ -32,173 +44,656 @@ from tensorrt_llm.serve.tool_parser.core_types import ToolCallItem
 # stage reports as a failure.
 pytestmark = pytest.mark.cpu_only
 
+_REASONING_PARSER = "glm47"
+_TOOL_PARSER = "glm47"
 
-def _make_mock_output(index: int = 0, text: str = "", text_diff: str = ""):
-    """Create a minimal mock output with .index, .text, .text_diff."""
+# Markup that must never reach a client as assistant text.
+_MARKUP = ("<tool_call>", "</tool_call>", "<arg_key>", "<arg_value>")
 
-    class MockOutput:
-        pass
+# One real GLM-4.7 response, verbatim, from a recorded agent run: eight stream
+# frames carrying reasoning, a sentence of prose, and two tool calls. Feeding
+# frames 0-6 used to publish 296 characters of `normal_text` beginning with the
+# prose and continuing straight into `<tool_call>functions.exec<arg_key>...`,
+# cut off mid-word at `yield`; the whole response yields 116 clean characters
+# and two calls. The frame boundaries matter - they are what put one closed
+# call and one open call in the accumulated text at the same time - so they are
+# kept exactly as recorded.
+_REAL_FRAMES = [
+    "Let",
+    (
+        " me start by understanding the problem. I need to:\n1. Read the problem definition\n2."
+        " Understand the kernel-factory-schemas\n3. Read the problem files\n4. Implement a CUDA"
+        " kernel\n\nLet me begin by reading the problem files and understanding what I'm workin"  # codespell:ignore
+        "g with.</think>I"
+    ),
+    (
+        "'ll start by reading the problem definition and understanding the schema, then dive in"
+        "to the kernel implementation.<tool_call>functions.exec<arg_key>input</arg_key><arg_val"
+        "ue>\n// Read the problem definition and related files\nconst out = await tools.exec_co"  # codespell:ignore ue
+        "mmand({cmd: `python3 - <<'PYEOF'\nimport json\nd = json.load(open"
+    ),
+    (
+        "('/tmp/problem/definition.json'))\nprint(\"Description:\", d.get('description', ''"
+        "))\nprint(\"\\nFixed axes:\", {k: v['value'] for k, v in d.get('axes', {}).items() i"
+        "f v.get('type') == 'const'})\nprint(\"Variable axes:\", [k for k, v in d.get('axes"
+        "', {}).items() if v.get('type')"
+    ),
+    (
+        " == 'var'})\nprint(\"\\nInputs:\")\nfor n, s in d['inputs'].items():  print(f\"  {n}:"
+        " shape={s['shape']}, dtype={s['dtype']}\")\nprint(\"Outputs (pre-allocated):\")\nfor "
+        "n, s in d['outputs'].items(): print(f\"  {n}: shape={s['shape']}, dtype={s"
+    ),
+    (
+        "['dtype']}\")\nin_args  = list(d['inputs'].keys())\nout_args = list(d['outputs']."
+        "keys())\nprint(f\"\\nRequired signature: def run({', '.join(in_args + out_args)}) -> "
+        'None:")\nPYEOF\necho "=== workload ==="\nhead -3 /tmp/problem/workload.jsonl\necho "=='
+        '= language ==="\ncat /'
+    ),
+    (
+        'tmp/problem/language.txt\necho "=== user_prompt ==="\ncat /tmp/problem/user_prompt.txt'
+        "\n`, yield_time_ms: 15000});\ntext(out.output);\n</arg_value></tool_call><tool_call>fu"
+        "nctions.exec<arg_key>input</arg_key><arg_value>\n// Read the baseline metrics\nconst o"
+        "ut = await tools.exec_command({cmd: `cat /tmp/problem/baseline/metrics.json`, yield"
+    ),
+    "_time_ms: 5000});\ntext(out.output);\n</arg_value></tool_call>",
+]
 
-    out = MockOutput()
-    out.index = index
-    out.text = text
-    out.text_diff = text_diff
-    return out
+# Everything the frames above put between `</think>` and the first
+# `<tool_call>`: the only visible assistant text in that response.
+_REAL_TEXT = (
+    "I'll start by reading the problem definition and understanding "
+    "the schema, then dive into the kernel implementation."
+)
 
 
-def _make_mock_request(tools: list | None = None):
-    """Create a minimal ResponsesRequest-like object with .tools.
+def _make_output(text: str, text_diff: str, index: int = 0):
+    """A stand-in for one RequestOutput as the streaming loop sees it."""
+    return SimpleNamespace(index=index, text=text, text_diff=text_diff)
 
-    SimpleNamespace rather than a nested class: a class body does not close over
-    the enclosing function's locals (unlike a nested function), so
+
+def _namespace_tool(namespace: str = "functions", name: str = "exec"):
+    """A namespaced tool, offered to the model as `<namespace>.<name>`.
+
+    This is the shape the recorded response was produced with, and the reason
+    its calls are named `functions.exec`.
+    """
+    inner = SimpleNamespace(
+        name=name,
+        type="function",
+        description="run a command",
+        parameters={
+            "type": "object",
+            "properties": {"input": {"type": "string"}},
+        },
+    )
+    return SimpleNamespace(name=namespace, type="namespace", description="tools", tools=[inner])
+
+
+def _function_tool(name: str = "get_time"):
+    return FunctionTool(
+        name=name,
+        type="function",
+        strict=False,
+        parameters={
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+        },
+    )
+
+
+def _make_request(tools=None):
+    """A minimal ResponsesRequest-like object.
+
+    SimpleNamespace rather than a nested class: a class body does not close
+    over the enclosing function's locals (unlike a nested function), so
     ``tools = tools or []`` inside one raises NameError on the right-hand name.
     """
-    return SimpleNamespace(tools=tools or [])
+    return SimpleNamespace(tools=list(tools) if tools else [])
 
 
-class TestShouldSendDoneEventsToolCalls:
-    """Test that _should_send_done_events returns tool_calls when text is done due to tool calls."""
+def _drive(
+    frames,
+    tools=None,
+    finish=True,
+    helper=None,
+    tool_parser_id=_TOOL_PARSER,
+    reasoning_parser_id=_REASONING_PARSER,
+):
+    """Feed `frames` through the streaming event generator, one chunk each.
 
-    def test_returns_tool_calls_when_text_done_due_to_tool_calls(self):
-        """When full text and tool_calls exist and is_text_sent, 5th return is tool_calls."""
-        output = _make_mock_output(
-            index=0,
-            text='Some text before <tool_call>{"name":"get_weather"}</tool_call>',
-            text_diff="",
-        )
-        tool_calls = [
-            ToolCallItem(tool_index=0, name="get_weather", parameters='{"location":"SF"}'),
-        ]
-        helper = ResponsesStreamingEventsHelper()
-        helper.is_text_sent = True
-
-        with (
-            patch(
-                "tensorrt_llm.serve.responses_utils._apply_reasoning_parser",
-                return_value=('Some text before <tool_call>{"name":"get_weather"}</tool_call>', ""),
-            ),
-            patch(
-                "tensorrt_llm.serve.responses_utils._apply_tool_parser",
-                return_value=("Some text before ", tool_calls),
-            ),
-        ):
-            result = _should_send_done_events(
-                output=output,
-                output_index=0,
-                tool_parser_id="test_parser",
-                tools=[],
-                tool_parser_dict={0: None},
+    Returns the flat list of events, which is what a client would receive.
+    """
+    helper = helper or ResponsesStreamingEventsHelper()
+    request = _make_request(tools if tools is not None else [_namespace_tool()])
+    reasoning_parser_dict, tool_parser_dict = {}, {}
+    events, accumulated = [], ""
+    for i, frame in enumerate(frames):
+        accumulated += frame
+        events.extend(
+            _generate_streaming_event(
+                output=_make_output(accumulated, frame),
+                request=request,
+                finished_generation=finish and i == len(frames) - 1,
                 streaming_events_helper=helper,
-                finished_generation=False,
+                reasoning_parser_id=reasoning_parser_id,
+                tool_parser_id=tool_parser_id,
+                reasoning_parser_dict=reasoning_parser_dict,
+                tool_parser_dict=tool_parser_dict,
+            )
+        )
+    return events
+
+
+def _of_type(events, event_type):
+    return [e for e in events if getattr(e, "type", None) == event_type]
+
+
+def _payloads(events, event_type):
+    return [e.text for e in _of_type(events, event_type)]
+
+
+def _done_payloads(events):
+    """Every terminal text payload a client would display, text or reasoning."""
+    return _payloads(events, "response.output_text.done") + _payloads(
+        events, "response.reasoning_text.done"
+    )
+
+
+def _items(events, event_type, item_type):
+    return [
+        e.item for e in _of_type(events, event_type) if getattr(e.item, "type", None) == item_type
+    ]
+
+
+def _call_items(events):
+    return _items(events, "response.output_item.done", "function_call")
+
+
+def _assert_no_markup(events):
+    for payload in _done_payloads(events):
+        for marker in _MARKUP:
+            assert marker not in payload, (
+                f"{marker!r} reached the client as assistant text: {payload!r}"
             )
 
-        should_reasoning, should_text, reasoning_content, text_content, done_tool_calls = result
-        assert should_text is True
-        assert text_content == "Some text before "
-        assert len(done_tool_calls) == 1
-        assert done_tool_calls[0].name == "get_weather"
-        assert done_tool_calls[0].parameters == '{"location":"SF"}'
 
-    def test_plain_text_completion_sends_text_done_and_no_tool_calls(self):
-        """The no-tool-call branch must still finish the text item.
+class TestTheDefect:
+    """Edge case 1: two or more calls in one response."""
 
-        Asserting only that the tool-call list comes back empty would be
-        asserting on the patched parser's own return value; what this branch
-        actually has to get right is that plain text still reaches the client
-        as a completed text item.
+    def test_text_item_closes_at_the_first_call_with_no_markup(self):
+        """The whole recorded response, replayed frame by frame.
+
+        Exactly one message item, holding only the prose that preceded the
+        first call, and both calls recovered. Before the fix this same replay
+        produced a 296-character message item running from the prose straight
+        into `<tool_call>functions.exec<arg_key>input</arg_key><arg_value>`.
         """
-        output = _make_mock_output(index=0, text="Just plain text", text_diff="")
-        helper = ResponsesStreamingEventsHelper()
-        helper.is_text_sent = True
+        events = _drive(_REAL_FRAMES)
 
-        with (
-            patch(
-                "tensorrt_llm.serve.responses_utils._apply_reasoning_parser",
-                return_value=("Just plain text", ""),
-            ),
-            patch(
-                "tensorrt_llm.serve.responses_utils._apply_tool_parser",
-                return_value=("Just plain text", []),
-            ),
-        ):
-            result = _should_send_done_events(
-                output=output,
-                output_index=0,
-                tools=[],
-                streaming_events_helper=helper,
-                finished_generation=True,
-            )
+        _assert_no_markup(events)
+        assert _payloads(events, "response.output_text.done") == [_REAL_TEXT]
 
-        (_, should_send_text_done, _, text_content, done_tool_calls) = result
-        # The behaviour this branch owns: generation finished with text already
-        # streamed and no tool calls, so the text item must be closed out.
-        assert should_send_text_done is True
-        assert text_content == "Just plain text"
-        assert done_tool_calls == []
+        calls = _call_items(events)
+        assert [c.name for c in calls] == ["exec", "exec"]
+        assert [c.namespace for c in calls] == ["functions", "functions"]
+        for call in calls:
+            # Arguments a client cannot parse are arguments it cannot run.
+            assert json.loads(call.arguments)["input"]
 
+    def test_the_prose_is_one_item_not_two(self):
+        """The chunk carrying both the prose and the call start is one turn.
 
-class TestGenerateStreamingEventToolCalls:
-    """Test that _generate_streaming_event yields output_item events for tool calls."""
+        The delta has to be appended to the open item before the call closes
+        it. If the close ran first, the prose in that chunk would land in a
+        second message item - the split happens mid-sentence, and a client
+        rendering only the last item shows only the fragment.
+        """
+        events = _drive(_REAL_FRAMES)
+        assert len(_items(events, "response.output_item.done", "message")) == 1
 
-    def test_emits_output_item_added_and_done_for_each_tool_call(self):
-        """When done_tool_calls is non-empty, we get output_item.added and .done per tool call."""
-        output = _make_mock_output(
-            index=0,
-            text='Hello <tool_call>{"name":"get_weather","arguments":{"location":"NYC"}}</tool_call>',
-            text_diff="",
+    def test_no_prefix_of_the_response_leaks_markup(self):
+        """Feeding frames 0..k for every k must never publish markup.
+
+        The failing window was narrow - it opened once one call had closed
+        while another was still open - so the whole prefix family is replayed
+        rather than just the end state.
+        """
+        for k in range(1, len(_REAL_FRAMES) + 1):
+            for finish in (False, True):
+                events = _drive(_REAL_FRAMES[:k], finish=finish)
+                _assert_no_markup(events)
+
+    def test_done_payload_is_exactly_the_deltas_that_were_streamed(self):
+        """The invariant, stated directly, for every prefix.
+
+        Every enumerated case is a consequence of this one property, and it
+        catches the regressions the enumerated cases miss: once a done payload
+        is defined as the sum of the deltas already sent, text that was never
+        streamed cannot appear in it.
+        """
+        delta_of = {
+            "response.output_text.done": "response.output_text.delta",
+            "response.reasoning_text.done": "response.reasoning_text.delta",
+        }
+        for k in range(1, len(_REAL_FRAMES) + 1):
+            for finish in (False, True):
+                events = _drive(_REAL_FRAMES[:k], finish=finish)
+                streamed: dict[tuple[str, str], str] = {}
+                for event in events:
+                    event_type = getattr(event, "type", None)
+                    if event_type in delta_of.values():
+                        key = (event.item_id, event_type)
+                        streamed[key] = streamed.get(key, "") + event.delta
+                    elif event_type in delta_of:
+                        key = (event.item_id, delta_of[event_type])
+                        assert event.text == streamed.get(key, ""), (
+                            f"k={k} finish={finish}: done payload differs from "
+                            f"the deltas sent for {event.item_id}"
+                        )
+
+    def test_any_chunking_of_the_response_gives_the_same_result(self):
+        """The recorded frame boundaries are one chunking out of many.
+
+        Whether a call arrives whole in one chunk or spread over ten is a
+        property of the decoder's timing, not of the response, so every
+        chunking has to produce the same text and the same two calls. Replayed
+        against the previous implementation this fails on 1742 of 2000
+        randomised chunkings; the boundaries are seeded so a failure is
+        reproducible.
+        """
+        full_text = "".join(_REAL_FRAMES)
+        rng = random.Random(20260918)
+
+        for _ in range(30):
+            cuts = sorted(rng.sample(range(1, len(full_text)), rng.randint(1, 40)))
+            frames = [full_text[a:b] for a, b in zip([0] + cuts, cuts + [len(full_text)])]
+            events = _drive(frames)
+
+            _assert_no_markup(events)
+            assert _payloads(events, "response.output_text.done") == [_REAL_TEXT]
+            assert [c.name for c in _call_items(events)] == ["exec", "exec"]
+
+    def test_two_whole_calls_in_one_chunk_are_both_reported(self):
+        """A parser reports at most one finished call per increment.
+
+        Glm47ToolParser returns as soon as it sees a `</tool_call>` and keeps
+        the rest buffered for the next increment. When the stream ends on that
+        chunk there is no next increment, so without draining the parser at
+        end of stream the second call is silently lost.
+        """
+        events = _drive(
+            [
+                "Thinking.</think>",
+                "<tool_call>get_time<arg_key>city</arg_key>"
+                "<arg_value>Beijing</arg_value></tool_call>"
+                "<tool_call>get_time<arg_key>city</arg_key>"
+                "<arg_value>Paris</arg_value></tool_call>",
+            ],
+            tools=[_function_tool()],
         )
-        request = _make_mock_request(
-            tools=[{"type": "function", "function": {"name": "get_weather"}}]
+
+        calls = _call_items(events)
+        assert [c.name for c in calls] == ["get_time", "get_time"]
+        assert [json.loads(c.arguments)["city"] for c in calls] == ["Beijing", "Paris"]
+
+
+class TestTransitions:
+    """Edge cases 2, 3 and 4: what closes, and what opens, around a call."""
+
+    def test_call_straight_after_reasoning_emits_no_message_item(self):
+        """Edge case 2/3: `</think><tool_call>` closes the reasoning item.
+
+        There is no text item to close, and none may be invented: an empty
+        message item is a turn the model never took.
+        """
+        events = _drive(
+            [
+                "Deciding what to do.</think>",
+                "<tool_call>get_time<arg_key>city</arg_key>"
+                "<arg_value>Beijing</arg_value></tool_call>",
+            ],
+            tools=[_function_tool()],
         )
+
+        assert _items(events, "response.output_item.done", "message") == []
+        assert _payloads(events, "response.reasoning_text.done") == ["Deciding what to do."]
+        assert [c.name for c in _call_items(events)] == ["get_time"]
+
+    def test_reasoning_item_closes_before_the_call_item_is_added(self):
+        """Edge case 3, on ordering: no call is nested inside another item.
+
+        A client that is still inside a reasoning item when a function_call
+        item arrives attributes the call to the reasoning.
+        """
+        events = _drive(
+            [
+                "Deciding what to do.</think>",
+                "<tool_call>get_time<arg_key>city</arg_key>"
+                "<arg_value>Beijing</arg_value></tool_call>",
+            ],
+            tools=[_function_tool()],
+        )
+
+        types = [getattr(e, "type", None) for e in events]
+        reasoning_done = types.index("response.reasoning_text.done")
+        call_added = next(
+            i
+            for i, e in enumerate(events)
+            if getattr(e, "type", None) == "response.output_item.added"
+            and getattr(e.item, "type", None) == "function_call"
+        )
+        assert reasoning_done < call_added
+
+    def test_text_after_a_call_opens_a_new_message_item(self):
+        """Edge case 4, constructed - no recorded response has text after a call.
+
+        All 35 multi-call records have nothing between `</tool_call>` and the
+        next `<tool_call>`, and nothing after the last one, so this shape only
+        exists here.
+        """
+        events = _drive(
+            [
+                "Thinking.</think>Before. ",
+                "<tool_call>get_time<arg_key>city</arg_key>"
+                "<arg_value>Beijing</arg_value></tool_call>",
+                "After.",
+            ],
+            tools=[_function_tool()],
+        )
+
+        _assert_no_markup(events)
+        assert _payloads(events, "response.output_text.done") == ["Before. ", "After."]
+
+    def test_text_in_the_same_chunk_as_the_closing_call_tag(self):
+        """Edge case 4 again, with the call and the trailing text in one chunk.
+
+        The parser keeps everything after `</tool_call>` in its buffer and only
+        returns it on the next increment, so a stream that ends on that chunk
+        relies on the end-of-stream flush to release it. Without the flush the
+        sentence is silently dropped.
+        """
+        events = _drive(
+            [
+                "Thinking.</think>Before. ",
+                "<tool_call>get_time<arg_key>city</arg_key>"
+                "<arg_value>Beijing</arg_value></tool_call>After.",
+            ],
+            tools=[_function_tool()],
+        )
+
+        _assert_no_markup(events)
+        assert _payloads(events, "response.output_text.done") == ["Before. ", "After."]
+
+    def test_whitespace_only_delta_between_calls_opens_a_message_item(self):
+        r"""Edge case 5, recording what happens rather than what should.
+
+        SGLang suppresses a whitespace-only message between calls because
+        qwen3-coder separates its calls with `\n`. GLM does not, so no GLM
+        traffic produces this, and suppressing it here would contradict the
+        rule directly above it in _generate_streaming_event: a whitespace-only
+        *first* delta must still open an item, or Codex CLI reports
+        "OutputTextDelta without active item" and prints nothing at all.
+        Reconciling the two needs its own decision, so this test pins the
+        current behaviour and will fail loudly if someone changes it by
+        accident.
+        """
+        events = _drive(
+            [
+                "Thinking.</think>",
+                "<tool_call>get_time<arg_key>city</arg_key>"
+                "<arg_value>Beijing</arg_value></tool_call>",
+                "\n",
+                "<tool_call>get_time<arg_key>city</arg_key>"
+                "<arg_value>Paris</arg_value></tool_call>",
+            ],
+            tools=[_function_tool()],
+        )
+
+        _assert_no_markup(events)
+        assert _payloads(events, "response.output_text.done") == ["\n"]
+        assert len(_call_items(events)) == 2
+
+
+class TestEndOfStream:
+    """Edge cases 6 and 7: streams that stop before the model was done."""
+
+    def test_stream_cut_off_mid_call_drops_the_markup(self):
+        """Edge case 6: the parser is still holding an unterminated call.
+
+        The old re-parse reported those bytes as the assistant's message,
+        which is the leak this change removes; dropping them is the deliberate
+        alternative. The text already streamed is unaffected.
+        """
+        with patch("tensorrt_llm.serve.responses_utils.logger") as mock_logger:
+            events = _drive(_REAL_FRAMES[:3])
+
+        _assert_no_markup(events)
+        assert _payloads(events, "response.output_text.done") == [_REAL_TEXT]
+        # The drop has to be visible in the log, not silent.
+        assert mock_logger.warning.called
+        assert "tool call" in mock_logger.warning.call_args[0][0]
+
+    def test_stream_cut_off_mid_call_reports_no_half_built_call(self):
+        """A call whose arguments never closed is not a call a client can run.
+
+        Its accumulated arguments are a JSON prefix. The non-streaming
+        endpoint reports no call for the same text, and the two must agree.
+        """
+        events = _drive(_REAL_FRAMES[:3])
+        assert _call_items(events) == []
+
+    def test_stream_cut_off_after_one_call_keeps_that_call(self):
+        """Dropping the unfinished call must not drop the finished ones.
+
+        Frames 0-6 close the first call and open the second, so exactly one
+        call survives.
+        """
+        events = _drive(_REAL_FRAMES[:7])
+        assert [c.name for c in _call_items(events)] == ["exec"]
+        assert json.loads(_call_items(events)[0].arguments)["input"]
+
+    def test_abort_closes_the_open_item(self):
+        """Edge case 7: an aborted stream still finalises what it had.
+
+        An abort surfaces as a final chunk carrying no new text, and an item
+        left open has no terminal state - Codex CLI echoes it back on the next
+        turn without a `status`, which the next request is rejected for.
+        """
+        events = _drive(["Thinking.</think>Partial answer", ""])
+
+        assert _payloads(events, "response.output_text.done") == ["Partial answer"]
+        assert len(_items(events, "response.output_item.done", "message")) == 1
+
+
+class TestUnchangedPaths:
+    """Edge cases 10 and 11, and the regressions the structure already fixed."""
+
+    def test_no_tool_parser_leaves_the_text_alone(self):
+        """Edge case 10: with no tool parser, nothing is a call.
+
+        The markup is ordinary text on this path, and it still has to come
+        back as exactly what was streamed.
+        """
+        events = _drive(["Thinking.</think>Answer <tool_call>x</tool_call>"], tool_parser_id=None)
+
+        assert _payloads(events, "response.output_text.done") == ["Answer <tool_call>x</tool_call>"]
+        assert _call_items(events) == []
+
+    def test_empty_delta_opens_nothing(self):
+        """Edge case 11."""
+        assert _drive([""], finish=False) == []
+
+    def test_reasoning_and_text_in_one_chunk_still_emits_the_reasoning(self):
+        """Regression: the chunk that spans `</think>` carries both halves.
+
+        The reasoning part has to be flushed in the delta branch or it is
+        never emitted; measured at 56% of reasoning items across four fleets,
+        and 100% of reasoning short enough to fit one chunk.
+        """
+        events = _drive(["I should answer.</think>Answer."])
+
+        assert _payloads(events, "response.reasoning_text.done") == ["I should answer."]
+        assert _payloads(events, "response.output_text.done") == ["Answer."]
+
+    def test_item_is_opened_before_a_whitespace_only_first_delta(self):
+        """Regression: a delta with no item open makes a client drop the turn.
+
+        Codex CLI reports "OutputTextDelta without active item" and prints
+        nothing. Short replies hit it, because a leading whitespace token is
+        more likely to be the whole first delta.
+        """
+        events = _drive(["Thinking.</think> ", "hi"])
+
+        types = [getattr(e, "type", None) for e in events]
+        first_delta = types.index("response.output_text.delta")
+        message_added = next(
+            i
+            for i, e in enumerate(events)
+            if getattr(e, "type", None) == "response.output_item.added"
+            and getattr(e.item, "type", None) == "message"
+        )
+        assert message_added < first_delta
+        assert _payloads(events, "response.output_text.done") == [" hi"]
+
+    def test_message_item_is_closed_before_the_call_item_is_added(self):
+        """Regression: a call must never be nested inside a message item."""
+        events = _drive(_REAL_FRAMES)
+
+        message_done = next(
+            i
+            for i, e in enumerate(events)
+            if getattr(e, "type", None) == "response.output_item.done"
+            and getattr(e.item, "type", None) == "message"
+        )
+        call_added = next(
+            i
+            for i, e in enumerate(events)
+            if getattr(e, "type", None) == "response.output_item.added"
+            and getattr(e.item, "type", None) == "function_call"
+        )
+        assert message_done < call_added
+
+    def test_calls_are_emitted_once_if_the_finished_output_arrives_twice(self):
+        """Regression: double emission must stay impossible.
+
+        `emitted_tool_calls` existed because the old per-chunk re-parse
+        re-reported the same calls on every chunk. Emission is driven by
+        accumulated fragments now, so the counter guards a different thing -
+        the emission block running for more than one chunk of the same
+        output - but it still has to guard it.
+        """
         helper = ResponsesStreamingEventsHelper()
-        helper.is_text_sent = True
-        helper.item_id = "msg_initial"
+        request = _make_request([_namespace_tool()])
+        reasoning_parser_dict, tool_parser_dict = {}, {}
 
-        tool_calls = [
-            ToolCallItem(tool_index=0, name="get_weather", parameters='{"location":"NYC"}'),
-        ]
-
-        # _apply_reasoning_parser: once for delta (""), once for full output in _should_send_done_events
-        # _apply_tool_parser: once in _should_send_done_events with full text -> return text before tools + tool_calls
-        with (
-            patch(
-                "tensorrt_llm.serve.responses_utils._apply_reasoning_parser",
-                side_effect=[("", ""), (output.text, "")],
-            ),
-            patch(
-                "tensorrt_llm.serve.responses_utils._apply_tool_parser",
-                return_value=("Hello ", tool_calls),
-            ),
-            patch(
-                "tensorrt_llm.serve.responses_utils._get_chat_completion_function_tools",
-                return_value=[],
-            ),
-        ):
-            events = list(
+        def step(text_diff, accumulated, finished):
+            return list(
                 _generate_streaming_event(
-                    output=output,
+                    output=_make_output(accumulated, text_diff),
                     request=request,
-                    finished_generation=True,
+                    finished_generation=finished,
                     streaming_events_helper=helper,
-                    tool_parser_id="test",
-                    tool_parser_dict={0: None},
+                    reasoning_parser_id=_REASONING_PARSER,
+                    tool_parser_id=_TOOL_PARSER,
+                    reasoning_parser_dict=reasoning_parser_dict,
+                    tool_parser_dict=tool_parser_dict,
                 )
             )
 
-        # We should have at least: text_done, content_part_done, output_item_done (text),
-        # then output_item_added (tool), output_item_done (tool)
-        types = [getattr(e, "type", None) for e in events]
-        assert "response.output_item.added" in types
-        assert "response.output_item.done" in types
-        # Find the done event that has a function_call item
-        from openai.types.responses import ResponseOutputItemDoneEvent
+        events, accumulated = [], ""
+        for frame in _REAL_FRAMES:
+            accumulated += frame
+            events += step(frame, accumulated, frame is _REAL_FRAMES[-1])
+        assert len(_call_items(events)) == 2
 
-        done_events = [e for e in events if isinstance(e, ResponseOutputItemDoneEvent)]
-        function_call_dones = [
-            e
-            for e in done_events
-            if getattr(getattr(e, "item", None), "type", None) == "function_call"
+        # A second finished chunk for the same output carries no new text, and
+        # must not re-report the calls already emitted for it.
+        assert _call_items(step("", accumulated, True)) == []
+
+
+class TestFragmentAssembly:
+    """The accumulator that turns parser fragments back into whole calls."""
+
+    def test_fragments_are_concatenated_in_order(self):
+        fragments: dict = {}
+        _accumulate_tool_call_fragments(
+            fragments,
+            [
+                ToolCallItem(tool_index=0, name="get_time", parameters=""),
+                ToolCallItem(tool_index=0, name=None, parameters='{"city": "Par'),
+                ToolCallItem(tool_index=0, name=None, parameters='is"}'),
+            ],
+        )
+
+        assert _assembled_tool_calls(fragments) == [
+            ToolCallItem(tool_index=0, name="get_time", parameters='{"city": "Paris"}')
         ]
-        assert len(function_call_dones) >= 1
-        assert function_call_dones[0].item.name == "get_weather"
-        assert function_call_dones[0].item.arguments == '{"location":"NYC"}'
+
+    def test_a_later_fragment_does_not_erase_the_name(self):
+        """Only a call's first fragment carries its name; the rest carry None."""
+        fragments: dict = {}
+        _accumulate_tool_call_fragments(
+            fragments,
+            [
+                ToolCallItem(tool_index=0, name="get_time", parameters=""),
+                ToolCallItem(tool_index=0, name=None, parameters="{}"),
+            ],
+        )
+        assert _assembled_tool_calls(fragments)[0].name == "get_time"
+
+    def test_the_unfinished_call_is_dropped_and_the_finished_ones_kept(self):
+        fragments: dict = {}
+        _accumulate_tool_call_fragments(
+            fragments,
+            [
+                ToolCallItem(tool_index=0, name="get_time", parameters='{"a": 1}'),
+                ToolCallItem(tool_index=1, name="get_time", parameters='{"a": '),
+            ],
+        )
+
+        assembled = _assembled_tool_calls(fragments, unfinished_tool_index=1)
+        assert [c.parameters for c in assembled] == ['{"a": 1}']
+
+    def test_a_call_whose_name_never_arrived_is_dropped(self):
+        """Matches parse_base_json on the non-streaming path."""
+        fragments: dict = {}
+        _accumulate_tool_call_fragments(
+            fragments, [ToolCallItem(tool_index=0, parameters='{"a": 1}')]
+        )
+        assert _assembled_tool_calls(fragments) == []
+
+    def test_fragments_are_kept_apart_per_output(self):
+        """Edge case 8: one parser instance per output, one fragment set each.
+
+        `tool_parser_dict` is keyed by output index, so two outputs of the same
+        request number their calls independently - both start at tool_index 0 -
+        and merging them would concatenate one output's arguments onto the
+        other's.
+        """
+        helper = ResponsesStreamingEventsHelper()
+        _accumulate_tool_call_fragments(
+            helper.tool_call_fragments(0),
+            [ToolCallItem(tool_index=0, name="first", parameters='{"a": 1}')],
+        )
+        _accumulate_tool_call_fragments(
+            helper.tool_call_fragments(1),
+            [ToolCallItem(tool_index=0, name="second", parameters='{"b": 2}')],
+        )
+
+        assert [c.name for c in _assembled_tool_calls(helper.tool_call_fragments(0))] == ["first"]
+        assert [c.name for c in _assembled_tool_calls(helper.tool_call_fragments(1))] == ["second"]
+
+    def test_two_helpers_do_not_share_fragments(self):
+        """Two requests in flight at once must not share an accumulator.
+
+        A mutable default on the state tracker's class body would be one
+        object shared by every request, so two concurrent streams would
+        accumulate into each other's calls.
+        """
+        first, second = (ResponsesStreamingEventsHelper(), ResponsesStreamingEventsHelper())
+        _accumulate_tool_call_fragments(
+            first.tool_call_fragments(0),
+            [ToolCallItem(tool_index=0, name="only_mine", parameters="{}")],
+        )
+
+        assert second.tool_call_fragments(0) == {}

@@ -1088,6 +1088,9 @@ def responses_api_post_processor(
         reasoning_parser=args.reasoning_parser,
         tool_parser=args.tool_parser,
         num_prompt_tokens=args.num_prompt_tokens,
+        # Set on every PostprocArgs by the worker (postproc_worker.py:195);
+        # used here only to count reasoning tokens for usage.
+        tokenizer=args.tokenizer,
     )
 
 
@@ -1101,5 +1104,5 @@ def responses_api_streaming_post_processor(
     if rsp._done:
         outputs.append(
             args.streaming_processor.get_final_response_non_store(
-                rsp, args.num_prompt_tokens))
+                rsp, args.num_prompt_tokens, tokenizer=args.tokenizer))
     return outputs

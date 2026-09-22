@@ -1140,8 +1140,8 @@ def _get_chat_completion_function_tools(
                 # A custom tool nested in a namespace needs the same freeform
                 # schema as a top-level one. It carries no `parameters`, so
                 # passing them straight through would describe it with an empty
-                # object schema - while _custom_tool_names still classifies the
-                # qualified name as custom, so the output path goes looking for
+                # object schema - while _tool_resolution still classifies the
+                # tool as custom, so the output path goes looking for
                 # CUSTOM_TOOL_INPUT_ARG the prompt never mentioned.
                 if getattr(inner, "type", None) == "custom":
                     inner_parameters = custom_parameters()
@@ -1445,6 +1445,101 @@ def _apply_reasoning_parser(
     return content, reasoning_content
 
 
+def _flush_tool_parser(
+    tools: Optional[list[Tool]],
+    output_index: int,
+    tool_parser_dict: Optional[dict[int, BaseToolParser]] = None,
+) -> Tuple[str, list[ToolCallItem], Optional[int]]:
+    """Whatever the incremental tool parser still holds when the stream ends.
+
+    Returns the text to release, the calls to add, and the parser's tool index
+    for a call it was cut off in the middle of (None if it was not).
+
+    The parser withholds any bytes that could still turn out to be tool-call
+    markup, and reports at most one finished call per increment, so the end of
+    a stream can leave both a complete call and a half-finished one behind with
+    no further increment coming. `finish` is each parser's own decision about
+    that remainder; most inherit the no-op, which leaves it sitting in
+    `_buffer`, so the buffer is drained and then inspected as well.
+
+    Unterminated markup is dropped rather than shown. Releasing it would
+    reintroduce exactly the leak this path was restructured to make
+    unreachable, only at a different moment - the bytes are not a message the
+    model meant to send, they are half of a call that never finished. It is
+    rare (1 of 3437 recorded responses) and the warning makes the loss visible
+    instead of silent.
+
+    A remainder with no markup in it is ordinary output that the parser was
+    holding only until it could rule out a call, and is released. This matches
+    what DeepSeekR1Parser.finish already does for a trailing fragment that
+    might still have grown into a `</think>`.
+    """
+    tool_parser = (tool_parser_dict or {}).get(output_index)
+    if tool_parser is None or tools is None:
+        # No parser was ever built for this output, so nothing is held back.
+        return "", [], None
+
+    released: list[str] = []
+    calls: list[ToolCallItem] = []
+
+    # Drain calls the parser has already received in full but not yet reported.
+    #
+    # Several parsers report at most one call per increment and leave the rest
+    # buffered for the next one - Glm47ToolParser returns the moment it sees a
+    # `</tool_call>`. Two calls arriving in a single stream chunk therefore
+    # leave the second sitting complete and unreported, and at end of stream
+    # there is no next increment to collect it; replaying one recorded
+    # two-call response under randomised chunk boundaries lost a call in 67 of
+    # 400 chunkings. Empty increments stand in for the chunks that will never
+    # arrive.
+    #
+    # Bounded by the buffer having to shrink on every pass, so a parser that
+    # cannot make progress on what it holds ends the loop rather than spinning.
+    # Entered only while the buffer still holds markup, because plain text left
+    # over is `finish`'s business and some parsers strip framing from it.
+    held = getattr(tool_parser, "_buffer", "")
+    while held and tool_parser.has_tool_call(held):
+        drained = tool_parser.parse_streaming_increment("", tools)
+        calls.extend(drained.calls)
+        if drained.normal_text:
+            released.append(drained.normal_text)
+        remaining = getattr(tool_parser, "_buffer", "")
+        if len(remaining) >= len(held):
+            break
+        held = remaining
+
+    result = tool_parser.finish(tools)
+    calls.extend(result.calls)
+    held = getattr(tool_parser, "_buffer", "")
+
+    dropped = 0
+    for remainder in (result.normal_text, held):
+        if not remainder:
+            continue
+        if tool_parser.has_tool_call(remainder):
+            dropped += len(remainder)
+        else:
+            released.append(remainder)
+
+    if dropped:
+        logger.warning(
+            f"Stream ended inside a tool call; dropped {dropped} characters "
+            f"of unterminated {type(tool_parser).__name__} markup rather than "
+            "reporting them as the assistant's message.")
+
+    # `current_tool_name_sent` is the parser's own record of having announced a
+    # call it has not yet closed, and `current_tool_id` numbers that call.
+    # Read through getattr because a parser that overrides
+    # parse_streaming_increment entirely need not maintain them; not
+    # maintaining them means it never reports a half-started call, which is
+    # the safe reading.
+    unfinished = None
+    if getattr(tool_parser, "current_tool_name_sent", False):
+        unfinished = getattr(tool_parser, "current_tool_id", None)
+
+    return "".join(released), calls, unfinished
+
+
 def _apply_tool_parser(
     tool_parser_id: Optional[str],
     tools: Optional[list[Tool]],
@@ -1485,9 +1580,15 @@ def _create_output_content(
     tool_parser: Optional[str] = None,
     tools: Optional[list[Tool]] = None,
     chat_template_kwargs: Optional[dict[str, Any]] = None,
-) -> Tuple[list[ResponseOutputItem], list[ChatCompletionMessageParam]]:
+    streamed_tool_call_ids: Optional[list[Tuple[str, str]]] = None,
+) -> Tuple[list[ResponseOutputItem], list[ChatCompletionMessageParam],
+           list[str]]:
     output_items: list[ResponseOutputItem] = []
     output_messages: list[ChatCompletionMessageParam] = []
+    # What the reasoning parser claimed as reasoning, per output and before
+    # stripping, so usage accounting can count its tokens. Kept raw: the
+    # whitespace around a reasoning block was generated too.
+    reasoning_texts: list[str] = []
     available_tools = _get_chat_completion_function_tools(tools)
 
     for output in final_res.outputs:
@@ -1503,6 +1604,7 @@ def _create_output_content(
             output.text,
             False,
             chat_template_kwargs=chat_template_kwargs)
+        reasoning_texts.append(reasoning_text or "")
 
         if text:
             text, calls = _apply_tool_parser(tool_parser, available_tools,
@@ -1554,12 +1656,28 @@ def _create_output_content(
             output_items.append(text_item)
 
         if calls:
-            custom_tool_names = _custom_tool_names(tools)
-            namespaced_tool_names = _namespaced_tool_names(tools)
-            tool_calls_item = [
-                _tool_call_output_item(call, custom_tool_names,
-                                       namespaced_tool_names) for call in calls
-            ]
+            tool_resolution = _tool_resolution(tools)
+            # Reuse the ids the streaming path already published, positionally:
+            # both passes enumerate the same parsed calls in the same order.
+            # Running out means this pass found calls the stream never emitted
+            # (a cut-off stream, say); those get fresh ids, and the mismatch is
+            # said out loud rather than silently producing ids the client has
+            # no way to match.
+            reusable = list(streamed_tool_call_ids or [])
+            if reusable and len(reusable) != len(calls):
+                logger.warning(
+                    "final response rebuilt %d tool call(s) but %d were "
+                    "streamed; ids beyond the streamed ones are new and will "
+                    "not match the client's tool outputs", len(calls),
+                    len(reusable))
+            tool_calls_item = []
+            for index, call in enumerate(calls):
+                ids = reusable[index] if index < len(reusable) else (None, None)
+                tool_calls_item.append(
+                    _tool_call_output_item(call,
+                                           tool_resolution,
+                                           item_id=ids[0],
+                                           call_id=ids[1]))
             output_items.extend(tool_calls_item)
 
         output_messages.extend(
@@ -1572,7 +1690,7 @@ def _create_output_content(
                 tool_calls_item,
             }))
 
-    return output_items, output_messages
+    return output_items, output_messages, reasoning_texts
 
 
 def _create_output_content_harmony(
@@ -1592,58 +1710,69 @@ def _create_output_content_harmony(
     return output_content, output_messages
 
 
-def _custom_tool_names(tools: Optional[list[Tool]]) -> set[str]:
-    """Names of the tools the request declared as freeform custom tools.
+def _tool_resolution(
+        tools: Optional[list[Tool]]
+) -> dict[str, Tuple[Optional[str], str, bool]]:
+    """Every spelling a parsed call may carry -> (namespace, bare name, custom).
 
-    Tools inside a namespace are keyed by the qualified name they are
-    offered to the model under, which is what a parsed call carries.
+    A chat template can only describe a flat list of functions, so a namespaced
+    tool is offered to the model as "namespace.tool" and has to be reported back
+    with the two parts separated again - that is how the client identifies it.
+
+    The model writes the name back BOTH ways. Measured over one agent session:
+    247 calls arrived as `exec` and 34 as `functions.exec`. The two functions
+    this replaces keyed only on the qualified spelling, so every bare-named call
+    missed the lookup, was classified as a plain function call, and reached the
+    client as JSON where a custom tool expects freeform text. The client rejects
+    that outright: 154 of 154 such calls came back "aborted", while the 10 that
+    happened to arrive qualified all ran. The agent then concluded its execution
+    runtime was broken and burned its retries.
+
+    A bare name is registered only when exactly one declared tool answers to it.
+    Two namespaces offering the same tool name cannot be told apart from the
+    name alone, and routing a call to the wrong namespace is worse than leaving
+    it unresolved - the caller reports an unresolved call as it always did, and
+    now warns about it.
     """
-    names: set[str] = set()
+    resolved: dict[str, Tuple[Optional[str], str, bool]] = {}
+    bare_claims: dict[str, list[str]] = {}
+
+    def claim(exposed: str, namespace: Optional[str], bare: str,
+              is_custom: bool) -> None:
+        resolved[exposed] = (namespace, bare, is_custom)
+        if exposed != bare:
+            bare_claims.setdefault(bare, []).append(exposed)
+
     for tool in tools or []:
         tool_type = getattr(tool, "type", None)
         name = getattr(tool, "name", None)
         if not name:
             continue
-        if tool_type == "custom":
-            names.add(name)
-        elif tool_type == "namespace":
+        if tool_type == "namespace":
             for inner in getattr(tool, "tools", None) or []:
                 inner_name = getattr(inner, "name", None)
-                if inner_name and getattr(inner, "type", None) == "custom":
-                    names.add(f"{name}.{inner_name}")
-    return names
+                if inner_name:
+                    claim(f"{name}.{inner_name}", name, inner_name,
+                          getattr(inner, "type", None) == "custom")
+        else:
+            claim(name, None, name, tool_type == "custom")
 
-
-def _namespaced_tool_names(
-        tools: Optional[list[Tool]]) -> dict[str, Tuple[str, str]]:
-    """Qualified name -> (namespace, bare name) for namespaced tools.
-
-    A chat template can only describe a flat list of functions, so a
-    namespaced tool is offered as "namespace.tool". The call has to be
-    reported back with the two parts separated again, since that is how the
-    client identifies the tool; a call named "collaboration.spawn_agent"
-    matches nothing it knows and comes back as "unsupported call".
-    """
-    mapping: dict[str, Tuple[str, str]] = {}
-    for tool in tools or []:
-        if getattr(tool, "type", None) != "namespace":
+    for bare, exposed_names in bare_claims.items():
+        # A top-level tool owning the spelling wins; it is what the model was
+        # shown under that exact name.
+        if bare in resolved:
             continue
-        namespace = getattr(tool, "name", None)
-        if not namespace:
-            continue
-        for inner in getattr(tool, "tools", None) or []:
-            inner_name = getattr(inner, "name", None)
-            if inner_name:
-                mapping[f"{namespace}.{inner_name}"] = (namespace, inner_name)
-    return mapping
+        if len(exposed_names) == 1:
+            resolved[bare] = resolved[exposed_names[0]]
+    return resolved
 
 
 def _tool_call_output_item(
     call,
-    custom_tool_names: set[str],
-    namespaced_tool_names: Optional[dict[str, Tuple[str, str]]] = None,
+    tool_resolution: dict[str, Tuple[Optional[str], str, bool]],
     item_id: Optional[str] = None,
     status: Optional[str] = None,
+    call_id: Optional[str] = None,
 ) -> Union[ResponseFunctionToolCall, ResponseCustomToolCall]:
     """Build the output item for one parsed tool call.
 
@@ -1652,15 +1781,33 @@ def _tool_call_output_item(
     function call hands the client JSON where it expects the raw payload,
     and the client rejects the call outright - for apply_patch, with
     "invoked with incompatible payload", which aborts the whole turn.
+
+    Which of the two it is turns on whether the call's name resolves to a
+    declared tool, and the model spells that name inconsistently; see
+    ``_tool_resolution`` for what that cost before it accepted both spellings.
     """
     name = call.name or ""
     arguments = call.parameters or "{}"
-    call_id = f"call_{_random_uuid()}"
+    # A fresh id only when this call has not been reported before. The final
+    # response re-derives its output from the generated text, so it must be
+    # given back the ids the stream already used; the client keys its tool
+    # outputs on those and matches nothing otherwise.
+    call_id = call_id or f"call_{_random_uuid()}"
 
-    is_custom = name in custom_tool_names
-    namespace = None
-    if namespaced_tool_names and name in namespaced_tool_names:
-        namespace, name = namespaced_tool_names[name]
+    resolved = (tool_resolution or {}).get(name)
+    if resolved is not None:
+        namespace, name, is_custom = resolved
+    else:
+        namespace, is_custom = None, False
+        # Previously silent, which is why a whole class of aborted calls went
+        # unexplained for as long as it did: a custom tool reported as a
+        # function call is rejected by the client, and nothing said so. SGLang
+        # logs "Model attempted to call undefined function" at the equivalent
+        # point; borrowing that is most of the value of this change.
+        logger.warning(
+            "tool call %r matches no declared tool; reporting it as a function "
+            "call. If it is in fact a custom tool, the client will reject it.",
+            name)
 
     if is_custom:
         # Unwrap the single string argument the tool was described with. A
@@ -1720,9 +1867,63 @@ def _ctx_usage_from_result(final_res: GenerationResult) -> Optional[Any]:
     return None
 
 
+def _count_reasoning_tokens(
+    tokenizer: Optional[TokenizerBase],
+    reasoning_texts: list[str],
+    output_tokens: int,
+) -> int:
+    """How many of the generated tokens went into reasoning.
+
+    The engine does not track this. `ThinkingBudgetLogitsProcessor` computes
+    the same quantity in token space (thinking_budget.py:93), but it lives in
+    the model engine process, only exists when `thinking_token_budget` is set,
+    and a LogitsProcessor has no channel back to the result -- so the count
+    has to be rebuilt here.
+
+    This re-encodes the text the reasoning parser itself claimed, rather than
+    searching `output.token_ids` for the `</think>` token. The marker search
+    is cheaper and exact, and it was the first design; it was dropped because
+    it has to restate the parser's rules and would silently disagree the
+    moment they differ. GLM alone needs three of them: it closes the block
+    more than once and only the first close counts, `<tool_call>` ends the
+    block implicitly, and a turn that emits neither is reasoning to its last
+    character (reasoning_parser.py:369-404, with a measured case of 26,055
+    characters and no closing tag at all). Deriving the count from the
+    parser's own output cannot drift from it, and it stays correct for the
+    parsers that interleave reasoning with content, where no single prefix
+    length describes the split.
+
+    The cost is one encode of the reasoning text per response, off the
+    engine's critical path, and a boundary that can differ by a token from
+    the generated one -- re-encoding a substring need not reproduce the
+    tokenization it came from. Returns 0 when it cannot be determined at all
+    (no tokenizer, or no reasoning parser configured), which is what this
+    reported unconditionally before.
+    """
+    if tokenizer is None:
+        return 0
+
+    total = 0
+    for text in reasoning_texts:
+        if not text:
+            continue
+        try:
+            total += len(tokenizer.encode(text, add_special_tokens=False))
+        except TypeError:
+            # Not every tokenizer accepts the keyword.
+            total += len(tokenizer.encode(text))
+
+    # Re-encoding can overshoot, and usage that claims more reasoning tokens
+    # than were generated is visibly wrong to a client budgeting a context
+    # window. Clamping is the conservative direction.
+    return min(total, output_tokens)
+
+
 def _create_usage(
         final_res: GenerationResult,
-        num_prompt_tokens: Optional[int] = None) -> Optional[ResponseUsage]:
+        num_prompt_tokens: Optional[int] = None,
+        tokenizer: Optional[TokenizerBase] = None,
+        reasoning_texts: Optional[list[str]] = None) -> Optional[ResponseUsage]:
     """Build the Responses-API usage block from a finished generation.
 
     Clients such as the Codex CLI rely on this to track how much of the
@@ -1763,9 +1964,9 @@ def _create_usage(
         input_tokens=input_tokens,
         input_tokens_details=InputTokensDetails(cached_tokens=cached_tokens),
         output_tokens=output_tokens,
-        # The reasoning tokens are not accounted separately from the
-        # generated ones, so report them as zero rather than guessing.
-        output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
+        output_tokens_details=OutputTokensDetails(
+            reasoning_tokens=_count_reasoning_tokens(tokenizer, reasoning_texts
+                                                     or [], output_tokens)),
         total_tokens=input_tokens + output_tokens,
     )
 
@@ -1780,6 +1981,8 @@ def _create_response(
     reasoning_parser: Optional[str] = None,
     tool_parser: Optional[str] = None,
     num_prompt_tokens: Optional[int] = None,
+    streamed_tool_call_ids: Optional[list[Tuple[str, str]]] = None,
+    tokenizer: Optional[TokenizerBase] = None,
 ) -> tuple[ResponsesResponse, list[Message | ChatCompletionMessageParam]]:
     _responses_debug_log("================================================")
     _responses_debug_log("RAW MODEL OUTPUT:")
@@ -1791,13 +1994,19 @@ def _create_response(
     if use_harmony:
         output_content, output_messages = _create_output_content_harmony(
             final_res)
+        # Harmony carries its reasoning on the `analysis` channel, which the
+        # adapter already tracks per token (harmony_adapter.py:207). Counting
+        # it is a separate change on that path; this one leaves it reported
+        # as zero rather than half-counting it here.
+        reasoning_texts = []
     else:
-        output_content, output_messages = _create_output_content(
+        output_content, output_messages, reasoning_texts = _create_output_content(
             final_res,
             reasoning_parser,
             tool_parser,
             request.tools,
-            chat_template_kwargs=reasoning_chat_template_kwargs(request))
+            chat_template_kwargs=reasoning_chat_template_kwargs(request),
+            streamed_tool_call_ids=streamed_tool_call_ids)
 
     finish_reason = final_res.outputs[0].finish_reason
     response = ResponsesResponse.from_request(
@@ -1807,7 +2016,10 @@ def _create_response(
         created_time=response_creation_time,
         output=output_content,
         status=finish_reason_mapping(finish_reason),
-        usage=_create_usage(final_res, num_prompt_tokens),
+        usage=_create_usage(final_res,
+                            num_prompt_tokens,
+                            tokenizer=tokenizer,
+                            reasoning_texts=reasoning_texts),
     )
     # Disaggregated serving. A context-only response is read by the
     # orchestrator, never by a client: it carries the KV-cache handle, the
@@ -1843,6 +2055,8 @@ async def create_response(
     reasoning_parser: Optional[str] = None,
     tool_parser: Optional[str] = None,
     num_prompt_tokens: Optional[int] = None,
+    streamed_tool_call_ids: Optional[list[Tuple[str, str]]] = None,
+    tokenizer: Optional[TokenizerBase] = None,
 ) -> ResponsesResponse:
 
     final_res: Optional[RequestOutput] = None
@@ -1869,6 +2083,8 @@ async def create_response(
         reasoning_parser=reasoning_parser,
         tool_parser=tool_parser,
         num_prompt_tokens=num_prompt_tokens,
+        streamed_tool_call_ids=streamed_tool_call_ids,
+        tokenizer=tokenizer,
     )
 
     if enable_store and request.store:
@@ -1889,6 +2105,8 @@ def create_response_non_store(
     reasoning_parser: Optional[str] = None,
     tool_parser: Optional[str] = None,
     num_prompt_tokens: Optional[int] = None,
+    streamed_tool_call_ids: Optional[list[Tuple[str, str]]] = None,
+    tokenizer: Optional[TokenizerBase] = None,
 ) -> ResponsesResponse:
     response_creation_time = create_time if create_time is not None else int(
         time.time())
@@ -1904,6 +2122,8 @@ def create_response_non_store(
         reasoning_parser=reasoning_parser,
         tool_parser=tool_parser,
         num_prompt_tokens=num_prompt_tokens,
+        streamed_tool_call_ids=streamed_tool_call_ids,
+        tokenizer=tokenizer,
     )
 
     return response
@@ -1924,11 +2144,41 @@ class ResponsesStreamingStateTracker:
     text_buffer: str = ""
     reasoning_buffer: str = ""
 
+    def __init__(self) -> None:
+        # Tool-call fragments from the incremental parser, keyed by output
+        # index, then by the parser's tool index. One parser instance per
+        # output lives in tool_parser_dict, so what those instances report has
+        # to be kept apart in the same way.
+        #
+        # Assigned here rather than in the class body above: a dict written as
+        # a class attribute is one object shared by every request, so two
+        # concurrent streams would accumulate into each other's calls. The
+        # fields above are immutable, so assigning to them rebinds per
+        # instance and they are safe as class-level defaults.
+        self.tool_call_fragments: dict[int, dict[int, dict[str, Any]]] = {}
+
+        # (item id, call id) of every tool call already streamed, in the order
+        # they went out. `response.completed` rebuilds the output from scratch,
+        # and _tool_call_output_item mints a fresh random id each time it runs,
+        # so without this the final response names every call differently from
+        # the events that carried it - and the client's tool outputs, which
+        # echo the streamed id, match nothing. Measured before the fix: 671 of
+        # 671 calls across three campaigns.
+        #
+        # A list here rather than a class attribute, for the reason above.
+        self.emitted_tool_call_ids: list[Tuple[str, str]] = []
+
 
 class ResponsesStreamingEventsHelper:
 
     def __init__(self):
         self.state_tracker = ResponsesStreamingStateTracker()
+
+    def tool_call_fragments(self,
+                            output_index: int) -> dict[int, dict[str, Any]]:
+        """The call fragments accumulated so far for one output."""
+        return self.state_tracker.tool_call_fragments.setdefault(
+            output_index, {})
 
     def content_index_increment(self):
         self.state_tracker.current_content_index += 1
@@ -1943,6 +2193,20 @@ class ResponsesStreamingEventsHelper:
     @emitted_tool_calls.setter
     def emitted_tool_calls(self, count: int) -> None:
         self.state_tracker.emitted_tool_calls = count
+
+    @property
+    def emitted_tool_call_ids(self) -> list[Tuple[str, str]]:
+        """(item id, call id) of the tool calls already streamed, in order."""
+        return self.state_tracker.emitted_tool_call_ids
+
+    def record_emitted_tool_call(self, item) -> None:
+        """Remember the ids a streamed call went out under.
+
+        The final response is built by a second, independent pass over the
+        generated text; handing it these lets it name the same call the same
+        way instead of minting new ids the client has never seen.
+        """
+        self.state_tracker.emitted_tool_call_ids.append((item.id, item.call_id))
 
     def append_text(self, delta: str) -> None:
         self.state_tracker.text_buffer += delta
@@ -2164,103 +2428,103 @@ class ResponsesStreamingEventsHelper:
         ))
 
 
-def _should_send_done_events(
-    output: RequestOutput,
-    output_index: int,
-    reasoning_parser_id: Optional[str] = None,
-    tool_parser_id: Optional[str] = None,
-    tools: Optional[list[Tool]] = None,
-    reasoning_parser_dict: Optional[dict[int, BaseReasoningParser]] = None,
-    tool_parser_dict: Optional[dict[int, BaseToolParser]] = None,
-    streaming_events_helper: Optional[ResponsesStreamingEventsHelper] = None,
-    finished_generation: bool = False,
-    chat_template_kwargs: Optional[dict[str, Any]] = None,
-) -> Tuple[bool, bool, Optional[str], Optional[str]]:
+def _accumulate_tool_call_fragments(fragments: dict[int, dict[str, Any]],
+                                    calls: list[ToolCallItem]) -> None:
+    """Fold the incremental parser's call fragments into whole calls.
+
+    `parse_streaming_increment` reports one call in several pieces: the name
+    first with empty parameters, then the arguments JSON a fragment at a time,
+    then the closing brace. Only the concatenation is something a client can
+    run, so the pieces are gathered here and the finished calls are emitted
+    when generation ends.
+
+    Keyed by the parser's own `tool_index`, which numbers the calls in the
+    order it saw them start; a dict preserves that order.
     """
-    Determine if done events should be sent for text or reasoning items.
+    for call in calls:
+        fragment = fragments.setdefault(call.tool_index, {
+            "name": None,
+            "parameters": "",
+        })
+        # Only a call's first fragment carries the name; every later one
+        # carries None, which must not erase the name already recorded.
+        if call.name:
+            fragment["name"] = call.name
+        fragment["parameters"] += call.parameters or ""
 
-    Analyzes the complete output text to detect when reasoning or text sections
-    have been completed and should receive done events.
 
-    Args:
-        output: RequestOutput containing full generated text in output.text
-        output_index: Index of the output being processed
-        reasoning_parser_id: Parser ID for extracting reasoning content
-        tool_parser_id: Parser ID for extracting tool calls
-        tools: Available tools for tool parsing
-        reasoning_parser_dict: Dictionary of reasoning parsers
-        tool_parser_dict: Dictionary of tool parsers
-        streaming_events_helper: Helper tracking current streaming state
+def _assembled_tool_calls(
+        fragments: dict[int, dict[str, Any]],
+        unfinished_tool_index: Optional[int] = None) -> list[ToolCallItem]:
+    r"""The accumulated fragments as whole calls, in the order they started.
 
-    Returns:
-        Tuple of (should_send_reasoning_done, should_send_text_done,
-                  reasoning_content, text_content)
+    A call whose name never arrived is dropped, which is what
+    `parse_base_json` does on the non-streaming path: a call the client cannot
+    name is not a call it can run.
+
+    `unfinished_tool_index` names a call the parser announced but never closed,
+    because the stream ended inside it. Its accumulated arguments are a JSON
+    prefix - `{"input": "\n// Read the problem` and nothing more - which no
+    client can parse or run, so it is dropped rather than reported. The
+    non-streaming path reports no call at all for the same text, since its
+    regex needs the closing tag, and the two endpoints have to agree about
+    what the model asked for.
+
+    A call whose assembled arguments are not valid JSON is dropped for the same
+    reason, one test later. That test keys on the markup being unterminated;
+    this one keys on the result being unusable, which is the property that
+    actually matters and which covers calls the markup test passes. A GLM-4.7
+    block that opens `<arg_value>` and never closes it, ending
+    `</think></tool_call>` instead, has a balanced `<tool_call>` pair and so
+    finalises normally - with arguments that assemble to `{"cmd": }`. That
+    reached a client, which stored it, replayed it in the next request's
+    history and was answered `tool_calls[0].function.arguments must be valid
+    JSON`; 2 of 13,014 delivered calls, each costing the agent run that hit it.
+
+    Here rather than in the parser because a parser cannot unsay what it has
+    already said. It streams `{`, `"cmd": `, the value and `}` over several
+    increments, each folded into `fragments` as it arrives, and only discovers
+    at `</tool_call>` that the whole does not parse. This is the last point at
+    which the fragments are known as a whole *and* declining to report them is
+    still possible.
+
+    Dropping beats repairing. Closing the quote and the brace would invent an
+    argument the model never wrote, and the client would then run a truncated
+    shell command with nothing to indicate anything was lost; executing half a
+    command is worse than executing none. The warning is what keeps the loss
+    from being silent.
+
+    The non-streaming path needs no equivalent - `parse_base_json` builds its
+    arguments with `json.dumps`, so they always parse - but it is not silent
+    about this text either: its pair regex reads nothing out of the block and
+    it reports the call with empty arguments. `{}` is something a client can
+    run, so the two paths do differ here, and settling that means deciding
+    what a call whose markup could not be read should be. A different
+    question, left alone.
     """
-    should_send_reasoning_done = False
-    should_send_text_done = False
-    reasoning_content = ""
-    text_content = ""
-
-    # TODO(JunyiXu-nv): find a more efficient way to decide if we need to send done events
-    # Parse complete output using non-streaming mode to get full content
-    full_text, full_reasoning = _apply_reasoning_parser(
-        reasoning_parser_id=reasoning_parser_id,
-        output_index=output_index,
-        text=output.text,
-        streaming=False,
-        reasoning_parser_dict=reasoning_parser_dict,
-        chat_template_kwargs=chat_template_kwargs,
-    )
-
-    # Apply tool parsing to get tool calls
-    tool_calls = []
-    if full_text:
-        full_text, tool_calls = _apply_tool_parser(
-            tool_parser_id=tool_parser_id,
-            tools=tools,
-            output_index=output_index,
-            text=full_text,
-            streaming=False,
-            tool_parser_dict=tool_parser_dict,
-        )
-
-    # Detect reasoning -> text transition
-    # Reasoning is done when we have sent reasoning content and now have text content
-    if full_reasoning and full_text:
-        if streaming_events_helper and streaming_events_helper.is_reasoning_sent and not streaming_events_helper.is_text_sent:
-            should_send_reasoning_done = True
-            reasoning_content = full_reasoning
-
-    # Detect text -> tool call transition
-    # Text is done when we have sent text content and now have tool calls
-    if full_text and tool_calls:
-        if streaming_events_helper and streaming_events_helper.is_text_sent:
-            should_send_text_done = True
-            text_content = full_text
-
-    # Also check if text is done because generation finished (no tool calls case)
-    # Text is done when generation completes and we've sent text
-    if full_text and not tool_calls and finished_generation:
-        if streaming_events_helper and streaming_events_helper.is_text_sent:
-            should_send_text_done = True
-            text_content = full_text
-
-    # Similarly, reasoning is done if generation finished with only reasoning (no text case)
-    if full_reasoning and not full_text and finished_generation:
-        if streaming_events_helper and streaming_events_helper.is_reasoning_sent:
-            should_send_reasoning_done = True
-            reasoning_content = full_reasoning
-
-    # No closing tag: reasoning was streamed but re-parse shows everything as
-    # content (no </think> found). Close the reasoning section so the text
-    # section can be properly opened and closed.
-    if not full_reasoning and full_text and finished_generation:
-        if streaming_events_helper and streaming_events_helper.is_reasoning_sent:
-            should_send_reasoning_done = True
-            reasoning_content = full_text
-
-    return (should_send_reasoning_done, should_send_text_done,
-            reasoning_content, text_content, tool_calls)
+    calls: list[ToolCallItem] = []
+    for tool_index, fragment in fragments.items():
+        if not fragment["name"] or tool_index == unfinished_tool_index:
+            # No warning for the unfinished call: `_flush_tool_parser` has
+            # already reported that loss, and saying it twice would read as two
+            # calls lost.
+            continue
+        arguments = fragment["parameters"]
+        try:
+            json.loads(arguments)
+        except ValueError as exc:
+            logger.warning(
+                f"Dropping the tool call to {fragment['name']!r}: its "
+                f"arguments did not assemble into valid JSON ({exc}). The "
+                "model emitted a malformed tool call, and reporting it would "
+                "hand the client arguments it can only reject. Assembled: "
+                f"{arguments[:200]!r}")
+            continue
+        calls.append(
+            ToolCallItem(tool_index=tool_index,
+                         name=fragment["name"],
+                         parameters=arguments))
+    return calls
 
 
 def _close_open_item(helper):
@@ -2342,13 +2606,25 @@ def _generate_streaming_event(
     )
 
     if delta_text:
-        # TODO(JunyiXu-nv): handle tool calls in streaming mode
         delta_text, calls = _apply_tool_parser(
             tool_parser_id=tool_parser_id,
             tools=available_tools,
             output_index=output_idx,
             text=delta_text,
             streaming=True,
+            tool_parser_dict=tool_parser_dict,
+        )
+
+    # End of stream: the tool parser gets one last word before its state is
+    # discarded, so bytes it was still withholding are released or dropped by
+    # a decision rather than by nobody ever asking. Only computed here; what
+    # it releases is emitted further down, after the call in front of it has
+    # closed the item it belongs to.
+    flushed_text, flushed_calls, unfinished_tool_index = "", [], None
+    if finished_generation:
+        flushed_text, flushed_calls, unfinished_tool_index = _flush_tool_parser(
+            tools=available_tools,
+            output_index=output_idx,
             tool_parser_dict=tool_parser_dict,
         )
 
@@ -2359,14 +2635,19 @@ def _generate_streaming_event(
 
     # Send delta events for ongoing content BEFORE any done events.
     #
-    # The done-event block below closes the item that is currently open. If it
-    # ran first, the final chunk's delta would arrive after that close and open
-    # a brand new output item for the tail of the same message - splitting one
+    # The close-on-calls block below ends the item that is currently open. If
+    # it ran first, this chunk's delta would arrive after that close and open a
+    # brand new output item for the tail of the same message - splitting one
     # assistant turn across two items, sometimes mid-word, and clients that
     # render the last item alone show only that fragment. The chat completions
     # path has the same shape: it appends the content delta to the chunk and
     # only then stamps finish_reason.
-    # Send delta events for ongoing content
+    #
+    # It is also what makes the done payload right in the common case: a chunk
+    # that carries the text before a call *and* the start of that call arrives
+    # as one delta plus one non-empty `calls`, so the text has to be appended
+    # to the item before the item is closed with it.
+    #
     # The item must be opened before *any* delta, including a whitespace-only
     # one. Gating the added-events on delta_text.strip() while emitting the
     # delta unconditionally sends output_text.delta with no item open, and a
@@ -2388,11 +2669,10 @@ def _generate_streaming_event(
         # It is not a rare boundary case. The reasoning between the last chunk
         # boundary and the tag is lost every time the two land in one chunk,
         # which measured 56% of reasoning items across four fleets, and 100%
-        # of reasoning short enough to fit inside a single chunk. Closing the
-        # item first is what makes it unrecoverable: _close_open_item clears
-        # is_reasoning_sent, and _should_send_done_events below is guarded on
-        # that flag -- so the correct full text it computes is discarded, and
-        # the done event carries the truncated text too.
+        # of reasoning short enough to fit inside a single chunk. Nothing
+        # downstream can recover it either: every done payload is now the sum
+        # of the deltas already streamed, so reasoning that was never streamed
+        # as a delta is simply not in the reasoning item at all.
         if reasoning_delta_text:
             if streaming_events_helper.is_text_sent:
                 yield from _close_open_item(streaming_events_helper)
@@ -2423,102 +2703,60 @@ def _generate_streaming_event(
         yield streaming_events_helper.get_reasoning_text_delta_event(
             reasoning_delta_text)
 
-    # Check if we need to send done events for completed sections
-    (should_send_reasoning_done, should_send_text_done, reasoning_full_content,
-     text_full_content, done_tool_calls) = _should_send_done_events(
-         output=output,
-         output_index=output_idx,
-         reasoning_parser_id=reasoning_parser_id,
-         tool_parser_id=tool_parser_id,
-         tools=available_tools,
-         reasoning_parser_dict=reasoning_parser_dict,
-         tool_parser_dict=tool_parser_dict,
-         streaming_events_helper=streaming_events_helper,
-         finished_generation=finished_generation,
-         chat_template_kwargs=reasoning_chat_template_kwargs(request),
-     )
+    # A tool call has started, so whichever item is open ends here.
+    #
+    # Only the incremental parser can report this. It is the one holding back
+    # the markup's bytes, so it knows it is mid-call; a re-parse of the
+    # accumulated text has no such memory and has to classify an unterminated
+    # call as ordinary text. That is exactly how the previous implementation
+    # published `<tool_call>functions.exec<arg_key>input</arg_key>...` as the
+    # assistant's message: the non-streaming tool regex needs a closing tag,
+    # so a call that had closed kept `tool_calls` non-empty while a second,
+    # still-open call stayed in the text, and both halves of its condition
+    # were true at once. It needed one closed and one open call to coexist,
+    # which is why it hit 41.7% of two-call responses and every three-call one
+    # while single-call responses were almost untouched.
+    #
+    # _close_open_item closes with take_text()/take_reasoning() - the deltas
+    # already streamed - so a done payload cannot contain anything that was
+    # never streamed as a delta, whatever the accumulated text looks like.
+    # Which item that is depends on what was open: prose before the call
+    # closes a message item, `</think><tool_call>` closes the reasoning item,
+    # and a call with nothing in front of it closes nothing and emits no
+    # events, rather than inventing an empty message item.
+    if calls:
+        yield from _close_open_item(streaming_events_helper)
 
-    # Send done events if needed
-    if should_send_reasoning_done and reasoning_full_content:
-        reasoning_item = ResponseReasoningItem(
-            id=streaming_events_helper.item_id,
-            summary=[],
-            type="reasoning",
-            content=[
-                Content(text=reasoning_full_content, type="reasoning_text")
-            ],
-            status="completed",
-        )
-        yield streaming_events_helper.get_reasoning_text_done_event(
-            reasoning_full_content)
-        yield streaming_events_helper.get_output_item_done_event(reasoning_item)
-        streaming_events_helper.take_reasoning()
-        streaming_events_helper.output_index_increment()
-        streaming_events_helper.is_output_item_added_sent = False
-        streaming_events_helper.is_reasoning_sent = False
+    # Whole calls have to be reassembled from the fragments the parser reports
+    # (name, then arguments piece by piece); see _accumulate_tool_call_fragments.
+    call_fragments = streaming_events_helper.tool_call_fragments(output_idx)
+    _accumulate_tool_call_fragments(call_fragments, calls)
+    _accumulate_tool_call_fragments(call_fragments, flushed_calls)
 
-    if should_send_text_done and text_full_content:
-        text_content = ResponseOutputText(
-            text=text_full_content,
-            annotations=[],
-            type="output_text",
-            logprobs=None,
-        )
-        text_item = ResponseOutputMessage(
-            id=streaming_events_helper.item_id,
-            content=[text_content],
-            role="assistant",
-            status="completed",
-            type="message",
-        )
-        yield streaming_events_helper.get_text_done_event(text_full_content, [])
-        yield streaming_events_helper.get_content_part_done_event(text_content)
-        yield streaming_events_helper.get_output_item_done_event(text_item)
-        streaming_events_helper.take_text()
-        streaming_events_helper.output_index_increment()
-        streaming_events_helper.is_output_item_added_sent = False
-        streaming_events_helper.is_text_sent = False
-
-    # Handle no-closing-tag case: reasoning was streamed but finish() moved
-    # all accumulated reasoning to content. Emit the full text section
-    # lifecycle (added → delta → done) since the reasoning section was just
-    # closed and generation is finished.
-    if (finished_generation and delta_text and should_send_reasoning_done
-            and not should_send_text_done):
+    # Text the parser was still holding when the stream ended, emitted here
+    # rather than folded into the delta block above because it sits *after*
+    # whatever the last chunk contained. The common shape is a call and the
+    # sentence following it arriving in one chunk: the parser returns the call
+    # and keeps the sentence, so folding it in would put that sentence in the
+    # message item the call just closed - one item reading "Before. After."
+    # with the call between them lost from the ordering.
+    if flushed_text:
+        if streaming_events_helper.is_reasoning_sent:
+            yield from _close_open_item(streaming_events_helper)
         streaming_events_helper.is_text_sent = True
         yield from streaming_events_helper.get_message_output_added_events()
-        yield streaming_events_helper.get_text_delta_event(delta_text, [])
-        text_content_obj = ResponseOutputText(
-            text=delta_text,
-            annotations=[],
-            type="output_text",
-            logprobs=None,
-        )
-        text_item = ResponseOutputMessage(
-            id=streaming_events_helper.item_id,
-            content=[text_content_obj],
-            role="assistant",
-            status="completed",
-            type="message",
-        )
-        yield streaming_events_helper.get_text_done_event(delta_text, [])
-        yield streaming_events_helper.get_content_part_done_event(
-            text_content_obj)
-        yield streaming_events_helper.get_output_item_done_event(text_item)
-        streaming_events_helper.output_index_increment()
-        streaming_events_helper.is_output_item_added_sent = False
-        streaming_events_helper.is_text_sent = False
-        delta_text = ""
+        streaming_events_helper.append_text(flushed_text)
+        yield streaming_events_helper.get_text_delta_event(flushed_text, [])
 
     # Close whatever item is still open once generation has finished.
     #
-    # The done-event block above runs *before* the delta block, so the last
-    # chunk of a generation closes the previous item and then opens a new one
-    # for its own delta - leaving that final item with no output_text.done,
-    # content_part.done or output_item.done. Clients then receive an item with
-    # no terminal state: Codex CLI renders it but echoes it back on the next
-    # turn without a `status`, and ResponseOutputMessageParam requires one, so
-    # the following request is rejected outright.
+    # Every other close above is triggered by a transition - reasoning into
+    # text, text into a tool call - and the last item of a response has no
+    # transition after it, so nothing else ever closes it. It would reach the
+    # client with no output_text.done, content_part.done or output_item.done,
+    # i.e. with no terminal state: Codex CLI renders it but echoes it back on
+    # the next turn without a `status`, and ResponseOutputMessageParam
+    # requires one, so the following request is rejected outright.
     #
     # The chat completions path has no equivalent problem because it finalises
     # on `output.finish_reason is not None` rather than on parser state. This
@@ -2561,7 +2799,7 @@ def _generate_streaming_event(
         streaming_events_helper.output_index_increment()
         streaming_events_helper.is_output_item_added_sent = False
 
-    # Emit any tool calls the parser found, as function_call output items.
+    # Emit the tool calls the parser found, as function_call output items.
     #
     # Without this the call is stripped out of the text by the tool parser and
     # then dropped, so the client receives prose - or, when the whole
@@ -2569,27 +2807,38 @@ def _generate_streaming_event(
     # tool should run. Codex CLI shows the model announcing an action and then
     # nothing happening at all.
     #
-    # Emitted after any open text item has been closed, so a call item is
-    # never nested inside a message item. The counter keeps this idempotent:
-    # _should_send_done_events re-parses the accumulated text on every chunk,
-    # so the same calls reappear on each one.
-    if finished_generation and done_tool_calls:
-        pending = done_tool_calls[streaming_events_helper.emitted_tool_calls:]
-        custom_tool_names = _custom_tool_names(request.tools)
-        namespaced_tool_names = _namespaced_tool_names(request.tools)
-        for call in pending:
-            tool_call_item = _tool_call_output_item(call,
-                                                    custom_tool_names,
-                                                    namespaced_tool_names,
-                                                    status="completed")
-            streaming_events_helper.item_id = tool_call_item.id
-            yield streaming_events_helper.get_output_item_added_event(
-                tool_call_item)
-            yield streaming_events_helper.get_output_item_done_event(
-                tool_call_item)
-            streaming_events_helper.output_index_increment()
-        streaming_events_helper.emitted_tool_calls = len(done_tool_calls)
-        streaming_events_helper.is_output_item_added_sent = False
+    # TODO(JunyiXu-nv): stream the call items as the parser produces them.
+    # They are held back until generation finishes for now. Streaming them is
+    # the direction both SGLang and vLLM have gone, but it is an observable
+    # protocol change - a client that assumes every call item arrives together
+    # at the end would see them spread out instead - and landing it here would
+    # mean a reviewer could not tell the leak fix from the protocol change,
+    # nor roll back one without the other. The close above is what the leak
+    # fix needs, and it already happens incrementally.
+    #
+    # Emitted after any open item has been closed, so a call item is never
+    # nested inside a message item. The counter keeps emission idempotent: it
+    # guarded against the old per-chunk re-parse re-reporting the same calls,
+    # and now guards against a finished output being presented twice.
+    if finished_generation:
+        assembled_calls = _assembled_tool_calls(call_fragments,
+                                                unfinished_tool_index)
+        pending = assembled_calls[streaming_events_helper.emitted_tool_calls:]
+        if pending:
+            tool_resolution = _tool_resolution(request.tools)
+            for call in pending:
+                tool_call_item = _tool_call_output_item(call,
+                                                        tool_resolution,
+                                                        status="completed")
+                streaming_events_helper.item_id = tool_call_item.id
+                yield streaming_events_helper.get_output_item_added_event(
+                    tool_call_item)
+                yield streaming_events_helper.get_output_item_done_event(
+                    tool_call_item)
+                streaming_events_helper.record_emitted_tool_call(tool_call_item)
+                streaming_events_helper.output_index_increment()
+            streaming_events_helper.emitted_tool_calls = len(assembled_calls)
+            streaming_events_helper.is_output_item_added_sent = False
 
 
 def _generate_streaming_event_harmony(
@@ -2772,6 +3021,7 @@ class ResponsesStreamingProcessor:
         self,
         final_res: RequestOutput,
         num_prompt_tokens: Optional[int] = None,
+        tokenizer: Optional[TokenizerBase] = None,
     ) -> str:
         final_response = await create_response(
             generator=None,
@@ -2786,6 +3036,15 @@ class ResponsesStreamingProcessor:
             reasoning_parser=self.reasoning_parser,
             tool_parser=self.tool_parser,
             num_prompt_tokens=num_prompt_tokens,
+            # Name the calls the way the stream already named them.
+            streamed_tool_call_ids=self.streaming_events_helper.
+            emitted_tool_call_ids,
+            # Taken as an argument rather than held on this object: the
+            # postproc-worker path pickles the processor across a process
+            # boundary, and that worker already has its own tokenizer
+            # (postproc_worker.py:195). Shipping one per request would be
+            # pure cost.
+            tokenizer=tokenizer,
         )
 
         return self._send_event(
@@ -2799,6 +3058,7 @@ class ResponsesStreamingProcessor:
         self,
         final_res: RequestOutput,
         num_prompt_tokens: Optional[int] = None,
+        tokenizer: Optional[TokenizerBase] = None,
     ) -> str:
         final_response = create_response_non_store(
             generation_result=final_res,
@@ -2810,6 +3070,15 @@ class ResponsesStreamingProcessor:
             reasoning_parser=self.reasoning_parser,
             tool_parser=self.tool_parser,
             num_prompt_tokens=num_prompt_tokens,
+            # Name the calls the way the stream already named them.
+            streamed_tool_call_ids=self.streaming_events_helper.
+            emitted_tool_call_ids,
+            # Taken as an argument rather than held on this object: the
+            # postproc-worker path pickles the processor across a process
+            # boundary, and that worker already has its own tokenizer
+            # (postproc_worker.py:195). Shipping one per request would be
+            # pure cost.
+            tokenizer=tokenizer,
         )
 
         return self._send_event(
@@ -3070,6 +3339,7 @@ async def process_streaming_events(
     create_time: Optional[int] = None,
     reasoning_parser: Optional[str] = None,
     tool_parser: Optional[str] = None,
+    tokenizer: Optional[TokenizerBase] = None,
 ) -> AsyncGenerator[str, None]:
     streaming_processor = ResponsesStreamingProcessor(
         request=request,
@@ -3093,7 +3363,8 @@ async def process_streaming_events(
         for event in events:
             yield event
 
-    final_response = await streaming_processor.get_final_response(final_res)
+    final_response = await streaming_processor.get_final_response(
+        final_res, tokenizer=tokenizer)
 
     yield final_response
 

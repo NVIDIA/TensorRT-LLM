@@ -131,3 +131,97 @@ def test_usage_validates_inside_a_streamed_completion_event():
     )
     assert event.response.usage.input_tokens == 7
     assert event.response.usage.input_tokens_details.cached_tokens == 6
+
+
+# ---------------------------------------------------------------------------
+# reasoning_tokens
+#
+# Reported as a hardcoded zero until now. The count is rebuilt from the text
+# the reasoning parser itself claimed, rather than by searching the generated
+# token ids for `</think>`, and these tests are the reason: GLM breaks a
+# marker search three separate ways under agent workloads, and each of them
+# was observed live before it was tested here.
+# ---------------------------------------------------------------------------
+
+
+class _WordTokenizer:
+    """One token per whitespace-separated word. Enough to count with."""
+
+    def encode(self, text, add_special_tokens=False):
+        return text.split()
+
+
+def _reasoning_tokens(text, parser="glm", tokenizer=_WordTokenizer(), tools=None):
+    """Run the real parser, then count what it called reasoning."""
+    from tensorrt_llm.serve.responses_utils import _count_reasoning_tokens, _create_output_content
+
+    _items, _messages, reasoning_texts = _create_output_content(
+        SimpleNamespace(outputs=[SimpleNamespace(index=0, text=text)]),
+        reasoning_parser=parser,
+        tool_parser=None,
+        tools=tools,
+    )
+    return _count_reasoning_tokens(tokenizer, reasoning_texts, 10_000)
+
+
+def test_reasoning_tokens_counts_up_to_the_closing_tag():
+    # The ordinary shape: reasoning, close, answer.
+    assert _reasoning_tokens("one two three</think>four five") == 3
+
+
+def test_reasoning_tokens_stop_at_the_first_close_not_the_last():
+    # GLM closes the block more than once (reasoning_parser.py:370-388). The
+    # parser splits at the first close and drops the stray one; a search for
+    # `</think>` in token space that took the last match -- which is what
+    # ThinkingBudgetLogitsProcessor does, for its own good reasons -- would
+    # count the middle stretch as reasoning too.
+    text = "one two</think>three four five</think><tool_call>x</tool_call>"
+    assert _reasoning_tokens(text) == 2
+
+
+def test_reasoning_tokens_end_at_an_implicit_tool_call():
+    # Observed live: 26,055 characters over 169 frames with no closing tag at
+    # all and one well-formed <tool_call>. Counting to the missing `</think>`
+    # would have called the entire turn reasoning.
+    text = "planning the call<tool_call>{}</tool_call>"
+    assert _reasoning_tokens(text) == 3
+
+
+def test_reasoning_tokens_covers_a_turn_that_never_leaves_the_block():
+    # `<think>` is prefilled by the template, so output starts inside the
+    # block; with no terminator the whole turn really is reasoning.
+    assert _reasoning_tokens("still thinking about it") == 4
+
+
+def test_reasoning_tokens_are_zero_without_a_reasoning_parser():
+    assert _reasoning_tokens("one two three", parser=None) == 0
+
+
+def test_reasoning_tokens_are_zero_without_a_tokenizer():
+    assert _reasoning_tokens("one two three", tokenizer=None) == 0
+
+
+def test_reasoning_tokens_never_exceed_generated_tokens():
+    # Re-encoding a detokenized substring need not reproduce the tokenization
+    # it came from, and usage claiming more reasoning than output is visibly
+    # wrong to a client budgeting a context window.
+    from tensorrt_llm.serve.responses_utils import _count_reasoning_tokens
+
+    assert _count_reasoning_tokens(_WordTokenizer(), ["a b c d e"], 3) == 3
+
+
+def test_usage_reports_the_reasoning_tokens_it_counts():
+    usage = _create_usage(
+        _generation(prompt_tokens=7, completion_tokens=9),
+        tokenizer=_WordTokenizer(),
+        reasoning_texts=["one two three four"],
+    )
+    assert usage.output_tokens_details.reasoning_tokens == 4
+    # Reasoning tokens are part of the generated total, not additional to it.
+    assert usage.output_tokens == 9
+    assert usage.total_tokens == 16
+
+
+def test_usage_still_defaults_to_zero_reasoning_tokens():
+    usage = _create_usage(_generation())
+    assert usage.output_tokens_details.reasoning_tokens == 0

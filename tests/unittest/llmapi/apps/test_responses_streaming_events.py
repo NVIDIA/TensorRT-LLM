@@ -23,6 +23,7 @@ an id it has not seen opened.
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -549,7 +550,7 @@ def _snapshot_kinds(text, tools=None):
     """
     from tensorrt_llm.serve.responses_utils import _create_output_content
 
-    items, _messages = _create_output_content(
+    items, _messages, _reasoning_texts = _create_output_content(
         _FakeRequestOutput(text),
         reasoning_parser="qwen3",
         tool_parser="qwen3" if tools else None,
@@ -640,9 +641,140 @@ def test_snapshot_order_matches_the_streamed_order():
             if getattr(event, "type", "") == "response.output_item.done":
                 streamed.append(event.item.type)
 
-    snapshot_items, _messages = _create_output_content(
+    snapshot_items, _messages, _reasoning_texts = _create_output_content(
         _FakeRequestOutput(accumulated), reasoning_parser="glm"
     )
 
     assert streamed == ["reasoning", "message"]
     assert [item.type for item in snapshot_items] == streamed
+
+
+def _finished_generation(text):
+    """A result complete enough to assemble a whole final response from.
+
+    `_create_output_content` reads only index and text, which is all
+    `_FakeRequestOutput` carries; building the response around it also reads
+    `finish_reason`, and usage reads `token_ids` and `prompt_token_ids`.
+    """
+    output = SimpleNamespace(
+        index=0,
+        text=text,
+        text_diff=text,
+        finish_reason="stop",
+        token_ids=[1, 2, 3],
+        disaggregated_params=None,
+    )
+    return SimpleNamespace(outputs=[output], prompt_token_ids=[1, 2], cached_tokens=0)
+
+
+def test_final_response_is_assembled_without_touching_a_missing_attribute():
+    """Regression: the final streaming event raised AttributeError.
+
+    `get_final_response_non_store` reached for `self.emitted_tool_call_ids`
+    on the processor. That list lives on the events helper's state tracker,
+    not on the processor, so every streaming Responses request died building
+    its last event. The client never saw a server error -- the chunked body
+    simply stopped, surfacing as `TransferEncodingError: Not enough data to
+    satisfy transfer length header` one hop upstream, which reads like a
+    network fault. Measured on a live instance: 286 of 287 requests.
+
+    `py_compile` passes on that bug, and so does an md5 comparison against the
+    file it came from. Only executing the call catches it, which is what this
+    test does: it asks for the final event and requires a real one back.
+    """
+    processor = _processor()
+    frame = processor.get_final_response_non_store(_finished_generation("hello"))
+
+    assert "response.completed" in frame
+    payload = _event_data(frame)
+    assert payload["type"] == "response.completed"
+    assert payload["response"]["status"] == "completed"
+
+
+def test_final_response_reuses_the_call_ids_the_stream_published():
+    """The ids a client matches its tool outputs against must not be reminted.
+
+    `response.completed` rebuilds `output` from the generation, and
+    `_tool_call_output_item` mints a fresh random id every time it runs, so
+    the snapshot used to disagree with the stream on every call -- 1224 of
+    1224 measured before the fix. A client keying tool results off the
+    streamed `call_id` then matches nothing in the final response.
+    """
+    processor = _processor()
+    helper = processor.streaming_events_helper
+    helper.record_emitted_tool_call(SimpleNamespace(id="fc_fixed", call_id="call_fixed"))
+
+    assert helper.emitted_tool_call_ids == [("fc_fixed", "call_fixed")]
+    # And the processor reaches it by the path the final response uses.
+    assert processor.streaming_events_helper.emitted_tool_call_ids == [("fc_fixed", "call_fixed")]
+
+
+def _processor_with_tools():
+    """A processor that can actually produce a tool call.
+
+    `_processor()` declares no tools and sets no parsers, so nothing it builds
+    ever contains one -- which is the case the next test needs.
+    """
+    request = ResponsesRequest(model="test-model", input="hi", stream=True, tools=_tools())
+    return ResponsesStreamingProcessor(
+        request=request,
+        sampling_params=request.to_sampling_params(),
+        model_name="test-model",
+        use_harmony=False,
+        reasoning_parser="glm",
+        tool_parser="qwen3",
+    )
+
+
+def test_final_response_reuses_a_streamed_call_id_end_to_end():
+    """The invariant the fix exists for, driven through the real final event.
+
+    This is the test that distinguishes the fix from the obvious-looking wrong
+    one. `AttributeError: no attribute 'emitted_tool_call_ids'` invites adding
+    the attribute to the processor -- the name would resolve and the crash
+    would stop. But `record_emitted_tool_call` appends to the state tracker's
+    list, so a new list on the processor stays empty forever, the final
+    response mints fresh ids, and the call_id mismatch is silently back.
+
+    The crash tests pass in that world. This one does not.
+    """
+    processor = _processor_with_tools()
+    processor.streaming_events_helper.record_emitted_tool_call(
+        SimpleNamespace(id="fc_streamed", call_id="call_streamed")
+    )
+
+    frame = processor.get_final_response_non_store(
+        _finished_generation(f"<think>{_THINK}</think>{_TOOL_CALL}")
+    )
+    calls = [
+        i
+        for i in _event_data(frame)["response"]["output"]
+        if i["type"] in ("function_call", "custom_tool_call")
+    ]
+
+    assert calls, "the final response should carry the tool call"
+    assert calls[0]["call_id"] == "call_streamed"
+    assert calls[0]["id"] == "fc_streamed"
+
+
+def test_nothing_streamed_means_fresh_ids_rather_than_a_crash():
+    """The other half: an empty list is a legal state, not an error.
+
+    A non-streaming request, or a stream cut off before any tool call, has
+    nothing to reuse. That must produce usable fresh ids -- keeping this
+    separate is what makes the test above read as "ids were not reused"
+    instead of "ids were missing".
+    """
+    processor = _processor_with_tools()
+    frame = processor.get_final_response_non_store(
+        _finished_generation(f"<think>{_THINK}</think>{_TOOL_CALL}")
+    )
+    calls = [
+        i
+        for i in _event_data(frame)["response"]["output"]
+        if i["type"] in ("function_call", "custom_tool_call")
+    ]
+
+    assert calls
+    assert calls[0]["call_id"].startswith("call_")
+    assert calls[0]["call_id"] != "call_streamed"

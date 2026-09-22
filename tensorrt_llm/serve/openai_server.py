@@ -3141,6 +3141,10 @@ class OpenAIServer(_VideoRoutesMixin):
                     reasoning_parser=args.reasoning_parser,
                     tool_parser=args.tool_parser,
                     num_prompt_tokens=args.num_prompt_tokens,
+                    # This path does no postprocessing in a worker, so nothing
+                    # has populated args.tokenizer. Used only to count
+                    # reasoning tokens for usage.
+                    tokenizer=self.tokenizer,
                 )
 
             await self._extract_metrics(promise, raw_request)
