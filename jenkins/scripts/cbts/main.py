@@ -340,11 +340,13 @@ def _load_pr_inputs(input_json_path: Path) -> PRInputs:
     # walk-up and stage-select misfires from cosmetic edits.
     # A null diff (PR API omits the patch for binary, rename, or
     # too-large diffs) normalizes to an empty diff.
-    diffs = {path: strip_noop_diff_lines(d or "") for path, d in data.get("diffs", {}).items()}
+    raw_diffs = {path: d or "" for path, d in data.get("diffs", {}).items()}
+    diffs = {path: strip_noop_diff_lines(diff) for path, diff in raw_diffs.items()}
     return PRInputs(
         changed_files=list(data.get("changed_files", [])),
         diffs=diffs,
         post_merge=bool(data.get("post_merge", False)),
+        raw_diffs=raw_diffs,
     )
 
 

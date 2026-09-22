@@ -189,7 +189,7 @@ def apply_coverage_tier(
         return None, "coverage tier skipped: no residual (all files handled by rules)"
 
     selector = CoverageSelector(db, repo_root, no_data_policy=no_data_policy)
-    cov = selector.decide(residual, pr.diffs)
+    cov = selector.decide(residual, pr.raw_diffs or pr.diffs)
     if not cov.ok:
         return None, f"coverage tier declined: {cov.reason}"
 

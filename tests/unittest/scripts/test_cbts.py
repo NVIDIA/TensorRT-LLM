@@ -48,7 +48,11 @@ from blocks import Stage, YAMLIndex  # noqa: E402
 from compact_db import write_leaf_database  # noqa: E402
 from python_change_analysis import ImportTarget, analyze_python_changes  # noqa: E402
 from repository_reference import RepositoryReferenceIndex  # noqa: E402
-from rules._helpers import iter_diff_deleted_post_lines, iter_diff_post_line_numbers  # noqa: E402
+from rules._helpers import (  # noqa: E402
+    iter_diff_deleted_post_lines,
+    iter_diff_post_line_numbers,
+    reconstruct_diff_pre_image,
+)
 from rules.base import PRInputs  # noqa: E402
 from rules.tests_def_rule import (  # noqa: E402
     ACCURACY_DIR,
@@ -369,6 +373,7 @@ def _analyze(source: str, diff: str):
         source,
         iter_diff_post_line_numbers(diff),
         iter_diff_deleted_post_lines(diff),
+        pre_source=reconstruct_diff_pre_image(source, diff),
     )
 
 
@@ -437,6 +442,155 @@ def test_same_module_import_from_replacement_resolves_consumers_and_targets() ->
     assert analysis.binding_consumers == {"consumer"}
     assert analysis.old_import_targets == {ImportTarget("helpers", 1, "old_helper")}
     assert analysis.new_import_targets == {ImportTarget("helpers", 1, "new_helper")}
+    assert analysis.new_import_bindings == {"new_helper"}
+
+
+def test_multiline_import_from_addition_resolves_consumer_and_new_target() -> None:
+    source = (
+        "from .helpers import (new_helper,\n"
+        "                      stable)\n\n"
+        "def consumer():\n"
+        "    return new_helper()\n"
+    )
+    diff = (
+        "@@ -1,4 +1,5 @@\n"
+        "-from .helpers import (stable)\n"
+        "+from .helpers import (new_helper,\n"
+        "+                      stable)\n"
+        " \n"
+        " def consumer():\n"
+        "     return new_helper()\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"new_helper"}
+    assert analysis.binding_consumers == {"consumer"}
+    assert not analysis.old_import_targets
+    assert analysis.new_import_targets == {ImportTarget("helpers", 1, "new_helper")}
+    assert analysis.new_import_bindings == {"new_helper"}
+
+
+def test_import_addition_is_not_new_when_pre_image_already_bound_the_name() -> None:
+    source = "new_helper = None\nfrom .helpers import new_helper, stable\n"
+    diff = (
+        "@@ -1,2 +1,2 @@\n"
+        " new_helper = None\n"
+        "-from .helpers import stable\n"
+        "+from .helpers import new_helper, stable\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"new_helper"}
+    assert not analysis.new_import_bindings
+
+
+def test_optional_parameter_addition_resolves_function_and_method() -> None:
+    source = (
+        "from typing import Optional\n\n"
+        "def helper(value: int, option: Optional[int] = None):\n"
+        "    return value\n\n"
+        "class Example:\n"
+        "    def method(self, value: int, option: Optional[int] = None):\n"
+        "        return value\n"
+    )
+    diff = (
+        "@@ -1,8 +1,8 @@\n"
+        " from typing import Optional\n"
+        " \n"
+        "-def helper(value: int):\n"
+        "+def helper(value: int, option: Optional[int] = None):\n"
+        "     return value\n"
+        " \n"
+        " class Example:\n"
+        "-    def method(self, value: int):\n"
+        "+    def method(self, value: int, option: Optional[int] = None):\n"
+        "         return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"helper", "Example.method"}
+
+
+def test_keyword_only_optional_parameter_addition_resolves_method() -> None:
+    source = (
+        "from typing import Optional\n\n"
+        "class Example:\n"
+        "    def method(self, value: int, *, option: Optional[int] = None, **kwargs):\n"
+        "        return value\n"
+    )
+    diff = (
+        "@@ -1,5 +1,5 @@\n"
+        " from typing import Optional\n"
+        " \n"
+        " class Example:\n"
+        "-    def method(self, value: int, **kwargs):\n"
+        "+    def method(self, value: int, *, option: Optional[int] = None, **kwargs):\n"
+        "         return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"Example.method"}
+
+
+def test_required_keyword_only_parameter_addition_remains_fail_closed() -> None:
+    source = (
+        "class Example:\n"
+        "    def method(self, value: int, *, option: int, **kwargs):\n"
+        "        return value\n"
+    )
+    diff = (
+        "@@ -1,3 +1,3 @@\n"
+        " class Example:\n"
+        "-    def method(self, value: int, **kwargs):\n"
+        "+    def method(self, value: int, *, option: int, **kwargs):\n"
+        "         return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+@pytest.mark.parametrize(
+    "new_parameter",
+    (
+        "required: int",
+        "option: Optional[int] = factory()",
+        "option: CustomType = None",
+    ),
+)
+def test_unsafe_parameter_addition_remains_fail_closed(new_parameter: str) -> None:
+    source = (
+        "from typing import Optional\n\n"
+        f"def helper(value: int, {new_parameter}):\n"
+        "    return value\n"
+    )
+    diff = (
+        "@@ -1,4 +1,4 @@\n"
+        " from typing import Optional\n"
+        " \n"
+        "-def helper(value: int):\n"
+        f"+def helper(value: int, {new_parameter}):\n"
+        "     return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+def test_reconstruct_diff_pre_image_rejects_mismatched_post_source() -> None:
+    diff = "@@ -1 +1 @@\n-old\n+new\n"
+
+    assert reconstruct_diff_pre_image("different\n", diff) is None
 
 
 def test_import_from_replacement_from_different_module_remains_fail_closed() -> None:
@@ -708,10 +862,16 @@ def test_selector_ignores_old_binding_rows_and_uses_new_function_and_consumer_ro
     tmp_path: Path,
 ) -> None:
     path, diff = _write_import_replacement_files(tmp_path)
+    checked_bindings: list[set[str]] = []
+
+    def external_references(_path: str, names: set[str]) -> set[str]:
+        checked_bindings.append(names)
+        return names & {"new_helper"}
+
     selector = CoverageSelector(
         _ImportReplacementDB(),
         tmp_path,
-        external_references=lambda _path, _names: set(),
+        external_references=external_references,
     )
 
     result = selector.decide([path], {path: diff})
@@ -719,6 +879,22 @@ def test_selector_ignores_old_binding_rows_and_uses_new_function_and_consumer_ro
     assert result.ok
     assert result.impacted == {"A10-PyTorch": {"test_new", "test_consumer"}}
     assert result.skippable == {"A10-PyTorch": {"test_old", "test_unrelated"}}
+    assert checked_bindings == [{"old_helper"}]
+
+
+def test_selector_keeps_external_check_for_rebound_import_binding(tmp_path: Path) -> None:
+    path, diff = _write_import_replacement_files(tmp_path)
+    selector = CoverageSelector(
+        _ImportReplacementDB(),
+        tmp_path,
+        external_references=lambda _path, names: names & {"old_helper"},
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert not result.ok
+    assert "external binding reference(s)" in result.reason
+    assert "old_helper" in result.reason
 
 
 def test_selector_declines_missing_old_static_binding(tmp_path: Path) -> None:
