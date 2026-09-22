@@ -106,6 +106,52 @@ def test_lookup_reports_present_for_a_built_configuration(kv_cache_dtype, output
     )
 
 
+def test_lookup_reports_present_for_nvfp4_kv_cache():
+    """An NVFP4 KV cache is read by an FP8 Q kernel, not a matched-precision one.
+
+    ``AttentionOp`` requires ``mFP8ContextFMHA`` for an FP4 KV cache and then
+    selects an E4M3 Q / E2M1 KV context kernel. The SM100-family kernel table
+    carries that combination at head size 64 with FP8 output, so the lookup
+    must answer "yes" for it rather than treat NVFP4 as an unknown precision.
+    """
+    if not _is_sm100_family():
+        pytest.skip("E2M1-KV context kernels exist only in the SM100-family kernel set")
+    assert thop.fused_context_fmha_kernel_exists(
+        head_size=_SUPPORTED_HEAD_SIZE,
+        kv_cache_dtype=DataType.NVFP4,
+        tokens_per_block=_TOKENS_PER_BLOCK,
+        output_dtype=DataType.FP8,
+    )
+
+
+def test_lookup_reports_absent_for_nvfp4_kv_cache_at_fmha_v2_head_size():
+    """Head size 72 is routed to FMHA-v2 even on the SM100 family, and that
+    runner asserts matched Q/KV precision. The lookup must answer "no" for
+    NVFP4 KV there without raising, mirroring the dispatcher's routing rule."""
+    if not _is_sm100_family():
+        pytest.skip("the head-size-72 routing exception is specific to the SM100-family dispatcher")
+    assert not thop.fused_context_fmha_kernel_exists(
+        head_size=72,
+        kv_cache_dtype=DataType.NVFP4,
+        tokens_per_block=_TOKENS_PER_BLOCK,
+        output_dtype=DataType.FP8,
+    )
+
+
+def test_lookup_reports_absent_for_nvfp4_kv_cache_outside_sm100_family():
+    """Off the SM100 family the lookup must answer "no" for NVFP4 KV without
+    raising: the FMHA-v2 dispatcher asserts that Q and KV precision match, and
+    the probe has to refuse before constructing it."""
+    if _is_sm100_family():
+        pytest.skip("the SM100-family kernel set does carry E2M1-KV context kernels")
+    assert not thop.fused_context_fmha_kernel_exists(
+        head_size=_SUPPORTED_HEAD_SIZE,
+        kv_cache_dtype=DataType.NVFP4,
+        tokens_per_block=_TOKENS_PER_BLOCK,
+        output_dtype=DataType.FP8,
+    )
+
+
 def test_lookup_reports_absent_for_an_unbuilt_head_size():
     """The lookup must be able to answer "no".
 

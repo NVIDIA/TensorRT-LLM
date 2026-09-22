@@ -20,6 +20,7 @@
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 #include <tensorrt_llm/common/attentionOp.h>
+#include <tensorrt_llm/common/cudaUtils.h>
 #include <tensorrt_llm/common/tllmDataType.h>
 #include <tensorrt_llm/kernels/fmhaDispatcher.h>
 #include <tensorrt_llm/kernels/helixAllToAll.h>
@@ -134,16 +135,33 @@ bool fusedContextFmhaKernelExists(
         return false;
     }
 
-    // Probe ordinary dense, causal paged context with matching Q/KV precision.
-    // thop enables FP8 context computation for FP8 paged KV. Output precision
-    // is independent and must be supplied explicitly by the caller.
+    // Probe ordinary dense, causal paged context with Q at the KV precision,
+    // except for an NVFP4 KV cache, which is read by an FP8 Q kernel. thop
+    // enables FP8 context computation for FP8 paged KV and attentionOp requires
+    // it for FP4 KV. Output precision is independent and must be supplied
+    // explicitly by the caller.
     Data_type dataType{};
+    Data_type dataTypeKv{};
     Data_type dataTypeOut{};
     switch (kvCacheDtype)
     {
-    case tensorrt_llm::DataType::kFP8: dataType = Data_type::DATA_TYPE_E4M3; break;
-    case tensorrt_llm::DataType::kBF16: dataType = Data_type::DATA_TYPE_BF16; break;
-    case tensorrt_llm::DataType::kHALF: dataType = Data_type::DATA_TYPE_FP16; break;
+    case tensorrt_llm::DataType::kFP8: dataType = dataTypeKv = Data_type::DATA_TYPE_E4M3; break;
+    case tensorrt_llm::DataType::kBF16: dataType = dataTypeKv = Data_type::DATA_TYPE_BF16; break;
+    case tensorrt_llm::DataType::kHALF: dataType = dataTypeKv = Data_type::DATA_TYPE_FP16; break;
+    case tensorrt_llm::DataType::kFP4:
+        // Only the trtllm-gen kernel set has E2M1-KV context kernels. The
+        // FMHA-v2 runner used everywhere else asserts that Q and KV precision
+        // match, so answer "no" wherever FmhaDispatcher would pick FMHA-v2
+        // instead of tripping that assertion inside a diagnostic query. This
+        // mirrors the dispatcher's trtllm-gen selection: SM100 family, and
+        // head size 72 excluded (trtllm-gen has no kernel for it).
+        if (!tensorrt_llm::common::isSM100Family() || headSize == 72)
+        {
+            return false;
+        }
+        dataType = Data_type::DATA_TYPE_E4M3;
+        dataTypeKv = Data_type::DATA_TYPE_E2M1;
+        break;
     default: return false;
     }
 
@@ -158,7 +176,7 @@ bool fusedContextFmhaKernelExists(
 
     tensorrt_llm::kernels::MHARunnerFixedParams params{};
     params.dataType = dataType;
-    params.dataTypeKv = dataType;
+    params.dataTypeKv = dataTypeKv;
     params.dataTypeOut = dataTypeOut;
     params.forceFp32Acc = false;
     params.attentionMaskType = tensorrt_llm::kernels::ContextAttentionMaskType::CAUSAL;
@@ -264,7 +282,8 @@ void initBindings(nb::module_& m)
     m.def("fused_context_fmha_kernel_exists", &fusedContextFmhaKernelExists, nb::arg("head_size"),
         nb::arg("kv_cache_dtype"), nb::arg("tokens_per_block"), nb::arg("output_dtype"),
         "Whether this build has a fused paged-context FMHA kernel for (this device's SM, head_size, KV cache dtype, "
-        "tokens per block, output dtype), with matching Q/KV precision, causal masking, and equal Q/KV heads. "
+        "tokens per block, output dtype), with Q at the KV precision (FP8 Q for an NVFP4 KV cache, which only the "
+        "SM100-family kernel set carries), causal masking, and equal Q/KV heads. "
         "This is a diagnostic for a fixed probe configuration and does not describe what a given model will run; "
         "AttentionOp checks its own exact initialized configuration before allowing paged-context attention. "
         "A build whose --cuda_architectures omits this device's SM carries no kernels for it and reports false.",
