@@ -478,11 +478,10 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             recv_expert_count=recv_expert_count,
             deep_ep_expert_capacity=deep_ep_expert_capacity,
             use_count_native_expert_metadata=self.use_direct_expert_metadata)
-        return self.forward_impl(
-            *forward_inputs,
-            enable_alltoall=self.enable_alltoall,
-            tile_size=tile_size,
-            **count_native_kwargs)
+        return self.forward_impl(*forward_inputs,
+                                 enable_alltoall=self.enable_alltoall,
+                                 tile_size=tile_size,
+                                 **count_native_kwargs)
 
     @AutoTuner.TacticsCapture.register_runner_tactic_comb_checker
     @staticmethod
