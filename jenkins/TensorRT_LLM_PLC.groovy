@@ -462,7 +462,19 @@ def pulseMalwareScanContainer(llmRepo, ref) {
                     )
                 })
                 sh "ls ${outputDir}"
-                sh "cat ${outputDir}/malware_report_1.json"
+                def reportFiles = findFiles(glob: "${outputDir}/malware_report_*.json")
+                if (reportFiles.length == 0) {
+                    throw new Exception("No malware_report_*.json files found in ${outputDir} for ${entry.image}")
+                }
+                reportFiles.each { reportFile ->
+                    def report = new JsonSlurper().parseText(readFile(reportFile.path))
+                    def success = report.success
+                    def status = report.data?.status
+                    echo "Malware scan result for ${entry.image} (${reportFile.name}): success=${success}, status=${status}"
+                    if (!(success == true && status == "CLEAN")) {
+                        throw new Exception("Malware scan failed for ${entry.image} (${reportFile.name}): success=${success}, status=${status}")
+                    }
+                }
             }
         }
     }
