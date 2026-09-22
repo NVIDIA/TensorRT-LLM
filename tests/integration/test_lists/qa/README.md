@@ -47,7 +47,8 @@ pip3 install -r ${TensorRT-LLM_PATH}/requirements-dev.txt
 This directory contains various test configuration files:
 
 ### Functional Test Lists
-- `llm_function_core.txt` - Primary test list for single node multi-GPU scenarios (all new test cases should be added here)
+- `llm_function_core.txt` - Primary LLM test list for single node multi-GPU scenarios
+- `visual_gen_function.txt` - VisualGen single-node functional tests, including Wan 2.2 pipeline correctness, batch generation, combined optimizations, examples, and serving
 - `llm_function_multinode.txt` - Multi-node functional test cases
 - `llm_function_rtx6k.txt` - RTX 6000 series specific tests
 - `llm_function_l20.txt` - L20 specific tests, only contains single gpu cases
@@ -75,7 +76,7 @@ QA tests are executed on a regular schedule:
 - **Weekly**: Automated regression testing
 - **Release**: Comprehensive validation before each release
    - **Full Cycle Testing**:
-        run all gpu with llm_function_core.txt and run config database tests with llm_config_database.yml
+        run LLM tests with llm_function_core.txt, VisualGen tests with visual_gen_function.txt on supported GPUs, and config database tests with llm_config_database.yml
 - **On-demand**: Manual execution for specific validation needs
 
 ## Running Tests
@@ -104,6 +105,6 @@ QA tests are typically executed through CI/CD pipelines with appropriate test se
 ## Test Guidelines
 
 ### Adding New Test Cases
-- **Primary Location**: For functional testing, new test cases should be added to `llm_function_full.txt` first
+- **Primary Location**: Add new single-node LLM functional tests to `llm_function_core.txt` and VisualGen functional tests to `visual_gen_function.txt`
 - **Categorization**: Test cases should be categorized based on their scope and execution time
 - **Validation**: Ensure test cases are properly validated before adding to any test list

@@ -1,0 +1,37 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ------------- VisualGen Wan 2.2 E2E (SM >= 100) ---------------
+
+# BF16/VANILLA pipeline correctness and batch generation for all three variants.
+unittest/_torch/visual_gen/test_wan22_t2v_pipeline.py::TestWan22_A14B_PipelineCorrectness
+unittest/_torch/visual_gen/test_wan22_t2v_pipeline.py::TestWan22T2VBatchGeneration
+unittest/_torch/visual_gen/test_wan22_i2v_pipeline.py::TestWan22_I2V_A14B_PipelineCorrectness
+unittest/_torch/visual_gen/test_wan22_i2v_pipeline.py::TestWan22I2VBatchGeneration
+unittest/_torch/visual_gen/test_wan22_ti2v_5b_pipeline.py::TestWan22TI2V5B_T2V_PipelineCorrectness
+unittest/_torch/visual_gen/test_wan22_ti2v_5b_pipeline.py::TestWan22TI2V5B_I2V_PipelineCorrectness
+unittest/_torch/visual_gen/test_wan22_ti2v_5b_pipeline.py::TestWan22TI2V5BBatchGeneration
+
+# FP8 + TRTLLM attention combination smoke tests with CacheDiT.
+unittest/_torch/visual_gen/test_wan22_t2v_pipeline.py::TestWan22T2VCombinedOptimizations
+unittest/_torch/visual_gen/test_wan22_i2v_pipeline.py::TestWan22I2VCombinedOptimizations
+unittest/_torch/visual_gen/test_wan22_ti2v_5b_pipeline.py::TestWan22TI2V5BCombinedOptimizations
+
+# NVFP4 examples for T2V-A14B and I2V-A14B.
+examples/visual_gen/test_visual_gen_wan.py::test_wan_t2v_example
+examples/visual_gen/test_visual_gen_wan.py::test_wan_i2v_example
+
+# Wan 2.2 I2V serving: synchronous and asynchronous video-generation requests.
+unittest/_torch/visual_gen/test_trtllm_serve_e2e.py::TestWanImageToVideo::test_ti2v_sync
+unittest/_torch/visual_gen/test_trtllm_serve_e2e.py::TestWanImageToVideo::test_ti2v_async_lifecycle
