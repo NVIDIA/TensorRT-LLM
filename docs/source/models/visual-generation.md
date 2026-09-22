@@ -56,15 +56,15 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 ### Feature Matrix
 
-| Model | FP8 blockwise | NVFP4 | TeaCache | Cache-DiT | CPU Offloading | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism | VSA |
+| Model | FP8 blockwise | NVFP4 | TeaCache | Cache-DiT | CPU Offloading | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism | SOL-Attn |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | **FLUX.1** | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
 | **FLUX.2** | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
-| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **Wan 2.1 VSA** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | Yes |
-| **Wan 2.2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **Wan 2.2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **FastWan 2.2** | Yes | Yes | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
-| **LTX-2** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | No |
+| **LTX-2** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | Yes |
 | **MiniMax-H3** | Yes | Yes | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
 | **Qwen-Image-Layered** | No | No | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
@@ -72,6 +72,8 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
 | **HunyuanVideo 1.5** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No |
 | **GlmImage** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No |
+
+SOL-Attn is a runtime sparse-attention feature of the `TRTLLM` and `CUTEDSL` backends (bfloat16 self-attention with `head_dim=128` on SM100/SM103); it needs no dedicated checkpoint. Video Sparse Attention (VSA) requires a VSA-fine-tuned checkpoint and is therefore listed as its own model, `Wan 2.1 VSA`. See [VisualGen Sparse Attention](../features/visualgen-sparse-attention.md) for both.
 
 ## Quick Start
 
@@ -358,45 +360,15 @@ args = VisualGenArgs(
 
 **Wan 2.2 dual-transformer note:** Wan 2.2 uses two expert transformers (high-noise and low-noise stacks). All `CacheDiTConfig` parameters apply to both stacks, except `max_warmup_steps` and `max_cached_steps`: the low-noise stack always uses fixed internal caps (`max_warmup_steps=2`, `max_cached_steps=20`) regardless of user config.
 
-### Video Sparse Attention (VSA)
+### Sparse Attention
 
-VSA reduces the compute cost of self-attention in video diffusion models by selectively attending to only the most relevant spatial-temporal blocks. It uses a two-branch design: a lightweight coarse mean-pool branch computes block-level attention scores to identify the top-K most relevant token blocks, then a fine branch runs the selected backend's block-sparse kernel over only those blocks. The two outputs are blended with learned gates.
+Attention dominates a denoising step at high resolution or long video length. VisualGen ships three sparse attention algorithms, all configured through `attention_config.sparse_attention_config` and all served by the `TRTLLM` and `CUTEDSL` attention backends:
 
-VisualGen owns VSA route prediction and coarse/fine post-processing. With the `TRTLLM` backend, it nests the predicted routes in `SparseRuntimeParams.block_sparse_inputs` and passes those precomputed runtime parameters through the normal core attention forward. The core `PrimsTSBlockSparseFmha` owns the general block-sparse execution contract; it does not own VSA-specific prediction or blending.
+- **Skip Softmax Attention** (`algorithm: skip_softmax`) skips negligible softmax blocks inside the FlashAttention-style kernel. It is plug-and-play for existing checkpoints; a ModelOpt-calibrated checkpoint can additionally map a `target_sparsity` to the kernel threshold.
+- **SOL Attention** (`algorithm: sol_attn`) routes attention blocks at runtime: blocks whose scores stand out are computed exactly and the rest are folded in from compact K/V proxies. It needs no dedicated checkpoint and applies to bfloat16 self-attention with `head_dim=128` on SM100/SM103 GPUs.
+- **Video Sparse Attention (VSA)** (`algorithm: vsa`) combines a coarse mean-pooled branch with a top-K block-sparse fine branch and requires a VSA-fine-tuned checkpoint such as [`FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers`](https://huggingface.co/FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers).
 
-**Requirements:**
-- VSA-fine-tuned checkpoint: [`FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers`](https://huggingface.co/FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers). Standard Wan checkpoints do not have the learned VSA gates.
-- `CUTEDSL` or `TRTLLM` attention backend. `CUTEDSL` uses the CuTe DSL fine-stage kernel; `TRTLLM` lowers the selected blocks through the generic PrimTS block-sparse FMHA contract.
-- A supported CUDA device and tensor shape for the selected block-sparse kernel. When that kernel is unavailable or the input is outside its supported envelope, the fine branch uses the selected backend's compact dense path (`SDPA` for `CUTEDSL`, TRTLLM attention for `TRTLLM`).
-- VSA cannot be combined with `quant_attention_config`.
-- Not compatible with Ring attention or Attention2D (VSA does not produce per-split LSE). Ulysses is supported.
-
-**`vsa_sparsity`** controls the fraction of K/V blocks skipped in the fine branch (0.0 = dense, 0.9 = 90% blocks skipped). Higher sparsity gives more speedup at the cost of some quality.
-
-Python API:
-
-```python
-from tensorrt_llm import VisualGenArgs
-from tensorrt_llm.visual_gen.args import AttentionConfig, VideoSparseAttentionConfig
-
-args = VisualGenArgs(
-    model="FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers",
-    attention_config=AttentionConfig(
-        backend="TRTLLM",  # Use "CUTEDSL" for the CuTe DSL fine-stage kernel.
-        sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9),
-    ),
-)
-```
-
-YAML (for use with `--visual_gen_args` or `trtllm-serve`):
-
-```yaml
-attention_config:
-  backend: TRTLLM  # CUTEDSL is also supported.
-  sparse_attention_config:
-    algorithm: vsa
-    vsa_sparsity: 0.90
-```
+Skip Softmax and SOL share the `disabled_until_timestep` schedule that keeps the high-noise prefix dense, and every algorithm participates in the CUDA Graph key so dense and sparse phases never share a graph. Configuration, requirements and Python/YAML examples for each algorithm are in [VisualGen Sparse Attention](../features/visualgen-sparse-attention.md).
 
 ### CPU Offloading
 

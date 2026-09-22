@@ -311,7 +311,42 @@ be reused for the sparse phase.
 
 ## Video Sparse Attention (VSA)
 
-VSA combines a coarse mean-pooled branch with a top-K block-sparse fine branch. Select either `CUTEDSL` for the CuTe DSL kernel or `TRTLLM` for PrimTS block-sparse attention. If the selected sparse kernel is unavailable or the known VSA tensor envelope is not met, the fine branch uses the compact Q/K/V tensors with that backend's dense path. VSA cannot be combined with `quant_attention_config`.
+VSA reduces the cost of self-attention in video diffusion models by attending only to the most relevant spatial-temporal blocks. It uses a two-branch design: a lightweight coarse branch mean-pools tokens into (4, 4, 4) cubes and computes cube-level attention scores to select the top-K most relevant cubes per query, then a fine branch runs the selected backend's block-sparse kernel over those cubes only. The two outputs are blended with learned gates, which is why VSA needs a fine-tuned checkpoint. Select either `CUTEDSL` for the CuTe DSL fine-stage kernel or `TRTLLM` for PrimTS block-sparse attention.
+
+Requirements:
+
+- A VSA-fine-tuned checkpoint such as [`FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers`](https://huggingface.co/FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers). Standard Wan checkpoints do not carry the learned VSA gates.
+- The `CUTEDSL` or `TRTLLM` attention backend. `CUTEDSL` uses the CuTe DSL fine-stage kernel; `TRTLLM` lowers the selected cubes through the generic PrimTS block-sparse FMHA contract.
+- A supported CUDA device and tensor shape for the selected block-sparse kernel. When that kernel is unavailable or the input is outside its envelope, the fine branch runs the compact Q/K/V through that backend's dense path (SDPA for `CUTEDSL`, TRTLLM attention for `TRTLLM`) and the VSA post-processing still applies.
+- VSA cannot be combined with `quant_attention_config`.
+- VSA is not compatible with Ring attention or Attention2D (it does not produce per-split LSE). Ulysses is supported.
+
+Configure VSA with `VideoSparseAttentionConfig` and either backend:
+
+```python
+from tensorrt_llm import VisualGenArgs
+from tensorrt_llm.visual_gen.args import AttentionConfig, VideoSparseAttentionConfig
+
+args = VisualGenArgs(
+    model="FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers",
+    attention_config=AttentionConfig(
+        backend="TRTLLM",  # or "CUTEDSL"
+        sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9),
+    ),
+)
+```
+
+The equivalent YAML, for `--visual_gen_args` or `trtllm-serve`:
+
+```yaml
+attention_config:
+  backend: TRTLLM                 # or CUTEDSL
+  sparse_attention_config:
+    algorithm: vsa
+    vsa_sparsity: 0.90            # fraction of K/V cubes skipped by the fine branch
+```
+
+`vsa_sparsity` controls the fraction of K/V cubes the fine branch skips (0.0 keeps every cube and reproduces dense attention, 0.9 skips 90% of them). Higher sparsity gives more speedup at the cost of some quality.
 
 VSA retains shape-dependent metadata and route tensors so CUDA Graph replay can reuse stable addresses. A pipeline instance keeps one set of these tensors per distinct shape profile for as long as the CUDA Graphs that reference them, so their footprint grows with the number of served resolution/frame profiles exactly like the graphs do.
 
