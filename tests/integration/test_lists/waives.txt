@@ -241,7 +241,6 @@ full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::Tes
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v1_kv_cache-cutlass-one_model-overlap_scheduler] SKIP (https://nvbugs/6672360)
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-cutlass-one_model-overlap_scheduler] SKIP (https://nvbugs/6672360)
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_vswa_reuse_4gpus[v1_kv_cache-one_model] SKIP (https://nvbugs/6672360)
-full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-cutlass-fp8] SKIP (https://nvbugs/6626640)
 full:sm100/unittest/bindings SKIP (Disable for Blackwell)
 llmapi/test_llm_examples.py::test_llmapi_speculative_decoding_eagle3 SKIP (https://nvbugs/6075431)
 perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_nemotron-ultra-v3-fp4_50k2k_con12_ctx1_dep4_gen6_tep4_eplb0_mtp6_ccb-NIXL] SKIP (https://nvbugs/6813584)
