@@ -66,6 +66,7 @@ from .phased import FmhaParams, PhasedFmha
 from .utils import (
     get_attention_chunk_size,
     get_bmm1_scale,
+    get_multi_ctas_kv_counter_size,
     get_multi_processor_count_for_device,
     get_trtllm_gen_context_workspace_size,
 )
@@ -215,23 +216,6 @@ def _install_flashinfer_mla_decode_tuning_config_cache() -> None:
 
 if IS_FLASHINFER_AVAILABLE:
     _install_flashinfer_mla_decode_tuning_config_cache()
-
-
-_MULTI_CTAS_KV_COUNTER_ALIGNMENT = 8
-
-
-def _get_multi_ctas_kv_counter_size(
-    num_heads: int,
-    max_num_sequences: int,
-    multi_processor_count: int,
-) -> int:
-    num_counters = max(num_heads * max_num_sequences, multi_processor_count)
-    aligned_num_counters = (
-        (num_counters + _MULTI_CTAS_KV_COUNTER_ALIGNMENT - 1)
-        // _MULTI_CTAS_KV_COUNTER_ALIGNMENT
-        * _MULTI_CTAS_KV_COUNTER_ALIGNMENT
-    )
-    return aligned_num_counters * torch.int32.itemsize
 
 
 def _get_bmm1_scale_log2(bmm1_scale: torch.Tensor) -> torch.Tensor:
@@ -815,9 +799,10 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
         # One counter per head per decoder sequence; beam search expands each
         # request into ``beam_width`` sequences.
-        required_counter_size = _get_multi_ctas_kv_counter_size(
+        max_num_sequences = metadata.max_num_sequences or metadata.max_num_requests
+        required_counter_size = get_multi_ctas_kv_counter_size(
             attn.num_heads,
-            metadata.max_num_sequences or metadata.max_num_requests,
+            max_num_sequences,
             self._multi_processor_count,
         )
         counter_buffer = self._multi_ctas_kv_counter_buffer
@@ -846,8 +831,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             raise RuntimeError(f"{type(self).__name__} requires output.")
         fp8_context_fmha = self._use_fp8_context_fmha(output, attention_input_type)
 
-        workspace_max_tokens = max(num_tokens, metadata.max_context_length)
-        workspace_max_gen_tokens = max(num_gen_tokens, metadata.max_num_requests)
+        workspace_max_tokens = max(num_tokens, metadata.max_context_length, max_num_sequences)
+        workspace_max_gen_tokens = max(num_gen_tokens, max_num_sequences)
         required_workspace_size = _get_workspace_size(
             dtype=q.dtype,
             num_tokens=workspace_max_tokens,
@@ -855,7 +840,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             num_heads=attn.num_heads,
             num_kv_heads=attn.num_kv_heads,
             head_size=attn.head_dim,
-            max_num_requests=metadata.max_num_requests,
+            max_num_requests=max_num_sequences,
             rotary_embedding_dim=attn.rope_dim,
             fp8_context_fmha=fp8_context_fmha,
         )

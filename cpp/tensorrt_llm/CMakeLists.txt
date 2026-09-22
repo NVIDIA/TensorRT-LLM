@@ -22,6 +22,47 @@ set(API_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/include)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/cutlass_extensions/include
                     ${API_INCLUDE_DIR})
 
+get_filename_component(TRTLLM_REPO_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.."
+                       ABSOLUTE)
+set(TRTLLM_FMHA_PARAMS_GENERATOR
+    "${TRTLLM_REPO_ROOT_DIR}/scripts/generate_fmha_params.py")
+# The schema classes live in the modules that own them; the generator parses all
+# of them and resolves a nested member by the class its annotation names.
+set(TRTLLM_FMHA_PARAMS_SCHEMAS
+    "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/fmha/interface.py"
+    "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/interface.py"
+    "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/sparse/params.py"
+)
+set(TRTLLM_FMHA_PARAMS_SCHEMA_ARGS "")
+foreach(_schema ${TRTLLM_FMHA_PARAMS_SCHEMAS})
+  list(APPEND TRTLLM_FMHA_PARAMS_SCHEMA_ARGS --module-path "${_schema}")
+endforeach()
+set(TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/generated")
+# Generate at configure time rather than as a build step: a configure-only tree,
+# which is how the clangd compile database is produced, still needs these
+# headers for attentionOp.h to parse. CONFIGURE_DEPENDS re-runs CMake when a
+# schema or the generator changes, so editing a schema and building is enough to
+# refresh them.
+set_property(
+  DIRECTORY
+  APPEND
+  PROPERTY CMAKE_CONFIGURE_DEPENDS ${TRTLLM_FMHA_PARAMS_GENERATOR}
+           ${TRTLLM_FMHA_PARAMS_SCHEMAS})
+execute_process(
+  COMMAND
+    "${Python3_EXECUTABLE}" "${TRTLLM_FMHA_PARAMS_GENERATOR}"
+    ${TRTLLM_FMHA_PARAMS_SCHEMA_ARGS} --class-name FmhaParams --out-dir
+    "${TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR}/tensorrt_llm/thop"
+  RESULT_VARIABLE TRTLLM_FMHA_PARAMS_RESULT
+  OUTPUT_VARIABLE TRTLLM_FMHA_PARAMS_OUTPUT
+  ERROR_VARIABLE TRTLLM_FMHA_PARAMS_OUTPUT)
+if(NOT TRTLLM_FMHA_PARAMS_RESULT EQUAL 0)
+  message(
+    FATAL_ERROR
+      "Generating native FmhaParams failed:\n${TRTLLM_FMHA_PARAMS_OUTPUT}")
+endif()
+
 set(TARGET_ARCH "unknown")
 
 message(STATUS "CMAKE_SYSTEM_PROCESSOR: ${CMAKE_SYSTEM_PROCESSOR}")

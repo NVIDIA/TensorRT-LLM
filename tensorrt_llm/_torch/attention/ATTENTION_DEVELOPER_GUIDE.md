@@ -378,6 +378,19 @@ starting with an empty selection cache. `TrtllmAttention` prepares the complete
 per-forward state, passes itself to the manager for selection, and then executes
 the selected library.
 
+`FallbackFmha` owns its lazy native `AttentionOp` cache. The stateless
+`attention()` compatibility adapter supports direct MHA and MLA calls and owns
+a separate Python cache. Both caches key by `StaticAttentionConfig`, CUDA device, and host
+thread, never by per-call tensors or sequence lengths. Streams are not part of
+the key so CUDA graph capture can reuse runners initialized during warmup.
+Quantization updates release the old manager's implementation-owned resources.
+
+`prepare_workspace(q, k, v, metadata, forward_args, workspace)` runs on the whole
+batch before phase execution. `CombinedFmha` delegates preparation to both
+implementations before either runs, so the shared workspace covers both phases.
+`FallbackFmha` builds its sizing parameters internally; other libraries do not
+need to accept `FmhaParams` for workspace preparation.
+
 `TLLM_FMHA_LIBS` controls the ordered selection. Dense PrimTS is opt-in because
 it may add host overhead; use `TLLM_FMHA_LIBS=+prims_ts` to add it to the
 defaults or `TLLM_FMHA_LIBS=fallback` to force the fallback path. Generic
@@ -387,10 +400,12 @@ default membership and follow canonical registry order, while an exact list
 preserves the user-specified order. Each FMHA library exposes `is_available()`
 for module/static environment checks and `is_supported()` for per-forward
 request checks. `AttentionForwardArgs.sparse_runtime_params` is the sole
-per-call lowered sparse runtime carrier and defaults to an empty
-`SparseRuntimeParams()`. The core forward overwrites that field with the carrier
-that `prepare_sparse_runtime_params` builds from the caller's carrier plus the
-hook results. The carrier holds both flat `AttentionOp` parameters and optional
+per-call lowered sparse runtime carrier and defaults to `None` at the backend
+boundary. Before selecting or calling FMHA, the core forward populates that
+field through `prepare_sparse_runtime_params`, which creates a per-call carrier
+and preserves caller-provided fields plus the hook results. Direct callers of
+FMHA must supply a prepared carrier, including an empty `SparseRuntimeParams()`
+for dense attention. The carrier holds both flat `AttentionOp` parameters and optional
 `BlockSparseForwardInputs` in its nested `block_sparse_inputs` field.
 `Fmha.is_supported()` rejects a request that carries routes for every library
 that does not declare `supports_block_sparse_inputs`, so no dense kernel can
@@ -500,11 +515,10 @@ chunk alone: the cached prefix is dropped from attention and then overwritten
 by the chunk's write-back, which turns a missing kernel into a plausible wrong
 answer rather than an error.
 
-`get_attention_op` in `thop/attentionOp.cpp` therefore refuses a non-MLA,
+The `AttentionOp` constructor in `thop/attentionOp.cpp` therefore refuses a non-MLA,
 non-cross paged-context configuration whose initialization produced no context
 FMHA kernel. The check runs after `initialize()`, because only the initialized
-op reflects the exact Q/KV/output precision, mask type and page size, and
-outside `initialize()` itself, which is `noexcept`.
+op reflects the exact Q/KV/output precision, mask type and page size.
 
 The refusal has three distinct causes, each with its own message, and the
 distinction matters when triaging:

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -62,6 +62,7 @@ enum class PositionEmbeddingType : int8_t
     kCHATGLM = 7,
     kYARN = 8,
     kROPE_M = 9,
+    kDEFERRED = 10,
 };
 
 enum class RotaryScalingType : int8_t
@@ -70,7 +71,9 @@ enum class RotaryScalingType : int8_t
     kLINEAR = 1,
     kDYNAMIC = 2,
     kLONG = 3,
-    kLLAMA3 = 4
+    kLLAMA3 = 4,
+    kYARN = 5,
+    kMROPE = 6
 };
 
 struct BlockSparseParams
