@@ -277,6 +277,17 @@ async def test_coordinator_expires_stale_reservation():
     assert coordinator._reservation_tasks == {}
 
 
+def _active_gen_load(coordinator) -> int:
+    """Requests the generation router still counts as in flight.
+
+    ServerState exposes no accessor for it, so the tests read the counter the
+    load-balancing router increments and decrements directly.
+    """
+    return sum(
+        state._num_active_requests for state in coordinator.gen_router._server_state.values()
+    )
+
+
 @pytest.mark.asyncio
 async def test_concurrent_select_replaces_same_reservation_without_leaking_load():
     config = _make_config([], ["gen0:8000", "gen1:8000"], "round_robin", "load_balancing")
@@ -288,15 +299,9 @@ async def test_concurrent_select_replaces_same_reservation_without_leaking_load(
         coordinator.select("generation", {}, 123, None),
     )
 
-    assert (
-        sum(state.num_active_requests() for state in coordinator.gen_router._server_state.values())
-        == 1
-    )
+    assert _active_gen_load(coordinator) == 1
     await coordinator.finish("generation", 123)
-    assert (
-        sum(state.num_active_requests() for state in coordinator.gen_router._server_state.values())
-        == 0
-    )
+    assert _active_gen_load(coordinator) == 0
 
 
 @pytest.mark.asyncio
@@ -315,12 +320,6 @@ async def test_coordinator_renew_replaces_reservation_timer():
     assert coordinator._reservation_tasks == {}
 
 
-def _active_gen_load(coordinator) -> int:
-    return sum(
-        state.num_active_requests() for state in coordinator.gen_router._server_state.values()
-    )
-
-
 @pytest.mark.asyncio
 async def test_coordinator_renew_restarts_the_full_expiration_period():
     """Renewing must reset the deadline, not merely swap the expiration task.
@@ -330,7 +329,9 @@ async def test_coordinator_renew_restarts_the_full_expiration_period():
     reservation has to outlive the deadline it was created with and only drop
     once a full timeout has elapsed since the renewal.
     """
-    timeout = 0.2
+    # Generous margins: the assertions sit half a timeout away from either
+    # deadline so a loaded CI machine oversleeping a little cannot flip them.
+    timeout = 1.0
     config = _make_config([], ["gen:8000"], "round_robin", "load_balancing")
     coordinator = DisaggCoordinatorService(
         config, _client_factory, reservation_timeout_secs=timeout
