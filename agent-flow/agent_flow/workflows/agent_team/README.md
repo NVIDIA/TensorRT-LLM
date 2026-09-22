@@ -207,11 +207,17 @@ no `ask_human`; only the backend's own built-in tools remain (reading,
 editing, and running commands are not MCP servers, so they are
 unaffected).
 
-**The system prompts change too.** The five base prompts in
-[`prompts/`](prompts) are *transport-neutral*: they describe what each
-role reads and records (the rolling status snapshot, the progress entry
-and its `summary` / `decision` / `weighted_score` fields) without naming
-a mechanism. The tool-level half — `read_latest_progress`,
+**The prompts change too — system and per-turn alike.** The five base
+prompts in [`prompts/`](prompts) are *transport-neutral*: they describe
+what each role reads and records (the rolling status snapshot, the
+progress entry and its `summary` / `decision` / `weighted_score` fields)
+without naming a mechanism. The same split applies to the *per-turn*
+prompts the orchestrator builds for each turn — `_LINEAR_MCP_PROTOCOL` in
+[`workflow.py`](workflow.py) for the linear path, `_NODE_MCP_PROTOCOL` in
+[`node_runner.py`](node_runner.py) for the concurrent one: the turn body
+says what this turn reads and records, and the tool names live in a block
+appended only when the run registers them. The tool-level half —
+`read_latest_progress`,
 `read_human_feedback`, `read_status` / `update_status`,
 `append_*_progress`, `ask_human` — lives in
 [`prompts/mcp_tools.py`](prompts/mcp_tools.py) and is appended per role

@@ -121,6 +121,99 @@ def _default_policy_for_type(node_type: str) -> _DefaultNodePolicy:
     return _DefaultNodePolicy(node_type=node_type)
 
 
+# --------------------------------------------------------------------------
+# Per-turn prompt protocol blocks
+#
+# The role *system* prompts are transport-neutral and get their tool names from
+# the pluggable ``MCP_TOOLS_EXTENSIONS`` (see ``PromptBundle``). The per-turn
+# prompts below must obey the same split, or ``--no-mcp-tools`` runs order a
+# role to call a tool the run never registered: the turn body says WHAT this
+# turn reads and records, and the mechanism comes from either this table (MCP
+# mode) or ``mcpless.build_recording_preamble`` (no-MCP mode), never both.
+#
+# Keyed by prompt *kind* rather than role, because the PlanDrafter's draft and
+# replan turns read different things. The ``human`` / ``replan_human`` turns
+# have no entry: ``ask_human`` requires an in-process MCP server, so those
+# modes are rejected at construction under ``--no-mcp-tools`` and only ever run
+# with tools present.
+# --------------------------------------------------------------------------
+
+_PROTOCOL_HEADER = (
+    "=== RECORDING PROTOCOL: in-process MCP tools ===\n"
+    "Use these tools for the reads and the recording described above:\n"
+)
+
+_LINEAR_MCP_PROTOCOL: dict[str, str] = {
+    "plan_drafter_draft": _PROTOCOL_HEADER
+    + (
+        '- `read_latest_progress` with `agent: "plan_reviewer"` — the latest '
+        "REJECT feedback, when this is a re-draft.\n"
+        "Before completing your turn, call `append_plan_drafter_progress` with "
+        'the `summary` and `decision: "DRAFT_READY"` described above.\n'
+        "Do NOT call `ask_human` in this phase."
+    ),
+    "plan_drafter_replan": _PROTOCOL_HEADER
+    + (
+        "- `read_latest_build_progress` (no agent filter, `iterations: 1`) — "
+        "the latest coder/reviewer/qa entries.\n"
+        "- `read_human_feedback` — any user-supplied guidance.\n"
+        '- `read_latest_progress` with `agent: "plan_reviewer"` — the '
+        "PlanReviewer's REJECT feedback, when your previous revision was "
+        "rejected.\n"
+        "Before completing your turn, call `append_plan_drafter_progress` "
+        "exactly once, with the decision described above."
+    ),
+    "plan_reviewer": _PROTOCOL_HEADER
+    + (
+        '- `read_latest_progress` with `agent: "plan_drafter"` — the '
+        "PlanDrafter's latest summary.\n"
+        # Deliberately generic: the turn body is what marks a replan as
+        # feedback-driven, and repeating that phrase here would leak the
+        # marker into every plan-review turn.
+        "- `read_human_feedback` — any user-supplied guidance this turn "
+        "points you at.\n"
+        "Before completing your turn, call `append_plan_reviewer_progress` "
+        "with the `summary` and `decision` described above."
+    ),
+    "coder": _PROTOCOL_HEADER
+    + (
+        "- `read_status` — the rolling status.md scratchpad.\n"
+        "- `read_latest_progress` with `iterations: 2` — the Reviewer's and "
+        "QA's latest REJECT feedback.\n"
+        "- `read_human_feedback` — direct user guidance recorded via "
+        "`--feedback`.\n"
+        "Before completing your turn, call **both** required tools: "
+        "`append_coder_progress` (with the `summary`) and `update_status` "
+        "(overwriting status.md with the snapshot described above)."
+    ),
+    "reviewer": _PROTOCOL_HEADER
+    + (
+        "- `read_status` — the rolling status.md scratchpad.\n"
+        '- `read_latest_progress` with `agent: "coder"` — the Coder\'s latest '
+        "summary.\n"
+        "- `read_human_feedback` — direct user guidance recorded via "
+        "`--feedback`.\n"
+        "Before completing your turn, call **both** required tools: "
+        "`append_reviewer_progress` (with the `summary` and `decision`) and "
+        "`update_status` (overwriting status.md as described above)."
+    ),
+    "qa": _PROTOCOL_HEADER
+    + (
+        "- `read_human_feedback` — direct user guidance recorded via "
+        "`--feedback`.\n"
+        "Before completing your turn, call the `append_qa_progress` tool with "
+        "the `summary`, `decision`, and `weighted_score` described above."
+    ),
+}
+
+
+def _with_protocol(body: str, kind: str, use_in_process_tools: bool) -> str:
+    """Append the MCP protocol block to ``body`` when this run has MCP tools."""
+    if not use_in_process_tools:
+        return body
+    return f"{body}\n\n{_LINEAR_MCP_PROTOCOL[kind]}"
+
+
 class AgentTeamWorkflow:
     """Plan phase then build phase loop, both built on AgentLayer.
 
@@ -1518,30 +1611,33 @@ class AgentTeamWorkflow:
         """
         self._progress_ctx.current_iteration = iteration
         if mode == "draft":
-            prompt = (
-                f"Workspace: {self.workspace}\n"
-                f"Plan iteration: {iteration}\n"
-                f"Phase: **draft** (PlanReviewer will check your work; do "
-                f"NOT call ask_human in this phase).\n\n"
-                f"Read `{self.task_path}` for the original task.\n"
-                f"Read the current contents of `{self.plan_path}` and "
-                f"`{self.acceptance_criteria_path}` — either may already "
-                f"hold user-supplied content you should preserve or "
-                f"refine; the other will be empty for you to draft from "
-                f"scratch.\n"
-                f"If this is a re-draft, call `read_latest_progress` with "
-                f'`agent: "plan_reviewer"` to fetch the latest REJECT '
-                f"feedback and address every item.\n\n"
-                f"Write your complete implementation plan to "
-                f"`{self.plan_path}` and your acceptance-criteria "
-                f"checklist (`- [ ] ...`) to "
-                f"`{self.acceptance_criteria_path}`. Both files must end "
-                f"this turn populated and coherent with each other and "
-                f"with `task.yaml`.\n\n"
-                f"Before completing your turn, call "
-                f"`append_plan_drafter_progress` with `summary` describing "
-                f"what you wrote/changed in **both** files and "
-                f'`decision: "DRAFT_READY"`.'
+            prompt = _with_protocol(
+                (
+                    f"Workspace: {self.workspace}\n"
+                    f"Plan iteration: {iteration}\n"
+                    f"Phase: **draft** (PlanReviewer will check your work; do "
+                    f"NOT seek human sign-off in this phase).\n\n"
+                    f"Read `{self.task_path}` for the original task.\n"
+                    f"Read the current contents of `{self.plan_path}` and "
+                    f"`{self.acceptance_criteria_path}` — either may already "
+                    f"hold user-supplied content you should preserve or "
+                    f"refine; the other will be empty for you to draft from "
+                    f"scratch.\n"
+                    f"If this is a re-draft, take in the PlanReviewer's "
+                    f"latest REJECT feedback and address every item.\n\n"
+                    f"Write your complete implementation plan to "
+                    f"`{self.plan_path}` and your acceptance-criteria "
+                    f"checklist (`- [ ] ...`) to "
+                    f"`{self.acceptance_criteria_path}`. Both files must end "
+                    f"this turn populated and coherent with each other and "
+                    f"with `task.yaml`.\n\n"
+                    f"Before completing your turn, record a PlanDrafter "
+                    f"progress entry whose `summary` describes what you "
+                    f"wrote/changed in **both** files, with "
+                    f'`decision: "DRAFT_READY"`.'
+                ),
+                "plan_drafter_draft",
+                self.use_in_process_tools,
             )
         elif mode in ("human", "replan_human"):
             if mode == "human":
@@ -1604,17 +1700,15 @@ class AgentTeamWorkflow:
             if self._replan_was_rejected():
                 rejected_block = (
                     "Your previous replan revision was REJECTed by the "
-                    "PlanReviewer. Call `read_latest_progress` with "
-                    '`agent: "plan_reviewer"` to fetch the REJECT '
-                    "feedback and address every item in this revision "
-                    "before deciding again.\n\n"
+                    "PlanReviewer. Take in that REJECT feedback and address "
+                    "every item in this revision before deciding again.\n\n"
                 )
             feedback_note = (
                 "**Feedback-triggered replan**: this replan turn was "
                 "forced by fresh human feedback "
                 "(`--trigger-replan-with-feedback`), NOT by a QA verdict "
                 "— the QA data below predates the feedback and may be "
-                "stale. Call `read_human_feedback` FIRST; the newest "
+                "stale. Take in the human feedback FIRST; the newest "
                 "entry is this turn's driver. Restructure the plan so "
                 "the very next Coder turn acts on that feedback: you may "
                 "preempt in-progress work per your protocol's "
@@ -1626,7 +1720,7 @@ class AgentTeamWorkflow:
                 if feedback_triggered
                 else ""
             )
-            prompt = (
+            prompt = _with_protocol(
                 f"Workspace: {self.workspace}\n"
                 f"Build iteration: {iteration}\n"
                 f"Phase: **replan** (PlanDrafter is re-invoked after every "
@@ -1642,11 +1736,9 @@ class AgentTeamWorkflow:
                 f"Read `{self.task_path}` (ground truth), the current "
                 f"`{self.plan_path}`, and "
                 f"`{self.acceptance_criteria_path}` (the pass/fail "
-                f"checklist QA just used). Call "
-                f"`read_latest_build_progress` (no agent filter, "
-                f"`iterations: 1`) to fetch the latest coder/reviewer/qa "
-                f"entries. Call `read_human_feedback` for any "
-                f"user-supplied guidance.\n\n"
+                f"checklist QA just used). Take in the latest "
+                f"coder/reviewer/qa entries from the build phase, and any "
+                f"user-supplied human feedback.\n\n"
                 f"Revise `{self.plan_path}` and "
                 f"`{self.acceptance_criteria_path}` where the build phase "
                 f"surfaced a real gap — sharpen vague guidance, fold in "
@@ -1654,9 +1746,8 @@ class AgentTeamWorkflow:
                 f"one is solid. Do NOT relax a criterion to make a "
                 f"failing QA pass; if a criterion no longer reflects "
                 f"`task.yaml`, justify the change in your `summary`.\n\n"
-                f"Before completing your turn, call "
-                f"`append_plan_drafter_progress` exactly once. Decision "
-                f"map:\n"
+                f"Before completing your turn, record exactly one "
+                f"PlanDrafter progress entry. Decision map:\n"
                 f"  - `DONE` — every acceptance item verified at runtime, "
                 f"score >= min_score, no new stage to push to. Workflow "
                 f"ends.\n"
@@ -1670,7 +1761,9 @@ class AgentTeamWorkflow:
                 f"Make `summary` self-contained: name the build-phase "
                 f"finding that motivated the revision, list the concrete "
                 f"changes to each file, and (for `DRAFT_READY`) justify "
-                f"every acceptance-criteria change."
+                f"every acceptance-criteria change.",
+                "plan_drafter_replan",
+                self.use_in_process_tools,
             )
         else:
             raise ValueError(f"unknown plan_drafter mode: {mode!r}")
@@ -1707,8 +1800,8 @@ class AgentTeamWorkflow:
         feedback_note = (
             "This replan turn was **feedback-triggered** "
             "(`--trigger-replan-with-feedback`): the PlanDrafter was "
-            "responding to fresh human feedback, not a QA verdict. Call "
-            "`read_human_feedback` to see the feedback the revision must "
+            "responding to fresh human feedback, not a QA verdict. Take in "
+            "that human feedback to see what the revision must "
             "serve. Where your prompt extension defines "
             "feedback-triggered edit rights (e.g. preempting in-progress "
             "work), judge the revision under those rules; still REJECT "
@@ -1729,16 +1822,15 @@ class AgentTeamWorkflow:
             if phase == "replan"
             else ""
         )
-        prompt = (
+        prompt = _with_protocol(
             f"Workspace: {self.workspace}\n"
             f"{iter_label}: {iteration}\n\n"
             f"{phase_note}"
             f"Read `{self.task_path}` (the user's original intent), "
             f"`{self.plan_path}` (the PlanDrafter's plan), and "
             f"`{self.acceptance_criteria_path}` (the pass/fail checklist "
-            f"QA will verify). Call `read_latest_progress` with "
-            f'`agent: "plan_drafter"` to fetch the PlanDrafter\'s '
-            f"latest summary.\n\n"
+            f"QA will verify). Take in the PlanDrafter's latest "
+            f"summary.\n\n"
             "Decide APPROVE or REJECT covering **both** plan-phase "
             "outputs as a unit: the plan must satisfy task.yaml and be "
             "concrete enough for the Coder to execute, and the "
@@ -1746,11 +1838,13 @@ class AgentTeamWorkflow:
             "checkable items faithful to task.yaml. Do NOT build, run, or "
             "test code — that belongs to the build-phase Reviewer. This "
             "is a paper review.\n\n"
-            "Before completing your turn, call "
-            "`append_plan_reviewer_progress` with `summary` and `decision` "
-            "(exactly `APPROVE` or `REJECT`). On REJECT, list specific "
-            "actionable items the PlanDrafter must address, naming the "
-            "file (`plan.md` or `acceptance-criteria.md`) for each item."
+            "Before completing your turn, record a PlanReviewer progress "
+            "entry with a `summary` and a `decision` of exactly `APPROVE` or "
+            "`REJECT`. On REJECT, list specific actionable items the "
+            "PlanDrafter must address, naming the file (`plan.md` or "
+            "`acceptance-criteria.md`) for each item.",
+            "plan_reviewer",
+            self.use_in_process_tools,
         )
         self._invoke_agent(
             "plan_reviewer",
@@ -1762,31 +1856,31 @@ class AgentTeamWorkflow:
 
     def _run_coder(self, iteration: int) -> None:
         self._progress_ctx.current_iteration = iteration
-        prompt = (
+        prompt = _with_protocol(
             f"Workspace: {self.workspace}\n"
             f"Iteration: {iteration}\n\n"
-            f"Start by calling `read_status` to load the rolling "
-            f"`status.md` scratchpad — that is your fastest way to pick up "
-            f"where the previous turn left off.\n\n"
+            f"Start by loading the rolling `status.md` scratchpad — that is "
+            f"your fastest way to pick up where the previous turn left "
+            f"off.\n\n"
             f"Read `{self.task_path}` for the original task from the user, "
             f"`{self.plan_path}` for the build plan, and "
             f"`{self.acceptance_criteria_path}` for the pass/fail "
-            f"checklist QA will verify (your definition of done). Call "
-            f"`read_latest_progress` with `iterations: 2` to fetch the "
-            f"Reviewer's latest REJECT feedback (if any) and the QA's "
-            f"latest REJECT report (if any). These are what you must "
-            f"address this iteration.\n\n"
-            f"Also call `read_human_feedback` to fetch any direct user "
-            f"guidance recorded via `--feedback`. Treat those entries as "
-            f"high-priority guidance from the human and address every "
-            f"unaddressed point this turn.\n\n"
+            f"checklist QA will verify (your definition of done). Take in "
+            f"the Reviewer's latest REJECT feedback (if any) and the QA's "
+            f"latest REJECT report (if any) from the last 2 iterations. "
+            f"These are what you must address this iteration.\n\n"
+            f"Also take in any direct user guidance recorded via "
+            f"`--feedback`. Treat those entries as high-priority guidance "
+            f"from the human and address every unaddressed point this "
+            f"turn.\n\n"
             "Implement or refine the code to address the feedback and "
             "satisfy every acceptance criterion. Before completing your "
-            "turn, call **both** required tools: `append_coder_progress` "
-            "(with a `summary` of what you built or changed) and "
-            "`update_status` (overwriting status.md with a short, clean "
-            "snapshot — current status, execution path, what's been tried, "
-            "what worked, what didn't, pointers for the next step)."
+            "turn, record a Coder progress entry with a `summary` of what "
+            "you built or changed, and refresh status.md with a short, "
+            "clean snapshot — current status, execution path, what's been "
+            "tried, what worked, what didn't, pointers for the next step.",
+            "coder",
+            self.use_in_process_tools,
         )
         self._invoke_agent("coder", self.coder, prompt, iteration)
 
@@ -1798,22 +1892,19 @@ class AgentTeamWorkflow:
         # modes). The default agent-team Reviewer prompt ignores the
         # line; no behavior change for callers that don't opt in.
         replan_mode = "enabled" if self.replan_on_qa else "disabled"
-        prompt = (
+        prompt = _with_protocol(
             f"Workspace: {self.workspace}\n"
             f"Iteration: {iteration}\n"
             f"Replan mode: {replan_mode}.\n\n"
-            f"Start by calling `read_status` to load the rolling "
-            f"`status.md` scratchpad so you know what the Coder claims "
-            f"the current state is.\n\n"
+            f"Start by loading the rolling `status.md` scratchpad so you "
+            f"know what the Coder claims the current state is.\n\n"
             f"Read `{self.plan_path}` for the build plan and "
             f"`{self.acceptance_criteria_path}` for the pass/fail "
-            f"checklist. Call `read_latest_progress` with "
-            f'`agent: "coder"` to fetch the Coder\'s latest summary.\n\n'
-            f"Also call `read_human_feedback` to fetch any direct user "
-            f"guidance recorded via `--feedback`. When you decide "
-            f"APPROVE/REJECT, verify the Coder has actually addressed "
-            f"every unaddressed point — if not, REJECT and call them out "
-            f"by name.\n\n"
+            f"checklist. Take in the Coder's latest summary.\n\n"
+            f"Also take in any direct user guidance recorded via "
+            f"`--feedback`. When you decide APPROVE/REJECT, verify the "
+            f"Coder has actually addressed every unaddressed point — if "
+            f"not, REJECT and call them out by name.\n\n"
             "Work closely with the Coder: inspect the changed files, then "
             "**build the code, run it, and execute the relevant tests** "
             "against the plan and the acceptance criteria. APPROVE only "
@@ -1824,13 +1915,14 @@ class AgentTeamWorkflow:
             "runtime behavior contradicts the plan, or any acceptance "
             "criterion is clearly unmet. Keep the loop tight: skip long "
             "benchmarks and full-suite stress runs (those belong to QA).\n\n"
-            "Before completing your turn, call **both** required tools: "
-            "`append_reviewer_progress` (with `summary` and `decision`, "
-            "exactly `APPROVE` or `REJECT` — cite the commands you ran "
-            "and what you observed in the summary) and `update_status` "
-            "(overwriting status.md to reflect the post-review state, "
-            "what was actually tested, and what the Coder must address "
-            "next on REJECT)."
+            "Before completing your turn, record a Reviewer progress entry "
+            "with a `summary` and a `decision` of exactly `APPROVE` or "
+            "`REJECT` — cite the commands you ran and what you observed in "
+            "the summary — and refresh status.md to reflect the post-review "
+            "state, what was actually tested, and what the Coder must "
+            "address next on REJECT.",
+            "reviewer",
+            self.use_in_process_tools,
         )
         self._invoke_agent("reviewer", self.reviewer, prompt, iteration)
 
@@ -1845,7 +1937,7 @@ class AgentTeamWorkflow:
                 f"Do not pad the score — if the artifact is not yet that "
                 f"good, say REJECT and list the gaps."
             )
-        prompt = (
+        prompt = _with_protocol(
             f"Workspace: {self.workspace}\n"
             f"Iteration: {iteration}\n\n"
             f"Read `{self.task_path}` (the user's stated intent — "
@@ -1858,8 +1950,8 @@ class AgentTeamWorkflow:
             f"those two specs and the actual code you build and "
             f"run. On any conflict between the criteria and "
             f"`task.yaml`, `task.yaml` wins — call out the gap.\n\n"
-            f"Call `read_human_feedback` to fetch any direct user "
-            f"guidance recorded via `--feedback`. Human feedback is "
+            f"Take in any direct user guidance recorded via "
+            f"`--feedback`. Human feedback is "
             f"the user's own voice, not a downstream agent's, so "
             f"treat it on par with `task.yaml`: APPROVE requires that "
             f"every unaddressed feedback point has been resolved at "
@@ -1868,8 +1960,8 @@ class AgentTeamWorkflow:
             "Discover the code under the workspace yourself (ls, grep, "
             "etc.), build it, run tests, and verify every acceptance "
             "criterion at runtime. Do not rely on code review alone.\n\n"
-            "Before completing your turn, call the `append_qa_progress` "
-            "tool with:\n"
+            "Before completing your turn, record a QA progress entry "
+            "with:\n"
             "- `summary`: per-criterion pass/fail with runtime "
             "evidence, evaluation-criterion scores, strengths, "
             "weaknesses, recommendation\n"
@@ -1877,7 +1969,9 @@ class AgentTeamWorkflow:
             "- `weighted_score`: the weighted average in [0, 10]\n\n"
             "APPROVE ends the workflow (subject to the score floor). "
             "REJECT sends the work back to the Coder; put the gaps they "
-            "must fix in `summary`." + gate_hint
+            "must fix in `summary`." + gate_hint,
+            "qa",
+            self.use_in_process_tools,
         )
         self._invoke_agent("qa", self.qa, prompt, iteration)
 
