@@ -998,8 +998,8 @@ class Qwen3VLTextRotaryEmbedding(nn.Module):
         )
         position_ids_expanded = position_ids[:, :, None, :]  # shape (3, bs, 1, positions)
 
-        # Elementwise, not a K=1 matmul: a GEMM under TF32 (default in NGC PyTorch
-        # images) rounds positions above 2048 and skews the phase of late tokens.
+        # Elementwise, not a K=1 matmul: a GEMM may run in TF32, which rounds
+        # positions above 2048 and skews the phase of late tokens.
         freqs = (inv_freq_expanded * position_ids_expanded).transpose(2, 3)
         freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
         emb = torch.cat((freqs, freqs), dim=-1)
