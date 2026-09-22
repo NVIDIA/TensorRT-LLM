@@ -75,6 +75,23 @@ class CacheReuseAdapter(ABC):
         """
 
     @abstractmethod
+    def get_block_ordinals(
+        self,
+        req: LlmRequest,
+        group_idx: int,
+        lg: AttentionLayerGroup,
+    ) -> np.ndarray:
+        """Positional block table for *req* (dtype ``int64``, beam 0).
+
+        Entry ``i`` is the primary-pool slot for tokens ``[i * tpb, ...)``, or
+        ``-1`` where the block is out-of-window (SWA-evicted) or unbound. Unlike
+        :meth:`get_block_ids`, position is carried by the index rather than by
+        the list length, so the caller can select a token range by slicing
+        instead of counting. Block lists carry beam 0 only, so this is the
+        positional table for every beam width.
+        """
+
+    @abstractmethod
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         """Commit KV blocks to radix tree for future prefix reuse.
 
@@ -104,10 +121,7 @@ class _CacheReuseAdapterV1(CacheReuseAdapter):
 
     def get_block_ids(self, req, group_idx, lg):  # noqa: ARG002
         first_layer = get_global_layer_ids(lg)[0]
-        beam_width = req.py_beam_width
-        raw_ids = self._mgr.get_batch_cache_indices(
-            [req.py_request_id], layer_idx=first_layer, beam_width=beam_width
-        )[0]
+        raw_ids = self._mgr.get_batch_cache_indices([req.py_request_id], layer_idx=first_layer)[0]
         if not raw_ids:
             return np.array([], dtype=np.int64)
         # block_id != primary-pool slot index once host offload kicks in; translate
@@ -122,6 +136,45 @@ class _CacheReuseAdapterV1(CacheReuseAdapter):
             list(raw_ids), window_size=window_size
         )
         return np.asarray(pool_indices, dtype=np.int64)
+
+    def _translate_chain(self, req, chain, window_size) -> np.ndarray:
+        """Positional pool slots for one beam chain, SWA-stale front masked to -1.
+
+        V1 keeps the whole pre-eviction chain in order (index == ordinal), and
+        only detaches front blocks during generation (``adjustBlocksIfNeeded``),
+        so ``get_num_front_blocks_removed`` can still read 0 here. Mask the
+        larger of that physical count and the logically stale count derived
+        from window/prompt length, then translate only what's left -- evicted
+        ids are back in the free pool and may be offloaded, which the
+        primary-pool translation rejects.
+        """
+        ordinals = np.full(len(chain), -1, dtype=np.int64)
+        if not chain:
+            return ordinals
+        tpb = self.tokens_per_block
+        physically_removed = self._mgr.get_num_front_blocks_removed(
+            req.py_request_id, window_size=window_size
+        )
+        logically_stale = max(0, (req.prompt_len + 1 - window_size) // tpb)
+        stale = min(max(physically_removed, logically_stale), len(chain))
+        live = list(chain[stale:])
+        if live:
+            ordinals[stale:] = self._mgr.get_memory_pool_block_indices(
+                live, window_size=window_size
+            )
+        return ordinals
+
+    def get_block_ordinals(self, req, group_idx, lg):  # noqa: ARG002
+        window_size = lg.sliding_window_size
+        # V1 layer groups carry the manager's window key (full-attention layers get the
+        # max window), so this is always set; see kv_extractor.build_page_table.
+        assert window_size is not None
+        # Block lists carry beam 0 only (beam-search attention reads prompt
+        # positions through beam 0's block table), so take the first chain.
+        beams = self._mgr.impl.get_batch_cache_block_ids([req.py_request_id], window_size)[0]
+        if not beams:
+            return np.array([], dtype=np.int64)
+        return self._translate_chain(req, list(beams[0]), window_size)
 
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         if not self.enable_block_reuse:
@@ -161,6 +214,17 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
         return np.fromiter(
             self._mgr.kv_cache_map[req.py_request_id].get_aggregated_page_indices(
                 group_idx, valid_only=True
+            ),
+            dtype=np.int64,
+        )
+
+    def get_block_ordinals(self, req, group_idx, lg):  # noqa: ARG002
+        # valid_only=False yields one entry per block ordinal, with -1
+        # (BAD_PAGE_INDEX) for out-of-window (SWA-evicted) and unbound blocks.
+        # Position is the index; no length arithmetic needed.
+        return np.fromiter(
+            self._mgr.kv_cache_map[req.py_request_id].get_aggregated_page_indices(
+                group_idx, valid_only=False
             ),
             dtype=np.int64,
         )

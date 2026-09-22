@@ -142,13 +142,14 @@ statically checkable without runtime signature inspection.
 
 Ordinary sparse variants use `attention_output_hidden_size` and the shared
 output allocation. DeepSeek-V4's fused epilogue instead uses the optional
-output-preparation hook to create one token-major O-LoRA output tensor. Its
-context- and generation-phase helpers allocate the private FP8 attention and
-scale buffers, then write the O-LoRA result into the corresponding token range.
-The shared MLA custom-op contract exposes exactly one mutable output tensor;
-`_create_outputs()` keeps that tensor in a single-entry list through forward
-and output projection. Phase-specific scratch buffers remain inside the
-DeepSeek-V4 algorithm module and do not widen the generic hook facade.
+output-preparation hook to create one token-major O-LoRA-sized output tensor.
+Its context- and generation-phase helpers allocate the private FP8 attention
+and scale buffers, run both O-LoRA projections, and write the final hidden
+states into the leading columns of that tensor. The shared MLA custom-op
+contract exposes exactly one mutable output tensor; `_create_outputs()` keeps
+that tensor in a single-entry list through forward and output projection.
+Phase-specific scratch buffers remain inside the DeepSeek-V4 algorithm module
+and do not widen the generic hook facade.
 
 Sparse prediction inputs stay out of shared MLA APIs. Algorithm modules wrap
 their module-to-backend inputs in a `SparseBackendForwardArgs` subclass and
@@ -280,11 +281,12 @@ estimator reserves it from the KV budget and the scheduler caps the driving sum.
 Keep the declared cost identical to the runtime allocation's when possible, or
 use a documented conservative upper bound. The current instances are the fp8
 context-MLA K/V dequant workspace and
-the NVFP4 DSA context gather workspace. Both are sized by summed attended KV
-length (`total_kv_len`), which cached prefixes can decouple from
-`max_num_tokens` (`TrtllmAttention.runtime_workspace_bytes_per_token`). NVFP4
-DSA reads the complete attended prefix even with chunked prefill, so it also
-returns `False` from `runtime_workspace_is_chunked_prefill_bounded`.
+the NVFP4 DSA and DeepSeek-V4 context gather workspaces. They are sized by
+summed attended KV length (`total_kv_len`), which cached prefixes can decouple
+from `max_num_tokens` (`TrtllmAttention.runtime_workspace_bytes_per_token`).
+NVFP4 sparse MLA reads the complete attended prefix even with chunked prefill,
+so it also returns `False` from
+`runtime_workspace_is_chunked_prefill_bounded`.
 
 ### 2.4 Capability reference
 
@@ -419,6 +421,10 @@ The FMHA package is split by role:
   selection caching.
 - `fmha/phased.py` defines `PhasedFmha`, shared phase splitting, and the
   context/generation and MHA/MLA entry points.
+  Each phase's `FmhaParams` carries packed QKV in `qkv_input` or separate Q
+  in `query_input`, with the other field set to `None`. Separate K/V remain
+  in `key_input`/`value_input`, and `output` holds the phase's output view.
+  MLA uses `query_input` with `is_fused_qkv=False`.
 - `fmha/combined.py` composes different context and generation implementations
   for non-MLA mixed batches.
 - `fmha/triton_custom_mask.py` implements the Triton custom-mask context phase.
@@ -579,8 +585,6 @@ Key test files:
 
 - `tests/unittest/_torch/attention/test_attention.py`
 - `tests/unittest/_torch/attention/test_attention_mla.py`
-- `tests/unittest/_torch/attention/test_fmha_manager.py`
-- `tests/unittest/_torch/attention/test_combined_fmha.py`
 - `tests/unittest/_torch/attention/test_vanilla_attention.py`
 - `tests/unittest/_torch/attention/test_flashinfer_attention.py`
 - `tests/unittest/_torch/attention/kernels/`

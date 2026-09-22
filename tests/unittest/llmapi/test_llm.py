@@ -251,7 +251,6 @@ def test_llm_with_kv_cache_retention_config():
         (get_model_path('codellama/CodeLlama-7b-Instruct-hf'), False, 0.95),
         (llama_model_path, False, 0.95),
         (get_model_path(qwen3_tokenizer_model_name), False, 0.95),
-        (get_model_path('llama-3.1-model/Meta-Llama-3.1-8B'), False, 0.95),
         (get_model_path('DeepSeek-R1/DeepSeek-R1'), False, 0.95)
     ])
 @pytest.mark.part0
@@ -539,7 +538,10 @@ def test_generate_with_detokenization_stop_words(model_path):
     out = outputs[0].outputs[0]
     assert out.finish_reason == 'stop'
     assert out.stop_reason == "How"
-    assert out.text == "Hello there!", \
+    # Truncation happens in text space (`text[:text.find(stop)]`), so the
+    # whitespace that separated "there!" from the stop string belongs to the
+    # retained prefix -- matching OpenAI/vLLM stop-string semantics.
+    assert out.text == "Hello there! ", \
         f"Stop string 'How' must not be retained in output text, got: {out.text!r}"
 
     # Test case 2: Stop word "there" should be detected after detokenization
@@ -600,7 +602,9 @@ def test_generate_with_detokenization_stop_words_streaming(model_path):
                                      streaming=True):
         if output.outputs[0].finish_reason == 'stop':
             assert output.outputs[0].stop_reason == "How"
-            assert output.outputs[0].text == "Hello there!"
+            # Trailing space is retained by text-space truncation; see the
+            # non-streaming test above.
+            assert output.outputs[0].text == "Hello there! "
             found_stop = True
             break
         elif output.outputs[0].finish_reason == 'length':

@@ -47,6 +47,13 @@ attention_dp_config:
   kv_cache_routing_conversation_affinity: true
 ```
 
+For token-aware placement, add
+`kv_cache_routing_new_conv_placement: least_tokens` under `attention_dp_config`.
+This chooses an eligible ADP rank with the lowest active prompt-token load,
+including input tokens of requests assigned in the current batch. The default
+is `round_robin`; `least_queued` uses active-request counts. Existing
+conversation affinity still applies.
+
 Use `/v1/chat/completions` for both instance and ADP-rank affinity. The
 `/v1/completions` endpoint supports instance affinity only.
 

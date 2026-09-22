@@ -368,14 +368,15 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # num_index_heads * query tokens into one Q block, which bounds the
         # draft length it can verify.
         decode_query_len = self._msa_max_decode_query_len()
+        num_index_heads = params.sharded_index_head_count(self.mapping)
         if not self._cutedsl_indexer_supported(
-            num_index_heads=params.num_index_heads,
+            num_index_heads=num_index_heads,
             page_size=page_size,
             decode_query_len=decode_query_len,
         ):
             raise RuntimeError(
                 "The MiniMax-M3 CuTe DSL indexer scorer does not support this "
-                f"configuration: {params.num_index_heads} index heads, page size "
+                f"configuration: {num_index_heads} index heads, page size "
                 f"{page_size}, index dtype {self._msa_index_kv_dtype()}, up to "
                 f"{decode_query_len} query tokens per generation request."
             )
@@ -475,13 +476,13 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             fmha_sm100 = require_msa_module()
             max_k_tiles = _worst_case_proxy_max_k_tiles(
                 fmha_sm100,
-                num_index_heads=params.num_index_heads,
+                num_index_heads=params.sharded_index_head_count(self.mapping),
                 kv_cache_manager=kv_cache_manager,
                 max_batch=max_num_sequences,
             )
             self._msa_worst_case_max_k_tiles = int(max_k_tiles)
             self._alloc_msa_proxy_scratch(
-                num_index_heads=params.num_index_heads,
+                num_index_heads=params.sharded_index_head_count(self.mapping),
                 max_tokens=self._msa_max_decode_tokens(),
                 max_k_tiles=max_k_tiles,
                 capture_graph=capture_graph,
@@ -863,7 +864,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         params = self._msa_params
         if params is None:
             return
-        num_index_heads = params.num_index_heads
+        num_index_heads = params.sharded_index_head_count(self.mapping)
         qo_lens_cpu = self.msa_qo_lens_cpu
         kv_lens_cpu = self.msa_kv_lens_cpu
         qo_offset_cpu = self.msa_qo_offset_cpu
@@ -1071,7 +1072,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
     def msa_idx_k_cache(self, layer_idx: int) -> torch.Tensor:
         """Return the paged index-K cache in the HND layout MSA consumes."""
-        return self.kv_cache_manager.get_index_k_buffer(layer_idx, kv_layout="HND")
+        return self.kv_cache_manager.get_index_k_buffer(layer_idx)
 
     def msa_write_idx_k(self, layer_idx: int, idx_k: torch.Tensor) -> None:
         """Write the new-token index-K into the side cache at out_cache_loc."""
@@ -1208,6 +1209,57 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         # index branches explicitly.
         return False
 
+    def write_layer_caches(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        idx_k: Optional[torch.Tensor],
+        metadata,
+    ) -> None:
+        """Write this layer's new-token K, V and (bf16 indexer) index-K.
+
+        One fused kernel launch when the source/cache layouts allow it, else
+        the legacy per-cache writes. The model layer calls this first, so the
+        index-K cache is populated before run_indexer's proxy pass reads it,
+        and then hands forward() k=v=None: write_msa_phase_kv writes nothing
+        for a phase without live K/V, so neither FMHA library repeats the
+        write. `idx_k` is None on the FP8 indexer path, where the fused
+        producer has already inserted E4M3 index-K into the side cache.
+        `metadata` only supplies the step's write slots (msa_out_cache_loc,
+        filled by prepare()) and the cache manager.
+        """
+        from .kernels.msa_scatter import fused_write_layer_caches
+
+        layer_idx = self.layer_idx
+        buffers = metadata.kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
+        k_view, v_view = buffers[:, 0], buffers[:, 1]
+        idx_cache = metadata.msa_idx_k_cache(layer_idx) if idx_k is not None else None
+        num_tokens = int(k.shape[0])
+        out_cache_loc = metadata.msa_out_cache_loc[:num_tokens]
+        if fused_write_layer_caches(k_view, v_view, idx_cache, out_cache_loc, k, v, idx_k):
+            return
+        num_kv_heads = int(k_view.shape[1])
+        head_dim = int(k_view.shape[3])
+        write_kv_slots(
+            k_view,
+            out_cache_loc,
+            k.reshape(num_tokens, num_kv_heads, head_dim),
+            layout="HND",
+        )
+        write_kv_slots(
+            v_view,
+            out_cache_loc,
+            v.reshape(num_tokens, num_kv_heads, head_dim),
+            layout="HND",
+        )
+        if idx_k is not None:
+            write_kv_slots(
+                idx_cache,
+                out_cache_loc,
+                idx_k.reshape(num_tokens, 1, int(idx_cache.shape[-1])),
+                layout="HND",
+            )
+
     def run_indexer(
         self,
         idx_q: torch.Tensor,
@@ -1215,6 +1267,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         metadata,
         *,
         idx_sm_scale: Optional[float] = None,
+        idx_k_prewritten: bool = False,
     ) -> torch.Tensor:
         """Write the index-K cache and return the selected block indices.
 
@@ -1222,6 +1275,8 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         forward_args.sparse_backend_args. Returns [total_q, num_kv_heads, topk].
         The generation rows are scored by the CuTe DSL kernel and any context
         rows by the fmha_sm100 proxy pass, over the plan prepare() built.
+        `idx_k_prewritten` marks that the fused per-layer cache write
+        (write_layer_caches) already stored this layer's index-K.
         """
         config = self.m3_config
         idx_sm_scale = idx_sm_scale if idx_sm_scale is not None else config.sparse_index_dim**-0.5
@@ -1254,13 +1309,18 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
                     "The MiniMax-M3 BF16 indexer requires BF16 index-Q and a live "
                     f"BF16 index-K tensor; got Q={idx_q_view.dtype}, K={live_k_dtype}."
                 )
-            idx_k_view = idx_k.view(num_tokens, 1, config.sparse_index_dim)
-            metadata.msa_write_idx_k(self.layer_idx, idx_k_view)
+            # The fused per-layer write (write_layer_caches, signalled by
+            # idx_k_prewritten) may already have stored this live bf16 index-K
+            # ahead of the proxy pass; write it here only when it did not.
+            if not idx_k_prewritten:
+                idx_k_view = idx_k.view(num_tokens, 1, config.sparse_index_dim)
+                metadata.msa_write_idx_k(self.layer_idx, idx_k_view)
         # The FP8 indexer mirrors vLLM's unscaled E4M3 contract: normalized
         # index Q/K are cast directly and the proxy accumulates their QK scores
         # in FP32. Block ordering is invariant to the omitted positive scale.
         # The fused production path arrives here with E4M3 Q and an already
-        # populated cache; the BF16 path writes its live K above.
+        # populated cache; the BF16 path writes its live K above unless the
+        # fused per-layer write already did.
 
         # Inputs for the CuTe DSL scorer, which takes this step's generation
         # span. Left None on a pure-prefill step, which has no span, so the

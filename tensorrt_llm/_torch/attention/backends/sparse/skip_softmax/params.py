@@ -17,7 +17,6 @@
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Literal, Optional, Union
 
-import numexpr
 import torch
 from pydantic import ConfigDict, model_validator
 from pydantic import Field as PydanticField
@@ -126,7 +125,9 @@ class SkipSoftmaxFormula(StrictBaseModel):
     )
 
     @model_validator(mode="after")
-    def _validate_formula(self):
+    def _validate_formula(self) -> "SkipSoftmaxFormula":
+        import numexpr
+
         try:
             parsed = numexpr.NumExpr(self.formula)
         except Exception as exc:
@@ -151,6 +152,8 @@ class SkipSoftmaxFormula(StrictBaseModel):
 
     def compute_threshold_scale_factor(self, target_sparsity: float) -> float:
         """Evaluate the formula at ``target_sparsity`` to get threshold_scale_factor."""
+        import numexpr
+
         result = numexpr.evaluate(
             self.formula,
             local_dict={**self.coefficients, "target_sparsity": float(target_sparsity)},
@@ -379,17 +382,23 @@ class SkipSoftmaxScheduler:
         *,
         runtime_params: Optional[SparseRuntimeParams] = None,
         timestep: Any = None,
+        graph_phase: Optional[int] = None,
     ) -> SparseRuntimeParams:
-        """Return runtime parameters with skip-softmax thresholds."""
+        """Return runtime parameters with skip-softmax thresholds.
+
+        ``graph_phase`` lets a caller that already resolved the dense-prefix
+        phase host-side (the CUDA-graph runner does, to build its key) pass it
+        in, so this never has to read ``timestep`` -- a ``.item()`` on a CUDA
+        tensor -- while a graph is being captured.
+        """
         if runtime_params is None:
             runtime_params = SparseRuntimeParams()
-        if (
-            self.get_graph_phase_for_timestep(
+        if graph_phase is None:
+            graph_phase = self.get_graph_phase_for_timestep(
                 timestep,
                 disabled_until_timestep=self.disabled_until_timestep,
             )
-            == 0
-        ):
+        if graph_phase == 0:
             return replace(
                 runtime_params,
                 threshold_scale_factor_prefill=0.0,
@@ -408,3 +417,4 @@ class SkipSoftmaxParams(SparseParams):
 
     algorithm: Literal["skip_softmax"] = field(init=False, default="skip_softmax")
     scheduler: SkipSoftmaxScheduler = field(default_factory=SkipSoftmaxScheduler)
+    uses_spcompress: bool = False

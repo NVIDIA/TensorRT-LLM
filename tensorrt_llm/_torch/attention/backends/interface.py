@@ -959,6 +959,7 @@ class AttentionForwardArgs:
     sage_attn_num_elts_per_blk_v: int = 0
     sage_attn_qk_int8: bool = False
 
+    # Packed QKV for non-MLA attention. MLA always passes a separate query.
     is_fused_qkv: bool = False
     update_kv_cache: bool = True
     # Optional normalized diffusion timestep for timestep-varying sparse attention.
