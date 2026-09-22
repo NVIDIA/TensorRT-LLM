@@ -95,6 +95,10 @@ class TestPerLayerHeadDimBasic(unittest.TestCase):
                 for base_page_index in base_page_indices[: kv_cache.num_blocks]
             ]
             self.assertEqual(result, [expected])
+            raw = list(base_page_indices[: kv_cache.num_blocks])
+            for layer_idx in range(mgr.num_local_layers):
+                self.assertEqual(mgr.get_batch_base_page_indices([7], layer_idx), [raw])
+                self.assertEqual(mgr.get_batch_cache_indices([7], layer_idx), [expected])
         finally:
             mgr.shutdown()
 

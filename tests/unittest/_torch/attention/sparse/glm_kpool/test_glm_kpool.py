@@ -37,6 +37,46 @@ from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.params import (
 pytestmark = pytest.mark.cpu_only
 
 
+def test_nope_mla_geometry_uses_shared_factory(monkeypatch):
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+    from tensorrt_llm._torch.attention.backends.utils import create_attention
+
+    def initialize_base(self, layer_idx, num_heads, head_dim, num_kv_heads, **kwargs):
+        self.mla_params = kwargs["mla_params"]
+        self.num_kv_heads = num_kv_heads
+        for name in ("q_lora_rank", "kv_lora_rank", "qk_nope_head_dim", "v_head_dim"):
+            setattr(self, name, getattr(self.mla_params, name))
+
+    monkeypatch.setattr(TrtllmAttention, "__init__", initialize_base)
+    kwargs = dict(
+        backend_name="TRTLLM",
+        layer_idx=0,
+        num_heads=16,
+        head_dim=512,
+        num_kv_heads=1,
+        is_mla_enable=True,
+        q_lora_rank=1536,
+        kv_lora_rank=512,
+        qk_rope_head_dim=0,
+        qk_nope_head_dim=256,
+        v_head_dim=256,
+        rope_append=False,
+        sparse_params=GlmKpoolSparseParams(),
+    )
+    backend = create_attention(**kwargs)
+    assert isinstance(backend, GlmKpoolSparseAttention)
+    assert backend.mla_params.qk_rope_head_dim == 0
+    assert backend.mla_params.rope_append is False
+    assert (backend.q_lora_rank, backend.kv_lora_rank, backend.v_head_dim) == (1536, 512, 256)
+    assert backend.softmax_scale == 256**-0.5
+    with pytest.raises(ValueError, match="must equal kv_lora_rank"):
+        create_attention(**{**kwargs, "head_dim": 256})
+    with pytest.raises(ValueError, match="fully NoPE"):
+        create_attention(**{**kwargs, "qk_rope_head_dim": 64})
+    with pytest.raises(AssertionError):
+        create_attention(**{**kwargs, "qk_rope_head_dim": -1})
+
+
 @pytest.fixture
 def forward_case():
     backend = object.__new__(GlmKpoolSparseAttention)

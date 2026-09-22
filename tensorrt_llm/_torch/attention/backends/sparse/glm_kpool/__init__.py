@@ -15,7 +15,8 @@
 """glm_kpool: the GLM-5.3-Flash pool-compressed sparse-MLA backend."""
 
 from .backend import INDEX_SENTINEL, GlmKpoolSparseAttention, latent_pool_rows, paged_slot_indices
-from .cache_manager import Glm5NextCacheManager, Glm5NextMamba2Metadata
+from .cache_manager import Glm5NextCacheManager
+from .metadata import Glm5NextMamba2Metadata
 from .params import GlmKpoolBackendForwardArgs, GlmKpoolSparseParams
 
 __all__ = [

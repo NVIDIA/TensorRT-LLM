@@ -27,7 +27,6 @@ provide the same cache contract for prefill, decode and verification.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -46,17 +45,10 @@ from .kernels import gather_fp8_kv_rows, kpool_expand, kpool_score, kpool_update
 from .native_decode import GlmKpoolNativeDecode
 from .params import INDEX_SENTINEL, GlmKpoolSparseParams
 
-
-def _flash_mla_sparse_fwd() -> Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """Resolve the FlashMLA sparse kernel lazily."""
-    try:
-        from tensorrt_llm.flash_mla import flash_mla_sparse_fwd
-    except ImportError as exc:  # pragma: no cover - wheel always bundles it
-        raise RuntimeError(
-            "glm_kpool sparse MLA requires tensorrt_llm.flash_mla."
-            "flash_mla_sparse_fwd, which this build does not provide"
-        ) from exc
-    return flash_mla_sparse_fwd
+try:
+    from tensorrt_llm.flash_mla import flash_mla_sparse_fwd
+except ImportError:
+    flash_mla_sparse_fwd = None
 
 
 def paged_slot_indices(
@@ -166,27 +158,17 @@ class GlmKpoolSparseAttention(TrtllmAttention):
             raise TypeError(
                 f"GlmKpoolSparseAttention needs GlmKpoolSparseParams, got {type(sparse_params)}"
             )
-        if head_dim != sparse_params.kv_lora_rank:
+        if mla_params is None:
+            raise ValueError("glm_kpool requires MLA parameters from create_attention")
+        if head_dim != mla_params.kv_lora_rank:
             raise ValueError(
                 "glm_kpool consumes absorbed latent-space queries: head_dim "
-                f"({head_dim}) must equal kv_lora_rank ({sparse_params.kv_lora_rank})"
+                f"({head_dim}) must equal kv_lora_rank ({mla_params.kv_lora_rank})"
             )
         if pos_embd_params is not None:
             raise ValueError(
                 "glm_kpool is fully NoPE; positional embedding parameters have no "
                 "meaning on this branch"
-            )
-        if mla_params is None:
-            # The standard create_attention MLA path asserts qk_rope_head_dim>0
-            # (the rope'd DeepSeek geometry), so this fully-NoPE branch states
-            # its MLA identity itself instead of loosening the shared assert.
-            mla_params = MLAParams(
-                q_lora_rank=sparse_params.q_lora_rank,
-                kv_lora_rank=sparse_params.kv_lora_rank,
-                qk_rope_head_dim=0,
-                qk_nope_head_dim=sparse_params.qk_nope_head_dim,
-                v_head_dim=sparse_params.v_head_dim,
-                rope_append=False,
             )
         if mla_params.qk_rope_head_dim != 0:
             raise ValueError(
@@ -214,7 +196,7 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         #: Softmax scale of the *unabsorbed* q . k product over
         #: ``qk_nope_head_dim``; absorption reassociates the matmuls but the
         #: score scale is unchanged.
-        self.softmax_scale = float(sparse_params.qk_nope_head_dim) ** -0.5
+        self.softmax_scale = float(self.qk_nope_head_dim) ** -0.5
         self._native_decode = GlmKpoolNativeDecode()
 
     @classmethod
@@ -515,7 +497,9 @@ class GlmKpoolSparseAttention(TrtllmAttention):
             q_padded = q_latent.new_zeros((q_latent.shape[0], kernel_heads, q_latent.shape[2]))
             q_padded[:, :local_heads, :] = q_latent
             q_latent = q_padded
-        out, _, _ = _flash_mla_sparse_fwd()(
+        if flash_mla_sparse_fwd is None:
+            raise RuntimeError("glm_kpool sparse attention requires FlashMLA in this build")
+        out, _, _ = flash_mla_sparse_fwd(
             q_latent,
             kv_rows,
             topk_rows.unsqueeze(1),
