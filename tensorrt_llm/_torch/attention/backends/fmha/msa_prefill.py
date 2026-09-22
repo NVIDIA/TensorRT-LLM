@@ -118,7 +118,7 @@ def run_msa_sparse_gqa(
 
 
 def _aligned_nvfp4_dequant_scales(
-    attn: "TrtllmAttention", kv_scale_quant_orig: torch.Tensor
+    attn: "TrtllmAttention", kv_scale_quant_orig: torch.Tensor, *, refresh: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return stable, separately 16-byte-aligned K/V dequant scales.
 
@@ -126,22 +126,26 @@ def _aligned_nvfp4_dequant_scales(
     tensor.  Slicing elements 1 and 2 leaves addresses four and eight bytes
     past the allocation base, while CuTe DSL requires every tensor argument
     to start on a 16-byte boundary.  Keep one padded two-row buffer per
-    layer-attention object.  It is populated during eager warmup and then
-    reused unchanged by CUDA-graph capture and replay.
+    layer-attention object. Populate it during eager warmup, and refresh its
+    contents after weight loading without changing captured tensor addresses.
     """
     if kv_scale_quant_orig.dtype != torch.float32 or kv_scale_quant_orig.numel() < 3:
         raise ValueError("MiniMax-M3 NVFP4 dequantization scales must be FP32 [Q, K, V]")
 
     cache = getattr(attn, "_msa_nvfp4_dequant_scales", None)
     source_ptr = int(kv_scale_quant_orig.data_ptr())
-    if cache is None or getattr(attn, "_msa_nvfp4_dequant_scale_source_ptr", None) != source_ptr:
+    if cache is None:
         if kv_scale_quant_orig.is_cuda and torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "MiniMax-M3 NVFP4 scale alignment buffer must be initialized during eager warmup"
             )
         cache = torch.empty((2, 4), dtype=torch.float32, device=kv_scale_quant_orig.device)
-        cache[:, 0].copy_(kv_scale_quant_orig[1:3])
         attn._msa_nvfp4_dequant_scales = cache
+        refresh = True
+    if cache.device != kv_scale_quant_orig.device:
+        raise ValueError("MiniMax-M3 NVFP4 scale reload must preserve the scale buffer device")
+    if refresh or getattr(attn, "_msa_nvfp4_dequant_scale_source_ptr", None) != source_ptr:
+        cache[:, 0].copy_(kv_scale_quant_orig[1:3])
         attn._msa_nvfp4_dequant_scale_source_ptr = source_ptr
 
     k_global_scale = cache[0, :1]

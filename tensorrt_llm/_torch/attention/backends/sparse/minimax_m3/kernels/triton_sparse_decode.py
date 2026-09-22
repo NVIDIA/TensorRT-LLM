@@ -11,6 +11,11 @@ second kernel merges the chunks by LSE weight. That beats running the
 context-schedule FMHA kernel at decode, where a single query token leaves most
 of a 128-row Q tile idle.
 
+GB300/SM103 tuning targets GQA group 16, top-k 16 and four-token Eagle3
+verification. Split-K, query pairing and launch tables require four KV heads;
+the linear-softmax policy also covers one and two KV heads. Other hardware
+and shapes retain the default policies, including supported SM100 NVFP4.
+
 Vendored from the vLLM source linked in the file header (v0.26.1rc0-77-g6f91edf96).
 Differences from upstream:
 
@@ -792,10 +797,10 @@ def resolve_num_topk_chunks(total_q: int, num_kv_heads: int, max_topk: int) -> i
     return 1 << (target.bit_length() - 1)
 
 
-# These policies were tuned on GB300/SM103. They are enabled for both
-# datacenter Blackwell targets, but may not be optimal on GB200/SM100 until
-# measured there.
+# NVFP4 instructions are supported on both datacenter Blackwell targets.
 _SM100F_CAPABILITIES = ((10, 0), (10, 3))
+# Shape-specific tuning was measured on GB300 only. SM100 uses the defaults.
+_NVFP4_TUNED_CAPABILITIES = ((10, 3),)
 
 
 def _sm100f_nvfp4_num_topk_chunks(
@@ -811,7 +816,7 @@ def _sm100f_nvfp4_num_topk_chunks(
     if capability is None:
         capability = torch.cuda.get_device_capability()
     if (
-        capability not in _SM100F_CAPABILITIES
+        capability not in _NVFP4_TUNED_CAPABILITIES
         or num_kv_heads != 4
         or gqa_group_size != 16
         or max_topk != 16
@@ -850,7 +855,7 @@ def _sm100f_nvfp4_use_linear_softmax(
     if capability is None:
         capability = torch.cuda.get_device_capability()
     if (
-        capability not in _SM100F_CAPABILITIES
+        capability not in _NVFP4_TUNED_CAPABILITIES
         or num_kv_heads not in (1, 2, 4)
         or gqa_group_size != 16
         or max_topk != 16
@@ -878,7 +883,7 @@ def _sm100f_nvfp4_query_group_size(
     if capability is None:
         capability = torch.cuda.get_device_capability()
     if (
-        capability not in _SM100F_CAPABILITIES
+        capability not in _NVFP4_TUNED_CAPABILITIES
         or num_kv_heads != 4
         or gqa_group_size != 16
         or max_topk != 16
@@ -912,7 +917,7 @@ def _sm100f_nvfp4_launch_options(
     if capability is None:
         capability = torch.cuda.get_device_capability()
     if (
-        capability not in _SM100F_CAPABILITIES
+        capability not in _NVFP4_TUNED_CAPABILITIES
         or num_kv_heads != 4
         or gqa_group_size != 16
         or max_topk != 16
@@ -944,7 +949,7 @@ def _sm100f_nvfp4_merge_launch_options(
     if capability is None:
         capability = torch.cuda.get_device_capability()
     if (
-        capability in _SM100F_CAPABILITIES
+        capability in _NVFP4_TUNED_CAPABILITIES
         and num_kv_heads == 4
         and gqa_group_size == 16
         and max_topk == 16

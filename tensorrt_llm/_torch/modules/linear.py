@@ -210,6 +210,24 @@ def copy_weight(dst: Parameter, src: torch.Tensor):
     dst.data.copy_(src)
 
 
+def _load_kv_cache_scales(module: Linear, k_scales: List[torch.Tensor],
+                          v_scales: List[torch.Tensor]) -> None:
+    """Merge calibration scales without replacing graph-visible storage."""
+    if not hasattr(module, "kv_scales") or os.environ.get(
+            "TRTLLM_LOAD_KV_SCALES", "1") != "1":
+        return
+    if not k_scales and not v_scales:
+        return
+    assert k_scales and v_scales, "k_scale and v_scale must be loaded together"
+    copy_weight(
+        module.kv_scales,
+        torch.tensor([1.0, max(k_scales).item(),
+                      max(v_scales).item()],
+                     dtype=torch.float32),
+    )
+    copy_weight(module.inv_kv_scales, module.kv_scales.reciprocal())
+
+
 def copy_weight_shard(dst: Parameter, src: torch.Tensor, shard_offset: int,
                       shard_size: int):
     if dst.dtype != src.dtype:
@@ -681,7 +699,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                         [1.0, max(k_scales).item(),
                          max(v_scales).item()],
                         dtype=torch.float32))
-                module.inv_kv_scales.data = 1.0 / module.kv_scales
+                copy_weight(module.inv_kv_scales, module.kv_scales.reciprocal())
 
     def load_weights_fused_gate_up_linear(
             self,
@@ -987,7 +1005,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                         [1.0, max(k_scales).item(),
                          max(v_scales).item()],
                         dtype=torch.float32))
-                module.inv_kv_scales.data = 1.0 / module.kv_scales
+                copy_weight(module.inv_kv_scales, module.kv_scales.reciprocal())
 
         # Clean up temporary attributes
         if hasattr(module, "tmp_k_scales"):
@@ -1956,19 +1974,8 @@ class NVFP4LinearMethod(LinearMethodBase):
         if weight_scale_2 is not None:
             copy_weight(module.weight_scale_2, weight_scale_2)
 
-        # Handle KV scales
-        if os.environ.get("TRTLLM_LOAD_KV_SCALES", "1") == "1":
-            k_scales = getattr(module, "tmp_k_scales", [])
-            v_scales = getattr(module, "tmp_v_scales", [])
-            if k_scales:
-                assert v_scales, "k_scale and v_scale must be loaded together"
-                copy_weight(
-                    module.kv_scales,
-                    torch.tensor(
-                        [1.0, max(k_scales).item(),
-                         max(v_scales).item()],
-                        dtype=torch.float32))
-                module.inv_kv_scales.data = 1.0 / module.kv_scales
+        _load_kv_cache_scales(module, getattr(module, "tmp_k_scales", []),
+                              getattr(module, "tmp_v_scales", []))
 
         self._cleanup_nvfp4_tmp_attrs(
             module, extra_attrs=["tmp_k_scales", "tmp_v_scales"])
@@ -3607,23 +3614,15 @@ class MXFP8LinearMethod(LinearMethodBase):
 
     def load_kv_cache_scales(self, module: Linear, weights: List[Dict]) -> None:
         """Load per-tensor KV calibration for ordinary and prepacked QKV."""
-        if hasattr(module, "kv_scales") and os.environ.get(
-                "TRTLLM_LOAD_KV_SCALES", "1") == "1":
-            k_scales = [
-                w["k_scale"][...].reshape([]) for w in weights if "k_scale" in w
-            ]
-            v_scales = [
-                w["v_scale"][...].reshape([]) for w in weights if "v_scale" in w
-            ]
-            if k_scales or v_scales:
-                assert k_scales and v_scales, "k_scale and v_scale must be loaded together"
-                copy_weight(
-                    module.kv_scales,
-                    torch.tensor(
-                        [1.0, max(k_scales).item(),
-                         max(v_scales).item()],
-                        dtype=torch.float32))
-                module.inv_kv_scales.data = 1.0 / module.kv_scales
+        # Do not materialize checkpoint slices when calibration is disabled.
+        if not hasattr(module, "kv_scales") or os.environ.get(
+                "TRTLLM_LOAD_KV_SCALES", "1") != "1":
+            return
+        _load_kv_cache_scales(
+            module,
+            [w["k_scale"][...].reshape([]) for w in weights if "k_scale" in w],
+            [w["v_scale"][...].reshape([]) for w in weights if "v_scale" in w],
+        )
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
                                           weights: List[Dict]) -> None:

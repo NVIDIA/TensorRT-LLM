@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 from types import SimpleNamespace
+from unittest.mock import create_autospec
 
 import pytest
 import torch
@@ -32,6 +33,7 @@ from transformers import AutoConfig
 from utils.llm_data import llm_models_root
 
 import tensorrt_llm._torch.models.modeling_minimaxm3 as modeling_minimaxm3
+from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
     MiniMaxM3SparseConfig,
@@ -55,6 +57,7 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     _load_qkv_index_proj_weights,
     _minimax_m3_swiglu_oai,
     _moe_routed_output_is_global,
+    _nvfp4_cache_supports_fused_write,
     _strip_language_model_prefix,
     _validate_sparse_attention_runtime_config,
     _wrap_dict_as_config,
@@ -66,6 +69,7 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
 )
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl_v2
+from tensorrt_llm._torch.modules.linear import _load_kv_cache_scales
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind
 from tensorrt_llm._torch.moe.fused_moe.routing import (
@@ -86,6 +90,115 @@ _NUM_HIDDEN_LAYERS = 7
 _SPARSE_FREQ = [0, 0, 0, 1, 1, 1, 1]
 _DISABLE_INDEX_VALUE = [0, 0, 0, 1, 1, 1, 1]
 _MOE_LAYER_FREQ = [0, 0, 0, 1, 1, 1, 1]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "layout, expected",
+    [
+        ("packed", True),
+        ("padded_planes", True),
+        ("padded_heads", False),
+        ("unaligned_planes", False),
+        ("overlapping_heads", None),
+        ("overlapping_planes", None),
+        ("overlapping_pages", None),
+        ("unpacked_rows", None),
+        ("different_scale_pages", None),
+        ("padded_scale_heads", None),
+    ],
+)
+def test_nvfp4_cache_fused_layout_validation(layout: str, expected: bool | None) -> None:
+    """Only valid layouts may fall back; invalid pools must fail before a write."""
+    shape = (3, 2, 4, 128, 64)
+    strides = [65536, 32768, 8192, 64, 1]
+    if layout == "padded_planes":
+        strides[:2] = [131072, 65536]
+    elif layout == "padded_heads":
+        strides[:3] = [131072, 65536, 16384]
+    elif layout == "unaligned_planes":
+        strides[:2] = [65538, 32769]
+    elif layout == "overlapping_heads":
+        strides[2] = 4096
+    elif layout == "overlapping_planes":
+        strides[1] = 16384
+    elif layout == "overlapping_pages":
+        strides[0] = 32768
+    elif layout == "unpacked_rows":
+        strides[3] = 65
+    data = torch.empty_strided(shape, strides, dtype=torch.uint8)
+    scales = torch.empty(
+        (2 if layout == "different_scale_pages" else 3, 2, 4, 128, 8), dtype=torch.uint8
+    )
+    if layout == "padded_scale_heads":
+        scales = torch.empty_strided(scales.shape, (16384, 8192, 2048, 8, 1), dtype=torch.uint8)
+    if expected is None:
+        with pytest.raises(ValueError, match="MiniMax-M3 NVFP4"):
+            _nvfp4_cache_supports_fused_write(data, scales, 4)
+    else:
+        assert _nvfp4_cache_supports_fused_write(data, scales, 4) is expected
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        pytest.param("cpu", marks=pytest.mark.cpu_only),
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graphs"),
+        ),
+    ],
+)
+def test_nvfp4_reload_preserves_attention_scale_storage(
+    monkeypatch: pytest.MonkeyPatch, device: str
+) -> None:
+    """The model reload hook updates eager and captured readers at stable addresses."""
+    target = MiniMaxM3ForCausalLM.__new__(MiniMaxM3ForCausalLM)
+    nn.Module.__init__(target)
+    target.model_config = ModelConfig(pretrained_config=_make_text_config())
+    target.config.use_gemma_norm = False
+    target.model = nn.Module()
+    decoder = nn.Module()
+    decoder.self_attn = nn.Module()
+    decoder.self_attn.attn = nn.Module()
+    projection = nn.Module()
+    projection.kv_scales = nn.Parameter(torch.ones(3, device=device), requires_grad=False)
+    projection.inv_kv_scales = nn.Parameter(torch.ones(3, device=device), requires_grad=False)
+    decoder.self_attn.qkv_proj = projection
+    target.model.layers = nn.ModuleList([decoder])
+    mapper = create_autospec(MiniMaxM3HfWeightMapper, instance=True, spec_set=True)
+
+    def load_scales(self, *, weights, **kwargs):
+        _load_kv_cache_scales(projection, [weights["k_scale"]], [weights["v_scale"]])
+
+    monkeypatch.setattr(SpecDecOneEngineForCausalLM, "load_weights", load_scales)
+    monkeypatch.setenv("TRTLLM_LOAD_KV_SCALES", "1")
+    k_scale, v_scale = _aligned_nvfp4_dequant_scales(decoder.self_attn.attn, projection.kv_scales)
+    pointers = [
+        x.data_ptr() for x in (projection.kv_scales, projection.inv_kv_scales, k_scale, v_scale)
+    ]
+    assert k_scale.data_ptr() % 16 == v_scale.data_ptr() % 16 == 0
+
+    def read_scales():
+        return torch.cat((k_scale, v_scale, projection.inv_kv_scales[1:]))
+
+    if device == "cuda":
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = read_scales()
+    target.load_weights(
+        {"k_scale": torch.tensor(0.5), "v_scale": torch.tensor(0.25)}, weight_mapper=mapper
+    )
+    new_k, new_v = _aligned_nvfp4_dequant_scales(decoder.self_attn.attn, projection.kv_scales)
+    assert [
+        x.data_ptr() for x in (projection.kv_scales, projection.inv_kv_scales, new_k, new_v)
+    ] == pointers
+    expected = torch.tensor([0.5, 0.25, 2.0, 4.0], device=device)
+    torch.testing.assert_close(read_scales(), expected)
+    if device == "cuda":
+        graph.replay()
+        torch.testing.assert_close(captured, expected)
 
 
 class _M3CompositionGate(nn.Module):
@@ -244,13 +357,38 @@ def test_validate_sparse_attention_runtime_config_rejects_wrong_backend(
         _validate_sparse_attention_runtime_config(model_config)
 
 
-def test_validate_sparse_attention_runtime_config_accepts_minimax_m3() -> None:
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("implementation", [None, "triton", "msa"])
+@pytest.mark.parametrize("kv_algo", [None, QuantAlgo.FP8, QuantAlgo.NVFP4])
+def test_validate_sparse_attention_runtime_config_backend_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    implementation: str | None,
+    kv_algo: QuantAlgo | None,
+) -> None:
+    sparse_config = MiniMaxM3SparseAttentionConfig()
+    if implementation is not None:
+        sparse_config.implementation = implementation
     model_config = ModelConfig(
         pretrained_config=_make_text_config(),
-        sparse_attention_config=MiniMaxM3SparseAttentionConfig(),
+        sparse_attention_config=sparse_config,
     )
+    if kv_algo is not None:
+        model_config.quant_config = QuantConfig(kv_cache_quant_algo=kv_algo)
+    warning = create_autospec(modeling_minimaxm3.logger.warning_once, spec_set=True)
+    monkeypatch.setattr(modeling_minimaxm3.logger, "warning_once", warning)
 
-    _validate_sparse_attention_runtime_config(model_config)
+    if kv_algo == QuantAlgo.NVFP4 and implementation != "msa":
+        with pytest.raises(ValueError, match="NVFP4 KV cache requires.*implementation='msa'"):
+            _validate_sparse_attention_runtime_config(model_config)
+    else:
+        _validate_sparse_attention_runtime_config(model_config)
+
+    if implementation != "msa":
+        warning.assert_called_once()
+        assert "implementation='msa'" in warning.call_args.args[0]
+        assert "recommended" in warning.call_args.args[0]
+    else:
+        warning.assert_not_called()
 
 
 @pytest.mark.cpu_only

@@ -1753,14 +1753,16 @@ def test_fused_scatter_matches_reference(src_dtype, cache_dtype, with_idx):
 
     # Paged HND caches carved from a pool with a coalescing axis, so the
     # views are non-contiguous like production get_buffers(...) output.
+    # Guard pages make an accidental negative-slot write observable without
+    # accessing memory outside the allocation.
     pool = torch.zeros(
-        num_pages, 2, num_kv_heads, tokens_per_block, head_dim, dtype=cache_dtype, device=device
+        num_pages + 2, 2, num_kv_heads, tokens_per_block, head_dim, dtype=cache_dtype, device=device
     )
-    k_cache, v_cache = pool[:, 0], pool[:, 1]
+    k_cache, v_cache = pool[1:-1, 0], pool[1:-1, 1]
     idx_pool = torch.zeros(
-        num_pages, 2, 1, tokens_per_block, head_dim, dtype=torch.bfloat16, device=device
+        num_pages + 2, 2, 1, tokens_per_block, head_dim, dtype=torch.bfloat16, device=device
     )
-    idx_cache = idx_pool[:, 0]
+    idx_cache = idx_pool[1:-1, 0]
 
     # Strided sources: rows sliced out of a wider fused-projection tensor.
     # randn has no fp8 variant, so generate bf16 and cast the whole buffer, as
@@ -1774,18 +1776,31 @@ def test_fused_scatter_matches_reference(src_dtype, cache_dtype, with_idx):
     v = qkv[:, inner : 2 * inner]
 
     slots = torch.randperm(num_pages * tokens_per_block, device=device)[:num_tokens].to(torch.int32)
+    # Padding rows must leave both the KV and index pools untouched, including
+    # the FP8 scatter path. Compare the complete pools to catch stray writes.
+    slots[0] = -1
+    valid = slots >= 0
 
     ref_pool = pool.clone()
     ref_idx_pool = idx_pool.clone()
     write_kv_slots(
-        ref_pool[:, 0], slots, k.reshape(num_tokens, num_kv_heads, head_dim), layout="HND"
+        ref_pool[1:-1, 0],
+        slots[valid],
+        k.reshape(num_tokens, num_kv_heads, head_dim)[valid],
+        layout="HND",
     )
     write_kv_slots(
-        ref_pool[:, 1], slots, v.reshape(num_tokens, num_kv_heads, head_dim), layout="HND"
+        ref_pool[1:-1, 1],
+        slots[valid],
+        v.reshape(num_tokens, num_kv_heads, head_dim)[valid],
+        layout="HND",
     )
     if with_idx:
         write_kv_slots(
-            ref_idx_pool[:, 0], slots, idx_k.reshape(num_tokens, 1, head_dim), layout="HND"
+            ref_idx_pool[1:-1, 0],
+            slots[valid],
+            idx_k.reshape(num_tokens, 1, head_dim)[valid],
+            layout="HND",
         )
 
     assert fused_write_layer_caches(

@@ -36,6 +36,7 @@ l0_b200:
   - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_fp8_indexer.py
   - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_fp8_main_kv_insert.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_unfused_index_projection_tp_construction
+  - unittest/_torch/models/test_minimax_m3.py::test_nvfp4_reload_preserves_attention_scale_storage[cuda]
   - unittest/others/test_kv_cache_transceiver.py::test_cpp_nixl_sync_transfer_stress
   - unittest/others/test_lora_manager.py
   - accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_nvfp4

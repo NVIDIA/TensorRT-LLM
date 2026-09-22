@@ -14,48 +14,6 @@ index b02f747..459f3be 100644
          return sparse_fmha_plan(qo_segment_lens=qo_segment_lens, kv_segment_lens=kv_segment_lens,
                  num_qo_heads=num_qo_heads, causal=causal, qo_offset=qo_offset,
                  num_kv_splits=num_kv_splits, page_size=page_size, output_maxscore=output_maxscore,
-@@ -645,7 +644,7 @@ def _fmha_sm100_plan(
-             max_kv_splits = min(2 * max(max_pieces, 1), 64)
- 
-             max_work_items = 131072 * max_kv_splits
--            
-+
-             packed_work_range = _alloc_perplan_buf(_BuffTag.packed_work_range, num_ctas, device, torch.int64)
-             packed_work_info = _alloc_perplan_buf(_BuffTag.packed_work_info, max_work_items, device, torch.int64)
-             kv_tile_begin_indices = _alloc_perplan_buf(_BuffTag.kv_tile_begin_indices, max_work_items, device, torch.int32)
-@@ -686,10 +685,10 @@ def _fmha_sm100_plan(
- 
-             return _make_plan_info(
-                 packed_work_range=packed_work_range, packed_work_info=packed_work_info,
--                kv_tile_begin_indices=kv_tile_begin_indices, kv_tile_end_indices=kv_tile_end_indices, 
--                kv_split_indices=kv_split_indices, num_kv_splits=max_kv_splits, workspace_o=workspace_o, 
--                workspace_lse=workspace_lse, max_qo_len=max_qo_len, predicted_speedup=predicted_speedup, 
--                num_kv_splits_per_row=num_kv_splits_per_row, qo_segment_offsets=qo_segment_offsets, 
-+                kv_tile_begin_indices=kv_tile_begin_indices, kv_tile_end_indices=kv_tile_end_indices,
-+                kv_split_indices=kv_split_indices, num_kv_splits=max_kv_splits, workspace_o=workspace_o,
-+                workspace_lse=workspace_lse, max_qo_len=max_qo_len, predicted_speedup=predicted_speedup,
-+                num_kv_splits_per_row=num_kv_splits_per_row, qo_segment_offsets=qo_segment_offsets,
-                 kv_segment_offsets=kv_segment_offsets, kv_page_indptr=kv_page_indptr, max_k_tiles=max_k_tiles,
-                 qo_segment_lens=qo_segment_lens_gpu, kv_segment_lens=kv_segment_lens, qo_offset=qo_offset,
-                 pack_factor=pack_factor, orig_num_qo_heads=orig_num_qo_heads,
-@@ -719,7 +718,7 @@ def _fmha_sm100_plan(
-         kv_split_indices = None
-         num_kv_splits_per_row = None
-         workspace_o = None
--        
-+
-         lse_total_size = 0
-         workspace_lse = None
- 
-@@ -768,7 +767,7 @@ def _fmha_sm100(
- ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
- 
-     if plan_info["MM-SA-Nv"]:
--        return sparse_fmha(q=q, k=k, v=v, plan_info=plan_info, out=out, max_score=max_score, 
-+        return sparse_fmha(q=q, k=k, v=v, plan_info=plan_info, out=out, max_score=max_score,
-                 sm_scale=sm_scale, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale, o_scale=o_scale,
-                 kv_indices=kv_indices, output_maxscore=output_maxscore, output_o=output_o, q_offset_override=q_offset_override,
-                 kv_block_indexes=kv_block_indexes, check_input_valid=check_input_valid)
 @@ -941,6 +940,62 @@ def _fmha_sm100(
      return out, max_score
  
@@ -282,15 +240,6 @@ index b02f747..459f3be 100644
              out.copy_(combined_out)
  
          # ---- Merge max_score ----
-@@ -1261,7 +1332,7 @@ def sparse_topk_select(
-     workspace_size = num_qo_heads * max_k_tiles * total_qo_len  # int32 elements
- 
-     workspace_buffer = _alloc_workspace_buf(_BuffTag.sparse_topk_workspace, workspace_size, max_score.device, torch.int32)
--    
-+
-     if output is not None:
-         output_indices = output
-     else:
 diff --git a/python/fmha_sm100/cute/interface.py b/python/fmha_sm100/cute/interface.py
 index d72b17a..8878d75 100644
 --- a/python/fmha_sm100/cute/interface.py

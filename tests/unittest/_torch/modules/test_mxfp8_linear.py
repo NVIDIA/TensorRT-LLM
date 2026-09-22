@@ -36,6 +36,7 @@ from tensorrt_llm._torch.modules.linear import (
     MXFP8LinearMethod,
     WeightMode,
     WeightsLoadingConfig,
+    _load_kv_cache_scales,
     flashinfer_mxfp8_autotune,
     flashinfer_mxfp8_decode_graph_capture,
     get_quant_method,
@@ -78,6 +79,7 @@ def test_mxfp8_dispatch_returns_mxfp8_method(monkeypatch):
     assert not method.use_native_autotuner
 
 
+@pytest.mark.cpu_only
 def test_mxfp8_fused_qkv_creates_nvfp4_kv_scales(monkeypatch):
     """MXFP8 QKV weights retain the scales required by an NVFP4 KV cache."""
     monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: False)
@@ -97,12 +99,51 @@ def test_mxfp8_fused_qkv_creates_nvfp4_kv_scales(monkeypatch):
 
     torch.testing.assert_close(linear.kv_scales, torch.ones(3))
     torch.testing.assert_close(linear.inv_kv_scales, torch.ones(3))
+    pointers = (linear.kv_scales.data_ptr(), linear.inv_kv_scales.data_ptr())
 
     linear.quant_method.load_kv_cache_scales(
         linear, [{"k_scale": torch.tensor(0.5)}, {"v_scale": torch.tensor(0.25)}]
     )
     torch.testing.assert_close(linear.kv_scales, torch.tensor([1.0, 0.5, 0.25]))
     torch.testing.assert_close(linear.inv_kv_scales, torch.tensor([1.0, 2.0, 4.0]))
+    assert (linear.kv_scales.data_ptr(), linear.inv_kv_scales.data_ptr()) == pointers
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("loader", ["shared", "mxfp8"])
+def test_kv_scale_loading_defaults_validation_and_reload(monkeypatch, loader):
+    """Both loader inputs obey the same calibration and storage contract."""
+    module = torch.nn.Module()
+    module.kv_scales = torch.nn.Parameter(torch.ones(3), requires_grad=False)
+    module.inv_kv_scales = torch.nn.Parameter(torch.ones(3), requires_grad=False)
+    pointers = (module.kv_scales.data_ptr(), module.inv_kv_scales.data_ptr())
+
+    def load(k, v):
+        if loader == "shared":
+            _load_kv_cache_scales(module, k, v)
+        else:
+            MXFP8LinearMethod.load_kv_cache_scales(
+                None, module, [{"k_scale": s} for s in k] + [{"v_scale": s} for s in v]
+            )
+
+    monkeypatch.setenv("TRTLLM_LOAD_KV_SCALES", "1")
+    load([], [])
+    torch.testing.assert_close(module.kv_scales, torch.ones(3))
+    for k, v in [([torch.tensor(0.5)], []), ([], [torch.tensor(0.25)])]:
+        with pytest.raises(AssertionError, match="must be loaded together"):
+            load(k, v)
+    load([torch.tensor(0.25), torch.tensor(0.5)], [torch.tensor(0.25)])
+    torch.testing.assert_close(module.kv_scales, torch.tensor([1.0, 0.5, 0.25]))
+    torch.testing.assert_close(module.inv_kv_scales, torch.tensor([1.0, 2.0, 4.0]))
+    monkeypatch.setenv("TRTLLM_LOAD_KV_SCALES", "0")
+    load([torch.tensor(0.125)], [])
+    load([torch.ones(2)], [])
+    torch.testing.assert_close(module.kv_scales, torch.tensor([1.0, 0.5, 0.25]))
+    monkeypatch.setenv("TRTLLM_LOAD_KV_SCALES", "1")
+    load([torch.tensor(0.125)], [torch.tensor(0.5)])
+    torch.testing.assert_close(module.kv_scales, torch.tensor([1.0, 0.125, 0.5]))
+    torch.testing.assert_close(module.inv_kv_scales, torch.tensor([1.0, 8.0, 2.0]))
+    assert (module.kv_scales.data_ptr(), module.inv_kv_scales.data_ptr()) == pointers
 
 
 def _mock_mxfp8_ops(monkeypatch):

@@ -29,7 +29,6 @@ accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-dp4-cutl
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-ep4-cutlass-auto] SKIP (https://nvbugs/5596343)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-tp4-cutlass-auto] SKIP (https://nvbugs/5596343)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_chunked_prefill[cutlass-auto] SKIP (https://nvbugs/5596343)
-accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True-kv_dtype=fp8] SKIP (https://nvbugs/6601633)
 accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_fp8[latency] SKIP (https://nvbugs/6177390)
 accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_fp8[throughput_latency] SKIP (https://nvbugs/6177390)
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[tep4_latency_moe_cutlass-torch_compile=True] SKIP (https://nvbugs/6561558)

@@ -45,7 +45,7 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
     copy_batch_block_offsets_to_device,
 )
 from tensorrt_llm.logger import logger
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, PageIndexMode, exact_div
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, PageIndexMode
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
 
@@ -262,7 +262,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     # Extra page sizes trtllm-gen may use with this manager (see
     # FlashInferTrtllmGenFmha); set with the virtual pools.
     trtllm_gen_extra_tokens_per_block: frozenset = frozenset()
-    draft_manager_kv_cache_dtype = "fp8"
     draft_manager_tokens_per_block = 32
     nvfp4_dense_tokens_per_block = 32
 
@@ -470,158 +469,29 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     def uses_hybrid_nvfp4_kv_cache(self) -> bool:
         return self.dtype == DataType.NVFP4
 
-    def _build_pool_mapping_tensors(self):
-        """Build the (kv_cache_pool_pointers, kv_cache_pool_mapping) tensors.
+    def _get_block_scale_role(self, role_a: DataRole, layer_id: int) -> Optional[DataRole]:
+        if not self.is_nvfp4_layer(int(self.pp_layers[layer_id])):
+            return None
+        return super()._get_block_scale_role(role_a, layer_id)
 
-        An overridable hook for subclasses whose pools coalesce extra
-        per-layer buffers alongside K/V.
-        """
-        kv_cache_pool_pointers_list = []
-        kv_cache_pool_mapping_list = []
-        block_scale_pool_pointers_list = []
-        if self._use_per_layer_page_tables:
-            for layer_id in range(self.num_local_layers):
-                pool_id = self.impl.get_layer_group_id(layer_id)
-                role_a, _ = self._get_pool_roles(pool_id)
-                kv_cache_pool_pointers_list.append(
-                    [
-                        self.impl.get_mem_pool_base_address(
-                            layer_id, role_a, PageIndexMode.PER_LAYER
-                        ),
-                        0,
-                    ]
-                )
-                if self.dtype == DataType.NVFP4:
-                    block_scale_role = (
-                        self._get_block_scale_role(role_a)
-                        if self.is_nvfp4_layer(int(self.pp_layers[layer_id]))
-                        else None
-                    )
-                    block_scale_pool_pointers_list.append(
-                        [
-                            self.impl.get_mem_pool_base_address(
-                                layer_id, block_scale_role, PageIndexMode.PER_LAYER
-                            )
-                            if block_scale_role is not None
-                            else 0,
-                            0,
-                        ]
-                    )
-                kv_cache_pool_mapping_list.append([int(layer_id), 0])
-        else:
-            for pool_id in range(self.num_pools):
-                role_a, _ = self._get_pool_roles(pool_id)
-                layer_id = self._pool_layer_ids_by_role[(pool_id, role_a)]
-                key_base_addr = self.impl.get_mem_pool_base_address(
-                    layer_id, role_a, PageIndexMode.SHARED
-                )
-                kv_cache_pool_pointers_list.append([key_base_addr, 0])
-                if self.dtype == DataType.NVFP4:
-                    # The KEY/scale pointers are a (rep-layer, 0-offset) origin
-                    # against which each layer's kv_cache_pool_mapping offset is
-                    # resolved. The block-scale origin must reproduce the SAME
-                    # per-layer offset() as KEY, so mirror the KEY base for the
-                    # same representative layer and shift it back by that layer's
-                    # offset. For the base manager offset(rep) == 0, so this is
-                    # just the rep layer's scale base; for address-ranked
-                    # subclasses (MiniMax-M3) offset(rep) may be non-zero, and the
-                    # shift lands the origin on the pool's slot-0 scale address.
-                    # This keeps block_scale_offset == offset without depending on
-                    # the non-contractual layer_grouping order.
-                    block_scale_role = (
-                        self._get_block_scale_role(role_a)
-                        if self.is_nvfp4_layer(int(self.pp_layers[layer_id]))
-                        else None
-                    )
-                    if block_scale_role is not None:
-                        rep_offset = self._kv_pool_mapping_offset(layer_id, pool_id, key_base_addr)
-                        scale_stride = (
-                            self.get_layer_bytes_per_token(layer_id, block_scale_role)
-                            * self.kv_factor
-                            * self.tokens_per_block
-                        )
-                        scale_base_addr = (
-                            self.impl.get_mem_pool_base_address(
-                                layer_id, block_scale_role, PageIndexMode.SHARED
-                            )
-                            - rep_offset * scale_stride
-                        )
-                    else:
-                        scale_base_addr = 0
-                    block_scale_pool_pointers_list.append([scale_base_addr, 0])
-
-            for layer_id in range(self.num_local_layers):
-                layer_group_id = self.impl.get_layer_group_id(layer_id)
-                role_a, role_b = self._get_pool_roles(layer_group_id)
-                index_base_addr = kv_cache_pool_pointers_list[layer_group_id][0]
-                if role_a == Role.KEY:
-                    offset = self._kv_pool_mapping_offset(layer_id, layer_group_id, index_base_addr)
-                else:
-                    addr_offset = (
-                        self.impl.get_mem_pool_base_address(layer_id, role_a, PageIndexMode.SHARED)
-                        - index_base_addr
-                    )
-                    offset_divisor = self.impl.get_page_stride(layer_id, role_a)
-                    if role_b is not None:
-                        offset_divisor *= self.kv_factor
-                    offset = exact_div(
-                        addr_offset,
-                        offset_divisor,
-                    )
-
-                if self.dtype != DataType.NVFP4 or role_a != Role.KEY:
-                    block_scale_offset = None
-                else:
-                    block_scale_role = (
-                        self._get_block_scale_role(role_a)
-                        if self.is_nvfp4_layer(int(self.pp_layers[layer_id]))
-                        else None
-                    )
-                    if block_scale_role is None:
-                        block_scale_offset = None
-                    else:
-                        block_scale_base_addr = block_scale_pool_pointers_list[layer_group_id][0]
-                        block_scale_addr_offset = (
-                            self.impl.get_mem_pool_base_address(
-                                layer_id, block_scale_role, PageIndexMode.SHARED
-                            )
-                            - block_scale_base_addr
-                        )
-                        block_scale_offset = exact_div(
-                            block_scale_addr_offset,
-                            self.get_layer_bytes_per_token(layer_id, block_scale_role)
-                            * self.kv_factor
-                            * self.tokens_per_block,
-                        )
-
-                if block_scale_offset is not None:
-                    assert block_scale_offset == offset, (
-                        "Block scale offset and offset should be the same"
-                    )
-
-                kv_cache_pool_mapping_list.append([layer_group_id, offset])
-
-        if self.dtype == DataType.NVFP4:
-            for pool_id, block_scale_pool_pointers in enumerate(block_scale_pool_pointers_list):
-                pool_pointers = kv_cache_pool_pointers_list[pool_id]
-                kv_cache_pool_pointers_list[pool_id] = [
-                    [pool_pointers[0], block_scale_pool_pointers[0]],
-                    [pool_pointers[1], block_scale_pool_pointers[1]],
-                ]
-
-        kv_cache_pool_pointers = torch.tensor(
-            kv_cache_pool_pointers_list,
-            dtype=torch.int64,
-            device="cpu",
-            pin_memory=prefer_pinned(),
-        )
-        kv_cache_pool_mapping = torch.tensor(
-            kv_cache_pool_mapping_list,
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=prefer_pinned(),
-        )
-        return kv_cache_pool_pointers, kv_cache_pool_mapping
+    def _get_attention_op_page_index_params(
+        self, layer_id: int, role: DataRole
+    ) -> Tuple[int, int, int]:
+        if (
+            self.is_fp8_subpaged_layer(int(self.pp_layers[layer_id]))
+            and not self.enable_swa_scratch_reuse
+        ):
+            # The target table has one entry per P128 logical block. Record
+            # its first P32 page here; the drafter reads the separate expanded
+            # table supplied by MiniMaxM3DraftSubpageView. Heterogeneous target
+            # pools still need the base per-layer table conversion.
+            converter = self.impl.get_page_index_converter(layer_id, role)
+            return (
+                int(converter.scale * converter.expansion),
+                int(converter.layer_offset * converter.expansion),
+                int(converter.scratch_pages_per_block * converter.expansion),
+            )
+        return super()._get_attention_op_page_index_params(layer_id, role)
 
     def get_draft_subpage_view(self) -> Optional["MiniMaxM3DraftSubpageView"]:
         """Sub-page view over the shared drafter pool, or None.
@@ -1266,6 +1136,7 @@ class MiniMaxM3DraftSubpageView:
         # draft layer's K address, while sourcing raw logical slot IDs from the
         # draft layer's actual V2 pool.
         local = manager.layer_offsets[layer_id]
+        self._local_layer_idx = int(local)
         self._source_pool_id = int(manager.impl.get_layer_group_id(int(local)))
         if is_hybrid_fp8:
             k, _v, slot_stride, pages_per_role = manager._fp8_dense_data_buffers(layer_id)
@@ -1311,6 +1182,18 @@ class MiniMaxM3DraftSubpageView:
         from the view and need not be included.
         """
         return (self._num_slots - 1) * self._slot_units + 2 * self._subdiv
+
+    def get_attention_op_num_blocks(self, local_layer_idx: int) -> int:
+        """Bound relative to this view's draft-K root, in P32 page units."""
+        if local_layer_idx != self._local_layer_idx:
+            raise ValueError("MiniMax-M3 draft cache view only addresses its shared draft layer")
+        return self.blocks_in_primary_pool
+
+    def get_attention_op_kv_page_offset(self, local_layer_idx: int) -> int:
+        """V follows this layer's K pages in each physical allocation slot."""
+        if local_layer_idx != self._local_layer_idx:
+            raise ValueError("MiniMax-M3 draft cache view only addresses its shared draft layer")
+        return self._subdiv
 
     def __getattr__(self, name):
         manager = self.__dict__.get("_manager")

@@ -51,6 +51,14 @@ def get_kv_page_offset(
         if cached is not None:
             return cached
 
+    # A cache view may use different page units and K/V roots from its owner.
+    view_offset = getattr(manager, "get_attention_op_kv_page_offset", None)
+    if view_offset is not None:
+        kv_offset = view_offset(local_layer_idx)
+        if kv_offset is not None and cache is not None:
+            cache[cache_key] = kv_offset
+        return kv_offset
+
     if isinstance(manager, KVCacheManagerV2):
         kv_offsets = manager.kv_offset
         kv_offset = int(kv_offsets[pool_index])

@@ -832,6 +832,8 @@ def test_resolve_num_topk_chunks_is_shape_only_power_of_two(total_q, num_kv_head
 )
 @pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
 def test_sm100f_nvfp4_launch_options(local_batch, expected, capability):
+    if capability != (10, 3):
+        expected = {}
     assert (
         _sm100f_nvfp4_launch_options(
             total_q=local_batch * 4,
@@ -864,6 +866,8 @@ def test_sm100f_nvfp4_launch_options(local_batch, expected, capability):
 )
 @pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
 def test_sm100f_nvfp4_num_topk_chunks(local_batch, expected, capability):
+    if capability != (10, 3):
+        expected = None
     assert (
         _sm100f_nvfp4_num_topk_chunks(
             total_q=local_batch * 4,
@@ -883,6 +887,8 @@ def test_sm100f_nvfp4_num_topk_chunks(local_batch, expected, capability):
 )
 @pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
 def test_sm100f_nvfp4_query_group_size_is_narrowly_scoped(local_batch, expected, capability):
+    if capability != (10, 3):
+        expected = 1
     common = dict(
         total_q=local_batch * 4,
         num_kv_heads=4,
@@ -927,6 +933,8 @@ def test_sm100f_nvfp4_launch_options_rejects_unmeasured_shapes():
 )
 @pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
 def test_sm100f_nvfp4_linear_softmax_policy(num_kv_heads, local_batch, expected, capability):
+    if capability != (10, 3):
+        expected = False
     common = dict(
         total_q=local_batch * 4,
         num_kv_heads=num_kv_heads,
@@ -956,6 +964,8 @@ def test_sm100f_nvfp4_linear_softmax_policy(num_kv_heads, local_batch, expected,
 )
 @pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
 def test_sm100f_nvfp4_merge_launch_options_is_narrowly_scoped(local_batch, expected, capability):
+    if capability != (10, 3):
+        expected = {}
     common = dict(
         num_kv_heads=4,
         gqa_group_size=16,

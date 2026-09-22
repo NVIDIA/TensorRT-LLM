@@ -31,12 +31,14 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import PretrainedConfig
 
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..attention.attention import Attention
 from ..attention.backends import AttentionMetadata
+from ..attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
 from ..attention.backends.interface import (
     AttentionForwardArgs,
     PositionalEmbeddingParams,
@@ -332,6 +334,41 @@ def get_text_model_config(
     return cfg
 
 
+def _nvfp4_cache_supports_fused_write(
+    data: torch.Tensor, scales: torch.Tensor, num_heads: int
+) -> bool:
+    """Reject invalid HND pools; select fusion only for its packed layout."""
+    if (
+        data.dim() != 5
+        or scales.dim() != 5
+        or data.shape[0] <= 0
+        or data.shape[0] != scales.shape[0]
+        or tuple(data.shape[1:]) != (2, num_heads, 128, 64)
+        or tuple(scales.shape[1:]) != (2, num_heads, 128, 8)
+        or data.dtype not in (torch.int8, torch.uint8)
+        or scales.dtype != torch.uint8
+    ):
+        raise ValueError("MiniMax-M3 NVFP4 data and scale caches must have matching HND geometry")
+    for cache in (data, scales):
+        if (
+            cache.stride(4) != 1
+            or cache.stride(3) != cache.shape[4]
+            or cache.stride(2) < 128 * cache.stride(3)
+            or cache.stride(1) < num_heads * cache.stride(2)
+            or cache.stride(0) < 2 * cache.stride(1)
+        ):
+            raise ValueError(
+                "MiniMax-M3 NVFP4 cache rows must be packed and heads/planes/pages must not overlap"
+            )
+    if scales.stride(2) != 128 * 8:
+        # The MSA consumer, including the separate-producer path, requires
+        # each head's scale block to follow the preceding head immediately.
+        raise ValueError("MiniMax-M3 NVFP4 MSA scale cache must have packed head blocks")
+    # Separate cache writes can use padded head strides. The packed PCG
+    # boundary requires fusion and reports an error when this returns False.
+    return data.stride(2) == 128 * 64 and data.stride(0) % 2 == 0 and data.stride(1) % 2 == 0
+
+
 def _validate_sparse_attention_runtime_config(
     model_config: "ModelConfig[PretrainedConfig]",
 ) -> None:
@@ -349,8 +386,26 @@ def _validate_sparse_attention_runtime_config(
             "Set the following in the LLM API configuration:\n"
             "sparse_attention_config:\n  algorithm: minimax_m3"
         )
+    implementation = sparse_config.implementation
+    if implementation == "triton":
+        logger.warning_once(
+            "MiniMax-M3 is using implementation='triton'. "
+            "Set sparse_attention_config.implementation='msa' to use the recommended "
+            "MiniMax-M3 backend on SM100/SM103 GPUs.",
+            key="minimax_m3_recommend_msa",
+        )
+    quant_config = model_config.quant_config
+    if (
+        quant_config is not None
+        and quant_config.quant_mode is not None
+        and quant_config.quant_mode.has_fp4_kv_cache()
+        and implementation != "msa"
+    ):
+        raise ValueError(
+            "MiniMax-M3 NVFP4 KV cache requires sparse_attention_config.implementation='msa'."
+        )
     if getattr(sparse_config, "fuse_qkv_index_projection", False):
-        if getattr(sparse_config, "implementation", None) != "msa":
+        if implementation != "msa":
             raise ValueError(
                 "MiniMax-M3 fuse_qkv_index_projection=True requires the 'msa' implementation."
             )
@@ -358,7 +413,6 @@ def _validate_sparse_attention_runtime_config(
             raise ValueError(
                 "MiniMax-M3 fuse_qkv_index_projection=True requires indexer_kv_dtype='fp8'."
             )
-        quant_config = model_config.quant_config
         if (
             quant_config is None
             or quant_config.quant_mode is None
@@ -1373,21 +1427,18 @@ class MiniMaxM3Attention(Attention):
         )
         kv_quant_scale = getattr(self.qkv_proj, "inv_kv_scales", None) if layer_uses_nvfp4 else None
         if layer_uses_nvfp4:
-            supported_main_cache = (
+            supports_fused_layout = (
                 buffers is not None
-                and buffers.is_cuda
-                and buffers.dtype in (torch.int8, torch.uint8)
-                and buffers.dim() == 5
-                and tuple(buffers.shape[1:]) == (2, self.num_key_value_heads, 128, 64)
-                and buffers.stride(4) == 1
-                and buffers.stride(3) == 64
                 and scale_buffers is not None
+                and _nvfp4_cache_supports_fused_write(
+                    buffers, scale_buffers, self.num_key_value_heads
+                )
+            )
+            supported_main_cache = (
+                supports_fused_layout
+                and buffers.is_cuda
                 and scale_buffers.is_cuda
-                and scale_buffers.dtype == torch.uint8
-                and scale_buffers.dim() == 5
-                and tuple(scale_buffers.shape[1:]) == (2, self.num_key_value_heads, 128, 8)
-                and scale_buffers.stride(4) == 1
-                and scale_buffers.stride(3) == 8
+                and scale_buffers.device == buffers.device
                 and kv_quant_scale is not None
                 and kv_quant_scale.is_cuda
                 and kv_quant_scale.dtype == torch.float32
@@ -2714,7 +2765,7 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
         if model_config.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4:
             # M3's 57 sparse target layers have an MSA NVFP4 consumer, but the
             # one-model Eagle layer has no shipped P32 NVFP4 decode cubin.
-            # Keep its modules and separate cache on their established FP8
+            # Keep its modules and shared draft cache on their established FP8
             # representation while the target remains NVFP4.
             model_config.extra_attrs["draft_kv_cache_quant_algo_override"] = QuantAlgo.FP8
         super().__init__(MiniMaxM3Model(model_config), model_config)
@@ -2749,6 +2800,14 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
             params_map=merged_params_map,
             allow_partial_loading=allow_partial_loading,
         )
+        # CUDA graphs retain the aligned MSA buffers created at warmup. Refresh
+        # their contents after refit; a new allocation would leave replay stale.
+        for layer in self.model.layers:
+            attention = layer.self_attn
+            if getattr(attention.attn, "_msa_nvfp4_dequant_scales", None) is not None:
+                _aligned_nvfp4_dequant_scales(
+                    attention.attn, attention.qkv_proj.kv_scales, refresh=True
+                )
 
     def setup_aliases(self) -> None:
         """Chain each decoder layer's next_layer_layernorm for POST fusion.

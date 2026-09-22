@@ -7394,8 +7394,8 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         if kv_dtype == "nvfp4" and not use_msa:
             pytest.skip("NVFP4 KV cache requires the MSA backend")
         # NVFP4 checkpoint: MXFP8 base layers with NVFP4 routed experts
-        # (MIXED_PRECISION checkpoint). The MSA path runs an FP8 KV cache; the
-        # Triton path keeps the KV cache in BF16.
+        # (MIXED_PRECISION checkpoint). MSA uses the selected FP8/NVFP4 KV
+        # cache; the legacy Triton backend keeps the cache in BF16.
         tp_size = ep_size = 4
         model_name = "nvidia/MiniMax-M3-NVFP4"
         model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
@@ -7433,8 +7433,8 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
     def test_nvfp4_eagle3(self, tp_size, ep_size, attention_dp,
                           overlap_scheduler, fuse_qkv_index_projection,
                           eval_mode, kv_dtype):
-        # One-model Eagle3 on the MSA backend with an FP8 KV cache and CUDA
-        # graphs; the GQA drafter shares the target KV cache. MMLU + GSM8K, or
+        # One-model Eagle3 on MSA with the selected FP8/NVFP4 main cache and
+        # CUDA graphs. The shared GQA draft layer keeps FP8 KV. MMLU + GSM8K, or
         # InferenceX GSM8K, plus a chat-GSM8K acceptance probe, since accuracy
         # alone does not notice a corrupted drafter KV.
         from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import \
@@ -7449,7 +7449,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             max_draft_len=max_draft_len,
             speculative_model=f"{llm_models_root()}/MiniMax-M3-EAGLE3-GQA",
         )
-        # The MSA path runs an FP8 KV cache, as in test_nvfp4.
+        # Sparse target layers use the selected dtype; dense/draft stay FP8.
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False,
                                         dtype=kv_dtype)
@@ -7537,9 +7537,11 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             chat_length = 1 + accepted / steps
             # Reference: the MHA drafter card (Inferact/MiniMax-M3-EAGLE3)
             # reports 0.839 / 3.518; the GQA head measures 0.838 / 3.515 here.
-            print(f"MiniMax-M3 Eagle3 chat-GSM8K acceptance: rate="
-                  f"{chat_rate:.3f}, mean acceptance length="
-                  f"{chat_length:.3f} ({steps} spec iterations)")
+            print(
+                f"MiniMax-M3 Eagle3 chat-GSM8K acceptance (KV={kv_dtype}): rate="
+                f"{chat_rate:.3f}, mean acceptance length="
+                f"{chat_length:.3f} ({accepted}/{drafted} draft tokens accepted, "
+                f"{steps} spec iterations)")
             min_rate = 0.78 if kv_dtype == "nvfp4" else 0.80
             min_length = 3.3 if kv_dtype == "nvfp4" else 3.4
             assert chat_rate > min_rate, \

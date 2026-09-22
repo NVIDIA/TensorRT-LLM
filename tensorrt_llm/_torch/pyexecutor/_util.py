@@ -1764,10 +1764,6 @@ class KvCacheCreator:
                                     max_seq_len, kv_cache_config))
         draft_config = kv_cache_config.model_copy(
             update={"max_attention_window": max_attention_window})
-        draft_dtype = getattr(self._kv_cache_manager_cls,
-                              "draft_manager_kv_cache_dtype", None)
-        if draft_dtype is not None and draft_config.dtype == "nvfp4":
-            draft_config.dtype = draft_dtype
         return draft_config
 
     def _create_one_model_draft_kv_cache_manager(
