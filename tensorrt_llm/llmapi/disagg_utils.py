@@ -188,24 +188,23 @@ def get_usage_tokens_from_ctx(
         return None, 0
 
     if isinstance(ctx_usage, dict):
-        from tensorrt_llm.serve.openai_protocol import UsageInfo
-        ctx_usage = UsageInfo.model_validate(ctx_usage)
-
-    prompt_tokens = getattr(ctx_usage, "prompt_tokens", None)
-    prompt_tokens_details = getattr(ctx_usage, "prompt_tokens_details", None)
+        prompt_tokens = ctx_usage.get("prompt_tokens")
+        prompt_tokens_details = ctx_usage.get("prompt_tokens_details")
+    else:
+        prompt_tokens = getattr(ctx_usage, "prompt_tokens", None)
+        prompt_tokens_details = getattr(ctx_usage, "prompt_tokens_details", None)
 
     cached_tokens = 0
     if prompt_tokens_details is not None:
-        cached_tokens = getattr(prompt_tokens_details, "cached_tokens", 0) or 0
+        if isinstance(prompt_tokens_details, dict):
+            cached_tokens = prompt_tokens_details.get("cached_tokens", 0) or 0
+        else:
+            cached_tokens = getattr(prompt_tokens_details, "cached_tokens", 0) or 0
     return prompt_tokens, cached_tokens
 
 
 def rewrite_usage_info_from_ctx(usage: Optional[Any],
                                 ctx_usage: Optional[Any]) -> Optional[Any]:
-    if ctx_usage is not None and isinstance(ctx_usage, dict):
-        from tensorrt_llm.serve.openai_protocol import UsageInfo
-        ctx_usage = UsageInfo.model_validate(ctx_usage)
-
     prompt_tokens, cached_tokens = get_usage_tokens_from_ctx(ctx_usage)
     if prompt_tokens is None or usage is None:
         return usage
@@ -216,11 +215,30 @@ def rewrite_usage_info_from_ctx(usage: Optional[Any],
     video_tokens = None
     audio_tokens = None
     if ctx_usage is not None:
-        details = getattr(ctx_usage, "prompt_tokens_details", None)
+        if isinstance(ctx_usage, dict):
+            details = ctx_usage.get("prompt_tokens_details")
+        else:
+            details = getattr(ctx_usage, "prompt_tokens_details", None)
         if details is not None:
-            image_tokens = getattr(details, "image_tokens", None)
-            video_tokens = getattr(details, "video_tokens", None)
-            audio_tokens = getattr(details, "audio_tokens", None)
+            if isinstance(details, dict):
+                image_tokens = details.get("image_tokens")
+                video_tokens = details.get("video_tokens")
+                audio_tokens = details.get("audio_tokens")
+            else:
+                image_tokens = getattr(details, "image_tokens", None)
+                video_tokens = getattr(details, "video_tokens", None)
+                audio_tokens = getattr(details, "audio_tokens", None)
+
+    # In generation-first disaggregated serving, gen worker calculates modality
+    # tokens on usage.prompt_tokens_details. If ctx_usage has no modality tokens,
+    # fall back to existing values on usage.prompt_tokens_details.
+    if usage.prompt_tokens_details is not None:
+        if image_tokens is None:
+            image_tokens = getattr(usage.prompt_tokens_details, "image_tokens", None)
+        if video_tokens is None:
+            video_tokens = getattr(usage.prompt_tokens_details, "video_tokens", None)
+        if audio_tokens is None:
+            audio_tokens = getattr(usage.prompt_tokens_details, "audio_tokens", None)
 
     usage.prompt_tokens = prompt_tokens
     usage.total_tokens = prompt_tokens + (usage.completion_tokens or 0)

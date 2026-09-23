@@ -2371,14 +2371,24 @@ class OpenAIServer(_VideoRoutesMixin):
                 generate_inputs = await loop.run_in_executor(
                     self._input_proc_executor,
                     functools.partial(preprocess_fn, prompt, sampling_params,
-                                      disagg            if mm_data:
+                                      disaggregated_params))
+
+            if mm_data:
                 try:
                     mm_metadata = None
                     processed_mm_data = None
+                    item_order = None
                     if isinstance(generate_inputs, dict):
                         processed_mm_data = generate_inputs.get("multi_modal_data")
+                        item_order = generate_inputs.get("mm_item_order")
                     elif hasattr(generate_inputs, "multimodal_params") and generate_inputs.multimodal_params is not None:
                         processed_mm_data = getattr(generate_inputs.multimodal_params, "multimodal_data", None)
+                        item_order = getattr(generate_inputs.multimodal_params, "mm_item_order", None)
+
+                    if item_order is None and isinstance(processed_mm_data, dict):
+                        item_order = processed_mm_data.get("mm_item_order")
+                    if item_order is None:
+                        item_order = prompt.get("mm_item_order")
 
                     if processed_mm_data is not None:
                         from tensorrt_llm.inputs.registry import \
@@ -2392,8 +2402,6 @@ class OpenAIServer(_VideoRoutesMixin):
                         embedding_lengths = mm_metadata.output_embedding_lengths
                     elif (isinstance(processed_mm_data, dict)
                           and "multimodal_embedding_lengths" in processed_mm_data):
-                        item_order = (processed_mm_data.get("mm_item_order")
-                                      or prompt.get("mm_item_order"))
                         lengths = processed_mm_data["multimodal_embedding_lengths"]
                         if (isinstance(item_order, list)
                                 and isinstance(lengths, list)
@@ -2415,31 +2423,6 @@ class OpenAIServer(_VideoRoutesMixin):
                             postproc_args.video_tokens = modality_totals["video"]
                         if "audio" in modality_totals:
                             postproc_args.audio_tokens = modality_totals["audio"]
-                    else:
-                        from tensorrt_llm.inputs.multimodal import \
-                            find_mm_token_lengths
-                        proc = getattr(self.generator, "input_processor", None)
-                        if proc is not None:
-                            mm_token_lengths = find_mm_token_lengths(
-                                mm_data,
-                                proc,
-                                multimodal_data=processed_mm_data if processed_mm_data is not None else prompt.get(
-                                    "multi_modal_data"))
-                            if mm_token_lengths:
-                                if "image" in mm_token_lengths:
-                                    postproc_args.image_tokens = sum(
-                                        mm_token_lengths["image"])
-                                if "video" in mm_token_lengths:
-                                    postproc_args.video_tokens = sum(
-                                        mm_token_lengths["video"])
-                                if "audio" in mm_token_lengths:
-                                    postproc_args.audio_tokens = sum(
-                                        mm_token_lengths["audio"])
-                        else:
-                            logger.warning_once(
-                                "Generator has no TRT-LLM input_processor; "
-                                "skipping multimodal token length calculation.",
-                                key="openai_server_no_input_processor")
                 except (AttributeError, TypeError, ValueError, KeyError) as e:
                     logger.warning_once(
                         f"Failed to calculate multimodal token counts: {e}",
