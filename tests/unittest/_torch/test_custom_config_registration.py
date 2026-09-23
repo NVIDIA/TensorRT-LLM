@@ -272,6 +272,14 @@ def test_nemotron_h_mtp_pattern_follows_block_types():
     config = NemotronHConfig(hybrid_override_pattern="M-*", mtp_hybrid_override_pattern="*E*")
     assert config.mtp_layers_block_type == ["attention", "moe", "attention"]
 
+    # An explicit pattern wins over a block-type list left at its default.
+    config = NemotronHConfig(
+        hybrid_override_pattern="M-*",
+        mtp_hybrid_override_pattern="*E*",
+        mtp_layers_block_type=["attention", "moe"],
+    )
+    assert config.mtp_hybrid_override_pattern == "*E*"
+
     config.mtp_layers_block_type = ["moe"]
     assert config.mtp_hybrid_override_pattern == "E"
     with pytest.raises(AttributeError):
@@ -305,6 +313,13 @@ def test_nemotron_h_missing_pattern_rejected():
 
     with pytest.raises(ValueError, match="hybrid_override_pattern"):
         NemotronHConfig(hybrid_override_pattern=None)
+
+
+def test_nemotron_h_invalid_block_type_rejected():
+    from tensorrt_llm._torch.configs import NemotronHConfig
+
+    with pytest.raises(ValueError, match="layers_block_type"):
+        NemotronHConfig(hybrid_override_pattern=None, layers_block_type=["unknown"])
 
 
 def test_transformers_tokenizer_registers_dense_nemotron_h_in_clean_process(tmp_path):

@@ -253,12 +253,15 @@ class NemotronHConfig(PretrainedConfig):
         self.norm_topk_prob = norm_topk_prob
 
         self.num_nextn_predict_layers = num_nextn_predict_layers
-        if mtp_layers_block_type is None:
-            mtp_layers_block_type = (
-                _pattern_to_block_types(mtp_hybrid_override_pattern)
-                if mtp_hybrid_override_pattern is not None
-                else ["attention", "moe"]
-            )
+        # As in the native config, an explicit pattern wins over a block-type
+        # list left at its default.
+        if mtp_hybrid_override_pattern is not None and mtp_layers_block_type in (
+            None,
+            ["attention", "moe"],
+        ):
+            mtp_layers_block_type = _pattern_to_block_types(mtp_hybrid_override_pattern)
+        elif mtp_layers_block_type is None:
+            mtp_layers_block_type = ["attention", "moe"]
         self.mtp_layers_block_type = mtp_layers_block_type
 
         self.num_logits_to_keep = num_logits_to_keep
