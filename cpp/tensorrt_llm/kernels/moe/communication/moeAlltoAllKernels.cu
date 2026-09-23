@@ -278,10 +278,12 @@ __device__ __forceinline__ void route_dispatch_token(int32_t const* token_select
     int const ep_base = num_experts / ep_size;
     int const ep_remainder = num_experts - ep_base * ep_size;
     int const expert_id = token_selected_experts[local_token_idx * TOP_K + k];
-    int const target_rank = compute_target_rank_id(expert_id, ep_base, ep_remainder);
+    // Invalid experts have no destination, but their lanes still participate in warp collectives.
+    bool const valid_expert = expert_id >= 0 && expert_id < num_experts;
+    int const target_rank = valid_expert ? compute_target_rank_id(expert_id, ep_base, ep_remainder) : -1;
 
     uint32_t const same_target = __match_any_sync(lane_mask, target_rank);
-    bool keep = (__ffs(same_target) - 1) == k;
+    bool keep = valid_expert && ((__ffs(same_target) - 1) == k);
     if constexpr (ENABLE_RANK_MASK)
     {
         keep = keep && is_rank_active(ptrs.active_rank_mask, target_rank);
