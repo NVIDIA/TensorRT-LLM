@@ -330,7 +330,6 @@ class EncoderDecoderRunner(EncoderMixin, ScheduledModelRunner):
         return {
             "encoder_hidden_states": hidden_states,
             "encoder_seq_lens": prepared.sequence_lengths,
-            "runtime_draft_len": inputs.runtime_draft_len,
         }
 
     def _forward_encoder_stack(self, inputs: dict[str, Any]) -> torch.Tensor:

@@ -207,7 +207,6 @@ class ModelEngine(ABC):
                 scheduled_requests: ScheduledRequests,
                 resource_manager: Optional[ResourceManager],
                 new_tensors_device: Optional[SampleStateTensors],
-                gather_context_logits: bool = False,
                 cache_indirection_buffer: Optional[torch.Tensor] = None,
                 num_accepted_tokens_device: Optional[torch.Tensor] = None):
         raise NotImplementedError
@@ -6123,7 +6122,6 @@ class PyTorchModelEngine(ModelEngine):
                 batch: Union[ScheduledRequests, PackedInputs],
                 resource_manager: Optional[ResourceManager] = None,
                 new_tensors_device: Optional[SampleStateTensors] = None,
-                gather_context_logits: bool = False,
                 cache_indirection_buffer: Optional[torch.Tensor] = None,
                 num_accepted_tokens_device: Optional[torch.Tensor] = None,
                 req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None):
@@ -6142,7 +6140,8 @@ class PyTorchModelEngine(ModelEngine):
                 req_id: request.py_seq_slot
                 for req_id, request in req_id_to_old_request.items()
             } if req_id_to_old_request is not None else None),
-            gather_context_logits=gather_context_logits,
+            gather_context_logits=any(request.py_return_context_logits
+                                      for request in batch.context_requests),
             enable_spec_decode=self.enable_spec_decode,
             runtime_draft_len=self.runtime_draft_len,
         )
@@ -6153,7 +6152,8 @@ class PyTorchModelEngine(ModelEngine):
             resource_manager=resource_manager,
             is_dummy=self.is_warmup,
         )
-        self.runtime_draft_len = outputs.pop("runtime_draft_len")
+        self.runtime_draft_len = outputs.pop("runtime_draft_len",
+                                             inputs.runtime_draft_len)
         return outputs
 
     def _forward_scheduled(
@@ -6179,8 +6179,7 @@ class PyTorchModelEngine(ModelEngine):
         self.enable_spec_decode = inputs.enable_spec_decode
         self.runtime_draft_len = inputs.runtime_draft_len
         outputs = self._forward_decoder(inputs, resource_manager)
-        outputs["runtime_draft_len"] = self.runtime_draft_len
-        return outputs
+        return {**outputs, "runtime_draft_len": self.runtime_draft_len}
 
     def _forward_decoder(
         self,

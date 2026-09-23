@@ -422,14 +422,12 @@ class NoKVCacheRunner(ScheduledModelRunner):
             runtime_draft_len=inputs.runtime_draft_len,
         )
         with MoeLoadBalancerIterContext(self._moe_load_balancer):
-            outputs = self._forward_step(
+            return self._forward_step(
                 prepared.kwargs,
                 batch,
                 gather_ids=prepared.gather_ids,
                 gather_context_logits=inputs.gather_context_logits,
             )
-        outputs["runtime_draft_len"] = inputs.runtime_draft_len
-        return outputs
 
     @abstractmethod
     def _forward_step(

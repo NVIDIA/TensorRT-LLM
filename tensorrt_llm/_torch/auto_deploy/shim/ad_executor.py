@@ -1052,11 +1052,13 @@ class ADEngine(ModelEngine):
         scheduled_requests: ScheduledRequests,
         resource_manager: ResourceManager,
         new_tensors_device: Optional[torch.Tensor] = None,
-        gather_context_logits: bool = False,
         cache_indirection_buffer: Optional[torch.Tensor] = None,
         num_accepted_tokens_device: Optional[torch.Tensor] = None,
     ):
         """Run forward from scheduled requests; main entrypoint that gets called by the executor."""
+        gather_context_logits = any(
+            request.py_return_context_logits for request in scheduled_requests.context_requests
+        )
         # we don't support gather_context_logits in spec dec
         if self.spec_config is not None and self.spec_config.spec_dec_mode.without_logits():
             assert not gather_context_logits, "gather_context_logits not supported in spec dec"

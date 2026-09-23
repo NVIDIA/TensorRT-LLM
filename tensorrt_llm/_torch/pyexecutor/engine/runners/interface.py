@@ -53,8 +53,8 @@ class ScheduledInputs:
     """Inputs for one scheduled forward; batch and tensors are borrowed.
 
     Keep borrowed data valid until GPU consumption completes. Spec enablement
-    is independent of draft length; the effective length is returned through
-    outputs["runtime_draft_len"] without modifying this record.
+    is independent of draft length; updates use outputs["runtime_draft_len"].
+    Omitting that key preserves the input length without modifying this record.
     """
 
     batch: ScheduledRequests
@@ -111,7 +111,10 @@ class ScheduledModelRunner(ModelRunner):
     ) -> dict[str, Any]:
         """Execute a batch using per-call inputs and borrowed runtime resources.
 
-        The output dictionary includes the effective ``runtime_draft_len``.
+        Runners that update draft length return the reserved ``runtime_draft_len``
+        key in a fresh dictionary; otherwise, omit it and reuse model outputs.
+        Callers may remove this key without changing cached outputs.
+        Tensor values retain their underlying storage and lifetime.
         Model/graph collaborators belong to the runner's dependencies.
         ``is_dummy`` is True for warmup and memory-profiling passes, not for
         serving batches that merely contain padding requests. Callers establish
