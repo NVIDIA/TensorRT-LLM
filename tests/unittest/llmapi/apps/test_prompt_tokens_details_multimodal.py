@@ -397,27 +397,10 @@ class TestHarmonyAdapterModalityTokens:
                 assert usage_details["audio_tokens"] == 75
 
 
+from types import SimpleNamespace
+
+
 class TestOpenAIServerMultimodalTokenCollection:
-    def test_find_mm_token_lengths_propagation_to_postproc_args(self):
-        """Verify that when mm_data is provided, find_mm_token_lengths aggregates modality counts."""
-        mm_data = {"image": ["img_data_1", "img_data_2"], "video": ["video_data"]}
-        mock_proc = MagicMock()
-
-        with patch("tensorrt_llm.inputs.multimodal.find_mm_token_lengths") as mock_find:
-            mock_find.return_value = {
-                "image": [576, 576],
-                "video": [1024],
-                "audio": [128],
-            }
-            res = mock_find(mm_data, mock_proc)
-            image_tokens = sum(res["image"]) if "image" in res else None
-            video_tokens = sum(res["video"]) if "video" in res else None
-            audio_tokens = sum(res["audio"]) if "audio" in res else None
-
-            assert image_tokens == 1152
-            assert video_tokens == 1024
-            assert audio_tokens == 128
-
     @pytest.mark.asyncio
     async def test_chat_multimodal_token_collection_and_propagation(self):
         """Verify multimodal token length collection and propagation in chat requests.
@@ -440,11 +423,13 @@ class TestOpenAIServerMultimodalTokenCollection:
         server._input_proc_executor = None
         server.await_disconnected = AsyncMock()
 
-        generator = MagicMock()
-        generator.args = MagicMock(num_postprocess_workers=0, reasoning_parser=None)
         promise = MagicMock()
         promise.prompt_token_ids = list(range(50))
-        generator.generate_async.return_value = promise
+
+        generator = SimpleNamespace(
+            args=SimpleNamespace(num_postprocess_workers=0, reasoning_parser=None),
+            generate_async=MagicMock(return_value=promise),
+        )
         server.generator = generator
 
         async def fake_create_chat_response(promise, postproc_params, raw_request, disagg_params):
@@ -521,12 +506,14 @@ class TestOpenAIServerMultimodalTokenCollection:
         server._input_proc_executor = None
         server.await_disconnected = AsyncMock()
 
-        generator = MagicMock()
-        generator.input_processor = trt_processor
-        generator.args = MagicMock(num_postprocess_workers=0, reasoning_parser=None)
         promise = MagicMock()
         promise.prompt_token_ids = list(range(50))
-        generator.generate_async.return_value = promise
+
+        generator = SimpleNamespace(
+            input_processor=trt_processor,
+            args=SimpleNamespace(num_postprocess_workers=0, reasoning_parser=None),
+            generate_async=MagicMock(return_value=promise),
+        )
         server.generator = generator
 
         async def fake_create_chat_response(promise, postproc_params, raw_request, disagg_params):
@@ -587,11 +574,13 @@ class TestOpenAIServerMultimodalTokenCollection:
         server._input_proc_executor = None
         server.await_disconnected = AsyncMock()
 
-        generator = MagicMock()
-        generator.args = MagicMock(num_postprocess_workers=0, reasoning_parser=None)
         promise = MagicMock()
         promise.prompt_token_ids = list(range(50))
-        generator.generate_async.return_value = promise
+
+        generator = SimpleNamespace(
+            args=SimpleNamespace(num_postprocess_workers=0, reasoning_parser=None),
+            generate_async=MagicMock(return_value=promise),
+        )
         server.generator = generator
 
         async def fake_create_chat_response(promise, postproc_params, raw_request, disagg_params):
@@ -632,7 +621,7 @@ class TestOpenAIServerMultimodalTokenCollection:
             patch("tensorrt_llm.serve.openai_server.async_apply_chat_template") as mock_template,
             patch(
                 "tensorrt_llm.inputs.multimodal.find_mm_token_lengths",
-                side_effect=RuntimeError("Token count error"),
+                side_effect=TypeError("Token count error"),
             ),
         ):
             mock_parse.return_value = ([], mm_coro(), None, None)
@@ -647,6 +636,101 @@ class TestOpenAIServerMultimodalTokenCollection:
             assert "image_tokens" not in details
             assert "video_tokens" not in details
             assert "audio_tokens" not in details
+
+    @pytest.mark.asyncio
+    async def test_chat_multimodal_token_collection_from_embedding_lengths(self):
+        """Verify deriving token counts from multimodal_embedding_lengths and mm_item_order."""
+        from tensorrt_llm.inputs.multimodal import MultimodalParams
+        from tensorrt_llm.llmapi.llm import PreprocessedInputs
+
+        server = object.__new__(OpenAIServer)
+        server.model = "test-model"
+        server.allow_request_chat_template = False
+        server.tool_parser = None
+        server.tool_call_id_type = "random"
+        server.processor = MagicMock()
+        server.model_config = None
+        server.multimodal_server_config = None
+        server.tokenizer = MagicMock()
+        server.chat_template = None
+        server.log_stats = False
+        server._input_proc_executor = None
+        server.await_disconnected = AsyncMock()
+
+        def mock_preprocess(prompt, sampling_params, disaggregated_params):
+            return PreprocessedInputs(
+                prompt_token_ids=[1, 2, 3],
+                multimodal_params=MultimodalParams(
+                    multimodal_data={
+                        "multimodal_embedding_lengths": [300, 600],
+                        "mm_item_order": [
+                            {"modality": "image", "index": 0},
+                            {"modality": "video", "index": 0},
+                        ],
+                    }
+                ),
+            )
+
+        promise = MagicMock()
+        promise.prompt_token_ids = list(range(50))
+
+        generator = SimpleNamespace(
+            preprocess=mock_preprocess,
+            args=SimpleNamespace(num_postprocess_workers=0, reasoning_parser=None),
+            generate_async=MagicMock(return_value=promise),
+        )
+        server.generator = generator
+
+        async def fake_create_chat_response(promise, postproc_params, raw_request, disagg_params):
+            args = postproc_params.postproc_args
+            details = PromptTokensDetails(
+                cached_tokens=0,
+                image_tokens=args.image_tokens,
+                video_tokens=args.video_tokens,
+                audio_tokens=args.audio_tokens,
+            )
+            usage = UsageInfo(
+                prompt_tokens=args.num_prompt_tokens,
+                completion_tokens=5,
+                total_tokens=args.num_prompt_tokens + 5,
+                prompt_tokens_details=details,
+            )
+            return ChatCompletionResponse(
+                id="chat-123",
+                created=1000,
+                model="test-model",
+                choices=[],
+                usage=usage,
+            )
+
+        server._create_chat_response = fake_create_chat_response
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "hello"}],
+            stream=False,
+        )
+
+        async def mm_coro():
+            return ({"image": [b"img"], "video": [b"vid"]}, None)
+
+        with (
+            patch("tensorrt_llm.serve.openai_server.parse_chat_messages_coroutines") as mock_parse,
+            patch("tensorrt_llm.serve.openai_server.async_apply_chat_template") as mock_template,
+            patch("tensorrt_llm.inputs.multimodal.find_mm_token_lengths") as mock_find_mm,
+        ):
+            mock_parse.return_value = ([], mm_coro(), None, None)
+            mock_template.return_value = "rendered text"
+
+            resp = await server.openai_chat(request, raw_request=None)
+            assert resp.status_code == 200
+            body = json.loads(resp.body.decode())
+            details = body["usage"]["prompt_tokens_details"]
+
+            assert details["image_tokens"] == 300
+            assert details["video_tokens"] == 600
+            assert "audio_tokens" not in details
+            mock_find_mm.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_chat_multimodal_token_collection_from_preprocessed_item_metadata(self):
@@ -685,12 +769,14 @@ class TestOpenAIServerMultimodalTokenCollection:
                 ),
             )
 
-        generator = MagicMock()
-        generator.preprocess = mock_preprocess
-        generator.args = MagicMock(num_postprocess_workers=0, reasoning_parser=None)
         promise = MagicMock()
         promise.prompt_token_ids = list(range(50))
-        generator.generate_async.return_value = promise
+
+        generator = SimpleNamespace(
+            preprocess=mock_preprocess,
+            args=SimpleNamespace(num_postprocess_workers=0, reasoning_parser=None),
+            generate_async=MagicMock(return_value=promise),
+        )
         server.generator = generator
 
         async def fake_create_chat_response(promise, postproc_params, raw_request, disagg_params):
