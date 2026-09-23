@@ -2029,8 +2029,8 @@ class DecodingBaseConfig(StrictBaseModel):
             "layer quantization, and a concrete backend applies only to the "
             "draft model or layers. Resolution may fall back based on model, "
             "quantization, and hardware support. Replacement-head MTP "
-            "checkpoints are unsupported because their independent "
-            "quantization metadata is not loaded. Nemotron-H embedded MTP "
+            "checkpoints must inherit the target model's MoE backend; leave "
+            "this option unset. Nemotron-H embedded MTP "
             "layers must inherit the target backend because their checkpoint "
             "mapper uses a shared backend-dependent layout. Decoding methods "
             "without a neural draft model ignore this option."))
@@ -2244,10 +2244,10 @@ class DecodingBaseConfig(StrictBaseModel):
                 or not self.uses_replacement_heads):
             return
         raise ValueError(
-            "speculative_config.moe_backend does not support replacement-head "
-            "MTP checkpoints because their independent quantization metadata "
-            "is not loaded. Leave moe_backend unset to inherit the target "
-            "backend, or use a full external draft-model checkpoint.")
+            "speculative_config.moe_backend cannot be set for replacement-head "
+            "MTP checkpoints. Replacement heads inherit the target model's "
+            "MoE backend. Leave moe_backend unset, or use a full external "
+            "draft-model checkpoint.")
 
     @property
     def uses_replacement_heads(self) -> bool:

@@ -234,6 +234,52 @@ def test_update_spec_config_uses_mtp_layers_block_type_when_present(tmp_path):
     assert model_config.mtp_layers_block_type == ["attention", "moe"]
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_nemotron_replacement_without_head_count_uses_shared_head(tmp_path, multimodal):
+    (tmp_path / "config.json").write_text(json.dumps({"mtp_hybrid_override_pattern": "*E"}))
+    language_config = SimpleNamespace(
+        architectures=["NemotronHForCausalLM"],
+        hybrid_override_pattern="*E",
+        num_nextn_predict_layers=0,
+        mtp_layers_block_type=None,
+    )
+    model_config = (
+        SimpleNamespace(architectures=["NemotronH_Nano_VL_V2"], llm_config=language_config)
+        if multimodal
+        else language_config
+    )
+    spec_config = MTPDecodingConfig(max_draft_len=3, speculative_model=str(tmp_path))
+
+    update_spec_config_from_model_config(spec_config, model_config)
+
+    assert language_config.num_nextn_predict_layers == 1
+    assert spec_config.num_nextn_predict_layers == 1
+    assert spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+    assert spec_config.max_draft_len == 3
+    assert language_config.mtp_layers_block_type == ["attention", "moe"]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("head_count", [1, 2])
+def test_nemotron_embedded_multimodal_mtp_uses_language_config(head_count: int) -> None:
+    language_config = SimpleNamespace(
+        architectures=["NemotronHForCausalLM"],
+        num_nextn_predict_layers=head_count,
+        hybrid_override_pattern="*E",
+        mtp_layers_block_type=["attention", "moe"],
+    )
+    config = SimpleNamespace(llm_config=language_config)
+    spec_config = MTPDecodingConfig(max_draft_len=3)
+
+    update_spec_config_from_model_config(spec_config, config)
+
+    assert spec_config.num_nextn_predict_layers == head_count
+    assert spec_config.spec_dec_mode.is_mtp_eagle_one_model() == (head_count == 1)
+    assert spec_config.max_draft_len == (3 if head_count == 1 else head_count)
+    assert not spec_config.uses_replacement_heads
+
+
 def test_remap_preprocessed_mtp_weights_for_draft_model():
     from tensorrt_llm._torch.speculative.utils import remap_preprocessed_mtp_weights_for_draft_model
 

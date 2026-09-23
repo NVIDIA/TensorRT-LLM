@@ -831,8 +831,10 @@ class ModelLoader:
             # into False. Keep an explicit False distinguishable and reject it
             # during FP4 validation instead of silently overriding the user.
             fp4_mla_config = copy.copy(config)
+            fp4_mla_config._frozen = False
             fp4_mla_config.attn_backend = llm_args.attn_backend
             fp4_mla_config.sparse_attention_config = llm_args.sparse_attention_config
+            fp4_mla_config._frozen = config._frozen
             if supports_fp4_mla_attention(fp4_mla_config):
                 validate_and_set_kv_cache_quant(fp4_mla_config,
                                                 llm_args.kv_cache_config.dtype)

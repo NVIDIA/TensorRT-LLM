@@ -82,13 +82,12 @@ def test_nemotron_h_moe_passes_w4a16_config_through_unchanged():
     assert model_config.quant_config.quant_algo == QuantAlgo.W4A16_NVFP4
 
 
-@pytest.mark.parametrize("suffix", ["", ".0.up_proj"])
-def test_nemotron_h_moe_uses_mixer_expert_layer_quant_config(suffix):
+def test_nemotron_h_moe_uses_mixer_expert_layer_quant_config():
     global_quant_config = QuantConfig()
     layer_quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4, group_size=16)
     model_config = _make_nemotron_h_moe_config(global_quant_config)
     model_config.quant_config_dict = {
-        f"model.layers.1.mixer.experts{suffix}": layer_quant_config,
+        "model.layers.1.mixer.experts.0.up_proj": layer_quant_config,
     }
     captured = {}
 
@@ -153,14 +152,15 @@ def test_nemotron_h_moe_exclusion_outranks_the_layer_quant_config():
     assert override.kv_cache_quant_algo == QuantAlgo.FP8
 
 
-def test_nemotron_h_moe_uses_module_prefix_for_mtp_sublayer_quant_config():
+@pytest.mark.parametrize("suffix", ["", ".0.up_proj"])
+def test_nemotron_h_moe_uses_module_prefix_for_mtp_sublayer_quant_config(suffix):
     """MTP sublayers live at model.layers.{N}.layers.{S}; the experts lookup
     has to follow that path rather than the decoder-layer default."""
     global_quant_config = QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION)
     layer_quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
     model_config = _make_nemotron_h_moe_config(global_quant_config)
     model_config.quant_config_dict = {
-        "model.layers.52.layers.1.mixer.experts.0.up_proj": layer_quant_config,
+        f"model.layers.52.layers.1.mixer.experts{suffix}": layer_quant_config,
     }
     captured = {}
 
@@ -348,6 +348,83 @@ def test_nemotron_replacement_quantization_isolates_mtp(tmp_path, head_algo):
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "target_kv_algo,replacement_kv_algo",
+    [(QuantAlgo.FP8, None), (None, QuantAlgo.FP8), (QuantAlgo.FP8, QuantAlgo.FP8)],
+)
+def test_nemotron_replacement_quantization_inherits_target_kv_dtype(
+    tmp_path, target_kv_algo, replacement_kv_algo
+):
+    metadata = {
+        "quant_algo": "MIXED_PRECISION",
+        "kv_cache_quant_algo": replacement_kv_algo,
+        "quantized_layers": {
+            "mtp.layers.0.mixer.q_proj": {"quant_algo": "FP8"},
+            "lm_head": {"quant_algo": "W4A16_NVFP4", "group_size": 16},
+        },
+    }
+    (tmp_path / "hf_quant_config.json").write_text(json.dumps({"quantization": metadata}))
+    target_quant_config = QuantConfig(kv_cache_quant_algo=target_kv_algo)
+    config = _make_nemotron_h_moe_config(target_quant_config)
+    config.pretrained_config.num_hidden_layers = 2
+    config.pretrained_config.num_nextn_predict_layers = 1
+    config.spec_config = SimpleNamespace(uses_replacement_heads=True, speculative_model=tmp_path)
+    target_entry = QuantConfig(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=target_kv_algo)
+    config.quant_config_dict = {"model.layers.0.mixer.q_proj": target_entry}
+
+    result = _with_replacement_mtp_quant_config(config)
+
+    attention_config = result.quant_config_dict["model.layers.2.layers.0.mixer.q_proj"]
+    head_config = result.quant_config_dict["draft_model.lm_head"]
+    assert attention_config.kv_cache_quant_algo == target_kv_algo
+    assert head_config.kv_cache_quant_algo == target_kv_algo
+    assert attention_config.quant_algo == QuantAlgo.FP8
+    assert head_config.quant_algo == QuantAlgo.W4A16_NVFP4
+    assert result.quant_config is target_quant_config
+    assert result.quant_config.kv_cache_quant_algo == target_kv_algo
+    assert result.quant_config_dict["model.layers.0.mixer.q_proj"] is target_entry
+    assert config.quant_config_dict == {"model.layers.0.mixer.q_proj": target_entry}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "quant_algo,head_count,head_algo,exclusions,error",
+    [
+        pytest.param("FP8", 1, "FP8", [], "MIXED_PRECISION metadata", id="homogeneous"),
+        pytest.param("MIXED_PRECISION", 2, "FP8", [], "supports one head", id="multiple-heads"),
+        pytest.param(
+            "MIXED_PRECISION", 1, "NVFP4", [], "NVFP4 LM heads are not supported", id="nvfp4-head"
+        ),
+        pytest.param(
+            "MIXED_PRECISION",
+            1,
+            "FP8",
+            ["mtp.layers.*.mixer.experts"],
+            "Replacement quantization exclusion conflicts",
+            id="replacement-exclusion",
+        ),
+    ],
+)
+def test_nemotron_replacement_quantization_rejects_unsupported_metadata(
+    tmp_path, quant_algo, head_count, head_algo, exclusions, error
+):
+    metadata = {"quant_algo": quant_algo, "exclude_modules": exclusions}
+    if quant_algo == "MIXED_PRECISION":
+        metadata["quantized_layers"] = {
+            "lm_head": {"quant_algo": head_algo, "group_size": 16},
+            "mtp.layers.1.mixer.experts": {"quant_algo": "NVFP4", "group_size": 16},
+        }
+    (tmp_path / "hf_quant_config.json").write_text(json.dumps({"quantization": metadata}))
+    config = _make_nemotron_h_moe_config(QuantConfig())
+    config.pretrained_config.num_hidden_layers = 2
+    config.pretrained_config.num_nextn_predict_layers = head_count
+    config.spec_config = SimpleNamespace(uses_replacement_heads=True, speculative_model=tmp_path)
+
+    with pytest.raises(ValueError, match=error):
+        _with_replacement_mtp_quant_config(config)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("has_head_scale", [False, True])
 def test_nemotron_replacement_preserves_homogeneous_target_head(
     tmp_path, monkeypatch, has_head_scale
@@ -378,3 +455,19 @@ def test_nemotron_replacement_preserves_homogeneous_target_head(
     assert DecoderModelForCausalLM._resolve_lm_head_quant_config(result) is expected
     assert config.quant_config_dict is None
     assert result.quant_config_dict["draft_model.lm_head"].quant_algo == QuantAlgo.FP8
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("target_algo", [QuantAlgo.NVFP4, QuantAlgo.FP8])
+def test_nemotron_replacement_omitted_sublayers_stay_unquantized(target_algo: QuantAlgo) -> None:
+    target_quant = QuantConfig(quant_algo=target_algo, kv_cache_quant_algo=QuantAlgo.FP8)
+    config = _make_nemotron_h_moe_config(target_quant)
+    config.spec_config = SimpleNamespace(uses_replacement_heads=True)
+    mtp = object.__new__(NemotronHMTP)
+
+    resolved = mtp._get_mtp_sublayer_quant_config(config, "model.layers.52.layers.0")
+
+    assert resolved.quant_algo is None
+    assert resolved.kv_cache_quant_algo == QuantAlgo.FP8
+    assert config.quant_config is target_quant
+    assert target_quant.quant_algo == target_algo

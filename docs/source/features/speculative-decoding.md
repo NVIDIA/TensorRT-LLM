@@ -121,6 +121,68 @@ llm = LLM("/path/to/deepseek_model", speculative_config=speculative_config)
 
 MTP can be combined with the [Suffix Automaton enhancement](#suffix-automaton-sa-enhancement) for improved acceptance rates on repetitive content. See the SA section below for details.
 
+#### Quantized Nemotron-H MTP
+
+Nemotron-H supports quantized MTP layers embedded in the target checkpoint,
+including multimodal checkpoints. For a checkpoint that already contains MTP,
+leave `speculative_model` unset. This example runs on one NVIDIA B200:
+
+```python
+from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig
+
+llm = LLM(
+    model="nvidia/Nemotron-Super-3.5-GA-row21-QAD-PreStitched-BoostedMTP",
+    trust_remote_code=True,
+    max_batch_size=1,
+    max_num_tokens=4096,
+    max_seq_len=4096,
+    enable_chunked_prefill=False,
+    kv_cache_config=KvCacheConfig(
+        dtype="fp8", free_gpu_memory_fraction=0.3,
+        mamba_ssm_cache_dtype="float32", enable_block_reuse=False,
+    ),
+    speculative_config=MTPDecodingConfig(max_draft_len=3),
+)
+prompt = llm.tokenizer.apply_chat_template(
+    [{"role": "user", "content": "What is 2 + 2?"}],
+    tokenize=False, add_generation_prompt=True, enable_thinking=False,
+)
+outputs = llm.generate(prompt, SamplingParams(max_tokens=32, temperature=0.0))
+```
+
+This checkpoint stores NVFP4 MTP experts and an FP8 LM head. Embedded MTP uses the
+checkpoint's LM head for both target and draft tokens. Its per-layer quantization
+metadata can identify the complete experts module or individual expert projections.
+The example uses FP8 KV cache because the NVFP4 KV-cache attention kernels do
+not cover all of this checkpoint's MTP verification shapes. The model weights
+retain their checkpoint quantization.
+
+#### Replacement MTP checkpoints
+
+Nemotron-H can load replacement MTP weights from a separate checkpoint through
+`speculative_model`:
+
+```python
+speculative_config = MTPDecodingConfig(
+    max_draft_len=3,
+    speculative_model="/path/to/replacement_mtp_checkpoint",
+)
+llm = LLM("/path/to/nemotron_h_target", speculative_config=speculative_config)
+```
+
+Quantized Nemotron-H replacements require per-layer `MIXED_PRECISION` metadata in
+`hf_quant_config.json` and a single MTP head, which can be replayed to generate
+multiple draft tokens. Independent quantized LM heads support `FP8` and
+`W4A16_NVFP4`; `NVFP4` LM heads are not supported. FP8 heads require
+`lm_head.weight` and `lm_head.weight_scale`. W4A16_NVFP4 heads additionally require
+`lm_head.weight_scale_2`. Unquantized LM heads share the target's head.
+
+Replacement heads inherit the target's MoE backend and KV-cache dtype. Leave
+`speculative_config.moe_backend` unset. See the
+[model support matrix](../models/supported-models.md#model-feature-support-matrix-key-models)
+for architecture-level MTP support.
+
 ### PARD
 
 PARD (PARallel Draft) is a target-independent speculative decoding method that predicts all draft tokens in a single forward pass using mask tokens. Unlike MTP or EAGLE 3 which generate drafts one token at a time, PARD produces K draft tokens in parallel.

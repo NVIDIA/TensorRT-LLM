@@ -924,7 +924,9 @@ def _with_replacement_mtp_quant_config(
     if head_config is not None and head_config.quant_algo not in (
             QuantAlgo.FP8, QuantAlgo.W4A16_NVFP4):
         raise ValueError(
-            "Nemotron replacement MTP LM heads support FP8 or W4A16_NVFP4")
+            "Quantized Nemotron replacement MTP LM heads support only FP8 "
+            f"or W4A16_NVFP4; got {head_config.quant_algo.value}. "
+            "NVFP4 LM heads are not supported.")
 
     start_layer_idx = model_config.pretrained_config.num_hidden_layers
     mtp_prefix = f"model.layers.{start_layer_idx}."
@@ -943,7 +945,7 @@ def _with_replacement_mtp_quant_config(
     for name, config in layer_configs.items():
         checkpoint_name = name
         if name.startswith("mtp.layers."):
-            name = mtp_prefix + "layers." + name.removeprefix("mtp.layers.")
+            name = _remap_hf_quant_module_name(name, start_layer_idx)
         elif name == "lm_head":
             name = "draft_model.lm_head"
         else:
@@ -961,6 +963,10 @@ def _with_replacement_mtp_quant_config(
             raise ValueError(
                 f"Target quantization exclusion conflicts with replacement {name}"
             )
+        # MTP attention writes to the KV pool configured by the target.
+        config.kv_cache_quant_algo = (
+            model_config.quant_config.kv_cache_quant_algo
+            if model_config.quant_config is not None else None)
         merged_configs[name] = config
 
     # Preserve shared custom-op registries while isolating the quantization map.
@@ -1043,11 +1049,6 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
                 "Set speculative_config.speculative_model to a separate MTP "
                 "head replacement checkpoint, or use a target checkpoint that "
                 "embeds MTP.")
-            if ckpt_nextn == 0 and has_mtp_head_replacement:
-                # Neither checkpoint declares a head count: fall back to a
-                # single shared head, matching MTPForCausalLM's MTP-Eagle
-                # default.
-                ckpt_nextn = model_nextn = 1
             if ckpt_nextn == 1 and not model_config.spec_config.use_mtp_vanilla:
                 pass
             else:
@@ -1425,7 +1426,8 @@ class NemotronHMTP(nn.Module):
         quant_config = model_config.quant_config
         if quant_config is None:
             return None
-        if (quant_config.quant_algo in (None, QuantAlgo.MIXED_PRECISION)
+        if (getattr(model_config.spec_config, "uses_replacement_heads", False)
+                or quant_config.quant_algo in (None, QuantAlgo.MIXED_PRECISION)
                 or quant_config.is_module_excluded_from_quantization(
                     sublayer_prefix)):
             return quant_config.model_copy(update={"quant_algo": None})
