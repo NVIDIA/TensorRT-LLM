@@ -302,9 +302,9 @@ authentication, configurable private workdirs, daemon launch/stop, and recovery.
 No GitHub App or systemd setup is required. All remote writes are opt-in with
 `--publish`; operator settings and credentials are not committed to this repo.
 
-The old `scripts/vendor_sources.py` and `scripts/maintain_prims_ts.py` paths are
-compatibility entry points. Existing PrimTS promotions can still be resumed
-through their original command and branch naming.
+Use the entry points under `scripts/vendor/` directly. The old top-level scripts
+and PrimTS-specific CLI aliases are not retained; callers must migrate to the
+generic commands and supply their vendor and repository configuration explicitly.
 
 ## License and attribution
 
