@@ -35,7 +35,7 @@ class PoolingRunner(NoKVCacheRunner):
         if inputs.get("spec_metadata") is not None:
             gather_ids = inputs["spec_metadata"].gather_ids
 
-        outputs = self._deps.model_forward(
+        outputs = self._deps.model_caller(
             **inputs,
             return_context_logits=gather_ids is not None or gather_context_logits,
         )

@@ -18,7 +18,7 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-from .engine.runners.interface import PackedEncoderBatch
+from .engine.runners.interface import PackedRequests
 
 
 class EncoderExecutor:
@@ -59,7 +59,7 @@ class EncoderExecutor:
         input_ids = model_inputs.pop("input_ids")
         if isinstance(input_ids, torch.Tensor):
             input_ids = input_ids.tolist()
-        batch = PackedEncoderBatch(
+        batch = PackedRequests(
             input_ids=input_ids,
             sequence_lengths=[int(length) for length in model_inputs.pop("seq_lens")],
             multi_item_part_lens=model_inputs.pop("multi_item_part_lens", None),
