@@ -12,13 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The two pieces of a Mooncake pool that outlive any one engine.
+"""The two pieces of a Mooncake pool that are not any one engine's to run.
 
-A server that owns its pool needs neither: it describes the pool in
-`kv_connector_config.mooncake_store` and `trtllm-serve` provisions it during
-bringup. These commands exist for the pools it cannot own, such as one shared by
-several engines, one that has to survive a restart, or one whose capacity comes
-from nodes that run no connector.
+`mooncake_master` owns a pool for as long as the command runs, and with
+`--config` also writes the client config its workers read into `--run_dir`.
+Pointing every server at that directory with `$TRTLLM_MOONCAKE_RUN_DIR`, or at
+the file with `$MOONCAKE_CONFIG_PATH`, is how a pool is described today.
+
+`mooncake_donor` lends a node's host memory to a pool it does not otherwise
+use, which is how capacity comes from nodes whose engines have no connector.
 """
 
 import contextlib
@@ -130,6 +132,16 @@ def _signal_handoff():
     "$TRTLLM_MOONCAKE_RUN_DIR, else a temporary directory.",
 )
 @click.option(
+    "--config",
+    type=str,
+    default=None,
+    help="Mooncake JSON config describing the pool. When given, a copy "
+    "naming this master is written to --run_dir as the client config "
+    "every worker reads, so no external script has to render one. "
+    "Workers find it by setting $TRTLLM_MOONCAKE_RUN_DIR to that "
+    "directory, or $MOONCAKE_CONFIG_PATH to the file.",
+)
+@click.option(
     "--heartbeat_seconds",
     type=int,
     default=300,
@@ -143,22 +155,31 @@ def mooncake_master(
     eviction_ratio: float,
     address_file: Optional[str],
     run_dir: Optional[str],
+    config: Optional[str],
     heartbeat_seconds: int,
     telemetry: bool,
 ):
-    """Run a mooncake_master for as long as this command runs.
-
-    A single server with a pool of its own should set
-    `mooncake_store.launch_master` instead.
-    """
+    """Run a mooncake_master for as long as this command runs."""
     _apply_cli_telemetry(telemetry)
 
     # Imported lazily so other subcommands and --help do not pay for the
     # connector package.
-    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import running_master
-    from tensorrt_llm.llmapi.llm_args import MooncakeStoreConfig
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import (
+        PoolSpec,
+        running_master,
+        write_client_config,
+    )
 
-    pool = MooncakeStoreConfig(
+    raw = {}
+    if config:
+        with open(config) as handle:
+            raw = json.load(handle)
+        # This command is the master, so whichever one the config names is not
+        # the one being described here.
+        raw.pop("master_server_address", None)
+
+    pool = PoolSpec.from_json(
+        raw,
         launch_master=True,
         master_port=rpc_port,
         master_metrics_port=metrics_port,
@@ -171,6 +192,8 @@ def mooncake_master(
     )
 
     with _signal_handoff(), running_master(pool, run_dir, address_file=address_file) as master:
+        if config:
+            write_client_config(pool, master.address, run_dir)
         logger.info(
             f"mooncake-store: this master owns the pool until this command "
             f"stops; address {master.address}, log {master.log_path}, metrics "

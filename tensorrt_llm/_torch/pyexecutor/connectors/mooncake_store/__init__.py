@@ -24,48 +24,48 @@ point to point between two known peers, while this one publishes pages into a
 pool addressed by content. The two compose, so a context server can write pages
 here and still hand off over NIXL.
 
-The pool is described in `KvCacheConnectorConfig.mooncake_store`, which lets
-`trtllm-serve` provision it during bringup so no external script has to; see
-`master.py`. Capacity comes only from processes that open a store handle, which
-in a disaggregated deployment is the context servers alone, so `donor.py` lends
-a node's memory to the pool without giving it a connector. Both need the
-Mooncake Python bindings (`pip install mooncake-transfer-engine`).
+`master.py` brings a pool up: it resolves or launches the `mooncake_master`
+and renders the client config the workers read. Capacity comes only from
+processes that open a store handle, which in a disaggregated deployment is the
+context servers alone, so `donor.py` lends a node's memory to the pool without
+giving it a connector. `trtllm-serve mooncake_master` and `mooncake_donor`
+expose both. Both need the Mooncake Python bindings (`pip install
+mooncake-transfer-engine`).
 
 `keys.py` and `staging.py` hold what the store side shares with the connector
 that moves pages in and out of the pool: how a block of tokens becomes a store
-key, and how pages reach the fabric on hosts without GPUDirect RDMA.
-`connector.py` holds the connector classes, which are placeholders.
+key, and how pages reach the fabric on hosts without GPUDirect RDMA. The
+connector itself, and the `LlmArgs` surface that selects it, land with the KV
+cache manager V2 support it depends on.
 """
 
 from .config import MooncakeStoreConnectorConfig, StoreRole, parse_size
-from .connector import MooncakeStoreConnectorScheduler, MooncakeStoreConnectorWorker
-from .donor import DEFAULT_DONOR_LOCAL_BUFFER_SIZE, donate_segment, maybe_donate_segment
+from .donor import DEFAULT_DONOR_LOCAL_BUFFER_SIZE, donate_segment
 from .master import (
+    PoolSpec,
     local_address,
     master_timeout,
-    maybe_provision_pool,
     provision_pool,
     resolve_device_name,
     resolve_master_address,
     running_master,
     wait_for_master,
+    write_client_config,
 )
 
 __all__ = [
     "DEFAULT_DONOR_LOCAL_BUFFER_SIZE",
     "MooncakeStoreConnectorConfig",
-    "MooncakeStoreConnectorScheduler",
-    "MooncakeStoreConnectorWorker",
+    "PoolSpec",
     "StoreRole",
     "donate_segment",
     "local_address",
     "master_timeout",
-    "maybe_donate_segment",
-    "maybe_provision_pool",
     "parse_size",
     "provision_pool",
     "resolve_device_name",
     "resolve_master_address",
     "running_master",
     "wait_for_master",
+    "write_client_config",
 ]

@@ -21,11 +21,13 @@ delivered to this process.
 """
 
 import contextlib
+import json
 import os
 import signal
 import time
 from types import SimpleNamespace
 
+import click
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.connectors import mooncake_store
@@ -75,15 +77,20 @@ class Resource:
     """Stands in for the master process or the mounted segment.
 
     Records its release, so a test can tell a signal that unwound the command
-    from one that ended it with the `finally` never reached.
+    from one that ended it with the `finally` never reached, and what it was
+    asked for, so a test can check what the command resolved before asking.
     """
 
     def __init__(self, held):
         self.held = held
         self.released = False
+        #: `None` until the resource is taken, which distinguishes a command
+        #: that gave up beforehand from one that took it.
+        self.taken_with = None
 
     @contextlib.contextmanager
-    def holding(self, *_args, **_kwargs):
+    def holding(self, *args, **_kwargs):
+        self.taken_with = args
         try:
             yield self.held
         finally:
@@ -199,3 +206,113 @@ def test_the_opt_out_the_group_documents_is_accepted(monkeypatch, command, flag)
         command.run(flag)
 
     assert command.resource.released
+
+
+# ---- what the donor resolves before it offers anything ----
+
+
+@pytest.fixture
+def segment(monkeypatch) -> Resource:
+    """Stub only the segment, so the command's address handling still runs."""
+    resource = Resource("10.0.0.1:12345")
+    monkeypatch.setattr(mooncake_store, "donate_segment", resource.holding)
+    return resource
+
+
+def donor_running(resource: Resource, *args: str) -> CommandUnderTest:
+    return CommandUnderTest(resource, ["mooncake_donor", *args])
+
+
+def test_a_donor_resolves_a_published_master_address_before_joining(monkeypatch, segment, tmp_path):
+    """What lets a generation node name a path instead of a scheduler's choice."""
+    address_file = tmp_path / "master.addr"
+    address_file.write_text("10.0.0.9:50051\n")
+    probed = []
+    monkeypatch.setattr(mooncake_store, "wait_for_master", probed.append)
+    signal_on_idle(monkeypatch, signal.SIGTERM)
+
+    with pytest.raises(_telemetry.SignalExit):
+        donor_running(
+            segment,
+            "--master_server_address",
+            f"file://{address_file}",
+            "--segment_size",
+            "2GiB",
+        ).run()
+
+    # The resolved address is both what was probed and what Mooncake is given:
+    # Mooncake cannot dial a file:// URL.
+    assert probed == ["10.0.0.9:50051"]
+    assert segment.taken_with[0] == "10.0.0.9:50051"
+    # A size string reaching Mooncake unparsed would be a segment of nothing.
+    assert segment.taken_with[1] == 2 * 1024**3
+
+
+def test_a_donor_reports_an_unreachable_master_before_offering_the_segment(monkeypatch, segment):
+    """Otherwise this is a status code from setup, with no address in it."""
+
+    def refuse(address):
+        raise TimeoutError(f"The Mooncake master at {address} did not accept connections")
+
+    monkeypatch.setattr(mooncake_store, "resolve_master_address", lambda address, _t: address)
+    monkeypatch.setattr(mooncake_store, "wait_for_master", refuse)
+
+    with pytest.raises(TimeoutError, match="10.0.0.1:50051"):
+        donor_running(segment, "--master_server_address", "10.0.0.1:50051").run()
+
+    assert segment.taken_with is None
+
+
+@pytest.mark.parametrize("size", ["", "16 GB!"])
+def test_a_donor_rejects_a_size_it_cannot_parse(monkeypatch, segment, size):
+    """Caught as a usage error rather than as a segment of some other size."""
+    monkeypatch.setattr(mooncake_store, "resolve_master_address", lambda address, _t: address)
+    monkeypatch.setattr(mooncake_store, "wait_for_master", lambda _address: None)
+
+    with pytest.raises(click.UsageError, match="--segment_size"):
+        donor_running(
+            segment, "--master_server_address", "10.0.0.1:50051", "--segment_size", size
+        ).run()
+
+    assert segment.taken_with is None
+
+
+# ---- describing the pool from the master's own run directory ----
+
+
+def test_the_master_writes_the_client_config_it_was_given(monkeypatch, master, tmp_path):
+    """Lets workers be pointed at the run directory instead of a hand-written file."""
+    config = tmp_path / "pool.json"
+    config.write_text(
+        json.dumps({"protocol": "tcp", "global_segment_size": "8GiB", "model_key": "m"})
+    )
+    written = {}
+    monkeypatch.setattr(
+        mooncake_store,
+        "write_client_config",
+        lambda pool, address, run_dir: written.update(pool=pool, address=address),
+    )
+    signal_on_idle(monkeypatch, signal.SIGTERM)
+
+    with pytest.raises(_telemetry.SignalExit):
+        master.run("--config", str(config))
+
+    # Written only once the master answers, and naming that master rather than
+    # whichever one the config was copied from.
+    assert written["address"] == "127.0.0.1:50051"
+    assert written["pool"].protocol == "tcp"
+    assert written["pool"].global_segment_size == "8GiB"
+    assert written["pool"].launch_master is True
+    assert written["pool"].master_server_address is None
+
+
+def test_the_master_writes_no_client_config_unless_asked(monkeypatch, master):
+    """A deployment that renders its own must not have it overwritten."""
+    calls = []
+    monkeypatch.setattr(mooncake_store, "write_client_config", lambda *args: calls.append(args))
+    signal_on_idle(monkeypatch, signal.SIGTERM)
+
+    with pytest.raises(_telemetry.SignalExit):
+        master.run()
+
+    assert calls == []

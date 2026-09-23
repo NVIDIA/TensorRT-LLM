@@ -28,9 +28,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import donor as do
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.donor import (
     DEFAULT_DONOR_LOCAL_BUFFER_SIZE,
     donate_segment,
-    maybe_donate_segment,
 )
-from tensorrt_llm.llmapi.llm_args import MooncakeDonationConfig
 
 GIB = 1024**3
 
@@ -76,40 +74,19 @@ def failing_bindings(fake_bindings):
     return Refusing
 
 
-@pytest.mark.parametrize("entry", ["direct", "config"])
-def test_a_donor_registers_the_segment_it_was_asked_for(
-    entry, fake_bindings, reachable_master, monkeypatch
-):
-    """Both entry paths must reach Mooncake with the same seven setup arguments.
-
-    The config-driven path is what makes a generation server a donor, and it
-    derives the hostname and parses the size string on the way: a size string
-    reaching Mooncake unparsed would be a segment of nothing.
-    """
-    if entry == "direct":
-        expected_host, expected_size, expected_device = "10.0.0.5", 32 * GIB, "mlx5_0"
-        donation = donate_segment(
-            "10.0.0.1:50051",
-            32 * GIB,
-            protocol="rdma",
-            device_name="mlx5_0",
-            metadata_server="P2PHANDSHAKE",
-            hostname="10.0.0.5",
-        )
-    else:
-        monkeypatch.setattr(donor_module, "local_address", lambda: "10.1.2.3")
-        expected_host, expected_size, expected_device = "10.1.2.3", 320 * GIB, "mlx5_1"
-        donation = maybe_donate_segment(
-            MooncakeDonationConfig(
-                master_server_address="10.0.0.1:50051",
-                segment_size="320GiB",
-                protocol="rdma",
-                device_name="mlx5_1",
-            )
-        )
+def test_a_donor_registers_the_segment_it_was_asked_for(fake_bindings):
+    """Mooncake's `setup` is positional, so all seven arguments are pinned."""
+    donation = donate_segment(
+        "10.0.0.1:50051",
+        32 * GIB,
+        protocol="rdma",
+        device_name="mlx5_0",
+        metadata_server="P2PHANDSHAKE",
+        hostname="10.0.0.5",
+    )
 
     with donation as host:
-        assert host == expected_host
+        assert host == "10.0.0.5"
         (
             registered_host,
             metadata_server,
@@ -120,11 +97,11 @@ def test_a_donor_registers_the_segment_it_was_asked_for(
             master,
         ) = fake_bindings.instances[0].setup_args
 
-    assert registered_host == expected_host
+    assert registered_host == "10.0.0.5"
     assert metadata_server == "P2PHANDSHAKE"
-    assert segment_size == expected_size
+    assert segment_size == 32 * GIB
     assert protocol == "rdma"
-    assert device_name == expected_device
+    assert device_name == "mlx5_0"
     assert master == "10.0.0.1:50051"
     assert local_buffer_size == DEFAULT_DONOR_LOCAL_BUFFER_SIZE
 
@@ -156,46 +133,5 @@ def test_missing_bindings_are_reported_as_the_separate_component_they_are(monkey
             pytest.fail("donation should not have yielded")
 
 
-@pytest.fixture
-def reachable_master(monkeypatch):
-    """Skip the socket probe: these tests are about what donation asks for."""
-    monkeypatch.setattr(donor_module, "wait_for_master", lambda address: 0.0)
-
-
-def test_a_server_that_was_not_asked_lends_nothing(fake_bindings):
-    """Every deployment that does not lend memory takes this path."""
-    with maybe_donate_segment(None) as host:
-        assert host is None
-    assert fake_bindings.instances == []
-
-
-def test_a_published_master_address_is_read_before_joining(
-    fake_bindings, reachable_master, tmp_path
-):
-    """What lets a generation server name a path instead of a scheduler's choice."""
-    address_file = tmp_path / "master.addr"
-    address_file.write_text("10.0.0.9:50051\n")
-    donation = MooncakeDonationConfig(
-        master_server_address=f"file://{address_file}",
-        segment_size=GIB,
-    )
-
-    with maybe_donate_segment(donation):
-        assert fake_bindings.instances[0].setup_args[6] == "10.0.0.9:50051"
-
-
-def test_an_unreachable_master_is_reported_before_the_segment_is_offered(
-    fake_bindings, monkeypatch
-):
-    """Otherwise this is a status code from setup, with no address in it."""
-
-    def refuse(address):
-        raise TimeoutError(f"The Mooncake master at {address} did not accept connections")
-
-    monkeypatch.setattr(donor_module, "wait_for_master", refuse)
-    donation = MooncakeDonationConfig(master_server_address="10.0.0.1:50051")
-
-    with pytest.raises(TimeoutError, match="10.0.0.1:50051"):
-        with maybe_donate_segment(donation):
-            pytest.fail("donation should not have yielded")
-    assert fake_bindings.instances == []
+# The address a donor joins is resolved and probed by the `mooncake_donor`
+# command before it gets here; see test_mooncake_store_cli.py.
