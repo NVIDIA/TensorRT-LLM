@@ -2,8 +2,8 @@ schema_version: 1
 vendors:
   flashinfer-prims-ts:
     url: https://github.com/yuxianq/flashinfer.git
-    branch: trtllm-prims-ts-dev
-    commit: 6e0d64e79f2a87eeb539e2f40ea12d009679a8f5
+    branch: vendor-source-bot--live-source
+    commit: 9d5b94eb3067072f004af4e12cceceeb103f6fe1
     source: flashinfer/attention/prims_ts
     destination: tensorrt_llm/_torch/attention/backends/prims_ts
     include:
