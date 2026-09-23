@@ -74,9 +74,9 @@ def donate_segment(
         from mooncake.store import MooncakeDistributedStore
     except ImportError as exc:
         raise ImportError(
-            "Donating memory needs the Mooncake Python bindings "
-            "(`pip install mooncake-transfer-engine`). The C++ transfer engine "
-            f"in the container is a different component: {exc}"
+            "Donating memory needs the Mooncake Python bindings, an optional "
+            "dependency: install them with `pip install tensorrt-llm[mooncake]`. "
+            f"The C++ transfer engine is a separate component: {exc}"
         ) from exc
 
     host = hostname or local_address()
