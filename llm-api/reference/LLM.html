@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc28';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc27" />
+  <meta name="docsearch:version" content="1.3.0rc28" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -373,6 +373,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector_vswa.html">KV Cache Connector under VSWA</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
@@ -406,13 +407,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
@@ -560,6 +558,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/prefix-tokenization-cache.html">Prefix-Tokenization Cache</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -763,6 +762,7 @@
 <li><p><strong>multimodal_config</strong> (<a class="reference internal" href="MultimodalConfig.html#tensorrt_llm.llmapi.MultimodalConfig" title="tensorrt_llm.llmapi.llm_args.MultimodalConfig"><em>tensorrt_llm.llmapi.llm_args.MultimodalConfig</em></a>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code>  Defaults to None.</p></li>
 <li><p><strong>attention_dp_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="AttentionDpConfig.html#tensorrt_llm.llmapi.AttentionDpConfig" title="tensorrt_llm.llmapi.llm_args.AttentionDpConfig"><em>tensorrt_llm.llmapi.llm_args.AttentionDpConfig</em></a><em>]</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Optimized load-balancing for the DP Attention scheduler. Defaults to None.</p></li>
 <li><p><strong>disable_overlap_scheduler</strong> (<em>bool</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Disable the overlap scheduler. Defaults to False.</p></li>
+<li><p><strong>enable_return_routed_experts</strong> (<em>bool</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Router Replay (R3): capture per-token pre-EPLB logical top-k MoE expert ids so they can be returned on outputs (per request via SamplingParams.return_routed_experts), for train/inference routing alignment in MoE reinforcement learning. Zero overhead when disabled. Separated-routing MoE backends only. Defaults to False.</p></li>
 <li><p><strong>moe_config</strong> (<a class="reference internal" href="MoeConfig.html#tensorrt_llm.llmapi.MoeConfig" title="tensorrt_llm.llmapi.llm_args.MoeConfig"><em>tensorrt_llm.llmapi.llm_args.MoeConfig</em></a>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> MoE config. Defaults to None.</p></li>
 <li><p><strong>nvfp4_gemm_config</strong> (<em>tensorrt_llm.llmapi.llm_args.Nvfp4GemmConfig</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> NVFP4 GEMM backend config. Defaults to None.</p></li>
 <li><p><strong>dwdp_config</strong> (<em>Optional</em><em>[</em><em>tensorrt_llm.llmapi.llm_args.DwdpConfig</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> DWDP (Distributed Weight Data Parallelism) config. Defaults to None.</p></li>
@@ -777,6 +777,7 @@
 <li><p><strong>enable_early_first_token_response</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Under the overlap scheduler, emit the first-token response ahead of the next sample step to reduce TTFT. No effect when the overlap scheduler is disabled. Defaults to False.</p></li>
 <li><p><strong>enable_low_latency_host_dispatch</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Use low-latency spin-wait mode for CUDA host task dispatch (cudaLaunchHostFunc_v2 with cudaHostTaskSpinWait). Reduces callback latency at the cost of a CPU core spinning while waiting for the GPU event. Requires CUDA 13.2+; on older CUDA versions, falls back to the default blocking mode and logs a one-time warning. Defaults to False.</p></li>
 <li><p><strong>enable_iter_perf_stats</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Enable iteration performance statistics. Defaults to False.</p></li>
+<li><p><strong>enable_tokenization_cache</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Cache the tokenization of recent prompts so that a prompt extending a cached one only tokenizes its tail, which speeds up multi-turn serving with long prompts. Requires a fast tokenizer and applies only to prompts tokenized with add_special_tokens=False and no truncation. The output is identical to tokenizing the whole prompt. Defaults to False.</p></li>
 <li><p><strong>enable_iter_req_stats</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> If true, enables per request stats per iteration. Must also set enable_iter_perf_stats to true to get request stats. Defaults to False.</p></li>
 <li><p><strong>print_iter_log</strong> (<em>bool</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Print iteration logs. Defaults to False.</p></li>
 <li><p><strong>batch_wait_timeout_ms</strong> (<em>float</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> If greater than 0, the request queue might wait up to batch_wait_timeout_ms to receive max_batch_size requests, if fewer than max_batch_size requests are currently available. If 0, no waiting occurs. Defaults to 0.</p></li>
@@ -813,8 +814,8 @@ If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader 
 <li><p><strong>enable_resource_governor</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Enable the resource governor for runtime cache management operations such as KV cache truncation. This adds a per-iteration broadcast collective. Defaults to False.</p></li>
 <li><p><strong>use_cute_dsl_blockscaling_mm</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> If true, use CuTe DSL fp8 blockscaling mm implementation. Defaults to False.</p></li>
 <li><p><strong>use_cute_dsl_blockscaling_bmm</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> If true, use CuTe DSL fp8 blockscaling bmm implementation. Defaults to False.</p></li>
-<li><p><strong>use_cute_dsl_bf16_bmm</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> If true, use CuTe DSL bf16 persistent GEMM for BMM on Blackwell. Defaults to False.</p></li>
-<li><p><strong>use_cute_dsl_bf16_gemm</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> If true, use CuTe DSL bf16 persistent GEMM for Linear layers on Blackwell. Defaults to False.</p></li>
+<li><p><strong>use_cute_dsl_bf16_bmm</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> If true, use CuTe DSL BF16 BMM on Blackwell (SM100/SM103) and Rubin (SM107), including the DeepSeek-V4 o_a projection on Rubin when DSL support and dimension alignment permit. Defaults to false; automatically enabled with pipeline_parallel_size &gt; 1 on SM100/SM103/SM107. Defaults to False.</p></li>
+<li><p><strong>use_cute_dsl_bf16_gemm</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> If true, use CuTe DSL BF16 persistent GEMM for Linear layers on Blackwell (SM100/SM103) and Rubin (SM107) when supported. Defaults to false; automatically enabled with pipeline_parallel_size &gt; 1 on SM100/SM103/SM107. Defaults to False.</p></li>
 <li><p><strong>max_stats_len</strong> (<em>int</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The max number of performance statistic entries. Set to -1 to keep all entries. Set to 0 to use a minimum buffer size of 1. Defaults to 1000.</p></li>
 <li><p><strong>layer_wise_benchmarks_config</strong> (<em>tensorrt_llm.llmapi.llm_args.LayerwiseBenchmarksConfig</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code>  Defaults to None.</p></li>
 </ul>
@@ -1473,9 +1474,9 @@ resolves to <code class="docutils literal notranslate"><span class="pre">[&quot;
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 14, 2026.</p>
+  <p>Last updated on September 21, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e">fca831e</a>.</p>
   
 </div></div>
       

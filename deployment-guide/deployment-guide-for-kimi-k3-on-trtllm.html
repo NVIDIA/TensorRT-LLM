@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc28';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -74,12 +74,12 @@
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware" href="deployment-guide-for-glm-5-on-trtllm.html" />
-    <link rel="prev" title="Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell" href="deployment-guide-for-kimi-k2-thinking-on-trtllm.html" />
+    <link rel="prev" title="Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware" href="deployment-guide-for-qwen3.8-flash-next-on-trtllm.html" />
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc27" />
+  <meta name="docsearch:version" content="1.3.0rc28" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -373,6 +373,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector_vswa.html">KV Cache Connector under VSWA</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
@@ -406,13 +407,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 current active has-children"><a class="reference internal" href="index.html">Model Recipes</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2 current active"><a class="current reference internal" href="#">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
@@ -560,6 +558,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/prefix-tokenization-cache.html">Prefix-Tokenization Cache</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -739,7 +738,7 @@
 <li><p><strong>CUDA graphs and the overlap scheduler are enabled.</strong> The performance-sweep recipes set <code class="docutils literal notranslate"><span class="pre">disable_overlap_scheduler:</span> <span class="pre">false</span></code> and enable CUDA graphs. DEP16 additionally sets <code class="docutils literal notranslate"><span class="pre">cuda_graph_config.enable_padding:</span> <span class="pre">true</span></code>.</p></li>
 <li><p><strong>Chunked prefill is supported and enabled</strong> (<code class="docutils literal notranslate"><span class="pre">enable_chunked_prefill:</span> <span class="pre">true</span></code>), so prompts longer than <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> are scheduled across multiple steps.</p></li>
 <li><p><strong><code class="docutils literal notranslate"><span class="pre">kv_cache_config.tokens_per_block</span></code> must be <code class="docutils literal notranslate"><span class="pre">64</span></code></strong> — required by the MLA (576, 512) generation kernels.</p></li>
-<li><p><strong>Speculative decoding and disaggregated serving are not yet available</strong> for Kimi K3; support is under development. See the “Current limitations” section of <code class="docutils literal notranslate"><span class="pre">examples/kimi_k3/README.md</span></code>.</p></li>
+<li><p><strong>Disaggregated serving and suffix-automaton speculative decoding are available.</strong> Disaggregated serving is validated end-to-end on GB300 with matched DEP16 context/generation servers; see <code class="docutils literal notranslate"><span class="pre">examples/kimi_k3/disagg/README.md</span></code>. Suffix-automaton speculation works for both aggregated and disaggregated serving. See the “Current limitations” section of <code class="docutils literal notranslate"><span class="pre">examples/kimi_k3/README.md</span></code> for constraints (e.g. only matched DEP16=DEP16 disagg geometry is validated at scale).</p></li>
 </ul>
 </section>
 <section id="deployment-steps">
@@ -998,7 +997,7 @@ INFO:     Uvicorn running on http://localhost:8000 (Press CTRL+C to quit)
 <span class="w">    </span>--task<span class="w"> </span>gsm8k<span class="w"> </span>--parallel<span class="w"> </span>tep
 </pre></div>
 </div>
-<p>The batch script declares <code class="docutils literal notranslate"><span class="pre">--nodes=4</span> <span class="pre">--ntasks-per-node=4</span> <span class="pre">--gpus-per-node=4</span></code>, and takes <code class="docutils literal notranslate"><span class="pre">--account</span></code>, <code class="docutils literal notranslate"><span class="pre">--partition</span></code> and <code class="docutils literal notranslate"><span class="pre">--qos</span></code> from the submitting command line. Export <code class="docutils literal notranslate"><span class="pre">KIMI_K3_ROUTER_BF16=0</span></code> before submitting: with attention-DP off the MoE router gate defaults to its BF16 fast path, which can flip borderline expert picks, so the reference scores above are only comparable with that path disabled. <code class="docutils literal notranslate"><span class="pre">KIMI_K3_FP8_WEIGHT_READ</span></code> defaults to <code class="docutils literal notranslate"><span class="pre">0</span></code>, which is the precision the reference scores were measured at.</p>
+<p>The batch script declares <code class="docutils literal notranslate"><span class="pre">--nodes=4</span> <span class="pre">--ntasks-per-node=4</span> <span class="pre">--gpus-per-node=4</span></code>, and takes <code class="docutils literal notranslate"><span class="pre">--account</span></code>, <code class="docutils literal notranslate"><span class="pre">--partition</span></code> and <code class="docutils literal notranslate"><span class="pre">--qos</span></code> from the submitting command line. Export <code class="docutils literal notranslate"><span class="pre">KIMI_K3_ROUTER_BF16=0</span></code> before submitting: with attention-DP off the MoE router gate defaults to its BF16 fast path, which can flip borderline expert picks, so the reference scores above are only comparable with that path disabled. The reference scores used BF16 shared/latent MLP projections, which remain the default (<code class="docutils literal notranslate"><span class="pre">KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=0</span></code>). Set <code class="docutils literal notranslate"><span class="pre">KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=1</span></code> to opt into lossy FP8 conversion of those projections. Attention projection datatypes follow the checkpoint quantization configuration.</p>
 <p>Measured on 16 GB200 GPUs (4 nodes, <code class="docutils literal notranslate"><span class="pre">100-real</span></code> build, 184.31 GiB per GPU), with the checkpoint’s native MXFP4 routed experts:</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
@@ -1197,12 +1196,12 @@ mkdir<span class="w"> </span>-p<span class="w"> </span><span class="s2">"</span>
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="deployment-guide-for-kimi-k2-thinking-on-trtllm.html"
+       href="deployment-guide-for-qwen3.8-flash-next-on-trtllm.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</p>
+        <p class="prev-next-title">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</p>
       </div>
     </a>
     <a class="right-next"
@@ -1373,9 +1372,9 @@ mkdir<span class="w"> </span>-p<span class="w"> </span><span class="s2">"</span>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 14, 2026.</p>
+  <p>Last updated on September 21, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e">fca831e</a>.</p>
   
 </div></div>
       

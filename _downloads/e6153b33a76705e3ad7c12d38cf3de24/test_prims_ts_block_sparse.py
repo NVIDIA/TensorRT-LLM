@@ -20,7 +20,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from utils.util import isSM100Family
+from utils.util import getSMVersion
 
 from tensorrt_llm._torch.attention.backends import prims_ts
 from tensorrt_llm._torch.attention.backends.fmha import prims_ts_block_sparse as block_sparse_fmha
@@ -41,7 +41,7 @@ from tensorrt_llm.functional import PositionEmbeddingType
 pytestmark = pytest.mark.cpu_only
 
 _REQUIRES_PRIMTS_GPU = pytest.mark.skipif(
-    not isSM100Family(),
+    getSMVersion() not in (100, 103),
     reason="PrimTS block-sparse attention requires SM100 or SM103",
 )
 
@@ -429,7 +429,7 @@ def test_paged_wrapper_uses_zero_copy_padded_row_stride_block_tables(monkeypatch
         fwd=args,
         workspace=torch.empty(0, dtype=torch.uint8),
         qkv_input=q,
-        context_buf=args.output,
+        output=args.output,
         sequence_lengths=torch.tensor([129, 193], dtype=torch.int32),
         input_seq_length=1,
         tokens_per_block=64,
@@ -505,7 +505,7 @@ def test_paged_block_tables_remain_live_across_graph_replay(monkeypatch) -> None
         fwd=args,
         workspace=torch.empty(0, dtype=torch.uint8),
         qkv_input=q,
-        context_buf=args.output,
+        output=args.output,
         sequence_lengths=torch.tensor([129, 193], dtype=torch.int32),
         input_seq_length=1,
         tokens_per_block=64,

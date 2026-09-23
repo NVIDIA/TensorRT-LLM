@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc28';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc27" />
+  <meta name="docsearch:version" content="1.3.0rc28" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -373,6 +373,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector_vswa.html">KV Cache Connector under VSWA</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
@@ -406,13 +407,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
@@ -560,6 +558,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/prefix-tokenization-cache.html">Prefix-Tokenization Cache</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -714,25 +713,31 @@
 <td><p>4,096</p></td>
 <td><p>256</p></td>
 </tr>
-<tr class="row-odd"><td><p>GPQA</p></td>
+<tr class="row-odd"><td><p>GSM8K (InferenceX protocol)</p></td>
+<td><p>QA; regex matching</p></td>
+<td><p>accuracy</p></td>
+<td><p>4,096</p></td>
+<td><p>12,288</p></td>
+</tr>
+<tr class="row-even"><td><p>GPQA</p></td>
 <td><p>QA; multiple choice</p></td>
 <td><p>accuracy</p></td>
 <td><p>32,768</p></td>
 <td><p>4,096</p></td>
 </tr>
-<tr class="row-even"><td><p>JSON mode eval</p></td>
+<tr class="row-odd"><td><p>JSON mode eval</p></td>
 <td><p>structured generation</p></td>
 <td><p>accuracy</p></td>
 <td><p>1,024</p></td>
 <td><p>512</p></td>
 </tr>
-<tr class="row-odd"><td><p>AIME 2025</p></td>
+<tr class="row-even"><td><p>AIME 2025</p></td>
 <td><p>QA; regex matching</p></td>
 <td><p>accuracy</p></td>
 <td><p>4,096</p></td>
 <td><p>32,768</p></td>
 </tr>
-<tr class="row-even"><td><p>AIME 2026</p></td>
+<tr class="row-odd"><td><p>AIME 2026</p></td>
 <td><p>QA; regex matching</p></td>
 <td><p>accuracy</p></td>
 <td><p>4,096</p></td>
@@ -759,6 +764,9 @@ trtllm-eval<span class="w"> </span>--model<span class="w"> </span>meta-llama/Lla
 <span class="c1"># Evaluate Llama-3.1-8B-Instruct on GSM8K</span>
 trtllm-eval<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-3.1-8B-Instruct<span class="w"> </span>gsm8k
 
+<span class="c1"># Evaluate a model on GSM8K under the InferenceX protocol (12,288-token generation budget)</span>
+trtllm-eval<span class="w"> </span>--model<span class="w"> </span>&lt;model&gt;<span class="w"> </span>--max_seq_len<span class="w"> </span><span class="m">16384</span><span class="w"> </span>gsm8k_inferencex
+
 <span class="c1"># Evaluate Llama-3.3-70B-Instruct on GPQA Diamond</span>
 trtllm-eval<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-3.3-70B-Instruct<span class="w"> </span>gpqa_diamond
 
@@ -767,8 +775,7 @@ trtllm-eval<span class="w"> </span>--model<span class="w"> </span>&lt;model&gt;<
 trtllm-eval<span class="w"> </span>--model<span class="w"> </span>&lt;model&gt;<span class="w"> </span>--max_seq_len<span class="w"> </span><span class="m">36864</span><span class="w"> </span>aime26
 </pre></div>
 </div>
-<p>The <code class="docutils literal notranslate"><span class="pre">--model</span></code> argument accepts either a Hugging Face model ID or a local checkpoint path. By default, <code class="docutils literal notranslate"><span class="pre">trtllm-eval</span></code> runs the model with the PyTorch backend; you can pass <code class="docutils literal notranslate"><span class="pre">--backend</span> <span class="pre">tensorrt</span></code> to switch to the TensorRT backend.</p>
-<p>Alternatively, the <code class="docutils literal notranslate"><span class="pre">--model</span></code> argument also accepts a local path to pre-built TensorRT engines. In this case, you should pass the Hugging Face tokenizer path to the <code class="docutils literal notranslate"><span class="pre">--tokenizer</span></code> argument.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">--model</span></code> argument accepts either a Hugging Face model ID or a local checkpoint path.</p>
 <p>For more details, see <code class="docutils literal notranslate"><span class="pre">trtllm-eval</span> <span class="pre">--help</span></code> and <code class="docutils literal notranslate"><span class="pre">trtllm-eval</span> <span class="pre">&lt;task&gt;</span> <span class="pre">--help</span></code>.</p>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
@@ -788,13 +795,13 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-eval-model">
 <span class="sig-name descname"><span class="pre">--model</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;model&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-model" title="Link to this definition">#</a></dt>
-<dd><p><strong>Required</strong> model name | HF checkpoint path | TensorRT engine path</p>
+<dd><p><strong>Required</strong> Model name or Hugging Face checkpoint path.</p>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-eval-tokenizer">
 <span class="sig-name descname"><span class="pre">--tokenizer</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;tokenizer&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-tokenizer" title="Link to this definition">#</a></dt>
-<dd><p>Path | Name of the tokenizer.Specify this value only if using TensorRT engine as model.</p>
+<dd><p>Path or name of the tokenizer.</p>
 </dd></dl>
 
 <dl class="std option">
@@ -806,7 +813,7 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-eval-backend">
 <span class="sig-name descname"><span class="pre">--backend</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;backend&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-backend" title="Link to this definition">#</a></dt>
-<dd><p>The backend to use for evaluation. Default is pytorch backend.</p>
+<dd><p>The backend to use for evaluation. This option is deprecated and will be removed in future versions.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Options<span class="colon">:</span></dt>
 <dd class="field-odd"><p>pytorch</p>
@@ -834,7 +841,7 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-eval-max_batch_size">
 <span class="sig-name descname"><span class="pre">--max_batch_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_batch_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-max_batch_size" title="Link to this definition">#</a></dt>
-<dd><p>Maximum number of requests that the engine can schedule.</p>
+<dd><p>Maximum number of requests that can be scheduled.</p>
 </dd></dl>
 
 <dl class="std option">
@@ -2041,6 +2048,122 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 </dd></dl>
 
 </section>
+<section id="trtllm-eval-gsm8k-inferencex">
+<h4>gsm8k_inferencex<a class="headerlink" href="#trtllm-eval-gsm8k-inferencex" title="Link to this heading">#</a></h4>
+<p class="rubric">Usage</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-eval<span class="w"> </span>gsm8k_inferencex<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
+</pre></div>
+</div>
+<p class="rubric">Options</p>
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gsm8k_inferencex-dataset_path">
+<span class="sig-name descname"><span class="pre">--dataset_path</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;dataset_path&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gsm8k_inferencex-dataset_path" title="Link to this definition">#</a></dt>
+<dd><p>The path to GSM8K dataset. If unspecified, the dataset is downloaded from HF hub.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gsm8k_inferencex-num_samples">
+<span class="sig-name descname"><span class="pre">--num_samples</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;num_samples&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gsm8k_inferencex-num_samples" title="Link to this definition">#</a></dt>
+<dd><p>Number of samples to run the evaluation; None means full dataset.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gsm8k_inferencex-random_seed">
+<span class="sig-name descname"><span class="pre">--random_seed</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;random_seed&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gsm8k_inferencex-random_seed" title="Link to this definition">#</a></dt>
+<dd><p>Random seed; data order is fixed under this protocol.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gsm8k_inferencex-apply_chat_template">
+<span class="sig-name descname"><span class="pre">--apply_chat_template</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;apply_chat_template&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gsm8k_inferencex-apply_chat_template" title="Link to this definition">#</a></dt>
+<dd><p>Whether to apply chat template.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gsm8k_inferencex-chat_template_kwargs">
+<span class="sig-name descname"><span class="pre">--chat_template_kwargs</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;chat_template_kwargs&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gsm8k_inferencex-chat_template_kwargs" title="Link to this definition">#</a></dt>
+<dd><p>Chat template kwargs as JSON string, e.g., ‘{“thinking_budget”: 0}’</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gsm8k_inferencex-fewshot_as_multiturn">
+<span class="sig-name descname"><span class="pre">--fewshot_as_multiturn</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;fewshot_as_multiturn&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gsm8k_inferencex-fewshot_as_multiturn" title="Link to this definition">#</a></dt>
+<dd><p>Apply fewshot as multiturn. InferenceX keeps the exemplars in the single user turn.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gsm8k_inferencex-num_fewshot">
+<span class="sig-name descname"><span class="pre">--num_fewshot</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;num_fewshot&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gsm8k_inferencex-num_fewshot" title="Link to this definition">#</a></dt>
+<dd><p>Override the task yaml’s shot count. Use 0 with –apply_chat_template for a single-question chat evaluation.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gsm8k_inferencex-system_prompt">
+<span class="sig-name descname"><span class="pre">--system_prompt</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;system_prompt&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gsm8k_inferencex-system_prompt" title="Link to this definition">#</a></dt>
+<dd><p>System prompt.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gsm8k_inferencex-max_input_length">
+<span class="sig-name descname"><span class="pre">--max_input_length</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_input_length&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gsm8k_inferencex-max_input_length" title="Link to this definition">#</a></dt>
+<dd><p>Maximum prompt length.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gsm8k_inferencex-max_output_length">
+<span class="sig-name descname"><span class="pre">--max_output_length</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_output_length&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gsm8k_inferencex-max_output_length" title="Link to this definition">#</a></dt>
+<dd><p>Maximum generation length.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gsm8k_inferencex-temperature">
+<span class="sig-name descname"><span class="pre">--temperature</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;temperature&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gsm8k_inferencex-temperature" title="Link to this definition">#</a></dt>
+<dd><p>Sampling temperature. Overrides task yaml gen_kwargs.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gsm8k_inferencex-top_p">
+<span class="sig-name descname"><span class="pre">--top_p</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;top_p&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gsm8k_inferencex-top_p" title="Link to this definition">#</a></dt>
+<dd><p>Nucleus sampling top_p. Overrides task yaml gen_kwargs.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gsm8k_inferencex-top_k">
+<span class="sig-name descname"><span class="pre">--top_k</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;top_k&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gsm8k_inferencex-top_k" title="Link to this definition">#</a></dt>
+<dd><p>Top-k sampling. Overrides task yaml gen_kwargs.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gsm8k_inferencex-sampling_seed">
+<span class="sig-name descname"><span class="pre">--sampling_seed</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;sampling_seed&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gsm8k_inferencex-sampling_seed" title="Link to this definition">#</a></dt>
+<dd><p>Random seed for generation sampling.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gsm8k_inferencex-stop_strings">
+<span class="sig-name descname"><span class="pre">--stop_strings</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;stop_strings&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gsm8k_inferencex-stop_strings" title="Link to this definition">#</a></dt>
+<dd><p>Replace the task yaml’s stop strings, as a JSON list, e.g. ‘[“&lt;/s&gt;”, “&lt;<a href="#id3"><span class="problematic" id="id4">|im_end|</span></a>&gt;”]’.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gsm8k_inferencex-log_samples">
+<span class="sig-name descname"><span class="pre">--log_samples</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-eval-gsm8k_inferencex-log_samples" title="Link to this definition">#</a></dt>
+<dd><p>Log sample outputs for debugging.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gsm8k_inferencex-output_path">
+<span class="sig-name descname"><span class="pre">--output_path</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;output_path&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gsm8k_inferencex-output_path" title="Link to this definition">#</a></dt>
+<dd><p>Path to save evaluation results.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-gsm8k_inferencex-output_dir">
+<span class="sig-name descname"><span class="pre">--output_dir</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;output_dir&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-gsm8k_inferencex-output_dir" title="Link to this definition">#</a></dt>
+<dd><p>Directory to save the task infos.</p>
+</dd></dl>
+
+</section>
 <section id="trtllm-eval-hle-aa">
 <h4>hle_aa<a class="headerlink" href="#trtllm-eval-hle-aa" title="Link to this heading">#</a></h4>
 <p class="rubric">Usage</p>
@@ -2737,7 +2860,7 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-eval-mmmu-post_process_fn">
 <span class="sig-name descname"><span class="pre">--post_process_fn</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;post_process_fn&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-mmmu-post_process_fn" title="Link to this definition">#</a></dt>
-<dd><p>Per-sample post-processor. ‘strip_thinking_mmmu’ strips &lt;think&gt;…&lt;/think&gt; and then runs the MMMU answer extractor — needed for thinking models (Kimi K2.5, Step3p7) whose CoT output the default lm-eval regex cannot parse. ‘kimi_k3_mmmu’ reads the answer from Kimi K3’s &lt;<a href="#id3"><span class="problematic" id="id4">|open|</span></a>&gt;response&lt;<a href="#id5"><span class="problematic" id="id6">|sep|</span></a>&gt;…&lt;<a href="#id7"><span class="problematic" id="id8">|close|</span></a>&gt;response channel (its reasoning ends with &lt;<a href="#id9"><span class="problematic" id="id10">|close|</span></a>&gt;think&lt;<a href="#id11"><span class="problematic" id="id12">|sep|</span></a>&gt;, not &lt;/think&gt;, so the strip_thinking path cannot see the answer) and falls back to the strip_thinking cascade when no channel is present.</p>
+<dd><p>Per-sample post-processor. ‘strip_thinking_mmmu’ strips &lt;think&gt;…&lt;/think&gt; and then runs the MMMU answer extractor — needed for thinking models (Kimi K2.5, Step3p7) whose CoT output the default lm-eval regex cannot parse. ‘kimi_k3_mmmu’ reads the answer from Kimi K3’s &lt;<a href="#id5"><span class="problematic" id="id6">|open|</span></a>&gt;response&lt;<a href="#id7"><span class="problematic" id="id8">|sep|</span></a>&gt;…&lt;<a href="#id9"><span class="problematic" id="id10">|close|</span></a>&gt;response channel (its reasoning ends with &lt;<a href="#id11"><span class="problematic" id="id12">|close|</span></a>&gt;think&lt;<a href="#id13"><span class="problematic" id="id14">|sep|</span></a>&gt;, not &lt;/think&gt;, so the strip_thinking path cannot see the answer) and falls back to the strip_thinking cascade when no channel is present.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Options<span class="colon">:</span></dt>
 <dd class="field-odd"><p>strip_thinking_mmmu | kimi_k3_mmmu</p>
@@ -3043,6 +3166,7 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-eval-gpqa-main">gpqa_main</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-eval-gpqa-ns">gpqa_ns</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-eval-gsm8k">gsm8k</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-eval-gsm8k-inferencex">gsm8k_inferencex</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-eval-hle-aa">hle_aa</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-eval-ifbench">ifbench</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-eval-image-generation-eval">image_generation_eval</a></li>
@@ -3148,9 +3272,9 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 14, 2026.</p>
+  <p>Last updated on September 21, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e">fca831e</a>.</p>
   
 </div></div>
       

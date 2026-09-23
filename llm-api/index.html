@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc28';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc27" />
+  <meta name="docsearch:version" content="1.3.0rc28" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -373,6 +373,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector_vswa.html">KV Cache Connector under VSWA</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
@@ -406,13 +407,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
@@ -560,6 +558,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/prefix-tokenization-cache.html">Prefix-Tokenization Cache</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -715,7 +714,7 @@
 <span class="linenos">33</span>    <span class="n">main</span><span class="p">()</span>
 </pre></div>
 </div>
-<p>For more advanced usage including distributed inference, multimodal, and speculative decoding, please refer to this <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95/examples/llm-api/README.md">README</a>.</p>
+<p>For more advanced usage including distributed inference, multimodal, and speculative decoding, please refer to this <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e/examples/llm-api/README.md">README</a>.</p>
 </section>
 <section id="model-input">
 <h2>Model Input<a class="headerlink" href="#model-input" title="Link to this heading">#</a></h2>
@@ -840,22 +839,27 @@ appear.</p>
 <section id="flashinfer-jit-workspaces-for-mpi-workers">
 <h3>FlashInfer JIT workspaces for MPI workers<a class="headerlink" href="#flashinfer-jit-workspaces-for-mpi-workers" title="Link to this heading">#</a></h3>
 <p><code class="docutils literal notranslate"><span class="pre">trtllm-llmapi-launch</span></code> ranks and dynamically spawned <code class="docutils literal notranslate"><span class="pre">MpiPoolSession</span></code> workers
-isolate FlashInfer JIT source-generation workspaces by default. Each process
-normally claims a locked, persistent cache slot under
-<code class="docutils literal notranslate"><span class="pre">~/.cache/tensorrt_llm/flashinfer</span></code>, while downloaded cubins remain in
-FlashInfer’s shared cache. This prevents concurrent MPI processes from writing
-the same generated source files without forcing a cold JIT compilation on
-every launch. Set <code class="docutils literal notranslate"><span class="pre">TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0</span></code> before invoking
-the launcher or creating the LLM instance to disable this behavior.</p>
+isolate FlashInfer JIT workspaces by default. Each process claims a locked,
+persistent cache slot under <code class="docutils literal notranslate"><span class="pre">~/.cache/tensorrt_llm/flashinfer</span></code> that holds its
+generated sources, compiled modules and downloaded FlashInfer artifacts, so
+concurrent MPI processes never write to each other’s compiler inputs while JIT
+artifacts stay warm across launches. Set
+<code class="docutils literal notranslate"><span class="pre">TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0</span></code> before invoking the launcher or
+creating the LLM instance to disable this behavior.</p>
 <p>Persistent slots are not pruned automatically, so their count can grow with
 peak job concurrency. When no TensorRT-LLM processes are using the cache, the
 slots may be deleted safely; subsequent launches rebuild the removed JIT
 artifacts.</p>
 <p>If persistent workspace setup is unavailable, each process falls back to a
-process-unique temporary workspace that is removed when the process exits.
-Persistent cache reuse is not available for this fallback.</p>
+process-unique temporary workspace that is removed, artifacts included, when
+the process exits.</p>
 <p>An explicitly configured <code class="docutils literal notranslate"><span class="pre">FLASHINFER_WORKSPACE_BASE</span></code> takes precedence in both
-launch modes. An explicitly configured <code class="docutils literal notranslate"><span class="pre">FLASHINFER_CUBIN_DIR</span></code> is also preserved.</p>
+launch modes. An explicitly configured <code class="docutils literal notranslate"><span class="pre">FLASHINFER_CUBIN_DIR</span></code> is propagated
+unchanged to every rank and is the way to share downloaded artifacts between
+ranks; populate it before the multi-rank launch, either by installing the
+<code class="docutils literal notranslate"><span class="pre">flashinfer-cubin</span></code> package matching <code class="docutils literal notranslate"><span class="pre">flashinfer-python</span></code> or with a single-rank
+warm-up run, and set <code class="docutils literal notranslate"><span class="pre">FLASHINFER_NO_DOWNLOAD=1</span></code> so a missing artifact fails
+instead of being downloaded concurrently into the shared directory.</p>
 </section>
 <section id="cannot-quit-after-generation">
 <h3>Cannot quit after generation<a class="headerlink" href="#cannot-quit-after-generation" title="Link to this heading">#</a></h3>
@@ -1037,9 +1041,9 @@ launch modes. An explicitly configured <code class="docutils literal notranslate
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 14, 2026.</p>
+  <p>Last updated on September 21, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e">fca831e</a>.</p>
   
 </div></div>
       

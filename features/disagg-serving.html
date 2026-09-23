@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc28';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc27" />
+  <meta name="docsearch:version" content="1.3.0rc28" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -373,6 +373,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector_vswa.html">KV Cache Connector under VSWA</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
@@ -406,13 +407,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
@@ -560,6 +558,7 @@
 <li class="toctree-l2"><a class="reference internal" href="visualgen-sparse-attention.html">Sparse Attention</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1"><a class="reference internal" href="prefix-tokenization-cache.html">Prefix-Tokenization Cache</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -812,7 +811,8 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <p><code class="docutils literal notranslate"><span class="pre">backend</span></code> selects the communication library used to transfer the KV cache. Set it to <code class="docutils literal notranslate"><span class="pre">NIXL</span></code>, which transfers over RDMA / NVLink. The field has no default — if it is left unset, the worker still starts, but it brings up no cache transceiver and rejects the disaggregated requests it is then routed. Set the same value on the context and the generation worker.</p>
 <p><code class="docutils literal notranslate"><span class="pre">max_tokens_in_buffer</span></code> is best left unset. It bounds how many KV transfers a generation worker admits concurrently, and the built-in default is derived from the model’s maximum sequence length, so a small hand-written value only throttles the transfer path.</p>
 <p><code class="docutils literal notranslate"><span class="pre">kv_transfer_timeout_ms</span></code> bounds how long a request may wait for its KV cache before it is cancelled and cleaned up. The default is <code class="docutils literal notranslate"><span class="pre">60000</span></code>.</p>
-<p><code class="docutils literal notranslate"><span class="pre">kv_cache_bounce_size_mb</span></code> is <code class="docutils literal notranslate"><span class="pre">0</span></code> by default, which sends each KV block separately. Setting it to a positive size coalesces a request’s blocks into one contiguous buffer of that many MiB per direction and issues a single NIXL write, which helps when a request’s blocks are scattered. It requires fabric (MNNVL) memory.</p>
+<p><code class="docutils literal notranslate"><span class="pre">kv_cache_bounce_size_mb</span></code> is <code class="docutils literal notranslate"><span class="pre">0</span></code> by default, which sends each KV block separately. Setting it to a positive size enables a bounce buffer, which helps when a request’s blocks are scattered. With the default Python implementation this is one contiguous buffer of that many MiB per direction and a single NIXL write per request; the C++ implementation (next paragraph) instead uses one buffer shared by both directions and chunked writes. The default Python implementation is designed for fabric (MNNVL) memory; the C++ implementation falls back to <code class="docutils literal notranslate"><span class="pre">cudaMalloc</span></code> where fabric memory is unavailable.</p>
+<p><code class="docutils literal notranslate"><span class="pre">agent_bounce_buffer_enable</span></code> (default <code class="docutils literal notranslate"><span class="pre">false</span></code>) switches to the C++ transfer-agent bounce implementation, which uses one buffer of <code class="docutils literal notranslate"><span class="pre">kv_cache_bounce_size_mb</span></code> MiB shared by send and receive (prefer a power of two; the usable capacity rounds down to one). By default it engages only for KV writes with many small descriptors (at least 1024, averaging at most 16 KiB), i.e. head-mismatch layouts such as context TP != generation TP or DP; head-matched layouts (MLA, symmetric TP) stay on the standard NIXL path unless <code class="docutils literal notranslate"><span class="pre">agent_bounce_params</span></code> relaxes the gate (lower <code class="docutils literal notranslate"><span class="pre">min_descriptor_count</span></code>, where <code class="docutils literal notranslate"><span class="pre">0</span></code> means no minimum; raise <code class="docutils literal notranslate"><span class="pre">max_average_descriptor_size</span></code>, e.g. <code class="docutils literal notranslate"><span class="pre">4MB</span></code>; <code class="docutils literal notranslate"><span class="pre">max_average_descriptor_size:</span> <span class="pre">0</span></code> routes every outbound write to standard NIXL, acting as an outbound gate off switch — it disables outbound routing only: the arena is still allocated, the handshake still advertised and inbound transfers still served; set <code class="docutils literal notranslate"><span class="pre">agent_bounce_buffer_enable:</span> <span class="pre">false</span></code> to turn the feature off). Set it consistently on the context and generation workers; in particular <code class="docutils literal notranslate"><span class="pre">request_timeout_ms</span></code> and the effective chunk cap must match on both sides, otherwise the pair falls back to standard NIXL with a WARNING when the peer is loaded (transfers are then routed silently). The compared chunk cap is the effective one, min(<code class="docutils literal notranslate"><span class="pre">max_chunk_size</span></code>, the arena’s usable capacity): <code class="docutils literal notranslate"><span class="pre">kv_cache_bounce_size_mb</span></code> matters only when its usable capacity (rounded down to a power of two) is below <code class="docutils literal notranslate"><span class="pre">max_chunk_size</span></code>; both sides must then clamp to the same chunk cap, otherwise the pair falls back to standard NIXL.</p>
 <p>For example, you could launch two context servers and one generation server as follows:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Generate context_config.yml</span>
 <span class="nb">echo</span><span class="w"> </span>-e<span class="w"> </span><span class="s2">"disable_overlap_scheduler: True\ncache_transceiver_config:\n  backend: NIXL"</span><span class="w"> </span>&gt;<span class="w"> </span>context_config.yml
@@ -870,7 +870,7 @@ when routing requests to the generation servers, the disaggregated server will m
 </div>
 <section id="launching-disaggregated-servers-on-slurm-clusters">
 <h4>Launching disaggregated servers on SLURM clusters<a class="headerlink" href="#launching-disaggregated-servers-on-slurm-clusters" title="Link to this heading">#</a></h4>
-<p>Please refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95/examples/disaggregated/slurm">Disaggregated Inference Benchmark Scripts</a>.</p>
+<p>Please refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e/examples/disaggregated/slurm">Disaggregated Inference Benchmark Scripts</a>.</p>
 </section>
 </section>
 <section id="multiple-instances">
@@ -1005,7 +1005,7 @@ when routing requests to the generation servers, the disaggregated server will m
 <p>TRT-LLM uses some environment variables to control the behavior of disaggregated service.</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP</span></code>: If set to <code class="docutils literal notranslate"><span class="pre">1</span></code>, the generation worker will not overlap KV cache transfer with model inference. The default value is <code class="docutils literal notranslate"><span class="pre">0</span></code>.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_NIXL_KVCACHE_BACKEND</span></code>: Selects the transport NIXL itself uses. Valid values are <code class="docutils literal notranslate"><span class="pre">UCX</span></code> (default) and <code class="docutils literal notranslate"><span class="pre">LIBFABRIC</span></code>; an unsupported value logs a warning and falls back to <code class="docutils literal notranslate"><span class="pre">UCX</span></code>. <code class="docutils literal notranslate"><span class="pre">LIBFABRIC</span></code> additionally requires a NIXL build carrying the libfabric plugin — see the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95/examples/disaggregated/README.md">disaggregated serving examples</a>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_NIXL_KVCACHE_BACKEND</span></code>: Selects the transport NIXL itself uses. Valid values are <code class="docutils literal notranslate"><span class="pre">UCX</span></code> (default) and <code class="docutils literal notranslate"><span class="pre">LIBFABRIC</span></code>; an unsupported value logs a warning and falls back to <code class="docutils literal notranslate"><span class="pre">UCX</span></code>. <code class="docutils literal notranslate"><span class="pre">LIBFABRIC</span></code> additionally requires a NIXL build carrying the libfabric plugin — see the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e/examples/disaggregated/README.md">disaggregated serving examples</a>.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_GPU_KEEPALIVE</span></code>: If set to <code class="docutils literal notranslate"><span class="pre">1</span></code>, a generation worker that is waiting at the benchmark fill gate (<code class="docutils literal notranslate"><span class="pre">TLLM_BENCHMARK_REQ_QUEUES_SIZE</span></code>) keeps a resident warp on every SM in ~100 ms chunks instead of idling through the wait, so GPU-activity metrics do not read idle while the context tier fills it. The work is drained when the gate opens and never overlaps a forward pass. The default value is <code class="docutils literal notranslate"><span class="pre">0</span></code>.</p></li>
 </ul>
 <p>There are some other useful environment variables that may help when encountering failures or performance issues.</p>
@@ -1231,9 +1231,9 @@ NCCL’s default graph mixing behavior.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 14, 2026.</p>
+  <p>Last updated on September 21, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e">fca831e</a>.</p>
   
 </div></div>
       

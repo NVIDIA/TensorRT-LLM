@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc28';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc27" />
+  <meta name="docsearch:version" content="1.3.0rc28" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -373,6 +373,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector_vswa.html">KV Cache Connector under VSWA</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
@@ -406,13 +407,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
@@ -560,6 +558,7 @@
 <li class="toctree-l2"><a class="reference internal" href="visualgen-sparse-attention.html">Sparse Attention</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1"><a class="reference internal" href="prefix-tokenization-cache.html">Prefix-Tokenization Cache</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -885,7 +884,7 @@ NVFP4 only in a cold cache tier and restores the runtime type before Attention;
 the latter sets <code class="docutils literal notranslate"><span class="pre">KvCacheConfig(dtype=&quot;nvfp4&quot;)</span></code> and keeps active GPU KV in
 NVFP4. See <a class="reference internal" href="quantization.html"><span class="std std-doc">Quantization</span></a> for active KV-cache quantization.
 For complete single-GPU and disaggregated-serving configurations, see the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95/examples/kv_cache_compression/nvfp4_cold_page.md">NVFP4 cold-page compression example</a>.</p>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e/examples/kv_cache_compression/nvfp4_cold_page.md">NVFP4 cold-page compression example</a>.</p>
 </section>
 <section id="triattention">
 <h3>TriAttention<a class="headerlink" href="#triattention" title="Link to this heading">#</a></h3>
@@ -914,7 +913,7 @@ implementation runs over the compacted cache.</p>
 </pre></div>
 </div>
 <p>For calibration, configuration parameters, and current requirements, see the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95/examples/kv_cache_compression/triattention.md">detailed TriAttention example</a>.</p>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e/examples/kv_cache_compression/triattention.md">detailed TriAttention example</a>.</p>
 </section>
 </section>
 <section id="support">
@@ -953,8 +952,12 @@ structures. Both share the same general platform requirements.<a class="footnote
 <td><p>Preserved losslessly</p></td>
 <td><p>Not supported</p></td>
 </tr>
-<tr class="row-even"><td><p>DeepSeek-V4 specialized sparse cache</p></td>
+<tr class="row-even"><td><p>DeepSeek-V4 CSA cache</p></td>
+<td><p>Supported<a class="footnote-reference brackets" href="#deepseek-v4" id="id4" role="doc-noteref"><span class="fn-bracket">[</span>4<span class="fn-bracket">]</span></a>; the NoPE part of the compressed KV is encoded as NVFP4, the RoPE part and the indexer cache are preserved losslessly</p></td>
 <td><p>Not supported</p></td>
+</tr>
+<tr class="row-odd"><td><p>DeepSeek-V4 SWA, HCA, and compressor state</p></td>
+<td><p>Preserved losslessly</p></td>
 <td><p>Not supported</p></td>
 </tr>
 </tbody>
@@ -968,6 +971,7 @@ structures. Both share the same general platform requirements.<a class="footnote
 <li><p>Qwen3.5 family</p></li>
 <li><p>GLM family, including GLM-5.2</p></li>
 <li><p>DeepSeek-R1 family</p></li>
+<li><p>DeepSeek-V4 family</p></li>
 </ul>
 <p>TriAttention has been tested with the following model families:</p>
 <ul class="simple">
@@ -983,8 +987,8 @@ examples for method-specific requirements.</p>
 <section id="further-reading">
 <h2>Further Reading<a class="headerlink" href="#further-reading" title="Link to this heading">#</a></h2>
 <ul class="simple">
-<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95/examples/kv_cache_compression/nvfp4_cold_page.md">NVFP4 Cold-Page KV-Cache Compression example</a></p></li>
-<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95/examples/kv_cache_compression/triattention.md">TriAttention KV-Cache Compression example</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e/examples/kv_cache_compression/nvfp4_cold_page.md">NVFP4 Cold-Page KV-Cache Compression example</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e/examples/kv_cache_compression/triattention.md">TriAttention KV-Cache Compression example</a></p></li>
 <li><p><a class="reference internal" href="../developer-guide/kv-cache-compression-development.html"><span class="std std-doc">KV Cache Compression Development Guide</span></a></p></li>
 <li><p><a class="reference internal" href="../developer-guide/kv-cache-cold-page-codec.html"><span class="std std-doc">KVCacheManagerV2 Cold-Page Codec Design</span></a></p></li>
 <li><p><a class="reference internal" href="kvcache.html"><span class="std std-doc">KV Cache System</span></a></p></li>
@@ -1003,15 +1007,24 @@ KVCM V2, and an NVIDIA GPU with compute capability SM100 or SM103.</p>
 <span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id2">2</a><span class="fn-bracket">]</span></span>
 <p>NVFP4 cold-page quantization additionally requires
 the native C++ KVCM V2 backend and a nonzero Host or Disk cache. See the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95/examples/kv_cache_compression/nvfp4_cold_page.md">NVFP4 cold-page compression example</a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e/examples/kv_cache_compression/nvfp4_cold_page.md">NVFP4 cold-page compression example</a>
 for its remaining requirements and validated modes.</p>
 </aside>
 <aside class="footnote brackets" id="triattention-requirements" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id3">3</a><span class="fn-bracket">]</span></span>
 <p>TriAttention requires a model-specific offline
 calibration file. See the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95/examples/kv_cache_compression/triattention.md">detailed TriAttention example</a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e/examples/kv_cache_compression/triattention.md">detailed TriAttention example</a>
 for its remaining requirements and validated modes.</p>
+</aside>
+<aside class="footnote brackets" id="deepseek-v4" role="doc-footnote">
+<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id4">4</a><span class="fn-bracket">]</span></span>
+<p>DeepSeek-V4 requires <code class="docutils literal notranslate"><span class="pre">tokens_per_block</span></code> of 128 or 256 (the
+DeepSeek-V4 cache manager’s constraint) and cold-page compression does not
+cover the FP8 <code class="docutils literal notranslate"><span class="pre">fp8_ds_mla</span></code> footer-scale KV layout; use the ordinary FP8 or
+BF16 runtime KV layout. If <code class="docutils literal notranslate"><span class="pre">scale_checkpoint_path</span></code> supplies ModelOpt KV
+scales, only the per-layer K scale is applied to the CSA cache; the V scale
+is not used.</p>
 </aside>
 </aside>
 
@@ -1171,9 +1184,9 @@ for its remaining requirements and validated modes.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 14, 2026.</p>
+  <p>Last updated on September 21, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e">fca831e</a>.</p>
   
 </div></div>
       

@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc28';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -73,13 +73,13 @@
 
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Architecture Overview" href="../developer-guide/overview.html" />
+    <link rel="next" title="Prefix-Tokenization Cache" href="prefix-tokenization-cache.html" />
     <link rel="prev" title="VisualGen Quantized Attention (Beta)" href="visualgen-quantized-attention.html" />
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc27" />
+  <meta name="docsearch:version" content="1.3.0rc28" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -373,6 +373,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector_vswa.html">KV Cache Connector under VSWA</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
@@ -406,13 +407,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
@@ -560,6 +558,7 @@
 <li class="toctree-l2 current active"><a class="current reference internal" href="#">Sparse Attention</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1"><a class="reference internal" href="prefix-tokenization-cache.html">Prefix-Tokenization Cache</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -685,6 +684,7 @@
 <li><p><a class="reference internal" href="#overview">Overview</a></p>
 <ul>
 <li><p><a class="reference internal" href="#algorithms">Algorithms</a></p></li>
+<li><p><a class="reference internal" href="#sol-attn">Sol-Attn</a></p></li>
 </ul>
 </li>
 <li><p><a class="reference internal" href="#skip-softmax-attention">Skip Softmax Attention</a></p></li>
@@ -708,13 +708,47 @@
 <td><p><code class="docutils literal notranslate"><span class="pre">SkipSoftmaxAttentionConfig</span></code></p></td>
 <td><p>Supported</p></td>
 </tr>
-<tr class="row-odd"><td><p>VSA</p></td>
-<td><p>TBD</p></td>
-<td><p>TODO</p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">vsa</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">VideoSparseAttentionConfig</span></code></p></td>
+<td><p>Supported (CUTEDSL)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">sol_attn</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">SolAttentionConfig</span></code></p></td>
+<td><p>Supported (CUTEDSL, sm100/sm103)</p></td>
 </tr>
 </tbody>
 </table>
 </div>
+</section>
+<section id="sol-attn">
+<h3>Sol-Attn<a class="headerlink" href="#sol-attn" title="Link to this heading">#</a></h3>
+<p>Sol-Attn (<a class="reference external" href="https://arxiv.org/abs/2607.24027">arXiv:2607.24027</a>) folds dynamic block
+routing, sparse computation, and an approximation-correction term into one
+online-softmax pass. It runs on the <strong>CUTEDSL</strong> backend only, on datacenter
+Blackwell – sm100 (B200/GB200) and sm103 (B300/GB300) – and requires
+<code class="docutils literal notranslate"><span class="pre">head_dim=128</span></code>, bfloat16, and MHA
+(<code class="docutils literal notranslate"><span class="pre">num_kv_heads</span> <span class="pre">==</span> <span class="pre">num_heads</span></code>).</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">attention_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">CUTEDSL</span>
+<span class="w">  </span><span class="nt">sparse_attention_config</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">sol_attn</span>
+<span class="w">    </span><span class="nt">tau</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2.0</span><span class="w">                        </span><span class="c1"># routing threshold; higher routes more blocks sparse</span>
+<span class="w">    </span><span class="nt">thresh_type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">diag</span><span class="w">               </span><span class="c1"># or "exact"</span>
+<span class="w">    </span><span class="nt">disabled_until_timestep</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.9090</span><span class="w"> </span><span class="c1"># dense while normalized timestep &gt;= cutoff</span>
+<span class="w">    </span><span class="nt">dense_layers</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">]</span><span class="w">               </span><span class="c1"># optional: layer indices forced dense</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> has the same meaning as it does for Skip Softmax:
+attention runs dense while the normalized denoising timestep is at or above the
+cutoff, protecting the high-noise prefix, and switches to the sparse kernel
+below it. Use <code class="docutils literal notranslate"><span class="pre">None</span></code> rather than <code class="docutils literal notranslate"><span class="pre">0.0</span></code> to disable the prefix.</p>
+<p>On an input the kernel is known not to serve — an unsupported architecture, a
+<code class="docutils literal notranslate"><span class="pre">head_dim</span></code> other than 128, a non-bfloat16 dtype — Sol-Attn runs dense
+attention instead (the configured backend’s dense kernel where available,
+torch SDPA otherwise), logs the specific reason once, and counts the fallback.
+Set <code class="docutils literal notranslate"><span class="pre">TRTLLM_SOL_ATTN_STRICT=1</span></code> to raise instead, which is useful when
+benchmarking to confirm the kernel actually ran. Errors raised by the kernel
+itself are not caught.</p>
 </section>
 </section>
 <section id="skip-softmax-attention">
@@ -758,6 +792,7 @@
 <li><p><code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> — optional normalized <code class="docutils literal notranslate"><span class="pre">[0,</span> <span class="pre">1]</span></code> transformer-forward timestep cutoff. Denoising starts near 1 and moves toward 0, so Skip Softmax Attention is disabled while <code class="docutils literal notranslate"><span class="pre">timestep</span> <span class="pre">&gt;=</span> <span class="pre">disabled_until_timestep</span></code> and enabled after the timestep drops below the cutoff.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">ignore</span></code> — optional fnmatch layer patterns where the calibrated Skip Softmax Attention config should not apply. Patterns match both full module names and component-relative names, so <code class="docutils literal notranslate"><span class="pre">blocks.0.attn1</span></code> matches <code class="docutils literal notranslate"><span class="pre">transformer.blocks.0.attn1</span></code> and <code class="docutils literal notranslate"><span class="pre">transformer_2.blocks.0.attn1</span></code>.</p></li>
 </ul>
+<p>TRT-LLM imports NumExpr only when it needs to consume a checkpoint formula. During package bootstrap, TRT-LLM defaults <code class="docutils literal notranslate"><span class="pre">NUMEXPR_NUM_THREADS</span></code> to <code class="docutils literal notranslate"><span class="pre">1</span></code> without overriding an explicit environment setting. This evaluates the scalar formulas without creating a NumExpr worker pool while allowing applications with substantial NumExpr work to opt into parallel evaluation. This setting controls only NumExpr and does not replace workload-specific OpenMP tuning. Applications that import NumExpr before TRT-LLM must configure it before process startup.</p>
 <p>Diffusers checkpoints with multiple transformer components keep calibration per component:</p>
 <div class="highlight-text notranslate"><div class="highlight"><pre><span></span>checkpoint/
   model_index.json
@@ -776,7 +811,7 @@
 <li><p>Set <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> to disable Skip Softmax Attention at the beginning of denoising. The cutoff is expressed in normalized scheduler time; the number of dense steps it produces depends on the scheduler and the number of inference steps.</p></li>
 </ul>
 <p><code class="docutils literal notranslate"><span class="pre">threshold_scale_factor</span></code> and <code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> are alternatives: if both are present, <code class="docutils literal notranslate"><span class="pre">threshold_scale_factor</span></code> takes precedence and the calibration formula is not used. User-provided <code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> and <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> override checkpoint defaults. Checkpoint <code class="docutils literal notranslate"><span class="pre">ignore</span></code> patterns always disable Skip Softmax Attention for matching layers.</p>
-<p>Skip Softmax Attention works with both the <strong>TRTLLM</strong> and <strong>CUTEDSL</strong> attention backends in VisualGen. Set <code class="docutils literal notranslate"><span class="pre">attention_config.backend</span></code> to either when enabling it. On CUTEDSL, Skip Softmax Attention can also be combined with <code class="docutils literal notranslate"><span class="pre">quant_attention_config</span></code>’s block-scaled Q/K recipes (MXFP8, NVFP4); VSA is the only CUTEDSL sparse-attention algorithm that is mutually exclusive with quantized attention.</p>
+<p>Skip Softmax Attention works with both the <strong>TRTLLM</strong> and <strong>CUTEDSL</strong> attention backends in VisualGen. Set <code class="docutils literal notranslate"><span class="pre">attention_config.backend</span></code> to either when enabling it. On CUTEDSL, Skip Softmax Attention can also be combined with <code class="docutils literal notranslate"><span class="pre">quant_attention_config</span></code>’s block-scaled Q/K recipes (MXFP8, NVFP4); VSA and Sol-Attn are currently the two supported sparse-attention algorithms, both available only through the CuTeDSL attention backend; quantized attention is not yet supported or enabled with either mode.</p>
 <section id="mapping-disabled-until-timestep-to-actual-denoising-steps">
 <h4>Mapping <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> to Actual Denoising Steps<a class="headerlink" href="#mapping-disabled-until-timestep-to-actual-denoising-steps" title="Link to this heading">#</a></h4>
 <p>VisualGen passes each transformer a normalized scheduler timestep <code class="docutils literal notranslate"><span class="pre">t</span></code> in <code class="docutils literal notranslate"><span class="pre">[0,</span> <span class="pre">1]</span></code>. Denoising proceeds from high to low <code class="docutils literal notranslate"><span class="pre">t</span></code>. Skip Softmax Attention is disabled while <code class="docutils literal notranslate"><span class="pre">t</span> <span class="pre">&gt;=</span> <span class="pre">disabled_until_timestep</span></code> and enabled once <code class="docutils literal notranslate"><span class="pre">t</span> <span class="pre">&lt;</span> <span class="pre">disabled_until_timestep</span></code>. Equality therefore belongs to the dense phase.</p>
@@ -940,11 +975,11 @@ shifted_sigma[i] = 3 * s[i] / (1 + 2 * s[i])
       </div>
     </a>
     <a class="right-next"
-       href="../developer-guide/overview.html"
+       href="prefix-tokenization-cache.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Architecture Overview</p>
+        <p class="prev-next-title">Prefix-Tokenization Cache</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -971,6 +1006,7 @@ shifted_sigma[i] = 3 * s[i] / (1 + 2 * s[i])
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">Overview</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#algorithms">Algorithms</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#sol-attn">Sol-Attn</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#skip-softmax-attention">Skip Softmax Attention</a><ul class="nav section-nav flex-column">
@@ -1076,9 +1112,9 @@ shifted_sigma[i] = 3 * s[i] / (1 + 2 * s[i])
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 14, 2026.</p>
+  <p>Last updated on September 21, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e">fca831e</a>.</p>
   
 </div></div>
       

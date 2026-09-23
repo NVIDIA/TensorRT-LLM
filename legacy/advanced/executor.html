@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc28';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,7 +77,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc27" />
+  <meta name="docsearch:version" content="1.3.0rc28" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -371,6 +371,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector_vswa.html">KV Cache Connector under VSWA</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
@@ -404,13 +405,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
@@ -558,6 +556,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/prefix-tokenization-cache.html">Prefix-Tokenization Cache</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -675,7 +674,7 @@
 <p>TensorRT-LLM includes a high-level C++ API called the Executor API which allows you to execute requests
 asynchronously, with in-flight batching, and without the need to define callbacks.</p>
 <p>A software component (referred to as “the client” in the text that follows) can interact
-with the executor using the API defined in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95/cpp/include/tensorrt_llm/executor/executor.h"><code class="docutils literal notranslate"><span class="pre">executor.h</span></code></a> file.
+with the executor using the API defined in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e/cpp/include/tensorrt_llm/executor/executor.h"><code class="docutils literal notranslate"><span class="pre">executor.h</span></code></a> file.
 For details about the API, refer to the <a class="reference internal" href="../../_cpp_gen/executor.html"><span class="doc">Executor</span></a>.</p>
 <p>The following sections provide an overview of the main classes defined in the Executor API.</p>
 <section id="api">
@@ -722,14 +721,14 @@ This allows the runtime to reconfigure itself for a new beam width when no reque
 <div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="n">std</span><span class="o">::</span><span class="n">unordered_map</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="p">,</span><span class="w"> </span><span class="n">function</span><span class="o">&lt;</span><span class="n">Tensor</span><span class="p">(</span><span class="n">IdType</span><span class="p">,</span><span class="w"> </span><span class="n">Tensor</span><span class="o">&amp;</span><span class="p">,</span><span class="w"> </span><span class="n">BeamTokens</span><span class="w"> </span><span class="k">const</span><span class="o">&amp;</span><span class="p">,</span><span class="w"> </span><span class="n">StreamPtr</span><span class="w"> </span><span class="k">const</span><span class="o">&amp;</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">optional</span><span class="o">&lt;</span><span class="n">IdType</span><span class="o">&gt;</span><span class="p">)</span><span class="o">&gt;&gt;</span>
 </pre></div>
 </div>
-<p>The map key is the name associated with that logits post-processing callback. Each request can then specify the name of the logits post-processor to use for that particular request, if any.</p>
+<p>The map key is the name associated with that logits post-processing callback.</p>
 <p>The first argument to the callback is the request id, second is the logits tensor, third are the tokens produced by the request so far, fourth is the operation stream used by the logits tensor, and last one is an optional client id. The callback returns a modified tensor of logits. Multiple requests can share same client id and callback can use different logic based on client id.</p>
 <p>You must use the stream to access the logits tensor. For example, to perform an addition with a bias tensor, the addition operation is enqueued on that stream. Alternatively, you can call <code class="docutils literal notranslate"><span class="pre">stream-&gt;synchronize()</span></code>, however, that will slow down the entire execution pipeline.</p>
 <p>The executor also includes a <a class="reference internal" href="../../_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor26LogitsPostProcessorBatchedE" title="tensorrt_llm::executor::LogitsPostProcessorBatched"><code class="xref cpp cpp-class docutils literal notranslate"><span class="pre">LogitsPostProcessorBatched</span></code></a> method that enables altering logits of multiple requests in a batch. The batched method allows further optimizations and reduces callback overheads.</p>
 <div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="n">std</span><span class="o">::</span><span class="n">function</span><span class="o">&lt;</span><span class="kt">void</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">vector</span><span class="o">&lt;</span><span class="n">IdType</span><span class="o">&gt;</span><span class="w"> </span><span class="k">const</span><span class="o">&amp;</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">vector</span><span class="o">&lt;</span><span class="n">Tensor</span><span class="o">&gt;&amp;</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">vector</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">reference_wrapper</span><span class="o">&lt;</span><span class="n">BeamTokens</span><span class="w"> </span><span class="k">const</span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="k">const</span><span class="o">&amp;</span><span class="p">,</span><span class="w"> </span><span class="n">StreamPtr</span><span class="w"> </span><span class="k">const</span><span class="o">&amp;</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">vector</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">optional</span><span class="o">&lt;</span><span class="n">IdType</span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="k">const</span><span class="o">&amp;</span><span class="p">)</span><span class="o">&gt;</span>
 </pre></div>
 </div>
-<p>A single batched callback can be specified in <code class="docutils literal notranslate"><span class="pre">LogitsPostProcessorConfig</span></code>. Each request can opt to apply this callback by specifying the name of the logits post-processor as <code class="docutils literal notranslate"><span class="pre">Request::kBatchedPostProcessorName</span></code>.</p>
+<p>A single batched callback can be specified in <code class="docutils literal notranslate"><span class="pre">LogitsPostProcessorConfig</span></code>.</p>
 <p>Note: Neither callback variant is supported with the <code class="docutils literal notranslate"><span class="pre">STATIC</span></code> batching type for the moment.</p>
 <p>In a multi-GPU run, the callback is invoked on all ranks in the first tensor-parallel group, by default. To ensure correct execution, replicate the client-side state that is accessed by the callback on these ranks. If replication is expensive or infeasible, use <code class="docutils literal notranslate"><span class="pre">LogitsPostProcessorConfig::setReplicate(false)</span></code> to invoke the callback only on rank 0. The executor broadcasts the sampled tokens internally to ensure correct execution.</p>
 </section>
@@ -743,7 +742,7 @@ This allows the runtime to reconfigure itself for a new beam width when no reque
 <span class="n">stop_token_ids</span> <span class="o">=</span> <span class="p">[</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">eos_token_id</span><span class="p">]</span>
 </pre></div>
 </div>
-<p>Refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95/tensorrt_llm/llmapi/tokenizer.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/llmapi/tokenizer.py</span></code></a> for more details. You may dump these materials to disk, and reload them to C++ runtime for use.</p>
+<p>Refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e/tensorrt_llm/llmapi/tokenizer.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/llmapi/tokenizer.py</span></code></a> for more details. You may dump these materials to disk, and reload them to C++ runtime for use.</p>
 <p>Each request can be optionally specified with a <code class="docutils literal notranslate"><span class="pre">GuidedDecodingParams</span></code>, which defines the desired structured format. Currently, it supports four types:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">GuidedDecodingParams::GuideType::kJSON</span></code>: The generated text is amenable to JSON format;</p></li>
@@ -792,12 +791,12 @@ This allows the runtime to reconfigure itself for a new beam width when no reque
 </section>
 <section id="c-executor-api-example">
 <h2>C++ Executor API Example<a class="headerlink" href="#c-executor-api-example" title="Link to this heading">#</a></h2>
-<p>Two C++ examples are provided that show how to use the Executor API and can be found in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95/examples/cpp/executor/"><code class="docutils literal notranslate"><span class="pre">examples/cpp/executor</span></code></a> folder.</p>
+<p>Two C++ examples are provided that show how to use the Executor API and can be found in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e/examples/cpp/executor/"><code class="docutils literal notranslate"><span class="pre">examples/cpp/executor</span></code></a> folder.</p>
 </section>
 <section id="python-bindings-for-the-executor-api">
 <h2>Python Bindings for the Executor API<a class="headerlink" href="#python-bindings-for-the-executor-api" title="Link to this heading">#</a></h2>
-<p>Python bindings for the Executor API are also available to use the Executor API from Python. The Python bindings are defined in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95/cpp/tensorrt_llm/nanobind/executor/bindings.cpp">bindings.cpp</a> and once built, are available in package <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.bindings.executor</span></code>. Running <code class="docutils literal notranslate"><span class="pre">help('tensorrt_llm.bindings.executor')</span></code> in a Python interpreter will provide an overview of the classes available.</p>
-<p>In addition, three Python examples are provided to demonstrate how to use the Python bindings to the Executor API for single and multi-GPU models. They can be found in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95/examples/bindings"><code class="docutils literal notranslate"><span class="pre">examples/bindings</span></code></a>.</p>
+<p>Python bindings for the Executor API are also available to use the Executor API from Python. The Python bindings are defined in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e/cpp/tensorrt_llm/nanobind/executor/bindings.cpp">bindings.cpp</a> and once built, are available in package <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.bindings.executor</span></code>. Running <code class="docutils literal notranslate"><span class="pre">help('tensorrt_llm.bindings.executor')</span></code> in a Python interpreter will provide an overview of the classes available.</p>
+<p>In addition, three Python examples are provided to demonstrate how to use the Python bindings to the Executor API for single and multi-GPU models. They can be found in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e/examples/bindings"><code class="docutils literal notranslate"><span class="pre">examples/bindings</span></code></a>.</p>
 </section>
 <section id="in-flight-batching-with-the-triton-inference-server">
 <h2>In-flight Batching with the Triton Inference Server<a class="headerlink" href="#in-flight-batching-with-the-triton-inference-server" title="Link to this heading">#</a></h2>
@@ -952,9 +951,9 @@ the TensorRT-LLM C++ Executor API.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 14, 2026.</p>
+  <p>Last updated on September 21, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e">fca831e</a>.</p>
   
 </div></div>
       
