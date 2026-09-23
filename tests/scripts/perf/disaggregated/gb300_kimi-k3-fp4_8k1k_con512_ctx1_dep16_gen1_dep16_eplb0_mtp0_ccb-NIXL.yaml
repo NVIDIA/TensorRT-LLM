@@ -102,10 +102,6 @@ worker_config:
       # Shared C++ agent arena for chunked gather/write/scatter transfers.
       kv_cache_bounce_size_mb: 1024
       agent_bounce_buffer_enable: true
-      # Exercise bounce for the larger MLA/recurrent-state descriptors.
-      agent_bounce_params:
-        min_descriptor_count: "1"
-        max_average_descriptor_size: "32MB"
     disable_overlap_scheduler: false
     trust_remote_code: true
   ctx:
@@ -133,9 +129,5 @@ worker_config:
       max_tokens_in_buffer: 8448
       kv_cache_bounce_size_mb: 1024
       agent_bounce_buffer_enable: true
-      # Exercise bounce for the larger MLA/recurrent-state descriptors.
-      agent_bounce_params:
-        min_descriptor_count: "1"
-        max_average_descriptor_size: "32MB"
     disable_overlap_scheduler: true
     trust_remote_code: true
