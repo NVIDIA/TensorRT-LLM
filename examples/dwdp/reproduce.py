@@ -10,7 +10,6 @@ matrix YAML, writes full benchmark configs, and forwards them to
 """
 
 import argparse
-import math
 import re
 import subprocess
 import sys
@@ -183,7 +182,6 @@ def build_worker_config(experiment: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("num_ctx_servers must be divisible by dwdp_group when DWDP is enabled")
 
     ctx_max_seq_len, gen_max_seq_len = calc_seq_lens(isl, osl, ratio)
-    max_tokens_in_buffer = math.ceil(ctx_max_seq_len / 64) * 64
     dwdp_size = num_ctx_servers // dwdp_group if dwdp_enabled else 1
     experts_per_worker = int(TOTAL_EXPERTS - (dwdp_size - 1) * prefetch)
     if dwdp_enabled and experts_per_worker <= 0:
@@ -220,9 +218,8 @@ def build_worker_config(experiment: Dict[str, Any]) -> Dict[str, Any]:
             "backend": "CUTEDSL",
         },
         "cache_transceiver_config": {
-            "backend": "UCX",
-            "transceiver_runtime": "CPP",
-            "max_tokens_in_buffer": max_tokens_in_buffer,
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
         },
         "num_postprocess_workers": 4,
     }
@@ -256,9 +253,8 @@ def build_worker_config(experiment: Dict[str, Any]) -> Dict[str, Any]:
             "free_gpu_memory_fraction": 0.3,
         },
         "cache_transceiver_config": {
-            "backend": "UCX",
-            "transceiver_runtime": "CPP",
-            "max_tokens_in_buffer": max_tokens_in_buffer,
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
         },
         "moe_config": {
             "backend": "CUTEDSL",

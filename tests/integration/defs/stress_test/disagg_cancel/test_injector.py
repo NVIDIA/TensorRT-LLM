@@ -94,7 +94,7 @@ def _dummy_yaml_with_injections(injections_yaml: str) -> str:
         stress_config:
           duration_min: 1
           kv_cache_manager: v1
-          transceiver: cpp
+          transceiver: python
           injections:
         """
     )
@@ -346,7 +346,7 @@ def test_respawn_uses_allocated_port_and_bounded_health_wait(
             stress_config:
               duration_min: 1
               kv_cache_manager: v1
-              transceiver: cpp
+              transceiver: python
               injections: []
             """
         )
@@ -468,7 +468,7 @@ def test_injector_empty_schedule_exits_immediately(tmp_path: Path) -> None:
             stress_config:
               duration_min: 1
               kv_cache_manager: v1
-              transceiver: cpp
+              transceiver: python
               injections: []
             """
         )

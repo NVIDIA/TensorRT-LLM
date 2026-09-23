@@ -135,7 +135,7 @@ _CANARY_YAML = textwrap.dedent(
     stress_config:
       duration_min: 1
       kv_cache_manager: v1
-      transceiver: cpp
+      transceiver: python
       canary:
         prompts_file: {prompts_file}
         rate_per_min: 5

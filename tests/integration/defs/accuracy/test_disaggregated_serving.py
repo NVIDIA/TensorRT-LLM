@@ -377,18 +377,12 @@ def launch_disaggregated_llm(
 
     for i, port in enumerate(ctx_ports):
         env = base_env.copy()
-        cache_transceiver_config_backend = ctx_server_config.get(
-            "cache_transceiver_config", {}).get("backend", "DEFAULT")
-        # NIXL backend ignores this env-var fallback; skip it.
-        if cache_transceiver_config_backend != "NIXL":
-            env["TRTLLM_USE_UCX_KVCACHE"] = "1"
         # Need to set UCX_TLS to ^ib to avoid hangs on CI B200 cluster.
         env["UCX_TLS"] = "^ib"
         if enable_perf:
             env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_perf_dir
 
-        if cache_transceiver_config_backend == "NIXL":
-            env["UCX_MM_ERROR_HANDLING"] = "y"
+        env["UCX_MM_ERROR_HANDLING"] = "y"
         gpu_range = range(current_gpu_offset,
                           current_gpu_offset + ctx_total_gpus)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
@@ -414,17 +408,11 @@ def launch_disaggregated_llm(
         env = base_env.copy()
         if gen_extra_env:
             env.update(gen_extra_env)
-        cache_transceiver_config_backend = gen_server_config.get(
-            "cache_transceiver_config", {}).get("backend", "DEFAULT")
-        # NIXL backend ignores this env-var fallback; skip it.
-        if cache_transceiver_config_backend != "NIXL":
-            env["TRTLLM_USE_UCX_KVCACHE"] = "1"
         # Need to set UCX_TLS to ^ib to avoid hangs on CI B200 cluster.
         env["UCX_TLS"] = "^ib"
         if enable_perf:
             env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_perf_dir
-        if cache_transceiver_config_backend == "NIXL":
-            env["UCX_MM_ERROR_HANDLING"] = "y"
+        env["UCX_MM_ERROR_HANDLING"] = "y"
         gpu_range = range(current_gpu_offset,
                           current_gpu_offset + gen_total_gpus)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
@@ -721,7 +709,6 @@ def run_parallel_test(model_name: str,
         "kv_cache_config": kv_cache_config,
         "cache_transceiver_config": {
             "backend": cache_transceiver_backend,
-            "max_tokens_in_buffer": 4096
         }
     }
     gen_server_config = {
@@ -731,7 +718,6 @@ def run_parallel_test(model_name: str,
         "kv_cache_config": kv_cache_config,
         "cache_transceiver_config": {
             "backend": cache_transceiver_backend,
-            "max_tokens_in_buffer": 4096
         }
     }
     if max_batch_size is not None:
@@ -785,7 +771,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096,
             },
         }
         gen_server_config = {
@@ -793,7 +778,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096,
             },
         }
         disaggregated_server_config = {
@@ -829,7 +813,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         }
         cache_transceiver_config = {
             "backend": "NIXL",
-            "max_tokens_in_buffer": 4096,
             "transceiver_runtime": "PYTHON",
         }
         ctx_server_config["cache_transceiver_config"] = cache_transceiver_config
@@ -897,6 +880,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "enable_partial_reuse": False,
             "tokens_per_block": 32,
         }
+        if enable_attention_dp:
+            # KVCacheManagerV2 rejects attention-DP with helix CP (its disagg
+            # transfer-completion consensus is skipped under attention-DP).
+            # The Python transceiver drives V1 as well, so pin V1 here; the
+            # C++ runtime used to force this fallback implicitly.
+            kv_cache_config["use_kv_cache_manager_v2"] = False
         ctx_server_config = {
             "pipeline_parallel_size": 1,
             "tensor_parallel_size": 4,
@@ -905,16 +894,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
             "cuda_graph_config": None,
-            # DEFAULT drops the per-test UCX pinning but still runs UCX, since
-            # launch_disaggregated_llm sets TRTLLM_USE_UCX_KVCACHE=1 for every
-            # backend but NIXL. Transport coverage is unchanged by this move.
-            # CPP is explicit: this test runs on UCX (see the DEFAULT note
-            # above), and DeepSeek's Python preference would otherwise be
-            # adopted verbatim and fail at creation on a non-NIXL backend.
             "cache_transceiver_config": {
                 "backend": "DEFAULT",
-                "max_tokens_in_buffer": 8192,
-                "transceiver_runtime": "CPP",
+                "transceiver_runtime": "PYTHON",
             },
         }
         gen_server_config = {
@@ -934,8 +916,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "cuda_graph_config": cuda_graph_config,
             "cache_transceiver_config": {
                 "backend": "DEFAULT",
-                "max_tokens_in_buffer": 8192,
-                "transceiver_runtime": "CPP",
+                "transceiver_runtime": "PYTHON",
             },
             "enable_attention_dp": enable_attention_dp,
         }
@@ -964,12 +945,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         ctx_server_config["cache_transceiver_config"] = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
-            "max_tokens_in_buffer": 4096
         }
         gen_server_config["cache_transceiver_config"] = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
-            "max_tokens_in_buffer": 4096
         }
         if mtp_nextn > 0:
             ctx_server_config["speculative_config"] = {
@@ -1019,7 +998,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             }
         }
         gen_server_config = {
@@ -1031,7 +1009,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             }
         }
         if mtp_nextn > 0:
@@ -1153,7 +1130,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 4
         }
@@ -1162,7 +1138,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 4
         }
@@ -1214,7 +1189,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 2,
             "kv_cache_config": {
@@ -1229,7 +1203,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 2,
             "kv_cache_config": {
@@ -1290,7 +1263,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 4,
             "kv_cache_config": {
@@ -1306,7 +1278,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 4,
             "kv_cache_config": {
@@ -1347,20 +1318,16 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(2)
     def test_nixl_backend(self):
-        # transceiver_runtime is left at 'auto', which resolves to the Python
-        # transceiver (the global default) on the NIXL backend.
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
                 "backend": "NIXL",
-                "max_tokens_in_buffer": 4096
             }
         }
         gen_server_config = {
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
                 "backend": "NIXL",
-                "max_tokens_in_buffer": 4096
             }
         }
         disaggregated_server_config = {
@@ -1391,7 +1358,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "cuda_graph_config": None,
             "cache_transceiver_config": {
                 "backend": "DEFAULT",
-                "max_tokens_in_buffer": 4096
             },
             "kv_cache_config": kv_cache_config,
         }
@@ -1400,7 +1366,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "cuda_graph_config": None,
             "cache_transceiver_config": {
                 "backend": "DEFAULT",
-                "max_tokens_in_buffer": 4096
             },
             "kv_cache_config": kv_cache_config,
         }
@@ -1433,7 +1398,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "cuda_graph_config": None,
             "cache_transceiver_config": {
                 "backend": "DEFAULT",
-                "max_tokens_in_buffer": 4096
             },
             "enable_chunked_prefill": True,
             "max_num_tokens": 256,
@@ -1444,7 +1408,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "cuda_graph_config": None,
             "cache_transceiver_config": {
                 "backend": "DEFAULT",
-                "max_tokens_in_buffer": 4096
             },
             "max_batch_size": max_batch_size,
         }
@@ -1490,7 +1453,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         }
         cache_transceiver_config = {
             "backend": "DEFAULT",
-            "max_tokens_in_buffer": 8192,
         }
         ctx_server_config = {
             "pipeline_parallel_size": 1,
@@ -1675,9 +1637,6 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
     def test_mixed_ctx_gen_model(self, ctx_pp, gen_tp):
         ctx_model = self.FP4_MODEL
         gen_model = self.FP8_MODEL
-        # Explicit NIXL so the launcher does not force the UCX env fallback;
-        # with the NIXL backend, transceiver_runtime='auto' resolves to the
-        # Python transceiver (the global default).
         return run_parallel_test("Qwen3/Qwen3-30B-A3B",
                                  ctx_model,
                                  ctx_pp=ctx_pp,
@@ -1718,7 +1677,6 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
             },
             "cache_transceiver_config": {
                 "backend": "NIXL",
-                "max_tokens_in_buffer": 4096
             }
         }
         gen_server_config = {
@@ -1730,7 +1688,6 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
             },
             "cache_transceiver_config": {
                 "backend": "NIXL",
-                "max_tokens_in_buffer": 4096
             }
         }
         disaggregated_server_config = {
@@ -1802,7 +1759,6 @@ class TestGPTOSS20B(LlmapiAccuracyTestHarness):
             "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": {
                 "backend": "NIXL",
-                "max_tokens_in_buffer": 4096
             }
         }
         gen_server_config = {
@@ -1811,7 +1767,6 @@ class TestGPTOSS20B(LlmapiAccuracyTestHarness):
             "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": {
                 "backend": "NIXL",
-                "max_tokens_in_buffer": 4096
             }
         }
         disaggregated_server_config = {
@@ -1851,11 +1806,8 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
         """Disaggregated GSM8K accuracy for Kimi-K2.5 (NVFP4).
 
         ctx and gen servers are each TP4 (8 GPUs total). The cache transceiver
-        uses backend=NIXL + transceiver_runtime=PYTHON: NIXL is required so the
-        disagg test harness skips its TRTLLM_USE_UCX_KVCACHE=1 fallback (which
-        would make the effective backend UCX and force the C++ transceiver),
-        letting the ctx->gen MLA-latent KV transfer run over the Python (v2)
-        transceiver. GSM8K is text-only, so requests run through the DeepSeek-V3
+        uses backend=NIXL + transceiver_runtime=PYTHON for ctx->gen MLA-latent
+        KV transfer. GSM8K is text-only, so requests run through the DeepSeek-V3
         MLA backbone (no vision).
         Kimi-K2.5 ships custom HF modeling code (auto_map in config.json), so
         trust_remote_code must be set on both servers or executor init fails at
@@ -1876,7 +1828,6 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 4,
             "enable_attention_dp": True,
@@ -1893,7 +1844,6 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 4,
             "enable_attention_dp": True,
@@ -1928,7 +1878,6 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
     def _make_configs(self, use_py_transceiver: bool = False):
         cache_transceiver_config = {
             "backend": "NIXL",
-            "max_tokens_in_buffer": 8192,
         }
         if use_py_transceiver:
             cache_transceiver_config["transceiver_runtime"] = "PYTHON"
@@ -2050,7 +1999,6 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
     def _make_configs(self, use_py_transceiver: bool):
         cache_transceiver_config = {
             "backend": "NIXL",
-            "max_tokens_in_buffer": 8192,
         }
         if use_py_transceiver:
             cache_transceiver_config["transceiver_runtime"] = "PYTHON"
@@ -2163,7 +2111,6 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
         cache_transceiver_config = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
-            "max_tokens_in_buffer": 8192,
         }
         kv_cache_config = {
             "enable_block_reuse": snapshot_policy is not None,
@@ -2325,11 +2272,9 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
         # NVFP4 weights ~71 GB/rank at TP=2, leaving ~107 GB for KV on B200.
         # TRTLLM backend required: it is the backend supporting V4-Flash MXFP4.
         # V4 uses pure-Python KVCacheManagerV2; needs Python transceiver.
-        # NIXL (not DEFAULT) skips the TRTLLM_USE_UCX_KVCACHE=1 fallback.
         cache_transceiver_config = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
-            "max_tokens_in_buffer": 4096,
         }
         ctx_server_config = {
             "tensor_parallel_size": 2,
@@ -2382,7 +2327,6 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
         cache_transceiver_config = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
-            "max_tokens_in_buffer": 4096,
         }
         ctx_server_config = {
             "tensor_parallel_size": 2,
@@ -2458,13 +2402,10 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
         warm up for a phase that never runs.
         """
         model_path = self.MODEL_PATH
-        # V4 uses the pure-Python KVCacheManagerV2, so the transceiver has to
-        # be the Python one; NIXL (not DEFAULT) skips the
-        # TRTLLM_USE_UCX_KVCACHE=1 fallback.
+        # V4 uses the pure-Python KVCacheManagerV2 and Python transceiver.
         cache_transceiver_config = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
-            "max_tokens_in_buffer": 4096,
         }
         # The drafter runs between target steps and its hidden-state capture
         # needs a whole-sequence prefill, hence no overlap scheduler and no
@@ -2597,11 +2538,9 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
         # TRTLLM backend: the CUTLASS FP8 block-scale path is Hopper-only.
         # Compact batching keeps KV cache ~1 GB/rank (default ~100 GB requires fully-clean GPU memory).
         # V4 uses pure-Python KVCacheManagerV2; needs Python transceiver.
-        # NIXL (not DEFAULT) skips the TRTLLM_USE_UCX_KVCACHE=1 fallback.
         cache_transceiver_config = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
-            "max_tokens_in_buffer": 4096,
         }
         ctx_server_config = {
             "tensor_parallel_size": 2,
@@ -2675,7 +2614,6 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 2,
             "moe_expert_parallel_size": 2,
@@ -2692,7 +2630,6 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 2,
             "moe_expert_parallel_size": 2,

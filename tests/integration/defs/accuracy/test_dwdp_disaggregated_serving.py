@@ -1,24 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """DWDP disaggregated serving accuracy tests.
 
 Separated from test_disaggregated_serving.py to isolate MPI-dependent test
 infrastructure for easier maintenance.
 
-NOTE: these tests no longer gate pre-merge CI. DWDP accuracy is gated by
-test_dwdp_aggregated.py, which exercises the same expert-sharing paths without
-the disaggregated KV cache transceiver and is therefore not exposed to
-per-cluster transport configuration. The tests here stay registered in the QA
-list, waived under nvbugs/6276923, so that the file keeps being collected --
-it imports helpers from test_disaggregated_serving.py and would otherwise rot
-unnoticed -- and so that dropping the waive is the natural signal once the
-disaggregated path is healthy again. They also remain useful as a manual
-reproduction of the disaggregated DWDP path.
-
-When running it manually, check the launcher's UCX settings first: SLURM
-enroot/pyxis injects ``UCX_TLS=tcp`` from the host MPI stack on some clusters,
-which pins the KV cache transceiver to a transport that can fail there and hang
-the run in ``check_gen_transfer_status``. Clear or pin ``UCX_TLS`` for the
-cluster before running -- see jenkins/scripts/slurm_env_setup.sh and
-examples/disaggregated/slurm/benchmark/start_worker_dwdp.sh.
+The worker launcher selects UCX transports for the GPU architecture instead of
+inheriting transport restrictions from SLURM/enroot/pyxis. In particular,
+``UCX_TLS=tcp`` inherited from the host MPI stack caused KV transfer failures
+and hangs in these tests (nvbugs/6276923).
 """
 
 import contextlib
@@ -34,6 +25,7 @@ import requests
 import yaml
 
 from defs.common import get_free_port_in_ci as get_free_port
+from defs.common import get_ucx_tls
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import LlmArgs
 from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
@@ -81,6 +73,8 @@ def launch_dwdp_disaggregated_llm(
     child_env = {
         k: v for k, v in os.environ.items() if not k.startswith(("OMPI_", "PMIX_", "PMI_"))
     }
+    # Override host MPI transport restrictions without changing the parent environment.
+    child_env["UCX_TLS"] = get_ucx_tls()
 
     mpi_cmd = [
         "mpirun",
@@ -228,9 +222,8 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "tokens_per_block": 32,
             },
             "cache_transceiver_config": {
-                "backend": "UCX",
-                "transceiver_runtime": "CPP",
-                "max_tokens_in_buffer": 8192,
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
             },
             "moe_config": {
                 "backend": "CUTEDSL",
@@ -261,9 +254,8 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "tokens_per_block": 32,
             },
             "cache_transceiver_config": {
-                "backend": "UCX",
-                "transceiver_runtime": "CPP",
-                "max_tokens_in_buffer": 8192,
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
             },
             "moe_config": {
                 "backend": "CUTEDSL",
@@ -345,9 +337,8 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "tokens_per_block": 32,
             },
             "cache_transceiver_config": {
-                "backend": "UCX",
-                "transceiver_runtime": "CPP",
-                "max_tokens_in_buffer": 8192,
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
             },
             "moe_config": {
                 "backend": "CUTEDSL",
@@ -379,9 +370,8 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "tokens_per_block": 32,
             },
             "cache_transceiver_config": {
-                "backend": "UCX",
-                "transceiver_runtime": "CPP",
-                "max_tokens_in_buffer": 8192,
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
             },
             "moe_config": {
                 "backend": "CUTEDSL",
@@ -482,9 +472,8 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "tokens_per_block": 32,
             },
             "cache_transceiver_config": {
-                "backend": "UCX",
-                "transceiver_runtime": "CPP",
-                "max_tokens_in_buffer": 8192,
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
             },
             "moe_config": {
                 "backend": "CUTEDSL",
@@ -519,9 +508,8 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "tokens_per_block": 32,
             },
             "cache_transceiver_config": {
-                "backend": "UCX",
-                "transceiver_runtime": "CPP",
-                "max_tokens_in_buffer": 8192,
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
             },
             "moe_config": {
                 "backend": "CUTEDSL",

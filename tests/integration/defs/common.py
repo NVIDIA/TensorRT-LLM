@@ -36,6 +36,22 @@ from .trt_test_alternative import (check_call, check_output, print_info,
                                    print_warning)
 
 
+def get_ucx_tls() -> str:
+    """Get UCX_TLS value based on GPU architecture.
+
+    Pre-Hopper GPUs need cuda_ipc excluded from UCX transports.
+    """
+    from .conftest import get_sm_version
+
+    sm = get_sm_version()
+    # GB300 ARM clusters need these transports enabled explicitly.
+    if sm == 103 and "aarch" in platform.machine().lower():
+        return "cuda_copy,cuda_ipc,sm,self,tcp"
+    if sm < 90:
+        return "^cuda_ipc,ib,gdr_copy"
+    return "^ib,gdr_copy"
+
+
 def venv_check_call(venv, cmd, env=None, **kwargs):
 
     def _war_check_call(*args, **kwargs):

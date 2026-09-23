@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # TensorRT-LLM Perf Sanity Test (`test_perf_sanity.py`)
 
 Performance sanity testing scripts for TensorRT-LLM with configuration-driven test cases supporting single-node, multi-node aggregated, and multi-node disaggregated architectures.
@@ -225,9 +228,22 @@ There are two modes for perf sanity tests: aggregated (aggr) and disaggregated (
 
 **File Naming**: `xxx.yaml` (can contain `-` hyphen).
 
-**Example**: `deepseek-r1-fp4_1k1k_ctx1_gen1_dep8_bs768_eplb0_mtp0_ccb-UCX.yaml`
+**Example**: `gb200_deepseek-r1-fp4_1k1k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL.yaml`
 
 **Use Case**: Disaggregated architecture where model runs across multiple nodes with separate context (prefill) and generation (decode) servers.
+
+Keep valid default-based settings in both `worker_config.ctx` and
+`worker_config.gen`, for example:
+
+```yaml
+cache_transceiver_config:
+  backend: DEFAULT
+```
+
+The standard PyTorch loading path currently resolves this to NIXL/Python
+under normal defaults. Tests of a specific backend/runtime may select it
+explicitly. Do not set `max_tokens_in_buffer` in these E2E recipes. NIXL may still use
+UCX as its underlying transport; `ccb-NIXL` identifies the transceiver backend.
 
 **Optional `benchmark_config` keys**: `benchmark_client` selects a non-default load
 generator (see [Benchmark Clients](#benchmark-clients)); `client_env_var` passes
@@ -520,7 +536,7 @@ Config files live in `tests/scripts/perf-sanity/disaggregated/`. The filename en
 {gpu_type}_{model}-{precision}_{ISL}k{OSL}k_con{concurrency}_ctx{ctx_count}_tp{ctx_tp}_gen{gen_count}_{gen_parallelism}_eplb{N}_mtp{N}_ccb-{transport}.yaml
 ```
 
-Example: `gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-UCX.yaml`
+Example: `gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL.yaml`
 
 The **base name** (filename without `.yaml`) is used as the test case ID in the test-db.
 
@@ -616,13 +632,13 @@ Search `tests/integration/test_lists/waives.txt` for the exact test case string.
 
 ### Worked Example
 
-Adding back `qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-UCX` as a gen_only test:
+Checking the existing `qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL` gen_only test, or re-enabling it if it has been disabled:
 
-1. Config file: `tests/scripts/perf-sanity/disaggregated/gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-UCX.yaml`
+1. Config file: `tests/scripts/perf-sanity/disaggregated/gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL.yaml`
 2. From config: `gpus_per_node=4`, `ctx_tp=1`, `gen_tp=4`, `num_ctx=1`, `num_gen=1`
 3. Nodes per ctx = `ceil(1/4)=1`, nodes per gen = `ceil(4/4)=1`, total nodes = 2, total GPUs = 8
 4. Test-db file: `l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4.yml`
-5. Uncomment the line: `- perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-UCX] TIMEOUT (120)`
-6. Count active tests in that file (now 4)
-7. In `L0_Test.groovy`, find the existing `buildStageConfigs` for `l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4`, update `testCount` from 3 to 4
-8. Check `waives.txt` — no matching entry, done
+5. Locate `perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL]`. It is currently active with `TIMEOUT (90)`; do not add a duplicate. Uncomment it only if it has been disabled.
+6. Recount the active tests after any edits.
+7. In `L0_Test.groovy`, find the `buildStageConfigs` for `l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4` and set `testCount` to that count, preserving it if unchanged.
+8. Check `waives.txt` for the exact test ID before enabling the test.

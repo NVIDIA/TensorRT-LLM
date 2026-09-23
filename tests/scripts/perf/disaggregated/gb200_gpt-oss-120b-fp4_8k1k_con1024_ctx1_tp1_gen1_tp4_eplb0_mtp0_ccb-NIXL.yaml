@@ -72,7 +72,6 @@ worker_config:
     moe_config:
       backend: TRTLLM
     cache_transceiver_config:
-      max_tokens_in_buffer: 9216
       backend: NIXL
       transceiver_runtime: PYTHON
       kv_cache_bounce_size_mb: 512
@@ -101,7 +100,6 @@ worker_config:
     moe_config:
       backend: TRTLLM
     cache_transceiver_config:
-      max_tokens_in_buffer: 9216
       backend: NIXL
       transceiver_runtime: PYTHON
       kv_cache_bounce_size_mb: 512

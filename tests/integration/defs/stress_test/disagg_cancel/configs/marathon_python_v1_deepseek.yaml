@@ -1,9 +1,9 @@
-# C++ transceiver marathon: V1 KV cache + C++ transceiver + NIXL, DeepSeek-class MLA.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Python transceiver marathon: V1 KV cache + Python transceiver + NIXL, DeepSeek-class MLA.
 #
-# Exercises the C++-backed disagg path (BindKvCacheTransceiver + V1
-# KVCacheManager + NIXL backend) — the configuration NVBug 6104831
-# was filed against and that the in-flight cancellation fix stabilizes. Schema
-# documentation lives in ../README.md.
+# Preserves the cancellation/lifetime regression scenarios from NVBug 6104831
+# while exercising the Python transceiver. Schema documentation is in ../README.md.
 
 hostname: localhost
 model: DeepSeek-V3-Lite/bf16
@@ -24,8 +24,7 @@ context_servers:
     use_kv_cache_manager_v2: false  # V1 KV cache (default)
   cache_transceiver_config:
     backend: NIXL
-    transceiver_runtime: CPP        # C++ transceiver (default; explicit for clarity)
-    max_tokens_in_buffer: 16384
+    transceiver_runtime: PYTHON
     kv_transfer_timeout_ms: 60000   # production default
 
 generation_servers:
@@ -43,8 +42,7 @@ generation_servers:
     use_kv_cache_manager_v2: false
   cache_transceiver_config:
     backend: NIXL
-    transceiver_runtime: CPP
-    max_tokens_in_buffer: 16384
+    transceiver_runtime: PYTHON
     kv_transfer_timeout_ms: 60000
 
 # ============================================================================
@@ -66,7 +64,7 @@ stress_config:
   # Backend-knob axis selectors. Must match
   # context_servers / generation_servers above.
   kv_cache_manager: v1               # V1 (C++) KV cache manager
-  transceiver: cpp                   # C++-backed transceiver (BindKvCacheTransceiver)
+  transceiver: python                # Python transceiver with V1 KV cache manager
 
   log_only_probe:
     interval_s: 30

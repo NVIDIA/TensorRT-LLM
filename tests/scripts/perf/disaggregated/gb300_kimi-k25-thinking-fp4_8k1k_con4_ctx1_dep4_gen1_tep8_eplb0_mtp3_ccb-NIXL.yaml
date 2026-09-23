@@ -70,7 +70,6 @@ worker_config:
     moe_config:
       backend: TRTLLM
     cache_transceiver_config:
-      max_tokens_in_buffer: 16384
       backend: NIXL
       transceiver_runtime: PYTHON
       kv_cache_bounce_size_mb: 384
@@ -102,7 +101,6 @@ worker_config:
       backend: CUTEDSL
       use_low_precision_moe_combine: true
     cache_transceiver_config:
-      max_tokens_in_buffer: 16384
       backend: NIXL
       transceiver_runtime: PYTHON
       kv_cache_bounce_size_mb: 384
