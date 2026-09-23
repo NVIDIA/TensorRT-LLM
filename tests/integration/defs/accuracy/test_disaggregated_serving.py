@@ -2277,6 +2277,7 @@ class TestGLM53FlashFP8(LlmapiAccuracyTestHarness):
             "tensor_parallel_size": 4,
             "pipeline_parallel_size": 1,
             "moe_expert_parallel_size": 4,
+            "disable_mm_encoder": True,
             "max_batch_size": 64,
             "max_num_tokens": 16384,
             "max_seq_len": 8192,
