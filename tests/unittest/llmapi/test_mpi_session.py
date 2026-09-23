@@ -45,6 +45,47 @@ def test_mpi_session_basic():
     assert results == [2, 2, 2, 2], results
 
 
+def flashinfer_environment_probe():
+    """Return this worker's FlashInfer isolation paths."""
+    # Keep importing this from initializing MPI in the submitting process.
+    from mpi4py import MPI
+
+    MPI.COMM_WORLD.barrier()
+    return (
+        os.environ.get("FLASHINFER_WORKSPACE_BASE"),
+        os.environ.get("FLASHINFER_CUBIN_DIR"),
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
+def test_mpi_pool_session_flashinfer_workspace_isolation(monkeypatch):
+    # A singleton spawn reuses OpenMPI's already-running DVM once one exists in
+    # this process, so a spawned worker's HOME can't be relied on to follow a
+    # monkeypatched HOME set here; compare against the real home directory
+    # instead.
+    monkeypatch.delenv("FLASHINFER_WORKSPACE_BASE", raising=False)
+    monkeypatch.delenv("FLASHINFER_CUBIN_DIR", raising=False)
+    monkeypatch.delenv("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", raising=False)
+
+    session = MpiPoolSession(n_workers=2, wait_shutdown=True)
+    try:
+        worker_envs = session.submit_sync(flashinfer_environment_probe)
+    finally:
+        session.shutdown()
+
+    workspaces = {workspace for workspace, _ in worker_envs}
+    cubin_dirs = {cubin_dir for _, cubin_dir in worker_envs}
+    assert None not in workspaces
+    assert len(workspaces) == 2
+    workspace_root = Path.home() / ".cache" / "tensorrt_llm" / "flashinfer"
+    assert all(
+        Path(workspace).parent == workspace_root for workspace in workspaces)
+    # Unset means FlashInfer derives the artifact cache from each worker's
+    # isolated workspace, keeping downloaded compiler inputs per-rank.
+    assert cubin_dirs == {None}
+
+
 def simple_task(x):
     print(f"** simple_task {x} returns {x * 2}\n", "green")
     res = x * 2
@@ -196,10 +237,35 @@ def test_llmapi_launch_multiple_tasks(task_script: str):
             raise subprocess.CalledProcessError(return_code, command)
 
 
-@pytest.mark.cpu_only
-def test_llmapi_launch_isolates_pmi_rank_without_size(tmp_path: Path) -> None:
+_LAUNCHER = (Path(__file__).parents[3] / "tensorrt_llm" / "llmapi" /
+             "trtllm-llmapi-launch")
+
+# Variables that would steer the launcher's workspace setup; each launcher test
+# starts from an environment without them and adds back only what it exercises.
+_LAUNCHER_ENV_SCRUB = (
+    "SLURM_NTASKS",
+    "SLURM_PROCID",
+    "OMPI_COMM_WORLD_SIZE",
+    "OMPI_COMM_WORLD_RANK",
+    "PMI_SIZE",
+    "PMI_ID",
+    "FLASHINFER_WORKSPACE_BASE",
+    "FLASHINFER_CUBIN_DIR",
+    "TRTLLM_FLASHINFER_WORKSPACE_MANAGED",
+    "TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS",
+)
+
+
+def _launcher_env(tmp_path: Path, home: str) -> dict:
+    """Environment for a rank-0 launcher-managed run of ``trtllm-llmapi-launch``.
+
+    ``python3`` and ``openssl`` are stubbed so the launcher can hand out an IPC
+    address and an HMAC key without importing tensorrt_llm; the stubbed
+    ``python3 -S`` used for the workspace lock exits 0, so the persistent slot
+    is treated as acquired.
+    """
     stub_bin = tmp_path / "bin"
-    stub_bin.mkdir()
+    stub_bin.mkdir(exist_ok=True)
     python_stub = stub_bin / "python3"
     python_stub.write_text("#!/bin/sh\n"
                            "if [ \"$1\" = \"-c\" ]; then\n"
@@ -210,29 +276,18 @@ def test_llmapi_launch_isolates_pmi_rank_without_size(tmp_path: Path) -> None:
     openssl_stub.write_text("#!/bin/sh\nprintf '%064d\\n' 0\n")
     openssl_stub.chmod(0o755)
 
-    home = tmp_path / "home"
-    home.mkdir()
     env = os.environ.copy()
-    for name in (
-            "SLURM_NTASKS",
-            "SLURM_PROCID",
-            "OMPI_COMM_WORLD_SIZE",
-            "OMPI_COMM_WORLD_RANK",
-            "PMI_SIZE",
-            "PMI_ID",
-            "FLASHINFER_WORKSPACE_BASE",
-            "FLASHINFER_CUBIN_DIR",
-            "TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS",
-    ):
+    for name in _LAUNCHER_ENV_SCRUB:
         env.pop(name, None)
     env["PMI_RANK"] = "0"
-    env["HOME"] = str(home)
+    env["HOME"] = home
     env["PATH"] = f"{stub_bin}{os.pathsep}{env['PATH']}"
+    return env
 
-    launcher = (Path(__file__).parents[3] / "tensorrt_llm" / "llmapi" /
-                "trtllm-llmapi-launch")
-    result = subprocess.run(  # nosec B603
-        ["bash", str(launcher), "/usr/bin/env"],
+
+def _run_launcher_env(env: dict) -> subprocess.CompletedProcess:
+    return subprocess.run(  # nosec B603
+        ["bash", str(_LAUNCHER), "/usr/bin/env"],
         check=True,
         capture_output=True,
         env=env,
@@ -240,36 +295,78 @@ def test_llmapi_launch_isolates_pmi_rank_without_size(tmp_path: Path) -> None:
         timeout=10,
     )
 
+
+@pytest.mark.cpu_only
+def test_llmapi_launch_isolates_pmi_rank_without_size(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    env = _launcher_env(tmp_path, str(home))
+
+    result = _run_launcher_env(env)
+
     workspace = home / ".cache" / "tensorrt_llm" / "flashinfer" / "rank-0"
     assert f"FLASHINFER_WORKSPACE_BASE={workspace}" in result.stdout
     assert "TRTLLM_FLASHINFER_WORKSPACE_MANAGED=1" in result.stdout
+    # The artifact cache must follow the per-rank workspace, so the launcher
+    # must not pin FLASHINFER_CUBIN_DIR to a shared directory.
+    assert "FLASHINFER_CUBIN_DIR=" not in result.stdout
+
+
+@pytest.mark.cpu_only
+def test_llmapi_launch_preserves_explicit_cubin_dir(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    shared = tmp_path / "shared-cubins"
+    env = _launcher_env(tmp_path, str(home))
+    env["FLASHINFER_CUBIN_DIR"] = str(shared)
+
+    result = _run_launcher_env(env)
+
+    workspace = home / ".cache" / "tensorrt_llm" / "flashinfer" / "rank-0"
+    assert f"FLASHINFER_WORKSPACE_BASE={workspace}" in result.stdout
+    lines = [
+        line for line in result.stdout.splitlines()
+        if line.startswith("FLASHINFER_CUBIN_DIR=")
+    ]
+    assert lines == [f"FLASHINFER_CUBIN_DIR={shared}"]
+
+
+@pytest.mark.cpu_only
+def test_llmapi_launch_temporary_fallback_leaves_cubin_dir_unset(
+        tmp_path: Path) -> None:
+    # A regular file as HOME makes the persistent workspace root impossible to
+    # create, which sends the launcher down the temporary-workspace fallback.
+    invalid_home = tmp_path / "home-file"
+    invalid_home.touch()
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+    env = _launcher_env(tmp_path, str(invalid_home))
+    env["TMPDIR"] = str(tmpdir)
+
+    result = _run_launcher_env(env)
+
+    prefix = f"FLASHINFER_WORKSPACE_BASE={tmpdir}/trtllm-flashinfer-rank-0."
+    assert any(line.startswith(prefix)
+               for line in result.stdout.splitlines()), result.stdout
+    assert "TRTLLM_FLASHINFER_WORKSPACE_MANAGED=1" in result.stdout
+    assert "FLASHINFER_CUBIN_DIR=" not in result.stdout
+    assert "temporary FlashInfer JIT workspace" in result.stderr
+    # The fallback workspace, artifacts included, is removed at exit.
+    assert list(tmpdir.iterdir()) == []
 
 
 @pytest.mark.cpu_only
 def test_llmapi_launch_aborts_when_no_workspace_is_available(
         tmp_path: Path) -> None:
     env = os.environ.copy()
-    for name in (
-            "SLURM_NTASKS",
-            "SLURM_PROCID",
-            "OMPI_COMM_WORLD_SIZE",
-            "OMPI_COMM_WORLD_RANK",
-            "PMI_SIZE",
-            "PMI_ID",
-            "FLASHINFER_WORKSPACE_BASE",
-            "FLASHINFER_CUBIN_DIR",
-            "TRTLLM_FLASHINFER_WORKSPACE_MANAGED",
-            "TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS",
-    ):
+    for name in _LAUNCHER_ENV_SCRUB:
         env.pop(name, None)
     env["PMI_RANK"] = "0"
     env["HOME"] = ""
     env["TMPDIR"] = str(tmp_path / "missing")
 
-    launcher = (Path(__file__).parents[3] / "tensorrt_llm" / "llmapi" /
-                "trtllm-llmapi-launch")
     result = subprocess.run(  # nosec B603
-        ["/bin/bash", str(launcher), "/usr/bin/true"],
+        ["/bin/bash", str(_LAUNCHER), "/usr/bin/true"],
         check=False,
         capture_output=True,
         env=env,

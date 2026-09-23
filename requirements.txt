@@ -24,16 +24,19 @@ h5py==3.12.1
 StrEnum
 sentencepiece>=0.1.99
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-08.html#rel-26-08 uses 2.14.0a0.
-# The floor tracks the public PyPI release (2.13.0, which pins triton==3.7.1 below); the
-# ceiling keeps the NGC alpha build admissible, since PEP 440 ordered comparisons drop the
-# local version and 2.14.0a0+nv26.8 therefore compares equal to 2.14.0a0.
-torch>=2.13.0,<=2.14.0a0
+# The floor is the NGC alpha, which PEP 440 orders below the public release of the same
+# series; the ceiling is that public release, which is what the resolver picks off the public
+# index. Ordered comparisons drop the local version, so the container's +nv build stays
+# admissible against the floor.
+torch>=2.14.0a0,<=2.14.0
 torchvision
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-08.html#rel-26-08 uses 2.30.7
-# torch 2.12.0+cu130 uses NCCL 2.29.7; NGC 26.08 uses NCCL 2.30.7.
-nvidia-nccl-cu13>=2.29.7,<=2.30.7
-# NcclEP uses nccl4py's nccl.ep package without changing the NCCL wheel constraint.
-nccl4py>=0.3.1,<0.4
+# The public torch above pins the same version, so an exact pin covers both it and the NGC
+# container's own NCCL; as with triton, carrying no local version keeps the +nv build admissible.
+nvidia-nccl-cu13==2.30.7
+# NCCL-EP uses nccl4py's nccl.ep package. The nccl-extensions wheel is built
+# from pinned source by CMake so it links against the container's NCCL.
+nccl4py>=0.4,<=0.5
 nvidia-cuda-nvrtc
 transformers==5.5.4
 prometheus_client
@@ -76,13 +79,12 @@ meson
 ninja
 blake3
 soundfile
-# Public torch 2.13.0 pins triton==3.7.1;
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-08.html#rel-26-08
-# ships 3.8.0. The range admits both, and the torch pin above decides which one the resolver
-# actually picks. An exact pin would make the wheel install downgrade the NGC container's own
-# triton, which must not happen -- the rest of the 26.08 stack is built against it. The floor
-# is the version the vendored triton_kernels below track.
-triton>=3.7.1,<=3.8.0 # NOTE: if you update this, you must also run scripts/vendor_triton_kernels.py to vendor the new version of triton_kernels
+# ships 3.8.0 and the torch pin above requires the same series, so floor and ceiling coincide.
+# The pin carries no local version, which keeps the container's own +nv build admissible -- it
+# must not be reinstalled underneath the rest of the stack that was built against it. This is
+# also the version the vendored triton_kernels below track.
+triton==3.8.0 # NOTE: if you update this, you must also run scripts/vendor_triton_kernels.py to vendor the new version of triton_kernels
 xdsl>=0.59.0 # Optional: required for MLIR-based elementwise fusion in AutoDeploy
 tiktoken
 blobfile
@@ -108,7 +110,8 @@ nvidia-cuda-tileiras>=13.1,<13.2
 nvidia-cudnn-frontend>=1.27.0,<1.28
 etcd-sdk-python==0.0.7
 # etcd-sdk-python imports google.protobuf but omits it from its package metadata.
-protobuf>=5.27.2
+# The binding lower bound comes from the CUTLASS DSL libraries, which need protobuf 6.x.
+protobuf>=6.30.2,<7
 python-multipart
 cache-dit>=1.3.5
 librosa

@@ -379,8 +379,15 @@ def _make_transport(
 
 
 def _recv_req(block_counts, rid=1, slice_id=0):
+    # Positional block tables: `n` held slots followed by one -1 hole, which
+    # the reserve sizing must not count.
     return SimpleNamespace(
-        block_ids_per_layer_groups=[SimpleNamespace(size=n) for n in block_counts],
+        block_ids_per_layer_groups=[
+            np.concatenate([np.arange(n, dtype=np.int64), np.array([-1], dtype=np.int64)])
+            if n
+            else np.array([], dtype=np.int64)
+            for n in block_counts
+        ],
         unique_rid=rid,
         slice_id=slice_id,
         bounce_dst_base=None,
@@ -780,7 +787,7 @@ class TestHybridK3Bounce:
 
     def test_reserve_engages_on_k3_mixed_layout(self, monkeypatch):
         # Regression pin: a K3 recv request always carries a trailing EMPTY entry for
-        # the mamba layer group (transceiver._create_kv_slice), which used to trip the
+        # the mamba layer group (transceiver._create_chunk), which used to trip the
         # unknown-slot-size guard and silently push every K3 request onto the per-fragment
         # (~0.4 GB/s host-staged) path. It must engage bounce, sized for MLA KV + KDA state.
         t = _make_transport(

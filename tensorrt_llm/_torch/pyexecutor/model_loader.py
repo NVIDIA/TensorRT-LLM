@@ -26,7 +26,8 @@ from tensorrt_llm._torch.weight_sharing import (
     PostTransformFeature, PostTransformProfile, PostTransformProfileRegistry,
     PostTransformQualificationDecision, PostTransformRuntimeConfig,
     PostTransformRuntimeConstraints, PostTransformTransferScope, SourceIdentity,
-    check_weight_sharing_compatibility)
+    WeightManifestWriteResult, check_weight_sharing_compatibility,
+    maybe_write_weight_manifest)
 from tensorrt_llm._utils import get_sm_version, str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
@@ -53,8 +54,10 @@ from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
-from .config_utils import (is_hybrid_linear, resolve_hf_torch_dtype,
-                           resolve_ssm_cache_dtype)
+from .config_utils import (is_hybrid_linear, is_mla,
+                           resolve_auto_ssm_cache_dtype,
+                           supports_fp4_mla_attention, uses_fp4_mla_attention,
+                           validate_kimi_kda_state_dtype)
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
@@ -134,12 +137,13 @@ def validate_and_set_mamba_ssm_cache_dtype(
         mamba_ssm_stochastic_rounding: bool = False,
         mamba_ssm_philox_rounds: int = 10) -> None:
     if mamba_ssm_cache_dtype == "auto":
-        mamba_ssm_cache_dtype = (
-            resolve_ssm_cache_dtype(config.pretrained_config)
-            or resolve_hf_torch_dtype(config.pretrained_config)
-            or config.torch_dtype)
+        mamba_ssm_cache_dtype = resolve_auto_ssm_cache_dtype(
+            config.pretrained_config, config.torch_dtype)
     else:
         mamba_ssm_cache_dtype = str_dtype_to_torch(mamba_ssm_cache_dtype)
+    validate_kimi_kda_state_dtype(config.pretrained_config,
+                                  mamba_ssm_cache_dtype,
+                                  mamba_ssm_stochastic_rounding)
 
     config.quant_config.mamba_ssm_cache_dtype = mamba_ssm_cache_dtype
     config.quant_config.mamba_ssm_stochastic_rounding = mamba_ssm_stochastic_rounding
@@ -159,9 +163,9 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
 
     effective_kv_cache_quant = (kv_cache_quant if pyt_kv_cache_dtype == "auto"
                                 else mapped_pyt_quant)
-    if (torch.cuda.is_available() and get_sm_version() == 107
-            and effective_kv_cache_quant
-            in (QuantAlgo.NVFP4, QuantAlgo.NVFP4.value)):
+    if (effective_kv_cache_quant in (QuantAlgo.NVFP4, QuantAlgo.NVFP4.value)
+            and not supports_fp4_mla_attention(model_config)
+            and torch.cuda.is_available() and get_sm_version() == 107):
         logger.warning(
             "NVFP4 KV cache is not supported by trtllm-gen on SM107; "
             "using FP8 KV cache instead.")
@@ -203,6 +207,32 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     if model_config.quant_config_dict is not None:
         for layer_quant_config in model_config.quant_config_dict.values():
             layer_quant_config.kv_cache_quant_algo = mapped_pyt_quant
+
+
+def validate_fp4_mla_config(model_config: ModelConfig,
+                            llm_args: TorchLlmArgs) -> None:
+    """Validate FP4 MLA before model construction and KV-cache allocation."""
+    if not (model_config.sparse_attention_config is None
+            and is_mla(model_config.pretrained_config)
+            and model_config.quant_config.quant_mode.has_fp4_kv_cache()):
+        return
+    if not supports_fp4_mla_attention(model_config):
+        raise ValueError("Dense FP4 MLA requires the TRTLLM attention backend; "
+                         "hybrid linear attention is not supported.")
+    if model_config.mapping.cp_size != 1:
+        raise ValueError("FP4 MLA does not support context parallelism.")
+    if llm_args.kv_cache_config.use_kv_cache_manager_v2 is False:
+        raise ValueError("FP4 MLA requires use_kv_cache_manager_v2=True.")
+    if llm_args.enable_chunked_prefill:
+        raise ValueError(
+            "FP4 MLA does not support chunked prefill or cached context; "
+            "set enable_chunked_prefill=False.")
+
+    spec_config = model_config.spec_config
+    if spec_config is not None and spec_config.spec_dec_mode.use_one_engine():
+        # HP/V-scale side pools are not switched by draft_kv_cache_context.
+        # Set this before models and workers consult the shared predicate.
+        spec_config._allow_separate_draft_kv_cache = False
 
 
 def validate_encoder_decoder_kv_cache_config(model_config: ModelConfig,
@@ -584,6 +614,7 @@ class ModelLoaderMetricNames(Enum):
     DRAFT_CHECKPOINT_FINALIZATION_SECONDS = (
         "draft_checkpoint_finalization_seconds")
     POST_LOAD_PROCESSING_SECONDS = "post_load_processing_seconds"
+    WEIGHT_MANIFEST_SECONDS = "weight_manifest_seconds"
 
 
 def _checkpoint_startup_metadata(
@@ -800,6 +831,21 @@ class ModelLoader:
         # Resolve "auto" sentinel values after model defaults are applied.
         _resolve_transceiver_runtime_auto(llm_args, preference_cls,
                                           config.pretrained_config)
+        if (original_kv_cache_manager_setting == "auto" and
+            (llm_args.kv_cache_config.dtype == "nvfp4" or
+             (llm_args.kv_cache_config.dtype == "auto"
+              and config.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4))):
+            # Resolve FP4 MLA before the generic model preference turns auto
+            # into False. Keep an explicit False distinguishable and reject it
+            # during FP4 validation instead of silently overriding the user.
+            fp4_mla_config = copy.copy(config)
+            fp4_mla_config.attn_backend = llm_args.attn_backend
+            fp4_mla_config.sparse_attention_config = llm_args.sparse_attention_config
+            if supports_fp4_mla_attention(fp4_mla_config):
+                validate_and_set_kv_cache_quant(fp4_mla_config,
+                                                llm_args.kv_cache_config.dtype)
+                if uses_fp4_mla_attention(fp4_mla_config):
+                    llm_args.kv_cache_config.use_kv_cache_manager_v2 = True
         _resolve_kv_cache_manager_v2_auto(llm_args, preference_cls,
                                           config.pretrained_config)
         _validate_and_adjust_mamba_snapshot_config(config, llm_args)
@@ -1394,6 +1440,13 @@ class ModelLoader:
                 # perturb NVLink barrier synchronization in multi-rank DG init.
                 torch.cuda.empty_cache()
 
+        manifest_result = self._dump_final_weight_manifest(
+            checkpoint_loader, model, weights_preloaded=weights_preloaded)
+        if manifest_result is not None:
+            self._metrics[ModelLoaderMetricNames.WEIGHT_MANIFEST_SECONDS.
+                          value] = (manifest_result.build_seconds +
+                                    manifest_result.write_seconds)
+
         metrics = ", ".join(f"{name}={value:.4f}"
                             for name, value in self._metrics.items())
         logger.info(
@@ -1558,6 +1611,34 @@ class ModelLoader:
                 model.model_config, model=model),
         )
 
+    def _dump_final_weight_manifest(
+            self, checkpoint_loader: BaseCheckpointLoader,
+            model: DecoderModelForCausalLM, *,
+            weights_preloaded: bool) -> Optional[WeightManifestWriteResult]:
+        """Write the env-gated final-state weight manifest for this rank.
+
+        This is a no-op unless `MX_WEIGHT_MANIFEST_DIR` is set. It runs after
+        every post-load hook and after MoE load-balancer finalization, and
+        before engine warmup, so the manifest describes the final post-load
+        state that all roles of the MX qualification harness share.
+        `reload()` is deliberately not covered: incremental weight updates own
+        their own lifecycle.
+        """
+        return maybe_write_weight_manifest(
+            model,
+            family="final",
+            rank=self.mapping.rank,
+            context={
+                "boundary": "model_loader_load_end",
+                "checkpoint_format": checkpoint_loader.checkpoint_format,
+                "weights_preloaded": bool(weights_preloaded),
+                "load_format": str(self.llm_args.load_format),
+                "tp_rank": self.mapping.tp_rank,
+                "pp_rank": self.mapping.pp_rank,
+                "world_size": self.mapping.world_size,
+                "model_class": type(model).__name__,
+            })
+
     def _post_load_publish(
             self, checkpoint_loader: BaseCheckpointLoader,
             model: DecoderModelForCausalLM, *, checkpoint_dir: str,
@@ -1710,7 +1791,8 @@ class ModelLoader:
         before rebinding fresh weights. Partial reloads keep existing transform
         guards intact because untouched modules may already contain transformed
         live weights. The owner of the update lifecycle is responsible for
-        running post-load processing once all bytes are present.
+        running post-load processing once all bytes are present. Weight
+        manifests are not written here; see `_dump_final_weight_manifest`.
 
         Args:
             model: Model instance receiving the replacement weights.
@@ -1883,6 +1965,7 @@ class ModelLoader:
                                                  self.llm_args.kv_cache_config)
         validate_and_set_kv_cache_quant(config,
                                         self.llm_args.kv_cache_config.dtype)
+        validate_fp4_mla_config(config, self.llm_args)
         validate_and_set_mamba_ssm_cache_dtype(
             config, self.llm_args.kv_cache_config.mamba_ssm_cache_dtype,
             self.llm_args.kv_cache_config.mamba_ssm_stochastic_rounding,

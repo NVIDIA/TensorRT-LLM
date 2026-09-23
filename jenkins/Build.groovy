@@ -668,11 +668,6 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         }
     }
 
-    def wheelDockerImage = env.wheelDockerImagePy310
-    if (!wheelDockerImage && cpu_arch == AARCH64_TRIPLE) {
-        wheelDockerImage = env.dockerImage
-    }
-
     def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
     buildConfigs = [
         "Build TRT-LLM": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
@@ -726,7 +721,7 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
                     stage(key) {
                         stage("[${key}] Run") {
                             echoNodeAndGpuInfo(pipeline, key)
-                            buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "cp312", "-a '90-real' -b Debug --micro_benchmarks --extra-cmake-vars NVRTC_DYNAMIC_LINKING=ON")
+                            buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "cp312", "-a '90-real' -b Debug --micro_benchmarks")
                         }
                     }
                 })

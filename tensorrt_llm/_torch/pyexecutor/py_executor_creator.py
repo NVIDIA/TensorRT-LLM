@@ -35,17 +35,20 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..distributed import Distributed
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
-                           get_spec_resource_manager)
+                           get_spec_resource_manager,
+                           should_use_separate_draft_kv_cache)
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
-                    create_py_executor_instance, instantiate_sampler, is_mla,
+                    compute_max_num_sequences, create_py_executor_instance,
+                    instantiate_sampler, is_disagg_enabled, is_mla,
                     validate_feature_combination)
 from .config_utils import (is_hybrid_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
-                           uses_vswa_kv_cache_layout)
+                           uses_fp4_mla_attention, uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager, get_global_dwdp_manager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
+from .hang_diagnostics import monitor_executor_initialization
 from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
@@ -58,6 +61,7 @@ _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS_STR = "/".join(
 _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR = "/".join(
     f"SM{sm_version}"
     for sm_version in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS)
+FP4_MLA_TOKENS_PER_BLOCK = 128
 
 
 class _ExecutorMemoryMonitor:
@@ -187,6 +191,24 @@ class _ExecutorMemoryMonitor:
                     free_gpu_memory_bytes_pre=free_gpu_memory_bytes_pre,
                     free_gpu_memory_bytes_post=free_gpu_memory_bytes_post,
                 ))
+
+
+def _flashinfer_one_engine_spec_supported(attn_backend: str,
+                                          spec_config) -> bool:
+    """Whether this speculation is qualified on the FlashInfer target backend.
+
+    DFlash remains unqualified regardless of its draft attention backend or
+    cache ownership. Its VANILLA and FA4 backends own private context buffers,
+    but that does not establish FlashInfer serving-scale qualification.
+
+    Other speculative modes are admitted when they do not need a separate
+    draft KV cache manager.
+    """
+    if spec_config is None or attn_backend != "FLASHINFER":
+        return True
+    if spec_config.spec_dec_mode.is_dflash():
+        return False
+    return not should_use_separate_draft_kv_cache(spec_config)
 
 
 def _set_model_engines_cache_reuse(model_engines, cache_reuse: bool):
@@ -438,12 +460,18 @@ def _create_py_executor_impl(
             )
             llm_args.disable_overlap_scheduler = True
 
-    if (spec_config is not None and llm_args.attn_backend == "FLASHINFER"
-            and spec_config.spec_dec_mode.use_one_engine()
-            and not spec_config._use_shared_kv_cache):
+    if not _flashinfer_one_engine_spec_supported(llm_args.attn_backend,
+                                                 spec_config):
+        if spec_config.spec_dec_mode.is_dflash():
+            raise ValueError(
+                "FLASHINFER target attention is not qualified for DFlash, "
+                "regardless of the draft attention backend or cache ownership. "
+                "Use TRTLLM target attention for DFlash.")
         raise ValueError(
-            "FLASHINFER attention backend supports one-engine speculative "
-            "decoding only when the draft model shares the target KV cache.")
+            f"FLASHINFER target attention is not qualified for "
+            f"{spec_config.spec_dec_mode.name}: this one-engine speculative "
+            "mode needs a separate draft KV cache manager, which FLASHINFER "
+            "does not support. Use TRTLLM target attention.")
 
     if mm_encoder_only:
         llm_args.mm_encoder_only = True
@@ -633,10 +661,28 @@ def _create_py_executor_impl(
     resolve_cache_transceiver_config(cache_transceiver_config)
 
     config = model_engine.model.model_config.pretrained_config
-    max_num_seq_slots = getattr(model_engine, "max_num_seq_slots",
-                                max_batch_size * getattr(mapping, "pp_size", 1))
+    max_num_seq_slots = getattr(
+        model_engine, "max_num_seq_slots", None) or compute_max_num_sequences(
+            mapping,
+            max_batch_size,
+            llm_args.disable_overlap_scheduler,
+            enable_overlap_headroom=getattr(model_engine,
+                                            "_enable_overlap_headroom", False))
     if is_mla(config):
-        if model_engine.model.model_config.enable_flash_mla:
+        if uses_fp4_mla_attention(model_engine.model.model_config):
+            tokens_per_block = FP4_MLA_TOKENS_PER_BLOCK
+            kv_cache_config.tokens_per_block = tokens_per_block
+            logger.info(
+                f"Change tokens_per_block to: {tokens_per_block} for using FP4 MLA attention"
+            )
+            if kv_cache_config.enable_block_reuse:
+                logger.warning(
+                    "FP4 MLA cached-context attention is not supported yet; "
+                    "disabling KV cache block reuse.")
+                kv_cache_config.enable_block_reuse = False
+                _set_model_engines_cache_reuse(
+                    [model_engine, draft_model_engine], False)
+        elif model_engine.model.model_config.enable_flash_mla:
             tokens_per_block = 64
             # Propagate the override back to kv_cache_config so any consumer
             # that later reads llm_args.kv_cache_config.tokens_per_block sees
@@ -729,15 +775,9 @@ def _create_py_executor_impl(
     if guided_decoding_config is not None:
         with allocation_scope(ExecutorMemoryType.GUIDED_DECODER):
             if mapping.is_last_pp_rank():
-                guided_decoder_slots = (max_num_seq_slots if getattr(
-                    model_engine, "_enable_disagg_adp_overlap_headroom", False)
-                                        else max_batch_size)
                 kwargs = {
                     "guided_decoding_config": guided_decoding_config,
-                    # The disaggregated attention-DP overlap path follows the
-                    # expanded slot pool. Other configurations retain
-                    # max_batch_size.
-                    "max_num_sequences": guided_decoder_slots,
+                    "max_num_sequences": max_num_seq_slots,
                     "vocab_size_padded": model_engine.model.vocab_size_padded,
                     "rank": mapping.rank,
                 }
@@ -780,15 +820,44 @@ def _create_py_executor_impl(
         logger.info(
             f"Initializing kv connector with config: {kv_connector_config}")
 
-        if scheduler_config.capacity_scheduler_policy != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
+        # `use_kv_cache_manager_v2` is tri-state and under "auto" the manager is
+        # not chosen until model loading, so the three manager-dependent
+        # rejections below fire here only when the config names the manager
+        # outright, sparing an explicit config a model load it cannot use.
+        # `_maybe_init_kv_connector_manager` repeats all three against the
+        # manager that was actually built.
+        v2_selection = kv_cache_config.use_kv_cache_manager_v2
+
+        # A policy that destroys and replays a live request leaves the
+        # connector's per-request block delta measured against pages that were
+        # freed with it. Only KVCacheManagerV2 drops that delta on replay.
+        if (scheduler_config.capacity_scheduler_policy
+                != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
+                and v2_selection is False):
             raise NotImplementedError(
-                "KV connector is only supported with guaranteed no evict scheduler policy."
+                "KV connector in this configuration is only supported with the "
+                "GUARANTEED_NO_EVICT capacity scheduler policy. Set "
+                "kv_cache_config.use_kv_cache_manager_v2=True to use another policy."
             )
 
-        max_attention_window = kv_cache_config.max_attention_window
-        if uses_vswa_kv_cache_layout(max_attention_window):
+        # Rejected draft tokens shrink a request's page list, and the freed slot
+        # goes to whichever request allocates next. The connector is only told
+        # about pages appended since the last report, so it would keep
+        # addressing a slot another request now owns.
+        if (spec_config is not None and spec_config.max_draft_len > 0
+                and v2_selection is True):
             raise NotImplementedError(
-                "KV connector is not supported with VSWA (Variable Sliding Window Attention)."
+                "KV connector is not supported with speculative decoding. "
+                "Disable speculative decoding to run a connector.")
+
+        # VSWA allocates one pool per window size, which only
+        # `register_kv_cache_layout` can describe.
+        max_attention_window = kv_cache_config.max_attention_window
+        if (uses_vswa_kv_cache_layout(max_attention_window)
+                and v2_selection is False):
+            raise NotImplementedError(
+                "KV connector is not supported with VSWA (Variable Sliding Window Attention) "
+                "in this configuration. Set kv_cache_config.use_kv_cache_manager_v2=True."
             )
 
         if mapping.enable_attention_dp:
@@ -848,8 +917,7 @@ def _create_py_executor_impl(
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
 
-        is_disagg = (cache_transceiver_config is not None
-                     and cache_transceiver_config.backend is not None)
+        is_disagg = is_disagg_enabled(cache_transceiver_config)
         is_hybrid = is_hybrid_linear(
             model_engine.model.model_config.pretrained_config)
 
@@ -1050,13 +1118,14 @@ def create_py_executor(
     """Create a PyExecutor and roll back a partially initialized DWDP runtime."""
     previous_dwdp_manager = get_global_dwdp_manager()
     try:
-        return _create_py_executor_impl(
-            llm_args=llm_args,
-            checkpoint_dir=checkpoint_dir,
-            tokenizer=tokenizer,
-            profiling_stage_data=profiling_stage_data,
-            resource_governor_queue=resource_governor_queue,
-        )
+        with monitor_executor_initialization():
+            return _create_py_executor_impl(
+                llm_args=llm_args,
+                checkpoint_dir=checkpoint_dir,
+                tokenizer=tokenizer,
+                profiling_stage_data=profiling_stage_data,
+                resource_governor_queue=resource_governor_queue,
+            )
     except BaseException:
         current_dwdp_manager = get_global_dwdp_manager()
         if (current_dwdp_manager is not None

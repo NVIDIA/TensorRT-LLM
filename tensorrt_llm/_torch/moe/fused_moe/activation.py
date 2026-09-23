@@ -33,7 +33,7 @@ not one shared concept: they are two registers in the activation functor that
 unrelated kinds borrow for unrelated jobs. ``SwigluBias`` reads ``alpha`` as a
 scale inside the sigmoid and ``beta`` as an additive offset (neutral ``0.0``);
 ``SiTu`` reads both as tanh soft-cap magnitudes that must be positive (neutral
-``1.0``). See ``cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/
+``1.0``). See ``cpp/tensorrt_llm/kernels/moe/cutlass/
 moe_kernels.cuh`` (``SwigluBiasAdaptor`` / ``SiTuAdaptor``) and
 ``GemmGatedActOptions.h``. A single nullable ``beta`` slot therefore has no
 coherent default and no readable meaning until you know the kind.
@@ -102,7 +102,16 @@ def _reject_non_positive_clamp(value: ActivationConstant | None) -> None:
         )
 
 
-def _reject_non_positive(value: ActivationConstant, *, name: str) -> None:
+def _reject_non_positive(value: ActivationConstant | None, *, name: str) -> None:
+    # Unlike ``_reject_non_positive_clamp``, absence is a rejection: a clamp
+    # has a value meaning "no clamp" and a softcap has none, so ``None`` is a
+    # missing constant. Spelled out so the failure is not ``float(None)``
+    # raising TypeError from inside the validator.
+    if value is None:
+        raise ValueError(
+            f"SiTu {name} is required because the kernel divides by it, and "
+            "unlike a clamp there is no value that encodes its absence; got None."
+        )
     smallest = (
         float(value.detach().min().item()) if isinstance(value, torch.Tensor) else float(value)
     )
@@ -393,11 +402,11 @@ def materialize_activation_params(
 def resolve_activation_support(module: torch.nn.Module) -> MoEActivationSupport:
     """The declaration that applies to ``module``, class attribute or override.
 
-    Static for ten of the eleven backends. TRTLLM-Gen is the documented
-    exception: its clamp ABI is a per-expert tensor for the FP4 fused-activation
-    cubins but a by-value ``double`` for the FP8 block-scale separate-activation
-    kernel, which is not a property of the class, so it defines
-    ``resolve_activation_support`` and narrows the shape per instance.
+    A class attribute for every backend but one. TRTLLM-Gen's clamp ABI is a
+    per-expert tensor for the FP4 fused-activation cubins and a by-value
+    ``float`` for the FP8 block-scale separate-activation kernel, so that one
+    class overrides this and the rest of the family falls through to the class
+    attribute. Hence the ``getattr`` probe.
     """
     override = getattr(module, "resolve_activation_support", None)
     if callable(override):
@@ -451,10 +460,10 @@ def _write_activation_slot(
     state dict, which is where a plain attribute already was -- these are
     backend configuration, not checkpoint values.
 
-    A slot that is already a parameter stays one. ``TRTLLMGenFusedMoE`` promotes
-    the SiTu slots so they do travel in the state dict, and the exclude-modules
-    pass clears ``_weights_created`` without unregistering them, so this runs
-    again over a live parameter.
+    A slot that is already a parameter stays one. TRTLLM-Gen's FP4 block-scale
+    class promotes the SiTu slots so they do travel in the state dict, and the
+    exclude-modules pass clears ``_weights_created`` without unregistering
+    them, so this runs again over a live parameter.
     """
     if isinstance(value, torch.Tensor) and name in getattr(module, "_parameters", {}):
         setattr(module, name, torch.nn.Parameter(value, requires_grad=False))

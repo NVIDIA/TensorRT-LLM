@@ -61,6 +61,7 @@ SUPPORTED_GPU_MAPPING = {
     "B200": "b200",
     "B300": "b300",
     "H200": "h200",
+    "VR200": "vr200",
 }
 
 # benchmark_client value selecting the AgentX trace-replay client
@@ -72,6 +73,36 @@ WARMUP_BENCHMARK_MODES = ("e2e", "ctx_only")
 
 def wants_warmup(benchmark_mode: str) -> bool:
     return benchmark_mode in WARMUP_BENCHMARK_MODES
+
+
+GEN_ONLY_NO_CONTEXT_MODE = "gen_only_no_context"
+
+DISAGG_BENCHMARK_MODES = ("e2e", "gen_only")
+
+AGGREGATED_DISAGG_YAML_MODES = ("ctx_only", GEN_ONLY_NO_CONTEXT_MODE)
+
+DISAGG_CONFIG_MODES = DISAGG_BENCHMARK_MODES + AGGREGATED_DISAGG_YAML_MODES
+
+GEN_ONLY_MODES = ("gen_only", GEN_ONLY_NO_CONTEXT_MODE)
+
+GEN_ONLY_NO_CONTEXT_RUNTIME = "gen_only_no_context_server"
+
+DISAGG_CONFIG_RUNTIMES = ("multi_node_disagg_server", GEN_ONLY_NO_CONTEXT_RUNTIME)
+
+
+def is_gen_only_no_context(benchmark_mode: Optional[str], config: Optional[dict]) -> bool:
+    """Return True when this case must run with zero context workers."""
+    if benchmark_mode == GEN_ONLY_NO_CONTEXT_MODE:
+        return True
+    if benchmark_mode != "gen_only":
+        return False
+    benchmark = (config or {}).get("benchmark") or {}
+    return GEN_ONLY_NO_CONTEXT_MODE in str(benchmark.get("mode", ""))
+
+
+def gen_only_no_context_server_counts() -> Tuple[int, int]:
+    """The (num_ctx_servers, num_gen_servers) this mode launches, always (0, 1)."""
+    return 0, 1
 
 
 BENCH_SERVING_REPO = "https://github.com/kedarpotdar-nv/bench_serving.git"
@@ -265,7 +296,7 @@ DEVICE_STEP_TIME_METRICS = (
 #
 # Every name here must also appear in MINIMIZE_METRICS (or MAXIMIZE_METRICS):
 # check_regression only iterates those two lists, so a gated name absent from
-# both is silently never checked. test_perf_sanity_helpers.py pins that.
+# both is silently never checked.
 #
 # gen_only ONLY. The other modes in DEVICE_STEP_TIME_MODES upload the same five
 # statistics but keep the default REGRESSION_METRICS (throughput), so for them
@@ -314,12 +345,12 @@ TEST_ID_MODIFIERS = (TIME_BREAKDOWN_MODIFIER,)
 # runs the same mode, so it uploads (and gates) exactly as its unmodified
 # sibling does.
 #
-# Only gen_only gates on these (GEN_ONLY_REGRESSION_METRICS); for e2e they are
-# uploaded and baselined but cannot fail a build. In e2e the gen worker still
-# does pure decode -- the ctx workers do the prefill -- so the statistic means
-# the same thing it does in gen_only and is comparable within its own
+# Only the gen_only modes gate on these (GEN_ONLY_REGRESSION_METRICS); for e2e
+# they are uploaded and baselined but cannot fail a build. In e2e the gen worker
+# still does pure decode -- the ctx workers do the prefill -- so the statistic
+# means the same thing it does in gen_only and is comparable within its own
 # s_test_case_name series.
-DEVICE_STEP_TIME_MODES = ("gen_only", "e2e")
+DEVICE_STEP_TIME_MODES = GEN_ONLY_MODES + ("e2e",)
 
 # Config stems that get a time_breakdown test id. Deliberately an allowlist
 # rather than "every disagg yaml": get_disagg_test_cases is a cartesian product,
@@ -723,6 +754,37 @@ def parse_gen_worker_device_step_time(
         output_dir, num_gen_servers, start_offsets, end_offsets
     )
     return _stats_at_mode_ngen(per_file_rows)
+
+
+def append_gen_worker_device_step_time(
+    output_dir: str,
+    num_gen_servers: int,
+    pending_device_step_time: List[dict],
+    outputs: List[str],
+) -> None:
+    """Parse each pending client's gen-worker window and append the five lines."""
+    for record in pending_device_step_time:
+        stats = parse_gen_worker_device_step_time(
+            output_dir,
+            num_gen_servers,
+            start_offsets=record["start_offsets"],
+            end_offsets=record.get("end_offsets"),
+        )
+        if stats is None:
+            continue
+        summary_lines = "\n".join(
+            [
+                f"Average Per Iter Device Step Time (ms): {stats.mean:.2f}",
+                f"Median Per Iter Device Step Time (ms): {stats.median:.4f}",
+                f"Stdev Per Iter Device Step Time (ms): {stats.std:.4f}",
+                f"P75 Per Iter Device Step Time (ms): {stats.p75:.4f}",
+                f"P99 Per Iter Device Step Time (ms): {stats.p99:.4f}",
+            ]
+        )
+        with open(record["benchmark_file_path"], "a") as benchmark_ctx:
+            benchmark_ctx.write(f"\n{summary_lines}\n")
+        idx = record["output_index"]
+        outputs[idx] = f"{outputs[idx]}\n{summary_lines}\n"
 
 
 def add_perf_metric_value(
@@ -2787,40 +2849,17 @@ class DisaggTestCmds(NamedTuple):
         the gen_only run before results are uploaded. Other modes in
         DEVICE_STEP_TIME_MODES treat the family as diagnostic, so a fallback
         parse that finds nothing simply omits the columns there.
-
-        Five lines are written, one statistic each -- see
-        DEVICE_STEP_TIME_LOG_QUERIES for why they must not share a leading
-        word. The mean keeps its original wording and 2 decimals so existing
-        log readers and dashboards are unaffected; the four new lines use 4
-        decimals because the stdev of a healthy run is O(0.1 ms) and would
-        round to two significant figures away at 2.
         """
         if not pending_device_step_time:
             return
 
         self.wait_for_gen_log_sentinels()
-        for record in pending_device_step_time:
-            stats = parse_gen_worker_device_step_time(
-                self.test_output_dir,
-                self.num_gen_servers,
-                start_offsets=record["start_offsets"],
-                end_offsets=record.get("end_offsets"),
-            )
-            if stats is None:
-                continue
-            summary_lines = "\n".join(
-                [
-                    f"Average Per Iter Device Step Time (ms): {stats.mean:.2f}",
-                    f"Median Per Iter Device Step Time (ms): {stats.median:.4f}",
-                    f"Stdev Per Iter Device Step Time (ms): {stats.std:.4f}",
-                    f"P75 Per Iter Device Step Time (ms): {stats.p75:.4f}",
-                    f"P99 Per Iter Device Step Time (ms): {stats.p99:.4f}",
-                ]
-            )
-            with open(record["benchmark_file_path"], "a") as benchmark_ctx:
-                benchmark_ctx.write(f"\n{summary_lines}\n")
-            idx = record["output_index"]
-            outputs[idx] = f"{outputs[idx]}\n{summary_lines}\n"
+        append_gen_worker_device_step_time(
+            self.test_output_dir,
+            self.num_gen_servers,
+            pending_device_step_time,
+            outputs,
+        )
 
     def _append_time_breakdown_metrics(
         self,
@@ -3169,6 +3208,269 @@ class DisaggTestCmds(NamedTuple):
         return ["multi-node disaggregated server tests, please check config files"]
 
 
+class AggrGenOnlyNoContextCmds(NamedTuple):
+    """Commands for gen_only_no_context: one gen worker, a proxy, no ctx fleet."""
+
+    server_cmds: List[Tuple[List[str], List[str]]]
+    client_cmds: Dict[int, List[List[str]]]
+    timeout: int
+    num_gen_servers: int
+    output_dir: str
+    test_output_dir: str
+    model_name: str = ""
+    internal_request_auth_key: str = ""
+    client_configs: Dict[int, List["ClientConfig"]] = {}
+    server_configs: List[Tuple["ServerConfig", "ServerConfig", "DisaggConfig"]] = []
+    router_config: Optional[dict] = None
+    gen_router_config: Optional[dict] = None
+    server_config_extra: Optional[dict] = None
+    perf_metrics_output_dir: str = ""
+
+    def _gen_worker_log(self, server_idx: int, gen_idx: int = 0) -> str:
+        return os.path.join(self.test_output_dir, f"gen_server_{gen_idx}.log")
+
+    def get_server_logs(self, server_idx: int) -> List[str]:
+        """Logs wait_for_endpoint_ready scans for a fatal error while polling."""
+        server_logs = [self._gen_worker_log(server_idx, i) for i in range(self.num_gen_servers)]
+        server_logs.append(os.path.join(self.test_output_dir, "disagg_server.log"))
+        server_logs.extend(
+            sorted(
+                glob.glob(
+                    os.path.join(self.test_output_dir, f"trtllm-benchmark.{server_idx}.*.log")
+                )
+            )
+        )
+        return server_logs
+
+    def _write_proxy_config(self, server_idx: int, gen_urls: List[str]) -> str:
+        """Write the proxy's config: zero context servers, one generation server."""
+        server_config = {
+            "hostname": "localhost",
+            "port": 0,
+            "backend": "pytorch",
+            "internal_request_auth_key": self.internal_request_auth_key,
+            "context_servers": {
+                "num_instances": 0,
+                "urls": [],
+            },
+            "generation_servers": {
+                "num_instances": self.num_gen_servers,
+                "urls": gen_urls,
+            },
+        }
+        if self.router_config:
+            server_config["generation_servers"]["router"] = copy.deepcopy(self.router_config)
+        if self.gen_router_config:
+            server_config["generation_servers"]["router"] = copy.deepcopy(self.gen_router_config)
+        if self.server_config_extra:
+            reserved = {
+                "port",
+                "hostname",
+                "internal_request_auth_key",
+                "context_servers",
+                "generation_servers",
+            }
+            clobbered = sorted(reserved & set(self.server_config_extra))
+            if clobbered:
+                raise RuntimeError(
+                    f"server_config_extra may not override harness-owned keys {clobbered}: "
+                    "the port is kernel-assigned and reported back via --report_addr, and "
+                    "the server urls are discovered at runtime."
+                )
+            server_config.update(copy.deepcopy(self.server_config_extra))
+        if self.perf_metrics_output_dir:
+            server_config["perf_metrics_output_dir"] = self.perf_metrics_output_dir
+        config_path = os.path.join(self.test_output_dir, f"server_config.{server_idx}.yaml")
+        with open(config_path, "w") as config_file:
+            yaml.dump(server_config, config_file)
+        print_info(f"Server config file {config_path} generated")
+        return config_path
+
+    def run_cmd(self, server_idx: int) -> List[str]:
+        """Start the gen worker, then the proxy, then run every client."""
+        outputs = []
+        gen_cmd, disagg_cmd = self.server_cmds[server_idx]
+        configs_for_idx = (
+            self.server_configs[server_idx] if server_idx < len(self.server_configs) else None
+        )
+        gen_cfg = configs_for_idx[1] if configs_for_idx is not None else None
+        disagg_cfg = configs_for_idx[2] if configs_for_idx is not None else None
+
+        pending_device_step_time: List[dict] = []
+        pending_time_breakdown: List[dict] = []
+        collect_time_breakdown = bool(self.perf_metrics_output_dir)
+
+        gen_proc = None
+        proxy_proc = None
+        try:
+            num_frontends = getattr(gen_cfg, "num_serve_frontends", 1) or 1
+            if num_frontends > 1:
+                raise RuntimeError(
+                    f"{GEN_ONLY_NO_CONTEXT_MODE} does not support num_serve_frontends="
+                    f"{num_frontends}: the worker is launched with port 0 and "
+                    "--report_addr, which trtllm-serve refuses with several frontends."
+                )
+            gen_addr_path = os.path.join(self.test_output_dir, f"GEN_0.{server_idx}.addr")
+            if os.path.exists(gen_addr_path):
+                os.remove(gen_addr_path)
+            gen_cmd_with_port = add_host_port_to_cmd(gen_cmd, "localhost", 0) + [
+                "--report_addr",
+                gen_addr_path,
+            ]
+            print_info(f"Starting gen worker. cmd is {gen_cmd_with_port}")
+            gen_log_path = self._gen_worker_log(server_idx)
+            gen_env = copy.deepcopy(os.environ)
+            if gen_cfg is not None:
+                gen_env.update(gen_cfg.to_env())
+            with open(gen_log_path, "a") as gen_ctx:
+                gen_proc = subprocess.Popen(
+                    gen_cmd_with_port,
+                    env=gen_env,
+                    stdout=gen_ctx,
+                    stderr=subprocess.STDOUT,
+                )
+                gen_host, gen_port = wait_for_reported_addr(gen_addr_path, self.timeout, gen_proc)
+
+                self._write_proxy_config(server_idx, [f"{gen_host}:{gen_port}"])
+                proxy_addr_path = os.path.join(
+                    self.test_output_dir, f"DISAGG_SERVER.{server_idx}.addr"
+                )
+                if os.path.exists(proxy_addr_path):
+                    os.remove(proxy_addr_path)
+                proxy_cmd = disagg_cmd + ["--report_addr", proxy_addr_path]
+                print_info(f"Starting disagg proxy. cmd is {proxy_cmd}")
+                proxy_log_path = os.path.join(self.test_output_dir, "disagg_server.log")
+                proxy_env = copy.deepcopy(os.environ)
+                if disagg_cfg is not None:
+                    proxy_env.update(to_env_dict(disagg_cfg.server_env_var))
+                with open(proxy_log_path, "w") as proxy_ctx:
+                    proxy_proc = subprocess.Popen(
+                        proxy_cmd,
+                        env=proxy_env,
+                        stdout=proxy_ctx,
+                        stderr=subprocess.STDOUT,
+                    )
+                    proxy_host, proxy_port = wait_for_reported_addr(
+                        proxy_addr_path, self.timeout, proxy_proc
+                    )
+                    wait_for_endpoint_ready(
+                        f"http://{proxy_host}:{proxy_port}/health",
+                        timeout=min(
+                            self.timeout,
+                            server_ready_timeout(DISAGG_SERVER_READY_TIMEOUT, "DISAGG"),
+                        ),
+                        check_files=self.get_server_logs(server_idx),
+                        server_proc=proxy_proc,
+                    )
+                    observation = collect_startup_observation(
+                        f"{gen_host}:{gen_port}",
+                        [gen_log_path],
+                        "gen",
+                        "GEN_0",
+                    )
+                    write_startup_observations(self.test_output_dir, server_idx, [observation])
+
+                    client_configs = self.client_configs.get(server_idx, [])
+                    for client_idx, client_cmd in enumerate(self.client_cmds[server_idx]):
+                        client_config = (
+                            client_configs[client_idx] if client_idx < len(client_configs) else None
+                        )
+                        only_run_accuracy = bool(client_config and client_config.only_run_accuracy)
+                        if only_run_accuracy:
+                            print_info(
+                                f"Skipping perf benchmark for client {client_idx}: "
+                                "only_run_accuracy=True"
+                            )
+                            outputs.append("")
+                            continue
+
+                        benchmark_file_path = os.path.join(
+                            self.test_output_dir,
+                            f"trtllm-benchmark.{server_idx}.{client_idx}.log",
+                        )
+                        client_cmd_with_port = add_host_port_to_cmd(
+                            client_cmd, proxy_host, proxy_port
+                        )
+                        print_info(f"Starting benchmark. cmd is {client_cmd_with_port}")
+
+                        gen_log_start_offsets = gen_worker_log_sizes(
+                            self.test_output_dir, self.num_gen_servers
+                        )
+                        if pending_device_step_time:
+                            pending_device_step_time[-1]["end_offsets"] = gen_log_start_offsets
+
+                        bench_env = copy.deepcopy(os.environ)
+                        if client_config:
+                            bench_env.update(client_config.to_env())
+                        bench_env["TRTLLM_AGENTX_ARTIFACT_DIR"] = os.path.join(
+                            self.test_output_dir, f"agentx.{server_idx}.{client_idx}"
+                        )
+                        output = _run_benchmark_with_log(
+                            client_cmd_with_port,
+                            bench_env,
+                            benchmark_file_path,
+                        )
+                        outputs.append(output)
+                        pending_device_step_time.append(
+                            {
+                                "output_index": len(outputs) - 1,
+                                "benchmark_file_path": benchmark_file_path,
+                                "start_offsets": gen_log_start_offsets,
+                                "end_offsets": None,
+                            }
+                        )
+                        if collect_time_breakdown:
+                            pending_time_breakdown.append(
+                                {
+                                    "output_index": len(outputs) - 1,
+                                    "benchmark_file_path": benchmark_file_path,
+                                    "benchmark_mode": GEN_ONLY_NO_CONTEXT_MODE,
+                                    "warmup": bool(client_config and client_config.warmup),
+                                    "expected_requests": (
+                                        client_config.num_requests if client_config else 0
+                                    ),
+                                }
+                            )
+
+                    # Prefer the per-client AccuracyConfig, falling back to ACCURACY_CONFIG_JSON.
+                    accuracy_cfg = None
+                    if client_configs and client_configs[0].accuracy_config:
+                        accuracy_cfg = client_configs[0].accuracy_config
+                    else:
+                        acc_cfg_json = os.environ.get("ACCURACY_CONFIG_JSON")
+                        if acc_cfg_json:
+                            import json as _json
+
+                            accuracy_cfg = AccuracyConfig.from_dict(_json.loads(acc_cfg_json))
+
+                    if accuracy_cfg and accuracy_cfg.enable_accuracy_test:
+                        accuracy_cfg.run(
+                            model_name=self.model_name,
+                            server_hostname=proxy_host,
+                            server_port=proxy_port,
+                            output_dir=self.test_output_dir,
+                            server_idx=server_idx,
+                        )
+        finally:
+            for proc, name in ((proxy_proc, "disagg proxy"), (gen_proc, "gen worker")):
+                if proc:
+                    print_info(f"Stopping {name}")
+                    proc.terminate()
+                    proc.wait()
+
+        append_gen_worker_device_step_time(
+            self.test_output_dir,
+            self.num_gen_servers,
+            pending_device_step_time,
+            outputs,
+        )
+        append_time_breakdown_metrics(pending_time_breakdown, outputs, self.perf_metrics_output_dir)
+        return outputs
+
+    def get_cmd_str(self, server_idx: int) -> List[str]:
+        return ["gen_only_no_context tests, please check config files"]
+
+
 def parse_select_pattern(select_pattern: str) -> list:
     """Parse select pattern (server config names).
 
@@ -3201,8 +3503,9 @@ def parse_test_string(test_case_name: str):
 
     Test name formats:
     - Disagg: disagg_upload-{e2e|gen_only}[-{modifier}]-{config_base}
-    - ctx_only: aggr_upload-ctx_only[-{modifier}]-{config_base} (runs aggr mode
-      but reads disagg config)
+    - ctx_only / gen_only_no_context:
+      aggr_upload-{ctx_only|gen_only_no_context}[-{modifier}]-{config_base}
+      (runs the aggregated launch path but reads a disagg config)
     - Regular aggr: aggr_upload-{config}-{server_name}
 
     The modifier segment is optional and drawn from the closed TEST_ID_MODIFIERS
@@ -3214,7 +3517,7 @@ def parse_test_string(test_case_name: str):
         tuple: (config_base_name, select_pattern, runtime_mode, benchmark_mode,
                 time_breakdown)
             - runtime_mode: "aggregated" or "disaggregated"
-            - benchmark_mode: "e2e", "gen_only", "ctx_only", or None (normal aggr)
+            - benchmark_mode: a DISAGG_CONFIG_MODES member, or None (normal aggr)
             - time_breakdown: True when the time_breakdown modifier is present
     """
     labels = test_case_name.split("-")
@@ -3244,16 +3547,20 @@ def parse_test_string(test_case_name: str):
         if len(labels) <= 2:
             raise ValueError(f"Disagg test must have benchmark_mode and config: {test_case_name}")
         benchmark_mode = labels[1]
-        if benchmark_mode not in ("e2e", "gen_only"):
-            raise ValueError(f"Invalid benchmark_mode for disagg: {benchmark_mode}")
+        if benchmark_mode not in DISAGG_BENCHMARK_MODES:
+            raise ValueError(
+                f"Invalid benchmark_mode for disagg: {benchmark_mode}. Expected one of "
+                f"{', '.join(repr(mode) for mode in DISAGG_BENCHMARK_MODES)}."
+            )
         runtime_mode = "disaggregated"
         time_breakdown, config_base_name = split_modifiers(labels[2:])
         select_pattern = None
     elif is_aggr_prefix:
-        # Check if this is ctx_only (aggr_upload-ctx_only[-{modifier}]-{config_base})
-        if len(labels) > 2 and labels[1] == "ctx_only":
+        # Check if this is a disagg config on the aggregated path
+        # (aggr_upload-{mode}[-{modifier}]-{config_base})
+        if len(labels) > 2 and labels[1] in AGGREGATED_DISAGG_YAML_MODES:
             # Runs in aggregated mode but reads disagg config
-            benchmark_mode = "ctx_only"
+            benchmark_mode = labels[1]
             runtime_mode = "aggregated"
             time_breakdown, config_base_name = split_modifiers(labels[2:])
             select_pattern = None
@@ -3275,12 +3582,12 @@ def get_config_dir(benchmark_mode: Optional[str]) -> str:
     """Get config directory based on benchmark_mode.
 
     Args:
-        benchmark_mode: "e2e", "gen_only", "ctx_only", or None (for normal aggr)
+        benchmark_mode: a DISAGG_CONFIG_MODES member, or None (for normal aggr)
 
     Returns:
         str: Absolute config directory path
     """
-    if benchmark_mode in ("e2e", "gen_only", "ctx_only"):
+    if benchmark_mode in DISAGG_CONFIG_MODES:
         config_dir = DISAGG_CONFIG_FOLDER
     else:
         config_dir = AGG_CONFIG_FOLDER
@@ -3337,7 +3644,9 @@ class PerfSanityTestConfig:
         ) = parse_test_string(test_case_name)
 
         # Set runtime based on parsed result
-        if runtime == "disaggregated":
+        if self.benchmark_mode == GEN_ONLY_NO_CONTEXT_MODE:
+            self.runtime = GEN_ONLY_NO_CONTEXT_RUNTIME
+        elif runtime == "disaggregated":
             self.runtime = "multi_node_disagg_server"
         else:
             self.runtime = "aggr_server"
@@ -3357,10 +3666,9 @@ class PerfSanityTestConfig:
         config_file_path = os.path.join(self.config_dir, self.config_file)
 
         # benchmark_mode determines which parser to use:
-        # - e2e, gen_only, ctx_only: use _parse_disagg_config_file (reads disagg
-        #   config)
+        # - DISAGG_CONFIG_MODES: use _parse_disagg_config_file (reads disagg config)
         # - None (normal aggr): use _parse_aggr_config_file
-        if self.benchmark_mode in ("e2e", "gen_only", "ctx_only"):
+        if self.benchmark_mode in DISAGG_CONFIG_MODES:
             self._parse_disagg_config_file(config_file_path, self.config_file)
         else:
             # Normal aggregated mode
@@ -3433,9 +3741,12 @@ class PerfSanityTestConfig:
     def _parse_disagg_config_file(self, config_file_path: str, config_file: str):
         """Parse YAML config file for disaggregated server.
 
-        This method handles e2e, gen_only, and ctx_only modes.
+        This method handles every DISAGG_CONFIG_MODES member: e2e, gen_only,
+        ctx_only and gen_only_no_context.
         For ctx_only: output is on par with _parse_aggr_config_file (single ServerConfig),
                      OSL is set to 1, and cache_transceiver_config is ignored.
+        For gen_only_no_context: both server counts come from
+                     gen_only_no_context_server_counts() rather than the YAML.
         """
         disagg_serving_type = os.environ.get("DISAGG_SERVING_TYPE", "BENCHMARK")
 
@@ -3463,11 +3774,12 @@ class PerfSanityTestConfig:
         # The mode segments of the test id, reused verbatim as the config name so
         # s_test_case_name reverses back into a runnable pytest id.
         test_label = format_test_label(benchmark_mode, self.time_breakdown)
-        if benchmark_mode == "gen_only":
-            # Check if it's gen_only_no_context from config
-            config_mode = benchmark.get("mode", "e2e")
-            if "gen_only_no_context" in config_mode:
-                hardware["num_ctx_servers"] = 0
+        # Check if it's gen_only_no_context from the test id or the config
+        if is_gen_only_no_context(benchmark_mode, config):
+            (
+                hardware["num_ctx_servers"],
+                hardware["num_gen_servers"],
+            ) = gen_only_no_context_server_counts()
 
         worker_env_var = environment.get("worker_env_var", "")
         # Optional per-role env vars appended to the shared worker_env_var so
@@ -3501,7 +3813,7 @@ class PerfSanityTestConfig:
             concurrency_values = [int(concurrency_str)]
 
         # Gen only mode only runs the first concurrency
-        if benchmark_mode == "gen_only":
+        if benchmark_mode in GEN_ONLY_MODES:
             concurrency_values = [concurrency_values[0]]
 
         # Handle ctx_only mode specially - output should be on par with _parse_aggr_config_file
@@ -3659,7 +3971,7 @@ class PerfSanityTestConfig:
             client_config_data = {
                 "concurrency": concurrency,
                 "iterations": 1
-                if benchmark_mode == "gen_only"
+                if benchmark_mode in GEN_ONLY_MODES
                 else benchmark.get("multi_round", 1),
                 "isl": benchmark.get("input_length", 1024),
                 "osl": osl,
@@ -3769,6 +4081,8 @@ class PerfSanityTestConfig:
         self.test_output_dir = os.path.join(self._output_dir, self._test_param_labels)
         os.makedirs(self.test_output_dir, exist_ok=True)
 
+        if self.runtime == GEN_ONLY_NO_CONTEXT_RUNTIME:
+            return self._get_gen_only_no_context_commands(self._output_dir, self.test_output_dir)
         # ctx_only runs in aggregated mode (uses _get_aggr_commands)
         if self.runtime == "aggr_server":
             return self._get_aggr_commands(self._output_dir, self.test_output_dir)
@@ -3885,6 +4199,66 @@ class PerfSanityTestConfig:
             internal_request_auth_key=disagg_config.internal_request_auth_key,
             router_config=disagg_config.router_config,
             ctx_router_config=disagg_config.ctx_router_config,
+            gen_router_config=disagg_config.gen_router_config,
+            server_config_extra=disagg_config.server_config_extra,
+            client_configs=self.server_client_configs,
+            server_configs=list(self.server_configs),
+            perf_metrics_output_dir=self.time_breakdown_dir(),
+        )
+
+    def _get_gen_only_no_context_commands(self, output_dir: str, test_output_dir: str):
+        """Get commands for gen_only_no_context: one gen worker plus a proxy."""
+        server_cmds = []
+        client_cmds = {}
+
+        for server_idx, (_ctx_config, gen_config, disagg_config) in enumerate(self.server_configs):
+            numa_bind = disagg_config.numa_bind
+            timeout = disagg_config.timeout
+
+            if disagg_config.num_gen_servers != gen_only_no_context_server_counts()[1]:
+                raise ValueError(
+                    f"{GEN_ONLY_NO_CONTEXT_MODE} launches exactly "
+                    f"{gen_only_no_context_server_counts()[1]} gen server, got "
+                    f"{disagg_config.num_gen_servers}: the config tuple was built "
+                    f"without _parse_disagg_config_file's override."
+                )
+
+            gen_cmd = gen_config.to_cmd(test_output_dir, numa_bind, "GEN")
+            config_content = gen_config.generate_extra_llm_api_config()
+            config_path = os.path.join(
+                test_output_dir, f"extra-llm-api-config.gen.{gen_config.name}.yml"
+            )
+            with open(config_path, "w") as f:
+                f.write(config_content)
+
+            disagg_cmd = [
+                "trtllm-serve",
+                "disaggregated",
+                "-c",
+                f"{test_output_dir}/server_config.{server_idx}.yaml",
+                "-t",
+                str(timeout),
+                "-r",
+                str(timeout),
+            ]
+
+            server_cmds.append((gen_cmd, disagg_cmd))
+
+            client_cmds[server_idx] = []
+            for client_config in self.server_client_configs[server_idx]:
+                client_cmds[server_idx].append(client_config.to_cmd())
+
+        disagg_config = self.server_configs[0][2]
+        return AggrGenOnlyNoContextCmds(
+            server_cmds=server_cmds,
+            client_cmds=client_cmds,
+            timeout=disagg_config.timeout,
+            num_gen_servers=disagg_config.num_gen_servers,
+            output_dir=output_dir,
+            test_output_dir=test_output_dir,
+            model_name=disagg_config.model_name,
+            internal_request_auth_key=disagg_config.internal_request_auth_key,
+            router_config=disagg_config.router_config,
             gen_router_config=disagg_config.gen_router_config,
             server_config_extra=disagg_config.server_config_extra,
             client_configs=self.server_client_configs,
@@ -4080,17 +4454,17 @@ class PerfSanityTestConfig:
                 # the mean alone is sufficient: all five statistics come from the same
                 # _DeviceStepTimeStats, so the mean is absent only if all of them are.
                 #
-                # Deliberately gen_only and not every mode in
-                # DEVICE_STEP_TIME_MODES. In gen_only this family is the only
-                # regression signal, so losing it makes the run pointless. In e2e
-                # it is diagnostic and throughput still gates, so an absent value
-                # costs five columns on one row; hard-failing there would turn a
-                # diagnostic addition into a new red-build mode for every e2e
-                # case on every cluster, gated on log-scrape plumbing rather than
-                # on performance.
+                # Deliberately GEN_ONLY_MODES and not every mode in
+                # DEVICE_STEP_TIME_MODES. In the gen_only modes this family is
+                # the only regression signal, so losing it makes the run
+                # pointless. In e2e it is diagnostic and throughput still gates,
+                # so an absent value costs five columns on one row; hard-failing
+                # there would turn a diagnostic addition into a new red-build
+                # mode for every e2e case on every cluster, gated on log-scrape
+                # plumbing rather than on performance.
                 if (
-                    self.runtime == "multi_node_disagg_server"
-                    and self.server_configs[server_idx][2].benchmark_mode == "gen_only"
+                    self.runtime in DISAGG_CONFIG_RUNTIMES
+                    and self.server_configs[server_idx][2].benchmark_mode in GEN_ONLY_MODES
                     and (
                         not metrics
                         or metrics.get("mean_gen_worker_per_iter_device_step_time") is None
@@ -4203,9 +4577,12 @@ class PerfSanityTestConfig:
                     startup_primary_row_pending = False
                     cmd_idx += 1
 
-        elif self.runtime == "multi_node_disagg_server":
+        elif self.runtime in DISAGG_CONFIG_RUNTIMES:
             # Only BENCHMARK node uploads
-            if self.server_configs[0][2].disagg_serving_type != "BENCHMARK":
+            if (
+                self.runtime == "multi_node_disagg_server"
+                and self.server_configs[0][2].disagg_serving_type != "BENCHMARK"
+            ):
                 return
 
             new_data_dict = {}
@@ -4242,7 +4619,7 @@ class PerfSanityTestConfig:
 
                     new_data = {
                         "s_gpu_type": self.gpu_type,
-                        "s_runtime": "multi_node_disagg_server",
+                        "s_runtime": self.runtime,
                         # The composed label, not the bare mode, so a
                         # time_breakdown run stays distinguishable by this field
                         # alone. It is reported, never matched on.
@@ -4314,8 +4691,8 @@ class PerfSanityTestConfig:
         # token throughput (token-based numbers are dominated by KV cache transfer
         # time in gen_only mode and are not a useful regression signal there).
         # For all other modes, d_al is added when any client runs spec decoding.
-        if self.runtime == "multi_node_disagg_server" and any(
-            sc[2].benchmark_mode == "gen_only" for sc in self.server_configs
+        if self.runtime in DISAGG_CONFIG_RUNTIMES and any(
+            sc[2].benchmark_mode in GEN_ONLY_MODES for sc in self.server_configs
         ):
             # See GEN_ONLY_REGRESSION_METRICS for why the median is gated too.
             # It has no baseline history yet, and check_regression skips any
@@ -4434,9 +4811,10 @@ def get_disagg_test_cases() -> List[str]:
                 label = format_test_label("e2e", time_breakdown=True)
                 test_cases.append(f"{test_type}-{label}-{config_yml}")
 
-        # ctx_only test cases (uses aggr prefix)
+        # ctx_only and gen_only_no_context test cases (use aggr prefix)
         for test_type in AGG_TEST_TYPES:
             test_cases.append(f"{test_type}-ctx_only-{config_yml}")
+            test_cases.append(f"{test_type}-{GEN_ONLY_NO_CONTEXT_MODE}-{config_yml}")
             # Allowlisted, for the same reason the e2e ids are.
             if config_yml in CTX_ONLY_TIME_BREAKDOWN_CONFIGS:
                 label = format_test_label("ctx_only", time_breakdown=True)

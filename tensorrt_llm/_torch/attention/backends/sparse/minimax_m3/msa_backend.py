@@ -152,6 +152,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # Graph-stable buffers; consumers slice to the live count at the call
     # site. Filled once the current step's cache write is prepared.
     msa_out_cache_loc: Optional[torch.Tensor] = None
+    # Zero-copy pool views prepared outside Dynamo; PCG passes these explicitly
+    # to its mutable producer instead of hiding writes behind runtime metadata.
+    msa_layer_cache_tensors: Optional[dict[int, tuple[torch.Tensor, torch.Tensor]]] = None
     msa_kv_indices: Optional[torch.Tensor] = None
     msa_max_score: Optional[torch.Tensor] = None
     msa_n_valid_blocks: Optional[torch.Tensor] = None
@@ -368,14 +371,15 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # num_index_heads * query tokens into one Q block, which bounds the
         # draft length it can verify.
         decode_query_len = self._msa_max_decode_query_len()
+        num_index_heads = params.sharded_index_head_count(self.mapping)
         if not self._cutedsl_indexer_supported(
-            num_index_heads=params.num_index_heads,
+            num_index_heads=num_index_heads,
             page_size=page_size,
             decode_query_len=decode_query_len,
         ):
             raise RuntimeError(
                 "The MiniMax-M3 CuTe DSL indexer scorer does not support this "
-                f"configuration: {params.num_index_heads} index heads, page size "
+                f"configuration: {num_index_heads} index heads, page size "
                 f"{page_size}, index dtype {self._msa_index_kv_dtype()}, up to "
                 f"{decode_query_len} query tokens per generation request."
             )
@@ -398,6 +402,14 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         self._msa_buffers_ready = False
         if kv_cache_manager is None or not hasattr(kv_cache_manager, "get_index_k_buffer"):
             return
+        self.msa_layer_cache_tensors = {
+            layer_idx: (
+                kv_cache_manager.get_buffers(layer_idx, kv_layout="HND"),
+                self.msa_idx_k_cache(layer_idx),
+            )
+            for layer_idx in getattr(kv_cache_manager, "sparse_layer_ids", ())
+            if layer_idx in kv_cache_manager.layer_offsets
+        }
         capture_graph = self.is_cuda_graph
         buffers = self.cuda_graph_buffers
         max_num_sequences = int(self.max_num_sequences)
@@ -475,13 +487,13 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             fmha_sm100 = require_msa_module()
             max_k_tiles = _worst_case_proxy_max_k_tiles(
                 fmha_sm100,
-                num_index_heads=params.num_index_heads,
+                num_index_heads=params.sharded_index_head_count(self.mapping),
                 kv_cache_manager=kv_cache_manager,
                 max_batch=max_num_sequences,
             )
             self._msa_worst_case_max_k_tiles = int(max_k_tiles)
             self._alloc_msa_proxy_scratch(
-                num_index_heads=params.num_index_heads,
+                num_index_heads=params.sharded_index_head_count(self.mapping),
                 max_tokens=self._msa_max_decode_tokens(),
                 max_k_tiles=max_k_tiles,
                 capture_graph=capture_graph,
@@ -863,7 +875,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         params = self._msa_params
         if params is None:
             return
-        num_index_heads = params.num_index_heads
+        num_index_heads = params.sharded_index_head_count(self.mapping)
         qo_lens_cpu = self.msa_qo_lens_cpu
         kv_lens_cpu = self.msa_kv_lens_cpu
         qo_offset_cpu = self.msa_qo_offset_cpu
@@ -969,9 +981,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         kv_lens_cpu = self.msa_kv_lens_cpu
         qo_offset_cpu = self.msa_qo_offset_cpu
         if request_ids is None or qo_lens_cpu is None:
+            self.msa_out_cache_loc.fill_(-1)
             return
         batch_size = int(qo_lens_cpu.shape[0])
         if batch_size == 0:
+            self.msa_out_cache_loc.fill_(-1)
             return
 
         kv_cache_manager = self.kv_cache_manager
@@ -1021,6 +1035,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             )
 
         self.msa_out_cache_loc[:total_new_tokens].copy_(out_cache_loc, non_blocking=True)
+        # Captured producers also execute padded rows. Invalidate only the
+        # unwritten tail so they cannot reuse the previous step's live slots.
+        if total_new_tokens < self.msa_out_cache_loc.shape[0]:
+            self.msa_out_cache_loc[total_new_tokens:].fill_(-1)
         if kv_indices is not None:
             self.msa_kv_indices[: int(kv_indices.shape[0])].copy_(kv_indices, non_blocking=True)
 
@@ -1071,7 +1089,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
     def msa_idx_k_cache(self, layer_idx: int) -> torch.Tensor:
         """Return the paged index-K cache in the HND layout MSA consumes."""
-        return self.kv_cache_manager.get_index_k_buffer(layer_idx, kv_layout="HND")
+        return self.kv_cache_manager.get_index_k_buffer(layer_idx)
 
     def msa_write_idx_k(self, layer_idx: int, idx_k: torch.Tensor) -> None:
         """Write the new-token index-K into the side cache at out_cache_loc."""

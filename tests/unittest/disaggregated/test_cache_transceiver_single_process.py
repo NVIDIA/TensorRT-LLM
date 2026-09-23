@@ -20,9 +20,14 @@ in a single process. Validates KV cache transfer correctness across different
 TP/PP/DP/MLA/sliding-window configurations for both V1 and V2 cache managers.
 """
 
+import gc
+import logging
 import os
 import threading
+import time
 import uuid
+from collections.abc import Callable
+from contextlib import ExitStack
 from types import SimpleNamespace
 
 # Do not inherit a NIC pin from the host: the selected interface may not exist
@@ -46,17 +51,37 @@ import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
+from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
+from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
+from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.utils import get_global_layer_ids
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.pyexecutor.disagg_adapter import (
+    PyExecutorEffects,
+    PyExecutorRequestRegistry,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, LlmRequestType
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    KVCacheManager,
+    ResourceManager,
+    ResourceManagerType,
+)
+from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
+    BindCapacityScheduler,
+    BindMicroBatchScheduler,
+    ScheduledRequests,
+    SimpleScheduler,
+)
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
+from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
+from tensorrt_llm.bindings.internal.testing import simulate_prefill_completion_only_use_for_testing
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, CacheTransceiverConfig, KvCacheConfig
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
@@ -197,6 +222,8 @@ class ThreadSafeDistributed:
         tp_rank: int,
         pp_rank: int,
         shared: dict,
+        cp_rank: int = 0,
+        cp_size: int = 1,
     ):
         self.rank = local_rank
         self._world_size = world_size
@@ -204,6 +231,14 @@ class ThreadSafeDistributed:
         self._pp_size = pp_size
         self._tp_rank = tp_rank
         self._pp_rank = pp_rank
+        # CP is orthogonal to TP/PP: each cp slice runs its own TP/PP collectives,
+        # so the per-group barriers are indexed by (rank, cp_rank). ctx side is
+        # cp_size==1, preserving the original single-axis behaviour.
+        # HELIX VALIDATE: assumes the transceiver's setup collectives group TP/PP
+        # within a fixed cp_rank (cp orthogonal). Confirm against the real helix
+        # registration exchange on GPU.
+        self._cp_rank = cp_rank
+        self._cp_size = cp_size
         self._s = shared
         self._bcast_idx = 0
         self._ag_idx = 0
@@ -249,15 +284,16 @@ class ThreadSafeDistributed:
     def pp_allgather(self, obj):
         idx = self._pp_ag_idx
         self._pp_ag_idx += 1
-        key = f"pp_ag_{idx}_tp{self._tp_rank}"
+        key = f"pp_ag_{idx}_tp{self._tp_rank}_cp{self._cp_rank}"
         with self._s["lock"]:
             if key not in self._s:
                 self._s[key] = [None] * self._pp_size
             self._s[key][self._pp_rank] = obj
-        # Sync only the PP group that shares this tp_rank. With attention data parallelism
-        # each tp_rank is an independent instance that may run a different number of
-        # collectives, so a single global barrier would deadlock; a per-group one does not.
-        pp_barrier = self._s["pp_barriers"][self._tp_rank]
+        # Sync only the PP group that shares this (tp_rank, cp_rank). With attention data
+        # parallelism each tp_rank is an independent instance that may run a different number
+        # of collectives, so a single global barrier would deadlock; a per-group one does not.
+        # CP adds an orthogonal axis, so the group is keyed by cp_rank too.
+        pp_barrier = self._s["pp_barriers"][self._tp_rank * self._cp_size + self._cp_rank]
         pp_barrier.wait()
         result = list(self._s[key])
         pp_barrier.wait()
@@ -266,13 +302,13 @@ class ThreadSafeDistributed:
     def tp_allgather(self, obj):
         idx = self._tp_ag_idx
         self._tp_ag_idx += 1
-        key = f"tp_ag_{idx}_pp{self._pp_rank}"
+        key = f"tp_ag_{idx}_pp{self._pp_rank}_cp{self._cp_rank}"
         with self._s["lock"]:
             if key not in self._s:
                 self._s[key] = [None] * self._tp_size
             self._s[key][self._tp_rank] = obj
-        # Sync only the TP group that shares this pp_rank (see pp_allgather).
-        tp_barrier = self._s["tp_barriers"][self._pp_rank]
+        # Sync only the TP group that shares this (pp_rank, cp_rank) (see pp_allgather).
+        tp_barrier = self._s["tp_barriers"][self._pp_rank * self._cp_size + self._cp_rank]
         tp_barrier.wait()
         result = list(self._s[key])
         tp_barrier.wait()
@@ -417,31 +453,42 @@ def _create_managers_for_instance(
     max_batch_size: int = MAX_BATCH_SIZE,
     enable_indexer_k_cache: bool = False,
     indexer_k_cache_layer_mask: list[bool] | None = None,
+    cp_size: int = 1,
 ) -> list[KVCacheManager | KVCacheManagerV2]:
-    """Create cache managers for all ranks in an instance."""
+    """Create cache managers for all ranks in an instance.
+
+    cp_size > 1 builds a helix-CP instance: each cp rank owns the global blocks
+    strided by [cp_rank::cp_size] (see transfer.py). Managers size off the full
+    (global) prompt via total_input_len_cp; the ranks are enumerated
+    pp_rank * (tp*cp) + tp_rank * cp + cp_rank.
+    """
     managers = []
+    cp_config = {"cp_type": "HELIX"} if cp_size > 1 else None
     for pp_rank in range(pp):
         for tp_rank in range(tp):
-            rank = pp_rank * tp + tp_rank
-            mapping = Mapping(
-                world_size=tp * pp,
-                rank=rank,
-                tp_size=tp,
-                pp_size=pp,
-                enable_attention_dp=enable_dp,
-            )
-            managers.append(
-                _create_cache_manager(
-                    mapping,
-                    is_mla,
-                    use_v2,
-                    max_attention_window_vec,
-                    num_layers,
-                    max_batch_size,
-                    enable_indexer_k_cache,
-                    indexer_k_cache_layer_mask,
+            for cp_rank in range(cp_size):
+                rank = (pp_rank * tp + tp_rank) * cp_size + cp_rank
+                mapping = Mapping(
+                    world_size=tp * pp * cp_size,
+                    rank=rank,
+                    tp_size=tp,
+                    pp_size=pp,
+                    cp_size=cp_size,
+                    cp_config=cp_config,
+                    enable_attention_dp=enable_dp,
                 )
-            )
+                managers.append(
+                    _create_cache_manager(
+                        mapping,
+                        is_mla,
+                        use_v2,
+                        max_attention_window_vec,
+                        num_layers,
+                        max_batch_size,
+                        enable_indexer_k_cache,
+                        indexer_k_cache_layer_mask,
+                    )
+                )
     return managers
 
 
@@ -552,10 +599,68 @@ def _init_pool_data(managers, tp, is_mla, use_v2, fill_random=True, seed_base=10
 # ---------------------------------------------------------------------------
 # Add sequence to manager
 # ---------------------------------------------------------------------------
-def _add_sequence(
-    mgr, request_id: int, prompt_len: int, use_v2: bool, *, is_generation: bool = False
+def _make_gen_request(
+    gen_rid, req_len, unique_rid, ctx_rid, ctx_dp_rank, ctx_info_endpoint, sampling_params
 ):
-    """Add a sequence to the cache manager. Returns kv_cache for V2 (needed for cleanup)."""
+    """Build one GENERATION_ONLY request wired to its context peer.
+
+    Used to mint a distinct request per helix CP rank (each needs its own
+    rank-local prompt_len); mirrors the inline construction in run_transfer_test.
+    """
+    req = LlmRequest(
+        request_id=gen_rid,
+        max_new_tokens=1,
+        input_tokens=list(range(req_len)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()
+        ),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+    )
+    req.py_disaggregated_params = DisaggregatedParams(
+        ctx_request_id=ctx_rid,
+        ctx_dp_rank=ctx_dp_rank,
+        ctx_info_endpoint=ctx_info_endpoint,
+        disagg_request_id=unique_rid,
+    )
+    return req
+
+
+def _helix_local_len(global_len: int, cp_rank: int, cp_size: int) -> int:
+    """Rank-local token count under helix (mirror of KVCacheManagerV2._helix_local_len).
+
+    A ledger block spans tpb*cp_size global tokens; global block b (page ``b``
+    within its ledger block) lives on CP rank ``b %% cp_size``. This is the
+    length the *transceiver* uses to bound the
+    transferred block list -- distinct from the ledger *capacity*, which the
+    manager sizes off the global length (rounded up to whole ledger blocks) and
+    so may bind one extra trailing page on ranks that own no token in it.
+    """
+    tpb = TOKENS_PER_BLOCK
+    ledger_tpb = tpb * cp_size
+    full, rem = divmod(global_len, ledger_tpb)
+    return full * tpb + min(max(rem - cp_rank * tpb, 0), tpb)
+
+
+def _add_sequence(
+    mgr,
+    request_id: int,
+    prompt_len: int,
+    use_v2: bool,
+    *,
+    is_generation: bool = False,
+    scratch_tokens: int = 0,
+):
+    """Add a sequence to the cache manager. Returns kv_cache for V2 (needed for cleanup).
+
+    scratch_tokens > 0 (generation side only) sizes the cache to
+    prompt_len + scratch_tokens with history_length still prompt_len -- exactly
+    what prepare_disagg_gen_init does for MTP -- so the speculative tail blocks
+    are allocated *and their pages bound* (materialised) without a forward pass.
+    That reproduces production's "surplus block" on a windowed slice, which the
+    harness cannot (it transfers right after a prompt-only resize, so valid_only
+    skips the page-less tail). Used to exercise the SWA + MTP transfer path.
+    """
     if use_v2:
         kv_cache = mgr._create_kv_cache(request_id, None, None)
         if not mgr.enable_block_reuse:
@@ -564,7 +669,7 @@ def _add_sequence(
         assert success, f"Failed to resume kv_cache for request {request_id}"
         if is_generation:
             kv_cache.enable_swa_scratch_reuse = False
-            kv_cache.resize(prompt_len, history_length=prompt_len)
+            kv_cache.resize(prompt_len + scratch_tokens, history_length=prompt_len)
         else:
             kv_cache.resize(prompt_len)
             kv_cache.resize(None, history_length=prompt_len)
@@ -613,35 +718,51 @@ def create_instance_transceivers(
     cache_managers: List,
     config: CacheTransceiverConfig,
     is_mla: bool,
+    cp_size: int = 1,
 ) -> List[KvCacheTransceiverV2]:
-    """Create KvCacheTransceiverV2 for all ranks via threaded init."""
-    world_size = tp * pp
+    """Create KvCacheTransceiverV2 for all ranks via threaded init.
+
+    cp_size > 1 builds a helix-CP instance (see _create_managers_for_instance).
+    Ranks are enumerated (pp_rank * tp + tp_rank) * cp_size + cp_rank, matching
+    the manager order so cache_managers[rank] lines up.
+    HELIX VALIDATE: the ThreadSafeDistributed collective grouping below is the
+    tp*pp structure; cp ranks are extra world ranks. Confirm the transceiver's
+    setup collectives behave under helix (they may need cp-aware grouping).
+    """
+    world_size = tp * pp * cp_size
     shared = {
         "barrier": threading.Barrier(world_size),
         # Per-group barriers for the grouped collectives, so attention-DP instances can
         # diverge in how many collectives they issue: pp_allgather syncs the PP ranks that
         # share a tp_rank, tp_allgather the TP ranks that share a pp_rank.
-        "pp_barriers": [threading.Barrier(pp) for _ in range(tp)],
-        "tp_barriers": [threading.Barrier(tp) for _ in range(pp)],
+        "pp_barriers": [threading.Barrier(pp) for _ in range(tp * cp_size)],
+        "tp_barriers": [threading.Barrier(tp) for _ in range(pp * cp_size)],
         "lock": threading.Lock(),
     }
     results = [None] * world_size
     errors = [None] * world_size
     threads = []
+    cp_config = {"cp_type": "HELIX"} if cp_size > 1 else None
 
     attention_type = AttentionTypeCpp.MLA if is_mla else AttentionTypeCpp.DEFAULT
 
     for rank in range(world_size):
-        pp_rank = rank // tp
-        tp_rank = rank % tp
+        cp_rank = rank % cp_size
+        base = rank // cp_size
+        pp_rank = base // tp
+        tp_rank = base % tp
         mapping = Mapping(
             world_size=world_size,
             rank=rank,
             tp_size=tp,
             pp_size=pp,
+            cp_size=cp_size,
+            cp_config=cp_config,
             enable_attention_dp=enable_dp,
         )
-        dist_mock = ThreadSafeDistributed(rank, world_size, tp, pp, tp_rank, pp_rank, shared)
+        dist_mock = ThreadSafeDistributed(
+            rank, world_size, tp, pp, tp_rank, pp_rank, shared, cp_rank, cp_size
+        )
         t = threading.Thread(
             target=_create_transceiver_in_thread,
             args=(
@@ -672,7 +793,9 @@ def create_instance_transceivers(
 # ---------------------------------------------------------------------------
 # Verification helpers
 # ---------------------------------------------------------------------------
-def _get_block_data_for_layer(mgr, request_id, layer_idx, use_v2, expected_valid=None):
+def _get_block_data_for_layer(
+    mgr, request_id, layer_idx, use_v2, expected_valid=None, drop_tail_blocks=0
+):
     """Get block data for a specific layer and request in HND layout.
 
     Returns tensor of shape [num_blocks, kv_factor, num_kv_heads_per_rank, tokens_per_block, head_dim].
@@ -680,6 +803,13 @@ def _get_block_data_for_layer(mgr, request_id, layer_idx, use_v2, expected_valid
     so we must use kv_layout='HND' to get a correct view.  Using the default NHD
     layout would reinterpret HND memory as NHD, which breaks cross-TP verification
     because the formatter concat/split operates on HND-ordered flat data.
+
+    *drop_tail_blocks* removes that many blocks from the tail before anything
+    else -- the MTP speculative/scratch blocks, which sit past the prompt and are
+    never transferred. It must be a COUNT from the tail (not a prompt_blocks
+    cut): the SWA front may already be evicted, so ``len(valid_indices)`` is not
+    prompt_blocks and a positional cut would leave the scratch in and drop a live
+    window block. Gen side only (the ctx cache has no scratch).
 
     If *expected_valid* is given, keeps only the last *expected_valid* blocks
     (used for sliding-window: only the window-tail blocks were transferred).
@@ -691,6 +821,8 @@ def _get_block_data_for_layer(mgr, request_id, layer_idx, use_v2, expected_valid
     valid_indices = [idx for idx in block_indices if idx >= 0]
     if not valid_indices:
         return None
+    if drop_tail_blocks > 0 and len(valid_indices) > drop_tail_blocks:
+        valid_indices = valid_indices[:-drop_tail_blocks]
     if expected_valid is not None and len(valid_indices) > expected_valid:
         valid_indices = valid_indices[-expected_valid:]
     layer_buffer = mgr.get_buffers(layer_idx, kv_layout="HND")
@@ -709,6 +841,7 @@ def _gather_full_layer_data(
     enable_dp: bool = False,
     req_idx: int = 0,
     num_layers: int = NUM_LAYERS,
+    drop_tail_blocks: int = 0,
 ):
     """Gather the full (unsharded) KV data for a layer by concatenating across TP ranks.
 
@@ -724,14 +857,14 @@ def _gather_full_layer_data(
         tp_rank = req_idx % tp
         rank = pp_rank * tp + tp_rank
         return _get_block_data_for_layer(
-            managers[rank], request_id, layer_idx, use_v2, expected_valid
+            managers[rank], request_id, layer_idx, use_v2, expected_valid, drop_tail_blocks
         )
 
     if is_replicated:
         # All TP ranks have identical data; take from tp_rank=0
         rank = pp_rank * tp + 0
         return _get_block_data_for_layer(
-            managers[rank], request_id, layer_idx, use_v2, expected_valid
+            managers[rank], request_id, layer_idx, use_v2, expected_valid, drop_tail_blocks
         )
 
     # Gather from all TP ranks and concat along kv_heads dim.
@@ -741,7 +874,7 @@ def _gather_full_layer_data(
     for tp_rank in range(tp):
         rank = pp_rank * tp + tp_rank
         data = _get_block_data_for_layer(
-            managers[rank], request_id, layer_idx, use_v2, expected_valid
+            managers[rank], request_id, layer_idx, use_v2, expected_valid, drop_tail_blocks
         )
         if data is not None:
             tp_data.append(data)
@@ -804,6 +937,7 @@ def verify_all_requests(
     use_v2: bool,
     max_attention_window_vec: Optional[List[int]] = None,
     num_layers: int = NUM_LAYERS,
+    gen_scratch_tokens: int = 0,
 ):
     """Verify transferred cache data for all requests.
 
@@ -821,16 +955,23 @@ def verify_all_requests(
         ctx_rid = ctx_request_ids[req_idx]
         gen_rid = gen_request_ids[req_idx]
 
+        # MTP speculative/scratch blocks on the gen side: sized past the prompt,
+        # never transferred. Drop them (from the tail) before comparing. The ctx
+        # cache has no scratch. Count = ceil((prompt+scratch)/tpb) - ceil(prompt/tpb).
+        prompt_blocks = (req_len + TOKENS_PER_BLOCK - 1) // TOKENS_PER_BLOCK
+        gen_scratch_blocks = (
+            req_len + gen_scratch_tokens + TOKENS_PER_BLOCK - 1
+        ) // TOKENS_PER_BLOCK - prompt_blocks
+
         for layer_idx in range(num_layers):
             # Compute expected_valid: the number of non-stale blocks that
             # were actually transferred, using the same eviction formula as
-            # _create_kv_slice.  Only compare these blocks in verification.
+            # _create_chunk.  Only compare these blocks in verification.
             expected_valid = None
             win = layer_to_window.get(layer_idx)
             if win is not None and win < MAX_SEQ_LEN:
-                total_blocks = (req_len + TOKENS_PER_BLOCK - 1) // TOKENS_PER_BLOCK
                 stale_end = max(0, (req_len + 1 - win) // TOKENS_PER_BLOCK)
-                expected_valid = total_blocks - stale_end
+                expected_valid = prompt_blocks - stale_end
 
             ctx_full = _gather_full_layer_data(
                 ctx_managers,
@@ -844,6 +985,7 @@ def verify_all_requests(
                 ctx_enable_dp,
                 req_idx,
                 num_layers,
+                0,  # ctx has no MTP scratch tail
             )
             gen_full = _gather_full_layer_data(
                 gen_managers,
@@ -857,6 +999,7 @@ def verify_all_requests(
                 gen_enable_dp,
                 req_idx,
                 num_layers,
+                gen_scratch_blocks,
             )
 
             if ctx_full is None or gen_full is None:
@@ -871,8 +1014,102 @@ def verify_all_requests(
                 ctx_full,
                 rtol=0,
                 atol=0,
-                msg=lambda m: (f"Data mismatch at req={req_idx} layer={layer_idx}: {m}"),
+                msg=lambda m: f"Data mismatch at req={req_idx} layer={layer_idx}: {m}",
             )
+
+
+def verify_all_requests_helix(
+    request_lengths: List[int],
+    ctx_managers: List,
+    gen_managers: List,
+    ctx_request_ids: List[int],
+    gen_request_ids: List[int],
+    is_mla: bool,
+    gen_cp: int,
+    max_attention_window_vec: Optional[List[int]] = None,
+    num_layers: int = NUM_LAYERS,
+):
+    """Verify a helix-CP transfer against the ctx block stride.
+
+    ctx holds the whole prompt (cp_size=1); each generation CP rank owns the
+    global blocks strided by [cp_rank::cp_size].
+
+    Restricted to ctx_tp==ctx_pp==gen_tp==gen_pp==1 so a rank is exactly a CP
+    rank (gen rank r == cp_rank r, ctx rank 0). That keeps the comparison a plain
+    positional stride over the ctx block list, matching transfer.py:1036
+    (``src_block_ids[cp_rank::cp_size]``) without also folding in TP head-concat.
+
+    HELIX VALIDATE: the ledger stride below assumes the sender strides over the
+    *transferred* (windowed) ctx block list in positional order. Confirm on GPU
+    that the SWA window + stride interaction matches (no_window is the clean case).
+    """
+    num_kv_heads = 1 if is_mla else NUM_KV_HEADS
+    # ctx side is cp_size=1: rank 0 holds the whole global block list.
+    layer_to_window = _get_layer_to_window_size(ctx_managers, 1, 1, True, num_layers)
+
+    for req_idx, req_len in enumerate(request_lengths):
+        ctx_rid = ctx_request_ids[req_idx]
+        gen_rid = gen_request_ids[req_idx]
+        prompt_blocks = (req_len + TOKENS_PER_BLOCK - 1) // TOKENS_PER_BLOCK
+
+        for layer_idx in range(num_layers):
+            expected_valid = None
+            win = layer_to_window.get(layer_idx)
+            if win is not None and win < MAX_SEQ_LEN:
+                stale_end = max(0, (req_len + 1 - win) // TOKENS_PER_BLOCK)
+                expected_valid = prompt_blocks - stale_end
+
+            # ctx: the full (global) transferred block set, positional order.
+            ctx_full = _get_block_data_for_layer(
+                ctx_managers[0], ctx_rid, layer_idx, True, expected_valid
+            )
+            if ctx_full is None:
+                continue
+
+            for cp_rank in range(gen_cp):
+                gen_full = _get_block_data_for_layer(
+                    gen_managers[cp_rank], gen_rid, layer_idx, True
+                )
+                # Ledger stride: rank r owns global blocks [r::cp_size].
+                expected = ctx_full[cp_rank::gen_cp]
+                # The gen ledger rounds capacity up to whole ledger blocks, so a
+                # rank that owns no token in the trailing ledger block still binds
+                # one extra (unfilled) page past its owned blocks. The transceiver
+                # only fills the rank-local prompt (the leading `n` pages), so
+                # compare just those -- exactly the ctx stride count.
+                n = expected.shape[0]
+                if gen_full is not None and gen_full.shape[0] > n:
+                    assert gen_full.shape[0] <= n + 1, (
+                        f"cp_rank {cp_rank} holds {gen_full.shape[0]} blocks but "
+                        f"the ctx stride is {n} (at most one trailing ledger page "
+                        f"is expected) at req={req_idx} layer={layer_idx}"
+                    )
+                    gen_full = gen_full[:n]
+                if n == 0:
+                    assert gen_full is None or gen_full.shape[0] == 0, (
+                        f"cp_rank {cp_rank} holds blocks but ctx stride is empty "
+                        f"at req={req_idx} layer={layer_idx}"
+                    )
+                    continue
+                assert gen_full is not None, (
+                    f"cp_rank {cp_rank} missing blocks at req={req_idx} layer={layer_idx}"
+                )
+                assert gen_full.shape == expected.shape, (
+                    f"Helix shape mismatch at req={req_idx} layer={layer_idx} "
+                    f"cp_rank={cp_rank}: gen={gen_full.shape} "
+                    f"ctx[{cp_rank}::{gen_cp}]={expected.shape}"
+                )
+                torch.testing.assert_close(
+                    gen_full,
+                    expected,
+                    rtol=0,
+                    atol=0,
+                    msg=lambda m: (
+                        f"Helix data mismatch at req={req_idx} layer={layer_idx} "
+                        f"cp_rank={cp_rank}: {m}"
+                    ),
+                )
+    _ = num_kv_heads  # (kept for signature parity with verify_all_requests)
 
 
 def _get_indexer_block_data(
@@ -960,7 +1197,7 @@ def _verify_indexer_k_all_requests(
                 ctx_data,
                 rtol=0,
                 atol=0,
-                msg=lambda m: (f"Indexer data mismatch at req={req_idx} layer={layer_idx}: {m}"),
+                msg=lambda m: f"Indexer data mismatch at req={req_idx} layer={layer_idx}: {m}",
             )
 
 
@@ -982,13 +1219,34 @@ def run_transfer_test(
     enable_indexer_k_cache: bool = False,
     indexer_k_cache_layer_mask: list[bool] | None = None,
     expect_cpp_bounce: bool = False,
+    gen_scratch_tokens: int = 0,
+    gen_cp: int = 1,
 ) -> None:
-    """Run a full KV transfer test using KvCacheTransceiverV2."""
+    """Run a full KV transfer test using KvCacheTransceiverV2.
+
+    gen_scratch_tokens > 0 sizes the generation cache to
+    prompt_len + gen_scratch_tokens (history still prompt_len), materialising an
+    MTP speculative tail block past the prompt. Combined with a sliding window
+    this exercises the SWA + MTP transfer path -- the combination that regressed
+    GSM8K (bug 6676406) and that no prior case covered.
+
+    gen_cp > 1 builds a helix-CP generation instance (context stays cp_size=1,
+    i.e. it holds the whole global prompt). Each generation CP rank owns the
+    global blocks strided by [cp_rank::cp_size] -- the ledger model where a
+    global block b lives on rank ``b %% cp_size`` (see transfer.py:1036 and
+    KVCacheManagerV2._helix_local_len). Helix rejects draft tokens, so this is
+    incompatible with gen_scratch_tokens > 0.
+    HELIX VALIDATE: the whole gen_cp path (dist-mock collectives, ledger block
+    ownership, strided verify) is exercised only on GPU -- validate end to end.
+    """
     if request_lengths is None:
         request_lengths = REQUEST_LENGTHS
+    assert not (gen_cp > 1 and gen_scratch_tokens > 0), (
+        "helix rejects draft/MTP tokens; gen_cp>1 requires gen_scratch_tokens==0"
+    )
     max_batch_size = max(MAX_BATCH_SIZE, len(request_lengths))
     ctx_world = ctx_tp * ctx_pp
-    gen_world = gen_tp * gen_pp
+    gen_world = gen_tp * gen_pp * gen_cp
 
     # 1. Create cache managers
     ctx_managers = _create_managers_for_instance(
@@ -1014,11 +1272,14 @@ def run_transfer_test(
         max_batch_size,
         enable_indexer_k_cache,
         indexer_k_cache_layer_mask,
+        cp_size=gen_cp,
     )
 
     # 2. Initialize data: random for ctx, zeros for gen
     _init_pool_data(ctx_managers, ctx_tp, is_mla, use_v2, fill_random=True, seed_base=1000)
-    _init_pool_data(gen_managers, gen_tp, is_mla, use_v2, fill_random=False)
+    # Gen pools start zeroed; gen_cp folds into the TP stride so per-rank pool
+    # seeding stays a no-op (fill_random=False ignores the seed anyway).
+    _init_pool_data(gen_managers, gen_tp * gen_cp, is_mla, use_v2, fill_random=False)
 
     # 3. Create KvCacheTransceiverV2 instances (threaded init)
     config = CacheTransceiverConfig(
@@ -1042,8 +1303,13 @@ def run_transfer_test(
         ctx_tp, ctx_pp, ctx_enable_dp, ctx_managers, config, is_mla
     )
     gen_tcs = create_instance_transceivers(
-        gen_tp, gen_pp, gen_enable_dp, gen_managers, config, is_mla
+        gen_tp, gen_pp, gen_enable_dp, gen_managers, config, is_mla, cp_size=gen_cp
     )
+
+    # Defined before the try so the finally-block teardown can always close them,
+    # even if setup raises before any sequence is added.
+    ctx_kv_caches: Dict[int, List] = {r: [] for r in range(ctx_world)}
+    gen_kv_caches: Dict[int, List] = {r: [] for r in range(gen_world)}
 
     try:
         ctx_info_endpoint = ctx_tcs[0]._context_info_endpoint
@@ -1053,8 +1319,6 @@ def run_transfer_test(
         gen_handle_map: Dict[int, List] = {r: [] for r in range(gen_world)}
         ctx_request_ids: List[int] = []
         gen_request_ids: List[int] = []
-        ctx_kv_caches: Dict[int, List] = {r: [] for r in range(ctx_world)}
-        gen_kv_caches: Dict[int, List] = {r: [] for r in range(gen_world)}
 
         sampling_params = SamplingParams()
 
@@ -1095,6 +1359,10 @@ def run_transfer_test(
                 ctx_info_endpoint=ctx_info_endpoint,
                 disagg_request_id=unique_rid,
             )
+            if gen_scratch_tokens > 0:
+                # Mark the request as MTP so its draft length matches the
+                # materialised speculative tail (see _add_sequence).
+                gen_request.py_draft_tokens = list(range(gen_scratch_tokens))
 
             for rank in range(ctx_world):
                 tp_rank = rank % ctx_tp
@@ -1103,20 +1371,51 @@ def run_transfer_test(
                     ctx_handle_map[rank].append((req_idx, ctx_request))
 
             for rank in range(gen_world):
-                tp_rank = rank % gen_tp
+                # rank = (pp_rank * gen_tp + tp_rank) * gen_cp + cp_rank.
+                # Every CP rank of a handling TP rank receives its strided slice.
+                tp_rank = (rank // gen_cp) % gen_tp
                 should_handle = (not gen_enable_dp) or (req_idx % gen_tp == tp_rank)
-                if should_handle:
+                if not should_handle:
+                    continue
+                if gen_cp > 1:
+                    # Helix: each CP rank gets its own request. The transceiver
+                    # bounds the transferred block list by prompt_len, which must
+                    # be the *rank-local* strided length so it matches the ctx
+                    # sender's src_block_ids[cp_rank::cp_size]. total_input_len_cp
+                    # carries the global length the manager sizes the ledger off.
+                    # A shared request cannot hold a per-rank prompt_len.
+                    cp_rank = rank % gen_cp
+                    req = _make_gen_request(
+                        gen_rid,
+                        req_len,
+                        unique_rid,
+                        ctx_rid,
+                        ctx_dp_rank,
+                        ctx_info_endpoint,
+                        sampling_params,
+                    )
+                    local_len = _helix_local_len(req_len, cp_rank, gen_cp)
+                    req.prompt_len = local_len
+                    req.py_prompt_len = local_len
+                    req.total_input_len_cp = req_len
+                    gen_handle_map[rank].append((req_idx, req))
+                else:
                     gen_handle_map[rank].append((req_idx, gen_request))
 
         # 5. Add sequences and gen receive first
         for rank in range(gen_world):
             for req_idx, req in gen_handle_map[rank]:
+                # Under helix req.prompt_len is the rank-local strided length
+                # (for the transceiver); the manager ledger must be sized off the
+                # GLOBAL length, so resize off request_lengths[req_idx] instead.
+                resize_len = request_lengths[req_idx] if gen_cp > 1 else req.prompt_len
                 kv = _add_sequence(
                     gen_managers[rank],
                     req.py_request_id,
-                    req.prompt_len,
+                    resize_len,
                     use_v2,
                     is_generation=True,
+                    scratch_tokens=gen_scratch_tokens,
                 )
                 if kv is not None:
                     gen_kv_caches[rank].append(kv)
@@ -1137,23 +1436,37 @@ def run_transfer_test(
         run_concurrent(gen_tcs, lambda tc: tc.check_gen_transfer_status(None))
 
         # 8. Verify
-        verify_all_requests(
-            request_lengths=request_lengths,
-            ctx_managers=ctx_managers,
-            gen_managers=gen_managers,
-            ctx_tp=ctx_tp,
-            ctx_pp=ctx_pp,
-            gen_tp=gen_tp,
-            gen_pp=gen_pp,
-            ctx_enable_dp=ctx_enable_dp,
-            gen_enable_dp=gen_enable_dp,
-            ctx_request_ids=ctx_request_ids,
-            gen_request_ids=gen_request_ids,
-            is_mla=is_mla,
-            use_v2=use_v2,
-            max_attention_window_vec=max_attention_window_vec,
-            num_layers=num_layers,
-        )
+        if gen_cp > 1:
+            verify_all_requests_helix(
+                request_lengths=request_lengths,
+                ctx_managers=ctx_managers,
+                gen_managers=gen_managers,
+                ctx_request_ids=ctx_request_ids,
+                gen_request_ids=gen_request_ids,
+                is_mla=is_mla,
+                gen_cp=gen_cp,
+                max_attention_window_vec=max_attention_window_vec,
+                num_layers=num_layers,
+            )
+        else:
+            verify_all_requests(
+                request_lengths=request_lengths,
+                ctx_managers=ctx_managers,
+                gen_managers=gen_managers,
+                ctx_tp=ctx_tp,
+                ctx_pp=ctx_pp,
+                gen_tp=gen_tp,
+                gen_pp=gen_pp,
+                ctx_enable_dp=ctx_enable_dp,
+                gen_enable_dp=gen_enable_dp,
+                ctx_request_ids=ctx_request_ids,
+                gen_request_ids=gen_request_ids,
+                is_mla=is_mla,
+                use_v2=use_v2,
+                max_attention_window_vec=max_attention_window_vec,
+                num_layers=num_layers,
+                gen_scratch_tokens=gen_scratch_tokens,
+            )
         if enable_indexer_k_cache:
             _verify_indexer_k_all_requests(
                 request_lengths=request_lengths,
@@ -1186,22 +1499,48 @@ def run_transfer_test(
             total_bounce_submits = sum(agent.bounce_submit_count for agent in agents)
             assert total_bounce_submits > 0, "no transfer was routed through the bounce fast path"
 
-        # 9. Cleanup
+    finally:
+        # Teardown must run on the failure path too, in this order:
+        #   drain GPU work -> close kv caches -> shutdown transceivers.
+        # If verify raises, skipping the drain/close and tearing down the NIXL
+        # agents while registered memory / in-flight transfers are still live
+        # makes the C++ side abort during GC and leaves the messenger/task-queue
+        # listener threads hanging (process never exits). Each step is guarded so
+        # a teardown error cannot mask the real test failure.
         if use_v2:
-            torch.cuda.current_stream().synchronize()
+            try:
+                torch.cuda.current_stream().synchronize()
+            except Exception:
+                pass
             for rank in range(ctx_world):
                 for kv in ctx_kv_caches[rank]:
-                    kv.close()
+                    try:
+                        kv.close()
+                    except Exception:
+                        pass
             for rank in range(gen_world):
                 for kv in gen_kv_caches[rank]:
-                    kv.close()
-
-    finally:
+                    try:
+                        kv.close()
+                    except Exception:
+                        pass
         for tc in ctx_tcs + gen_tcs:
             try:
                 tc.shutdown()
             except Exception:
                 pass
+        # On the failure path pytest keeps the traceback alive, which pins this
+        # frame's locals (ctx_tcs/gen_tcs) and defers finalizing their NIXL C++
+        # agents to a later GC -- which then lands inside the *next* test's NIXL
+        # init and aborts the process. Drop the references and collect now so the
+        # C++ teardown happens deterministically here, within this test.
+        tc = None
+        ctx_tcs = gen_tcs = None
+        try:
+            gc.collect()
+            torch.cuda.synchronize()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1301,6 +1640,7 @@ UNEVEN_PP_CONFIGS = [
     ids=[w[1] for w in WINDOW_CONFIGS],
 )
 @pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize("gen_scratch_tokens", [0, TOKENS_PER_BLOCK], ids=["spec_off", "spec_on"])
 def test_cache_transceiver(
     ctx_tp,
     ctx_pp,
@@ -1311,8 +1651,25 @@ def test_cache_transceiver(
     is_mla,
     max_attention_window_vec,
     use_v2,
+    gen_scratch_tokens,
 ):
-    """Test KvCacheTransceiverV2 with V1/V2 cache managers."""
+    """Test KvCacheTransceiverV2 with V1/V2 cache managers.
+
+    The ``gen_scratch_tokens`` dimension (id ``spec_off`` / ``spec_on``) adds a
+    speculative-decoding tail: the generation cache is sized
+    prompt_len + TOKENS_PER_BLOCK so a surplus block sits past the prompt,
+    exercising the manager+transceiver combinations *with speculation* -- the
+    tail is generic (any spec mode, e.g. MTP or Eagle), including the
+    sliding-window case that regressed GSM8K under MTP (bug 6676406). Every prior
+    run was spec_off (gen_scratch_tokens=0). The transfer must still cover exactly
+    the prompt blocks the receiver needs; a count-based slice would let the
+    surplus shift or drop a live prompt block.
+    """
+    # Speculative scratch materialisation (resize past history_length) is V2-only
+    # here; the V1 path in _add_sequence uses a different allocation entry.
+    if gen_scratch_tokens > 0 and not use_v2:
+        pytest.skip("speculative scratch materialisation is V2-only in this test")
+
     # VSWA (variable sliding window) only supported for V1 with ModelConfigCpp
     is_vswa = max_attention_window_vec is not None and len(set(max_attention_window_vec)) > 1
     if is_vswa and not use_v2:
@@ -1332,7 +1689,8 @@ def test_cache_transceiver(
         f"\nRunning transfer test: "
         f"ctx_tp={ctx_tp} ctx_pp={ctx_pp} gen_tp={gen_tp} gen_pp={gen_pp} "
         f"ctx_dp={ctx_enable_dp} gen_dp={gen_enable_dp} "
-        f"mla={is_mla} v2={use_v2} window={max_attention_window_vec}"
+        f"mla={is_mla} v2={use_v2} window={max_attention_window_vec} "
+        f"scratch={gen_scratch_tokens}"
     )
 
     run_transfer_test(
@@ -1345,6 +1703,7 @@ def test_cache_transceiver(
         is_mla=is_mla,
         use_v2=use_v2,
         max_attention_window_vec=max_attention_window_vec,
+        gen_scratch_tokens=gen_scratch_tokens,
     )
 
     print("PASSED")
@@ -1417,6 +1776,46 @@ def test_cache_transceiver_uneven_pp(
         use_v2=use_v2,
         max_attention_window_vec=max_attention_window_vec,
         num_layers=num_layers,
+    )
+
+    print("PASSED")
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize("is_mla", [False, True], ids=["mha", "mla"])
+@pytest.mark.parametrize("gen_cp", [2, 4], ids=["cp2", "cp4"])
+def test_cache_transceiver_helix_cp(gen_cp, is_mla):
+    """Helix-CP KV transfer: un-sharded context (cp_size=1) -> helix generation.
+
+    The context worker holds the whole global prompt; each generation CP rank
+    owns the global blocks strided by [cp_rank::cp_size] (the ledger model, see
+    transfer.py:1036 and KVCacheManagerV2._helix_local_len). verify_all_requests_helix
+    asserts each gen rank received exactly its stride of the context blocks.
+
+    Scope (deliberately narrow):
+      * V2 only -- helix awareness lives in KVCacheManagerV2.
+      * Full attention only -- the transfer path rejects a token_range (chunked /
+        windowed slice) under CP (transfer.py:979), so no sliding window here.
+      * tp=pp=1 on both sides -- keeps a rank == a CP rank so the verify is a
+        plain positional stride without also unfolding TP head-concat.
+      * No speculation -- helix rejects draft tokens.
+    """
+    print(
+        f"\nRunning helix-CP transfer test: gen_cp={gen_cp} mla={is_mla} "
+        f"(ctx cp=1, full attention, v2)"
+    )
+
+    run_transfer_test(
+        ctx_tp=1,
+        ctx_pp=1,
+        gen_tp=1,
+        gen_pp=1,
+        ctx_enable_dp=False,
+        gen_enable_dp=False,
+        is_mla=is_mla,
+        use_v2=True,
+        max_attention_window_vec=None,
+        gen_cp=gen_cp,
     )
 
     print("PASSED")
@@ -1629,6 +2028,582 @@ def test_python_nixl_cache_transceiver_uses_cpp_bounce(
         enable_indexer_k_cache=enable_indexer_k_cache,
         expect_cpp_bounce=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# V1 host offload: block IDs diverge from primary slots; the sender must use slots
+# ---------------------------------------------------------------------------
+_OFFLOAD_SEQ_LEN = TOKENS_PER_BLOCK * 4  # four-block context primary pool, one window
+_OFFLOAD_PROMPT_LEN = TOKENS_PER_BLOCK * 2
+
+
+def _offload_cycle_manager(
+    *,
+    max_tokens: int,
+    host_cache_size: int,
+    enable_block_reuse: bool,
+    execution_stream: Optional[torch.cuda.Stream] = None,
+) -> KVCacheManager:
+    """V1 manager sized in tokens; ``host_cache_size > 0`` adds the secondary (host) pool."""
+    return KVCacheManager(
+        KvCacheConfig(
+            max_tokens=max_tokens,
+            free_gpu_memory_fraction=0.1,
+            max_attention_window=[_OFFLOAD_SEQ_LEN],
+            enable_block_reuse=enable_block_reuse,
+            enable_partial_reuse=enable_block_reuse,
+            copy_on_partial_reuse=False,
+            host_cache_size=host_cache_size,
+            secondary_offload_min_priority=0,
+        ),
+        CacheTypeCpp.SELF,
+        num_layers=NUM_LAYERS,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        tokens_per_block=TOKENS_PER_BLOCK,
+        max_seq_len=_OFFLOAD_SEQ_LEN,
+        max_batch_size=MAX_BATCH_SIZE,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.FLOAT,
+        execution_stream=execution_stream,
+    )
+
+
+def _offload_request_pair(index: int, tokens: List[int], ctx_info_endpoint):
+    """Context/generation request pair for one prompt (ids ``2*index`` and ``2*index + 1``)."""
+    disagg_request_id = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+
+    def make(request_id, request_type):
+        return LlmRequest(
+            request_id=request_id,
+            max_new_tokens=1,
+            input_tokens=list(tokens),
+            sampling_config=tensorrt_llm.bindings.SamplingConfig(
+                SamplingParams()._get_sampling_config()
+            ),
+            is_streaming=False,
+            llm_request_type=request_type,
+        )
+
+    ctx = make(2 * index, LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+    ctx.py_disaggregated_params = DisaggregatedParams(disagg_request_id=disagg_request_id)
+    gen = make(2 * index + 1, LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY)
+    gen.py_disaggregated_params = DisaggregatedParams(
+        ctx_request_id=ctx.py_request_id,
+        ctx_dp_rank=0,
+        ctx_info_endpoint=ctx_info_endpoint,
+        disagg_request_id=disagg_request_id,
+    )
+    return ctx, gen
+
+
+def _v1_block_ids_and_slots(mgr: KVCacheManager, request_id: int):
+    block_ids = [int(b) for b in mgr.get_batch_cache_indices([request_id], layer_idx=0)[0]]
+    window = mgr.max_attention_window_vec[0]
+    slots = mgr.get_memory_pool_block_indices(block_ids, window_size=window)
+    return block_ids, [int(s) for s in slots]
+
+
+def _v1_blocks_at(mgr: KVCacheManager, slots: List[int]) -> List[torch.Tensor]:
+    """Per-layer copies of the primary-pool blocks at *slots* (HND layout)."""
+    torch.cuda.synchronize()
+    return [mgr.get_buffers(layer, kv_layout="HND")[slots].clone() for layer in range(NUM_LAYERS)]
+
+
+def _v1_is_offloaded(mgr: KVCacheManager, block_id: int) -> bool:
+    try:
+        mgr.get_memory_pool_block_indices([block_id], window_size=mgr.max_attention_window_vec[0])
+    except RuntimeError as exc:
+        assert "Block is not in the primary pool" in str(exc), exc
+        return True
+    return False
+
+
+def _settle(check, expected: set, what: str, timeout_s: float = 60.0) -> None:
+    """Poll *check* without blocking until exactly the transfers in *expected* settled.
+
+    Any failed or cancelled transfer, a settled id outside *expected*, or running out of
+    time fails the test with the state seen so far. The status calls report outcomes
+    without raising; ``at_least_request_num=0`` keeps them from waiting inside, so this
+    deadline is the one that fires.
+    """
+    done, deadline = set(), time.monotonic() + timeout_s
+    while done != expected:
+        assert time.monotonic() < deadline, f"{what}: settled {done}, expected {expected}"
+        status = check()
+        assert status.error_request_ids == [], status
+        assert not getattr(status, "cancelled_requests", None), status
+        settled = set(status.completed_request_ids)
+        assert settled <= expected, status
+        if not settled:
+            time.sleep(0.01)
+        done |= settled
+
+
+@pytest.mark.timeout(180)
+def test_cache_transceiver_v1_sends_primary_slots_under_host_offload():
+    """Under context-side host offload the sender must move the bytes at the primary slots.
+
+    A block's ID and its primary slot diverge once blocks move to host; the real V1 reuse
+    adapter and the real NIXL path carry the transfer. Four-block context primary pool with
+    a host pool behind it, two-block prompts, two requests in flight per round:
+      1. A and B are sent, then released into the reuse tree.
+      2. C and D evict A/B to host and take over their slots under new block IDs; the
+         pool is rewritten as their "prefill", and the receiver must hold exactly the
+         rewritten slots.
+      3. A and B are re-issued: reuse onboards them from host; the receiver holds the
+         bytes at the translated slots, and the reused blocks are A/B's original bytes.
+         Everything is released and the receiver's pool is back to its starting free count.
+    A missing host pool or an eviction that does not offload fails the test rather than
+    skipping it: this is the CI replacement for the host-offload E2E case.
+    """
+    primary_blocks = _OFFLOAD_SEQ_LEN // TOKENS_PER_BLOCK
+    kv_bytes_per_token = NUM_LAYERS * 2 * NUM_KV_HEADS * HEAD_DIM * 4  # fp32 K and V
+    ctx_mgr = _offload_cycle_manager(
+        max_tokens=_OFFLOAD_SEQ_LEN,
+        host_cache_size=64 * TOKENS_PER_BLOCK * kv_bytes_per_token,
+        enable_block_reuse=True,
+    )
+    gen_mgr = _offload_cycle_manager(
+        max_tokens=_OFFLOAD_SEQ_LEN * 16, host_cache_size=0, enable_block_reuse=False
+    )
+    transceivers = []
+    teardown_errors: List[Exception] = []
+    try:
+        # Host pool large enough to hold both evicted rounds.
+        assert ctx_mgr.blocks_in_secondary_pool >= 2 * primary_blocks, (
+            ctx_mgr.blocks_in_secondary_pool
+        )
+        _init_pool_data_v1([ctx_mgr], 1, False, fill_random=True, seed_base=1000)
+        _init_pool_data_v1([gen_mgr], 1, False, fill_random=False)
+        config = CacheTransceiverConfig(
+            backend="NIXL", transceiver_runtime="PYTHON", max_tokens_in_buffer=512
+        )
+        (ctx_tc,) = create_instance_transceivers(1, 1, False, [ctx_mgr], config, False)
+        transceivers.append(ctx_tc)
+        (gen_tc,) = create_instance_transceivers(1, 1, False, [gen_mgr], config, False)
+        transceivers.append(gen_tc)
+        endpoint = ctx_tc._context_info_endpoint
+        # A, B, C, D
+        prompts = [list(range(base, base + _OFFLOAD_PROMPT_LEN)) for base in (0, 1000, 2000, 3000)]
+
+        def add(ctx, gen):
+            ctx_mgr.impl.add_sequence_batch([(ctx.py_request_id, ctx.prompt_len, 1)], [ctx])
+            _add_sequence(
+                gen_mgr, gen.py_request_id, gen.prompt_len, use_v2=False, is_generation=True
+            )
+            torch.cuda.synchronize()  # offload/onboard copies the manager issued
+
+        def transfer(pairs):
+            expected = {get_unique_rid(ctx) for ctx, _gen in pairs}
+            for _ctx, gen in pairs:
+                gen_tc.request_and_receive_async(gen)
+            for ctx, _gen in pairs:
+                ctx_tc.respond_and_send_async(ctx)
+            _settle(
+                lambda: ctx_tc.check_context_transfer_status(0, mark_complete=True),
+                expected,
+                "context send",
+            )
+            _settle(lambda: gen_tc.check_gen_transfer_status(0), expected, "generation receive")
+            for ctx, gen in pairs:
+                assert ctx.state == LlmRequestState.DISAGG_CONTEXT_COMPLETE, ctx.state
+                assert gen.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE, gen.state
+
+        def ctx_bytes(ctx):
+            _, slots = _v1_block_ids_and_slots(ctx_mgr, ctx.py_request_id)
+            return _v1_blocks_at(ctx_mgr, slots)
+
+        def assert_received(gen, expected):
+            block_ids, slots = _v1_block_ids_and_slots(gen_mgr, gen.py_request_id)
+            assert block_ids == slots  # nothing is offloaded on the receiver
+            for got, want in zip(_v1_blocks_at(gen_mgr, slots), expected):
+                torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+        def release(ctx, gen):
+            simulate_prefill_completion_only_use_for_testing(ctx)
+            ctx_mgr.free_resources(ctx)  # commits the blocks to the reuse tree
+            gen_mgr.free_resources(gen)
+
+        gen_free_blocks = gen_mgr.get_num_free_blocks()
+
+        # 1. Nothing offloaded yet: block IDs are the slots.
+        a, ga = _offload_request_pair(0, prompts[0], endpoint)
+        b, gb = _offload_request_pair(1, prompts[1], endpoint)
+        add(a, ga)
+        add(b, gb)
+        ids_a, slots_a = _v1_block_ids_and_slots(ctx_mgr, a.py_request_id)
+        ids_b, slots_b = _v1_block_ids_and_slots(ctx_mgr, b.py_request_id)
+        assert ids_a == slots_a and ids_b == slots_b
+        bytes_a, bytes_b = _v1_blocks_at(ctx_mgr, slots_a), _v1_blocks_at(ctx_mgr, slots_b)
+        transfer([(a, ga), (b, gb)])
+        assert_received(ga, bytes_a)
+        assert_received(gb, bytes_b)
+        release(a, ga)
+        release(b, gb)
+
+        # 2. C and D need every primary slot; the committed A/B blocks are offloaded (priority
+        #    0, host space available) and C/D take over their slots under new block IDs.
+        c, gc = _offload_request_pair(2, prompts[2], endpoint)
+        d, gd = _offload_request_pair(3, prompts[3], endpoint)
+        add(c, gc)
+        add(d, gd)
+        assert _v1_is_offloaded(ctx_mgr, ids_a[0]) and _v1_is_offloaded(ctx_mgr, ids_b[0]), (
+            ids_a,
+            ids_b,
+        )
+        ids_c, slots_c = _v1_block_ids_and_slots(ctx_mgr, c.py_request_id)
+        ids_d, slots_d = _v1_block_ids_and_slots(ctx_mgr, d.py_request_id)
+        assert sorted(slots_c + slots_d) == list(range(primary_blocks))
+        assert ids_c != slots_c or ids_d != slots_d, (ids_c, slots_c, ids_d, slots_d)
+        _init_pool_data_v1([ctx_mgr], 1, False, fill_random=True, seed_base=2000)  # C/D "prefill"
+        bytes_c, bytes_d = _v1_blocks_at(ctx_mgr, slots_c), _v1_blocks_at(ctx_mgr, slots_d)
+        transfer([(c, gc), (d, gd)])
+        assert_received(gc, bytes_c)
+        assert_received(gd, bytes_d)
+        release(c, gc)
+        release(d, gd)
+
+        # 3. Re-issuing A and B onboards their reusable prefix from host.
+        a2, ga2 = _offload_request_pair(4, prompts[0], endpoint)
+        b2, gb2 = _offload_request_pair(5, prompts[1], endpoint)
+        add(a2, ga2)
+        add(b2, gb2)
+        for req, original in ((a2, bytes_a), (b2, bytes_b)):
+            # The first block must come back whole; the second is at most a partial hit
+            # because the reuse keys stop one token short of the prompt end.
+            reused_blocks = req.prepopulated_prompt_len // TOKENS_PER_BLOCK
+            assert reused_blocks >= 1, req.prepopulated_prompt_len
+            for got, want in zip(ctx_bytes(req), original):
+                torch.testing.assert_close(
+                    got[:reused_blocks], want[:reused_blocks], rtol=0, atol=0
+                )
+        transfer([(a2, ga2), (b2, gb2)])
+        assert_received(ga2, ctx_bytes(a2))
+        assert_received(gb2, ctx_bytes(b2))
+        release(a2, ga2)
+        release(b2, gb2)
+
+        assert gen_mgr.get_num_free_blocks() == gen_free_blocks
+    finally:
+        # Teardown runs on both paths. A teardown error must not mask a body failure (see
+        # run_transfer_test), so failures are collected here and raised below, which only
+        # runs when the body passed.
+        for tc in transceivers:
+            try:
+                tc.shutdown()
+            except Exception as exc:
+                teardown_errors.append(exc)
+        for mgr in (ctx_mgr, gen_mgr):
+            try:
+                mgr.shutdown()
+            except Exception as exc:
+                teardown_errors.append(exc)
+    assert not teardown_errors, f"teardown failed after a passing body: {teardown_errors!r}"
+
+
+def _offload_lifecycle_executor(
+    manager: KVCacheManager, transceiver: KvCacheTransceiverV2
+) -> tuple[PyExecutor, list]:
+    """Real resource/response lifecycle, without model loading or response transport.
+
+    Metrics and response delivery are stubs; unexpected errors fail the test.
+    Termination, response staging, pin/unpin and resource preparation keep
+    their production bodies.
+    """
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = []
+    executor.canceled_req_ids = set()
+    executor.dist = SimpleNamespace(rank=0, world_size=1, tp_size=1, pp_size=1)
+    executor.resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
+    executor.async_transfer_manager = AsyncTransferManager(executor.resource_manager)
+    executor._pending_transfer_responses = []
+    executor._pending_response_terminations = []
+    executor._prefetched_request_ids = set()
+    executor._disagg_pp_termination_handler = None
+    executor.result_wait_queues = {}
+    executor.gather_all_responses = False
+    executor.enable_attention_dp = False
+    # PP=1 with eager reuse: terminate the sequence after its response, while
+    # the transfer manager's pin continues to protect the source blocks.
+    executor.force_terminate_ctx_for_partial_reuse = True
+    executor.disable_overlap_scheduler = False
+    executor.iter_counter = 0
+    executor.stream_interval = 1
+    executor.perf_manager = SimpleNamespace(
+        get_timestamp=time.monotonic, append_step_metrics=lambda *args, **kwargs: None
+    )
+    responses = []
+    executor._enqueue_responses = responses.extend
+
+    def fail(error_msg: str, *args, **kwargs) -> None:
+        pytest.fail(error_msg)
+
+    executor._handle_errors = fail
+    executor._disagg_coordinator = DisaggTransferCoordinator(
+        transceiver=transceiver,
+        transfer_manager=executor.async_transfer_manager,
+        kv_cache_manager=manager,
+        dist=executor.dist,
+        effects=PyExecutorEffects(executor),
+        registry=PyExecutorRequestRegistry(executor),
+        enable_attention_dp=False,
+        force_terminate_ctx_for_partial_reuse=True,
+    )
+    return executor, responses
+
+
+@pytest.mark.timeout(180)
+def test_cache_transceiver_host_offload_scheduler_lifecycle(monkeypatch) -> None:
+    """A pending send survives pressure, and a completed send funds prefix replay.
+
+    Single GPU, real V1 scheduler/manager, coordinator and Python/NIXL transfer.
+    A waits for its receiver registration while B completes; C then evicts B,
+    and replaying B onboards its prefix while A is still pinned. Both CTX
+    sequences are terminated before their transfers finish, as in PP=1 eager
+    reuse. No fake completion, scheduler result or allocation is injected.
+
+    Deterministic KV writes stand in for model forward; an execution-stream
+    event stands in for sampler completion before publishing KV. Offload/onboard
+    dependencies come from prepare_resources(), not device-wide synchronization.
+    This covers the module lifecycle, not serving/router or multi-rank behavior.
+    """
+    for name in (
+        "TRTLLM_DISAGG_BENCHMARK_GEN_ONLY",
+        "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP",
+        "TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    ctx_stream, gen_stream = torch.cuda.Stream(), torch.cuda.Stream()
+    kv_bytes_per_token = NUM_LAYERS * 2 * NUM_KV_HEADS * HEAD_DIM * 4
+    teardown_errors: list[tuple[str, Exception]] = []
+
+    def shutdown(name: str, callback: Callable[[], None]) -> None:
+        try:
+            callback()
+        except Exception as exc:
+            # Keep cleaning up without replacing a failure from the test body.
+            teardown_errors.append((name, exc))
+            logging.getLogger(__name__).exception("Failed to shut down %s", name)
+
+    with ExitStack() as cleanup:
+        ctx_mgr = _offload_cycle_manager(
+            max_tokens=_OFFLOAD_SEQ_LEN,
+            host_cache_size=64 * TOKENS_PER_BLOCK * kv_bytes_per_token,
+            enable_block_reuse=True,
+            execution_stream=ctx_stream,
+        )
+        cleanup.callback(shutdown, "context KV manager", ctx_mgr.shutdown)
+        gen_mgr = _offload_cycle_manager(
+            max_tokens=_OFFLOAD_SEQ_LEN * 16,
+            host_cache_size=0,
+            enable_block_reuse=False,
+            execution_stream=gen_stream,
+        )
+        cleanup.callback(shutdown, "generation KV manager", gen_mgr.shutdown)
+        assert ctx_mgr.blocks_in_secondary_pool >= 4
+        assert ctx_mgr.get_num_free_blocks() == 4
+        gen_free = gen_mgr.get_num_free_blocks()
+        config = CacheTransceiverConfig(
+            backend="NIXL", transceiver_runtime="PYTHON", max_tokens_in_buffer=512
+        )
+        (ctx_tc,) = create_instance_transceivers(1, 1, False, [ctx_mgr], config, False)
+        cleanup.callback(shutdown, "context transceiver", ctx_tc.shutdown)
+        (gen_tc,) = create_instance_transceivers(1, 1, False, [gen_mgr], config, False)
+        cleanup.callback(shutdown, "generation transceiver", gen_tc.shutdown)
+        ctx, responses = _offload_lifecycle_executor(ctx_mgr, ctx_tc)
+        gen, _ = _offload_lifecycle_executor(gen_mgr, gen_tc)
+        scheduler = SimpleScheduler(
+            BindCapacityScheduler(MAX_BATCH_SIZE, ctx_mgr.impl, None),
+            BindMicroBatchScheduler(MAX_BATCH_SIZE, max_num_tokens=_OFFLOAD_SEQ_LEN),
+        )
+        ctx_stream.wait_stream(torch.cuda.current_stream())
+        gen_stream.wait_stream(torch.cuda.current_stream())
+
+        # Leave room for the first generated token in GUARANTEED_NO_EVICT's
+        # reservation: each prompt and its output fit exactly two blocks.
+        prompts = [list(range(base, base + _OFFLOAD_PROMPT_LEN - 1)) for base in (0, 100, 200)]
+        pairs = [
+            _offload_request_pair(i, tokens, ctx_tc._context_info_endpoint)
+            for i, tokens in enumerate([*prompts, prompts[1]])
+        ]
+        # Use the supported ctx_request_id rendezvous. Local status IDs must
+        # match each executor's registry/transfer-manager keys.
+        for sender, receiver in pairs:
+            sender.py_disaggregated_params.disagg_request_id = None
+            receiver.py_disaggregated_params.disagg_request_id = None
+        (a, ga), (b, gb), (c, gc_req), (replay, greplay) = pairs
+
+        def expected_kv(tokens: list[int]) -> list[torch.Tensor]:
+            result = []
+            features = torch.arange(
+                2 * NUM_KV_HEADS * HEAD_DIM, dtype=torch.float32, device="cpu"
+            ).reshape(2, NUM_KV_HEADS, HEAD_DIM)
+            for layer in range(NUM_LAYERS):
+                data = torch.zeros(
+                    2,
+                    2,
+                    NUM_KV_HEADS,
+                    TOKENS_PER_BLOCK,
+                    HEAD_DIM,
+                    dtype=torch.float32,
+                    device="cpu",
+                )
+                for position, token in enumerate(tokens):
+                    block, offset = divmod(position, TOKENS_PER_BLOCK)
+                    data[block, :, :, offset, :] = features + (token * NUM_LAYERS + layer) * 1024
+                result.append(data)
+            return result
+
+        expected = {
+            req.py_request_id: expected_kv(tokens)
+            for (req, _), tokens in zip(pairs, [*prompts, prompts[1]])
+        }
+
+        def schedule() -> ScheduledRequests:
+            result = scheduler.schedule_request(ctx.active_requests, ReqIdsSet())
+            assert not result.paused_requests
+            assert not result.generation_requests
+            batch = ScheduledRequests()
+            batch.reset_context_requests(result.context_requests)
+            return batch
+
+        def prefill(batch: ScheduledRequests) -> dict[int, tuple[list[int], list[int]]]:
+            allocations = {}
+            with torch.cuda.stream(ctx_stream):
+                ctx.resource_manager.prepare_resources(batch)
+                for req in batch.context_requests:
+                    block_ids, slots = _v1_block_ids_and_slots(ctx_mgr, req.py_request_id)
+                    allocations[req.py_request_id] = (block_ids, slots)
+                    for layer, want in enumerate(expected[req.py_request_id]):
+                        pool = ctx_mgr.get_buffers(layer, kv_layout="HND")
+                        # Check reused bytes BEFORE writing the uncomputed suffix.
+                        reused = req.prepopulated_prompt_len
+                        if reused:
+                            got = pool[slots].cpu().permute(0, 3, 1, 2, 4).flatten(0, 1)
+                            prefix = want.permute(0, 3, 1, 2, 4).flatten(0, 1)
+                            torch.testing.assert_close(
+                                got[:reused], prefix[:reused], rtol=0, atol=0
+                            )
+                        device_data = want.to(pool.device)
+                        for block, slot in enumerate(slots):
+                            start = max(0, reused - block * TOKENS_PER_BLOCK)
+                            if start < TOKENS_PER_BLOCK:
+                                pool[slot, :, :, start:, :].copy_(
+                                    device_data[block, :, :, start:, :]
+                                )
+                # The executor consumes sampler completion before starting a
+                # send. Wait only for this batch's writes, not the whole device.
+                ready = ctx_stream.record_event()
+            ready.synchronize()
+            for req in batch.context_requests:
+                simulate_prefill_completion_only_use_for_testing(req)
+                req.add_new_token(42, 0)
+                req.py_decoding_iter = 1
+                req.state = LlmRequestState.GENERATION_IN_PROGRESS
+            ctx.disagg.send_completed_context(batch.context_requests)
+            # Real PP=1 response pass removes sequences; only transfer pins
+            # now protect these blocks while their peer/transfer is pending.
+            ctx._handle_responses()
+            return allocations
+
+        def start_receive(req: LlmRequest) -> None:
+            gen.active_requests.append(req)
+            with torch.cuda.stream(gen_stream):
+                gen.disagg.receive_gen_init([req])
+
+        def finish_pair(sender: LlmRequest, receiver: LlmRequest) -> None:
+            deadline = time.monotonic() + 30
+            while True:
+                ctx.disagg.reap_context_sends(0)
+                gen.disagg.reap_gen_receives(0)
+                ctx._flush_pending_transfer_responses()
+                assert sender.state != LlmRequestState.DISAGG_TRANS_ERROR
+                assert receiver.state != LlmRequestState.DISAGG_TRANS_ERROR
+                if (
+                    sender.state == LlmRequestState.DISAGG_CONTEXT_COMPLETE
+                    and receiver.is_disagg_generation_transmission_complete
+                ):
+                    break
+                assert time.monotonic() < deadline, (
+                    sender.py_request_id,
+                    sender.state,
+                    receiver.state,
+                    list(ctx.async_transfer_manager.requests_in_transfer()),
+                )
+                time.sleep(0.01)
+            _, slots = _v1_block_ids_and_slots(gen_mgr, receiver.py_request_id)
+            with torch.cuda.stream(gen_stream):
+                for layer, want in enumerate(expected[sender.py_request_id]):
+                    got = gen_mgr.get_buffers(layer, kv_layout="HND")[slots].cpu()
+                    torch.testing.assert_close(got, want, rtol=0, atol=0)
+                assert gen.disagg.try_finish_gen_receive(receiver)
+                gen._terminate_request(receiver)
+            gen.active_requests.remove(receiver)
+            assert sender.py_request_id not in ctx.async_transfer_manager.requests_in_transfer()
+
+        # A/B consume all primary capacity, but neither has a receiver yet.
+        ctx.active_requests.extend([a, b])
+        batch = schedule()
+        assert batch.context_requests == [a, b]
+        allocations = prefill(batch)
+        ids_a, slots_a = allocations[a.py_request_id]
+        ids_b, _ = allocations[b.py_request_id]
+        assert ctx.active_requests == []
+        assert ctx_mgr.get_num_free_blocks() == 0
+        assert set(ctx.async_transfer_manager.requests_in_transfer()) == {
+            a.py_request_id,
+            b.py_request_id,
+        }
+
+        ctx.active_requests.append(c)
+        assert schedule().batch_size == 0  # Pins, not sequence ownership, prevent admission.
+        start_receive(gb)
+        finish_pair(b, gb)
+        assert ctx_mgr.get_num_free_blocks() == 2
+
+        # B's completion funds C. A stays pending and cannot be evicted.
+        batch = schedule()
+        assert batch.context_requests == [c]
+        allocations = prefill(batch)
+        _, slots_c = allocations[c.py_request_id]
+        assert set(slots_a).isdisjoint(slots_c)
+        assert all(_v1_is_offloaded(ctx_mgr, block_id) for block_id in ids_b)
+        assert ctx_mgr.get_memory_pool_block_indices(ids_a, window_size=_OFFLOAD_SEQ_LEN) == slots_a
+        with torch.cuda.stream(ctx_stream):
+            for layer, want in enumerate(expected[a.py_request_id]):
+                got = ctx_mgr.get_buffers(layer, kv_layout="HND")[slots_a].cpu()
+                torch.testing.assert_close(got, want, rtol=0, atol=0)
+        assert a.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+        assert ctx_mgr.get_num_free_blocks() == 0
+        start_receive(gc_req)
+        finish_pair(c, gc_req)
+
+        # Reuse/onboard B's evicted prefix while A still holds its transfer pin.
+        ctx.active_requests.append(replay)
+        batch = schedule()
+        assert batch.context_requests == [replay]
+        prefill(batch)
+        # Reuse every eligible token, including the partial second block;
+        # the final prompt token is always recomputed by V1.
+        assert replay.prepopulated_prompt_len == replay.prompt_len - 1
+        assert a.py_request_id in ctx.async_transfer_manager.requests_in_transfer()
+        start_receive(greplay)
+        finish_pair(replay, greplay)
+        assert ctx_mgr.get_num_free_blocks() == 2
+
+        # Register A last: its original KV must survive all intervening prefills.
+        start_receive(ga)
+        finish_pair(a, ga)
+        assert ctx_mgr.get_num_free_blocks() == 4
+        assert gen_mgr.get_num_free_blocks() == gen_free
+        assert not ctx.async_transfer_manager.has_any_inflight_requests()
+        assert not ctx.active_requests and not gen.active_requests
+        assert sorted(rid for rid, _ in responses) == sorted(req.py_request_id for req, _ in pairs)
+
+    # Reached only if the body passed; cleanup failures must still fail the test.
+    assert not teardown_errors, f"teardown failed after a passing body: {teardown_errors!r}"
 
 
 if __name__ == "__main__":

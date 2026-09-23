@@ -36,6 +36,7 @@ from pathlib import Path, PurePosixPath
 from typing import Optional
 
 from blocks import Stage, YAMLIndex
+from repository_reference import RepositoryReferenceIndex
 
 from ._helpers import (
     iter_diff_added_post_line_numbers,
@@ -62,73 +63,11 @@ _CLASS_RE = re.compile(r"class\s+(\w+)")
 _TEST_ID_KEY_RE = re.compile(r"^(Test\w+)::(\w+)$")
 
 
-def _defs_module_name(relative_path: str) -> str:
-    parts = list(PurePosixPath(relative_path).with_suffix("").parts)
-    if parts and parts[-1] == "__init__":
-        parts.pop()
-    return ".".join(parts)
-
-
-def _normalize_defs_module(module: str) -> str:
-    for prefix in ("tests.integration.defs.", "defs."):
-        if module.startswith(prefix):
-            return module.removeprefix(prefix)
-    return module
-
-
-def _imported_modules(
-    node: ast.Import | ast.ImportFrom,
-    importer: str,
-) -> set[str]:
-    if isinstance(node, ast.Import):
-        return {alias.name for alias in node.names}
-
-    importer_module = _defs_module_name(importer)
-    if PurePosixPath(importer).name == "__init__.py":
-        package = importer_module
-    else:
-        package = importer_module.rpartition(".")[0]
-    if node.level:
-        package_parts = package.split(".") if package else []
-        parents = node.level - 1
-        if parents > len(package_parts):
-            return set()
-        base_parts = package_parts[: len(package_parts) - parents]
-        if node.module:
-            base_parts.extend(node.module.split("."))
-        base = ".".join(base_parts)
-    else:
-        base = node.module or ""
-
-    modules = {base} if base else set()
-    for alias in node.names:
-        if alias.name != "*":
-            modules.add(f"{base}.{alias.name}" if base else alias.name)
-    return modules
-
-
-def _module_import_relation(
-    module: str,
-    target_module: str,
-    target_parent: str,
-    importer_parent: str,
-) -> bool | None:
-    normalized = _normalize_defs_module(module)
-    if normalized == target_module:
-        return True
-    target_stem = target_module.rsplit(".", 1)[-1]
-    if normalized != target_stem or "." not in target_module:
-        return False
-    return True if importer_parent == target_parent else None
-
-
-def _is_dynamic_import_call(node: ast.Call) -> bool:
-    if isinstance(node.func, ast.Name):
-        return node.func.id in {"__import__", "import_module"}
-    return isinstance(node.func, ast.Attribute) and node.func.attr == "import_module"
-
-
-def _direct_test_importers(repo_root: Path, git_path: str) -> list[str] | None:
+def _direct_test_importers(
+    repo_root: Path,
+    git_path: str,
+    reference_index: RepositoryReferenceIndex | None = None,
+) -> list[str] | None:
     """Return direct static test importers or None for directory fallback."""
     if not git_path.startswith(DEFS_GIT_PREFIX) or not git_path.endswith(".py"):
         return None
@@ -140,52 +79,16 @@ def _direct_test_importers(repo_root: Path, git_path: str) -> list[str] | None:
     defs_root = repo_root / DEFS_GIT_PREFIX
     if not (defs_root / target).is_file():
         return None
-    target_module = _defs_module_name(target)
-    target_parent = PurePosixPath(target).parent.as_posix()
-    target_stem = PurePosixPath(target).stem
-    consumers: list[str] = []
-
-    for source_path in sorted(defs_root.rglob("*.py")):
-        importer = source_path.relative_to(defs_root).as_posix()
-        if importer == target:
-            continue
-        try:
-            source = source_path.read_text(encoding="utf-8")
-            tree = ast.parse(source)
-        except (OSError, SyntaxError, UnicodeDecodeError, ValueError):
-            return None
-
-        importer_parent = PurePosixPath(importer).parent.as_posix()
-        imports_target = False
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                for module in _imported_modules(node, importer):
-                    relation = _module_import_relation(
-                        module,
-                        target_module,
-                        target_parent,
-                        importer_parent,
-                    )
-                    if relation is None:
-                        return None
-                    imports_target = imports_target or relation
-            elif isinstance(node, ast.Call) and _is_dynamic_import_call(node):
-                if (
-                    not node.args
-                    or not isinstance(node.args[0], ast.Constant)
-                    or not isinstance(node.args[0].value, str)
-                    or target_stem in node.args[0].value
-                ):
-                    return None
-
-        if target_stem in source and not imports_target:
-            return None
-        if not imports_target:
-            continue
-        if not PurePosixPath(importer).name.startswith("test_"):
-            return None
-        consumers.append(importer)
-    return sorted(consumers) or None
+    index = reference_index or RepositoryReferenceIndex(
+        defs_root,
+        module_prefixes=("tests.integration.defs", "defs"),
+    )
+    importers = index.direct_importers(target)
+    if not importers.complete or not importers.paths:
+        return None
+    if any(not PurePosixPath(path).name.startswith("test_") for path in importers.paths):
+        return None
+    return list(importers.paths)
 
 
 def _scope_start_line(node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef) -> int:
@@ -363,6 +266,10 @@ class TestsDefRule(Rule):
         self.yaml_index = yaml_index
         self._stages_by_yaml = stages_by_yaml_stem(stages)
         self._repo_root = repo_root
+        self._reference_index = RepositoryReferenceIndex(
+            repo_root / DEFS_GIT_PREFIX,
+            module_prefixes=("tests.integration.defs", "defs"),
+        )
         self._total_blocks = len(yaml_index.blocks)
         self._acc_class_indexes: Optional[tuple[dict[str, list[str]], dict[str, list[str]]]] = None
         self._acc_source_texts: tuple[str, ...] = ()
@@ -376,7 +283,11 @@ class TestsDefRule(Rule):
         accuracy/references/*.yaml diffs are refined to per-test-class
         anchors via the model-name mapping.
         """
-        import_consumers = _direct_test_importers(self._repo_root, git_path)
+        import_consumers = _direct_test_importers(
+            self._repo_root,
+            git_path,
+            self._reference_index,
+        )
         if (
             import_consumers is not None
             and lookup_paths_into_block_filters(self.yaml_index, import_consumers)[0]
