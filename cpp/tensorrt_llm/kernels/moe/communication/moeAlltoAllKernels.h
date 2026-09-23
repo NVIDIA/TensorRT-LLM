@@ -94,8 +94,8 @@ struct DispatchKernelPointers
     int* local_token_counter; // Atomic counter for completed tokens
 
     // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
-    int* topk_target_ranks; // target rank per k, -1 for invalid or duplicate routes
-    int* topk_send_indices; // dst index per k, -1 for invalid or duplicate routes
+    int* topk_target_ranks;   // target rank per k, -1 for invalid or duplicate routes
+    int* topk_target_indices; // dst index per k, -1 for invalid or duplicate routes
 
     // Optional: Statistics for EPLB
     int const* eplb_local_stats;         // [eplb_stats_num_experts]
@@ -139,8 +139,8 @@ struct CombineKernelPointers
     uint32_t* flag_val;                    // The value of the flag for this round (stored on the local rank)
 
     // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
-    int const* topk_target_ranks; // target rank per k, -1 for invalid or duplicate routes
-    int const* topk_send_indices; // dst index per k, -1 for invalid or duplicate routes
+    int const* topk_target_ranks;   // target rank per k, -1 for invalid or duplicate routes
+    int const* topk_target_indices; // dst index per k, -1 for invalid or duplicate routes
 
     // ---- CFT combine (counted-write) fields. Unused by the fence combine path. ----
     // Local LE combine counters: per receive-slot HW-incremented byte counters.
@@ -182,8 +182,8 @@ struct MoeA2ADispatchParams
     int* send_counters;       // [ep_size] atomic counters - tracks tokens sent to each target rank
     int* topk_target_ranks; // Top-K compact routing info per local token (size: [local_num_tokens, top_k]), target rank
                             // per k, -1 for duplicates
-    int* topk_send_indices; // Top-K compact routing info per local token (size: [local_num_tokens, top_k]), dst index
-                            // per k, -1 for duplicates
+    int* topk_target_indices; // Top-K compact routing info per local token (size: [local_num_tokens, top_k]), dst index
+                              // per k, -1 for duplicates
 
     // Distributed aux data and recv buffers
     // Each rank owns recv_counters[parity][source_rank]. The two parity banks
@@ -272,8 +272,8 @@ struct MoeA2ACombineParams
     uint32_t* flag_val;     // The value of the flag for this round (stored on the local rank)
     int* topk_target_ranks; // Top-K compact routing info per local token (size: [local_num_tokens, top_k]), target rank
                             // per k, -1 for duplicates
-    int* topk_send_indices; // Top-K compact routing info per local token (size: [local_num_tokens, top_k]), dst index
-                            // per k, -1 for duplicates
+    int* topk_target_indices; // Top-K compact routing info per local token (size: [local_num_tokens, top_k]), dst index
+                              // per k, -1 for duplicates
     // Local recv_counters[parity][source_rank]. The two parity banks alternate
     // between A2A rounds.
     int const* recv_counters;

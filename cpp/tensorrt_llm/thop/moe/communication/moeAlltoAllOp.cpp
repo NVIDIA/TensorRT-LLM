@@ -202,9 +202,9 @@ MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens, int eplbStatsNu
     offset += static_cast<size_t>(maxNumTokens) * static_cast<size_t>(tensorrt_llm::kernels::moe_comm::kMaxTopK)
         * kSizeOfInt32;
 
-    // topk_send_indices: [maxNumTokens, kMaxTopK]
+    // topk_target_indices: [maxNumTokens, kMaxTopK]
     offset = alignOffset(offset, CACHELINE_ALIGNMENT);
-    offsets[TOPK_SEND_INDICES_OFFSET_INDEX] = offset;
+    offsets[TOPK_TARGET_INDICES_OFFSET_INDEX] = offset;
     offset += static_cast<size_t>(maxNumTokens) * static_cast<size_t>(tensorrt_llm::kernels::moe_comm::kMaxTopK)
         * kSizeOfInt32;
 
@@ -626,7 +626,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     params.local_token_counter = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[LOCAL_TOKEN_COUNTER_OFFSET_INDEX]);
     params.send_counters = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[SEND_COUNTERS_OFFSET_INDEX]);
     params.topk_target_ranks = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_TARGET_RANKS_OFFSET_INDEX]);
-    params.topk_send_indices = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_SEND_INDICES_OFFSET_INDEX]);
+    params.topk_target_indices = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_TARGET_INDICES_OFFSET_INDEX]);
 
     for (int target_rank = 0; target_rank < epSize; target_rank++)
     {
@@ -885,7 +885,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
 
     params.flag_val = reinterpret_cast<uint32_t*>(rankWorkSpacePtr + offsets[FLAG_VAL_OFFSET_INDEX]);
     params.topk_target_ranks = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_TARGET_RANKS_OFFSET_INDEX]);
-    params.topk_send_indices = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_SEND_INDICES_OFFSET_INDEX]);
+    params.topk_target_indices = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_TARGET_INDICES_OFFSET_INDEX]);
     params.recv_counters = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[RECV_COUNTERS_OFFSET_INDEX]);
 
     for (int target_rank = 0; target_rank < epSize; target_rank++)

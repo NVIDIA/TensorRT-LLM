@@ -258,20 +258,27 @@ __device__ __forceinline__ bool wait_round_flag(
     return false;
 }
 
-template <int TOP_K, bool ENABLE_RANK_MASK, bool COMPACT_FANOUT>
+// Mask the first NUM_LANES lanes of a warp.
+template <int NUM_LANES>
+__host__ __device__ constexpr uint32_t make_warp_lane_mask()
+{
+    static_assert(NUM_LANES > 0 && NUM_LANES <= 32, "warp lane count must be in [1, 32]");
+    return (NUM_LANES == 32) ? ~0U : ((1U << NUM_LANES) - 1U);
+}
+
+template <int TOP_K, bool ENABLE_RANK_MASK, bool USE_RANK_COMPACT_ROUTING>
 __device__ __forceinline__ void route_dispatch_token(int32_t const* token_selected_experts,
     DispatchKernelPointers const& ptrs, int local_token_idx, int ep_size, int num_experts, int* topk_target_ranks,
-    int* topk_send_indices)
+    int* topk_target_indices, uint32_t lane_mask)
 {
     static_assert(TOP_K <= 32, "warp-parallel routing requires TOP_K <= warpSize");
-    uint32_t const lane_mask = (TOP_K == 32) ? ~0U : ((1U << TOP_K) - 1U);
     int const k = threadIdx.x;
 
-    if constexpr (COMPACT_FANOUT)
+    if constexpr (USE_RANK_COMPACT_ROUTING)
     {
         // EP < TOP_K, so the routing lanes initialize every destination slot.
         topk_target_ranks[k] = -1;
-        topk_send_indices[k] = -1;
+        topk_target_indices[k] = -1;
         __syncwarp(lane_mask);
     }
 
@@ -282,32 +289,37 @@ __device__ __forceinline__ void route_dispatch_token(int32_t const* token_select
     bool const valid_expert = expert_id >= 0 && expert_id < num_experts;
     int const target_rank = valid_expert ? compute_target_rank_id(expert_id, ep_base, ep_remainder) : -1;
 
+    // Experts on the same rank share one token transfer; only their first lane allocates a send slot.
     uint32_t const same_target = __match_any_sync(lane_mask, target_rank);
-    bool keep = valid_expert && ((__ffs(same_target) - 1) == k);
+    bool should_send = valid_expert && ((__ffs(same_target) - 1) == k);
     if constexpr (ENABLE_RANK_MASK)
     {
-        keep = keep && is_rank_active(ptrs.active_rank_mask, target_rank);
+        should_send = should_send && is_rank_active(ptrs.active_rank_mask, target_rank);
     }
 
-    int const target_rank_to_store = keep ? target_rank : -1;
-    int const send_index_to_store = keep ? atomicAdd(&ptrs.send_counters[target_rank], 1) : -1;
+    int const target_rank_to_store = should_send ? target_rank : -1;
+    int const target_index_to_store = should_send ? atomicAdd(&ptrs.send_counters[target_rank], 1) : -1;
 
+    // Keep persistent routing metadata indexed by top-k slot for combine.
     ptrs.topk_target_ranks[local_token_idx * TOP_K + k] = target_rank_to_store;
-    ptrs.topk_send_indices[local_token_idx * TOP_K + k] = send_index_to_store;
-    if constexpr (COMPACT_FANOUT)
+    ptrs.topk_target_indices[local_token_idx * TOP_K + k] = target_index_to_store;
+    if constexpr (USE_RANK_COMPACT_ROUTING)
     {
-        uint32_t const kept_lanes = __ballot_sync(lane_mask, keep);
-        if (keep)
+        // Pack unique target ranks into consecutive shared-memory slots instead of leaving
+        // holes at duplicate expert lanes. Dispatch then scans a rank-bounded list, not TOP_K slots.
+        uint32_t const sending_lanes = __ballot_sync(lane_mask, should_send);
+        if (should_send)
         {
-            int const compact_index = __popc(kept_lanes & ((1U << k) - 1U));
+            // Count sending lanes before this lane to obtain its packed slot.
+            int const compact_index = __popc(sending_lanes & ((1U << k) - 1U));
             topk_target_ranks[compact_index] = target_rank;
-            topk_send_indices[compact_index] = send_index_to_store;
+            topk_target_indices[compact_index] = target_index_to_store;
         }
     }
     else
     {
         topk_target_ranks[k] = target_rank_to_store;
-        topk_send_indices[k] = send_index_to_store;
+        topk_target_indices[k] = target_index_to_store;
     }
 }
 
@@ -357,82 +369,53 @@ __device__ void vectorized_copy(void* dst, void const* src, int size)
     }
 }
 
-// Cache destination addresses once per payload, then fan each source vector out.
-template <int VEC_SIZE, int TOP_K, int MAX_FANOUT>
-__device__ void vectorized_dispatch_impl(uint8_t const* src_ptr, int bytes_per_token, int rank_id,
-    int max_tokens_per_rank, int payload_idx, DispatchKernelPointers const& ptrs, int const* topk_target_ranks,
-    int const* topk_send_indices)
+// Fan each source vector out through the CTA's shared destination table.
+template <int VEC_SIZE, int TOP_K, bool USE_RANK_COMPACT_ROUTING>
+__device__ void vectorized_dispatch_impl(
+    uint8_t const* src_ptr, int bytes_per_token, int ep_size, uint8_t* const* destinations)
 {
     using flashinfer::vec_t;
-    constexpr bool kCompact = MAX_FANOUT > 0;
-    constexpr int kDestinations = kCompact ? MAX_FANOUT : TOP_K;
-    if constexpr (kCompact)
-    {
-        if (threadIdx.x * VEC_SIZE >= bytes_per_token)
-        {
-            return;
-        }
-    }
 
-    uint8_t* destinations[kDestinations];
-#pragma unroll
-    for (int k = 0; k < kDestinations; ++k)
-    {
-        int const send_index = topk_send_indices[k];
-        if (send_index < 0)
-        {
-            destinations[k] = nullptr;
-            continue;
-        }
-        int const peer = topk_target_ranks[k];
-        auto* data = static_cast<uint8_t*>(ptrs.recv_buffers[peer][payload_idx]);
-        size_t const token = static_cast<size_t>(rank_id) * max_tokens_per_rank + send_index;
-        destinations[k] = data + token * bytes_per_token;
-    }
-
+    int const num_destinations = USE_RANK_COMPACT_ROUTING ? ep_size : TOP_K;
     for (int offset = threadIdx.x * VEC_SIZE; offset < bytes_per_token; offset += blockDim.x * VEC_SIZE)
     {
         vec_t<uint8_t, VEC_SIZE> value;
         value.load(src_ptr + offset);
-#pragma unroll
-        for (int k = 0; k < kDestinations; ++k)
+#pragma unroll(USE_RANK_COMPACT_ROUTING ? 2 : TOP_K)
+        for (int k = 0; k < num_destinations; ++k)
         {
-            if (destinations[k] != nullptr)
+            uint8_t* const destination = destinations[k];
+            if (destination != nullptr)
             {
-                value.store(destinations[k] + offset);
+                value.store(destination + offset);
             }
         }
     }
 }
 
-template <int TOP_K, int MAX_FANOUT>
-__device__ void vectorized_dispatch(uint8_t const* src_ptr, int bytes_per_token, int rank_id, int max_tokens_per_rank,
-    int payload_idx, DispatchKernelPointers const& ptrs, int const* topk_target_ranks, int const* topk_send_indices)
+template <int TOP_K, bool USE_RANK_COMPACT_ROUTING>
+__device__ void vectorized_dispatch(
+    uint8_t const* src_ptr, int bytes_per_token, int ep_size, uint8_t* const* destinations)
 {
     if (bytes_per_token % 16 == 0)
     {
-        vectorized_dispatch_impl<16, TOP_K, MAX_FANOUT>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
-            payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+        vectorized_dispatch_impl<16, TOP_K, USE_RANK_COMPACT_ROUTING>(src_ptr, bytes_per_token, ep_size, destinations);
     }
     else if (bytes_per_token % 8 == 0)
     {
-        vectorized_dispatch_impl<8, TOP_K, MAX_FANOUT>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
-            payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+        vectorized_dispatch_impl<8, TOP_K, USE_RANK_COMPACT_ROUTING>(src_ptr, bytes_per_token, ep_size, destinations);
     }
     else if (bytes_per_token % 4 == 0)
     {
-        vectorized_dispatch_impl<4, TOP_K, MAX_FANOUT>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
-            payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+        vectorized_dispatch_impl<4, TOP_K, USE_RANK_COMPACT_ROUTING>(src_ptr, bytes_per_token, ep_size, destinations);
     }
     else if (bytes_per_token % 2 == 0)
     {
-        vectorized_dispatch_impl<2, TOP_K, MAX_FANOUT>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
-            payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+        vectorized_dispatch_impl<2, TOP_K, USE_RANK_COMPACT_ROUTING>(src_ptr, bytes_per_token, ep_size, destinations);
     }
     else
     {
-        vectorized_dispatch_impl<1, TOP_K, MAX_FANOUT>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
-            payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+        vectorized_dispatch_impl<1, TOP_K, USE_RANK_COMPACT_ROUTING>(src_ptr, bytes_per_token, ep_size, destinations);
     }
 }
 
@@ -465,14 +448,13 @@ __global__ void moeA2APrepareDispatchKernel(
 // Dispatch Kernels
 // ============================================================================
 
-template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK, int MAX_FANOUT>
+template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK, bool USE_RANK_COMPACT_ROUTING>
 __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [local_num_tokens, TOP_K]
     const DispatchKernelPointers ptrs,                                      // Struct containing all kernel pointers
     int num_payloads,                                                       // Number of payloads
     int max_tokens_per_rank,                                                // Maximum tokens per rank
     int local_num_tokens, int rank_id, int ep_size, int num_experts, int eplb_stats_num_experts)
 {
-    constexpr bool COMPACT_FANOUT = MAX_FANOUT > 0;
     int thread_idx = threadIdx.x;
     int local_token_idx = blockIdx.x;
 
@@ -497,31 +479,39 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         // Global routing metadata always retains all top-k slots.
         extern __shared__ int smem[];
         int* smem_topk_target_ranks = smem;
-        int* smem_topk_send_indices = smem + TOP_K;
+        int* smem_topk_target_indices = smem + TOP_K;
 
 #if TLLM_MOE_A2A_COMPILE_SM90
         cudaGridDependencySynchronize();
 #endif
+        static_assert(TOP_K > 0 && TOP_K <= 32, "routing and destination setup require one warp");
+        constexpr uint32_t kRoutingLaneMask = make_warp_lane_mask<TOP_K>();
+        __shared__ uint8_t* destinations[kMaxPayloads][TOP_K];
         if (thread_idx < TOP_K)
         {
-            route_dispatch_token<TOP_K, ENABLE_RANK_MASK, COMPACT_FANOUT>(token_selected_experts, ptrs, local_token_idx,
-                ep_size, num_experts, smem_topk_target_ranks, smem_topk_send_indices);
-        }
-        // Sync before dispatching data
-        __syncthreads();
+            route_dispatch_token<TOP_K, ENABLE_RANK_MASK, USE_RANK_COMPACT_ROUTING>(token_selected_experts, ptrs,
+                local_token_idx, ep_size, num_experts, smem_topk_target_ranks, smem_topk_target_indices,
+                kRoutingLaneMask);
+            // Compact routing slots may be written by a different lane.
+            __syncwarp(kRoutingLaneMask);
 
-        // Read staged routing once into registers per thread
-        int topk_target_ranks[TOP_K];
-        int topk_send_indices[TOP_K];
-        if constexpr (!COMPACT_FANOUT)
-        {
-#pragma unroll
-            for (int k = 0; k < TOP_K; ++k)
+            // Resolve each payload's destinations once per CTA; unused routes remain null.
+            int const target_index = smem_topk_target_indices[thread_idx];
+            int const peer = smem_topk_target_ranks[thread_idx];
+            for (int p = 0; p < num_payloads; ++p)
             {
-                topk_target_ranks[k] = smem_topk_target_ranks[k];
-                topk_send_indices[k] = smem_topk_send_indices[k];
+                uint8_t* destination = nullptr;
+                if (target_index >= 0)
+                {
+                    size_t const token = static_cast<size_t>(rank_id) * max_tokens_per_rank + target_index;
+                    destination
+                        = static_cast<uint8_t*>(ptrs.recv_buffers[peer][p]) + token * ptrs.payload_bytes_per_token[p];
+                }
+                destinations[p][thread_idx] = destination;
             }
         }
+        // Publish the destination table to all payload-copying warps.
+        __syncthreads();
 
         // Perform a single source load and TOP_K fanout per payload
         for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++)
@@ -529,9 +519,8 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             uint8_t const* src_data = static_cast<uint8_t const*>(ptrs.src_data_ptrs[payload_idx]);
             int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
             uint8_t const* src_ptr = src_data + local_token_idx * bytes_per_token;
-            vectorized_dispatch<TOP_K, MAX_FANOUT>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank, payload_idx,
-                ptrs, COMPACT_FANOUT ? smem_topk_target_ranks : topk_target_ranks,
-                COMPACT_FANOUT ? smem_topk_send_indices : topk_send_indices);
+            vectorized_dispatch<TOP_K, USE_RANK_COMPACT_ROUTING>(
+                src_ptr, bytes_per_token, ep_size, destinations[payload_idx]);
         }
 
         __syncthreads();
@@ -809,12 +798,11 @@ __device__ __forceinline__ void cft_elect_and_publish(DispatchKernelPointers con
     }
 }
 
-template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK, int MAX_FANOUT>
+template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK, bool USE_RANK_COMPACT_ROUTING>
 __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, DispatchKernelPointers const ptrs,
     int num_payloads, int max_tokens_per_rank, int local_num_tokens, int rank_id, int ep_size, int num_experts,
     int eplb_stats_num_experts)
 {
-    constexpr bool COMPACT_FANOUT = MAX_FANOUT > 0;
     int local_token_idx = blockIdx.x;
     uint32_t parity = 0;
     __shared__ int is_last_token_cta;
@@ -839,7 +827,7 @@ __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, 
 
         extern __shared__ int smem[];
         int* smem_topk_target_ranks = smem;
-        int* smem_topk_send_indices = smem + TOP_K;
+        int* smem_topk_target_indices = smem + TOP_K;
 
         // CFT smem layout (disjoint regions, kept stable across phases):
         //   [0 .. kRoutingBytes)                                       routing indices (above)
@@ -881,10 +869,12 @@ __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, 
         }
 
         // ---- Routing: map tokens to target ranks ----
+        constexpr uint32_t kRoutingLaneMask = make_warp_lane_mask<TOP_K>();
         if (threadIdx.x < TOP_K)
         {
-            route_dispatch_token<TOP_K, ENABLE_RANK_MASK, COMPACT_FANOUT>(token_selected_experts, ptrs, local_token_idx,
-                ep_size, num_experts, smem_topk_target_ranks, smem_topk_send_indices);
+            route_dispatch_token<TOP_K, ENABLE_RANK_MASK, USE_RANK_COMPACT_ROUTING>(token_selected_experts, ptrs,
+                local_token_idx, ep_size, num_experts, smem_topk_target_ranks, smem_topk_target_indices,
+                kRoutingLaneMask);
         }
         __syncthreads();
 
@@ -893,28 +883,16 @@ __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, 
         cft_elect_and_publish<ENABLE_EPLB, ENABLE_RANK_MASK>(
             ptrs, rank_id, ep_size, parity, eplb_stats_num_experts, local_num_tokens, is_last_token_cta);
 
-        int topk_target_ranks[TOP_K];
-        int topk_send_indices[TOP_K];
-        if constexpr (!COMPACT_FANOUT)
-        {
-#pragma unroll
-            for (int k = 0; k < TOP_K; ++k)
-            {
-                topk_target_ranks[k] = smem_topk_target_ranks[k];
-                topk_send_indices[k] = smem_topk_send_indices[k];
-            }
-        }
-
         // ---- Data dispatch: self via TMA s2g, remote via fabric.try_put.counted ----
         // Separate issuing warps overlap self and remote transfers. Both consume
         // smem_staging only after the TMA g2s wait below.
         bool has_remote = false;
         bool has_self = false;
-#pragma unroll
-        for (int k = 0; k < (COMPACT_FANOUT ? MAX_FANOUT : TOP_K); ++k)
+#pragma unroll(USE_RANK_COMPACT_ROUTING ? 2 : TOP_K)
+        for (int k = 0; k < (USE_RANK_COMPACT_ROUTING ? ep_size : TOP_K); ++k)
         {
-            int const dst_idx = COMPACT_FANOUT ? smem_topk_send_indices[k] : topk_send_indices[k];
-            int const target_rank = COMPACT_FANOUT ? smem_topk_target_ranks[k] : topk_target_ranks[k];
+            int const dst_idx = smem_topk_target_indices[k];
+            int const target_rank = smem_topk_target_ranks[k];
             if (dst_idx < 0)
                 continue;
             if (target_rank == rank_id)
@@ -941,11 +919,11 @@ __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, 
             for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++)
             {
                 int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
-#pragma unroll
-                for (int k = 0; k < (COMPACT_FANOUT ? MAX_FANOUT : TOP_K); ++k)
+#pragma unroll(USE_RANK_COMPACT_ROUTING ? 2 : TOP_K)
+                for (int k = 0; k < (USE_RANK_COMPACT_ROUTING ? ep_size : TOP_K); ++k)
                 {
-                    int const dst_idx_k = COMPACT_FANOUT ? smem_topk_send_indices[k] : topk_send_indices[k];
-                    int const target_rank_k = COMPACT_FANOUT ? smem_topk_target_ranks[k] : topk_target_ranks[k];
+                    int const dst_idx_k = smem_topk_target_indices[k];
+                    int const target_rank_k = smem_topk_target_ranks[k];
                     if (dst_idx_k < 0 || target_rank_k != rank_id)
                         continue;
                     uint8_t* dst = static_cast<uint8_t*>(ptrs.recv_buffers[rank_id][payload_idx])
@@ -969,11 +947,11 @@ __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, 
             for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++)
             {
                 int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
-#pragma unroll
-                for (int k = 0; k < (COMPACT_FANOUT ? MAX_FANOUT : TOP_K); ++k)
+#pragma unroll(USE_RANK_COMPACT_ROUTING ? 2 : TOP_K)
+                for (int k = 0; k < (USE_RANK_COMPACT_ROUTING ? ep_size : TOP_K); ++k)
                 {
-                    int const dst_idx_k = COMPACT_FANOUT ? smem_topk_send_indices[k] : topk_send_indices[k];
-                    int const target_rank_k = COMPACT_FANOUT ? smem_topk_target_ranks[k] : topk_target_ranks[k];
+                    int const dst_idx_k = smem_topk_target_indices[k];
+                    int const target_rank_k = smem_topk_target_ranks[k];
                     if (dst_idx_k < 0 || target_rank_k == rank_id)
                         continue;
                     uint64_t base_le_offset = ptrs.le_payload_offsets[payload_idx]
@@ -1141,37 +1119,6 @@ void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params)
 // Launch Functions
 // ============================================================================
 
-// Bound compact pointer/accumulator arrays without specializing every EP size.
-// Zero selects the unchanged top-k path; unused compact slots are initialized to -1.
-template <int TOP_K, typename Launch>
-void launch_with_fanout(int ep_size, Launch&& launch)
-{
-    if (ep_size >= TOP_K)
-    {
-        launch(std::integral_constant<int, 0>{});
-    }
-    else if (ep_size <= 2)
-    {
-        launch(std::integral_constant<int, (TOP_K < 2 ? TOP_K : 2)>{});
-    }
-    else if (ep_size <= 4)
-    {
-        launch(std::integral_constant<int, (TOP_K < 4 ? TOP_K : 4)>{});
-    }
-    else if (ep_size <= 8)
-    {
-        launch(std::integral_constant<int, (TOP_K < 8 ? TOP_K : 8)>{});
-    }
-    else if (ep_size <= 16)
-    {
-        launch(std::integral_constant<int, (TOP_K < 16 ? TOP_K : 16)>{});
-    }
-    else
-    {
-        launch(std::integral_constant<int, TOP_K>{});
-    }
-}
-
 void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
 {
     constexpr int kBlockSize = 256;
@@ -1225,7 +1172,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     kernel_ptrs.send_counters = params.send_counters;
     kernel_ptrs.local_token_counter = params.local_token_counter;
     kernel_ptrs.topk_target_ranks = params.topk_target_ranks;
-    kernel_ptrs.topk_send_indices = params.topk_send_indices;
+    kernel_ptrs.topk_target_indices = params.topk_target_indices;
     kernel_ptrs.eplb_local_stats = params.eplb_local_stats;
 
     // CFT handle-based counted writes fields
@@ -1292,21 +1239,19 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
         SWITCH_BOOL(params.enable_rank_mask, ENABLE_RANK_MASK, {
             SWITCH_BOOL(params.enable_eplb, EPLB_STATS, {
                 SWITCH_TOP_K(params.top_k, TOP_K, {
-                    launch_with_fanout<TOP_K>(params.ep_size,
-                        [&](auto fanout)
+                    SWITCH_BOOL(params.ep_size < TOP_K, ENABLE_RANK_COMPACT_ROUTING, {
+                        auto kernel_fn = moeA2ADispatchKernel_Cft<TOP_K, EPLB_STATS, ENABLE_RANK_MASK,
+                            ENABLE_RANK_COMPACT_ROUTING>;
+                        if (shared_bytes > kDefaultDynamicSmemBytes)
                         {
-                            constexpr int kMaxFanout = decltype(fanout)::value;
-                            auto kernel_fn = moeA2ADispatchKernel_Cft<TOP_K, EPLB_STATS, ENABLE_RANK_MASK, kMaxFanout>;
-                            if (shared_bytes > kDefaultDynamicSmemBytes)
-                            {
-                                TLLM_CUDA_CHECK(cudaFuncSetAttribute(
-                                    kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
-                            }
-                            launchWithPdlWhenEnabled("moeA2ADispatchKernel_Cft", kernel_fn, grid_size, kBlockSize,
-                                shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
-                                params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens,
-                                params.ep_rank, params.ep_size, params.num_experts, params.eplb_stats_num_experts);
-                        });
+                            TLLM_CUDA_CHECK(cudaFuncSetAttribute(
+                                kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
+                        }
+                        launchWithPdlWhenEnabled("moeA2ADispatchKernel_Cft", kernel_fn, grid_size, kBlockSize,
+                            shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
+                            params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
+                            params.ep_size, params.num_experts, params.eplb_stats_num_experts);
+                    });
                 });
             });
         });
@@ -1316,16 +1261,14 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
         SWITCH_BOOL(params.enable_rank_mask, ENABLE_RANK_MASK, {
             SWITCH_BOOL(params.enable_eplb, EPLB_STATS, {
                 SWITCH_TOP_K(params.top_k, TOP_K, {
-                    launch_with_fanout<TOP_K>(params.ep_size,
-                        [&](auto fanout)
-                        {
-                            constexpr int kMaxFanout = decltype(fanout)::value;
-                            auto kernel_fn = moeA2ADispatchKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK, kMaxFanout>;
-                            launchWithPdlWhenEnabled("moeA2ADispatchKernel", kernel_fn, grid_size, kBlockSize,
-                                shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
-                                params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens,
-                                params.ep_rank, params.ep_size, params.num_experts, params.eplb_stats_num_experts);
-                        });
+                    SWITCH_BOOL(params.ep_size < TOP_K, ENABLE_RANK_COMPACT_ROUTING, {
+                        auto kernel_fn
+                            = moeA2ADispatchKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK, ENABLE_RANK_COMPACT_ROUTING>;
+                        launchWithPdlWhenEnabled("moeA2ADispatchKernel", kernel_fn, grid_size, kBlockSize, shared_bytes,
+                            params.stream, params.token_selected_experts, kernel_ptrs, params.num_payloads,
+                            params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank, params.ep_size,
+                            params.num_experts, params.eplb_stats_num_experts);
+                    });
                 });
             });
         });
@@ -1336,405 +1279,148 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
 // Combine kernels
 // ============================================================================
 
-// Accumulate across all valid ranks into float32 registers, then store as OutputT.
-// InputT is the wire element type in the receive buffer.
-//
-// Unified path: load VEC_SIZE bytes, reinterpret as InputT[elems_per_vec], accumulate as float32,
-// store as OutputT. Works for same-type and FP8-to-payload-type accumulation.
-// sizeof(InputT) must divide VEC_SIZE.
-template <int VEC_SIZE, int TOP_K, typename OutputT, typename InputT = OutputT>
-__device__ void vectorized_combine_impl(OutputT* dst_typed_base, int size_per_token, int stride_per_token, int rank_id,
-    int max_tokens_per_rank, CombineKernelPointers const& ptrs)
-{
-    using flashinfer::vec_t;
-
-    // elems_per_vec is the number of InputT elements per VEC_SIZE-byte load.
-    constexpr int elems_per_vec = VEC_SIZE / static_cast<int>(sizeof(InputT));
-
-    int const stride = blockDim.x * VEC_SIZE;
-    int const local_token_idx = blockIdx.x;
-
-    // offset is a byte offset into the recv buffer, stepping by VEC_SIZE bytes.
-    for (int offset = threadIdx.x * VEC_SIZE; offset < size_per_token; offset += stride)
-    {
-        // Per-k vec_t<float, elems_per_vec> accumulators, zero-initialised via fill().
-        // Using vec_t enables cast_store() for the output, emitting a vectorized int4 write.
-        vec_t<float, elems_per_vec> acc[TOP_K];
-
-        // Pass 1: issue all TOP_K loads back-to-back without any type conversion.
-        // Raw InputT bytes are loaded directly into acc[k]'s register storage, reinterpreted as
-        // vec_t<InputT, elems_per_vec> (VEC_SIZE bytes, fitting in the low end of acc[k]'s
-        // sizeof(float)*elems_per_vec allocation).  Separating load from cast lets the compiler
-        // schedule all VEC_SIZE-byte global loads consecutively, hiding memory latency across k.
-#pragma unroll
-        for (int k = 0; k < TOP_K; ++k)
-        {
-            int target_rank = ptrs.topk_target_ranks[local_token_idx * TOP_K + k];
-            int dst_idx = ptrs.topk_send_indices[local_token_idx * TOP_K + k];
-            if (dst_idx < 0)
-            {
-                acc[k].fill(0.0f);
-                continue;
-            }
-
-            // Every contribution uses the same compact receive-buffer layout.
-            uint8_t const* recv_buffer = static_cast<uint8_t const*>(ptrs.recv_buffers[target_rank][0]);
-            size_t base_source_rank = static_cast<size_t>(rank_id) * static_cast<size_t>(max_tokens_per_rank)
-                + static_cast<size_t>(dst_idx);
-            size_t base_token = base_source_rank * static_cast<size_t>(stride_per_token);
-
-            reinterpret_cast<vec_t<InputT, elems_per_vec>&>(acc[k]).load(
-                reinterpret_cast<InputT const*>(recv_buffer + base_token + offset));
-        }
-
-        // Pass 2: in-place cast InputT to float, iterating j in descending order.
-        // float[j] occupies bytes [j*4, j*4+3]; InputT[j] occupies
-        // [j*sizeof(InputT), ...). For narrow inputs, high-j float writes land above all
-        // remaining InputT bytes, so descending order is write-after-read safe.
-#pragma unroll
-        for (int k = 0; k < TOP_K; ++k)
-        {
-            int target_rank = ptrs.topk_target_ranks[local_token_idx * TOP_K + k];
-            int dst_idx = ptrs.topk_send_indices[local_token_idx * TOP_K + k];
-            if (dst_idx < 0)
-            {
-                continue; // acc[k] already holds 0.0f from fill() above
-            }
-#pragma unroll
-            for (int j = elems_per_vec - 1; j >= 0; --j)
-                acc[k][j] = static_cast<float>(reinterpret_cast<InputT const*>(&acc[k])[j]);
-        }
-        // Reduce acc[TOP_K] into acc[0] via unrolled tree-reduction.
-        // acc[k][j] uses vec_t::operator[] which returns float& — no indirection overhead.
-        if constexpr (TOP_K == 22)
-        {
-#pragma unroll
-            for (int j = 0; j < elems_per_vec; ++j)
-            {
-                acc[0][j] += acc[1][j];
-                acc[2][j] += acc[3][j];
-                acc[4][j] += acc[5][j];
-                acc[6][j] += acc[7][j];
-                acc[8][j] += acc[9][j];
-                acc[10][j] += acc[11][j];
-                acc[12][j] += acc[13][j];
-                acc[14][j] += acc[15][j];
-                acc[16][j] += acc[17][j];
-                acc[18][j] += acc[19][j];
-                acc[20][j] += acc[21][j];
-            }
-#pragma unroll
-            for (int j = 0; j < elems_per_vec; ++j)
-            {
-                acc[0][j] += acc[2][j];
-                acc[4][j] += acc[6][j];
-                acc[8][j] += acc[10][j];
-                acc[12][j] += acc[14][j];
-                acc[16][j] += acc[18][j];
-            }
-#pragma unroll
-            for (int j = 0; j < elems_per_vec; ++j)
-            {
-                acc[0][j] += acc[4][j];
-                acc[8][j] += acc[12][j];
-                acc[16][j] += acc[20][j];
-            }
-#pragma unroll
-            for (int j = 0; j < elems_per_vec; ++j)
-            {
-                acc[0][j] += acc[8][j];
-                acc[0][j] += acc[16][j];
-            }
-        }
-        else if constexpr (TOP_K == 16)
-        {
-#pragma unroll
-            for (int j = 0; j < elems_per_vec; ++j)
-            {
-                acc[0][j] += acc[1][j];
-                acc[2][j] += acc[3][j];
-                acc[4][j] += acc[5][j];
-                acc[6][j] += acc[7][j];
-                acc[8][j] += acc[9][j];
-                acc[10][j] += acc[11][j];
-                acc[12][j] += acc[13][j];
-                acc[14][j] += acc[15][j];
-            }
-#pragma unroll
-            for (int j = 0; j < elems_per_vec; ++j)
-            {
-                acc[0][j] += acc[2][j];
-                acc[4][j] += acc[6][j];
-                acc[8][j] += acc[10][j];
-                acc[12][j] += acc[14][j];
-            }
-#pragma unroll
-            for (int j = 0; j < elems_per_vec; ++j)
-            {
-                acc[0][j] += acc[4][j];
-                acc[8][j] += acc[12][j];
-            }
-#pragma unroll
-            for (int j = 0; j < elems_per_vec; ++j)
-            {
-                acc[0][j] += acc[8][j];
-            }
-        }
-        else if constexpr (TOP_K == 10)
-        {
-#pragma unroll
-            for (int j = 0; j < elems_per_vec; ++j)
-            {
-                acc[0][j] += acc[1][j];
-                acc[2][j] += acc[3][j];
-                acc[4][j] += acc[5][j];
-                acc[6][j] += acc[7][j];
-                acc[8][j] += acc[9][j];
-            }
-#pragma unroll
-            for (int j = 0; j < elems_per_vec; ++j)
-            {
-                acc[0][j] += acc[2][j];
-                acc[4][j] += acc[6][j];
-            }
-#pragma unroll
-            for (int j = 0; j < elems_per_vec; ++j)
-            {
-                acc[0][j] += acc[4][j];
-                acc[0][j] += acc[8][j];
-            }
-        }
-        else if constexpr (TOP_K == 8)
-        {
-#pragma unroll
-            for (int j = 0; j < elems_per_vec; ++j)
-            {
-                acc[0][j] += acc[1][j];
-                acc[2][j] += acc[3][j];
-                acc[4][j] += acc[5][j];
-                acc[6][j] += acc[7][j];
-            }
-#pragma unroll
-            for (int j = 0; j < elems_per_vec; ++j)
-            {
-                acc[0][j] += acc[2][j];
-                acc[4][j] += acc[6][j];
-            }
-#pragma unroll
-            for (int j = 0; j < elems_per_vec; ++j)
-            {
-                acc[0][j] += acc[4][j];
-            }
-        }
-        else if constexpr (TOP_K == 6)
-        {
-#pragma unroll
-            for (int j = 0; j < elems_per_vec; ++j)
-            {
-                acc[0][j] += acc[1][j];
-                acc[2][j] += acc[3][j];
-                acc[4][j] += acc[5][j];
-            }
-#pragma unroll
-            for (int j = 0; j < elems_per_vec; ++j)
-            {
-                acc[0][j] += acc[2][j];
-                acc[0][j] += acc[4][j];
-            }
-        }
-        else if constexpr (TOP_K == 4)
-        {
-#pragma unroll
-            for (int j = 0; j < elems_per_vec; ++j)
-            {
-                acc[0][j] += acc[1][j];
-                acc[2][j] += acc[3][j];
-            }
-#pragma unroll
-            for (int j = 0; j < elems_per_vec; ++j)
-            {
-                acc[0][j] += acc[2][j];
-            }
-        }
-        else if constexpr (TOP_K == 2)
-        {
-#pragma unroll
-            for (int j = 0; j < elems_per_vec; ++j)
-            {
-                acc[0][j] += acc[1][j];
-            }
-        }
-        else if constexpr (TOP_K == 1)
-        {
-            // nothing to do
-        }
-        else
-        {
-            // Generic fallback: accumulate all into acc[0]
-#pragma unroll
-            for (int k = 1; k < TOP_K; ++k)
-            {
-#pragma unroll
-                for (int j = 0; j < elems_per_vec; ++j)
-                {
-                    acc[0][j] += acc[k][j];
-                }
-            }
-        }
-
-        // cast_store converts each accumulated element to OutputT before the vectorized store.
-        acc[0].cast_store(dst_typed_base + offset / static_cast<int>(sizeof(InputT)));
-    }
-}
-
-// Compact routing contains only valid contributions, in their original top-k order.
-// Bound the register arrays by EP rather than top-k while retaining parallel loads.
-template <int VEC_SIZE, int GROUP_SIZE, typename OutputT, typename InputT>
-__device__ void vectorized_combine_compact_impl(
+// Load source vectors in their wire dtype and accumulate in FP32.
+// Only the first source_count entries are valid, one per contributing rank.
+template <int VEC_SIZE, typename OutputT, typename InputT>
+__device__ void vectorized_combine_impl(
     OutputT* output, int size_per_token, uint8_t const* const* sources, int source_count)
 {
     using flashinfer::vec_t;
     constexpr int kElements = VEC_SIZE / static_cast<int>(sizeof(InputT));
-    for (int offset = threadIdx.x * VEC_SIZE; offset < size_per_token; offset += blockDim.x * VEC_SIZE)
+    if (source_count <= 2)
     {
-        vec_t<float, kElements> values[GROUP_SIZE];
-#pragma unroll
-        for (int k = 0; k < GROUP_SIZE; ++k)
+        for (int offset = threadIdx.x * VEC_SIZE; offset < size_per_token; offset += blockDim.x * VEC_SIZE)
         {
-            if (k < source_count)
+            vec_t<InputT, kElements> left;
+            vec_t<InputT, kElements> right;
+            left.fill(InputT(0.0f));
+            right.fill(InputT(0.0f));
+            if (source_count > 0)
             {
-                reinterpret_cast<vec_t<InputT, kElements>&>(values[k]).load(
-                    reinterpret_cast<InputT const*>(sources[k] + offset));
+                left.load(reinterpret_cast<InputT const*>(sources[0] + offset));
             }
-            else
+            if (source_count > 1)
             {
-                values[k].fill(0.0f);
+                right.load(reinterpret_cast<InputT const*>(sources[1] + offset));
+            }
+            vec_t<float, kElements> value;
+#pragma unroll
+            for (int j = 0; j < kElements; ++j)
+            {
+                value[j] = static_cast<float>(left[j]) + static_cast<float>(right[j]);
+            }
+            value.cast_store(output + offset / static_cast<int>(sizeof(InputT)));
+        }
+        return;
+    }
+
+    // TOP_K <= 32: eight sources per lane require at most four cooperating lanes.
+    int const rank_bits = (source_count > 8) + (source_count > 16);
+    int const rank_lanes = 1 << rank_bits;
+    int const lane = threadIdx.x & 31;
+    int const rank_lane = lane & (rank_lanes - 1);
+    int const output_lane = lane >> rank_bits;
+    int const warp = threadIdx.x >> 5;
+    int const vectors_per_warp = warpSize >> rank_bits;
+    int const stride = (blockDim.x >> rank_bits) * VEC_SIZE;
+    // Prefetch low-precision vectors, then combine adjacent sources in tree order.
+    for (int base = warp * vectors_per_warp * VEC_SIZE; base < size_per_token; base += stride)
+    {
+        int const offset = base + output_lane * VEC_SIZE;
+        bool const valid_output = offset < size_per_token;
+        vec_t<InputT, kElements> packed[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k)
+        {
+            packed[k].fill(InputT(0.0f));
+            int const source = 8 * rank_lane + k;
+            if (valid_output && source < source_count)
+            {
+                packed[k].load(reinterpret_cast<InputT const*>(sources[source] + offset));
             }
         }
+        vec_t<float, kElements> value;
 #pragma unroll
-        for (int k = 0; k < GROUP_SIZE; ++k)
+        for (int j = 0; j < kElements; ++j)
         {
-            if (k < source_count)
-            {
-#pragma unroll
-                for (int j = kElements - 1; j >= 0; --j)
-                {
-                    values[k][j] = static_cast<float>(reinterpret_cast<InputT const*>(&values[k])[j]);
-                }
-            }
+            float const p0 = static_cast<float>(packed[0][j]) + static_cast<float>(packed[1][j]);
+            float const p1 = static_cast<float>(packed[2][j]) + static_cast<float>(packed[3][j]);
+            float const p2 = static_cast<float>(packed[4][j]) + static_cast<float>(packed[5][j]);
+            float const p3 = static_cast<float>(packed[6][j]) + static_cast<float>(packed[7][j]);
+            value[j] = (p0 + p1) + (p2 + p3);
         }
 #pragma unroll
-        for (int step = 1; step < GROUP_SIZE; step *= 2)
+        for (int step = 1; step < 4; step *= 2)
         {
-#pragma unroll
-            for (int k = 0; k < GROUP_SIZE; k += 2 * step)
+            if (step < rank_lanes)
             {
-                if (k + step < GROUP_SIZE)
-                {
 #pragma unroll
-                    for (int j = 0; j < kElements; ++j)
+                for (int j = 0; j < kElements; ++j)
+                {
+                    float const next = __shfl_down_sync(~0U, value[j], step, rank_lanes);
+                    if ((rank_lane & (2 * step - 1)) == 0)
                     {
-                        values[k][j] += values[k + step][j];
+                        value[j] += next;
                     }
                 }
             }
         }
-        values[0].cast_store(output + offset / static_cast<int>(sizeof(InputT)));
+        if (rank_lane == 0 && valid_output)
+        {
+            value.cast_store(output + offset / static_cast<int>(sizeof(InputT)));
+        }
     }
 }
 
-template <int TOP_K, int GROUP_SIZE, typename OutputT, typename InputT>
-__device__ void vectorized_combine_compact(OutputT* output, int size_per_token, int stride_per_token, int rank_id,
+// Pack valid source pointers in routing order and count the contributing ranks.
+// stride_per_token can exceed the wire size for in-place low-precision combine.
+template <int TOP_K, typename OutputT, typename InputT>
+__device__ void vectorized_combine(OutputT* output, int size_per_token, int stride_per_token, int rank_id,
     int max_tokens_per_rank, CombineKernelPointers const& ptrs)
 {
-    static_assert(TOP_K <= 32, "compact combine routing requires TOP_K <= warpSize");
-    static_assert(GROUP_SIZE > 0 && GROUP_SIZE <= TOP_K);
-    __shared__ uint8_t const* sources[GROUP_SIZE];
+    static_assert(TOP_K > 0 && TOP_K <= 32, "combine routing requires TOP_K <= warpSize");
+    constexpr uint32_t kRoutingLaneMask = make_warp_lane_mask<TOP_K>();
+    __shared__ uint8_t const* sources[TOP_K];
     __shared__ int source_count;
-    if (threadIdx.x < warpSize)
+    if (threadIdx.x < TOP_K)
     {
         int const k = threadIdx.x;
         int const index = blockIdx.x * TOP_K + k;
-        int const send_index = k < TOP_K ? ptrs.topk_send_indices[index] : -1;
-        uint32_t const valid = __ballot_sync(~0U, send_index >= 0);
+        int const target_index = ptrs.topk_target_indices[index];
+        uint32_t const valid = __ballot_sync(kRoutingLaneMask, target_index >= 0);
         if (k == 0)
         {
             source_count = __popc(valid);
         }
-        if (send_index >= 0)
+        if (target_index >= 0)
         {
             int const peer = ptrs.topk_target_ranks[index];
             int const compact_index = __popc(valid & ((1U << k) - 1U));
-            size_t const token = static_cast<size_t>(rank_id) * max_tokens_per_rank + send_index;
+            size_t const token = static_cast<size_t>(rank_id) * max_tokens_per_rank + target_index;
             sources[compact_index] = static_cast<uint8_t const*>(ptrs.recv_buffers[peer][0]) + token * stride_per_token;
         }
     }
     __syncthreads();
 
-    constexpr int kGroupSize = GROUP_SIZE;
     if (size_per_token % 16 == 0)
     {
-        vectorized_combine_compact_impl<16, kGroupSize, OutputT, InputT>(output, size_per_token, sources, source_count);
+        vectorized_combine_impl<16, OutputT, InputT>(output, size_per_token, sources, source_count);
     }
     else if (size_per_token % 8 == 0)
     {
-        vectorized_combine_compact_impl<8, kGroupSize, OutputT, InputT>(output, size_per_token, sources, source_count);
+        vectorized_combine_impl<8, OutputT, InputT>(output, size_per_token, sources, source_count);
     }
     else if (size_per_token % 4 == 0)
     {
-        vectorized_combine_compact_impl<4, kGroupSize, OutputT, InputT>(output, size_per_token, sources, source_count);
+        vectorized_combine_impl<4, OutputT, InputT>(output, size_per_token, sources, source_count);
     }
     else if (size_per_token % 2 == 0)
     {
-        vectorized_combine_compact_impl<2, kGroupSize, OutputT, InputT>(output, size_per_token, sources, source_count);
+        vectorized_combine_impl<2, OutputT, InputT>(output, size_per_token, sources, source_count);
     }
     else if constexpr (sizeof(InputT) == 1)
     {
-        vectorized_combine_compact_impl<1, kGroupSize, OutputT, InputT>(output, size_per_token, sources, source_count);
-    }
-}
-
-// Wrapper that selects vector width based on size_per_token alignment.
-// stride_per_token: byte distance between tokens in the recv buffer (may differ from
-// size_per_token when low-precision in-place data retains its payload-dtype workspace stride).
-// InputT is the input element type in the receive buffer.
-template <int TOP_K, typename OutputT, typename InputT = OutputT>
-__device__ void vectorized_combine(OutputT* dst_typed_base, int size_per_token, int stride_per_token, int rank_id,
-    int max_tokens_per_rank, CombineKernelPointers const& ptrs)
-{
-    // Each branch is guarded by if constexpr (sizeof(InputT) <= VEC_SIZE) so that the compiler
-    // never instantiates vectorized_combine_impl with elems_per_vec=0.
-    // Branches where VEC_SIZE < sizeof(InputT) are unreachable at runtime because size_per_token
-    // is always a multiple of sizeof(InputT), so a larger alignment branch is taken first.
-    if (size_per_token % 16 == 0)
-    {
-        if constexpr (static_cast<int>(sizeof(InputT)) <= 16)
-            vectorized_combine_impl<16, TOP_K, OutputT, InputT>(
-                dst_typed_base, size_per_token, stride_per_token, rank_id, max_tokens_per_rank, ptrs);
-    }
-    else if (size_per_token % 8 == 0)
-    {
-        if constexpr (static_cast<int>(sizeof(InputT)) <= 8)
-            vectorized_combine_impl<8, TOP_K, OutputT, InputT>(
-                dst_typed_base, size_per_token, stride_per_token, rank_id, max_tokens_per_rank, ptrs);
-    }
-    else if (size_per_token % 4 == 0)
-    {
-        if constexpr (static_cast<int>(sizeof(InputT)) <= 4)
-            vectorized_combine_impl<4, TOP_K, OutputT, InputT>(
-                dst_typed_base, size_per_token, stride_per_token, rank_id, max_tokens_per_rank, ptrs);
-    }
-    else if (size_per_token % 2 == 0)
-    {
-        if constexpr (static_cast<int>(sizeof(InputT)) <= 2)
-            vectorized_combine_impl<2, TOP_K, OutputT, InputT>(
-                dst_typed_base, size_per_token, stride_per_token, rank_id, max_tokens_per_rank, ptrs);
-    }
-    else
-    {
-        if constexpr (static_cast<int>(sizeof(InputT)) <= 1)
-            vectorized_combine_impl<1, TOP_K, OutputT, InputT>(
-                dst_typed_base, size_per_token, stride_per_token, rank_id, max_tokens_per_rank, ptrs);
+        vectorized_combine_impl<1, OutputT, InputT>(output, size_per_token, sources, source_count);
     }
 }
 
@@ -1893,7 +1579,7 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, void cons
 // Generic Combine Kernel Implementation (Templated by data type)
 // ============================================================================
 
-template <typename T, int TOP_K, bool LOW_PRECISION, bool ENABLE_RANK_MASK, int MAX_FANOUT>
+template <typename T, int TOP_K, bool LOW_PRECISION, bool ENABLE_RANK_MASK>
 __global__ void moeA2ACombineKernel(
     const CombineKernelPointers ptrs, // Combine-specific struct, src_data_ptrs[0] is output
     int max_tokens_per_rank, int elements_per_token, int local_num_tokens, int rank_id, int ep_size,
@@ -1984,16 +1670,8 @@ __global__ void moeA2ACombineKernel(
         return;
 
     T* token_output = static_cast<T*>(ptrs.src_data_ptrs[0]) + local_token_idx * elements_per_token;
-    if constexpr (MAX_FANOUT > 0)
-    {
-        vectorized_combine_compact<TOP_K, MAX_FANOUT, T, InputT>(
-            token_output, size_per_token, stride_per_token, rank_id, max_tokens_per_rank, ptrs);
-    }
-    else
-    {
-        vectorized_combine<TOP_K, T, InputT>(
-            token_output, size_per_token, stride_per_token, rank_id, max_tokens_per_rank, ptrs);
-    }
+    vectorized_combine<TOP_K, T, InputT>(
+        token_output, size_per_token, stride_per_token, rank_id, max_tokens_per_rank, ptrs);
 #if TLLM_MOE_A2A_COMPILE_SM90
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
@@ -2108,7 +1786,7 @@ __global__ void moeA2ACombinePushKernel_Cft(
 #endif
 }
 
-template <typename T, int TOP_K, bool LOW_PRECISION, bool ENABLE_RANK_MASK, int MAX_FANOUT>
+template <typename T, int TOP_K, bool LOW_PRECISION, bool ENABLE_RANK_MASK>
 __global__ void moeA2ACombineKernel_Cft(const CombineKernelPointers ptrs, int max_tokens_per_rank,
     int elements_per_token, int local_num_tokens, int rank_id, int ep_size)
 {
@@ -2138,7 +1816,7 @@ __global__ void moeA2ACombineKernel_Cft(const CombineKernelPointers ptrs, int ma
             for (int kk = lane_id; kk < TOP_K; kk += warpSize)
             {
                 int tr = ptrs.topk_target_ranks[my_token * TOP_K + kk];
-                int di = ptrs.topk_send_indices[my_token * TOP_K + kk];
+                int di = ptrs.topk_target_indices[my_token * TOP_K + kk];
                 if (tr < 0 || di < 0)
                     continue; // duplicate / invalid routing slot
                 if constexpr (ENABLE_RANK_MASK)
@@ -2186,16 +1864,8 @@ __global__ void moeA2ACombineKernel_Cft(const CombineKernelPointers ptrs, int ma
 #endif
 
         T* token_output = static_cast<T*>(ptrs.src_data_ptrs[0]) + local_token_idx * elements_per_token;
-        if constexpr (MAX_FANOUT > 0)
-        {
-            vectorized_combine_compact<TOP_K, MAX_FANOUT, T, InputT>(
-                token_output, size_per_token, size_per_token, rank_id, max_tokens_per_rank, ptrs);
-        }
-        else
-        {
-            vectorized_combine<TOP_K, T, InputT>(
-                token_output, size_per_token, size_per_token, rank_id, max_tokens_per_rank, ptrs);
-        }
+        vectorized_combine<TOP_K, T, InputT>(
+            token_output, size_per_token, size_per_token, rank_id, max_tokens_per_rank, ptrs);
     }
 
 #if !DISABLE_SYNC_FOR_PROFILING
@@ -2365,7 +2035,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
         }
         kp.flag_val = params.flag_val;
         kp.topk_target_ranks = params.topk_target_ranks;
-        kp.topk_send_indices = params.topk_send_indices;
+        kp.topk_target_indices = params.topk_target_indices;
 
         // CFT combine metadata.
         kp.combine_counters = params.cft_le_combine_counters;
@@ -2395,16 +2065,10 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
             SWITCH_DTYPE(params.dtype, T, {
                 SWITCH_BOOL(params.use_low_precision, LOW_PRECISION, {
                     SWITCH_TOP_K(params.top_k, TOP_K, {
-                        launch_with_fanout<TOP_K>(params.ep_size,
-                            [&](auto fanout)
-                            {
-                                constexpr int kMaxFanout = decltype(fanout)::value;
-                                auto kernel_fn
-                                    = moeA2ACombineKernel_Cft<T, TOP_K, LOW_PRECISION, ENABLE_RANK_MASK, kMaxFanout>;
-                                launchWithPdlWhenEnabled("moeA2ACombineKernel_Cft", kernel_fn, cft_grid, kBlockSize, 0,
-                                    params.stream, kp, params.max_tokens_per_rank, params.elements_per_token,
-                                    params.local_num_tokens, params.ep_rank, params.ep_size);
-                            });
+                        auto kernel_fn = moeA2ACombineKernel_Cft<T, TOP_K, LOW_PRECISION, ENABLE_RANK_MASK>;
+                        launchWithPdlWhenEnabled("moeA2ACombineKernel_Cft", kernel_fn, cft_grid, kBlockSize, 0,
+                            params.stream, kp, params.max_tokens_per_rank, params.elements_per_token,
+                            params.local_num_tokens, params.ep_rank, params.ep_size);
                     });
                 });
             });
@@ -2442,7 +2106,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
 
     // Copy communication tracking pointers
     kernel_ptrs.topk_target_ranks = params.topk_target_ranks;
-    kernel_ptrs.topk_send_indices = params.topk_send_indices;
+    kernel_ptrs.topk_target_indices = params.topk_target_indices;
 
     // Copy active-rank bitmask into the kernel pointers struct
     for (int w = 0; w < kRankMaskWords; ++w)
@@ -2454,16 +2118,10 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
         SWITCH_DTYPE(params.dtype, T, {
             SWITCH_BOOL(params.use_low_precision, LOW_PRECISION, {
                 SWITCH_TOP_K(params.top_k, TOP_K, {
-                    launch_with_fanout<TOP_K>(params.ep_size,
-                        [&](auto fanout)
-                        {
-                            constexpr int kMaxFanout = decltype(fanout)::value;
-                            auto kernel_fn = moeA2ACombineKernel<T, TOP_K, LOW_PRECISION, ENABLE_RANK_MASK, kMaxFanout>;
-                            launchWithPdlWhenEnabled("moeA2ACombineKernel", kernel_fn, grid, kBlockSize, 0,
-                                params.stream, kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token,
-                                params.local_num_tokens, params.ep_rank, params.ep_size,
-                                params.reduce_stride_per_token);
-                        });
+                    auto kernel_fn = moeA2ACombineKernel<T, TOP_K, LOW_PRECISION, ENABLE_RANK_MASK>;
+                    launchWithPdlWhenEnabled("moeA2ACombineKernel", kernel_fn, grid, kBlockSize, 0, params.stream,
+                        kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token, params.local_num_tokens,
+                        params.ep_rank, params.ep_size, params.reduce_stride_per_token);
                 });
             });
         });

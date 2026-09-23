@@ -132,6 +132,13 @@ PROFILES: Dict[str, Profile] = {
         num_experts=896,
         quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8,
     ),
+    "qwen3p8_2p4t_a95b": Profile(
+        name="qwen3p8_2p4t_a95b",
+        hidden_size=8192,
+        top_k=10,
+        num_experts=512,
+        quant_algo=QuantAlgo.NO_QUANT,
+    ),
 }
 
 
