@@ -925,10 +925,6 @@ disallow_untyped_defs = false
 warn_return_any = false
 
 [[tool.mypy.overrides]]
-module = ["tensorrt_llm.runtime.kv_cache_manager_v2.*"]
-disallow_any_generics = false
-
-[[tool.mypy.overrides]]
 module = ["tensorrt_llm.bindings.*"]
 ignore_errors = true
 

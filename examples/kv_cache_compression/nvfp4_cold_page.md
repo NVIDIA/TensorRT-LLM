@@ -71,9 +71,8 @@ and KV-cache block reuse remains supported because Page and token identity are
 unchanged. One-model MTP-EAGLE and EAGLE3 are supported; HELIX context
 parallelism is not currently supported.
 
-Set `kv_cache_config.use_kv_cache_manager_v2: true` explicitly, and do not set
-`TLLM_KV_CACHE_MANAGER_V2_BACKEND=python`. A nonzero Host or Disk cache is also
-required for Pages to cross a compression boundary.
+Set `kv_cache_config.use_kv_cache_manager_v2: true` explicitly. A nonzero Host
+or Disk cache is also required for Pages to cross a compression boundary.
 
 On Linux 6.11 through 6.13, mixed models that need both NVFP4 Attention
 lifecycles and lossless SSM/GDN fallback lifecycles are not supported. See the

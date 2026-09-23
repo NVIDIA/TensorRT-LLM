@@ -195,13 +195,6 @@ else:
         'flash_mla/LICENSE',
         'flash_mla/*.py',
         'flash_mla_cpp_tllm.*.so',
-        'runtime/kv_cache_manager_v2/*.so',
-        'runtime/kv_cache_manager_v2/**/*.so',
-        'runtime/kv_cache_manager_v2/*.pyi',
-        'runtime/kv_cache_manager_v2/**/*.pyi',
-        'runtime/kv_cache_manager_v2/rawref/*.py',
-        'runtime/kv_cache_manager_v2/rawref/*.pyi',
-        'runtime/*__mypyc*.so',
     ]
 
 package_data += [
@@ -568,15 +561,11 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
             # (deep_gemm, deep_ep, flash_mla Python files are generated during build)
             if file.filename.endswith(".py"):
                 allowed_dirs = (
-                    "tensorrt_llm/deep_gemm/", "tensorrt_llm/deep_ep/",
+                    "tensorrt_llm/deep_gemm/",
+                    "tensorrt_llm/deep_ep/",
                     "tensorrt_llm/flash_mla/",
-                    "tensorrt_llm/runtime/kv_cache_manager_v2/rawref/__init__.py"
                 )
                 if not any(file.filename.startswith(d) for d in allowed_dirs):
-                    # Exclude all .py files in kv_cache_manager_v2 except rawref/__init__.py
-                    if file.filename.startswith("tensorrt_llm/runtime/kv_cache_manager_v2/") and \
-                       not file.filename.endswith("rawref/__init__.py"):
-                        continue
                     continue
 
             for filename_pattern in package_data:
@@ -610,37 +599,8 @@ sanity_check()
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
-    # We use find_packages with a custom exclude filter to handle the mypyc compiled modules.
-    # We want to exclude the .py source files for modules that are compiled to .so.
-    # We exclude the kv_cache_manager_v2 package entirely from the source list,
-    # but explicitly add back the rawref subpackage (which is not compiled by mypyc).
-    # The .so and .pyi files for kv_cache_manager_v2 are added via package_data.
-enable_mypyc = os.getenv("TRTLLM_ENABLE_MYPYC", "0") == "1"
-if enable_mypyc:
-    packages = find_packages(exclude=[
-        "tensorrt_llm.runtime.kv_cache_manager_v2",
-        "tensorrt_llm.runtime.kv_cache_manager_v2.*",
-    ]) + ["tensorrt_llm.runtime.kv_cache_manager_v2.rawref"]
-    exclude_package_data = {
-        "tensorrt_llm": [
-            "runtime/kv_cache_manager_v2/*.py",
-            "runtime/kv_cache_manager_v2/**/*.py"
-        ],
-        "tensorrt_llm.runtime.kv_cache_manager_v2": ["*.py", "**/*.py"],
-    }
-else:
-    packages = find_packages()
-    exclude_package_data = {}
-
-    # Remove mypyc shared objects from package_data to avoid packaging stale files
-    package_data = [
-        p for p in package_data if p not in [
-            'runtime/kv_cache_manager_v2/*.so',
-            'runtime/kv_cache_manager_v2/**/*.so', 'runtime/*__mypyc*.so'
-        ]
-    ]
-    # Ensure rawref is included
-    package_data.append('runtime/kv_cache_manager_v2/rawref/*.so')
+packages = find_packages()
+exclude_package_data = {}
 
 # Add vendored triton_kernels as an explicit top-level package.
 # This is vendored from the Triton project and kept at repo root so its
