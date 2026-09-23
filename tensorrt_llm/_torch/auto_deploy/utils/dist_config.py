@@ -41,6 +41,8 @@ class DistConfig(BaseModel):
     moe_cluster_size: int = Field(default=1, ge=1)
     enable_attention_dp: bool = Field(default=False)
     allreduce_strategy: str = Field(default="NCCL")
+    encoder_prefill_disagg: bool = Field(default=False)
+    encoder_world_size: int = Field(default=0)
 
     @model_validator(mode="after")
     def _validate_grid(self) -> "DistConfig":
@@ -134,6 +136,8 @@ class DistConfig(BaseModel):
         dist_mapping: dict,
         enable_attention_dp: bool = False,
         allreduce_strategy: str = "NCCL",
+        encoder_prefill_disagg: bool = False,
+        encoder_world_size: int = 0,
     ) -> "DistConfig":
         """Build ``DistConfig`` from sharding-transform YAML inputs + runtime MPI info.
 
@@ -151,6 +155,8 @@ class DistConfig(BaseModel):
             moe_cluster_size=dist_mapping.get("moe_cluster", 1),
             enable_attention_dp=enable_attention_dp,
             allreduce_strategy=allreduce_strategy,
+            encoder_prefill_disagg=encoder_prefill_disagg,
+            encoder_world_size=encoder_world_size,
         )
 
     def to_mapping(self) -> Any:
