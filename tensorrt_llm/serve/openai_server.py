@@ -2371,9 +2371,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 generate_inputs = await loop.run_in_executor(
                     self._input_proc_executor,
                     functools.partial(preprocess_fn, prompt, sampling_params,
-                                      disaggregated_params))
-
-            if mm_data:
+                                      disagg            if mm_data:
                 try:
                     mm_metadata = None
                     processed_mm_data = None
@@ -2387,13 +2385,30 @@ class OpenAIServer(_VideoRoutesMixin):
                             get_multimodal_encoder_item_metadata
                         mm_metadata = get_multimodal_encoder_item_metadata(processed_mm_data)
 
+                    item_refs = None
+                    embedding_lengths = None
                     if mm_metadata is not None:
+                        item_refs = mm_metadata.item_refs
+                        embedding_lengths = mm_metadata.output_embedding_lengths
+                    elif (isinstance(processed_mm_data, dict)
+                          and "multimodal_embedding_lengths" in processed_mm_data):
+                        item_order = (processed_mm_data.get("mm_item_order")
+                                      or prompt.get("mm_item_order"))
+                        lengths = processed_mm_data["multimodal_embedding_lengths"]
+                        if (isinstance(item_order, list)
+                                and isinstance(lengths, list)
+                                and len(item_order) == len(lengths)):
+                            item_refs = [
+                                (e["modality"] if isinstance(e, dict) else e[0],
+                                 e.get("index", 0) if isinstance(e, dict) else e[1])
+                                for e in item_order
+                            ]
+                            embedding_lengths = lengths
+
+                    if item_refs is not None and embedding_lengths is not None:
                         modality_totals = {}
-                        for (modality,
-                             _), length in zip(mm_metadata.item_refs,
-                                              mm_metadata.output_embedding_lengths):
-                            modality_totals[modality] = modality_totals.get(
-                                modality, 0) + length
+                        for (modality, _), length in zip(item_refs, embedding_lengths):
+                            modality_totals[modality] = modality_totals.get(modality, 0) + length
                         if "image" in modality_totals:
                             postproc_args.image_tokens = modality_totals["image"]
                         if "video" in modality_totals:
@@ -2403,8 +2418,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     else:
                         from tensorrt_llm.inputs.multimodal import \
                             find_mm_token_lengths
-                        proc = getattr(self.generator, "input_processor",
-                                       None) or self.processor
+                        proc = getattr(self.generator, "input_processor", None)
                         if proc is not None:
                             mm_token_lengths = find_mm_token_lengths(
                                 mm_data,
@@ -2421,9 +2435,16 @@ class OpenAIServer(_VideoRoutesMixin):
                                 if "audio" in mm_token_lengths:
                                     postproc_args.audio_tokens = sum(
                                         mm_token_lengths["audio"])
-                except Exception as e:
-                    logger.debug(
+                        else:
+                            logger.warning(
+                                "Generator has no TRT-LLM input_processor; "
+                                "skipping multimodal token length calculation.")
+                except (AttributeError, TypeError, ValueError, KeyError) as e:
+                    logger.warning(
                         f"Failed to calculate multimodal token counts: {e}")
+                except Exception as e:
+                    logger.warning(
+                        f"Unexpected error calculating multimodal token counts: {e}")
 
             promise = self.generator.generate_async(
                 inputs=generate_inputs,
@@ -2905,33 +2926,12 @@ class OpenAIServer(_VideoRoutesMixin):
             if rsp.prompt_token_ids is not None:
                 all_prompt_token_ids.append(rsp.prompt_token_ids)
 
-        def _aggregate_modality(modality: str) -> Optional[int]:
-            if not responses:
-                return None
-            counts = []
-            for rsp in responses:
-                if rsp.usage is None or rsp.usage.prompt_tokens_details is None:
-                    return None
-                count = getattr(rsp.usage.prompt_tokens_details,
-                                f"{modality}_tokens", None)
-                if count is None:
-                    return None
-                counts.append(count)
-            return sum(counts)
-
-        num_image_tokens = _aggregate_modality("image")
-        num_video_tokens = _aggregate_modality("video")
-        num_audio_tokens = _aggregate_modality("audio")
-
         usage_info = UsageInfo(
             prompt_tokens=num_prompt_tokens,
             completion_tokens=num_gen_tokens,
             total_tokens=num_gen_tokens + num_prompt_tokens,
             prompt_tokens_details=PromptTokensDetails(
                 cached_tokens=num_cached_tokens,
-                image_tokens=num_image_tokens,
-                video_tokens=num_video_tokens,
-                audio_tokens=num_audio_tokens,
             ),
         )
         merged_rsp = CompletionResponse(
