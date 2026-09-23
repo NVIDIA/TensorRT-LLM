@@ -688,13 +688,14 @@ def test_mistral_attention_swa_layer_types():
 # ---------------------------------------------------------------------------
 def _make_dummy_processor(
     *,
-    patch_size=14,
-    spatial_merge_size=2,
-    image_size=1540,
-    num_channels=3,
-    processor_cls=MistralHFInputProcessor,
-    geometry_from_processor=False,
-):
+    patch_size: int = 14,
+    spatial_merge_size: int = 2,
+    image_size: int = 1540,
+    num_channels: int = 3,
+    processor_cls: type[MistralHFInputProcessor]
+    | type[MistralNativeInputProcessor] = MistralHFInputProcessor,
+    geometry_from_processor: bool = False,
+) -> MistralHFInputProcessor | MistralNativeInputProcessor:
     """Construct a processor stub with just the geometry the dummy math reads.
 
     Bypasses the real ``__init__`` (tokenizer/processor loading). By default the
@@ -724,7 +725,7 @@ def _make_dummy_processor(
     return instance
 
 
-def _make_text_only_native_processor():
+def _make_text_only_native_processor() -> MistralNativeInputProcessor:
     """A mistral-native processor for a checkpoint with no vision encoder.
 
     ``MistralNativeInputProcessor`` serves every ``checkpoint_format="mistral"``
@@ -869,8 +870,9 @@ def test_dummy_mm_data_satisfies_the_encoder_input_contract():
 @pytest.mark.parametrize("geometry_from_processor", [False, True], ids=["from_config", "from_proc"])
 @pytest.mark.cpu_only
 def test_both_mistral_processors_satisfy_item_scheduling_contract(
-    processor_cls, geometry_from_processor
-):
+    processor_cls: type[MistralHFInputProcessor] | type[MistralNativeInputProcessor],
+    geometry_from_processor: bool,
+) -> None:
     proc = _make_dummy_processor(
         processor_cls=processor_cls, geometry_from_processor=geometry_from_processor
     )
@@ -900,7 +902,7 @@ def test_both_mistral_processors_satisfy_item_scheduling_contract(
 # rather than raising `AttributeError` out of the encoder geometry -- the engine
 # calls `get_mm_max_tokens_per_item` unconditionally.
 @pytest.mark.cpu_only
-def test_text_only_native_checkpoint_reports_no_encoder_geometry():
+def test_text_only_native_checkpoint_reports_no_encoder_geometry() -> None:
     proc = _make_text_only_native_processor()
 
     assert proc.get_mm_max_tokens_per_item() == {}

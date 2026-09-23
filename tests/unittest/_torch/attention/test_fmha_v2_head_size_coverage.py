@@ -37,20 +37,21 @@ def sm100_specs() -> tuple[ModuleType, list[Any]]:
     return module, [kspec for kspec, *_ in captured if kspec.sm == 100]
 
 
+@pytest.mark.parametrize("dtype", ["fp16", "bf16"])
 def test_sm100_pixtral_head_size_has_a_padding_mask_kernel(
-    sm100_specs: tuple[ModuleType, list[Any]], monkeypatch: pytest.MonkeyPatch
+    sm100_specs: tuple[ModuleType, list[Any]], dtype: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Generate the BF16 packed-QKV padding-mask kernel Pixtral requests."""
+    """Generate the packed-QKV padding-mask kernels Pixtral requests."""
     module, specs = sm100_specs
     matching = [
         kspec
         for kspec in specs
         if kspec.head_size == 104
-        and kspec.dtype == "bf16"
+        and kspec.dtype == dtype
         and kspec.input_layout == module.InputLayout.PACKED_QKV
         and kspec.flash_attention
     ]
-    assert matching, "No SM100 BF16 packed-QKV FMHA v2 kernel is generated for head size 104"
+    assert matching, f"No SM100 {dtype} packed-QKV FMHA v2 kernel is generated for head size 104"
 
     monkeypatch.setenv("GENERATE_CUBIN", "1")
     assert any(module.selected_mask_types(kspec)[0] == "1" for kspec in matching), (
