@@ -280,7 +280,8 @@
       "source_repository": "https://gitlab-master.nvidia.com/jintaop/cutedsl_megamoe.git",
       "source_revision": "522fbb019942ad6bbe0f418dba02541f837ea46c",
       "source_path": "next/sources/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_kernel.py",
-      "description": "Include the complete standalone fused FC12 top-level from the same pinned upstream source; normalize its formatting with Ruff 0.9.4."
+      "description": "Include the complete standalone fused FC12 top-level from the same pinned upstream source; normalize its formatting with Ruff 0.9.4.",
+      "runtime_contract": "The standalone upstream FC12 top-level does not reset its readiness counters after a launch. The shared-expert runner clears require_zero_workspace_leading_bytes on the same CUDA stream before every invocation with cuMemsetD8Async."
     }
   ]
 }

@@ -21,6 +21,7 @@ class _SharedFc12Runner:
         swiglu_limit: float | None,
         stream_handle: int,
     ) -> None:
+        import cuda.bindings.driver as cuda
         import cutlass
         import cutlass.cute as cute
         import cutlass.utils as utils
@@ -86,8 +87,11 @@ class _SharedFc12Runner:
         local_zero_bytes, shared_zero_bytes = kernel.require_zero_workspace_leading_bytes
         if shared_zero_bytes:
             raise RuntimeError("shared FC12 must not initialize communication state")
-        self.workspace[:local_zero_bytes].zero_()
         self.workspace_pointer = self.workspace.data_ptr()
+        self.workspace_reset_bytes = local_zero_bytes
+        self._memset_async = cuda.cuMemsetD8Async
+        self._cuda_success = cuda.CUresult.CUDA_SUCCESS
+        self._cuda_stream = cuda.CUstream(stream_handle)
         # A slice supplies the current E=1 token count without a per-call GPU write.
         self.token_counts = torch.arange(max_tokens + 1, dtype=torch.int32, device=device)
 
@@ -161,6 +165,8 @@ class _SharedFc12Runner:
             "max_tokens": max_tokens,
             "dynamic_token_dimension": True,
             "routing_or_communication": False,
+            "reset_strategy": "cuMemsetD8Async_before_fc12_same_stream",
+            "workspace_reset_bytes": self.workspace_reset_bytes,
         }
 
     def __call__(
@@ -180,6 +186,12 @@ class _SharedFc12Runner:
             (token_rows, 1, self.hidden_size), dtype=torch.bfloat16, device=activation.device
         )
         with torch.cuda.nvtx.range("MEGAMOE_SHARED_FC12"):
+            # The standalone FC12 readiness counters require reset before every invocation.
+            (status,) = self._memset_async(
+                self.workspace_pointer, 0, self.workspace_reset_bytes, self._cuda_stream
+            )
+            if status != self._cuda_success:
+                raise RuntimeError(f"shared FC12 asynchronous counter reset failed: {status}")
             self.compiled(
                 activation=quantized,
                 fc1_weight=fc1_weight.transpose(1, 2),
@@ -283,4 +295,5 @@ def run_shared_fc12(
         swiglu_limit,
         stream.cuda_stream,
     )
-    return runner(activation, fc1_weight, fc1_weight_sf, fc2_weight, fc2_weight_sf)
+    with torch.cuda.device(activation.device):
+        return runner(activation, fc1_weight, fc1_weight_sf, fc2_weight, fc2_weight_sf)
