@@ -440,6 +440,9 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
             "sf_padding_block": int,
             "work_id_mode": str,
             "is_swap_ab": bool,
+            "dfc1_m_group": OptionalRequirement(int),
+            "defer_consumer_until_full_ready": OptionalRequirement(bool),
+            "fuse_ready_probe_and_linear1_claim": OptionalRequirement(bool),
             **_mixed_cga_impl_requirements(),
         }
 
@@ -458,6 +461,13 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
         self.sf_padding_block = impl_desc["sf_padding_block"]
         self.work_id_mode: WorkIdAcquisitionMode = impl_desc["work_id_mode"]
         self.is_swap_ab = impl_desc["is_swap_ab"]
+        self.dfc1_m_group = impl_desc.get("dfc1_m_group", 1)
+        self.defer_consumer_until_full_ready = impl_desc.get(
+            "defer_consumer_until_full_ready", False
+        )
+        self.fuse_ready_probe_and_linear1_claim = impl_desc.get(
+            "fuse_ready_probe_and_linear1_claim", False
+        )
         self.non_clc_mixed_cga_config = _make_non_clc_mixed_cga_config(impl_desc)
         self.launch_cluster_cnt_merge_as_preferred = (
             self.non_clc_mixed_cga_config.launch_cluster_cnt_merge_as_preferred
@@ -494,9 +504,12 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
             self.intermediate_gateup_size + mapping_cluster_tile_n - 1
         ) // mapping_cluster_tile_n
         self.blocks_fc2 = (self.hidden_size + mapping_cluster_tile_n - 1) // mapping_cluster_tile_n
-        interleave_gcd = math.gcd(self.blocks_fc1, self.blocks_fc2)
-        self.interleave_fc2_slots = self.blocks_fc2 // interleave_gcd
-        self.interleave_cycle_length = (self.blocks_fc1 + self.blocks_fc2) // interleave_gcd
+        self.fc2_claims_per_token_block = self.blocks_fc2
+        interleave_gcd = math.gcd(self.blocks_fc1, self.fc2_claims_per_token_block)
+        self.interleave_fc2_slots = self.fc2_claims_per_token_block // interleave_gcd
+        self.interleave_cycle_length = (
+            self.blocks_fc1 + self.fc2_claims_per_token_block
+        ) // interleave_gcd
         self.minimum_global_fc1_claims = minimum_phase_interleave_fc1_claims(
             blocks_fc1=self.blocks_fc1,
             blocks_fc2=self.blocks_fc2,
@@ -507,7 +520,9 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
             blocks_fc2=self.blocks_fc2,
             launch_cluster_cnt_merge_as_preferred=self.launch_cluster_cnt_merge_as_preferred,
         )
-        if self.fc1_prologue_tiles < minimum_hint:
+        if self.fc1_prologue_tiles < minimum_hint and not (
+            self.fc1_prologue_tiles == 0 and self.defer_consumer_until_full_ready
+        ):
             raise ValueError(
                 f"phase_interleave hint {self.fc1_prologue_tiles} cannot cover a "
                 f"{self.launch_cluster_cnt_merge_as_preferred}-cluster FC2 claim wave; "
@@ -539,11 +554,36 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
         if (
             isinstance(self.fc1_prologue_tiles, bool)
             or not isinstance(self.fc1_prologue_tiles, int)
-            or self.fc1_prologue_tiles <= 0
+            or self.fc1_prologue_tiles < 0
         ):
             raise ValueError(
-                "fc1_prologue_tiles must be a positive Python int resolved by the kernel frontend."
+                "fc1_prologue_tiles must be a non-negative Python int "
+                "resolved by the kernel frontend."
             )
+        if type(self.dfc1_m_group) is not int or self.dfc1_m_group not in (1, 16):
+            raise ValueError("dfc1_m_group must be 1 or 16")
+        if self.dfc1_m_group > 1 and (self.is_swap_ab or not self.defer_consumer_until_full_ready):
+            raise ValueError(
+                "Grouped dFC1 M traversal requires non-swap singleton consumers, "
+                "ordinary producer order and full-ready admission"
+            )
+        if not isinstance(self.defer_consumer_until_full_ready, bool):
+            raise TypeError("defer_consumer_until_full_ready must be a bool.")
+        if not isinstance(self.fuse_ready_probe_and_linear1_claim, bool):
+            raise TypeError("fuse_ready_probe_and_linear1_claim must be a bool.")
+        if self.defer_consumer_until_full_ready and self.non_clc_mixed_cga_config.is_mixed:
+            raise NotImplementedError(
+                "defer_consumer_until_full_ready does not yet support fixed "
+                "preferred/fallback cluster groups."
+            )
+        if self.fuse_ready_probe_and_linear1_claim:
+            if not self.defer_consumer_until_full_ready:
+                raise ValueError(
+                    "fuse_ready_probe_and_linear1_claim requires "
+                    "defer_consumer_until_full_ready=True."
+                )
+        if self.fc1_prologue_tiles == 0 and not self.defer_consumer_until_full_ready:
+            raise ValueError("fc1_prologue_tiles=0 requires deferred full-readiness.")
         if self.token_padding_block <= 0:
             raise ValueError("token_padding_block must be positive.")
         if self.sf_padding_block <= 0:
@@ -643,14 +683,135 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
             is_swap_ab=self.is_swap_ab,
             expert_token_sizes=expert_token_sizes,
             expert_token_prefix_sum=expert_token_prefix_sum,
+            dfc1_m_group=self.dfc1_m_group,
         )
         self._control_state = _PhaseInterleaveControlState(
             prologue_remaining=Int32(self.fc1_prologue_tiles),
-            cycle_position=Int32(0),
+            # Stagger the steady-state cadence by physical cluster.  Starting
+            # every persistent cluster at slot zero turns an intended rolling
+            # mix into chip-wide FC1/FC2 bursts; the phase offset keeps both
+            # streams represented in every claim wave after the prologue.
+            cycle_position=(Int32(block_idx[2]) % Int32(self.interleave_cycle_length)),
             fc1_exhausted=Boolean(False),
             fc2_exhausted=Boolean(False),
-            prologue_claims_synchronized=Boolean(False),
+            prologue_claims_synchronized=Boolean(self.defer_consumer_until_full_ready),
         )
+
+    @cute.jit
+    def cluster_uniform_counter_ready(
+        self,
+        counter_pointer: cute.Pointer,
+        ready_threshold: Int32,
+        ready_is_mask: bool = False,
+    ) -> Boolean:
+        """Observe one counter on the cluster leader and broadcast readiness."""
+        if cutlass.const_expr(not self.defer_consumer_until_full_ready):
+            raise ValueError(
+                "cluster readiness polling requires defer_consumer_until_full_ready=True."
+            )
+        work_id_worker = self._work_id_worker
+        ready = work_id_worker.cluster_uniform_counter_ready(
+            counter_pointer, ready_threshold, ready_is_mask
+        )
+        self._work_id_worker = work_id_worker
+        return ready
+
+    @cute.jit
+    def gen_next_linear1_work_unless_counter_ready(
+        self,
+        counter_pointer: cute.Pointer,
+        ready_threshold: Int32,
+        ready_is_mask: bool = False,
+    ) -> Tuple[Boolean, SchedulerWorkTileBase]:
+        """Probe full readiness and otherwise claim one Linear1 tile.
+
+        When Linear1 still has unclaimed work, the readiness load and atomic
+        claim share one cluster broadcast transaction.  Once the stream is
+        exhausted this falls back to a probe-only transaction, avoiding
+        repeated tail over-claims while the held consumer drains.
+        """
+        if cutlass.const_expr(not self.fuse_ready_probe_and_linear1_claim):
+            raise ValueError(
+                "fused readiness/Linear1 claims require fuse_ready_probe_and_linear1_claim=True."
+            )
+
+        work_tile = make_fc12_done_tile(self.is_swap_ab)
+        work_id_worker = self._work_id_worker
+        task_mapping_state = self._task_mapping_state
+        control_state = self._control_state
+        fc1_exhausted = control_state.fc1_exhausted
+        ready = Boolean(False)
+
+        if fc1_exhausted:
+            ready = work_id_worker.cluster_uniform_counter_ready(
+                counter_pointer, ready_threshold, ready_is_mask
+            )
+        else:
+            ready, linear_work_id = work_id_worker.cluster_uniform_counter_ready_or_claim(
+                counter_pointer,
+                ready_threshold,
+                claim_stream_index=Int32(0),
+                ready_is_mask=ready_is_mask,
+            )
+            if not ready:
+                cta_id_in_mapping_cluster = _to_fc12_mapping_cta_coord(
+                    work_id_worker.cta_coord_in_preferred_cluster,
+                    self.is_swap_ab,
+                )
+                work_tile, stream_has_work, task_mapping_state = map_phase_interleaved_fc12_work_id(
+                    linear_work_id,
+                    Int32(BlockPhase.Linear1),
+                    cta_id_in_mapping_cluster,
+                    task_mapping_state,
+                )
+                if not stream_has_work:
+                    fc1_exhausted = Boolean(True)
+
+        control_state.fc1_exhausted = fc1_exhausted
+        self._work_id_worker = work_id_worker
+        self._task_mapping_state = task_mapping_state
+        self._control_state = control_state
+        return ready, work_tile
+
+    @cute.jit
+    def gen_next_linear1_work(self) -> SchedulerWorkTileBase:
+        """Force one dependency-free Linear1 claim while a Linear2 tile is held.
+
+        This corrective claim is outside the normal rolling cadence: the
+        deferred Linear2 claim already consumed its cadence slot.  The caller
+        must publish a returned Linear1 tile before rechecking or publishing
+        the held consumer.  Consequently no producer descriptor can become
+        trapped behind an unready consumer.
+        """
+        if cutlass.const_expr(not self.defer_consumer_until_full_ready):
+            raise ValueError("forced Linear1 claims require defer_consumer_until_full_ready=True.")
+
+        work_tile = make_fc12_done_tile(self.is_swap_ab)
+        work_id_worker = self._work_id_worker
+        task_mapping_state = self._task_mapping_state
+        control_state = self._control_state
+        fc1_exhausted = control_state.fc1_exhausted
+
+        if not fc1_exhausted:
+            linear_work_id = work_id_worker.claim_next_work(Int32(0))
+            cta_id_in_mapping_cluster = _to_fc12_mapping_cta_coord(
+                work_id_worker.cta_coord_in_preferred_cluster,
+                self.is_swap_ab,
+            )
+            work_tile, stream_has_work, task_mapping_state = map_phase_interleaved_fc12_work_id(
+                linear_work_id,
+                Int32(BlockPhase.Linear1),
+                cta_id_in_mapping_cluster,
+                task_mapping_state,
+            )
+            if not stream_has_work:
+                fc1_exhausted = Boolean(True)
+
+        control_state.fc1_exhausted = fc1_exhausted
+        self._work_id_worker = work_id_worker
+        self._task_mapping_state = task_mapping_state
+        self._control_state = control_state
+        return work_tile
 
     @cute.jit
     def _wait_for_fc1_prologue_claims(
@@ -664,14 +825,10 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
             fc1_counter_pointer = work_id_worker.get_atomic_counter_pointer(Int32(0))
             minimum_claim_count = Int32(self.minimum_global_fc1_claims)
             if not spin_peek(fc1_counter_pointer, lambda value: value >= minimum_claim_count):
-                claim_target, stream_ends_before_target = (
-                    resolve_phase_interleaved_fc1_claim_target(
-                        minimum_claim_count, task_mapping_state
-                    )
+                claim_target, _ = resolve_phase_interleaved_fc1_claim_target(
+                    minimum_claim_count, task_mapping_state
                 )
                 spin_wait(fc1_counter_pointer, lambda value: value >= claim_target)
-                if stream_ends_before_target:
-                    fc1_exhausted = Boolean(True)
         return fc1_exhausted
 
     @cute.jit
@@ -685,6 +842,7 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
         cycle_position = control_state.cycle_position
         fc1_exhausted = control_state.fc1_exhausted
         fc2_exhausted = control_state.fc2_exhausted
+        stream_has_work = Boolean(False)
         prologue_claims_synchronized = control_state.prologue_claims_synchronized
         resolved = Boolean(False)
 
@@ -692,7 +850,8 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
             if fc1_exhausted and fc2_exhausted:
                 work_tile = make_fc12_done_tile(self.is_swap_ab)
                 resolved = Boolean(True)
-            else:
+
+            if not resolved:
                 want_fc1 = Boolean(True)
                 if prologue_remaining <= Int32(0):
                     is_fc2_slot = (cycle_position * Int32(self.interleave_fc2_slots)) % Int32(
@@ -709,14 +868,17 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
                     atomic_counter_index = Int32(0)
                 linear_work_id = work_id_worker.claim_next_work(atomic_counter_index)
                 want_fc1 = work_id_worker.claimed_stream_index == Int32(0)
-                phase = Int32(BlockPhase.Linear2)
-                if want_fc1:
-                    phase = Int32(BlockPhase.Linear1)
                 cta_id_in_mapping_cluster = _to_fc12_mapping_cta_coord(
                     work_id_worker.cta_coord_in_preferred_cluster, self.is_swap_ab
                 )
+                phase = Int32(BlockPhase.Linear2)
+                if want_fc1:
+                    phase = Int32(BlockPhase.Linear1)
                 work_tile, stream_has_work, task_mapping_state = map_phase_interleaved_fc12_work_id(
-                    linear_work_id, phase, cta_id_in_mapping_cluster, task_mapping_state
+                    linear_work_id,
+                    phase,
+                    cta_id_in_mapping_cluster,
+                    task_mapping_state,
                 )
                 if stream_has_work:
                     if (not want_fc1) and (not prologue_claims_synchronized):
@@ -799,6 +961,10 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
             "mapping_cluster_shape_mn",
             "blocks_fc1",
             "blocks_fc2",
+            "dfc1_m_group",
+            "defer_consumer_until_full_ready",
+            "fuse_ready_probe_and_linear1_claim",
+            "fc2_claims_per_token_block",
             "interleave_fc2_slots",
             "interleave_cycle_length",
             "minimum_global_fc1_claims",

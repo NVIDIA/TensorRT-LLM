@@ -1643,6 +1643,8 @@ repos:
         entry: ./scripts/check_pinned_memory_usage.py
         language: script
         files: ^(tensorrt_llm|triton_backend)/.*\.py$
+        # The scheduler GPU-visible host mailbox requires pinned memory.
+        exclude: ^tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/
     -   id: check-skill-naming-convention
         name: Check Claude Code skill naming convention
         entry: python scripts/check_skill_naming_convention.py

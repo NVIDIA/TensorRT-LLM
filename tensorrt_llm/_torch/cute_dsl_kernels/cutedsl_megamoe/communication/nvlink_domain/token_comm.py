@@ -104,6 +104,7 @@ class _MetadataPushRouter(KernelComponent):
 
     router_smem_limit_bytes: ClassVar[int] = 227 * 1024
     router_warps_per_cta: ClassVar[int] = 16
+    all_expert_push_chunk_routes: ClassVar[int] = 256
 
     sizes_by_rank_region = "nvlink.token_comm.sizes_by_rank"
     sizes_region = "nvlink.token_comm.sizes"
@@ -768,6 +769,48 @@ class _MetadataPushRouter(KernelComponent):
         iket.range_pop()
 
     @cute.jit
+    def _router_push_metadata_interval(
+        self,
+        global_expert: Int32,
+        route_begin: Int32,
+        route_end: Int32,
+    ) -> None:
+        """Push one warp-owned half-open route interval for an expert."""
+        source_expert_base = self._device_workspace.tensor(self.source_expert_base_region)
+        push_destination_base = self._device_workspace.tensor(self.push_destination_base_region)
+        source_begin = source_expert_base[global_expert]
+        destination_begin = push_destination_base[global_expert]
+        destination_rank = global_expert // Int32(self.experts_per_rank)
+        peer_offset = self._peer_rank_ptr_mapper.map(Int64(0), destination_rank, Int64(0))
+        source_metadata = self._device_workspace.ptr(self.sorted_metadata_region)
+        destination_metadata_address = (
+            self._device_workspace.ptr(self.token_src_metadata_region).toint() + peer_offset
+        )
+        if cutlass.const_expr(self.apply_topk_at_fc1):
+            source_scores = self._device_workspace.ptr(self.sorted_scores_region)
+            destination_scores_address = (
+                self._device_workspace.ptr(self.fc1_topk_scores_region).toint() + peer_offset
+            )
+
+        route_round_count = (route_end - route_begin + Int32(31)) // Int32(32)
+        for route_round in cutlass.range(route_round_count, unroll=1):
+            route = route_begin + Int32(route_round) * Int32(32) + self._router_lane_idx
+            if route < route_end:
+                source_position = source_begin + route
+                destination_position = destination_begin + route
+                metadata = cute.arch.load(source_metadata + source_position, cutlass.Int64)
+                stg_b64(
+                    destination_metadata_address
+                    + Int64(destination_position) * Int64(TokenSrcMetadata.nbytes),
+                    metadata,
+                )
+                if cutlass.const_expr(self.apply_topk_at_fc1):
+                    score = cute.arch.load(source_scores + source_position, cutlass.Float32)
+                    stg_f32(
+                        destination_scores_address + Int64(destination_position) * Int64(4), score
+                    )
+
+    @cute.jit
     def _router_push_metadata(self) -> None:
         block_thread_count = self.router_warps_per_cta * 32
         sorted_metadata_ready = self._device_workspace.ptr(self.sorted_metadata_ready_region)
@@ -781,45 +824,50 @@ class _MetadataPushRouter(KernelComponent):
                 nanosleep(150)
         cute.arch.sync_threads()
 
-        global_expert = (
-            self._router_linear_cta_idx * Int32(self.router_warps_per_cta) + self._router_warp_idx
+        sizes_by_rank = self._device_workspace.tensor(self.sizes_by_rank_region)
+        cta_expert_begin = self._router_linear_cta_idx * Int32(self.router_warps_per_cta)
+
+        # Flatten ceil(route_count / 256) chunks for every expert owned by this
+        # PUSH CTA. All 16 warps consume that queue with a warp-strided schedule;
+        # empty experts contribute no work and the final interval is truncated.
+        cta_chunk_count = Int32(0)
+        for expert_offset in cutlass.range_constexpr(self.router_warps_per_cta):
+            count_global_expert = cta_expert_begin + Int32(expert_offset)
+            if count_global_expert < Int32(self.expert_count):
+                count_route_count = sizes_by_rank[self._router_local_rank, count_global_expert]
+                cta_chunk_count = cta_chunk_count + (
+                    count_route_count + Int32(self.all_expert_push_chunk_routes - 1)
+                ) // Int32(self.all_expert_push_chunk_routes)
+
+        queue_round_count = (cta_chunk_count + Int32(self.router_warps_per_cta - 1)) // Int32(
+            self.router_warps_per_cta
         )
-        if global_expert < Int32(self.expert_count):
-            sizes_by_rank = self._device_workspace.tensor(self.sizes_by_rank_region)
-            source_expert_base = self._device_workspace.tensor(self.source_expert_base_region)
-            push_destination_base = self._device_workspace.tensor(self.push_destination_base_region)
-            route_count = sizes_by_rank[self._router_local_rank, global_expert]
-            source_begin = source_expert_base[global_expert]
-            destination_begin = push_destination_base[global_expert]
-            destination_rank = global_expert // Int32(self.experts_per_rank)
-            peer_offset = self._peer_rank_ptr_mapper.map(Int64(0), destination_rank, Int64(0))
-            source_metadata = self._device_workspace.ptr(self.sorted_metadata_region)
-            destination_metadata_address = (
-                self._device_workspace.ptr(self.token_src_metadata_region).toint() + peer_offset
-            )
-            if cutlass.const_expr(self.apply_topk_at_fc1):
-                source_scores = self._device_workspace.ptr(self.sorted_scores_region)
-                destination_scores_address = (
-                    self._device_workspace.ptr(self.fc1_topk_scores_region).toint() + peer_offset
-                )
-            route_round_count = (route_count + Int32(31)) // Int32(32)
-            for route_round in cutlass.range(route_round_count, unroll=1):
-                route = Int32(route_round) * Int32(32) + self._router_lane_idx
-                if route < route_count:
-                    source_position = source_begin + route
-                    destination_position = destination_begin + route
-                    metadata = cute.arch.load(source_metadata + source_position, cutlass.Int64)
-                    stg_b64(
-                        destination_metadata_address
-                        + Int64(destination_position) * Int64(TokenSrcMetadata.nbytes),
-                        metadata,
-                    )
-                    if cutlass.const_expr(self.apply_topk_at_fc1):
-                        score = cute.arch.load(source_scores + source_position, cutlass.Float32)
-                        stg_f32(
-                            destination_scores_address + Int64(destination_position) * Int64(4),
-                            score,
-                        )
+        for queue_round in cutlass.range(queue_round_count, unroll=1):
+            chunk_id = self._router_warp_idx + Int32(queue_round) * Int32(self.router_warps_per_cta)
+            if chunk_id < cta_chunk_count:
+                chunk_prefix = Int32(0)
+                for expert_offset in cutlass.range_constexpr(self.router_warps_per_cta):
+                    global_expert = cta_expert_begin + Int32(expert_offset)
+                    if global_expert < Int32(self.expert_count):
+                        route_count = sizes_by_rank[self._router_local_rank, global_expert]
+                        expert_chunk_count = (
+                            route_count + Int32(self.all_expert_push_chunk_routes - 1)
+                        ) // Int32(self.all_expert_push_chunk_routes)
+                        next_chunk_prefix = chunk_prefix + expert_chunk_count
+                        if chunk_id >= chunk_prefix:
+                            if chunk_id < next_chunk_prefix:
+                                expert_chunk_id = chunk_id - chunk_prefix
+                                route_begin = expert_chunk_id * Int32(
+                                    self.all_expert_push_chunk_routes
+                                )
+                                route_end = cutlass.min(
+                                    route_begin + Int32(self.all_expert_push_chunk_routes),
+                                    route_count,
+                                )
+                                self._router_push_metadata_interval(
+                                    global_expert, route_begin, route_end
+                                )
+                        chunk_prefix = next_chunk_prefix
 
         cute.arch.sync_threads()
         if self._router_thread_idx == Int32(0):
@@ -1328,6 +1376,7 @@ class TokenCommNonDeterministic(KernelComponent):
             "token_in_flag_batch": int,
             "token_back_mode": str,
             "token_back_schedule_mode": str,
+            "token_back_ready_granularity": OptionalRequirement(str),
             "reduce_topk_in_kernel": bool,
             "router_smem_limit_bytes": OptionalRequirement(int),
         }
@@ -1352,6 +1401,7 @@ class TokenCommNonDeterministic(KernelComponent):
         self.token_in_flag_batch = impl_desc["token_in_flag_batch"]
         self.token_back_mode: TokenBackMode = impl_desc["token_back_mode"]
         self.token_back_schedule_mode: TokenBackScheduleMode = impl_desc["token_back_schedule_mode"]
+        self.token_back_ready_granularity = impl_desc.get("token_back_ready_granularity", "expert")
         self.reduce_topk_in_kernel = impl_desc["reduce_topk_in_kernel"]
         self.router_smem_limit_bytes = impl_desc.get("router_smem_limit_bytes", 227 * 1024)
 
@@ -1399,6 +1449,17 @@ class TokenCommNonDeterministic(KernelComponent):
         if self.token_back_schedule_mode not in ("static", "atomic_counter"):
             raise ValueError(
                 f"token_back_schedule_mode must be static or atomic_counter, got {self.token_back_schedule_mode!r}."
+            )
+        if self.token_back_ready_granularity not in ("expert", "token_tile"):
+            raise ValueError(
+                f"Unsupported token_back_ready_granularity {self.token_back_ready_granularity!r}."
+            )
+        if self.token_back_ready_granularity == "token_tile" and (
+            self.token_back_mode not in ("standalone_warps", "reuse_dispatch_warps")
+            or self.token_back_schedule_mode != "atomic_counter"
+        ):
+            raise ValueError(
+                "token_tile return-ready requires standalone_warps or reuse_dispatch_warps with atomic_counter."
             )
         if not 1 <= self.token_in_flag_batch <= 32:
             raise ValueError(
@@ -1655,10 +1716,15 @@ class TokenCommNonDeterministic(KernelComponent):
         )
 
         if self.token_back_enabled:
+            fc2_done_slots = (
+                self.max_fc1_ready_slot_count
+                if self.token_back_ready_granularity == "token_tile"
+                else self.experts_per_rank
+            )
             workspace.register(
                 self.fc2_done_region,
                 cutlass.Int32,
-                (self.experts_per_rank,),
+                (fc2_done_slots,),
                 buffer_space="local",
                 reset="tail_reset",
             )
@@ -2229,27 +2295,46 @@ class TokenCommNonDeterministic(KernelComponent):
         next_dense_token = self.next_token(next_dense_token)
         expert_valid_begin = Int32(0)
         transfer_phase = Int32(0)
+        if cutlass.const_expr(self.token_back_ready_granularity == "token_tile"):
+            expert_ready_slot_begin = Int32(0)
+            last_ready_slot = Int32(-1)
 
         iket.range_push("token_back.work")
         local_expert = Int32(0)
         while local_expert < Int32(self.experts_per_rank):
             expert_token_count = owned_sizes[local_expert]
             expert_valid_end = expert_valid_begin + expert_token_count
-            if next_dense_token < expert_valid_end:
-                token_tile_count = (
-                    expert_token_count + Int32(self.tokens_per_fc1_ready_slot - 1)
-                ) // Int32(self.tokens_per_fc1_ready_slot)
-                completion_target = token_tile_count * Int32(self.fc2_done_signals_per_token_tile)
-                iket.range_push("token_back.wait_fc2")
-                while (
-                    cute.arch.load(fc2_done + local_expert, Int32, sem="acquire", scope="gpu")
-                    < completion_target
-                ):
-                    nanosleep(500)
-                iket.range_pop()
+            if cutlass.const_expr(self.token_back_ready_granularity == "expert"):
+                if next_dense_token < expert_valid_end:
+                    token_tile_count = (
+                        expert_token_count + Int32(self.tokens_per_fc1_ready_slot - 1)
+                    ) // Int32(self.tokens_per_fc1_ready_slot)
+                    completion_target = token_tile_count * Int32(
+                        self.fc2_done_signals_per_token_tile
+                    )
+                    iket.range_push("token_back.wait_fc2")
+                    while (
+                        cute.arch.load(fc2_done + local_expert, Int32, sem="acquire", scope="gpu")
+                        < completion_target
+                    ):
+                        nanosleep(500)
+                    iket.range_pop()
 
             while next_dense_token < expert_valid_end:
                 token_in_expert = next_dense_token - expert_valid_begin
+                if cutlass.const_expr(self.token_back_ready_granularity == "token_tile"):
+                    # Same rank-local expert/tile prefix as FC1 ready; separate counter storage.
+                    ready_slot = expert_ready_slot_begin + token_in_expert // Int32(
+                        self.tokens_per_fc1_ready_slot
+                    )
+                    if ready_slot != last_ready_slot:
+                        iket.range_push("token_back.wait_fc2")
+                        while cute.arch.load(
+                            fc2_done + ready_slot, Int32, sem="acquire", scope="gpu"
+                        ) < Int32(self.fc2_done_signals_per_token_tile):
+                            nanosleep(500)
+                        iket.range_pop()
+                        last_ready_slot = ready_slot
                 pool_token_idx = pool_expert_bases[local_expert] + token_in_expert
                 metadata = TokenSrcMetadata.load(
                     token_metadata_pointer.toint()
@@ -2433,6 +2518,11 @@ class TokenCommNonDeterministic(KernelComponent):
                 cute.arch.sync_warp()
                 next_dense_token = self.next_token(next_dense_token)
 
+            if cutlass.const_expr(self.token_back_ready_granularity == "token_tile"):
+                # Advance even when this worker skipped the expert (empty experts contribute zero).
+                expert_ready_slot_begin = expert_ready_slot_begin + (
+                    expert_token_count + Int32(self.tokens_per_fc1_ready_slot - 1)
+                ) // Int32(self.tokens_per_fc1_ready_slot)
             expert_valid_begin = expert_valid_end
             local_expert = local_expert + Int32(1)
         iket.range_pop()
