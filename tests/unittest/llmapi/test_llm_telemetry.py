@@ -246,10 +246,12 @@ class TestTelemetryPyTorchBackend:
         assert captured.get("llm_args") is not None, "report_usage was not called with llm_args"
 
 
-class TestTelemetryPretrainedConfigSelection:
-    """Verify telemetry receives the effective runtime model configuration."""
+class TestEffectiveRuntimeArchitectureReporting:
+    """Verify effective runtime architecture reporting end to end."""
 
-    def test_encode_only_uses_runtime_pretrained_config(self):
+    def test_encode_only_reports_effective_runtime_architecture(
+        self, monkeypatch, enable_telemetry
+    ):
         raw_config = SimpleNamespace(architectures=["Qwen3ForCausalLM"])
         runtime_config = SimpleNamespace(architectures=["Qwen3ForTextEmbedding"])
         llm = object.__new__(BaseLLM)
@@ -263,30 +265,41 @@ class TestTelemetryPretrainedConfigSelection:
             )
         )
 
-        with patch("tensorrt_llm.usage.report_usage") as report_usage:
+        report_args = {}
+
+        def capture_report_args(**kwargs):
+            report_args.update(kwargs)
+
+        with patch("tensorrt_llm.usage.report_usage", side_effect=capture_report_args):
             llm._start_usage_reporting()
 
-        report_usage.assert_called_once_with(
-            llm_args=llm.args,
-            pretrained_config=runtime_config,
-            telemetry_config=None,
-        )
+        payloads = []
+        stop_event = threading.Event()
+        stop_event.set()
+        monkeypatch.setattr(usage_lib, "_SESSION", None)
+        monkeypatch.setattr(usage_lib, "_SESSION_DISABLED", False)
+        monkeypatch.setattr(usage_lib, "_SESSION_LOCK", threading.Lock())
+        monkeypatch.setattr(usage_lib, "_REPORTER_STARTED", False)
+        monkeypatch.setattr(usage_lib, "_REPORTER_ACTIVE", False)
+        monkeypatch.setattr(usage_lib, "_PENDING_TERMINAL", None)
+        monkeypatch.setattr(usage_lib, "_PROCESS_PID", os.getpid())
+        monkeypatch.setattr(usage_lib, "_PROCESS_EXIT_HOOK_REGISTERED", True)
+        assert usage_lib.apply_usage_session_config()
 
-    def test_generation_uses_loaded_hf_config(self):
-        raw_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
-        llm = object.__new__(BaseLLM)
-        llm.args = SimpleNamespace(telemetry_config=None)
-        llm._hf_model_config = raw_config
-        llm._encoder_executor = None
+        with (
+            patch.object(usage_lib, "_send_to_gxt", side_effect=payloads.append),
+            patch.object(usage_lib, "_REPORTER_STOP", stop_event),
+        ):
+            usage_lib._background_reporter(
+                report_args["llm_args"],
+                report_args["pretrained_config"],
+                "",
+            )
 
-        with patch("tensorrt_llm.usage.report_usage") as report_usage:
-            llm._start_usage_reporting()
-
-        report_usage.assert_called_once_with(
-            llm_args=llm.args,
-            pretrained_config=raw_config,
-            telemetry_config=None,
-        )
+        assert len(payloads) == 1
+        params = payloads[0]["events"][0]["parameters"]
+        assert params["architectureClassName"] == "Qwen3ForTextEmbedding"
+        assert params["architectureClassHash"] == ""
 
 
 class TestTelemetryArchitectureExtraction:

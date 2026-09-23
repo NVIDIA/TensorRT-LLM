@@ -198,12 +198,11 @@ class TestModelInfo:
         assert "num_attention_heads" not in fields
         assert "model_type" not in fields
 
-    @pytest.mark.parametrize("architecture", ["LlamaForCausalLM", "Qwen3ForTextEmbedding"])
-    def test_public_architecture_is_reported_by_name(self, architecture: str) -> None:
+    def test_public_architecture_is_reported_by_name(self) -> None:
         """Allowlisted public names use plaintext and no hash."""
         mock = MagicMock(spec=[])
-        mock.architectures = [architecture]
-        assert usage_lib._architecture_telemetry_fields(mock) == (architecture, "")
+        mock.architectures = ["LlamaForCausalLM"]
+        assert usage_lib._architecture_telemetry_fields(mock) == ("LlamaForCausalLM", "")
 
     def test_unknown_architecture_is_hashed(self) -> None:
         """Unknown names use a stable domain-separated SHA-256 digest."""

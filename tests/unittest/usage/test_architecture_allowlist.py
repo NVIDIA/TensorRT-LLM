@@ -28,8 +28,3 @@ def test_allowlist_entries_are_well_formed() -> None:
         name.isidentifier() and name.strip() == name and len(name) <= 256
         for name in PUBLIC_MODEL_ARCHITECTURES
     )
-
-
-def test_public_runtime_architecture_is_allowlisted() -> None:
-    """A documented TRT-LLM runtime architecture may be sent in plaintext."""
-    assert "Qwen3ForTextEmbedding" in PUBLIC_MODEL_ARCHITECTURES
