@@ -600,12 +600,13 @@ def _init_pool_data(managers, tp, is_mla, use_v2, fill_random=True, seed_base=10
 # Add sequence to manager
 # ---------------------------------------------------------------------------
 def _make_gen_request(
-    gen_rid, req_len, unique_rid, ctx_rid, ctx_dp_rank, ctx_info_endpoint, sampling_params
+    gen_rid, req_len, unique_rid, ctx_dp_rank, ctx_info_endpoint, sampling_params
 ):
     """Build one GENERATION_ONLY request wired to its context peer.
 
     Used to mint a distinct request per helix CP rank (each needs its own
-    rank-local prompt_len); mirrors the inline construction in run_transfer_test.
+    rank-local prompt_len); mirrors the inline construction in run_transfer_test,
+    including ctx_request_id carrying the key the ctx TxSession registered under.
     """
     req = LlmRequest(
         request_id=gen_rid,
@@ -618,7 +619,7 @@ def _make_gen_request(
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
     )
     req.py_disaggregated_params = DisaggregatedParams(
-        ctx_request_id=ctx_rid,
+        ctx_request_id=unique_rid,
         ctx_dp_rank=ctx_dp_rank,
         ctx_info_endpoint=ctx_info_endpoint,
         disagg_request_id=unique_rid,
@@ -1354,7 +1355,7 @@ def run_transfer_test(
                 llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
             )
             gen_request.py_disaggregated_params = DisaggregatedParams(
-                ctx_request_id=ctx_rid,
+                ctx_request_id=unique_rid,
                 ctx_dp_rank=ctx_dp_rank,
                 ctx_info_endpoint=ctx_info_endpoint,
                 disagg_request_id=unique_rid,
@@ -1389,7 +1390,6 @@ def run_transfer_test(
                         gen_rid,
                         req_len,
                         unique_rid,
-                        ctx_rid,
                         ctx_dp_rank,
                         ctx_info_endpoint,
                         sampling_params,
