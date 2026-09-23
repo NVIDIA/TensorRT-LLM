@@ -27,17 +27,20 @@ class UnusedChatTemplateKwargsError(ValueError):
 # Renderer parameters and standard context overrides retain their existing
 # behavior. Only additional template controls are checked.
 #
-# `enable_thinking` and `thinking` are not template-only controls: the
-# reasoning parsers read them from chat_template_kwargs after generation
-# (llmapi/reasoning_parser.py, serve/postprocess_handlers.py) to decide how
-# to split reasoning from the visible answer, and the servers set them from
-# API-level fields (Responses `reasoning.effort`, Anthropic `thinking`). A
-# template that never reads them still leaves them with a consumer, so they
-# are accepted everywhere.
+# `enable_thinking`, `thinking` and `force_nonempty_content` are not
+# template-only controls: the reasoning parsers read them from
+# chat_template_kwargs after generation (llmapi/reasoning_parser.py,
+# serve/postprocess_handlers.py) to decide how to split reasoning from the
+# visible answer, and the servers set `enable_thinking`/`thinking` from
+# API-level fields (Responses `reasoning.effort`, Anthropic `thinking`).
+# `force_nonempty_content` is consumed by NemotronV3ReasoningParser
+# independently of the template. A template that never reads them still
+# leaves them with a consumer, so they are accepted everywhere.
 ALWAYS_ALLOWED_CHAT_TEMPLATE_KWARGS = frozenset(
     {
         "enable_thinking",
         "thinking",
+        "force_nonempty_content",
         "messages",
         "tools",
         "documents",
