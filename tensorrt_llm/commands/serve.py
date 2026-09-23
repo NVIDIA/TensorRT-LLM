@@ -19,7 +19,7 @@ from importlib.util import find_spec
 from pathlib import Path
 from types import FrameType
 from typing import (TYPE_CHECKING, Any, Dict, NamedTuple, NoReturn, Optional,
-                    Sequence, Set)
+                    Sequence, Set, Tuple)
 
 import click
 import torch
@@ -52,6 +52,8 @@ from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
+from tensorrt_llm.serve.multi_frontend import (LAUNCHER_UDS_NAME,
+                                               MultiFrontendServing)
 from tensorrt_llm.serve.tool_parser import ToolParserFactory
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
     MODEL_TYPE_TO_TOOL_PARSER, resolve_auto_tool_parser)
@@ -490,7 +492,68 @@ def _init_multi_frontend_mode(llm_args: dict,
     return mode
 
 
-def _spawn_attached_frontends(llm, num_frontends: int) -> list:
+def _attached_launcher_uds(multi_frontend: MultiFrontendMode) -> Optional[str]:
+    """The launcher's Unix socket path handed to this attached frontend.
+
+    Only the path is read; the attach env var itself (which also carries the
+    executor HMAC keys) is consumed and deleted by GenerationExecutor.create.
+    """
+    if not multi_frontend.is_attached_frontend:
+        return None
+    attach_env = os.getenv("TLLM_EXECUTOR_ATTACH_INFO")
+    if not attach_env:
+        return None
+    return json.loads(attach_env).get("launcher_uds")
+
+
+def _bind_launcher_uds(llm) -> Tuple[socket.socket, str]:
+    """Bind the launcher's Unix socket inside the multi-frontend ipc dir.
+
+    uvicorn serves it next to the TCP socket, so attached frontends can
+    forward launcher-owned routes (/metrics, /kv_cache_events, profiling,
+    message batches) to the one process that owns the engine. The ipc dir
+    is private to the launcher's user and removed by the executor proxy.
+    """
+    ipc_dir = getattr(getattr(llm, "_executor", None),
+                      "_multi_frontend_ipc_dir", None)
+    if not ipc_dir:
+        raise ValueError(
+            "num_serve_frontends > 1 requires the classic IPC executor "
+            "proxy in multi-frontend mode")
+    path = os.path.join(ipc_dir, LAUNCHER_UDS_NAME)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(path)
+    return sock, path
+
+
+def _share_prometheus_multiproc_dir(llm, ipc_dir: str) -> None:
+    """Give every frontend one PROMETHEUS_MULTIPROC_DIR before spawning.
+
+    prometheus_client's multiprocess mode aggregates the .db files under
+    that directory. Left to OpenAIServer, each process would create its own
+    after the children already exist, and every /prometheus/metrics scrape
+    would report a single frontend's share of the request counters.
+
+    The directory lives inside the multi-frontend ipc dir, which the
+    executor proxy removes at shutdown. It is deliberately not created via
+    set_prometheus_multiproc_dir(): that helper keeps only its most recent
+    TemporaryDirectory alive, so its second call (OpenAIServer.__init__)
+    would garbage-collect, and thereby delete, a shared directory created
+    by the first while every process still writes into it.
+    """
+    args = getattr(llm, "args", None)
+    if args is None or os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+        return
+    if (getattr(args, "return_perf_metrics", False)
+            or getattr(args, "perf_metrics_output_dir", None)):
+        path = tempfile.mkdtemp(prefix="prometheus_", dir=ipc_dir)
+        os.environ["PROMETHEUS_MULTIPROC_DIR"] = path
+        logger.info(
+            f"Shared PROMETHEUS_MULTIPROC_DIR for all frontends: {path}")
+
+
+def _spawn_attached_frontends(llm, num_frontends: int,
+                              launcher_uds: str) -> list:
     """Spawn num_frontends - 1 attached serving frontend processes.
 
     Each child re-execs this trtllm-serve command line with env vars
@@ -513,6 +576,9 @@ def _spawn_attached_frontends(llm, num_frontends: int) -> list:
         raise ValueError(
             "num_serve_frontends > 1 requires the classic IPC executor "
             f"proxy in multi-frontend mode, got {type(executor).__name__}")
+    # Where the launcher's uvicorn also listens; attached frontends forward
+    # launcher-owned routes there (see serve/multi_frontend.py).
+    attach_info["launcher_uds"] = launcher_uds
     # Carries the executor HMAC keys; the child deletes it from its env
     # once consumed (GenerationExecutor.create).
     attach_env = json.dumps(attach_info)
@@ -634,6 +700,8 @@ def launch_server(
     model = served_model_name or llm_args["model"]
 
     multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
+    # Read before the LLM consumes (and deletes) the attach env var.
+    attached_launcher_uds = _attached_launcher_uds(multi_frontend)
     # Same hazard the disaggregated fleet guard covers: _spawn_attached_frontends
     # re-execs this command line verbatim, so with port 0 every frontend binds
     # its own kernel-assigned port instead of sharing one, and every frontend
@@ -711,10 +779,24 @@ def launch_server(
         # server construction, middleware registration, and runtime, or a
         # failure in between leaks the child processes.
         frontend_children = []
+        sockets = [s]
+        launcher_uds_sock = None
+        multi_frontend_serving = None
+        if attached_launcher_uds is not None:
+            multi_frontend_serving = MultiFrontendServing(
+                launcher_uds=attached_launcher_uds,
+                is_launcher=False,
+                launcher_pid=os.getppid())
         try:
             if multi_frontend.is_launcher:
+                launcher_uds_sock, launcher_uds = _bind_launcher_uds(llm)
+                _share_prometheus_multiproc_dir(llm,
+                                                os.path.dirname(launcher_uds))
                 frontend_children = _spawn_attached_frontends(
-                    llm, multi_frontend.num_frontends)
+                    llm, multi_frontend.num_frontends, launcher_uds)
+                multi_frontend_serving = MultiFrontendServing(
+                    launcher_uds=launcher_uds, is_launcher=True)
+                sockets.append(launcher_uds_sock)
 
             server = OpenAIServer(
                 generator=llm,
@@ -728,7 +810,8 @@ def launch_server(
                 allow_request_chat_template=allow_request_chat_template,
                 input_processor_workers=num_input_processor_workers,
                 media_load_workers=num_media_load_workers,
-                internal_disagg_auth_key=internal_disagg_auth_key)
+                internal_disagg_auth_key=internal_disagg_auth_key,
+                multi_frontend_serving=multi_frontend_serving)
             _apply_fastapi_middlewares(server.app, middleware)
 
             # Optionally disable GC (default: not disabled)
@@ -736,10 +819,16 @@ def launch_server(
                 gc.disable()
 
             _signal_frontend_ready(multi_frontend)
-            uvloop.run(server(host, port, sockets=[s]))
+            uvloop.run(server(host, port, sockets=sockets))
         finally:
             if frontend_children:
                 _terminate_attached_frontends(frontend_children)
+            if launcher_uds_sock is not None:
+                launcher_uds_sock.close()
+                try:
+                    os.unlink(launcher_uds_sock.getsockname())
+                except OSError:
+                    pass
 
 
 def launch_mm_encoder_server(
