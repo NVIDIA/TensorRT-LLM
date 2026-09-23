@@ -4252,6 +4252,7 @@ def run(
     is_var_q: bool,
     query_lens: Optional[Tuple[int, ...]],
     emit_softmax_stats: bool,
+    kv_bounds: Optional[Tuple[int, ...]],
 ):
     """Execute Multi-Head Latent Attention (MLA) on Blackwell architecture and validate results.
 
@@ -4313,6 +4314,7 @@ def run(
     :param is_var_q: Whether to use compact variable-length query storage
     :param query_lens: Required when is_var_q is True; otherwise must be None
     :param emit_softmax_stats: Whether to emit Helix softmax statistics
+    :param kv_bounds: Optional flattened per-query local KV bounds
 
     :raises ValueError: If input shapes are incompatible or head dimension is unsupported
     :raises RuntimeError: If GPU is unavailable for computation
@@ -4601,6 +4603,23 @@ def run(
 
     cache_seqs_ref, cache_seqs, cache_seqs_torch = create_cache_seqs(
         batch_size, seq_len_k, is_var_seq)
+    kv_bounds_ref, kv_bounds_torch, kv_bounds_ct = None, None, None
+    if kv_bounds is not None:
+        total_q = sum(query_lens) if is_var_q else batch_size * seq_len_q
+        if len(kv_bounds) != total_q:
+            raise ValueError("kv_bounds must contain one entry per query token")
+        kv_bounds_ref = torch.tensor(kv_bounds, dtype=torch.int32)
+        q_offset = 0
+        for b in range(batch_size):
+            q_len = query_lens[b] if is_var_q else seq_len_q
+            bounds = kv_bounds_ref[q_offset:q_offset + q_len]
+            k_len = int(cache_seqs_ref[b])
+            if ((bounds < max(0, k_len - q_len)) | (bounds > k_len)).any():
+                raise ValueError("kv_bounds must lie within [max(0, K-Q), K]")
+            q_offset += q_len
+        kv_bounds_torch = kv_bounds_ref.cuda()
+        kv_bounds_ct = from_dlpack(kv_bounds_torch,
+                                   assumed_align=4).mark_layout_dynamic()
     page_table_ref, page_table, page_table_torch = create_page_table(
         batch_size, seq_len_k, is_var_seq, page_size)
     cluster_shape_mnk = (2, 1, 1)
@@ -4741,7 +4760,7 @@ def run(
         workspace,
         split_kv,
         cache_seqs,
-        None,  # kv_bounds: helix-only, not exercised here
+        kv_bounds_ct,
         cum_seq_lens_q,
         block_split_kvs,
         softmax_scale,
@@ -4777,6 +4796,9 @@ def run(
                 -1, latent_dim)[:k_len]
             queries = q_ref[b, :q_len]
             upper = k_len - q_len + 1 + torch.arange(q_len)
+            if kv_bounds_ref is not None:
+                q_offset = sum(query_lens[:b]) if is_var_q else b * seq_len_q
+                upper = kv_bounds_ref[q_offset:q_offset + q_len]
             valid = torch.arange(k_len)[None, None, :] < upper[:, None, None]
             output = F.scaled_dot_product_attention(queries,
                                                     keys.unsqueeze(0),
@@ -4787,6 +4809,9 @@ def run(
             s_ref = queries @ keys.t()
             s_ref = s_ref.masked_fill(~valid, float("-inf"))
             s_ref_max, _ = torch.max(s_ref, dim=-1, keepdim=True)
+            if kv_bounds_ref is not None:
+                s_ref_max = torch.where(upper[:, None, None] > 0, s_ref_max,
+                                        0.0)
             softmax_scale_log2 = LOG2_E * softmax_scale
             s_ref_sum = torch.sum(torch.exp2(
                 (s_ref - s_ref_max) * softmax_scale_log2),
@@ -4827,7 +4852,7 @@ def run(
             workspace,
             split_kv,
             cache_seqs,
-            None,  # kv_bounds: helix-only, not exercised here
+            kv_bounds_ct,
             cum_seq_lens_q,
             block_split_kvs,
             softmax_scale,
@@ -4881,6 +4906,18 @@ def run(
             o = o_torch.cpu().to(torch.float32)
         lse = lse_torch.cpu()
         lse_ref = lse_ref.to(cutlass.torch.dtype(lse_dtype))
+        if kv_bounds_ref is not None:
+            # Match Helix's per-token sanitizer; empty-row raw O/LSE are undefined.
+            empty = kv_bounds_ref == 0
+            if is_var_q:
+                empty_lse = empty.unsqueeze(0).expand_as(lse_ref)
+                empty_o = empty.view(1, 1, -1)
+            else:
+                empty = empty.view(batch_size, seq_len_q).t()
+                empty_lse = empty.unsqueeze(0).expand_as(lse_ref)
+                empty_o = empty.view(1, 1, seq_len_q, batch_size)
+            o = o.masked_fill(empty_o, 0.0)
+            lse = lse.masked_fill(empty_lse, float("-inf"))
         # Assert close results
         torch.testing.assert_close(o, o_ref, atol=tolerance, rtol=1e-05)
         torch.testing.assert_close(lse, lse_ref, atol=tolerance, rtol=1e-05)
@@ -4893,8 +4930,16 @@ def run(
                                        rtol=1e-5)
         print("Results verified successfully!")
 
+    if iterations == 0:
+        return
+
     def generate_tensors():
-        _, cache_seqs, _ = create_cache_seqs(batch_size, seq_len_k, is_var_seq)
+        if kv_bounds is not None:
+            cache_seqs = from_dlpack(cache_seqs_torch.clone(),
+                                     assumed_align=16).mark_layout_dynamic()
+        else:
+            _, cache_seqs, _ = create_cache_seqs(batch_size, seq_len_k,
+                                                 is_var_seq)
         _, page_table, _ = create_page_table(batch_size, seq_len_k, is_var_seq,
                                              page_size)
         _split_kv, _, block_split_kvs, _ = create_block_split_kvs(
@@ -4975,7 +5020,7 @@ def run(
             workspace,
             _split_kv,
             cache_seqs,
-            None,  # kv_bounds: helix-only, not exercised here
+            kv_bounds_ct,
             cum_seq_lens_q,
             block_split_kvs,
             softmax_scale,
@@ -5041,6 +5086,10 @@ if __name__ == "__main__":
         default=None,
         help="Per-request query lengths; required with --is_var_q")
     parser.add_argument("--emit_softmax_stats", action="store_true")
+    parser.add_argument("--kv_bounds",
+                        type=parse_comma_separated_ints,
+                        default=None,
+                        help="Comma-separated per-query local KV bounds")
 
     parser.add_argument(
         "--in_dtype",
@@ -5239,6 +5288,7 @@ if __name__ == "__main__":
         args.is_var_q,
         args.query_lens,
         args.emit_softmax_stats,
+        args.kv_bounds,
     )
 
     print("PASS")
