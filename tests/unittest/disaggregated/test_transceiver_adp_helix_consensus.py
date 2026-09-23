@@ -141,7 +141,7 @@ def test_adp_with_pp_only_syncs_across_pp_group() -> None:
 def test_adp_gen_consensus_outcome_retires_cancellation_only_when_every_cp_rank_drained() -> None:
     """A cancelled request retires only once both CP ranks report their resources drained."""
 
-    def run(local_drained: bool):
+    def run(local_drained: bool, local_cancelled: list[int]):
         session = SimpleNamespace(
             _enforce_physical_ownership=True,
             resources_drained=lambda: local_drained,
@@ -156,7 +156,19 @@ def test_adp_gen_consensus_outcome_retires_cancellation_only_when_every_cp_rank_
             _mapping(tp_size=2, cp_size=2, world_size=4, enable_attention_dp=True), dist
         )
         tc._recv_sessions = {9: session}
-        return tc._gen_consensus_outcome([9], [9], [], [])
+        return tc._gen_consensus_outcome([9], local_cancelled, [], [])
 
-    assert run(local_drained=False) == ([], [], [])
-    assert run(local_drained=True) == ([9], [], [])
+    assert run(local_drained=False, local_cancelled=[9]) == ([], [], [])
+    assert run(local_drained=True, local_cancelled=[9]) == ([9], [], [])
+    # A cancellation observed only on the CP peer still reaches this rank, which
+    # proves the outcome went through the CP gather rather than local state.
+    assert run(local_drained=True, local_cancelled=[]) == ([9], [], [])
+
+
+def test_kv_size_rank_factor_scales_by_helix_cp_under_adp() -> None:
+    """kv_cache_size scales local shard bytes by cp_size under attention-DP, tp*cp otherwise."""
+    factor = KvCacheTransceiverV2._kv_size_rank_factor_for
+    assert factor(_mapping(tp_size=2, cp_size=1, enable_attention_dp=True)) == 1
+    assert factor(_mapping(tp_size=2, cp_size=2, enable_attention_dp=True)) == 2
+    assert factor(_mapping(tp_size=2, cp_size=2, enable_attention_dp=False)) == 4
+    assert factor(_mapping(tp_size=1, cp_size=1, enable_attention_dp=False)) == 1
