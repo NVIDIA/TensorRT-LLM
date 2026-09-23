@@ -22,7 +22,7 @@ def test_pixtral_sm100_attention(dtype: torch.dtype, monkeypatch: pytest.MonkeyP
         pytest.skip("Exercises the SM100-family Pixtral FMHA dispatcher")
     # Exercise thop's dispatcher regardless of optional library configuration.
     monkeypatch.setenv("TLLM_FMHA_LIBS", "fallback")
-    torch.manual_seed(6665906)
+    generator = torch.Generator(device="cuda").manual_seed(6665906)
     lengths = [2048, 32]
     num_heads, head_dim = 4, 104
     metadata = TrtllmAttentionMetadata(
@@ -38,7 +38,9 @@ def test_pixtral_sm100_attention(dtype: torch.dtype, monkeypatch: pytest.MonkeyP
         layer_idx=0, num_heads=num_heads, num_kv_heads=num_heads, head_dim=head_dim
     )
     q, k, v = [
-        torch.randn(sum(lengths), num_heads * head_dim, device="cuda", dtype=dtype)
+        torch.randn(
+            sum(lengths), num_heads * head_dim, device="cuda", dtype=dtype, generator=generator
+        )
         for _ in range(3)
     ]
     output = attention.forward(

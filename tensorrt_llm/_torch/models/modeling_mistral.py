@@ -325,7 +325,11 @@ class MistralCommonImageProcessor:
             Image.new("RGB", (w, h)))
         return ncols * nrows + nrows
 
-    def __call__(self, text, images=None, **kwargs):
+    def __call__(self,
+                 text: str,
+                 images: list[Image.Image] | None = None,
+                 **kwargs: Any) -> dict[str, torch.Tensor]:
+        """Tokenize a native request and batch images without losing their sizes."""
         mm_items = [{
             "type": "image",
             "base64": encode_base64_image(image)
@@ -340,21 +344,27 @@ class MistralCommonImageProcessor:
         }]
 
         encoded = self.tokenizer.transformers_tokenizer.apply_chat_template(
-            conversation, tokenize=True, return_dict=True, return_tensors='pt')
+            conversation, tokenize=True, return_dict=True, return_tensors=None)
 
         processed = {
-            "input_ids": encoded.input_ids,
+            "input_ids": torch.tensor([encoded.input_ids]),
         }
 
         # text-only mode for VLM
         if "pixel_values" in encoded:
+            # Native images may have different shapes. Preserve their unpadded
+            # sizes for item scheduling and the vision encoder's patch slicing.
+            pixel_values, image_sizes = Mistral3VLM.batch_pixel_values([
+                torch.as_tensor(image, dtype=self.dtype).unsqueeze(0)
+                for image in encoded.pixel_values
+            ], [torch.tensor([size]) for size in encoded.image_sizes])
             processed.update({
                 "pixel_values":
-                encoded.pixel_values.to(self.dtype),
+                pixel_values,
                 "attention_mask":
-                encoded.attention_mask,
+                torch.tensor([encoded.attention_mask]),
                 "image_sizes":
-                torch.tensor([encoded.pixel_values.shape[2:]])
+                image_sizes,
             })
         return processed
 

@@ -766,6 +766,72 @@ def test_mistral_item_metadata_separates_patch_and_embedding_units():
     assert metadata.output_embedding_lengths == [2, 4]
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sizes", [[[28, 56]], [[28, 56], [28, 56]], [[28, 56], [56, 56]]])
+def test_native_processed_images_preserve_item_sizes(sizes: list[list[int]]) -> None:
+    """Keep unpadded per-image geometry through native processing and scheduling."""
+    proc = _make_dummy_processor(processor_cls=MistralNativeInputProcessor)
+    pixels = [
+        torch.full((3, height, width), float(i + 1)) for i, (height, width) in enumerate(sizes)
+    ]
+    encoded = transformers.BatchEncoding(
+        {
+            "input_ids": [1, 2, 3],
+            "attention_mask": [1, 1, 1],
+            "pixel_values": [pixel.numpy() for pixel in pixels],
+            "image_sizes": sizes,
+        }
+    )
+    tokenizer = SimpleNamespace(
+        transformers_tokenizer=mock.Mock(),
+        instruct=SimpleNamespace(
+            mm_encoder=mock.Mock(
+                spec=modeling_mistral.ImageEncoder,
+                mm_config=SimpleNamespace(image_patch_size=14, max_image_size=1540),
+            )
+        ),
+    )
+
+    def apply_chat_template(
+        *args: Any, return_tensors: str | None, **kwargs: Any
+    ) -> transformers.BatchEncoding:
+        if return_tensors == "pt":
+            return transformers.BatchEncoding(
+                {
+                    "input_ids": torch.tensor([encoded.input_ids]),
+                    "attention_mask": torch.tensor([encoded.attention_mask]),
+                    "pixel_values": torch.stack(pixels),
+                    "image_sizes": torch.tensor(sizes),
+                }
+            )
+        return encoded
+
+    tokenizer.transformers_tokenizer.apply_chat_template.side_effect = apply_chat_template
+    proc._processor = modeling_mistral.MistralCommonImageProcessor(tokenizer, proc.dtype)
+    input_ids, extra = proc.call_with_text_prompt(
+        {
+            "prompt": "Describe these images.",
+            "multi_modal_data": {"image": [Image.new("RGB", (w, h)) for h, w in sizes]},
+        },
+        tensorrt_llm.SamplingParams(),
+    )
+
+    assert input_ids == [1, 2, 3]
+    image = extra["multimodal_data"]["image"]
+    assert image["image_sizes"] == sizes
+    assert image["pixel_values"].shape == (len(sizes), 3, max(h for h, _ in sizes), 56)
+    for i, ((height, width), pixel) in enumerate(zip(sizes, pixels)):
+        torch.testing.assert_close(
+            image["pixel_values"][i, :, :height, :width], pixel.to(proc.dtype)
+        )
+        assert torch.count_nonzero(image["pixel_values"][i, :, height:]) == 0
+    metadata = proc.get_mm_encoder_item_metadata(input_ids, extra["multimodal_data"])
+    metadata.validate()
+    assert metadata.item_refs == [("image", i) for i in range(len(sizes))]
+    assert metadata.encoder_token_lengths == [8 if h == 28 else 16 for h, _ in sizes]
+    assert metadata.output_embedding_lengths == [2 if h == 28 else 4 for h, _ in sizes]
+
+
 @pytest.mark.parametrize("budget", [1024, 4096, 8192])
 def test_dummy_get_size_for_max_tokens_fits_and_aligns(budget):
     proc = _make_dummy_processor()
