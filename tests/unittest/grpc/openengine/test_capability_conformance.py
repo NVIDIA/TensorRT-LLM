@@ -22,9 +22,7 @@ from typing import Any
 
 import pytest
 
-pytest.importorskip(
-    "grpc", reason='gRPC runtime not installed (pip install "tensorrt_llm[openengine]")'
-)
+pytest.importorskip("grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.67.1,<2")')
 
 import torch  # noqa: E402
 from conftest import AbortError, FakeServicerContext  # noqa: E402

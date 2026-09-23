@@ -1,11 +1,6 @@
 {
   "schema_revision": 1,
   "minimum_client_revision": 1,
-  "upstream": {
-    "repository": "https://github.com/ai-dynamo/openengine",
-    "tag": "v0.1.0",
-    "git_commit": "b5f2bd93721f7b888d3e2440679e0ae7012939d1"
-  },
   "bsr": {
     "module": "buf.build/openengine/openengine",
     "release": "768a93c7b44e40f28c692ad0b471a8f2"
@@ -21,15 +16,5 @@
   "runtime_floors": {
     "protobuf": "6.30.2",
     "grpcio": "1.67.1"
-  },
-  "files": {
-    "openengine/v1/error.proto": "b1c559a3b7847c55a247145f1493805b56b58491a320fb26e6ebcd7072b62fb3",
-    "openengine/v1/generation.proto": "3c4e9f11664d50dd26e393cb2b34dca9af680419097493d4f7ceb2654b0f1058",
-    "openengine/v1/kv.proto": "4f5c46a65a7998ecf34ea37117b325b0f0a5a70149702d6bca919726b40526cd",
-    "openengine/v1/lifecycle.proto": "0b39bbecc617db3de900333efe6c070dadca2f71f5e372c306d44973229d48c9",
-    "openengine/v1/lora.proto": "c1aa58fca3ab1b40f7c75dbbd17280b2b52ee295256479b6b0fc74f924047ef9",
-    "openengine/v1/model.proto": "5166cdcdaa260b1f5de2fa8d170dacbab1595af9413e73f09c6902b25f553284",
-    "openengine/v1/openengine.proto": "1d1baafee0aaf0dbf51962ae2d293431fbd3be96601b375288fab785fc2d8572",
-    "openengine/v1/server.proto": "deb379508d5e93c719cc0c5ebe222e66af7d8784384d3cc270e95d0b48274d96"
   }
 }

@@ -14,9 +14,10 @@ _MANIFEST = json.loads(
 _PROTOBUF_GENCODE = str(_MANIFEST["generator"]["protobuf_gencode"])
 _PROTOBUF_RUNTIME_MAJOR = int(str(_MANIFEST["runtime_floors"]["protobuf"]).split(".", 1)[0])
 
-# Protobuf 6 warns for supported Protobuf 5 gencode. The generator validates
-# this exact one-major pairing, and constraints.txt prevents a Protobuf 7
-# runtime, so suppress only the known compatibility warning for our schema.
+# Older Protobuf 6 runtimes near the requirements.txt floor warn for this
+# supported Protobuf 5 gencode pairing. Newer 6.x runtimes omit the warning,
+# making this version-specific filter a no-op there. Suppress only the known
+# compatibility warning for our schema; requirements.txt excludes Protobuf 7.
 with warnings.catch_warnings():
     warnings.filterwarnings(
         "ignore",

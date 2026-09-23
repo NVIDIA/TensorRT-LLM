@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import pytest
 
 grpc = pytest.importorskip(  # noqa: E402
-    "grpc", reason='gRPC runtime not installed (pip install "tensorrt_llm[openengine]")'
+    "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.67.1,<2")'
 )
 
 from tensorrt_llm.grpc.openengine.bindings import openengine_pb2_grpc, server_pb2  # noqa: E402

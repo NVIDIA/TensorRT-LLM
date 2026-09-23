@@ -11,6 +11,15 @@ vendors:
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
     patch_digest: sha256:ba917f330d8281781ce30ddb89f1772ee8f9017264d948b588b881a92f511e45
     digest: sha256-tree-v1:fa65b674a9ec6121b4158069d5585cc56df28243d1ac1199eb97003d81135d76
+  openengine-proto:
+    url: https://github.com/ai-dynamo/openengine.git
+    tag: v0.1.0
+    commit: b5f2bd93721f7b888d3e2440679e0ae7012939d1
+    source: proto/openengine/v1
+    destination: tensorrt_llm/grpc/openengine/proto/openengine/v1
+    include:
+    - '*.proto'
+    digest: sha256-tree-v1:54c95724673b50dee9f27ba72f98ed13b3009209f858f80e044ccd13974770f4
   sana-sol-attn:
     url: https://github.com/NVlabs/Sana.git
     branch: sol-engine

@@ -109,28 +109,6 @@ def _load_manifest(project_root: Path) -> tuple[Path, dict[str, object]]:
     schema_root = project_root / "tensorrt_llm/grpc/openengine/proto"
     manifest_path = schema_root / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    files = manifest.get("files")
-    if not isinstance(files, dict):
-        raise RuntimeError(f"{manifest_path} must contain a 'files' checksum map")
-    expected_files = {
-        *(f"{_PROTO_PACKAGE.as_posix()}/{name}.proto" for name in _PROTO_NAMES),
-    }
-    if set(files) != expected_files:
-        missing = sorted(expected_files - set(files))
-        unexpected = sorted(set(files) - expected_files)
-        raise RuntimeError(
-            f"Unexpected vendored source manifest; missing={missing}, unexpected={unexpected}"
-        )
-    for relative_path, expected_checksum in files.items():
-        if not isinstance(relative_path, str) or not isinstance(expected_checksum, str):
-            raise RuntimeError(f"{manifest_path} contains an invalid checksum entry")
-        source_path = schema_root / relative_path
-        actual_checksum = _sha256(source_path)
-        if actual_checksum != expected_checksum:
-            raise RuntimeError(
-                f"Vendored OpenEngine source checksum mismatch for {source_path}: "
-                f"expected {expected_checksum}, got {actual_checksum}"
-            )
     return schema_root, manifest
 
 

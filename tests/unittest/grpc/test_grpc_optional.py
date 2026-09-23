@@ -16,9 +16,9 @@
 
 These run correctly with or without the dependencies installed: the "missing" case is
 simulated so it is meaningful in every environment, and the "present" case is
-guarded with ``importorskip``. OpenEngine's generated bindings are bundled with
-TensorRT-LLM, while its gRPC runtime remains optional; the simulated case below
-checks the install hint without depending on the current environment.
+guarded with ``importorskip``. OpenEngine's generated bindings and gRPC runtime
+are base TensorRT-LLM dependencies; the simulated missing-runtime case below
+checks recovery guidance for an incomplete installation.
 """
 
 import asyncio
@@ -146,10 +146,9 @@ def test_openengine_server_missing_grpc_raises_import_error(
 
     ``trtllm-serve --grpc --grpc_protocol openengine`` wraps the import of
     ``tensorrt_llm.grpc.openengine.server`` in ``except ImportError`` to
-    re-raise it as a ClickException carrying the
-    ``pip install "tensorrt_llm[openengine]"`` hint. If the module ever fails
-    with something outside that hierarchy, the hint silently stops reaching
-    users, so pin the contract the handler depends on.
+    re-raise it as a ClickException carrying direct grpcio recovery guidance.
+    If the module ever fails with something outside that hierarchy, the hint
+    silently stops reaching users, so pin the contract the handler depends on.
     """
     real_import = builtins.__import__
 
@@ -177,7 +176,7 @@ def test_openengine_server_missing_grpc_raises_import_error(
 def test_serve_openengine_missing_grpc_shows_install_hint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The OpenEngine CLI path provides the optional-runtime installation hint."""
+    """The OpenEngine CLI path provides missing-runtime recovery guidance."""
     import tensorrt_llm.commands.serve as serve_module
 
     real_import = builtins.__import__
@@ -228,4 +227,4 @@ def test_serve_openengine_missing_grpc_shows_install_hint(
     )
 
     assert result.exit_code == 1
-    assert 'python -m pip install "tensorrt_llm[openengine]"' in result.output
+    assert 'python -m pip install "grpcio>=1.67.1,<2"' in result.output

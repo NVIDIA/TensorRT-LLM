@@ -154,7 +154,8 @@ devel_deps, _ = parse_requirements(
          if on_windows else "requirements-dev.txt"))
 mx_deps = ["modelexpress>=0.5.1,<0.6.0"]
 # OpenEngine's private schema bindings ship in this wheel and use the base
-# grpcio dependency. SMG still consumes its external generated package.
+# grpcio dependency; its empty extra remains an install-compatible feature
+# marker. SMG still consumes its external generated package.
 grpc_smg_deps, _ = parse_requirements(Path("requirements-grpc-smg.txt"))
 constraints_file = Path("constraints.txt")
 if constraints_file.exists():

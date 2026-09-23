@@ -64,7 +64,7 @@ non-loopback address.
 
 The schema source is the Apache-2.0-licensed [`ai-dynamo/openengine`](https://github.com/ai-dynamo/openengine) repository at signed Git tag [`v0.1.0`](https://github.com/ai-dynamo/openengine/releases/tag/v0.1.0), Git commit `b5f2bd93721f7b888d3e2440679e0ae7012939d1`. That release maps to the public [`buf.build/openengine/openengine`](https://buf.build/openengine/openengine) module at immutable BSR release `768a93c7b44e40f28c692ad0b471a8f2`.
 
-TensorRT-LLM vendors that immutable schema under `tensorrt_llm/grpc/openengine/proto/`. The adjacent `manifest.json` records the source mapping, generator versions, runtime floors, and per-file checksums. The deterministic private bindings under `tensorrt_llm.grpc.openengine._generated` are checked in so ordinary wheel and editable builds do not require a protocol compiler or network access.
+TensorRT-LLM vendors that immutable schema under `tensorrt_llm/grpc/openengine/proto/`. `3rdparty/vendor_sources.lock.yaml` pins the upstream commit and verifies that the schema files are exact upstream copies. The adjacent `manifest.json` records protocol metadata, generator versions, and runtime floors. The deterministic private bindings under `tensorrt_llm.grpc.openengine._generated` are checked in so ordinary wheel and editable builds do not require a protocol compiler or network access.
 
 When changing the schema, generator, or `requirements-build-openengine.txt`, regenerate and commit the bindings:
 
@@ -79,6 +79,8 @@ python scripts/generate_openengine_protos.py --check --tool-env-root build/opene
 ```
 
 The wheel ships these bindings only in TensorRT-LLM's private namespace; it does not provide or depend on a top-level `openengine` Python package. Its protobuf and `grpcio>=1.67.1,<2` runtime constraints are base TensorRT-LLM requirements.
+
+The private Python namespace does not change the protobuf descriptor names: generated modules still register `openengine/v1/*.proto` in the process-wide default descriptor pool. Importing another OpenEngine binding package in the same process is safe only when it registers identical schema bytes; a different schema revision can raise a duplicate-file `TypeError` during import.
 
 ## Maintenance boundary
 

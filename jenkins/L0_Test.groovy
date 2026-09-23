@@ -5115,9 +5115,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             }
             if (!skipInstallWheel) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
-                // Resolve the optional dependency sets through the installed
-                // artifact so wheel metadata participates in this check.
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install 'tensorrt_llm[grpc-smg,openengine]'")
             }
             if (stageName.contains("-ModelExpress-")) {
                 // The wheel goes in with --no-deps above, so its `mx` extra never

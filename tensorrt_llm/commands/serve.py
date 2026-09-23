@@ -1558,8 +1558,8 @@ def serve(
                 except ImportError as error:
                     raise click.ClickException(
                         f"Failed to import OpenEngine support: {error}. "
-                        "Install the optional gRPC runtime with `python -m pip "
-                        "install \"tensorrt_llm[openengine]\"`.") from error
+                        "Restore the required gRPC runtime with `python -m pip "
+                        "install \"grpcio>=1.67.1,<2\"`.") from error
 
                 launch_grpc_server(host,
                                    port,
