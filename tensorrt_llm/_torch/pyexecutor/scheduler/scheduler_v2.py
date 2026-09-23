@@ -15,6 +15,7 @@
 
 import enum
 import os
+from collections import Counter
 from typing import Callable, Optional
 
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
@@ -1511,6 +1512,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         generation requests at all.
         """
         if made_progress:
+            if self._stalled_schedules:
+                logger.debug(
+                    f"[V2Scheduler] Stall cleared after {self._stalled_schedules} pass(es); "
+                    "scheduling resumed."
+                )
             self._stalled_schedules = 0
             return
 
@@ -1528,6 +1534,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         )
         if num_gen_candidates == 0 and num_ctx_candidates == 0:
             # Legitimately idle: nothing to schedule.
+            if self._stalled_schedules:
+                logger.debug(
+                    f"[V2Scheduler] Stall cleared after {self._stalled_schedules} pass(es); "
+                    "no candidates remain."
+                )
             self._stalled_schedules = 0
             return
 
@@ -1547,11 +1558,30 @@ class KVCacheV2Scheduler(RequestScheduler):
             and self._async_transfer_manager.has_any_inflight_requests()
         )
         if transfer_holding:
+            if self._stalled_schedules:
+                logger.debug(
+                    f"[V2Scheduler] {num_gen_candidates} generation and "
+                    f"{num_ctx_candidates} context request(s) cannot allocate, but KV "
+                    "transfers in flight will release pages; stall cleared."
+                )
             self._stalled_schedules = 0
             return
 
         self._stalled_schedules += 1
         if self._stalled_schedules < self._DEADLOCK_STALL_ITERS:
+            # Warn as the stall builds so the raise is not a surprise. A quarter
+            # of the threshold keeps this to a handful of lines beforehand.
+            if self._stalled_schedules == 1:
+                logger.debug(
+                    "[V2Scheduler] Scheduling stall started: "
+                    f"{self._summarize_stall(active_requests, pending_ctx, inflight_request_ids, preempted_ids)}"
+                )
+            elif self._stalled_schedules % max(1, self._DEADLOCK_STALL_ITERS // 4) == 0:
+                logger.warning(
+                    f"[V2Scheduler] Stalled {self._stalled_schedules}/"
+                    f"{self._DEADLOCK_STALL_ITERS} consecutive passes: "
+                    f"{self._summarize_stall(active_requests, pending_ctx, inflight_request_ids, preempted_ids)}"
+                )
             return
 
         # A connector rejects every tier below GPU at bring-up
@@ -1570,12 +1600,58 @@ class KVCacheV2Scheduler(RequestScheduler):
                 "Configure kv_cache_config.host_cache_size, increase "
                 "kv_cache_config.max_tokens, or lower max_batch_size."
             )
+        # Logged before the raise so the diagnostic survives even if the
+        # exception is caught or truncated upstream.
+        logger.warning(
+            f"[V2Scheduler] Declaring deadlock after {self._stalled_schedules} passes: "
+            f"{self._summarize_stall(active_requests, pending_ctx, inflight_request_ids, preempted_ids)} "
+            f"{remedy}"
+        )
         raise RuntimeError(
             f"V2 scheduler deadlock: {num_gen_candidates} generation and "
             f"{num_ctx_candidates} context request(s) active but none could "
             f"be scheduled, suspended or preempted in "
             f"{self._stalled_schedules} consecutive attempts. The KV cache "
             f"pool is likely exhausted. {remedy}"
+        )
+
+    def _summarize_stall(
+        self,
+        active_requests: RequestList,
+        pending_ctx: RequestList,
+        inflight_request_ids: set[int],
+        preempted_ids: set[int],
+    ) -> str:
+        """One-line breakdown of a stalled pass for the deadlock logs.
+
+        Re-derives the blocked candidates so the per-pass detector stays cheap:
+        this runs only on the rare logging branches.
+        """
+        gen = [
+            r
+            for r in active_requests
+            if r.is_generation_in_progress_state
+            and not r.is_generation_to_complete_state
+            and r.request_id not in inflight_request_ids
+        ]
+        ctx = [
+            r
+            for r in pending_ctx
+            if r.py_request_id not in preempted_ids and r.request_id not in inflight_request_ids
+        ]
+        states = Counter(LlmRequestState(r.state_value).name for r in gen + ctx)
+        sample_ids = [r.py_request_id for r in (gen + ctx)[:5]]
+        has_connector = getattr(self.kv_cache_manager, "kv_connector_manager", None) is not None
+        transfers_in_flight = (
+            self._async_transfer_manager is not None
+            and self._async_transfer_manager.has_any_inflight_requests()
+        )
+        return (
+            f"{len(gen)} generation and {len(ctx)} context request(s) blocked; "
+            f"states={dict(states)}; sample_ids={sample_ids}; "
+            f"kv_connector={has_connector}; "
+            f"cache_tier_below_gpu={self.kv_cache_manager.has_cache_tier_below_gpu}; "
+            f"transfers_in_flight={transfers_in_flight}"
         )
 
     def _free_kv_caches(self, req: LlmRequest) -> None:
