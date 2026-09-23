@@ -117,6 +117,7 @@ def _make_llm(
     tensor_parallel_size: int = 1,
     encoder_graphs: bool = False,
     enable_block_reuse: bool = False,
+    use_python_scheduler: bool = True,
 ) -> LLM:
     """Build a Whisper LLM for the test matrix, optionally with encoder CUDA graphs."""
     # CudaGraphConfig captures the decode step; the enc-dec encoder step opts in
@@ -166,7 +167,7 @@ def _make_llm(
         # 1500 encoder positions every Whisper request produces.
         max_input_len=_ENCODER_OUTPUT_LEN,
         max_num_tokens=2 * _ENCODER_OUTPUT_LEN,
-        scheduler_config=SchedulerConfig(use_python_scheduler=True),
+        scheduler_config=SchedulerConfig(use_python_scheduler=use_python_scheduler),
         tensor_parallel_size=tensor_parallel_size,
         **encoder_kwargs,
         **dtype_kwargs,
@@ -264,7 +265,11 @@ def test_whisper_pytorch_block_reuse_requested(monkeypatch):
     wave, sample_rate = soundfile.read(_get_audio_path())
     sampling_params = SamplingParams(temperature=0.0, max_tokens=_MAX_NEW_TOKENS)
 
-    with _make_llm(model_path, enable_block_reuse=True) as llm:
+    with _make_llm(
+        model_path,
+        enable_block_reuse=True,
+        use_python_scheduler=False,
+    ) as llm:
         for batch_size in (1, 2):
             outputs = llm.generate(
                 [_audio_prompt(wave, sample_rate) for _ in range(batch_size)],

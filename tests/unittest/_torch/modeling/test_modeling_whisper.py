@@ -25,7 +25,15 @@ import pytest
 import torch
 from transformers import WhisperConfig, WhisperFeatureExtractor
 
-from tensorrt_llm._torch.models.modeling_whisper import WhisperLogMelFrontend
+from tensorrt_llm._torch.models.modeling_whisper import (
+    WhisperForConditionalGeneration,
+    WhisperLogMelFrontend,
+)
+from tensorrt_llm.inputs.registry import input_processor_requires_encoder_features
+
+
+def test_whisper_input_processor_requires_encoder_features():
+    assert input_processor_requires_encoder_features(WhisperForConditionalGeneration)
 
 
 def _synthetic_waveform_batch(n_samples: int, seed: int = 1234) -> np.ndarray:
