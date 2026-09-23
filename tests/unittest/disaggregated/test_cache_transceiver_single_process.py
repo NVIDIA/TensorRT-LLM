@@ -1843,6 +1843,29 @@ BOUNDARY_CONFIGS = [
 ]
 
 
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("is_mla", [False, True], ids=["mha", "mla"])
+def test_kv_cache_manager_v2_accepts_attention_dp_with_helix_cp(is_mla):
+    """KVCacheManagerV2 must build a helix-CP generation instance with attention-DP.
+
+    The Python transceiver now runs its gen-side completion consensus across the
+    CP ranks of a DP group, so the constructor no longer rejects
+    enable_attention_dp=True together with helix context parallelism.
+    """
+    managers = _create_managers_for_instance(
+        tp=2,
+        pp=1,
+        enable_dp=True,
+        is_mla=is_mla,
+        use_v2=True,
+        cp_size=2,
+    )
+    assert len(managers) == 4
+    assert all(isinstance(m, KVCacheManagerV2) for m in managers)
+    for m in managers:
+        m.shutdown()
+
+
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize(
     "ctx_tp,ctx_pp,gen_tp,gen_pp,ctx_enable_dp,gen_enable_dp,is_mla",
