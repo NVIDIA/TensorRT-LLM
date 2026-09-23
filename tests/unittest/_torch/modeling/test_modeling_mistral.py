@@ -767,8 +767,18 @@ def test_mistral_item_metadata_separates_patch_and_embedding_units():
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("sizes", [[[28, 56]], [[28, 56], [28, 56]], [[28, 56], [56, 56]]])
-def test_native_processed_images_preserve_item_sizes(sizes: list[list[int]]) -> None:
+@pytest.mark.parametrize(
+    "sizes, encoder_lengths, embedding_lengths",
+    [
+        ([[28, 56]], [8], [2]),
+        ([[28, 56], [28, 56]], [8, 8], [2, 2]),
+        ([[28, 56], [56, 56]], [8, 16], [2, 4]),
+        ([[28, 56], [56, 84]], [8, 24], [2, 6]),
+    ],
+)
+def test_native_processed_images_preserve_item_sizes(
+    sizes: list[list[int]], encoder_lengths: list[int], embedding_lengths: list[int]
+) -> None:
     """Keep unpadded per-image geometry through native processing and scheduling."""
     proc = _make_dummy_processor(processor_cls=MistralNativeInputProcessor)
     pixels = [
@@ -819,17 +829,23 @@ def test_native_processed_images_preserve_item_sizes(sizes: list[list[int]]) -> 
     assert input_ids == [1, 2, 3]
     image = extra["multimodal_data"]["image"]
     assert image["image_sizes"] == sizes
-    assert image["pixel_values"].shape == (len(sizes), 3, max(h for h, _ in sizes), 56)
+    assert image["pixel_values"].shape == (
+        len(sizes),
+        3,
+        max(h for h, _ in sizes),
+        max(w for _, w in sizes),
+    )
     for i, ((height, width), pixel) in enumerate(zip(sizes, pixels)):
         torch.testing.assert_close(
             image["pixel_values"][i, :, :height, :width], pixel.to(proc.dtype)
         )
         assert torch.count_nonzero(image["pixel_values"][i, :, height:]) == 0
+        assert torch.count_nonzero(image["pixel_values"][i, :, :, width:]) == 0
     metadata = proc.get_mm_encoder_item_metadata(input_ids, extra["multimodal_data"])
     metadata.validate()
     assert metadata.item_refs == [("image", i) for i in range(len(sizes))]
-    assert metadata.encoder_token_lengths == [8 if h == 28 else 16 for h, _ in sizes]
-    assert metadata.output_embedding_lengths == [2 if h == 28 else 4 for h, _ in sizes]
+    assert metadata.encoder_token_lengths == encoder_lengths
+    assert metadata.output_embedding_lengths == embedding_lengths
 
 
 @pytest.mark.parametrize("budget", [1024, 4096, 8192])
