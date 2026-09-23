@@ -575,7 +575,6 @@ class Cosmos3CausalAttention(Attention):
             layer_idx=layer_idx,
             module_name=module_name,
             enable_sequence_parallel=False,
-            share_qkv_input_quant=uses_static_fp8(model_config),
         )
         # Attention Q/K norms run the fp32-weight-multiply flavor in both
         # recipes (this path has always been F.rms_norm); only the layernorms
@@ -694,7 +693,6 @@ class Cosmos3CrossAttention(Attention):
             layer_idx=layer_idx,
             module_name=module_name,
             enable_sequence_parallel=True,
-            share_qkv_input_quant=static_fp8,
         )
         model_config.attention.backend = original_backend
 

@@ -12,17 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for Attention's opt-in shared QKV input quantization.
+"""Tests for Attention's shared QKV input quantization.
 
 Static FP8 checkpoints keep q/k/v as separate calibrated projections, so a fused
 QKV Linear would re-quantize two of them onto a third's scale. Splitting them
 costs three quantizations of one identical activation instead of one, which
-``share_qkv_input_quant=True`` recovers by quantizing once and handing the same
-FP8 tensor to all three.
+sharing recovers by quantizing once and handing the same FP8 tensor to all three.
 
-The flag is opt-in: enabling it also commits the caller to running
-``post_load_weights()``, which is where the equal-input_scale invariant that
-makes the sharing sound is actually checked. These tests pin both halves.
+Eligibility is structural and derived, never asked for: the constructor sets it
+from the quantization recipe, and ``post_load_weights()`` revokes it once the
+checkpoint's scales are known to disagree. These tests pin both halves.
 """
 
 import pytest
@@ -39,7 +38,7 @@ INPUT_SCALE, WEIGHT_SCALE = 1e-2, 1.1e-3
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 
-def _make(*, share, qkv_mode=QKVMode.SEPARATE_QKV, quant_algo=QuantAlgo.FP8, force_dynamic=False):
+def _make(*, qkv_mode=QKVMode.SEPARATE_QKV, quant_algo=QuantAlgo.FP8, force_dynamic=False):
     config = DiffusionModelConfig(
         quant_config=QuantConfig(quant_algo=quant_algo) if quant_algo else QuantConfig(),
         force_dynamic_quantization=force_dynamic,
@@ -54,7 +53,6 @@ def _make(*, share, qkv_mode=QKVMode.SEPARATE_QKV, quant_algo=QuantAlgo.FP8, for
         bias=False,
         config=config,
         enable_sequence_parallel=False,
-        share_qkv_input_quant=share,
     ).cuda()
 
 
@@ -70,32 +68,27 @@ def _calibrate(attn, input_scale=INPUT_SCALE):
 
 
 @requires_cuda
-def test_default_does_not_share():
-    """Every existing caller relies on the unshared default."""
-    attn = _make(share=False)
-    assert attn.share_qkv_input_quant is False
-    _calibrate(attn)
-    assert attn._shares_qkv_input_quant() is False
-
-
-@requires_cuda
-def test_fused_qkv_rejects_sharing():
+def test_fused_qkv_does_not_share():
     """A fused QKV projection already quantizes its input exactly once."""
-    with pytest.raises(ValueError, match="SEPARATE_QKV"):
-        _make(share=True, qkv_mode=QKVMode.FUSE_QKV)
+    attn = _make(qkv_mode=QKVMode.FUSE_QKV)
+    assert attn._maybe_share_qkv_quantize is False
 
 
 @requires_cuda
-def test_forced_dynamic_rejects_sharing():
-    with pytest.raises(ValueError, match="force_dynamic_quantization"):
-        _make(share=True, force_dynamic=True)
+def test_forced_dynamic_does_not_share():
+    """A dynamic scale is derived per Linear per call, so there is none to share."""
+    attn = _make(force_dynamic=True)
+    assert attn._maybe_share_qkv_quantize is False
 
 
 @requires_cuda
 def test_unquantized_attention_does_not_share():
     """Without FP8 weights there is no static scale to quantize against."""
-    attn = _make(share=True, quant_algo=None)
-    assert attn._shares_qkv_input_quant() is False
+    attn = _make(quant_algo=None)
+    assert attn._maybe_share_qkv_quantize is False
+    _calibrate(attn)
+    x = torch.randn(TOKENS, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    assert attn._can_share_qkv_quantize(x, None) is False
 
 
 @requires_cuda
@@ -106,7 +99,7 @@ def test_shared_input_is_quantized_once():
     every input, so dtype alone proves nothing -- storage identity is what
     discriminates.
     """
-    attn = _make(share=True)
+    attn = _make()
     _calibrate(attn)
     attn.post_load_weights()
 
@@ -136,8 +129,11 @@ def test_sharing_matches_unshared_result():
 
     Each Linear applies its own input_scale in the epilogue, and all three agree
     here, so quantizing once must be bit-identical to quantizing three times.
+    The baseline revokes eligibility directly: with equal scales nothing else
+    would make an otherwise identical module take the per-projection path.
     """
-    shared, unshared = _make(share=True), _make(share=False)
+    shared, unshared = _make(), _make()
+    unshared._maybe_share_qkv_quantize = False
     torch.manual_seed(0)
     for name in ("to_q", "to_k", "to_v"):
         out_features = getattr(shared, name).out_features
@@ -157,7 +153,7 @@ def test_sharing_matches_unshared_result():
 @requires_cuda
 def test_cross_attention_source_is_not_shared():
     """k/v read a different tensor than q, so there is no single activation."""
-    attn = _make(share=True)
+    attn = _make()
     _calibrate(attn)
     attn.post_load_weights()
 
@@ -172,32 +168,37 @@ def test_cross_attention_source_is_not_shared():
 
 
 @requires_cuda
-def test_post_load_weights_rejects_mismatched_input_scales():
-    """A checkpoint violating the shared-scale invariant must fail loudly.
+def test_post_load_weights_revokes_on_mismatched_input_scales():
+    """A checkpoint that violates the invariant loads and runs, unshared.
 
     to_k's GEMM would apply its own scale to activations quantized with to_q's,
-    which silently corrupts the projection rather than erroring.
+    which silently corrupts the projection. Sharing is an optimization, not a
+    requirement, so the checkpoint keeps working with one quantize per
+    projection instead of being rejected.
     """
-    attn = _make(share=True)
+    attn = _make()
     _calibrate(attn)
     _set_scales(attn.to_k, input_scale=INPUT_SCALE * 2)
 
-    with pytest.raises(ValueError, match="same calibrated input_scale"):
-        attn.post_load_weights()
+    assert attn._maybe_share_qkv_quantize is True
+    attn.post_load_weights()
+    assert attn._maybe_share_qkv_quantize is False
+
+    x = torch.randn(TOKENS, HIDDEN, device="cuda", dtype=torch.bfloat16) * 0.02
+    assert attn._can_share_qkv_quantize(x, None) is False
 
 
 @requires_cuda
-def test_post_load_weights_is_a_noop_when_not_sharing():
-    attn = _make(share=False)
-    _calibrate(attn)
-    _set_scales(attn.to_k, input_scale=INPUT_SCALE * 2)
+def test_post_load_weights_is_a_noop_when_not_eligible():
+    attn = _make(qkv_mode=QKVMode.FUSE_QKV)
     attn.post_load_weights()
+    assert attn._maybe_share_qkv_quantize is False
 
 
 @requires_cuda
 def test_prequantized_input_is_passed_through():
     """An upstream fused norm+quant already produced FP8; do not re-quantize."""
-    attn = _make(share=True)
+    attn = _make()
     _calibrate(attn)
     attn.post_load_weights()
 
@@ -209,7 +210,7 @@ def test_prequantized_input_is_passed_through():
 @pytest.mark.parametrize("shape", [(TOKENS, HIDDEN), (2, TOKENS, HIDDEN)], ids=["rank2", "rank3"])
 def test_rank_is_preserved(shape):
     """The quantize reshape is a view; projections must still see their rank."""
-    attn = _make(share=True)
+    attn = _make()
     _calibrate(attn)
     attn.post_load_weights()
 

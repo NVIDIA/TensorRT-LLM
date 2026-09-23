@@ -279,7 +279,7 @@ def test_topology_follows_quantization(checkpoint_subdir, static_fp8):
         # The UND tower is SEPARATE_QKV in both configurations; only the shared
         # activation quantization is conditional.
         und_attn = transformer.language_model.layers[0].self_attn
-        assert und_attn.share_qkv_input_quant is static_fp8
+        assert und_attn._maybe_share_qkv_quantize is static_fp8
     finally:
         del transformer
         gc.collect()
@@ -317,7 +317,7 @@ def test_dynamic_quantization_stays_fused(dynamic_field):
         names = set(dict(transformer.named_modules()))
         assert "gen_layers.0.cross_attention.qkv_proj" in names
         assert "gen_layers.0.mlp.gate_up_proj" in names
-        assert transformer.language_model.layers[0].self_attn.share_qkv_input_quant is False
+        assert transformer.language_model.layers[0].self_attn._maybe_share_qkv_quantize is False
     finally:
         del transformer
         gc.collect()
