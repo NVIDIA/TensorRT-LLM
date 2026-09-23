@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Ref2VA uses transformer_ref/ from the converted MiniMax-H3 checkpoint.
+pipeline_config:
+  workflow: ref2va
+# Eager execution preserves the reference BF16 rounding boundaries.
+torch_compile_config:
+  enable: false
+cuda_graph_config:
+  enable: false
+attention_config:
+  backend: VANILLA
+compilation_config:
+  skip_warmup: true

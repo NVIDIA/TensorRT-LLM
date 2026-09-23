@@ -160,8 +160,14 @@ The same fields carry references over `trtllm-serve`; see [`examples/visual_gen/
 
 ## MiniMax-H3 Notes
 
-- Text-to-video (T2VA) and first/last-frame-to-video (FL2VA) are supported. Reference-to-video
-  (Ref2VA) is not enabled yet.
+- Text-to-video (T2VA), first/last-frame-to-video (FL2VA), and reference-to-video
+  with audio (Ref2VA) are supported on one GPU. Enable Ref2VA with
+  `pipeline_config: {workflow: ref2va}`; it requires `transformer_ref/` weights.
+  Set `torch_compile_config: {enable: false}` for reference-precision BF16 execution.
+  Pass image, video, and audio inputs through the existing reference slots with
+  role `reference`. Audio requires an image or video reference. See the
+  [Ref2VA example](../../../examples/visual_gen/README.md#minimax-h3-reference-to-video-and-audio)
+  for input limits, ordering, and media dependencies.
 - MiniMax-H3 currently restricts TRTLLM attention to SM100 or SM103. This is a
   model-specific restriction, not a general VisualGen backend requirement.
 - The published [MiniMax-H3 checkpoint license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)

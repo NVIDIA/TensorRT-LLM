@@ -604,8 +604,18 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             if value:
                 extra_attrs[key] = value
 
+        h3_workflow = resolved_pipeline_config.get("workflow")
+        if h3_workflow is not None:
+            if h3_workflow not in ("fl2va", "ref2va"):
+                raise ValueError("MiniMax-H3 workflow must be 'fl2va' or 'ref2va'.")
+            extra_attrs["workflow"] = h3_workflow
+
         # Discover pipeline components (diffusers layout)
         components = discover_pipeline_components(checkpoint_path)
+        if h3_workflow == "ref2va":
+            if "transformer_ref" not in components:
+                raise ValueError("MiniMax-H3 ref2va requires the transformer_ref checkpoint.")
+            components[PipelineComponent.TRANSFORMER] = components.pop("transformer_ref")
         component_config_dicts: Dict[str, Dict[str, Any]] = {}
 
         if components:

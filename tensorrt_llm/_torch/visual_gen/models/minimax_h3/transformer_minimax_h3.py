@@ -45,6 +45,44 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 MINIMAX_H3_MODALITY_NUM = 3
 
 
+def _use_reference_precision(model_config: DiffusionModelConfig) -> bool:
+    return (
+        model_config.extra_attrs.get("workflow") == "ref2va"
+        and model_config.quant_config.quant_algo is None
+    )
+
+
+def _reference_swiglu(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Keep the BF16 SiLU rounding before multiplication used by the checkpoint."""
+    gate, up = hidden_states.chunk(2, dim=-1)
+    return F.silu(gate) * up
+
+
+class _ReferenceRMSNorm(RMSNorm):
+    """TRTLLM norm parameters with the checkpoint's native BF16 rounding."""
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return F.rms_norm(hidden_states, (self.weight.numel(),), self.weight, self.variance_epsilon)
+
+
+def _make_h3_rms_norm(
+    *,
+    model_config: DiffusionModelConfig,
+    hidden_size: int,
+    eps: float,
+    dtype: torch.dtype,
+    has_weights: bool = True,
+) -> nn.Module:
+    # Ref2VA's long conditioning sequences amplify differences in BF16
+    # rounding. Match Diffusers' native RMSNorm and staged SwiGLU in BF16;
+    # retain the existing kernels for FL2VA and quantized configurations.
+    if _use_reference_precision(model_config):
+        return _ReferenceRMSNorm(
+            hidden_size=hidden_size, eps=eps, dtype=dtype, has_weights=has_weights
+        )
+    return RMSNorm(hidden_size=hidden_size, eps=eps, dtype=dtype, has_weights=has_weights)
+
+
 @dataclass
 class MiniMaxH3TransformerOutput:
     """Velocity predictions for packed video and audio rows."""
@@ -144,6 +182,7 @@ class MiniMaxH3Attention(Attention):
             layer_idx=layer_idx,
             module_name=module_name,
         )
+        self.reference_precision = _use_reference_precision(model_config)
 
     def forward(
         self,
@@ -158,7 +197,17 @@ class MiniMaxH3Attention(Attention):
             batch_size, sequence_length, self.local_num_attention_heads, self.head_dim
         )
         key = key.view(batch_size, sequence_length, self.local_num_key_value_heads, self.head_dim)
-        query, key = self.apply_qk_norm(query, key)
+        if self.reference_precision:
+            # Keep the shared Attention norm modules (and their weight handling).
+            # Only the arithmetic differs from the fused kernel for BF16 parity.
+            query = F.rms_norm(
+                query, (self.head_dim,), self.norm_q.weight, self.norm_q.variance_epsilon
+            )
+            key = F.rms_norm(
+                key, (self.head_dim,), self.norm_k.weight, self.norm_k.variance_epsilon
+            )
+        else:
+            query, key = self.apply_qk_norm(query, key)
 
         if rotary_emb is not None:
             query = apply_minimax_h3_rotary_emb(query, *rotary_emb)
@@ -176,7 +225,7 @@ class MiniMaxH3Attention(Attention):
         return self.to_out[0](hidden_states)
 
 
-def _norm_2d(norm: RMSNorm, hidden_states: torch.Tensor) -> torch.Tensor:
+def _norm_2d(norm: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
     """Apply an RMSNorm over a packed ``[B, S, D]`` tensor.
 
     FlashInfer reads a 3-D input as ``(batch, heads, head_dim)`` and dispatches
@@ -228,8 +277,12 @@ class MiniMaxH3AdaLayerNormOut(nn.Module):
         model_config: DiffusionModelConfig,
     ) -> None:
         super().__init__()
-        self.norm = RMSNorm(
-            hidden_size=hidden_size, eps=eps, dtype=model_config.torch_dtype, has_weights=True
+        self.norm = _make_h3_rms_norm(
+            model_config=model_config,
+            hidden_size=hidden_size,
+            eps=eps,
+            dtype=model_config.torch_dtype,
+            has_weights=True,
         )
         self.linear = Linear(
             time_embed_dim,
@@ -270,8 +323,12 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         layer_idx: int,
     ) -> None:
         super().__init__()
-        self.norm1 = RMSNorm(
-            hidden_size=hidden_size, eps=norm_eps, dtype=model_config.torch_dtype, has_weights=True
+        self.norm1 = _make_h3_rms_norm(
+            model_config=model_config,
+            hidden_size=hidden_size,
+            eps=norm_eps,
+            dtype=model_config.torch_dtype,
+            has_weights=True,
         )
         self.attn = MiniMaxH3Attention(
             hidden_size=hidden_size,
@@ -282,12 +339,17 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             layer_idx=layer_idx,
             module_name=f"token_refiner.refiner_blocks.{layer_idx}.attn",
         )
-        self.norm2 = RMSNorm(
-            hidden_size=hidden_size, eps=norm_eps, dtype=model_config.torch_dtype, has_weights=True
+        self.norm2 = _make_h3_rms_norm(
+            model_config=model_config,
+            hidden_size=hidden_size,
+            eps=norm_eps,
+            dtype=model_config.torch_dtype,
+            has_weights=True,
         )
         self.ff = GatedMLP(
             hidden_size=hidden_size,
             intermediate_size=ffn_dim,
+            activation=_reference_swiglu if _use_reference_precision(model_config) else F.silu,
             bias=False,
             dtype=model_config.torch_dtype,
             config=model_config,
@@ -335,7 +397,8 @@ class MiniMaxH3TokenRefiner(nn.Module):
                 for layer_idx in range(num_layers)
             ]
         )
-        self.final_norm = RMSNorm(
+        self.final_norm = _make_h3_rms_norm(
+            model_config=model_config,
             hidden_size=hidden_size,
             eps=final_norm_eps,
             dtype=model_config.torch_dtype,
@@ -363,8 +426,12 @@ class MiniMaxH3TransformerBlock(nn.Module):
         layer_idx: int,
     ) -> None:
         super().__init__()
-        self.norm1 = RMSNorm(
-            hidden_size=hidden_size, eps=norm_eps, dtype=model_config.torch_dtype, has_weights=True
+        self.norm1 = _make_h3_rms_norm(
+            model_config=model_config,
+            hidden_size=hidden_size,
+            eps=norm_eps,
+            dtype=model_config.torch_dtype,
+            has_weights=True,
         )
         self.attn = MiniMaxH3Attention(
             hidden_size=hidden_size,
@@ -375,12 +442,17 @@ class MiniMaxH3TransformerBlock(nn.Module):
             layer_idx=layer_idx,
             module_name=f"transformer_blocks.{layer_idx}.attn",
         )
-        self.norm2 = RMSNorm(
-            hidden_size=hidden_size, eps=norm_eps, dtype=model_config.torch_dtype, has_weights=True
+        self.norm2 = _make_h3_rms_norm(
+            model_config=model_config,
+            hidden_size=hidden_size,
+            eps=norm_eps,
+            dtype=model_config.torch_dtype,
+            has_weights=True,
         )
         self.ff = GatedMLP(
             hidden_size=hidden_size,
             intermediate_size=ffn_dim,
+            activation=_reference_swiglu if _use_reference_precision(model_config) else F.silu,
             bias=False,
             dtype=model_config.torch_dtype,
             config=model_config,

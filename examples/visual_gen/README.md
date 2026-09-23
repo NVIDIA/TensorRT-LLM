@@ -40,3 +40,32 @@ for supported tasks, the TRTLLM attention restriction, and checkpoint licensing.
 Install deps from the repo root: `pip install -r requirements-dev.txt`.
 
 Output: `.png` for image models; `.mp4` for video models when FFmpeg is installed (otherwise `.avi`).
+
+### MiniMax-H3 reference-to-video-and-audio
+
+Ref2VA loads `transformer_ref/`; FL2VA and text-only generation use `transformer/`.
+Use the converted checkpoint containing both partitions and the shared encoders/VAEs:
+
+```bash
+python models/minimax_h3.py --model <approved-checkpoint> \
+  --visual_gen_args configs/minimax-h3-ref2va-bf16-1gpu.yaml \
+  --image_reference subject.png --audio_reference voice.wav \
+  --prompt 'The person in <Picture 1> speaks with the voice in <Audio 1>.' \
+  --output_path ref2va.mp4
+```
+
+Repeat `--image_reference`, `--video_reference`, or `--audio_reference` for multiple
+references (up to 9 images, 3 videos, 3 audio clips, 12 total). Audio alone is not
+supported. Video references include their soundtrack when present. Media files
+retain their frame/sample rates; PyAV decodes video/audio, and torchaudio is needed
+only when audio must be resampled to 32 kHz. References default to images, then
+videos, then audio, preserving each list's order. Set `--reference_order video:0
+image:0` to change cross-modality order; include every reference exactly once.
+
+The Python API uses existing `MediaRef` slots with role `reference`,
+`VisualGenArgs.pipeline_config={"workflow": "ref2va"}`, and optional
+`VisualGenParams.extra_params={"reference_order": ["video:0", "image:0"]}`.
+The BF16 Ref2VA example disables `torch_compile_config.enable` to preserve
+the reference rounding boundaries; compilation can introduce numerical drift.
+Ref2VA references condition content rather than anchoring the first/last frame;
+the default output canvas is 768×1344 regardless of reference dimensions.

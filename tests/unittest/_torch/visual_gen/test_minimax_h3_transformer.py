@@ -1176,3 +1176,68 @@ def test_pinned_diffusers_golden_matches_live_hf_reference() -> None:
         rtol=2e-2,
         atol=2e-2,
     )
+
+
+@requires_cuda
+def test_ref2va_bf16_matches_diffusers_rounding() -> None:
+    from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3Transformer3DModel
+
+    config = _make_model_config(num_layers=1, num_refiner_layers=1)
+    config.extra_attrs["workflow"] = "ref2va"
+    target = h3.MiniMaxH3Transformer3DModel(config).to("cuda")
+    _initialize_diffusers_golden_weights(target)
+    reference = MiniMaxH3Transformer3DModel(
+        **(_TINY_CONFIG | {"num_layers": 1, "num_refiner_layers": 1})
+    ).to(device="cuda", dtype=torch.bfloat16)
+    for name in ("proj_in", "audio_proj_in", "time_embedder", "rope", "proj_out", "audio_proj_out"):
+        getattr(reference, name).to(torch.float32)
+    _copy_golden_parameters_to_hf(reference, target)
+    inputs = {name: tensor.to("cuda") for name, tensor in _diffusers_golden_inputs().items()}
+    reference_inputs = dict(inputs)
+    reference_inputs["timestep"] = reference_inputs.pop("conditioning_timesteps")
+    with torch.inference_mode():
+        expected = reference(**reference_inputs)
+        actual = target(**inputs)
+    torch.testing.assert_close(actual.sample, expected.sample, rtol=0, atol=1e-6)
+    torch.testing.assert_close(actual.audio_sample, expected.audio_sample, rtol=0, atol=1e-6)
+
+
+@pytest.mark.parametrize("workflow", ["fl2va", "ref2va"])
+def test_ref2va_selects_reference_precision_only_for_its_bf16_model(workflow: str) -> None:
+    config = _make_model_config(num_layers=1, num_refiner_layers=1)
+    config.extra_attrs["workflow"] = workflow
+    model = h3.MiniMaxH3Transformer3DModel(config)
+    assert isinstance(model.norm_out.norm, h3._ReferenceRMSNorm) == (workflow == "ref2va")
+    assert (model.transformer_blocks[0].ff.activation is h3._reference_swiglu) == (
+        workflow == "ref2va"
+    )
+    from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNormTPAware
+
+    assert isinstance(model.transformer_blocks[0].attn.norm_q, RMSNormTPAware)
+    assert model.transformer_blocks[0].attn.reference_precision == (workflow == "ref2va")
+
+
+def test_ref2va_swiglu_preserves_intermediate_bf16_rounding() -> None:
+    # A nontrivial range exercises values whose SiLU result is not exactly
+    # representable in BF16 before it is multiplied by the other branch.
+    gate = torch.linspace(-4, 4, 1024, dtype=torch.bfloat16)
+    up = torch.linspace(0.5, 1.5, 1024, dtype=torch.bfloat16)
+    actual = h3._reference_swiglu(torch.cat((gate, up)))
+    expected = up * nn.SiLU()(gate)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    single_rounding = (F.silu(gate.float()) * up.float()).to(torch.bfloat16)
+    assert not torch.equal(actual, single_rounding)
+
+
+def test_ref2va_norm_initialization_supports_deferred_weight_loading() -> None:
+    from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
+
+    config = _make_model_config()
+    config.extra_attrs["workflow"] = "ref2va"
+    config.skip_create_weights_in_init = True
+    with MetaInitMode():
+        model = h3.MiniMaxH3Transformer3DModel(config)
+    for module in model.modules():
+        if isinstance(module, h3._ReferenceRMSNorm):
+            assert module.weight.device.type != "meta"
+            torch.testing.assert_close(module.weight, torch.ones_like(module.weight))
