@@ -1340,14 +1340,42 @@ __device__ void vectorized_combine_impl(
             }
         }
         vec_t<float, kElements> value;
-#pragma unroll
-        for (int j = 0; j < kElements; ++j)
+        if constexpr (std::is_same_v<InputT, __nv_fp8_e4m3> && kElements % 2 == 0)
         {
-            float const p0 = static_cast<float>(packed[0][j]) + static_cast<float>(packed[1][j]);
-            float const p1 = static_cast<float>(packed[2][j]) + static_cast<float>(packed[3][j]);
-            float const p2 = static_cast<float>(packed[4][j]) + static_cast<float>(packed[5][j]);
-            float const p3 = static_cast<float>(packed[6][j]) + static_cast<float>(packed[7][j]);
-            value[j] = (p0 + p1) + (p2 + p3);
+#pragma unroll
+            for (int j = 0; j < kElements; j += 2)
+            {
+                float2 pair[8];
+#pragma unroll
+                for (int k = 0; k < 8; ++k)
+                {
+                    __nv_fp8x2_e4m3 input;
+                    input.__x = reinterpret_cast<uint16_t const*>(&packed[k])[j / 2];
+                    pair[k] = static_cast<float2>(input);
+                }
+                float const x0 = pair[0].x + pair[1].x;
+                float const x1 = pair[2].x + pair[3].x;
+                float const x2 = pair[4].x + pair[5].x;
+                float const x3 = pair[6].x + pair[7].x;
+                float const y0 = pair[0].y + pair[1].y;
+                float const y1 = pair[2].y + pair[3].y;
+                float const y2 = pair[4].y + pair[5].y;
+                float const y3 = pair[6].y + pair[7].y;
+                value[j] = (x0 + x1) + (x2 + x3);
+                value[j + 1] = (y0 + y1) + (y2 + y3);
+            }
+        }
+        else
+        {
+#pragma unroll
+            for (int j = 0; j < kElements; ++j)
+            {
+                float const p0 = static_cast<float>(packed[0][j]) + static_cast<float>(packed[1][j]);
+                float const p1 = static_cast<float>(packed[2][j]) + static_cast<float>(packed[3][j]);
+                float const p2 = static_cast<float>(packed[4][j]) + static_cast<float>(packed[5][j]);
+                float const p3 = static_cast<float>(packed[6][j]) + static_cast<float>(packed[7][j]);
+                value[j] = (p0 + p1) + (p2 + p3);
+            }
         }
 #pragma unroll
         for (int step = 1; step < 4; step *= 2)
