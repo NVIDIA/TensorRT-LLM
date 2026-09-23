@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import logging
 import os
 import threading
@@ -338,6 +341,10 @@ def extract_disagg_cfg(
     config.internal_request_auth_key = internal_request_auth_key
     config.conversation_affinity_header_for_subagents = (
         conversation_affinity_header_for_subagents)
+    if (conversation_affinity_header_for_subagents
+            and internal_request_auth_key is None):
+        raise ValueError("conversation_affinity_header_for_subagents requires "
+                         "internal_request_auth_key")
     if subagent_affinity_scope not in ('context', 'both'):
         raise ValueError(
             "subagent_affinity_scope must be 'context' or 'both', got "
