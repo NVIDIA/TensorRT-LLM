@@ -1708,6 +1708,11 @@
       "path": "speculative_config.sa_config.threshold"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "speculative_config.skip_ctx_buffer_budget_check"
+    },
+    {
       "capture_policy": "list[int]|none",
       "kind": "value",
       "path": "speculative_config.target_layer_ids"

@@ -526,6 +526,28 @@ class CapturableGuidedDecoder(GuidedDecoder):
         # See: https://github.com/pytorch/pytorch/issues/163061
         torch.compiler.set_stance("force_eager")
 
+    def _drain_host_functions(self) -> None:
+        """Wait until every host function enqueued by the caller has run.
+
+        Each host function is a Python callback that must take the GIL. If one
+        is still pending when the caller enters a native call that holds the
+        GIL while waiting on device progress (e.g. a drafter's flash-attn
+        forward, or the context-synchronizing lazy kernel-module load inside
+        it), the rank deadlocks: the callback waits for the GIL, the native
+        call waits for work only the callback can advance. The
+        ``set_stance("force_eager")`` mitigation above covers only
+        torch.compile kernels, not plain extension calls (pytorch#163061).
+
+        ``bitmask_event`` is recorded on the side stream after every host
+        function the callers enqueue, so synchronizing on it (which releases
+        the GIL) guarantees they have all run. Host-side ordering only — the
+        callers already order the bitmask consumer against the same event on
+        the device. Skipped while capturing: a host wait is illegal there,
+        and captured host nodes do not run until replay.
+        """
+        if not torch.cuda.is_current_stream_capturing():
+            self.bitmask_event.synchronize()
+
     @nvtx_range("GuidedDecoder.add_batch")
     def add_batch(self,
                   scheduled_requests: ScheduledRequests,
@@ -577,6 +599,7 @@ class CapturableGuidedDecoder(GuidedDecoder):
         torch.cuda.current_stream().wait_event(self.bitmask_event)
         self.apply_bitmask(logits, d2t=d2t)
 
+        self._drain_host_functions()
         return failed_requests
 
     @hostfunc
@@ -682,6 +705,7 @@ class CapturableGuidedDecoder(GuidedDecoder):
             # CUDA graph capture requires every forked stream to be joined.
             self.bitmask_event.record()
         torch.cuda.current_stream().wait_event(self.bitmask_event)
+        self._drain_host_functions()
 
     def execute_draft_batch(self,
                             logits: torch.Tensor,
@@ -705,4 +729,5 @@ class CapturableGuidedDecoder(GuidedDecoder):
                            d2t=d2t,
                            num_bitmask_tokens=len(self.requests))
 
+        self._drain_host_functions()
         return failed_requests

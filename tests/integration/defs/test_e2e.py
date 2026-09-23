@@ -620,7 +620,8 @@ def test_openai_mmencoder_example(llm_root, llm_venv):
 
 
 @pytest.mark.parametrize(
-    "model_name", [pytest.param("openai/gpt-oss-120b", marks=skip_pre_hopper)])
+    "model_name",
+    [pytest.param("openai/gpt-oss-120b", marks=skip_pre_blackwell)])
 def test_openai_chat_guided_decoding(llm_root, llm_venv, model_name: str):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([

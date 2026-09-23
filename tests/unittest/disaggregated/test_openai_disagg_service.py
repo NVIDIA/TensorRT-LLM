@@ -605,6 +605,37 @@ async def test_context_only_response_finishes_hooks(stream):
 
 
 @pytest.mark.asyncio
+async def test_gen_only_benchmark_streams_the_generation_worker_output_as_is(monkeypatch):
+    """Gen-only benchmark mode hands the client the generation worker's stream as is.
+
+    The context server is skipped, and an error the worker reports on the stream (an
+    executor fail-fast, for example) ends the client's stream instead of being swallowed.
+    """
+    monkeypatch.setenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", "1")
+    service = _make_service("context_first")
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=42)
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._gen_router.get_next_server = AsyncMock(return_value=("gen:9001", {"server_info": {}}))
+    gen_chunks = [
+        b'data: {"error": {"message": "Insufficient KV cache for gen-only benchmark mode",'
+        b' "type": "server_error"}}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+    service._gen_client.send_request = AsyncMock(return_value=_mock_streaming_response(gen_chunks))
+    request = CompletionRequest(model="test-model", prompt="hello", stream=True)
+
+    result = await service._send_disagg_request(request)
+
+    service._ctx_client.send_request.assert_not_awaited()
+    gen_req = service._gen_client.send_request.call_args.args[0]
+    assert gen_req.disaggregated_params.request_type == "generation_only"
+    assert gen_req.disaggregated_params.first_gen_tokens == [7]
+    assert gen_req.ignore_eos is True
+    assert [chunk async for chunk in result] == gen_chunks
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
 async def test_send_disagg_request_leaves_streaming_usage_to_gen_server(schedule_style):
     service = _make_service(schedule_style)
