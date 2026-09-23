@@ -343,7 +343,6 @@ class Monitor:
             auto_merge=True,
             wait=False,
             timeout=3600,
-            legacy_prims_ts=False,
         )
         plan = promote._make_plan(arguments, self.gh)
         # Attribution evidence is versioned with the durable promotion record.

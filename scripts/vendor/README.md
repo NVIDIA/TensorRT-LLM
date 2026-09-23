@@ -17,11 +17,10 @@ repositories and canonical **branches**, not tag promotion or periodic rebases.
 | `python scripts/vendor/promote.py promote` | Promote an immutable, merged source update and prepare a lock-only PR |
 | `python scripts/vendor/bot.py run` | Monitor source-update PRs, validate metadata, resolve attribution, and promote |
 
-`scripts/vendor_sources.py` remains a compatibility entry point. The old
-`scripts/maintain_prims_ts.py` command supplies the original PrimTS defaults and
-branch naming for historical operation retries. New invocations should use the
-generic entry points. The separate legacy Triton packager does not use this lock
-and is not migrated by this change.
+Use these entry points directly; no backward compatibility is promised for the
+old top-level scripts or PrimTS-specific CLI aliases. Supply vendor and repository
+configuration explicitly. The separate legacy Triton packager does not use this
+lock and is not migrated by this change.
 
 ## Workflow
 

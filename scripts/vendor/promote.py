@@ -283,13 +283,11 @@ class Promotion:
     record: dict
     consumer_repo: str = "NVIDIA/TensorRT-LLM"
     base_branch: str = "main"
-    legacy_prims_ts: bool = False
     completed_pr: dict | None = None
 
     @property
     def branch(self) -> str:
-        name = "prims-ts" if self.legacy_prims_ts else self.previous.name
-        return f"chore/{name}-promote-{self.number}-{self.reviewed.commit[:12]}"
+        return f"chore/{self.previous.name}-promote-{self.number}-{self.reviewed.commit[:12]}"
 
     @property
     def title(self) -> str:
@@ -382,7 +380,6 @@ def _make_plan(
         record,
         consumer_repo=gh.consumer_repo,
         base_branch=gh.base_branch,
-        legacy_prims_ts=args.legacy_prims_ts,
     )
     # A completed operation is historical: later promotions, deleted temporary
     # forks, or changed upstream PR state must not make it run again or fail.
@@ -974,13 +971,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     promote = commands.add_parser("promote", help="Promote a merged consumer source update.")
-    promote.add_argument("--source-pr", "--trtllm-pr", dest="source_pr", required=True)
+    promote.add_argument("--source-pr", required=True)
     promote.add_argument("--vendor", required=True, help="Vendor key in the lock file.")
     promote.add_argument("--consumer-repo", default="NVIDIA/TensorRT-LLM")
     promote.add_argument("--base-branch", default="main")
     promote.add_argument("--upstream-repo", required=True, help="Upstream OWNER/REPO.")
     promote.add_argument("--upstream-branch", default="main")
-    promote.add_argument("--legacy-prims-ts", action="store_true", help=argparse.SUPPRESS)
     promote.add_argument(
         "--canonical-repo",
         required=True,
@@ -1014,8 +1010,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     promote.add_argument(
         "--source-repo",
-        "--flashinfer-repo",
-        dest="source_repo",
         type=Path,
         help="Local source repository containing both immutable SHAs.",
     )

@@ -178,11 +178,11 @@ Manual publication uses `--publish --auto-merge`; dry-run is the default.
 `--daemon`, and opt-in `--publish`. Do not launch a publishing daemon unless the
 user requested ongoing automation. Never commit operator credentials or runtime
 state. The bot asks the PR author to correct metadata or ambiguous attribution;
-it never approves code merely because metadata passes. The old script paths
-remain compatibility entry points. See `scripts/vendor/README.md` and
-`3rdparty/vendor-sources.md`. Preserve structured promotion provenance and DCO
-sign-off in the final squash message. CI skip applies only to verified lock-only
-promotions, not changes to these tools.
+it never approves code merely because metadata passes. Use the entry points
+under `scripts/vendor/`; no legacy script wrappers are provided. See
+`scripts/vendor/README.md` and `3rdparty/vendor-sources.md`. Preserve structured
+promotion provenance and DCO sign-off in the final squash message. CI skip applies
+only to verified lock-only promotions, not changes to these tools.
 
 ### Triggering CI
 
