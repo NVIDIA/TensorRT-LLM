@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@user/yiqingy/fix_vr200_dlcluster', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -1171,7 +1171,10 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
                 }
                 def slurmCommand = SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl, imageForSlurm, mounts)
-                def clusterExcludes = placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName)
+                def clusterExcludes = SlurmConfig.getSlurmPlacementExcludes(
+                    pipeline, remote, partition,
+                    placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName)
+                )
                 def slurmCommandWithExclusion = trtllm_utils.addSlurmExcludeToCommand(slurmCommand, clusterExcludes)
                 def slurmExcludeArg = trtllm_utils.buildSlurmExcludeArg(clusterExcludes)
                 if (slurmExcludeArg) {
@@ -2176,7 +2179,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 if (SlurmConfig.needsIdleGpuExemption(cluster)) {
                     exemptionComment = "--comment='${SlurmConfig.IDLE_GPU_EXEMPTION_PAYLOAD}'"
                 }
-                def slurmExcludeArg = trtllm_utils.buildSlurmExcludeArg(placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName))
+                def clusterExcludes = SlurmConfig.getSlurmPlacementExcludes(
+                    pipeline, remote, partition,
+                    placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName)
+                )
+                def slurmExcludeArg = trtllm_utils.buildSlurmExcludeArg(clusterExcludes)
                 def slurmExcludeDirective = slurmExcludeArg ? "#SBATCH ${slurmExcludeArg}" : ""
                 if (slurmExcludeArg) {
                     echo "[INFRA-RETRY] ${stageName}: requesting SLURM retry placement exclusion: ${slurmExcludeArg}"
@@ -6458,6 +6465,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 5, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 4, 5, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 5, 5, 4, 1, true, false],
+        "VR200-PyTorch-Post-Merge-1": ["auto:vr200-x1", "l0_vr200", 1, 1],
     ]
     SBSASlurmTestConfigs = cbtsResizeSplits(SBSASlurmTestConfigs)
     fullSet += SBSASlurmTestConfigs.keySet()
