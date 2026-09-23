@@ -1002,7 +1002,7 @@ def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
     assert wrapper.run.call_args.args[3] is qo_indptr
     assert wrapper.run.call_args.kwargs["softmax_stats"] is stats
     assert wrapper.run.call_args.args[1].shape == (9, 6, 192)
-    assert wrapper.plan.call_args.kwargs["enable_softmax_stats"]
+    assert wrapper.plan.call_args.kwargs["store_softmax_stats"]
     assert wrapper.run.call_args.kwargs["validate"] is False
 
 

@@ -1074,7 +1074,7 @@ class PrimsTSFmha(PhasedFmha):
                 packed=True,
                 mask_type=mask,
                 sm_scale=sm_scale,
-                enable_softmax_stats=stats is not None,
+                store_softmax_stats=stats is not None,
             )
             self._mla_context_wrappers[key] = wrapper
         wrapper.run(

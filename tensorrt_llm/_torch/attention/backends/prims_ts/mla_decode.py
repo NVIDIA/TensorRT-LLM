@@ -90,6 +90,7 @@ class _MLADecodeCompileSpec:
     has_kernel_workspace: bool
     split_kv: int
     kernel: Any = field(compare=False, hash=False, repr=False)
+    store_softmax_stats: bool = False
 
 
 @dataclass(frozen=True)
@@ -131,6 +132,7 @@ class _MLADecodePlanState:
     compiled: Callable[..., object]
     policy: tuple[tuple[str, object], ...]
     split_kv: int
+    store_softmax_stats: bool = False
 
 
 @dataclass(frozen=True)
@@ -671,6 +673,32 @@ def _validate_out(
     _validate_16byte_alignment(out, "out")
 
 
+def _validate_mla_softmax_stats(
+    query: torch.Tensor,
+    softmax_stats: Optional[torch.Tensor],
+    store_softmax_stats: bool,
+    validate: bool,
+) -> None:
+    """Always enforce plan/buffer agreement; validate storage without CUDA sync."""
+    if (softmax_stats is not None) != store_softmax_stats:
+        raise ValueError(
+            "softmax_stats must be supplied exactly when store_softmax_stats=True"
+        )
+    if validate and softmax_stats is not None:
+        if not isinstance(softmax_stats, torch.Tensor):
+            raise TypeError("softmax_stats must be a torch.Tensor")
+        if softmax_stats.dtype != torch.float32:
+            raise TypeError("softmax_stats must have dtype torch.float32")
+        if softmax_stats.device != query.device:
+            raise ValueError("softmax_stats must be on the query device")
+        if tuple(softmax_stats.shape) != (*query.shape[:-1], 2):
+            raise ValueError("softmax_stats must have shape [*query.shape[:-1], 2]")
+        if not softmax_stats.is_contiguous():
+            raise ValueError("softmax_stats must be contiguous")
+        if softmax_stats.data_ptr() % 4:
+            raise ValueError("softmax_stats must be 4-byte aligned")
+
+
 def _kernel_dtype_name(dtype_key: str) -> str:
     names = {
         "bfloat16": "bf16",
@@ -720,6 +748,7 @@ def _resolve_mla_decode_launch_spec(
     output_dtype_key: str,
     mask_type: str,
     seq_len_q: int = 1,
+    store_softmax_stats: bool = False,
 ):
     """Resolve and cache MLA policy/workspace without compiling."""
 
@@ -869,6 +898,7 @@ def _resolve_mla_decode_launch_spec(
                 cfg=final_cfg,
                 partial_o_dtype=cutlass.BFloat16,
                 lse_dtype=cutlass.Float32,
+                store_softmax_stats=store_softmax_stats,
             )
             separate_reducer_impl, reducer_cluster_size = _separate_reducer_provenance(
                 kernel,
@@ -953,6 +983,7 @@ def _resolve_mla_decode_launch_spec(
                 split_kv=split_kv,
                 partial_o_dtype=cutlass.BFloat16,
                 lse_dtype=cutlass.Float32,
+                store_softmax_stats=store_softmax_stats,
             )
             separate_reducer_impl, reducer_cluster_size = _separate_reducer_provenance(
                 kernel,
@@ -1018,6 +1049,7 @@ def _make_mla_decode_compile_spec(
     output_dtype_key: str,
     max_seq_len_q: int,
     packed_query: bool,
+    store_softmax_stats: bool = False,
 ) -> _MLADecodeCompileSpec:
     """Keep policy resolution plan-specific and JIT identity batch-free."""
 
@@ -1035,6 +1067,7 @@ def _make_mla_decode_compile_spec(
         has_kernel_workspace=launch_spec.kernel_workspace_bytes > 0,
         split_kv=launch_spec.split_kv,
         kernel=launch_spec.kernel,
+        store_softmax_stats=store_softmax_stats,
     )
 
 
@@ -1161,6 +1194,16 @@ def _get_compiled_mla_decode(
             assumed_align=4,
         )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    stats_fake = None
+    if compile_spec.store_softmax_stats:
+        stats_rows = (
+            runtime_total_q * num_heads
+            if packed_query
+            else batch_size * max_seq_len_q * num_heads
+        )
+        stats_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32, (stats_rows, 2), stride_order=(1, 0), assumed_align=4
+        )
 
     # Task objects carry loop-local state through generated control flow, so
     # select the public staged frontend for this compilation.
@@ -1182,6 +1225,7 @@ def _get_compiled_mla_decode(
             cutlass.Float32(1.0),
             cutlass.Float32(1.0),
             stream_fake,
+            stats_fake,
             options=_COMPILE_OPTIONS,
         )
     return compiled
@@ -1202,6 +1246,7 @@ def get_prims_ts_batch_mla_decode_workspace_size(
     out_dtype: torch.dtype = torch.bfloat16,
     mask_type: Literal["dense", "causal"] = "causal",
     device=None,
+    store_softmax_stats: bool = False,
 ) -> int:
     """Return caller-workspace bytes for one automatic MLA policy.
 
@@ -1212,11 +1257,16 @@ def get_prims_ts_batch_mla_decode_workspace_size(
     packed-query launches;
     ``seq_len_q`` remains a backward-compatible fixed-Q alias. If neither is
     supplied, the bound is one. The returned byte count includes both split-KV
-    scratch and the internal FP32 LSE tensor. Allocate a contiguous
+    scratch and the internal FP32 LSE tensor. With ``store_softmax_stats=True``,
+    it also includes split maxima and sums to export actual maximum/denominator
+    statistics; the public statistics buffer is caller-owned and excluded.
+    Allocate a contiguous
     ``torch.int8`` or ``torch.uint8`` CUDA buffer; MLA does not require its
     contents to be initialized before first use.
     """
 
+    if not isinstance(store_softmax_stats, bool):
+        raise TypeError("store_softmax_stats must be a bool")
     batch_size = _validate_positive_int(batch_size, "batch_size")
     num_heads = _validate_positive_int(num_heads, "num_heads")
     _validate_mla_dims(kv_lora_rank, qk_rope_head_dim)
@@ -1252,6 +1302,7 @@ def get_prims_ts_batch_mla_decode_workspace_size(
         _dtype_key(out_dtype),
         mask_type,
         max_seq_len_q,
+        store_softmax_stats,
     )
     return _make_mla_workspace_layout(
         spec.kernel_workspace_bytes, batch_size, num_heads, max_seq_len_q
@@ -1382,6 +1433,7 @@ def _launch_mla_decode(
     split_kv: int,
     workspace: _MLAWorkspaceViews,
     compiled: Callable[..., object],
+    softmax_stats: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Form the dimension-first views and launch one compiled MLA kernel."""
 
@@ -1418,6 +1470,7 @@ def _launch_mla_decode(
         None,
         runtime.bmm1_scale,
         runtime.bmm2_scale,
+        None if softmax_stats is None else softmax_stats.view(-1, 2),
     )
     return runtime.out
 
@@ -1440,6 +1493,8 @@ def prims_ts_batch_mla_decode_with_kv_cache(
     bmm2_scale: float = 1.0,
     mask_type: Literal["dense", "causal"] = "causal",
     out_dtype: torch.dtype = torch.bfloat16,
+    store_softmax_stats: bool = False,
+    softmax_stats: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Launch fixed or packed-query paged MLA decode with caller-owned scratch.
 
@@ -1504,8 +1559,18 @@ def prims_ts_batch_mla_decode_with_kv_cache(
         Attention mask mode.
     out_dtype : torch.dtype
         Output dtype.
+    store_softmax_stats : bool
+        Compile statistics export; defaults to ``False``.
+    softmax_stats : torch.Tensor, optional
+        Caller-owned, contiguous FP32 ``[*query.shape[:-1], 2]`` buffer for
+        the actual natural-log maximum and unscaled softmax denominator.
+        Required exactly when statistics are enabled. Must not overlap any
+        input, output, or workspace; statistics-buffer overlap is not checked.
     """
 
+    if not isinstance(store_softmax_stats, bool):
+        raise TypeError("store_softmax_stats must be a bool")
+    _validate_mla_softmax_stats(query, softmax_stats, store_softmax_stats, True)
     packed_query = qo_indptr is not None
     _validate_query(query, packed_query=packed_query)
     metadata_device, batch_size, max_num_pages = _validate_mla_metadata(
@@ -1567,6 +1632,7 @@ def prims_ts_batch_mla_decode_with_kv_cache(
         _dtype_key(out_dtype),
         mask_type,
         max_seq_len_q,
+        store_softmax_stats,
     )
     spec = _resolve_mla_decode_launch_spec(*spec_key)
     layout = _make_mla_workspace_layout(
@@ -1625,6 +1691,7 @@ def prims_ts_batch_mla_decode_with_kv_cache(
         output_dtype_key=_dtype_key(out_dtype),
         max_seq_len_q=max_seq_len_q,
         packed_query=packed_query,
+        store_softmax_stats=store_softmax_stats,
     )
     compiled = _get_compiled_mla_decode(compile_spec)
     workspace = _bind_mla_workspace(workspace_buffer, layout)
@@ -1638,6 +1705,7 @@ def prims_ts_batch_mla_decode_with_kv_cache(
         split_kv=spec.split_kv,
         workspace=workspace,
         compiled=compiled,
+        softmax_stats=softmax_stats,
     )
 
 
@@ -1666,6 +1734,7 @@ class BatchMLADecodePagedTSWrapper:
         kv_data_type: torch.dtype,
         o_data_type: torch.dtype,
         mask_type: Literal["dense", "causal"] = "causal",
+        store_softmax_stats: bool = False,
         workspace_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         """Compile one static MLA shape and bind its reusable workspace.
@@ -1704,6 +1773,9 @@ class BatchMLADecodePagedTSWrapper:
             Query, K/V, and output dtypes used to compile the plan.
         mask_type : {"dense", "causal"}
             Attention mask mode.
+        store_softmax_stats : bool
+            Compile final FP32 maximum/denominator export. Supply its caller-owned
+            buffer to every run when enabled. Defaults to ``False``.
         workspace_buffer : torch.Tensor, optional
             Caller-owned contiguous int8 or uint8 scratch on ``device``. It
             must be 32-byte aligned and large enough for the selected plan.
@@ -1713,6 +1785,8 @@ class BatchMLADecodePagedTSWrapper:
 
         if not isinstance(packed_query, bool):
             raise TypeError("packed_query must be a bool")
+        if not isinstance(store_softmax_stats, bool):
+            raise TypeError("store_softmax_stats must be a bool")
         _validate_mask(mask_type)
         batch_size = _validate_positive_int(batch_size, "batch_size")
         _validate_mla_int32_extent(batch_size, "batch_size")
@@ -1743,6 +1817,7 @@ class BatchMLADecodePagedTSWrapper:
             _dtype_key(o_data_type),
             mask_type,
             max_seq_len_q,
+            store_softmax_stats,
         )
         spec = _resolve_mla_decode_launch_spec(*spec_key)
         compile_spec = _make_mla_decode_compile_spec(
@@ -1756,6 +1831,7 @@ class BatchMLADecodePagedTSWrapper:
             output_dtype_key=_dtype_key(o_data_type),
             max_seq_len_q=max_seq_len_q,
             packed_query=packed_query,
+            store_softmax_stats=store_softmax_stats,
         )
         policy = spec.policy
         workspace_layout = _make_mla_workspace_layout(
@@ -1797,6 +1873,7 @@ class BatchMLADecodePagedTSWrapper:
             compiled=compiled,
             policy=policy,
             split_kv=int(dict(policy)["split_kv"]),
+            store_softmax_stats=store_softmax_stats,
         )
 
     @flashinfer_api
@@ -1811,6 +1888,7 @@ class BatchMLADecodePagedTSWrapper:
         bmm1_scale: float = 1.0,
         bmm2_scale: float = 1.0,
         out: Optional[torch.Tensor] = None,
+        softmax_stats: Optional[torch.Tensor] = None,
         validate: bool = True,
     ) -> torch.Tensor:
         """Launch the most recently planned MLA decode on the current stream.
@@ -1840,6 +1918,13 @@ class BatchMLADecodePagedTSWrapper:
             QK and value/output scaling factors.
         out : torch.Tensor, optional
             Caller-owned output tensor. A new tensor is allocated when omitted.
+        softmax_stats : torch.Tensor, optional
+            Caller-owned, contiguous FP32 ``[*query.shape[:-1], 2]`` buffer.
+            Stores the actual maximum scaled logit in natural-log units and
+            ``sum(exp(logit - max))`` without internal FP8 scaling. Required
+            exactly when ``store_softmax_stats=True``, even with ``validate=False``.
+            Must not overlap any input, output, or workspace; statistics-buffer
+            overlap is a caller precondition and is not checked.
         validate : bool
             Enable explicit runtime validation. Defaults to ``True``.
 
@@ -1854,6 +1939,9 @@ class BatchMLADecodePagedTSWrapper:
             raise RuntimeError("plan() must be called before run()")
         if not isinstance(validate, bool):
             raise TypeError("validate must be a bool")
+        _validate_mla_softmax_stats(
+            query, softmax_stats, state.store_softmax_stats, validate
+        )
         runtime_qo_indptr = qo_indptr if state.packed_query else None
         caller_provided_out = out is not None
         runtime = _prepare_mla_runtime(
@@ -1910,6 +1998,7 @@ class BatchMLADecodePagedTSWrapper:
             split_kv=state.split_kv,
             workspace=state.workspace_views,
             compiled=state.compiled,
+            softmax_stats=softmax_stats,
         )
 
 
@@ -1930,6 +2019,8 @@ def batch_mla_decode_with_paged_kv_cache(
     bmm2_scale: float = 1.0,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
+    store_softmax_stats: bool = False,
+    softmax_stats: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """One-shot convenience wrapper for fixed or packed-query MLA decode.
 
@@ -1968,6 +2059,11 @@ def batch_mla_decode_with_paged_kv_cache(
         Caller-owned output tensor.
     out_dtype : torch.dtype
         Output dtype.
+    store_softmax_stats : bool
+        Compile statistics export; defaults to ``False``.
+    softmax_stats : torch.Tensor, optional
+        Caller-owned FP32 maximum/denominator buffer with shape
+        ``[*query.shape[:-1], 2]``; required exactly when statistics are enabled.
 
     Returns
     -------
@@ -2095,6 +2191,7 @@ def batch_mla_decode_with_paged_kv_cache(
         kv_data_type=normalized_cache.dtype,
         o_data_type=out_dtype,
         mask_type=mask_type,
+        store_softmax_stats=store_softmax_stats,
     )
     return wrapper.run(
         query,
@@ -2105,6 +2202,7 @@ def batch_mla_decode_with_paged_kv_cache(
         bmm1_scale=bmm1_scale,
         bmm2_scale=bmm2_scale,
         out=out,
+        softmax_stats=softmax_stats,
     )
 
 

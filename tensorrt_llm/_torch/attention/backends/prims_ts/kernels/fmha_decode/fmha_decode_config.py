@@ -966,6 +966,9 @@ class FmhaDecodeConfig:
     # denominator (extra logit that absorbs probability mass). Requires the
     # `attention_sinks` tensor argument at launch.
     use_attention_sinks: bool = False
+    # Export merge-compatible (natural-log maximum, unscaled denominator).
+    # Only separate reducers require an additional per-split maximum scalar.
+    store_softmax_stats: bool = False
     # Optional profile and reduction knobs selected by launcher policy or tests.
     use_keeps_mma_ab: bool = False
     # Nonzero means each K/V stage covers only this many head-dim columns.
@@ -1698,8 +1701,13 @@ class FmhaDecodeConfig:
         where that trade was measured to pay: KV256 tiles and block-sparse
         routes, whose row maximum moves often but rarely by much.
         """
-        return self.use_keeps_mma_ab and (
-            self.tile_size_kv == 256 or self.use_block_sparse
+        # The public statistics contract requires the actual maximum, not a
+        # merge-equivalent delayed anchor. Keep the fast default policy intact;
+        # statistics-enabled kernels maintain the exact online maximum.
+        return (
+            not self.store_softmax_stats
+            and self.use_keeps_mma_ab
+            and (self.tile_size_kv == 256 or self.use_block_sparse)
         )
 
     @property

@@ -296,7 +296,9 @@ class MlaConfig:
     def cluster_reduction_slices(self) -> int:
         return ceil(self.tile_size_q / self.cluster_reduction_rows_per_slice)
 
-    def cluster_reduction_smem_bytes_for(self, num_ctas_kv: int) -> int:
+    def cluster_reduction_smem_bytes_for(
+        self, num_ctas_kv: int, *, store_softmax_stats: bool = False
+    ) -> int:
         """Return multi-CTA KV cluster reduction SMEM footprint."""
         if num_ctas_kv <= 1:
             return 0
@@ -305,7 +307,9 @@ class MlaConfig:
         num_slices_per_cta = ceil(num_slices / num_ctas_kv)
         num_rows_per_cta = num_slices_per_cta * rows_per_slice
         num_bytes_per_row_o = self.head_dim_per_cta_v * self.partial_o_dtype_bytes
-        num_bytes_per_row_stats = 2 * self.acc_dtype_bytes
+        num_bytes_per_row_stats = (
+            3 if store_softmax_stats else 2
+        ) * self.acc_dtype_bytes
         return (
             num_ctas_kv
             * num_rows_per_cta
@@ -388,6 +392,7 @@ def compute_workspace_size(
     cfg: MlaConfig,
     partial_o_dtype,
     lse_dtype,
+    store_softmax_stats: bool = False,
 ) -> int:
     """Return the exact 1CTA split-KV GMEM workspace size in bytes.
 
@@ -401,7 +406,9 @@ def compute_workspace_size(
         return 0
     partial_rows = cfg.batch_size * cfg.seq_len_q * cfg.num_heads_q * split_kv
     return partial_rows * (
-        cfg.head_dim_v * partial_o_dtype.width // 8 + lse_dtype.width // 8
+        cfg.head_dim_v * partial_o_dtype.width // 8
+        + lse_dtype.width // 8
+        + (8 if store_softmax_stats else 0)
     )
 
 

@@ -103,6 +103,7 @@ def compute_workspace_size(
     split_kv: int,
     partial_o_dtype,
     lse_dtype,
+    store_softmax_stats: bool = False,
 ) -> int:
     """Return the physical flat-tile split-KV workspace size in bytes."""
 
@@ -114,7 +115,9 @@ def compute_workspace_size(
         raise ValueError(f"num_q_tiles must be positive, got {num_q_tiles}")
     partial_rows = batch_size * tile_size_q * num_q_tiles * split_kv
     return partial_rows * (
-        latent_dim * partial_o_dtype.width // 8 + lse_dtype.width // 8
+        latent_dim * partial_o_dtype.width // 8
+        + lse_dtype.width // 8
+        + (8 if store_softmax_stats else 0)
     )
 
 

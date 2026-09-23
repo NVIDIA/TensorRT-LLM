@@ -414,6 +414,8 @@ class SmemPResource(DecodeGenResourceBase):
         if safe_new_max == _neg_max_f32():
             safe_new_max = Float32(0.0)
         minus_max_scale = Float32(-self.scale_softmax_log2 * safe_new_max)
+        if cutlass.const_expr(cfg.store_softmax_stats):
+            minus_max_scale = Float32(0.0)
         tmem_base = self._tmem_base_addr + Int32(self._tmem_alloc.offset)
         tidx, _, _ = cute.arch.thread_idx()
         publishes_fragment = (tidx & Int32(31)) == Int32(0)
@@ -435,6 +437,12 @@ class SmemPResource(DecodeGenResourceBase):
             )
             for score_idx in cutlass.range_constexpr(fragment_regs):
                 s_arr[score_idx] = loaded[score_idx]
+            if cutlass.const_expr(cfg.store_softmax_stats):
+                for pair_idx in cutlass.range_constexpr(fragment_regs // 2):
+                    idx = pair_idx * 2
+                    s_arr[idx], s_arr[idx + 1] = fadd2(
+                        (s_arr[idx], s_arr[idx + 1]), (-safe_new_max, -safe_new_max)
+                    )
 
             local_sum = self._exponentiate_fragment_pairs(s_arr, minus_max_scale)
             if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
@@ -612,6 +620,14 @@ class SmemPResource(DecodeGenResourceBase):
         if safe_new_max == _neg_max_f32():
             safe_new_max = Float32(0.0)
         neg_scaled_max = -self.scale_softmax_log2 * safe_new_max
+        if cutlass.const_expr(cfg.store_softmax_stats):
+            # Keep P and its denominator relative to the exact raw row maximum.
+            for pair_idx in cutlass.range_constexpr(num_s_regs // 2):
+                idx = pair_idx * 2
+                s_arr[idx], s_arr[idx + 1] = fadd2(
+                    (s_arr[idx], s_arr[idx + 1]), (-safe_new_max, -safe_new_max)
+                )
+            neg_scaled_max = Float32(0.0)
         if cutlass.const_expr(cfg.use_fp8_qkv):
             neg_scaled_max += _fp8_log2_quant_scale()
 
@@ -836,6 +852,7 @@ class SmemPResource(DecodeGenResourceBase):
                             s_arr[q32_s_base + 17],
                             s_arr[q32_s_base + 18],
                             s_arr[q32_s_base + 19],
+                            store_softmax_stats=cfg.store_softmax_stats,
                         )
                     )
                     packed_p[scale_pair_idx] = p_lo
@@ -860,6 +877,7 @@ class SmemPResource(DecodeGenResourceBase):
                         s_arr[q32_s_base + 17],
                         s_arr[q32_s_base + 18],
                         s_arr[q32_s_base + 19],
+                        store_softmax_stats=cfg.store_softmax_stats,
                     )
                     packed_p[scale_pair_idx] = p_lo
                     packed_p[scale_pair_idx + 4] = p_hi
@@ -934,6 +952,7 @@ class SmemPResource(DecodeGenResourceBase):
                             s_arr[s_base + 9],
                             s_arr[s_base + 10],
                             s_arr[s_base + 11],
+                            store_softmax_stats=cfg.store_softmax_stats,
                         )
                     )
                 else:
@@ -949,6 +968,7 @@ class SmemPResource(DecodeGenResourceBase):
                         s_arr[s_base + 9],
                         s_arr[s_base + 10],
                         s_arr[s_base + 11],
+                        store_softmax_stats=cfg.store_softmax_stats,
                     )
                 packed_p[scale_pair_idx] = p_lo
                 packed_p[scale_pair_idx + 2] = p_hi
@@ -1010,10 +1030,20 @@ class SmemPResource(DecodeGenResourceBase):
                             s_idx = (
                                 generic_s_base + q_repeats * 4 + (k_pair_idx - 2) * 2
                             )
-                        p_val = cute.math.exp2(
-                            s_arr[s_idx] * self.scale_softmax_log2 + neg_scaled_max,
-                            fastmath=True,
-                        )
+                        if cutlass.const_expr(cfg.store_softmax_stats):
+                            exponent = (
+                                s_arr[s_idx] - safe_new_max
+                            ) * self.scale_softmax_log2
+                            if cutlass.const_expr(
+                                cfg.use_fp8_qkv or cfg.kv_dtype_bytes == 1
+                            ):
+                                exponent += _fp8_log2_quant_scale()
+                            p_val = cute.math.exp2(exponent, fastmath=True)
+                        else:
+                            p_val = cute.math.exp2(
+                                s_arr[s_idx] * self.scale_softmax_log2 + neg_scaled_max,
+                                fastmath=True,
+                            )
                         p_vals[s_idx] = p_val
                         local_sums[scale_idx] += p_val
                         if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
@@ -1147,6 +1177,7 @@ class SmemPResource(DecodeGenResourceBase):
                             s_arr[5],
                             s_arr[6],
                             s_arr[7],
+                            store_softmax_stats=cfg.store_softmax_stats,
                         )
                     )
             elif cutlass.const_expr(
@@ -1169,6 +1200,7 @@ class SmemPResource(DecodeGenResourceBase):
                         s_arr[5],
                         s_arr[6],
                         s_arr[7],
+                        store_softmax_stats=cfg.store_softmax_stats,
                     )
                 )
             else:
@@ -1187,6 +1219,7 @@ class SmemPResource(DecodeGenResourceBase):
                         s_arr[5],
                         s_arr[6],
                         s_arr[7],
+                        store_softmax_stats=cfg.store_softmax_stats,
                     )
                 )
             # Publish sums through TmemS; packed E4M3 P bytes use the
@@ -1237,6 +1270,7 @@ class SmemPResource(DecodeGenResourceBase):
                     s_arr[5],
                     s_arr[6],
                     s_arr[7],
+                    store_softmax_stats=cfg.store_softmax_stats,
                 )
                 for p_idx in cutlass.range_constexpr(8):
                     p_vals[p_idx] = p_result[p_idx]

@@ -93,6 +93,7 @@ from ...helpers.tile import (
 from .common import (
     MlaResource,
 )
+from ...helpers.softmax_stats import partial_max_tensor, store_softmax_stats
 
 # =====================================================================
 # TmemCorrResource — Correction and output store to GMEM
@@ -116,6 +117,8 @@ class TmemCorrResource(MlaResource):
     lse_tensor: object = None
     acc_o_tensor: object = None
     acc_lse_tensor: object = None
+    softmax_stats: object = None
+    softmax_stats_scale: object = None
     cache_seqs: object = None
     head_idx: object = None
     batch_idx: object = None
@@ -152,9 +155,15 @@ class TmemCorrResource(MlaResource):
         allocs = [self._alloc, self._sum_alloc]
         if self.cfg.cluster_reduction_smem_bytes and self.acc_o_tensor is None:
             if self._cluster_reduction_alloc is None:
+                cluster_bytes = max(
+                    self.cfg.cluster_reduction_smem_bytes_for(
+                        splits, store_softmax_stats=self.softmax_stats is not None
+                    )
+                    for splits in range(2, self.cfg.num_ctas_per_seq_kv + 1)
+                )
                 self._cluster_reduction_alloc = SmemAllocation(
                     name=f"{self.name}_clusterReduction",
-                    size_bytes=self.cfg.cluster_reduction_smem_bytes,
+                    size_bytes=cluster_bytes,
                     alignment=64,
                 )
             if self._cluster_reduction_barrier_alloc is None:
@@ -195,7 +204,7 @@ class TmemCorrResource(MlaResource):
                 context,
                 self._cluster_reduction_alloc,
                 Int8,
-                self.cfg.cluster_reduction_smem_bytes,
+                self._cluster_reduction_alloc.size_bytes,
             )
             self._cluster_reduction_barrier = smem_array(
                 context,
@@ -262,7 +271,8 @@ class TmemCorrResource(MlaResource):
                 cute.math.min(Int32(rows_per_cta), remaining_rows),
             )
             bytes_per_row = Int32(
-                cfg.head_dim_per_cta_v * cfg.partial_o_dtype_bytes + cfg.acc_dtype_bytes
+                cfg.head_dim_per_cta_v * cfg.partial_o_dtype_bytes
+                + cfg.acc_dtype_bytes * (3 if self.softmax_stats is not None else 1)
             )
             expected_bytes = valid_rows * Int32(cfg.num_ctas_per_seq_kv) * bytes_per_row
             if warp_idx == Int32(cfg.correction_warp_idx):
@@ -348,14 +358,15 @@ class TmemCorrResource(MlaResource):
         )
 
     @cute.jit
-    def _store_partial_lse_to_cluster_smem(self, local_row_idx, cta_idx_kv, lse_val):
+    def _store_partial_lse_to_cluster_smem(
+        self, local_row_idx, cta_idx_kv, lse_val, raw_maximum=None, row_sum=None
+    ):
         """Send one partial log-sum-exp value to the matching reduction owner."""
         rows_per_cta = self._cluster_rows_per_cta()
         owner_rank = local_row_idx // rows_per_cta
         owner_row_idx = local_row_idx - owner_rank * rows_per_cta
-        stats_elem_offset = cta_idx_kv * rows_per_cta * Int32(
-            2
-        ) + owner_row_idx * Int32(2)
+        stats_width = Int32(3 if self.softmax_stats is not None else 2)
+        stats_elem_offset = (cta_idx_kv * rows_per_cta + owner_row_idx) * stats_width
         byte_offset = self._cluster_o_bytes() + Int64(
             stats_elem_offset * Int32(self.cfg.acc_dtype_bytes)
         )
@@ -370,6 +381,31 @@ class TmemCorrResource(MlaResource):
                 remote_barrier.ir_value(),
             ],
         )
+        if cutlass.const_expr(self.softmax_stats is not None):
+            if cutlass.const_expr(raw_maximum is None):
+                raw_maximum = Float32(-Float32.inf)
+            if cutlass.const_expr(row_sum is None):
+                row_sum = Float32(0.0)
+            max_ptr = remote_ptr + Int32(1)
+            cute.arch.inline_ptx(
+                "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 "
+                "[{$r0}], {$r1}, [{$r2}];",
+                read_only_args=[
+                    max_ptr.ir_value(),
+                    raw_maximum.bitcast(Int32),
+                    remote_barrier.ir_value(),
+                ],
+            )
+            sum_ptr = remote_ptr + Int32(2)
+            cute.arch.inline_ptx(
+                "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 "
+                "[{$r0}], {$r1}, [{$r2}];",
+                read_only_args=[
+                    sum_ptr.ir_value(),
+                    row_sum.bitcast(Int32),
+                    remote_barrier.ir_value(),
+                ],
+            )
 
     @cute.jit
     def _store_o_slice_to_gmem(
@@ -530,7 +566,11 @@ class TmemCorrResource(MlaResource):
                 )
                 if cutlass.const_expr(self.cfg.use_cluster_reduction == 1):
                     self._store_partial_lse_to_cluster_smem(
-                        local_row_idx, cta_idx_kv, lse_val
+                        local_row_idx,
+                        cta_idx_kv,
+                        lse_val,
+                        final_max[scale_idx],
+                        lse_sum,
                     )
                 elif cutlass.const_expr(self.acc_lse_tensor is not None):
                     if valid_output_row and cta_idx_head_dim_v == Int32(0):
@@ -547,6 +587,18 @@ class TmemCorrResource(MlaResource):
                         (self.acc_lse_tensor.iterator.raw_ptr() + elem_offset).store(
                             lse_val
                         )
+                        if cutlass.const_expr(self.softmax_stats is not None):
+                            acc_max = partial_max_tensor(
+                                self.acc_lse_tensor, self.softmax_stats
+                            )
+                            (acc_max.iterator.raw_ptr() + elem_offset).store(
+                                final_max[scale_idx]
+                            )
+                            (
+                                acc_max.iterator.raw_ptr()
+                                + Int64(cute.cosize(self.acc_lse_tensor.layout))
+                                + elem_offset
+                            ).store(lse_sum)
                 else:
                     if valid_output_row:
                         elem_offset = public_query_flat_row(
@@ -558,13 +610,20 @@ class TmemCorrResource(MlaResource):
                         (self.lse_tensor.iterator.raw_ptr() + elem_offset).store(
                             lse_val
                         )
+                        if cta_idx_head_dim_v == Int32(0):
+                            store_softmax_stats(
+                                self.softmax_stats,
+                                elem_offset,
+                                final_max[scale_idx],
+                                lse_sum,
+                                self.softmax_stats_scale,
+                            )
 
     @cute.jit
     def _cluster_lse_byte_offset(self, split_idx, owner_row_idx):
         rows_per_cta = self._cluster_rows_per_cta()
-        stats_elem_offset = split_idx * rows_per_cta * Int32(2) + owner_row_idx * Int32(
-            2
-        )
+        stats_width = Int32(3 if self.softmax_stats is not None else 2)
+        stats_elem_offset = (split_idx * rows_per_cta + owner_row_idx) * stats_width
         return self._cluster_o_bytes() + Int64(
             stats_elem_offset * Int32(self.cfg.acc_dtype_bytes)
         )
@@ -811,6 +870,65 @@ class TmemCorrResource(MlaResource):
                                     (
                                         self.lse_tensor.iterator.raw_ptr() + lse_offset
                                     ).store(published_lse)
+                                    if cutlass.const_expr(
+                                        self.softmax_stats is not None
+                                    ):
+                                        true_max = Float32(-Float32.inf)
+                                        for split_idx in cutlass.range_constexpr(
+                                            cfg.num_ctas_per_seq_kv
+                                        ):
+                                            if local_lse[split_idx] != Float32(
+                                                -Float32.inf
+                                            ):
+                                                max_ptr = self._cluster_local_smem_ptr(
+                                                    self._cluster_lse_byte_offset(
+                                                        Int32(split_idx), owner_row_idx
+                                                    )
+                                                    + Int64(cfg.acc_dtype_bytes),
+                                                    Int32,
+                                                )
+                                                true_max = cute.math.max(
+                                                    true_max,
+                                                    max_ptr.load().bitcast(Float32),
+                                                    ftz=True,
+                                                )
+                                        denominator = Float32(0.0)
+                                        for split_idx in cutlass.range_constexpr(
+                                            cfg.num_ctas_per_seq_kv
+                                        ):
+                                            if local_lse[split_idx] != Float32(
+                                                -Float32.inf
+                                            ):
+                                                max_ptr = self._cluster_local_smem_ptr(
+                                                    self._cluster_lse_byte_offset(
+                                                        Int32(split_idx), owner_row_idx
+                                                    )
+                                                    + Int64(cfg.acc_dtype_bytes),
+                                                    Int32,
+                                                )
+                                                partial_max = max_ptr.load().bitcast(
+                                                    Float32
+                                                )
+                                                partial_sum = (
+                                                    (max_ptr + Int32(1))
+                                                    .load()
+                                                    .bitcast(Float32)
+                                                )
+                                                denominator += (
+                                                    partial_sum
+                                                    * cute.math.exp2(
+                                                        (partial_max - true_max)
+                                                        * self.scale_softmax_log2,
+                                                        fastmath=True,
+                                                    )
+                                                )
+                                        store_softmax_stats(
+                                            self.softmax_stats,
+                                            lse_offset,
+                                            true_max,
+                                            denominator,
+                                            self.softmax_stats_scale,
+                                        )
 
                             acc_vec = vector_from_scalars(
                                 (

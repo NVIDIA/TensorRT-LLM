@@ -33,6 +33,7 @@ from ..helpers.query import (
     split_o_element_offset,
 )
 from ..helpers.tile import runtime_seq_len_kv_for_q
+from ..helpers.softmax_stats import store_reduced_softmax_stats
 
 
 # Baseline split-KV reduction uses one 128-thread CTA.  Each thread owns eight
@@ -235,6 +236,8 @@ def run_gmem_reduction_kernel(
     cu_seqlens_q,
     cfg,
     num_reduction_ctas,
+    softmax_stats=None,
+    softmax_stats_scale=None,
 ):
     """Reduce split-KV partial O/LSE rows written by the 1CTA main kernel.
 
@@ -342,6 +345,15 @@ def run_gmem_reduction_kernel(
                         cu_seqlens_q,
                     )
                     (lse.iterator.raw_ptr() + output_query_row).store(global_lse)
+                    if head_dim_cta_idx == Int32(0):
+                        store_reduced_softmax_stats(
+                            softmax_stats,
+                            output_query_row,
+                            acc_lse,
+                            row_lse,
+                            cfg.num_ctas_per_seq_kv,
+                            softmax_stats_scale,
+                        )
 
                 acc_vec = vector_from_scalars(
                     (
@@ -487,6 +499,14 @@ def run_gmem_reduction_kernel(
                         cu_seqlens_q,
                     )
                     (lse.iterator.raw_ptr() + output_query_row).store(global_lse)
+                    store_reduced_softmax_stats(
+                        softmax_stats,
+                        output_query_row,
+                        acc_lse,
+                        row_lse,
+                        cfg.num_ctas_per_seq_kv,
+                        softmax_stats_scale,
+                    )
                 for i in cutlass.range_constexpr(lse_per_thread):
                     split_idx = lane_idx + Int32(i * GMEM_REDUCTION_WARP_LANES)
                     if cute.elem_less(split_idx, Int32(cfg.num_ctas_per_seq_kv)):
@@ -654,6 +674,14 @@ def run_gmem_reduction_kernel(
                         cu_seqlens_q,
                     )
                     (lse.iterator.raw_ptr() + output_query_row).store(global_lse)
+                    store_reduced_softmax_stats(
+                        softmax_stats,
+                        output_query_row,
+                        acc_lse,
+                        row_lse,
+                        cfg.num_ctas_per_seq_kv,
+                        softmax_stats_scale,
+                    )
                 for i in cutlass.range_constexpr(lse_per_thread):
                     split_idx = lane_idx + Int32(i * GMEM_REDUCTION_WARP_LANES)
                     if cute.elem_less(split_idx, Int32(cfg.num_ctas_per_seq_kv)):
@@ -811,6 +839,14 @@ def run_gmem_reduction_kernel(
                     cu_seqlens_q,
                 )
                 (lse.iterator.raw_ptr() + output_query_row).store(global_lse)
+                store_reduced_softmax_stats(
+                    softmax_stats,
+                    output_query_row,
+                    acc_lse,
+                    g_lse,
+                    cfg.num_ctas_per_seq_kv,
+                    softmax_stats_scale,
+                )
         for i in cutlass.range_constexpr(lse_per_thread):
             split_idx = lane_idx + Int32(i * GMEM_REDUCTION_WARP_LANES)
             if cute.elem_less(split_idx, Int32(cfg.num_ctas_per_seq_kv)):
