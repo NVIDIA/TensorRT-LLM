@@ -19,6 +19,8 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Iterator
 
+import pytest
+
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import OpWrapper
 
 
@@ -47,3 +49,70 @@ def validating(*wrappers: OpWrapper) -> Iterator[None]:
     finally:
         for cls, original in reversed(saved):
             cls.__call__ = original
+
+
+@pytest.fixture
+def certifying():
+    """Arm one entry for the rest of the test: drive its guard, and refuse to
+    finish unless its own reference and gate were the ones used.
+
+    ``validating`` interposes ``is_valid`` and nothing more, which is right for
+    a guard test but leaves the certification itself unchecked: an entry can
+    carry a mirror that nothing calls and a band that nothing applies, and the
+    type system is satisfied while both claims are dead. That is not
+    hypothetical -- ``mla_rope_append_paged_kv_assign_q`` ships a 38-line
+    ``reference`` its own test never reaches, comparing against a local copy
+    instead.
+
+    A fixture rather than a context manager because the comparison does not
+    happen where the call does. In every entry that uses ``validating`` today
+    the op call sits inside the block and ``reference``/``compare`` are
+    statements after it -- and in the paged-cache entries the block is buried
+    inside a helper, tens of lines from the comparison. A block that spanned
+    both would have to span the whole test.
+
+    What this proves is that the entry's own members were the ones exercised,
+    not that the exercise was meaningful: ``op.compare(x, x)`` also counts.
+    That is the same bound the other static gates in this tree state about
+    themselves, and it is worth what it costs -- a dead mirror is invisible
+    without it.
+    """
+    armed: list[tuple[type, str, object, bool]] = []
+    seen: dict[str, int] = {}
+
+    def arm(*wrappers: OpWrapper) -> None:
+        for w in wrappers:
+            assert isinstance(w, OpWrapper), f"{w!r} is not a catalog entry"
+            cls = type(w)
+            for name in ("__call__", "reference", "compare"):
+                original = getattr(cls, name)
+                # Whether the subclass owns it decides how to put it back:
+                # `compare` and `is_valid` have base defaults, and restoring an
+                # inherited method with setattr would copy it onto the subclass
+                # permanently.
+                owned = name in cls.__dict__
+                armed.append((cls, name, original, owned))
+
+                def counted(self, *args, _o=original, _n=name, **kwargs):
+                    seen[_n] = seen.get(_n, 0) + 1
+                    if _n == "__call__":
+                        self.is_valid(*args, **kwargs)
+                    return _o(self, *args, **kwargs)
+
+                setattr(cls, name, counted)
+
+    yield arm
+
+    for cls, name, original, owned in reversed(armed):
+        if owned:
+            setattr(cls, name, original)
+        else:
+            delattr(cls, name)
+
+    if not armed:
+        return
+    missing = [n for n in ("__call__", "reference", "compare") if not seen.get(n)]
+    assert not missing, (
+        f"the entry was armed but {', '.join(missing)} never ran: a cell driven "
+        f"without the entry's own reference and gate certifies nothing it claims"
+    )
