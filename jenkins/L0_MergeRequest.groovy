@@ -2340,21 +2340,48 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
 
                 // BOLT profile generation (producer): refreshes the branch-keyed
-                // `latest` bundle the BOLT consumers pull, on this pipeline's
-                // cadence. Post-merge only -- it profiles the SBSA build just
-                // built under three multi-hour GPU workloads, so it must never
-                // land on a pre-merge /bot run. Best-effort: the producer depends
-                // on external SLURM health and bundles are drift-tolerant, so a
-                // failure just leaves `latest` where it was; it must not fail
-                // post-merge nor block the tests behind it.
+                // `latest` bundle the BOLT consumers pull, and publishes this
+                // run's optimized SBSA build, on this pipeline's cadence.
+                // Post-merge only -- it profiles the SBSA build just built under
+                // three multi-hour GPU workloads, so it must never land on a
+                // pre-merge /bot run.
+                //
+                // UNSTABLE, not SUCCESS, on failure. This used to be swallowed
+                // entirely, on the grounds that the producer depends on external
+                // SLURM health and bundles are drift-tolerant. That reasoning
+                // still holds for the bundle -- a failure just leaves `latest`
+                // where it was -- but it hid the case that matters: a run whose
+                // BOLT step failed produced no optimized build, and a green
+                // post-merge said nothing about it. UNSTABLE surfaces that
+                // without failing an otherwise-good post-merge or blocking the
+                // tests behind this stage. Consumers that cannot accept an
+                // unoptimized build fail on their own (they require
+                // bolted-<tarball> by name), so nothing silently degrades.
                 if (env.JOB_NAME ==~ /.*PostMerge.*/) {
                     stage("[BOLT-Profile-Gen] Remote Run") {
-                        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
                             def additionalParameters = [
                                 "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                                 'targetArch': "aarch64-linux-gnu",
                                 'branch': globalVars[BUILD_BRANCH],
                                 'promote': "true",
+                                // Publish this run's optimized SBSA build at artifactPath
+                                // as bolted-<tarball>, a distinct object alongside the
+                                // untouched canonical one. Consumers that require
+                                // optimized binaries name it explicitly and fail if it
+                                // never appears, rather than racing the canonical object
+                                // and permanently baking in the unoptimized wheel. The
+                                // SBSA test stages that follow are sequenced after this
+                                // one and prefer it when present, so post-merge tests
+                                // exercise the very build this run promotes.
+                                // applyProfiles is passed explicitly even though it already
+                                // defaults on: publishing REQUIRES it (no BOLT_APPLY=1 in
+                                // the merge job means no bolted tarball to push), and the
+                                // helper skips publishing when it is off, so pinning it
+                                // here keeps a later default flip from quietly turning the
+                                // publication back off.
+                                'applyProfiles': "true",
+                                'boltPublishBolted': "true",
                             ]
                             launchJob(pipeline, "/LLM/helpers/BoltProfileGen", false, false, globalVars, "SBSA", additionalParameters)
                         }
