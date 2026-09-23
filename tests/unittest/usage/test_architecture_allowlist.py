@@ -16,15 +16,20 @@
 
 import pytest
 
-from tensorrt_llm.usage.architecture_allowlist import PUBLIC_HF_ARCHITECTURES
+from tensorrt_llm.usage.architecture_allowlist import PUBLIC_MODEL_ARCHITECTURES
 
 pytestmark = pytest.mark.cpu_only
 
 
 def test_allowlist_entries_are_well_formed() -> None:
     """Runtime entries are valid schema-bounded identifiers."""
-    assert PUBLIC_HF_ARCHITECTURES
+    assert PUBLIC_MODEL_ARCHITECTURES
     assert all(
         name.isidentifier() and name.strip() == name and len(name) <= 256
-        for name in PUBLIC_HF_ARCHITECTURES
+        for name in PUBLIC_MODEL_ARCHITECTURES
     )
+
+
+def test_public_runtime_architecture_is_allowlisted() -> None:
+    """A documented TRT-LLM runtime architecture may be sent in plaintext."""
+    assert "Qwen3ForTextEmbedding" in PUBLIC_MODEL_ARCHITECTURES

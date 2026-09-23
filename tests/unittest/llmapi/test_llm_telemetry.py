@@ -246,6 +246,49 @@ class TestTelemetryPyTorchBackend:
         assert captured.get("llm_args") is not None, "report_usage was not called with llm_args"
 
 
+class TestTelemetryPretrainedConfigSelection:
+    """Verify telemetry receives the effective runtime model configuration."""
+
+    def test_encode_only_uses_runtime_pretrained_config(self):
+        raw_config = SimpleNamespace(architectures=["Qwen3ForCausalLM"])
+        runtime_config = SimpleNamespace(architectures=["Qwen3ForTextEmbedding"])
+        llm = object.__new__(BaseLLM)
+        llm.args = SimpleNamespace(telemetry_config=None)
+        llm._hf_model_config = raw_config
+        llm._encoder_executor = SimpleNamespace(
+            model_engine=SimpleNamespace(
+                model=SimpleNamespace(
+                    model_config=SimpleNamespace(pretrained_config=runtime_config)
+                )
+            )
+        )
+
+        with patch("tensorrt_llm.usage.report_usage") as report_usage:
+            llm._start_usage_reporting()
+
+        report_usage.assert_called_once_with(
+            llm_args=llm.args,
+            pretrained_config=runtime_config,
+            telemetry_config=None,
+        )
+
+    def test_generation_uses_loaded_hf_config(self):
+        raw_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
+        llm = object.__new__(BaseLLM)
+        llm.args = SimpleNamespace(telemetry_config=None)
+        llm._hf_model_config = raw_config
+        llm._encoder_executor = None
+
+        with patch("tensorrt_llm.usage.report_usage") as report_usage:
+            llm._start_usage_reporting()
+
+        report_usage.assert_called_once_with(
+            llm_args=llm.args,
+            pretrained_config=raw_config,
+            telemetry_config=None,
+        )
+
+
 class TestTelemetryArchitectureExtraction:
     """End-to-end: _extract_architecture_class_name with a real HF config."""
 

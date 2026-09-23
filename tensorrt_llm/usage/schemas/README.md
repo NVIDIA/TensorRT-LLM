@@ -81,7 +81,7 @@ fails earlier can send a terminal report without an initial report.
 
 | Field | Type | Description | Example |
 |-------|------|-------------|---------|
-| `architectureClassName` | LongString | Exact model architecture class when it appears in the checked-in public Hugging Face architecture allowlist; otherwise empty. | `"MixtralForCausalLM"`, `"LlamaForCausalLM"`, `""` |
+| `architectureClassName` | LongString | Public model architecture identifier when it appears in the checked-in allowlist; otherwise empty. The identifier may come from a public model checkpoint or a documented TensorRT-LLM runtime architecture. | `"LlamaForCausalLM"`, `"Qwen3ForTextEmbedding"`, `""` |
 | `architectureClassHash` | LongString | Pseudonymous, deterministic SHA-256 grouping key for a non-empty architecture outside the public allowlist; otherwise empty. | `"sha256:76873a...ccd04"`, `""` |
 | `backend` | ShortString | Execution backend. | `"pytorch"`, `"tensorrt"` |
 | `dtype` | ShortString | Model data type. | `"float16"`, `"bfloat16"`, `"auto"` |
@@ -115,10 +115,14 @@ makes the same unknown architecture globally correlatable across deployments.
 The intended guarantee is only that the raw name is not transmitted while stable
 grouping remains possible; the hash must not be treated as anonymous or secret.
 
-Extraction uses the first Hugging Face `architectures` value and also supports
-legacy singular values and nested engine configs. Invalid or empty values leave
-both fields empty. The conservative allowlist is maintained manually; custom
-names remain excluded until reviewed.
+Extraction uses the first `architectures` value from the pretrained
+configuration and also supports legacy singular values and nested engine
+configs. Encode-only models use the effective runtime configuration after
+model overrides are applied. Invalid or empty values leave both fields empty.
+The conservative allowlist is maintained manually. An identifier may be
+included when it is publicly documented by the upstream model provider or in
+TensorRT-LLM's supported-models table; custom names remain excluded until
+reviewed.
 
 #### Aggregate LLM lifecycle counters
 

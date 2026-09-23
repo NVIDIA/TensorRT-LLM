@@ -519,9 +519,13 @@ class BaseLLM:
                     == _usage.UsageContext.UNKNOWN):
                 telemetry_config = telemetry_config.model_copy(
                     update={"usage_context": _usage.UsageContext.LLM_CLASS})
+            pretrained_config = self._hf_model_config
+            if self._encoder_executor is not None:
+                pretrained_config = (self._encoder_executor.model_engine.model.
+                                     model_config.pretrained_config)
             _usage.report_usage(
                 llm_args=self.args,
-                pretrained_config=self._hf_model_config,
+                pretrained_config=pretrained_config,
                 telemetry_config=telemetry_config,
             )
         except Exception as exc:

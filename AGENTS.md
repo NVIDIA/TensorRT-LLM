@@ -15,9 +15,10 @@ Python and C++ codebase with PyTorch and AutoDeploy execution paths.
 - `pre-commit` hooks run on commit — if files are modified by hooks, re-stage and commit again
 - LLM args or nested-config changes must run `python3 scripts/generate_llm_args_golden_manifest.py` and commit
   `tensorrt_llm/usage/llm_args_golden_manifest.json`; new fields require telemetry/privacy CODEOWNER approval
-- When adding or renaming a public model architecture, update
-  `tensorrt_llm/usage/architecture_allowlist.py` with its exact Hugging Face architecture name;
-  never add private or customer-specific names
+- When adding or renaming a public model architecture identifier, update
+  `tensorrt_llm/usage/architecture_allowlist.py` with its exact identifier. It must be publicly
+  documented by the upstream model provider or in `docs/source/models/supported-models.md`; never add
+  private, customer-specific, or arbitrary user-supplied names
 - PR title format: `[JIRA/NVBUG/None][type] description` (e.g., `[TRTLLM-5516][perf] optimize cuda graph padding`)
 - Put a change's rationale and history (why it was made, what it replaces, ticket/PR references) in the PR
   description, not in code comments. Code comments should explain the code as it stands for a future reader,
