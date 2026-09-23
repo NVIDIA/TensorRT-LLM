@@ -354,3 +354,61 @@ async def test_queued_http_refresh_settles_outage_before_ttl_operations(
             assert await client.get(key) is None
         finally:
             await client._session.close()
+
+
+@pytest.mark.asyncio
+async def test_consecutive_outages_are_not_charged_to_ttl():
+    """A stall right after a settled one must not expire a live worker.
+
+    Any TTL operation settles the overdue outage sample, and the sampling task
+    cannot arm the next one until the loop gives it a turn -- which it cannot
+    while another ready handler is blocking. Leaving that window unmeasured
+    charges the second stall to the key and deletes a worker whose periodic
+    refresh is merely queued (https://nvbugs/6786712). Same tight
+    functional-test timings as above (ttl=2s, refresh every 1s).
+    """
+    ttl, refresh_sec, block_sec = 2, 1, 2.5
+    storage = HttpClusterStorageServer("", "")
+    await storage.start()
+    try:
+        key = gen_key("consecutive_outage_key")
+        assert await storage.set(key, "worker", ttl=ttl)
+
+        async def refresh_periodically():
+            while True:
+                await asyncio.sleep(refresh_sec)
+                await storage.expire(key, ttl)
+
+        def block_the_loop():
+            # Busy-wait, holding the loop exactly as a cold tokenizer build does.
+            block_end = time.monotonic() + block_sec
+            while time.monotonic() < block_end:
+                pass
+
+        async def stall_then_read():
+            # Settles the first stall's sample before the sweep can resume.
+            block_the_loop()
+            assert await storage.get(key) == "worker"
+
+        async def stall_again():
+            # Already queued, so it runs in the same batch as the handler above
+            # and blocks the loop again before the sweep gets a turn.
+            block_the_loop()
+
+        refresher = asyncio.create_task(refresh_periodically())
+        try:
+            await asyncio.sleep(refresh_sec + 0.2)  # one clean refresh first
+            await asyncio.gather(stall_then_read(), stall_again())
+            assert await storage.get(key) == "worker", (
+                "the second consecutive stall was charged to the key's TTL, "
+                "expiring a live worker for the storage's own outage")
+        finally:
+            refresher.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await refresher
+
+        # The clock must still expire a worker that really stopped refreshing.
+        await asyncio.sleep(ttl + storage._check_expired_interval + 0.5)
+        assert await storage.get(key) is None
+    finally:
+        await storage.stop()

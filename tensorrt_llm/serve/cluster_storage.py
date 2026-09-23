@@ -230,12 +230,21 @@ class HttpClusterStorageServer(ClusterStorage):
             self.add_routes(server)
 
     def _settle_outage_sample(self, now: float) -> None:
-        """Account for an overdue event-loop probe exactly once."""
+        """Account for an overdue event-loop probe exactly once.
+
+        Re-arm rather than disarm: the sampling task cannot re-arm until the
+        loop gives it a turn, and everything else already queued runs first.
+        Clearing the deadline here would leave that window unmeasured, so a
+        second handler blocking back-to-back with the first is charged to TTL
+        and expires a live worker. Arming the next sample from ``now`` keeps
+        the accounting continuous; ``_sleep_counting_outage`` overwrites this
+        deadline with its own the moment it does get a turn.
+        """
         deadline = self._outage_sample_deadline
         if deadline is None or now < deadline:
             return
         self._unserviceable_sec += now - deadline
-        self._outage_sample_deadline = None
+        self._outage_sample_deadline = now + self._OUTAGE_SAMPLE_SEC
 
     def _service_now(self) -> float:
         """Monotonic time minus however long this loop could not serve requests.
