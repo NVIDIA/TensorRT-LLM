@@ -5,7 +5,7 @@
 
 `trtllm-serve` can expose an experimental OpenEngine gRPC server instead of its normal OpenAI HTTP server. SMG remains the default gRPC protocol.
 
-Install the optional gRPC runtime:
+Install TensorRT-LLM with the OpenEngine feature marker:
 
 ```bash
 python -m pip install "tensorrt_llm[openengine]"
@@ -78,7 +78,7 @@ Verify that a checkout is current without modifying it:
 python scripts/generate_openengine_protos.py --check --tool-env-root build/openengine-proto-tools
 ```
 
-The wheel ships these bindings only in TensorRT-LLM's private namespace; it does not provide or depend on a top-level `openengine` Python package. The runtime dependencies remain TensorRT-LLM's base protobuf constraint plus `grpcio>=1.67.1,<2` from the OpenEngine extra.
+The wheel ships these bindings only in TensorRT-LLM's private namespace; it does not provide or depend on a top-level `openengine` Python package. Its protobuf and `grpcio>=1.67.1,<2` runtime constraints are base TensorRT-LLM requirements.
 
 ## Maintenance boundary
 

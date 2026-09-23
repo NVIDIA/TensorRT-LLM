@@ -5092,13 +5092,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
             }
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
-            // Gateway adapters (SMG, OpenEngine) are opt-in extras excluded
-            // from requirements.txt. OpenEngine's private bindings are already
-            // in the wheel/source artifact, so its requirements file contains
-            // only the optional gRPC runtime. Install both runtime sets on every
-            // stage and verify that their dependency constraints co-resolve.
+            // SMG's generated package remains an opt-in dependency. OpenEngine's
+            // private bindings and grpcio dependency are part of the base package.
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-grpc-smg.txt")
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-openengine.txt")
             if (stageName.contains("-Ray-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]==2.55.1")
                 // TODO(dlfw-26.08): reinstate causal-conv1d and mamba-ssm once

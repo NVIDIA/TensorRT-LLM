@@ -125,11 +125,8 @@ def verify_openengine_distribution() -> None:
 
     dist = distribution("tensorrt_llm")
     provided_extras = set(dist.metadata.get_all("Provides-Extra") or ())
-    expected_requirements = {
-        "grpc-smg": Requirement("smg-grpc-proto>=0.4.2"),
-        "openengine": Requirement("grpcio>=1.67.1,<2"),
-    }
-    missing_extras = set(expected_requirements) - provided_extras
+    expected_requirements = {"grpc-smg": Requirement("smg-grpc-proto>=0.4.2")}
+    missing_extras = {"grpc-smg", "openengine"} - provided_extras
     if missing_extras:
         raise RuntimeError("Missing TensorRT-LLM wheel extras: " +
                            ", ".join(sorted(missing_extras)))
@@ -145,6 +142,16 @@ def verify_openengine_distribution() -> None:
         if not declared:
             raise RuntimeError(
                 f"Wheel extra {extra!r} does not declare {expected}")
+
+    expected_grpc = Requirement("grpcio>=1.67.1,<2")
+    grpc_declared = any(
+        canonicalize_name(requirement.name) == canonicalize_name(
+            expected_grpc.name) and requirement.specifier ==
+        expected_grpc.specifier and requirement.marker is None
+        for requirement in requirements)
+    if not grpc_declared:
+        raise RuntimeError(
+            f"TensorRT-LLM does not declare base requirement {expected_grpc}")
 
     proto_names = (
         "error",
@@ -163,7 +170,6 @@ def verify_openengine_distribution() -> None:
         *(f"tensorrt_llm/grpc/openengine/_generated/{name}_pb2.pyi"
           for name in proto_names),
         "tensorrt_llm/grpc/openengine/_generated/openengine_pb2_grpc.py",
-        "tensorrt_llm/grpc/openengine/proto/LICENSE",
         "tensorrt_llm/grpc/openengine/proto/manifest.json",
         *(f"tensorrt_llm/grpc/openengine/proto/openengine/v1/{name}.proto"
           for name in proto_names),

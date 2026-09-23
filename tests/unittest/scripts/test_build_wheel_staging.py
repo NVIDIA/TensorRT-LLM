@@ -50,7 +50,6 @@ def test_stage_python_package(
     requirements = (
         "requirements.txt",
         "requirements-dev.txt",
-        "requirements-openengine.txt",
         "requirements-grpc-smg.txt",
         "requirements-windows.txt",
         "requirements-dev-windows.txt",

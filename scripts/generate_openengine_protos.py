@@ -113,7 +113,6 @@ def _load_manifest(project_root: Path) -> tuple[Path, dict[str, object]]:
     if not isinstance(files, dict):
         raise RuntimeError(f"{manifest_path} must contain a 'files' checksum map")
     expected_files = {
-        "LICENSE",
         *(f"{_PROTO_PACKAGE.as_posix()}/{name}.proto" for name in _PROTO_NAMES),
     }
     if set(files) != expected_files:
@@ -210,9 +209,7 @@ def _validate_gencode_versions(
     requirements_path = project_root / "requirements.txt"
     declared_protobuf_floor = _read_runtime_floor(requirements_path, "protobuf")
     declared_protobuf_ceiling = _read_runtime_ceiling(requirements_path, "protobuf")
-    declared_grpc_floor = _read_runtime_floor(
-        project_root / "requirements-openengine.txt", "grpcio"
-    )
+    declared_grpc_floor = _read_runtime_floor(requirements_path, "grpcio")
     expected_protobuf_floor = str(runtime_floors["protobuf"])
     expected_grpc_floor = str(runtime_floors["grpcio"])
     if declared_protobuf_floor != expected_protobuf_floor:
@@ -222,7 +219,7 @@ def _validate_gencode_versions(
         )
     if declared_grpc_floor != expected_grpc_floor:
         raise RuntimeError(
-            f"Manifest records grpcio>={expected_grpc_floor}, but requirements-openengine.txt "
+            f"Manifest records grpcio>={expected_grpc_floor}, but requirements.txt "
             f"declares grpcio>={declared_grpc_floor}"
         )
     if _version_tuple(next(iter(protobuf_versions))) > _version_tuple(declared_protobuf_floor):

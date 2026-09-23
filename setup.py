@@ -152,12 +152,9 @@ required_deps, extra_URLs = parse_requirements(
 devel_deps, _ = parse_requirements(
     Path("requirements-dev-windows.txt"
          if on_windows else "requirements-dev.txt"))
-openengine_deps, _ = parse_requirements(Path("requirements-openengine.txt"))
 mx_deps = ["modelexpress>=0.5.1,<0.6.0"]
-# Gateway runtimes are opt-in extras. OpenEngine's private schema bindings ship
-# in this wheel, so its extra adds only grpcio; SMG still consumes its external
-# generated package. The dedicated requirements files remain the source of
-# truth for runtime pins and are co-installed by CI.
+# OpenEngine's private schema bindings ship in this wheel and use the base
+# grpcio dependency. SMG still consumes its external generated package.
 grpc_smg_deps, _ = parse_requirements(Path("requirements-grpc-smg.txt"))
 constraints_file = Path("constraints.txt")
 if constraints_file.exists():
@@ -217,7 +214,6 @@ package_data += [
     '_torch/auto_deploy/custom_ops/fused_moe/triton_fused_moe_configs/*',
     'usage/schemas/*.json',
     'grpc/openengine/_generated/*.pyi',
-    'grpc/openengine/proto/LICENSE',
     'grpc/openengine/proto/manifest.json',
     'grpc/openengine/proto/openengine/v1/*.proto',
 ]
@@ -758,7 +754,7 @@ setup(
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
     extras_require={
         "devel": devel_deps + grpc_smg_deps,
-        "openengine": openengine_deps,
+        "openengine": [],
         "mx": mx_deps,
         "grpc-smg": grpc_smg_deps,
     },

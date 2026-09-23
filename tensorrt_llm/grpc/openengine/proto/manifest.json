@@ -23,7 +23,6 @@
     "grpcio": "1.67.1"
   },
   "files": {
-    "LICENSE": "7382b1cf711e7a7c7af9816e0e07b49b91e7149b7c6d347225f98800fcb1f1c2",
     "openengine/v1/error.proto": "b1c559a3b7847c55a247145f1493805b56b58491a320fb26e6ebcd7072b62fb3",
     "openengine/v1/generation.proto": "3c4e9f11664d50dd26e393cb2b34dca9af680419097493d4f7ceb2654b0f1058",
     "openengine/v1/kv.proto": "4f5c46a65a7998ecf34ea37117b325b0f0a5a70149702d6bca919726b40526cd",

@@ -1654,7 +1654,7 @@ repos:
         - protobuf==5.27.2
         - setuptools==84.0.0
         pass_filenames: false
-        files: ^(requirements\.txt|requirements-(build-)?openengine\.txt|scripts/generate_openengine_protos\.py|tensorrt_llm/grpc/openengine/(proto/|_generated/))
+        files: ^(requirements\.txt|requirements-build-openengine\.txt|scripts/generate_openengine_protos\.py|tensorrt_llm/grpc/openengine/(proto/|_generated/))
     -   id: test lists format
         name: Check for tabs and multiple spaces in test_lists txt files
         entry: ./scripts/format_test_list.py
