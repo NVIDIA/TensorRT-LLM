@@ -1615,7 +1615,7 @@ class DeepseekV4MoE(nn.Module):
         ):
             from ..modules.megamoe_shared_mlp import MegaMoESharedMLP
 
-            # Keep the shared kernel identical for OFF and ON; only its SM budget changes.
+            # Use the same complete shared FC12 path for OFF and ON.
             shared_mlp_cls = MegaMoESharedMLP
 
         self.shared_experts = shared_mlp_cls(
