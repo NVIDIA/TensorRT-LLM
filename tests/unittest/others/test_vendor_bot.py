@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import importlib
 import importlib.util
@@ -340,6 +341,48 @@ def test_discovery_and_persistent_operator_scope(monitor: b.Monitor) -> None:
         b.Monitor(changed, monitor.gh, monitor.store)
 
 
+def test_cold_discovery_backfills_old_merged_prs_and_honors_cutoff(
+    monitor: b.Monitor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gh = monitor.gh
+    gh.pr.update(
+        state="closed",
+        merged=True,
+        merged_at="2020-01-01T00:00:00Z",
+        updated_at="2020-01-01T00:00:00Z",
+    )
+    api = gh.api
+
+    def filtered(endpoint: str, **kwargs):
+        if "/pulls?state=open" in endpoint:
+            return []
+        return api(endpoint, **kwargs)
+
+    monkeypatch.setattr(gh, "api", filtered)
+    assert monitor._discover() == [7]
+    with contextlib.closing(b.Store(":memory:")) as store:
+        restarted = b.Monitor(monitor.args, gh, store)
+        assert restarted._discover() == [7]
+    restricted = copy.copy(monitor.args)
+    restricted.since = "2021-01-01T00:00:00Z"
+    with contextlib.closing(b.Store(":memory:")) as store:
+        assert b.Monitor(restricted, gh, store)._discover() == []
+    assert not gh.writes
+
+
+def test_feedback_deduplicates_with_empty_sqlite(monitor: b.Monitor) -> None:
+    monitor._feedback(monitor.gh.pr, "Missing block")
+    writes = copy.deepcopy(monitor.gh.writes)
+    with contextlib.closing(b.Store(":memory:")) as store:
+        restarted = b.Monitor(monitor.args, monitor.gh, store)
+        restarted._feedback(monitor.gh.pr, "Missing block")
+        assert monitor.gh.writes == writes
+        restarted._feedback(monitor.gh.pr, None)
+    assert len(monitor.gh.comments) == len(monitor.gh.reviews) == 1
+    assert monitor.gh.reviews[0]["state"] == "DISMISSED"
+
+
 def _vendor(commit: str, url: str, branch: str):
     return m.manage._validate_vendor(
         "toy",
@@ -355,7 +398,7 @@ def _vendor(commit: str, url: str, branch: str):
     )
 
 
-def test_monitor_reuses_matching_and_publishes_once_after_merge(
+def test_monitor_revalidates_matching_until_committed_and_publishes_once_after_merge(
     monitor: b.Monitor,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -384,6 +427,11 @@ def test_monitor_reuses_matching_and_publishes_once_after_merge(
             consumer_repo="org/consumer",
         )
 
+    monkeypatch.setattr(p, "_plan_identity", lambda args, gh: argparse.Namespace(main_sha="c" * 40))
+    monkeypatch.setattr(p, "_recover_plan", lambda *args: False)
+    monkeypatch.setattr(p, "_lock_at", lambda *args: reviewed)
+    monkeypatch.setattr(p, "_check_current", lambda *args: None)
+
     def publish(args, github, plan):
         publications.append(plan)
         assert plan.record["attribution"][reviewed.commit]["method"] == "same-edits"
@@ -408,7 +456,7 @@ def test_monitor_reuses_matching_and_publishes_once_after_merge(
     monkeypatch.setattr(p, "_verify_remote_commit", lambda *args: "verified")
     monitor.inspect(7)
     monitor.inspect(7)
-    assert len(matches) == 1
+    assert len(matches) == 2
     assert not publications
     gh.pr.update(merged=True, state="closed")
     monitor.inspect(7)
@@ -501,6 +549,35 @@ def test_workdir_locks_and_refuses_unrelated_data(tmp_path: Path) -> None:
 def test_workdir_refuses_checkout(source: Path) -> None:
     with pytest.raises(ValueError, match="outside a Git worktree"):
         b._initialize_workdir(source / "bot-state")
+
+
+def test_workdir_recovers_without_sqlite_but_preserves_artifacts(tmp_path: Path) -> None:
+    workdir = tmp_path / "state"
+    b._initialize_workdir(workdir)
+    (workdir / "bot.log").write_text("previous log\n")
+    (workdir / "bot.lock").touch()
+    (workdir / "sources.git").mkdir()
+    (workdir / ("promotion-7-" + "a" * 12)).mkdir()
+    b._initialize_workdir(workdir)
+    assert (workdir / "bot.log").read_text() == "previous log\n"
+    with b._locked(workdir):
+        with pytest.raises(ValueError, match="already owns"):
+            with b._locked(workdir):
+                pass
+    with contextlib.closing(b.Store(workdir / b._STATE_FILE)) as store:
+        assert store.get("tracked") is None
+
+
+@pytest.mark.parametrize("name", ["state.sqlite", "bot.log", "bot.lock", "sources.git"])
+def test_workdir_recovery_rejects_symlinks(tmp_path: Path, name: str) -> None:
+    workdir = tmp_path / "state"
+    workdir.mkdir()
+    target = tmp_path / "private-data"
+    target.write_text("preserve")
+    (workdir / name).symlink_to(target)
+    with pytest.raises(ValueError, match="unexpected entry"):
+        b._initialize_workdir(workdir)
+    assert target.read_text() == "preserve"
 
 
 def test_daemon_launch_status_stop_without_systemd(tmp_path: Path) -> None:

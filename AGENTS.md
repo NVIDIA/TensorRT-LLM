@@ -183,6 +183,9 @@ under `scripts/vendor/`; no legacy script wrappers are provided. See
 `scripts/vendor/README.md` and `3rdparty/vendor-sources.md`. Preserve structured
 promotion provenance and DCO sign-off in the final squash message. CI skip applies
 only to verified lock-only promotions, not changes to these tools.
+Git/GitHub promotion commits are authoritative; SQLite is a disposable cache.
+After cache loss, stop the old process and relaunch with the same operator/config.
+Cold discovery backfills merged PRs; `--since` explicitly limits that history.
 
 ### Triggering CI
 
