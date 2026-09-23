@@ -346,28 +346,13 @@ def _collect_gpu_info() -> Dict[str, Any]:
 def _extract_architecture_class_name(pretrained_config: Any) -> Optional[str]:
     """Extract the architecture class name from a pretrained model config.
 
-    Handles three config formats:
-
-    1. **HF PretrainedConfig** (from ``transformers.PretrainedConfig``):
-       Has ``.architectures`` — a *list* of strings, e.g. ``["LlamaForCausalLM"]``.
-       This is the standard format when loading from a HuggingFace model dir.
-
-    2. [DEPRECATED] **TRT-LLM PretrainedConfig** (from ``tensorrt_llm.models.modeling_utils``):
-       Has ``.architecture`` — a *singular string*, e.g. ``"LlamaForCausalLM"``.
-       This is the format used in TRT-LLM checkpoint ``config.json`` files.
-
-    3. [DEPRECATED] **Engine config loaded by HF** (``transformers.PretrainedConfig.from_pretrained``
-       reading a TRT-LLM engine dir):
-       The engine ``config.json`` has top-level keys ``pretrained_config`` (dict)
-       and ``build_config`` (dict). HF's loader puts these as attributes on a
-       generic ``PretrainedConfig`` object. The architecture string is at
-       ``pretrained_config["architecture"]``.
+    Hugging Face model configs expose an ``architectures`` list. The first
+    entry is the architecture name when it is a non-empty string.
     """
     if pretrained_config is None:
         return None
     try:
-        # Case 1: HF PretrainedConfig — .architectures (plural list). The
-        # first item is authoritative; later entries are intentionally ignored.
+        # The first item is authoritative; later entries are intentionally ignored.
         architectures = getattr(pretrained_config, "architectures", None)
         if isinstance(architectures, (list, tuple)) and architectures:
             architecture = architectures[0]
@@ -375,22 +360,9 @@ def _extract_architecture_class_name(pretrained_config: Any) -> Optional[str]:
                 return architecture
             return None
 
-        # Case 2: TRT-LLM PretrainedConfig — .architecture (singular str)
-        architecture = getattr(pretrained_config, "architecture", None)
-        if isinstance(architecture, str) and architecture.strip():
-            return architecture
-
-        # Case 3: HF from_pretrained on engine dir — nested pretrained_config dict
-        nested_config = getattr(pretrained_config, "pretrained_config", None)
-        if isinstance(nested_config, dict) and "architecture" in nested_config:
-            architecture = nested_config["architecture"]
-            if isinstance(architecture, str) and architecture.strip():
-                return architecture
-
-        # Preserve the legacy fallback when no explicit architecture is present.
-        # The caller still applies the plaintext allowlist before reporting it.
+        # The caller still applies the plaintext allowlist to the class-name fallback.
         return type(pretrained_config).__name__
-    except (AttributeError, TypeError, KeyError, IndexError):
+    except (AttributeError, TypeError):
         return None
 
 
@@ -424,7 +396,7 @@ def _extract_trtllm_config(llm_args: Any) -> Dict[str, Any]:
     """Extract TRT-LLM configuration from LlmArgs.
 
     Args:
-        llm_args: The args object from BaseLLM (TrtLlmArgs, TorchLlmArgs, etc.)
+        llm_args: The args object from BaseLLM.
 
     Returns:
         Dict of config values, with None for unavailable fields.
@@ -442,11 +414,6 @@ def _extract_trtllm_config(llm_args: Any) -> Dict[str, Any]:
         backend = getattr(llm_args, "backend", None)
         if backend is not None:
             config["backend"] = str(backend)
-        else:
-            # Infer backend from args class when not explicitly set
-            cls_name = type(llm_args).__name__
-            if "TrtLlm" in cls_name:
-                config["backend"] = "tensorrt"
 
         # Parallelism
         parallel_config = getattr(llm_args, "parallel_config", None)
@@ -530,7 +497,7 @@ def _collect_features(llm_args: Any) -> str:
     GXT event schema (``stringVariableLength``).
 
     Args:
-        llm_args: The args object from BaseLLM (TrtLlmArgs, TorchLlmArgs, etc.)
+        llm_args: The args object from BaseLLM.
                   May be None.
 
     Returns:
@@ -564,18 +531,9 @@ def _collect_features(llm_args: Any) -> str:
             if block_reuse is not None:
                 features["prefix_caching"] = bool(block_reuse)
 
-        # CUDA graphs: two different config paths depending on backend.
-        # PyTorch backend: cuda_graph_config (TorchLlmArgs only).
-        #   None = disabled; CudaGraphConfig() = enabled (default).
-        # TRT backend: extended_runtime_perf_knob_config.cuda_graph_mode (TrtLlmArgs only).
+        # CUDA graphs are enabled when a CUDA graph configuration is present.
         cuda_graph_config = getattr(llm_args, "cuda_graph_config", None)
-        ext_config = getattr(llm_args, "extended_runtime_perf_knob_config", None)
-        if cuda_graph_config is not None:
-            # PyTorch path: presence of config object means enabled
-            features["cuda_graphs"] = True
-        elif ext_config is not None:
-            # TRT path: explicit cuda_graph_mode flag
-            features["cuda_graphs"] = bool(getattr(ext_config, "cuda_graph_mode", False))
+        features["cuda_graphs"] = cuda_graph_config is not None
 
         # Chunked context / chunked prefill: defined on BaseLlmArgs.
         features["chunked_context"] = bool(getattr(llm_args, "enable_chunked_prefill", False))

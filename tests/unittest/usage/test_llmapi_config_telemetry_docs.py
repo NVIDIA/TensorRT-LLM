@@ -63,7 +63,7 @@ def _load_manifest_generator() -> ModuleType:
 def _sample_manifest() -> dict[str, list[dict[str, object]]]:
     # Keep both mapping levels unsorted so the test exercises recursive key sorting.
     return {
-        "TrtLlmArgs": [],
+        "ZArgs": [],
         "TorchLlmArgs": [
             {
                 "path": "flag",
@@ -182,10 +182,10 @@ def test_manifest_generator_subprocess_resolves_local_source_without_pythonpath(
     (usage_package.parent / "__init__.py").write_text("")
     (usage_package / "__init__.py").write_text("")
     (usage_package / "llmapi_config.py").write_text(
-        "def golden_manifest():\n    return {'TorchLlmArgs': [], 'TrtLlmArgs': []}\n"
+        "def golden_manifest():\n    return {'TorchLlmArgs': [], 'ZArgs': []}\n"
     )
     manifest_path = usage_package / "llm_args_golden_manifest.json"
-    committed = json.dumps({"TorchLlmArgs": [], "TrtLlmArgs": []}, indent=2, sort_keys=True) + "\n"
+    committed = json.dumps({"TorchLlmArgs": [], "ZArgs": []}, indent=2, sort_keys=True) + "\n"
     manifest_path.write_text(committed)
 
     environment = os.environ.copy()
