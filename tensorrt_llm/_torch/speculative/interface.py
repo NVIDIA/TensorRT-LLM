@@ -136,6 +136,11 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
     if (spec_config.spec_dec_mode.is_dspark()
             and spec_config.draft_is_embedded_in_target):
         return False
+    # Suffix automaton (SA) drafts from a dedicated suffix-automaton state pool
+    # and never reads a paged draft KV cache manager, so it needs no separate
+    # draft KV cache despite reaching this one-engine path.
+    if spec_config.spec_dec_mode.is_sa():
+        return False
     return spec_config._allow_separate_draft_kv_cache
 
 
@@ -459,9 +464,15 @@ class SpeculativeDecodingMode(IntEnum):
 
 # Philox seed for requests that did not set ``SamplingParams.seed``. Fixed
 # rather than advanced per step so a run is reproducible: a request's stream is
-# separated from other rows' by the kernel's per-row subsequence and from its
-# own earlier steps by the offset, which leaves the seed free to be a constant.
+# separated from other rows' by the kernel's per-row subsequence and from every
+# other unseeded request's, past or present, by the offset (see
+# ``SpecMetadata._rng_window_counter``), which leaves the seed free to be a
+# constant.
 DEFAULT_SAMPLING_SEED = 42
+
+# Key in ``SpecMetadata._rng_window_counter`` for the window counter shared by
+# all unseeded requests. A string so it cannot collide with a slot id.
+_UNSEEDED_RNG_WINDOW_KEY = "unseeded"
 
 
 @dataclass
@@ -633,7 +644,9 @@ class SpecMetadata:
     # https://github.com/flashinfer-ai/flashinfer/pull/2345.
     request_seeds: Optional[torch.Tensor] = None
     request_offsets: Optional[torch.Tensor] = None
-    # Per-slot count of RNG windows already handed out, keyed by py_seq_slot.
+    # Count of RNG windows already handed out. Seeded requests are counted per
+    # py_seq_slot; every unseeded request draws from one shared counter under
+    # _UNSEEDED_RNG_WINDOW_KEY.
     #
     # This deliberately does NOT read request.py_decoding_iter: the overlap
     # scheduler runs _forward_step (where this is populated) before the
@@ -644,14 +657,22 @@ class SpecMetadata:
     # under either scheduler.
     #
     # Held in a dict so create_cuda_graph_metadata's copy.copy keeps graph and
-    # eager views sharing one counter; keyed by slot rather than batch position
-    # because batch composition shifts between iterations. Bounded by the slot
-    # pool, which SeqSlotManager frees and reuses on request completion.
+    # eager views sharing one counter. Seeded requests are keyed by slot rather
+    # than batch position because batch composition shifts between iterations;
+    # the slot keys are bounded by the slot pool, which SeqSlotManager frees
+    # and reuses on request completion.
     #
-    # The counter is not reset when a slot is reused, so a new request on a
-    # recycled slot starts partway into its stream. That is still a disjoint
-    # region of it, so sampling stays correct; the cost is that a seeded
-    # request reproduces bit-exactly only for a given slot history.
+    # A per-slot counter is not reset when a slot is reused, so a new seeded
+    # request on a recycled slot starts partway into its stream. That is still
+    # a disjoint region of it, so sampling stays correct; the cost is that a
+    # seeded request reproduces bit-exactly only for a given slot history.
+    #
+    # Unseeded requests all share DEFAULT_SAMPLING_SEED, so a per-slot counter
+    # would give two requests on never-used slots the same (seed, offset) and
+    # hence the same tokens whenever they also share a batch row. SlotManager
+    # hands serial requests a fresh slot each time, so that is the common
+    # low-concurrency case. The shared counter guarantees every unseeded
+    # request an offset window no earlier request has used.
     _rng_window_counter: dict = field(default_factory=dict)
     # The same state expanded to one entry per logits row, mirroring the
     # temperatures / top_ks / top_ps / min_ps layout, for the sampling calls that
@@ -734,6 +755,23 @@ class SpecMetadata:
         self.context_prompt_lookahead_tokens[:num_contexts].copy_(
             tokens_cpu, non_blocking=True)
 
+    def _take_rng_window_offsets(self, requests: list["LlmRequest"],
+                                 seeded: list[bool]) -> list[int]:
+        """
+        Hand each request the base of a fresh Philox offset window.
+        """
+        window = self.max_draft_len + 1
+        offsets: list[int] = []
+        for request, is_seeded in zip(requests, seeded):
+            # Dummy/padding requests (no slot) never have their output kept;
+            # they are unseeded, so they draw from the shared counter like any
+            # other unseeded request and never perturb a real slot's stream.
+            key = request.py_seq_slot if is_seeded else _UNSEEDED_RNG_WINDOW_KEY
+            step = self._rng_window_counter.get(key, 0)
+            self._rng_window_counter[key] = step + 1
+            offsets.append(step * window)
+        return offsets
+
     def _populate_request_rng_state(
         self, requests: list["LlmRequest"],
         per_request_normalized: list[tuple[float, int, float, float,
@@ -742,46 +780,34 @@ class SpecMetadata:
 
         A request's seed is fixed for its lifetime, so the offset is what has
         to advance between steps -- otherwise every step of a seeded request
-        would draw the same numbers. Taking it from the request's own window
-        counter, rather than a global step counter, is what ties the stream to
-        how far that request has decoded instead of to when it was scheduled.
+        would draw the same numbers. A seeded request takes it from its own
+        slot's window counter, rather than a shared one, which ties the stream
+        to how far that request has decoded instead of to when it was
+        scheduled.
 
         Both layouts are produced: ``request_*`` with one entry per request,
         and ``seeds`` / ``offsets`` expanded to one entry per logits row (the
         temperatures / top_ks / top_ps / min_ps layout), because the sampling calls
         take one or the other.
 
-        A request that specified no seed gets ``DEFAULT_SAMPLING_SEED``. Its
+        A request that specified no seed gets ``DEFAULT_SAMPLING_SEED`` and an
+        offset window from the counter shared by all unseeded requests. Its
         stream is then separated from the other rows' by the kernel's per-row
-        subsequence and from its own earlier steps by the offset, so unseeded
-        requests still sample independently -- just reproducibly.
+        subsequence and from every other unseeded request's, including its own
+        earlier steps, by the offset -- so unseeded requests sample
+        independently of each other, just reproducibly for a given traffic
+        history.
         """
         from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import \
             request_random_seed
 
+        user_seeds = [request_random_seed(request) for request in requests]
         request_seeds = [
-            seed if (seed := request_random_seed(request)) is not None else
-            DEFAULT_SAMPLING_SEED for request in requests
+            DEFAULT_SAMPLING_SEED if seed is None else seed
+            for seed in user_seeds
         ]
-        # Base of this step's Philox offset window. Each sampling pass owns
-        # max_draft_len + 1 consecutive offsets: the target sampler (or the
-        # rejection kernel, which is its alternative) takes the first, and
-        # draft step i takes base + 1 + i. Sizing the window by the static
-        # max_draft_len rather than the runtime one keeps a step's offsets
-        # disjoint from its neighbours' even when the draft length shrinks.
-        #
-        # The window index comes from _rng_window_counter, not from
-        # py_decoding_iter, which is still stale here under the overlap
-        # scheduler (see the field's comment).
-        window = self.max_draft_len + 1
-        request_offsets = []
-        for request in requests:
-            slot = request.py_seq_slot
-            # Dummy/padding requests (no slot) never have their output kept,
-            # so they share one counter rather than perturbing a real slot's.
-            step = self._rng_window_counter.get(slot, 0)
-            self._rng_window_counter[slot] = step + 1
-            request_offsets.append(step * window)
+        request_offsets = self._take_rng_window_offsets(
+            requests, [seed is not None for seed in user_seeds])
         num_tokens_per_request = [n for *_, n in per_request_normalized]
 
         flat_seeds: list[int] = []
@@ -1686,8 +1712,7 @@ class SpecWorkerBase(nn.Module, ABC):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
 
-        if self.guided_decoder is not None:
-            self.guided_decoder.execute(logits)
+        self._execute_guided_decoder_if_present(logits)
 
         target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
                                                       num_contexts, batch_size)
@@ -2848,7 +2873,14 @@ class SpecWorkerBase(nn.Module, ABC):
         return tokens.type(torch.int32)
 
     def _execute_guided_decoder_if_present(self, logits):
-        """Execute guided decoder on target model logits if available."""
+        """Execute the guided decoder on the target logits, if configured.
+
+        ``CapturableGuidedDecoder.execute`` drains its own CUDA host functions
+        before returning (see ``_drain_host_functions``). Every one-engine
+        drafter runs a draft forward immediately after this, and a host
+        function still pending when that forward enters a GIL-holding native
+        extension call deadlocks the rank.
+        """
         if self.guided_decoder is not None:
             self.guided_decoder.execute(logits)
 
