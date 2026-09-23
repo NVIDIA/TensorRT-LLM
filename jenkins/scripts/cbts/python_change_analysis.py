@@ -195,14 +195,56 @@ def _module_binding_names(node: ast.stmt, future_annotations: bool) -> set[str] 
     return None
 
 
-def _import_from_bindings(node: ast.stmt) -> dict[str, str] | None:
-    """Return ``{local name: source name}`` for a static ``from`` import."""
+def _import_from_bindings(node: ast.stmt) -> dict[str, ImportTarget] | None:
+    """Return local bindings for one statically named ``from`` import."""
     if not isinstance(node, ast.ImportFrom) or node.module is None:
         return None
     if any(alias.name == "*" for alias in node.names):
         return None
-    bindings = {alias.asname or alias.name: alias.name for alias in node.names}
+    bindings = {
+        alias.asname or alias.name: ImportTarget(node.module, node.level, alias.name)
+        for alias in node.names
+    }
     return bindings if len(bindings) == len(node.names) else None
+
+
+def _module_import_from_bindings(tree: ast.Module) -> dict[str, ImportTarget] | None:
+    """Return unambiguous direct ``from``-import bindings for one module."""
+    bindings: dict[str, ImportTarget] = {}
+    binding_counts: dict[str, int] = {}
+    for node in tree.body:
+        for local in _direct_scope_bindings([node]):
+            binding_counts[local] = binding_counts.get(local, 0) + 1
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        imported = _import_from_bindings(node)
+        if imported is None or imported.keys() & bindings.keys():
+            return None
+        bindings.update(imported)
+    if any(binding_counts[local] != 1 for local in bindings):
+        return None
+    return bindings
+
+
+def _module_import_from_delta(
+    tree: ast.Module, old_tree: ast.Module
+) -> tuple[set[str], set[ImportTarget], set[ImportTarget], set[str]] | None:
+    """Describe the complete direct ``from``-import binding delta."""
+    current = _module_import_from_bindings(tree)
+    previous = _module_import_from_bindings(old_tree)
+    if current is None or previous is None:
+        return None
+    changed_locals = {
+        local
+        for local in previous.keys() | current.keys()
+        if previous.get(local) != current.get(local)
+    }
+    return (
+        changed_locals,
+        {previous[local] for local in changed_locals if local in previous},
+        {current[local] for local in changed_locals if local in current},
+        current.keys() - previous.keys(),
+    )
 
 
 def _statically_bound_names(tree: ast.Module) -> set[str]:
@@ -265,20 +307,62 @@ def _import_from_replacement(
         for local in previous.keys() | current.keys()
         if previous.get(local) != current.get(local)
     }
-    old_targets = {
-        ImportTarget(node.module, node.level, source_name)
-        for local in changed_locals
-        for source_name in (previous.get(local),)
-        if source_name is not None
-    }
-    new_targets = {
-        ImportTarget(node.module, node.level, source_name)
-        for local in changed_locals
-        for source_name in (current.get(local),)
-        if source_name is not None
-    }
+    old_targets = {previous[local] for local in changed_locals if local in previous}
+    new_targets = {current[local] for local in changed_locals if local in current}
     added_locals = current.keys() - previous.keys()
     return changed_locals, old_targets, new_targets, added_locals
+
+
+def _trusted_type_checking_guard(node: ast.If, module_nodes: list[ast.stmt]) -> bool:
+    """Return whether ``node`` is a trusted, import-only TYPE_CHECKING block."""
+    if (
+        node.orelse
+        or not node.body
+        or not all(isinstance(statement, (ast.Import, ast.ImportFrom)) for statement in node.body)
+    ):
+        return False
+
+    if isinstance(node.test, ast.Name):
+        guard_root = node.test.id
+
+        def establishes_guard(statement: ast.stmt) -> bool:
+            return (
+                isinstance(statement, ast.ImportFrom)
+                and statement.module == "typing"
+                and any(
+                    alias.name == "TYPE_CHECKING" and (alias.asname or alias.name) == guard_root
+                    for alias in statement.names
+                )
+            )
+
+    elif (
+        isinstance(node.test, ast.Attribute)
+        and node.test.attr == "TYPE_CHECKING"
+        and isinstance(node.test.value, ast.Name)
+    ):
+        guard_root = node.test.value.id
+
+        def establishes_guard(statement: ast.stmt) -> bool:
+            return isinstance(statement, ast.Import) and any(
+                alias.name == "typing" and (alias.asname or alias.name) == guard_root
+                for alias in statement.names
+            )
+
+    else:
+        return False
+
+    trusted = False
+    for statement in module_nodes:
+        if statement is node:
+            break
+        if guard_root in _direct_scope_bindings([statement]):
+            trusted = establishes_guard(statement)
+    return trusted
+
+
+def _line_in_import_only_block(node: ast.If, line: int) -> bool:
+    """Return whether ``line`` belongs to an import inside ``node``."""
+    return any(statement.lineno <= line <= statement.end_lineno for statement in node.body)
 
 
 _SAFE_ANNOTATION_BUILTINS = {
@@ -683,9 +767,9 @@ def analyze_python_changes(
     """Describe low-risk import-time bindings and their local references.
 
     Literal assignments (including literal replacements), low-risk added
-    function declarations, newly added builtin-module imports, and same-module
-    static ``ImportFrom`` replacements are represented. Unsupported syntax is
-    returned as an unresolved fact for policy callers.
+    function declarations, newly added builtin-module imports, and static
+    top-level ``ImportFrom`` binding deltas are represented. Unsupported syntax
+    is returned as an unresolved fact for policy callers.
     """
     try:
         tree = ast.parse(source)
@@ -697,6 +781,7 @@ def analyze_python_changes(
         return PythonChangeFacts(set(), set(), {}, "unparsable pre-image")
     old_module_nodes = list(old_tree.body) if old_tree is not None else None
     old_bound_names = _statically_bound_names(old_tree) if old_tree is not None else set()
+    import_from_delta = _module_import_from_delta(tree, old_tree) if old_tree is not None else None
 
     scopes = _collect_scopes(tree)
     import_qualnames = import_executed_qualnames(source)
@@ -724,6 +809,7 @@ def analyze_python_changes(
     new_declaration_bindings: set[str] = set()
     handled_module_nodes: set[int] = set()
     handled_signatures: set[str] = set()
+    handled_import_from_delta = False
     for line in sorted(import_lines):
         scope = _innermost(line, scopes)
         signature_qualname = (
@@ -818,6 +904,24 @@ def analyze_python_changes(
             continue
         if node is not None:
             handled_module_nodes.add(id(node))
+        if (
+            isinstance(node, ast.If)
+            and _line_in_import_only_block(node, line)
+            and _trusted_type_checking_guard(node, module_nodes)
+        ):
+            continue
+        if isinstance(node, ast.ImportFrom) and import_from_delta is not None:
+            current_bindings = _import_from_bindings(node)
+            changed_locals, old_targets, new_targets, added_locals = import_from_delta
+            if current_bindings is None or not current_bindings.keys() & changed_locals:
+                return PythonChangeFacts(set(), set(), {}, "unresolved import replacement")
+            if not handled_import_from_delta:
+                binding_names.update(changed_locals)
+                old_import_targets.update(old_targets)
+                new_import_targets.update(new_targets)
+                new_import_bindings.update(added_locals - old_bound_names)
+                handled_import_from_delta = True
+            continue
         if isinstance(node, ast.ImportFrom) and (
             old_module_nodes is not None or line in deleted_lines
         ):

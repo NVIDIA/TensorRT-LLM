@@ -70,6 +70,12 @@ the local functions and methods that consume the changed binding:
   the old and new statements are safe assignments to the same names;
 - an annotated literal when `from __future__ import annotations` postpones annotation evaluation;
 - a newly added builtin-module `import` (replacement imports remain unsupported);
+- an unambiguous top-level `from ... import ...` binding delta, computed from the complete pre- and
+  post-image; old targets must resolve to static declarations and new targets to static top-level
+  functions before their target and local-consumer rows are selected;
+- imports added inside an import-only `if TYPE_CHECKING:` / `if typing.TYPE_CHECKING:` block whose
+  guard comes directly from `typing` and has not been rebound; these are ignored because the block is
+  statically false at runtime;
 - a newly added plain function declaration with no decorator, default expression, or eagerly evaluated
   annotation.
 

@@ -472,6 +472,32 @@ def test_multiline_import_from_addition_resolves_consumer_and_new_target() -> No
     assert analysis.new_import_bindings == {"new_helper"}
 
 
+def test_new_import_from_statement_resolves_consumer_and_target() -> None:
+    source = (
+        "from .helpers import stable\n"
+        "from .new_helpers import new_helper\n\n"
+        "def consumer():\n"
+        "    return new_helper()\n"
+    )
+    diff = (
+        "@@ -1,4 +1,5 @@\n"
+        " from .helpers import stable\n"
+        "+from .new_helpers import new_helper\n"
+        " \n"
+        " def consumer():\n"
+        "     return new_helper()\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"new_helper"}
+    assert analysis.binding_consumers == {"consumer"}
+    assert not analysis.old_import_targets
+    assert analysis.new_import_targets == {ImportTarget("new_helpers", 1, "new_helper")}
+    assert analysis.new_import_bindings == {"new_helper"}
+
+
 def test_import_addition_is_not_new_when_pre_image_already_bound_the_name() -> None:
     source = "new_helper = None\nfrom .helpers import new_helper, stable\n"
     diff = (
@@ -593,13 +619,67 @@ def test_reconstruct_diff_pre_image_rejects_mismatched_post_source() -> None:
     assert reconstruct_diff_pre_image("different\n", diff) is None
 
 
-def test_import_from_replacement_from_different_module_remains_fail_closed() -> None:
+def test_import_from_replacement_from_different_module_resolves_targets() -> None:
     source = "from .new_helpers import helper\n"
     diff = "@@ -1 +1 @@\n-from .old_helpers import helper\n+from .new_helpers import helper\n"
 
     analysis = _analyze(source, diff)
 
-    assert analysis.limitation == "unresolved import replacement"
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"helper"}
+    assert analysis.old_import_targets == {ImportTarget("old_helpers", 1, "helper")}
+    assert analysis.new_import_targets == {ImportTarget("new_helpers", 1, "helper")}
+    assert not analysis.new_import_bindings
+
+
+def test_import_only_type_checking_addition_is_ignored() -> None:
+    source = (
+        "from typing import TYPE_CHECKING\n\n"
+        "if TYPE_CHECKING:\n"
+        "    from .model import Model\n"
+        "    from .scheduler import ScheduledRequests\n"
+    )
+    diff = (
+        "@@ -1,4 +1,5 @@\n"
+        " from typing import TYPE_CHECKING\n"
+        " \n"
+        " if TYPE_CHECKING:\n"
+        "+    from .model import Model\n"
+        "     from .scheduler import ScheduledRequests\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert not analysis.changed_bindings
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        (
+            "from typing import TYPE_CHECKING\n"
+            "TYPE_CHECKING = enabled()\n\n"
+            "if TYPE_CHECKING:\n"
+            "    from .model import Model\n"
+            "    from .scheduler import ScheduledRequests\n"
+        ),
+        (
+            "from typing import TYPE_CHECKING\n\n"
+            "if TYPE_CHECKING:\n"
+            "    initialize()\n"
+            "    from .model import Model\n"
+            "    from .scheduler import ScheduledRequests\n"
+        ),
+    ),
+)
+def test_untrusted_type_checking_import_addition_remains_fail_closed(source: str) -> None:
+    added_line = 5
+    diff = f"@@ -{added_line - 1},0 +{added_line} @@\n+    from .model import Model\n"
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "effectful module statement"
 
 
 @pytest.mark.parametrize("body", ("", "# explanatory comment"))
