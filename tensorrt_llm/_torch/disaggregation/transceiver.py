@@ -242,14 +242,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # The transfer worker is already live by this point.
             self._transfer_worker.shutdown()
             raise
-        # _chunk_num_bytes() is this rank's KV shard, so scale by tp_size to get the request total (kv_cache_size),
-        # except under attention DP where the TP-local count already is the total.
-        # Helix CP ranks hold disjoint block sets, so they scale the request
-        # total the same way TP shards do, with or without attention DP (metric only).
-        self._kv_size_rank_factor = max(
-            1,
-            mapping.cp_size if mapping.enable_attention_dp else mapping.tp_size * mapping.cp_size,
-        )
+        self._kv_size_rank_factor = self._kv_size_rank_factor_for(mapping)
 
         # Sticky role markers; flip True once any session opens, used to short-circuit
         # per-iter tp_allgather when this transceiver never sends/receives.
@@ -269,6 +262,19 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._dist.broadcast(endpoint, 0)
             return endpoint
         return cast(str, self._dist.broadcast(None, 0))
+
+    @staticmethod
+    def _kv_size_rank_factor_for(mapping) -> int:
+        """Scale from this rank's KV shard bytes to the request total (metric only).
+
+        _chunk_num_bytes() is the local shard: TP shards and helix CP ranks each hold a
+        disjoint part of the request, so multiply by tp_size * cp_size. Under attention
+        DP the TP dimension is not sharded, but helix CP still is.
+        """
+        shards = (
+            mapping.cp_size if mapping.enable_attention_dp else mapping.tp_size * mapping.cp_size
+        )
+        return max(1, shards)
 
     def _init_sync_policy(self):
         m = self._mapping

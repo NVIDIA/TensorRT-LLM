@@ -943,9 +943,15 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "num_instances": 1
             }
         }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
+        with launch_disaggregated_llm(
+                disaggregated_server_config,
+                ctx_server_config,
+                gen_server_config,
+                self.MODEL_PATH,
+                # A helix transfer deadlock must fail the test, not hold the
+                # 8-GPU slot until the class-level pytest timeout.
+                request_timeout_s=DEFAULT_ACC_EVALUATION_TIMEOUT,
+        ) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
 
     @pytest.mark.skip_less_device(8)
@@ -1529,9 +1535,15 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                 "urls": ["localhost:8002"]
             }
         }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
+        with launch_disaggregated_llm(
+                disaggregated_server_config,
+                ctx_server_config,
+                gen_server_config,
+                self.MODEL_PATH,
+                # A helix transfer deadlock must fail the test, not hold the
+                # 8-GPU slot until the class-level pytest timeout.
+                request_timeout_s=DEFAULT_ACC_EVALUATION_TIMEOUT,
+        ) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
     @skip_pre_blackwell
