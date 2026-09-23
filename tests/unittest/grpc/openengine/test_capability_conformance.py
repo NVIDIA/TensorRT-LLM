@@ -22,17 +22,18 @@ from typing import Any
 
 import pytest
 
-pytest.importorskip(
-    "openengine",
-    reason='OpenEngine dependency not installed (pip install "tensorrt_llm[openengine]")',
-)
+pytest.importorskip("grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.67.1,<2")')
 
 import torch  # noqa: E402
 from conftest import AbortError, FakeServicerContext  # noqa: E402
-from openengine.v1 import generation_pb2, lifecycle_pb2, model_pb2  # noqa: E402
 from utils.llm_data import llm_models_root  # noqa: E402
 
 from tensorrt_llm import LLM  # noqa: E402
+from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
+    generation_pb2,
+    lifecycle_pb2,
+    model_pb2,
+)
 from tensorrt_llm.grpc.openengine.capabilities import (  # noqa: E402
     GUIDE_SUPPORT_BY_BACKEND,
     supported_guides,
@@ -514,7 +515,8 @@ def test_every_handoff_attribute_is_a_real_disaggregated_params_field():
 
 def _session(**kw):
     from google.protobuf import struct_pb2
-    from openengine.v1 import kv_pb2
+
+    from tensorrt_llm.grpc.openengine.bindings import kv_pb2
 
     attrs = struct_pb2.Struct()
     attrs.update(kw.pop("attributes", {}))

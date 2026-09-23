@@ -7,8 +7,7 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from openengine.v1 import error_pb2, generation_pb2
-
+from .bindings import error_pb2, generation_pb2
 from .disagg import prefill_ready_response
 from .formatting import (
     _MAX_PROMPT_LOGPROB_ENTRIES,

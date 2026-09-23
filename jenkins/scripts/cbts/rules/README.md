@@ -306,10 +306,9 @@ unconditionally (`ALWAYS_RUN_STAGE_PREFIX`), so they still run on every baseline
 pipeline. `test_capability_conformance.py` builds a real `LLM` and so is registered in `l0_a10.yml`,
 adding `A10-PyTorch-*`: an OpenEngine change does pull one GPU shard. Any GPU serves — the model is
 TinyLlama-1.1B — so it sits with the other gateway tests rather than claiming a scarcer type.
-`requirements-openengine.txt` is installed on every stage in `jenkins/L0_Test.groovy` alongside the
-SMG file, so no stage-name guard decides which gateway a shard can import. If no OpenEngine test
-entry is registered, the rule returns `scope=None` and falls back to the baseline rather than
-silently skipping coverage.
+OpenEngine's private bindings and gRPC runtime are base package dependencies, so no stage-name guard
+decides which gateway a shard can import. If no OpenEngine test entry is registered, the rule
+returns `scope=None` and falls back to the baseline rather than silently skipping coverage.
 
 Tests under `tests/unittest/grpc/openengine/` remain owned by `TestsDefRule`;
 source-plus-test changes combine through the `testsonly` scope family.

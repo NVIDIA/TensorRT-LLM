@@ -65,6 +65,11 @@ def sanity_check():
             '`scripts/build_wheel.py` first (CMake FetchContent stages it under '
             '3rdparty/fmha_sm100), or use TRTLLM_USE_PRECOMPILED to extract it '
             'from a published wheel.')
+    if not (tensorrt_llm_path / "grpc" / "openengine" / "_generated" /
+            "openengine_pb2.py").is_file():
+        raise ImportError(
+            'The checked-in private OpenEngine bindings are missing. Please check the package integrity.'
+        )
 
 
 def get_version():
@@ -147,14 +152,10 @@ required_deps, extra_URLs = parse_requirements(
 devel_deps, _ = parse_requirements(
     Path("requirements-dev-windows.txt"
          if on_windows else "requirements-dev.txt"))
-openengine_deps, _ = parse_requirements(Path("requirements-openengine.txt"))
 mx_deps = ["modelexpress>=0.5.1,<0.6.0"]
-# Gateway protocol adapters are opt-in extras: the default installation must
-# not carry any gateway protobuf package. Each gateway owns a dedicated
-# requirements-<gateway>.txt as the single source of truth for its pins; CI
-# stages that exercise a gateway install that file explicitly, and the file
-# may carry gateway-specific options (such as an --extra-index-url) without
-# affecting the default dependency graph.
+# OpenEngine's private schema bindings ship in this wheel and use the base
+# grpcio dependency; its empty extra remains an install-compatible feature
+# marker. SMG still consumes its external generated package.
 grpc_smg_deps, _ = parse_requirements(Path("requirements-grpc-smg.txt"))
 constraints_file = Path("constraints.txt")
 if constraints_file.exists():
@@ -213,6 +214,9 @@ package_data += [
     '_torch/auto_deploy/custom_ops/fused_moe/moe_align_kernel.cu',
     '_torch/auto_deploy/custom_ops/fused_moe/triton_fused_moe_configs/*',
     'usage/schemas/*.json',
+    'grpc/openengine/_generated/*.pyi',
+    'grpc/openengine/proto/manifest.json',
+    'grpc/openengine/proto/openengine/v1/*.proto',
 ]
 
 
@@ -241,13 +245,17 @@ def download_precompiled(workspace: str, version: str) -> str:
 def should_skip_precompiled_package_data(filename: str) -> bool:
     """Return True for source-owned package data kept from local checkout.
 
-    Precompiled wheels own native bits. Source owns telemetry schema JSON.
-    Skip those wheel files so Python-only schema edits layer over old wheels.
+    Precompiled wheels own native bits. Source owns telemetry schemas and the
+    OpenEngine contract. Skip those wheel files so Python-only edits layer over
+    old wheels and tracked bindings from the current checkout remain authoritative.
     """
     filename = filename.replace("\\", "/")
-    source_owned_package_data_prefixes = ("tensorrt_llm/usage/schemas/", )
-    return filename.endswith(".json") and filename.startswith(
-        source_owned_package_data_prefixes)
+    if filename.startswith("tensorrt_llm/usage/schemas/"):
+        return filename.endswith(".json")
+    return filename.startswith((
+        "tensorrt_llm/grpc/openengine/_generated/",
+        "tensorrt_llm/grpc/openengine/proto/",
+    ))
 
 
 def warn_on_build_skew(precompiled_location: str) -> None:
@@ -747,7 +755,7 @@ setup(
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
     extras_require={
         "devel": devel_deps + grpc_smg_deps,
-        "openengine": openengine_deps,
+        "openengine": [],
         "mx": mx_deps,
         "grpc-smg": grpc_smg_deps,
     },

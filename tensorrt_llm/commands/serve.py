@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import atexit
 import contextlib
@@ -1555,10 +1558,8 @@ def serve(
                 except ImportError as error:
                     raise click.ClickException(
                         f"Failed to import OpenEngine support: {error}. "
-                        "Install the optional Python bindings with `python -m "
-                        "pip install --extra-index-url "
-                        "https://buf.build/gen/python "
-                        "\"tensorrt_llm[openengine]\"`.") from error
+                        "Restore the required gRPC runtime with `python -m pip "
+                        "install \"grpcio>=1.67.1,<2\"`.") from error
 
                 launch_grpc_server(host,
                                    port,

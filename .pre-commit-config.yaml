@@ -1601,9 +1601,10 @@ repos:
     rev: v0.9.4
     hooks:
     -   id: ruff
-        args: [--fix, --exit-non-zero-on-fix]
+        args: [--fix, --exit-non-zero-on-fix, --exclude=tensorrt_llm/grpc/openengine/_generated]
         exclude: *legacy_files
     -   id: ruff-format
+        args: [--exclude=tensorrt_llm/grpc/openengine/_generated]
         exclude: *legacy_files
 -   repo: https://github.com/executablebooks/mdformat
     rev: 0.7.17
@@ -1643,6 +1644,17 @@ repos:
         additional_dependencies: [PyYAML]
         always_run: true
         pass_filenames: false
+    -   id: openengine-bindings-check
+        name: verify generated OpenEngine bindings are in sync
+        entry: python scripts/generate_openengine_protos.py --check
+        language: python
+        additional_dependencies:
+        - grpcio==1.67.1
+        - grpcio-tools==1.67.1
+        - protobuf==5.27.2
+        - setuptools==84.0.0
+        pass_filenames: false
+        files: ^(requirements\.txt|requirements-build-openengine\.txt|scripts/generate_openengine_protos\.py|tensorrt_llm/grpc/openengine/(proto/|_generated/))
     -   id: test lists format
         name: Check for tabs and multiple spaces in test_lists txt files
         entry: ./scripts/format_test_list.py

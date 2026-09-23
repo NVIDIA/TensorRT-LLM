@@ -33,7 +33,6 @@ def test_stage_python_package(
         (package / "__init__.py").write_text(f"# {tree}\n")
         (package / "__pycache__" / "cached.pyc").write_bytes(b"cache")
         (package / "cached.pyc").write_bytes(b"cache")
-
     assets = (
         "setup.py",
         "pyproject.toml",
@@ -51,7 +50,6 @@ def test_stage_python_package(
     requirements = (
         "requirements.txt",
         "requirements-dev.txt",
-        "requirements-openengine.txt",
         "requirements-grpc-smg.txt",
         "requirements-windows.txt",
         "requirements-dev-windows.txt",

@@ -11,19 +11,16 @@ from typing import Any
 
 import pytest
 
-pytest.importorskip(
-    "openengine",
-    reason='OpenEngine dependency not installed (pip install "tensorrt_llm[openengine]")',
+grpc = pytest.importorskip(  # noqa: E402
+    "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.67.1,<2")'
 )
-
-import grpc  # noqa: E402
 from conftest import AbortError, FakeServicerContext  # noqa: E402
-from openengine.v1 import generation_pb2  # noqa: E402
 
 import tensorrt_llm.grpc.openengine.disagg as oe_disagg  # noqa: E402
 import tensorrt_llm.grpc.openengine.formatting as oe_formatting  # noqa: E402
 import tensorrt_llm.grpc.openengine.servicer as openengine_servicer  # noqa: E402
 import tensorrt_llm.grpc.openengine.streaming as oe_streaming  # noqa: E402
+from tensorrt_llm.grpc.openengine.bindings import generation_pb2  # noqa: E402
 from tensorrt_llm.grpc.openengine.request_mapping import sampling_params_from_request  # noqa: E402
 from tensorrt_llm.grpc.openengine.servicer import OpenEngineInferenceServicer  # noqa: E402
 from tensorrt_llm.sampling_params import SamplingParams  # noqa: E402

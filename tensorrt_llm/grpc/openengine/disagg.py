@@ -14,11 +14,11 @@ from urllib.parse import urlsplit
 
 from google.protobuf import struct_pb2
 from google.protobuf.json_format import MessageToDict
-from openengine.v1 import generation_pb2, kv_pb2
 
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 from tensorrt_llm.executor.result import Logprob
 
+from .bindings import generation_pb2, kv_pb2
 from .formatting import clamp_logprob
 
 # OpenEngine has no native request-type field, so the phase of a disaggregated
