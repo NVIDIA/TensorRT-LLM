@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM configuration, loading and vision ownership regressions without checkpoint files."""
 
+from copy import deepcopy
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, create_autospec, patch
 
@@ -121,6 +122,115 @@ def test_text_processing_without_native_processor(monkeypatch):
         load_processor.assert_not_called()
         with pytest.raises(RuntimeError, match="transformers==5.17.0"):
             processor.get_mm_max_tokens_per_item()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "overrides,image_rescale,video_rescale,sample_frames",
+    [
+        ({}, True, False, False),
+        ({"do_rescale": True, "do_sample_frames": True}, True, True, True),
+        (
+            {
+                "images_kwargs": {"do_rescale": False},
+                "videos_kwargs": {"do_rescale": True, "do_sample_frames": True},
+            },
+            False,
+            True,
+            True,
+        ),
+    ],
+    ids=["defaults", "flat-overrides", "modality-overrides"],
+)
+def test_mixed_processor_kwargs(overrides, image_rescale, video_rescale, sample_frames):
+    from PIL import Image
+
+    from tensorrt_llm._torch.models.modeling_glm5_next_vision import Glm5NextInputProcessor
+    from tensorrt_llm.inputs.multimodal_data import VideoData
+    from tensorrt_llm.llmapi import SamplingParams
+
+    processor = Glm5NextInputProcessor("unused", _config(), tokenizer=Mock())
+    processor._processor = Mock(
+        image_token="<|image|>",
+        video_token="<|video|>",
+        return_value={"input_ids": torch.tensor([[1, 2]])},
+    )
+    original = deepcopy(overrides)
+    processor.call_with_text_prompt(
+        {
+            "prompt": "<|image|><|video|>",
+            "multi_modal_data": {
+                "image": [Image.new("RGB", (28, 28))],
+                "video": [VideoData(frames=[torch.zeros(3, 28, 28)] * 2, metadata={})],
+            },
+            "mm_processor_kwargs": overrides,
+        },
+        SamplingParams(),
+    )
+    kwargs = processor._processor.call_args.kwargs
+    assert kwargs["images_kwargs"].get("do_rescale", kwargs.get("do_rescale")) == image_rescale
+    assert kwargs["videos_kwargs"].get("do_rescale", kwargs.get("do_rescale")) == video_rescale
+    assert (
+        kwargs["videos_kwargs"].get("do_sample_frames", kwargs.get("do_sample_frames"))
+        == sample_frames
+    )
+    assert overrides == original
+    assert kwargs["images_kwargs"] is not overrides.get("images_kwargs")
+    assert kwargs["videos_kwargs"] is not overrides.get("videos_kwargs")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tensor_images", [False, True], ids=["pil-image", "tensor-image"])
+def test_mixed_processor_matches_separate_inputs(tensor_images):
+    native = pytest.importorskip("transformers.models.glm5_next.processing_glm5_next")
+    from PIL import Image
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import Glm5NextImageProcessor, Glm5NextVideoProcessor, PreTrainedTokenizerFast
+
+    from tensorrt_llm._torch.models.modeling_glm5_next_vision import Glm5NextInputProcessor
+    from tensorrt_llm.inputs.multimodal_data import VideoData
+    from tensorrt_llm.llmapi import SamplingParams
+
+    special_tokens = ["[UNK]", "<|image|>", "<|video|>", "<|begin_of_video|>", "<|end_of_video|>"]
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(
+            WordLevel(dict(zip(special_tokens, range(5))), unk_token="[UNK]")
+        ),
+        unk_token="[UNK]",
+        additional_special_tokens=special_tokens[1:],
+    )
+    processor = Glm5NextInputProcessor("unused", _config(), tokenizer=tokenizer)
+    processor._processor = native.Glm5NextProcessor(
+        image_processor=Glm5NextImageProcessor(do_resize=False),
+        video_processor=Glm5NextVideoProcessor(do_resize=False),
+        tokenizer=tokenizer,
+    )
+    pil_image = Image.new("RGB", (28, 28), (64, 128, 192))
+    tensor_image = (
+        torch.tensor([64, 128, 192], dtype=torch.float32)[:, None, None].expand(3, 28, 28) / 255
+    )
+    media = {
+        "image": [tensor_image if tensor_images else pil_image],
+        "video": [
+            VideoData(
+                frames=[pil_image if tensor_images else tensor_image] * 2,
+                metadata={"fps": 2, "frames_indices": [0, 1]},
+            )
+        ],
+    }
+    _, mixed = processor.call_with_text_prompt(
+        {"prompt": "<|image|><|video|>", "multi_modal_data": media}, SamplingParams()
+    )
+    for modality in ("image", "video"):
+        _, separate = processor.call_with_text_prompt(
+            {"prompt": f"<|{modality}|>", "multi_modal_data": {modality: media[modality]}},
+            SamplingParams(),
+        )
+        for key, expected in separate["multimodal_data"][modality].items():
+            torch.testing.assert_close(
+                mixed["multimodal_data"][modality][key], expected, rtol=0, atol=0
+            )
 
 
 def _config():

@@ -950,15 +950,16 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         # Media loaders may deliver pre-rescaled float tensors (the server
         # default) instead of PIL / uint8; tell the HF processor not to
         # rescale those a second time (Qwen2-VL precedent).
-        do_rescale = True
-        if images and isinstance(images[0], torch.Tensor):
-            do_rescale = False
+        images_kwargs = dict(mm_processor_kwargs.get("images_kwargs") or {})
+        videos_kwargs = dict(mm_processor_kwargs.get("videos_kwargs") or {})
+        if images and "do_rescale" not in mm_processor_kwargs:
+            images_kwargs.setdefault("do_rescale", not isinstance(images[0], torch.Tensor))
         videos = None
         video_metadata = None
         if video_datas:
             videos = [video_data.frames for video_data in video_datas]
-            if isinstance(videos[0][0], torch.Tensor):
-                do_rescale = False
+            if "do_rescale" not in mm_processor_kwargs:
+                videos_kwargs.setdefault("do_rescale", not isinstance(videos[0][0], torch.Tensor))
             # Frames are already sampled by the media loader; the processor
             # only needs fps / frame indices to lay out the per-frame
             # timestamps (``VideoMetadata.timestamps``).
@@ -967,7 +968,11 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 meta = dict(video_data.metadata or {})
                 meta["total_num_frames"] = len(video_data.frames)
                 video_metadata.append(meta)
-            mm_processor_kwargs.setdefault("do_sample_frames", False)
+            if "do_sample_frames" not in mm_processor_kwargs:
+                videos_kwargs.setdefault("do_sample_frames", False)
+
+        mm_processor_kwargs["images_kwargs"] = images_kwargs
+        mm_processor_kwargs["videos_kwargs"] = videos_kwargs
 
         # Fail closed before any pixel work: a placeholder / item count
         # mismatch must surface as a ValueError (an HTTP error at the serving
@@ -989,7 +994,6 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             images=images,
             videos=videos,
             video_metadata=video_metadata,
-            do_rescale=do_rescale,
             return_tensors="pt",
             **mm_processor_kwargs,
         )
