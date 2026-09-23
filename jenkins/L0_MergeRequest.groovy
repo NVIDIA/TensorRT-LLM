@@ -1986,8 +1986,7 @@ def resolveBoltProfileRef(String branch, String triple = "aarch64-linux-gnu")
         echo "BOLT profile pin: nothing promoted for ${branch}/${triple}; running unpinned."
         return ""
     }
-    echo "BOLT profile pin: ${branch}/${triple} -> ${ref}. Consumers honouring the pin use this bundle; " +
-         "the image profile-bundle overlay still resolves latest independently."
+    echo "BOLT profile pin: ${branch}/${triple} -> ${ref}. Every consumer in this pipeline uses this bundle."
     return ref
 }
 

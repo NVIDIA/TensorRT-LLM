@@ -395,10 +395,21 @@ def overlayBoltBundle(pairs, arch, action) {
     //    (manifest + >=1 profile) so "pulled but empty" is not accepted. First hit wins.
     def haveBundle = false
     def branch = null
+    // The overlay is a consumer like any other, so it takes the pipeline's pin
+    // rather than resolving `latest` when it happens to run. Without this the
+    // released image could carry a profile bundle that no other artifact in the
+    // run was built from. Empty means unpinned and pull-latest behaves exactly
+    // as before. The candidate walk is kept: the ref is a commit SHA, so the
+    // same ref under another branch's promote directory is the bundle built
+    // from that same commit.
+    if (BOLT_PINNED_REF) {
+        echo "[BOLT] overlay pinned to bundle ${BOLT_PINNED_REF}"
+    }
     for (cand in candidates) {
         for (int attempt = 1; attempt <= 3 && !haveBundle; attempt++) {
             def rc = sh(script: """
                 rm -rf ${ctxDir} && mkdir -p ${ctxDir}/${bundleSub} && \
+                export BOLT_PROFILE_REF='${BOLT_PINNED_REF}' && \
                 cd ${LLM_ROOT} && bash scripts/bolt/internal/artifactory.sh pull-latest ${cand} ${triple} ${ctxDir}/${bundleSub}
             """, returnStatus: true)
             if (rc == 0) {
