@@ -287,6 +287,7 @@ class _DummyRequest:
         self.py_seq_slot = seq_slot
         self.py_request_id = seq_slot
         self.py_batch_idx = None
+        self.py_return_context_logits = False
         self.py_multimodal_data = None
         self.multimodal_positions = None
         self.multimodal_lengths = None

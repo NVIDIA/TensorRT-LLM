@@ -14,6 +14,7 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.workspace import EagerWorkspaceReclaimer, WorkspaceShrinkPolicy
 
@@ -181,6 +182,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         self.engine.model = SimpleNamespace(
             model_config=SimpleNamespace(extra_attrs={}), forward=Mock(return_value=42)
         )
+        self.engine._model_caller = ModelCaller(self.engine.model)
         reclaimer_patch = patch(f"{_ENGINE_MODULE}.EagerWorkspaceReclaimer", autospec=True)
         self.reclaimer_class = reclaimer_patch.start()
         self.addCleanup(reclaimer_patch.stop)
@@ -193,8 +195,14 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
 
     def call(self) -> int:
         with (
-            patch(f"{_ENGINE_MODULE}.get_model_extra_attrs", return_value={}),
-            patch(f"{_ENGINE_MODULE}.is_trace_enabled", return_value=False),
+            patch(
+                "tensorrt_llm._torch.pyexecutor.engine.model_call.get_model_extra_attrs",
+                return_value={},
+            ),
+            patch(
+                "tensorrt_llm._torch.pyexecutor.engine.model_call.is_trace_enabled",
+                return_value=False,
+            ),
         ):
             return self.engine.model_forward(attn_metadata=self.metadata)
 

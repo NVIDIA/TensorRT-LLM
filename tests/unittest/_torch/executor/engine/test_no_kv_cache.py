@@ -2,14 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
+from tensorrt_llm._torch.pyexecutor.engine.input_buffers import InputBuffers
 from tensorrt_llm._torch.pyexecutor.engine.runners import no_kv_cache as no_kv_cache_module
-from tensorrt_llm._torch.pyexecutor.engine.runners.interface import RunnerDeps
 from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunnerConfig
 from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
@@ -80,40 +80,43 @@ def _prepare(
     gather_ids_cuda = torch.full((8,), -1, dtype=torch.int)
     draft_tokens_cuda = torch.empty(8, dtype=torch.int)
     lora = SimpleNamespace(build=Mock(return_value=lora_params))
-    runner = PoolingRunner(
-        model or SimpleNamespace(),
-        RunnerDeps(
-            dist=dist,
-            mapping=SimpleNamespace(has_cp_helix=lambda: False),
-            input_ids_cuda=input_ids_cuda,
-            position_ids_cuda=position_ids_cuda,
-            gather_ids_cuda=gather_ids_cuda,
-            draft_tokens_cuda=draft_tokens_cuda,
-            cache_indirection=None,
-            lora=lora,
-            moe_load_balancer=None,
-            model_forward=Mock(),
-        ),
-        NoKVCacheRunnerConfig(
-            max_batch_size=4,
-            max_num_tokens=16,
-            max_seq_len=8,
-            max_beam_width=1,
-            without_logits=False,
-            attention_backend=_AttentionBackend,
-            attention_runtime_features=AttentionRuntimeFeatures(),
-            enable_attention_dp=enable_attention_dp,
-            prefill_cuda_graph_backend=PrefillCudaGraphBackend.DISABLED,
-            prefill_cuda_graph_num_tokens=[],
-            mm_encoder_cache_enabled=True,
-            spec_config=object() if enable_spec_decode else None,
-            is_draft_model=False,
-            num_seq_slots=None,
-            original_max_draft_len=0,
-            original_max_total_draft_tokens=0,
-            spec_dec_max_total_draft_tokens=0,
-        ),
+    buffers = InputBuffers(
+        input_ids_cuda=input_ids_cuda,
+        position_ids_cuda=position_ids_cuda,
+        gather_ids_cuda=gather_ids_cuda,
+        draft_tokens_cuda=draft_tokens_cuda,
     )
+    with (
+        patch.object(InputBuffers, "allocate", return_value=buffers),
+        patch.object(no_kv_cache_module, "LoraParamBuilder", return_value=lora),
+    ):
+        runner = PoolingRunner(
+            model or SimpleNamespace(),
+            NoKVCacheRunnerConfig(
+                max_batch_size=4,
+                max_num_tokens=16,
+                max_seq_len=8,
+                max_beam_width=1,
+                without_logits=False,
+                attention_backend=_AttentionBackend,
+                attention_runtime_features=AttentionRuntimeFeatures(),
+                enable_attention_dp=enable_attention_dp,
+                prefill_cuda_graph_backend=PrefillCudaGraphBackend.DISABLED,
+                prefill_cuda_graph_num_tokens=[],
+                mm_encoder_cache_enabled=True,
+                spec_config=object() if enable_spec_decode else None,
+                is_draft_model=False,
+                num_seq_slots=None,
+                original_max_draft_len=0,
+                original_max_total_draft_tokens=0,
+                spec_dec_max_total_draft_tokens=0,
+                max_draft_loop_tokens=0,
+            ),
+            mapping=SimpleNamespace(has_cp_helix=lambda: False),
+            dist=dist,
+            moe_load_balancer=None,
+            model_caller=Mock(),
+        )
     monkeypatch.setattr(
         runner,
         "setup_attn_metadata",
@@ -127,7 +130,6 @@ def _prepare(
     prepared = runner.prepare_inputs(
         scheduled_requests,
         resource_manager=SimpleNamespace(name="resources"),
-        cuda_graph_lora_manager=None,
         runtime_draft_len=2,
     )
     return (
