@@ -233,6 +233,22 @@ def _spec_forward_stub():
     )
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("draft_config", [None, SimpleNamespace()])
+def test_nemotron_nano_delegates_draft_loading(draft_config):
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+
+    model = object.__new__(NemotronHMultimodalModel)
+    torch.nn.Module.__init__(model)
+    model.llm = MagicMock(draft_config=draft_config, draft_model=object())
+    weights, mapper = {"mtp.layers.0.norm.weight": torch.ones(4)}, object()
+
+    assert model.draft_config is draft_config
+    assert model.draft_model is model.llm.draft_model
+    ModelLoader._call_load_weights(None, model.load_draft_weights, weights, mapper)
+    model.llm.load_draft_weights.assert_called_once_with(weights, weight_mapper=mapper)
+
+
 def test_nemotron_nano_forward_threads_spec_decoding_args():
     """MTP drafting needs spec_metadata and resource_manager to reach the inner LM."""
     model = _spec_forward_stub()
