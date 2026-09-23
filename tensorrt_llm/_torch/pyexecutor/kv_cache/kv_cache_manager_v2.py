@@ -4917,7 +4917,8 @@ class KVCacheManagerV2(BaseResourceManager):
                     req.total_input_len_cp = token_num * self._helix_cp_size - 1
                     req.py_decoding_iter = 1
                 if prepare_resource:
-                    new_capacity = kv_cache.capacity + _kv_draft + 1
+                    # token_num already includes the current generation input.
+                    new_capacity = kv_cache.capacity + _kv_draft
                     success = kv_cache.resize(new_capacity, history_length=history_hint)
                     if not success:
                         release_resources(req, free_draft_resources=draft_kv_cache is not None)

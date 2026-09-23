@@ -1501,6 +1501,44 @@ def test_external_draft_estimated_quota_supports_allocation_and_resume(
         manager.shutdown()
 
 
+@pytest.mark.parametrize("draft_len", [0, 4])
+def test_generation_dummy_uses_available_capacity(draft_len: int) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    init_cuda_once()
+    manager = KVCacheManagerV2(
+        KvCacheConfig(enable_block_reuse=False, max_gpu_total_bytes=4 << 20),
+        CacheType.SELF,
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=128,
+        tokens_per_block=32,
+        max_seq_len=131072,
+        max_batch_size=1,
+        max_num_tokens=128,
+        mapping=Mapping(),
+        dtype=DataType.HALF,
+        spec_config=MTPDecodingConfig(max_draft_len=draft_len) if draft_len else None,
+    )
+    try:
+        token_num = manager.get_num_available_tokens(
+            token_num_upper_bound=manager.max_seq_len, max_num_draft_tokens=draft_len
+        )
+        capacity = token_num + manager.num_extra_kv_tokens + draft_len
+        assert capacity % manager.tokens_per_block == 0
+        # The current generation input is already included in token_num.
+        requests = manager.add_dummy_requests(
+            [0], token_nums=[token_num], is_gen=True, max_num_draft_tokens=draft_len
+        )
+        assert requests is not None
+        cache = manager.kv_cache_map[requests[0].py_request_id]
+        assert cache.history_length == token_num - 1
+        assert cache.capacity == capacity
+        manager.free_resources(requests[0])
+    finally:
+        manager.shutdown()
+
+
 @pytest.fixture
 def max_num_turns() -> int:
     return 1
