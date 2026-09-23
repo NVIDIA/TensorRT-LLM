@@ -70,6 +70,15 @@ ENABLE_INFRA_SCOPED_FAILFAST = env.ENABLE_INFRA_SCOPED_FAILFAST ? env.ENABLE_INF
 // must be declared there as a boolean parameter defaulting to false. Until it is,
 // the parameter is simply absent and this stays false.
 BOLT_CONSUME_ENABLED = (params.boltConsume ?: env.boltConsume ?: env.BOLT_CONSUME ?: "false").toString() == "true"
+// Publish the BOLTed build BESIDE an untouched canonical tarball instead of
+// replacing canonical with it. Set by the post-merge launch, where canonical is
+// BoltProfileGen's input and must stay un-BOLTed. Same resolution order as above.
+BOLT_PUBLISH_VARIANT = (params.boltPublishVariant ?: env.boltPublishVariant ?: "false").toString() == "true"
+// The profile bundle this pipeline pinned, or "" for whatever `latest` is now.
+// A BINDING variable, not a local: `globalVars` is a parameter of launchStages and
+// is not in scope inside applyLatestBolt, so the value is hoisted here the same way
+// BOLT_CONSUME_ENABLED is.
+BOLT_PINNED_REF = (params.boltProfileRef ?: env.boltProfileRef ?: "").toString()
 
 // Literals for easier access.
 @Field
@@ -357,16 +366,22 @@ def copyCachedArtifacts(stageName, reuseArtifactPath, artifacts)
     return reused
 }
 
+// artifacts maps an upload name to either a local path, or a Map of
+// [path: <local path>, props: <"k=v;k=v" or null>] when the object needs
+// Artifactory properties attached. Properties are set in the same request as the
+// upload, so metadata and bytes cannot disagree.
 def uploadArtifacts(artifacts, prefix = UPLOAD_PATH, retryTimes = 2, serverId = 'Artifactory')
 {
     for (it in artifacts) {
         def uploadpath = it.key
-        def filepath = it.value
+        def filepath = it.value instanceof Map ? it.value.path : it.value
+        def props = it.value instanceof Map ? it.value.props : null
+        def propsField = props ? ",\n                        \"props\": \"${props}\"" : ""
         def spec = """{
                     "files": [
                         {
                         "pattern": "${filepath}",
-                        "target": "${prefix}/${uploadpath}"
+                        "target": "${prefix}/${uploadpath}"${propsField}
                         }
                     ]
                 }"""
@@ -557,6 +572,10 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
     // parent's main-only gate if either name starts being forwarded.
     def branch = env.gitlabTargetBranch ?: env.branch_name ?: "main"
     def triple = is_linux_x86_64 ? "x86_64-linux-gnu" : "aarch64-linux-gnu"
+    // The bundle this pipeline pinned, or "" to take whatever `latest` is now.
+    // Exported to apply_latest.sh, which passes it to artifactory.sh; also stamped
+    // onto the published artifact so a consumer can verify what it received.
+    def boltRef = BOLT_PINNED_REF
     def llvmArch = is_linux_x86_64 ? "X64" : "ARM64"
     def llvmVer = "21.1.5"   // keep in sync with scripts/bolt internal/slurm_*.sh
     stage("BOLT consume") {
@@ -576,6 +595,7 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
                 tar -xJf /tmp/\$tb -C .bolt-llvm --strip-components=1
                 rm -f /tmp/\$tb
             fi
+            export BOLT_PROFILE_REF='${boltRef}'
             bash ${LLM_ROOT}/scripts/bolt/internal/apply_latest.sh \
                  ${branch} ${triple} ${tarName} bolted-${tarName}
         """)
@@ -586,23 +606,47 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
         if (rc != 0) {
             error("[bolt-consume] apply_latest.sh failed (rc=${rc}) for ${branch}/${triple}")
         }
-        // Applied: preserve the un-BOLTed original as unbolted-<tarName> and promote
-        // the BOLTed build to the canonical name. Matches the postmerge
-        // publishBoltedCanonical convention (canonical = BOLTed).
-        sh """
-            set -e
-            cp -f ${tarName} unbolted-${tarName}
-            mv -f bolted-${tarName} ${tarName}
-            echo '[bolt-consume] ${tarName} is now BOLTed; original preserved as unbolted-${tarName}'
-        """
-        // Register the unbolted- variant for upload via the caller's artifacts map,
-        // so it is pushed by buildOrCache OUTSIDE the build container (where the
-        // JFrog 'Artifactory' server resolves). Uploading here with rtUpload fails
-        // with "Couldn't find JFrog Instance ID: Artifactory" -- the server is not
-        // available inside the container context. Added only on a successful apply,
-        // so a skipped arch never references a nonexistent file.
-        if (artifacts != null) {
-            artifacts["unbolted-${tarName}"] = "unbolted-${tarName}"
+        // Applied. Which name the BOLTed build takes depends on who consumes this
+        // build, and the two cases are opposites:
+        //
+        //   pre-merge  -- BOLTed becomes canonical, original kept as unbolted-.
+        //                 Every downstream consumer should exercise the optimized
+        //                 build, and canonical is what they all fetch.
+        //   post-merge -- canonical stays UN-BOLTed and the optimized build is
+        //                 published beside it as bolted-<tarName>. Canonical is
+        //                 BoltProfileGen's input; replacing it would generate the
+        //                 next bundle from already-optimized binaries.
+        //
+        // Both register the second variant through the caller's artifacts map, so
+        // it is pushed by buildOrCache OUTSIDE the build container -- rtUpload here
+        // fails with "Couldn't find JFrog Instance ID: Artifactory", the server not
+        // being resolvable in the container context. Added only on a successful
+        // apply, so a skipped arch never references a nonexistent file.
+        if (BOLT_PUBLISH_VARIANT) {
+            sh """
+                set -e
+                echo '[bolt-consume] ${tarName} left un-BOLTed (BoltProfileGen input); optimized build published as bolted-${tarName}'
+            """
+            if (artifacts != null) {
+                // bolt.ref records WHICH bundle produced it, so a consumer can
+                // assert it matches the pin rather than trusting the filename, and
+                // an A/B job can tell the two sides apart by property rather than
+                // by a name that means the opposite thing pre-merge.
+                artifacts["bolted-${tarName}"] = [
+                    path: "bolted-${tarName}",
+                    props: boltRef ? "bolt.ref=${boltRef}" : null,
+                ]
+            }
+        } else {
+            sh """
+                set -e
+                cp -f ${tarName} unbolted-${tarName}
+                mv -f bolted-${tarName} ${tarName}
+                echo '[bolt-consume] ${tarName} is now BOLTed; original preserved as unbolted-${tarName}'
+            """
+            if (artifacts != null) {
+                artifacts["unbolted-${tarName}"] = "unbolted-${tarName}"
+            }
         }
     }
 }
@@ -672,6 +716,10 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         if (globalVars[BOLT_CONSUME_BUILD]?.toString() == "true") {
             BOLT_CONSUME_ENABLED = true
             echo "[bolt-consume] enabled via globalVars.bolt_consume_build"
+        }
+        if (globalVars[BOLT_PROFILE_REF]) {
+            BOLT_PINNED_REF = globalVars[BOLT_PROFILE_REF].toString()
+            echo "[bolt-consume] pinned to profile bundle ${BOLT_PINNED_REF}"
         }
     }
 
