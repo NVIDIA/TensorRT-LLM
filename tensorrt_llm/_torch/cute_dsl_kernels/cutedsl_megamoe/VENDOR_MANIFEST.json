@@ -24,7 +24,7 @@
     "kernel_src/blackwell/custom_mix_cga_helpers.py": "f32e451604cd88128265a2350209dbf726dbe1ff925ed7c52fa30ede272a87a1",
     "kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_epilogue.py": "6bd14ec1dad36cf11634f51eebd9eca2136a3bdc17ee388c83f643f6a8c83093",
     "kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_extension.py": "7d363e9feb4c40d96a03b67dd5b3150e9b317c9915c84de4afc3d6d850772c7a",
-    "kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_kernel.py": "61bceafb257bf247c740ecf602f4390fa9e8db0d20be8dd04c385b233e6d1735",
+    "kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_kernel.py": "3dcd9f4e6abb08ccce8d3736f547eea4ee5cac844abc525249c1f3072c6e0b27",
     "kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_mainloop.py": "1c6f14cbc29f1025c0404ae191b832177d0b06ea67110816edc51adc58bbd084",
     "kernel_src/blackwell/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py": "f9dec78af4c0518c2c49f784c238e447d111e3f11db80d5d32cd094bb968e1c0",
     "kernel_src/blackwell/inference/mega/dynamic_mainloop.py": "6662dd61f1bd51dde33742e0bb0bddff3d5970af720fc25a2a23b298dd2b8e2c",
@@ -273,15 +273,17 @@
     },
     {
       "patch": "SHARED_FC12.patch",
-      "patch_sha256": "c2cc2338d03d54e1fd9287cf7d382ed0a7ff7b85366a73d7363bd470c5ce1d96",
+      "patch_sha256": "26077ce45904925929d10b9d134e5c1ce34216d1f838eebf64b5344cefa10aed",
       "file": "kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_kernel.py",
-      "unpatched_vendored_sha256": "327ef47af5d0b113752a0fe43a37dfaa94abd2cef84a3fe81fcb7332de86852b",
-      "patched_sha256": "61bceafb257bf247c740ecf602f4390fa9e8db0d20be8dd04c385b233e6d1735",
+      "unpatched_vendored_sha256": "1d73bbdd1c43052bba7ce7449c5dff641a1047d1b3200c87ddc9c8496ca13e9f",
+      "patched_sha256": "3dcd9f4e6abb08ccce8d3736f547eea4ee5cac844abc525249c1f3072c6e0b27",
       "source_repository": "https://gitlab-master.nvidia.com/jintaop/cutedsl_megamoe.git",
       "source_revision": "522fbb019942ad6bbe0f418dba02541f837ea46c",
       "source_path": "next/sources/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_kernel.py",
-      "description": "Include the complete standalone fused FC12 top-level from the same pinned upstream source; normalize its formatting with Ruff 0.9.4.",
-      "runtime_contract": "The standalone upstream FC12 top-level does not reset its readiness counters after a launch. The shared-expert runner clears require_zero_workspace_leading_bytes on the same CUDA stream before every invocation with cuMemsetD8Async."
+      "description": "Include the complete standalone fused FC12 top-level from the same pinned upstream source; add the standard vendor SPDX header and apply import normalization after Ruff 0.9.4 formatting.",
+      "runtime_contract": "The standalone upstream FC12 top-level does not reset its readiness counters after a launch. The shared-expert runner clears require_zero_workspace_leading_bytes on the same CUDA stream before every invocation with cuMemsetD8Async.",
+      "upstream_file_sha256": "327ef47af5d0b113752a0fe43a37dfaa94abd2cef84a3fe81fcb7332de86852b",
+      "format_before": "ruff 0.9.4"
     }
   ]
 }

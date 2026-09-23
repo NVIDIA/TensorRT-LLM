@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Lean block-scaled swap-AB FC12 kernel composition for Blackwell."""
 
 from typing import ClassVar, Optional, Tuple

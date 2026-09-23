@@ -32,18 +32,31 @@ already initialized CUDA without 4x, startup rejects the configuration. That
 guard cannot detect every external CUDA context; applications that initialize
 CUDA elsewhere first must export `CUDA_SCALE_LAUNCH_QUEUES=4x` before startup.
 
-Shared FC1/FC2 use a static eight-SM launch budget by default. To select CLC:
+For eager DeepSeek V4 on Rubin with the MegaMoE CuTe DSL routed backend and
+FP8 shared weights, both OFF and ON use the upstream complete
+`BlockScaledSwapAbFc12Kernel`. FC1, clamped SwiGLU, and FC2 execute in one
+kernel. Checkpoint loading, TP shards, shared-output scaling, and the enclosing
+MoE reduction retain their existing contracts. Other backend/precision/graph
+configurations keep their existing shared path.
 
-```bash
-export TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER=clc_dynamic
-```
+ON leaves eight SMs outside the shared kernel's launch budget: 102 two-CTA
+clusters on a 212-SM device, versus OFF's 106. Shared-input MXFP8 and routed-input
+NVFP4 quantization retain `reserved_sms=8`: 816 CTAs for sufficient input rows,
+versus OFF's 848. These are launch budgets, not hardware partitions.
 
-This process-wide override applies to supported Rubin dense GEMMs. CLC does not
-use the static cluster budget or guarantee eight idle SMs. Unset it or select
-`static` to restore ON's default. Static and CLC tuning identities are distinct.
-Shared-input MXFP8 and routed-input NVFP4 quantization retain `reserved_sms=8`
-in either mode: 816 CTAs on a 212-SM device, versus OFF's 848. These are launch
-budgets, not hardware partitions; concurrent memory traffic can still add cost.
+The shared forward enqueues input quantization, a small same-stream asynchronous
+counter memset, and the complete FC12 kernel. The memset clears 272 bytes at
+capacity 8192 and is required before every invocation; it introduces no host
+wait or global grid barrier. Token count is dynamic; an initialized count-table
+slice supplies metadata without a per-forward fill/copy or shape-specific compile.
+`TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER` continues to control separate supported dense
+GEMMs; it does not select this complete FC12 kernel's scheduler.
+
+Loaded FP8 weight values are preserved while gate/up rows and scales are
+rearranged for FC12. The fused intermediate uses FP32 FC1/activation arithmetic
+and K32 MXFP8 quantization, whereas the previous split path rounded FC1 and
+activation through BF16 and quantized at K128. Numerical equivalence must
+therefore be validated with explicit tolerances rather than asserted bitwise.
 
 ## Execution and lifetime
 
@@ -70,9 +83,9 @@ synthetic tuning input does not replace the inference dataset.
 
 Upstream pins and file hashes are in the [scheduler manifest](tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/VENDOR_MANIFEST.json)
 and [MegaMoE manifest](tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/VENDOR_MANIFEST.json).
-The latter records the FC1 claim-exhaustion fix and the TensorRT-LLM main
-compatibility patch. Vendor refresh replays both patches and verifies each file
-hash; the compatibility patch requires Ruff 0.9.4 formatting before application.
+The latter records the FC1 claim-exhaustion fix, TensorRT-LLM main compatibility,
+and the complete shared FC12 source. Vendor refresh replays the recorded patches
+and verifies each file hash, including the required Ruff 0.9.4 formatting steps.
 
 The default combine format remains main's `bf16`. Set
 `MEGAMOE_COMBINE_FORMAT` explicitly to select another supported format, and use
@@ -83,8 +96,11 @@ the same value across ranks and benchmark configurations.
 Run the [portable contracts and targeted GPU tests](scripts/verification/dynamic_load_balance/README.md).
 CPU contracts cover submission order, ownership, queue propagation, tactic
 selection and packaging. They do not establish GPU numerical correctness.
-Validate the native quantizer overloads and shared GEMM on the new source-built
-wheel, then run EP8 helper-slot accuracy and same-node unprofiled OFF/ON E2E.
+Validate the native quantizer overloads and real-weight shared FC12 against both
+the previous shared implementation and an independent quantized reference.
+Check repeated calls, dynamic token shapes, actual launch grids, and the single
+FC12 kernel in a GPU trace. Then run EP8 helper-slot accuracy and same-node
+unprofiled OFF/ON E2E with the same shared implementation.
 The ON accuracy check must use the tactics selected by its own E2E autotune
 cache. Earlier tekit checks and measurements below are historical references,
 not validation of this main-branch port.

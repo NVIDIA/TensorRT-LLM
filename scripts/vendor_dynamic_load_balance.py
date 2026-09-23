@@ -94,7 +94,12 @@ def main() -> None:
     pending = [
         path.relative_to(mega_dst) for path in mega_dst.rglob("*.py") if path.name != "__init__.py"
     ]
-    pending.append(Path("kernel_src/schedulers/__init__.py"))
+    pending.extend(
+        (
+            Path("kernel_src/schedulers/__init__.py"),
+            Path("kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_kernel.py"),
+        )
+    )
     copied = set()
     while pending:
         rel = pending.pop()
