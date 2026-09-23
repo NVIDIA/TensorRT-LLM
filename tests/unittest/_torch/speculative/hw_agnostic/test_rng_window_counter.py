@@ -35,9 +35,17 @@ def _meta(max_num_requests: int = 8) -> SpecMetadata:
 
 
 def _request(
-    slot: Optional[int], decoding_iter: int = 0, seed: Optional[int] = None
+    slot: Optional[int],
+    decoding_iter: int = 0,
+    seed: Optional[int] = None,
+    request_id: int = 0,
 ) -> types.SimpleNamespace:
-    return types.SimpleNamespace(py_seq_slot=slot, py_decoding_iter=decoding_iter, seed=seed)
+    return types.SimpleNamespace(
+        py_seq_slot=slot,
+        py_decoding_iter=decoding_iter,
+        seed=seed,
+        py_request_id=request_id,
+    )
 
 
 def _offsets(meta: SpecMetadata, requests: list[types.SimpleNamespace]) -> list[int]:
@@ -78,6 +86,32 @@ def test_seeded_counter_is_keyed_by_slot_not_batch_position() -> None:
     _offsets(meta, [_request(0, seed=7), _request(1, seed=11), _request(2, seed=13)])
     # Slot 1 finishes; slot 2 moves to batch position 0.
     assert _offsets(meta, [_request(2, seed=13), _request(0, seed=7)]) == [WINDOW, WINDOW]
+
+
+def test_seeded_slot_reuse_resets_the_stream() -> None:
+    # A seeded request must be reproducible regardless of what previously ran
+    # on its slot: when a recycled slot shows up under a new request id, the
+    # counter restarts at 0 instead of continuing the finished request's
+    # stream.
+    meta = _meta()
+    first = _request(0, seed=7, request_id=1)
+    assert _offsets(meta, [first]) == [0]
+    assert _offsets(meta, [first]) == [WINDOW]
+    # First request finishes; a new seeded request lands on the same slot.
+    second = _request(0, seed=7, request_id=2)
+    assert _offsets(meta, [second]) == [0]
+    assert _offsets(meta, [second]) == [WINDOW]
+
+
+def test_seeded_slot_reuse_reset_leaves_other_counters_alone() -> None:
+    meta = _meta()
+    survivor = _request(1, seed=11, request_id=1)
+    assert _offsets(meta, [_request(0, seed=7, request_id=2), survivor]) == [0, 0]
+    # Slot 0 is recycled to a new request; the survivor on slot 1 and the
+    # shared unseeded counter must keep advancing where they left off.
+    _offsets(meta, [_request(3)])
+    assert _offsets(meta, [_request(0, seed=7, request_id=3), survivor]) == [0, WINDOW]
+    assert _offsets(meta, [_request(3)]) == [WINDOW]
 
 
 # --- unseeded requests: one shared counter ------------------------------------
