@@ -48,6 +48,7 @@
 #include <cuda_runtime_api.h>
 #include <nccl.h>
 #include <torch/csrc/distributed/c10d/FileStore.hpp>
+#include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp>
@@ -1862,6 +1863,49 @@ std::vector<torch::Tensor> allreduce_pg(torch::Tensor const& input, torch::optio
 #endif // ENABLE_MULTI_DEVICE
 }
 
+// VisualGen-only: takes the process group's name instead of a boxed ScriptObject,
+// which Dynamo can't proxy under torch.compile(fullgraph=True)
+std::vector<torch::Tensor> allreduce_pg_by_name(torch::Tensor const& input,
+    torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
+    torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias,
+    torch::optional<torch::Tensor> const& workspace, torch::List<int64_t> const& group_, int64_t rank,
+    std::string const& group_name, int64_t const strategy_, int64_t const fusion_op_, double const eps_,
+    bool const trigger_completion_at_end_)
+{
+#if ENABLE_MULTI_DEVICE
+    auto pg = c10d::resolve_process_group(group_name);
+    auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
+    auto const strategy = static_cast<AllReduceStrategyType>(int8_t(strategy_));
+    auto const fusion_op = static_cast<AllReduceFusionOp>(int8_t(fusion_op_));
+    float const eps = eps_;
+    std::set<int> group;
+
+    for (int64_t my_rank : group_)
+    {
+        group.insert(static_cast<int>(my_rank));
+    }
+
+    auto it = group.find(rank);
+    if (it == group.end())
+    {
+        throw std::runtime_error("Rank not found in group");
+    }
+    int nccl_rank = std::distance(group.begin(), it);
+
+    if (nccl_rank != pg->getRank())
+    {
+        throw std::runtime_error("nccl_rank != pg->getRank()");
+    }
+
+    AllreduceOp op(group, pg, dtype, strategy, fusion_op, eps);
+    op.initialize();
+    auto ret = op.run(input, residual, norm_weight, scale, bias, trigger_completion_at_end_, workspace);
+    return ret;
+#else
+    return {input};
+#endif // ENABLE_MULTI_DEVICE
+}
+
 // residual [m, hidden_dim]
 // norm_weight [hidden_dim]
 // device_num_experts [1]
@@ -2363,6 +2407,21 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "float eps,"
         "bool trigger_completion_at_end) -> Tensor[]");
     m.def(
+        "allreduce_pg_by_name("
+        "Tensor input,"
+        "Tensor? residual,"
+        "Tensor? norm_weight,"
+        "Tensor? scale,"
+        "Tensor? bias,"
+        "Tensor? workspace,"
+        "int[] group,"
+        "int rank,"
+        "str group_name,"
+        "int strategy,"
+        "int op,"
+        "float eps,"
+        "bool trigger_completion_at_end) -> Tensor[]");
+    m.def(
         "moe_allreduce("
         "Tensor residual,"
         "Tensor norm_weight,"
@@ -2418,6 +2477,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("autotuned_allreduce", &tensorrt_llm::torch_ext::autotunedAllreduce);
     m.impl("register_allreduce_tactic", &tensorrt_llm::torch_ext::registerAllReduceTactic);
     m.impl("allreduce_pg", &tensorrt_llm::torch_ext::allreduce_pg);
+    m.impl("allreduce_pg_by_name", &tensorrt_llm::torch_ext::allreduce_pg_by_name);
     m.impl("moe_allreduce", &tensorrt_llm::torch_ext::moe_allreduce);
     m.impl("moe_finalize_allreduce", &tensorrt_llm::torch_ext::moe_finalize_allreduce);
     m.impl("preallocate_nccl_window_buffer", &tensorrt_llm::torch_ext::preallocateNCCLWindowBuffer);

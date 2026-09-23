@@ -934,7 +934,14 @@ class AllReduce(nn.Module):
         self.symm_mem_allreduce = None
         self._disable_mpi = mpi_disabled()
 
-        self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
+        # isinstance() won't work: to_llm_mapping() returns a plain Mapping.
+        self._is_visual_gen = getattr(mapping, "_visual_gen_origin", False)
+
+        self.all_reduce_op = torch.ops.trtllm.allreduce
+        if self._disable_mpi:
+            self.all_reduce_op = (torch.ops.trtllm.allreduce_pg_by_name
+                                  if self._is_visual_gen else
+                                  torch.ops.trtllm.allreduce_pg)
 
         # Propagate model-level prealloc config to AllReduceRunner once per
         # process.  extra_attrs is only active during model __init__, so we
@@ -1110,13 +1117,18 @@ class AllReduce(nn.Module):
 
         additional_args = {}
         if self._disable_mpi:
-            # Get ProcessGroup from mapping
             pg = self.mapping.tp_group_pg
             assert pg is not None, "TP ProcessGroup not initialised"
-            additional_args = {
-                "rank": torch.distributed.get_rank(),
-                "pg": pg.boxed(),
-            }
+            if self._is_visual_gen:
+                additional_args = {
+                    "rank": torch.distributed.get_rank(),
+                    "group_name": pg.group_name,
+                }
+            else:
+                additional_args = {
+                    "rank": torch.distributed.get_rank(),
+                    "pg": pg.boxed(),
+                }
 
         # In case that AutoTuner brings potential perf regression
         # TODO: Remove this if no perf regression is observed.
