@@ -26,7 +26,9 @@ l0_gb300:
   - accuracy/test_disaggregated_serving.py::TestQwen3_8_Flash_Next::test_fp8_nixl_python[prefix_cache]
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
-  # The modeling_v2 sm_103 entries live on l0_gb300_single_gpu.yml: they need one
-  # GPU, and every stage reading this list declares four, which puts them behind
-  # the multi-GPU approval label for no reason. The two that do need 4 ranks are
-  # on l0_gb300_multi_gpus.yml.
+  # The single-GPU modeling_v2 sm_103 entries live on l0_b300.yml. Same
+  # Blackwell Ultra die ('*gb110*' matches on both lists), so the receipt is the
+  # same architecture's, and that list runs on a stage that accepts a one-GPU
+  # job -- the GB300 QOS does not (`sbatch: error: QOSMinGRES`), so every stage
+  # reading this list declares four. The entries that genuinely need four ranks
+  # are on l0_gb300_multi_gpus.yml.
