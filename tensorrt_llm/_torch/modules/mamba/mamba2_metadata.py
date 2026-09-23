@@ -36,6 +36,60 @@ _FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE = 256
 
 
 @triton.jit
+def _snapshot_gdn_replay_work_items_kernel(
+    state_indices,
+    history_len,
+    work_items,
+    n_writes_output,
+    num_decodes,
+    work_item_width: tl.constexpr,
+    position_field: tl.constexpr,
+    cache_slot_field: tl.constexpr,
+    history_len_field: tl.constexpr,
+    cache_buf_idx_field: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Snapshot single-buffer history lengths before the layer replay loop."""
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    active = offsets < num_decodes
+    slots = tl.load(state_indices + offsets, mask=active, other=0)
+    lengths = tl.load(history_len + slots, mask=active, other=0)
+    output_base = work_items + offsets * work_item_width
+    tl.store(output_base + position_field, offsets, mask=active)
+    tl.store(output_base + cache_slot_field, slots, mask=active)
+    tl.store(output_base + history_len_field, lengths, mask=active)
+    tl.store(output_base + cache_buf_idx_field, 0, mask=active)
+    if tl.program_id(0) == 0:
+        tl.store(n_writes_output, 0)
+
+
+def _build_gdn_replay_work_items(
+    state_indices: torch.Tensor,
+    history_len: torch.Tensor,
+    work_items: torch.Tensor,
+    n_writes: torch.Tensor,
+) -> None:
+    """Build the immutable inputs consumed by the split GDN MTP commit."""
+    num_decodes = state_indices.shape[0]
+    block_size = 256
+    _snapshot_gdn_replay_work_items_kernel[(triton.cdiv(
+        num_decodes, block_size), )](
+            state_indices,
+            history_len,
+            work_items,
+            n_writes,
+            num_decodes,
+            work_item_width=REPLAY_WORK_ITEM_WIDTH,
+            position_field=REPLAY_WORK_POSITION_IN_DECODE_BATCH,
+            cache_slot_field=REPLAY_WORK_CACHE_SLOT,
+            history_len_field=REPLAY_WORK_PNAT,
+            cache_buf_idx_field=REPLAY_WORK_CACHE_BUF_IDX,
+            BLOCK_SIZE=block_size,
+            num_warps=4,
+        )
+
+
+@triton.jit
 def _prepare_gdn_replay_work_items_kernel(
     state_indices,
     prev_num_accepted_tokens,
@@ -408,15 +462,14 @@ class Mamba2Metadata:
         self.replay_num_decodes = num_decodes
         if num_decodes == 0:
             return
+        use_gdn_mtp_replay = getattr(kv_cache_manager, "use_gdn_mtp_replay",
+                                     False)
         use_gdn_all_layer_commit = getattr(
             kv_cache_manager, "use_gdn_cached_replay_all_layer_commit", False)
         if use_gdn_all_layer_commit:
             from tensorrt_llm._torch.modules.fla.cached_replay import \
                 CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
 
-            # The fused small-batch GDN kernel commits its checkpoint in-layer
-            # and indexes cache metadata directly. Work items are only consumed
-            # by the partitioned replay + all-layer commit path.
             if num_decodes < CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE:
                 return
 
@@ -435,6 +488,18 @@ class Mamba2Metadata:
         cache_buf_idx = replay_metadata.cache_buf_idx
         replay_step_width = replay_metadata.replay_step_width
         replay_history_size = replay_metadata.replay_history_size
+
+        if use_gdn_mtp_replay:
+            _build_gdn_replay_work_items(
+                self.state_indices[num_contexts:batch_size],
+                replay_metadata.history_len,
+                self.replay_work_items,
+                self.replay_n_writes,
+            )
+            return
+
+        if cache_buf_idx is None:
+            raise RuntimeError("Mamba2 replay requires cache buffer indices")
 
         if (use_gdn_all_layer_commit
                 and num_decodes <= _FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE):

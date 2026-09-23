@@ -43,6 +43,63 @@ def test_gdn_replay_env_defaults_on_and_requires_one_when_set(monkeypatch, value
     assert is_gdn_replay_enabled() is expected
 
 
+def test_gdn_replay_dispatch_skips_standalone_conv(monkeypatch):
+    """GDN replay consumes raw QKV and bypasses the standalone Conv4 path."""
+    import tensorrt_llm._torch.modules.mamba.gdn_mixer as gdn_mixer
+
+    layer = gdn_mixer.Qwen3NextGatedDeltaNet.__new__(gdn_mixer.Qwen3NextGatedDeltaNet)
+    torch.nn.Module.__init__(layer)
+    layer.num_v_heads_per_tp = 2
+    layer.head_v_dim = 4
+
+    batch = 2
+    replay_width = 4
+    channels = 12
+    mixed_qkv = torch.randn(batch * replay_width, channels)
+    a = torch.randn(batch * replay_width, layer.num_v_heads_per_tp)
+    b = torch.randn_like(a)
+    expected = torch.randn(batch, replay_width, layer.num_v_heads_per_tp, layer.head_v_dim)
+    captured = {}
+
+    def replay(**kwargs):
+        captured.update(kwargs)
+        return expected
+
+    layer._replay_verify = replay
+    monkeypatch.setattr(
+        gdn_mixer,
+        "causal_conv1d_update_triton",
+        lambda *args, **kwargs: pytest.fail("standalone Conv4 must be skipped"),
+    )
+
+    result = layer.forward_decode(
+        conv_states=torch.empty(1),
+        ssm_states=torch.empty(1),
+        query_start_loc_long=torch.empty(0, dtype=torch.int64),
+        spec_metadata=SimpleNamespace(runtime_draft_len=replay_width - 1),
+        intermediate_conv_states=torch.empty(batch, replay_width, channels),
+        is_target_verify=True,
+        mixed_qkv=mixed_qkv,
+        a=a,
+        b=b,
+        cache_indices=torch.arange(batch, dtype=torch.int32),
+        num_decodes=batch,
+        intermediate_state_indices=torch.arange(batch, dtype=torch.int32),
+        use_replay=True,
+        replay_metadata=object(),
+        layer_cache=object(),
+        is_dummy=torch.zeros(batch, dtype=torch.bool),
+    )
+
+    assert captured["raw_x"] is mixed_qkv
+    assert captured["packed_ba"] is b
+    assert captured["candidate_x"].shape == (batch, replay_width, channels)
+    torch.testing.assert_close(
+        result,
+        expected.view(1, batch * replay_width, layer.num_v_heads_per_tp, layer.head_v_dim),
+    )
+
+
 # ---- Reference implementations ----
 
 
