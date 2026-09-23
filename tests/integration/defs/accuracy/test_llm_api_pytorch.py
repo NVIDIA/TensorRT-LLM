@@ -7464,9 +7464,25 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
     def test_nvfp4(self, use_msa, kv_dtype):
         if kv_dtype == "nvfp4" and not use_msa:
             pytest.skip("NVFP4 KV cache requires the MSA backend")
-        # NVFP4 checkpoint: MXFP8 base layers with NVFP4 routed experts
-        # (MIXED_PRECISION checkpoint). MSA uses the selected FP8/NVFP4 KV
-        # cache; the legacy Triton backend keeps the cache in BF16.
+        self._run_nvfp4(use_msa, kv_dtype=kv_dtype)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("fuse_qkv_index_projection", [False, True])
+    def test_nvfp4_piecewise_cuda_graph(
+            self, fuse_qkv_index_projection: bool) -> None:
+        """Check PCG accuracy with separate or fused QKV and index projections."""
+        self._run_nvfp4(True,
+                        piecewise=True,
+                        fuse_qkv_index_projection=fuse_qkv_index_projection)
+
+    def _run_nvfp4(self,
+                   use_msa: bool,
+                   *,
+                   kv_dtype: str = "fp8",
+                   piecewise: bool = False,
+                   fuse_qkv_index_projection: bool = False) -> None:
+        """Run the shared four-GPU NVFP4 M3 accuracy workload."""
         tp_size = ep_size = 4
         model_name = "nvidia/MiniMax-M3-NVFP4"
         model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
@@ -7475,7 +7491,8 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                                         dtype=kv_dtype if use_msa else "auto")
         sparse_attention_config = MiniMaxM3SparseAttentionConfig(
             implementation="msa" if use_msa else "triton",
-            indexer_kv_dtype="fp8" if use_msa else "bf16")
+            indexer_kv_dtype="fp8" if use_msa else "bf16",
+            fuse_qkv_index_projection=fuse_qkv_index_projection)
         moe_config = MoeConfig(backend="CUTLASS")
         with LLM(model_path,
                  tensor_parallel_size=tp_size,
@@ -7483,6 +7500,13 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  sparse_attention_config=sparse_attention_config,
                  moe_config=moe_config,
+                 prefill_cuda_graph_backend=(PrefillCudaGraphBackend.PIECEWISE
+                                             if piecewise else
+                                             PrefillCudaGraphBackend.DISABLED),
+                 prefill_capture_num_tokens=[128, 512, 2048]
+                 if piecewise else None,
+                 torch_compile_config=TorchCompileConfig()
+                 if piecewise else None,
                  max_seq_len=4096,
                  trust_remote_code=True) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
@@ -7504,8 +7528,41 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
     def test_nvfp4_eagle3(self, tp_size, ep_size, attention_dp,
                           overlap_scheduler, fuse_qkv_index_projection,
                           eval_mode, kv_dtype):
-        # One-model Eagle3 on MSA with the selected FP8/NVFP4 main cache and
-        # CUDA graphs. The shared GQA draft layer keeps FP8 KV. MMLU + GSM8K, or
+        self._run_nvfp4_eagle3(tp_size,
+                               ep_size,
+                               attention_dp,
+                               overlap_scheduler,
+                               fuse_qkv_index_projection,
+                               eval_mode,
+                               kv_dtype=kv_dtype)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("fuse_qkv_index_projection", [False, True])
+    def test_nvfp4_eagle3_piecewise_cuda_graph(
+            self, fuse_qkv_index_projection: bool) -> None:
+        """Check accuracy and draft acceptance from piecewise prefill to decode."""
+        self._run_nvfp4_eagle3(
+            4,
+            4,
+            attention_dp=True,
+            overlap_scheduler=True,
+            fuse_qkv_index_projection=fuse_qkv_index_projection,
+            eval_mode="default",
+            piecewise=True)
+
+    def _run_nvfp4_eagle3(self,
+                          tp_size: int,
+                          ep_size: int,
+                          attention_dp: bool,
+                          overlap_scheduler: bool,
+                          fuse_qkv_index_projection: bool,
+                          eval_mode: str,
+                          *,
+                          kv_dtype: str = "fp8",
+                          piecewise: bool = False) -> None:
+        # One-model Eagle3 uses the selected main cache dtype and CUDA graphs.
+        # Dense/shared draft layers keep FP8 KV. MMLU + GSM8K, or
         # InferenceX GSM8K, plus a chat-GSM8K acceptance probe, since accuracy
         # alone does not notice a corrupted drafter KV.
         from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import \
@@ -7532,6 +7589,24 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         else:
             max_seq_len = 4096
             max_batch_size = 256 if attention_dp else 512
+        cuda_graph_max_batch_size = 64 if (inferencex or attention_dp) else 128
+        piecewise_kwargs = {}
+        if piecewise:
+            # With ADP's 64 query heads, at most 32 requests keep MSA's
+            # short-query plans (up to 32 tokens/request) within 65536.
+            # The 2K/4K many-request warmups then use the long-prefill path.
+            max_batch_size = 32
+            cuda_graph_max_batch_size = max_batch_size
+            # Cover the entire scheduler token budget so these evaluations
+            # exercise captured prefill, rather than falling back above the
+            # capture ceiling. Generation-only steps still take the eager
+            # model path, including the Eagle3 epilogue and decode graphs.
+            piecewise_kwargs = dict(
+                prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE,
+                prefill_capture_num_tokens=[128, 512, 2048, 4096],
+                torch_compile_config=TorchCompileConfig(),
+                max_num_tokens=4096,
+            )
         with LLM(
                 model_path,
                 tensor_parallel_size=tp_size,
@@ -7547,7 +7622,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 speculative_config=spec_config,
                 cuda_graph_config=CudaGraphConfig(
                     enable_padding=True,
-                    max_batch_size=64 if (inferencex or attention_dp) else 128,
+                    max_batch_size=cuda_graph_max_batch_size,
                 ),
                 disable_overlap_scheduler=not overlap_scheduler,
                 enable_attention_dp=attention_dp,
@@ -7555,7 +7630,8 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 # Keep the whole acceptance probe: the default buffer holds
                 # only the latest 1000 iterations.
                 max_stats_len=5000,
-                trust_remote_code=True) as llm:
+                trust_remote_code=True,
+                **piecewise_kwargs) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
             if kv_dtype == "nvfp4":
                 assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
