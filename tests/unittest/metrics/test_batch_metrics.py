@@ -231,7 +231,7 @@ spec.loader.exec_module(module)
 for model, backend, size in [(sys.argv[2], "pytorch", 5), ("other", "pytorch", 9), (sys.argv[2], "unknown", 3)]:
     metric = module.BatchMetrics(model, backend, rank=2)
     metric.update(SimpleNamespace(batch_size=size), filter_dummies=False)
-Gauge("existing_metric", "Existing gauge", ["model_name"], multiprocess_mode="all").labels(model_name="original").set(7)
+Gauge("existing_metric", "Existing gauge", ["model_name"], multiprocess_mode="all").labels(model_name="original").set(5)
 """
     subprocess.run(
         [sys.executable, "-c", script, batch_metrics.__file__, model],
@@ -262,7 +262,12 @@ Gauge("existing_metric", "Existing gauge", ["model_name"], multiprocess_mode="al
         for metric in text_string_to_metric_families(response.text)
         for sample in metric.samples
     ]
-    published = {sample.value: sample for sample in samples}
+    published = {
+        sample.value: sample
+        for sample in samples
+        if sample.name == "trtllm_scheduled_batch_size"
+    }
+    assert len(published) == 3
     assert published[5].labels["model_name"] == model_label
     assert published[5].labels["engine_type"] == "pytorch"
     assert published[5].labels["rank"] == "2"
@@ -270,7 +275,11 @@ Gauge("existing_metric", "Existing gauge", ["model_name"], multiprocess_mode="al
     assert published[9].labels["model_name"] == "other"
     assert published[3].labels["engine_type"] == "unknown"
     assert published[3].labels["model_name"] == ("model" if configured_model == "local" else model)
-    assert published[7].labels["model_name"] == "original"
+    # The unrelated gauge deliberately shares a value with the batch metric.
+    existing = [sample for sample in samples if sample.name == "existing_metric"]
+    assert [(sample.labels["model_name"], sample.value) for sample in existing] == [
+        ("original", 5)
+    ]
 
 
 @pytest.mark.parametrize("invalid_path", ["missing", "file", ""])
