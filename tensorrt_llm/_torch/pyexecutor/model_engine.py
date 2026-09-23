@@ -8,7 +8,6 @@ import inspect
 import math
 import os
 from abc import ABC, abstractmethod
-from collections.abc import Mapping as RequestMapping
 from contextlib import contextmanager
 from typing import (Any, Callable, Dict, List, Optional, Sequence, Tuple, Type,
                     Union)
@@ -4650,7 +4649,7 @@ class PyTorchModelEngine(ModelEngine):
         new_tensors_device: Optional[SampleStateTensors] = None,
         cache_indirection_buffer: Optional[torch.Tensor] = None,
         num_accepted_tokens_device: Optional[torch.Tensor] = None,
-        previous_request_slots: Optional[RequestMapping[int, int]] = None,
+        previous_request_slots: Optional[dict[int, int]] = None,
         resource_manager: Optional[ResourceManager] = None,
         maybe_graph: bool = False,
         promoted_context_request_ids: frozenset[int] = frozenset(),
@@ -6064,7 +6063,7 @@ class PyTorchModelEngine(ModelEngine):
         new_tensors_device: Optional[SampleStateTensors] = None,
         cache_indirection_buffer: Optional[torch.Tensor] = None,
         num_accepted_tokens_device: Optional[torch.Tensor] = None,
-        previous_request_slots: Optional[RequestMapping[int, int]] = None,
+        previous_request_slots: Optional[dict[int, int]] = None,
         resource_manager: Optional[ResourceManager] = None,
         maybe_graph: bool = False,
         promoted_context_request_ids: frozenset[int] = frozenset(),

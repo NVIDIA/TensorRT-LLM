@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping as RequestMapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -61,7 +60,7 @@ class ScheduledInputs:
     new_tensors_device: SampleStateTensors | None = None
     cache_indirection_buffer: torch.Tensor | None = None
     num_accepted_tokens_device: torch.Tensor | None = None
-    previous_request_slots: RequestMapping[int, int] | None = None
+    previous_request_slots: dict[int, int] | None = None
     gather_context_logits: bool = False
     enable_spec_decode: bool = False
     runtime_draft_len: int = 0
@@ -109,16 +108,9 @@ class ScheduledModelRunner(ModelRunner):
         resource_manager: ResourceManager,
         is_dummy: bool = False,
     ) -> dict[str, Any]:
-        """Execute a batch using per-call inputs and borrowed runtime resources.
+        """Return model outputs with an optional ``runtime_draft_len`` update.
 
-        Runners that update draft length return the reserved ``runtime_draft_len``
-        key in a fresh dictionary; otherwise, omit it and reuse model outputs.
-        Callers may remove this key without changing cached outputs.
-        Tensor values retain their underlying storage and lifetime.
-        Model/graph collaborators belong to the runner's dependencies.
-        ``is_dummy`` is True for warmup and memory-profiling passes, not for
-        serving batches that merely contain padding requests. Callers establish
-        any required warmup contexts separately; this flag does not switch them.
+        ``is_dummy`` marks warmup and memory-profiling passes.
         """
 
 
