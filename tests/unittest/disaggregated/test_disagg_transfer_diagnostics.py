@@ -18,6 +18,7 @@ import os
 import threading
 import uuid
 from collections.abc import Iterator
+from contextlib import closing
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -356,10 +357,12 @@ def test_sink_records_validated_run_identity(
         "_write",
         staticmethod(lambda record: records.append(record.copy())),
     )
-    sink = diagnostics._get_sink(os.getpid())
-    sink.submit({"event": "diagnostic_capabilities", "request_id": None})
-    sink.flush()
+    # Leak detection runs before fixture teardown, so stop the writer in the test body.
+    with closing(diagnostics._get_sink(os.getpid())) as sink:
+        sink.submit({"event": "diagnostic_capabilities", "request_id": None})
+        sink.flush()
 
+    assert not sink._thread.is_alive()
     assert len(records) == 1
     record = records[0]
     assert record["run_uuid"] == expected_run_id
@@ -378,28 +381,29 @@ def test_event_identity_is_cached_and_cannot_be_overridden(monkeypatch: pytest.M
         "_write",
         staticmethod(lambda record: records.append(record.copy())),
     )
-    sink = diagnostics._get_sink(os.getpid())
     unexpected_call = MagicMock(side_effect=AssertionError("event regenerated identity"))
-    monkeypatch.setattr(
-        diagnostics, "uuid", SimpleNamespace(uuid4=unexpected_call, UUID=unexpected_call)
-    )
-    monkeypatch.setattr(
-        diagnostics, "os", SimpleNamespace(getpid=os.getpid, getenv=unexpected_call)
-    )
-
-    for event in ("diagnostic_capabilities", "ctx_send_ready"):
-        diagnostics.emit_event(
-            event,
-            side="ctx",
-            request_id=17,
-            run_uuid="forged-run",
-            process_uuid="forged-process",
-            run_uuid_status="invalid",
-            host="forged-host",
-            pid=-1,
+    with closing(diagnostics._get_sink(os.getpid())) as sink:
+        monkeypatch.setattr(
+            diagnostics, "uuid", SimpleNamespace(uuid4=unexpected_call, UUID=unexpected_call)
         )
-    sink.flush()
+        monkeypatch.setattr(
+            diagnostics, "os", SimpleNamespace(getpid=os.getpid, getenv=unexpected_call)
+        )
 
+        for event in ("diagnostic_capabilities", "ctx_send_ready"):
+            diagnostics.emit_event(
+                event,
+                side="ctx",
+                request_id=17,
+                run_uuid="forged-run",
+                process_uuid="forged-process",
+                run_uuid_status="invalid",
+                host="forged-host",
+                pid=-1,
+            )
+        sink.flush()
+
+    assert not sink._thread.is_alive()
     unexpected_call.assert_not_called()
     assert len(records) == 2
     for record in records:
@@ -417,19 +421,29 @@ def test_recreated_sink_has_fresh_process_identity(
     run_uuid = str(uuid.uuid4())
     monkeypatch.setenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS_RUN_ID", run_uuid)
     pid = os.getpid()
-    original_sink = diagnostics._get_sink(pid)
-    assert diagnostics._get_sink(pid) is original_sink
-    if restart == "same_pid":
-        diagnostics._reset_diagnostic_sink_for_tests()
-        replacement_sink = diagnostics._get_sink(pid)
-    else:
-        # Model PID replacement without inheriting a live parent thread.
-        original_sink.close()
-        replacement_sink = diagnostics._get_sink(pid + 1)
+    with closing(diagnostics._get_sink(pid)) as original_sink:
+        assert diagnostics._get_sink(pid) is original_sink
+        if restart == "same_pid":
+            diagnostics._reset_diagnostic_sink_for_tests()
+            replacement_pid = pid
+        else:
+            # Model PID replacement without inheriting a live parent thread.
+            original_sink.close()
+            replacement_pid = pid + 1
+        with closing(diagnostics._get_sink(replacement_pid)) as replacement_sink:
+            assert replacement_sink is not original_sink
+            assert (
+                replacement_sink._identity["process_uuid"]
+                != original_sink._identity["process_uuid"]
+            )
+            assert (
+                replacement_sink._identity["run_uuid"]
+                == original_sink._identity["run_uuid"]
+                == run_uuid
+            )
 
-    assert replacement_sink is not original_sink
-    assert replacement_sink._identity["process_uuid"] != original_sink._identity["process_uuid"]
-    assert replacement_sink._identity["run_uuid"] == original_sink._identity["run_uuid"] == run_uuid
+    assert not original_sink._thread.is_alive()
+    assert not replacement_sink._thread.is_alive()
 
 
 @pytest.mark.parametrize("failing_dependency", ["uuid", "environment"])
