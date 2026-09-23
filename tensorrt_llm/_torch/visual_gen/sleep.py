@@ -34,7 +34,13 @@ class PipelineSleepManager:
     not drain an external scheduler or preserve a terminated process.
     """
 
-    def __init__(self, restore_mode: Literal["CPU", "PINNED"], device: torch.device) -> None:
+    def __init__(
+        self,
+        restore_mode: Literal["CPU", "PINNED"],
+        device: torch.device,
+        *,
+        release_cpu_backup: bool = False,
+    ) -> None:
         if restore_mode not in ("CPU", "PINNED"):
             raise ValueError("Pipeline sleep requires CPU or PINNED memory backing")
         self._mode = virtual_memory.RestoreMode[restore_mode]
@@ -48,6 +54,7 @@ class PipelineSleepManager:
         self._condition = Condition()
         self._transition_lock = Lock()
         self._generation_thread: int | None = None
+        self._release_backup_on_wake = release_cpu_backup
 
     @contextmanager
     def loading(self) -> Iterator[None]:
@@ -142,6 +149,8 @@ class PipelineSleepManager:
                             f"expected {self._released_blobs}"
                         )
                     torch.cuda.synchronize(self._device)
+                    if self._release_backup_on_wake:
+                        virtual_memory.release_host_backups_with_tag(self._tag)
                 with self._condition:
                     self._state = "awake"
             finally:

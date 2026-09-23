@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -318,6 +318,40 @@ size_t CudaVirtualMemoryManager::materializeWithTag(std::string const& tag)
 
         throw;
     }
+    return count;
+}
+
+size_t CudaVirtualMemoryManager::releaseHostBackupsWithTag(std::string const& tag)
+{
+    std::vector<IBuffer::UniquePtr> backups;
+    {
+        std::unique_lock lock(mMutex);
+        auto const [begin, end] = mEntries.equal_range(tag);
+        size_t count = 0;
+        for (auto it = begin; it != end; ++it)
+        {
+            auto const& memory = it->second->second.mMemory;
+            TLLM_CHECK_WITH_INFO(memory.status() == CUDAVirtualMemoryChunk::MATERIALIZED,
+                "Host backups can only be released after restoring all allocations for the tag");
+            count += memory.mConfigurators.size();
+        }
+        // Reserve before transferring ownership so allocation failure leaves backups intact.
+        backups.reserve(count);
+        for (auto it = begin; it != end; ++it)
+        {
+            for (auto& configurator : it->second->second.mMemory.mConfigurators)
+            {
+                auto* offload = dynamic_cast<OffloadConfigurator*>(configurator.get());
+                if (offload != nullptr && offload->mBackedStorage != nullptr)
+                {
+                    backups.push_back(std::move(offload->mBackedStorage));
+                }
+            }
+        }
+    }
+    // Pinned-memory deallocation can be slow; do not hold the shared manager lock.
+    auto const count = backups.size();
+    backups.clear();
     return count;
 }
 

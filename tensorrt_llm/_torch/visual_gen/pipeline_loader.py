@@ -202,6 +202,7 @@ class PipelineLoader:
         skip_components: Optional[List[Union[str, PipelineComponent]]] = None,
         *,
         sleep_restore_mode: Literal["CPU", "PINNED"] | None = None,
+        sleep_release_cpu_backup: bool = False,
     ) -> "BasePipeline":
         """Load a pipeline, optionally backing its persistent GPU state in host RAM.
 
@@ -210,8 +211,12 @@ class PipelineLoader:
         Sleep/wake transitions are serialized per instance; callers remain
         responsible for external request queues.
         Warmup allocations remain outside the persistent allocation pool.
+        ``sleep_release_cpu_backup=True`` frees host backups before wake returns.
+        This makes wake slower, and each subsequent sleep allocates a fresh backup.
         """
         if sleep_restore_mode is None:
+            if sleep_release_cpu_backup:
+                raise ValueError("sleep_release_cpu_backup requires sleep_restore_mode")
             return self._load(checkpoint_dir, skip_warmup, skip_components)
 
         if self.args.parallel_config.n_workers != 1:
@@ -226,7 +231,9 @@ class PipelineLoader:
         from .models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
         from .sleep import PipelineSleepManager
 
-        manager = PipelineSleepManager(sleep_restore_mode, self.device)
+        manager = PipelineSleepManager(
+            sleep_restore_mode, self.device, release_cpu_backup=sleep_release_cpu_backup
+        )
         with manager.loading():
             pipeline = cast(
                 MiniMaxH3Pipeline,

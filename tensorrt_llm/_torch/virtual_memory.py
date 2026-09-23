@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 import functools
 from contextlib import contextmanager
@@ -13,7 +16,7 @@ from tensorrt_llm.bindings.internal.runtime import (
 
 __all__ = [
     "RestoreMode", "maybe_scope", "scope", "release_with_tag",
-    "materialize_with_tag"
+    "materialize_with_tag", "release_host_backups_with_tag"
 ]
 
 
@@ -137,3 +140,12 @@ def materialize_with_tag(*tags: str) -> int:
     manager = get_virtual_memory_manager()
     materialized_blobs = sum(manager.materialize_with_tag(tag) for tag in tags)
     return materialized_blobs
+
+
+def release_host_backups_with_tag(tag: str) -> int:
+    """Discard a tag's host backups after restoration copies have finished.
+
+    Serialize this operation with release/materialize for the same tag.
+    Sleeping allocations are rejected. GPU allocations remain unchanged.
+    """
+    return get_virtual_memory_manager().release_host_backups_with_tag(tag)

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -200,6 +200,8 @@ private:
     CUmemGenericAllocationHandle mHandle{};
     std::unique_ptr<Creator> mCreator;
     std::vector<std::unique_ptr<Configurator>> mConfigurators;
+
+    friend class CudaVirtualMemoryManager;
 };
 
 /**
@@ -418,6 +420,15 @@ public:
      * Call `retrieveBadHandles` to retrieve handles of all CUDAVirtualMemoryChunk that got removed due to exception.
      */
     size_t materializeWithTag(std::string const& tag);
+
+    /**
+     * Discard host backups of materialized allocations with the given tag.
+     * The caller must finish restoration copies and serialize this operation with
+     * release/materialize. Sleeping allocations are rejected without discarding any backups.
+     * Host buffers are detached under the manager lock, then freed outside it.
+     * @return Number of host buffers freed.
+     */
+    size_t releaseHostBackupsWithTag(std::string const& tag);
 
     /**
      * Retrieve handles of all CUDAVirtualMemoryChunk that got removed due to exception and reset the list.

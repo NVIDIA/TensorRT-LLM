@@ -19,8 +19,29 @@ pipeline.wake_up()
 `CPU` selects pageable host backing; `PINNED` selects pinned host backing. Both
 reuse TensorRT-LLM's virtual-memory allocator and restore the original device
 addresses. Reserve host RAM for the captured allocation pool in addition to
-ordinary process memory. The allocator retains host backing after wake, so this
-RAM budget is required for the lifetime of the pipeline after its first sleep.
+ordinary process memory. By default the allocator retains host backing after
+wake, so this RAM budget is required for the lifetime of the pipeline after its
+first sleep.
+
+To release that host backup on every wake instead, opt in when loading:
+
+```python
+pipeline = PipelineLoader(args).load(
+    sleep_restore_mode="PINNED", sleep_release_cpu_backup=True
+)
+```
+
+This also works with `CPU` backing. The policy applies only to this pipeline's
+captured allocations and is fixed at load time. Wake restores GPU memory and
+waits for host-backup cleanup before returning or allowing generation. This
+makes wake slower. Each subsequent sleep allocates a fresh backup, incurring
+the first-sleep allocation cost instead of reusing existing backing. Exceptions
+propagated from cleanup are raised by `wake_up()` and disable further generation;
+restart the worker rather than reusing that pipeline. Low-level deallocation
+errors follow the existing allocator's logging behavior. Peak host capacity must still
+accommodate the backup while asleep; this option reduces retained memory while
+awake, not the required capacity during offload. The host allocator may retain
+freed pages, so process RSS is not guaranteed to return exactly to its baseline.
 
 Loading captures persistent allocations; inference and warmup allocations are
 outside that pool. Sleep also empties PyTorch's unused caching-allocator blocks,
@@ -40,7 +61,9 @@ allocations.
 
 ## Scope
 
-- Disabled by default; no changes to the text LLM executor or shared allocator.
+- Disabled by default; no changes to the text LLM executor or existing allocator
+  modes. A tag-scoped allocator operation detaches restored host backups and frees
+  them outside the shared manager lock. Only opted-in H3 pipelines call it on wake.
 - Sleep state and controls belong only to MiniMaxH3Pipeline; BasePipeline and
   other model implementations are unchanged.
 - H3 already supports only one GPU and rejects CUDA graphs, CPU stage offload,
@@ -53,7 +76,7 @@ allocations.
   external request queues and must not bypass `forward` to access model weights
   during sleep/wake. The pipeline is not a concurrent request scheduler.
 
-## Local Validation
+## Tests and Validation
 
 Unit tests are in `tests/unittest/_torch/visual_gen/test_sleep.py`; small real-GPU
 allocator tests are in `test_sleep_gpu.py` alongside it, including two independent
@@ -63,7 +86,11 @@ checkpoint-backed test is
 `LLM_MODELS_ROOT` (or `MINIMAX_H3_CHECKPOINT` for the local checkpoint override).
 The full-model test needs a GPU with at least 140 GiB and sufficient host RAM
 for H3 plus its allocation backup; the development run reserves 320 GiB.
-These tests add no CI registration and are intended for local/QA validation.
+The state/loader unit tests run in CPU CI, and the small GPU allocator tests run
+in A10 CI. Both checkpoint-backed retention policies are listed in
+`tests/integration/test_lists/qa/llm_function_core.txt`, not in pre-merge CI.
+Run them sequentially on a large-memory single GPU with the host-RAM budget
+above. The QA list also selects the non-H3 regressions below.
 `test_sleep_non_h3.py` creates tiny local Wan/FLUX checkpoints and exercises
 real default loading, weight materialization, transformer forwards, and rejection
 of unsupported sleep requests without downloading pretrained checkpoints.

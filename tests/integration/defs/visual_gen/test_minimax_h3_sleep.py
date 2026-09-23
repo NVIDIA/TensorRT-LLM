@@ -12,6 +12,7 @@ from pathlib import Path
 from threading import Event
 from unittest.mock import patch
 
+import psutil
 import pytest
 import torch
 from test_common.llm_data import get_checkpoint
@@ -21,7 +22,8 @@ from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_minimax_h3_sleep_preserves_video_and_audio() -> None:
+@pytest.mark.parametrize("release_cpu_backup", [False, True])
+def test_minimax_h3_sleep_preserves_video_and_audio(release_cpu_backup: bool) -> None:
     if torch.cuda.get_device_properties(0).total_memory < 140 * 1024**3:
         pytest.skip("H3 FP8 sleep test requires a GPU with at least 140 GiB")
     checkpoint = os.environ.get("MINIMAX_H3_CHECKPOINT") or get_checkpoint("MiniMax-H3")
@@ -33,7 +35,12 @@ def test_minimax_h3_sleep_preserves_video_and_audio() -> None:
         cuda_graph_config={"enable": False},
         attention_config={"backend": "VANILLA"},
     )
-    pipeline = PipelineLoader(config).load(skip_warmup=True, sleep_restore_mode="PINNED")
+    pipeline = PipelineLoader(config).load(
+        skip_warmup=True,
+        sleep_restore_mode="PINNED",
+        sleep_release_cpu_backup=release_cpu_backup,
+    )
+    process = psutil.Process()
     request = dict(
         prompt="A spacecraft passes an icy moon, with a deep engine rumble.",
         seed=42,
@@ -102,14 +109,26 @@ def test_minimax_h3_sleep_preserves_video_and_audio() -> None:
             assert released_gib > 50
             with pytest.raises(RuntimeError, match="asleep"):
                 pipeline.forward(**request)
+            asleep_rss = process.memory_info().rss
             wake_start = time.perf_counter()
             pipeline.wake_up()
+            wake_s = time.perf_counter() - wake_start
+            freed_host_gib = (asleep_rss - process.memory_info().rss) / 1024**3
+            if release_cpu_backup:
+                assert freed_host_gib > 50
+            else:
+                assert abs(freed_host_gib) < 1
+            output = pipeline.forward(**request)
+            torch.testing.assert_close(output.video.cpu(), reference_video, rtol=0, atol=0)
+            torch.testing.assert_close(output.audio.cpu(), reference_audio, rtol=0, atol=0)
+            del output
             print(
                 {
                     "cycle": cycle + 1,
                     "drain_s": timings["drain_end"] - timings["drain_start"],
                     "offload_s": timings["sleep_end"] - timings["drain_end"],
-                    "wake_s": time.perf_counter() - wake_start,
+                    "wake_s": wake_s,
+                    "freed_host_gib": freed_host_gib,
                     "released_gib": released_gib,
                 }
             )
@@ -117,10 +136,6 @@ def test_minimax_h3_sleep_preserves_video_and_audio() -> None:
             assert pointers == {
                 name: tensor.data_ptr() for name, tensor in pipeline.named_parameters()
             }
-            output = pipeline.forward(**request)
-            torch.testing.assert_close(output.video.cpu(), reference_video, rtol=0, atol=0)
-            torch.testing.assert_close(output.audio.cpu(), reference_audio, rtol=0, atol=0)
-            del output
         pipeline.sleep()
     finally:
         del pipeline

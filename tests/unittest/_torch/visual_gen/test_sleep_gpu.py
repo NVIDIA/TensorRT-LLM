@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Local/QA allocator regression tests; no model checkpoint required."""
+"""Allocator regression tests; no model checkpoint required."""
 
 import gc
 
@@ -13,9 +13,14 @@ from tensorrt_llm._torch.visual_gen.sleep import PipelineSleepManager
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("mode", ["CPU", "PINNED"])
-def test_sleep_preserves_values_addresses_and_unrelated_allocations(mode: str) -> None:
+@pytest.mark.parametrize("release_cpu_backup", [False, True])
+def test_sleep_preserves_values_addresses_and_unrelated_allocations(
+    mode: str, release_cpu_backup: bool
+) -> None:
     unrelated = torch.full((1024,), 17, dtype=torch.int32, device="cuda")
-    manager = PipelineSleepManager(mode, torch.device("cuda:0"))
+    manager = PipelineSleepManager(
+        mode, torch.device("cuda:0"), release_cpu_backup=release_cpu_backup
+    )
     with manager.loading():
         tensor = torch.full((8 * 1024 * 1024,), 42, dtype=torch.int32, device="cuda")
     pointer = tensor.data_ptr()
@@ -40,7 +45,7 @@ def test_sleep_preserves_values_addresses_and_unrelated_allocations(mode: str) -
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("mode", ["CPU", "PINNED"])
 def test_sleep_isolates_two_allocation_pools(mode: str) -> None:
-    first = PipelineSleepManager(mode, torch.device("cuda:0"))
+    first = PipelineSleepManager(mode, torch.device("cuda:0"), release_cpu_backup=True)
     with first.loading():
         first_tensor = torch.full((1024 * 1024,), 42, dtype=torch.int32, device="cuda")
     first_pointer = first_tensor.data_ptr()
