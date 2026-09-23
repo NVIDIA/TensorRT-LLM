@@ -2247,9 +2247,11 @@ class TxSession(TxSessionBase):
             msg += f": {reason}"
         aux_failures: list[RecvReqInfo] = []
         with self.lock:
-            self._exception = RuntimeError(msg)
+            if self._exception is None:
+                self._exception = RuntimeError(msg)
             self._logical_outcomes.fail(self._exception)
-            self._terminal_status = SessionStatus.ERROR
+            if self._terminal_status is None:
+                self._terminal_status = SessionStatus.ERROR
             for task in self.kv_tasks:
                 if not task.is_done:
                     task.fail(self._exception)

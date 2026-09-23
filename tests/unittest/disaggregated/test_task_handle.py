@@ -36,6 +36,7 @@ from tensorrt_llm._torch.disaggregation.base import (
     Failed,
     TokenRange,
 )
+from tensorrt_llm._torch.disaggregation.base.transfer import WaitResult
 from tensorrt_llm._torch.disaggregation.native.fetch import PeerFetch
 from tensorrt_llm._torch.disaggregation.native.handle import TaskHandle
 from tensorrt_llm._torch.disaggregation.native.transfer import (
@@ -764,6 +765,53 @@ def test_sender_sibling_failure_is_stable_across_late_completion(
         outcome = observer.poll()
         assert isinstance(outcome, Failed)
         assert "first sibling failed" in outcome.reason
+
+
+@pytest.mark.parametrize("by_peer", [False, True])
+def test_sender_cancel_survives_late_kv_and_aux_exceptions(by_peer: bool) -> None:
+    sender, session = _sending_pieces()
+    tasks = [session.kv_tasks[0], session.send_aux()]
+    for task in tasks:
+        task.status = TaskStatus.TRANSFERRING
+
+    assert session.cancel(by_peer=by_peer) is True
+    session.set_exception("late KV worker failure")
+    first_error = session.exception
+    session.set_exception("late auxiliary worker failure")
+
+    assert session.status is SessionStatus.CANCELLED
+    assert session.cancelled_by_peer is by_peer
+    assert session.exception is first_error
+    assert first_error is not None
+    assert "late KV worker failure" in str(first_error)
+    assert session.wait_complete(blocking=False) is WaitResult.FAILED
+    assert session.cancel(by_peer=not by_peer) is False
+    sender.send_cancel_to_receivers.assert_called_once_with(session.disagg_request_id)
+    for task in tasks:
+        assert task.status is TaskStatus.ERROR
+        assert task._exception is first_error
+        assert task.logical_outcome.status is SessionStatus.CANCELLED
+        assert task.logical_outcome.by_peer is by_peer
+    outcome = TaskHandle(session, session.kv_tasks[0], TOKENS).poll()
+    assert isinstance(outcome, Cancelled)
+    assert outcome.by_peer is by_peer
+
+
+def test_sender_session_keeps_first_failure_before_later_cancel() -> None:
+    sender, session = _sending_pieces()
+    session.set_exception("first session failure")
+    first_error = session.exception
+    session.set_exception("later cleanup failure")
+
+    assert session.status is SessionStatus.ERROR
+    assert session.exception is first_error
+    assert session.cancel() is True
+    assert session.wait_complete(blocking=False) is WaitResult.FAILED
+    sender.send_cancel_to_receivers.assert_called_once_with(session.disagg_request_id)
+    outcome = TaskHandle(session, session.kv_tasks[0], TOKENS).poll()
+    assert isinstance(outcome, Failed)
+    assert outcome.reason == str(first_error)
+    assert "first session failure" in outcome.reason
 
 
 def test_terminal_failure_cause_is_stable_without_polling() -> None:
