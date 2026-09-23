@@ -230,10 +230,14 @@ def test_supports_mnnvl_accepts_full_fabric(
 
 @patch.object(MnnvlMemory, "_ensure_nvml_initialized")
 @patch(
-    "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetHandleByIndex", side_effect=lambda index: index
+    "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetHandleByIndex",
+    side_effect=lambda index: index,
 )
 @patch("tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.NVML_NVLINK_MAX_LINKS", 36)
-@patch("tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetNvLinkCapability", return_value=True)
+@patch(
+    "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetNvLinkCapability",
+    return_value=True,
+)
 def test_support_nvlink_ignores_indices_past_the_gpu_link_count(
     mock_capability, mock_get_handle, mock_initialize
 ) -> None:
@@ -250,16 +254,23 @@ def test_support_nvlink_ignores_indices_past_the_gpu_link_count(
             raise pynvml.NVMLError_NotSupported()
         return True
 
-    with patch("tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetNvLinkState", side_effect=link_state):
+    with patch(
+        "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetNvLinkState",
+        side_effect=link_state,
+    ):
         assert MnnvlMemory.support_nvlink(0, True)
 
 
 @patch.object(MnnvlMemory, "_ensure_nvml_initialized")
 @patch(
-    "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetHandleByIndex", side_effect=lambda index: index
+    "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetHandleByIndex",
+    side_effect=lambda index: index,
 )
 @patch("tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.NVML_NVLINK_MAX_LINKS", 36)
-@patch("tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetNvLinkCapability", return_value=True)
+@patch(
+    "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetNvLinkCapability",
+    return_value=True,
+)
 def test_support_nvlink_rejects_a_down_link_inside_the_gpu_range(
     mock_capability, mock_get_handle, mock_initialize
 ) -> None:
@@ -271,16 +282,23 @@ def test_support_nvlink_rejects_a_down_link_inside_the_gpu_range(
             raise pynvml.NVMLError_NotSupported()
         return link_idx != 3
 
-    with patch("tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetNvLinkState", side_effect=link_state):
+    with patch(
+        "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetNvLinkState",
+        side_effect=link_state,
+    ):
         assert not MnnvlMemory.support_nvlink(0, True)
 
 
 @patch.object(MnnvlMemory, "_ensure_nvml_initialized")
 @patch(
-    "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetHandleByIndex", side_effect=lambda index: index
+    "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetHandleByIndex",
+    side_effect=lambda index: index,
 )
 @patch("tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.NVML_NVLINK_MAX_LINKS", 36)
-@patch("tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetNvLinkCapability", return_value=True)
+@patch(
+    "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetNvLinkCapability",
+    return_value=True,
+)
 def test_support_nvlink_keeps_probing_after_a_rejected_index(
     mock_capability, mock_get_handle, mock_initialize
 ) -> None:
@@ -294,7 +312,10 @@ def test_support_nvlink_keeps_probing_after_a_rejected_index(
             raise pynvml.NVMLError_NotSupported()
         return link_idx != down_link
 
-    with patch("tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetNvLinkState", side_effect=link_state):
+    with patch(
+        "tensorrt_llm._torch.distributed.mnnvl_memory.pynvml.nvmlDeviceGetNvLinkState",
+        side_effect=link_state,
+    ):
         assert not MnnvlMemory.support_nvlink(0, True)
 
 

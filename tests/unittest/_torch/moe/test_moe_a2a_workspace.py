@@ -160,8 +160,8 @@ def test_failed_reservation_does_not_publish_workspace(monkeypatch, use_cft):
         "_MnnvlAlltoAllWorkspaceLifecycle",
         SimpleNamespace(get_or_create=MagicMock(return_value=lifecycle)),
     )
-    monkeypatch.setenv("TRTLLM_MOE_A2A_WORKSPACE_MB", "1")
-    monkeypatch.delenv("TRTLLM_MOE_A2A_FORCE_CFT", raising=False)
+    monkeypatch.setenv("TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB", "1")
+    monkeypatch.delenv("TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT", raising=False)
     with pytest.raises(ValueError, match="too small"):
         NVLinkOneSided(
             SimpleNamespace(world_size=4, rank=0, has_cp_helix=lambda: False),

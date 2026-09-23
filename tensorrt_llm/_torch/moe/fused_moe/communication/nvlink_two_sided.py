@@ -28,10 +28,7 @@ from weakref import WeakSet
 
 import torch
 
-from tensorrt_llm._torch.distributed.mnnvl_memory import (
-    MnnvlCheckpointCommunicator,
-    MnnvlMemory,
-)
+from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlCheckpointCommunicator, MnnvlMemory
 from tensorrt_llm._torch.mnnvl_alltoall_workspace import _collect_active_ranks
 from tensorrt_llm.mapping import Mapping
 

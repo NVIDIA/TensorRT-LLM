@@ -19,16 +19,16 @@ from weakref import WeakSet
 
 import torch
 
-from tensorrt_llm._torch.distributed.mnnvl_memory import (
-    MnnvlCheckpointCommunicator,
-    MnnvlMemory,
-    _checkpoint_allgather,
-)
 from tensorrt_llm._torch.alltoall_watchdog import (
     AlltoAllWatchdog,
     AlltoAllWatchdogCoordinator,
     AlltoAllWatchdogTimeout,
     EPGroupHealthLike,
+)
+from tensorrt_llm._torch.distributed.mnnvl_memory import (
+    MnnvlCheckpointCommunicator,
+    MnnvlMemory,
+    _checkpoint_allgather,
 )
 
 _WORKSPACE_LIFECYCLE_KEY = "mnnvl_alltoall_workspace_lifecycle"

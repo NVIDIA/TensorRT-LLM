@@ -106,19 +106,6 @@ def get_force_cft() -> bool | None:
     return None
 
 
-def resolve_can_use_cft(can_use_cft_counted_writes: bool) -> bool:
-    """Apply the TRTLLM_MOE_A2A_FORCE_CFT override to a caller's request.
-
-    Workspace sizing and workspace layout both depend on this, so they must
-    resolve it identically: a caller that sizes without the override and then
-    constructs with it would lay out the CFT region in an undersized buffer.
-    """
-    force_cft = get_force_cft()
-    if force_cft is None:
-        return can_use_cft_counted_writes
-    return force_cft
-
-
 def _get_nvidia_driver_version() -> str | None:
     try:
         try:
@@ -176,6 +163,30 @@ def _cft_device_support_reason() -> str | None:
         if not supported:
             return f"device does not support {attribute.name}"
     return None
+
+
+def select_cft_counted_writes(force_cft: bool | None) -> bool:
+    """Resolve CFT availability identically for workspace sizing and construction."""
+    driver_version = None
+    if force_cft is not False:
+        driver_version = _get_nvidia_driver_version()
+    if not resolve_cft_counted_writes(force_cft, driver_version):
+        if driver_version is not None:
+            tllm_logger.warning_once(
+                "CFT counted writes disabled: NVIDIA driver "
+                f"{driver_version} is below required {_CFT_MIN_DRIVER_BRANCH}.00. "
+                "Falling back to fence-based dispatch.",
+                key=f"moe_a2a_cft_driver_unsupported_{driver_version}",
+            )
+        return False
+    unsupported_reason = _cft_device_support_reason()
+    if unsupported_reason is not None:
+        tllm_logger.warning_once(
+            f"CFT counted writes disabled: {unsupported_reason}. Falling back to fence.",
+            key=f"moe_a2a_cft_device_unsupported_{unsupported_reason}",
+        )
+        return False
+    return True
 
 
 def should_use_cft(
@@ -320,7 +331,7 @@ class NVLinkOneSided(Communication):
         extra_payload_bytes_per_token: int = 0,
         can_use_cft_counted_writes: bool = False,
     ) -> int:
-        can_use_cft_counted_writes = resolve_can_use_cft(can_use_cft_counted_writes)
+        can_use_cft_counted_writes = select_cft_counted_writes(get_force_cft())
         element_size = dtype.itemsize
 
         # Auxiliary data size
@@ -449,28 +460,7 @@ class NVLinkOneSided(Communication):
         self.enable_eplb = num_experts is not None
         self.eplb_stats_num_experts = num_experts
         self._force_cft = get_force_cft()
-        driver_version = None
-        if self._force_cft is not False:
-            driver_version = _get_nvidia_driver_version()
-        can_use_cft_counted_writes = resolve_cft_counted_writes(
-            self._force_cft,
-            driver_version,
-        )
-        if not can_use_cft_counted_writes and driver_version is not None:
-            tllm_logger.warning_once(
-                "CFT counted writes disabled: NVIDIA driver "
-                f"{driver_version} is below required {_CFT_MIN_DRIVER_BRANCH}.00. "
-                "Falling back to fence-based dispatch.",
-                key=f"moe_a2a_cft_driver_unsupported_{driver_version}",
-            )
-        if can_use_cft_counted_writes:
-            unsupported_reason = _cft_device_support_reason()
-            if unsupported_reason is not None:
-                can_use_cft_counted_writes = False
-                tllm_logger.warning_once(
-                    f"CFT counted writes disabled: {unsupported_reason}. Falling back to fence.",
-                    key=f"moe_a2a_cft_device_unsupported_{unsupported_reason}",
-                )
+        can_use_cft_counted_writes = select_cft_counted_writes(self._force_cft)
         self.can_use_cft_counted_writes = can_use_cft_counted_writes
         if self._force_cft is None:
             self.cft_max_batch_for_dispatch = _get_cft_max_batch_for_dispatch()

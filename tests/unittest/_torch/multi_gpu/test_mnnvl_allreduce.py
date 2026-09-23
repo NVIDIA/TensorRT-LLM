@@ -26,9 +26,9 @@ from mpi4py import MPI
 from utils.util import skip_pre_blackwell
 
 import tensorrt_llm
-from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams)
+from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping

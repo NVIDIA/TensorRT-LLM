@@ -24,7 +24,6 @@ import torch
 import tensorrt_llm._torch.distributed.mnnvl_memory as mnnvl
 import tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided as one_sided_module
 from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
-from tensorrt_llm._torch.moe.fused_moe.communication.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import NVLinkTwoSided
 
@@ -659,11 +658,8 @@ def test_two_sided_checkpoint_restore_noop_preserves_shared_owner_state(
     assert second._dispatch_state
 
 
-@pytest.mark.parametrize("wrapper_type", [MoeAlltoAll, NVLinkOneSided])
-def test_frontend_checkpoint_delegates_to_shared_lifecycle(
-    wrapper_type: type[MoeAlltoAll] | type[NVLinkOneSided],
-) -> None:
-    wrapper = wrapper_type.__new__(wrapper_type)
+def test_frontend_checkpoint_delegates_to_shared_lifecycle() -> None:
+    wrapper = NVLinkOneSided.__new__(NVLinkOneSided)
     wrapper.can_use_cft_counted_writes = False
     wrapper._workspace_lifecycle = Mock()
     comm = Mock()
@@ -676,69 +672,18 @@ def test_frontend_checkpoint_delegates_to_shared_lifecycle(
     assert wrapper._workspace_lifecycle.checkpoint_restore.call_args.args[0] is comm
 
 
-@pytest.mark.parametrize("wrapper_type", [MoeAlltoAll, NVLinkOneSided])
-def test_frontend_destroy_unregisters_from_shared_lifecycle(
-    wrapper_type: type[MoeAlltoAll] | type[NVLinkOneSided],
-) -> None:
-    wrapper = wrapper_type.__new__(wrapper_type)
+def test_frontend_destroy_unregisters_from_shared_lifecycle() -> None:
+    wrapper = NVLinkOneSided.__new__(NVLinkOneSided)
     wrapper._destroyed = False
     wrapper._workspace_registered = True
     lifecycle = Mock()
     wrapper._workspace_lifecycle = lifecycle
-    if wrapper_type is NVLinkOneSided:
-        wrapper._workspace_key = None
+    wrapper._workspace_key = None
 
     wrapper.destroy()
     wrapper.destroy()
 
     lifecycle.unregister.assert_called_once_with(wrapper)
-
-
-def test_moe_alltoall_aborted_registration_does_not_unregister(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    lifecycle = Mock()
-    lifecycle.register.side_effect = RuntimeError("registration failed")
-    monkeypatch.setattr(MoeAlltoAll, "_WORKSPACES", {})
-    monkeypatch.setattr(MoeAlltoAll, "_init_constants", Mock())
-    monkeypatch.setattr(
-        MoeAlltoAll,
-        "_METAINFO_INDEX",
-        {
-            "FLAG_VAL_OFFSET_INDEX": 0,
-            "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX": 0,
-            "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX": 0,
-        },
-    )
-    monkeypatch.setattr(mnnvl.MnnvlMemory, "initialize", Mock())
-    memory = Mock()
-    memory.as_torch_strided_tensor.return_value = torch.zeros(1, dtype=torch.uint8)
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.moe.fused_moe.communication.moe_alltoall.MnnvlMemory",
-        Mock(return_value=memory),
-    )
-    monkeypatch.setattr(
-        _MnnvlAlltoAllWorkspaceLifecycle,
-        "get_or_create",
-        Mock(return_value=lifecycle),
-    )
-    monkeypatch.setattr(
-        torch.ops.trtllm,
-        "moe_a2a_initialize",
-        Mock(return_value=torch.tensor([1])),
-    )
-    mapping = SimpleNamespace(moe_ep_size=2, moe_ep_rank=0)
-
-    with pytest.raises(RuntimeError, match="registration failed"):
-        MoeAlltoAll(
-            mapping=mapping,
-            max_num_tokens=1,
-            top_k=1,
-            num_slots=2,
-            workspace_size_per_rank=1,
-        )
-
-    lifecycle.unregister.assert_not_called()
 
 
 def test_one_sided_checkpoint_rejects_destroyed_workspace(

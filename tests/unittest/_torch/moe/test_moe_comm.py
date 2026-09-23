@@ -66,16 +66,17 @@ from mpi4py import MPI
 import tensorrt_llm as tllm
 import tensorrt_llm._torch.distributed.mnnvl_memory as mnnvl
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
-from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import MnnvlMoe
 from tensorrt_llm._torch.moe.fused_moe.communication.allgather_reducescatter import (
-
     AllGatherReduceScatter,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep import DeepEP
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
 from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEP
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
-from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import NVLinkTwoSided
+from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import (
+    MnnvlMoe,
+    NVLinkTwoSided,
+)
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided_flashinfer import (
     NVLinkTwoSidedFlashinfer,
 )

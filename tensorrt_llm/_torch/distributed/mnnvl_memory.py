@@ -21,7 +21,7 @@ import sys
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, List, Optional, Protocol, Union
+from typing import Any, List, Optional, Protocol
 
 import pynvml
 import torch
