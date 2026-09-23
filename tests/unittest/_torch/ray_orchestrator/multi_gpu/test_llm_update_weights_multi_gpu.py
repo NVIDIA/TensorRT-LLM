@@ -1130,9 +1130,8 @@ def test_llm_update_weights_nemotron_h():
 
     Requires mamba-ssm and causal-conv1d to be importable: without them HF
     falls back to the naive Python selective_scan path, which OOMs on
-    Nemotron-H and produces unmatched logits. The Ray CI stage used to install
-    both next to ray, and will again once upstream ships wheels for this base
-    image's torch -- see the TODO in jenkins/scripts/slurm_install.sh."""
+    Nemotron-H and produces unmatched logits. The Ray CI stage builds both
+    against its installed torch via jenkins/scripts/install_mamba.sh."""
     try:
         import causal_conv1d  # noqa: F401
         import mamba_ssm  # noqa: F401
@@ -1140,10 +1139,9 @@ def test_llm_update_weights_nemotron_h():
         # Fail loudly here rather than let the naive fallback OOM further in,
         # which is a much harder failure to read.
         pytest.fail(
-            f"{e.name} is not installed, so the mamba fast path is unavailable. "
-            "The Ray CI stage stopped installing mamba-ssm and causal-conv1d "
-            "because upstream has no wheel for this base image's torch; "
-            "see the TODO in jenkins/scripts/slurm_install.sh."
+            f"The mamba fast path is unavailable: {e}. "
+            "Install mamba-ssm and causal-conv1d against the current torch with "
+            "bash jenkins/scripts/install_mamba.sh."
         )
     model_dir = str(llm_models_root() / "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
     num_hidden_layers = 7

@@ -5108,21 +5108,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-openengine.txt")
             if (stageName.contains("-Ray-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]==2.55.1")
-                // TODO(dlfw-26.08): reinstate causal-conv1d and mamba-ssm once
-                // upstream publishes wheels built against this base image's torch.
-                // They used to be installed here, from
-                //   causal-conv1d v1.6.2  causal_conv1d-1.6.1+cu13torch26.04cxx11abiTRUE
-                //   mamba v2.3.0          mamba_ssm-2.3.0+cu13torch26.01cxx11abiTRUE
-                // but the newest builds upstream offers target torch 26.07 and 26.04,
-                // so on DLFW 26.08 the extension loads with an undefined c10 symbol,
-                // materialize_cow_storage(StorageImpl&). A broken install is worse
-                // than none: transformers gates its causal_conv1d import on a
-                // package-metadata probe, which a broken install still passes, so
-                // modeling_qwen3_5_moe raises at import and every test collected from
-                // a module that imports it dies as a collection error. Absent, the
-                // gate says no and the model falls back to its Python path -- slower,
-                // and it OOMs on Nemotron-H, which is why
-                // test_llm_update_weights_nemotron_h is waived under nvbugs/6729495.
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash ${llmSrc}/jenkins/scripts/install_mamba.sh")
             }
             if (!skipInstallWheel) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
