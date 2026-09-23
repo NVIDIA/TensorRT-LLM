@@ -5,6 +5,7 @@
 
 import logging
 import weakref
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -21,6 +22,8 @@ from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import (
     BreakableCUDAGraphRunner,
     BreakableCUDAGraphRunnerState,
 )
+from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import make_weak_ref
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -234,20 +237,38 @@ class _LogitsProcessor(nn.Module):
         return value * 2
 
 
-def test_runner_warmup_capture_execute_and_shared_output():
+@pytest.mark.parametrize("through_model_engine", [False, True])
+def test_runner_warmup_capture_execute_and_shared_output(through_model_engine):
     body = _Body().cuda()
     logits_processor = _LogitsProcessor().cuda()
     runner = BreakableCUDAGraphRunner(body)
     counters = {"outer": 0}
     inputs = {}
 
-    def engine_forward():
+    def decoder_forward(*args):
         counters["outer"] += 1
         if runner.is_capturing:
             return runner.capture_model_body(
                 lambda: {"logits": logits_processor(body(inputs["value"]))}
             )
         return {"logits": logits_processor(body(inputs["value"]))}
+
+    if through_model_engine:
+        engine = object.__new__(PyTorchModelEngine)
+        engine.model = SimpleNamespace(extra_attrs={})
+        engine._runner = None
+        engine._fallback_to_engine = True
+        engine._is_warmup = True
+        engine.enable_spec_decode = False
+        engine.runtime_draft_len = 0
+        engine._forward_decoder = decoder_forward
+        batch = ScheduledRequests()
+        resources = object()
+
+    def engine_forward():
+        if through_model_engine:
+            return engine.forward(batch, resources)
+        return decoder_forward()
 
     inputs["value"] = torch.zeros((8, 4), device="cuda")
     runner.capture(8, engine_forward)

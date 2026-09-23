@@ -297,7 +297,8 @@ class _DummyRequest:
 
 
 @pytest.mark.parametrize("tokens_per_block", [256, 2])
-def test_ad_engine_chunked_prefill_equivalence(tokens_per_block: int):
+@pytest.mark.parametrize("return_context_logits", [False, True])
+def test_ad_engine_chunked_prefill_equivalence(tokens_per_block: int, return_context_logits: bool):
     """Verify ADEngine logits match between chunked and non-chunked prefill.
 
     We simulate chunking by splitting a single context request into two chunks and
@@ -333,25 +334,37 @@ def test_ad_engine_chunked_prefill_equivalence(tokens_per_block: int):
 
     # No-chunk: whole prompt in one request
     req_full = _DummyRequest(tokens=tokens, begin=0, size=len(tokens), seq_slot=0)
+    req_full.py_return_context_logits = return_context_logits
     scheduled_requests = ScheduledRequests()
     scheduled_requests.context_requests_last_chunk.append(req_full)
-    logits_full_last = engine.forward(scheduled_requests, resource_manager)["logits"][-1]
+    logits_full = engine.forward(scheduled_requests, resource_manager)["logits"].clone()
 
     # Chunked: split into two context chunks
     split = len(tokens) // 2
     req_part1 = _DummyRequest(tokens=tokens, begin=0, size=split, seq_slot=0)
     req_part2 = _DummyRequest(tokens=tokens, begin=split, size=len(tokens) - split, seq_slot=0)
+    req_part1.py_return_context_logits = return_context_logits
+    req_part2.py_return_context_logits = return_context_logits
 
     scheduled_requests_part1 = ScheduledRequests()
     scheduled_requests_part1.context_requests_chunking.append(req_part1)
     scheduled_requests_part2 = ScheduledRequests()
     scheduled_requests_part2.context_requests_last_chunk.append(req_part2)
 
-    # Run first chunk (ignored output), then compare second chunk logits to full
-    _ = engine.forward(scheduled_requests_part1, resource_manager)
-    logits_chunked_last = engine.forward(scheduled_requests_part2, resource_manager)["logits"][-1]
+    logits_part1 = engine.forward(scheduled_requests_part1, resource_manager)["logits"].clone()
+    logits_part2 = engine.forward(scheduled_requests_part2, resource_manager)["logits"]
 
-    torch.testing.assert_close(logits_full_last, logits_chunked_last)  # , atol=1e-5)
+    torch.testing.assert_close(logits_full[-1], logits_part2[-1])
+    if return_context_logits:
+        assert logits_full.shape[0] == len(tokens)
+        assert logits_part1.shape[0] == split
+        assert logits_part2.shape[0] == len(tokens) - split
+        torch.testing.assert_close(logits_full, torch.cat([logits_part1, logits_part2]))
+        with torch.inference_mode():
+            expected = engine.model(torch.tensor([tokens], device=device))[0].squeeze(0)
+        torch.testing.assert_close(logits_full, expected.float())
+    else:
+        assert logits_full.shape[0] == logits_part1.shape[0] == logits_part2.shape[0] == 1
 
     cache_seq_interface.shutdown()
 

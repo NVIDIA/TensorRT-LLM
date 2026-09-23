@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
+from tensorrt_llm._torch.compilation.backend import Backend
 from tensorrt_llm._torch.pyexecutor.engine.input_buffers import InputBuffers
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.runners import no_kv_cache as no_kv_cache_module
@@ -629,7 +630,7 @@ def test_engine_consumes_optional_length_update_and_passes_call_state(effective_
     engine, resources = _model_engine_with_runner(runner, kv_cache_manager=None)
     engine.runtime_draft_len = 2
     engine.enable_spec_decode = True
-    engine.is_warmup = is_dummy
+    engine._is_warmup = is_dummy
     batch = ScheduledRequests()
     batch.context_requests_last_chunk = [SimpleNamespace(py_return_context_logits=True)]
 
@@ -680,6 +681,48 @@ def test_no_kv_forward_preserves_model_output_dictionary_without_length_update()
     assert inputs.runtime_draft_len == 3
 
 
+@pytest.mark.parametrize("raw_output", [torch.tensor([1.0]), None], ids=["tensor", "none"])
+@pytest.mark.parametrize("is_dummy", [False, True])
+def test_engine_forward_preserves_raw_decoder_outputs_and_length(raw_output, is_dummy):
+    engine, resources = _model_engine_with_runner(None, kv_cache_manager=object())
+    engine._fallback_to_engine = True
+    engine._is_warmup = is_dummy
+    engine.runtime_draft_len = 2
+
+    def decoder_forward(inputs, resource_manager):
+        assert inputs.runtime_draft_len == 2
+        engine.runtime_draft_len = 4
+        return raw_output
+
+    engine._forward_decoder = Mock(side_effect=decoder_forward)
+
+    assert engine.forward(ScheduledRequests(), resources) is raw_output
+    assert engine.runtime_draft_len == 4
+
+
+@pytest.mark.parametrize("previous_slots", [None, {}, {7: 3, 2: 9}])
+def test_engine_forwards_previous_request_slots_to_decoder(previous_slots):
+    engine, resources = _model_engine_with_runner(None, kv_cache_manager=object())
+    engine._fallback_to_engine = True
+    engine._forward_decoder = Mock(return_value={"logits": None})
+    previous_requests = (
+        {req_id: SimpleNamespace(py_seq_slot=slot) for req_id, slot in previous_slots.items()}
+        if previous_slots is not None
+        else None
+    )
+    batch = ScheduledRequests()
+
+    engine.forward(batch, resources, req_id_to_old_request=previous_requests)
+
+    inputs, actual_resources = engine._forward_decoder.call_args.args
+    assert inputs.batch is batch
+    assert actual_resources is resources
+    assert inputs.previous_request_slots == previous_slots
+    if previous_requests:
+        previous_requests[7].py_seq_slot = 5
+        assert inputs.previous_request_slots[7] == 3
+
+
 def test_model_caller_uses_current_forward_and_restores_outer_attribute_context():
     metadata = _AttentionMetadata()
     spec_metadata = object()
@@ -706,3 +749,31 @@ def test_model_caller_uses_current_forward_and_restores_outer_attribute_context(
             with pytest.raises(RuntimeError, match="model failure"):
                 caller(attn_metadata=metadata)
         assert get_model_extra_attrs() is outer_attrs
+
+
+def test_model_caller_borrows_live_compile_streams_and_events():
+    streams = Backend.Streams()
+    backend = SimpleNamespace(events=Backend.Events())
+    metadata = _AttentionMetadata()
+    current_stream = object()
+    attrs = {}
+
+    def forward(**kwargs):
+        assert get_model_extra_attrs() is attrs
+        assert attrs["aux_streams"]() is streams
+        assert attrs["events"]() is backend.events
+        assert attrs["global_stream"] is current_stream
+        return len(attrs["aux_streams"]()), len(attrs["events"]())
+
+    model = SimpleNamespace(model_config=SimpleNamespace(extra_attrs={}), forward=forward)
+    caller = ModelCaller(model, compile_backend=backend, aux_streams=streams)
+    with patch("torch.cuda.current_stream", return_value=current_stream), model_extra_attrs(attrs):
+        assert caller(attn_metadata=metadata) == (0, 0)
+        streams.append(object())
+        backend.events = Backend.Events([object(), object()])
+        assert caller(attn_metadata=metadata) == (1, 2)
+
+
+def test_model_caller_requires_streams_with_compile_backend():
+    with pytest.raises(ValueError, match="requires its auxiliary stream container"):
+        ModelCaller(SimpleNamespace(), compile_backend=SimpleNamespace(events=Backend.Events()))

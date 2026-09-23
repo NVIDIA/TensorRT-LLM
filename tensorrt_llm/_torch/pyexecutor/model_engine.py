@@ -6150,8 +6150,9 @@ class PyTorchModelEngine(ModelEngine):
             resource_manager=resource_manager,
             is_dummy=self.is_warmup,
         )
-        self.runtime_draft_len = outputs.pop("runtime_draft_len",
-                                             inputs.runtime_draft_len)
+        if isinstance(outputs, dict):
+            self.runtime_draft_len = outputs.pop("runtime_draft_len",
+                                                 inputs.runtime_draft_len)
         return outputs
 
     def _forward_scheduled(
@@ -6160,7 +6161,7 @@ class PyTorchModelEngine(ModelEngine):
         *,
         resource_manager: ResourceManager,
         is_dummy: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> Any:
         if not self._fallback_to_engine:
             assert isinstance(self._runner, ScheduledModelRunner), (
                 "scheduled execution requires a scheduled runner")
@@ -6177,13 +6178,16 @@ class PyTorchModelEngine(ModelEngine):
         self.enable_spec_decode = inputs.enable_spec_decode
         self.runtime_draft_len = inputs.runtime_draft_len
         outputs = self._forward_decoder(inputs, resource_manager)
+        # Legacy decoder paths include the tensor returned by BCG body capture.
+        if not isinstance(outputs, dict):
+            return outputs
         return {**outputs, "runtime_draft_len": self.runtime_draft_len}
 
     def _forward_decoder(
         self,
         forward_inputs: ScheduledInputs,
         resource_manager: ResourceManager,
-    ) -> Dict[str, Any]:
+    ) -> Any:
         scheduled_requests = forward_inputs.batch
         new_tensors_device = forward_inputs.new_tensors_device
         cache_indirection_buffer = forward_inputs.cache_indirection_buffer

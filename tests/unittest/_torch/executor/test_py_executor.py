@@ -15,6 +15,7 @@ to PyExecutor, including:
 import threading
 import time
 import types
+from contextlib import nullcontext
 from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
@@ -28,6 +29,7 @@ from tensorrt_llm._torch.disaggregation.orchestration.admission import (
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.disaggregation.orchestration.interfaces import ExecutorEffects
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
+from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ScheduledModelRunner
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
@@ -58,6 +60,61 @@ from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, MTPDecodingConfi
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize("return_context_logits", [False, True])
+def test_forward_step_carries_context_logits_request_to_runner(return_context_logits):
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [
+        types.SimpleNamespace(context_chunk_size=3, py_return_context_logits=return_context_logits)
+    ]
+    logits = torch.arange(12).reshape(3, 4)
+    runner = Mock(spec=ScheduledModelRunner)
+    runner.forward.side_effect = lambda inputs, **kwargs: {
+        "logits": logits if inputs.gather_context_logits else logits[-1:]
+    }
+    engine = object.__new__(PyTorchModelEngine)
+    engine.model = types.SimpleNamespace(extra_attrs={})
+    engine._runner = runner
+    engine._fallback_to_engine = False
+    engine.enable_spec_decode = False
+    engine.runtime_draft_len = 0
+    resources = object()
+    cache_indirection = object()
+    new_tensors = object()
+    accepted_tokens = object()
+    executor = types.SimpleNamespace(
+        model_engine=engine,
+        resource_manager=resources,
+        iter_counter=0,
+        sampler=Mock(get_cache_indirection=Mock(return_value=cache_indirection)),
+        execution_stream=Mock(),
+        _iter_adp_dummy_ctx_tokens=0,
+        _iter_adp_dummy_gen_tokens=0,
+        _compute_adp_dummy_tokens=PyExecutor._compute_adp_dummy_tokens,
+        _maybe_record_hang_diagnostic_phase=Mock(),
+        _attach_encoder_output_to_execution_stream=Mock(),
+        _mark_cross_kv_projection_consumed=Mock(),
+        _kv_connector_wait_for_save=Mock(),
+        _handle_errors=Mock(),
+    )
+    with (
+        patch("torch.cuda.current_stream", return_value=Mock()),
+        patch("torch.cuda.stream", return_value=nullcontext()),
+        patch("tensorrt_llm._torch.pyexecutor.py_executor.ExpertStatistic.set_iter"),
+    ):
+        outputs = PyExecutor._forward_step(executor, batch, new_tensors, accepted_tokens)
+
+    executor._handle_errors.assert_not_called()
+    runner.forward.assert_called_once()
+    inputs = runner.forward.call_args.args[0]
+    assert inputs.batch is batch
+    assert inputs.gather_context_logits is return_context_logits
+    assert inputs.new_tensors_device is new_tensors
+    assert inputs.cache_indirection_buffer is cache_indirection
+    assert inputs.num_accepted_tokens_device is accepted_tokens
+    assert runner.forward.call_args.kwargs["resource_manager"] is resources
+    torch.testing.assert_close(outputs["logits"], logits if return_context_logits else logits[-1:])
 
 
 class _InflightRequestIds:
