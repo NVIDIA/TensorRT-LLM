@@ -265,8 +265,12 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     # Extra page sizes trtllm-gen may use with this manager (see
     # FlashInferTrtllmGenFmha); set with the virtual pools.
     trtllm_gen_extra_tokens_per_block: frozenset = frozenset()
-    draft_manager_tokens_per_block = 32
-    nvfp4_dense_tokens_per_block = 32
+    # In the hybrid NVFP4/FP8 cache, shared FP8 Eagle layers require physical
+    # P32 pages for SM100/SM103 kernel compatibility. The KVCM config describes
+    # logical MSA blocks (P128), so allocation and the draft view share this
+    # physical page size instead. The subpage adapter is needed until Eagle
+    # kernels support the configured logical page size for this layout.
+    DRAFT_PHYSICAL_TOKENS_PER_BLOCK = 32
 
     def __init__(
         self,
@@ -406,7 +410,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         if self.dtype != DataType.NVFP4:
             return super()._build_cache_config(config)
 
-        physical_page = self.nvfp4_dense_tokens_per_block
+        physical_page = self.DRAFT_PHYSICAL_TOKENS_PER_BLOCK
         assert config.tokens_per_block % physical_page == 0, (
             f"M3 logical page P{config.tokens_per_block} must be divisible by "
             f"the dense/Eagle physical page P{physical_page}."
@@ -501,7 +505,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         executing it (see ``resolve_draft_kv_cache_manager``).
 
         Retires with the P128 Eagle kernel fixes; see
-        ``draft_manager_tokens_per_block``.
+        ``DRAFT_PHYSICAL_TOKENS_PER_BLOCK``.
         """
         if self.dtype != DataType.NVFP4 or self.is_draft or not self._shared_draft_layer_ids:
             return None
@@ -518,7 +522,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         if not draft_layers:
             return None
         if self._draft_subpage_view_obj is None:
-            subpage_tokens = self.draft_manager_tokens_per_block
+            subpage_tokens = self.DRAFT_PHYSICAL_TOKENS_PER_BLOCK
             self._draft_subpage_view_obj = MiniMaxM3DraftSubpageView(
                 self,
                 draft_layers,
@@ -540,7 +544,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         block), and the view owns no block lifecycle.
 
         Retires with the P128 Eagle kernel fixes; see
-        ``draft_manager_tokens_per_block``.
+        ``DRAFT_PHYSICAL_TOKENS_PER_BLOCK``.
         """
         if isinstance(kwargs.get("draft_kv_cache_manager"), MiniMaxM3DraftSubpageView):
             kwargs["draft_kv_cache_manager"] = None
@@ -894,7 +898,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         if not self.is_fp8_subpaged_layer(layer_idx):
             raise RuntimeError(f"layer {layer_idx} is not a physical-P32 hybrid FP8 layer")
         local_layer_idx = self.layer_offsets[layer_idx]
-        physical_page = self.nvfp4_dense_tokens_per_block
+        physical_page = self.DRAFT_PHYSICAL_TOKENS_PER_BLOCK
         pages_per_role = self.tokens_per_block // physical_page
         addr_key = self.impl.get_mem_pool_base_address(local_layer_idx, Role.KEY)
         addr_value = self.impl.get_mem_pool_base_address(local_layer_idx, Role.VALUE)
@@ -1104,7 +1108,7 @@ class MiniMaxM3DraftSubpageView:
     view owns no blocks: lifecycle stays entirely with the shared manager.
 
     Retires with the P128 Eagle kernel fixes; see the retirement plan on
-    ``MiniMaxM3KVCacheManagerV2.draft_manager_tokens_per_block``.
+    ``MiniMaxM3KVCacheManagerV2.DRAFT_PHYSICAL_TOKENS_PER_BLOCK``.
     """
 
     def __init__(self, manager, draft_layer_ids: Sequence[int], subpage_tokens: int):
@@ -1120,9 +1124,9 @@ class MiniMaxM3DraftSubpageView:
             getattr(manager, "is_fp8_subpaged_layer", lambda _layer_idx: False)(layer_id)
         )
         if is_hybrid_fp8:
-            assert self.tokens_per_block == manager.nvfp4_dense_tokens_per_block, (
-                "hybrid FP8 Eagle draft attention must use the physical dense-cache "
-                f"page size P{manager.nvfp4_dense_tokens_per_block}, got "
+            assert self.tokens_per_block == manager.DRAFT_PHYSICAL_TOKENS_PER_BLOCK, (
+                "hybrid FP8 Eagle draft attention must use the physical draft-cache "
+                f"page size P{manager.DRAFT_PHYSICAL_TOKENS_PER_BLOCK}, got "
                 f"P{self.tokens_per_block}"
             )
         assert manager.tokens_per_block % self.tokens_per_block == 0, (

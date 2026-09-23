@@ -334,7 +334,7 @@ class _Nvfp4BaseManager:
 
 class _Nvfp4HybridManager(_Nvfp4BaseManager):
     dtype = DataType.NVFP4
-    nvfp4_dense_tokens_per_block = 32
+    DRAFT_PHYSICAL_TOKENS_PER_BLOCK = 32
     num_pools = 2
 
     def __init__(self):
@@ -383,7 +383,7 @@ def test_hybrid_view_rejects_non_p32_draft_pages():
     try:
         MiniMaxM3DraftSubpageView(_Nvfp4HybridManager(), [NVFP4_DRAFT_LAYER], 128)
     except AssertionError as error:
-        assert "physical dense-cache page size P32" in str(error)
+        assert "physical draft-cache page size P32" in str(error)
     else:
         raise AssertionError("expected NVFP4 Eagle draft view to require P32 pages")
 
@@ -432,7 +432,6 @@ def test_draft_subpage_view_rejects_multiple_local_layers(via_accessor: bool) ->
     manager.is_draft = False
     manager._shared_draft_layer_ids = [60, 61]
     manager.enable_swa_scratch_reuse = False
-    manager.draft_manager_tokens_per_block = 32
     manager._draft_subpage_view_obj = None
 
     with pytest.raises(NotImplementedError, match="exactly one local shared draft layer"):
