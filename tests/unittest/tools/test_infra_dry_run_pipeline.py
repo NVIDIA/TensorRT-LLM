@@ -95,6 +95,20 @@ class InfraDryRunPipelineTest(unittest.TestCase):
             L0_TEST,
         )
 
+    def test_cbts_parser_preserves_coverage_preflight_fields(self) -> None:
+        parser = _function_body(
+            L0_PARENT, "_cbtsParseSelectionResult", "getOssComplianceFileChanged"
+        )
+
+        self.assertIn(
+            "coverage_residual_files: data.coverage_residual_files ?: []",
+            parser,
+        )
+        self.assertIn(
+            'coverage_decline_reason: data.coverage_decline_reason ?: ""',
+            parser,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
