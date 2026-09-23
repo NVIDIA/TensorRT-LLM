@@ -28,7 +28,7 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
-class Block;
+struct Block;
 
 using EventTokenId = std::variant<int64_t, std::string>;
 
