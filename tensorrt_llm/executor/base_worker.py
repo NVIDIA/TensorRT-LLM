@@ -35,6 +35,7 @@ from .._torch.pyexecutor.llm_request import LlmResponse
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
+from ..llmapi._load_balance_env import configure_moe_launch_queues
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
@@ -100,6 +101,13 @@ class BaseWorker(GenerationExecutor):
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
     ) -> None:
+        # Direct worker construction also bypasses BaseLLM/worker_main.
+        if llm_args is not None and llm_args.backend == "pytorch":
+            queue_overrides = configure_moe_launch_queues(
+                getattr(llm_args, "moe_config", None), llm_args.env_overrides)
+            if queue_overrides is not llm_args.env_overrides:
+                llm_args.env_overrides = queue_overrides
+
         postproc_config = postproc_worker_config or PostprocWorkerConfig()
         super().__init__(
             num_postprocess_workers=postproc_config.num_postprocess_workers,

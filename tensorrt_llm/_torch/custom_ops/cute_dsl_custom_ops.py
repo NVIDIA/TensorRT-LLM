@@ -40,6 +40,44 @@ try:
 except ImportError:
     from cuda import cuda
 
+# TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER=clc_dynamic|static pins the Rubin dense
+# block-scaled GEMM autotuner to one scheduler (unset: runner defaults).
+# Pins apply only to runners supporting the requested scheduler. For those
+# runners, ``clc_dynamic`` also drops static-only mixed-cluster tactics
+# and does not enforce reserved_sms. This pin affects supported dense GEMMs,
+# including shared experts, rather than only the shared-expert runner.
+_DENSE_GEMM_SCHEDULER_ENV = "TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER"
+_dense_gemm_scheduler_announced = set()
+
+
+def _dense_gemm_scheduler_override() -> Optional[str]:
+    """Scheduler pinned by the env var, read at use time; None if unset."""
+    value = os.environ.get(_DENSE_GEMM_SCHEDULER_ENV,
+                           "").strip().lower() or None
+    if value not in (None, "static", "clc_dynamic"):
+        raise ValueError(f"{_DENSE_GEMM_SCHEDULER_ENV} must be 'static' or "
+                         f"'clc_dynamic', got {value!r}")
+    if value is not None and value not in _dense_gemm_scheduler_announced:
+        _dense_gemm_scheduler_announced.add(value)
+        excluded = (
+            " (static-only tactics excluded; reserved_sms does not cap CLC)"
+            if value == "clc_dynamic" else "")
+        logger.info(
+            f"[cute_dsl_custom_ops] {_DENSE_GEMM_SCHEDULER_ENV}={value}: Rubin dense "
+            f"GEMM tactics pinned for runners supporting that scheduler{excluded}; "
+            "unsupported pins leave restricted runner defaults unchanged")
+    return value
+
+
+def _dense_gemm_scheduler_modes(
+        default: Tuple[str, ...],
+        supported: Optional[Tuple[str, ...]] = None) -> Tuple[str, ...]:
+    """Apply an explicit supported pin, otherwise retain default candidates."""
+    override = _dense_gemm_scheduler_override()
+    allowed = default if supported is None else supported
+    return (override, ) if override in allowed else default
+
+
 # Torch schema parsing rejects ``inf`` as a default value.
 SWIGLU_LIMIT_SCALAR_DISABLED = -1.0
 _CUTEDSL_FC2_N_TILE_SIZE_ENV = "TRTLLM_CUTEDSL_FC2_N_TILE_SIZE"
@@ -13191,6 +13229,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             mixed_scheduler_mode_candidates: ClassVar[Tuple[str,
                                                             ...]] = ("static", )
             split_k_candidates: ClassVar[Tuple[int, ...]] = (1, 2, 4, 8)
+            supported_scheduler_modes: ClassVar[Tuple[
+                str, ...]] = scheduler_mode_candidates
+            supported_mixed_scheduler_modes: ClassVar[Tuple[
+                str, ...]] = mixed_scheduler_mode_candidates
             tuning_config: ClassVar[TuningConfig]
 
             def __init__(self,
@@ -13207,9 +13249,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.to_userbuffers = to_userbuffers
                 self.use_tvm_ffi = use_tvm_ffi
 
+            def _max_active_clusters(self, cluster_size: int) -> int:
+                return get_max_activate_clusters(cluster_size)
+
             def unique_id(self):
-                return (self.output_dtype, self.to_userbuffers,
+                # The scheduler pin selects the tactic space, so it is part of
+                # the autotuner cache key: a cache file written without the pin
+                # must not hand a static or mixed-cluster tactic to a pinned
+                # run (or the reverse). Unpinned runs and unsupported pins
+                # keep the old key because their tactic space is unchanged.
+                base = (self.output_dtype, self.to_userbuffers,
                         self.use_tvm_ffi)
+                override = _dense_gemm_scheduler_override()
+                if override not in self.supported_scheduler_modes:
+                    return base
+                return base + (override, )
 
             def __hash__(self):
                 return hash(
@@ -13272,6 +13326,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     m, output_aligned)
                 mixed_swap_ab_candidates = _get_cute_dsl_swap_ab_candidates(
                     m, output_aligned, include_alternative=True)
+                scheduler_modes = _dense_gemm_scheduler_modes(
+                    self.scheduler_mode_candidates,
+                    self.supported_scheduler_modes)
+                mixed_scheduler_modes = tuple(
+                    mode for mode in _dense_gemm_scheduler_modes(
+                        self.mixed_scheduler_mode_candidates,
+                        self.supported_mixed_scheduler_modes)
+                    if mode in scheduler_modes)
+                if not mixed_scheduler_modes:
+                    mixed_swap_ab_candidates = []
                 if not base_swap_ab_candidates:
                     logger.debug(
                         f"CuteDSL: No valid C layout for M={m}, N={n}. "
@@ -13354,7 +13418,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                 cluster_shape_mn,
                                 split_k,
                         ):
-                            for scheduler_mode in self.scheduler_mode_candidates:
+                            for scheduler_mode in scheduler_modes:
                                 valid_tactics.append(
                                     ("base", mma_tiler_mnk, mma_inst_shape,
                                      cluster_shape_mn, swap_ab, use_prefetch,
@@ -13395,7 +13459,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             preferred_cluster_shape_mn,
                             fallback_cluster_shape_mn,
                     ):
-                        if self.mixed_scheduler_mode_candidates == ("static", ):
+                        if mixed_scheduler_modes == ("static", ):
                             # Preserve the existing raster-only tactic schema
                             # for runners that do not profile mixed-cluster
                             # schedulers (currently NVFP4).
@@ -13405,7 +13469,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                  fallback_cluster_shape_mn, swap_ab,
                                  use_prefetch, raster_order))
                         else:
-                            for scheduler_mode in self.mixed_scheduler_mode_candidates:
+                            for scheduler_mode in mixed_scheduler_modes:
                                 # CUTLASS DSL 4.5 loses flexible-CGA x/y
                                 # offsets in its z-linearized CLC path. Keep
                                 # dynamic mixed clusters on the direct-grid
@@ -13427,6 +13491,56 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"CuteDSL SM107: Found {len(valid_tactics)} valid tactics for M={m}, N={n}, K={real_k}"
                 )
                 return valid_tactics
+
+            def should_profile_tactic_in_subprocess(
+                self,
+                custom_op: str,
+                inputs: List[torch.Tensor],
+                tactic,
+                tuning_config: TuningConfig,
+                **kwargs,
+            ) -> bool:
+                if (not isinstance(tactic, tuple) or not tactic
+                        or tactic[0] not in {"base", "mixed_clusters"}):
+                    return False
+                scheduler_modes = _dense_gemm_scheduler_modes(
+                    self.scheduler_mode_candidates,
+                    self.supported_scheduler_modes)
+                if tactic[0] == "base":
+                    if len(tactic) not in {6, 7, 8, 9}:
+                        return False
+                    if not isinstance(tactic[5], bool):
+                        return False
+                    scheduler_mode = tactic[6] if len(tactic) >= 7 else "static"
+                    if scheduler_mode not in scheduler_modes:
+                        return False
+                    if len(tactic) >= 8 and tactic[
+                            7] not in self.raster_order_candidates:
+                        return False
+                    return (len(tactic) < 9
+                            or (type(tactic[8]) is int
+                                and tactic[8] in self.split_k_candidates))
+
+                if len(tactic) not in {7, 8, 9}:
+                    return False
+                if not isinstance(tactic[6], bool):
+                    return False
+                scheduler_mode = "static"
+                raster_order = "m"
+                if len(tactic) == 8:
+                    if tactic[7] in self.supported_mixed_scheduler_modes:
+                        scheduler_mode = tactic[7]
+                    else:
+                        raster_order = tactic[7]
+                elif len(tactic) == 9:
+                    scheduler_mode, raster_order = tactic[7:]
+                return (scheduler_mode in scheduler_modes
+                        and scheduler_mode in _dense_gemm_scheduler_modes(
+                            self.mixed_scheduler_mode_candidates,
+                            self.supported_mixed_scheduler_modes)
+                        and raster_order in self.raster_order_candidates
+                        and (scheduler_mode != "clc_dynamic"
+                             or raster_order == "m"))
 
             def make_cute_dsl_global_pointer(self, tensor: torch.Tensor, dtype,
                                              assumed_align: int):
@@ -13490,7 +13604,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             # Accept both prior length-8 schemas: raster-only
                             # and scheduler-only.
                             if tuning_options[
-                                    0] in self.mixed_scheduler_mode_candidates:
+                                    0] in self.supported_mixed_scheduler_modes:
                                 scheduler_mode = tuning_options[0]
                                 raster_order = "m"
                             else:
@@ -13545,7 +13659,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     raise ValueError("CuteDSL SM107 raster_order must be 'm' "
                                      f"or 'n', got {raster_order!r}")
                 if (kernel_variant == "mixed_clusters" and scheduler_mode
-                        not in self.mixed_scheduler_mode_candidates):
+                        not in self.supported_mixed_scheduler_modes):
                     raise ValueError(
                         "Unsupported CuteDSL SM107 mixed-cluster scheduler "
                         f"mode {scheduler_mode!r}")
@@ -13555,7 +13669,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     raise ValueError(
                         "CuteDSL SM107 mixed-cluster CLC scheduling only "
                         "supports raster_order='m'")
-                if scheduler_mode not in {"static", "clc_dynamic"}:
+                if scheduler_mode not in self.supported_scheduler_modes:
                     raise ValueError("Unsupported CuteDSL SM107 scheduler mode "
                                      f"{scheduler_mode!r}")
 
@@ -13696,11 +13810,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 # autotuning compiles across weight families sharing a
                 # tactic. Per-shape tactic validity is still enforced by
                 # can_implement at tactic-selection time.
-                max_active_clusters = get_max_activate_clusters(
+                max_active_clusters = self._max_active_clusters(
                     cluster_shape_mn[0] * cluster_shape_mn[1])
                 max_active_preferred_clusters = None
                 if kernel_variant == "mixed_clusters":
-                    max_active_preferred_clusters = get_max_activate_clusters(
+                    max_active_preferred_clusters = self._max_active_clusters(
                         preferred_cluster_shape_mn[0] *
                         preferred_cluster_shape_mn[1])
                 cache_key = (kernel_variant, sf_vec_size, mma_tiler_mnk,
@@ -13913,6 +14027,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             allow_unswapped_small_m_fallback = True
             raster_order_candidates = ("m", "n")
             mixed_scheduler_mode_candidates = ("static", "clc_dynamic")
+            supported_mixed_scheduler_modes = mixed_scheduler_mode_candidates
             tuning_config = TuningConfig(
                 dynamic_tensor_specs=(DynamicTensorSpec(
                     0, 0, get_last_power_of_2_num_tokens_buckets,
@@ -13923,6 +14038,56 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
                 use_cuda_graph=True,
             )
+
+            def __init__(self,
+                         output_dtype: torch.dtype,
+                         to_userbuffers: bool = False,
+                         use_tvm_ffi: bool = True,
+                         reserved_sms: int = 0):
+                super().__init__(output_dtype, to_userbuffers, use_tvm_ffi)
+                if type(reserved_sms) is not int or reserved_sms < 0:
+                    raise ValueError(
+                        "reserved_sms must be a nonnegative integer")
+                self.reserved_sms = reserved_sms
+                if reserved_sms:
+                    # Default to a budgeted static grid. An explicit CLC pin
+                    # is supported, but CLC ignores max_active_clusters and
+                    # does not guarantee any SM reservation.
+                    self.scheduler_mode_candidates = ("static", )
+                    self.mixed_scheduler_mode_candidates = ("static", )
+
+            def unique_id(self):
+                identity = super().unique_id()
+                # Keep the existing full-device tuning cache identity intact.
+                if self.reserved_sms:
+                    grid_policy = ("clc_dynamic_grid_v1"
+                                   if _dense_gemm_scheduler_override()
+                                   == "clc_dynamic" else "static_grid_v1")
+                    return (*identity, "reserved_sms", self.reserved_sms,
+                            grid_policy)
+                return identity
+
+            def __hash__(self):
+                return hash(self.unique_id())
+
+            def __eq__(self, other):
+                return (isinstance(other, self.__class__)
+                        and self.unique_id() == other.unique_id())
+
+            def _max_active_clusters(self, cluster_size: int) -> int:
+                full = super()._max_active_clusters(cluster_size)
+                if not self.reserved_sms:
+                    return full
+                sm_count = torch.cuda.get_device_properties(
+                    torch.cuda.current_device()).multi_processor_count
+                active = min(full,
+                             (sm_count - self.reserved_sms) // cluster_size)
+                if active <= 0:
+                    raise ValueError(
+                        "reserved_sms leaves no active GEMM cluster")
+                # This reduces the static persistent grid; it does not create
+                # a hardware partition or reserve particular physical SM IDs.
+                return active
 
         class CuteDSLNVFP4InplaceRubinLinear(CuteDSLNVFP4RubinLinear):
             kernel_cache = dict()
@@ -13947,8 +14112,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
             weight_scale: torch.Tensor,
             output_dtype: torch.dtype = torch.bfloat16,
             use_tvm_ffi: bool = True,
+            reserved_sms: int = 0,
         ) -> torch.Tensor:
-            """Run the SM107 dense MXFP8 GEMM with K32 R128c4 UE8M0 scales."""
+            """Run the SM107 dense MXFP8 GEMM with K32 R128c4 UE8M0 scales.
+
+            ``reserved_sms`` reduces static persistent grids for concurrent
+            work and is part of the runner's autotuning identity. An explicit
+            ``TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER=clc_dynamic`` pin uses CLC,
+            which does not enforce this SM budget.
+            """
             if output_dtype != torch.bfloat16:
                 raise ValueError(
                     f"CuteDSL MXFP8 only supports bfloat16 output, got "
@@ -13965,7 +14137,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             alpha = _get_mxfp8_gemm_alpha(input.device)
             runner = CuteDSLMXFP8RubinLinear(output_dtype=output_dtype,
-                                             use_tvm_ffi=use_tvm_ffi)
+                                             use_tvm_ffi=use_tvm_ffi,
+                                             reserved_sms=reserved_sms)
             inputs = [input, weight, input_scale, weight_scale, alpha]
             _, best_tactic = AutoTuner.get().choose_one(
                 "trtllm::cute_dsl_mxfp8_gemm_rubin",
@@ -13983,6 +14156,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             weight_scale: torch.Tensor,
             output_dtype: torch.dtype = torch.bfloat16,
             use_tvm_ffi: bool = True,
+            reserved_sms: int = 0,
         ) -> torch.Tensor:
             shape = list(mat_a.shape)
             shape[-1] = mat_b.shape[-2]

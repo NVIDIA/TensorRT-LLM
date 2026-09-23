@@ -61,6 +61,8 @@ class MoEStaticCapability:
     # Whether the backend can consume DeepEP's expert-major receive counts
     # directly, without materializing token-major adapter metadata.
     supports_deep_ep_direct_metadata: bool = False
+    # Kernel ABI supports H resident experts plus S copied helper slots.
+    supports_prefill_rebalance: bool = False
 
 
 @dataclass(frozen=True)

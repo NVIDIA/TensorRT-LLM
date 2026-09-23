@@ -56,9 +56,10 @@ from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
+from ._load_balance_env import configure_moe_launch_queues
 from .llm_args import (ENCODER_RUNNER_MANAGED_INPUTS,
                        TORCH_LLMARGS_EXPLICIT_DOCSTRING,
-                       TORCH_LLMARGS_REMOVED_ARGS, TorchLlmArgs,
+                       TORCH_LLMARGS_REMOVED_ARGS, MoeConfig, TorchLlmArgs,
                        validate_token_encoder_bucket_config)
 from .llm_utils import CachedModelLoader, KvCacheRetentionConfig, ModelLoader
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
@@ -377,6 +378,17 @@ class BaseLLM:
 
         try:
             env_overrides = kwargs.get("env_overrides", None)
+            if kwargs.get("backend") == "pytorch":
+                # This must precede TorchLlmArgs validators and GPU probes.
+                moe_config = kwargs.get("moe_config")
+                if isinstance(moe_config, dict):
+                    moe_config = MoeConfig(**moe_config)
+                    kwargs["moe_config"] = moe_config
+                queue_overrides = configure_moe_launch_queues(
+                    moe_config, env_overrides)
+                if queue_overrides is not env_overrides:
+                    kwargs["env_overrides"] = queue_overrides
+                    env_overrides = queue_overrides
             self._process_env_overrides(env_overrides)
 
             backend = kwargs.get('backend', None)

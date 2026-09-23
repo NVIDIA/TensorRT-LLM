@@ -884,6 +884,7 @@ class PyExecutor:
                     self._warmup_encoder_cuda_graphs_enc_dec).result()
 
         self.is_warmup = False
+        self._handoff_rebalance_warmup_owners()
 
         # Snapshot some cumulative KV cache counters so that stats reported to
         # users exclude blocks reused and missed during warmup dummy requests.
@@ -1118,6 +1119,27 @@ class PyExecutor:
     def metrics(self) -> dict[str, float | dict[str, float]]:
         """Return executor construction and model-engine startup metrics."""
         return self._metrics
+
+    def _handoff_rebalance_warmup_owners(self) -> None:
+        """Drain active warmup producers before serving changes the CPU owner."""
+        groups = {}
+        for engine in (self.model_engine, self.draft_model_engine):
+            model = getattr(engine, "model", None)
+            if model is None:
+                continue
+            for module in model.modules():
+                group = getattr(module, "_rebalance_scheduler_group", None)
+                if (group is not None and getattr(group, "_owner_thread_id",
+                                                  None) is not None):
+                    groups[id(group)] = group
+        if not groups:
+            return
+        # Target, draft, and encoder warmup have all completed. A device drain
+        # covers MAIN and COPY once before the serving worker can bind ownership.
+        torch.cuda.synchronize(self.execution_stream.device)
+        execution_stream_handle = int(self.execution_stream.cuda_stream)
+        for group in groups.values():
+            group.release_warmup_owner_after_sync(execution_stream_handle)
 
     def _maybe_init_kv_connector_manager(self):
         if self.kv_connector_manager is not None:

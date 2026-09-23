@@ -30,6 +30,7 @@ from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
 from tensorrt_llm.executor.ray.utils import control_action_decorator
 
 from ... import TorchLlmArgs
+from ...llmapi._load_balance_env import configure_moe_launch_queues
 from ...llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ...llmapi.tokenizer import TokenizerBase
 from ...llmapi.utils import configure_cpu_affinity
@@ -57,6 +58,13 @@ def resolve_obj_by_qualname(qualname: str) -> Any:
 class RayWorkerWrapper:
 
     def __init__(self, worker_cls, worker_kwargs, world_size, rank):
+        llm_args = worker_kwargs.get("llm_args")
+        if llm_args is not None and llm_args.backend == "pytorch":
+            queue_overrides = configure_moe_launch_queues(
+                getattr(llm_args, "moe_config", None), llm_args.env_overrides)
+            if queue_overrides is not llm_args.env_overrides:
+                llm_args.env_overrides = queue_overrides
+
         self.master_address = os.environ["MASTER_ADDR"]
         self.world_size = world_size
         self.rank = rank
