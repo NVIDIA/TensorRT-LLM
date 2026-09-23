@@ -1,0 +1,33 @@
+{
+  "commit": "fa6e81ed048a2afc023fda717fbfcf15514b0684",
+  "source_tree_dirty": false,
+  "kind": "complete scheduler package",
+  "retained_legacy_host": [],
+  "files": {
+    "__init__.py": "2077e75537e4128e5f02c51a45c13f6188b522ffddb0dfc63983ebcf7bc98daa",
+    "csrc/in_switch_copy/gpu_plan.h": "f177fd93198c54c7e06ea02e0abfe3302489e53865d028f59c2793330a0e2e85",
+    "csrc/in_switch_copy/gpu_plan_builder.cuh": "856b91ee8b65d30beb34b39217db4c5f3670a7c392b1bef3607feeb646096a25",
+    "csrc/in_switch_copy/plan_policy.cuh": "4e941a3dcb695129d42cfd08749a4e5ad0db1633dee8c2492ca6f5beac274bb3",
+    "csrc/in_switch_copy/sami_hierarchical_release.c": "43720757cb7a7dd488491c827511c727fef5cf9943390bb7674a6baad1f3b6ab",
+    "csrc/in_switch_copy/sami_shards.h": "2768150b47b0ebf8123a3bf75ecc2eb8dc928a5630bf1d9e9e8bc18a7cfcc75b",
+    "csrc/in_switch_copy/tma_copy.cu": "b047afbbdfccb18b0f20028dd4d7adec82fe83d723b4997d3aa9935157fe7ec8",
+    "csrc/in_switch_copy/tma_copy.h": "07560bf3f17f9bc1a0b38726257faadb4d7521667995cf9b499bb8ef0c397a6b",
+    "cuda_scheduler/__init__.py": "dfd129c1690f404c60185d67bf68aca0a58c813178e3583cf0aaf54ce043382a",
+    "cuda_scheduler/csrc/halo_q_scheduler.cu": "5a6762287214ab1405ecb88d0ca2b501ecda7cd112fd8f7efed05205e9daaeeb",
+    "cuda_scheduler/multirank_dist.py": "235c89ebc641e56514ffe863849cfc185942ceebabfce644669b7362490d794a",
+    "cuda_scheduler/runtime.py": "be7c7518c8790b057f6ccf9a23a369015fec2dd696ff1f046f4979c19ffd293b",
+    "geometry.py": "74de927de618beffcffa69231f10d283dcf92f86f2aaf5f0ec59b56a15dae56c",
+    "integrations/__init__.py": "b50ff1b5e1bef5d171dff4c487e90477aaea02a726c921fff4c6f309e74141e4",
+    "integrations/megamoe/README.md": "52f3e32789c9cba0ddc24eb1e4c01a1f7ed5e63ecc450c8c6c9787378cd3a405",
+    "integrations/megamoe/__init__.py": "6b95b6d9b3cc46e7eb21ab7f6f5250d65e2886a01f0dca1cea728e11b501744d",
+    "integrations/megamoe/direct_live_weight_bridge.py": "b94e358661fc9995b62163602d534e0ab5032efa551ce3be9615ba9ed3933ac2",
+    "integrations/megamoe/dynamic_load_balance.py": "e95cbecb9b5c093875d6a391b00d38281ee7ccd2e194d855fec3f45806d6702f",
+    "native.py": "472fc25a930121277e3b10aed2ca034f9538a84b8452384e3d40a5c6705c6936",
+    "sami/__init__.py": "47e138c48486d203f9169acb6f6d364bfcc86c4bc987cf0e483c9d82177a5845",
+    "sami/_util.py": "22ad1b52d8ba8811818a90180d81213ff253c5c6edc651cc9db51a23778d76d9",
+    "sami/arena.py": "a3ecaf8acf30fe35e9898b694dbf37ecd0f5d7196f264948d2bc37158037776f",
+    "sami/fabric.py": "53b48fdf9c51f3dc8330f38e565f0423ae5f82c0f0423bfb7959f08198eded68",
+    "sami/geometry.py": "e39195802acbe498ab647fec84f651b230290432847a092a6ba31a0236781559",
+    "sami/hierarchical.py": "6d8e4ac4365bd11dcaf4c12f2d3c53b2e9b62ead3dfb0e0e6806f9645f8b60ca"
+  }
+}

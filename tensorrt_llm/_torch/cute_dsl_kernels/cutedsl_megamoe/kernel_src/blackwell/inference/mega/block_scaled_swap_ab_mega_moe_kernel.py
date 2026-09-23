@@ -3,6 +3,7 @@
 
 """Fused pull-dispatch MegaMoE kernel composition for Blackwell."""
 
+import hashlib
 from typing import ClassVar, Optional, Tuple
 
 import cuda.bindings.driver as cuda
@@ -28,7 +29,13 @@ from .....helpers.cute_py_helpers import (
     tcgen05_block_scaled_acc_dtype,
 )
 from .....helpers.device_workspace import DeviceWorkspace
+from .....helpers.dlb_expert_count import resolve_dlb_expert_counts
+from .....helpers.helper_weight_ready_gate import (
+    derive_helper_weight_ready_topology,
+    make_helper_weight_ready_generation_gate,
+)
 from .....helpers.iket_compat import iket
+from .....helpers.megamoe_aot import make_megamoe_aot_callable
 from .....helpers.smem_workspace import SmemWorkspace
 from .....helpers.utils import ceil_div, round_up
 from .....quant_def import CombineFormat, QuantKind
@@ -110,10 +117,18 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "token_in_flag_batch": int,
             "token_back_mode": str,
             "reduce_topk_in_kernel": bool,
+            "helper_expert_count": OptionalRequirement(int),
+            "total_helper_slots": OptionalRequirement(int),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         self._validate_desc_inputs(problem_desc, impl_desc)
+        problem_desc, impl_desc = resolve_dlb_expert_counts(
+            problem_desc, impl_desc, world_size=problem_desc["world_size"]
+        )
+        # The Blackwell epilogue publishes expert counters, not token-tile counters.
+        if impl_desc.get("token_back_ready_granularity", "expert") != "expert":
+            raise ValueError("Blackwell requires token_back_ready_granularity='expert'.")
 
         self.expert_count = problem_desc["expert_count"]
         self.intermediate_gateup_size = problem_desc["intermediate_gateup_size"]
@@ -154,10 +169,23 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.token_in_flag_batch = impl_desc["token_in_flag_batch"]
         self.token_back_mode = impl_desc["token_back_mode"]
         self.reduce_topk_in_kernel = impl_desc["reduce_topk_in_kernel"]
-
+        self.helper_expert_count = impl_desc.get("helper_expert_count", 0)
+        if type(self.helper_expert_count) is not int or self.helper_expert_count < 0:
+            raise ValueError("helper_expert_count must be a non-negative exact int")
         self.occupancy = 1
         self.architecture = "sm_100"
         self.local_expert_count = self.expert_count // self.world_size
+        if self.helper_expert_count > 0:
+            helper_topology = derive_helper_weight_ready_topology(
+                self.local_expert_count,
+                self.helper_expert_count,
+            )
+            self.home_expert_count = helper_topology.home_expert_count
+        else:
+            # Preserve the baseline's runtime-expert-count specialization.  A
+            # static M is required only when an S>0 helper boundary must be
+            # compiled into the scheduler gate.
+            self.home_expert_count = self.local_expert_count
         self.threads_per_cta = 16 * 32 if self.token_back_mode == "standalone_warps" else 12 * 32  # nosec B105
         self.other_warp_register_count = 64 if self.token_back_mode == "standalone_warps" else 72  # nosec B105
 
@@ -462,6 +490,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             f"{dtype_name(self.a_dtype)}_{dtype_name(self.b_dtype)}_{dtype_name(self.acc_dtype)}_"
             f"sfvec{self.sf_vec_size}_a{self.a_major_mode.name.lower()}_b{self.b_major_mode.name.lower()}_"
             f"e{self.expert_count}_ep{self.world_size}_topk{self.topk}_"
+            f"helpers{self.helper_expert_count}_"
             f"topkidx{dtype_name(self.topk_index_dtype)}_"
             f"h{self.hidden_size}_i{self.intermediate_gateup_size}_maxtoken{self.max_tokens_per_rank}_"
             f"tile{tile}_cluster{cluster}_{'2cta' if self.use_2cta_instrs else '1cta'}_"
@@ -479,6 +508,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             f"situ{self.situ_beta}x{self.situ_linear_beta}_"
             f"{'apply_topk_fc1' if self.apply_topk_at_fc1 else 'apply_topk_fc2'}_"
             f"{'inkernel_redg' if self.reduce_topk_in_kernel else 'separate_reduce'}"
+            "_dlb_v1"
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):
@@ -565,6 +595,16 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             ),
             stream=make_fake_stream(),
         )
+        if self.helper_expert_count > 0:
+            fake_arguments.update(
+                hot_expert_weight_ready_flags=make_ptr(
+                    cutlass.Uint64,
+                    0,
+                    AddressSpace.gmem,
+                    assumed_align=8,
+                ),
+                hot_expert_weight_ready_generation=cutlass.Uint64(1),
+            )
         if self.quant_kind.uses_global_scale:
             # nvfp4 carries per-expert dequant scalars. Under an e8m0 scale they do not exist at
             # all, and declaring them here would put three tensors in the ABI that the caller has
@@ -579,15 +619,21 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         if out_path is None:
             return compiled
         compiled.export_to_c(
-            out_path, function_name=_aot_symbol_prefix, export_only_tvm_ffi_symbols=True
+            out_path,
+            function_name=self._aot_symbol_name(),
+            export_only_tvm_ffi_symbols=True,
         )
         return out_path
 
-    @staticmethod
-    def load_compiled(path: str):
+    def _aot_symbol_name(self) -> str:
+        identity = hashlib.sha256(self.name().encode()).hexdigest()[:16]
+        return f"{_aot_symbol_prefix}_{identity}"
+
+    def load_compiled(self, path: str):
         from cutlass.cute.runtime import load_module
 
-        return load_module(path, enable_tvm_ffi=True)[_aot_symbol_prefix]
+        function = getattr(load_module(path, enable_tvm_ffi=True), self._aot_symbol_name())
+        return make_megamoe_aot_callable(function, self)
 
     def _build_mainloop_and_smem(
         self, problem_desc: ProblemDesc, resolved_impl_desc: ImplDesc
@@ -631,11 +677,31 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc1_alpha: Optional[cute.Tensor] = None,  # (local_experts,)
         fc2_alpha: Optional[cute.Tensor] = None,  # (local_experts,)
         fc1_norm_const: Optional[cute.Tensor] = None,  # (local_experts,)
+        hot_expert_weight_ready_flags: Optional[cute.Pointer] = None,  # uint64[EP]
+        hot_expert_weight_ready_generation: Optional[cutlass.Uint64] = None,
     ) -> None:
         """Launch router, fused MegaMoE compute, and optional TopK reduce."""
 
         def rewrite_tensor_shape(tensor: cute.Tensor, shape: Tuple) -> cute.Tensor:
             return cute.make_tensor(tensor.iterator, cute.make_layout(shape, stride=tensor.stride))
+
+        helper_ready_bundle = (
+            hot_expert_weight_ready_flags,
+            hot_expert_weight_ready_generation,
+        )
+        if cutlass.const_expr(
+            (
+                self.helper_expert_count > 0
+                and not all(value is not None for value in helper_ready_bundle)
+            )
+            or (
+                self.helper_expert_count == 0
+                and any(value is not None for value in helper_ready_bundle)
+            )
+        ):
+            raise ValueError(
+                "helper READY flags/generation must both be present iff helper_expert_count > 0"
+            )
 
         if cutlass.const_expr(topk_indices.element_type is not self.topk_index_dtype):
             raise TypeError(
@@ -886,6 +952,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             fc1_alpha,
             fc2_alpha,
             fc1_norm_const,
+            hot_expert_weight_ready_flags,
+            hot_expert_weight_ready_generation,
         )
         if cutlass.const_expr(self.mixed_cga_config.is_mixed):
             kernel.launch(
@@ -953,6 +1021,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc1_alpha: Optional[cute.Tensor],
         fc2_alpha: Optional[cute.Tensor],
         fc1_norm_const: Optional[cute.Tensor],
+        hot_expert_weight_ready_flags: Optional[cute.Pointer],
+        hot_expert_weight_ready_generation: Optional[cutlass.Uint64],
     ):
         """Compose TokenComm, Scheduler, Mainloop, and Epilogue."""
         self._mainloop.materialize_codegen_members()
@@ -1048,6 +1118,15 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc2_spin_threshold = (
             intermediate_gateup + self._mainloop.cta_tile_m - 1
         ) // self._mainloop.cta_tile_m
+        helper_weight_ready_gate = None
+        if cutlass.const_expr(self.helper_expert_count > 0):
+            helper_weight_ready_gate = make_helper_weight_ready_generation_gate(
+                memory_slot_count=self.local_expert_count,
+                helper_count=self.helper_expert_count,
+                source_count=self.world_size,
+                terminal_flags=hot_expert_weight_ready_flags,
+                expected_generation=hot_expert_weight_ready_generation,
+            )
         kernel_extension = BlockScaledSwapAbFc12Extension(
             sf_vec_size=self.sf_vec_size,
             fc1_done_counter_pointer=fc1_done_counter.iterator,
@@ -1091,9 +1170,17 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             iket.range_push("scheduler.gen_work")
             work_tile = scheduler.gen_next_work()
             iket.range_pop()
+            helper_ready_latched = Int32(0)
             while work_tile.is_valid_tile:
                 iket.range_push("scheduler.publish_work")
-                scheduler.publish_work(kernel_extension.prepare_work_tile(work_tile))
+                prepared_tile = kernel_extension.prepare_work_tile(work_tile)
+                if cutlass.const_expr(helper_weight_ready_gate is not None):
+                    helper_ready_latched = (
+                        helper_weight_ready_gate.wait_before_first_helper_publish(
+                            prepared_tile.expert_idx, helper_ready_latched
+                        )
+                    )
+                scheduler.publish_work(prepared_tile)
                 iket.range_pop()
                 iket.range_push("scheduler.gen_work")
                 work_tile = scheduler.gen_next_work()

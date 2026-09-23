@@ -76,6 +76,25 @@ def read_clock64(
     )
 
 
+@dsl_user_op
+def read_globaltimer_ns(
+    *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None
+) -> cutlass.Uint64:
+    """Read the 64-bit global nanosecond timer, independent of SM clock rate."""
+    return cutlass.Uint64(
+        llvm.inline_asm(
+            T.i64(),
+            [],
+            "mov.u64 $0, %globaltimer;",
+            "=l",
+            has_side_effects=True,
+            asm_dialect=0,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 @cute.jit
 def movmatrix_b16(input_regs: cute.Tensor) -> cute.Tensor:
     """Transpose every packed m8n8 b16 register fragment across the warp."""
@@ -562,6 +581,136 @@ def cvt_f32x4_to_f8x4_pack_i32(fp32x4: cute.Tensor, fp8_type, *, loc=None, ip=No
 
 
 @dsl_user_op
+def cvt_f32_to_ue8m0_raw_i32(
+    value,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Int32:
+    """Round one f32 up to a raw UE8M0 byte in the low bits of an i32."""
+    packed_scale = llvm.inline_asm(
+        T.i32(),
+        [Float32(value).ir_value(loc=loc, ip=ip)],
+        "{\n"
+        "  .reg .b16 sf2;\n"
+        "  cvt.rp.satfinite.ue8m0x2.f32 sf2, 0f00000000, $1;\n"
+        "  cvt.u32.u16 $0, sf2;\n"
+        "}",
+        "=r,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(packed_scale)
+
+
+@cute.jit
+def cvt_f32x4_to_f8x4_scaled_pack_i32(
+    fp32x4: cute.Tensor,
+    fp8_type,
+    scale_raw_i32,
+    *,
+    loc=None,
+    ip=None,
+) -> Int32:
+    """Pack four f32 values to FP8 while dividing by one UE8M0 scale."""
+    fp32x4 = fp32x4.load()
+    src_vec4 = fp32x4.ir_value(loc=loc, ip=ip) if hasattr(fp32x4, "ir_value") else fp32x4
+    srcs = [
+        Float32(vector.extract(src_vec4, [], [index])).ir_value(loc=loc, ip=ip)
+        for index in range(4)
+    ]
+    scale_i32 = Int32(scale_raw_i32).ir_value(loc=loc, ip=ip)
+
+    if cutlass.const_expr(fp8_type is cutlass.Float8E4M3FN):
+        cvt_instruction = "cvt.rn.satfinite.scaled::n1::ue8m0.e4m3x2.f32"
+    elif cutlass.const_expr(fp8_type is cutlass.Float8E5M2):
+        cvt_instruction = "cvt.rn.satfinite.scaled::n1::ue8m0.e5m2x2.f32"
+    else:
+        raise ValueError(f"Scaled FP8 conversion does not support {fp8_type}.")
+
+    packed_i32 = llvm.inline_asm(
+        T.i32(),
+        [*srcs, scale_i32],
+        "{\n"
+        "  .reg .b16 lo;\n"
+        "  .reg .b16 hi;\n"
+        "  .reg .b8 s;\n"
+        "  cvt.u8.u32 s, $5;\n"
+        f"  {cvt_instruction} lo, $2, $1, s;\n"
+        f"  {cvt_instruction} hi, $4, $3, s;\n"
+        "  mov.b32 $0, {lo, hi};\n"
+        "}",
+        "=r,f,f,f,f,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(packed_i32)
+
+
+@cute.jit
+def cvt_f32x4_to_f8x4_scaled4_pack_i32(
+    fp32x4: cute.Tensor,
+    fp8_type,
+    scales_packed_i32,
+    *,
+    loc=None,
+    ip=None,
+) -> Int32:
+    """Pack four f32 values to FP8 using four independent UE8M0 scales."""
+    fp32x4 = fp32x4.load()
+    src_vec4 = fp32x4.ir_value(loc=loc, ip=ip) if hasattr(fp32x4, "ir_value") else fp32x4
+    srcs = [
+        Float32(vector.extract(src_vec4, [], [index])).ir_value(loc=loc, ip=ip)
+        for index in range(4)
+    ]
+    scales_i32 = Int32(scales_packed_i32).ir_value(loc=loc, ip=ip)
+
+    if cutlass.const_expr(fp8_type is cutlass.Float8E4M3FN):
+        cvt_instruction = "cvt.rn.satfinite.scaled::n1::ue8m0.e4m3x2.f32"
+    elif cutlass.const_expr(fp8_type is cutlass.Float8E5M2):
+        cvt_instruction = "cvt.rn.satfinite.scaled::n1::ue8m0.e5m2x2.f32"
+    else:
+        raise ValueError(f"Scaled FP8 conversion does not support {fp8_type}.")
+
+    packed_i32 = llvm.inline_asm(
+        T.i32(),
+        [*srcs, scales_i32],
+        "{\n"
+        "  .reg .b8 s0, s1, s2, s3;\n"
+        "  .reg .b16 t0, t1, t2, t3;\n"
+        "  .reg .b32 e1, e2, e3, p01, p23;\n"
+        "  shr.u32 e1, $5, 8;\n"
+        "  shr.u32 e2, $5, 16;\n"
+        "  shr.u32 e3, $5, 24;\n"
+        "  cvt.u8.u32 s0, $5;\n"
+        "  cvt.u8.u32 s1, e1;\n"
+        "  cvt.u8.u32 s2, e2;\n"
+        "  cvt.u8.u32 s3, e3;\n"
+        f"  {cvt_instruction} t0, $1, $1, s0;\n"
+        f"  {cvt_instruction} t1, $2, $2, s1;\n"
+        f"  {cvt_instruction} t2, $3, $3, s2;\n"
+        f"  {cvt_instruction} t3, $4, $4, s3;\n"
+        "  mov.b32 p01, {t0, t1};\n"
+        "  mov.b32 p23, {t2, t3};\n"
+        "  prmt.b32 $0, p01, p23, 0x6420;\n"
+        "}",
+        "=r,f,f,f,f,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(packed_i32)
+
+
+@dsl_user_op
 def stg_e8m0_from_f32(addr: Int64, fp32_val: Float32, *, loc=None, ip=None) -> None:
     """Convert ``fp32_val`` to E8M0 via PTX and store the 1-byte result to global memory.
 
@@ -647,13 +796,17 @@ __all__ = [
     "cp_reduce_async_bulk_add_bf16_s2g",
     "cp_reduce_async_bulk_add_u32_s2g",
     "cvt_f32_to_fp8_to_f32",
+    "cvt_f32_to_ue8m0_raw_i32",
     "cvt_f32x4_to_f8x4_pack_i32",
+    "cvt_f32x4_to_f8x4_scaled4_pack_i32",
+    "cvt_f32x4_to_f8x4_scaled_pack_i32",
     "exit",
     "lds128_v4_b32",
     "mbarrier_arrive_expect_tx_on_peer",
     "movmatrix_b16",
     "nanosleep",
     "read_clock64",
+    "read_globaltimer_ns",
     "red_add_relaxed_sys_f32",
     "red_add_relaxed_sys_s32",
     "red_add_relaxed_sys_v2_bf16x2",

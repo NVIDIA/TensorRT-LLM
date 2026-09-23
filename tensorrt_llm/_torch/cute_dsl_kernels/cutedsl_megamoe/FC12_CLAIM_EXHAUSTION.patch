@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+Subject: Preserve the target branch FC1 claim-exhaustion fix
+
+Upstream base: jintaop/cutedsl_megamoe 522fbb019942ad6bbe0f418dba02541f837ea46c
+Target repository: https://gitlab-master.nvidia.com/ftp/tekit.git
+Target branch snapshot: user/lizhiz/rubin-advance at 06c3af7315b944015c593a1bebeafc3907c6e421
+Target diff base: 1926426ce3bba0ac384fb894602762a68462435a
+
+The target change removes the prologue's early fc1_exhausted assignment.
+The claim watermark wait remains; actual claim/map exhaustion still terminates
+FC1. This patch adapts that same two-line deletion onto the vendored DLB source.
+It does not claim that the upstream base commit already contains this change.
+
+Unpatched vendored file SHA256: 6e3ec2efe83a13e04636055aa505d2065da96022f5f50983cf113cd63d78ec74
+Patched vendored file SHA256:   46ca708d62d9ffa5154abe483fd0972f2ee42235212ae04ec95f00294154563e
+
+Re-vendoring:
+- scripts/vendor_dynamic_load_balance.py replays this patch from the manifest,
+  checking the patch digest and the unpatched/patched source digests.
+- To reproduce this snapshot, use the upstream commit above. For a new revision,
+  reconcile this patch and its manifest record before re-vendoring. A source
+  digest mismatch is rejected; the script does not silently drop the fix.
+
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/fc12_scheduler.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/fc12_scheduler.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/fc12_scheduler.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/fc12_scheduler.py
+@@ -817,4 +817,2 @@
+                 spin_wait(fc1_counter_pointer, lambda value: value >= claim_target)
+-                if stream_ends_before_target:
+-                    fc1_exhausted = Boolean(True)
+         return fc1_exhausted

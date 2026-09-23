@@ -1,0 +1,6 @@
+upstream: https://gitlab-master.nvidia.com/jintaop/cutedsl_eplb_scheduler_copy.git
+commit: fa6e81ed048a2afc023fda717fbfcf15514b0684
+source_tree_dirty: false
+kind: complete scheduler package
+manifest: VENDOR_MANIFEST.json
+Regenerate with scripts/vendor_dynamic_load_balance.py; edit kernels upstream.

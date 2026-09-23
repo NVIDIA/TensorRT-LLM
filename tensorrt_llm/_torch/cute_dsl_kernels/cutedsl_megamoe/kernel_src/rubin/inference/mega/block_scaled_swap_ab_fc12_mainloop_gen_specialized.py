@@ -1,7 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
 """Mainloop component for the Rubin generation-phase block-scaled swap-AB FC12 kernel.
 
 Three properties separate this from the two mainloops it descends from.

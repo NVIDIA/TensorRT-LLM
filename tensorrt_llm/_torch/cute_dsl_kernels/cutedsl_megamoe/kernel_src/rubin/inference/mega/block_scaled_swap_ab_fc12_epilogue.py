@@ -1013,6 +1013,7 @@ class SwapABGatedActEpilogue(KernelComponent):
             "fc2_tma_stages": OptionalRequirement(int),
             "reduce_topk_in_kernel": OptionalRequirement(bool),
             "token_back_push_data": OptionalRequirement(bool),
+            "token_back_ready_granularity": OptionalRequirement(str),
         }
 
     @staticmethod
@@ -1068,6 +1069,11 @@ class SwapABGatedActEpilogue(KernelComponent):
         self.communication_enabled = impl_desc["communication_enabled"]
         self.fc1_epi_flag_batch = impl_desc["fc1_epi_flag_batch"]
         self.fc2_epi_flag_batch = impl_desc["fc2_epi_flag_batch"]
+        self.token_back_ready_granularity = impl_desc.get("token_back_ready_granularity", "expert")
+        if self.token_back_ready_granularity not in ("expert", "token_tile"):
+            raise ValueError(
+                f"Unsupported token_back_ready_granularity {self.token_back_ready_granularity!r}."
+            )
 
         if self.communication_enabled:
             for field_name in ("reduce_topk_in_kernel", "token_back_push_data"):
@@ -2199,7 +2205,14 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         publish: cutlass.Constexpr = self.token_back_enabled
         flag_address = Int64(0)
         if cutlass.const_expr(publish):
-            flag_address = (self.fc2_done_counter.iterator + work_tile_info.expert_idx).toint()
+            if cutlass.const_expr(self.token_back_ready_granularity == "token_tile"):
+                # The scheduler maps every fallback CTA into the preferred
+                # logical cluster. N=1 keeps this slot common to all hidden
+                # shards; padded hidden CTAs must also publish their completion.
+                slot = work_tile_info.cumulative_token_block_count + work_tile_info.tile_n_idx
+                flag_address = (self.fc2_done_counter.iterator + slot).toint()
+            else:
+                flag_address = (self.fc2_done_counter.iterator + work_tile_info.expert_idx).toint()
         no_fire: cutlass.Constexpr = not publish
         return flag_tracker.accumulate(
             next_work_tile_info.phase, self.fc2_epi_flag_batch, flag_address, no_fire
