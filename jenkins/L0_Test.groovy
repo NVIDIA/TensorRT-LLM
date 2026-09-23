@@ -159,9 +159,17 @@ REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200", "gb10x"]
 // K8s pod retry, so 1 pod × 2 SLURM attempts = 2 total.
 SLURM_INFRA_RETRY_MAX = 1
 
-// Only this bounded tail is copied from a failed SLURM job for local evidence
-// matching. The temporary copy is deleted after matching and is never uploaded.
-SLURM_FAILURE_EVIDENCE_LOG_BYTES = 20 * 1024 * 1024
+// Only machine-specific device / driver / interconnect signatures are safe to
+// match against arbitrary test stdout/stderr in the SLURM job log. Keep the
+// concrete terms and their retry policy owned by FailureClassifier.
+SLURM_JOB_LOG_EVIDENCE_QUERY_IDS = [
+    "cuda-device-unavailable",
+    "cuda-buffer-mapping",
+    "nvidia-driver-unavailable",
+    "gpu-lost",
+    "gpu-ecc-uncorrectable",
+    "nvlink-fabric-failure",
+]
 
 // Maximum K8s infra-failure retries (total attempts = K8S_INFRA_RETRY_MAX + 1).
 // Kept distinct from SLURM_INFRA_RETRY_MAX so the two paths can be tuned
@@ -315,38 +323,26 @@ def echoRemoteLogTail(def pipeline, Map remote, String remotePath, int lines = 2
     }
 }
 
-// Copy a bounded failed-job log tail to the Jenkins agent, reduce it to a small
-// set of catalog candidate lines, and delete both temporary copies. Matching
-// policy remains in the shared libraries: this helper only collects evidence.
-def collectSlurmJobLogEvidence(def pipeline, Map remote, String remoteLogPath,
-                               String evidenceExtractorPath) {
-    def queries = FailureClassifier.failureEvidenceQueries(InfraFailure.SLURM)
-    def evidenceId = UUID.randomUUID().toString()
-    def localLogPath = Utils.createTempLocation(pipeline, "./${evidenceId}-slurm-job-output.log")
-    def localQueriesPath = Utils.createTempLocation(pipeline, "./${evidenceId}-slurm-failure-queries.json")
-    def remoteLogTailPath = "${remoteLogPath}.${evidenceId}.failure-evidence"
+// Stream-scan the complete remote job log for the source-safe catalog subset,
+// returning at most one occurrence of each signature. Matching policy and
+// query precedence remain in the shared libraries.
+def collectSlurmJobLogEvidence(def pipeline, Map remote, String remoteLogPath) {
+    def queries = FailureClassifier.failureEvidenceQueries(InfraFailure.SLURM).findAll {
+        SLURM_JOB_LOG_EVIDENCE_QUERY_IDS.contains(it.id)
+    }
+    def grepPatterns = queries.collectMany { it.anyOf }.collect {
+        "-e '" + it.replace("'", "'\"'\"'") + "'"
+    }.join(" ")
     try {
-        pipeline.writeFile(file: localQueriesPath, text: JsonOutput.toJson(queries))
-        def copyLogTail = "test -f '${remoteLogPath}' && " +
-            "tail -c ${SLURM_FAILURE_EVIDENCE_LOG_BYTES} -- '${remoteLogPath}' > '${remoteLogTailPath}'"
-        Utils.exec(
+        def scanLog = "if [ -f '${remoteLogPath}' ]; then " +
+            "grep -aFio ${grepPatterns} -- '${remoteLogPath}' 2>/dev/null " +
+            '''| awk '{ key=tolower($0); if (!seen[key]++) print }'; fi'''
+        def candidateText = Utils.exec(
             pipeline,
-            script: Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd(copyLogTail)),
-            retryOnFail: false,
-            noNVDFEvent: true,
-        )
-        Utils.exec(
-            pipeline,
-            script: scpFromRemoteCmd(remote, remoteLogTailPath, localLogPath),
-            retryOnFail: false,
-            noNVDFEvent: true,
-        )
-        def candidateText = pipeline.sh(
+            script: Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd(scanLog)),
             returnStdout: true,
-            script: """#!/bin/bash
-                set +x
-                python3 '${evidenceExtractorPath}' --log '${localLogPath}' --queries '${localQueriesPath}'
-            """,
+            retryOnFail: false,
+            noNVDFEvent: true,
         )?.trim()
         def match = FailureEvidenceCollector.matchQueries(candidateText, queries)
         return [
@@ -362,22 +358,6 @@ def collectSlurmJobLogEvidence(def pipeline, Map remote, String remoteLogPath,
         pipeline.echo("Ignorable warning: could not collect failure evidence from ${remoteLogPath} on " +
             "${remote.host}: ${collectionError.message}")
         return [source: "SLURM_JOB_LOG", collectionStatus: "COLLECTION_ERROR"]
-    } finally {
-        try {
-            pipeline.sh(returnStatus: true, script: "rm -f '${localLogPath}' '${localQueriesPath}'")
-            Utils.exec(
-                pipeline,
-                script: Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd("rm -f '${remoteLogTailPath}'")),
-                returnStatus: true,
-                timeout: 60,
-                noNVDFEvent: true,
-            )
-        } catch (InterruptedException interruptedError) {
-            throw interruptedError
-        } catch (Exception cleanupError) {
-            pipeline.echo("Ignorable warning: could not delete temporary SLURM failure evidence: " +
-                cleanupError.message)
-        }
     }
 }
 
@@ -2701,7 +2681,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         pipeline,
                         remote,
                         slurmJobLogPath,
-                        "${llmSrcLocal}/jenkins/scripts/extract_failure_evidence_candidates.py",
                     )
                     def classified = FailureClassifier.classify(jobFailure, InfraFailure.SLURM, evidence)
                     if (classified instanceof InfraFailure) {
