@@ -50,11 +50,24 @@ def _pattern_to_block_types(pattern: str) -> list[str]:
         ) from exc
 
 
+def _block_types_to_pattern(block_types) -> str:
+    try:
+        return "".join(_BLOCK_TYPE_TO_PATTERN[block_type] for block_type in block_types)
+    except KeyError as exc:
+        raise ValueError(
+            f"Invalid layers_block_type {block_types!r}: expected entries in "
+            f"{sorted(_BLOCK_TYPE_TO_PATTERN)}"
+        ) from exc
+
+
 def _is_natively_representable(pattern) -> bool:
     """Whether the installed transformers `NemotronHConfig` can hold `pattern`."""
     return not pattern or set(pattern) <= _NATIVE_PATTERN_CHARS
 
 
+# The class name must match transformers' `NemotronHConfig`: AutoDeploy dispatches
+# its custom model on `type(config).__name__`, and `config_class_to_model_type`
+# reverse-maps the class name to `nemotron_h`.
 class NemotronHConfig(PretrainedConfig):
     """Nemotron-H config that preserves `hybrid_override_pattern` verbatim.
 
@@ -75,6 +88,19 @@ class NemotronHConfig(PretrainedConfig):
     @classmethod
     def from_dict(cls, config_dict, **kwargs):
         pattern = config_dict.get("hybrid_override_pattern")
+        layer_types = config_dict.get("layers_block_type")
+        # Checkpoints re-saved by transformers >= 5.13 serialize only
+        # `layers_block_type` (respelled to the legacy vocabulary by
+        # `config_utils.nemotron_h_legacy_layer_types`); "mlp" entries there
+        # are just as unrepresentable natively as "-" in the pattern.
+        if (
+            pattern is None
+            and isinstance(layer_types, list)
+            and "mlp" in layer_types
+            and set(layer_types) <= set(_BLOCK_TYPE_TO_PATTERN)
+        ):
+            pattern = _block_types_to_pattern(layer_types)
+            config_dict = {**config_dict, "hybrid_override_pattern": pattern}
         # Only take over when transformers would raise; otherwise the native
         # class stays authoritative (defaults, validation, future fixes).
         if _is_natively_representable(pattern):
@@ -159,6 +185,12 @@ class NemotronHConfig(PretrainedConfig):
         use_conv_bias = kwargs.pop("mamba_conv_bias", use_conv_bias)
         chunk_size = kwargs.pop("mamba_chunk_size", chunk_size)
 
+        if hybrid_override_pattern is None and layers_block_type is not None:
+            hybrid_override_pattern = _block_types_to_pattern(layers_block_type)
+        if not isinstance(hybrid_override_pattern, str):
+            raise ValueError(
+                f"hybrid_override_pattern must be a string, got {hybrid_override_pattern!r}"
+            )
         self.hybrid_override_pattern = hybrid_override_pattern
         # The pattern is authoritative for depth, matching the native config's
         # `num_hidden_layers` property.
@@ -221,18 +253,13 @@ class NemotronHConfig(PretrainedConfig):
         self.norm_topk_prob = norm_topk_prob
 
         self.num_nextn_predict_layers = num_nextn_predict_layers
-        self.mtp_layers_block_type = (
-            mtp_layers_block_type if mtp_layers_block_type is not None else ["attention", "moe"]
-        )
-        # Plain attribute (the native config derives it from
-        # mtp_layers_block_type); modeling_nemotron_h reads it directly.
-        self.mtp_hybrid_override_pattern = (
-            mtp_hybrid_override_pattern
-            if mtp_hybrid_override_pattern is not None
-            else "".join(
-                _BLOCK_TYPE_TO_PATTERN[block_type] for block_type in self.mtp_layers_block_type
+        if mtp_layers_block_type is None:
+            mtp_layers_block_type = (
+                _pattern_to_block_types(mtp_hybrid_override_pattern)
+                if mtp_hybrid_override_pattern is not None
+                else ["attention", "moe"]
             )
-        )
+        self.mtp_layers_block_type = mtp_layers_block_type
 
         self.num_logits_to_keep = num_logits_to_keep
         self.initializer_range = initializer_range
@@ -243,6 +270,9 @@ class NemotronHConfig(PretrainedConfig):
         self.residual_in_fp32 = residual_in_fp32
         self.hidden_dropout = hidden_dropout
         self.rescale_prenorm_residual = rescale_prenorm_residual
+        # PretrainedConfig does not keep `use_cache`; set it like the native
+        # config so AutoDeploy's factory default lands on the config.
+        self.use_cache = use_cache
 
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
@@ -252,3 +282,10 @@ class NemotronHConfig(PretrainedConfig):
             eos_token_id=eos_token_id,
             **kwargs,
         )
+
+    @property
+    def mtp_hybrid_override_pattern(self) -> str:
+        # Derived, as in the native config: speculative/utils.py overlays a
+        # draft checkpoint's `mtp_layers_block_type` and relies on this
+        # following it.
+        return _block_types_to_pattern(self.mtp_layers_block_type)

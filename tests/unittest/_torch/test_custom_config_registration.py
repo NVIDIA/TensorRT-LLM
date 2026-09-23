@@ -263,6 +263,50 @@ def test_nemotron_h_pattern_overrides_explicit_block_types(layers_block_type):
     assert len(config.layers_block_type) == config.num_hidden_layers
 
 
+def test_nemotron_h_mtp_pattern_follows_block_types():
+    # speculative/utils.py overlays a draft checkpoint's mtp_layers_block_type
+    # onto the target config; the pattern modeling_nemotron_h builds MTP layers
+    # from must follow it, as it does on the native config.
+    from tensorrt_llm._torch.configs import NemotronHConfig
+
+    config = NemotronHConfig(hybrid_override_pattern="M-*", mtp_hybrid_override_pattern="*E*")
+    assert config.mtp_layers_block_type == ["attention", "moe", "attention"]
+
+    config.mtp_layers_block_type = ["moe"]
+    assert config.mtp_hybrid_override_pattern == "E"
+    with pytest.raises(AttributeError):
+        config.mtp_hybrid_override_pattern = "*E"
+
+
+def test_nemotron_h_keeps_use_cache():
+    from tensorrt_llm._torch.configs import NemotronHConfig
+
+    assert NemotronHConfig(hybrid_override_pattern="-").use_cache is True
+    assert NemotronHConfig(hybrid_override_pattern="-", use_cache=False).use_cache is False
+
+
+def test_nemotron_h_block_types_only_dense_checkpoint(tmp_path):
+    # transformers >= 5.13 re-saves only layers_block_type; "mlp" entries there
+    # are as unrepresentable natively as "-" in the pattern.
+    from tensorrt_llm._torch.configs import NemotronHConfig
+
+    config_dict = _nemotron_h_min_config("M-M*")
+    del config_dict["hybrid_override_pattern"]
+    config_dict["layers_block_type"] = ["mamba", "mlp", "mamba", "attention"]
+
+    cfg = AutoConfig.from_pretrained(_write_config(tmp_path, "nemotron_h_list", config_dict))
+
+    assert isinstance(cfg, NemotronHConfig)
+    assert cfg.hybrid_override_pattern == "M-M*"
+
+
+def test_nemotron_h_missing_pattern_rejected():
+    from tensorrt_llm._torch.configs import NemotronHConfig
+
+    with pytest.raises(ValueError, match="hybrid_override_pattern"):
+        NemotronHConfig(hybrid_override_pattern=None)
+
+
 def test_transformers_tokenizer_registers_dense_nemotron_h_in_clean_process(tmp_path):
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
