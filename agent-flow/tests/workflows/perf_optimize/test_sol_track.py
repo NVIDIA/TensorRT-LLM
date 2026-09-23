@@ -244,6 +244,20 @@ def test_the_corpus_is_the_workload_not_the_sizing_bound(tmp_path):
     assert "sequence-length bounds" in notes
 
 
+def test_no_note_answers_its_own_question_with_none(tmp_path):
+    """The resolved spec carried ``code_id at plan time: None``, always.
+
+    ``plan()`` emits no such key -- the previous CLI digested the config and
+    the checkout into one fingerprint and this one does not -- so the line
+    was structurally absent, in the one place a reader goes to work out what
+    a number was measured against.
+    """
+    data = task_schema.load_and_validate_task_yaml(
+        _write_task(tmp_path, {SOL_TRACK_FIELD: _gen(tmp_path)})
+    )
+    assert not any("code_id" in note for note in data[SOL_TRACK_FIELD]["filled_from_sweep_plan"])
+
+
 def test_an_owner_who_names_another_metric_still_wins(tmp_path):
     data = task_schema.load_and_validate_task_yaml(
         _write_task(
@@ -658,6 +672,68 @@ def test_a_resumed_run_keeps_measuring_what_it_started_with(tmp_path):
     }
 
 
+def test_a_resume_does_not_overwrite_where_the_copy_came_from(tmp_path):
+    """``adopted_from`` is what ``--clean`` restores from, so it must survive.
+
+    A run resumed with ``--task <workspace>/task.yaml`` reads a spec whose
+    ``sweep`` is already the copy. Recording that path as the origin would
+    leave the workspace pointing only at itself, and nothing able to say
+    which file the campaign was actually cut from.
+    """
+    original = _sweep_dir(tmp_path)
+    task = {SOL_TRACK_FIELD: {"track": "gen", "workspace": "/w", "sweep": str(original)}}
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sol_track.adopt_sweep(task, ws)
+
+    resumed = {SOL_TRACK_FIELD: dict(task[SOL_TRACK_FIELD])}  # as the workspace spec reads
+    sol_track.adopt_sweep(resumed, ws)
+    assert resumed[SOL_TRACK_FIELD][sol_track.ADOPTED_FROM_KEY] == str(original)
+
+
+def test_clean_leaves_the_spec_pointing_at_a_copy_that_is_gone(tmp_path):
+    """And the origin is what makes that recoverable rather than fatal.
+
+    ``--clean`` removes the adopted copy -- it has to, or the "fresh" run
+    re-adopts one ``apply_overlay`` has already written the previous
+    campaign's accepted tuning into. A spec that named the copy then
+    dangles, and ``adopted_from`` is the only thing that knows where to
+    look instead.
+    """
+    import shutil
+
+    original = _sweep_dir(tmp_path)
+    task = {SOL_TRACK_FIELD: {"track": "gen", "workspace": "/w", "sweep": str(original)}}
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sol_track.adopt_sweep(task, ws)
+
+    shutil.rmtree(ws / "sweep")  # what --clean does
+    resumed = {SOL_TRACK_FIELD: dict(task[SOL_TRACK_FIELD])}
+    adopted = sol_track.adopt_sweep(resumed, ws)
+
+    assert adopted == ws / "sweep" / "sweep.yaml"
+    assert resumed[SOL_TRACK_FIELD][sol_track.ADOPTED_FROM_KEY] == str(original)
+    # Said out loud: the re-adopted original may have moved on since the
+    # copy was taken, and a reader must not have to already know.
+    assert "--clean" in resumed[SOL_TRACK_FIELD][sol_track.READOPTED_KEY]
+
+
+def test_a_sweep_that_is_simply_missing_is_not_readopted(tmp_path):
+    """The fallback is for a deleted COPY, not for any unreadable path."""
+    task = {
+        SOL_TRACK_FIELD: {
+            "track": "gen",
+            "workspace": "/w",
+            "sweep": str(tmp_path / "nowhere" / "sweep.yaml"),
+            sol_track.ADOPTED_FROM_KEY: str(tmp_path / "also-nowhere" / "sweep.yaml"),
+        }
+    }
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    assert sol_track.adopt_sweep(task, ws) is None
+
+
 # ------------------------------------------------------------------ the prompt
 
 
@@ -787,3 +863,25 @@ def test_a_speculating_sweep_still_needs_one(tmp_path):
         task_schema.load_and_validate_task_yaml(
             _write_task(tmp_path, {SOL_TRACK_FIELD: _block(tmp_path, sweep=sweep)})
         )
+
+
+def test_the_refusal_names_the_key_that_actually_clears_it(tmp_path):
+    """It said ``options.accept_rate``; nothing reads there.
+
+    ``sweep_accept_rate`` reads the sweep's TOP LEVEL, where the harness has
+    read it since v0.4.7. A message that names a key the reader does not
+    read sends someone to add one and re-run into the same refusal, which is
+    worse than a vague message: it is a confident wrong instruction.
+    """
+    sweep = dict(GEN_SWEEP)
+    sweep.pop("accept_rate", None)
+    sweep["gen_configs"] = [[1, 1, 4, 64, 256, False, "0.9", 3, 0, "1,32"]]
+    with pytest.raises(task_schema.TaskSchemaError) as caught:
+        task_schema.load_and_validate_task_yaml(
+            _write_task(tmp_path, {SOL_TRACK_FIELD: _block(tmp_path, sweep=sweep)})
+        )
+    message = str(caught.value)
+    assert "top-level 'accept_rate'" in message
+    assert "options.accept_rate" not in message
+    # And the fix, spelled: the shape the harness expects.
+    assert "rate:" in message and "source:" in message

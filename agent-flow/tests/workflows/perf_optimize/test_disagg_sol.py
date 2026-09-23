@@ -571,6 +571,12 @@ def test_a_dry_run_selects_and_writes_every_spec_without_starting_anything(tmp_p
     assert record["gen_point"]["concurrency"] == 1
     assert [c["track"] for c in record["campaigns"]] == ["ctx", "gen"]
     assert (tmp_path / "ws" / disagg_sol.RUN_RECORD).is_file()
+    # "Writes every spec" was the promise and not the behaviour: `materialize`
+    # lives inside `start_all`, and returning above it skipped the one
+    # artefact a reader would check the plan against.
+    for campaign in record["campaigns"]:
+        assert (Path(campaign["workspace"]) / "task.yaml").is_file()
+    assert set(record["task_paths"]) == {"ctx", "gen"}
 
 
 def test_the_record_says_what_was_selected_and_against_what(tmp_path):
@@ -1163,3 +1169,182 @@ def test_the_plan_gives_the_derivation_the_campaign_s_checkout(tmp_path):
     )
     got = _yaml.safe_load(Path(launches[0].spec["sol_track"]["sweep"]).read_text())
     assert got["trtllm_install"]["trtllm_repo"].endswith("trtllm-gen")
+
+
+# ------------------------------------------- the units the two sides count in
+
+
+GEN_NUM_SWEEP = {
+    "model_id": "deepseek-ai/DeepSeek-V4-Pro",
+    "isl": 8192,
+    "osl": 1024,
+    # Two generation servers: the row's list is PER SERVER, so this shape was
+    # measured at 2, 8 and 32 requests in flight across the deployment.
+    "gen_configs": [[1, 2, 8, 64, 64, False, "0.9", 0, 0, "1,4,16"]],
+}
+
+
+def _gen_num_sweep(tmp_path):
+    import yaml as _yaml
+
+    p = tmp_path / "design2" / "sweep.yaml"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(_yaml.safe_dump(GEN_NUM_SWEEP))
+    return p
+
+
+def test_a_multi_server_shape_is_matched_in_the_deployment_s_own_unit(tmp_path):
+    """The two sides of this comparison were in different units.
+
+    A measured point's concurrency comes from `gen_only_perf.csv`, and the
+    harness names its result directories after the requests in flight across
+    the DEPLOYMENT -- the row's list times `gen_num`. The row's own list is
+    per generation server. Comparing them directly is right exactly when
+    `gen_num == 1`, and every multi-server shape had its own correct sweep
+    refused with "0 rows matching the selected point".
+    """
+    import yaml as _yaml
+
+    out = disagg_sol.derive_sweep_at_point(
+        _gen_num_sweep(tmp_path),
+        "gen",
+        {"shape": "tep_8_eplb0_mtp0", "concurrency": 32},  # 16 per server x 2
+        into=tmp_path / "ws",
+    )
+    row = _yaml.safe_load(out.read_text())["gen_configs"][0]
+    # Written back in the ROW's unit, not the deployment's: the total here
+    # would restate the point as a twice-as-large one and still look like
+    # the row it was cut from.
+    assert row[9] == "16"
+    assert row[1] == 2
+
+
+def test_a_point_that_is_not_in_the_deployment_ladder_is_still_refused(tmp_path):
+    """The unit fix must not turn the check into a rubber stamp."""
+    with pytest.raises(disagg_sol.DisaggSolError, match="0 rows matching"):
+        disagg_sol.derive_sweep_at_point(
+            _gen_num_sweep(tmp_path),
+            "gen",
+            {"shape": "tep_8_eplb0_mtp0", "concurrency": 16},  # a per-server value
+            into=tmp_path / "ws",
+        )
+
+
+def test_the_pairing_check_counts_in_the_deployment_s_unit_too(tmp_path):
+    """`verify_sweep_matches_point` had the same mismatch, one layer over."""
+    sweep = _gen_num_sweep(tmp_path)
+    disagg_sol.verify_sweep_matches_point(
+        sweep, "gen", {"shape": "tep_8_eplb0_mtp0", "concurrency": 8}
+    )
+    with pytest.raises(disagg_sol.DisaggSolError, match="requests in flight"):
+        disagg_sol.verify_sweep_matches_point(
+            sweep, "gen", {"shape": "tep_8_eplb0_mtp0", "concurrency": 3}
+        )
+
+
+# ------------------------------------ what a ctx point is, and is not, made of
+
+
+CTX_REPEATS_SWEEP = {
+    "rounds": 3,
+    "benchmarks": [
+        {
+            "isl": 8192,
+            "osl": 1,
+            "max_batch": [2],
+            "tp_size": [4],
+            "ratio": [0.8],
+            "mtp_range": [0, 1, 2, 3],
+        }
+    ],
+}
+
+
+def _ctx_repeats_sweep(tmp_path):
+    import yaml as _yaml
+
+    p = tmp_path / "design3" / "ctx_config.yaml"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(_yaml.safe_dump(CTX_REPEATS_SWEEP))
+    return p
+
+
+def test_the_ctx_cut_collapses_the_speculation_range_to_one_depth(tmp_path):
+    """`mtp_range` is not part of a ctx point -- it is how the design repeated.
+
+    A ctx case runs at output_length 1, so there is no decode and the
+    speculation depth changes nothing it measures. `select_ctx_point` groups
+    on (ctx_gpus, max_batch, adp) and means the rest for that reason, which
+    makes the design's four depths four REPEATS. Left as a range, the
+    campaign would re-run all four every time it measured -- and the run
+    this was found on did not: the agent narrowed to MTP0 at submit time,
+    outside the sweep, so the file said twelve cases and the campaign booked
+    one draw.
+    """
+    import yaml as _yaml
+
+    out = disagg_sol.derive_sweep_at_point(
+        _ctx_repeats_sweep(tmp_path),
+        "ctx",
+        {"ctx_gpus": 4, "max_batch": 2, "repeats": 12},
+        into=tmp_path / "ws",
+    )
+    got = _yaml.safe_load(out.read_text())
+    assert got["benchmarks"][0]["mtp_range"] == [0]
+    # `rounds` stays: it is the campaign's OWN repetition, and it is what
+    # turns a single draw into a mean the noise floor can be read against.
+    assert got["rounds"] == 3
+
+
+def test_the_derived_sweep_says_how_many_repeats_each_side_counted(tmp_path):
+    """Because the selected value and the campaign's baseline are two means.
+
+    The point was chosen from a mean over the design's repeats; the campaign
+    re-measures its own over a different, smaller n. Comparable, not
+    interchangeable -- and a gain quoted against the design's number rather
+    than the campaign's own baseline silently inherits the difference.
+    """
+    import yaml as _yaml
+
+    out = disagg_sol.derive_sweep_at_point(
+        _ctx_repeats_sweep(tmp_path),
+        "ctx",
+        {"ctx_gpus": 4, "max_batch": 2, "repeats": 12},
+        into=tmp_path / "ws",
+    )
+    repeats = _yaml.safe_load(out.read_text())["_derived_from"]["repeats"]
+    assert repeats["design"] == 12
+    assert repeats["campaign"] == 3
+    assert "baseline" in repeats["note"]
+
+
+# ---------------------------------------------- the flag that meant two things
+
+
+def test_a_dry_run_on_a_single_track_spec_is_refused_not_ignored(tmp_path, capsys):
+    """Silently ignoring it turns "show me" into a real campaign.
+
+    The flag lives on the shared parser because argparse cannot know which
+    path a spec takes until the file is read, and only the staged path
+    implements it. Accepted and dropped, `--dry-run` on an ordinary campaign
+    started the full multi-hour run on real hardware -- the one failure mode
+    a dry run must not have.
+    """
+    from agent_flow.workflows.perf_optimize import cli
+
+    # Otherwise valid, so the refusal can only be about the flag: a spec
+    # that fails validation exits 2 as well, and a test that cannot tell
+    # the two apart passes on either.
+    (tmp_path / "ckpt").mkdir()
+    (tmp_path / "repo").mkdir()
+    task = tmp_path / "task.yaml"
+    task.write_text(
+        f"checkpoint_path: {tmp_path / 'ckpt'}\ntrtllm_repo_path: {tmp_path / 'repo'}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit) as caught:
+        cli.main(["--task", str(task), "--workspace", str(tmp_path / "ws"), "--dry-run"])
+    assert caught.value.code == 2
+    error = capsys.readouterr().err
+    assert "staged disagg path only" in error
+    assert "would start it for real" in error

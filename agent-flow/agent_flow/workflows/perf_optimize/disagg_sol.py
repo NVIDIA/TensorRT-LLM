@@ -47,6 +47,7 @@ from agent_flow.workflows.perf_optimize.bench_cli import (
     ctx_cases,
     gen_cases,
     gen_only_points,
+    operating_point,
 )
 from agent_flow.workflows.perf_optimize.sweep_design import designer_instruction, load_yaml
 
@@ -771,19 +772,24 @@ def verify_sweep_matches_point(sweep: Path, track: str, point: Mapping[str, Any]
         if wanted[0] is None:
             return  # a ctx-only selection: nothing to check the gen sweep against
         try:
+            # `operating_point`, not the row's own `concurrency`: the selected
+            # point's number is the deployment total the measured case was
+            # named after, and the row's is per generation server. They agree
+            # only at `gen_num == 1`, so comparing the raw fields refuses
+            # every correct multi-server sweep and says the sweep diverged.
             available = {
-                (case["name"], (case["config"] or {}).get("concurrency"))
-                for case in gen_cases(config)
+                (case["name"], operating_point(case["config"] or {})) for case in gen_cases(config)
             }
         except BenchCliError as exc:  # pragma: no cover - message path
             raise DisaggSolError(str(exc)) from exc
         if wanted not in available:
             raise DisaggSolError(
                 f"the gen sweep {sweep} does not contain the selected point "
-                f"{wanted[0]} @ concurrency {wanted[1]}. It expands to "
-                f"{sorted(available)}. The campaign would run one of those while "
-                f"its point_provenance claimed the selected one -- a record that "
-                f"says the run used an operating point it did not."
+                f"{wanted[0]} @ concurrency {wanted[1]} (requests in flight across "
+                f"the deployment, which is the row's own list times its gen_num). "
+                f"It expands to {sorted(available)}. The campaign would run one of "
+                f"those while its point_provenance claimed the selected one -- a "
+                f"record that says the run used an operating point it did not."
             )
         return
 
@@ -856,7 +862,12 @@ def derive_sweep_at_point(
                 f"one. The design sweep and the measured space have diverged."
             )
         row = list(kept[0])
-        row[9] = str(wanted[1])  # this point only, not the row's whole ladder
+        # Written back in the row's OWN unit. `wanted[1]` is the deployment
+        # total the measured point was named after; this field is per
+        # generation server. Writing the total here would restate the point
+        # as a `gen_num`-times larger one and still look like the row it was
+        # cut from.
+        row[9] = str(_gen_row_concurrency(kept[0], wanted))
         config["gen_configs"] = [row]
     else:
         wanted_ctx = (point.get("ctx_gpus"), point.get("max_batch"))
@@ -873,7 +884,23 @@ def derive_sweep_at_point(
                 f"selected ctx point tp_size {wanted_ctx[0]} @ max_batch "
                 f"{wanted_ctx[1]}; a campaign needs exactly one."
             )
-        config["benchmarks"] = kept_ctx
+        # `mtp_range` is not part of a ctx point and must not survive as a
+        # range. `select_ctx_point` groups on (ctx_gpus, max_batch, adp) and
+        # means the rest, because a ctx case runs at output_length 1: there
+        # is no decode, so the speculation depth changes nothing it measures.
+        # The design's four values are four REPEATS, which is why the point
+        # it produced is a mean over twelve of them and not a reading of one.
+        #
+        # Left as a range, the campaign would re-run all four every time it
+        # measured -- and the run this was found on did not: the agent
+        # narrowed to MTP0 at submit time, outside the sweep, so the file
+        # said twelve cases and the campaign booked one draw. Narrowed here
+        # instead, so what is measured is what is written down.
+        entry = dict(kept_ctx[0])
+        depths = [d for d in (entry.get("mtp_range") or []) if isinstance(d, int)]
+        if depths:
+            entry["mtp_range"] = [min(depths)]
+        config["benchmarks"] = [entry]
         config.pop("gpu_overrides", None)
 
     if repo is not None:
@@ -893,22 +920,72 @@ def derive_sweep_at_point(
             "row of it, because two shapes at one concurrency cannot both be "
             "'concurrency_<c>'"
         ),
+        # The one number a reader needs to not over-read the campaign's
+        # percentages. The point was chosen from a mean; the campaign
+        # measures its own mean over a different, smaller n, so the two are
+        # the same KIND of quantity at different precision -- comparable, but
+        # not interchangeable, and a gain quoted against the design's number
+        # rather than the campaign's own baseline inherits the difference.
+        "repeats": {
+            "design": point.get("repeats"),
+            "campaign": config.get("rounds"),
+            "note": (
+                "the selected value is a mean over the design's repeats; this "
+                "campaign re-measures its own baseline over 'campaign' repeats and "
+                "scores every attempt against that. Quote the campaign's baseline, "
+                "not the design's point, as what a gain is relative to."
+            ),
+        },
     }
     into.mkdir(parents=True, exist_ok=True)
     out.write_text(yaml.safe_dump(config, sort_keys=False, allow_unicode=True), encoding="utf-8")
     return out
 
 
-def _gen_row_matches(row: Any, wanted: tuple) -> bool:
+def _gen_num(row: Any) -> int:
+    """How many generation servers a sweep row stands up, defaulting to 1.
+
+    The row order is the harness': ``[ctx_num, gen_num, tp_size, batch, mnt,
+    adp, gmf, mtp, eplb, concurrency_list]``. Defensive about the value for
+    the same reason :func:`.bench_cli.operating_point` is -- a malformed row must
+    not silently become a different operating point.
+    """
     if not isinstance(row, (list, tuple)) or len(row) < 10:
-        return False
+        return 1
+    value = row[1]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return 1
+    return value
+
+
+def _gen_row_concurrency(row: Any, wanted: tuple) -> int | None:
+    """The row's PER-SERVER concurrency at the selected point, or ``None``.
+
+    The two sides of this comparison are in different units, which is the
+    whole reason this is a function. A measured point's ``concurrency`` comes
+    from ``gen_only_perf.csv``, and the harness names its result directories
+    after the requests in flight across the DEPLOYMENT -- ``listed x
+    gen_num``. The sweep row's own list is PER GENERATION SERVER. Comparing
+    them directly is correct exactly when ``gen_num == 1`` and silently wrong
+    otherwise: every multi-generation-server shape would have its own correct
+    sweep refused with "0 rows matching the selected point".
+    """
+    if not isinstance(row, (list, tuple)) or len(row) < 10:
+        return None
     tp, adp, mtp, eplb = row[2], row[5], row[7], row[8]
     name = f"{'dep' if adp else 'tep'}_{tp}_eplb{eplb}_mtp{mtp}"
     if name != wanted[0]:
-        return False
-    return any(
-        token.strip().isdigit() and int(token) == wanted[1] for token in str(row[9]).split(",")
-    )
+        return None
+    servers = _gen_num(row)
+    for token in str(row[9]).split(","):
+        token = token.strip()
+        if token.isdigit() and int(token) * servers == wanted[1]:
+            return int(token)
+    return None
+
+
+def _gen_row_matches(row: Any, wanted: tuple) -> bool:
+    return _gen_row_concurrency(row, wanted) is not None
 
 
 class CampaignLaunch:
@@ -1143,7 +1220,18 @@ def supervise(
         json.dumps(record, indent=2, default=str) + "\n", encoding="utf-8"
     )
     if dry_run:
+        # Write the specs, then stop -- which is what `--dry-run` has always
+        # advertised ("write every campaign's task.yaml, then stop without
+        # starting them") and did not do: `materialize` lives inside
+        # `start_all`, and returning above it meant the one artefact a reader
+        # would check the plan against was the one thing the dry run skipped.
+        # `spawn` separates the two calls precisely so this is the same code
+        # path minus the spawning, rather than a second implementation of it.
+        record["task_paths"] = {run.track: str(spawn.materialize(run)) for run in launches}
         record["started"] = False
+        (Path(workspace_root) / RUN_RECORD).write_text(
+            json.dumps(record, indent=2, default=str) + "\n", encoding="utf-8"
+        )
         return record
 
     started = spawn.start_all(launches)
