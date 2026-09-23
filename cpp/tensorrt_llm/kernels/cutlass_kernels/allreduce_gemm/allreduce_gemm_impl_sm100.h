@@ -190,12 +190,13 @@ public:
     public:
         using BarrierT = typename TileBarrierType::T;
 
-        PersistentWorkspace(int64_t M, int64_t N, std::set<int> ranks)
-            : _ranks(ranks)
+        PersistentWorkspace(int64_t M, int64_t N, runtime::IpcNvlsRendezvousPtr rendezvous)
+            : _rendezvous(std::move(rendezvous))
             , _num_elements(M * N)
         {
             assert(M > 0 && "M is 0.");
             assert(N > 0 && "N is 0.");
+            TLLM_CHECK_WITH_INFO(_rendezvous != nullptr, "NVLS rendezvous must not be null");
             // barriers to know when each tile ready to be consumed by AR
             _num_tile_barriers = CollectiveAllReduce::get_num_barrier_flags(M, N);
             // need barrier per warpgroup to indicate broadcast complete, this is safe.
@@ -207,11 +208,11 @@ public:
         /////////////////////////////////////////
         void allocate() override
         {
-            _tile_barriers.reset(_num_tile_barriers, _ranks);
-            _completion_barriers.reset(_num_completion_barriers, _ranks);
-            if (_ranks.size() == 2)
+            _tile_barriers.reset(_num_tile_barriers, _rendezvous);
+            _completion_barriers.reset(_num_completion_barriers, _rendezvous);
+            if (_rendezvous->size() == 2)
             {
-                _stage_buf.reset(_num_elements, _ranks);
+                _stage_buf.reset(_num_elements, _rendezvous);
             }
 
             TLLM_CUDA_CHECK(
@@ -219,11 +220,8 @@ public:
             TLLM_CUDA_CHECK(cudaMemset(
                 _completion_barriers.getUnicastPointer(), 0, _completion_barriers.getCapacity() * sizeof(BarrierT)));
 
-            // Ensure local memset is visible across all processes
-            if (_ranks.size() > 1)
-            {
-                MPI_group_barrier(_ranks);
-            }
+            // Ensure local memset is visible across all processes.
+            _rendezvous->barrier();
         }
 
         int free() override
@@ -238,7 +236,7 @@ public:
             size_t size_bytes = 0;
             size_bytes += _num_tile_barriers * sizeof(BarrierT);
             size_bytes += _num_completion_barriers * sizeof(BarrierT);
-            if (_ranks.size() == 2)
+            if (_rendezvous->size() == 2)
             {
                 size_bytes += _num_elements * sizeof(ElementD);
             }
@@ -263,13 +261,14 @@ public:
         size_t _num_tile_barriers = 0;
         size_t _num_completion_barriers = 0;
         size_t _num_elements = 0;
-        std::set<int> _ranks;
+        runtime::IpcNvlsRendezvousPtr _rendezvous;
         DeviceAllocationNvls<BarrierT> _tile_barriers;
         DeviceAllocationNvls<BarrierT> _completion_barriers;
         DeviceAllocationNvls<ElementD> _stage_buf;
     };
 
-    GemmAllReduceImplTwoshot_Sm100()
+    explicit GemmAllReduceImplTwoshot_Sm100(runtime::IpcNvlsRendezvousPtr rendezvous = nullptr)
+        : _rendezvous(std::move(rendezvous))
     {
         int device_id = -1;
         TLLM_CUDA_CHECK(cudaGetDevice(&device_id));
@@ -281,7 +280,8 @@ public:
     {
         auto [M, N, K, L] = max_problem.problem_size;
         assert(L == 1 && "batched GEMM not supported yet.");
-        return std::make_shared<PersistentWorkspace>(M, N, max_problem.ranks);
+        auto rendezvous = _rendezvous ? _rendezvous : runtime::makeMpiIpcNvlsRendezvous(max_problem.ranks);
+        return std::make_shared<PersistentWorkspace>(M, N, std::move(rendezvous));
     }
 
     int run(ProblemArgs const& problem, cudaStream_t stream) override
@@ -371,6 +371,8 @@ private:
             {// TileScheduler arguments
                 1, RasterOrderOptions::AlongM}};
     }
+
+    runtime::IpcNvlsRendezvousPtr _rendezvous;
 
     // Holds the number of SMs on the GPU.
     // This information is used by the underlying kernel.

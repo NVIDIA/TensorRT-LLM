@@ -125,6 +125,7 @@ add_library(
   tinygemm2.cpp
   dsv3RopeOp.cpp
   fusedGemmAllreduceOp.cpp
+  ../runtime/ipcNvlsMemoryTorch.cpp
   convertReqIndexToGlobalOp.cpp
   nvfp4MlaKvCacheGatherOp.cpp
   trtllmGenQKVProcessOp.cpp
@@ -142,6 +143,11 @@ target_link_libraries(
 
 if(BUILD_DEEP_GEMM)
   target_compile_definitions(th_common PRIVATE TRTLLM_MHC_ENABLE_FUSED_HC)
+endif()
+
+if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+  set_property(SOURCE fusedGemmAllreduceOp.cpp APPEND
+               PROPERTY COMPILE_DEFINITIONS USING_OSS_CUTLASS_ALLREDUCE_GEMM)
 endif()
 
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)

@@ -15,9 +15,14 @@
  */
 #pragma once
 
+#include <cstdint>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <memory>
 #include <set>
+#include <stdexcept>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace tensorrt_llm::runtime
@@ -65,6 +70,32 @@ IpcNvlsHandle* ipcNvlsAllocate(size_t size, std::set<int> ranks);
 
 void ipcNvlsFree(IpcNvlsHandle* handle);
 
+enum class IpcNvlsRendezvousKind
+{
+    kMPI,
+    kTorchDist,
+};
+
+//! Type-erased rendezvous used by NVLS allocations. Implementations own their
+//! communication group, so the group remains alive for the allocation lifetime.
+class IpcNvlsRendezvous
+{
+public:
+    virtual ~IpcNvlsRendezvous() = default;
+
+    virtual IpcNvlsHandle* allocate(size_t bytes) const = 0;
+    virtual void barrier() const = 0;
+    [[nodiscard]] virtual int rank() const = 0;
+    [[nodiscard]] virtual int size() const = 0;
+    [[nodiscard]] virtual uintptr_t identity() const = 0;
+    [[nodiscard]] virtual IpcNvlsRendezvousKind kind() const = 0;
+    [[nodiscard]] virtual std::string describe() const = 0;
+};
+
+using IpcNvlsRendezvousPtr = std::shared_ptr<IpcNvlsRendezvous const>;
+
+IpcNvlsRendezvousPtr makeMpiIpcNvlsRendezvous(std::set<int> ranks);
+
 template <typename T>
 class DeviceAllocationNvls
 {
@@ -76,47 +107,61 @@ public:
         this->free();
     }
 
-    void reset(size_t size, std::set<int> ranks)
+    void reset(size_t size, IpcNvlsRendezvousPtr rendezvous)
     {
         this->free();
-        _handle = ipcNvlsAllocate(size * sizeof(T), ranks);
-        _capacity = size;
+        mRendezvous = std::move(rendezvous);
+        if (!mRendezvous)
+        {
+            throw std::invalid_argument("NVLS rendezvous must not be null");
+        }
+        mHandle = mRendezvous->allocate(size * sizeof(T));
+        mCapacity = size;
+    }
+
+    // Preserve the existing MPI API.
+    void reset(size_t size, std::set<int> const& ranks)
+    {
+        reset(size, makeMpiIpcNvlsRendezvous(ranks));
     }
 
     // Return device pointer to multicast memory
     [[nodiscard]] T* getMulticastPointer() const
     {
-        return reinterpret_cast<T*>(_handle->mc_ptr);
+        return reinterpret_cast<T*>(mHandle->mc_ptr);
     }
 
     // Return device pointer for current rank
     [[nodiscard]] T* getUnicastPointer() const
     {
-        return reinterpret_cast<T*>(_handle->uc_ptr);
+        return reinterpret_cast<T*>(mHandle->uc_ptr);
     }
 
     // Return host list of device pointers to memory on each rank
     [[nodiscard]] T** getIpcUnicastPointers()
     {
-        return reinterpret_cast<T**>(_handle->ipc_uc_ptrs.data());
+        return reinterpret_cast<T**>(mHandle->ipc_uc_ptrs.data());
     }
 
     [[nodiscard]] size_t getCapacity() const
     {
-        return _capacity;
+        return mCapacity;
     }
 
     void free()
     {
-        if (_capacity > 0)
+        if (mHandle != nullptr)
         {
-            ipcNvlsFree(_handle);
-            _capacity = 0;
+            ipcNvlsFree(mHandle);
+            mHandle = nullptr;
         }
+        mCapacity = 0;
+        mRendezvous.reset();
     }
 
 private:
-    size_t _capacity = 0;
-    IpcNvlsHandle* _handle;
+    size_t mCapacity{0};
+    IpcNvlsHandle* mHandle{nullptr};
+    IpcNvlsRendezvousPtr mRendezvous;
 };
 } // namespace tensorrt_llm::runtime

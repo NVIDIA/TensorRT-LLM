@@ -20,7 +20,8 @@ from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
-    BufferKind, mxfp8_quantize_gemm_autotuned)
+    BufferKind, Fp8BlockScaleGemmAllreduceRunner, GemmAllreduceRunner,
+    mxfp8_quantize_gemm_autotuned)
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
@@ -638,6 +639,27 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 group=group)
         else:
             output = F.linear(input, module.weight, bias)
+        return output
+
+    def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
+                               bias: Optional[torch.Tensor], tp_rank: int,
+                               tp_group: List[int], *args, **kwargs):
+        process_group = module._gemm_allreduce_process_group
+        if process_group is None:
+            raise RuntimeError(
+                'TorchDist GEMM+allreduce requires mapping.tp_group_pg')
+
+        input_2d = input.reshape(-1, input.shape[-1]).contiguous()
+        runner = getattr(module, '_torch_dist_gemm_allreduce_runner', None)
+        if runner is None:
+            runner = GemmAllreduceRunner(module.dtype, process_group,
+                                         input.device)
+            module._torch_dist_gemm_allreduce_runner = runner
+
+        output = runner(input_2d, module.weight, -1)
+        output = output.reshape(*input.shape[:-1], module.weight.shape[0])
+        if bias is not None:
+            output = output + bias
         return output
 
     def load_weights_vanilla(self,
@@ -1335,6 +1357,36 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         if len(original_shape) > 2:
             output = output.reshape(*original_shape[:-1], output.shape[-1])
 
+        if bias is not None:
+            output = output + bias
+        return output
+
+    def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
+                               bias: Optional[torch.Tensor], tp_rank: int,
+                               tp_group: List[int], *args, **kwargs):
+        process_group = module._gemm_allreduce_process_group
+        if process_group is None:
+            raise RuntimeError(
+                'FP8 block-scale GEMM+allreduce requires mapping.tp_group_pg')
+
+        original_shape = input.shape
+        input_2d = input.reshape(-1, input.shape[-1])
+        if input_2d.dtype == torch.float8_e4m3fn:
+            input_2d = input_2d.to(torch.bfloat16) * module.input_scale
+        assert input_2d.dtype == torch.bfloat16
+
+        act_fp8, act_scale = torch.ops.trtllm.fp8_quantize_1x128(input_2d)
+        runner = getattr(module,
+                         '_torch_dist_fp8_blockscale_gemm_allreduce_runner',
+                         None)
+        if runner is None:
+            runner = Fp8BlockScaleGemmAllreduceRunner(module.dtype,
+                                                      process_group,
+                                                      input.device)
+            module._torch_dist_fp8_blockscale_gemm_allreduce_runner = runner
+
+        output = runner(act_fp8, module.weight, act_scale, module.weight_scale)
+        output = output.reshape(*original_shape[:-1], module.weight.shape[0])
         if bias is not None:
             output = output + bias
         return output
@@ -3827,16 +3879,32 @@ class Linear(nn.Module):
         tp_valid = self.tp_mode is not None and self.tp_mode == TensorParallelMode.ROW and self.tp_size > 1
         quant_valid = quant_config_has_nvfp4_activation_quantization(
             self.quant_config)
+        unquantized = self.quant_config is None or self.quant_config.quant_algo is None
+        fp8_block_scaled = (self.quant_config is not None
+                            and self.quant_config.quant_algo
+                            == QuantAlgo.FP8_BLOCK_SCALES)
 
-        device_supported = get_sm_version() >= 100
         enable_gemm_allreduce_fusion_env = (os.environ.get(
             "TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED", "0") == "1")
 
+        # Keep the existing MPI/NVFP4 path and add a TorchDist path for
+        # unquantized VisualGen projections on Hopper. The latter binds the
+        # mapping's multi-backend TP ProcessGroup into the C++ runner.
+        self._gemm_allreduce_process_group = None
+        if mpi_disabled():
+            self._gemm_allreduce_process_group = getattr(
+                self.mapping, 'tp_group_pg', None)
+        mpi_fusion = mpi_enabled and quant_valid and get_sm_version() >= 100
+        torch_dist_fusion = (not mpi_enabled
+                             and self._gemm_allreduce_process_group is not None
+                             and ((unquantized and get_sm_version() == 90) or
+                                  (fp8_block_scaled and get_sm_version() == 90
+                                   and self.dtype == torch.bfloat16)))
+
         self.use_fused_gemm_allreduce = all([
-            self.reduce_output, mpi_enabled, dtype_supported,
-            in_features_aligned, out_features_aligned, tp_valid, quant_valid,
-            device_supported, enable_gemm_allreduce_fusion,
-            enable_gemm_allreduce_fusion_env
+            self.reduce_output, dtype_supported, in_features_aligned,
+            out_features_aligned, tp_valid, mpi_fusion or torch_dist_fusion,
+            enable_gemm_allreduce_fusion, enable_gemm_allreduce_fusion_env
         ])
         if self.use_fused_gemm_allreduce:
             self.use_fused_gemm_allreduce = ipc_nvls_supported()
@@ -4033,9 +4101,18 @@ class Linear(nn.Module):
             return
 
         # Mixed-precision loading may replace quant_config after __init__.
-        # Weight-only W4A16 must not retain the activation-quantized fused path.
-        if not quant_config_has_nvfp4_activation_quantization(
-                self.quant_config):
+        # Keep fusion for either the existing activation-quantized MPI path or
+        # the unquantized TorchDist path. Weight-only methods support neither.
+        has_nvfp4_activation_quantization = quant_config_has_nvfp4_activation_quantization(
+            self.quant_config)
+        is_unquantized = self.quant_config is None or self.quant_config.quant_algo is None
+        is_fp8_block_scaled = (self.quant_config is not None
+                               and self.quant_config.quant_algo
+                               == QuantAlgo.FP8_BLOCK_SCALES)
+        has_torch_dist_rendezvous = self._gemm_allreduce_process_group is not None
+        if not has_nvfp4_activation_quantization and not (
+            (is_unquantized or is_fp8_block_scaled)
+                and has_torch_dist_rendezvous):
             self.use_fused_gemm_allreduce = False
 
         self.rebuild_tensor_metadata = {}

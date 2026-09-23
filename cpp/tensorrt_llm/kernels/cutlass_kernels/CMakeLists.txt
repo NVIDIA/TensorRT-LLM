@@ -287,6 +287,8 @@ if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
   add_library(
     ar_gemm_src STATIC
     ${ARGEMM_SRC_CU} ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime/ipcNvlsMemory.cu)
+  target_compile_definitions(ar_gemm_src
+                             PRIVATE USING_OSS_CUTLASS_ALLREDUCE_GEMM)
   target_include_directories(
     ar_gemm_src
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../internal_cutlass_kernels/include)

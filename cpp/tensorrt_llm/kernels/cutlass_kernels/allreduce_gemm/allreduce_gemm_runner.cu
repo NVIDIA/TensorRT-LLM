@@ -15,6 +15,7 @@
  */
 #include "./allreduce_gemm_impl_sm100.h"
 #include "./allreduce_gemm_impl_sm90.h"
+#include "./allreduce_gemm_impl_sm90_blockscale.h"
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -57,6 +58,11 @@ template <typename KeyType, typename ValueType>
 class GemmAllReduceRegistryBuilder
 {
 public:
+    explicit GemmAllReduceRegistryBuilder(runtime::IpcNvlsRendezvousPtr rendezvous = nullptr)
+        : mRendezvous(std::move(rendezvous))
+    {
+    }
+
     template <typename GemmTraits, GemmAllReduceImpl Impl, MainloopScheduleType Schedule, TileShape TileShape_MNK,
         ClusterShape ClusterShape_MNK>
     void addSm90()
@@ -87,8 +93,24 @@ public:
 
         const GemmAllReduceImplInterface::LaunchConfig key(
             {Impl, Schedule, TileShape_MNK, ClusterShape_MNK, 1, true /* transposed*/});
-        auto value = std::make_shared<GemmType>();
+        auto value = std::make_shared<GemmType>(mRendezvous);
 
+        mGemmRegistry.insert({key, value});
+    }
+
+    template <typename GemmTraits, GemmAllReduceImpl Impl, TileShape TileShape_MNK>
+    void addSm90BlockScaled()
+    {
+        using Sm90GemmTraits = Sm90GemmTypes<typename GemmTraits::ElementA, typename GemmTraits::ElementB,
+            typename GemmTraits::ElementC, typename GemmTraits::ElementD, typename GemmTraits::ElementSFA,
+            typename GemmTraits::ElementSFB, typename GemmTraits::LayoutA, typename GemmTraits::LayoutB,
+            typename GemmTraits::LayoutC, typename GemmTraits::LayoutD, decltype(get_tile_shape<TileShape_MNK>()),
+            decltype(get_cluster_shape<ClusterShape::ClusterShape_1x1x1>()), void, void>;
+        using GemmType = GemmAllReduceImplBlockScaleSm90<Sm90GemmTraits>;
+
+        const GemmAllReduceImplInterface::LaunchConfig key({Impl, MainloopScheduleType::WARPSPECIALIZED, TileShape_MNK,
+            ClusterShape::ClusterShape_1x1x1, 1, false /* transposed */});
+        auto value = std::make_shared<GemmType>(mRendezvous);
         mGemmRegistry.insert({key, value});
     }
 
@@ -109,7 +131,7 @@ public:
 
         const GemmAllReduceImplInterface::LaunchConfig key({Impl, MainloopScheduleType::WARPSPECIALIZED, TileShape_MNK,
             ClusterShape_MNK, MMA_SMs, false /* transposed */});
-        auto value = std::make_shared<GemmType>();
+        auto value = std::make_shared<GemmType>(mRendezvous);
 
         mGemmRegistry.insert({key, value});
     }
@@ -159,6 +181,7 @@ private:
             and std::is_same_v<typename GemmTraits::ElementB, cutlass::float_e4m3_t>;
     }
 
+    runtime::IpcNvlsRendezvousPtr mRendezvous;
     std::map<KeyType, ValueType> mGemmRegistry;
 };
 
@@ -168,16 +191,41 @@ private:
 template <typename GemmTraits>
 GemmAllReduceImplRunner<GemmTraits>::GemmAllReduceImplRunner()
 {
-    GemmAllReduceRegistryBuilder<KeyType, ValueType> registry_builder;
+    initializeRegistry();
+}
+
+template <typename GemmTraits>
+GemmAllReduceImplRunner<GemmTraits>::GemmAllReduceImplRunner(runtime::IpcNvlsRendezvousPtr rendezvous)
+    : mRendezvous(std::move(rendezvous))
+{
+    TLLM_CHECK_WITH_INFO(mRendezvous != nullptr, "NVLS rendezvous must not be null");
+    initializeRegistry();
+}
+
+template <typename GemmTraits>
+void GemmAllReduceImplRunner<GemmTraits>::initializeRegistry()
+{
+    GemmAllReduceRegistryBuilder<KeyType, ValueType> registry_builder(mRendezvous);
     constexpr int bits_input = cutlass::sizeof_bits<typename GemmTraits::ElementA>::value;
+
+    constexpr bool isSm90Fp8BlockScaled = std::is_same_v<typename GemmTraits::ElementA, cutlass::float_e4m3_t>
+        && std::is_same_v<typename GemmTraits::ElementB, cutlass::float_e4m3_t>
+        && std::is_same_v<typename GemmTraits::ElementD, cutlass::bfloat16_t>
+        && std::is_same_v<typename GemmTraits::ElementSFA, float>
+        && std::is_same_v<typename GemmTraits::ElementSFB, float>;
 
     // Instantiate GEMMs for each config
     switch (tensorrt_llm::common::getSMVersion())
     {
     // Hopper
     case 90:
+        if constexpr (isSm90Fp8BlockScaled)
+        {
+            registry_builder
+                .addSm90BlockScaled<GemmTraits, GemmAllReduceImpl::kNVLS_2SHOT, TileShape::TileShape_32x128x128>();
+        }
         // Sub-byte GEMMs not supported
-        if constexpr (bits_input >= 8)
+        else if constexpr (bits_input >= 8)
         {
             registry_builder.addSm90<GemmTraits, GemmAllReduceImpl::kNVLS_2SHOT, MainloopScheduleType::PINGPONG,
                 TileShape::TileShape_128x16x128, ClusterShape::ClusterShape_2x1x1>();
@@ -192,8 +240,11 @@ GemmAllReduceImplRunner<GemmTraits>::GemmAllReduceImplRunner()
     // Blackwell
     case 100:
     case 103:
-        registry_builder.addSm100<GemmTraits, GemmAllReduceImpl::kNVLS_2SHOT, _2SM, TileShape::TileShape_128x256x128,
-            ClusterShape::ClusterShape_4x1x1>();
+        if constexpr (!isSm90Fp8BlockScaled)
+        {
+            registry_builder.addSm100<GemmTraits, GemmAllReduceImpl::kNVLS_2SHOT, _2SM,
+                TileShape::TileShape_128x256x128, ClusterShape::ClusterShape_4x1x1>();
+        }
         break;
     default: TLLM_THROW("SM architecture not supported for GEMM+AR fusion.");
     }
@@ -262,7 +313,7 @@ GemmAllReduceImplInterface::ProblemArgs GemmAllReduceImplRunner<GemmTraits>::swa
     swapped_problem.A = problem.B;
     swapped_problem.B = problem.A;
     swapped_problem.A_scale = problem.B_scale;
-    swapped_problem.B_scale = problem.B_scale;
+    swapped_problem.B_scale = problem.A_scale;
     swapped_problem.problem_size = std::make_tuple(N, M, K, L);
     return swapped_problem;
 }
@@ -285,6 +336,11 @@ template class GemmAllReduceImplRunner<
 // fp8xfp8=fp16
 template class GemmAllReduceImplRunner<
     GemmTypes<cutlass::float_e4m3_t, cutlass::float_e4m3_t, cutlass::half_t, cutlass::half_t, void, void,
+        cutlass::layout::RowMajor, cutlass::layout::ColumnMajor, cutlass::layout::RowMajor, cutlass::layout::RowMajor>>;
+
+// Hopper FP8 block-scaled x FP8 block-scaled = BF16, with FP32 scales.
+template class GemmAllReduceImplRunner<
+    GemmTypes<cutlass::float_e4m3_t, cutlass::float_e4m3_t, cutlass::bfloat16_t, cutlass::bfloat16_t, float, float,
         cutlass::layout::RowMajor, cutlass::layout::ColumnMajor, cutlass::layout::RowMajor, cutlass::layout::RowMajor>>;
 
 // fp4xfp4=fp16

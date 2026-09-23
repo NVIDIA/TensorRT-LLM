@@ -204,6 +204,10 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
 
         self.world_size = world_size
         self._rank = rank
+        # Linear/AllReduce consume the common Mapping interface. VisualGen does
+        # not currently implement attention data parallelism, so expose the
+        # expected capability flag explicitly.
+        self.enable_attention_dp = False
         self.cfg_size = cfg_size
         self.tp_size = tp_size
         self.ring_size = ring_size
