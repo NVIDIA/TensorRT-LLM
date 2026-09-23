@@ -35,9 +35,14 @@ import pytest
 from pytest import param
 
 from tensorrt_llm.serve.openai_protocol import (
-    ChatCompletionResponseChoice, ChatCompletionResponseStreamChoice,
-    ChatMessage, CompletionResponseChoice, CompletionResponseStreamChoice,
-    DeltaMessage, SpeculativeDecodingStats)
+    ChatCompletionResponseChoice,
+    ChatCompletionResponseStreamChoice,
+    ChatMessage,
+    CompletionResponseChoice,
+    CompletionResponseStreamChoice,
+    DeltaMessage,
+    SpeculativeDecodingStats,
+)
 
 STATS = SpeculativeDecodingStats(
     acceptance_rate=0.5,
@@ -52,21 +57,16 @@ STATS = SpeculativeDecodingStats(
 def _choices(stats):
     """One instance of each choice model that can carry the field."""
     return {
-        "completion":
-        CompletionResponseChoice(index=0, text="hi", speculative_decoding=stats),
-        "completion_stream":
-        CompletionResponseStreamChoice(index=0,
-                                       text="hi",
-                                       speculative_decoding=stats),
-        "chat":
-        ChatCompletionResponseChoice(index=0,
-                                     message=ChatMessage(role="assistant",
-                                                         content="hi"),
-                                     speculative_decoding=stats),
-        "chat_stream":
-        ChatCompletionResponseStreamChoice(index=0,
-                                           delta=DeltaMessage(content="hi"),
-                                           speculative_decoding=stats),
+        "completion": CompletionResponseChoice(index=0, text="hi", speculative_decoding=stats),
+        "completion_stream": CompletionResponseStreamChoice(
+            index=0, text="hi", speculative_decoding=stats
+        ),
+        "chat": ChatCompletionResponseChoice(
+            index=0, message=ChatMessage(role="assistant", content="hi"), speculative_decoding=stats
+        ),
+        "chat_stream": ChatCompletionResponseStreamChoice(
+            index=0, delta=DeltaMessage(content="hi"), speculative_decoding=stats
+        ),
     }
 
 
@@ -86,14 +86,12 @@ class TestAbsentStatsAreOmitted:
 
     def test_model_dump_json_exclude_unset_false(self, name):
         # The completions stream serializes this way.
-        assert "speculative_decoding" not in ABSENT[name].model_dump_json(
-            exclude_unset=False)
+        assert "speculative_decoding" not in ABSENT[name].model_dump_json(exclude_unset=False)
 
     def test_model_dump_json_exclude_none(self, name):
         # The chat stream serializes this way; it would have dropped the null
         # anyway, but the field-scoped serializer must not conflict with it.
-        assert "speculative_decoding" not in ABSENT[name].model_dump_json(
-            exclude_none=True)
+        assert "speculative_decoding" not in ABSENT[name].model_dump_json(exclude_none=True)
 
 
 @pytest.mark.parametrize("name", sorted(PRESENT))  # fmt: skip

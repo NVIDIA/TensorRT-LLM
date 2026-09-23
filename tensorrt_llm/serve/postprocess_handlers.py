@@ -148,9 +148,14 @@ class ChatPostprocArgs(PostprocArgs):
 
 
 def _build_spec_decode_stats(
-        rsp: GenerationResultBase, args: PostprocArgs,
+        counters: Any, args: PostprocArgs,
         finish_reason: Optional[str]) -> Optional[SpeculativeDecodingStats]:
     """Derive per-request speculative-decoding acceptance for one sequence.
+
+    ``counters`` is the sequence's own ``CompletionOutput._spec_dec_counters``,
+    never the request-level copies on the GenerationResult: with n > 1 every
+    candidate reports its own counters and those copies hold whichever
+    candidate responded last.
 
     Returns None -- meaning the field is omitted entirely -- when the caller has
     not opted in, when the sequence has not finished (streaming carries this
@@ -163,11 +168,12 @@ def _build_spec_decode_stats(
     spec_dec_totals, which the executor accumulates exactly, rather than from
     summing the vectors.
     """
-    if not args.return_spec_decode_stats or finish_reason is None:
+    if (not args.return_spec_decode_stats or finish_reason is None
+            or counters is None):
         return None
-    totals = getattr(rsp, 'spec_dec_totals', None)
-    per_pos_accepted = getattr(rsp, 'per_pos_accepted', None)
-    per_pos_drafted = getattr(rsp, 'per_pos_drafted', None)
+    totals = counters.spec_dec_totals
+    per_pos_accepted = counters.per_pos_accepted
+    per_pos_drafted = counters.per_pos_drafted
     if not totals or not per_pos_drafted or not per_pos_accepted:
         return None
     accepted, drafted = totals
@@ -584,7 +590,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
             speculative_decoding=_build_spec_decode_stats(
-                rsp, args, output.finish_reason),
+                output._spec_dec_counters, args, output.finish_reason),
             stop_reason=output.stop_reason,
         )
         if args.return_logprobs:
@@ -751,7 +757,7 @@ def chat_response_post_processor(
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
             speculative_decoding=_build_spec_decode_stats(
-                rsp, args, output.finish_reason),
+                output._spec_dec_counters, args, output.finish_reason),
         )
         if output.finish_reason == "stop" and args.has_tool_call.get(
                 output.index, False):
@@ -881,7 +887,7 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
             speculative_decoding=_build_spec_decode_stats(
-                rsp, args, output.finish_reason),
+                output._spec_dec_counters, args, output.finish_reason),
         )
         if args.return_logprobs:
             logprobs = output.logprobs_diff
@@ -951,7 +957,7 @@ def completion_response_post_processor(
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
             speculative_decoding=_build_spec_decode_stats(
-                rsp, args, output.finish_reason),
+                output._spec_dec_counters, args, output.finish_reason),
         )
         if args.return_logprobs:
             logprobs = output.logprobs

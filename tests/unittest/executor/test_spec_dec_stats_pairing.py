@@ -124,7 +124,7 @@ class TestAccumulator:
         request = _fake_request(verified=deep, accepted=deep - 2, draft_buffer_len=deep)
         _accumulate([request], max_draft_len=deep)
         assert request.py_per_pos_drafted[:deep] == [1] * deep
-        assert request.py_per_pos_accepted[:deep - 2] == [1] * (deep - 2)
+        assert request.py_per_pos_accepted[: deep - 2] == [1] * (deep - 2)
         # The survival array must sum to the exact accepted total: that identity
         # is what a consumer derives the acceptance histogram from.
         assert sum(request.py_per_pos_accepted) == request.py_total_accepted_draft_tokens
