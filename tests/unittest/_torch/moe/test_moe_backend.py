@@ -174,7 +174,13 @@ def test_fp8_block_scale_moe_fallback_tactic_is_explicit_and_deterministic():
         _select_explicit_fallback_tactic([])
 
 
-def test_cutedsl_count_native_runner_keeps_both_tactics_and_threads_counts() -> None:
+@pytest.mark.parametrize("use_direct_expert_metadata", [False, True])
+def test_cutedsl_count_native_runner_keeps_both_tactics_and_threads_counts(
+    monkeypatch: pytest.MonkeyPatch, use_direct_expert_metadata: bool
+) -> None:
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl.get_sm_version", lambda: 100
+    )
     forward_impl = MagicMock(return_value=torch.empty(1))
     runner = CuteDslFusedMoENvfp4Runner(
         forward_impl=forward_impl,
@@ -182,19 +188,27 @@ def test_cutedsl_count_native_runner_keeps_both_tactics_and_threads_counts() -> 
         top_k=1,
         num_local_experts=8,
         local_expert_offset=0,
-        use_direct_expert_metadata=True,
+        use_direct_expert_metadata=use_direct_expert_metadata,
     )
     counts = torch.tensor([0, 1, 31, 32, 7, 0, 16, 2], dtype=torch.int32)
-    inputs = [torch.empty(8 * 32, 1) for _ in range(6)] + [counts]
+    inputs = [torch.empty(8 * 32, 1) for _ in range(6)]
+    forward_inputs = inputs + [counts] if use_direct_expert_metadata else inputs
 
-    runner.forward(inputs, tactic=256)
+    assert runner.forward(forward_inputs, tactic=256) is forward_impl.return_value
 
-    assert runner.unique_id()[-1] == "direct_expert_metadata"
     assert runner.get_valid_tactics([], OptimizationProfile()) == [128, 256]
-    assert runner.get_tuning_config().inputs_pre_hook is None
-    assert forward_impl.call_args.kwargs["recv_expert_count"] is counts
-    assert forward_impl.call_args.kwargs["deep_ep_expert_capacity"] == 32
-    assert forward_impl.call_args.kwargs["use_count_native_expert_metadata"] is True
+    expected_kwargs = {"enable_alltoall": False, "tile_size": 256}
+    if use_direct_expert_metadata:
+        assert runner.unique_id()[-1] == "direct_expert_metadata"
+        assert runner.get_tuning_config().inputs_pre_hook is None
+        expected_kwargs.update(
+            recv_expert_count=counts,
+            deep_ep_expert_capacity=32,
+            use_count_native_expert_metadata=True,
+        )
+    else:
+        assert runner.get_tuning_config().inputs_pre_hook is not None
+    forward_impl.assert_called_once_with(*inputs, **expected_kwargs)
 
 
 def test_cutedsl_direct_metadata_tuning_buckets_capacity_and_legacy_uses_tokens() -> None:

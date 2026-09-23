@@ -460,24 +460,24 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             tile_size = tactic
         else:
             tile_size = 128
-        recv_expert_count = None
-        forward_inputs = inputs
-        if self.use_direct_expert_metadata:
-            recv_expert_count = inputs[-1]
-            forward_inputs = inputs[:-1]
-            num_rows = forward_inputs[0].size(0)
-            if num_rows % self.num_local_experts != 0:
-                raise ValueError(
-                    "Expert-major input rows must be divisible by the number "
-                    "of local experts")
-            deep_ep_expert_capacity = num_rows // self.num_local_experts
-        else:
-            deep_ep_expert_capacity = None
+        if not self.use_direct_expert_metadata:
+            return self.forward_impl(*inputs,
+                                     enable_alltoall=self.enable_alltoall,
+                                     tile_size=tile_size)
+
+        recv_expert_count = inputs[-1]
+        forward_inputs = inputs[:-1]
+        num_rows = forward_inputs[0].size(0)
+        if num_rows % self.num_local_experts != 0:
+            raise ValueError(
+                "Expert-major input rows must be divisible by the number "
+                "of local experts")
+        deep_ep_expert_capacity = num_rows // self.num_local_experts
         # The locality-domain impl does not take the count-native arguments.
         count_native_kwargs = {} if self.use_locality_domain else dict(
             recv_expert_count=recv_expert_count,
             deep_ep_expert_capacity=deep_ep_expert_capacity,
-            use_count_native_expert_metadata=self.use_direct_expert_metadata)
+            use_count_native_expert_metadata=True)
         return self.forward_impl(*forward_inputs,
                                  enable_alltoall=self.enable_alltoall,
                                  tile_size=tile_size,
@@ -924,9 +924,9 @@ class CuteDslFusedMoE(MoEImplBase):
 
         self.scaling_vector_size = 16
         # locality domain: fork/join with _locality_domain kernel variants + shared output buffers.
-        # Weight splitting happens in post_load_weights after normal loading.
+        # Weight splitting happens in transform_weights after normal loading.
         self._locality_domain_runtime = None
-        self._locality_domain_weight_shards = None  # set in post_load_weights
+        self._locality_domain_weight_shards = None  # set in transform_weights
         planner = LocalityDomainExecutionPlanner(
             model_config.locality_domain_policy)
         self._locality_domain_plan = planner.plan_moe(
@@ -2036,17 +2036,26 @@ class CuteDslFusedMoE(MoEImplBase):
     def load_weights(self,
                      weights: List[Dict],
                      allow_partial_loading: bool = False):
+        if self._locality_domain_weight_shards is not None:
+            self.pre_reload_weights()
         super().load_weights(weights,
                              allow_partial_loading=allow_partial_loading)
         # Keep DWDP registration after base weight loading. This preserves
         # loaded tensors for collector setup and remains compatible with the
-        # later locality domain post_load_weights splitting flow.
+        # later locality domain transform_weights splitting flow.
         dwdp_handle_collector = getattr(self, "dwdp_handle_collector", None)
         if dwdp_handle_collector is not None:
             dwdp_handle_collector.register_weights(self)
 
-    def post_load_weights(self):
-        super().post_load_weights()
+    def transform_weights(self) -> None:
+        # ConfigurableMoE and ModelLoader call staged hooks directly. Localized
+        # allocations belong to the mutating transform stage, not the reader's
+        # cache_derived_state stage or an override of post_load_weights.
+        if getattr(self, "_weights_transformed", False):
+            return
+        self.quant_method.transform_weights(self)
+        # Refresh views of the finalized scales before copying their shards.
+        self.quant_method.setup_quant_scales(self)
         # Split full weights into per-partition halves on localized memory
         if self._locality_domain_runtime is not None:
             self._locality_domain_weight_shards = self._split_weights_for_locality_domain(
@@ -2055,6 +2064,14 @@ class CuteDslFusedMoE(MoEImplBase):
             # Resolve the borrowed remainder stream now, never during capture.
             self._get_reserved_moe_output_memset_stream()
             self._release_full_weights_after_locality_domain_split()
+        self._weights_transformed = True
+
+    def pre_reload_weights(self) -> None:
+        # The quant method rebuilds the original full-weight schemas. Drop
+        # shards so the next transform uses the newly loaded checkpoint.
+        super().pre_reload_weights()
+        self._locality_domain_weight_shards = None
+        self._weights_transformed = False
 
     def _release_full_weights_after_locality_domain_split(self):
         """Release full tensors that are replaced by localized locality domain shards."""
@@ -2067,6 +2084,11 @@ class CuteDslFusedMoE(MoEImplBase):
             param = getattr(self, param_name, None)
             if param is None:
                 continue
+            metadata = self.rebuild_tensor_metadata.get(param_name)
+            meta_tensor = param.to(
+                "meta") if metadata is None else metadata["meta"]
+            # Retain the reload schema without a reference to the full weight.
+            self.rebuild_tensor_metadata[param_name] = {"meta": meta_tensor}
             setattr(
                 self,
                 param_name,

@@ -411,8 +411,6 @@ def test_mlp_fp4out_min_m_switch():
         (107, False, False),
     ],
 )
-# TODO: drop this skip when the locality-domain wiring PR lands.
-@pytest.mark.skip(reason="requires locality-domain wiring from a later PR in this series")
 def test_nvfp4_swiglu_blackwell_capability(monkeypatch, sm_version, partitioned, expected):
     """SM107 and locality domain shards must keep gate/up weights in the Rubin layout."""
     import types
@@ -428,6 +426,7 @@ def test_nvfp4_swiglu_blackwell_capability(monkeypatch, sm_version, partitioned,
     layer.has_bias = False
     layer.partition_plan = types.SimpleNamespace(enabled=partitioned)
     layer._weights_created = True
+    layer.quant_method = types.SimpleNamespace(quantizes_nvfp4_activations=True)
     layer.quant_config = types.SimpleNamespace(
         layer_quant_mode=types.SimpleNamespace(has_nvfp4=lambda: True),
     )
@@ -438,6 +437,9 @@ def test_nvfp4_swiglu_blackwell_capability(monkeypatch, sm_version, partitioned,
     mlp = GatedMLP.__new__(GatedMLP)
     torch.nn.Module.__init__(mlp)
     mlp.gate_up_proj = layer
+    mlp.activation = F.silu
+    mlp.swiglu_alpha = None
+    mlp.swiglu_beta = None
 
     assert layer.can_use_cute_dsl_nvfp4_swiglu_blackwell() is expected
     assert mlp._can_fuse_gate_up_swiglu() is expected

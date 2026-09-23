@@ -55,6 +55,7 @@ from tensorrt_llm._torch.utils import (
     unswizzle_sf,
 )
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 
 def swiglu_ref(x: torch.Tensor, swiglu_limit: float = float("inf")) -> torch.Tensor:
@@ -4254,7 +4255,14 @@ def test_moe_module_locality_domain_correctness_rubin(num_tokens: int, top_k: in
     get_sm_version() != 107,
     reason="This test is only supported on Rubin (SM 107) GPUs",
 )
-def test_moe_module_bf16_locality_domain_lifecycle_and_forward_chunk_rubin():
+@pytest.mark.parametrize(
+    ("quant_algo", "rtol", "atol"),
+    [
+        pytest.param(None, 1e-2, 2e-2, id="bf16"),
+        pytest.param(QuantAlgo.NVFP4, 1e-2, 0.15, id="nvfp4"),
+    ],
+)
+def test_moe_module_locality_domain_lifecycle_and_forward_rubin(quant_algo, rtol, atol):
     _skip_if_no_locality_domain()
 
     from _torch.moe.quantize_utils import get_test_quant_params
@@ -4263,8 +4271,9 @@ def test_moe_module_bf16_locality_domain_lifecycle_and_forward_chunk_rubin():
     from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.moe.fused_moe import RenormalizeMoeRoutingMethod
-    from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
+    from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
     from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+    from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
     from tensorrt_llm._utils import mpi_rank
     from tensorrt_llm.mapping import Mapping
 
@@ -4287,7 +4296,7 @@ def test_moe_module_bf16_locality_domain_lifecycle_and_forward_chunk_rubin():
         router_logits = torch.randn((num_tokens, num_experts), dtype=dtype, device="cuda")
 
         quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
-            None, input_tensor, "CUTEDSL"
+            quant_algo, input_tensor, "CUTEDSL"
         )
         quantize_util = quantize_util_cls(
             num_experts=num_experts,
@@ -4314,8 +4323,9 @@ def test_moe_module_bf16_locality_domain_lifecycle_and_forward_chunk_rubin():
                 moe_backend="CUTEDSL",
                 locality_domain_policy=LocalityDomainPolicy(enabled=enable_locality_domains),
             )
-            backend = create_moe_backend(
+            module = ConfigurableMoE(
                 moe_cls=CuteDslFusedMoE,
+                weight_loading_mode=MoEWeightLoadingMode.VANILLA,
                 routing_method=routing_method,
                 num_experts=num_experts,
                 hidden_size=hidden_size,
@@ -4323,9 +4333,9 @@ def test_moe_module_bf16_locality_domain_lifecycle_and_forward_chunk_rubin():
                 dtype=dtype,
                 reduce_results=True,
                 model_config=model_config,
-                init_load_balancer=False,
             )
-            backend.load_weights([weights])
+            module.load_weights([weights])
+            backend = module.backend
             full_w3_w1 = None
             full_w2 = None
             source_storage_ptrs = ()
@@ -4336,18 +4346,24 @@ def test_moe_module_bf16_locality_domain_lifecycle_and_forward_chunk_rubin():
                     backend.w3_w1_weight.untyped_storage().data_ptr(),
                     backend.w2_weight.untyped_storage().data_ptr(),
                 )
-            backend.post_load_weights()
-            backend.cuda()
-            return backend, full_w3_w1, full_w2, source_storage_ptrs
+            module.post_load_weights()
+            module.cuda()
+            return module, full_w3_w1, full_w2, source_storage_ptrs
 
-        base_backend, _, _, _ = create_backend(False)
-        locality_domain_backend, full_w3_w1, full_w2, source_storage_ptrs = create_backend(True)
+        base_module, _, _, _ = create_backend(False)
+        locality_module, full_w3_w1, full_w2, source_storage_ptrs = create_backend(True)
+        locality_domain_backend = locality_module.backend
 
         assert locality_domain_backend._locality_domain_runtime is not None
         assert locality_domain_backend._locality_domain_weight_shards is not None
         assert hasattr(locality_domain_backend, "_cached_reserved_moe_output_memset_stream")
 
         shards = locality_domain_backend._locality_domain_weight_shards
+        # Both the standalone post-load path and repeated reader walks must
+        # preserve already-localized storage.
+        locality_domain_backend.post_load_weights()
+        locality_module.cache_derived_state()
+        assert locality_domain_backend._locality_domain_weight_shards is shards
         for shard in shards:
             assert shard["w3_w1_weight"].untyped_storage().data_ptr() != source_storage_ptrs[0]
             assert shard["w2_weight"].untyped_storage().data_ptr() != source_storage_ptrs[1]
@@ -4356,17 +4372,28 @@ def test_moe_module_bf16_locality_domain_lifecycle_and_forward_chunk_rubin():
         assert locality_domain_backend.w3_w1_weight.numel() == 0
         assert locality_domain_backend.w2_weight.numel() == 0
 
-        # Keep the production-shape lifecycle and public forward_chunk
+        # Keep the production-shape lifecycle and scheduler-owned forward
         # integration here. Broad accuracy, autotune, capture, and outer-tile
         # replay are covered by the unified backend matrix.
         with torch.inference_mode():
-            base_output = base_backend.forward_chunk(input_tensor, router_logits)
-            locality_domain_output = locality_domain_backend.forward_chunk(
-                input_tensor, router_logits
-            )
+            base_output = base_module(input_tensor, router_logits)
+            locality_domain_output = locality_module(input_tensor, router_logits)
 
         torch.cuda.synchronize()
-        torch.testing.assert_close(base_output, locality_domain_output, rtol=1e-2, atol=0.15)
+        torch.testing.assert_close(base_output, locality_domain_output, rtol=rtol, atol=atol)
+
+        # Both direct updates and explicit reload hooks must rebuild released weights.
+        for explicit_pre_reload in (False, True):
+            shards = locality_domain_backend._locality_domain_weight_shards
+            if explicit_pre_reload:
+                locality_module.pre_reload_weights()
+            locality_module.load_weights([weights])
+            locality_module.post_load_weights()
+            assert locality_domain_backend._locality_domain_weight_shards is not shards
+            with torch.inference_mode():
+                reloaded_output = locality_module(input_tensor, router_logits)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(reloaded_output, base_output, rtol=rtol, atol=atol)
 
 
 @pytest.mark.skipif(

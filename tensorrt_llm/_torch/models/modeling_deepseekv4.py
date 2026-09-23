@@ -937,7 +937,7 @@ class DeepseekV4WeightLoader:
 
                     attn_module = all_named_modules[parent_module_name]
                     _, v_b_proj = split_kv_b_proj(module.weight.data, is_scale=False)
-                    attn_module.v_b_proj = nn.Parameter(v_b_proj, requires_grad=False)
+                    attn_module._bind_v_b_proj_weight(v_b_proj)
 
                     attn_module.k_b_proj_trans.data.copy_(
                         k_b_proj_trans.reshape(attn_module.k_b_proj_trans.shape)
@@ -1410,6 +1410,7 @@ class DeepseekV4Attention(MLA):
             o_lora_rank=config.o_lora_rank,
             mapping_with_cp=mapping_with_cp,
             reduce_output=reduce_output,
+            enable_locality_domain_bf16_linear=True,
         )
 
 

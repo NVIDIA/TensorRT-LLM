@@ -6104,6 +6104,12 @@ class TorchLlmArgs(BaseLlmArgs):
         description="If true, use CuTe DSL fp8 blockscaling bmm implementation.",
         status="prototype")
     # bf16 cute dsl configs
+    enable_locality_domains: bool = Field(
+        default=False,
+        description=
+        "Enable locality domain execution for supported PyTorch backend ops.",
+        status="prototype")
+
     use_cute_dsl_bf16_bmm: bool = Field(
         default=False,
         description=
@@ -6847,6 +6853,16 @@ class TorchLlmArgs(BaseLlmArgs):
                 "gms_config is set but load_format is '%s', not 'GMS'. "
                 "The GMS config will be ignored. Set load_format='GMS' to "
                 "enable GPU Memory Service.", self.load_format.name)
+        return self
+
+    @model_validator(mode="after")
+    def validate_gms_locality_domain_compat(self) -> 'TorchLlmArgs':
+        """Reject localized weights that cannot be shared through the GMS pool."""
+        if self.load_format == LoadFormat.GMS and self.enable_locality_domains:
+            raise ValueError(
+                "LoadFormat.GMS is incompatible with enable_locality_domains=True. "
+                "Localized weights are allocated outside the shared GMS pool. "
+                "Disable enable_locality_domains or use LoadFormat.AUTO.")
         return self
 
     @model_validator(mode="after")
