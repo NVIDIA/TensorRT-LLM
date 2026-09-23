@@ -35,6 +35,8 @@ can reach it.
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.utils import (
@@ -54,6 +56,56 @@ from .identity import MARLIN_CAPABILITIES, MARLIN_INPUT_REQUIREMENT
 
 # Block size for moe_align_block_size — must match TILE_M in the kernel
 _MOE_BLOCK_SIZE = 16
+# Hidden-dimension tile for _sum_topk_kernel. 256 BF16 elements × 4 warps
+# (128 threads) = 2 elements/thread per load — fills one 128B cache line and
+# keeps all warps active on Ada/Hopper without register pressure.
+_SUM_TOPK_BLOCK_H = 256
+
+
+@triton.jit
+def _sum_topk_kernel(
+    expert_outputs,
+    output,
+    num_tokens,
+    hidden_size: tl.constexpr,
+    top_k: tl.constexpr,
+    block_h: tl.constexpr,
+):
+    """Sum contiguous ``[token, top_k, hidden]`` Marlin expert outputs."""
+    token_idx = tl.program_id(0)
+    hidden_offsets = tl.program_id(1) * block_h + tl.arange(0, block_h)
+    mask = (token_idx < num_tokens) & (hidden_offsets < hidden_size)
+    accumulator = tl.zeros((block_h,), dtype=tl.float32)
+    for top_k_idx in tl.static_range(top_k):
+        offsets = (token_idx * top_k + top_k_idx) * hidden_size + hidden_offsets
+        accumulator += tl.load(expert_outputs + offsets, mask=mask, other=0.0).to(tl.float32)
+    tl.store(output + token_idx * hidden_size + hidden_offsets, accumulator, mask=mask)
+
+
+def sum_topk_expert_outputs(
+    expert_outputs: torch.Tensor,
+    num_tokens: int,
+    top_k: int,
+    hidden_size: int,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Reduce contiguous Marlin outputs from ``[num_tokens * top_k, hidden_size]``."""
+    output = torch.empty(
+        (num_tokens, hidden_size), dtype=output_dtype, device=expert_outputs.device
+    )
+    if num_tokens == 0:
+        return output
+    grid = (num_tokens, triton.cdiv(hidden_size, _SUM_TOPK_BLOCK_H))
+    _sum_topk_kernel[grid](
+        expert_outputs,
+        output,
+        num_tokens,
+        hidden_size=hidden_size,
+        top_k=top_k,
+        block_h=_SUM_TOPK_BLOCK_H,
+        num_warps=4,
+    )
+    return output
 
 
 def _has_fused_moe_kernel() -> bool:
@@ -369,17 +421,29 @@ class MarlinFusedMoEBase(MoEImplBase):
             use_fp32_reduce=False,
         )  # [num_tokens_gemm2, hidden_size]
 
-        # gemm2_out rows are flattened (token_idx * top_k + k) pairs, hence the
-        # floor-divide back to token indices for the index_add_ reduce.
+        # gemm2_out rows are [token_idx * top_k + k, hidden_size] — contiguous
+        # because marlin_nvfp4_moe_gemm writes size_n == unpadded_hidden_size
+        # with no hidden-dim padding.  The Triton kernel exploits this layout
+        # directly, accumulating top_k rows per token in FP32 (more precise
+        # than BF16 index_add_ which rounds after each expert).
         gemm2_out = gemm2_out[:num_tokens_gemm2, : self.unpadded_hidden_size]
+        if gemm2_out.is_contiguous():
+            return sum_topk_expert_outputs(
+                gemm2_out,
+                num_tokens,
+                top_k,
+                self.unpadded_hidden_size,
+                output_dtype,
+            )
+
+        # Fallback: gemm2_out is non-contiguous (e.g. future kernel pads the
+        # hidden dimension).  index_add_ handles arbitrary strides safely.
         row_indices = torch.arange(num_tokens_gemm2, device=x.device)
         orig_tokens = row_indices // top_k
-
         final_hidden_states = torch.zeros(
             (num_tokens, self.unpadded_hidden_size),
             dtype=output_dtype,
             device=x.device,
         )
         final_hidden_states.index_add_(0, orig_tokens, gemm2_out.to(output_dtype))
-
         return final_hidden_states
