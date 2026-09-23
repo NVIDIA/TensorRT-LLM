@@ -634,10 +634,15 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
         as reasoning_content since we are still in reasoning mode.
 
         If the closing tag was already found (or reasoning was never
-        entered), flushes any remaining buffer as content."""
+        entered), flushes any remaining buffer as content.
+
+        A buffer holding exactly a complete tag is a delimiter rather than
+        model output, so it is discarded."""
+        remaining = self._buffer
+        self._buffer = ""
+        if remaining in (self.reasoning_start, self.reasoning_end):
+            remaining = ""
         if self.in_reasoning and not self._found_closing_tag:
-            remaining = self._buffer
-            self._buffer = ""
             if self._force_nonempty_content:
                 all_content = self._accumulated_reasoning + remaining
                 self._accumulated_reasoning = ""
@@ -648,8 +653,6 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
             if remaining:
                 return ReasoningParserResult(reasoning_content=remaining)
             return ReasoningParserResult()
-        remaining = self._buffer
-        self._buffer = ""
         if remaining:
             return ReasoningParserResult(content=remaining)
         return ReasoningParserResult()
