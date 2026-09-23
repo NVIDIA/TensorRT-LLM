@@ -495,6 +495,62 @@ class TestServerInjectedControls:
             )
 
 
+class TestParserConsumedControls:
+    """Controls a reasoning parser reads after generation must not be rejected.
+
+    `force_nonempty_content` is consumed by NemotronV3ReasoningParser
+    (llmapi/reasoning_parser.py), which reads it from chat_template_kwargs to
+    decide whether an empty-content response gets its reasoning swapped into
+    content. The standard Nemotron template never references the key, so a
+    guard that only accepts template-referenced kwargs rejected previously
+    valid requests.
+    """
+
+    _MESSAGES = [{"role": "user", "content": "hi"}]
+    # What a Nemotron caller sends against a Nemotron-style template:
+    # TEMPLATE_WITH_TOGGLE reads `enable_thinking` but not
+    # `force_nonempty_content`, matching the real template.
+    _KWARGS = {"enable_thinking": True, "force_nonempty_content": True}
+
+    def test_force_nonempty_content_renders_on_server_path(self):
+        rendered = apply_chat_template(
+            model_type="fake_model_type_for_guard_test",
+            tokenizer=_FakeJinjaTokenizer(TEMPLATE_WITH_TOGGLE),
+            processor=None,
+            conversation=list(self._MESSAGES),
+            add_generation_prompt=True,
+            mm_placeholder_counts=[{}],
+            chat_template_kwargs=dict(self._KWARGS),
+        )
+        assert rendered == "rendered"
+
+    def test_force_nonempty_content_renders_on_router_path(self):
+        from tensorrt_llm.serve.chat_tokenization import render_chat_request_for_tokenizer
+        from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=list(self._MESSAGES),
+            chat_template_kwargs=dict(self._KWARGS),
+        )
+        tokenizer = _FakeRouterTokenizer(TEMPLATE_WITH_TOGGLE)
+        assert render_chat_request_for_tokenizer(request, tokenizer) == "rendered"
+        # Accepted, not pruned: the parser reads the key from the same dict
+        # after generation, so it must still reach the renderer untouched.
+        assert tokenizer.applied_kwargs["force_nonempty_content"] is True
+
+    def test_same_kwargs_drive_the_nemotron_parser(self):
+        # The exemption exists because this consumer does: with the kwargs the
+        # guard just accepted, the parser swaps an all-reasoning response
+        # (no closing think tag) into content instead of leaving it empty.
+        from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+
+        parser = ReasoningParserFactory.create_reasoning_parser("nemotron-v3", dict(self._KWARGS))
+        result = parser.parse("a b")
+        assert result.content == "a b"
+        assert result.reasoning_content == ""
+
+
 def _chat_request_as_the_server_sees_it(body: dict):
     """Build a ChatCompletionRequest the way ``openai_server.openai_chat`` ends up with it.
 
