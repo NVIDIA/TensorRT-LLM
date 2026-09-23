@@ -81,6 +81,7 @@ class SmemPResource(MlaResource):
     """
 
     inst_id: cutlass.Constexpr[int] = 0
+    store_softmax_stats: cutlass.Constexpr[bool] = False
     scale_softmax_log2: Float32 = None
     tmem_s_ref: Optional[MemoryResource] = None
     order_p01_alloc: cutlass.Constexpr[Optional[SmemAllocation]] = None
@@ -264,11 +265,21 @@ class SmemPResource(MlaResource):
                     scale_idx = scale_base + (s_idx % 2)
                     p_val = Float32(0.0)
                     if new_max_arr[scale_idx] != neg_max_f32():
-                        p_val = cute.math.exp2(
-                            s_arr[s_idx] * self.scale_softmax_log2
-                            + neg_scaled_max[scale_idx],
-                            fastmath=True,
-                        )
+                        if cutlass.const_expr(self.store_softmax_stats):
+                            # Subtract raw maxima before scaling: a fused
+                            # multiply/add of large absolutes loses the origin.
+                            p_val = cute.math.exp2(
+                                (s_arr[s_idx] - new_max_arr[scale_idx])
+                                * self.scale_softmax_log2
+                                + fp8_log2_quant_scale(),
+                                fastmath=True,
+                            )
+                        else:
+                            p_val = cute.math.exp2(
+                                s_arr[s_idx] * self.scale_softmax_log2
+                                + neg_scaled_max[scale_idx],
+                                fastmath=True,
+                            )
                     p_vals[elem_idx] = p_val
                     local_sums[scale_idx] += p_val
                 regs_p[packed_idx] = pack_float4_to_fp8_e4m3(
@@ -287,15 +298,29 @@ class SmemPResource(MlaResource):
                 new_max0 = new_max_arr[scale0]
                 new_max1 = new_max_arr[scale1]
                 if new_max0 != neg_max_f32():
-                    p0 = cute.math.exp2(
-                        s_arr[s0] * self.scale_softmax_log2 + neg_scaled_max[scale0],
-                        fastmath=True,
-                    )
+                    if cutlass.const_expr(self.store_softmax_stats):
+                        p0 = cute.math.exp2(
+                            (s_arr[s0] - new_max0) * self.scale_softmax_log2,
+                            fastmath=True,
+                        )
+                    else:
+                        p0 = cute.math.exp2(
+                            s_arr[s0] * self.scale_softmax_log2
+                            + neg_scaled_max[scale0],
+                            fastmath=True,
+                        )
                 if new_max1 != neg_max_f32():
-                    p1 = cute.math.exp2(
-                        s_arr[s1] * self.scale_softmax_log2 + neg_scaled_max[scale1],
-                        fastmath=True,
-                    )
+                    if cutlass.const_expr(self.store_softmax_stats):
+                        p1 = cute.math.exp2(
+                            (s_arr[s1] - new_max1) * self.scale_softmax_log2,
+                            fastmath=True,
+                        )
+                    else:
+                        p1 = cute.math.exp2(
+                            s_arr[s1] * self.scale_softmax_log2
+                            + neg_scaled_max[scale1],
+                            fastmath=True,
+                        )
                 local_sums[scale0] += p0
                 local_sums[scale1] += p1
                 regs_p[pair_idx] = pack_float2_to_bf16(p0, p1)

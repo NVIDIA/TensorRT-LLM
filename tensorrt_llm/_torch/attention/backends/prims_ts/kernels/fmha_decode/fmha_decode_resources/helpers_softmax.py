@@ -148,6 +148,7 @@ def _compute_fp8_p_regs_and_local_sums(
     s5: Float32,
     s6: Float32,
     s7: Float32,
+    store_softmax_stats: Constexpr[bool] = False,
 ) -> tuple[Int32, Int32, Float32, Float32]:
     """Compute masked FP8 P registers and local softmax sums."""
     # Safe path: masked tiles can produce NEG_FLT_MAX as new_max. Treat that
@@ -158,6 +159,15 @@ def _compute_fp8_p_regs_and_local_sums(
     if safe_new_max_0 == _neg_max_f32():
         safe_new_max_0 = Float32(0.0)
     if safe_new_max_1 == _neg_max_f32():
+        safe_new_max_1 = Float32(0.0)
+    if cutlass.const_expr(store_softmax_stats):
+        # Subtract raw scores before scaling; a rounded absolute offset can
+        # leave a nonzero fused exponent even when the score equals the max.
+        s0, s1 = fadd2((s0, s1), (-safe_new_max_0, -safe_new_max_1))
+        s2, s3 = fadd2((s2, s3), (-safe_new_max_0, -safe_new_max_1))
+        s4, s5 = fadd2((s4, s5), (-safe_new_max_0, -safe_new_max_1))
+        s6, s7 = fadd2((s6, s7), (-safe_new_max_0, -safe_new_max_1))
+        safe_new_max_0 = Float32(0.0)
         safe_new_max_1 = Float32(0.0)
     neg_scaled_max_pair = ffma2(
         (safe_new_max_0, safe_new_max_1),
@@ -218,9 +228,19 @@ def _compute_fp8_p_regs_and_local_sums_dense(
     s5: Float32,
     s6: Float32,
     s7: Float32,
+    store_softmax_stats: Constexpr[bool] = False,
 ) -> tuple[Int32, Int32, Float32, Float32]:
     """Compute dense FP8 P registers and local softmax sums."""
     # Dense path: all S entries are valid, so no NEG_FLT_MAX guard is needed.
+    if cutlass.const_expr(store_softmax_stats):
+        # Subtract raw scores before scaling; a rounded absolute offset can
+        # leave a nonzero fused exponent even when the score equals the max.
+        s0, s1 = fadd2((s0, s1), (-new_max_0, -new_max_1))
+        s2, s3 = fadd2((s2, s3), (-new_max_0, -new_max_1))
+        s4, s5 = fadd2((s4, s5), (-new_max_0, -new_max_1))
+        s6, s7 = fadd2((s6, s7), (-new_max_0, -new_max_1))
+        new_max_0 = Float32(0.0)
+        new_max_1 = Float32(0.0)
     neg_scaled_max_pair = ffma2(
         (new_max_0, new_max_1),
         (-scale_softmax_log2, -scale_softmax_log2),
@@ -277,6 +297,7 @@ def _compute_p_values_and_local_sums_dense(
     s5: Float32,
     s6: Float32,
     s7: Float32,
+    store_softmax_stats: Constexpr[bool] = False,
 ) -> tuple[
     Float32,
     Float32,
@@ -292,6 +313,15 @@ def _compute_p_values_and_local_sums_dense(
     """Compute dense 16-bit P values and paired local softmax sums."""
     # Dense 16-bit path: compute eight P values and the two local sums without
     # per-row validity checks.
+    if cutlass.const_expr(store_softmax_stats):
+        # Subtract raw scores before scaling; a rounded absolute offset can
+        # leave a nonzero fused exponent even when the score equals the max.
+        s0, s1 = fadd2((s0, s1), (-new_max_0, -new_max_1))
+        s2, s3 = fadd2((s2, s3), (-new_max_0, -new_max_1))
+        s4, s5 = fadd2((s4, s5), (-new_max_0, -new_max_1))
+        s6, s7 = fadd2((s6, s7), (-new_max_0, -new_max_1))
+        new_max_0 = Float32(0.0)
+        new_max_1 = Float32(0.0)
     neg_scaled_max_pair = fmul2(
         (new_max_0, new_max_1),
         (-scale_softmax_log2, -scale_softmax_log2),

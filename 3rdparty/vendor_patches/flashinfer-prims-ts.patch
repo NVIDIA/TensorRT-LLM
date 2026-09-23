@@ -57,7 +57,7 @@ index c7e881ca73dfb95314da532912db39fe7b05eb94..e19dc7b1de7fca03c44b8e98217f8d10
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/context.py b/context.py
-index 4ada42762c38c1c7215d2dfbe4582926fd8f9701..678432780332b20a78fb553405ad1e29d692b430 100644
+index 187f0ec0c093d00f7548524f4186543480d26dc7..60315ebab3e148d4a4afa318055656b13f9f01c4 100644
 --- a/context.py
 +++ b/context.py
 @@ -31,8 +31,7 @@ position is ``q + (S_kv - S_q)`` and ``window_left`` is measured from that
@@ -70,7 +70,7 @@ index 4ada42762c38c1c7215d2dfbe4582926fd8f9701..678432780332b20a78fb553405ad1e29
  """
  
  from dataclasses import dataclass
-@@ -438,7 +437,7 @@ def _validate_device(device: torch.device) -> int:
+@@ -450,7 +449,7 @@ def _validate_device(device: torch.device) -> int:
      # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
      # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
      if capability == (10, 7):
@@ -80,7 +80,7 @@ index 4ada42762c38c1c7215d2dfbe4582926fd8f9701..678432780332b20a78fb553405ad1e29
          require_cute_dsl_arch(device_index)
      return device_index
 diff --git a/decode.py b/decode.py
-index b47093bd298ea9b5514e6b25ad2a34a47ac3bff0..35236fcc7ce98bdee1f51f72dbd1f841cdbce7b2 100644
+index 76e6ee7d178a01681fd7ab54f8b1639149c30cf3..fc53565691590828904a07b0a1b9c962a4c9d102 100644
 --- a/decode.py
 +++ b/decode.py
 @@ -1,3 +1,4 @@
@@ -109,7 +109,7 @@ index b47093bd298ea9b5514e6b25ad2a34a47ac3bff0..35236fcc7ce98bdee1f51f72dbd1f841
  
          require_cute_dsl_arch(device_index)
      return device_index
-@@ -2145,7 +2141,7 @@ def _validate_decode_run_metadata_values(
+@@ -2201,7 +2197,7 @@ def _validate_decode_run_metadata_values(
                  )
  
  
@@ -118,7 +118,7 @@ index b47093bd298ea9b5514e6b25ad2a34a47ac3bff0..35236fcc7ce98bdee1f51f72dbd1f841
  def prims_ts_batch_decode_with_kv_cache(
      query: torch.Tensor,
      kv_cache: PagedKVCache,
-@@ -2708,7 +2704,7 @@ class BatchDecodePagedTSWrapper:
+@@ -2790,7 +2786,7 @@ class BatchDecodePagedTSWrapper:
          # previous complete plan revision usable.
          self._plan_state = candidate
  
@@ -127,7 +127,7 @@ index b47093bd298ea9b5514e6b25ad2a34a47ac3bff0..35236fcc7ce98bdee1f51f72dbd1f841
      def run(
          self,
          q: torch.Tensor,
-@@ -2893,7 +2889,7 @@ class BatchDecodePagedTSWrapper:
+@@ -2987,7 +2983,7 @@ class BatchDecodePagedTSWrapper:
          )
  
  
@@ -137,7 +137,7 @@ index b47093bd298ea9b5514e6b25ad2a34a47ac3bff0..35236fcc7ce98bdee1f51f72dbd1f841
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/mla_decode.py b/mla_decode.py
-index 8b7f19d1cc2baab6309018d46213f509c44d919a..cff2ee7d2ad051c8061ad396b87ee973eebed788 100644
+index 81e0c4371a8361ee0d1cd1e10d315e6568c7233b..4a4fc3eea0b45c5372b6a6c73bc09a258de81237 100644
 --- a/mla_decode.py
 +++ b/mla_decode.py
 @@ -1,3 +1,4 @@
@@ -153,8 +153,8 @@ index 8b7f19d1cc2baab6309018d46213f509c44d919a..cff2ee7d2ad051c8061ad396b87ee973
  )
  
  from ._tensor_aliasing import (
-@@ -1799,7 +1799,7 @@ class BatchMLADecodePagedTSWrapper:
-             split_kv=int(dict(policy)["split_kv"]),
+@@ -1876,7 +1876,7 @@ class BatchMLADecodePagedTSWrapper:
+             store_softmax_stats=store_softmax_stats,
          )
  
 -    @flashinfer_api(trace=prims_ts_decode_mla_wrapper_trace_dispatch)
