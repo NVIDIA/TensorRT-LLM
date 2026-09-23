@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc28';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc27" />
+  <meta name="docsearch:version" content="1.3.0rc28" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -373,6 +373,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector_vswa.html">KV Cache Connector under VSWA</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
@@ -406,13 +407,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
@@ -560,6 +558,7 @@
 <li class="toctree-l2"><a class="reference internal" href="visualgen-sparse-attention.html">Sparse Attention</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1"><a class="reference internal" href="prefix-tokenization-cache.html">Prefix-Tokenization Cache</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -749,7 +748,7 @@ one. Set it to <code class="docutils literal notranslate"><span class="pre">true
 </tr>
 </thead>
 <tbody>
-<tr class="row-even"><td><p>Hybrid Mamba (NemotronH, Qwen3-Next)</p></td>
+<tr class="row-even"><td><p>Hybrid Mamba (NemotronH and its multimodal models, Qwen3-Next)</p></td>
 <td><p>Attention KV and Mamba state pools must be sized together</p></td>
 </tr>
 <tr class="row-odd"><td><p>DeepSeek-V4</p></td>
@@ -761,12 +760,27 @@ one. Set it to <code class="docutils literal notranslate"><span class="pre">true
 <tr class="row-odd"><td><p>Gemma3 / Gemma4 (text and multimodal)</p></td>
 <td><p>Alternating sliding-window and full-attention layers (VSWA); same independent pool sizing</p></td>
 </tr>
+<tr class="row-even"><td><p>Llama / Llama4</p></td>
+<td><p>Uniform KV pool layout; chunked attention does not partition the pools</p></td>
+</tr>
 </tbody>
 </table>
 </div>
 <p>Separately, Gemma4 hybrid attention and sparse-attention models are routed to
 V2 unconditionally: their per-layer buffer layouts cannot be represented by V1’s
 unified pool, so <code class="docutils literal notranslate"><span class="pre">use_kv_cache_manager_v2</span></code> does not apply to them.</p>
+<p>For a model whose <code class="docutils literal notranslate"><span class="pre">layer_types</span></code> mixes sliding-window and full-attention layers
+and that publishes a single <code class="docutils literal notranslate"><span class="pre">sliding_window</span></code> (GPT-OSS, Gemma3), the V2 manager
+derives one attention window per layer from <code class="docutils literal notranslate"><span class="pre">layer_types</span></code> when
+<code class="docutils literal notranslate"><span class="pre">max_attention_window</span></code> is not set: sliding layers get <code class="docutils literal notranslate"><span class="pre">sliding_window</span></code>, full
+layers get <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>, and the two window sizes form two layer groups whose
+pools are sized independently. The derived list is logged at startup. Set
+<code class="docutils literal notranslate"><span class="pre">max_attention_window</span></code> explicitly to override the derivation; a single entry
+restores one full-context pool for every layer. With derived windows,
+<code class="docutils literal notranslate"><span class="pre">pool_ratio</span></code> must carry one entry per layer group (two for such a model). If a
+configured <code class="docutils literal notranslate"><span class="pre">pool_ratio</span></code> does not match the derived group count, the manager
+logs a warning and keeps the single-window default, so existing configurations
+continue to run.</p>
 <p>For the native V2 cold-storage representation and codec extension contract, see
 <a class="reference internal" href="../developer-guide/kv-cache-cold-page-codec.html"><span class="std std-doc">KVCacheManagerV2 Cold-Page Codec Design</span></a>.</p>
 </section>
@@ -809,7 +823,7 @@ layer group in layer-group ID order.
 If neither <code class="docutils literal notranslate"><span class="pre">avg_seq_len</span></code> nor an explicit <code class="docutils literal notranslate"><span class="pre">pool_ratio</span></code> is configured, hybrid
 Mamba models warn and fall back to half of <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>, which can produce a
 suboptimal pool split. Exact explicit boundaries currently require
-<code class="docutils literal notranslate"><span class="pre">MambaHybridCacheManagerV2</span></code>, <code class="docutils literal notranslate"><span class="pre">max_beam_width=1</span></code>, and no KV connector. Hybrid
+<code class="docutils literal notranslate"><span class="pre">MambaHybridCacheManagerV2</span></code> and <code class="docutils literal notranslate"><span class="pre">max_beam_width=1</span></code>. Hybrid
 Mamba models select V2 by default (see
 <a class="reference internal" href="#selecting-the-kv-cache-manager">Selecting the KV Cache Manager</a>); set
 <code class="docutils literal notranslate"><span class="pre">use_kv_cache_manager_v2</span></code> to <code class="docutils literal notranslate"><span class="pre">false</span></code> to select the V1 C++
@@ -826,7 +840,7 @@ snapshots only.</p>
 <section id="multimodal-uuid-support-for-cache-identification">
 <h3>Multimodal UUID Support for Cache Identification<a class="headerlink" href="#multimodal-uuid-support-for-cache-identification" title="Link to this heading">#</a></h3>
 <p>When working with multimodal models (e.g., vision-language models), the KV cache system needs to identify which cached blocks correspond to which multimodal inputs (images, videos, etc.). By default, the system uses content-based hashing to generate unique identifiers for each multimodal input. However, this approach has limitations for cache management across sessions, as the same content must be re-processed to generate the same hash.</p>
-<p>To enable deterministic cache management, you can provide custom UUID strings for your multimodal data using the <code class="docutils literal notranslate"><span class="pre">multi_modal_uuids</span></code> parameter when creating requests. When provided, these UUIDs are returned in KV cache events instead of computed content hashes, while the cache key itself is computed from <strong>both</strong> the UUID and content together for correctness.</p>
+<p>You can provide custom UUID strings for your multimodal data using the <code class="docutils literal notranslate"><span class="pre">multi_modal_uuids</span></code> parameter when creating requests. Both cache managers compute the item digest from <strong>both</strong> the UUID and content together for correctness. V1 returns the original UUID in the KV cache event’s <code class="docutils literal notranslate"><span class="pre">mm_keys[].hash</span></code> field when one is supplied. V2 returns the item digest as a hexadecimal string, including for items with UUIDs.</p>
 <p><strong>Usage Example:</strong></p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.inputs</span><span class="w"> </span><span class="kn">import</span> <span class="n">TextPrompt</span>
 
@@ -842,15 +856,16 @@ snapshots only.</p>
 <ul class="simple">
 <li><p><strong>Cache Correctness</strong>: When a UUID is provided, the cache key is computed from both the UUID and content together using <code class="docutils literal notranslate"><span class="pre">BLAKE3(UUID</span> <span class="pre">||</span> <span class="pre">Content)</span></code>. This ensures different content always produces different cache entries, even with the same UUID.</p></li>
 <li><p><strong>User Isolation</strong>: Same content with different UUIDs produces different cache entries, enabling per-user or per-session cache isolation.</p></li>
-<li><p><strong>Stable Event Identifiers</strong>: The original UUID string is preserved and returned in KV cache events via <code class="docutils literal notranslate"><span class="pre">get_kv_cache_events()</span></code>, enabling deterministic external cache management.</p></li>
+<li><p><strong>Stable Event Identifiers</strong>: <code class="docutils literal notranslate"><span class="pre">get_kv_cache_events()</span></code> returns the original UUID for V1, or the item digest for V2. V2 consumers can use the same digest that appears in its cache-key token sequence.</p></li>
 <li><p><strong>Partial UUID Support</strong>: You can provide UUIDs for some items and use <code class="docutils literal notranslate"><span class="pre">None</span></code> for others to fall back to content-only hashing.</p></li>
 <li><p><strong>Cross-Modality Support</strong>: Different modalities (images, videos) can each have their own UUIDs.</p></li>
 </ul>
 <p><strong>UUID Format:</strong></p>
 <ul class="simple">
 <li><p>Can be any string (e.g., “image-123”, “user-session-img-a”, database keys)</p></li>
-<li><p>Original UUID strings are preserved and returned in KV cache events</p></li>
+<li><p>Original UUID strings are preserved in request metadata and returned in V1 KV cache events</p></li>
 </ul>
+<p>V2 derives <code class="docutils literal notranslate"><span class="pre">mm_keys</span></code> directly from the cached token sequence. Each entry identifies a continuous multimodal segment within that block: <code class="docutils literal notranslate"><span class="pre">hash</span></code> is the item’s digest, and <code class="docutils literal notranslate"><span class="pre">start_offset</span></code> is the segment’s first token offset within the item. An item spanning multiple blocks retains the same digest with increasing offsets. Text may separate segments of the same item. Items are processed in prompt order; one item cannot resume after another item has started. The item digest is distinct from <code class="docutils literal notranslate"><span class="pre">block_hash</span></code>, which also depends on the preceding token sequence.</p>
 </section>
 <section id="enable-offloading-to-host-memory">
 <h3>Enable Offloading to Host Memory<a class="headerlink" href="#enable-offloading-to-host-memory" title="Link to this heading">#</a></h3>
@@ -1151,9 +1166,9 @@ dropped before reaching the executor.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 14, 2026.</p>
+  <p>Last updated on September 21, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e">fca831e</a>.</p>
   
 </div></div>
       

@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc28';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc27" />
+  <meta name="docsearch:version" content="1.3.0rc28" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -373,6 +373,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector_vswa.html">KV Cache Connector under VSWA</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
@@ -406,13 +407,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
@@ -560,6 +558,7 @@
 <li class="toctree-l2"><a class="reference internal" href="visualgen-sparse-attention.html">Sparse Attention</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1"><a class="reference internal" href="prefix-tokenization-cache.html">Prefix-Tokenization Cache</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -813,7 +812,8 @@ mixed-layout tests.</p></li>
 <li><p>Run a real ModelExpress donor/receiver test with the model configurations
 being claimed, including the supported quantization and TP/PP/EP layouts.
 Compare deterministic output token IDs with the standard Hugging Face load
-path before documenting the family as supported.</p></li>
+path, and require the per-rank weight manifests to match (see the
+qualification test below), before documenting the family as supported.</p></li>
 </ol>
 </section>
 <section id="qualification-test">
@@ -824,15 +824,48 @@ baseline, a live MX donor, and an MX receiver on disjoint GPU sets. The receiver
 uses a metadata-only view of the donor’s canonical snapshot and contains no
 weight shards. A positive result therefore requires direct transfer; disk
 fallback cannot accidentally satisfy the test.</p>
+<p>Each role generates eight fixed prompts for exactly 32 greedy tokens
+(<code class="docutils literal notranslate"><span class="pre">end_id=-1</span></code>, so no sequence stops early), and the test requires exact
+token-ID equality of the donor and the receiver against the HF baseline.</p>
+<p><strong>Weight manifests.</strong> Every rank also writes a SHA-256 manifest of all
+registered parameters and buffers
+(<code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/weight_sharing/weight_manifest.py</span></code>) when
+<code class="docutils literal notranslate"><span class="pre">MX_WEIGHT_MANIFEST_DIR</span></code> is set; the harness sets it for all three roles and
+production loads never write one. Two manifest families are compared byte for
+byte:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">manifest.final.&lt;role&gt;.rank&lt;N&gt;.json</span></code> is written at the end of
+<code class="docutils literal notranslate"><span class="pre">ModelLoader.load</span></code>, after every post-load hook and MoE load-balancer
+finalization. Baseline, donor, and receiver must be pairwise identical:
+same tensor names, dtypes, shapes, strides, storage offsets, digests,
+skipped-tensor sets, and storage-alias partitions.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">manifest.transfer.&lt;role&gt;.rank&lt;N&gt;.json</span></code> is written inside the MX checkpoint
+loader at the donor’s publish point and at the receiver’s P2P success point
+(MX roles only). Donor and receiver parameters must be identical at this
+boundary; derived buffers are enforced at the final tier because the
+receiver’s <code class="docutils literal notranslate"><span class="pre">cache_derived_state()</span></code> runs after the transfer.</p></li>
+</ul>
+<p>A row may list <code class="docutils literal notranslate"><span class="pre">final_manifest_exempt_patterns</span></code> on its <code class="docutils literal notranslate"><span class="pre">MxE2ECase</span></code> to exempt
+named tensors from the final-tier digest comparison. That is never a numeric
+tolerance and never applies to the transfer tier, and every pattern needs a
+code comment explaining why; the current BF16 dense rows exempt nothing.
+Manifests carry a <code class="docutils literal notranslate"><span class="pre">manifest_format_version</span></code>, and manifests of different
+versions never compare.</p>
 <p>Run the TP=1 smoke test against an isolated ModelExpress 0.5.1 service with
 NIXL enabled:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">TRTLLM_MX_E2E_REQUIRED</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
 <span class="nv">MODEL_EXPRESS_URL</span><span class="o">=</span>http://127.0.0.1:8001<span class="w"> </span><span class="se">\</span>
 <span class="nv">LLM_MODELS_ROOT</span><span class="o">=</span>/path/to/llm-models<span class="w"> </span><span class="se">\</span>
 pytest<span class="w"> </span>-v<span class="w"> </span>tests/integration/defs/model_express/test_model_express.py<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>-k<span class="w"> </span>llama-bf16-tp1
+<span class="w">  </span>-k<span class="w"> </span>llama-bf16-tp1<span class="w"> </span>--output-dir<span class="w"> </span>/path/to/artifacts
 </pre></div>
 </div>
+<p>With <code class="docutils literal notranslate"><span class="pre">--output-dir</span></code> (always set in CI), the worker payloads, worker logs,
+transfer logs, weight manifests, and <code class="docutils literal notranslate"><span class="pre">timing.json</span></code> are copied to
+<code class="docutils literal notranslate"><span class="pre">model_express/&lt;case-id&gt;/</span></code> under that directory, so they are part of the stage
+results archive even when the test fails. The test also prints one
+<code class="docutils literal notranslate"><span class="pre">MX</span> <span class="pre">E2E</span> <span class="pre">timing</span></code> line per role and rank with the load, generation, and manifest
+durations.</p>
 <p>Run the TP=2 rank-mapping qualification on four GPUs by selecting
 <code class="docutils literal notranslate"><span class="pre">llama-bf16-tp2</span></code>. <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_LLAMA_MODEL</span></code> can override the default TinyLlama
 checkpoint path. The Qwen2, Qwen3, and Mistral profile rows use
@@ -1154,9 +1187,9 @@ is already registered.</p></li>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 14, 2026.</p>
+  <p>Last updated on September 21, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e">fca831e</a>.</p>
   
 </div></div>
       

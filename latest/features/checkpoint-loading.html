@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc27';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc28';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc27" />
+  <meta name="docsearch:version" content="1.3.0rc28" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -373,6 +373,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector_vswa.html">KV Cache Connector under VSWA</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
@@ -406,13 +407,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
@@ -560,6 +558,7 @@
 <li class="toctree-l2"><a class="reference internal" href="visualgen-sparse-attention.html">Sparse Attention</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1"><a class="reference internal" href="prefix-tokenization-cache.html">Prefix-Tokenization Cache</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -835,9 +834,13 @@ activation logs also report the local reader assignment.</p>
 <p>Pre-merge perf-sanity runs that upload telemetry explicitly assign eligible
 built-in PyTorch/HF launches to the default <code class="docutils literal notranslate"><span class="pre">auto</span></code> policy, so merge decisions do
 not depend on an unrelated CI identifier. Post-merge telemetry runs use the
-numeric root Jenkins build number modulo 4 to assign one native bucket and
-three auto buckets before generated server configs are written. Every rank and
-node in one distributed startup therefore receives the same concrete policy.
+numeric root Jenkins build number modulo 2 to assign <code class="docutils literal notranslate"><span class="pre">native</span></code> to even builds and
+<code class="docutils literal notranslate"><span class="pre">auto</span></code> to odd builds before generated server configs are written. This gives a
+50/50 assignment across consecutive root builds without adding CI stages or
+model launches; successful observations may not be evenly split. Every rank
+and node in one distributed startup receives the same concrete policy. The
+experiment version is <code class="docutils literal notranslate"><span class="pre">checkpoint-io-v4-postmerge-50-auto-50-native</span></code>, distinct
+from the previous 75/25 assignment.
 Non-telemetry runs, invalid or missing post-merge build identities,
 incompatible configurations, and purpose-built configs with an explicit
 <code class="docutils literal notranslate"><span class="pre">checkpoint_io_policy</span></code> are not assigned and retain their normal configuration,
@@ -854,6 +857,21 @@ rows use <code class="docutils literal notranslate"><span class="pre">premerge_d
 Multiple client rows can share one server startup; use
 <code class="docutils literal notranslate"><span class="pre">s_startup_observation_id</span></code> to group them and filter
 <code class="docutils literal notranslate"><span class="pre">b_startup_observation_primary_row:true</span></code> to count each startup once.</p>
+<p>To compare rank-striped loading against native loading, separately report
+confirmed effective <code class="docutils literal notranslate"><span class="pre">rank_striped_read_ahead</span></code> observations and native controls
+with matching runtime-image identity, GPU, model/checkpoint, and parallelism
+configuration. Keep auto fallbacks and unknown effective policies separate;
+do not infer activation from the assigned arm. Retain root build IDs when
+grouping repeated observations. This effective-policy comparison is
+observational, not a controlled head-to-head benchmark.</p>
+<p>Keep results from the old 75/25 split separate from the new 50/50 split using
+the experiment version, not bucket numbers alone. To check the split, use the
+assigned policy; to compare loading performance, use the loader that actually
+ran.</p>
+<p>Even builds use native loading, while odd builds use auto. Before comparing
+performance, check that both groups use comparable runtime images, hardware,
+CI configurations, and cache conditions—otherwise, those differences could be
+mistaken for a loader improvement.</p>
 <p>This policy remains separate from ModelStreamer, MX, GMS, or snapshot
 integrations. Those systems may change the source or bypass raw loading without
 requiring a new combined checkpoint format.</p>
@@ -1264,9 +1282,9 @@ requiring a new combined checkpoint format.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 14, 2026.</p>
+  <p>Last updated on September 21, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6e1cc95">6e1cc95</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e">fca831e</a>.</p>
   
 </div></div>
       
