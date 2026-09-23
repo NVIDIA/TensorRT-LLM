@@ -696,6 +696,31 @@ class TestCrossKvCacheConstruction:
             (pytest.approx(0.45), expected_split),
         ]
 
+    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
+    def test_build_managers_disables_feature_encoder_reuse(
+        self, use_kv_cache_manager_v2: bool
+    ) -> None:
+        """Pass reuse-disabled configs to both feature-encoder managers."""
+        config = _make_kv_cache_config(
+            cross_kv_cache_fraction=0.5,
+            max_gpu_total_bytes=8 * (1 << 30),
+            use_kv_cache_manager_v2=use_kv_cache_manager_v2,
+        )
+        creator = _make_creator(config, is_enc_dec=True)
+        creator.configure_kv_cache_capacity = Mock()
+        creator._encoder_input_is_features = Mock(return_value=True)
+        creator._should_create_separate_draft_kv_cache = Mock(return_value=False)
+        creator._create_kv_cache_manager = Mock(return_value=Mock())
+        creator._create_cross_kv_cache_manager = Mock(return_value=Mock())
+
+        creator.build_managers({}, estimating_kv_cache=False)
+
+        self_config = creator._create_kv_cache_manager.call_args.kwargs["kv_cache_config_override"]
+        cross_config = creator._create_cross_kv_cache_manager.call_args.args[0]
+        assert config.enable_block_reuse
+        assert not self_config.enable_block_reuse
+        assert not cross_config.enable_block_reuse
+
     def test_build_managers_skips_cross_pool_for_decoder_only(self):
         creator = _make_creator(
             _make_kv_cache_config(
