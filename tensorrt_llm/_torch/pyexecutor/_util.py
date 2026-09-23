@@ -1876,9 +1876,6 @@ class KvCacheCreator:
         if self._llm_args.cuda_graph_config is not None:
             return ("Unified DSpark KV cache currently requires eager "
                     "execution; set cuda_graph_config=None.")
-        if not self._disable_overlap_scheduler:
-            return ("Unified DSpark KV cache requires "
-                    "disable_overlap_scheduler=True.")
         if self._llm_args.enable_chunked_prefill:
             return ("Unified DSpark KV cache does not yet support "
                     "chunked prefill; set enable_chunked_prefill=False.")
