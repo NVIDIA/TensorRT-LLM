@@ -22,22 +22,24 @@ Grid: (NUM_SMS, 1, 1) — 148 persistent blocks, each loops over work units
   Total work units = (NT/4) * H * B, distributed round-robin across SMs
   Block i processes work units i, i+NUM_SMS, i+2*NUM_SMS, ...
 Block: 992 threads (31 warps), warp-specialized with setmaxnreg:
-  Warps 0-15:  TMA+K1 fused (8×2, vec2, prefetch pipeline) – 4 WGs, 56 regs
-  Warps 16-26: K2 MMA compute (10 active + warp 26 as TMA producer) – 72 regs
+  Warps 0-15:  K1 compute (8×2, vec2) – 4 WGs, 56 regs
+  Warps 16-25: K2 MMA compute – 72 regs
+  Warp 26:     Dedicated TMA producer (TMA_WARP_ID) – 72 regs
   Warps 27-30: Store/Inversion warps – 24 regs
 
 Pipeline (single for_generate, warp groups separated by if-blocks):
   per work unit:
-    Warps 0-15:  prefetch chunk 0→stage 0 (warp 0), then loop:
-                    TMA next chunk (warp 0), wait cur chunk, K1 compute, arrive(k1_done)
-    Warps 16-26: wait(k1_done)+wait(store_done), MMA, arrive(mma_done+stage_reuse)
+    Warps 0-15:  wait(tma), K1 cumsum, arrive(k1_done),
+                    Pass 2b Q/K reads and scaling, arrive(stage_reuse)
+    Warps 16-25: wait(k1_done)+wait(store_done), MMA, arrive(mma_done+stage_reuse)
+    Warp 26:     wait(stage_reuse), TMA Q/K/G for each chunk, signal(tma)
     Warps 27-30: wait(mma_done), store sAqk/sAkk→GMEM, arrive(store_done)
   All warp-group invariants are computed inside each group's if-block (not hoisted)
   to eliminate cross-group register pressure — same budget as the _all version.
   Mbarrier phases self-reset after 4 iterations (2 stages × 2 phases).
 
 Mbarriers:
-  tma_mbars[2]:          count=1, warp 0 lane 0 → K1+MMA wait for TMA data
+  tma_mbars[2]:          count=1, TMA_WARP_ID (26) lane 0 → K1+MMA wait for TMA data
   stage_reuse_mbars[2]:  count=832, K1(16)+MMA(10 warps) → TMA waits before reuse
   k1_done_mbars[2]:      count=512, K1(16 warps) → MMA waits for g_cumsum ready
   mma_done_mbars[2]:     count=320, MMA(10 warps) → Store waits for sAqk/sAkk ready
