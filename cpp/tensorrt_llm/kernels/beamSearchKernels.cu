@@ -131,8 +131,10 @@ __global__ void updateCacheIndirectionKernel(
 void invokeUpdateCacheIndirection(int* tgtCI, int const* srcCI, BeamHypotheses& bh,
     runtime::SizeType32 const maxAttentionWindow, runtime::SizeType32 sinkTokenLength, cudaStream_t stream)
 {
-    dim3 const grid(common::roundUp(bh.nMaxSeqLen, 32), bh.nBatchSize, bh.nBeamWidthOut);
-    updateCacheIndirectionKernel<<<grid, 32, 0, stream>>>(tgtCI, srcCI, bh, maxAttentionWindow, sinkTokenLength);
+    int constexpr kThreadsPerBlock{32};
+    dim3 const grid(common::divUp(bh.nMaxSeqLen, kThreadsPerBlock), bh.nBatchSize, bh.nBeamWidthOut);
+    updateCacheIndirectionKernel<<<grid, kThreadsPerBlock, 0, stream>>>(
+        tgtCI, srcCI, bh, maxAttentionWindow, sinkTokenLength);
     sync_check_cuda_error(stream);
 }
 
