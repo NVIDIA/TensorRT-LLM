@@ -18,15 +18,19 @@ import pytest
 
 # tests/unittest/scripts shadows the repository's scripts namespace. Load the
 # standalone tool as an isolated package, without editing sys.path.
-_SCRIPTS = Path(__file__).resolve().parents[3] / "scripts"
+_SCRIPTS = Path(__file__).resolve().parents[3] / "scripts" / "vendor"
 _SPEC = importlib.util.spec_from_file_location(
     "prims_ts_maintenance_test",
-    _SCRIPTS / "maintain_prims_ts.py",
+    _SCRIPTS / "promote.py",
     submodule_search_locations=[str(_SCRIPTS)],
 )
 m = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = m
 _SPEC.loader.exec_module(m)
+
+_VENDOR = "example-vendor"
+_CONSUMER = "NVIDIA/TensorRT-LLM"
+_UPSTREAM = "flashinfer-ai/flashinfer"
 
 pytestmark = pytest.mark.cpu_only
 
@@ -64,6 +68,7 @@ class World(m.GitHub):
     """GitHub facade whose immutable data comes from temporary Git repositories."""
 
     def __init__(self, root: Path) -> None:
+        super().__init__(_CONSUMER, _VENDOR, _UPSTREAM)
         self.root = root
         self.source = _init(root / "flashinfer")
         _write(self.source, "prims_ts/kernel.py", "VALUE = 0\n")
@@ -81,7 +86,7 @@ class World(m.GitHub):
                     "--lock",
                     str(self.consumer / m._LOCK),
                     "create",
-                    m._VENDOR,
+                    _VENDOR,
                     "--url",
                     "https://github.com/maintainer/flashinfer.git",
                     "--branch",
@@ -108,7 +113,7 @@ class World(m.GitHub):
                     "--lock",
                     str(self.consumer / m._LOCK),
                     "pin",
-                    m._VENDOR,
+                    _VENDOR,
                     "--url",
                     "https://github.com/dev/flashinfer.git",
                     "--branch",
@@ -144,7 +149,8 @@ class World(m.GitHub):
 
     def args(self, **overrides: object) -> argparse.Namespace:
         values = dict(
-            trtllm_pr="17",
+            source_pr="17",
+            legacy_prims_ts=False,
             canonical_repo="maintainer/flashinfer",
             canonical_branch="trtllm-prims-ts-dev",
             upstream_pr=["4829"],
@@ -152,7 +158,7 @@ class World(m.GitHub):
             map_upstream=[],
             repo=self.consumer,
             fork=None,
-            flashinfer_repo=self.source,
+            source_repo=self.source,
             worktree=self.root / "followup",
             publish=False,
             auto_merge=False,
@@ -176,7 +182,7 @@ class World(m.GitHub):
         }
 
     def compare(self, repo: str, base: str, head: str, *, all_commits: bool = False) -> dict:
-        source = self.consumer if repo == m._TRTLLM else self.source
+        source = self.consumer if repo == _CONSUMER else self.source
         commits = _git(source, "rev-list", "--reverse", f"{base}..{head}").splitlines()
         return {
             "merge_base_commit": {"sha": _git(source, "merge-base", base, head)},
@@ -252,7 +258,7 @@ class World(m.GitHub):
                 raise RuntimeError("simulated comment failure after posting")
             return copy.deepcopy(comment)
         if not route:
-            root = m._FLASHINFER if name == "flashinfer" else m._TRTLLM
+            root = _UPSTREAM if name == "flashinfer" else _CONSUMER
             return {
                 "source": {"full_name": root},
                 "allow_auto_merge": True,
@@ -262,9 +268,9 @@ class World(m.GitHub):
             return [{"type": "required_status_checks"}]
         if route.startswith("git/ref/heads/"):
             branch = route[len("git/ref/heads/") :]
-            if repository == m._TRTLLM:
+            if repository == _CONSUMER:
                 return {"object": {"sha": self.main}}
-            if repository == m._FLASHINFER:
+            if repository == _UPSTREAM:
                 return {"object": {"sha": self.upstream}}
             remote = self.canonical if name == "flashinfer" else self.fork
             result = subprocess.run(
@@ -301,7 +307,7 @@ class World(m.GitHub):
             return copy.deepcopy(self.prs[99])
         if route.startswith("pulls/"):
             number = int(route.split("/")[1])
-            if repository == m._FLASHINFER:
+            if repository == _UPSTREAM:
                 return {
                     "number": number,
                     "base": {"ref": "main", "sha": self.upstream},
@@ -326,7 +332,7 @@ class World(m.GitHub):
 def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> World:
     instance = World(tmp_path)
     monkeypatch.setattr(m, "_git", instance.routed_git)
-    monkeypatch.setattr(m, "GitHub", lambda: instance)
+    monkeypatch.setattr(m, "GitHub", lambda *args: instance)
     return instance
 
 
@@ -337,6 +343,12 @@ def test_dry_run_has_no_writes_and_pins_merged_not_live_head(
         m.main(
             [
                 "promote",
+                "--vendor",
+                _VENDOR,
+                "--upstream-repo",
+                _UPSTREAM,
+                "--canonical-branch",
+                "trtllm-prims-ts-dev",
                 "--trtllm-pr",
                 "17",
                 "--canonical-repo",
@@ -365,7 +377,7 @@ def test_publish_signed_lock_only_and_repeat(world: World) -> None:
     assert _git(world.canonical, "rev-parse", "trtllm-prims-ts-dev") == world.reviewed
     head = pr["head"]["sha"]
     assert _git(world.consumer, "diff", "--name-only", f"{head}^", head) == m._LOCK
-    assert m._lock_at(world, m._TRTLLM, head).to_mapping() == plan.promoted
+    assert m._lock_at(world, _CONSUMER, head).to_mapping() == plan.promoted
     message = _git(world.consumer, "show", "-s", "--format=%B", head)
     assert m._record_from_message(message) == plan.record
     assert "Signed-off-by: Promotion Test <promotion@example.invalid>" in message
@@ -385,7 +397,7 @@ def test_auto_merge_message_and_immediate_merge(world: World, state: str) -> Non
     m._publish(args, world, plan)
     if state == "CLEAN":
         assert world.prs[99]["merged"]
-        m._verify_remote_commit(world, plan, m._TRTLLM, world.main)
+        m._verify_remote_commit(world, plan, _CONSUMER, world.main)
         m._publish(args, world, m._make_plan(args, world))
     else:
         saved = world.prs[99]["auto_merge"]
@@ -398,13 +410,100 @@ def test_resume_after_upstream_head_moves_retains_snapshot(world: World) -> None
     args = world.args(publish=True)
     original = m._make_plan(args, world)
     m._publish(args, world, original)
-    changed = world.get(f"repos/{m._FLASHINFER}/pulls/4829")
+    changed = world.get(f"repos/{_UPSTREAM}/pulls/4829")
     changed["head"]["sha"] = "b" * 40
-    world.overrides[f"repos/{m._FLASHINFER}/pulls/4829"] = changed
+    world.overrides[f"repos/{_UPSTREAM}/pulls/4829"] = changed
     resumed = m._make_plan(args, world)
     assert resumed.record != original.record
     m._publish(args, world, resumed)
     assert resumed.record == original.record
+
+
+def test_bot_attribution_survives_retry_and_squash_merge(world: World) -> None:
+    args = world.args(publish=True, auto_merge=True)
+    original = m._make_plan(args, world)
+    provenance = {
+        "attribution": {
+            world.first: {"method": "same-commit"},
+            world.reviewed: {
+                "method": "author-assertion",
+                "reason": "downstream adaptation",
+                "refresh_policy": "retain-until-verified",
+            },
+        },
+        "contributor_metadata": {
+            "source_head": "a" * 40,
+            "metadata_digest": "b" * 64,
+            "pr_author": "contributor",
+        },
+    }
+    original.record.update(provenance)
+    m._publish(args, world, original)
+    resumed = m._make_plan(args, world)
+    resumed.record.update(provenance)
+    m._publish(args, world, resumed)
+    # Model GitHub completing the already-armed auto-merge asynchronously.
+    followup = world.prs[99]
+    saved = followup["auto_merge"]
+    tree = _git(world.consumer, "rev-parse", f"{followup['head']['sha']}^{{tree}}")
+    world.main = _git(
+        world.consumer,
+        "commit-tree",
+        tree,
+        "-p",
+        world.main,
+        text=f"{saved['commit_title']}\n\n{saved['commit_message']}\n",
+    )
+    followup.update(merged=True, merged_at="today", state="closed", merge_commit_sha=world.main)
+    completed = m._make_plan(args, world)
+    assert completed.completed_pr["merged"]
+    assert completed.record == original.record
+
+
+def test_non_main_consumer_and_upstream_branches(world: World) -> None:
+    world.base_branch = "release/next"
+    world.upstream_branch = "develop"
+    source = world.get(f"repos/{_CONSUMER}/pulls/17")
+    source["base"]["ref"] = world.base_branch
+    upstream = world.get(f"repos/{_UPSTREAM}/pulls/4829")
+    upstream["base"]["ref"] = world.upstream_branch
+    world.overrides[f"repos/{_CONSUMER}/pulls/17"] = source
+    world.overrides[f"repos/{_UPSTREAM}/pulls/4829"] = upstream
+    world.overrides[f"repos/{_CONSUMER}/rules/branches/{world.base_branch}"] = []
+    args = world.args(publish=True, auto_merge=True)
+    plan = m._make_plan(args, world)
+    m._publish(args, world, plan)
+    assert plan.record["consumer_base"] == "release/next"
+    assert plan.record["upstream_branch"] == "develop"
+    creates = [
+        payload
+        for method, endpoint, payload in world.calls
+        if method == "POST" and endpoint.endswith("/pulls")
+    ]
+    assert creates[0]["base"] == "release/next"
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["vendors: [", "schema_version: 1\nvendors: &v {toy: *v}", "schema_version: 1\nvendors: []"],
+)
+def test_malformed_remote_lock_is_actionable(world: World, content: str) -> None:
+    world.overrides[f"repos/{_CONSUMER}/contents/{m._LOCK}?ref={world.merged}"] = {
+        "encoding": "base64",
+        "content": base64.b64encode(content.encode()).decode(),
+    }
+    with pytest.raises(ValueError):
+        m._lock_document_at(world, _CONSUMER, world.merged)
+
+
+def test_remote_lock_accepts_github_wrapped_base64(world: World) -> None:
+    endpoint = f"repos/{_CONSUMER}/contents/{m._LOCK}?ref={world.merged}"
+    response = world.get(endpoint)
+    original = m._lock_document_at(world, _CONSUMER, world.merged)
+    encoded = response["content"]
+    response["content"] = "\n".join(encoded[i : i + 60] for i in range(0, len(encoded), 60)) + "\n"
+    world.overrides[endpoint] = response
+    assert m._lock_document_at(world, _CONSUMER, world.merged) == original
 
 
 def test_resume_after_push_before_pr_creation(world: World) -> None:
@@ -428,7 +527,7 @@ def test_auto_merge_tampering_disables_request(world: World) -> None:
 
 @pytest.mark.parametrize("field,value", [("merged", False), ("base", {"ref": "release"})])
 def test_unmerged_or_wrong_base_rejected(world: World, field: str, value: object) -> None:
-    endpoint = f"repos/{m._TRTLLM}/pulls/17"
+    endpoint = f"repos/{_CONSUMER}/pulls/17"
     changed = world.get(endpoint)
     changed[field] = value
     world.overrides[endpoint] = changed
@@ -463,7 +562,7 @@ def test_divergent_source_rejected(world: World, monkeypatch: pytest.MonkeyPatch
 
 
 def test_upstream_closed_unmerged_rejected(world: World) -> None:
-    endpoint = f"repos/{m._FLASHINFER}/pulls/4829"
+    endpoint = f"repos/{_UPSTREAM}/pulls/4829"
     changed = world.get(endpoint)
     changed.update(state="closed", merged=False)
     world.overrides[endpoint] = changed
@@ -474,11 +573,11 @@ def test_upstream_closed_unmerged_rejected(world: World) -> None:
 @pytest.mark.parametrize("setting", ["auto", "squash", "queue"])
 def test_unsupported_auto_merge_settings_fail_before_push(world: World, setting: str) -> None:
     if setting == "queue":
-        world.overrides[f"repos/{m._TRTLLM}/rules/branches/main"] = [{"type": "merge_queue"}]
+        world.overrides[f"repos/{_CONSUMER}/rules/branches/main"] = [{"type": "merge_queue"}]
     else:
-        data = world.get(f"repos/{m._TRTLLM}")
+        data = world.get(f"repos/{_CONSUMER}")
         data[f"allow_{'auto_merge' if setting == 'auto' else 'squash_merge'}"] = False
-        world.overrides[f"repos/{m._TRTLLM}"] = data
+        world.overrides[f"repos/{_CONSUMER}"] = data
     args = world.args(publish=True, auto_merge=True)
     with pytest.raises(ValueError, match="allow|Merge queues"):
         m._publish(args, world, m._make_plan(args, world))
@@ -565,6 +664,12 @@ def test_cli_invalid_flags(flags: list[str]) -> None:
         m.main(
             [
                 "promote",
+                "--vendor",
+                _VENDOR,
+                "--upstream-repo",
+                _UPSTREAM,
+                "--canonical-branch",
+                "trtllm-prims-ts-dev",
                 "--trtllm-pr",
                 "17",
                 "--canonical-repo",
@@ -643,7 +748,7 @@ def test_remote_lock_cannot_change_other_vendor_entries(
 
     monkeypatch.setattr(m, "_lock_document_at", tampered)
     with pytest.raises(ValueError, match="branch/URL-only"):
-        m._verify_remote_commit(world, plan, m._TRTLLM, pr["head"]["sha"])
+        m._verify_remote_commit(world, plan, _CONSUMER, pr["head"]["sha"])
 
 
 def test_unmerged_parent_cannot_hide_unrelated_commits(
@@ -656,13 +761,13 @@ def test_unmerged_parent_cannot_hide_unrelated_commits(
 
     def unrelated(repo: str, base: str, head: str, **kwargs: object) -> dict:
         result = original(repo, base, head, **kwargs)
-        if repo == m._TRTLLM:
+        if repo == _CONSUMER:
             result["merge_base_commit"]["sha"] = world.base
         return result
 
     monkeypatch.setattr(world, "compare", unrelated)
-    with pytest.raises(ValueError, match="not on TRT-LLM main"):
-        m._verify_remote_commit(world, plan, m._TRTLLM, pr["head"]["sha"])
+    with pytest.raises(ValueError, match="not on the consumer base branch"):
+        m._verify_remote_commit(world, plan, _CONSUMER, pr["head"]["sha"])
 
 
 def test_wait_checks_final_commit(world: World) -> None:
@@ -684,7 +789,7 @@ def test_wait_timeout_preserves_enabled_auto_merge(
 
 
 def test_source_fetch_uses_reviewed_sha_when_no_local_checkout(world: World) -> None:
-    args = world.args(publish=True, flashinfer_repo=None)
+    args = world.args(publish=True, source_repo=None)
     m._publish(args, world, m._make_plan(args, world))
     assert any(args[0] == "fetch" and args[-1] == world.reviewed for args in world.git_calls)
 
@@ -713,8 +818,8 @@ def test_unpaired_promotion_publishes_and_resumes(world: World) -> None:
     m._publish(args, world, plan)
     m._publish(args, world, m._make_plan(args, world))
     assert len(world.prs) == 1
-    assert "No paired FlashInfer PR" in world.prs[99]["body"]
-    assert not any(f"repos/{m._FLASHINFER}/pulls/" in call[1] for call in world.calls)
+    assert "No paired upstream PR" in world.prs[99]["body"]
+    assert not any(f"repos/{_UPSTREAM}/pulls/" in call[1] for call in world.calls)
     changed = copy.deepcopy(plan.record)
     changed["changes"][0]["refresh_policy"] = "drop"
     with pytest.raises(ValueError, match="reason/policy"):
@@ -753,7 +858,7 @@ def test_canonical_branch_name_on_developer_fork(world: World, same_fork: bool) 
         return
     plan = m._make_plan(args, world)
     m._publish(args, world, plan)
-    actual = m.vendor._load_lock(args.worktree / m._LOCK).vendors[m._VENDOR].to_mapping()
+    actual = m.vendor._load_lock(args.worktree / m._LOCK).vendors[_VENDOR].to_mapping()
     assert actual == {**plan.reviewed.to_mapping(), "url": plan.previous.url}
 
 
@@ -762,6 +867,12 @@ def test_unpaired_cli_dry_run(world: World, capsys: pytest.CaptureFixture) -> No
         m.main(
             [
                 "promote",
+                "--vendor",
+                _VENDOR,
+                "--upstream-repo",
+                _UPSTREAM,
+                "--canonical-branch",
+                "trtllm-prims-ts-dev",
                 "--trtllm-pr",
                 "17",
                 "--canonical-repo",
@@ -813,16 +924,16 @@ def test_completed_promotion_ignores_later_live_state(
     _git(world.consumer, "switch", "--detach", world.main)
     _write(world.consumer, "later.txt", "later main commit\n")
     world.main = _commit(world.consumer, "later main update")
-    world.overrides[f"repos/{m._TRTLLM}"] = {"allow_auto_merge": False}
+    world.overrides[f"repos/{_CONSUMER}"] = {"allow_auto_merge": False}
     world.overrides["repos/maintainer/flashinfer/git/ref/heads/trtllm-prims-ts-dev"] = {
         "object": {"sha": "b" * 40}
     }
     world.overrides["repos/dev/flashinfer"] = {}
-    world.overrides[f"repos/{m._FLASHINFER}/pulls/4829"] = {"state": "closed", "merged": False}
+    world.overrides[f"repos/{_UPSTREAM}/pulls/4829"] = {"state": "closed", "merged": False}
     original_compare = world.compare
 
     def compare(repo: str, base: str, head: str, **kwargs: object) -> dict:
-        assert repo == m._TRTLLM, "Completed retry must not query old source history"
+        assert repo == _CONSUMER, "Completed retry must not query old source history"
         return original_compare(repo, base, head, **kwargs)
 
     monkeypatch.setattr(world, "compare", compare)
@@ -981,7 +1092,7 @@ def test_ci_request_rejects_changed_pr(world: World, change: str) -> None:
 
 
 def test_generated_body_passes_repository_checklist(world: World) -> None:
-    checker = runpy.run_path(str(_SCRIPTS.parent / ".github/scripts/pr_checklist_check.py"))
+    checker = runpy.run_path(str(_SCRIPTS.parent.parent / ".github/scripts/pr_checklist_check.py"))
     plan = m._make_plan(world.args(), world)
     body = m._pr_body(plan, f"{plan.title}\n\n{m._record_text(plan.record)}")
     assert checker["find_unresolved_tasks"](body) == []
