@@ -17,6 +17,11 @@ IS_CUTLASS_DSL_RUBIN_AVAILABLE = False
 # block-scaled path even when the attribute access is shimmed. Treat the
 # presence of both submodules as the capability marker for that kernel.
 IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE = False
+# The SM100/SM103 (data-center Blackwell) port of the fused FC1+FC2 MoE kernel
+# (cute_dsl_kernels/blackwell/moe/blackwell_contiguous_grouped_blockscaled_gemm_fused_fc12.py)
+# only needs the public Blackwell helpers plus the same ``cutlass.memory`` /
+# ``cutlass.tensor_utils`` submodules; it does not need ``rubin_helpers``.
+IS_CUTLASS_DSL_FUSED_FC12_BLACKWELL_AVAILABLE = False
 
 if platform.system() != "Windows":
     try:
@@ -38,14 +43,28 @@ if platform.system() != "Windows":
                 import cutlass.memory  # noqa
                 import cutlass.tensor_utils  # noqa
                 logger.info(
-                    "cutlass dsl supports the Rubin fused FC12 MoE kernel"
-                )
+                    "cutlass dsl supports the Rubin fused FC12 MoE kernel")
                 IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE = True
             except ImportError:
                 logger.info(
                     "cutlass dsl build is too old for the Rubin fused "
                     "FC12 MoE kernel (no cutlass.memory / cutlass.tensor_utils); "
                     "MXFP8 CuTe DSL MoE is disabled")
+        try:
+            import cutlass.memory  # noqa
+            import cutlass.tensor_utils  # noqa
+            import cutlass.utils.blackwell_helpers  # noqa
+            import cutlass.utils.blockscaled_layout  # noqa
+            logger.info(
+                "cutlass dsl supports the Blackwell (SM100/SM103) fused FC12 MoE kernel"
+            )
+            IS_CUTLASS_DSL_FUSED_FC12_BLACKWELL_AVAILABLE = True
+        except ImportError:
+            logger.info(
+                "cutlass dsl build is too old for the Blackwell fused FC12 MoE "
+                "kernel (needs cutlass.memory / cutlass.tensor_utils / "
+                "cutlass.utils.blackwell_helpers); MXFP8 CuTe DSL MoE on "
+                "SM100/SM103 is disabled")
     except ImportError:
         pass
 

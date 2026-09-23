@@ -29,6 +29,7 @@ from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
 from tensorrt_llm._torch.cute_dsl_utils import (
     IS_CUTLASS_DSL_AVAILABLE,
     IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE,
+    IS_CUTLASS_DSL_FUSED_FC12_BLACKWELL_AVAILABLE,
     IS_CUTLASS_DSL_RUBIN_AVAILABLE,
 )
 from tensorrt_llm._torch.locality_domain_utils import (
@@ -4412,21 +4413,23 @@ def _mxfp8_fused_fc12_reference(
     return out
 
 
+_MXFP8_FUSED_FC12_CASES = [
+    (128, 2, 1, 1024, 512, 16),
+    (515, 8, 8, 1024, 512, 64),
+    # Qwen3.5-397B expert geometry: hidden 4096, inner 1024, 512 experts,
+    # top-k 10; EP4 large batch and EP16 decode-shaped.
+    (1024, 10, 4, 4096, 1024, 512),
+    (32, 10, 16, 4096, 1024, 512),
+]
+
+
 @pytest.mark.skipif(
     get_sm_version() != 107 or not IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE,
     reason="MXFP8 fused FC12 MoE requires Rubin (SM107) with a CuTe DSL build that supports the fused FC12 kernel",
 )
 @pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize(
-    "num_tokens,top_k,ep_size,hidden_size,interm_size,num_experts",
-    [
-        (128, 2, 1, 1024, 512, 16),
-        (515, 8, 8, 1024, 512, 64),
-        # Qwen3.5-397B expert geometry: hidden 4096, inner 1024, 512 experts,
-        # top-k 10; EP4 large batch and EP16 decode-shaped.
-        (1024, 10, 4, 4096, 1024, 512),
-        (32, 10, 16, 4096, 1024, 512),
-    ],
+    "num_tokens,top_k,ep_size,hidden_size,interm_size,num_experts", _MXFP8_FUSED_FC12_CASES
 )
 def test_mxfp8_fused_fc12_moe_rubin(
     num_tokens: int,
@@ -4437,7 +4440,72 @@ def test_mxfp8_fused_fc12_moe_rubin(
     num_experts: int,
     tile_size: int,
 ):
-    """End-to-end check of the fused MXFP8 FC1+FC2 MoE op against a float oracle.
+    """Rubin (SM107) fused MXFP8 FC1+FC2 MoE op against a float oracle."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import Sm107Mxfp8FusedFc12MoeRunner
+
+    _run_mxfp8_fused_fc12_moe_case(
+        torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin,
+        Sm107Mxfp8FusedFc12MoeRunner,
+        num_tokens,
+        top_k,
+        ep_size,
+        hidden_size,
+        interm_size,
+        num_experts,
+        tile_size,
+    )
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103) or not IS_CUTLASS_DSL_FUSED_FC12_BLACKWELL_AVAILABLE,
+    reason="MXFP8 fused FC12 MoE (Blackwell port) requires SM100/SM103 with the CuTe DSL Blackwell helpers",
+)
+@pytest.mark.parametrize("tile_size", [128, 256])
+@pytest.mark.parametrize(
+    "num_tokens,top_k,ep_size,hidden_size,interm_size,num_experts", _MXFP8_FUSED_FC12_CASES
+)
+def test_mxfp8_fused_fc12_moe_blackwell(
+    num_tokens: int,
+    top_k: int,
+    ep_size: int,
+    hidden_size: int,
+    interm_size: int,
+    num_experts: int,
+    tile_size: int,
+):
+    """Blackwell (SM100/SM103) port of the fused MXFP8 FC1+FC2 MoE op against a float oracle.
+
+    Same adapter contract as the Rubin op; the tactic additionally carries the
+    weight-streaming, L2-prefetch and sparse-gather policies (every enumerated
+    tactic is run on the small shapes).
+    """
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import Sm100Mxfp8FusedFc12MoeRunner
+
+    _run_mxfp8_fused_fc12_moe_case(
+        torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_blackwell,
+        Sm100Mxfp8FusedFc12MoeRunner,
+        num_tokens,
+        top_k,
+        ep_size,
+        hidden_size,
+        interm_size,
+        num_experts,
+        tile_size,
+    )
+
+
+def _run_mxfp8_fused_fc12_moe_case(
+    fused_op,
+    runner_cls,
+    num_tokens: int,
+    top_k: int,
+    ep_size: int,
+    hidden_size: int,
+    interm_size: int,
+    num_experts: int,
+    tile_size: int,
+):
+    """End-to-end check of a fused MXFP8 FC1+FC2 MoE op against a float oracle.
 
     Exercises the full adapter contract: linear per-token activation scales,
     swizzled + gate/up-interleaved FC1 weights and scales, swizzled FC2 scales,
@@ -4445,8 +4513,6 @@ def test_mxfp8_fused_fc12_moe_rubin(
     into a pre-zeroed output. The small shapes additionally run every tactic
     the runner enumerates for the routing tile.
     """
-    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import Sm107Mxfp8FusedFc12MoeRunner
-
     torch.manual_seed(0)
     sf_vec_size = 32
     num_local_experts = num_experts // ep_size
@@ -4562,7 +4628,7 @@ def test_mxfp8_fused_fc12_moe_rubin(
     # 1. Public op with the default tactic; the output must be pre-zeroed.
     output = torch.zeros(num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
     with torch.inference_mode():
-        torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin(output=output, **common_kwargs)
+        fused_op(output=output, **common_kwargs)
     torch.cuda.synchronize()
     check(output, "default tactic")
 
@@ -4572,9 +4638,7 @@ def test_mxfp8_fused_fc12_moe_rubin(
         (num_tokens, hidden_size), float("nan"), dtype=torch.bfloat16, device="cuda"
     )
     with torch.inference_mode():
-        torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin(
-            output=output_dirty, zero_output=True, **common_kwargs
-        )
+        fused_op(output=output_dirty, zero_output=True, **common_kwargs)
     torch.cuda.synchronize()
     assert not torch.isnan(output_dirty).any(), "zero_output left rows uncleared"
     check(output_dirty, "default tactic, zero_output=True")
@@ -4587,9 +4651,7 @@ def test_mxfp8_fused_fc12_moe_rubin(
     raw_kwargs = dict(common_kwargs, input=a, input_scale=torch.full_like(a_sf, 255))
     raw_output = torch.empty_like(output)
     with torch.inference_mode():
-        torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin(
-            output=raw_output, zero_output=True, **raw_kwargs
-        )
+        fused_op(output=raw_output, zero_output=True, **raw_kwargs)
     torch.cuda.synchronize()
     check(raw_output, "raw BF16 input, quantize/reset fusion")
     assert (raw_kwargs["input_scale"] == 255).all()
@@ -4599,7 +4661,7 @@ def test_mxfp8_fused_fc12_moe_rubin(
     #    geometry is a DSL compile).
     if num_experts > 64:
         return
-    runner = Sm107Mxfp8FusedFc12MoeRunner(
+    runner = runner_cls(
         num_experts, top_k, num_local_experts, 0, tile_size, swiglu_limit=swiglu_limit
     )
     inputs = [
@@ -4622,30 +4684,31 @@ def test_mxfp8_fused_fc12_moe_rubin(
     tactics = runner.get_valid_tactics(inputs, OptimizationProfile())
     assert len(tactics) > 0, f"No valid tactics for tile_size={tile_size}"
     assert all(t[0][0] == tile_size for t in tactics), "mma_tiler_m must equal the routing tile"
-    # Full-GPU runners keep one cache policy for both GEMMs; only locality
-    # domain shards add the cached-FC2 variant under streaming FC1 weights.
-    assert all(t[4] == t[5] for t in tactics), "full-GPU tactics must not decouple FC2"
-    decoupled_runner = Sm107Mxfp8FusedFc12MoeRunner(
-        num_experts,
-        top_k,
-        num_local_experts,
-        0,
-        tile_size,
-        swiglu_limit=swiglu_limit,
-        decouple_fc2_cache_policy=True,
-    )
-    decoupled_tactics = decoupled_runner.get_valid_tactics(inputs, OptimizationProfile())
-    assert set(tactics) < set(decoupled_tactics)
-    assert {t[:4] for t in decoupled_tactics if t[4] and not t[5]} == {
-        t[:4] for t in tactics if t[4]
-    }
+    if runner_cls.__name__ == "Sm107Mxfp8FusedFc12MoeRunner":
+        # Full-GPU runners keep one cache policy for both GEMMs; only locality
+        # domain shards add the cached-FC2 variant under streaming FC1 weights.
+        # The Blackwell runner has no locality-domain variant.
+        assert all(t[4] == t[5] for t in tactics), "full-GPU tactics must not decouple FC2"
+        decoupled_runner = runner_cls(
+            num_experts,
+            top_k,
+            num_local_experts,
+            0,
+            tile_size,
+            swiglu_limit=swiglu_limit,
+            decouple_fc2_cache_policy=True,
+        )
+        decoupled_tactics = decoupled_runner.get_valid_tactics(inputs, OptimizationProfile())
+        assert set(tactics) < set(decoupled_tactics)
+        assert {t[:4] for t in decoupled_tactics if t[4] and not t[5]} == {
+            t[:4] for t in tactics if t[4]
+        }
     failed = []
     for tactic in tactics:
-        mma_tiler, mma_inst, cluster, scheduler, stream_weights, fc2_stream_weights = tactic
-        label = (
-            f"mma_tiler={mma_tiler} inst={mma_inst} cluster={cluster} sched={scheduler} "
-            f"stream_weights={stream_weights} fc2_stream_weights={fc2_stream_weights}"
-        )
+        # Rubin: (mma_tiler, mma_inst, cluster, scheduler, stream_weights,
+        # fc2_stream_weights); Blackwell: (mma_tiler, mma_inst, cluster,
+        # scheduler, stream_weights, fc1_prefetch, fc2_prefetch, sparse_gather).
+        label = "tactic=" + " ".join(str(v) for v in tactic)
         output.zero_()
         with torch.inference_mode():
             runner.forward(inputs, tactic=tactic)
@@ -4697,8 +4760,9 @@ def test_mxfp8_fused_fc12_tactic_roundtrips_through_autotuner_cache():
 
 
 @pytest.mark.skipif(
-    not IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE,
-    reason="MXFP8 fused FC12 MoE requires a CuTe DSL build that supports the fused FC12 kernel",
+    get_sm_version() != 107 or not IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE,
+    reason="Sm107Mxfp8FusedFc12MoeRunner constructs on Rubin (SM107) only, with a CuTe DSL build "
+    "that supports the fused FC12 kernel",
 )
 def test_mxfp8_fused_fc12_sparse_gather_selection():
     """The gather variant is chosen from static shapes, scaled by the rank's expert share.

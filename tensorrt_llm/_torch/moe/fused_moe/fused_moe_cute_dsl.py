@@ -30,6 +30,7 @@ from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
 from ...custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
 from ...cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                                IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE,
+                               IS_CUTLASS_DSL_FUSED_FC12_BLACKWELL_AVAILABLE,
                                IS_CUTLASS_DSL_RUBIN_AVAILABLE)
 from ...locality_domain.autotune import \
     LocalityDomainConcurrentTunableRunner as \
@@ -668,7 +669,7 @@ class CuteDslFusedMoEBF16Runner(TunableRunner):
 
 
 class CuteDslFusedMoEMxfp8Runner(TunableRunner):
-    """Autotuner runner for MXFP8 MoE on Rubin (SM107).
+    """Autotuner runner for MXFP8 MoE on Rubin (SM107) and Blackwell (SM100/SM103).
 
     Selects the routing tile size from {128, 256} and delegates to
     ``forward_impl`` (``run_moe_mxfp8_impl`` for the full-GPU fused FC1+FC2
@@ -822,6 +823,10 @@ class CuteDslFusedMoEMxfp8Runner(TunableRunner):
             from ...custom_ops.cute_dsl_custom_ops import \
                 Sm107Mxfp8FusedFc12MoeRunner
             checked_runner_types.append(Sm107Mxfp8FusedFc12MoeRunner)
+        if IS_CUTLASS_DSL_FUSED_FC12_BLACKWELL_AVAILABLE:
+            from ...custom_ops.cute_dsl_custom_ops import \
+                Sm100Mxfp8FusedFc12MoeRunner
+            checked_runner_types.append(Sm100Mxfp8FusedFc12MoeRunner)
 
         return _runner_tactics_match_tile_size(
             comb,
@@ -914,8 +919,8 @@ class CuteDslFusedMoE(MoEImplBase):
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
-        """CuteDSL grouped GEMM: NVFP4 on SM100/SM103/SM107; BF16 and MXFP8
-        (fused FC1+FC2 kernel) on SM107."""
+        """CuteDSL grouped GEMM: NVFP4 on SM100/SM103/SM107; BF16 on SM107;
+        MXFP8 (fused FC1+FC2 kernel) on SM107 and SM100/SM103."""
         sm_version = d.env.sm
         quant_algo = p.quant_algo
 
@@ -995,22 +1000,31 @@ class CuteDslFusedMoE(MoEImplBase):
                 return rejection
             return MoEEligibility.ok()
 
-        # MXFP8 (W8A8 e4m3 x e4m3, UE8M0 1x32 block scales) - SM107 only,
-        # served by the fused FC1+FC2 CuTe DSL kernel.
+        # MXFP8 (W8A8 e4m3 x e4m3, UE8M0 1x32 block scales) - SM107 (Rubin
+        # kernel) or SM100/SM103 (Blackwell port), both served by the fused
+        # FC1+FC2 CuTe DSL kernel.
         if quant_algo == QuantAlgo.MXFP8:
-            if sm_version != 107:
-                return _reject(
-                    MoERejectReason.SM_UNSUPPORTED,
-                    f"CuteDslFusedMoE MXFP8 requires SM107 (Rubin), got "
-                    f"SM{sm_version}")
-            if not IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE:
-                return _reject(
-                    MoERejectReason.DEP_MISSING,
-                    "MXFP8 on SM107 (Rubin) requires a CuTE DSL internal build "
-                    "that supports the fused FC12 MoE kernel (cutlass.memory / "
-                    "cutlass.tensor_utils submodules; e.g. 0.3.0+20260803 or "
-                    "newer)")
-            return MoEEligibility.ok()
+            if sm_version == 107:
+                if not IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE:
+                    return _reject(
+                        MoERejectReason.DEP_MISSING,
+                        "MXFP8 on SM107 (Rubin) requires a CuTE DSL internal "
+                        "build that supports the fused FC12 MoE kernel "
+                        "(cutlass.memory / cutlass.tensor_utils submodules; "
+                        "e.g. 0.3.0+20260803 or newer)")
+                return MoEEligibility.ok()
+            if sm_version in (100, 103):
+                if not IS_CUTLASS_DSL_FUSED_FC12_BLACKWELL_AVAILABLE:
+                    return _reject(
+                        MoERejectReason.DEP_MISSING,
+                        "MXFP8 on SM100/SM103 requires a CuTe DSL build with "
+                        "cutlass.memory / cutlass.tensor_utils and the "
+                        "Blackwell helpers (e.g. 4.8.0a0+20260821 or newer)")
+                return MoEEligibility.ok()
+            return _reject(
+                MoERejectReason.SM_UNSUPPORTED,
+                f"CuteDslFusedMoE MXFP8 requires SM107 (Rubin) or SM100/SM103 "
+                f"(Blackwell), got SM{sm_version}")
         # FP8_BLOCK_SCALES lands here on purpose. ``run_moe_fp8_block_scales``
         # exists, but its GEMM is ``cute_dsl_fp8_group_blockwise_gemm_ref`` --
         # an fp32 einsum-per-expert reference, not a CuteDSL kernel -- so
@@ -1236,8 +1250,13 @@ class CuteDslFusedMoE(MoEImplBase):
         ``weight_alignment`` while the fused path writes exactly
         ``hidden / 32`` columns, so the two agree only when the hidden size
         is a multiple of the weight alignment.
+
+        Only the Rubin kernel fuses the quantization into its reset launch;
+        the Blackwell op quantizes raw input in a separate launch, so on
+        SM100/SM103 the native quantizer is used directly.
         """
-        return (x.dtype in (torch.bfloat16, torch.float16) and x.dim() == 2
+        return (get_sm_version() == 107
+                and x.dtype in (torch.bfloat16, torch.float16) and x.dim() == 2
                 and x.is_contiguous()
                 and x.shape[1] % self.quant_method.BLOCK_SIZE == 0
                 and x.shape[1] % self.quant_method.weight_alignment == 0
@@ -1710,7 +1729,7 @@ class CuteDslFusedMoE(MoEImplBase):
         moe_output: Optional[torch.Tensor] = None,
         enable_alltoall: bool = False,
     ) -> torch.Tensor:
-        """Autotuner wrapper for MXFP8 MoE on Rubin (SM107).
+        """Autotuner wrapper for MXFP8 MoE on Rubin (SM107) and Blackwell (SM100/SM103).
 
         The whole expert computation (gather, FC1, SwiGLU, MXFP8 requant, FC2,
         top-k finalize) runs in one fused CuTe DSL kernel, so this path has no
@@ -1976,7 +1995,7 @@ class CuteDslFusedMoE(MoEImplBase):
         enable_alltoall: bool = False,
         tile_size: int = 128,
     ) -> torch.Tensor:
-        """MXFP8 MoE via the fused FC1+FC2 CuTe DSL kernel (Rubin)."""
+        """MXFP8 MoE via the fused FC1+FC2 CuTe DSL kernel (Rubin or Blackwell)."""
         effective_top_k = token_selected_experts.size(1)
         esp = self.expert_size_per_partition
         slot_start = self.slot_start
@@ -2033,7 +2052,13 @@ class CuteDslFusedMoE(MoEImplBase):
             torch.uint8)
         swiglu_limit = self._mxfp8_fused_fc12_swiglu_limit()
 
-        torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin(
+        # SM107 runs the Rubin kernel, SM100/SM103 its Blackwell port; both
+        # ops share the input contract.
+        fused_fc12_op = (
+            torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin
+            if get_sm_version() == 107 else
+            torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_blackwell)
+        fused_fc12_op(
             input=x,
             fc1_weight=self.w3_w1_weight,
             input_scale=x_sf,

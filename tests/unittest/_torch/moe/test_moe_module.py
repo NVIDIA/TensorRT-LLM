@@ -1008,6 +1008,8 @@ LOCAL_MOE_MODEL_CONFIGS = CI_MOE_MODEL_CONFIGS + [
     # 512-expert tier of the post-topK routing sort (single-block kernel
     # for <= 16 tokens, cluster kernel above) used by the CuteDSL backend.
     MoeModelConfig(512, 10, 512, 256),
+    # Qwen3.5-397B-class shape at production hidden/intermediate sizes.
+    MoeModelConfig(512, 10, 4096, 3072),
     # === Boundary Tests: num_experts / top_k ===
     MoeModelConfig(4, 4, 512, 512),  # top_k=num_experts, all experts activated
     MoeModelConfig(7, 2, 256, 512),  # prime num_experts
@@ -1140,6 +1142,11 @@ def _get_comm_method_skip_reason(
             return (
                 f"DeepEPLowLatency does not support hidden_size={model_config.hidden_size}, "
                 f"requires one of {sorted(DeepEPLowLatency.SUPPORTED_HIDDEN_SIZES)}"
+            )
+        if model_config.top_k > DeepEPLowLatency.MAX_TOP_K:
+            return (
+                f"DeepEPLowLatency does not support top_k={model_config.top_k}, "
+                f"MAX_TOP_K={DeepEPLowLatency.MAX_TOP_K}"
             )
     return None
 
