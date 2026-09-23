@@ -70,6 +70,7 @@ def parse_and_display_metrics(metrics_data: str) -> None:
 
     # Define metrics to display with descriptions
     metrics_of_interest = {
+        f"{METRIC_PREFIX}scheduled_batch_size": "Scheduled batch size (zero when sampled after idle)",
         f"{METRIC_PREFIX}request_success_total": "Total successful requests",
         f"{METRIC_PREFIX}e2e_request_latency_seconds": "End-to-end request latency",
         f"{METRIC_PREFIX}time_to_first_token_seconds": "Time to first token",

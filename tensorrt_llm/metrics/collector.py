@@ -53,6 +53,9 @@ class MetricsCollector:
             trtllm_generation_perplexity
             trtllm_request_error_total
 
+        Scheduler metric (published independently by metrics.batch_metrics):
+            trtllm_scheduled_batch_size
+
         Iteration-level metrics:
             trtllm_kv_cache_hit_rate
             trtllm_kv_cache_utilization

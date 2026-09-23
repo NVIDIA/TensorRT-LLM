@@ -538,12 +538,24 @@ class PyExecutor:
         self.enable_iter_perf_stats = self.llm_args.enable_iter_perf_stats
         self.enable_iter_req_stats = self.llm_args.enable_iter_req_stats
         self._batch_metrics = None
-        if (self.llm_args.return_perf_metrics
-                and os.path.isdir(os.getenv("PROMETHEUS_MULTIPROC_DIR", ""))):
-            self._batch_metrics = BatchMetrics(
-                model_name=str(self.llm_args.model),
-                engine_type=self.llm_args.backend or "pytorch",
-                rank=self.dist.rank)
+        if self.llm_args.return_perf_metrics:
+            metrics_dir = os.getenv("PROMETHEUS_MULTIPROC_DIR", "")
+            if not os.path.isdir(metrics_dir):
+                logger.warning(
+                    "Scheduled batch metric disabled: PROMETHEUS_MULTIPROC_DIR "
+                    f"is unset or is not an accessible directory: {metrics_dir!r}")
+            else:
+                from prometheus_client import values
+                if not values.ValueClass._multiprocess:
+                    logger.warning(
+                        "Scheduled batch metric disabled: prometheus_client was "
+                        "imported before PROMETHEUS_MULTIPROC_DIR was set. Set "
+                        "the directory before importing prometheus_client.")
+                else:
+                    self._batch_metrics = BatchMetrics(
+                        model_name=str(self.llm_args.model),
+                        engine_type=self.llm_args.backend or "unknown",
+                        rank=self.dist.rank)
         self.stream_interval = self.llm_args.stream_interval
         self.perf_manager = PerfMetricsManager(
             enabled=getattr(self.llm_args, 'return_perf_metrics', False))

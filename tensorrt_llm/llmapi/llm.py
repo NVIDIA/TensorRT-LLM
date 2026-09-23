@@ -433,6 +433,9 @@ class BaseLLM:
 
         # Executor metrics must share the serving process's directory, and the
         # Prometheus client selects its storage when first imported.
+        # This also creates a temporary directory and sets a process-wide env
+        # variable for offline return_perf_metrics users. An already-started
+        # external MPI session must inherit the directory before its launch.
         if self.args.return_perf_metrics:
             set_prometheus_multiproc_dir()
 
