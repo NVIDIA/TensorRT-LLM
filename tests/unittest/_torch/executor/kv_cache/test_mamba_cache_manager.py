@@ -487,8 +487,8 @@ def test_hybrid_cache_manager_factory_honors_v2_setting(
     assert get_kv_cache_manager_cls(_hybrid_model_config(), kv_cache_config) is expected
 
 
-def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
-    """GDN replay uses C++ V1 directly and V2 through state descriptors."""
+def test_qwen3_gdn_replay_requires_v2_manager(monkeypatch):
+    """GDN replay is enabled only with its supported V2 cache manager."""
     captured_cpp = {}
     captured_mixed = {}
     captured_v2 = {}
@@ -519,11 +519,11 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
         quant_config=None,
     )
     mamba_params = MambaKVCacheParams(
-        state_size=8,
+        state_size=128,
         conv_kernel=4,
-        num_heads=4,
-        n_groups=1,
-        head_dim=8,
+        num_heads=6,
+        n_groups=2,
+        head_dim=128,
         mamba_layer_mask=[True, False],
         target_full_attention_layer_mask=[False, True],
         num_mamba_layers=1,
@@ -532,7 +532,8 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
         mamba_ssm_cache_dtype=torch.bfloat16,
     )
     monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", "1")
-    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor._util.get_sm_version", lambda: 90)
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor._util.get_sm_version", lambda: 100)
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor._util.IS_CUTLASS_DSL_AVAILABLE", True)
     monkeypatch.setattr(
         "tensorrt_llm._torch.pyexecutor._util.extract_mamba_kv_cache_params",
         lambda *args, **kwargs: mamba_params,
@@ -575,7 +576,7 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
         **common_kwargs,
     )
 
-    assert captured_cpp["use_replay_state_update"] is True
+    assert captured_cpp["use_replay_state_update"] is False
     assert captured_cpp["model_type"] == "qwen3_next"
     assert captured_cpp["max_num_tokens"] == 256
     assert "vocab_size" not in captured_cpp
@@ -589,8 +590,9 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
     assert "model_type" not in captured_v2
     assert captured_v2["conv_state_layout"] == "q_k_v"
     fallback_logs = [str(call.args[0]) for call in info_log.call_args_list]
-    assert any("RecordingMixedManager was selected" in log for log in fallback_logs)
+    assert any("RecordingMixedManager" in log for log in fallback_logs)
     assert not any("RecordingV2Manager was selected" in log for log in fallback_logs)
+    assert any("RecordingCppManager" in log for log in fallback_logs)
 
 
 @pytest.mark.parametrize(
@@ -1405,7 +1407,6 @@ def test_cpp_hybrid_replay_bookkeeping_is_fused_into_conv_promotion(
     mgr.intermediate_state_indices = torch.arange(2, dtype=torch.int32)
     mgr.all_conv_states = torch.empty(0)
     mgr.intermediate_conv_states = torch.empty(0)
-    mgr._commit_gdn_cached_replay_history_layers = MagicMock()
 
     promote_calls = []
     monkeypatch.setattr(
@@ -1425,7 +1426,6 @@ def test_cpp_hybrid_replay_bookkeeping_is_fused_into_conv_promotion(
         state_indices=torch.tensor([0, 1], dtype=torch.int32),
     )
 
-    mgr._commit_gdn_cached_replay_history_layers.assert_called_once()
     assert len(promote_calls) == 1
     _, kwargs = promote_calls[0]
     assert kwargs["replay_pnat"] is mgr.prev_num_accepted_tokens
@@ -4009,127 +4009,70 @@ def test_hybrid_replay_buffers_size_by_tokens_per_gen_step(builder):
 
 
 @skip_no_cuda
-def test_v2_gdn_replay_builds_affine_state_layout():
+def test_v2_gdn_replay_allocates_single_history_buffer():
     mgr = _build_v2_hybrid_with_mamba_layer(
         max_batch_size=16,
         num_mamba_layers=3,
         spec_config=MTPDecodingConfig(max_draft_len=3),
         use_replay_state_update=True,
         conv_state_layout="q_k_v",
+        mamba_ssm_cache_dtype=torch.bfloat16,
     )
     try:
-        assert mgr.use_gdn_cached_replay_all_layer_commit
-        assert mgr._gdn_cached_replay_state_descriptors is None
-        state_strides = mgr._gdn_cached_replay_state_strides
-        assert state_strides is not None
-        states = mgr.all_ssm_states
-        first_state = states[0]
-        expected_layer_stride = (
-            states[1].data_ptr() - first_state.data_ptr()
-        ) // first_state.element_size()
-        assert state_strides == (
-            mgr.local_num_mamba_layers,
-            expected_layer_stride,
-            first_state.stride(0),
+        assert mgr.use_gdn_mtp_replay
+        assert mgr.cache_buf_idx is None
+        assert mgr.old_dA_cumsum is None
+        assert mgr._gdn_mtp_replay_state_view is not None
+        assert mgr._gdn_mtp_replay_conv_state_view is not None
+        assert mgr.intermediate_conv_states.shape == (
+            3,
+            16,
+            4,
+            mgr.conv_state_shape[0],
         )
+
+        replay_metadata = mgr.get_replay_state_update_metadata()
+        assert replay_metadata is not None
+        assert replay_metadata.cache_buf_idx is None
+        expected_capacity = replay_metadata.replay_history_size + replay_metadata.replay_step_width
+        layer_cache = mgr.mamba_layer_cache(0)
+        assert layer_cache.old_x.shape[1] == expected_capacity
+        assert layer_cache.old_dA_cumsum is None
+        assert layer_cache.cache_buf_idx is None
     finally:
         mgr.shutdown()
 
 
-@skip_no_cuda
-def test_v2_gdn_replay_all_layer_commit_matches_contiguous_layout():
-    from tensorrt_llm._torch.modules.fla.cached_replay import (
-        commit_gdn_cached_replay_history_layers,
-    )
-
-    batch_size = 16
-    mgr = _build_v2_hybrid_with_mamba_layer(
-        max_batch_size=batch_size,
-        num_mamba_layers=3,
-        spec_config=MTPDecodingConfig(max_draft_len=3),
-        use_replay_state_update=True,
-        conv_state_layout="q_k_v",
-    )
-    try:
-        torch.manual_seed(1234)
-        for state in mgr.all_ssm_states:
-            state.normal_()
-        mgr.old_x.normal_()
-        mgr.old_B.normal_()
-        mgr.old_dt.uniform_(-0.2, -0.01)
-
-        positions = torch.arange(batch_size, device="cuda", dtype=torch.int32)
-        replay_work_items = torch.stack(
-            (
-                positions,
-                positions,
-                torch.full_like(positions, mgr.replay_history_size),
-                torch.zeros_like(positions),
-            ),
-            dim=1,
-        )
-        n_writes = torch.tensor([batch_size], device="cuda", dtype=torch.int32)
-        expected = torch.stack(mgr.all_ssm_states)
-        commit_gdn_cached_replay_history_layers(
-            ssm_states=expected,
-            old_u=mgr.old_x,
-            old_k=mgr.old_B,
-            old_G=mgr.old_dt,
-            replay_work_items=replay_work_items,
-            n_writes=n_writes,
-            history_size=mgr.replay_history_size,
-        )
-
-        mgr._commit_gdn_cached_replay_history_layers(
-            SimpleNamespace(
-                mamba_metadata=SimpleNamespace(
-                    replay_num_decodes=batch_size,
-                    replay_work_items=replay_work_items,
-                    replay_n_writes=n_writes,
-                )
-            ),
-            batch_size,
-        )
-
-        torch.testing.assert_close(torch.stack(mgr.all_ssm_states), expected, rtol=0, atol=0)
-    finally:
-        mgr.shutdown()
-
-
-def test_v2_gdn_replay_commits_before_advancing_bookkeeping(monkeypatch):
+def test_v2_gdn_replay_uses_combined_commit_only(monkeypatch):
     mgr = object.__new__(MambaHybridCacheManagerV2)
-    batch_size = 16
     mgr.local_num_mamba_layers = 1
     mgr._use_replay_state_update = True
-    mgr._use_gdn_cached_replay_all_layer_commit = True
-    mgr.replay_step_width = 4
-    mgr.replay_history_size = MIN_REPLAY_HISTORY_SIZE
-    mgr.prev_num_accepted_tokens = torch.zeros(batch_size, dtype=torch.int32)
-    mgr.cache_buf_idx = torch.zeros(batch_size, dtype=torch.int32)
-    mgr.intermediate_state_indices = torch.arange(batch_size, dtype=torch.int32)
-    mgr._dummy_request_mask = torch.zeros(batch_size, dtype=torch.bool)
-    mgr.all_conv_states = [torch.empty(0)]
-    mgr._stacked_conv_states = None
-    mgr.intermediate_conv_states = torch.empty(0)
+    mgr._use_gdn_mtp_replay = True
+    mgr.intermediate_state_indices = torch.arange(2, dtype=torch.int32)
+    mgr._dummy_request_mask = torch.tensor([False, True, False])
 
-    events = []
-    mgr._commit_gdn_cached_replay_history_layers = lambda *_args, **_kwargs: events.append("commit")
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager._advance_replay_state",
-        lambda *_args, **_kwargs: events.append("advance"),
-    )
+    captured = {}
+
+    def combined_commit(_metadata, num_decodes, accepted_tokens, is_dummy):
+        captured["num_decodes"] = num_decodes
+        captured["accepted_tokens"] = accepted_tokens.clone()
+        captured["is_dummy"] = is_dummy.clone()
+
+    mgr._commit_gdn_mtp_replay = combined_commit
     monkeypatch.setattr(
         "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager._promote_mamba_state_triton",
-        lambda *_args, **_kwargs: None,
+        lambda *_args, **_kwargs: pytest.fail("separate promotion must be skipped"),
     )
 
     mgr.update_mamba_states(
-        SimpleNamespace(num_seqs=batch_size, num_contexts=0),
-        torch.full((batch_size,), 3, dtype=torch.int32),
-        state_indices=torch.arange(batch_size, dtype=torch.int32),
+        SimpleNamespace(num_seqs=3, num_contexts=1),
+        torch.tensor([1, 2, 4], dtype=torch.int32),
+        state_indices=torch.tensor([7, 8, 9], dtype=torch.int32),
     )
 
-    assert events == ["commit", "advance"]
+    assert captured["num_decodes"] == 2
+    assert torch.equal(captured["accepted_tokens"], torch.tensor([2, 4], dtype=torch.int32))
+    assert torch.equal(captured["is_dummy"], torch.tensor([True, False]))
 
 
 def test_v2_hybrid_replay_update_skips_dummy_and_padding_rows(monkeypatch):
@@ -4150,6 +4093,7 @@ def test_v2_hybrid_replay_update_skips_dummy_and_padding_rows(monkeypatch):
     mgr._dummy_request_mask = torch.zeros(4, dtype=torch.bool)
     mgr._dummy_request_mask_host = torch.zeros(4, dtype=torch.bool)
     mgr._use_replay_state_update = True
+    mgr._use_gdn_mtp_replay = False
     mgr.replay_step_width = 5
     mgr.replay_history_size = 16
     mgr.prev_num_accepted_tokens = torch.full((4,), 13, dtype=torch.int32)
