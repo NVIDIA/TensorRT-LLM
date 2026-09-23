@@ -15,10 +15,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import run_msa_nvfp4_sparse_gqa
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
     build_kv_page_indices,
     msa_package_available,
+    require_msa_module,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.triton_sparse_decode import (
     NVFP4_SF_VEC_SIZE,
@@ -30,6 +32,9 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.triton_spa
     _sm100f_nvfp4_use_linear_softmax,
     minimax_m3_sparse_attn_decode,
     resolve_num_topk_chunks,
+)
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import (
+    MiniMaxM3MsaSparseAttentionMetadata,
 )
 from tensorrt_llm._utils import get_sm_version
 
@@ -699,19 +704,9 @@ def test_nvfp4_sparse_decode_matches_msa_csr_kernel(num_kv_heads, group):
     Triton scatter that wrote the bytes, MSA's CuTe reader, and this kernel's
     reader. A torch oracle alone could share a misreading of the layout.
 
-    The two kernels differ in compute precision, asymmetrically: MSA
-    dequantizes FP4 to FP8 and so re-quantizes every scaled K and V element,
-    while Triton dequantizes to bf16. That leaves MSA about 0.2 absolute from
-    an fp32 oracle on these shapes, too coarse for a tight equality. The sharp
-    assertion is therefore the second one, that Triton is the more accurate of
-    the two by a wide margin; reading the wrong scale bytes fails it well
-    before the loose envelope notices.
+    FP8 staging introduces ordinary rounding after full NVFP4 reconstruction;
+    it must not clip the unscaled FP4/block-scale product.
     """
-    from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import run_msa_nvfp4_sparse_gqa
-    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
-        require_msa_module,
-    )
-
     require_msa_module()
     seq_lens = [1025, 4097, 300, 8192]
     case = _make_nvfp4_inputs(seq_lens, num_kv_heads=num_kv_heads, group=group, seed=97)
@@ -723,7 +718,8 @@ def test_nvfp4_sparse_decode_matches_msa_csr_kernel(num_kv_heads, group):
     kv_lens = torch.tensor(seq_lens, device="cuda", dtype=torch.int32)
     cu_kv = torch.zeros(batch + 1, device="cuda", dtype=torch.int32)
     torch.cumsum(kv_lens, 0, out=cu_kv[1:])
-    metadata = SimpleNamespace(
+    metadata = object.__new__(MiniMaxM3MsaSparseAttentionMetadata)
+    metadata.__dict__.update(
         _msa_live_batch=batch,
         msa_cu_q_lens=torch.arange(batch + 1, device="cuda", dtype=torch.int32),
         msa_cu_kv_lens=cu_kv,
@@ -733,14 +729,14 @@ def test_nvfp4_sparse_decode_matches_msa_csr_kernel(num_kv_heads, group):
         _msa_total_k_rows=sum((s + PAGE_SIZE - 1) // PAGE_SIZE for s in seq_lens),
         msa_block_table=case.block_table,
         msa_seq_lens_cuda=case.seq_lens,
-        num_contexts=2,
+        _num_contexts=2,
         _msa_context_prefix_bounds=(
             1,
             max(seq_lens[:2]),
             sum(seq_lens[:2]),
             sum((s + PAGE_SIZE - 1) // PAGE_SIZE for s in seq_lens[:2]),
         ),
-        num_generations=batch - 2,
+        _num_generations=batch - 2,
     )
 
     triton_out = _run_nvfp4(case)
@@ -777,10 +773,6 @@ def test_nvfp4_sparse_decode_matches_msa_csr_kernel(num_kv_heads, group):
     )
     torch.testing.assert_close(prefix_out, msa_out[:prefix_rows], rtol=1e-2, atol=1e-2)
 
-    # A layout error makes K/V effectively random, so the two would disagree by
-    # O(1) rather than by MSA's FP8 rounding.
-    torch.testing.assert_close(triton_out.float(), msa_out.float(), rtol=0.3, atol=0.35)
-
     reference = _reference_sparse_decode(
         case.q.to(torch.bfloat16),
         case.k_ref,
@@ -791,13 +783,96 @@ def test_nvfp4_sparse_decode_matches_msa_csr_kernel(num_kv_heads, group):
         sm_scale=HEAD_DIM**-0.5,
         decode_query_len=1,
     )
-    triton_error = (triton_out.float() - reference).abs().max().item()
-    msa_error = (msa_out.float() - reference).abs().max().item()
-    assert triton_error * 10 < msa_error, (
-        f"Triton NVFP4 decode is not clearly the more accurate reader: "
-        f"its worst error against the fp32 oracle is {triton_error:.2e} against "
-        f"MSA's {msa_error:.2e}."
+    torch.testing.assert_close(triton_out.float(), reference, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(msa_out.float(), reference, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.parametrize("q_dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"])
+@pytest.mark.parametrize("pair_dequant", [False, True], ids=["scalar", "pair"])
+@pytest.mark.parametrize("kv_len", [1, 2], ids=["one-token", "k-sensitive"])
+@skip_not_sm100
+@pytest.mark.skipif(not msa_package_available(), reason="fmha_sm100 (MSA submodule) required")
+def test_msa_nvfp4_calibrated_staging_and_scale_replay(
+    q_dtype: torch.dtype, pair_dequant: bool, kv_len: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Global scales must precede FP8 conversion and remain live during replay."""
+    monkeypatch.setenv("MINIMAX_KVFP4_FP8_PAIR_DEQUANT", str(int(pair_dequant)))
+    require_msa_module()
+    q = torch.zeros((1, 8, HEAD_DIM), device="cuda", dtype=torch.bfloat16)
+    q[:, :, 0] = 1.0
+    q = q.to(q_dtype)
+    data = torch.zeros((1, 2, 1, PAGE_SIZE, HEAD_DIM // 2), device="cuda", dtype=torch.uint8)
+    # E2M1 nibble 7 is +6, nibble 15 is -6. With block scale 448,
+    # the unscaled magnitude is 2688, outside E4M3's finite range.
+    data[:, 0, :, 0] = 0xFF
+    data[:, 0, :, 1] = 0x77
+    data[:, 1, :, 0] = 0x77
+    data[:, 1, :, 1] = 0xFF
+    # Constant scales work for both K-linear and V-swizzle4x4 layouts.
+    scales = (
+        torch.full(
+            (1, 2, 1, PAGE_SIZE, HEAD_DIM // NVFP4_SF_VEC_SIZE),
+            448.0,
+            device="cuda",
+            dtype=torch.float32,
+        )
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8)
     )
+    k_global = torch.tensor([2.0 / 2688.0], device="cuda", dtype=torch.float32)
+    v_global = torch.tensor([1.0 / 2688.0], device="cuda", dtype=torch.float32)
+    metadata = object.__new__(MiniMaxM3MsaSparseAttentionMetadata)
+    metadata._msa_live_batch = 1
+    metadata.msa_cu_q_lens = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    metadata.msa_cu_kv_lens = torch.tensor([0, kv_len], device="cuda", dtype=torch.int32)
+    metadata._msa_max_q_len = 1
+    metadata._msa_max_kv_len_all = kv_len
+    metadata._msa_total_k = kv_len
+    metadata._msa_total_k_rows = 1
+    metadata.msa_block_table = torch.zeros((1, 1), device="cuda", dtype=torch.int32)
+    metadata.msa_seq_lens_cuda = torch.tensor([kv_len], device="cuda", dtype=torch.int32)
+    topk = torch.full((1, 1, MSA_REQUIRED_TOPK), -1, device="cuda", dtype=torch.int32)
+    topk[..., 0] = 0
+    out = torch.empty(q.shape, device="cuda", dtype=torch.bfloat16)
+
+    def run() -> None:
+        run_msa_nvfp4_sparse_gqa(
+            q,
+            data[:, 0],
+            data[:, 1],
+            scales,
+            topk,
+            metadata,
+            sm_scale=1.0,
+            k_global_scale=k_global,
+            v_global_scale=v_global,
+            out=out,
+        )
+
+    # One token must reconstruct V=1, not the premature-saturation result 1/6.
+    # Two tokens also expose K saturation through softmax([-2, 2]).
+    logits = torch.tensor([-2.0, 2.0], device="cuda")[:kv_len]
+    values = torch.tensor([1.0, -1.0], device="cuda")[:kv_len]
+    expected = (logits.softmax(0) * values).sum().expand_as(out)
+    run()
+    torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        run()
+    k_ptr, v_ptr = k_global.data_ptr(), v_global.data_ptr()
+    k_global.mul_(0.5)
+    v_global.mul_(2.0)
+    expected_updated = ((logits * 0.5).softmax(0) * values * 2.0).sum().expand_as(out)
+    graph.replay()
+    torch.testing.assert_close(out.float(), expected_updated, rtol=2e-2, atol=2e-2)
+    run()
+    torch.testing.assert_close(out.float(), expected_updated, rtol=2e-2, atol=2e-2)
+    assert (k_global.data_ptr(), v_global.data_ptr()) == (k_ptr, v_ptr)
 
 
 @pytest.mark.parametrize(

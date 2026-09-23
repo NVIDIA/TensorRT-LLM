@@ -1,5 +1,5 @@
 diff --git a/python/fmha_sm100/api.py b/python/fmha_sm100/api.py
-index b02f747..459f3be 100644
+index b02f747..17d7cfb 100644
 --- a/python/fmha_sm100/api.py
 +++ b/python/fmha_sm100/api.py
 @@ -532,9 +532,8 @@ def _fmha_sm100_plan(
@@ -241,7 +241,7 @@ index b02f747..459f3be 100644
  
          # ---- Merge max_score ----
 diff --git a/python/fmha_sm100/cute/interface.py b/python/fmha_sm100/cute/interface.py
-index d72b17a..8878d75 100644
+index d72b17a..0cf430c 100644
 --- a/python/fmha_sm100/cute/interface.py
 +++ b/python/fmha_sm100/cute/interface.py
 @@ -136,6 +136,35 @@ def _prepare_paged_kv_for_tma(k, v, blk_kv: int):
@@ -532,7 +532,7 @@ index d72b17a..8878d75 100644
      k_global_scale: Optional[torch.Tensor],
      v_global_scale: Optional[torch.Tensor],
      k2q_row_ptr: torch.Tensor,
-@@ -805,11 +949,20 @@ def sparse_atten_nvfp4_kv_func(
+@@ -805,16 +949,25 @@ def sparse_atten_nvfp4_kv_func(
          because each byte packs two FP4 values.
      v : torch.Tensor
          Packed NVFP4 V data with the same shape as ``k``.
@@ -558,6 +558,13 @@ index d72b17a..8878d75 100644
      k_global_scale : torch.Tensor, optional
          FP32 tensor/global dequant scale for K.  May be ``None``.
      v_global_scale : torch.Tensor, optional
+-        FP32 tensor/global dequant scale for V.  May be ``None``.  The V global
+-        scale is applied in the combine stage.
++        FP32 tensor/global dequant scale for V. May be ``None``. FP8 staging
++        applies it before conversion; BF16 staging applies it during combine.
+     k2q_row_ptr : torch.Tensor
+         CSR row pointers with shape ``[Hkv, total_rows + 1]`` and dtype int32.
+     k2q_q_indices : torch.Tensor
 @@ -847,7 +1000,14 @@ def sparse_atten_nvfp4_kv_func(
          Paged-KV physical page table with shape
          ``[batch_size, max_num_pages_per_seq]`` and dtype int32.
@@ -609,6 +616,15 @@ index d72b17a..8878d75 100644
          None if k_global_scale is None else k_global_scale.contiguous(),
          None if v_global_scale is None else v_global_scale.contiguous(),
          k2q_row_ptr.contiguous(),
+@@ -978,7 +1145,7 @@ def sparse_atten_nvfp4_kv_func(
+         lse_temperature_out=LSE_temperature_out,
+         cu_seqlens=cu_seqlens_q,
+         split_counts=split_counts,
+-        output_scale=v_global_scale,
++        output_scale=None if q.dtype == torch.float8_e4m3fn else v_global_scale,
+         use_pdl=True,
+     )
+     if temperature_lse_fast_path:
 @@ -1296,13 +1463,34 @@ class SparseDecodePagedAttentionWrapper:
          self.work_count = schedule.work_count
          self.padded_work_count = schedule.padded_work_count
@@ -729,6 +745,19 @@ index d72b17a..8878d75 100644
      k_global_scale,
      v_global_scale,
      k2q_row_ptr,
+@@ -1859,9 +2100,9 @@ def _call_sparse_forward_sm100_csr_varlen_nvfp4_kv(
+     qhead_per_kv = head_q // head_kv
+     fp8_pair_dequant = os.environ.get("MINIMAX_KVFP4_FP8_PAIR_DEQUANT", "1") != "0"
+     k_global_scale_kernel = k_global_scale
+-    # V global scale is linear in the final output. Keep K1 on block-scale-only V
+-    # and apply the tensor scale once in K2 combine.
+-    v_global_scale_kernel = None
++    # FP8 cannot hold the block-scaled NVFP4 intermediate (up to 6 * 448).
++    # Reconstruct V before the FP8 cast. BF16 keeps its existing deferred scale.
++    v_global_scale_kernel = v_global_scale if q.dtype == torch.float8_e4m3fn else None
+     has_k_global_scale = k_global_scale_kernel is not None
+     has_v_global_scale = v_global_scale_kernel is not None
+     paged_kv = page_table is not None
 @@ -1873,6 +2114,18 @@ def _call_sparse_forward_sm100_csr_varlen_nvfp4_kv(
          _prepare_paged_kv_for_tma(k, v, n_block_size)
      k_kernel = k
@@ -1879,7 +1908,7 @@ index 5bdc19a..9df4699 100644
      )
      desc_ptr = cute_ir.inttoptr(ptr_ty, ptr_i64_align, loc=loc, ip=ip)
 diff --git a/python/fmha_sm100/cute/src/common/utils.py b/python/fmha_sm100/cute/src/common/utils.py
-index 10b2b1f..cb7ea1c 100644
+index 10b2b1f..3b9f909 100644
 --- a/python/fmha_sm100/cute/src/common/utils.py
 +++ b/python/fmha_sm100/cute/src/common/utils.py
 @@ -17,8 +17,42 @@ from cutlass.cute.runtime import from_dlpack
@@ -2014,18 +2043,29 @@ index 10b2b1f..cb7ea1c 100644
          out = llvm.inline_asm(
              llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
              [cutlass.Int32(src).ir_value(loc=loc, ip=ip)],
-@@ -703,9 +788,7 @@ def cvt_fp4x8_e2m1_scaled_e4m3x8(
+@@ -697,15 +782,18 @@ def cvt_fp4x8_e2m1_bf16x8(
+ def cvt_fp4x8_e2m1_scaled_e4m3x8(
+     src: cutlass.Int32,
+     scale_e4m3: cutlass.Int32,
++    global_scale: Optional[Float32] = None,
+     *,
+     loc=None,
+     ip=None,
  ) -> Tuple[cutlass.Int32, cutlass.Int32]:
-     """Scale eight packed E2M1 values by one E4M3 byte and convert to E4M3."""
+-    """Scale eight packed E2M1 values by one E4M3 byte and convert to E4M3."""
++    """Reconstruct eight NVFP4 values before rounding them to E4M3.
  
 -    from cutlass import CUDA_VERSION
--
++    The block-scaled intermediate can reach 6 * 448. Applying the FP32
++    global scale after an E4M3 conversion would preserve its saturation error.
++    """
+ 
 -    if CUDA_VERSION.major > 13 or (CUDA_VERSION.major == 13 and CUDA_VERSION.minor >= 2):
-+    if _toolchain_supports(_PTX_PROBE_SCALED_E4M3_MUL):
++    if global_scale is None and _toolchain_supports(_PTX_PROBE_SCALED_E4M3_MUL):
          out = llvm.inline_asm(
              llvm.StructType.get_literal([T.i32(), T.i32()]),
              [
-@@ -731,44 +814,89 @@ def cvt_fp4x8_e2m1_scaled_e4m3x8(
+@@ -731,44 +819,91 @@ def cvt_fp4x8_e2m1_scaled_e4m3x8(
          out1 = cutlass.Int32(llvm.extractvalue(T.i32(), out, [1], loc=loc, ip=ip))
          return out0, out1
  
@@ -2128,6 +2168,8 @@ index 10b2b1f..cb7ea1c 100644
 +        Float32(llvm.extractvalue(T.f32(), out, [i], loc=loc, ip=ip))
 +        for i in range(8)
 +    ]
++    if global_scale is not None:
++        values = [value * global_scale for value in values]
 +    return (
 +        cvt_fp8x4_e4m3_f32(*values[:4], loc=loc, ip=ip),
 +        cvt_fp8x4_e4m3_f32(*values[4:], loc=loc, ip=ip),
@@ -2151,7 +2193,7 @@ index f5950f3..caad594 100644
          tOrP: cute.Tensor,
          sK: cute.Tensor,
 diff --git a/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd_nvfp4_kv.py b/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd_nvfp4_kv.py
-index ba930a6..2ba2ca4 100644
+index ba930a6..f2d7fb3 100644
 --- a/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd_nvfp4_kv.py
 +++ b/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd_nvfp4_kv.py
 @@ -9,7 +9,8 @@ forward contract:
@@ -2434,7 +2476,42 @@ index ba930a6..2ba2ca4 100644
  
      @cute.jit
      def _dequant_fp4x16_to_bf16(
-@@ -1316,25 +1422,6 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1282,12 +1388,14 @@ class SparseAttentionForwardNvfp4KvSm100:
+         src_words: cute.Tensor,
+         scale_e4m3: Int32,
+         dst: cute.Tensor,
++        global_scale: Optional[Float32],
+     ):
+         dst_i32 = cute.recast_tensor(dst, cutlass.Int32)
+         for word_idx in cutlass.range_constexpr(2):
+             fp8_lo, fp8_hi = utils.cvt_fp4x8_e2m1_scaled_e4m3x8(
+                 src_words[word_idx],
+                 scale_e4m3,
++                global_scale,
+             )
+             dst_i32[word_idx * 2] = fp8_lo
+             dst_i32[word_idx * 2 + 1] = fp8_hi
+@@ -1299,12 +1407,14 @@ class SparseAttentionForwardNvfp4KvSm100:
+         scale_e4m3_lo: Int32,
+         scale_e4m3_hi: Int32,
+         dst: cute.Tensor,
++        global_scale: Optional[Float32],
+     ):
+         dst_i32 = cute.recast_tensor(dst, cutlass.Int32)
+         for word_idx in cutlass.range_constexpr(2):
+             fp8_lo, fp8_hi = utils.cvt_fp4x8_e2m1_scaled_e4m3x8(
+                 src_words[word_idx],
+                 scale_e4m3_lo,
++                global_scale,
+             )
+             dst_i32[word_idx * 2] = fp8_lo
+             dst_i32[word_idx * 2 + 1] = fp8_hi
+@@ -1312,29 +1422,11 @@ class SparseAttentionForwardNvfp4KvSm100:
+             fp8_lo, fp8_hi = utils.cvt_fp4x8_e2m1_scaled_e4m3x8(
+                 src_words[word_idx + 2],
+                 scale_e4m3_hi,
++                global_scale,
+             )
              dst_i32[word_idx * 2 + 4] = fp8_lo
              dst_i32[word_idx * 2 + 5] = fp8_hi
  
@@ -2460,7 +2537,7 @@ index ba930a6..2ba2ca4 100644
      @cute.jit
      def _load_k_fp4_to_smem(
          self,
-@@ -1350,11 +1437,34 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1350,11 +1442,37 @@ class SparseAttentionForwardNvfp4KvSm100:
          kv_block_idx: Int32,
          k_batch_offset: Int32,
          num_heads_kv: Int32,
@@ -2491,12 +2568,15 @@ index ba930a6..2ba2ca4 100644
 +        #   1. FP8 pair  : 2 blocks/iter, 128-bit load, 2 scale bytes. == mode 2 x2, loop fusion.
 +        #   2. FP8 scalar: 1 block/iter, 64-bit load. Half a 32-elem tile, hence the local_tile().
 +        #   3. BF16      : 1 block/iter; global scale folded here since mul_bf16x2 runs anyway.
-+        # The FP8 modes have no slot for it, so K's global scale is applied
-+        # downstream in FP32 on the S = Q*K^T accumulator.
++        # FP8 staging must include the global scale before conversion, since
++        # the block-scaled FP4 intermediate can exceed E4M3's finite range.
++        k_global = None
++        if const_expr(self.has_k_global_scale):
++            k_global = mKGlobalScale[0]
          if const_expr(self.k_dtype == cutlass.Float8E4M3FN and self.fp8_pair_dequant):
              elems_per_pair: cutlass.Constexpr[int] = 32
              bytes_per_pair: cutlass.Constexpr[int] = 16
-@@ -1379,22 +1489,17 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1379,22 +1497,17 @@ class SparseAttentionForwardNvfp4KvSm100:
                  pair_col = task_idx - row * Int32(scale_pairs)
                  scale_col = pair_col * Int32(2)
                  byte_col = pair_col * Int32(bytes_per_pair)
@@ -2525,27 +2605,34 @@ index ba930a6..2ba2ca4 100644
                  smem_offset = row * Int32(self.head_dim // 2) + byte_col
                  s_ptr = cute.make_ptr(
                      cutlass.Int32,
-@@ -1404,10 +1509,16 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1404,10 +1517,16 @@ class SparseAttentionForwardNvfp4KvSm100:
                  )
                  s_vec = cute.make_tensor(s_ptr, cute.make_layout(bytes_per_pair // 4))
                  cute.copy(g2r_pair_atom, s_vec, r_words_pair)
 -                scale_e4m3_lo = self._load_scale_e4m3_u8(mKScale, scale_row, scale_col)
 -                scale_e4m3_hi = self._load_scale_e4m3_u8(
 +                scale_e4m3_lo = self._load_scale_e4m3_u8_linear(
-                     mKScale,
--                    scale_row,
++                    mKScale,
 +                    sf_region_base,
 +                    sf_token,
 +                    scale_col,
 +                )
 +                scale_e4m3_hi = self._load_scale_e4m3_u8_linear(
-+                    mKScale,
+                     mKScale,
+-                    scale_row,
 +                    sf_region_base,
 +                    sf_token,
                      scale_col + Int32(1),
                  )
                  self._dequant_fp4x32_to_fp8(
-@@ -1421,92 +1532,94 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1415,98 +1534,101 @@ class SparseAttentionForwardNvfp4KvSm100:
+                     scale_e4m3_lo,
+                     scale_e4m3_hi,
+                     r_vals_pair,
++                    k_global,
+                 )
+                 sK_vec = sK[(row, None), 0, pair_col, 0]
+                 r_tiles = cute.logical_divide(r_vals_pair, cute.make_layout(16))
                  s_tiles = cute.logical_divide(sK_vec, cute.make_layout(16))
                  for v in cutlass.range_constexpr(elems_per_pair // 16):
                      cute.copy(r2s_pair_atom, r_tiles[None, v], s_tiles[None, v])
@@ -2688,7 +2775,7 @@ index ba930a6..2ba2ca4 100644
 +                        (elems_per_block,),
 +                        (scale_col % Int32(2),),
 +                    )
-+                    self._dequant_fp4x16_to_fp8(r_words, scale_e4m3, r_vals)
++                    self._dequant_fp4x16_to_fp8(r_words, scale_e4m3, r_vals, k_global)
 +                else:
 +                    # Mode 3: replicated bf16x2 scale, global scale folded in.
 +                    combined_bf16x2 = self._load_scale_bf16x2_linear(
@@ -2722,7 +2809,7 @@ index ba930a6..2ba2ca4 100644
          cute.arch.fence_view_async_shared()
  
      @cute.jit
-@@ -1524,11 +1637,29 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1524,11 +1646,30 @@ class SparseAttentionForwardNvfp4KvSm100:
          kv_block_idx: Int32,
          k_batch_offset: Int32,
          num_heads_kv: Int32,
@@ -2747,13 +2834,14 @@ index ba930a6..2ba2ca4 100644
 +                k_batch_offset + kv_block_idx * Int32(self.n_block_size)
 +            )
 +        # Same three trace-time modes as `_load_k_fp4_to_smem`; V only differs
-+        # in the smem destination and the 4x4-swizzled scale reads.  V's global
-+        # scale is likewise folded into the BF16 arm only -- in the FP8 modes it
-+        # rides the row scale in the output stage.
++        # in the smem destination and the 4x4-swizzled scale reads.
++        v_global = None
++        if const_expr(self.has_v_global_scale):
++            v_global = mVGlobalScale[0]
          if const_expr(self.v_dtype == cutlass.Float8E4M3FN and self.fp8_pair_dequant):
              elems_per_pair: cutlass.Constexpr[int] = 32
              bytes_per_pair: cutlass.Constexpr[int] = 16
-@@ -1553,22 +1684,18 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1553,22 +1694,18 @@ class SparseAttentionForwardNvfp4KvSm100:
                  pair_col = task_idx - row * Int32(scale_pairs)
                  scale_col = pair_col * Int32(2)
                  byte_col = pair_col * Int32(bytes_per_pair)
@@ -2783,7 +2871,7 @@ index ba930a6..2ba2ca4 100644
                  smem_offset = row * Int32(self.head_dim // 2) + byte_col
                  s_ptr = cute.make_ptr(
                      cutlass.Int32,
-@@ -1578,10 +1705,16 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1578,10 +1715,16 @@ class SparseAttentionForwardNvfp4KvSm100:
                  )
                  s_vec = cute.make_tensor(s_ptr, cute.make_layout(bytes_per_pair // 4))
                  cute.copy(g2r_pair_atom, s_vec, r_words_pair)
@@ -2803,7 +2891,15 @@ index ba930a6..2ba2ca4 100644
                      scale_col + Int32(1),
                  )
                  self._dequant_fp4x32_to_fp8(
-@@ -1596,81 +1729,86 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1589,6 +1732,7 @@ class SparseAttentionForwardNvfp4KvSm100:
+                     scale_e4m3_lo,
+                     scale_e4m3_hi,
+                     r_vals_pair,
++                    v_global,
+                 )
+                 sV_cols = sV[(None, row % Int32(32)), 0, row // Int32(32), 0]
+                 sV_vec = cute.local_tile(sV_cols, (elems_per_pair,), (pair_col,))
+@@ -1596,81 +1740,86 @@ class SparseAttentionForwardNvfp4KvSm100:
                  s_tiles = cute.logical_divide(sV_vec, cute.make_layout(16))
                  for v in cutlass.range_constexpr(elems_per_pair // 16):
                      cute.copy(r2s_pair_atom, r_tiles[None, v], s_tiles[None, v])
@@ -2930,7 +3026,7 @@ index ba930a6..2ba2ca4 100644
 +                        sf_token,
 +                        scale_col,
 +                    )
-+                    self._dequant_fp4x16_to_fp8(r_words, scale_e4m3, r_vals)
++                    self._dequant_fp4x16_to_fp8(r_words, scale_e4m3, r_vals, v_global)
 +                    sV_cols = sV[(None, row % Int32(32)), 0, row // Int32(32), 0]
 +                else:
 +                    # Mode 3: bf16x2 scale, global folded in; 16-row smem groups.
@@ -2961,7 +3057,7 @@ index ba930a6..2ba2ca4 100644
          cute.arch.fence_view_async_shared()
  
      @cute.jit
-@@ -1794,6 +1932,8 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1794,6 +1943,8 @@ class SparseAttentionForwardNvfp4KvSm100:
          kv_block_idx: Int32,
          k_batch_offset: Int32,
          num_heads_kv: Int32,
@@ -2970,7 +3066,7 @@ index ba930a6..2ba2ca4 100644
      ):
          warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
          warp_idx_in_wg = warp_idx - Int32(dequant_warp_base)
-@@ -1814,6 +1954,8 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1814,6 +1965,8 @@ class SparseAttentionForwardNvfp4KvSm100:
                  kv_block_idx,
                  k_batch_offset,
                  num_heads_kv,
@@ -2979,7 +3075,7 @@ index ba930a6..2ba2ca4 100644
              )
              dequant_barrier.arrive_and_wait()
              if warp_idx_in_wg == Int32(0):
-@@ -1838,6 +1980,8 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1838,6 +1991,8 @@ class SparseAttentionForwardNvfp4KvSm100:
          kv_block_idx: Int32,
          k_batch_offset: Int32,
          num_heads_kv: Int32,
@@ -2988,7 +3084,7 @@ index ba930a6..2ba2ca4 100644
      ):
          warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
          warp_idx_in_wg = warp_idx - Int32(dequant_warp_base)
-@@ -1858,6 +2002,8 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1858,6 +2013,8 @@ class SparseAttentionForwardNvfp4KvSm100:
                  kv_block_idx,
                  k_batch_offset,
                  num_heads_kv,
@@ -2997,7 +3093,7 @@ index ba930a6..2ba2ca4 100644
              )
              dequant_barrier.arrive_and_wait()
              if warp_idx_in_wg == Int32(0):
-@@ -2191,8 +2337,8 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -2191,8 +2348,8 @@ class SparseAttentionForwardNvfp4KvSm100:
          self,
          tiled_mma_qk: cute.TiledMma,
          tiled_mma_pv: cute.TiledMma,
@@ -3008,6 +3104,60 @@ index ba930a6..2ba2ca4 100644
          tStS: cute.Tensor,
          tOrP: cute.Tensor,
          sK: cute.Tensor,
+@@ -2479,17 +2636,6 @@ class SparseAttentionForwardNvfp4KvSm100:
+             self.qk_acc_dtype)
+         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
+ 
+-        if const_expr(
+-            self.q_dtype == cutlass.Float8E4M3FN
+-            and self.has_k_global_scale
+-        ):
+-            k_global = mKGlobalScale[0]
+-            for i in cutlass.range_constexpr(0, cute.size(tSrS_t2r.shape), 2):
+-                tSrS_t2r[i], tSrS_t2r[i + 1] = cute.arch.mul_packed_f32x2(
+-                    (tSrS_t2r[i], tSrS_t2r[i + 1]),
+-                    (k_global, k_global),
+-                )
+-
+         seqlen_info = SeqlenInfoQK(
+             Int32(0),
+             Int32(0),
+@@ -3071,11 +3217,6 @@ class SparseAttentionForwardNvfp4KvSm100:
+                                     row_sum_val
+                                     if not is_zero_or_nan
+                                     else Float32(1.0))
+-                                if const_expr(
+-                                    self.q_dtype == cutlass.Float8E4M3FN
+-                                    and self.has_v_global_scale
+-                                ):
+-                                    row_scale *= mVGlobalScale[0]
+                                 row_base_ptr = (
+                                     flat_row * Int64(self.head_dim))
+                                 o0 = tOrO_mn[r, c_base]
+@@ -3133,11 +3274,6 @@ class SparseAttentionForwardNvfp4KvSm100:
+                                     row_sum_val
+                                     if not is_zero_or_nan
+                                     else Float32(1.0))
+-                                if const_expr(
+-                                    self.q_dtype == cutlass.Float8E4M3FN
+-                                    and self.has_v_global_scale
+-                                ):
+-                                    row_scale *= mVGlobalScale[0]
+                                 row_base_ptr = (
+                                     flat_row * Int64(self.head_dim))
+                                 o0 = tOrO_mn[r, c_base]
+@@ -3211,11 +3347,6 @@ class SparseAttentionForwardNvfp4KvSm100:
+                                     if not is_zero_or_nan
+                                     else Float32(1.0)
+                                 )
+-                                if const_expr(
+-                                    self.q_dtype == cutlass.Float8E4M3FN
+-                                    and self.has_v_global_scale
+-                                ):
+-                                    row_scale *= mVGlobalScale[0]
+                                 row_base_ptr = flat_row * Int64(self.head_dim)
+                                 o0 = tOrO_mn[r, c_base]
+                                 o1 = tOrO_mn[r, c_base + Int32(1)]
 diff --git a/python/fmha_sm100/cute/src/sm100/fwd_decode/atten_fwd.py b/python/fmha_sm100/cute/src/sm100/fwd_decode/atten_fwd.py
 index 8ccc2cb..daf0e74 100644
 --- a/python/fmha_sm100/cute/src/sm100/fwd_decode/atten_fwd.py
@@ -3158,7 +3308,7 @@ index 599dace..f29b5b0 100644
                  cute.arch.issue_clc_query(
                      mbarrier_addr, response_ptr, loc=loc, ip=ip)
 diff --git a/python/fmha_sm100/cute/test_sparse_atten.py b/python/fmha_sm100/cute/test_sparse_atten.py
-index 21c777e..e651567 100644
+index 21c777e..fa48c96 100644
 --- a/python/fmha_sm100/cute/test_sparse_atten.py
 +++ b/python/fmha_sm100/cute/test_sparse_atten.py
 @@ -19,9 +19,11 @@ from __future__ import annotations
@@ -3468,10 +3618,10 @@ index 21c777e..e651567 100644
 +    That is what lets the BF16 reference stand as an absolute gate across the
 +    layout change.
 +    """
++
++    from quantize import dequantize_nvfp4_to_bf16
  
 -    return dequantize_nvfp4_128x4_to_bf16(
-+    from quantize import dequantize_nvfp4_to_bf16
-+
 +    return dequantize_nvfp4_to_bf16(
          qx,
          include_global_scale=include_global_scale,
@@ -3801,7 +3951,16 @@ index 21c777e..e651567 100644
          k_q.global_scale,
          v_q.global_scale,
          inputs["k2q_row_ptr"],
-@@ -2280,8 +2726,7 @@ def test_sparse_atten_nvfp4_kv_fp8_q_matches_block_scaled_fp8_reference(
+@@ -2237,7 +2683,7 @@ def test_sparse_atten_nvfp4_kv_te_quantized_flat_smoke() -> None:
+ @pytest.mark.parametrize("paged", [False, True])
+ @pytest.mark.parametrize("qhead_per_kv", [1, 2, 4, 8, 16])
+ @pytest.mark.parametrize("topk", [4, 8])
+-def test_sparse_atten_nvfp4_kv_fp8_q_matches_block_scaled_fp8_reference(
++def test_sparse_atten_nvfp4_kv_fp8_q_matches_calibrated_fp8_reference(
+     topk: int,
+     qhead_per_kv: int,
+     paged: bool,
+@@ -2280,15 +2726,14 @@ def test_sparse_atten_nvfp4_kv_fp8_q_matches_block_scaled_fp8_reference(
          v_source = inputs["v"]
  
      q_fp8 = inputs["q"].to(torch.float8_e4m3fn)
@@ -3809,9 +3968,33 @@ index 21c777e..e651567 100644
 -    v_q = _quantize_bf16_to_nvfp4_or_skip(v_source)
 +    k_q, v_q = _quantize_kv_bf16_to_nvfp4(k_source, v_source)
      fp8_max = torch.finfo(torch.float8_e4m3fn).max
-     k_stage = _dequant_nvfp4_to_bf16(k_q, include_global_scale=False)
-     v_stage = _dequant_nvfp4_to_bf16(v_q, include_global_scale=False)
-@@ -2327,8 +2772,8 @@ def test_sparse_atten_nvfp4_kv_fp8_q_matches_block_scaled_fp8_reference(
+-    k_stage = _dequant_nvfp4_to_bf16(k_q, include_global_scale=False)
+-    v_stage = _dequant_nvfp4_to_bf16(v_q, include_global_scale=False)
++    # The block-scaled FP4 product is exactly representable in BF16. Apply
++    # the global scale in FP32, avoiding an extra BF16 rounding before FP8.
++    k_stage = _dequant_nvfp4_to_bf16(k_q, include_global_scale=False).float() * k_q.global_scale
++    v_stage = _dequant_nvfp4_to_bf16(v_q, include_global_scale=False).float() * v_q.global_scale
+     k_stage = k_stage.float().clamp(min=-fp8_max, max=fp8_max).to(torch.float8_e4m3fn)
+     v_stage = v_stage.float().clamp(min=-fp8_max, max=fp8_max).to(torch.float8_e4m3fn)
+-    k_global = float(k_q.global_scale.reshape(-1)[0].item())
+-    v_global = float(v_q.global_scale.reshape(-1)[0].item())
+ 
+     if paged:
+         k_ref_chunks = []
+@@ -2315,20 +2760,19 @@ def test_sparse_atten_nvfp4_kv_fp8_q_matches_block_scaled_fp8_reference(
+         q_lens=inputs["q_lens"],
+         k_lens=inputs["k_lens"],
+         blk_kv=inputs["blk_kv"],
+-        softmax_scale=inputs["softmax_scale"] * k_global,
++        softmax_scale=inputs["softmax_scale"],
+         causal=causal,
+         upcast=True,
+         seqused_k=inputs["seqused_k"] if paged else None,
+         p_dtype=torch.float8_e4m3fn,
+     )
+-    out_ref = out_ref * v_global
+ 
+     out, lse = sparse_atten_nvfp4_kv_func(
          q_fp8,
          k_q.data,
          v_q.data,
@@ -3822,7 +4005,7 @@ index 21c777e..e651567 100644
          k_q.global_scale,
          v_q.global_scale,
          inputs["k2q_row_ptr"],
-@@ -2366,8 +2811,14 @@ def test_sparse_atten_nvfp4_kv_fp8_q_without_global_scale_matches_reference() ->
+@@ -2366,8 +2810,14 @@ def test_sparse_atten_nvfp4_kv_fp8_q_without_global_scale_matches_reference() ->
          q2k_pattern=Q2KPattern.UNIFORM,
      )
      q_fp8 = inputs["q"].to(torch.float8_e4m3fn)
@@ -3839,7 +4022,7 @@ index 21c777e..e651567 100644
      fp8_max = torch.finfo(torch.float8_e4m3fn).max
      k_ref = _dequant_nvfp4_to_bf16(
          k_q,
-@@ -2395,8 +2846,8 @@ def test_sparse_atten_nvfp4_kv_fp8_q_without_global_scale_matches_reference() ->
+@@ -2395,8 +2845,8 @@ def test_sparse_atten_nvfp4_kv_fp8_q_without_global_scale_matches_reference() ->
          q_fp8,
          k_q.data,
          v_q.data,
@@ -3850,7 +4033,7 @@ index 21c777e..e651567 100644
          None,
          None,
          inputs["k2q_row_ptr"],
-@@ -2560,10 +3011,13 @@ def test_sparse_decode_page_fp8_forward(kv_tokens: int) -> None:
+@@ -2560,10 +3010,13 @@ def test_sparse_decode_page_fp8_forward(kv_tokens: int) -> None:
  
      out, lse = _run_sparse_decode_page_fp8(fn, inputs)
      out_ref, lse_ref = _decode_paged_dense_reference(inputs)
@@ -3865,7 +4048,7 @@ index 21c777e..e651567 100644
  
  
  def test_sparse_decode_page_fp8_forward_forced_split_kv_tile_aligned_partial() -> None:
-@@ -2596,7 +3050,10 @@ def test_sparse_decode_page_fp8_forward_forced_split_kv_tile_aligned_partial() -
+@@ -2596,7 +3049,10 @@ def test_sparse_decode_page_fp8_forward_forced_split_kv_tile_aligned_partial() -
          return_softmax_lse=True,
      )
      out_ref, lse_ref = _decode_paged_dense_reference(inputs)
@@ -3877,7 +4060,7 @@ index 21c777e..e651567 100644
  
  
  # ---------------------------------------------------------------------------
-@@ -2943,10 +3400,12 @@ def _build_sparse_nvfp4_kv_benchmark_context(
+@@ -2943,10 +3399,12 @@ def _build_sparse_nvfp4_kv_benchmark_context(
          raise ValueError(f"Unsupported NVFP4 KV benchmark Q dtype: {q_dtype}")
      k_q = _make_synthetic_nvfp4_tensor(
          tuple(k_source.shape),
@@ -3890,7 +4073,7 @@ index 21c777e..e651567 100644
          global_scale_value=1.25,
      )
      k_bf16 = _dequant_nvfp4_to_bf16(k_q)
-@@ -2990,8 +3449,8 @@ def _build_sparse_nvfp4_kv_benchmark_context(
+@@ -2990,8 +3448,8 @@ def _build_sparse_nvfp4_kv_benchmark_context(
              q,
              k_q.data,
              v_q.data,
@@ -3901,6 +4084,20 @@ index 21c777e..e651567 100644
              k_q.global_scale,
              v_q.global_scale,
              k2q_row_ptr,
+diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
+index fa63a02..b1fd74b 100644
+--- a/python/fmha_sm100/jit.py
++++ b/python/fmha_sm100/jit.py
+@@ -199,6 +199,9 @@ def _get_nvcc_flags(cache_dir, fmha=True):
+         "--expt-relaxed-constexpr", "--expt-extended-lambda",
+         "-gencode=arch=compute_100a,code=sm_100a",
+         "-gencode=arch=compute_103a,code=sm_103a",
++        # SM100-family image so the rest of the family can load these kernels;
++        # sm_100a/sm_103a are arch-conditional and outrank it on those devices.
++        "-gencode=arch=compute_100f,code=sm_100f",
+         "-static-global-template-stub=false",
+         "-DFLASHINFER_ENABLE_BF16",
+         "-DFLASHINFER_ENABLE_FP8_E4M3",
 diff --git a/python/fmha_sm100/sparse.py b/python/fmha_sm100/sparse.py
 index 7006fcd..9a09324 100644
 --- a/python/fmha_sm100/sparse.py
@@ -4138,16 +4335,3 @@ index 306b416..a564d47 100644
          out.copy_(result)
          return out, None
      return result, None
-diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
---- a/python/fmha_sm100/jit.py
-+++ b/python/fmha_sm100/jit.py
-@@ -199,6 +199,9 @@
-         "--expt-relaxed-constexpr", "--expt-extended-lambda",
-         "-gencode=arch=compute_100a,code=sm_100a",
-         "-gencode=arch=compute_103a,code=sm_103a",
-+        # SM100-family image so the rest of the family can load these kernels;
-+        # sm_100a/sm_103a are arch-conditional and outrank it on those devices.
-+        "-gencode=arch=compute_100f,code=sm_100f",
-         "-static-global-template-stub=false",
-         "-DFLASHINFER_ENABLE_BF16",
-         "-DFLASHINFER_ENABLE_FP8_E4M3",
