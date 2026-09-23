@@ -36,7 +36,7 @@ _TARGETS = {
 
 # Synthetic architecture name -> the module whose import registers it.
 TARGET_MODULES = {
-    "ModelingV2DeepseekR10528Nvfp4Sm103Dep4": "models.deepseek_v3.targets.r1_0528_nvfp4.sm_103.dep4.modeling",
+    "ModelingV2DeepseekR10528Nvfp4Sm103Dep4": "models.deepseek_v3.r1_0528_nvfp4__sm_103__dep4.modeling",
 }
 
 

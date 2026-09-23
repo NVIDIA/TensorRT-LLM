@@ -87,12 +87,12 @@ def test_each_target_module_registers_its_own_name(arch):
 
 @pytest.mark.parametrize("arch", _ARCHS)
 def test_target_identity_matches_its_path(arch):
-    """Identity is the path: <checkpoint>/<gpu arch>/<parallel>.
+    """Identity is the directory name: <checkpoint>__<gpu arch>__<parallel>.
 
     The class name encodes the same triple, and the routing module's ``_SM``
     has to be the arch segment those targets actually live under -- a target
-    moved to a new SM directory without its routing constant following is the
-    one drift that would still route, and route wrong.
+    moved to a new SM without its routing constant following is the one drift
+    that would still route, and route wrong.
     """
     routing = routing_module(arch)
     major, minor = routing._SM
@@ -101,7 +101,12 @@ def test_target_identity_matches_its_path(arch):
     for name, dotted in routing.TARGET_MODULES.items():
         parts = dotted.split(".")
         assert parts[-1] == "modeling", dotted
-        parallel, sm_segment, checkpoint = parts[-2], parts[-3], parts[-4]
+        segments = parts[-2].split("__")
+        assert len(segments) == 3, (
+            f"{arch}: {parts[-2]!r} is not a <checkpoint>__<sm>__<parallel> "
+            f"directory name"
+        )
+        checkpoint, sm_segment, parallel = segments
 
         assert sm_segment == expected_segment, (
             f"{arch}: {name} lives under {sm_segment} but its routing module "

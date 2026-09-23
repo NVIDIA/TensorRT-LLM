@@ -140,7 +140,7 @@ def test_resolving_registers_the_target_class():
     assert cls is not None, f"{name} resolved to no class"
     assert cls.__name__ == name
     assert cls.__module__.endswith(
-        "modeling_v2.models.gpt_oss.targets.gpt_oss_120b.sm_103.tp1.modeling"
+        "modeling_v2.models.gpt_oss.gpt_oss_120b__sm_103__tp1.modeling"
     )
 
 
