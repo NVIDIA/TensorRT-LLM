@@ -392,28 +392,30 @@ For a full benchmarking + profiling workflow (including multi-cycle capture unde
 Configuring with YAML Files and ``--set``
 ------------------------------------------
 
-You can configure various options of ``trtllm-serve`` using YAML files by setting the ``--config`` option to the path of a YAML file. Explicit CLI flags take precedence over values in the YAML; un-set CLI flags fall back to the YAML.
+Pass a YAML file with ``--config``. Explicit CLI flags override conflicting
+YAML values; otherwise, YAML values override the defaults.
 
 .. include:: ../../_includes/note_sections.rst
    :start-after: .. start-note-config-flag-alias
    :end-before: .. end-note-config-flag-alias
 
-The yaml file is configuration of `tensorrt_llm.llmapi.LlmArgs <https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs>`_, the class has multiple levels of hierarchy, to configure the top level arguments like ``max_batch_size``, the yaml file should be like:
+The file configures
+`tensorrt_llm.llmapi.LlmArgs <https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs>`_.
+For example, set a top-level field as follows:
 
 .. code-block:: yaml
 
    max_batch_size: 8
 
-To configure the nested level arguments like ``moe_config.backend``, the yaml file should be like:
+Use YAML mappings for nested fields:
 
 .. code-block:: yaml
 
    moe_config:
        backend: CUTLASS
 
-You can override individual YAML/Pydantic configuration fields without editing
-the file by repeating ``--set PATH=YAML_VALUE``. Paths use the canonical
-snake-case ``LlmArgs`` field names, and dots address nested fields:
+Use repeatable ``--set PATH=YAML_VALUE`` options to override individual fields.
+Paths use canonical snake-case ``LlmArgs`` field names and dots for nesting:
 
 .. code-block:: bash
 
@@ -423,71 +425,46 @@ snake-case ``LlmArgs`` field names, and dots address nested fields:
        --set multimodal_config.video_pruning_rate=0.6 \
        --set 'cuda_graph_config.batch_sizes=[1, 2, 4]'
 
-Configuration sources have fixed precedence, independent of their order on the
-command line:
+Precedence is fixed, regardless of command-line order:
 
 .. code-block:: text
 
    LlmArgs defaults < --config < dedicated CLI flags < --set
 
-The right-hand side of an override is parsed as one YAML value. Accepted value
-shapes are ``null``, booleans, finite numbers, strings, lists, and
-string-keyed mappings. YAML timestamps, binary and set tags, non-string mapping
-keys, non-finite numbers, and recursive aliases are rejected. Quote the
-complete argument when it contains spaces or shell-special characters. Each
-assignment replaces the value at exactly the addressed path. Consequently,
-setting ``scheduler_config.capacity_scheduler_policy`` preserves its sibling
-fields, while setting ``scheduler_config={...}`` replaces the complete
-``scheduler_config`` value. Lists are replaced as a unit, ``null`` becomes
-``None``, and the last assignment wins when the same exact path is repeated.
-Combining an ancestor and descendant path, such as ``x={...}`` and ``x.y=1``,
-is an error. A child path also cannot traverse an effective ancestor that is a
-scalar or list; replace that ancestor with a mapping instead.
-
-For the ``_autodeploy`` backend, its documented shortcut and long-form
-transform paths are treated as aliases for one setting. A long-form override
-is synchronized with its shortcut so it retains ``--set`` precedence over
-lower configuration sources. Specifying multiple aliases for the same setting
-in one invocation is an error.
+Values use YAML syntax and support ``null``, booleans, finite numbers, strings,
+lists, and string-keyed mappings. Quote arguments containing spaces or shell
+characters. An assignment replaces exactly the addressed value; assigning a
+mapping or list replaces it entirely. The last duplicate path wins, while
+conflicting parent and child paths are rejected.
 
 ``--set`` supports public, YAML-serializable fields in the selected backend's
 ``LlmArgs`` schema, with the following exceptions:
 
-* ``model``: use the ``MODEL`` positional argument. Model selection occurs
-  before LLM configuration is composed.
-* ``backend``: use ``--backend``. It selects the schema and defaults used to
-  validate all other arguments.
-* ``telemetry_config`` and its descendants: use ``--telemetry`` or
-  ``--no-telemetry``. Telemetry opt-out is evaluated before normal Click
-  argument processing.
-* ``env_overrides`` and its descendants: keep environment overrides in the
-  YAML configuration.
-* ``internal_request_auth_key``: keep this secret in the YAML configuration.
+* ``model`` and ``backend``: use ``MODEL`` and ``--backend``.
+* ``telemetry_config``: use ``--telemetry`` or ``--no-telemetry``.
+* ``env_overrides`` and ``internal_request_auth_key``: use the YAML file.
 * ``allow_request_chat_template``: use ``--allow_request_chat_template``.
-* ``disagg_cluster``: use ``--disagg_cluster_uri`` or the YAML configuration.
+* ``disagg_cluster``: use ``--disagg_cluster_uri`` or the YAML file.
 * ``batched_logits_processor``, ``checkpoint_loader``, ``mpi_session``,
   ``ray_placement_config.placement_groups``,
   ``speculative_config.drafter``, and
-  ``speculative_config.resource_manager``: these require live Python objects
-  and are available only through the Python LLM API.
+  ``speculative_config.resource_manager``: use the Python LLM API.
 
 Assigning a whole parent mapping does not bypass these exclusions; a mapping
 that contains one of the excluded descendant paths is rejected.
 
-``--set`` is available only for normal LLM serving. It is not supported by
-VisualGen; use ``--visual_gen_args`` for that runtime. It is also not exposed
-by the ``embeddings``, ``mm_embedding_serve``, ``disaggregated``, or
-``disaggregated_mpi_worker`` subcommands. Other server-only YAML keys,
-list-index syntax, escaped dots, and Hydra/OmegaConf interpolation are not
-supported. For free-form mapping keys that contain dots or do not use snake
-case, replace the enclosing mapping with one YAML mapping value instead of
-addressing the key as a path component.
+``--set`` is available only for normal LLM serving. It is unavailable for
+VisualGen and the ``embeddings``, ``mm_embedding_serve``, ``disaggregated``,
+and ``disaggregated_mpi_worker`` subcommands. Server-only YAML keys, list
+indexes, escaped dots, and Hydra/OmegaConf interpolation are also unsupported.
+Replace an enclosing mapping to set free-form keys that cannot be expressed as
+a path.
+For ``_autodeploy``, shortcut and long-form transform paths are aliases;
+specifying multiple aliases for one setting is an error.
 
-Do not pass secrets through ``--set``. Its values are command-line arguments
-and may be visible in shell history, process listings, and validation or
-application logs. Secret-bearing paths are intentionally excluded. Eligible
-fields from the effective validated ``LlmArgs`` configuration may be included
-in usage telemetry; use ``--no-telemetry`` to opt out. For details, see
+Do not pass secrets through ``--set`` because arguments may appear in shell
+history, process listings, or logs. Eligible configuration fields may also be
+included in usage telemetry; use ``--no-telemetry`` to opt out. See
 :doc:`../../developer-guide/telemetry`.
 
 .. _syntax:
