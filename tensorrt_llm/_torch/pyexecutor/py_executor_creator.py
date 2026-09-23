@@ -377,7 +377,9 @@ def _move_model_engine_metrics(
         model_engine: PyTorchModelEngine,
         stage: str,
         draft_model_engine: Optional[PyTorchModelEngine] = None) -> None:
-    """Move model-engine metrics into the executor under a startup stage."""
+    """Move model-engine metrics and optional draft-model-engine metrics into the
+    executor under a startup stage.
+    """
     py_executor.metrics[f"{stage}_model_engine"] = dict(model_engine.metrics)
     model_engine.metrics.clear()
 
@@ -1121,6 +1123,7 @@ def _create_py_executor(
         assert kv_cache_creator is not None
         _move_model_engine_metrics(py_executor, model_engine, "initial",
                                    draft_model_engine)
+        # record initial metrics as py_executor will be deleted later
         initial_model_engine_metrics = dict(py_executor.metrics)
         with allocation_scope(ExecutorMemoryType.MODEL_EXTRA):
             kv_cache_creator.configure_kv_cache_capacity(py_executor)
