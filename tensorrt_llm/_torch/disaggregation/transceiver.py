@@ -243,11 +243,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._transfer_worker.shutdown()
             raise
         # _chunk_num_bytes() is this rank's KV shard, so scale by tp_size to get the request total (kv_cache_size),
-        # except under attention DP where the local count already is the total.
+        # except under attention DP where the TP-local count already is the total.
         # Helix CP ranks hold disjoint block sets, so they scale the request
-        # total the same way TP shards do (metric only).
-        self._kv_size_rank_factor = (
-            1 if mapping.enable_attention_dp else max(1, mapping.tp_size * mapping.cp_size)
+        # total the same way TP shards do, with or without attention DP (metric only).
+        self._kv_size_rank_factor = max(
+            1,
+            mapping.cp_size if mapping.enable_attention_dp else mapping.tp_size * mapping.cp_size,
         )
 
         # Sticky role markers; flip True once any session opens, used to short-circuit
