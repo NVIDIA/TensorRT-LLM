@@ -28,6 +28,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
 from tensorrt_llm._torch.models.modeling_speculative import (
     Eagle3ForCausalLM,
+    MTPForCausalLM,
     SpecDecOneEngineForCausalLM,
     _build_mtp_one_model_draft,
     _copy_model_config_with_moe_backend,
@@ -505,6 +506,65 @@ def test_internal_mtp_without_override_reuses_target_model_config() -> None:
     assert draft_model is sentinel.draft_model
     assert mtp_cls.call_args.args[0] is target_config
     assert target_model.preload_weight_modules == []
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "model_type,replacement,head_algo",
+    [
+        ("nemotron_h", True, QuantAlgo.FP8),
+        ("nemotron_h_puzzle", True, QuantAlgo.W4A16_NVFP4),
+        ("nemotron_h", False, QuantAlgo.FP8),
+        ("qwen3_next", True, QuantAlgo.FP8),
+    ],
+)
+def test_only_nemotron_replacement_owns_quantized_mtp_head(
+    monkeypatch, model_type, replacement, head_algo
+):
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_nemotron_h.NemotronHMTP", lambda *args: nn.Identity()
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_qwen3_next.Qwen3NextMTP", lambda *args: nn.Identity()
+    )
+    monkeypatch.setattr("tensorrt_llm._torch.modules.linear.get_sm_version", lambda: 100)
+    config = ModelConfig(
+        pretrained_config=SimpleNamespace(
+            model_type=model_type,
+            num_nextn_predict_layers=1,
+            hidden_size=16,
+            vocab_size=32,
+            torch_dtype=torch.bfloat16,
+            tie_word_embeddings=False,
+        ),
+        spec_config=SimpleNamespace(
+            uses_replacement_heads=replacement,
+            max_draft_len=1,
+            spec_dec_mode=SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL,
+        ),
+        quant_config_dict={
+            "draft_model.lm_head": QuantConfig(quant_algo=head_algo, group_size=16),
+        },
+    )
+    with torch.device("cpu"):
+        target_head = nn.Linear(16, 32, bias=False)
+        target = SimpleNamespace(aux_stream_dict={}, embed_tokens=nn.Embedding(32, 16))
+        draft = MTPForCausalLM(config, 2, target_head, target)
+    owns_head = replacement and model_type.startswith("nemotron_h")
+    assert draft.owns_lm_head == owns_head
+    assert (draft.lm_head is target_head) == (not owns_head)
+    assert draft.embed_tokens is target.embed_tokens
+    if owns_head:
+        packed = head_algo == QuantAlgo.W4A16_NVFP4
+        assert draft.lm_head.weight.shape == (32, 8 if packed else 16)
+        assert draft.lm_head.weight.dtype == (torch.uint8 if packed else torch.float8_e4m3fn)
+        config.pretrained_config.tie_word_embeddings = True
+        with pytest.raises(ValueError, match="cannot tie embeddings"):
+            MTPForCausalLM(config, 2, target_head, target)
+        config.pretrained_config.tie_word_embeddings = False
+        config.mapping.enable_attention_dp = config.mapping.enable_lm_head_tp_in_adp = True
+        with pytest.raises(ValueError, match="enable_lm_head_tp_in_adp=False"):
+            MTPForCausalLM(config, 2, target_head, target)
 
 
 @pytest.mark.parametrize("requested_backend", ["TRTLLM", "AUTO"])

@@ -22,6 +22,7 @@ from tensorrt_llm._torch.speculative.utils import (
     uses_mtp_head_checkpoint,
 )
 from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig, MTPDecodingConfig
+from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
 class _ExternalDraftModelTarget:
@@ -488,3 +489,45 @@ def test_separate_mtp_draft_load_skip_shared_head_scales(monkeypatch):
     )
     assert captured["skip_modules"] == []
     assert "mtp_layers.0.shared_head.norm.weight" in captured["weight_keys"]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("head_algo", [QuantAlgo.FP8, QuantAlgo.W4A16_NVFP4])
+def test_replacement_mtp_loads_owned_head_and_requires_scales(monkeypatch, head_algo):
+    from tensorrt_llm._torch.models import modeling_utils
+
+    loaded = {}
+    monkeypatch.setattr(
+        modeling_utils,
+        "_load_weights_impl_v2",
+        lambda model, weights, mapper, **kwargs: loaded.update(weights=weights, **kwargs),
+    )
+    model = _make_one_engine_stub(
+        MTPDecodingConfig(max_draft_len=1, speculative_model="/path/to/mtp"), num_hidden_layers=52
+    )
+    model.draft_model.owns_lm_head = True
+    model.draft_model.lm_head = SimpleNamespace(quant_config=QuantConfig(quant_algo=head_algo))
+    mapper = _PassthroughMtpMapper(52)
+    head_weights = {"lm_head.weight": torch.ones(4, 4), "lm_head.weight_scale": torch.ones(1)}
+    if head_algo == QuantAlgo.W4A16_NVFP4:
+        head_weights["lm_head.weight_scale_2"] = torch.ones(1)
+    weights = {
+        **_nemotron_style_mtp_weights(include_shared_head=False),
+        **head_weights,
+        "model.embed_tokens.weight": torch.zeros(4, 4),
+    }
+
+    model.load_draft_weights(weights, mapper)
+
+    assert loaded["allow_partial_loading"] is False
+    assert loaded["skip_modules"] == ["shared_head"]
+    assert "mtp_layers.0.layers.0.enorm.weight" in loaded["weights"]
+    assert "model.embed_tokens.weight" not in loaded["weights"]
+    for name, value in head_weights.items():
+        assert loaded["weights"][name] is value
+        with pytest.raises(ValueError, match="missing " + name):
+            model.load_draft_weights({k: v for k, v in weights.items() if k != name}, mapper)
+
+    model.draft_model.owns_lm_head = False
+    model.load_draft_weights(weights, mapper)
+    assert not any(name.startswith("lm_head.") for name in loaded["weights"])

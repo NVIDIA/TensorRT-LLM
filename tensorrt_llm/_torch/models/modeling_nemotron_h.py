@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import os
 import re
 from contextlib import contextmanager
@@ -272,9 +273,10 @@ class NemotronHMOE(nn.Module):
         # Look up the per-expert quant config from quant_config_dict and use it for create_moe.
         override_quant_config = None
         if model_config.quant_config_dict is not None:
-            experts_prefix = f"{module_prefix}.mixer.experts."
+            experts_prefix = f"{module_prefix}.mixer.experts"
             for key, cfg in model_config.quant_config_dict.items():
-                if key.startswith(experts_prefix):
+                if key == experts_prefix or key.startswith(experts_prefix +
+                                                           "."):
                     override_quant_config = cfg
                     break
 
@@ -898,6 +900,78 @@ def _use_w4a16_for_nvfp4_on_hopper():
         nvfp4_entry["sm_constraint"] = original_sm_constraint
 
 
+def _with_replacement_mtp_quant_config(
+        model_config: NemotronHModelConfig) -> NemotronHModelConfig:
+    """Attach replacement MTP quantization to its runtime module names."""
+    spec_config = model_config.spec_config
+    if not getattr(spec_config, "uses_replacement_heads", False):
+        return model_config
+    checkpoint_dir = str(spec_config.speculative_model)
+    quant_path = os.path.join(checkpoint_dir, "hf_quant_config.json")
+    if not os.path.isfile(quant_path):
+        return model_config
+    quant_config, layer_configs = ModelConfig.load_modelopt_quant_config(
+        quant_path, checkpoint_dir, model_config.moe_backend)
+    if quant_config.quant_algo is None:
+        return model_config
+    if quant_config.quant_algo != QuantAlgo.MIXED_PRECISION or not layer_configs:
+        raise ValueError(
+            "Quantized Nemotron MTP replacement heads require per-layer "
+            "MIXED_PRECISION metadata in hf_quant_config.json")
+    if model_config.pretrained_config.num_nextn_predict_layers != 1:
+        raise ValueError("Quantized Nemotron MTP replacement supports one head")
+    head_config = layer_configs.get("lm_head")
+    if head_config is not None and head_config.quant_algo not in (
+            QuantAlgo.FP8, QuantAlgo.W4A16_NVFP4):
+        raise ValueError(
+            "Nemotron replacement MTP LM heads support FP8 or W4A16_NVFP4")
+
+    start_layer_idx = model_config.pretrained_config.num_hidden_layers
+    mtp_prefix = f"model.layers.{start_layer_idx}."
+    # Omitted replacement modules keep the MTP unquantized default.
+    merged_configs = {
+        name: config
+        for name, config in (model_config.quant_config_dict or {}).items()
+        if not name.startswith(("mtp.", mtp_prefix, "draft_model."))
+    }
+    if model_config.quant_config_dict is None:
+        # Creating a per-layer map disables homogeneous LM-head inference.
+        target_head_config = SpecDecOneEngineForCausalLM._resolve_lm_head_quant_config(
+            model_config)
+        if target_head_config is not None:
+            merged_configs["lm_head"] = target_head_config
+    for name, config in layer_configs.items():
+        checkpoint_name = name
+        if name.startswith("mtp.layers."):
+            name = mtp_prefix + "layers." + name.removeprefix("mtp.layers.")
+        elif name == "lm_head":
+            name = "draft_model.lm_head"
+        else:
+            continue
+        if quant_config.is_module_excluded_from_quantization(checkpoint_name):
+            raise ValueError(
+                f"Replacement quantization exclusion conflicts with {checkpoint_name}"
+            )
+        candidates = [name]
+        if name.endswith((".q_proj", ".k_proj", ".v_proj")):
+            candidates.append(name.rsplit(".", 1)[0] + ".qkv_proj")
+        if (model_config.quant_config is not None and any(
+                model_config.quant_config.is_module_excluded_from_quantization(
+                    n) for n in candidates)):
+            raise ValueError(
+                f"Target quantization exclusion conflicts with replacement {name}"
+            )
+        merged_configs[name] = config
+
+    # Preserve shared custom-op registries while isolating the quantization map.
+    result = copy.copy(model_config)
+    was_frozen = result._frozen
+    result._frozen = False
+    result.quant_config_dict = merged_configs
+    result._frozen = was_frozen
+    return result
+
+
 @register_auto_model("NemotronHPuzzleForCausalLM")
 @register_auto_model("NemotronHForCausalLM")
 class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
@@ -949,6 +1023,7 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
             }
             model_config._frozen = True
 
+        model_config = _with_replacement_mtp_quant_config(model_config)
         _force_moe_backend_for_w4a16_on_hopper(model_config)
         with _use_w4a16_for_nvfp4_on_hopper():
             super().__init__(

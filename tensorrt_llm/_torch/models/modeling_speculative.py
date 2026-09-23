@@ -12,7 +12,7 @@ from torch import nn
 from transformers import LlamaConfig, PretrainedConfig
 
 from tensorrt_llm.logger import logger
-from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 from ...functional import PositionEmbeddingType
 from ..attention.attention import Attention
@@ -21,7 +21,7 @@ from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ..attention.mla import MLA
 from ..model_config import ModelConfig, TConfig
 from ..modules.decoder_layer import DecoderLayer
-from ..modules.embedding import Embedding, get_masked_input_and_mask
+from ..modules.embedding import Embedding, LMHead, get_masked_input_and_mask
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
@@ -1282,6 +1282,7 @@ class MTPForCausalLM(nn.Module):
         # Import here to avoid circular import
         model_type = model_config.pretrained_config.model_type
         mtp_layer = None
+        lm_head_quant_config = None
         match model_type:
             case "glm4_moe":
                 from .modeling_glm import Glm4MTP
@@ -1295,6 +1296,9 @@ class MTPForCausalLM(nn.Module):
             case "nemotron_h" | "nemotron_h_puzzle":
                 from .modeling_nemotron_h import NemotronHMTP
                 mtp_layer = NemotronHMTP
+                if model_config.spec_config.uses_replacement_heads:
+                    lm_head_quant_config = (model_config.quant_config_dict
+                                            or {}).get("draft_model.lm_head")
             case "qwen3_next" | "qwen3_5_text" | "qwen3_5_moe_text":
                 from .modeling_qwen3_next import Qwen3NextMTP
                 mtp_layer = Qwen3NextMTP
@@ -1329,7 +1333,30 @@ class MTPForCausalLM(nn.Module):
                       model.aux_stream_dict)
             for layer_idx in range(mtp_num_layers)
         ])
-        self.lm_head = lm_head
+        self.owns_lm_head = lm_head_quant_config is not None
+        if self.owns_lm_head:
+            if getattr(model_config.pretrained_config, "tie_word_embeddings",
+                       False):
+                raise ValueError(
+                    "A quantized replacement MTP head cannot tie embeddings")
+            if (model_config.mapping.enable_attention_dp
+                    and model_config.mapping.enable_lm_head_tp_in_adp):
+                raise ValueError("Quantized replacement MTP LM heads require "
+                                 "enable_lm_head_tp_in_adp=False")
+            self.lm_head = LMHead(
+                model_config.pretrained_config.vocab_size,
+                model_config.pretrained_config.hidden_size,
+                dtype=model_config.pretrained_config.torch_dtype,
+                mapping=model_config.mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                gather_output=model_config.lm_head_gather_output,
+                reduce_output=False,
+                use_custom_cublas_mm=getattr(lm_head, "use_custom_cublas_mm",
+                                             False),
+                quant_config=lm_head_quant_config,
+            )
+        else:
+            self.lm_head = lm_head
         self.embed_tokens = model.embed_tokens
 
 
@@ -1803,18 +1830,36 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             # load used allow_partial_loading=True, which silently left MTP
             # modules at random init when keys did not bind.
             n_total = len(weights)
+            lm_head_weights = {}
+            if getattr(self.draft_model, "owns_lm_head", False):
+                lm_head_weights = {
+                    name: value
+                    for name, value in weights.items()
+                    if name.startswith("lm_head.")
+                }
+                required_head_tensors = {"lm_head.weight"}
+                head_quant_algo = self.draft_model.lm_head.quant_config.quant_algo
+                if head_quant_algo in (QuantAlgo.FP8, QuantAlgo.W4A16_NVFP4):
+                    required_head_tensors.add("lm_head.weight_scale")
+                if head_quant_algo == QuantAlgo.W4A16_NVFP4:
+                    required_head_tensors.add("lm_head.weight_scale_2")
+                missing = sorted(required_head_tensors - lm_head_weights.keys())
+                if missing:
+                    raise ValueError(
+                        "Quantized replacement MTP checkpoint is missing " +
+                        ", ".join(missing))
             weights = select_mtp_checkpoint_weights(weights)
             if not weights:
                 raise ValueError(
                     "speculative_model was set for MTP but no 'mtp.*' weights "
                     f"were found in {self.spec_config.speculative_model!r}. "
                     "Expected keys like 'mtp.layers.0.*'.")
-            n_dropped = n_total - len(weights)
+            n_dropped = n_total - len(weights) - len(lm_head_weights)
             if n_dropped:
                 logger.warning(
-                    "Ignoring %d non-mtp.* tensors from speculative_model while "
-                    "loading MTP heads (kept %d mtp.* tensors).", n_dropped,
-                    len(weights))
+                    "Ignoring %d unrelated tensors from speculative_model while "
+                    "loading MTP heads (kept %d MTP and %d LM head tensors).",
+                    n_dropped, len(weights), len(lm_head_weights))
             if weight_mapper is None:
                 raise ValueError(
                     "weight_mapper is required to load separate MTP heads")
@@ -1826,6 +1871,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 num_hidden_layers=num_hidden_layers,
                 num_mtp_layers=num_mtp_layers,
             )
+            weights.update(lm_head_weights)
 
             # Skip optional modules (e.g. shared_head) only when absent from
             # this checkpoint; architectures that ship those tensors still load
