@@ -816,9 +816,16 @@ def publishBoltedTarball(pipeline, remote, String boltedLocal, String artifactBa
         chmod 600 "${netrc}"
         # A PUT-upload, NOT /api/copy: the target repo is virtual, so a server-side
         # copy returns 409.
+        #
+        # The matrix parameter records WHICH bundle produced this build, in the same
+        # request that uploads it. A consumer can then assert the artifact matches
+        # the bundle its pipeline pinned instead of trusting that it fetched the
+        # right thing -- and an A/B job can tell an optimized build from a baseline
+        # by property rather than by a filename that means the opposite thing
+        # pre-merge (there the BOLTed build takes the canonical name).
         curl -fS --netrc-file "${netrc}" --retry 5 --retry-all-errors \\
              --connect-timeout 30 --speed-time 300 --speed-limit 1024 \\
-             -T "${boltedLocal}" "${boltedUrl}"
+             -T "${boltedLocal}" "${boltedUrl};bolt.ref=${BOLT_REF};bolt.triple=${TRIPLE}"
     """.stripIndent()
     pipeline.withCredentials([pipeline.usernamePassword(credentialsId: 'urm-artifactory-creds',
             usernameVariable: 'ART_USER', passwordVariable: 'ART_PASS')]) {
@@ -826,7 +833,7 @@ def publishBoltedTarball(pipeline, remote, String boltedLocal, String artifactBa
         Utils.exec(pipeline, timeout: false, numRetries: 2, noNVDFEvent: true,
             script: feed + Utils.sshUserCmd(remote, b64BashRemoteCmdStdin(publish, "${boltedLocal}.publish.sh")))
     }
-    pipeline.echo("Published. BOLTed build = ${boltedUrl}")
+    pipeline.echo("Published. BOLTed build = ${boltedUrl} (bolt.ref=${BOLT_REF})")
 }
 
 
