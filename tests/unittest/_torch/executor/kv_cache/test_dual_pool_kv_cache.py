@@ -302,6 +302,17 @@ class TestSplitKvCacheBudgetForCross:
         assert not self_config.enable_block_reuse
         assert not cross_config.enable_block_reuse
 
+    def test_token_encoder_preserves_reuse_for_both_pools(self) -> None:
+        """Token inputs retain reusable identities for both KV pools."""
+        config = _make_kv_cache_config(cross_kv_cache_fraction=0.5)
+        creator = _make_creator(config, is_enc_dec=True)
+        creator._encoder_input_is_features = Mock(return_value=False)
+
+        self_config, cross_config = creator._split_kv_cache_budget_for_cross()
+
+        assert self_config.enable_block_reuse
+        assert cross_config.enable_block_reuse
+
     def test_is_encoder_decoder_helper(self):
         dec_config = _make_model_config(is_encoder_decoder=False)
         dec_creator = _make_creator(_make_kv_cache_config(), model_config=dec_config)
