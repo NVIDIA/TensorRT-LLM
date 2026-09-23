@@ -263,9 +263,7 @@ Gauge("existing_metric", "Existing gauge", ["model_name"], multiprocess_mode="al
         for sample in metric.samples
     ]
     published = {
-        sample.value: sample
-        for sample in samples
-        if sample.name == "trtllm_scheduled_batch_size"
+        sample.value: sample for sample in samples if sample.name == "trtllm_scheduled_batch_size"
     }
     assert len(published) == 3
     assert published[5].labels["model_name"] == model_label
@@ -277,9 +275,7 @@ Gauge("existing_metric", "Existing gauge", ["model_name"], multiprocess_mode="al
     assert published[3].labels["model_name"] == ("model" if configured_model == "local" else model)
     # The unrelated gauge deliberately shares a value with the batch metric.
     existing = [sample for sample in samples if sample.name == "existing_metric"]
-    assert [(sample.labels["model_name"], sample.value) for sample in existing] == [
-        ("original", 5)
-    ]
+    assert [(sample.labels["model_name"], sample.value) for sample in existing] == [("original", 5)]
 
 
 @pytest.mark.parametrize("invalid_path", ["missing", "file", ""])
