@@ -2987,14 +2987,20 @@ class RxSession(RxSessionBase):
 
     @property
     def disagg_request_id(self) -> int:
+        """The key this session goes on the wire under, so it must be the id the
+        ctx TxSession registered with: every REQUEST_DATA, result and cancel
+        message is matched by it on both sides.
+
+        ``ctx_request_id`` is that id: the ctx server sets it from its own
+        TxSession key when it answers. ``disagg_request_id`` only agrees with it
+        when the orchestrator handed both servers the same id, so it is a
+        fallback rather than the first choice.
+        """
         params = self._base_args.params
-        if params.disagg_request_id is not None:
-            return params.disagg_request_id
-        # ctx_request_id is set on gen-side requests to the ctx server's request ID,
-        # which matches the key the ctx TxSession registered under.  Fall back to
-        # the local request_id only when neither field is available.
         if params.ctx_request_id is not None:
             return params.ctx_request_id
+        if params.disagg_request_id is not None:
+            return params.disagg_request_id
         return self.request_id
 
     @contextmanager
