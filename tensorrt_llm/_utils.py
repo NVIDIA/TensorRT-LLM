@@ -1230,13 +1230,19 @@ class KVCacheEventSerializer:
             return []
 
 
-def set_prometheus_multiproc_dir() -> object:
+def set_prometheus_multiproc_dir() -> None:
+    """Initialize or validate the shared metrics directory without replacing its owner."""
     # Adapted from: https://github.com/sgl-project/sglang/blob/v0.4.10/python/sglang/srt/utils.py#L1266
     global prometheus_multiproc_dir
     if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
-        logger.info("User set PROMETHEUS_MULTIPROC_DIR detected.")
-        prometheus_multiproc_dir = tempfile.TemporaryDirectory(
-            dir=os.environ["PROMETHEUS_MULTIPROC_DIR"])
+        metrics_dir = os.environ["PROMETHEUS_MULTIPROC_DIR"]
+        if not os.path.isdir(metrics_dir):
+            raise ValueError(
+                "PROMETHEUS_MULTIPROC_DIR must point to an existing directory: "
+                f"{metrics_dir!r}")
+        logger.info("Reusing existing PROMETHEUS_MULTIPROC_DIR.")
+        # Reuse the directory initialized before executor workers were spawned.
+        # Replacing its owner here could delete the workers' metric files.
     else:
         prometheus_multiproc_dir = tempfile.TemporaryDirectory()
         os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name

@@ -175,6 +175,7 @@ l0_cpu:
   - unittest/llmapi/test_tokenizer_aliases.py
   - unittest/llmapi/test_utils.py
   - unittest/llmapi/test_visual_gen_startup_shutdown.py
+  - unittest/metrics/test_batch_metrics.py
   - unittest/metrics/test_collector.py
   - unittest/models/test_quant_config_utils.py
   - unittest/others

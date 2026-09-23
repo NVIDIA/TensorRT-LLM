@@ -1457,11 +1457,16 @@ class OpenAIServer(_VideoRoutesMixin):
         # We need to set PROMETHEUS_MULTIPROC_DIR environment variable
         # before prometheus_client is imported.
         # See https://prometheus.github.io/client_python/multiprocess/
-        from prometheus_client import (CollectorRegistry, make_asgi_app,
-                                       multiprocess)
+        from prometheus_client import CollectorRegistry, make_asgi_app
         from prometheus_fastapi_instrumentator import Instrumentator
+
+        from tensorrt_llm.metrics.batch_metrics import BatchMetricsCollector
         registry = CollectorRegistry()
-        multiprocess.MultiProcessCollector(registry)
+        BatchMetricsCollector(
+            registry,
+            model_name=str(self.generator.args.model),
+            labels=self.metrics_collector.labels,
+        )
         Instrumentator(
             should_group_status_codes=False,
             should_respect_env_var=True,

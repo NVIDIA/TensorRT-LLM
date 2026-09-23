@@ -38,7 +38,7 @@ from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.metrics.enums import MetricNames
 
-from .._utils import nvtx_range_debug
+from .._utils import nvtx_range_debug, set_prometheus_multiproc_dir
 from ..bindings import steady_clock_now
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
@@ -430,6 +430,14 @@ class BaseLLM:
 
         finally:
             logger.set_level(log_level)  # restore the log level
+
+        # Executor metrics must share the serving process's directory, and the
+        # Prometheus client selects its storage when first imported.
+        # This also creates a temporary directory and sets a process-wide env
+        # variable for offline return_perf_metrics users. An already-started
+        # external MPI session must inherit the directory before its launch.
+        if self.args.return_perf_metrics:
+            set_prometheus_multiproc_dir()
 
         logger_debug(f"LLM.args.mpi_session: {self.args.mpi_session}\n",
                      "yellow")
