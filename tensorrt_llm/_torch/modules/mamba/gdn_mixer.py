@@ -14,10 +14,6 @@ import triton.language as tl
 from torch import nn
 from transformers import Qwen3NextConfig
 
-from tensorrt_llm._torch.modules.fla.cached_replay import (
-    CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
-    fused_recurrent_gated_delta_rule_cached_replay_update,
-)
 from tensorrt_llm._torch.modules.fla.fused_recurrent import fused_recurrent_gated_delta_rule_update
 from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
     _can_use_flashinfer_gdn_verify,
@@ -29,6 +25,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ...attention.backends import AttentionMetadata
+from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ...distributed import AllReduceParams
 from ...model_config import ModelConfig
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
@@ -48,6 +45,11 @@ from .layernorm_gated import rms_norm_gated_token_major
 from .mamba2_metadata import Mamba2Metadata
 from .mamba2_mixer import _cached_arange
 from .recurrent_state_cache import reset_recurrent_state_rows
+
+if IS_CUTLASS_DSL_AVAILABLE:
+    from tensorrt_llm._torch.custom_ops.cute_dsl_gdn_mtp_replay import gdn_mtp_replay
+else:
+    gdn_mtp_replay = None
 
 
 # FlashInfer GDN prefill is ON by default; set TLLM_USE_FLASHINFER_GDN_PREFILL=0
@@ -210,8 +212,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         replay_enabled = is_gdn_replay_enabled()
         if replay_enabled:
             logger.info_once(
-                "GDN MTP replay is requested; set TRTLLM_USE_GDN_REPLAY=0 to disable it",
-                key="gdn_mtp_replay_cached",
+                "GDN MTP replay is enabled by default; set TRTLLM_USE_GDN_REPLAY=0 to disable it",
+                key="gdn_mtp_replay_enabled",
             )
         else:
             logger.info_once(
@@ -426,68 +428,78 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         attn_out = attn_out.view(-1, self.value_dim_per_tp)
         return self.out_proj(attn_out, all_reduce_params=all_reduce_params)
 
-    def _replay_verify_recurrent(
+    def _replay_verify(
         self,
-        query,
-        key,
-        value,
-        a,
-        b,
-        ssm_states,
-        state_indices_d,
-        num_decodes,
-        draft_token_num,
+        raw_x: torch.Tensor,
+        packed_ba: torch.Tensor,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        state_indices: torch.Tensor,
+        num_decodes: int,
+        draft_token_num: int,
         replay_metadata,
         layer_cache,
-        replay_work_items,
-        replay_n_writes,
-        output_d=None,
-        packed_qkv=None,
-        use_all_layer_commit=False,
-    ):
-        """Run MTP target verification via the replay kernel.
-
-        This avoids intermediate-state writes and accepted-state copies; commits
-        are deferred via the compact history cache. Cached replay reuses the
-        Mamba2 fields as old_x<->U, old_B<->normalized k, and
-        old_dt<->cumulative G.
-        """
+        is_dummy: torch.Tensor,
+        candidate_x: torch.Tensor,
+        output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Fuse Conv4 with single-buffer GDN replay."""
         assert replay_metadata is not None, (
             "GDN replay enabled but replay metadata was not allocated."
         )
-        assert draft_token_num == replay_metadata.replay_step_width, (
-            "GDN replay does not support dynamic draft length yet: "
-            f"{draft_token_num} != {replay_metadata.replay_step_width}"
-        )
-        if draft_token_num > 8 or replay_metadata.replay_history_size > 16:
+        if (
+            draft_token_num > replay_metadata.replay_step_width
+            or draft_token_num > 8
+            or replay_metadata.replay_history_size not in (16, 32)
+        ):
             raise RuntimeError(
-                "GDN cached replay requires draft_token_num <= 8 and replay_history_size <= 16."
+                "GDN replay requires a runtime width no larger than "
+                "the configured width or 8, and history size 16 or 32."
             )
-        return fused_recurrent_gated_delta_rule_cached_replay_update(
-            q=query,
-            k=key,
-            v=value,
-            g=a,
-            beta=b,
+        if self.conv_kernel_size != 4 or self.conv1d.bias is not None:
+            raise RuntimeError("GDN replay requires bias-free depthwise Conv4.")
+        if self.activation not in ("silu", "swish"):
+            raise RuntimeError("GDN replay requires SiLU activation.")
+        if gdn_mtp_replay is None:
+            raise RuntimeError("GDN replay requires CUTLASS DSL")
+
+        expected_rows = num_decodes * draft_token_num
+        if raw_x.shape != (expected_rows, self.conv_dim_per_tp):
+            raise RuntimeError("GDN replay received an invalid raw QKV view")
+        if packed_ba.shape != (expected_rows, self.num_v_heads_per_tp):
+            raise RuntimeError("GDN replay received an invalid packed BA view")
+        if output is None:
+            output = raw_x.new_empty(
+                num_decodes,
+                draft_token_num,
+                self.num_v_heads_per_tp,
+                self.head_v_dim,
+            )
+
+        row_stride = raw_x.stride(0)
+        raw_x_batched = raw_x.as_strided(
+            (num_decodes, draft_token_num, self.conv_dim_per_tp),
+            (draft_token_num * row_stride, row_stride, 1),
+        )
+        history_capacity = replay_metadata.replay_history_size + draft_token_num
+        gdn_mtp_replay(
+            raw_x=raw_x_batched,
+            conv_weight=self.conv1d.weight,
+            conv_state=conv_states,
+            packed_ba=packed_ba,
+            checkpoint=ssm_states,
+            state_indices=state_indices[:num_decodes],
+            is_dummy=is_dummy,
+            history_u=layer_cache.old_x[:, :history_capacity],
+            history_k=layer_cache.old_B[:, :history_capacity],
+            history_G=layer_cache.old_dt[:, :, :history_capacity],
+            history_len=replay_metadata.history_len,
             A_log=self.A_log,
             dt_bias=self.dt_bias,
-            launch_with_pdl=True,
-            ssm_states=ssm_states,
-            state_indices=state_indices_d[:num_decodes],
-            old_u=layer_cache.old_x,
-            old_k=layer_cache.old_B,
-            old_G=layer_cache.old_dt,
-            old_beta=layer_cache.old_dA_cumsum,
-            cache_buf_idx=layer_cache.cache_buf_idx,
-            prev_num_accepted_tokens=layer_cache.prev_num_accepted_tokens,
-            history_size=replay_metadata.replay_history_size,
-            replay_work_items=replay_work_items,
-            n_writes=replay_n_writes,
-            use_qk_l2norm_in_kernel=True,
-            packed_qkv=packed_qkv,
-            use_all_layer_commit=use_all_layer_commit,
-            output=output_d,
+            output=output,
+            candidate_x=candidate_x[:num_decodes, :draft_token_num],
         )
+        return output
 
     def forward_decode(
         self,
@@ -516,12 +528,38 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             assert intermediate_conv_states is not None
             assert kwargs.get("use_replay", False) or intermediate_ssm_states is not None
 
-            # Speculative verification path:
-            # 1. run conv update with per-step intermediate cache writes
-            # 2. run recurrent delta rule with intermediate SSM-state cache writes
-            # 3. defer final state selection to kv_cache_manager.update_mamba_states()
-            intermediate_state_indices = kwargs["intermediate_state_indices"]
+            # Replay fuses Conv4 and the recurrent update and stores compact
+            # raw candidates for the combined all-layer commit.
+            if kwargs.get("use_replay", False):
+                output_d = None
+                if output is not None:
+                    output_d = output.view(
+                        num_decodes,
+                        draft_token_num,
+                        self.num_v_heads_per_tp,
+                        self.head_v_dim,
+                    )
+                return self._replay_verify(
+                    raw_x=mixed_qkv,
+                    packed_ba=b,
+                    conv_states=conv_states,
+                    ssm_states=ssm_states,
+                    state_indices=cache_indices,
+                    num_decodes=num_decodes,
+                    draft_token_num=draft_token_num,
+                    replay_metadata=kwargs.get("replay_metadata"),
+                    layer_cache=kwargs.get("layer_cache"),
+                    is_dummy=kwargs.get("is_dummy"),
+                    candidate_x=intermediate_conv_states,
+                    output=output_d,
+                ).view(
+                    1,
+                    num_decodes * draft_token_num,
+                    self.num_v_heads_per_tp,
+                    self.head_v_dim,
+                )
 
+            intermediate_state_indices = kwargs["intermediate_state_indices"]
             mixed_qkv_reshaped = mixed_qkv.reshape(num_decodes, draft_token_num, -1).transpose(1, 2)
             mixed_qkv_processed = causal_conv1d_update_triton(
                 mixed_qkv_reshaped,
@@ -532,8 +570,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 conv_state_indices=cache_indices[:num_decodes],
                 intermediate_conv_window=intermediate_conv_states,
                 intermediate_state_indices=intermediate_state_indices,
-                # PDL chain: conv1d -> replay verify kernel (replay only)
-                launch_dependent_kernels=kwargs.get("use_replay", False),
             )
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).reshape(
                 num_decodes * draft_token_num, -1
@@ -562,39 +598,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             # intermediate states written to the batch-scoped [:num_decodes]
             # prefix consumed by update_mamba_states()); fall back to the
             # Triton recurrent kernel when unavailable.
-            if kwargs.get("use_replay", False):
-                output_d = None
-                if output is not None:
-                    output_d = output.view(
-                        num_decodes,
-                        draft_token_num,
-                        self.num_v_heads // self.attn_tp_size,
-                        self.head_v_dim,
-                    )
-                return self._replay_verify_recurrent(
-                    query,
-                    key,
-                    value,
-                    a,
-                    b,
-                    ssm_states,
-                    cache_indices,
-                    num_decodes,
-                    draft_token_num,
-                    kwargs.get("replay_metadata"),
-                    kwargs.get("layer_cache"),
-                    kwargs.get("replay_work_items"),
-                    kwargs.get("replay_n_writes"),
-                    output_d,
-                    packed_qkv=mixed_qkv,
-                    use_all_layer_commit=kwargs.get("use_cached_replay_all_layer_commit", False),
-                ).view(
-                    1,
-                    num_decodes * draft_token_num,
-                    self.num_v_heads // self.attn_tp_size,
-                    self.head_v_dim,
-                )
-
             if _can_use_flashinfer_gdn_verify(
                 ssm_states, self.head_k_dim, self.head_v_dim, draft_token_num
             ):
@@ -738,6 +741,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         num_decodes = kwargs["num_decodes"]
 
         conv_states_to_use = conv_states
+        use_replay = kwargs.get("use_replay", False)
 
         seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
         if num_decode_tokens > 0:
@@ -773,21 +777,22 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 assert intermediate_conv_states is not None
                 assert kwargs.get("use_replay", False) or intermediate_ssm_states is not None
 
-                intermediate_state_indices = kwargs["intermediate_state_indices"]
-                mixed_qkv_d = mixed_qkv_d.reshape(num_decodes, draft_token_num, -1).transpose(1, 2)
-                mixed_qkv_d = causal_conv1d_update_triton(
-                    mixed_qkv_d,
-                    conv_states_to_use,
-                    self.conv1d.weight,
-                    self.conv1d.bias,
-                    activation=self.activation,
-                    conv_state_indices=state_indices_d,
-                    intermediate_conv_window=intermediate_conv_states,
-                    intermediate_state_indices=intermediate_state_indices,
-                    # PDL chain: conv1d -> replay verify kernel (replay only)
-                    launch_dependent_kernels=kwargs.get("use_replay", False),
-                )
-                mixed_qkv_d = mixed_qkv_d.transpose(1, 2).reshape(num_decode_tokens, -1)
+                if not use_replay:
+                    intermediate_state_indices = kwargs["intermediate_state_indices"]
+                    mixed_qkv_d = mixed_qkv_d.reshape(num_decodes, draft_token_num, -1).transpose(
+                        1, 2
+                    )
+                    mixed_qkv_d = causal_conv1d_update_triton(
+                        mixed_qkv_d,
+                        conv_states_to_use,
+                        self.conv1d.weight,
+                        self.conv1d.bias,
+                        activation=self.activation,
+                        conv_state_indices=state_indices_d,
+                        intermediate_conv_window=intermediate_conv_states,
+                        intermediate_state_indices=intermediate_state_indices,
+                    )
+                    mixed_qkv_d = mixed_qkv_d.transpose(1, 2).reshape(num_decode_tokens, -1)
             else:
                 mixed_qkv_d = causal_conv1d_update(
                     mixed_qkv_d,
@@ -812,13 +817,14 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                         self.head_v_dim,
                         beta_dtype=b.dtype,
                     )
-                query_d, key_d, value_d = pack_gdn_decode_qkv(
-                    mixed_qkv_d,
-                    self.num_k_heads_per_tp,
-                    self.head_k_dim,
-                    self.num_v_heads_per_tp,
-                    self.head_v_dim,
-                )
+                if not use_replay:
+                    query_d, key_d, value_d = pack_gdn_decode_qkv(
+                        mixed_qkv_d,
+                        self.num_k_heads_per_tp,
+                        self.head_k_dim,
+                        self.num_v_heads_per_tp,
+                        self.head_v_dim,
+                    )
             else:
                 query, key, value, g, beta = fused_gdn_post_conv(
                     mixed_qkv_p_t,
@@ -890,20 +896,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 )
 
             draft_token_num = spec_metadata.runtime_draft_len + 1
-            query_d = query_d.reshape(
-                num_decodes, draft_token_num, self.num_k_heads // self.attn_tp_size, self.head_k_dim
-            )
-            key_d = key_d.reshape(
-                num_decodes, draft_token_num, self.num_k_heads // self.attn_tp_size, self.head_k_dim
-            )
-            value_d = value_d.reshape(
-                num_decodes, draft_token_num, self.num_v_heads // self.attn_tp_size, self.head_v_dim
-            )
-
-            a_d = a_d.reshape(num_decodes, draft_token_num, -1)
-            b_d = b_d.reshape(num_decodes, draft_token_num, -1)
             out_v_heads = self.num_v_heads // self.attn_tp_size
-
             output_d = None
             if output is not None:
                 output_d = output[:, num_prefill_tokens:, :, :].view(
@@ -913,73 +906,92 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                     self.head_v_dim,
                 )
 
-            if kwargs.get("use_replay", False):
-                attn_out_decode = self._replay_verify_recurrent(
-                    query_d,
-                    key_d,
-                    value_d,
-                    a_d,
-                    b_d,
-                    ssm_states,
-                    state_indices_d,
-                    num_decodes,
-                    draft_token_num,
-                    kwargs.get("replay_metadata"),
-                    kwargs.get("layer_cache"),
-                    kwargs.get("replay_work_items"),
-                    kwargs.get("replay_n_writes"),
-                    output_d,
-                    use_all_layer_commit=kwargs.get("use_cached_replay_all_layer_commit", False),
-                ).reshape(1, num_decode_tokens, out_v_heads, self.head_v_dim)
-            elif _can_use_flashinfer_gdn_verify(
-                ssm_states, self.head_k_dim, self.head_v_dim, draft_token_num
-            ):
-                # FI gathers the initial state from the pool via state_indices_d
-                # (no host gather) and writes batch-scoped intermediate states;
-                # the [:num_decodes] prefix matches update_mamba_states()'s rows.
-                attn_out_decode = _flashinfer_gdn_verify(
-                    A_log=self.A_log,
-                    a=a_d,
-                    dt_bias=self.dt_bias,
-                    softplus_beta=1.0,
-                    softplus_threshold=20.0,
-                    q=query_d,
-                    k=key_d,
-                    v=value_d,
-                    b=b_d,
-                    initial_state_source=ssm_states,
-                    initial_state_indices=state_indices_d,
-                    intermediate_states_buffer=intermediate_ssm_states[:num_decodes],
-                    scale=self.head_k_dim**-0.5,
-                    use_qk_l2norm_in_kernel=True,
+            if use_replay:
+                attn_out_decode = self._replay_verify(
+                    raw_x=mixed_qkv_d,
+                    packed_ba=b_d,
+                    conv_states=conv_states_to_use,
+                    ssm_states=ssm_states,
+                    state_indices=state_indices_d,
+                    num_decodes=num_decodes,
+                    draft_token_num=draft_token_num,
+                    replay_metadata=kwargs.get("replay_metadata"),
+                    layer_cache=kwargs.get("layer_cache"),
+                    is_dummy=kwargs.get("is_dummy"),
+                    candidate_x=intermediate_conv_states,
                     output=output_d,
                 ).reshape(1, num_decode_tokens, out_v_heads, self.head_v_dim)
             else:
-                beta_d = b_d.sigmoid()
-                g_d = fused_gdn_gating(
-                    self.A_log,
-                    a_d.view(num_decodes * draft_token_num, -1),
-                    self.dt_bias,
-                ).reshape(num_decodes, draft_token_num, -1)
+                query_d = query_d.reshape(
+                    num_decodes,
+                    draft_token_num,
+                    self.num_k_heads // self.attn_tp_size,
+                    self.head_k_dim,
+                )
+                key_d = key_d.reshape(
+                    num_decodes,
+                    draft_token_num,
+                    self.num_k_heads // self.attn_tp_size,
+                    self.head_k_dim,
+                )
+                value_d = value_d.reshape(
+                    num_decodes,
+                    draft_token_num,
+                    self.num_v_heads // self.attn_tp_size,
+                    self.head_v_dim,
+                )
+                a_d = a_d.reshape(num_decodes, draft_token_num, -1)
+                b_d = b_d.reshape(num_decodes, draft_token_num, -1)
 
-                recurrent_state_source = ssm_states[state_indices_d]
-                recurrent_state_indices = kwargs["intermediate_state_indices"]
+                if _can_use_flashinfer_gdn_verify(
+                    ssm_states,
+                    self.head_k_dim,
+                    self.head_v_dim,
+                    draft_token_num,
+                ):
+                    # FI gathers initial state from the V2 pool and writes
+                    # batch-scoped intermediate states for accepted promotion.
+                    attn_out_decode = _flashinfer_gdn_verify(
+                        A_log=self.A_log,
+                        a=a_d,
+                        dt_bias=self.dt_bias,
+                        softplus_beta=1.0,
+                        softplus_threshold=20.0,
+                        q=query_d,
+                        k=key_d,
+                        v=value_d,
+                        b=b_d,
+                        initial_state_source=ssm_states,
+                        initial_state_indices=state_indices_d,
+                        intermediate_states_buffer=intermediate_ssm_states[:num_decodes],
+                        scale=self.head_k_dim**-0.5,
+                        use_qk_l2norm_in_kernel=True,
+                        output=output_d,
+                    ).reshape(1, num_decode_tokens, out_v_heads, self.head_v_dim)
+                else:
+                    beta_d = b_d.sigmoid()
+                    g_d = fused_gdn_gating(
+                        self.A_log,
+                        a_d.view(num_decodes * draft_token_num, -1),
+                        self.dt_bias,
+                    ).reshape(num_decodes, draft_token_num, -1)
 
-                attn_out_decode = fused_recurrent_gated_delta_rule_update(
-                    q=query_d,
-                    k=key_d,
-                    v=value_d,
-                    g=g_d,
-                    beta=beta_d,
-                    initial_state_source=recurrent_state_source,
-                    initial_state_indices=recurrent_state_indices,
-                    use_qk_l2norm_in_kernel=True,
-                    disable_state_update=True,
-                    intermediate_states_buffer=intermediate_ssm_states,
-                    cache_steps=draft_token_num,
-                    output=output_d,
-                ).view(1, num_decode_tokens, out_v_heads, self.head_v_dim)
-
+                    recurrent_state_source = ssm_states[state_indices_d]
+                    recurrent_state_indices = kwargs["intermediate_state_indices"]
+                    attn_out_decode = fused_recurrent_gated_delta_rule_update(
+                        q=query_d,
+                        k=key_d,
+                        v=value_d,
+                        g=g_d,
+                        beta=beta_d,
+                        initial_state_source=recurrent_state_source,
+                        initial_state_indices=recurrent_state_indices,
+                        use_qk_l2norm_in_kernel=True,
+                        disable_state_update=True,
+                        intermediate_states_buffer=intermediate_ssm_states,
+                        cache_steps=draft_token_num,
+                        output=output_d,
+                    ).view(1, num_decode_tokens, out_v_heads, self.head_v_dim)
             if output is not None:
                 return output
             if attn_out_prefill is None:
@@ -1083,15 +1095,15 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             layer_cache.intermediate_conv_window if is_target_verify else None
         )
         intermediate_ssm_states = layer_cache.intermediate_ssm if is_target_verify else None
+        use_replay = is_target_verify and getattr(
+            attn_metadata.kv_cache_manager, "use_gdn_mtp_replay", False
+        )
         intermediate_state_indices = (
             _verify_intermediate_state_indices(
                 attn_metadata.kv_cache_manager, num_decodes, state_indices.device
             )
-            if is_target_verify
+            if is_target_verify and not use_replay
             else None
-        )
-        use_replay = is_target_verify and getattr(
-            attn_metadata.kv_cache_manager, "use_replay_state_update", False
         )
         replay_metadata = (
             attn_metadata.kv_cache_manager.get_replay_state_update_metadata()
@@ -1099,13 +1111,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             else None
         )
 
-        use_cached_replay_all_layer_commit = (
-            num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
-            and getattr(
-                attn_metadata.kv_cache_manager,
-                "use_gdn_cached_replay_all_layer_commit",
-                False,
-            )
+        replay_dummy_mask = (
+            attn_metadata.kv_cache_manager.get_replay_dummy_request_mask() if use_replay else None
         )
         kwargs = {
             "mixed_qkv": mixed_qkv,
@@ -1126,13 +1133,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             "use_replay": use_replay,
             "replay_metadata": replay_metadata,
             "layer_cache": layer_cache,
-            "replay_work_items": mamba_metadata.replay_work_items[:num_decodes]
-            if use_replay and num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+            "is_dummy": replay_dummy_mask[num_prefills : num_prefills + num_decodes]
+            if replay_dummy_mask is not None
             else None,
-            "replay_n_writes": mamba_metadata.replay_n_writes
-            if use_replay and num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
-            else None,
-            "use_cached_replay_all_layer_commit": use_cached_replay_all_layer_commit,
         }
         if num_prefills > 0:
             attn_out = self.forward_extend(

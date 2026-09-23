@@ -31,84 +31,69 @@ REPLAY_WORK_CACHE_SLOT = 1
 REPLAY_WORK_PNAT = 2
 REPLAY_WORK_CACHE_BUF_IDX = 3
 REPLAY_WORK_ITEM_WIDTH = 4
-_FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE = 256
 
 
 @triton.jit
 def _prepare_gdn_replay_work_items_kernel(
     state_indices,
-    prev_num_accepted_tokens,
-    cache_buf_idx,
+    history_len,
     work_items,
     n_writes_output,
     num_decodes,
-    replay_step_width: tl.constexpr,
-    replay_history_size: tl.constexpr,
     work_item_width: tl.constexpr,
     position_field: tl.constexpr,
     cache_slot_field: tl.constexpr,
-    pnat_field: tl.constexpr,
+    history_len_field: tl.constexpr,
     cache_buf_idx_field: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Build the write-first GDN replay partition in one launch."""
-    offsets = tl.arange(0, BLOCK_SIZE)
+    """Snapshot single-buffer history lengths before the layer replay loop."""
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     active = offsets < num_decodes
     slots = tl.load(state_indices + offsets, mask=active, other=0)
-    pnat = tl.load(prev_num_accepted_tokens + slots, mask=active, other=0)
-    active_buffer = tl.load(cache_buf_idx + slots, mask=active, other=0)
-    writes = active & (pnat + replay_step_width > replay_history_size)
-    writes_i32 = writes.to(tl.int32)
-    inclusive_write_offsets = tl.cumsum(writes_i32, axis=0)
-    write_offsets = inclusive_write_offsets - writes_i32
-    n_writes = tl.sum(writes_i32, axis=0)
-    no_write_offsets = offsets - write_offsets
-    output_offsets = tl.where(writes, write_offsets,
-                              n_writes + no_write_offsets)
-    output_base = work_items + output_offsets * work_item_width
+    lengths = tl.load(history_len + slots, mask=active, other=0)
+    output_base = work_items + offsets * work_item_width
     tl.store(output_base + position_field, offsets, mask=active)
     tl.store(output_base + cache_slot_field, slots, mask=active)
-    tl.store(output_base + pnat_field, pnat, mask=active)
-    tl.store(output_base + cache_buf_idx_field, active_buffer, mask=active)
-    tl.store(n_writes_output, n_writes)
+    tl.store(output_base + history_len_field, lengths, mask=active)
+    tl.store(output_base + cache_buf_idx_field, 0, mask=active)
+    if tl.program_id(0) == 0:
+        tl.store(n_writes_output, 0)
 
 
-def _build_replay_work_items_triton(state_indices, prev_num_accepted_tokens,
-                                    cache_buf_idx, work_items, n_writes,
-                                    replay_step_width, replay_history_size):
-    """Single-launch build of the write-first replay partition.
-
-    Interchangeable with :func:`_build_replay_work_items_torch`; the caller
-    picks between them. Kept to one CTA because the write-first offsets come
-    from an in-block ``tl.cumsum``.
-    """
+def _build_gdn_replay_work_items(
+    state_indices: torch.Tensor,
+    history_len: torch.Tensor,
+    work_items: torch.Tensor,
+    n_writes: torch.Tensor,
+) -> None:
+    """Build the immutable inputs consumed by the split GDN MTP commit."""
     num_decodes = state_indices.shape[0]
-    _prepare_gdn_replay_work_items_kernel[(1, )](
-        state_indices,
-        prev_num_accepted_tokens,
-        cache_buf_idx,
-        work_items,
-        n_writes,
-        num_decodes,
-        replay_step_width=replay_step_width,
-        replay_history_size=replay_history_size,
-        work_item_width=REPLAY_WORK_ITEM_WIDTH,
-        position_field=REPLAY_WORK_POSITION_IN_DECODE_BATCH,
-        cache_slot_field=REPLAY_WORK_CACHE_SLOT,
-        pnat_field=REPLAY_WORK_PNAT,
-        cache_buf_idx_field=REPLAY_WORK_CACHE_BUF_IDX,
-        BLOCK_SIZE=triton.next_power_of_2(num_decodes),
-        num_warps=4,
-    )
+    block_size = 256
+    _prepare_gdn_replay_work_items_kernel[(triton.cdiv(
+        num_decodes, block_size), )](
+            state_indices,
+            history_len,
+            work_items,
+            n_writes,
+            num_decodes,
+            work_item_width=REPLAY_WORK_ITEM_WIDTH,
+            position_field=REPLAY_WORK_POSITION_IN_DECODE_BATCH,
+            cache_slot_field=REPLAY_WORK_CACHE_SLOT,
+            history_len_field=REPLAY_WORK_PNAT,
+            cache_buf_idx_field=REPLAY_WORK_CACHE_BUF_IDX,
+            BLOCK_SIZE=block_size,
+            num_warps=4,
+        )
 
 
 def _build_replay_work_items_torch(state_indices, prev_num_accepted_tokens,
                                    cache_buf_idx, work_items, n_writes,
                                    replay_step_width, replay_history_size):
-    """Same partition as :func:`_build_replay_work_items_triton`, in ATen ops.
+    """Build the write-first Mamba2 replay partition with ATen operations.
 
-    Keep field order and write-first partitioning in sync with the AutoDeploy
-    replay metadata path in shim/interface.py.
+    Keep field order and partitioning in sync with the AutoDeploy replay
+    metadata path in ``shim/interface.py``.
     """
     num_decodes = state_indices.shape[0]
     position_in_decode_batch = torch.arange(num_decodes,
@@ -403,17 +388,8 @@ class Mamba2Metadata:
         self.replay_num_decodes = num_decodes
         if num_decodes == 0:
             return
-        use_gdn_all_layer_commit = getattr(
-            kv_cache_manager, "use_gdn_cached_replay_all_layer_commit", False)
-        if use_gdn_all_layer_commit:
-            from tensorrt_llm._torch.modules.fla.cached_replay import \
-                CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
-
-            # The fused small-batch GDN kernel commits its checkpoint in-layer
-            # and indexes cache metadata directly. Work items are only consumed
-            # by the partitioned replay + all-layer commit path.
-            if num_decodes < CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE:
-                return
+        use_gdn_mtp_replay = getattr(kv_cache_manager, "use_gdn_mtp_replay",
+                                     False)
 
         if not hasattr(kv_cache_manager, 'get_replay_state_update_metadata'):
             raise RuntimeError(
@@ -431,12 +407,19 @@ class Mamba2Metadata:
         replay_step_width = replay_metadata.replay_step_width
         replay_history_size = replay_metadata.replay_history_size
 
-        if (use_gdn_all_layer_commit
-                and num_decodes <= _FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE):
-            build_work_items = _build_replay_work_items_triton
-        else:
-            build_work_items = _build_replay_work_items_torch
-        build_work_items(
+        if use_gdn_mtp_replay:
+            _build_gdn_replay_work_items(
+                self.state_indices[num_contexts:batch_size],
+                replay_metadata.history_len,
+                self.replay_work_items,
+                self.replay_n_writes,
+            )
+            return
+
+        if cache_buf_idx is None:
+            raise RuntimeError("Mamba2 replay requires cache buffer indices")
+
+        _build_replay_work_items_torch(
             self.state_indices[num_contexts:batch_size],
             prev_num_accepted_tokens,
             cache_buf_idx,
