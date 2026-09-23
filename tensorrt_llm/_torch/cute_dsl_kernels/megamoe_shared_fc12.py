@@ -45,11 +45,11 @@ class _SharedFc12Runner:
         self.max_tokens = max_tokens
         self.reserved_sms = properties.multi_processor_count - sm_count
         self.stream_handle = stream_handle
-        cluster_size = 2
+        cluster_size = 1 if self.reserved_sms > 0 else 2
         hardware_clusters = utils.HardwareInfo(device_index).get_max_active_clusters(cluster_size)
         launch_clusters = min(sm_count // cluster_size, hardware_clusters)
         if launch_clusters <= 0:
-            raise ValueError("shared FC12 requires at least two available SMs")
+            raise ValueError("shared FC12 requires at least one active cluster")
 
         problem = ProblemDesc(
             {
@@ -65,9 +65,9 @@ class _SharedFc12Runner:
         )
         implementation = ImplDesc(
             {
-                "mma_tiler_mnk": (256, 128, 128),
-                "cluster_shape_mn": (2, 1),
-                "use_2cta_instrs": True,
+                "mma_tiler_mnk": (128, 256, 128) if cluster_size == 1 else (256, 128, 128),
+                "cluster_shape_mn": (cluster_size, 1),
+                "use_2cta_instrs": cluster_size == 2,
                 "group_hint": launch_clusters,
                 "token_padding_block": 64,
                 "sf_padding_block": 128,
@@ -162,7 +162,10 @@ class _SharedFc12Runner:
             "input_quantizer_reserved_sms": self.reserved_sms,
             "launch_cluster_count": launch_clusters,
             "work_id_mode": implementation["work_id_mode"],
-            "launch_grid": [2, 1, launch_clusters],
+            "launch_grid": [cluster_size, 1, launch_clusters],
+            "mma_tiler_mnk": list(implementation["mma_tiler_mnk"]),
+            "cluster_shape_mn": list(implementation["cluster_shape_mn"]),
+            "use_2cta_instrs": implementation["use_2cta_instrs"],
             "max_tokens": max_tokens,
             "dynamic_token_dimension": True,
             "routing_or_communication": False,
