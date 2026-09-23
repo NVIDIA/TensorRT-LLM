@@ -61,14 +61,14 @@ else:
             truncate_sha256_hash_to_int64,
         )
 
-from ._common import GPU_LEVEL, PRIORITY_DEFAULT, CacheLevel, Priority, TokenIdExt
+from ._common import GPU_LEVEL, PRIORITY_DEFAULT, CacheLevel, MmItemContext, Priority, TokenIdExt
 
 EventBlockHash = int | str
 BlockHashLike = bytes | EventBlockHash
 BlockHashesLike = BlockHashLike | Iterable[BlockHashLike]
 LayerGroupId = int | None
 EventTokenId = int | str
-MmKey = tuple[bytes, int] | tuple[bytes, int, str | None]
+MmKey = tuple[bytes, int] | tuple[bytes, int, str | None] | tuple[bytes, int, str | None, bool]
 AttentionDpGatherFn = Callable[[list["KVCacheEvent"]], list[list["KVCacheEvent"]]]
 
 
@@ -539,6 +539,8 @@ class KVCacheEventManager:
 
     @staticmethod
     def _normalize_token(token: TokenIdExt) -> UniqueToken:
+        if isinstance(token, MmItemContext):
+            return UniqueToken(token.digest.hex())
         if isinstance(token, bytes):
             return UniqueToken(token.hex())
         return UniqueToken(int(token))
@@ -550,17 +552,27 @@ class KVCacheEventManager:
         id_offset = self._mm_token_id_offset
         assert id_offset is not None
         parent = block.prev
-        digest = parent.last_token_digest if parent.ordinal >= 0 else None
+        context = parent.last_mm_item_context if parent.ordinal >= 0 else None
         in_mm_run = False
         mm_keys: list[MmKey] = []
+
+        def make_mm_key(item_context: MmItemContext, start_offset: int) -> MmKey:
+            if item_context.uuid is None:
+                return (item_context.digest, start_offset)
+            return (item_context.digest, start_offset, item_context.uuid, True)
+
         for token in block.tokens:
-            if isinstance(token, bytes):
-                digest = token
-                mm_keys.append((digest, 0))
+            if isinstance(token, MmItemContext):
+                context = token
+                mm_keys.append(make_mm_key(context, 0))
                 in_mm_run = True
-            elif token > id_offset and digest is not None:
+            elif isinstance(token, bytes):
+                context = MmItemContext(token)
+                mm_keys.append(make_mm_key(context, 0))
+                in_mm_run = True
+            elif token > id_offset and context is not None:
                 if not in_mm_run:
-                    mm_keys.append((digest, int(token) - id_offset))
+                    mm_keys.append(make_mm_key(context, int(token) - id_offset))
                 in_mm_run = True
             else:
                 # Text may separate runs of the same item, so retain its digest.

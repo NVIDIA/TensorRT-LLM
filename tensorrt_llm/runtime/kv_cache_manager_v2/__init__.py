@@ -43,6 +43,7 @@ if _BACKEND == "python":
         CudaStream,
         LayerId,
         MemAddress,
+        MmItemContext,
         PageIndexMode,
         PageStatus,
         Priority,
@@ -264,6 +265,7 @@ else:
     ReusedBlocksByLevel = _cpp.ReusedBlocksByLevel
     SwaScratchReuseConfig = getattr(_cpp, "SwaScratchReuseConfig", None)
     UniqueToken = _cpp.UniqueToken
+    MmItemContext = _cpp.MmItemContext
 
     BeamIndex = int
     CacheLevel = int
@@ -280,7 +282,7 @@ else:
     Priority = int
     SlidingWindowSize = Optional[int]
     TokenId = int
-    TokenIdExt = Union[int, bytes]
+    TokenIdExt = Union[int, bytes, MmItemContext]
 
     BAD_PAGE_INDEX = -1
     DEFAULT_BEAM_INDEX = 0
@@ -362,6 +364,7 @@ __all__ = [
     "LayerId",
     "LifeCycleId",
     "MemAddress",
+    "MmItemContext",
     "NDEBUG",
     "OutOfPagesError",
     "PageIndexConverter",

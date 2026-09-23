@@ -231,7 +231,12 @@ static std::pair<std::vector<kv::TokenIdExt>, bool> castTokenIterable(nb::handle
     bool knownNoDigest = true;
     for (auto item : nb::cast<nb::iterable>(tokens))
     {
-        if (nb::isinstance<nb::bytes>(item))
+        if (nb::isinstance<kv::MmItemContext>(item))
+        {
+            vec.emplace_back(nb::cast<kv::MmItemContext>(item));
+            knownNoDigest = false;
+        }
+        else if (nb::isinstance<nb::bytes>(item))
         {
             auto b = nb::cast<nb::bytes>(item);
             if (nb::len(b) != kv::kDIGEST_LEN)
@@ -372,8 +377,15 @@ static nb::list tokenList(std::vector<kv::TokenIdExt> const& tokens)
         }
         else
         {
-            auto const& digest = tok.digest();
-            result.append(nb::bytes(reinterpret_cast<char const*>(digest.data()), digest.size()));
+            auto const& context = tok.mmItemContext();
+            if (context.uuid.has_value())
+            {
+                result.append(nb::cast(context));
+            }
+            else
+            {
+                result.append(nb::bytes(reinterpret_cast<char const*>(context.digest.data()), context.digest.size()));
+            }
         }
     }
     return result;
@@ -440,12 +452,12 @@ static std::vector<kv::MmKey> castMmKeys(nb::handle values)
     for (nb::handle value : nb::cast<nb::iterable>(values))
     {
         nb::tuple tuple = nb::cast<nb::tuple>(value);
-        if (tuple.size() != 2 && tuple.size() != 3)
+        if (tuple.size() != 2 && tuple.size() != 3 && tuple.size() != 4)
         {
-            throw std::invalid_argument("mm_key must have two or three entries");
+            throw std::invalid_argument("mm_key must have two, three, or four entries");
         }
         std::optional<std::string> uuid;
-        if (tuple.size() == 3 && !tuple[2].is_none())
+        if (tuple.size() >= 3 && !tuple[2].is_none())
         {
             uuid = nb::cast<std::string>(tuple[2]);
         }
@@ -454,8 +466,14 @@ static std::vector<kv::MmKey> castMmKeys(nb::handle values)
             throw std::invalid_argument("mm_key hash must be bytes");
         }
         auto hash = nb::cast<nb::bytes>(tuple[0]);
+        kv::MmKeyUuidMode uuidMode = kv::MmKeyUuidMode::kNone;
+        if (tuple.size() >= 3)
+        {
+            uuidMode = tuple.size() == 4 && nb::cast<bool>(tuple[3]) ? kv::MmKeyUuidMode::kAdditive
+                                                                     : kv::MmKeyUuidMode::kReplacesHash;
+        }
         result.push_back(kv::MmKey{std::string(hash.c_str(), static_cast<size_t>(nb::len(hash))),
-            nb::cast<int>(tuple[1]), std::move(uuid), tuple.size() == 3});
+            nb::cast<int>(tuple[1]), std::move(uuid), uuidMode});
     }
     return result;
 }
@@ -466,13 +484,15 @@ static nb::list castMmKeys(kv::KVCacheStoredBlockData const& data)
     for (auto const& mmKey : data.mmKeys)
     {
         auto hash = nb::bytes(mmKey.hash.data(), mmKey.hash.size());
-        if (mmKey.hasUuidField)
+        switch (mmKey.uuidMode)
         {
+        case kv::MmKeyUuidMode::kAdditive:
+            result.append(nb::make_tuple(std::move(hash), mmKey.startOffset, mmKey.uuid, true));
+            break;
+        case kv::MmKeyUuidMode::kReplacesHash:
             result.append(nb::make_tuple(std::move(hash), mmKey.startOffset, mmKey.uuid));
-        }
-        else
-        {
-            result.append(nb::make_tuple(std::move(hash), mmKey.startOffset));
+            break;
+        case kv::MmKeyUuidMode::kNone: result.append(nb::make_tuple(std::move(hash), mmKey.startOffset)); break;
         }
     }
     return result;
@@ -883,6 +903,53 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                              .value("ACTIVE", kv::KvCache::Status::ACTIVE)
                              .value("SUSPENDED", kv::KvCache::Status::SUSPENDED)
                              .value("CLOSED", kv::KvCache::Status::CLOSED);
+
+    nb::class_<kv::MmItemContext>(m, "MmItemContext")
+        .def(
+            "__init__",
+            [](kv::MmItemContext* self, nb::bytes digestBytes, std::optional<std::string> uuid)
+            {
+                if (nb::len(digestBytes) != kv::kDIGEST_LEN)
+                {
+                    throw std::invalid_argument("digest must have length kDIGEST_LEN");
+                }
+                kv::Digest digest;
+                std::memcpy(digest.data(), digestBytes.c_str(), kv::kDIGEST_LEN);
+                new (self) kv::MmItemContext{digest, std::move(uuid)};
+            },
+            nb::arg("digest"), nb::arg("uuid") = std::nullopt)
+        .def_prop_ro("digest",
+            [](kv::MmItemContext const& self)
+            { return nb::bytes(reinterpret_cast<char const*>(self.digest.data()), self.digest.size()); })
+        .def_ro("uuid", &kv::MmItemContext::uuid)
+        .def(
+            "__eq__",
+            [](kv::MmItemContext const& self, nb::handle other)
+            {
+                if (nb::isinstance<kv::MmItemContext>(other))
+                {
+                    return self == nb::cast<kv::MmItemContext>(other);
+                }
+                if (nb::isinstance<nb::bytes>(other) && nb::len(other) == kv::kDIGEST_LEN)
+                {
+                    auto const bytes = nb::cast<nb::bytes>(other);
+                    return std::memcmp(self.digest.data(), bytes.c_str(), kv::kDIGEST_LEN) == 0;
+                }
+                return false;
+            },
+            nb::arg("other"))
+        .def("__hash__",
+            [](kv::MmItemContext const& self)
+            {
+                auto digest = nb::bytes(reinterpret_cast<char const*>(self.digest.data()), self.digest.size());
+                return PyObject_Hash(digest.ptr());
+            })
+        .def("__reduce__",
+            [](kv::MmItemContext const& self)
+            {
+                auto digest = nb::bytes(reinterpret_cast<char const*>(self.digest.data()), self.digest.size());
+                return nb::make_tuple(nb::type<kv::MmItemContext>(), nb::make_tuple(std::move(digest), self.uuid));
+            });
 
     // ---- KV cache events ----------------------------------------------------
     nb::class_<kv::UniqueToken>(m, "UniqueToken")
@@ -2578,7 +2645,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     m.def(
         "gen_multimodal_cache_key_tokens",
-        [](int idOffset, nb::bytes multiModalDataDigest, int numTokens, int tokenOffset)
+        [](int idOffset, nb::bytes multiModalDataDigest, int numTokens, int tokenOffset,
+            std::optional<std::string> uuid)
         {
             auto const digestSize = nb::len(multiModalDataDigest);
             if (digestSize != kv::kDIGEST_LEN)
@@ -2587,9 +2655,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             }
             auto const* first = reinterpret_cast<uint8_t const*>(multiModalDataDigest.c_str());
             std::vector<uint8_t> digest(first, first + digestSize);
-            return tokenList(kv::genMultimodalCacheKeyTokens(idOffset, digest, numTokens, tokenOffset));
+            return tokenList(
+                kv::genMultimodalCacheKeyTokens(idOffset, digest, numTokens, tokenOffset, std::move(uuid)));
         },
-        nb::arg("id_offset"), nb::arg("multi_modal_data_digest"), nb::arg("num_tokens"), nb::arg("token_offset") = 0);
+        nb::arg("id_offset"), nb::arg("multi_modal_data_digest"), nb::arg("num_tokens"), nb::arg("token_offset") = 0,
+        nb::arg("uuid") = std::nullopt);
     // Lazy iterator yielding (token_block, key) pairs; hashes one block per __next__.
     nb::class_<BlockchainKeyIterator>(m, "_BlockchainKeyIterator")
         .def("__iter__", [](nb::handle self) { return self; })

@@ -20,7 +20,7 @@ from itertools import chain
 from typing import TYPE_CHECKING, Iterable, Iterator, NamedTuple, Sequence, TypeVar, cast
 
 from . import rawref
-from ._common import NDEBUG, BlockOrdinal, PageStatus, TokenId, TokenIdExt
+from ._common import NDEBUG, BlockOrdinal, MmItemContext, PageStatus, TokenId, TokenIdExt
 from ._life_cycle_registry import AttnLifeCycle, LifeCycle, LifeCycleId, LifeCycleRegistry
 from ._utils import TypedIndexList, filled_list, map_optional, typed_range, unwrap_rawref
 
@@ -41,7 +41,11 @@ if _UINT_ITEM_SIZE != 4:
 # id_offset is usually vocab_size. Backend-neutral (depends only on _common); the
 # C++ backend exposes a native gen_multimodal_cache_key_tokens via nanobind instead.
 def gen_multimodal_cache_key_tokens(
-    id_offset: int, multi_modal_data_digest: bytes, num_tokens: int, token_offset: int = 0
+    id_offset: int,
+    multi_modal_data_digest: bytes,
+    num_tokens: int,
+    token_offset: int = 0,
+    uuid: str | None = None,
 ) -> list[TokenIdExt]:
     """Create synthetic tokens used only when building multimodal KV-cache keys.
 
@@ -55,6 +59,7 @@ def gen_multimodal_cache_key_tokens(
         num_tokens: Number of synthetic tokens to generate. Must be positive.
         token_offset: Item-local index of the first generated token. Must be non-negative;
             only offset 0 carries the digest.
+        uuid: Optional external routing identity to retain with the digest token.
 
     Returns:
         The generated tokens, digest first when ``token_offset`` is 0.
@@ -70,7 +75,9 @@ def gen_multimodal_cache_key_tokens(
     if token_offset < 0:
         raise ValueError("token_offset must be non-negative")
     return [
-        multi_modal_data_digest if token_offset + i == 0 else TokenId(id_offset + token_offset + i)
+        (multi_modal_data_digest if uuid is None else MmItemContext(multi_modal_data_digest, uuid))
+        if token_offset + i == 0
+        else TokenId(id_offset + token_offset + i)
         for i in range(num_tokens)
     ]
 
@@ -79,8 +86,9 @@ class Hasher:
     """Incremental SHA-256 hasher used to derive block keys for the radix tree.
 
     Accepts ints (encoded as 4 little-endian bytes each, matching the C++ backend's
-    4-byte ``TokenIdExt`` layout), raw ``bytes`` (multimodal content digests and
-    reuse-scope fields), or a sequence mixing the two. Both backends must produce
+    4-byte ``TokenIdExt`` layout), raw ``bytes`` or ``MmItemContext`` values
+    (multimodal content digests and reuse-scope fields), or a sequence mixing them.
+    UUID metadata in ``MmItemContext`` is deliberately ignored. Both backends must produce
     identical digests for the same logical input, so the encoding is part of the
     on-disk/cross-process contract and cannot change unilaterally.
 
@@ -102,18 +110,23 @@ class Hasher:
     __slots__ = "_hasher"
     _hasher: "hashlib._Hash"
 
-    def __init__(self, data: int | bytes | Sequence[int | bytes] | None = None) -> None:
+    def __init__(
+        self,
+        data: int | bytes | MmItemContext | Sequence[int | bytes | MmItemContext] | None = None,
+    ) -> None:
         self._hasher = hashlib.sha256()
         if data is not None:
             self.update(data)
 
-    def update(self, data: int | bytes | Sequence[int | bytes]) -> "Hasher":
+    def update(
+        self, data: int | bytes | MmItemContext | Sequence[int | bytes | MmItemContext]
+    ) -> "Hasher":
         """Fold ``data`` into the running digest.
 
         Args:
-            data: An int token id (0 <= id < 2**31), raw ``bytes``, or a sequence of
-                either. An all-int sequence takes a single-call fast path; a sequence
-                containing ``bytes`` (multimodal blocks) falls back to per-item hashing.
+            data: An int token id (0 <= id < 2**31), raw ``bytes``, an
+                ``MmItemContext``, or a sequence of these. An all-int sequence takes a
+                single-call fast path; a multimodal block falls back to per-item hashing.
 
         Returns:
             This ``Hasher``, to allow chaining.
@@ -124,6 +137,8 @@ class Hasher:
             self._hasher.update(data.to_bytes(4, "little"))
         elif type(data) is bytes:
             self._hasher.update(data)
+        elif isinstance(data, MmItemContext):
+            self._hasher.update(data.digest)
         else:
             # Hash the whole token block in one C call instead of one per token.
             # array("I", data).tobytes() packs each int as 4 native-endian bytes
@@ -140,8 +155,14 @@ class Hasher:
                         NDEBUG
                         or (type(item) is int and (0 <= item < (1 << 31)))
                         or type(item) is bytes
+                        or isinstance(item, MmItemContext)
                     )
-                    self._hasher.update(item.to_bytes(4, "little") if (type(item) is int) else item)  # type: ignore
+                    if type(item) is int:
+                        self._hasher.update(item.to_bytes(4, "little"))
+                    elif isinstance(item, MmItemContext):
+                        self._hasher.update(item.digest)
+                    else:
+                        self._hasher.update(item)  # type: ignore
         return self
 
     @property
@@ -406,7 +427,7 @@ class Block:
         "_needs_token_digest_context",
         "_prev",
         "key",
-        "last_token_digest",
+        "last_mm_item_context",
         "next",
         "ordinal",
         "storage",
@@ -414,7 +435,7 @@ class Block:
     )
     key: BlockKey
     tokens: Sequence[TokenIdExt]
-    last_token_digest: bytes | None
+    last_mm_item_context: MmItemContext | None
     ordinal: BlockOrdinal
     _needs_token_digest_context: bool
     _prev: rawref.ref["Block | RootBlock"]
@@ -438,7 +459,7 @@ class Block:
         self.storage = filled_list(None, prev.num_life_cycles)
         self.__rawref__ = rawref.NULL
         self._needs_token_digest_context = prev._needs_token_digest_context
-        self.last_token_digest = None
+        self.last_mm_item_context = None
         # a Block is useless if all its tokens are covered by a sibling block. Raise UselessBlockError if so.
         if self.key in prev.next:
             raise UselessBlockError(prev.next[self.key])
@@ -451,10 +472,15 @@ class Block:
         if self._needs_token_digest_context:
             # Share the last digest through text-only descendants, including ancestors
             # without committable pages that never publish a stored event themselves.
-            self.last_token_digest = prev.last_token_digest if isinstance(prev, Block) else None
+            self.last_mm_item_context = (
+                prev.last_mm_item_context if isinstance(prev, Block) else None
+            )
             for token in reversed(tokens):
+                if isinstance(token, MmItemContext):
+                    self.last_mm_item_context = token
+                    break
                 if isinstance(token, bytes):
-                    self.last_token_digest = token
+                    self.last_mm_item_context = MmItemContext(token)
                     break
         # A later turn may extend a partial endpoint to this longer block, replacing the
         # partial sibling. That turn may not have a committable SWA page for this block:
@@ -483,6 +509,13 @@ class Block:
                 event_manager.add_removed_event(b.key)
             assert b.is_orphan  # _KVCache may still hold it.
         # prev.next keeps a strong ref to this _Block, so no need to remove self from prev.next in __del__().
+
+    @property
+    def last_token_digest(self) -> bytes | None:
+        """Digest-only compatibility view of the inherited multimodal context."""
+        if self.last_mm_item_context is None:
+            return None
+        return self.last_mm_item_context.digest
 
     def page_coverage(self, lc_idx: LifeCycleId) -> int:
         """Return the page's recorded token count, or zero if the slot is empty.

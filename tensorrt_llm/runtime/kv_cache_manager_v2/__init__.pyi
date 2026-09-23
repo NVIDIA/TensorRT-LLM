@@ -64,7 +64,15 @@ LifeCycleId = NewType("LifeCycleId", int)
 LayerGroupId: TypeAlias = LifeCycleId
 CacheLevel = NewType("CacheLevel", int)
 TokenId = NewType("TokenId", int)
-TokenIdExt = Union[TokenId, bytes]
+
+class MmItemContext:
+    def __init__(self, digest: bytes, uuid: str | None = None) -> None: ...
+    @property
+    def digest(self) -> bytes: ...
+    @property
+    def uuid(self) -> str | None: ...
+
+TokenIdExt = Union[TokenId, bytes, MmItemContext]
 
 class PlannedDropHandle:
     def drop(self) -> None: ...
@@ -245,7 +253,9 @@ EventBlockHash: TypeAlias = int | str
 BlockHashLike: TypeAlias = bytes | EventBlockHash
 BlockHashesLike: TypeAlias = BlockHashLike | Iterable[BlockHashLike]
 EventTokenId: TypeAlias = int | str
-MmKey: TypeAlias = tuple[bytes, int] | tuple[bytes, int, str | None]
+MmKey: TypeAlias = (
+    tuple[bytes, int] | tuple[bytes, int, str | None] | tuple[bytes, int, str | None, bool]
+)
 AttentionDpGatherFn: TypeAlias = Callable[[list["KVCacheEvent"]], list[list["KVCacheEvent"]]]
 
 @dataclass(slots=True, frozen=True)
@@ -340,6 +350,7 @@ def gen_multimodal_cache_key_tokens(
     multi_modal_data_digest: bytes,
     num_tokens: int,
     token_offset: int = 0,
+    uuid: str | None = None,
 ) -> list[TokenIdExt]: ...
 def sequence_to_blockchain_keys(
     tokens_per_block: int,

@@ -40,6 +40,7 @@ import zmq
 from tensorrt_llm.llmapi.llm_args import KVEventsConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_hash import truncate_sha256_hash_to_int64
+from tensorrt_llm.runtime.kv_cache_manager_v2 import MmItemContext
 from tensorrt_llm.runtime.kv_cache_manager_v2._event_manager import KVCacheEvent, KVCacheEventDiff
 
 # Subscribers decode block hashes as 64-bit ints, so a bytes value would fail the
@@ -506,11 +507,12 @@ def _kv_event_wire_hash_from_radix_key(block_key: bytes) -> int:
 
 
 class _MultimodalBlockError(ValueError):
-    """A block token is a multimodal cache-key digest (bytes), not a wire int.
+    """A block token is a multimodal cache-key digest, not a wire int.
 
-    ``gen_multimodal_cache_key_tokens`` stores the per-item digest as ``bytes``,
-    which has no integer wire representation. Such blocks are skipped
-    quietly rather than routed through the malformed-data traceback path.
+    ``gen_multimodal_cache_key_tokens`` stores the per-item digest as ``bytes``
+    or an ``MmItemContext`` carrying its UUID. Neither has an integer wire
+    representation. Such blocks are skipped quietly rather than routed through
+    the malformed-data traceback path.
     """
 
 
@@ -678,7 +680,7 @@ class StreamingKVCacheEventManager:
     def _token_ids(tokens: Any) -> list[int]:
         token_ids: list[int] = []
         for token in tokens:
-            if type(token) is bytes:
+            if type(token) is bytes or isinstance(token, MmItemContext):
                 # Multimodal cache-key digest; not representable as a wire int.
                 raise _MultimodalBlockError
             if type(token) is not int:

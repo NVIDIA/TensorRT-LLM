@@ -54,12 +54,36 @@ CACHE_LEVEL1: Final[CacheLevel] = CacheLevel(1)
 # Normal token id that falls in the tokenizer vocabulary.
 TokenId = NewType("TokenId", int)
 
+
+@dataclass(slots=True, frozen=True, eq=False)
+class MmItemContext:
+    """Multimodal cache identity carried by a digest token.
+
+    ``digest`` alone defines token identity and radix-tree keys. ``uuid`` is
+    request metadata retained only for KV-cache event routing.
+    """
+
+    digest: bytes
+    uuid: str | None = None
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, MmItemContext):
+            return self.digest == other.digest
+        if isinstance(other, bytes):
+            return self.digest == other
+        return False
+
+    def __hash__(self) -> int:
+        return hash(self.digest)
+
+
 # For multi-modal tokens, we can handle it in either of the following ways:
 #   1. Hash combine image digest and local_token_id, then use digest for every multi-modal token.
 #   2. Use digest only for the first multi-modal token, and use int(vocab_size + local_token_id) for the rest.
-#   3. Hash the multi-modal token embedding data and use the digest as TokenIdExt for every multi-modal token.
+#   3. Hash the multi-modal token embedding data and use the digest context as
+#      TokenIdExt for every multi-modal token.
 #      If we do this, we can't skip the encoder.
-TokenIdExt = TokenId | bytes
+TokenIdExt = TokenId | bytes | MmItemContext
 
 
 BlockOrdinal = NewType("BlockOrdinal", int)

@@ -41,6 +41,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheStoredData as NativeKVCacheStoredData
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheUpdatedData as NativeKVCacheUpdatedData
+from tensorrt_llm.runtime.kv_cache_manager_v2 import MmItemContext
 from tensorrt_llm.runtime.kv_cache_manager_v2 import UniqueToken as NativeUniqueToken
 from tensorrt_llm.runtime.kv_cache_manager_v2._event_manager import (
     KVCacheCreatedData,
@@ -63,6 +64,10 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         RootBlock,
         detach_next,
     )
+    from kv_cache_manager_v2._common import MmItemContext as PythonMmItemContext
+    from kv_cache_manager_v2._event_manager import (
+        KVCacheEventManager as PythonBackendKVCacheEventManager,
+    )
     from kv_cache_manager_v2._life_cycle_registry import LifeCycleRegistry
     from kv_cache_manager_v2._utils import CachedCudaStream, init_cuda_once, temporary_sys_path
 else:
@@ -80,6 +85,12 @@ else:
         RootBlock,
         detach_next,
     )
+    from tensorrt_llm.runtime.kv_cache_manager_v2._common import (
+        MmItemContext as PythonMmItemContext,
+    )
+    from tensorrt_llm.runtime.kv_cache_manager_v2._event_manager import (
+        KVCacheEventManager as PythonBackendKVCacheEventManager,
+    )
     from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import LifeCycleRegistry
     from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
         CachedCudaStream,
@@ -94,6 +105,10 @@ except ImportError:
 
 
 _USING_CPP_BACKEND = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() != "python"
+_BackendMmItemContext = MmItemContext if _USING_CPP_BACKEND else PythonMmItemContext
+_BackendKVCacheEventManager = (
+    NativeKVCacheEventManager if _USING_CPP_BACKEND else PythonBackendKVCacheEventManager
+)
 
 
 with temporary_sys_path(os.path.dirname(os.path.abspath(__file__))):
@@ -304,7 +319,11 @@ def test_native_event_data_value_semantics_match_python_reference():
         [native_token],
         cache_level=1,
         priority=35,
-        mm_keys=[(b"short-mm-key", 3), (b"another-key", 5, "uuid")],
+        mm_keys=[
+            (b"short-mm-key", 3),
+            (b"another-key", 5, "uuid"),
+            (b"digest-key", 7, "routing-identity", True),
+        ],
         cache_salt="salt",
     )
     native_diff = NativeKVCacheEventDiff(0, 1)
@@ -333,7 +352,11 @@ def test_native_event_data_value_semantics_match_python_reference():
         [python_token],
         cache_level=1,
         priority=35,
-        mm_keys=[(b"short-mm-key", 3), (b"another-key", 5, "uuid")],
+        mm_keys=[
+            (b"short-mm-key", 3),
+            (b"another-key", 5, "uuid"),
+            (b"digest-key", 7, "routing-identity", True),
+        ],
         cache_salt="salt",
     )
     python_diff = KVCacheEventDiff(0, 1)
@@ -1048,13 +1071,16 @@ def test_v2_kv_cache_event_manager_uses_stored_registry_for_removed_event(
 def test_v2_kv_cache_event_manager_derives_mm_keys_across_blocks(
     real_block_factory, ancestor_coverage
 ):
-    event_manager = NativeKVCacheEventManager(
+    event_manager = _BackendKVCacheEventManager(
         max_kv_event_entries=8, window_size=128, mm_token_id_offset=1000
     )
     make_block = real_block_factory(event_manager)
     digest_a = bytes(range(32))
     digest_b = bytes(reversed(range(32)))
-    first = make_block([1, digest_a, 1001, 1002], [ancestor_coverage])
+    uuid_a = "frontend-h-a"
+    first = make_block(
+        [1, _BackendMmItemContext(digest_a, uuid_a), 1001, 1002], [ancestor_coverage]
+    )
     gap = make_block([2, 3, 4, 5], [ancestor_coverage], parent=first)
     continued = make_block([1003, 7, 1004, 1005], [4], parent=gap)
     last = make_block([1006, digest_b, 1001, 9], [4], parent=continued)
@@ -1071,29 +1097,51 @@ def test_v2_kv_cache_event_manager_derives_mm_keys_across_blocks(
     }
     expected = {
         _block_key(continued).hex(): [
-            {"type": "mm_key", "hash": digest_a.hex(), "start_offset": 3},
-            {"type": "mm_key", "hash": digest_a.hex(), "start_offset": 4},
+            {
+                "type": "mm_key",
+                "hash": digest_a.hex(),
+                "uuid": uuid_a,
+                "start_offset": 3,
+            },
+            {
+                "type": "mm_key",
+                "hash": digest_a.hex(),
+                "uuid": uuid_a,
+                "start_offset": 4,
+            },
         ],
         _block_key(last).hex(): [
-            {"type": "mm_key", "hash": digest_a.hex(), "start_offset": 6},
+            {
+                "type": "mm_key",
+                "hash": digest_a.hex(),
+                "uuid": uuid_a,
+                "start_offset": 6,
+            },
             {"type": "mm_key", "hash": digest_b.hex(), "start_offset": 0},
         ],
     }
     if ancestor_coverage == 4:
         expected[_block_key(first).hex()] = [
-            {"type": "mm_key", "hash": digest_a.hex(), "start_offset": 0}
+            {
+                "type": "mm_key",
+                "hash": digest_a.hex(),
+                "uuid": uuid_a,
+                "start_offset": 0,
+            }
         ]
         expected[_block_key(gap).hex()] = []
     assert mm_keys_by_hash == expected
 
 
 def test_v2_kv_cache_event_manager_preserves_mm_keys_after_life_cycle_removal(real_block_factory):
-    event_manager = NativeKVCacheEventManager(
+    event_manager = _BackendKVCacheEventManager(
         max_kv_event_entries=8, window_size=128, mm_token_id_offset=1000
     )
     make_block = real_block_factory(event_manager, num_life_cycles=2)
     mm_hash = bytes(range(32))
-    block = make_block([mm_hash, 1001], [2, 2])
+    uuid = "frontend-routing-identity-" + "x" * 1024
+    assert uuid != mm_hash.hex()[:16]
+    block = make_block([_BackendMmItemContext(mm_hash, uuid), 1001], [2, 2])
     block_key = _block_key(block)
 
     _add_stored_block(event_manager, block)
@@ -1103,6 +1151,7 @@ def test_v2_kv_cache_event_manager_preserves_mm_keys_after_life_cycle_removal(re
         {
             "type": "mm_key",
             "hash": mm_hash.hex(),
+            "uuid": uuid,
             "start_offset": 0,
         }
     ]
@@ -1153,18 +1202,25 @@ def test_python_v2_mm_digest_context_survives_detached_ancestor():
     tree = BlockRadixTree(life_cycles, tokens_per_block=4, event_manager=event_manager)
     root = tree.add_or_get_existing(ReuseScope())
     digest = bytes(range(32))
-    first = Block([0, digest, 1001, 1002], root)
+    uuid = "routing-identity"
+    first = Block([0, PythonMmItemContext(digest, uuid), 1001, 1002], root)
     gap = Block([1, 2, 3, 4], first)
     continued = Block([1003, 5, 1004, 1005], gap)
     parent_ref = gap._prev
     try:
         assert detach_next(first, gap.key) is gap
         assert gap.last_token_digest == digest
-        assert event_manager._mm_keys_from_radix_block(continued) == [(digest, 3), (digest, 4)]
+        assert event_manager._mm_keys_from_radix_block(continued) == [
+            (digest, 3, uuid, True),
+            (digest, 4, uuid, True),
+        ]
 
         gap._prev = parent_ref
         first.next[gap.key] = gap
-        assert event_manager._mm_keys_from_radix_block(continued) == [(digest, 3), (digest, 4)]
+        assert event_manager._mm_keys_from_radix_block(continued) == [
+            (digest, 3, uuid, True),
+            (digest, 4, uuid, True),
+        ]
     finally:
         gap._prev = parent_ref
         first.next[gap.key] = gap

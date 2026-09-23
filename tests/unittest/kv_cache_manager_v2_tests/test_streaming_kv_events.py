@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import socket
 from types import SimpleNamespace
 from typing import Callable
@@ -29,6 +30,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_events import (
     validate_streaming_support,
 )
 from tensorrt_llm.llmapi.llm_args import KVEventsConfig
+from tensorrt_llm.runtime.kv_cache_manager_v2 import MmItemContext
 from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
     Block,
     BlockRadixTree,
@@ -136,6 +138,40 @@ def test_streaming_sink_supports_real_radix_blocks(monkeypatch: pytest.MonkeyPat
         assert manager.stored_blocks == 2
     finally:
         tree.clear()
+        manager.shutdown()
+
+
+def test_streaming_sink_suppresses_multimodal_context_blocks(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Multimodal digest tokens are expected omissions, not malformed events."""
+    manager = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=4,
+        max_window_size=128,
+    )
+    published: list[KVEventBatch] = []
+    manager._publisher.publish = lambda batch: published.append(batch) or True
+    root = SimpleNamespace(ordinal=-1)
+    block = SimpleNamespace(
+        key=b"\x01" * 32,
+        tokens=[1, MmItemContext(bytes(range(32)), "routing-identity"), 1001, 1002],
+        prev=root,
+    )
+
+    try:
+        with caplog.at_level(logging.ERROR, logger="tensorrt_llm"):
+            manager._add_full_block(block)
+            manager.flush_iteration_events()
+
+        assert manager.multimodal_blocks_suppressed == 1
+        assert manager.dropped_events == 0
+        assert manager.stored_blocks == 0
+        assert manager._pending_events == []
+        assert published == []
+        assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+    finally:
         manager.shutdown()
 
 

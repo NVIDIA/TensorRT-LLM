@@ -28,13 +28,20 @@ except ImportError:
     from cuda.core.experimental._module import ObjectCode
 
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
-    from kv_cache_manager_v2._common import CudaStream, LayerId, MemAddress, TokenIdExt
+    from kv_cache_manager_v2._common import (
+        CudaStream,
+        LayerId,
+        MemAddress,
+        MmItemContext,
+        TokenIdExt,
+    )
     from kv_cache_manager_v2._utils import _unwrap, div_up, exact_div
 else:
     from tensorrt_llm.runtime.kv_cache_manager_v2._common import (
         CudaStream,
         LayerId,
         MemAddress,
+        MmItemContext,
         TokenIdExt,
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._utils import _unwrap, div_up, exact_div
@@ -224,7 +231,13 @@ def _make_tokens(tokens: Sequence[TokenIdExt], max_tokens: int) -> ctypes.Struct
     return Tokens(
         tokens=(ctypes.c_uint32 * max_tokens)(
             *[
-                t if isinstance(t, int) else int.from_bytes(t[:4], "little", signed=False)
+                t
+                if isinstance(t, int)
+                else int.from_bytes(
+                    t.digest[:4] if isinstance(t, MmItemContext) else t[:4],
+                    "little",
+                    signed=False,
+                )
                 for t in padded
             ]
         )

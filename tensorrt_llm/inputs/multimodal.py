@@ -216,9 +216,9 @@ class MultimodalInput:
     multimodal_uuids: Optional[List[Optional[str]]] = None
     """Optional user-provided UUIDs for multimodal data items.
 
-    When provided, these UUIDs will be returned in KV cache events instead of the
-    computed hash hex string. This enables deterministic cache identification across
-    sessions using user-defined stable identifiers.
+    When provided, these UUIDs are preserved in KV cache events. V1 reports the UUID
+    through the legacy ``hash`` field; V2 keeps the derived digest in ``hash`` and
+    reports the UUID through the optional ``uuid`` field.
 
     Each element can be:
     - A string UUID: Used as the cache identifier (returned in events)

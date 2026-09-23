@@ -172,7 +172,7 @@ This isolation is enforced entirely by the block-key hash: the salt is mixed int
 
 When working with multimodal models (e.g., vision-language models), the KV cache system needs to identify which cached blocks correspond to which multimodal inputs (images, videos, etc.). By default, the system uses content-based hashing to generate unique identifiers for each multimodal input. However, this approach has limitations for cache management across sessions, as the same content must be re-processed to generate the same hash.
 
-You can provide custom UUID strings for your multimodal data using the `multi_modal_uuids` parameter when creating requests. Both cache managers compute the item digest from **both** the UUID and content together for correctness. V1 returns the original UUID in the KV cache event's `mm_keys[].hash` field when one is supplied. V2 returns the item digest as a hexadecimal string, including for items with UUIDs.
+You can provide custom UUID strings for your multimodal data using the `multi_modal_uuids` parameter when creating requests. Both cache managers compute the item digest from **both** the UUID and content together for correctness. V1 returns the original UUID in the KV cache event's `mm_keys[].hash` field when one is supplied. V2 always returns the derived digest in `mm_keys[].hash` and adds the original identity in the optional `mm_keys[].uuid` field.
 
 **Usage Example:**
 
@@ -191,16 +191,16 @@ prompt = TextPrompt(
 
 - **Cache Correctness**: When a UUID is provided, the cache key is computed from both the UUID and content together using `BLAKE3(UUID || Content)`. This ensures different content always produces different cache entries, even with the same UUID.
 - **User Isolation**: Same content with different UUIDs produces different cache entries, enabling per-user or per-session cache isolation.
-- **Stable Event Identifiers**: `get_kv_cache_events()` returns the original UUID for V1, or the item digest for V2. V2 consumers can use the same digest that appears in its cache-key token sequence.
+- **Stable Event Identifiers**: `get_kv_cache_events()` returns the original UUID in V1's `hash` field. V2 returns the item digest in `hash` and the original UUID in the optional `uuid` field.
 - **Partial UUID Support**: You can provide UUIDs for some items and use `None` for others to fall back to content-only hashing.
 - **Cross-Modality Support**: Different modalities (images, videos) can each have their own UUIDs.
 
 **UUID Format:**
 
 - Can be any string (e.g., "image-123", "user-session-img-a", database keys)
-- Original UUID strings are preserved in request metadata and returned in V1 KV cache events
+- Original UUID strings are preserved in request metadata and returned in KV cache events
 
-V2 derives `mm_keys` directly from the cached token sequence. Each entry identifies a continuous multimodal segment within that block: `hash` is the item's digest, and `start_offset` is the segment's first token offset within the item. An item spanning multiple blocks retains the same digest with increasing offsets. Text may separate segments of the same item. Items are processed in prompt order; one item cannot resume after another item has started. The item digest is distinct from `block_hash`, which also depends on the preceding token sequence.
+V2 derives `mm_keys` directly from the cached token sequence. Each entry identifies a continuous multimodal segment within that block: `hash` is the item's digest, optional `uuid` is the externally supplied identity, and `start_offset` is the segment's first token offset within the item. An item spanning multiple blocks retains the same digest and UUID with increasing offsets. Text may separate segments of the same item. Items are processed in prompt order; one item cannot resume after another item has started. The item digest is distinct from `block_hash`, which also depends on the preceding token sequence. Clients that require the externally supplied identity must read `uuid`; truncating or otherwise deriving an identity from `hash` does not recover the UUID.
 
 
 ### Enable Offloading to Host Memory

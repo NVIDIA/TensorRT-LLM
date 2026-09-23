@@ -35,6 +35,7 @@ from .._common import (
     BlockOrdinalT,
     CacheLevel,
     CudaStream,
+    MmItemContext,
     PageIndex,
     PageIndexMode,
     PageStatus,
@@ -799,7 +800,7 @@ class _KVCache:
                 "configured text_only=True"
             )
         # Claiming text-only is a fast-path claim; verify committed tokens are digest-free.
-        if text_only and any(isinstance(t, bytes) for t in self._committed_tokens):
+        if text_only and any(isinstance(t, (bytes, MmItemContext)) for t in self._committed_tokens):
             raise ValueError(
                 "Cannot set text_only=True: this sequence has already committed digest tokens"
             )
