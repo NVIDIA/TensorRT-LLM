@@ -243,6 +243,10 @@ def isInfraDryRun() {
     return testFilter[(INFRA_DRY_RUN)] ?: false
 }
 
+def getShortenedJenkinsInstanceName() {
+    return trtllm_utils.getShortenedInstanceName(env.JENKINS_URL ?: Jenkins.instance.rootUrl)
+}
+
 def isCbtsStage(String stageName) {
     // Pipeline-level eligibility (post-merge gate + kill switch) is decided in L0_MergeRequest.groovy and propagated via testFilter.
     if (!(testFilter[(CBTS_COVERAGE)] ?: false)) {
@@ -1096,8 +1100,8 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
     def entrypoint = SlurmConfig.containerRuntimeToEntrypoint[cluster.containerRuntime]
 
-    // Create a unique suffix for the node name and workspace
-    String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
+    // Create a unique suffix for the instance, node name and workspace
+    String customSuffix = "${getShortenedJenkinsInstanceName()}-${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
     def nodeName = "${cluster.host}-test-${customSuffix}"
     def customWorkspace = "/tmp/${nodeName}"
     def nodeSecret = CloudManager.createNode(nodeName, customWorkspace)
@@ -1789,7 +1793,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     }
 
     // Create a unique suffix for the job name
-    String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
+    String customSuffix = "${getShortenedJenkinsInstanceName()}-${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
     def jobUID = "${cluster.host}-multi_node_test-${customSuffix}"
     def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
     def disaggMultiNodeMode = stageName.contains("Disagg-PerfSanity")
@@ -7074,7 +7078,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                             // wheel under test is linked against that libtorch, and a mismatch fails
                             // the import with an undefined c10 symbol instead of a version error.
                             // Use internal mirror instead of https://download.pytorch.org/whl/cu132 for better network stability.
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.13.0+cu132 torchvision==0.28.0+cu132 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu132")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.14.0+cu132 torchvision==0.29.0+cu132 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu132")
                         }
 
                         // A stock image, so nothing here went through Dockerfile.multi or

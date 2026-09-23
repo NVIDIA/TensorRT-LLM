@@ -17,7 +17,7 @@ from operator import getitem
 
 import pytest
 import torch
-from torch._higher_order_ops.auto_functionalize import auto_functionalized_v2
+from torch._higher_order_ops.auto_functionalize import auto_functionalized, auto_functionalized_v2
 from torch.fx import Graph
 
 # Registers torch.ops.trtllm.mla_custom_op_inplace, used below. The op is a
@@ -29,6 +29,61 @@ import tensorrt_llm._torch.compilation.remove_copy_pass as remove_copy_pass
 from tensorrt_llm._torch.attention.kernels.fused_qk_norm_rope_gate import (
     fused_sigmoid_mul_inplace,  # noqa: F401
 )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_remove_copy_preserves_minimax_producer_outputs(use_v2: bool) -> None:
+    """Preserve query outputs and cache aliases when removing functionalization."""
+    import tensorrt_llm._torch.models.modeling_minimaxm3  # noqa: F401
+
+    graph = Graph()
+    hidden = graph.placeholder("hidden")
+    positions = graph.placeholder("positions")
+    main = graph.placeholder("main")
+    index = graph.placeholder("index")
+    slots = graph.placeholder("slots")
+    op = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer.default
+    kwargs = dict(hidden_states=hidden, position_ids=positions, out_cache_loc=slots, layer_idx="3")
+    if use_v2:
+        kwargs.update(_all_bases=(main, index), _kv_cache_base_index=0, _index_k_cache_base_index=1)
+    else:
+        kwargs.update(kv_cache=main, index_k_cache=index)
+    functionalized = graph.call_function(
+        auto_functionalized_v2 if use_v2 else auto_functionalized, args=(op,), kwargs=kwargs
+    )
+    q = graph.call_function(getitem, args=(functionalized, 0))
+    index_q = graph.call_function(getitem, args=(functionalized, 1))
+    q.meta["val"] = torch.empty(4, 3)
+    index_q.meta["val"] = torch.empty(4, 1)
+    functionalized.meta["val"] = (
+        q.meta["val"],
+        index_q.meta["val"],
+        torch.empty(8, 3),
+        torch.empty(8, 1),
+    )
+    updated_main = graph.call_function(getitem, args=(functionalized, 2))
+    updated_index = graph.call_function(getitem, args=(functionalized, 3))
+    output = graph.output((q, index_q, updated_main, updated_index))
+
+    remove_copy_pass.remove_copy_for_mutates_args(graph)
+
+    calls = [node for node in graph.nodes if node.target == op]
+    assert len(calls) == 1
+    assert calls[0].kwargs["kv_cache"] is main
+    assert calls[0].kwargs["index_k_cache"] is index
+    assert calls[0].kwargs["out_cache_loc"] is slots
+    assert calls[0].meta["val"] == (q.meta["val"], index_q.meta["val"])
+    new_q, new_index_q, new_main, new_index = output.args[0]
+    assert new_q.args == (calls[0], 0)
+    assert new_index_q.args == (calls[0], 1)
+    assert new_main is main and new_index is index
+    assert new_q.meta["val"] is q.meta["val"]
+    assert new_index_q.meta["val"] is index_q.meta["val"]
+    assert all(
+        node.target not in (auto_functionalized, auto_functionalized_v2) for node in graph.nodes
+    )
+    graph.lint()
 
 
 def test_remove_copy_for_mutates_args_auto_functionalized_v2(

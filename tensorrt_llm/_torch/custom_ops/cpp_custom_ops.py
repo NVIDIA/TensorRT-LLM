@@ -405,10 +405,9 @@ def _register_fake():
           conv_state_v: torch.Tensor, a_log: torch.Tensor, g: torch.Tensor,
           dt_bias: torch.Tensor, beta: torch.Tensor, onorm_g: torch.Tensor,
           onorm_weight: torch.Tensor, ssm_state_indices: Optional[torch.Tensor],
-          cu_seqlens: torch.Tensor, state: torch.Tensor, apply_onorm: bool,
-          update_conv_cache: bool, use_lower_bound: bool,
-          apply_beta_sigmoid: bool, lower_bound: float, scale: float,
-          onorm_eps: float, output: torch.Tensor) -> None:
+          state: torch.Tensor, apply_onorm: bool, update_conv_cache: bool,
+          use_lower_bound: bool, apply_beta_sigmoid: bool, lower_bound: float,
+          scale: float, onorm_eps: float, output: torch.Tensor) -> None:
         # Inplace-only: the kernel writes into ``output``, so there is nothing
         # to allocate and nothing to return.
         return None
@@ -432,6 +431,54 @@ def _register_fake():
         del base, position_ids
         return qk.new_empty((qk.shape[0], num_heads_q, head_dim),
                             dtype=torch.float8_e4m3fn)
+
+    @torch.library.register_fake("trtllm::fused_qk_norm_rope_to_fp8")
+    def _(qkv: torch.Tensor, num_heads_q: int, num_heads_k: int,
+          num_heads_v: int, head_dim: int, rotary_dim: int, eps: float,
+          q_weight: torch.Tensor, k_weight: torch.Tensor, base: float,
+          is_neox: bool, position_ids: torch.Tensor, factor: float, low: float,
+          high: float, attention_factor: float, is_qk_norm: bool,
+          use_gemma: bool, use_mrope: bool, mrope_section1: int,
+          mrope_section2: int) -> torch.Tensor:
+        """Infer FP8 QKV output geometry while preserving symbolic token counts."""
+        del rotary_dim, eps, q_weight, k_weight, base, is_neox, position_ids
+        del factor, low, high, attention_factor, is_qk_norm, use_gemma
+        del use_mrope, mrope_section1, mrope_section2
+        total_heads = num_heads_q + num_heads_k + num_heads_v
+        return qkv.new_empty((qkv.shape[0], total_heads * head_dim),
+                             dtype=torch.float8_e4m3fn)
+
+    @torch.library.register_fake(
+        "trtllm::minimax_m3_fp8_qk_norm_rope_kv_insert")
+    def _(qkv: torch.Tensor, kv_cache: torch.Tensor,
+          out_cache_loc: torch.Tensor, num_heads_q: int, num_heads_k: int,
+          num_heads_v: int, head_dim: int, rotary_dim: int, eps: float,
+          q_weight: torch.Tensor, k_weight: torch.Tensor, base: float,
+          is_neox: bool, position_ids: torch.Tensor) -> torch.Tensor:
+        """Infer FP8 query geometry without performing the KV-cache write."""
+        del kv_cache, out_cache_loc, num_heads_k, num_heads_v, rotary_dim, eps
+        del q_weight, k_weight, base, is_neox, position_ids
+        return qkv.new_empty((qkv.shape[0], num_heads_q, head_dim),
+                             dtype=torch.float8_e4m3fn)
+
+    @torch.library.register_fake(
+        "trtllm::minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert")
+    def _(packed: torch.Tensor, kv_cache: torch.Tensor,
+          index_k_cache: torch.Tensor, out_cache_loc: torch.Tensor,
+          num_heads_q: int, num_heads_kv: int, num_heads_index: int,
+          head_dim: int, rotary_dim: int, eps: float, q_weight: torch.Tensor,
+          k_weight: torch.Tensor, index_q_weight: torch.Tensor,
+          index_k_weight: torch.Tensor, rotary_cos_sin: torch.Tensor,
+          position_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Infer main and index query shapes without mutating either cache."""
+        del kv_cache, index_k_cache, out_cache_loc, num_heads_kv, rotary_dim
+        del eps, q_weight, k_weight, index_q_weight, index_k_weight
+        del rotary_cos_sin, position_ids
+        num_tokens = packed.shape[0]
+        return (packed.new_empty((num_tokens, num_heads_q, head_dim),
+                                 dtype=torch.float8_e4m3fn),
+                packed.new_empty((num_tokens, num_heads_index, head_dim),
+                                 dtype=torch.float8_e4m3fn))
 
     @torch.library.register_fake("trtllm::userbuffers_allreduce_finalize")
     def _(input, force_applying_finalize):
@@ -1340,7 +1387,12 @@ def _register_fake():
         ]
 
     @torch.library.register_fake("trtllm::alltoall_helix_native")
-    def _(partial_o, softmax_stats, workspace, cp_rank, cp_size):
+    def _(partial_o,
+          softmax_stats,
+          workspace,
+          cp_rank,
+          cp_size,
+          zero_kv_mask=None):
         # Returns outputs with same shapes as inputs
         return partial_o.new_empty(partial_o.shape), softmax_stats.new_empty(
             softmax_stats.shape)
