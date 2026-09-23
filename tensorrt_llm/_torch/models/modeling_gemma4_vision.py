@@ -199,9 +199,9 @@ class Gemma4VisionRotaryEmbedding(nn.Module):
             dim_position_ids = position_ids[:, :, i]
             dim_position_ids_expanded = dim_position_ids[:, None, :].float()
             with torch.autocast(device_type=x.device.type, enabled=False):
-                freqs = (inv_freq_expanded.float() @ dim_position_ids_expanded.float()).transpose(
-                    1, 2
-                )
+                # This is an outer product. Keep it out of GEMM so TF32 matmul settings cannot
+                # reduce rotary phase precision.
+                freqs = (inv_freq_expanded * dim_position_ids_expanded).transpose(1, 2)
                 emb = torch.cat((freqs, freqs), dim=-1)
                 cos = emb.cos() * self.attention_scaling
                 sin = emb.sin() * self.attention_scaling
