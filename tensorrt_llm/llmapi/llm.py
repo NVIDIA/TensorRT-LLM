@@ -522,8 +522,11 @@ class BaseLLM:
             pretrained_config = self._hf_model_config
             if getattr(self, "_encoder_executor", None) is not None:
                 try:
-                    pretrained_config = (self._encoder_executor.model_engine.
-                                         model.model_config.pretrained_config)
+                    runtime_pretrained_config = (
+                        self._encoder_executor.model_engine.model.model_config.
+                        pretrained_config)
+                    if runtime_pretrained_config is not None:
+                        pretrained_config = runtime_pretrained_config
                 except AttributeError:
                     # Missing runtime metadata must not suppress usage reporting.
                     pass

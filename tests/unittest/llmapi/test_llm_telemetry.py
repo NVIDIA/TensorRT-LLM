@@ -256,6 +256,7 @@ class TestRuntimeArchitecturePayloadFlow:
             ("generation", "Qwen3ForCausalLM"),
             ("missing_executor", "Qwen3ForCausalLM"),
             ("missing_model", "Qwen3ForCausalLM"),
+            ("null_runtime_config", "Qwen3ForCausalLM"),
         ],
     )
     def test_reports_selected_architecture(
@@ -264,6 +265,8 @@ class TestRuntimeArchitecturePayloadFlow:
         """Report the runtime architecture or retain the checkpoint fallback."""
         raw_config = SimpleNamespace(architectures=["Qwen3ForCausalLM"])
         runtime_config = SimpleNamespace(architectures=["Qwen3ForTextEmbedding"])
+        if executor_state == "null_runtime_config":
+            runtime_config = None
         llm = object.__new__(BaseLLM)
         llm.args = SimpleNamespace(telemetry_config=None)
         llm._hf_model_config = raw_config
