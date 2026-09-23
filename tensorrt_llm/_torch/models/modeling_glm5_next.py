@@ -350,9 +350,10 @@ def build_glm5_next_runtime_context(attn_metadata: AttentionMetadata) -> Glm5Nex
     if attn_metadata.kv_cache_manager is None:
         raise ValueError("glm5_next requires a kv cache manager; got None")
     mamba_metadata = attn_metadata.mamba_metadata
-    if mamba_metadata is None or mamba_metadata is False:
-        raise ValueError("glm5_next requires mamba_metadata; call attn_metadata.prepare() first")
-    if getattr(mamba_metadata, "glm_block_tables", None) is None:
+    assert isinstance(mamba_metadata, Glm5NextMamba2Metadata), (
+        "glm5_next requires Glm5NextMamba2Metadata"
+    )
+    if mamba_metadata.glm_block_tables is None:
         raise RuntimeError(
             "glm5_next requires prepared glm_block_tables; call attn_metadata.prepare() "
             "with Glm5NextMamba2Metadata before eager execution or CUDA graph capture"
