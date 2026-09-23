@@ -1255,6 +1255,42 @@ def check_float8_is_summed_as_raw_bytes() -> None:
     COMM.Barrier()
 
 
+def check_the_guard_refuses_every_dtype_it_cannot_sum() -> None:
+    """The allowlist, driven on both ways a dtype goes wrong.
+
+    `bool` maps to ncclInt8 exactly as float8_e4m3fn does, so ncclSum adds its
+    raw bytes and the result reads as OR rather than as an error. `float64` is
+    not in `getDtypeMap` at all, and the conversion that rejects it runs
+    *inside* the group the op has already opened -- which is what
+    `check_unsupported_dtypes_raise_and_poison_every_later_collective` measures
+    below, and the reason this check has to come before it.
+
+    The last assertion is the point. That later check ends the process; this
+    one does not, because `is_valid` raised before `ncclGroupStart`. The guard
+    is what turns one into the other.
+    """
+    rows, seed = 8, 97000
+    sizes = [rows] * WORLD
+
+    for dtype in (torch.bool, torch.float64):
+        x = torch.ones(4 * WORLD, 8, dtype=torch.float32, device="cuda").to(dtype)
+        try:
+            with validating(reducescatter):
+                reducescatter(x, None, GROUP)
+        except AssertionError as exc:
+            assert "not summable" in str(exc), str(exc)
+        else:
+            raise AssertionError(f"the guard accepted {dtype}")
+        COMM.Barrier()
+
+    _assert_bitwise(
+        reducescatter(_input(RANK, sizes, seed), None, GROUP),
+        _ref(sizes, RANK, seed),
+        "the group after the guard refused an unsummable dtype",
+    )
+    COMM.Barrier()
+
+
 def check_unsupported_dtypes_raise_and_poison_every_later_collective() -> None:
     """fp64 and the other float8 formats raise — and the raise is terminal.
 
@@ -1450,6 +1486,9 @@ CHECKS = (
     check_wrapper_guards_a_sizes_list_of_the_wrong_length,
     check_wrapper_guards_a_split_that_does_not_cover_the_input,
     check_the_group_still_works_after_the_negative_tests,
+    # The guard check runs first of the two: it refuses the same dtypes
+    # before the group opens, so it leaves the communicator usable.
+    check_the_guard_refuses_every_dtype_it_cannot_sum,
     # Stays last: the raise it asserts leaves every later collective in the
     # process returning garbage, so nothing can run after it.
     check_unsupported_dtypes_raise_and_poison_every_later_collective,

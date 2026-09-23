@@ -16,7 +16,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsno
 )
 
 __extra_import_path__ = [".."]
-from _validating import validating  # noqa: E402 — needs the path declared above
+from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "flashinfer_rmsnorm requires a CUDA device"
 
@@ -30,10 +30,10 @@ def _build(spec, seed):
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
-def test_certified_cells(cell) -> None:
+def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
+    certifying(op)
     x, weight, eps = _build(cell.spec, seed=abs(hash(cell.why)) % 2**31)
-    with validating(op):
-        out = op(x, weight, eps)
+    out = op(x, weight, eps)
     assert out.shape == x.shape and out.dtype == x.dtype
     assert out.data_ptr() != x.data_ptr(), "the op must return a new tensor"
     op.compare(out, op.reference(x, weight, eps))
