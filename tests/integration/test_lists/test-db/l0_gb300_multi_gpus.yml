@@ -15,19 +15,8 @@ l0_gb300_multi_gpus:
       stage: post_merge
       backend: pytorch
   tests:
-  # ModelingV2 collective entries. Each spawns its own 4-rank job rather than
-  # using the mpi_pool_executor fixture: their cases read module-global rank
-  # state and several assert on communicator state the previous case left
-  # behind, so they are one ordered sequence inside one job, and a broken
-  # collective hangs rather than raising -- the launcher's deadline is what
-  # keeps that from wedging the run, and the fixture has none.
+  # One ordered sequence in one job: the cases share module-global rank state.
   - unittest/_torch/modeling_v2/comm
-  # ModelingV2 whole-model gates for the dep4 target. The mtp3 variant selects a
-  # second forward path AND a second weight-loading path, so the identity gate
-  # does not speak for it: it carries its own accuracy pairing and its own
-  # acceptance gate. The two acceptance legs are independent cases read against
-  # one shared minimum -- modeling_v2 failing while stock passes means the draft
-  # path regressed; both failing means the anchor is stale.
   - accuracy/test_modeling_v2_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_gsm8k_identity_vs_mtp3
   - accuracy/test_modeling_v2_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_mtp3_acceptance[modeling_v2]
   - accuracy/test_modeling_v2_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_mtp3_acceptance[stock]
