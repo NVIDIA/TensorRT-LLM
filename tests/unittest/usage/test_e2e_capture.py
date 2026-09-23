@@ -210,6 +210,63 @@ def reset_usage_state():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("failure", ["config_validation", "after_model_config"])
+def test_startup_failure_context_e2e(failure, capture_server, monkeypatch, enable_telemetry):
+    """Real validation and injected loading failures deliver schema-valid context over HTTP."""
+    from pydantic import ValidationError
+
+    from tensorrt_llm import LLM
+    from tensorrt_llm.usage import usage_lib
+
+    model = _get_model_path()
+    monkeypatch.setattr(usage_lib, "_get_stats_server", lambda: capture_server)
+    options = (
+        {"kv_cache_config": {"free_gpu_memory_fraction": 2.0}}
+        if failure == "config_validation"
+        else {}
+    )
+    expected_error = ValidationError
+    expected_message = "free_gpu_memory_fraction"
+    if failure == "after_model_config":
+        from tensorrt_llm.llmapi.llm import _TorchLLM
+
+        expected_error = OSError
+        expected_message = "Injected loading failure after normal model config discovery"
+
+        def fail_loading(self):
+            raise OSError(expected_message)
+
+        monkeypatch.setattr(_TorchLLM, "_try_load_generation_config", fail_loading)
+    with pytest.raises(expected_error, match=expected_message):
+        LLM(model=model, **options)
+    start = time.monotonic()
+    usage_lib.report_exit(usage_lib.TerminalOutcome("exception", exit_code_known=True, exit_code=1))
+    elapsed = time.monotonic() - start
+    assert CaptureHandler.capture_event.wait(2)
+    assert len(CaptureHandler.captured_payloads) == 1
+    payload = CaptureHandler.captured_payloads[0]
+    assert [event["name"] for event in payload["events"]] == [
+        "trtllm_initial_report",
+        "trtllm_exit_report",
+    ]
+    for event in payload["events"]:
+        _assert_event_matches_sms_schema(event)
+    params = payload["events"][0]["parameters"]
+    meta = json.loads(params["llmApiConfigMetaJson"])
+    assert meta["report_context"] == "pre_initialization_exit"
+    assert params["llmInitializationFailures"] == params["llmInitializationAttempts"] == 1
+    assert params["llmInstancesCreated"] == 0
+    if failure == "config_validation":
+        assert params["llmApiConfigJson"] == "{}"
+    else:
+        assert meta["capture_succeeded"]
+        assert params["architectureClassName"] == "LlamaForCausalLM"
+    assert model not in json.dumps(payload)
+    assert payload["events"][0]["ts"] == payload["events"][1]["ts"]
+    assert not usage_lib._REPORTER_STARTED
+    print(f"Startup terminal delivery including optional NVML: {elapsed * 1000:.1f} ms")
+
+
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 

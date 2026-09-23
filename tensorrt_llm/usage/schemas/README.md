@@ -44,9 +44,38 @@ login context.
 
 ### `trtllm_initial_report`
 
-Sent once after the first successful LLM initialization. Contains system info
-and the first successfully reported LLM's serving configuration. A process that
-fails earlier can send a terminal report without an initial report.
+Normally sent after the first successful LLM initialization, with system info
+and the first successfully reported LLM's serving configuration.
+
+An identified LLM startup that exits before any instance succeeds can instead
+send **partial context** alongside its exit event, in one envelope with matching
+session ID and timestamp. This does not start heartbeats. Consumers must inspect
+`llmApiConfigMetaJson.report_context == "pre_initialization_exit"`; such reports
+are not successful initialization or evidence of measured serving GPU-hours.
+Deploy compatible consumers before enabling this producer behavior. Schema 0.7
+is unchanged; verify multi-event routing in staging before production rollout.
+
+Partial metadata identifies the `capture_phase`, `source` (`unavailable`,
+`requested_pre_initialization`, or `validated_pre_initialization`), `gpu_source`,
+`attempt_attribution`, and `known_fields` (available top-level properties).
+Unknown parallelism is zero, and unknown features/configuration stay `{}`.
+Only allowlisted backend/dtype and valid positive parallel sizes are copied
+before validation. After typed args validate, the normal sanitizer captures
+their pre-initialization values, not final effective settings. Architecture is
+captured only after normal model-config loading, under the existing privacy policy.
+Multiple attempts omit model/config attribution; an earlier successful instance
+prevents a partial replacement. Unresolved LLM/VisualGen routing, clean CLI probes,
+and model-free coordinators do not produce this LLM-specific context.
+
+Hardware discovery uses already-initialized CUDA, or a bounded NVML fallback
+(at most 50 ms inside the existing 500 ms terminal wait). NVML reports physical
+hardware, not successful CUDA initialization or model assignment; its memory
+total may differ from CUDA's usable total. Only unambiguous single-device or full
+GPU-UUID visibility is resolved. Ambiguous numeric mappings, MIG, unavailable
+drivers, and timeouts leave fields unknown. GPU identifiers never leave the process.
+`cudaVersion` remains the already-loaded PyTorch CUDA build version, not the driver
+version. Discovery may reduce the remaining network-delivery time; it does not
+extend the terminal wait. Failure to build optional context still sends exit-only.
 
 #### System fields
 

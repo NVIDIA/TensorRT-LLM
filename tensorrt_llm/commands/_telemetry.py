@@ -269,6 +269,17 @@ class TelemetryGroup(click.Group):
         usage.set_lifecycle_phase("config_validation")
         return super().invoke(ctx)
 
+    def resolve_command(self, ctx: click.Context, args: list[str]) -> tuple:
+        result = super().resolve_command(ctx, args)
+        if self._telemetry_usage_context == UsageContext.CLI_BENCH and result[0] in (
+            "throughput",
+            "latency",
+        ):
+            from tensorrt_llm.usage.usage_lib import _capture_startup_context
+
+            _capture_startup_context(requested={})
+        return result
+
     def _start_telemetry(self, args: Sequence[str]) -> None:
         try:
             self._telemetry_config = TelemetryConfig(

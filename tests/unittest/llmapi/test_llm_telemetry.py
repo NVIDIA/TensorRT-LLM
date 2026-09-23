@@ -18,6 +18,7 @@ Verifies that pretrained_config is populated and valid when the telemetry
 hook fires, and that telemetry_disabled flows through correctly.
 """
 
+import builtins
 import os
 import threading
 from pathlib import Path
@@ -204,6 +205,42 @@ class TestProcessLifecycleCounters:
 
         assert llm._usage_lifecycle_active is False
         start_reporting.assert_called_once_with()
+
+    @pytest.mark.parametrize("failure", ["import", "collector"])
+    def test_startup_capture_failure_preserves_constructor(
+        self, monkeypatch, enable_telemetry, failure
+    ):
+        """Optional capture failures must not replace errors after argument validation."""
+        from tensorrt_llm.llmapi import llm as llm_module
+
+        downstream_error = RuntimeError("constructor continued past telemetry")
+
+        class Args:
+            model_fields = {}
+
+            def __init__(self, **kwargs):
+                self.telemetry_config = llm_args.TelemetryConfig()
+
+            @property
+            def mpi_session(self):
+                raise downstream_error
+
+        original_import = builtins.__import__
+
+        def fail_import(name, *args, **kwargs):
+            if name == "tensorrt_llm.usage.usage_lib":
+                raise ImportError("optional telemetry unavailable")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(llm_module, "TorchLlmArgs", Args)
+        monkeypatch.setattr(llm_module, "mpi_disabled", lambda: False)
+        if failure == "import":
+            monkeypatch.setattr(builtins, "__import__", fail_import)
+        else:
+            monkeypatch.setattr(usage_lib, "_capture_startup_context", lambda *a, **kw: 1 / 0)
+        with pytest.raises(RuntimeError) as raised:
+            LLM_torch(model="unused")
+        assert raised.value is downstream_error
 
     def test_shutdown_decrements_once_per_object(self, enable_telemetry):
         """Repeated shutdown calls cannot decrement the active gauge twice."""
