@@ -1503,6 +1503,7 @@ def serve(
 
     is_visual_gen = (enable_visual_gen or visual_gen_args is not None
                      or get_is_diffusion_only_model(model))
+    # Honor YAML telemetry opt-out before --set parsing can raise an error.
     raw_llm_args_extra_dict = {}
     if not is_visual_gen and extra_llm_api_options is not None:
         with open(extra_llm_api_options, 'r') as f:
