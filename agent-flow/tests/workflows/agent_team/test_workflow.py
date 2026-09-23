@@ -1707,48 +1707,23 @@ def test_every_registered_tool_is_documented_in_the_role_prompt(tmp_path):
 
 
 def test_coder_and_reviewer_required_tools_include_status_update(tmp_path):
-    """The composed Stop hook must enforce both progress and status calls."""
+    """Every role declares all required calls, including Codex-backed roles."""
     module = _load_module()
     workflow = _make_workflow(module, tmp_path)
     try:
-        # Each per-tool hook is a separate matcher; with two required tools
-        # we expect two matchers stacked together (composition = AND).
-        coder_hooks = workflow.coder.config.backend.hooks
-        reviewer_hooks = workflow.reviewer.config.backend.hooks
-        plan_drafter_hooks = workflow.plan_drafter.config.backend.hooks
-        plan_reviewer_hooks = workflow.plan_reviewer.config.backend.hooks
-        qa_hooks = workflow.qa.config.backend.hooks
-
-        assert coder_hooks is not None
-        assert len(coder_hooks["Stop"]) == 2
-        assert reviewer_hooks is not None
-        assert len(reviewer_hooks["Stop"]) == 2
-
-        # PlanDrafter, PlanReviewer, and QA each have a single required
-        # tool — one matcher.
-        assert plan_drafter_hooks is not None
-        assert len(plan_drafter_hooks["Stop"]) == 1
-        assert plan_reviewer_hooks is not None
-        assert len(plan_reviewer_hooks["Stop"]) == 1
-        assert qa_hooks is not None
-        assert len(qa_hooks["Stop"]) == 1
+        expected = {
+            "coder": ("append_coder_progress", "update_status"),
+            "reviewer": ("append_reviewer_progress", "update_status"),
+            "plan_drafter": ("append_plan_drafter_progress",),
+            "plan_reviewer": ("append_plan_reviewer_progress",),
+            "qa": ("append_qa_progress",),
+        }
+        for role, names in expected.items():
+            config = getattr(workflow, role).config
+            assert config.required_tools == names
+            assert config.backend.hooks is None
     finally:
         workflow.close()
-
-
-def test_compose_required_tools_hooks_handles_empty_and_single(tmp_path):
-    """Helper returns ``None`` for empty and one matcher for a single tool."""
-    module = _load_module()
-
-    assert module._compose_required_tools_hooks([]) is None
-
-    single = module._compose_required_tools_hooks(["append_plan_drafter_progress"])
-    assert single is not None
-    assert len(single["Stop"]) == 1
-
-    pair = module._compose_required_tools_hooks(["append_coder_progress", "update_status"])
-    assert pair is not None
-    assert len(pair["Stop"]) == 2
 
 
 def test_qa_uses_stateless_session(tmp_path):
@@ -2306,6 +2281,7 @@ def test_resume_from_qa_skips_coder_and_reviewer(tmp_path):
     assert state.done is True
 
 
+@pytest.mark.live_backend
 def test_claude_agents_baseline_context_under_20_percent(tmp_path):
     """Each Claude-backed team agent's pre-input context must stay < 20%.
 
@@ -3334,6 +3310,7 @@ def test_no_mcp_mode_builds_agents_without_tools(tmp_path):
         for agent in (wf.plan_drafter, wf.plan_reviewer, wf.coder, wf.reviewer, wf.qa):
             assert agent.config.backend.tools is None
             assert agent.config.backend.hooks is None
+            assert agent.config.required_tools == ()
             assert agent.config.human_input_enabled is False
         # The backend split itself is untouched: only the tools are dropped.
         assert wf.plan_drafter.config.backend.kind == "codex"
@@ -3349,7 +3326,7 @@ def test_mcp_mode_is_the_default_and_keeps_tools(tmp_path):
     try:
         assert wf.use_in_process_tools is True
         assert wf.plan_drafter.config.backend.tools is not None
-        assert wf.plan_drafter.config.backend.hooks is not None
+        assert wf.plan_drafter.config.required_tools == ("append_plan_drafter_progress",)
         assert wf.plan_drafter.config.human_input_enabled is True
     finally:
         wf.close()
@@ -3364,8 +3341,10 @@ def test_no_mcp_mode_resets_rebuild_agents_without_tools(tmp_path):
         wf._reset_reviewer()
         assert wf.coder.config.backend.tools is None
         assert wf.coder.config.backend.hooks is None
+        assert wf.coder.config.required_tools == ()
         assert wf.reviewer.config.backend.tools is None
         assert wf.reviewer.config.backend.hooks is None
+        assert wf.reviewer.config.required_tools == ()
     finally:
         wf.close()
 

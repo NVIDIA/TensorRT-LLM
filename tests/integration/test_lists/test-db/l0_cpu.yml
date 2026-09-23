@@ -25,6 +25,7 @@ l0_cpu:
   - disaggregated/test_aiperf_gate.py::test_non_request_records_excluded_from_denominator
   # Kimi K3 disagg parity harness self-test (comparison logic only, no GPUs).
   - test_kimi_k3_specdec.py::test_kimi_k3_disagg_parity_selftest
+  - examples/visual_gen/test_media_deps_install.py::test_install_ffmpeg_via_apt_installs_ffmpeg
   # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
   # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
   # is what picks them up:
@@ -38,8 +39,11 @@ l0_cpu:
   # runs -m cpu_only, so this entry contributes only the 3 marked files under attention/.
   - unittest/_torch/attention
   - unittest/_torch/cute_dsl/test_kimi_k3_kda_ptx_patch.py
+  - unittest/_torch/compilation/test_auto_multi_stream.py
+  - unittest/_torch/compilation/test_remove_copy_pass.py::test_remove_copy_preserves_minimax_producer_outputs
   - unittest/_torch/distributed
   - unittest/_torch/executor
+  - unittest/test_startup.py
   - unittest/_torch/disaggregation
   - unittest/_torch/peft
   - unittest/_torch/memory
@@ -58,7 +62,12 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3.py::test_piecewise_attention_boundary_runs_horizontal_producer
   - unittest/_torch/models/test_minimax_m3.py::test_piecewise_projection_fake_preserves_padded_hidden_rows
   - unittest/_torch/models/test_minimax_m3.py::test_piecewise_fused_projection_preserves_input_token_dimension
-  - unittest/_torch/models/test_minimax_m3.py::test_msa_attention_core_routes_compact_q_to_attention_dispatcher
+  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_captured_producer_preserves_symbolic_shapes
+  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_captures_horizontal_producer_before_attention
+  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_captured_producer_rejects_unavailable_fusion
+  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_captured_producer_declares_cache_mutations
+  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_unfused_indexer_keeps_cache_write_eager
+  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_attention_boundary_preserves_indexer_cache_contract
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_projection_shard_geometry
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_loader_returns_exact_generic_skip
   - unittest/_torch/models/checkpoints
@@ -69,6 +78,7 @@ l0_cpu:
   - unittest/_torch/speculative/hw_agnostic
   # l0_h100 selects with -m "not cpu_only", so this entry is what runs it.
   - unittest/_torch/speculative/test_spec_slot_pool_sizing.py
+  - unittest/_torch/test_hf_quant_config.py
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_model_config.py
   - unittest/_torch/test_route_capture.py

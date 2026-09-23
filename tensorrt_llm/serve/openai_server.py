@@ -36,6 +36,7 @@ from pydantic import ValidationError
 from starlette.routing import Mount
 from transformers import AutoProcessor
 
+from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.async_llm import AsyncLLM
 from tensorrt_llm._utils import EnergyMonitor
 # yapf: disable
@@ -83,10 +84,10 @@ from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines,
                                            resolve_top_level_model_type)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
-from tensorrt_llm.serve.conversation_id import (
-    extract_subagent_affinity_id_from_headers, resolve_request_conversation_id)
+from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
 from tensorrt_llm.serve.disagg_auth import (
-    request_requires_internal_disagg_auth, validate_internal_disagg_request)
+    request_requires_internal_disagg_auth, validate_internal_disagg_request,
+    validate_subagent_affinity)
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
                                                QueueFullError)
@@ -1120,6 +1121,16 @@ class OpenAIServer(_VideoRoutesMixin):
         headers = None if raw_request is None else raw_request.headers
         validate_internal_disagg_request(
             getattr(self, "_internal_disagg_auth_key", None), request, headers)
+
+    def _get_scheduling_params(
+            self, request: ChatCompletionRequest,
+            raw_request: Optional[Request]) -> SchedulingParams:
+        return SchedulingParams(
+            agent_hierarchy=request.agent_hierarchy,
+            subagent_affinity_id=validate_subagent_affinity(
+                getattr(self, "_internal_disagg_auth_key", None), request,
+                getattr(self, "server_role", None),
+                None if raw_request is None else raw_request.headers))
 
     def _has_cache_transceiver_config(self) -> bool:
         cache_transceiver_config = getattr(
@@ -2359,10 +2370,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 request, None if raw_request is None else raw_request.headers)
             conversation_params = to_llm_conversation_params(
                 request.conversation_params)
-            scheduling_params = SchedulingParams(
-                agent_hierarchy=request.agent_hierarchy,
-                subagent_affinity_id=extract_subagent_affinity_id_from_headers(
-                    None if raw_request is None else raw_request.headers))
+            scheduling_params = self._get_scheduling_params(
+                request, raw_request)
 
             generate_inputs = prompt
             preprocess_fn = getattr(self.generator, "preprocess", None)
@@ -3167,10 +3176,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 request, None if raw_request is None else raw_request.headers)
             conversation_params = to_llm_conversation_params(
                 request.conversation_params)
-            scheduling_params = SchedulingParams(
-                agent_hierarchy=request.agent_hierarchy,
-                subagent_affinity_id=extract_subagent_affinity_id_from_headers(
-                    None if raw_request is None else raw_request.headers))
+            scheduling_params = self._get_scheduling_params(
+                request, raw_request)
 
             # Generate
             promise = self.generator.generate_async(
@@ -3946,11 +3953,15 @@ class OpenAIServer(_VideoRoutesMixin):
         server = create_uvicorn_server(config)
 
         async def _register_after_serving():
-            while not server.started:
-                await asyncio.sleep(0.1)
+            with _StartupTimer("http_server_start"):
+                while not server.started:
+                    await asyncio.sleep(0.1)
             if self.disagg_cluster_worker:
                 try:
-                    await self.disagg_cluster_worker.register_worker()
+                    with _StartupTimer(
+                            f"service_registration/{self.disagg_cluster_worker.worker_info.worker_id}"
+                    ):
+                        await self.disagg_cluster_worker.register_worker()
                 except Exception as e:
                     logger.error(f"Worker registration failed: {e}")
                     server.should_exit = True

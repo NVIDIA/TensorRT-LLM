@@ -96,8 +96,8 @@ statuses for the same architecture in the two matrices.
 | `Step3p7ForConditionalGeneration`| Yes               | Yes        | Yes                        | Untested              | Untested        | MTP                        | Yes           | No             | Yes                      | Yes                   | Yes             |
 | `MiniMaxM3SparseForConditionalGeneration` [^12] | Yes               | Yes        | Yes                        | Untested              | Untested        | EAGLE-3 (Linear)           | Yes           | No             | N/A                      | Yes                   | Yes             |
 
-[^1]: Chunked Prefill for MLA can only be enabled on SM90/SM100/SM103/SM120.
-[^2]: KV cache reuse for MLA can only be enabled on SM90/SM100/SM103/SM120/SM121 and in BF16/FP8 KV cache dtype.
+[^1]: Chunked Prefill for MLA can only be enabled on SM90/SM100/SM103/SM107/SM120.
+[^2]: KV cache reuse for MLA can only be enabled on SM90/SM100/SM103/SM107/SM120/SM121 and in BF16/FP8 KV cache dtype.
 [^3]: Qwen3-Next-80B-A3B exhibits relatively low accuracy on the SciCode-AA-v2 benchmark.
 [^5]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See [AD Configs](source:examples/auto_deploy/model_registry/configs).
 [^6]: Also supports text-only inference via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
