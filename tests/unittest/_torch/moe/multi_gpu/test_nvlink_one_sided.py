@@ -217,8 +217,13 @@ def _dequantize(payload: torch.Tensor, sf: torch.Tensor | None, mode: str) -> to
         ).flatten(1)
     packed = payload.view(torch.uint8)
     codes = torch.stack((packed & 15, packed >> 4), dim=-1).flatten(1).long()
-    levels = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=payload.device)
-    values = levels[codes & 7] * torch.where(codes < 8, 1.0, -1.0)
+    # Decode E2M1 on-device without a host lookup-table copy during graph capture.
+    mantissa = (codes & 1).float()
+    exponent = (codes >> 1) & 3
+    magnitude = torch.where(
+        exponent == 0, mantissa * 0.5, torch.ldexp(1.0 + mantissa * 0.5, exponent - 1)
+    )
+    values = torch.where(codes < 8, magnitude, -magnitude)
     scales = sf.view(torch.float8_e4m3fn).float().repeat_interleave(16, dim=-1)
     return values * scales
 
@@ -674,6 +679,71 @@ CASES = [
 @pytest.mark.parametrize("case", CASES)
 def test_nvlink_one_sided(case: Case, mpi_pools: dict[tuple[int, bool], MPIPoolExecutor]) -> None:
     _run(case, mpi_pools)
+
+
+# ============================================================================
+# Allocation-time workspace layout (no MPI workers)
+# ============================================================================
+
+
+@pytest.mark.parametrize("cft,fp8_combine", [(False, False), (True, False), (True, True)])
+def test_workspace_layout(cft: bool, fp8_combine: bool) -> None:
+    from tensorrt_llm.bindings import internal as _tllm_internal
+
+    thop = _tllm_internal.thop
+
+    def field(layout: torch.Tensor, name: str) -> int:
+        return int(layout[getattr(thop, f"MOE_A2A_{name}")])
+
+    ep_size, top_k, capacity, hidden_size = 8, 6, 128, 7168
+    layout = NVLinkOneSided._make_workspace_layout(
+        ep_size, top_k, capacity, hidden_size, torch.bfloat16, None, 0, cft, fp8_combine
+    )
+    dispatch_start = field(layout, "DISPATCH_PAYLOAD_OFFSET_INDEX")
+    dispatch_end = dispatch_start + field(layout, "DISPATCH_PAYLOAD_SIZE_INDEX")
+    combine_start = field(layout, "COMBINE_INPUT_OFFSET_INDEX")
+    combine_end = combine_start + field(layout, "COMBINE_INPUT_SIZE_INDEX")
+    total = field(layout, "WORKSPACE_SIZE_INDEX")
+    assert field(layout, "TOPK_TARGET_INDICES_OFFSET_INDEX") < dispatch_start
+    assert dispatch_end <= field(layout, "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX") < combine_start
+    assert field(layout, "COMBINE_INPUT_SIZE_INDEX") == ep_size * capacity * hidden_size * 2
+    assert dispatch_start % 256 == combine_start % 256 == total % 256 == 0
+    assert total == NVLinkOneSided.calculate_required_workspace_size(
+        ep_size,
+        top_k,
+        capacity,
+        hidden_size,
+        torch.bfloat16,
+        can_use_cft_counted_writes=cft,
+        use_low_precision_combine=fp8_combine,
+    )
+    if cft:
+        recv_start = field(layout, "COMBINE_RECV_OFFSET_INDEX")
+        recv_bytes = field(layout, "COMBINE_RECV_SIZE_INDEX")
+        assert combine_end <= recv_start and recv_start % 256 == 0
+        assert recv_bytes == ep_size * capacity * hidden_size * (1 if fp8_combine else 2)
+        assert recv_start + recv_bytes == total
+        assert (
+            dispatch_end
+            <= field(layout, "COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX")
+            < combine_start
+        )
+    else:
+        assert field(layout, "COMBINE_RECV_OFFSET_INDEX") == 0
+        assert field(layout, "COMBINE_RECV_SIZE_INDEX") == 0
+        assert field(layout, "COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX") == 0
+        assert combine_end == total
+
+    # Routing metadata reserves the configured top-k, not the maximum supported top-k.
+    routes_start = field(layout, "TOPK_TARGET_RANKS_OFFSET_INDEX")
+    indices_start = field(layout, "TOPK_TARGET_INDICES_OFFSET_INDEX")
+    assert indices_start - routes_start == capacity * top_k * 4
+    with pytest.raises(RuntimeError, match="capacity"):
+        torch.ops.trtllm.moe_a2a_get_workspace_layout(ep_size, capacity, top_k, -1, 256, 0)
+    with pytest.raises(RuntimeError, match="overflows"):
+        torch.ops.trtllm.moe_a2a_get_workspace_layout(
+            ep_size, capacity, top_k, (1 << 63) - 512, 1024, 0
+        )
 
 
 # ============================================================================

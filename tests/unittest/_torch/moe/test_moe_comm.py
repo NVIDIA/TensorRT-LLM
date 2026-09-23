@@ -389,7 +389,7 @@ def _expected_nvlink_rank_mask_combine_output(
         dtype=torch.float32,
         device=payload.device,
     )
-    payload_offset_index = int(_tllm_internal.thop.MOE_A2A_PAYLOAD_DATA_OFFSET_INDEX)
+    payload_offset_index = int(_tllm_internal.thop.MOE_A2A_DISPATCH_PAYLOAD_OFFSET_INDEX)
     payload_offset = comm.moe_a2a_metainfo[payload_offset_index].item()
     bytes_per_rank = (
         comm.ep_size * runtime_max_tokens_per_rank * hidden_size * payload.element_size()

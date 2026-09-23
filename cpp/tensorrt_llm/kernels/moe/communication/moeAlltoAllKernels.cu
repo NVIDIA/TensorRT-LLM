@@ -1375,8 +1375,8 @@ __device__ void vectorized_combine_impl(
 // Pack valid source pointers in routing order and count the contributing ranks.
 // stride_per_token can exceed the wire size for in-place low-precision combine.
 template <int TOP_K, typename OutputT, typename InputT>
-__device__ void vectorized_combine(OutputT* output, int size_per_token, int stride_per_token, int rank_id,
-    int max_tokens_per_rank, CombineKernelPointers const& ptrs)
+__device__ void vectorized_combine(
+    OutputT* output, int size_per_token, int stride_per_token, CombineKernelPointers const& ptrs)
 {
     static_assert(TOP_K > 0 && TOP_K <= 32, "combine routing requires TOP_K <= warpSize");
     constexpr uint32_t kRoutingLaneMask = make_warp_lane_mask<TOP_K>();
@@ -1396,8 +1396,7 @@ __device__ void vectorized_combine(OutputT* output, int size_per_token, int stri
         {
             int const peer = ptrs.topk_target_ranks[index];
             int const compact_index = __popc(valid & ((1U << k) - 1U));
-            size_t const token = static_cast<size_t>(rank_id) * max_tokens_per_rank + target_index;
-            sources[compact_index] = static_cast<uint8_t const*>(ptrs.recv_buffers[peer][0]) + token * stride_per_token;
+            sources[compact_index] = ptrs.source_buffers[peer] + static_cast<size_t>(target_index) * stride_per_token;
         }
     }
     __syncthreads();
@@ -1515,13 +1514,13 @@ __device__ void vectorized_quant(DstT* dst, SrcT const* src, int num_elements)
 
 // Advance flag_val to the combine phase and prepare valid tokens in the requested range.
 // Copy SrcT payloads, or quantize them to FP8 when LOW_PRECISION is enabled.
-// CFT self contributions go to region_c_base; other prepared tokens go to recv_buffer_bytes.
+// CFT self contributions go to combine_recv_base; other prepared tokens go to combine_input_base.
 // This kernel performs no remote transfers or reduction.
 template <bool LOW_PRECISION, typename SrcT>
-__global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, void const* source_payload,
+__global__ void moeA2APrepareCombineKernel(uint8_t* combine_input_base, void const* source_payload,
     int elements_per_token, int ep_size, int max_tokens_per_rank, uint32_t* flag_val_ptr, int const* recv_counters,
     int source_stride_per_token, int workspace_stride_per_token, int prepare_first_token, int prepare_num_tokens,
-    uint8_t* region_c_base, int ep_rank)
+    uint8_t* combine_recv_base, int ep_rank)
 {
 #if TLLM_MOE_A2A_COMPILE_SM90
     cudaGridDependencySynchronize();
@@ -1549,7 +1548,7 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, void cons
 
     // CFT combine stages local tokens compactly into the dedicated receive region. This keeps
     // local and peer contributions in one uniform layout without an in-place write-after-read hazard.
-    bool const stage_self = (region_c_base != nullptr && rank_idx == ep_rank);
+    bool const stage_self = (combine_recv_base != nullptr && rank_idx == ep_rank);
 
     size_t const source_offset = static_cast<size_t>(global_token_idx) * source_stride_per_token;
     size_t const workspace_offset = static_cast<size_t>(global_token_idx) * workspace_stride_per_token;
@@ -1561,16 +1560,16 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, void cons
     {
         SrcT const* src_ptr
             = reinterpret_cast<SrcT const*>(static_cast<uint8_t const*>(source_payload) + source_offset);
-        // Self -> region C (compact, separate buffer). Peer -> in-place workspace (push reads it).
-        __nv_fp8_e4m3* dst_ptr = stage_self ? reinterpret_cast<__nv_fp8_e4m3*>(region_c_base + self_slot_offset)
-                                            : reinterpret_cast<__nv_fp8_e4m3*>(recv_buffer_bytes + workspace_offset);
+        // Self contributions go directly to the receive inbox; peer contributions are staged for the push.
+        __nv_fp8_e4m3* dst_ptr = stage_self ? reinterpret_cast<__nv_fp8_e4m3*>(combine_recv_base + self_slot_offset)
+                                            : reinterpret_cast<__nv_fp8_e4m3*>(combine_input_base + workspace_offset);
         vectorized_quant<SrcT, __nv_fp8_e4m3>(dst_ptr, src_ptr, elements_per_token);
     }
     else
     {
         // Same-type byte copy. CFT self tokens use the receive region; fence combine uses the workspace.
         uint8_t const* src = static_cast<uint8_t const*>(source_payload) + source_offset;
-        uint8_t* dst = stage_self ? (region_c_base + self_slot_offset) : (recv_buffer_bytes + workspace_offset);
+        uint8_t* dst = stage_self ? (combine_recv_base + self_slot_offset) : (combine_input_base + workspace_offset);
         vectorized_copy(dst, src, elements_per_token * static_cast<int>(sizeof(SrcT)));
     }
 }
@@ -1580,10 +1579,8 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, void cons
 // ============================================================================
 
 template <typename T, int TOP_K, bool LOW_PRECISION, bool ENABLE_RANK_MASK>
-__global__ void moeA2ACombineKernel(
-    const CombineKernelPointers ptrs, // Combine-specific struct, src_data_ptrs[0] is output
-    int max_tokens_per_rank, int elements_per_token, int local_num_tokens, int rank_id, int ep_size,
-    int stride_per_token)
+__global__ void moeA2ACombineKernel(const CombineKernelPointers ptrs, int max_tokens_per_rank, int elements_per_token,
+    int local_num_tokens, int rank_id, int ep_size, int stride_per_token)
 {
     using InputT = std::conditional_t<LOW_PRECISION, __nv_fp8_e4m3, T>;
 
@@ -1669,9 +1666,8 @@ __global__ void moeA2ACombineKernel(
     if (local_num_tokens == 0)
         return;
 
-    T* token_output = static_cast<T*>(ptrs.src_data_ptrs[0]) + local_token_idx * elements_per_token;
-    vectorized_combine<TOP_K, T, InputT>(
-        token_output, size_per_token, stride_per_token, rank_id, max_tokens_per_rank, ptrs);
+    T* token_output = static_cast<T*>(ptrs.output) + local_token_idx * elements_per_token;
+    vectorized_combine<TOP_K, T, InputT>(token_output, size_per_token, stride_per_token, ptrs);
 #if TLLM_MOE_A2A_COMPILE_SM90
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
@@ -1863,9 +1859,8 @@ __global__ void moeA2ACombineKernel_Cft(const CombineKernelPointers ptrs, int ma
         __syncthreads();
 #endif
 
-        T* token_output = static_cast<T*>(ptrs.src_data_ptrs[0]) + local_token_idx * elements_per_token;
-        vectorized_combine<TOP_K, T, InputT>(
-            token_output, size_per_token, size_per_token, rank_id, max_tokens_per_rank, ptrs);
+        T* token_output = static_cast<T*>(ptrs.output) + local_token_idx * elements_per_token;
+        vectorized_combine<TOP_K, T, InputT>(token_output, size_per_token, size_per_token, ptrs);
     }
 
 #if !DISABLE_SYNC_FOR_PROFILING
@@ -1958,7 +1953,7 @@ void moe_a2a_cft_combine_push_launch(MoeA2ACombineParams const& params)
         launchWithPdlWhenEnabled("moeA2ACombinePushKernel_Cft", kernel_fn, dim3(params.ep_size, blocks_per_rank),
             dim3(blockThreads), smem_size, params.stream, local_payload, params.recv_counters, params.flag_val,
             peer_info, params.ep_rank, params.ep_size, params.max_tokens_per_rank, bytes_per_token,
-            params.cft_le_combine_payload_base, params.cft_le_combine_counter_base, params.combine_counter_ep_stride,
+            params.cft_combine_recv_offset, params.cft_le_combine_counter_base, params.combine_counter_ep_stride,
             local_stride_per_token);
     });
 }
@@ -1968,10 +1963,9 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
     constexpr int kBlockSize = 256;
     TLLM_CHECK(params.max_tokens_per_rank > 0);
 
-    uint8_t* recv_buffer_bytes = static_cast<uint8_t*>(const_cast<void*>(params.recv_buffers[params.ep_rank]));
+    uint8_t* combine_input_base = params.combine_input_buffers[params.ep_rank];
     // CFT combine stages local contributions compactly into its dedicated receive region.
-    uint8_t* const region_c_base
-        = params.use_cft_for_combine ? static_cast<uint8_t*>(const_cast<void*>(params.cft_le_combine_recv)) : nullptr;
+    uint8_t* const combine_recv_base = params.use_cft_for_combine ? params.cft_combine_recv_payload : nullptr;
     int const grid = std::max(params.prepare_num_tokens, 1);
 
     // Preserve params.cft_le_combine_counters and params.cft_combine_counter_baseline
@@ -1981,10 +1975,10 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
         SWITCH_DTYPE(params.dtype, SrcT, {
             auto kernel_fn = moeA2APrepareCombineKernel<LOW_PRECISION, SrcT>;
             launchWithPdlWhenEnabled("moeA2APrepareCombineKernel", kernel_fn, grid, kBlockSize, 0, params.stream,
-                recv_buffer_bytes, params.source_payload, params.elements_per_token, params.ep_size,
+                combine_input_base, params.source_payload, params.elements_per_token, params.ep_size,
                 params.max_tokens_per_rank, params.flag_val, params.recv_counters, params.source_stride_per_token,
-                params.workspace_stride_per_token, params.prepare_first_token, params.prepare_num_tokens, region_c_base,
-                params.ep_rank);
+                params.workspace_stride_per_token, params.prepare_first_token, params.prepare_num_tokens,
+                combine_recv_base, params.ep_rank);
         });
     });
 }
@@ -2024,11 +2018,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
         }
 
         CombineKernelPointers kp = {};
-        kp.src_data_ptrs[0] = params.output_data;
-        for (int rank = 0; rank < params.ep_size; rank++)
-        {
-            kp.recv_buffers[rank][0] = params.recv_buffers[rank];
-        }
+        kp.output = params.output_data;
         for (int i = 0; i < params.ep_size; i++)
         {
             kp.completion_flags[i] = params.completion_flags[i];
@@ -2047,18 +2037,11 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
             kp.active_rank_mask[w] = params.active_rank_mask[w];
         }
 
-        // Offset-trick gather: peers' pushed data lands in THIS rank's region C
-        // (cft_le_combine_recv). recv_buffers[P] = region_C_base + (P - S) * stride so the
-        // reduce reads peer P's contribution at the same slot layout as the fence path.
-        uint8_t const* combine_base = static_cast<uint8_t const*>(params.cft_le_combine_recv);
-        int const element_size = static_cast<int>(tensorrt_llm::common::getDTypeSize(params.dtype));
-        // Every contribution uses the same compact wire layout in the receive region.
-        int const bytes_per_token = params.elements_per_token * (params.use_low_precision ? 1 : element_size);
-        int64_t const peer_src_stride_per_rank = static_cast<int64_t>(params.max_tokens_per_rank) * bytes_per_token;
+        // A source rank's pushed tokens occupy one runtime-packed slice in the local inbox.
+        int64_t const peer_stride = static_cast<int64_t>(params.max_tokens_per_rank) * params.wire_bytes_per_token;
         for (int rank = 0; rank < params.ep_size; rank++)
         {
-            // Local tokens occupy the zero-offset slice; peer slices are addressed relative to it.
-            kp.recv_buffers[rank][0] = combine_base + (rank - params.ep_rank) * peer_src_stride_per_rank;
+            kp.source_buffers[rank] = params.cft_combine_recv_payload + rank * peer_stride;
         }
 
         SWITCH_BOOL(params.enable_rank_mask, ENABLE_RANK_MASK, {
@@ -2088,13 +2071,14 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     CombineKernelPointers kernel_ptrs = {}; // Zero-initialize
     kernel_ptrs.timeout_cycles = params.timeout_cycles;
 
-    // Set output data pointer in src_data_ptrs[0]
-    kernel_ptrs.src_data_ptrs[0] = params.output_data;
+    kernel_ptrs.output = params.output_data;
 
-    // Fill recv buffer pointers
+    // Each expert rank stores this origin rank's tokens in its own combine input region.
+    int64_t const origin_offset
+        = static_cast<int64_t>(params.ep_rank) * params.max_tokens_per_rank * params.reduce_stride_per_token;
     for (int rank = 0; rank < params.ep_size; rank++)
     {
-        kernel_ptrs.recv_buffers[rank][0] = params.recv_buffers[rank];
+        kernel_ptrs.source_buffers[rank] = params.combine_input_buffers[rank] + origin_offset;
     }
 
     // Copy completion flag pointers

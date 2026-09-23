@@ -126,12 +126,12 @@ struct DispatchKernelPointers
     int64_t timeout_cycles{kDefaultTimeoutCycles};
 };
 
-// Combine kernel pointers - non-const output in src_data_ptrs[0], const recv buffers
+// Gather one contribution slice per expert rank.
 struct CombineKernelPointers
 {
-    // Payload pointers
-    void* src_data_ptrs[kMaxPayloads];                 // src_data_ptrs[0] is output
-    void const* recv_buffers[kMaxRanks][kMaxPayloads]; // 2D array of receive buffer pointers (const)
+    void* output;
+    // Fence: peer input slices. CFT: peer contributions in the local receive inbox.
+    uint8_t const* source_buffers[kMaxRanks];
 
     // Combine readiness flags shared by the fence and CFT paths.
     uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
@@ -281,17 +281,17 @@ struct MoeA2ACombineParams
     // Distributed aux data and recv buffers
     uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
                                            // rank has signaled the target rank
-    void const* recv_buffers[kMaxRanks];   // Per-rank receive buffers (only for single payload)
+    uint8_t* combine_input_buffers[kMaxRanks]; // Expert-output/staging region on each rank
 
     // ---- CFT combine (counted-write) path. Gated by use_cft_for_combine. ----
     // When true, moe_a2a_combine_launch takes the CFT push+reduce path and the base fence
     // combine below is bypassed. The base fence combine is unaffected when false.
     bool use_cft_for_combine;
     uint32_t cft_peer_le_ids[kMaxRanks];    // LE ID per target rank
-    uint64_t cft_le_combine_payload_base;   // LE byte offset for combine payload (region C)
+    uint64_t cft_combine_recv_offset;       // LE byte offset of the combine receive inbox
     uint64_t cft_le_combine_counter_base;   // LE byte offset for combine counters
     uint64_t* cft_le_combine_counters;      // Direct pointer to local LE combine counters
-    void* cft_le_combine_recv;              // Direct pointer to local LE combine payload region (C)
+    uint8_t* cft_combine_recv_payload;      // Local CFT receive inbox, including the self contribution
     uint64_t* cft_combine_counter_baseline; // [ep_size * max_tokens_per_rank] regular device memory
     int combine_counter_ep_stride = 0;      // STABLE static stride (maxNumTokens) for counter/baseline slot indexing
 
