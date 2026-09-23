@@ -30,12 +30,21 @@ namespace dev {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// __block_size__ is only supported in CUDA 13 and later.
-// We can always emit the macro, and it will simply be ignored in CUDA 12.
+// __block_size__ is only supported in CUDA 13 and later. When combined with
+// __launch_bounds__, the compiler emits .reqntid instead of .maxntid while
+// preserving .minnctapersm. This expresses the exact block dimensions without
+// dropping the occupancy constraint from the two-argument launch bounds.
 #if defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ >= 13
 #define TLLM_BLOCK_SIZE(bx, by, bz) __block_size__((bx, by, bz))
+#define TLLM_BLOCK_SIZE_OR_LAUNCH_BOUNDS(bx, by, bz, maxThreads)                          \
+  __launch_bounds__(maxThreads) __block_size__((bx, by, bz))
+#define TLLM_BLOCK_SIZE_OR_LAUNCH_BOUNDS_MIN_BLOCKS(bx, by, bz, maxThreads, minBlocks)             \
+  __launch_bounds__(maxThreads, minBlocks) __block_size__((bx, by, bz))
 #else
 #define TLLM_BLOCK_SIZE(bx, by, bz)
+#define TLLM_BLOCK_SIZE_OR_LAUNCH_BOUNDS(bx, by, bz, maxThreads) __launch_bounds__(maxThreads)
+#define TLLM_BLOCK_SIZE_OR_LAUNCH_BOUNDS_MIN_BLOCKS(bx, by, bz, maxThreads, minBlocks)             \
+  __launch_bounds__(maxThreads, minBlocks)
 #endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
