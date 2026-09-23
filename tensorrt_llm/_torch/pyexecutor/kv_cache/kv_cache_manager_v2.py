@@ -1209,14 +1209,6 @@ class KVCacheManagerV2(BaseResourceManager):
                     "KVCacheManagerV2 does not support a draft cache "
                     "manager with helix context parallelism."
                 )
-            if mapping.enable_attention_dp:
-                raise ValueError(
-                    "KVCacheManagerV2 does not support attention-DP with "
-                    "helix context parallelism: disagg transfer-completion "
-                    "consensus is skipped under attention-DP, so the "
-                    "scheduler's request view would not be rank-invariant "
-                    "across the CP group."
-                )
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.max_cuda_graph_batch_size = max_cuda_graph_batch_size

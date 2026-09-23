@@ -273,11 +273,25 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         m = self._mapping
         self._ctx_need_tp_sync = m.tp_size > 1 and not m.enable_attention_dp
         self._ctx_need_pp_sync = m.pp_size > 1
-        self._gen_need_sync = not (m.world_size == 1 or (m.enable_attention_dp and m.pp_size == 1))
-        pp_allgather: Callable = getattr(self._dist, "pp_allgather")
-        self._gen_allgather: Callable = (
-            pp_allgather if m.enable_attention_dp else self._dist.allgather
-        )
+        if m.enable_attention_dp:
+            # DP groups schedule independently, but the PP ranks and the helix CP
+            # ranks of one DP group share the same requests, so gen-side consensus
+            # spans PP x CP (like the C++ transceiver's mGroupDataComm). Without it
+            # a CP rank can start decoding before its partner received the KV and
+            # the helix all-to-all deadlocks.
+            self._gen_need_sync = m.pp_size * m.cp_size > 1
+            self._gen_allgather: Callable = self._dp_group_allgather
+        else:
+            self._gen_need_sync = m.world_size > 1
+            self._gen_allgather = self._dist.allgather
+
+    def _dp_group_allgather(self, obj):
+        """Allgather over the PP x CP ranks of this DP group (CP first, then PP)."""
+        m = self._mapping
+        gathered = list(self._dist.cp_allgather(obj)) if m.cp_size > 1 else [obj]
+        if m.pp_size > 1:
+            gathered = [x for part in self._dist.pp_allgather(gathered) for x in part]
+        return gathered
 
     def _exchange_rank_info(self):
         endpoints = cast(list, self._dist.allgather(self._transfer_worker.sender_endpoint))
@@ -533,11 +547,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return ready_ids
 
     def _gen_consensus(self, local_ids: list) -> list:
-        sync_size = (
-            self._mapping.pp_size if self._mapping.enable_attention_dp else self._mapping.world_size
-        )
-        all_ranks = self._gen_allgather(local_ids) if self._gen_need_sync else [local_ids]
-        return _find_consensus_request_ids(all_ranks, sync_size)
+        if not self._gen_need_sync:
+            return list(local_ids)
+        all_ranks = self._gen_allgather(local_ids)
+        return _find_consensus_request_ids(all_ranks, len(all_ranks))
 
     @staticmethod
     def _union(all_lists: List[List[int]]) -> set:
