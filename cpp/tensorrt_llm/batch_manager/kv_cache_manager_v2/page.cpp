@@ -23,6 +23,8 @@
 
 #include "tensorrt_llm/common/assert.h"
 
+#include <unordered_map>
+
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
@@ -93,6 +95,15 @@ SharedPtr<PageHolder> Page::hold()
 SharedPageLock Page::lock(KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lc, bool skipWait)
 {
     return hold()->lock(kvCache, beamIndex, ordinal, lc, skipWait);
+}
+
+bool Page::canLockAt(CacheLevel level) const
+{
+    if (level == kHotLevel)
+        return true;
+    auto const* attention = std::get_if<AttnLifeCycle>(&manager->getLifeCycle(lifeCycle));
+    return level == kHostLevel && attention != nullptr && attention->isSparse && level < manager->numCacheLevels()
+        && manager->cacheTier(level) == CacheTier::HOST_MEM;
 }
 
 // ---------------------------------------------------------------------------
@@ -280,9 +291,9 @@ SharedPageLock PageHolder::lock(
 UniqPageLock::UniqPageLock(SharedPtr<PageHolder> h)
     : holder(std::move(h))
 {
-    if (holder->page->cacheLevel != kHotLevel)
+    if (!holder->page->canLockAt(holder->page->cacheLevel))
     {
-        throw LogicError("Lock can only be applied to hot-tier pages");
+        throw LogicError("Pages can only be locked on GPU or, for sparse attention, in level-1 host memory");
     }
 }
 
@@ -292,7 +303,7 @@ UniqPageLock::~UniqPageLock()
         [this]
         {
             Page& p = *page();
-            TLLM_CHECK_DEBUG(p.cacheLevel == kHotLevel && !p.scheduledForEviction());
+            TLLM_CHECK_DEBUG(p.canLockAt(p.cacheLevel) && !p.scheduledForEviction());
             // Set readyEvent to the merged finish events of all readers. For committed (read-only)
             // pages, this means the next reader will wait for prior reads to complete, which is
             // unnecessary but correct. See the CommittedPage comment in page.h for rationale.
@@ -423,10 +434,10 @@ void SharedPageLock::releasePageIndex()
 }
 
 // ---------------------------------------------------------------------------
-// batchedLockToGpu
+// batchedLockPages
 // ---------------------------------------------------------------------------
 
-std::vector<SharedPageLock> batchedLockToGpu(KvCache& kvCache, std::vector<BatchedLockTarget> const& targets)
+std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<BatchedLockTarget> const& targets)
 {
     auto* storeMgr = kvCache.storageManager();
     TLLM_CHECK_DEBUG(storeMgr);
@@ -434,41 +445,56 @@ std::vector<SharedPageLock> batchedLockToGpu(KvCache& kvCache, std::vector<Batch
     TLLM_CHECK_DEBUG(targets.empty()
         || std::all_of(targets.begin(), targets.end(), [&](auto const& t) { return t.page->manager == storeMgr; }));
 
-    // Determine how many GPU slots are needed per pool group.
-    TypedVec<PoolGroupIndex, SlotCount> requirements(storeMgr->numPoolGroups(), 0);
-    std::vector<bool> wasScheduled(targets.size(), false);
-
-    for (size_t i = 0; i < targets.size(); ++i)
+    // Shared prefixes and beams may name the same physical page more than once.
+    // Reserve and migrate once per page, but issue one lock per owner below.
+    std::unordered_map<Page*, CacheLevel> destinations;
+    TypedVec<CacheLevel, std::vector<SharedPtr<Page>>> pagesByLevel(storeMgr->numCacheLevels());
+    for (auto const& target : targets)
     {
-        auto const& t = targets[i];
-        wasScheduled[i] = t.page->scheduledForEviction();
-        if (wasScheduled[i])
-            storeMgr->excludeFromEviction(*t.page);
-        if (t.page->cacheLevel != kHotLevel)
+        auto const& page = target.page;
+        CacheLevel const level = target.cacheLevel;
+        if (!page->canLockAt(level) || page->cacheLevel < level)
+            throw LogicError("Invalid destination for page locking; offload requires a separate handoff");
+        if (page->status() == PageStatus::LOCKED && page->cacheLevel != level)
+            throw LogicError("Cannot migrate a page locked by another owner");
+        auto const [it, inserted] = destinations.emplace(page.get(), level);
+        if (!inserted && it->second != level)
+            throw LogicError("Conflicting lock levels for a shared page");
+        if (inserted)
+            pagesByLevel[level].push_back(page);
+    }
+
+    // Protect every destination group while any group is allocating. On failure,
+    // also reschedule pages that were successfully restored to an evictable tier.
+    auto reschedule = FuncGuard(
+        [&]()
         {
-            PoolGroupIndex pgIdx = storeMgr->getPoolGroupIndex(t.lifeCycle);
-            requirements[pgIdx] += 1;
-        }
-    }
+            for (auto const& pages : pagesByLevel)
+                for (auto const& page : pages)
+                    if (!page->scheduledForEviction() && storeMgr->isEvictable(*page))
+                        storeMgr->scheduleForEviction(*page);
+        });
+    for (auto const& pages : pagesByLevel)
+        for (auto const& page : pages)
+            if (page->scheduledForEviction())
+                storeMgr->excludeFromEviction(*page);
 
-    try
+    MigrationRecorder const migrationRecorder
+        = [&kvCache](std::vector<SharedPtr<Page>> const& pages, std::vector<Slot> const& slots, CacheLevel srcLevel,
+              CacheLevel dstLevel) { kvCache._recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
+    DropRecorder const dropRecorder = [&kvCache](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
+    { kvCache._recordDroppedPages(pages, cacheLevel); };
+    for (CacheLevel level{0}; level < pagesByLevel.size(); ++level)
     {
-        MigrationRecorder const migrationRecorder
-            = [&kvCache](std::vector<SharedPtr<Page>> const& pages, std::vector<Slot> const& slots, CacheLevel srcLevel,
-                  CacheLevel dstLevel) { kvCache._recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
-        DropRecorder const dropRecorder = [&kvCache](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
-        { kvCache._recordDroppedPages(pages, cacheLevel); };
-        storeMgr->prepareFreeSlots(kHotLevel, requirements, migrationRecorder, dropRecorder);
-        // Migrate non-GPU pages.
-        storeMgr->batchedMigrateToGpu(targets, migrationRecorder);
-    }
-    catch (...)
-    {
-        // Restore eviction scheduling.
-        for (size_t i = 0; i < targets.size(); ++i)
-            if (wasScheduled[i])
-                storeMgr->scheduleForEviction(*targets[i].page);
-        throw;
+        auto const& pages = pagesByLevel[level];
+        if (pages.empty())
+            continue;
+        TypedVec<PoolGroupIndex, SlotCount> requirements(storeMgr->numPoolGroups(level), 0);
+        for (auto const& page : pages)
+            if (page->cacheLevel != level)
+                ++requirements[storeMgr->getPoolGroupIndex(level, page->lifeCycle)];
+        storeMgr->prepareFreeSlots(level, requirements, migrationRecorder, dropRecorder);
+        storeMgr->batchedMigrate(level, pages, migrationRecorder);
     }
 
     // Wait for all ready events on KvCache's stream (deduplicated).
@@ -483,9 +509,23 @@ std::vector<SharedPageLock> batchedLockToGpu(KvCache& kvCache, std::vector<Batch
     // Lock all pages.
     std::vector<SharedPageLock> locks;
     locks.reserve(targets.size());
+    auto releaseOnFailure = FuncGuard(
+        [&]()
+        {
+            if (locks.empty())
+                return;
+            if (kvCache.mFinishEvent.has_value())
+                locks.clear();
+            else
+            {
+                auto scope = kvCache.recordEventScope();
+                locks.clear();
+            }
+        });
     for (auto const& t : targets)
         locks.emplace_back(t.page->lock(kvCache, t.beamIndex, t.ordinal, t.lifeCycle,
             /*skipWait=*/true));
+    releaseOnFailure.cancel();
     return locks;
 }
 
