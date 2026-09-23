@@ -52,6 +52,7 @@ from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_mixin import (
     EncoderGroup,
+    MultimodalEncoderContractError,
     MultimodalModelMixin,
     PreparedLlmInputs,
     encode_multimodal_by_groups,
@@ -1250,7 +1251,14 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         the hidden dim, so the single-tensor contract holds).
         """
         if self.mm_encoder is None:
-            raise ValueError("Raw multimodal inputs require a local multimodal encoder.")
+            # Contract error, not a server fault: the deployment is text-only
+            # (disable_mm_encoder, or an encoder-handoff worker) and this one
+            # request arrived with raw pixels. The engine turns this into a
+            # MultimodalEncoderRequestError, which fails the request and
+            # leaves the executor running.
+            raise MultimodalEncoderContractError(
+                "Raw multimodal inputs require a local multimodal encoder."
+            )
 
         mm_embeds = self.mm_encoder.forward(list(multimodal_params), **encoder_kwargs)
         if len(mm_embeds) != 1:
