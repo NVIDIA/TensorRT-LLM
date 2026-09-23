@@ -65,6 +65,10 @@ BOLT_PROFILES_REQUIRED = (params.boltProfilesRequired ?: env.boltProfilesRequire
 // tarball is BOLT-optimized in the image build, before the release stage pip
 // installs it. Kept independent so it can be rolled back on its own.
 BOLT_OPTIMIZE_WHEEL = (params.boltOptimizeWheel ?: env.boltOptimizeWheel ?: "false").toString() == "true"
+// The bundle this pipeline pinned, hoisted out of globalVars in launchBuildJobs
+// because prepareWheelFromBuildStage runs well below the scope globalVars is
+// passed into. Empty means unpinned, i.e. take whatever `latest` is.
+BOLT_PINNED_REF = ""
 // <<< BOLT profile-bundle overlay <<<
 
 ENABLE_USE_WHEEL_FROM_BUILD_STAGE = params.useWheelFromBuildStage ?: false
@@ -321,6 +325,14 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
             .unique()
         echo "Release image for ${arch} will BOLT-optimize its wheel using profiles from: ${branches.join(', ')}"
         wheelArgs += " --bolt-branch ${branches.join(',')}"
+        // With a pin the candidate list collapses to its first entry: the ref
+        // names one immutable bundle under one branch's promote directory, so
+        // falling through to another branch would optimize the image's wheel
+        // with different profiles than the release wheel and the tested build.
+        if (BOLT_PINNED_REF) {
+            echo "Release image for ${arch} is pinned to BOLT bundle ${BOLT_PINNED_REF}"
+            wheelArgs += " --bolt-profile-ref ${BOLT_PINNED_REF}"
+        }
     }
     return " BUILD_WHEEL_SCRIPT=${wheelScript} BUILD_WHEEL_ARGS='${wheelArgs}'"
 }
@@ -694,6 +706,7 @@ def buildImage(config, imageKeyToTag, versionOverride)
 
 def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
     def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
+    BOLT_PINNED_REF = globalVars[BOLT_PROFILE_REF]?.toString() ?: ""
     def defaultBuildConfig = [
         target: "tritondevel",
         action: params.action,
