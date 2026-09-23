@@ -171,7 +171,8 @@ when no pin:
       ranged GET both architecture tarballs      → skip b unless both exist
       GET build_info.txt, parse `commit=`         → sha; skip when absent
       first complete pair with a known sha        → latest coverage DB
-   upload the build/commit pin                    → stable for this PR head
+   Python writes the build/commit pin locally
+   Jenkins uploads that file                      → stable for this PR head
 compare <sha>...<PR base>                        → record topology and absolute distance
 fetch PR head locally; fetch base and selected DB from the normal CI Git mirror
 create a squashed PR commit with `commit-tree`, parented at the PR base
@@ -184,10 +185,13 @@ The pin lives under
 `LLM/main/cbts/coverage-db-pins/v1/<PR number>/<PR head>/cbts_db_pin.json`. A new PR head has no
 pin and therefore receives the freshest complete pair available at its first CBTS run. Repeated
 `/bot run` commands for the same head reuse that build even after newer post-merge DBs appear.
-Pin lookup, validation, and first-write upload fail closed; CBTS never silently substitutes a
-newer build when a pin cannot be read or written. Preparation also verifies that the pinned
-build's `build_info.txt` still names the commit recorded in the pin, so an overwritten or
-corrupted build cannot silently change a repeated run.
+`artifact.py --resolve-pin` owns pin lookup, schema validation, build selection, local pin
+creation, and fail-closed reasons. Groovy only supplies PR identity and uses Jenkins'
+authenticated artifact uploader when Python reports `pin_upload_required`. Lookup, validation,
+and first-write upload fail closed; CBTS never silently substitutes a newer build when a pin
+cannot be read or written. Preparation also verifies that the pinned build's `build_info.txt`
+still names the commit recorded in the pin, so an overwritten or corrupted build cannot silently
+change a repeated run.
 
 Requiring the architecture pair prevents the selector from narrowing only one CPU architecture.
 For an unpinned head, builds are probed newest first and the first complete pair with commit
@@ -242,10 +246,11 @@ the PR runs in full.
 
 ### 8.3 What happens with the result
 
-After Tier 1 computes the residual, Groovy resolves and persists a build pin before any large
-download. `--prepare DIR --build BUILD --paths-json PATH` then resolves the PR base, validates the
-pinned pair's residual compatibility, streams both tarballs down, unpacks their identically named
-SQLite files separately, and unions them with `compact_db.merge_databases`.
+After Tier 1 computes the residual, `--resolve-pin FILE` returns a reuse/create/decline plan.
+Groovy uploads `FILE` only for a create plan, before any large download. `--prepare DIR --build
+BUILD --paths-json PATH` then resolves the PR base, validates the pinned pair's residual
+compatibility, streams both tarballs down, unpacks their identically named SQLite files
+separately, and unions them with `compact_db.merge_databases`.
 It writes the selection JSON
 beside the merged SQLite as `cbts_coverage_db.json` and prints `{path, meta}`. Groovy binds the
 credentials, logs the successful compatibility check, and runs `coverage_audit.py` over the result.

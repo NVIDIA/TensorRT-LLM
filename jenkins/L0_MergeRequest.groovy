@@ -184,12 +184,6 @@ def INFRA_DRY_RUN = "infra_dry_run"
 // Kill switch for CBTS per-test coverage; official post-merge pipeline only, single-GPU stages only in Phase 1.
 @Field
 def ENABLE_CBTS_COVERAGE = true
-@Field
-def CBTS_COVERAGE_PIN_VERSION = 1
-@Field
-def CBTS_COVERAGE_PIN_BASE = "sw-tensorrt-generic/llm-artifacts/LLM/main/cbts/coverage-db-pins/v1"
-@Field
-def URM_ARTIFACTORY_BASE = "https://urm.nvidia.com/artifactory"
 // Version-controlled Tier 2 application policy. Coverage decisions are evaluated
 // for every eligible PR, but only these authors receive coverage-based narrowing.
 // Keep the policy in the infra-owned Groovy boundary so rollout requires infra review.
@@ -1220,6 +1214,17 @@ def _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
     }
 }
 
+def _cbtsCoverageDecline(boolean pilotEligible, String reason)
+{
+    return [
+        db: [
+            compatibility: "unknown",
+            decline_reason: "coverage tier declined: ${reason}",
+        ],
+        pilotEligible: pilotEligible,
+    ]
+}
+
 // Resolve pilot application eligibility, then fetch and audit the touch DB for
 // every Tier-2 residual. Returns {db, pilotEligible}; a compatibility decline
 // remains in db without a path so it is observable in shadow and pilot modes.
@@ -1231,8 +1236,16 @@ def _cbtsCoverageAudit(pipeline, globalVars, String residualPath)
         // ${LLM_ROOT}-relative, matching the main.py caller's `cd ${LLM_ROOT}`.
         // The checked-out revision is the PR head; its merge base is what drift is measured against.
         def prHead = env.gitlabMergeRequestLastCommit ?: ""
+        def prNumber = _cbtsPrNumber(globalVars)
+        if (!(prHead ==~ /[0-9a-fA-F]{40}/) || !(prNumber ==~ /[1-9]\d*/)) {
+            pipeline.echo("CBTS audit: PR number/head unavailable; cannot make coverage DB selection repeatable")
+            return _cbtsCoverageDecline(
+                pilotEligible, "PR identity unavailable for coverage DB pin")
+        }
+
         def readyJson = ""
         def prAuthor = ""
+        def pinPlanJson = ""
         withCredentials([usernamePassword(
             credentialsId: 'github-cred-trtllm-ci',
             usernameVariable: 'NOT_USED_YET',
@@ -1244,129 +1257,37 @@ def _cbtsCoverageAudit(pipeline, globalVars, String residualPath)
             ).trim()
             pilotEligible = prAuthor && CBTS_COVERAGE_PILOT_USERS.any { it.equalsIgnoreCase(prAuthor) }
             pipeline.echo("CBTS coverage pilot: pr_author=${prAuthor ?: 'unknown'}, eligible=${pilotEligible}")
+            pinPlanJson = sh(
+                script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
+                        "--resolve-pin cbts_db_pin.json --pr-number ${prNumber} " +
+                        "--pr-head ${prHead} || true",
+                returnStdout: true,
+            ).trim()
+        }
+        if (!pinPlanJson) {
+            pipeline.echo("CBTS audit: coverage DB pin could not be resolved")
+            return _cbtsCoverageDecline(pilotEligible, "coverage DB pin could not be resolved")
+        }
+        def pinPlan = new groovy.json.JsonSlurper().parseText(pinPlanJson)
+        if (pinPlan.status != "ready") {
+            pipeline.echo("CBTS audit: ${pinPlan.decline_reason ?: 'coverage DB pin declined'}")
+            return [db: pinPlan, pilotEligible: pilotEligible]
         }
 
-        def prNumber = _cbtsPrNumber(globalVars)
-        if (!prHead || !prNumber) {
-            pipeline.echo("CBTS audit: PR number/head unavailable; cannot make coverage DB selection repeatable")
-            return [
-                db: [
-                    compatibility: "unknown",
-                    decline_reason: "coverage tier declined: PR identity unavailable for coverage DB pin",
-                ],
-                pilotEligible: pilotEligible,
-            ]
-        }
-
-        def pinPath = "${LLM_ROOT}/cbts_db_pin.json"
-        def pinUrl = "${URM_ARTIFACTORY_BASE}/${CBTS_COVERAGE_PIN_BASE}/${prNumber}/${prHead}/cbts_db_pin.json"
-        if (fileExists(pinPath)) {
-            deleteFile pinPath
-        }
-        def pinStatus = sh(
-            script: "curl --noproxy '*' -sS -o ${pinPath} -w '%{http_code}' " +
-                    "--connect-timeout 5 --max-time 30 '${pinUrl}' || true",
-            returnStdout: true,
-        ).trim()
-        def pinnedBuild = null
-        def pinnedCommit = ""
-        def pinExists = pinStatus == "200"
-        if (pinExists) {
-            def pin = new groovy.json.JsonSlurper().parseText(readFile(file: pinPath))
-            def validPin = pin instanceof Map &&
-                pin.version?.toString() == CBTS_COVERAGE_PIN_VERSION.toString() &&
-                pin.pr_number?.toString() == prNumber.toString() &&
-                pin.pr_head?.toString() == prHead &&
-                pin.coverage_db_build?.toString() ==~ /[1-9]\d*/ &&
-                pin.coverage_db_commit?.toString() ==~ /[0-9a-fA-F]{40}/
-            if (!validPin) {
-                pipeline.echo("CBTS audit: coverage DB pin is malformed or does not match this PR head")
-                return [
-                    db: [
-                        compatibility: "unknown",
-                        decline_reason: "coverage tier declined: invalid coverage DB pin",
-                    ],
-                    pilotEligible: pilotEligible,
-                ]
-            }
-            pinnedBuild = pin.coverage_db_build.toString().toInteger()
-            pinnedCommit = pin.coverage_db_commit.toString()
-            pipeline.echo("CBTS audit: reusing pinned coverage DB build ${pinnedBuild}")
-        } else if (pinStatus == "404") {
-            pipeline.echo("CBTS audit: no pin for this PR head; selecting the latest coverage DB")
-        } else {
-            pipeline.echo("CBTS audit: coverage DB pin query failed (HTTP ${pinStatus ?: 'unknown'})")
-            return [
-                db: [
-                    compatibility: "unknown",
-                    decline_reason: "coverage tier declined: coverage DB pin query failed",
-                ],
-                pilotEligible: pilotEligible,
-            ]
-        }
-
-        if (!pinExists) {
-            def selectionJson = ""
-            withCredentials([usernamePassword(
-                credentialsId: 'github-cred-trtllm-ci',
-                usernameVariable: 'NOT_USED_YET',
-                passwordVariable: 'GITHUB_API_TOKEN'),
-            ]) {
-                selectionJson = sh(
-                    script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
-                            "--resolve-build --pr-head ${prHead} || true",
-                    returnStdout: true,
-                ).trim()
-            }
-            if (!selectionJson) {
-                pipeline.echo("CBTS audit: latest coverage DB could not be resolved; pin not written")
-                return [
-                    db: [
-                        compatibility: "unknown",
-                        decline_reason: "coverage tier declined: coverage DB could not be resolved",
-                    ],
-                    pilotEligible: pilotEligible,
-                ]
-            }
-            def selected = new groovy.json.JsonSlurper().parseText(selectionJson)
-            if (!(selected instanceof Map) ||
-                    !(selected.build?.toString() ==~ /[1-9]\d*/) ||
-                    !(selected.commit?.toString() ==~ /[0-9a-fA-F]{40}/)) {
-                pipeline.echo("CBTS audit: selected coverage DB metadata is invalid; pin not written")
-                return [
-                    db: [
-                        compatibility: "unknown",
-                        decline_reason: "coverage tier declined: selected coverage DB metadata invalid",
-                    ],
-                    pilotEligible: pilotEligible,
-                ]
-            }
-            def pin = [
-                version: CBTS_COVERAGE_PIN_VERSION,
-                pr_number: prNumber.toString(),
-                pr_head: prHead,
-                coverage_db_build: selected.build,
-                coverage_db_commit: selected.commit,
-            ]
-            writeFile file: pinPath, text: groovy.json.JsonOutput.toJson(pin)
+        if (pinPlan.pin_upload_required) {
             try {
-                def pinTarget = "${CBTS_COVERAGE_PIN_BASE}/${prNumber}/${prHead}/"
-                trtllm_utils.uploadArtifacts(pinPath, pinTarget)
-                pinnedBuild = selected.build.toString().toInteger()
-                pinnedCommit = selected.commit.toString()
-                pipeline.echo("CBTS audit: pinned coverage DB build ${pinnedBuild} for PR head ${prHead}")
+                trtllm_utils.uploadArtifacts(
+                    "${LLM_ROOT}/${pinPlan.pin_path}", pinPlan.pin_target)
+                pipeline.echo("CBTS audit: pinned coverage DB build ${pinPlan.build} " +
+                              "for PR head ${prHead}")
             } catch (InterruptedException e) {
                 throw e
             } catch (Exception e) {
                 pipeline.echo("CBTS audit: coverage DB pin upload failed (${e.message})")
-                return [
-                    db: [
-                        compatibility: "unknown",
-                        decline_reason: "coverage tier declined: coverage DB pin upload failed",
-                    ],
-                    pilotEligible: pilotEligible,
-                ]
+                return _cbtsCoverageDecline(pilotEligible, "coverage DB pin upload failed")
             }
+        } else {
+            pipeline.echo("CBTS audit: reusing pinned coverage DB build ${pinPlan.build}")
         }
 
         withCredentials([
@@ -1380,20 +1301,14 @@ def _cbtsCoverageAudit(pipeline, globalVars, String residualPath)
                 script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
                         "--prepare cbts_cov --paths-json ${residualPath}" +
                         " --pr-head ${prHead}" +
-                        " --build ${pinnedBuild}" +
-                        " --expected-commit ${pinnedCommit} || true",
+                        " --build ${pinPlan.build}" +
+                        " --expected-commit ${pinPlan.commit} || true",
                 returnStdout: true,
             ).trim()
         }
         if (!readyJson) {
             pipeline.echo("CBTS audit: no coverage DB could be prepared — Tier 2 decision unavailable")
-            return [
-                db: [
-                    compatibility: "unknown",
-                    decline_reason: "coverage tier declined: coverage DB could not be prepared",
-                ],
-                pilotEligible: pilotEligible,
-            ]
+            return _cbtsCoverageDecline(pilotEligible, "coverage DB could not be prepared")
         }
         def ready = new groovy.json.JsonSlurper().parseText(readyJson)
         if (!ready.path) {
