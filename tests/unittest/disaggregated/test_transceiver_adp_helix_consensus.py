@@ -26,7 +26,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
+
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _transceiver(mapping, dist) -> KvCacheTransceiverV2:
