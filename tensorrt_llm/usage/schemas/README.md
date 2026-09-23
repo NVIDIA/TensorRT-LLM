@@ -118,7 +118,10 @@ grouping remains possible; the hash must not be treated as anonymous or secret.
 Extraction uses the first `architectures` value from the pretrained
 configuration and also supports legacy singular values and nested engine
 configs. Encode-only models use the effective runtime configuration after
-model overrides are applied. Invalid or empty values leave both fields empty.
+model overrides are applied, falling back to the checkpoint configuration if
+the runtime metadata is unavailable. Generation models use the checkpoint
+configuration; architecture overrides applied in their worker process are not
+currently reflected in telemetry. Invalid or empty values leave both fields empty.
 The conservative allowlist is maintained manually. An identifier may be
 included when it is publicly documented by the upstream model provider or in
 TensorRT-LLM's supported-models table; custom names remain excluded until

@@ -246,12 +246,22 @@ class TestTelemetryPyTorchBackend:
         assert captured.get("llm_args") is not None, "report_usage was not called with llm_args"
 
 
-class TestEffectiveRuntimeArchitectureReporting:
-    """Verify effective runtime architecture reporting end to end."""
+class TestRuntimeArchitecturePayloadFlow:
+    """Verify config selection reaches the payload with a stubbed executor."""
 
-    def test_encode_only_reports_effective_runtime_architecture(
-        self, monkeypatch, enable_telemetry
-    ):
+    @pytest.mark.parametrize(
+        "executor_state,expected_architecture",
+        [
+            ("runtime", "Qwen3ForTextEmbedding"),
+            ("generation", "Qwen3ForCausalLM"),
+            ("missing_executor", "Qwen3ForCausalLM"),
+            ("missing_model", "Qwen3ForCausalLM"),
+        ],
+    )
+    def test_reports_selected_architecture(
+        self, monkeypatch, enable_telemetry, executor_state, expected_architecture
+    ) -> None:
+        """Report the runtime architecture or retain the checkpoint fallback."""
         raw_config = SimpleNamespace(architectures=["Qwen3ForCausalLM"])
         runtime_config = SimpleNamespace(architectures=["Qwen3ForTextEmbedding"])
         llm = object.__new__(BaseLLM)
@@ -264,6 +274,12 @@ class TestEffectiveRuntimeArchitectureReporting:
                 )
             )
         )
+        if executor_state == "generation":
+            llm._encoder_executor = None
+        elif executor_state == "missing_executor":
+            del llm._encoder_executor
+        elif executor_state == "missing_model":
+            del llm._encoder_executor.model_engine.model
 
         report_args = {}
 
@@ -298,7 +314,7 @@ class TestEffectiveRuntimeArchitectureReporting:
 
         assert len(payloads) == 1
         params = payloads[0]["events"][0]["parameters"]
-        assert params["architectureClassName"] == "Qwen3ForTextEmbedding"
+        assert params["architectureClassName"] == expected_architecture
         assert params["architectureClassHash"] == ""
 
 
