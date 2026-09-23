@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.encoder_executor import EncoderExecutor
-from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PackedEncoderBatch
+from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PackedInputs
 
 pytestmark = pytest.mark.cpu_only
 
@@ -45,11 +45,11 @@ def test_batch_forward_hands_the_packed_batch_to_the_engine() -> None:
         "token_type_ids",
     }
     model_engine.forward.assert_called_once_with(
-        PackedEncoderBatch(
+        PackedInputs(
             input_ids=[11, 12, 21, 22, 23],
             sequence_lengths=[2, 3],
             multi_item_part_lens=[[1, 1], [2, 1]],
             model_inputs={"token_type_ids": inputs["token_type_ids"]},
+            gather_context_logits=True,
         ),
-        gather_context_logits=True,
     )

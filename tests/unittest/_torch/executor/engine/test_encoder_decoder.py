@@ -10,6 +10,7 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import EncoderPreparedInputs
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ScheduledInputs
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 pytestmark = pytest.mark.cpu_only
@@ -56,8 +57,6 @@ def test_encoder_decoder_rejects_mixed_token_and_feature_batch() -> None:
         runner.prepare_inputs(
             scheduled_requests,
             resource_manager=None,
-            cuda_graph_lora_manager=None,
-            runtime_draft_len=0,
         )
 
 
@@ -156,11 +155,8 @@ def test_encoder_decoder_forward_returns_hidden_states_with_prepared_lengths() -
     resource_manager = object()
 
     outputs = runner.forward(
-        scheduled_requests,
+        ScheduledInputs(batch=scheduled_requests),
         resource_manager=resource_manager,
-        cuda_graph_lora_manager=None,
-        runtime_draft_len=0,
-        gather_context_logits=False,
     )
 
     assert outputs == {
@@ -170,7 +166,5 @@ def test_encoder_decoder_forward_returns_hidden_states_with_prepared_lengths() -
     runner.prepare_inputs.assert_called_once_with(
         scheduled_requests,
         resource_manager=resource_manager,
-        cuda_graph_lora_manager=None,
-        runtime_draft_len=0,
     )
     runner._execute_prepared.assert_called_once_with(prepared)

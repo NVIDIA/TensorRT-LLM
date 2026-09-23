@@ -14,16 +14,18 @@ from torch import nn
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttentionMetadata
+from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.memory_buffer_utils import with_shared_pool
-from tensorrt_llm._torch.peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
+from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancer
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import nvtx_range, prefer_pinned
+from tensorrt_llm.mapping import Mapping
 
 from .common import apply_position_id_offset, get_top_level_model
 from .encoder import EncoderConfigMixin, EncoderMixin, EncoderPreparedInputs
-from .interface import RunnerConfig, RunnerDeps
+from .interface import RunnerConfig, ScheduledInputs, ScheduledModelRunner
 
 
 @dataclass(frozen=True)
@@ -35,18 +37,23 @@ class EncoderDecoderRunnerConfig(EncoderConfigMixin, RunnerConfig):
     """
 
 
-class EncoderDecoderRunner(EncoderMixin):
+class EncoderDecoderRunner(EncoderMixin, ScheduledModelRunner):
     """Run the independent encoder phase of an encoder-decoder model."""
 
     def __init__(
         self,
         model: nn.Module,
-        deps: RunnerDeps,
         config: EncoderDecoderRunnerConfig,
+        *,
+        mapping: Mapping,
+        dist: Distributed | None,
+        moe_load_balancer: MoeLoadBalancer | None,
     ) -> None:
         if not config.is_encoder_decoder:
             raise ValueError("EncoderDecoderRunner requires an encoder-decoder model.")
-        self._initialize_encoder(model, deps, config)
+        self._initialize_encoder(
+            model, config, mapping=mapping, dist=dist, moe_load_balancer=moe_load_balancer
+        )
         self._feature_staging: torch.Tensor | None = None
         self._feature_staging_event: torch.cuda.Event | None = None
         self._feature_copy_stream: torch.cuda.Stream | None = None
@@ -81,11 +88,8 @@ class EncoderDecoderRunner(EncoderMixin):
         scheduled_requests: ScheduledRequests,
         *,
         resource_manager: ResourceManager,
-        cuda_graph_lora_manager: CudaGraphLoraManager | None,
-        runtime_draft_len: int,
     ) -> EncoderPreparedInputs:
         """Pack one scheduled encoder batch into the model's input contract."""
-        del cuda_graph_lora_manager, runtime_draft_len
         encoder_requests = scheduled_requests.encoder_requests
         if not encoder_requests:
             raise ValueError("Encoder execution requires at least one request.")
@@ -242,9 +246,7 @@ class EncoderDecoderRunner(EncoderMixin):
         return packed
 
     def warmup(self, resource_manager: ResourceManager) -> None:
-        """Encoder-decoder warmup is performed while capturing graph shapes."""
-
-    def capture_graphs(self, resource_manager: ResourceManager) -> None:
+        """Warm up and capture the encoder graph shapes."""
         self._capture_encoder_cuda_graphs(
             lambda sequence_lengths: self._prepare_capture_inputs(
                 sequence_lengths, resource_manager
@@ -314,19 +316,15 @@ class EncoderDecoderRunner(EncoderMixin):
     @nvtx_range("encoder_decoder_forward")
     def forward(
         self,
-        scheduled_requests: ScheduledRequests,
+        inputs: ScheduledInputs,
         *,
         resource_manager: ResourceManager,
-        cuda_graph_lora_manager: CudaGraphLoraManager | None,
-        runtime_draft_len: int,
-        gather_context_logits: bool,
+        is_dummy: bool = False,
     ) -> dict[str, Any]:
-        del gather_context_logits
+        del is_dummy
         prepared = self.prepare_inputs(
-            scheduled_requests,
+            inputs.batch,
             resource_manager=resource_manager,
-            cuda_graph_lora_manager=cuda_graph_lora_manager,
-            runtime_draft_len=runtime_draft_len,
         )
         hidden_states = self._execute_prepared(prepared)
         return {

@@ -21,7 +21,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import (
     EncoderDecoderRunner,
     EncoderDecoderRunnerConfig,
 )
-from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PackedEncoderBatch
+from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PackedInputs
 from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig
 
 pytestmark = pytest.mark.cpu_only
@@ -149,10 +149,9 @@ def test_encoder_only_attention_metadata_uses_runner_cache_indirection() -> None
         attention_backend=TrtllmAttention,
         attention_runtime_features=AttentionRuntimeFeatures(),
     )
-    runner._deps = SimpleNamespace(
-        mapping=object(),
-        cache_indirection=cache_indirection,
-    )
+    runner._mapping = object()
+    runner._buffers = SimpleNamespace(cache_indirection=cache_indirection)
+    runner._attn_metadata = None
     runner._encoder_config = SimpleNamespace(is_encoder_decoder=False)
 
     with patch.object(
@@ -160,7 +159,7 @@ def test_encoder_only_attention_metadata_uses_runner_cache_indirection() -> None
         "build_attention_metadata",
         return_value=metadata,
     ) as build_metadata:
-        actual = runner._create_attention_metadata()
+        actual = runner._setup_attention_metadata()
 
     assert actual is metadata
     assert build_metadata.call_args.kwargs["cache_indirection"] is cache_indirection
@@ -182,10 +181,7 @@ def test_encoder_decoder_attention_metadata_omits_decoder_cache_indirection() ->
         attention_backend=TrtllmAttention,
         attention_runtime_features=AttentionRuntimeFeatures(),
     )
-    runner._deps = SimpleNamespace(
-        mapping=object(),
-        cache_indirection=object(),
-    )
+    runner._mapping = object()
     runner._encoder_config = SimpleNamespace(is_encoder_decoder=True)
 
     with patch.object(
@@ -246,7 +242,7 @@ def test_packed_inputs_reject_inconsistent_request_boundaries(
     runner = object.__new__(EncoderRunner)
 
     with pytest.raises(ValueError, match=message):
-        runner.prepare_inputs(PackedEncoderBatch(input_ids, sequence_lengths, multi_item_part_lens))
+        runner.prepare_inputs(PackedInputs(input_ids, sequence_lengths, multi_item_part_lens))
 
 
 @pytest.mark.parametrize(
@@ -264,9 +260,7 @@ def test_encoder_runner_rejects_model_inputs_owned_by_the_runner(reserved_name: 
     runner._encoder_cuda_graph_runner = SimpleNamespace(enabled=False)
 
     with pytest.raises(ValueError, match=reserved_name):
-        runner.prepare_inputs(
-            PackedEncoderBatch([11, 12], [2], model_inputs={reserved_name: object()})
-        )
+        runner.prepare_inputs(PackedInputs([11, 12], [2], model_inputs={reserved_name: object()}))
 
 
 def test_encoder_runner_forwards_model_inputs_to_eager_preparation() -> None:
@@ -277,7 +271,7 @@ def test_encoder_runner_forwards_model_inputs_to_eager_preparation() -> None:
     token_type_ids = torch.tensor([0, 1])
 
     actual = runner.prepare_inputs(
-        PackedEncoderBatch([11, 12], [2], model_inputs={"token_type_ids": token_type_ids})
+        PackedInputs([11, 12], [2], model_inputs={"token_type_ids": token_type_ids})
     )
 
     assert actual is expected
@@ -295,7 +289,7 @@ def test_encoder_runner_rejects_model_inputs_for_cuda_graph_execution() -> None:
 
     with pytest.raises(NotImplementedError, match="token_type_ids"):
         runner.prepare_inputs(
-            PackedEncoderBatch([11, 12], [2], model_inputs={"token_type_ids": object()})
+            PackedInputs([11, 12], [2], model_inputs={"token_type_ids": object()})
         )
 
 
@@ -303,7 +297,7 @@ def test_encoder_runner_forwards_eager_model_inputs_and_gathers_logits() -> None
     metadata = SimpleNamespace(on_update_kv_lens=Mock())
     model_forward = Mock(return_value={"logits": torch.arange(12).reshape(3, 4)})
     runner = object.__new__(EncoderRunner)
-    runner._deps = SimpleNamespace(model_forward=model_forward)
+    runner._model_caller = model_forward
     runner._config = SimpleNamespace(without_logits=False)
     inputs = {
         "input_ids": torch.tensor([1, 2, 3]),
@@ -374,7 +368,7 @@ def test_token_graph_capture_and_replay_enter_moe_iteration_context() -> None:
             return {"logits": torch.tensor([[2.0]])}
 
     runner = object.__new__(EncoderRunner)
-    runner._deps = SimpleNamespace(moe_load_balancer=load_balancer)
+    runner._moe_load_balancer = load_balancer
     runner._encoder_cuda_graph_runner = _GraphRunner()
     prepared = EncoderPreparedInputs(
         {"input_ids": object()},
@@ -394,10 +388,8 @@ def test_token_graph_capture_and_replay_enter_moe_iteration_context() -> None:
 
 def _warmup_runner(*, world_size: int) -> EncoderRunner:
     runner = object.__new__(EncoderRunner)
-    runner._deps = SimpleNamespace(
-        dist=SimpleNamespace(world_size=world_size),
-        mapping=SimpleNamespace(dwdp_enabled=False),
-    )
+    runner._dist = SimpleNamespace(world_size=world_size)
+    runner._mapping = SimpleNamespace(dwdp_enabled=False)
     runner._encoder_cuda_graph_runner = SimpleNamespace(
         enabled=True,
         build_capture_sequence_lengths=Mock(return_value=[1]),
@@ -436,6 +428,6 @@ def test_encoder_release_clears_owned_graph_backend() -> None:
     runner = object.__new__(EncoderRunner)
     runner._encoder_cuda_graph_runner = Mock()
 
-    runner.cleanup()
+    runner.release_graphs()
 
     runner._encoder_cuda_graph_runner.clear.assert_called_once_with()

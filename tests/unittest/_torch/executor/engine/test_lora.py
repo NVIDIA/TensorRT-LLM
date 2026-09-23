@@ -84,12 +84,16 @@ def _peft_cache_manager(
     )
 
 
-def _builder(*, is_linear_tree: bool = True, extend_ctx: bool = False) -> LoraParamBuilder:
+def _builder(
+    *, is_linear_tree: bool = True, extend_ctx: bool = False, cuda_graph_manager=None
+) -> LoraParamBuilder:
     spec_config = SimpleNamespace(
         is_linear_tree=is_linear_tree,
         spec_dec_mode=SimpleNamespace(extend_ctx=lambda backend: extend_ctx),
     )
-    return LoraParamBuilder(spec_config=spec_config, attn_backend=object())
+    return LoraParamBuilder(
+        spec_config=spec_config, attn_backend=object(), cuda_graph_manager=cuda_graph_manager
+    )
 
 
 def _build(
@@ -105,7 +109,6 @@ def _build(
     return builder.build(
         batch,
         attn_metadata,
-        cuda_graph_lora_manager=None,
         peft_cache_manager=_peft_cache_manager(peft_table),
         **kwargs,
     )
@@ -272,7 +275,6 @@ def test_missing_peft_table_yields_none_and_an_empty_one_yields_an_empty_dict() 
     no_manager = builder.build(
         batch,
         _attn_metadata(),
-        cuda_graph_lora_manager=None,
         enable_spec_decode=False,
         runtime_draft_len=0,
         peft_cache_manager=None,
@@ -326,10 +328,9 @@ def test_base_only_batch_short_circuits_before_any_parameter_build() -> None:
     manager = _FakeCudaGraphLoraManager()
     peft_cache_manager = _peft_cache_manager({})
 
-    params = _builder().build(
+    params = _builder(cuda_graph_manager=manager).build(
         _batch(context=[_request(0, lora_task_id=None)]),
         _attn_metadata(),
-        cuda_graph_lora_manager=manager,
         enable_spec_decode=False,
         runtime_draft_len=0,
         peft_cache_manager=peft_cache_manager,
@@ -354,10 +355,9 @@ def test_cuda_graph_path_sizes_tokens_per_seq(
     graph_params = {"source": "cuda-graph"}
     manager = _FakeCudaGraphLoraManager(graph_params=graph_params)
 
-    params = _builder().build(
+    params = _builder(cuda_graph_manager=manager).build(
         _batch(generation=[_request(0, lora_task_id=7)]),
         _attn_metadata(num_contexts=0, num_generations=1),
-        cuda_graph_lora_manager=manager,
         enable_spec_decode=enable_spec_decode,
         runtime_draft_len=runtime_draft_len,
         peft_cache_manager=_peft_cache_manager({}),
@@ -374,10 +374,9 @@ def test_eager_fallback_releases_evicted_adapter_slots() -> None:
     manager = _FakeCudaGraphLoraManager()
     peft_cache_manager = _peft_cache_manager({})
 
-    _builder().build(
+    _builder(cuda_graph_manager=manager).build(
         _batch(context=[_request(0, lora_task_id=None)]),
         _attn_metadata(),
-        cuda_graph_lora_manager=manager,
         enable_spec_decode=False,
         runtime_draft_len=0,
         peft_cache_manager=peft_cache_manager,

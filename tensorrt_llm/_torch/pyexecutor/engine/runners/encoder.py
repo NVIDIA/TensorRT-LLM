@@ -21,9 +21,14 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionMetadata,
     AttentionRuntimeFeatures,
 )
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.memory_buffer_utils import with_shared_pool
-from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancerIterContext
+from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
+    MoeLoadBalancer,
+    MoeLoadBalancerIterContext,
+)
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     EncoderCUDAGraphRunner,
     EncoderCUDAGraphRunnerConfig,
@@ -42,8 +47,10 @@ from ..cuda_graph import (
     filter_cuda_graph_num_tokens,
     filter_cuda_graph_seq_lens,
 )
+from ..input_buffers import InputBuffers
 from ..metadata import build_attention_metadata
-from .interface import PackedEncoderBatch, PreparedInputs, RunnerConfig, RunnerDeps
+from ..model_call import ModelCaller
+from .interface import PackedInputs, PackedModelRunner, PreparedInputs, RunnerConfig
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -264,11 +271,16 @@ class EncoderMixin:
     def _initialize_encoder(
         self,
         model: nn.Module,
-        deps: RunnerDeps,
         config: EncoderConfigMixin,
+        *,
+        mapping: Mapping,
+        dist: Distributed | None,
+        moe_load_balancer: MoeLoadBalancer | None,
     ) -> None:
         self._model = model
-        self._deps = deps
+        self._mapping = mapping
+        self._dist = dist
+        self._moe_load_balancer = moe_load_balancer
         self._config = cast(RunnerConfig, config)
         self._encoder_config = config
         self._initialize_encoder_cuda_graph()
@@ -321,6 +333,7 @@ class EncoderMixin:
     def _create_attention_metadata(
         self,
         *,
+        cache_indirection: torch.Tensor | None = None,
         enable_context_mla_with_cached_kv: bool | None = None,
         num_heads_per_kv: int | None = None,
     ) -> AttentionMetadata:
@@ -331,10 +344,8 @@ class EncoderMixin:
             max_beam_width=self._config.max_beam_width,
             attention_backend=self._config.attention_backend,
             attention_runtime_features=self._config.attention_runtime_features,
-            mapping=self._deps.mapping,
-            cache_indirection=(
-                None if self._encoder_config.is_encoder_decoder else self._deps.cache_indirection
-            ),
+            mapping=self._mapping,
+            cache_indirection=cache_indirection,
             kv_cache_manager=None,
             enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
             num_heads_per_kv=num_heads_per_kv,
@@ -344,10 +355,10 @@ class EncoderMixin:
         return metadata
 
     def _is_distributed_forward(self) -> bool:
-        dist = self._deps.dist
+        dist = self._dist
         if dist is None:
             return False
-        return dist.world_size > 1 or self._deps.mapping.dwdp_enabled
+        return dist.world_size > 1 or self._mapping.dwdp_enabled
 
     def _prepare_encoder_graph_inputs(
         self,
@@ -523,7 +534,7 @@ class EncoderMixin:
         key = prepared.graph_key
         assert key is not None
         # Only token encoder graphs participate in MoE load-balancer iterations.
-        moe_load_balancer = None if runner.feature_mode else self._deps.moe_load_balancer
+        moe_load_balancer = None if runner.feature_mode else self._moe_load_balancer
         capture_outputs = None
         if runner.needs_capture(key):
 
@@ -537,11 +548,11 @@ class EncoderMixin:
         with MoeLoadBalancerIterContext(moe_load_balancer):
             return runner.replay(key, prepared.kwargs)
 
-    def cleanup(self) -> None:
+    def release_graphs(self) -> None:
         self._encoder_cuda_graph_runner.clear()
 
 
-class EncoderRunner(EncoderMixin):
+class EncoderRunner(EncoderMixin, PackedModelRunner):
     """Run the direct EncodeOnly model contract.
 
     This runner deliberately knows nothing about ``LlmRequest``, decoder
@@ -551,17 +562,33 @@ class EncoderRunner(EncoderMixin):
     def __init__(
         self,
         model: nn.Module,
-        deps: RunnerDeps,
         config: EncoderRunnerConfig,
+        *,
+        mapping: Mapping,
+        dist: Distributed | None,
+        moe_load_balancer: MoeLoadBalancer | None,
+        model_caller: ModelCaller,
     ) -> None:
+        self._model_caller = model_caller
         if config.is_encoder_decoder:
             raise ValueError("EncoderRunner cannot run an encoder-decoder model.")
-        self._initialize_encoder(model, deps, config)
+        self._buffers = InputBuffers.allocate(
+            max_num_tokens=config.max_num_tokens,
+            max_batch_size=config.max_batch_size,
+            max_beam_width=config.max_beam_width,
+            max_seq_len=config.max_seq_len,
+            use_cache_indirection=config.attention_backend.Metadata is TrtllmAttentionMetadata,
+        )
+        self._initialize_encoder(
+            model, config, mapping=mapping, dist=dist, moe_load_balancer=moe_load_balancer
+        )
         self._attn_metadata: AttentionMetadata | None = None
 
     def _setup_attention_metadata(self) -> AttentionMetadata:
         if self._attn_metadata is None:
-            self._attn_metadata = self._create_attention_metadata()
+            self._attn_metadata = self._create_attention_metadata(
+                cache_indirection=self._buffers.cache_indirection
+            )
         return self._attn_metadata
 
     def _prepare_encoder_inputs(
@@ -611,14 +638,16 @@ class EncoderRunner(EncoderMixin):
         metadata.multi_item_part_lens = multi_item_part_lens
         metadata.prepare_encoder_only()
 
-        self._deps.input_ids_cuda[:actual_num_tokens].copy_(input_ids_cpu, non_blocking=True)
-        self._deps.position_ids_cuda[:actual_num_tokens].copy_(position_ids_cpu, non_blocking=True)
+        self._buffers.input_ids_cuda[:actual_num_tokens].copy_(input_ids_cpu, non_blocking=True)
+        self._buffers.position_ids_cuda[:actual_num_tokens].copy_(
+            position_ids_cpu, non_blocking=True
+        )
         return PreparedInputs(
             {
                 **model_inputs,
                 "attn_metadata": metadata,
-                "input_ids": self._deps.input_ids_cuda[:actual_num_tokens],
-                "position_ids": self._deps.position_ids_cuda[:actual_num_tokens].unsqueeze(0),
+                "input_ids": self._buffers.input_ids_cuda[:actual_num_tokens],
+                "position_ids": self._buffers.position_ids_cuda[:actual_num_tokens].unsqueeze(0),
             }
         )
 
@@ -641,7 +670,7 @@ class EncoderRunner(EncoderMixin):
                 f"the inputs. Unsupported keys: {sorted(model_inputs)}"
             )
 
-    def prepare_inputs(self, batch: PackedEncoderBatch) -> EncoderPreparedInputs:
+    def prepare_inputs(self, batch: PackedInputs) -> EncoderPreparedInputs:
         """Prepare a batch the caller already packed."""
         model_inputs = batch.model_inputs
         self._reject_unsupported_model_inputs(model_inputs)
@@ -722,7 +751,7 @@ class EncoderRunner(EncoderMixin):
             ],
             pin_memory=prefer_pinned(),
             dtype=torch.int32,
-        ).to(device=self._deps.position_ids_cuda.device, non_blocking=True)
+        ).to(device=self._buffers.position_ids_cuda.device, non_blocking=True)
         ends = torch.tensor(
             [
                 end + 1
@@ -732,7 +761,7 @@ class EncoderRunner(EncoderMixin):
             ],
             pin_memory=prefer_pinned(),
             dtype=torch.int32,
-        ).to(device=self._deps.position_ids_cuda.device, non_blocking=True)
+        ).to(device=self._buffers.position_ids_cuda.device, non_blocking=True)
         return torch_multi_arange(
             starts=starts,
             ends=ends,
@@ -761,10 +790,6 @@ class EncoderRunner(EncoderMixin):
         gc.collect()
         torch.cuda.empty_cache()
         self._run_autotuner_warmup()
-
-    @torch.inference_mode()
-    @with_model_extra_attrs(lambda self: self._model.extra_attrs)
-    def capture_graphs(self) -> None:
         self._capture_encoder_cuda_graphs(
             self._prepare_capture_inputs,
             self._execute_prepared,
@@ -811,7 +836,7 @@ class EncoderRunner(EncoderMixin):
     def _run_autotuner_warmup(self) -> None:
         if not self._encoder_config.enable_autotuner:
             return
-        AutoTuner.get().setup_distributed_state(self._deps.mapping, self._deps.dist)
+        AutoTuner.get().setup_distributed_state(self._mapping, self._dist)
         logger.info("Running encoder autotuner warmup...")
 
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH")
@@ -846,7 +871,7 @@ class EncoderRunner(EncoderMixin):
         graph_runner = self._encoder_cuda_graph_runner
         with with_shared_pool(graph_runner.get_graph_pool()):
             if prepared.graph_key is None:
-                with MoeLoadBalancerIterContext(self._deps.moe_load_balancer):
+                with MoeLoadBalancerIterContext(self._moe_load_balancer):
                     return forward(prepared.kwargs)
             graph_outputs = self._execute_encoder_cuda_graph(prepared, forward)
         if not isinstance(graph_outputs, dict):
@@ -865,15 +890,13 @@ class EncoderRunner(EncoderMixin):
     @with_model_extra_attrs(lambda self: self._model.extra_attrs)
     def forward(
         self,
-        batch: PackedEncoderBatch,
-        *,
-        gather_context_logits: bool = False,
+        inputs: PackedInputs,
     ) -> dict[str, Any]:
-        """Execute a batch the caller already packed."""
-        prepared = self.prepare_inputs(batch)
+        """Execute packed inputs with their requested output options."""
+        prepared = self.prepare_inputs(inputs)
         return self._execute_prepared(
             prepared,
-            gather_context_logits=gather_context_logits,
+            gather_context_logits=inputs.gather_context_logits,
         )
 
     def _forward_step(
@@ -887,7 +910,7 @@ class EncoderRunner(EncoderMixin):
         if metadata is not None:
             metadata.on_update_kv_lens()
 
-        outputs = self._deps.model_forward(
+        outputs = self._model_caller(
             **inputs,
             return_context_logits=(gather_ids is not None or gather_context_logits),
         )

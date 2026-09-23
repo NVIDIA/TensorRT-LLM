@@ -275,6 +275,7 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine.moe_load_balancer = None
         model_engine.is_warmup = False
         model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+        model_engine._fallback_to_engine = False
         model_engine._runner = Mock(spec=NoKVCacheRunner)
         resource_manager = Mock()
         resource_manager.get_resource_manager.return_value = None
@@ -286,7 +287,7 @@ class TestWarmupCleanup(unittest.TestCase):
 
         self.assertEqual(
             model_engine._runner.method_calls,
-            [call.warmup(resource_manager), call.capture_graphs(resource_manager)],
+            [call.warmup(resource_manager)],
         )
         warmup_sampling.assert_not_called()
 
@@ -296,7 +297,12 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine.moe_load_balancer = None
         model_engine.is_warmup = False
         model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+        model_engine._fallback_to_engine = False
         model_engine._runner = Mock(spec=NoKVCacheRunner)
+        runner = model_engine._runner
+        runner._config = SimpleNamespace(is_draft_model=False)
+        runner._validate_resources = NoKVCacheRunner._validate_resources.__get__(runner)
+        runner.warmup.side_effect = NoKVCacheRunner.warmup.__get__(runner)
         resource_manager = Mock()
         resource_manager.get_resource_manager.return_value = object()
 
@@ -306,7 +312,7 @@ class TestWarmupCleanup(unittest.TestCase):
         ):
             model_engine.warmup(resource_manager)
 
-        self.assertEqual(model_engine._runner.method_calls, [])
+        model_engine._runner.warmup.assert_called_once_with(resource_manager)
 
     def test_legacy_warmup_skips_without_kv_cache(self):
         model_engine = object.__new__(PyTorchModelEngine)
@@ -314,6 +320,7 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine.is_warmup = False
         model_engine.enable_in_graph_sampling = False
         model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+        model_engine._fallback_to_engine = True
         model_engine._runner = None
         resource_manager = Mock()
         resource_manager.get_resource_manager.return_value = None
@@ -343,7 +350,7 @@ class TestWarmupCleanup(unittest.TestCase):
 
         self.assertEqual(
             model_engine._runner.method_calls,
-            [call.warmup(resource_manager), call.capture_graphs(resource_manager)],
+            [call.warmup(resource_manager)],
         )
 
     def test_empty_cache_fires_immediately_after_autotuner(self):
