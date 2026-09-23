@@ -300,7 +300,7 @@ class Gemma4VisionAttention(Attention):
     so we pass ``q_scaling = 1 / sqrt(head_dim)`` to neutralize the sqrt.
     """
 
-    # trtllm-gen FMHA on sm100a ships cubins for these head_dim sizes only.
+    # trtllm-gen FMHA on the SM100 family (SM100/SM103/SM107) ships cubins for these head_dim sizes only.
     # Variants whose HF ``head_dim`` is not in this set are padded up to the
     # next supported size; the kernel sees zero-padded q/k/v while RMSNorm,
     # RoPE, and o_proj math run on the unpadded HF channels (see ``forward``
