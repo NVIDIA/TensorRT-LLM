@@ -580,5 +580,6 @@ def test_remote_submit_sync_raises_forwarded_worker_exception():
 
 
 def test_remote_submit_sync_returns_results_unchanged():
-    client = _remote_client_with_response([10, 20])
-    assert client.submit_sync(simple_task, 1) == [10, 20]
+    response = [10, 20]
+    client = _remote_client_with_response(response)
+    assert client.submit_sync(simple_task, 1) is response
