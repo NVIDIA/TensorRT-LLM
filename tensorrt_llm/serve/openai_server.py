@@ -2436,15 +2436,14 @@ class OpenAIServer(_VideoRoutesMixin):
                                     postproc_args.audio_tokens = sum(
                                         mm_token_lengths["audio"])
                         else:
-                            logger.warning(
+                            logger.warning_once(
                                 "Generator has no TRT-LLM input_processor; "
-                                "skipping multimodal token length calculation.")
+                                "skipping multimodal token length calculation.",
+                                key="openai_server_no_input_processor")
                 except (AttributeError, TypeError, ValueError, KeyError) as e:
-                    logger.warning(
-                        f"Failed to calculate multimodal token counts: {e}")
-                except Exception as e:
-                    logger.warning(
-                        f"Unexpected error calculating multimodal token counts: {e}")
+                    logger.warning_once(
+                        f"Failed to calculate multimodal token counts: {e}",
+                        key="openai_server_multimodal_token_calc_failed")
 
             promise = self.generator.generate_async(
                 inputs=generate_inputs,
