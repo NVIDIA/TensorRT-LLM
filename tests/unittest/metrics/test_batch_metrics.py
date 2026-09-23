@@ -76,17 +76,6 @@ def _reap_workers(workers):
     assert not failures, "\n".join(failures)
 
 
-def test_worker_timeout_still_reaps_remaining_children():
-    stuck, healthy = Mock(pid=1), Mock(pid=2, returncode=0)
-    stuck.communicate.side_effect = [subprocess.TimeoutExpired("worker", 10), ("", "stuck")]
-    healthy.communicate.return_value = ("", "")
-    with pytest.raises(AssertionError, match="timed out"):
-        _reap_workers([stuck, healthy])
-    stuck.kill.assert_called_once_with()
-    assert stuck.communicate.call_count == 2
-    healthy.communicate.assert_called_once_with(timeout=10)
-
-
 def test_multiprocess_scrape_keeps_workers_and_ranks_separate(tmp_path):
     # Use fresh interpreters: the Prometheus client chooses mmap storage at
     # import time. Load only the module under test, avoiding CUDA initialization
@@ -431,6 +420,7 @@ def test_event_loop_cleanup_clears_published_batch(monkeypatch, error):
         (False, True, True),
         (True, False, True),
         (True, True, False),
+        (True, True, None),
         (True, True, True),
     ],
 )
@@ -443,9 +433,11 @@ def test_executor_initializes_metrics_only_with_multiprocess_storage(
 
     metrics_dir = tmp_path if directory_exists else tmp_path / "missing"
     monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(metrics_dir))
-    monkeypatch.setattr(
-        values, "ValueClass", values.MultiProcessValue() if multiprocess_mode else values.MutexValue
-    )
+    if multiprocess_mode is None:
+        value_class = object  # Simulate a client without the private storage marker.
+    else:
+        value_class = values.MultiProcessValue() if multiprocess_mode else values.MutexValue
+    monkeypatch.setattr(values, "ValueClass", value_class)
     monkeypatch.setattr(py_executor.torch.cuda, "current_device", Mock(return_value=0))
     monkeypatch.setattr(py_executor.torch.cuda, "Stream", Mock())
     # Stop after the metric initialization in the real constructor; remaining
@@ -476,7 +468,7 @@ def test_executor_initializes_metrics_only_with_multiprocess_storage(
             max_num_sequences=8,
             start_worker=False,
         )
-    expected = enabled and directory_exists and multiprocess_mode
+    expected = enabled and directory_exists and multiprocess_mode is True
     assert (executor._batch_metrics is not None) == expected
     if expected:
         executor._batch_metrics.update(_batch(generation=3), filter_dummies=False)

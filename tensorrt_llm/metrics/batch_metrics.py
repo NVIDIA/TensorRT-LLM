@@ -98,6 +98,7 @@ class BatchMetricsCollector:
             "engine_type": labels["engine_type"],
         }
         self._labels = dict(labels)
+        self._logged_label_mismatch = False
         registry.register(self)
 
     def collect(self) -> Iterator["Metric"]:
@@ -110,4 +111,13 @@ class BatchMetricsCollector:
                         for key, value in self._source_labels.items()
                     ):
                         sample.labels.update(self._labels)
+                    elif not self._logged_label_mismatch:
+                        from tensorrt_llm.logger import logger
+
+                        logger.debug(
+                            f"Leaving {SCHEDULED_BATCH_SIZE} sample labels unchanged: "
+                            f"expected source labels {self._source_labels!r}, "
+                            f"got {sample.labels!r}."
+                        )
+                        self._logged_label_mismatch = True
             yield metric

@@ -547,11 +547,12 @@ class PyExecutor:
                 )
             else:
                 from prometheus_client import values
-                if not values.ValueClass._multiprocess:
+                if not getattr(values.ValueClass, "_multiprocess", False):
                     logger.warning(
-                        "Scheduled batch metric disabled: prometheus_client was "
-                        "imported before PROMETHEUS_MULTIPROC_DIR was set. Set "
-                        "the directory before importing prometheus_client.")
+                        "Scheduled batch metric disabled: prometheus_client is "
+                        "not using recognized multiprocess storage. It may have "
+                        "been imported before PROMETHEUS_MULTIPROC_DIR was set. "
+                        "Set the directory before importing prometheus_client.")
                 else:
                     self._batch_metrics = BatchMetrics(
                         model_name=str(self.llm_args.model),
