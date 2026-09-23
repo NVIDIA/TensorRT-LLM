@@ -543,7 +543,8 @@ class PyExecutor:
             if not os.path.isdir(metrics_dir):
                 logger.warning(
                     "Scheduled batch metric disabled: PROMETHEUS_MULTIPROC_DIR "
-                    f"is unset or is not an accessible directory: {metrics_dir!r}")
+                    f"is unset or is not an accessible directory: {metrics_dir!r}"
+                )
             else:
                 from prometheus_client import values
                 if not values.ValueClass._multiprocess:

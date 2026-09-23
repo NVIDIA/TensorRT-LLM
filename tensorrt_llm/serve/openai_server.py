@@ -1459,6 +1459,7 @@ class OpenAIServer(_VideoRoutesMixin):
         # See https://prometheus.github.io/client_python/multiprocess/
         from prometheus_client import CollectorRegistry, make_asgi_app
         from prometheus_fastapi_instrumentator import Instrumentator
+
         from tensorrt_llm.metrics.batch_metrics import BatchMetricsCollector
         registry = CollectorRegistry()
         BatchMetricsCollector(

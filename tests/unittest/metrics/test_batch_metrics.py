@@ -60,7 +60,6 @@ def test_attention_dp_dummies_are_not_user_work():
     assert metrics._batch_size._value.get() == 0
 
 
-
 def _reap_workers(workers):
     """Reap every child, including a child that ignores stdin closure."""
     failures = []
@@ -113,14 +112,16 @@ for command in sys.stdin:
     workers = []
     try:
         for rank in (0, 1, 0):
-            workers.append(subprocess.Popen(
-            [sys.executable, "-u", "-c", script, batch_metrics.__file__, str(rank)],
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            ))
+            workers.append(
+                subprocess.Popen(
+                    [sys.executable, "-u", "-c", script, batch_metrics.__file__, str(rank)],
+                    env=env,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            )
     except BaseException:
         _reap_workers(workers)
         raise
@@ -232,8 +233,13 @@ for model, backend, size in [(sys.argv[2], "pytorch", 5), ("other", "pytorch", 9
     metric.update(SimpleNamespace(batch_size=size), filter_dummies=False)
 Gauge("existing_metric", "Existing gauge", ["model_name"], multiprocess_mode="all").labels(model_name="original").set(7)
 """
-    subprocess.run([sys.executable, "-c", script, batch_metrics.__file__, model],
-                   check=True, timeout=30, capture_output=True, text=True)
+    subprocess.run(
+        [sys.executable, "-c", script, batch_metrics.__file__, model],
+        check=True,
+        timeout=30,
+        capture_output=True,
+        text=True,
+    )
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
     from prometheus_client.parser import text_string_to_metric_families
@@ -245,12 +251,17 @@ Gauge("existing_metric", "Existing gauge", ["model_name"], multiprocess_mode="al
     server.app = FastAPI()
     server.generator = SimpleNamespace(args=SimpleNamespace(model=model))
     server.metrics_collector = SimpleNamespace(
-        labels={"model_name": model_label, "engine_type": "pytorch"})
+        labels={"model_name": model_label, "engine_type": "pytorch"}
+    )
     server.mount_metrics()
     with TestClient(server.app) as client:
         response = client.get("/prometheus/metrics")
     assert response.status_code == 200
-    samples = [sample for metric in text_string_to_metric_families(response.text) for sample in metric.samples]
+    samples = [
+        sample
+        for metric in text_string_to_metric_families(response.text)
+        for sample in metric.samples
+    ]
     published = {sample.value: sample for sample in samples}
     assert published[5].labels["model_name"] == model_label
     assert published[5].labels["engine_type"] == "pytorch"
@@ -288,10 +299,14 @@ class _ReachedForward(Exception):
     """Stop a real scheduler loop at the mocked GPU boundary."""
 
 
-@pytest.mark.parametrize("loop_name", ["_executor_loop", "_executor_loop_overlap", "_executor_loop_pp"])
+@pytest.mark.parametrize(
+    "loop_name", ["_executor_loop", "_executor_loop_overlap", "_executor_loop_pp"]
+)
 @pytest.mark.parametrize("can_queue", [False, True])
 @pytest.mark.parametrize("enable_iter_perf_stats", [False, True])
-def test_scheduler_publishes_prepared_batch(loop_name, can_queue, enable_iter_perf_stats, monkeypatch):
+def test_scheduler_publishes_prepared_batch(
+    loop_name, can_queue, enable_iter_perf_stats, monkeypatch
+):
     from tensorrt_llm._torch.pyexecutor import py_executor
 
     executor = object.__new__(py_executor.PyExecutor)
@@ -326,11 +341,20 @@ def test_scheduler_publishes_prepared_batch(loop_name, can_queue, enable_iter_pe
     executor._check_benchmark_disagg_gate = Mock(return_value=(True, False))
     executor._fetch_and_activate_new_requests = Mock(return_value=[])
     for name in (
-        "_handle_control_request", "_pad_attention_dp_dummy_request", "_terminate_requests",
-        "_pause_requests", "_wait_for_model_engine_input_copy", "_add_inflight_ids",
-        "_prepare_disagg_gen_transmission_complete", "_handle_dynamic_draft_len",
-        "_kv_connector_start_batch", "_finalize_adp_dummy_allocation", "_commit_kv_cache_stats",
-        "_get_init_iter_stats", "_get_new_active_requests_queue_latency", "_collect_scheduled_batch_stats",
+        "_handle_control_request",
+        "_pad_attention_dp_dummy_request",
+        "_terminate_requests",
+        "_pause_requests",
+        "_wait_for_model_engine_input_copy",
+        "_add_inflight_ids",
+        "_prepare_disagg_gen_transmission_complete",
+        "_handle_dynamic_draft_len",
+        "_kv_connector_start_batch",
+        "_finalize_adp_dummy_allocation",
+        "_commit_kv_cache_stats",
+        "_get_init_iter_stats",
+        "_get_new_active_requests_queue_latency",
+        "_collect_scheduled_batch_stats",
     ):
         setattr(executor, name, Mock())
     batch = _batch(context=2, generation=5)
@@ -395,9 +419,15 @@ def test_event_loop_cleanup_clears_published_batch(monkeypatch, error):
     executor._executor_loop_cleanup.assert_called_once_with()
 
 
-@pytest.mark.parametrize("enabled,directory_exists,multiprocess_mode", [
-    (False, True, True), (True, False, True), (True, True, False), (True, True, True),
-])
+@pytest.mark.parametrize(
+    "enabled,directory_exists,multiprocess_mode",
+    [
+        (False, True, True),
+        (True, False, True),
+        (True, True, False),
+        (True, True, True),
+    ],
+)
 def test_executor_initializes_metrics_only_with_multiprocess_storage(
     tmp_path, monkeypatch, enabled, directory_exists, multiprocess_mode
 ):
@@ -407,7 +437,9 @@ def test_executor_initializes_metrics_only_with_multiprocess_storage(
 
     metrics_dir = tmp_path if directory_exists else tmp_path / "missing"
     monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(metrics_dir))
-    monkeypatch.setattr(values, "ValueClass", values.MultiProcessValue() if multiprocess_mode else values.MutexValue)
+    monkeypatch.setattr(
+        values, "ValueClass", values.MultiProcessValue() if multiprocess_mode else values.MutexValue
+    )
     monkeypatch.setattr(py_executor.torch.cuda, "current_device", Mock(return_value=0))
     monkeypatch.setattr(py_executor.torch.cuda, "Stream", Mock())
     # Stop after the metric initialization in the real constructor; remaining
@@ -416,12 +448,28 @@ def test_executor_initializes_metrics_only_with_multiprocess_storage(
     warning = Mock()
     monkeypatch.setattr(py_executor.logger, "warning", warning)
     executor = object.__new__(py_executor.PyExecutor)
-    args = SimpleNamespace(max_stats_len=10, max_num_tokens=10, print_iter_log=False,
-                           enable_iter_perf_stats=False, enable_iter_req_stats=False,
-                           return_perf_metrics=enabled, stream_interval=1, model="org/model", backend=None)
+    args = SimpleNamespace(
+        max_stats_len=10,
+        max_num_tokens=10,
+        print_iter_log=False,
+        enable_iter_perf_stats=False,
+        enable_iter_req_stats=False,
+        return_perf_metrics=enabled,
+        stream_interval=1,
+        model="org/model",
+        backend=None,
+    )
     engine = SimpleNamespace(llm_args=args, enable_attention_dp=False)
     with pytest.raises(_ReachedForward):
-        executor.__init__(Mock(), Mock(), engine, Mock(), SimpleNamespace(rank=2), max_num_sequences=8, start_worker=False)
+        executor.__init__(
+            Mock(),
+            Mock(),
+            engine,
+            Mock(),
+            SimpleNamespace(rank=2),
+            max_num_sequences=8,
+            start_worker=False,
+        )
     expected = enabled and directory_exists and multiprocess_mode
     assert (executor._batch_metrics is not None) == expected
     if expected:
@@ -481,7 +529,12 @@ with patch.object(LLM, "_build_model", build_model):
 """
     env = {key: value for key, value in os.environ.items() if key != "PROMETHEUS_MULTIPROC_DIR"}
     env["TLLM_TELEMETRY_OPT_OUT"] = "1"
-    result = subprocess.run([sys.executable, "-c", script, str(tmp_path)], env=env,
-                            capture_output=True, text=True, timeout=120)
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "constructor metric scrape verified" in result.stdout

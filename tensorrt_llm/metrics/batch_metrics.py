@@ -105,6 +105,9 @@ class BatchMetricsCollector:
         for metric in self._collector.collect():
             if metric.name == SCHEDULED_BATCH_SIZE:
                 for sample in metric.samples:
-                    if all(sample.labels.get(key) == value for key, value in self._source_labels.items()):
+                    if all(
+                        sample.labels.get(key) == value
+                        for key, value in self._source_labels.items()
+                    ):
                         sample.labels.update(self._labels)
             yield metric
