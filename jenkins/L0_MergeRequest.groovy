@@ -280,6 +280,13 @@ def BOLT_CONSUME_BUILD = "bolt_consume_build"
 // unpinned, i.e. today's read-`latest`-per-consumer behaviour.
 @Field
 def BOLT_PROFILE_REF = "bolt_profile_ref"
+// Whether this run's build publishes bolted-<tarName> beside an untouched
+// canonical. Decided once: the build needs it to know what to publish, and the
+// test stages need it to know what to fetch. Two copies of the condition would
+// eventually disagree, and the failure would be tests silently reading the
+// un-BOLTed tarball -- indistinguishable from a healthy run.
+@Field
+def BOLT_PUBLISH_VARIANT = "bolt_publish_variant"
 @Field
 def RELEASE_TARGET = "release_target"
 def globalVars = [
@@ -293,6 +300,7 @@ def globalVars = [
     (RELEASE_TARGET): runMode == "nightly_release" ?
         normalizeReleaseTargets(gitlabParamsFromBot.get(RELEASE_TARGET, null)) : [],
     (BOLT_PROFILE_REF): "",
+    (BOLT_PUBLISH_VARIANT): (env.JOB_NAME ==~ /.*PostMerge.*/) && ENABLE_BOLT_POSTMERGE_VARIANT,
 ]
 globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
 // Compare against "true" rather than relying on Groovy truthiness: the bot phrase
@@ -2206,7 +2214,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         // Publish the BOLTed build beside an untouched canonical rather
                         // than replacing it. Post-merge only: canonical is the un-BOLTed
                         // tarball BoltProfileGen profiles.
-                        'boltPublishVariant': (env.JOB_NAME ==~ /.*PostMerge.*/) && ENABLE_BOLT_POSTMERGE_VARIANT,
+                        'boltPublishVariant': globalVars[BOLT_PUBLISH_VARIANT],
                     ]
                     // launchJob returns UNSTABLE (without throwing) when the build
                     // sub-job was infra-incomplete: only infra aborts, no genuine
@@ -2392,7 +2400,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         // allowed only together with boltPublishVariant below, which
                         // keeps canonical -- the BOLT-Profile-Gen input -- un-BOLTed.
                         'boltConsume': globalVars[BOLT_CONSUME_BUILD],
-                        'boltPublishVariant': (env.JOB_NAME ==~ /.*PostMerge.*/) && ENABLE_BOLT_POSTMERGE_VARIANT,
+                        'boltPublishVariant': globalVars[BOLT_PUBLISH_VARIANT],
                     ]
                     // launchJob returns UNSTABLE (without throwing) when the build
                     // sub-job was infra-incomplete: only infra aborts, no genuine
