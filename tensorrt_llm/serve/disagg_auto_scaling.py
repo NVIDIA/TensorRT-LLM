@@ -18,6 +18,7 @@ import os
 import random
 import socket
 import time
+import traceback
 from dataclasses import asdict, dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -168,7 +169,10 @@ class DisaggClusterManager:
                             # drain() is destructive: a failing event must not
                             # discard the remaining events in this batch.
                             logger.error(
-                                f"Error updating routers by worker event: {e}")
+                                f"Error updating routers by worker event "
+                                f"{event.event_type} for "
+                                f"{event.storage_item.key}: {e}\n"
+                                f"{traceback.format_exc()}")
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
