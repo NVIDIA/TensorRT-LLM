@@ -2667,8 +2667,6 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
     if (runMode == "nightly_release") {
         testFilter[TEST_STAGE_LIST] = null
         testFilter[EXTRA_STAGE_LIST] = null
-        stages.remove("Release-Check")
-        stages.remove("OSS-Compliance-Check")
         if (!wheelSelected) {
             stages.remove("x86_64-Linux")
             stages.remove("SBSA-Linux")
