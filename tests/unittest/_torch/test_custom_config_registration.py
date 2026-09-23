@@ -346,7 +346,10 @@ assert tokenizer.encode("hello") == [1]
 """
     result = subprocess.run(
         [sys.executable, "-c", script, str(model_dir)],
-        cwd=Path(__file__).parents[3],
+        # Do not put the source checkout first on sys.path: CPU L0 runs this
+        # test against the built wheel, while the checkout has no compiled
+        # tensorrt_llm.bindings extension for a fresh interpreter to import.
+        cwd=tmp_path,
         capture_output=True,
         text=True,
         timeout=120,
