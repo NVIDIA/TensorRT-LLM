@@ -1,12 +1,8 @@
-# Disaggregated config that exercises the KV-cache bounce buffer.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
-# Same as disagg_config_overlap_transceiver_runtime_python.yaml, plus the bounce switch on both the
-# context (sender) and generation (receiver) cache_transceiver_config:
-#   kv_cache_bounce_size_mb: >0 turns bounce on and sizes the per-region fabric-VMM arena.
-# Plain-KV transfers gate on block count; the gate is lowered to 1 via the
-# TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS env (set by the test) so the ordinary short test prompts still
-# take the coalesced-bounce WRITE path (the production default of 96 would need a ~2k-token prompt).
-# GB200/GB300 only, since the bounce arena is fabric (MNNVL) VMM memory.
+# Python transceiver with the C++ NIXL agent's shared bounce buffer on both workers.
+# Relax the descriptor gates so short, head-matched TinyLlama transfers use bounce.
 model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
 hostname: localhost
 port: 8000
@@ -28,6 +24,10 @@ context_servers:
     backend: NIXL
     transceiver_runtime: PYTHON
     kv_cache_bounce_size_mb: 128
+    agent_bounce_buffer_enable: true
+    agent_bounce_params:
+      min_descriptor_count: "1"
+      max_average_descriptor_size: "1MB"
   urls:
       - "localhost:8001"
 generation_servers:
@@ -45,5 +45,9 @@ generation_servers:
     backend: NIXL
     transceiver_runtime: PYTHON
     kv_cache_bounce_size_mb: 128
+    agent_bounce_buffer_enable: true
+    agent_bounce_params:
+      min_descriptor_count: "1"
+      max_average_descriptor_size: "1MB"
   urls:
       - "localhost:8002"

@@ -1014,12 +1014,13 @@ def run_disaggregated_test(example_dir,
                            ctx_env=None,
                            gen_env=None,
                            share_gpu=False,
-                           server_start_timeout=300):
+                           server_start_timeout=300,
+                           assert_ctx_log_contains=None):
     """Run disaggregated test using service discovery instead of MPI.
 
-    If assert_gen_log_contains is set, the generation-worker logs are captured and, after the
-    client tests, at least one of them must contain that substring (used to prove an intended
-    code path actually engaged instead of silently falling back to another one).
+    If assert_ctx_log_contains or assert_gen_log_contains is set, worker logs are captured and,
+    after the client tests, at least one worker of each specified role must log its substring
+    (used to prove an intended code path actually engaged instead of silently falling back).
     """
     if mpi_disabled():
         pytest.skip(
@@ -1037,11 +1038,13 @@ def run_disaggregated_test(example_dir,
 
     config_file = get_test_config(test_desc, example_dir,
                                   os.path.dirname(__file__))
+    assert_worker_logs = (assert_ctx_log_contains is not None
+                          or assert_gen_log_contains is not None)
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
                              server_start_timeout=server_start_timeout,
                              schedule_style=disagg_schedule_style,
-                             save_log=assert_gen_log_contains is not None,
+                             save_log=assert_worker_logs,
                              perf_metrics_output_dir=perf_metrics_output_dir,
                              ctx_env=ctx_run_env, gen_env=gen_run_env,
                              share_gpu=share_gpu)
@@ -1081,16 +1084,21 @@ def run_disaggregated_test(example_dir,
             use_ray=True)
         if post_client_test is not None:
             post_client_test(server_url)
-        if assert_gen_log_contains is not None:
+        for role, workers, marker in (
+            ("context", ctx_workers, assert_ctx_log_contains),
+            ("generation", gen_workers, assert_gen_log_contains),
+        ):
+            if marker is None:
+                continue
             # Fail loudly if the marker is absent: the code path the test means to
             # exercise never ran and something else silently took its place.
             logs = []
-            for w in gen_workers:
+            for w in workers:
                 if w.log_path and os.path.exists(w.log_path):
                     with open(w.log_path, 'r', errors='replace') as f:
                         logs.append(f.read())
-            assert any(assert_gen_log_contains in log for log in logs), (
-                f"expected marker {assert_gen_log_contains!r} in a generation-worker log, "
+            assert any(marker in log for log in logs), (
+                f"expected marker {marker!r} in a {role}-worker log, "
                 f"but none of {len(logs)} log(s) contained it "
                 f"(the intended code path did not engage)")
         success = True
@@ -1099,7 +1107,7 @@ def run_disaggregated_test(example_dir,
         # When the marker assertion is active the worker logs are file-based
         # (save_log=True). Preserve work_dir on the failure path so the first
         # failures on the newly enabled stages arrive with logs to read.
-        if success or assert_gen_log_contains is None:
+        if success or not assert_worker_logs:
             shutil.rmtree(work_dir, ignore_errors=True)
 
 
@@ -1468,38 +1476,27 @@ def test_disaggregated_overlap_transceiver_runtime_python_fabric_memory(
                            cwd=llm_venv.get_working_directory())
 
 
-# Exercises the disaggregated KV-cache transfer path with the Python cache transceiver AND the
-# KV-cache bounce optimization (cache_transceiver_config.kv_cache_bounce_size_mb > 0): scattered
-# per-block WRITEs are gathered into one coalesced fabric-VMM buffer before a single NIXL WRITE.
-# Restricted to GB200/GB300 since the bounce arena is fabric (MNNVL) VMM memory.
-#
-# The bounce transport coalesces a transfer only when it clears the receiver's min_blocks gate.
-# The test lowers that gate via the TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS env so the ordinary short
-# prompts still take the coalesced-bounce WRITE path -- no special long prompt is needed. The test
-# runs the normal disagg output verification (the coalesced KV must still decode to the right
-# answer, e.g. "Berlin"; a corrupt transfer would garble it) AND asserts the generation worker
-# logged the coalesced-bounce marker, so a silent fall-back to the per-fragment path fails the
-# test instead of passing quietly.
 @pytest.mark.skip_device_not_contain(["GB200", "GB300"])
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
 def test_disaggregated_overlap_transceiver_runtime_python_bounce(
         disaggregated_test_root, llm_venv, disaggregated_example_root,
         llama_model_root):
+    """Verify output correctness and C++ agent bounce engagement on fabric-capable GPUs."""
     setup_model_symlink(llm_venv, llama_model_root,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
-    # min_blocks=1 forces bounce on even for the short test prompt (the gate is internal, tuned via
-    # env). No fabric-pool env is needed: the bounce arena is its own fabric memory.
-    env["TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS"] = "1"
-    run_disaggregated_test(disaggregated_example_root,
-                           "overlap_transceiver_runtime_python_bounce",
-                           env=env,
-                           model_path=llama_model_root,
-                           cwd=llm_venv.get_working_directory(),
-                           assert_gen_log_contains="[kv-bounce] coalesced")
+    env["TRTLLM_USE_PY_NIXL_KVCACHE"] = "0"
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "overlap_transceiver_runtime_python_bounce",
+        env=env,
+        model_path=llama_model_root,
+        cwd=llm_venv.get_working_directory(),
+        ctx_env={"TLLM_LOG_LEVEL_BY_MODULE": "debug:executor"},
+        assert_ctx_log_contains="bounce path engaged for write")
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],

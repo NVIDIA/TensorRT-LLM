@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 metadata:
   model_name: k25_thinking_fp4
   precision: fp4
@@ -63,6 +66,11 @@ worker_config:
       backend: NIXL
       transceiver_runtime: PYTHON
       kv_cache_bounce_size_mb: 384
+      agent_bounce_buffer_enable: true
+      # Exercise bounce for the larger MLA/recurrent-state descriptors.
+      agent_bounce_params:
+        min_descriptor_count: "1"
+        max_average_descriptor_size: "32MB"
     disable_overlap_scheduler: false
     trust_remote_code: true
     num_postprocess_workers: 4
@@ -90,5 +98,10 @@ worker_config:
       backend: NIXL
       transceiver_runtime: PYTHON
       kv_cache_bounce_size_mb: 384
+      agent_bounce_buffer_enable: true
+      # Exercise bounce for the larger MLA/recurrent-state descriptors.
+      agent_bounce_params:
+        min_descriptor_count: "1"
+        max_average_descriptor_size: "32MB"
     disable_overlap_scheduler: false
     trust_remote_code: true
