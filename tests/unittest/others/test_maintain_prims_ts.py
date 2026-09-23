@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import copy
 import dataclasses
+import importlib
 import importlib.util
 import runpy
 import subprocess
@@ -27,6 +29,8 @@ _SPEC = importlib.util.spec_from_file_location(
 m = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = m
 _SPEC.loader.exec_module(m)
+sys.modules[f"{_SPEC.name}.promote"] = m
+b = importlib.import_module(f"{_SPEC.name}.bot")
 
 _VENDOR = "example-vendor"
 _CONSUMER = "NVIDIA/TensorRT-LLM"
@@ -146,6 +150,10 @@ class World(m.GitHub):
         self.fail_comment_before = False
         self.fail_comment_after = False
         self.git_calls: list[tuple[str, ...]] = []
+        self.source_comments: list[dict] = []
+        self.source_body = b.metadata.template(_VENDOR, _UPSTREAM).replace(
+            "/pull/123", "/pull/4829"
+        )
 
     def args(self, **overrides: object) -> argparse.Namespace:
         values = dict(
@@ -196,6 +204,7 @@ class World(m.GitHub):
             "https://github.com/maintainer/TensorRT-LLM.git": str(self.fork),
             "https://github.com/maintainer/flashinfer.git": str(self.canonical),
             "https://github.com/dev/flashinfer.git": str(self.source),
+            "https://github.com/flashinfer-ai/flashinfer.git": str(self.source),
         }
         if args[:3] == ("remote", "get-url", "fork"):
             return "https://github.com/maintainer/TensorRT-LLM.git"
@@ -241,6 +250,16 @@ class World(m.GitHub):
         owner, name, *rest = endpoint[len(prefix) :].split("/")
         repository = f"{owner}/{name}"
         route = "/".join(rest)
+        if route.startswith("issues/17/comments"):
+            if method == "GET":
+                return copy.deepcopy(self.source_comments)
+            comment = {
+                "id": len(self.source_comments) + 1,
+                "body": payload["body"],
+                "user": {"login": "maintainer"},
+            }
+            self.source_comments.append(comment)
+            return copy.deepcopy(comment)
         if route.startswith("issues/99/comments"):
             if method == "GET":
                 page = int(route.rsplit("page=", 1)[1])
@@ -287,7 +306,16 @@ class World(m.GitHub):
         if route.startswith("commits/"):
             return self.commit_data(self.consumer, route.split("/")[1])
         if route.startswith("pulls?"):
+            if "head=" not in route:
+                if "state=open" in route:
+                    return copy.deepcopy([pr for pr in self.prs.values() if pr["state"] == "open"])
+                return [
+                    self.get(f"repos/{_CONSUMER}/pulls/17"),
+                    *copy.deepcopy(list(self.prs.values())),
+                ]
             return copy.deepcopy(list(self.prs.values()))
+        if route.startswith("pulls/") and "/files?" in route:
+            return [{"filename": m._LOCK}]
         if route == "pulls" and method == "POST":
             if self.fail_create:
                 raise RuntimeError("simulated PR creation failure")
@@ -299,6 +327,8 @@ class World(m.GitHub):
                 state="open",
                 merged=False,
                 head={"sha": head},
+                base={"ref": "main"},
+                updated_at="2020-01-01T00:00:00Z",
                 html_url="https://github.com/NVIDIA/TensorRT-LLM/pull/99",
                 body=payload["body"],
                 auto_merge=None,
@@ -319,6 +349,11 @@ class World(m.GitHub):
                 return {
                     "number": 17,
                     "merged": True,
+                    "state": "closed",
+                    "merged_at": "2020-01-01T00:00:00Z",
+                    "updated_at": "2020-01-01T00:00:00Z",
+                    "user": {"login": "author"},
+                    "body": self.source_body,
                     "base": {"ref": "main"},
                     "merge_commit_sha": self.merged,
                     "head": {"sha": "a" * 40},
@@ -938,7 +973,7 @@ def test_completed_promotion_ignores_later_live_state(
     monkeypatch.setattr(world, "compare", compare)
     world.calls.clear()
     world.git_calls.clear()
-    args.flashinfer_repo = world.root / "missing-source"
+    args.source_repo = world.root / "missing-source"
     resumed = m._make_plan(args, world)
     assert resumed.completed_pr["merge_commit_sha"] == merged
     assert resumed.record == plan.record
@@ -1110,3 +1145,229 @@ def test_mutating_git_commands_stream_output(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(m.subprocess, "run", run)
     assert m._git(Path("/test/repository"), "worktree", "add", "new") == ""
     assert m._git(Path("/test/repository"), "commit", "-s", "-F", "-", text="test") == ""
+
+
+@pytest.mark.parametrize("loss", ["sqlite", "workdir"])
+@pytest.mark.parametrize(
+    "phase",
+    ["worktree", "stage", "commit", "branch", "canonical", "pr", "comment", "auto_merge", "merged"],
+)
+def test_bot_recovers_publication_after_cache_loss(
+    world: World,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    loss: str,
+) -> None:
+    workdir = world.root / "bot-state"
+    b._initialize_workdir(workdir)
+    args = argparse.Namespace(
+        canonical_repo="maintainer/flashinfer",
+        canonical_branch="trtllm-prims-ts-dev",
+        fork="maintainer/TensorRT-LLM",
+        repo=world.consumer,
+        workdir=workdir,
+        publish=True,
+        since=None,
+    )
+    database = workdir / b._STATE_FILE
+    store = b.Store(database)
+    monitor = b.Monitor(args, world, store)
+    if phase == "merged":
+        world.state = "CLEAN"
+    git, api = world.routed_git, world.api
+
+    def crash_git(repo: Path, *arguments: str, text: str | None = None) -> str:
+        result = git(repo, *arguments, text=text)
+        boundary = (
+            "worktree"
+            if arguments[:2] == ("worktree", "add")
+            else "stage"
+            if arguments[0] == "add"
+            else "commit"
+            if arguments[0] == "commit"
+            else "branch"
+            if arguments[:2] == ("push", "https://github.com/maintainer/TensorRT-LLM.git")
+            else "canonical"
+            if arguments[:2] == ("push", "https://github.com/maintainer/flashinfer.git")
+            else None
+        )
+        if boundary == phase:
+            raise RuntimeError("simulated process loss")
+        return result
+
+    def crash_api(endpoint: str, *, method: str = "GET", payload: dict | None = None):
+        result = api(endpoint, method=method, payload=payload)
+        if method == "POST":
+            boundary = (
+                "pr"
+                if endpoint.endswith("/pulls")
+                else "comment"
+                if endpoint.endswith("/issues/99/comments")
+                else phase
+                if endpoint == "graphql"
+                and payload["query"].startswith("mutation")
+                and phase in ("auto_merge", "merged")
+                else None
+            )
+            if boundary == phase:
+                raise RuntimeError("simulated process loss")
+        return result
+
+    with monkeypatch.context() as crash:
+        crash.setattr(m, "_git", crash_git)
+        crash.setattr(world, "api", crash_api)
+        with pytest.raises(RuntimeError, match="simulated process loss"):
+            monitor.inspect(17)
+    # Publication of the provenance branch precedes the first canonical mutation.
+    if phase == "branch":
+        assert _git(world.canonical, "rev-parse", "trtllm-prims-ts-dev") == world.previous
+    committed = phase not in ("worktree", "stage")
+    expected_head = (
+        m._local_branch(world.consumer, m._plan_identity(args=world.args(), gh=world).branch)
+        if committed
+        else None
+    )
+    expected_record = (
+        m._record_from_message(_git(world.consumer, "show", "-s", "--format=%B", expected_head))
+        if committed
+        else None
+    )
+    source_comments = copy.deepcopy(world.source_comments)
+    store.close()
+    if loss == "sqlite":
+        database.unlink()
+    else:
+        # Preserve the lost directory for assertions; Git's registration now
+        # refers to a missing path, as on workdir loss on the same machine.
+        workdir.rename(world.root / "lost-bot-state")
+    b._initialize_workdir(workdir)
+
+    if committed:
+        world.source_body = "Description changed after the durable promotion commit."
+        world.overrides[f"repos/{_UPSTREAM}/pulls/4829"] = {"state": "closed", "merged": False}
+
+        def no_rematching(*unused):
+            raise AssertionError("Durable promotion must not re-match mutable upstream PRs")
+
+        monkeypatch.setattr(b.metadata, "resolve", no_rematching)
+
+    store = b.Store(database)
+    resumed = b.Monitor(args, world, store)
+    assert 17 in resumed._discover()  # The merged source PR predates startup by years.
+    resumed.poll()
+    assert store.get("problem:17") is None
+    assert store.get("problem:99") is None
+    assert world.source_comments == source_comments
+    assert len(world.prs) == len(world.comments) == 1
+    assert _git(world.canonical, "rev-parse", "trtllm-prims-ts-dev") == world.reviewed
+    pr = world.prs[99]
+    if committed:
+        assert pr["head"]["sha"] == expected_head
+    assert sum(call[0] == "commit" for call in world.git_calls) == 1
+    if not pr.get("merged"):
+        saved = copy.deepcopy(pr["auto_merge"])
+        assert saved["merge_method"] == "squash"
+        writes = [
+            (method, endpoint, payload)
+            for method, endpoint, payload in world.calls
+            if method != "GET"
+            and (endpoint != "graphql" or payload["query"].startswith("mutation"))
+        ]
+        resumed.inspect(17)
+        repeated = [
+            (method, endpoint, payload)
+            for method, endpoint, payload in world.calls
+            if method != "GET"
+            and (endpoint != "graphql" or payload["query"].startswith("mutation"))
+        ]
+        assert writes == repeated
+        tree = _git(world.consumer, "rev-parse", f"{pr['head']['sha']}^{{tree}}")
+        world.main = _git(
+            world.consumer,
+            "commit-tree",
+            tree,
+            "-p",
+            world.main,
+            text=f"{saved['commit_title']}\n\n{saved['commit_message']}\n",
+        )
+        pr.update(merged=True, merged_at="today", state="closed", merge_commit_sha=world.main)
+        resumed.inspect(17)
+    assert store.get("complete:17") == pr["html_url"]
+    store.close()
+
+    # Even completion markers are only a cache: recover from the squash commit
+    # with an entirely new database and unavailable live source/metadata.
+    database.unlink()
+    world.source_body = "No metadata remains."
+    world.overrides["repos/dev/flashinfer"] = {}
+    calls_before = len(world.calls)
+    store = b.Store(database)
+    final = b.Monitor(args, world, store)
+    final.inspect(17)
+    assert store.get("complete:17") == pr["html_url"]
+    assert all(method == "GET" for method, _, _ in world.calls[calls_before:])
+    assert m._lock_at(world, _CONSUMER, world.main).commit == world.reviewed
+    if committed:
+        assert (
+            m._record_from_message(_git(world.consumer, "show", "-s", "--format=%B", world.main))
+            == expected_record
+        )
+    store.close()
+
+
+@pytest.mark.parametrize("tamper", ["identity", "diff", "dco", "canonical", "closed"])
+def test_recovery_rejects_changed_artifacts_without_writes(world: World, tamper: str) -> None:
+    args = world.args(publish=True)
+    original = m._make_plan(args, world)
+    m._publish(args, world, original)
+    pr = world.prs[99]
+    endpoint = f"repos/{_CONSUMER}/commits/{pr['head']['sha']}"
+    commit = world.get(endpoint)
+    if tamper == "identity":
+        record = copy.deepcopy(original.record)
+        record["promoted"] = "a" * 40
+        commit["commit"]["message"] = m._record_text(record)
+    elif tamper == "diff":
+        commit["files"].append({"filename": "unreviewed.py"})
+    elif tamper == "dco":
+        commit["commit"]["message"] = m._record_text(original.record)
+    elif tamper == "canonical":
+        _git(world.canonical, "update-ref", "refs/heads/trtllm-prims-ts-dev", world.first)
+    else:
+        pr["state"] = "closed"
+    world.overrides[endpoint] = commit
+    world.calls.clear()
+    world.git_calls.clear()
+    with pytest.raises(ValueError):
+        m._recover_plan(args, world, m._plan_identity(args, world))
+    assert all(method == "GET" for method, _, _ in world.calls)
+    assert not any(call[0] in ("push", "commit", "worktree") for call in world.git_calls)
+
+
+def test_bot_cold_recovery_dry_run_and_superseded_history(world: World) -> None:
+    args = argparse.Namespace(
+        canonical_repo="maintainer/flashinfer",
+        canonical_branch="trtllm-prims-ts-dev",
+        fork="maintainer/TensorRT-LLM",
+        repo=world.consumer,
+        workdir=world.root,
+        publish=False,
+        since=None,
+    )
+    # No published operation exists and a later pin has superseded this update.
+    world.main = world.base
+    world.source_body = "No metadata"
+    with contextlib.closing(b.Store(":memory:")) as store:
+        b.Monitor(args, world, store).inspect(17)
+    assert not world.source_comments
+    assert all(method == "GET" for method, _, _ in world.calls)
+
+    world.main = world.merged
+    m._publish(world.args(publish=True), world, m._make_plan(world.args(), world))
+    world.calls.clear()
+    world.git_calls.clear()
+    with contextlib.closing(b.Store(":memory:")) as store:
+        b.Monitor(args, world, store).inspect(17)
+    assert all(method == "GET" for method, _, _ in world.calls)
+    assert not world.git_calls
+    assert world.prs[99]["auto_merge"] is None

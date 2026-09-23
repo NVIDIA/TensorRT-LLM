@@ -12,6 +12,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import signal
 import sqlite3
 import subprocess
@@ -34,7 +35,7 @@ _STOP = threading.Event()
 
 
 class Store:
-    """Transactional runtime state; no authentication material is persisted."""
+    """Disposable reconciliation cache; Git/GitHub own promotion provenance and state."""
 
     def __init__(self, path: Path) -> None:
         self.connection = sqlite3.connect(path)
@@ -100,8 +101,7 @@ class Monitor:
         if store.get("since") is None:
             store.put(
                 "since",
-                args.since
-                or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                args.since or "1970-01-01T00:00:00Z",
             )
 
     def _discover(self) -> list[int]:
@@ -284,10 +284,51 @@ class Monitor:
         if target_is_canonical:
             return None  # Periodic refresh/direct canonical update: separate workflow.
         if not canonical:
+            if pr.get("merged"):
+                return None  # Historical update belonging to another canonical branch.
             raise ValueError(
                 "Finish the preceding vendor promotion, then rebase this source-update PR onto the canonical pin."
             )
         return previous, reviewed
+
+    def _arguments(self, number: int, reviewed: manage.Vendor) -> argparse.Namespace:
+        return argparse.Namespace(
+            source_pr=str(number),
+            canonical_repo=self.args.canonical_repo,
+            canonical_branch=self.args.canonical_branch,
+            upstream_pr=[],
+            unpaired_reason=None,
+            map_upstream=[],
+            repo=self.args.repo,
+            fork=self.args.fork,
+            source_repo=None,
+            worktree=self.args.workdir / f"promotion-{number}-{reviewed.commit[:12]}",
+            publish=self.args.publish,
+            auto_merge=True,
+            wait=False,
+            timeout=3600,
+        )
+
+    def _publish(self, arguments: argparse.Namespace, plan: promote.Promotion) -> None:
+        number = plan.number
+        if plan.completed_pr is not None:
+            self.store.put(f"complete:{number}", plan.completed_pr["html_url"])
+            _LOG.info(
+                "PR #%s: verified completed promotion %s", number, plan.completed_pr["html_url"]
+            )
+            return
+        if not self.args.publish:
+            _LOG.info("PR #%s: promotion ready (dry run): %s", number, plan.branch)
+            return
+        followup = promote._publish(arguments, self.gh, plan)
+        self.store.put(f"promotion:{number}", followup["number"])
+        latest = self.gh.get(f"{self.prefix}/pulls/{followup['number']}")
+        if latest.get("merged"):
+            promote._verify_remote_commit(
+                self.gh, plan, self.gh.consumer_repo, latest["merge_commit_sha"]
+            )
+            self.store.put(f"complete:{number}", latest["html_url"])
+        _LOG.info("PR #%s: promotion %s", number, latest["html_url"])
 
     def inspect(self, number: int) -> None:
         """Reconcile one source-update PR and its deterministic promotion operation."""
@@ -301,21 +342,27 @@ class Monitor:
             if inputs is None:
                 return
             previous, reviewed = inputs
+        except (ValueError, manage.VendorError) as error:
+            self._feedback(pr, str(error))
+            self.store.put(f"problem:{number}", str(error))
+            return
+        arguments = self._arguments(number, reviewed)
+        if pr.get("merged"):
+            plan = promote._plan_identity(arguments, self.gh)
+            if promote._recover_plan(arguments, self.gh, plan):
+                self._publish(arguments, plan)
+                return
+            current = promote._lock_at(self.gh, self.gh.consumer_repo, plan.main_sha)
+            if current.to_mapping() != reviewed.to_mapping():
+                _LOG.info("PR #%s: historical pin is no longer pending promotion", number)
+                return
+            promote._check_current(self.gh, plan)
+        try:
             entry = metadata.parse(pr.get("body") or "", self.gh.vendor_name, self.gh.upstream_repo)
-            signature = metadata.fingerprint(
-                {
-                    "previous": previous.to_mapping(),
-                    "reviewed": reviewed.to_mapping(),
-                    "metadata": entry,
-                }
-            )
-            key = f"matching:{number}:{signature}"
-            saved = self.store.get(key)
             cache = self.args.workdir / "sources.git"
-            if saved is None:
-                assignments, evidence = metadata.resolve(self.gh, previous, reviewed, entry, cache)
-                saved = {"assignments": assignments, "evidence": evidence}
-                self.store.put(key, saved)
+            # Until provenance is committed, decisions follow current remote
+            # inputs, not whichever upstream heads a previous process cached.
+            assignments, evidence = metadata.resolve(self.gh, previous, reviewed, entry, cache)
         except (ValueError, manage.VendorError) as error:
             self._feedback(pr, str(error))
             self.store.put(f"problem:{number}", str(error))
@@ -328,44 +375,21 @@ class Monitor:
         current = self.gh.get(f"{self.prefix}/pulls/{number}")
         if current.get("body") != pr.get("body") or current["head"]["sha"] != pr["head"]["sha"]:
             return
-        arguments = argparse.Namespace(
-            source_pr=str(number),
-            canonical_repo=self.args.canonical_repo,
-            canonical_branch=self.args.canonical_branch,
-            upstream_pr=[str(item) for item in entry["upstream_prs"]],
-            unpaired_reason=entry["unpaired_reason"],
-            map_upstream=[f"{sha}={target}" for sha, target in saved["assignments"].items()],
-            repo=self.args.repo,
-            fork=self.args.fork,
-            source_repo=cache if not entry["unpaired_reason"] and cache.exists() else None,
-            worktree=self.args.workdir / f"promotion-{number}-{reviewed.commit[:12]}",
-            publish=self.args.publish,
-            auto_merge=True,
-            wait=False,
-            timeout=3600,
-        )
+        arguments.upstream_pr = [str(item) for item in entry["upstream_prs"]]
+        arguments.unpaired_reason = entry["unpaired_reason"]
+        arguments.map_upstream = [f"{sha}={target}" for sha, target in assignments.items()]
+        arguments.source_repo = cache if cache.exists() else None
         plan = promote._make_plan(arguments, self.gh)
         # Attribution evidence is versioned with the durable promotion record.
         # Reuse the original published record on retries rather than replacing it.
         if plan.completed_pr is None:
-            plan.record["attribution"] = saved["evidence"]
+            plan.record["attribution"] = evidence
             plan.record["contributor_metadata"] = {
                 "source_head": pr["head"]["sha"],
                 "metadata_digest": metadata.fingerprint(entry),
                 "pr_author": pr["user"]["login"],
             }
-        if not self.args.publish:
-            _LOG.info("PR #%s: promotion ready (dry run): %s", number, plan.branch)
-            return
-        followup = promote._publish(arguments, self.gh, plan)
-        self.store.put(f"promotion:{number}", followup["number"])
-        latest = self.gh.get(f"{self.prefix}/pulls/{followup['number']}")
-        if latest.get("merged"):
-            promote._verify_remote_commit(
-                self.gh, plan, self.gh.consumer_repo, latest["merge_commit_sha"]
-            )
-            self.store.put(f"complete:{number}", latest["html_url"])
-        _LOG.info("PR #%s: promotion %s", number, latest["html_url"])
+        self._publish(arguments, plan)
 
     def poll(self) -> None:
         """Process candidates serially; preserve failures for safe later retries."""
@@ -387,8 +411,6 @@ class Monitor:
 
 
 def _initialize_workdir(path: Path) -> None:
-    if path.exists() and any(path.iterdir()) and not (path / _STATE_FILE).exists():
-        raise ValueError("Choose an empty workdir or an existing vendor-bot workdir.")
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
     if path.stat().st_uid != os.getuid():
         raise ValueError("Workdir must be owned by the current user.")
@@ -401,6 +423,28 @@ def _initialize_workdir(path: Path) -> None:
         raise ValueError(
             "Bot workdir must be outside a Git worktree to keep runtime state private."
         )
+    files = {
+        _STATE_FILE,
+        "state.sqlite-wal",
+        "state.sqlite-shm",
+        "state.sqlite-journal",
+        "bot.log",
+        "bot.lock",
+        "stop",
+    }
+    for entry in path.iterdir():
+        directory = entry.name == "sources.git" or re.fullmatch(
+            r"promotion-[0-9]+-[0-9a-f]{12}", entry.name
+        )
+        if (
+            entry.is_symlink()
+            or entry.stat().st_uid != os.getuid()
+            or not (entry.is_dir() if directory else entry.name in files and entry.is_file())
+        ):
+            raise ValueError(
+                "Choose an empty workdir or an existing vendor-bot workdir; unexpected entry: "
+                + entry.name
+            )
     path.chmod(0o700)
 
 
@@ -489,7 +533,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--since",
-        help="First-run merged-PR cutoff, UTC YYYY-MM-DDTHH:MM:SSZ; default startup time.",
+        help=(
+            "Optional historical discovery cutoff, UTC YYYY-MM-DDTHH:MM:SSZ; "
+            "default all history. Reuse the same cutoff after cache loss."
+        ),
     )
     run.add_argument(
         "--publish",

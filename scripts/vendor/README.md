@@ -31,11 +31,16 @@ flowchart TD
     match -->|missing or ambiguous| feedback[Request changes with author-facing instructions]
     feedback -->|author corrects block, pin, or targeted resolution| metadata
     match -->|valid and source PR merged| verify[Verify ancestry, current lock, and materialization]
-    verify --> ff[Fast-forward configured canonical source branch]
+    verify --> durable[Commit provenance and publish the promotion branch]
+    durable --> ff[Fast-forward configured canonical source branch]
     ff --> promotion[Create or reuse URL/branch-only promotion PR]
     promotion --> ci[Request CI skip and enable squash auto-merge]
     ci -->|required checks and owner reviews| merged[Verify final lock and squash provenance]
     merged --> rebase[Other source-update authors rebase onto the canonical pin]
+    restart[Restart after local cache loss] --> recover[Rediscover PRs and verify Git provenance]
+    recover -->|pending recorded operation| verify
+    recover -->|no record and pin still pending| metadata
+    recover -->|completed promotion| merged
 ```
 
 Promotion preserves the source SHA, selected files, compatibility patch, and
@@ -105,10 +110,10 @@ When there is no upstream PR for the update, replace `upstream_prs` with a
 nonempty `unpaired_reason`. Do not combine those alternatives. Unpaired changes
 are retained during future refresh until equivalence is established separately.
 
-The source head and normalized metadata are rechecked before feedback and
-publication. Metadata corrections rerun validation. Historical promotion
-records remain authoritative; editing a merged description does not rewrite an
-already completed promotion's provenance.
+Before a new operation is committed, the source head and normalized metadata
+are rechecked before feedback and publication. Metadata corrections rerun
+validation. Durable promotion records remain authoritative; later description
+edits or upstream PR changes do not rewrite a recorded operation's provenance.
 
 ## Launch the local monitor
 
@@ -146,19 +151,49 @@ The daemon survives terminal closure but does not automatically restart after a
 crash or reboot; a supervisor is optional. Stop before changing launch settings.
 
 The workdir must be empty on first use, owned by the current user, and outside a
-Git worktree. It holds private SQLite state, a bare source cache, process-lock
+Git worktree. It holds a disposable SQLite cache, a bare source cache, process-lock
 and stop files, and isolated promotion worktrees. Runtime state is not committed.
 An existing workdir is bound to its operator and vendor configuration; use a
 different directory for another operator/vendor. Authentication is inherited
 from the launching environment and is not persisted in that state.
 
-The default interval is 120 seconds (`--interval`, minimum 30). First launch
-discovers existing open PRs and merges occurring from startup onward. To include
-earlier merges, set `--since 2026-01-01T00:00:00Z` on first launch. The saved
-cutoff and tracked PRs survive restarts; retries discover interrupted pushes,
-PR creation, CI requests, and auto-merge without duplicating them. Old historical
-operations should be resumed with their original CLI/settings, not backfilled
-indiscriminately into a newly configured monitor.
+The default interval is 120 seconds (`--interval`, minimum 30). A cold start
+discovers existing open PRs and backfills merged PRs from all history. This scan
+can be expensive; subsequent polls use a cached cursor and tracked candidates.
+An explicit `--since 2026-01-01T00:00:00Z` restricts historical discovery; use the
+same cutoff on every launch, including recovery. Historical updates belonging
+to another canonical branch, or superseded pins without a recoverable promotion,
+are not promoted or sent author feedback.
+
+### Recovery after cache loss
+
+Git/GitHub are the source of truth; SQLite is not required to reconstruct a
+promotion. Stop the old process before replacing or discarding its database.
+Relaunch with the **same account, repositories, canonical branch, and cutoff**.
+The bot accepts an existing workdir containing only recognized bot artifacts
+even if SQLite is missing. It preserves those artifacts and refuses unrelated
+files and symlinks. A new empty workdir also works; existing registered Git
+worktrees are validated and reused, or recreated when their directories are gone.
+
+Recovery checks the deterministic promotion PR/branch and its signed-off commit
+before parsing the source PR description or consulting upstream PR heads. It
+verifies the operation identity, lock-only diff, and provenance, then resumes
+the recorded operation. Completed promotions are verified against their squash
+commit without requiring the old source fork or mutable PR metadata. Existing
+feedback, reviews, CI-skip comments, and auto-merge settings are discovered from
+GitHub rather than duplicated from missing local IDs.
+
+Before the first canonical-branch push, the signed promotion commit is pushed to
+the configured publishing fork. Therefore loss after any remote publication
+step retains a durable provenance record. A locally committed but not yet pushed
+operation can also be recovered from the consumer repository's Git branch.
+Before any provenance commit exists, attribution is recomputed from current
+remote inputs; a previous successful match in SQLite is never authoritative.
+
+Recovery assumes a single publishing operator and accessible, unmodified Git/GitHub
+artifacts. It is not recovery from deleted remote history or a replacement
+publishing account/fork. Tampered commits, unexpected branch moves, closed-unmerged
+promotion PRs, and unrelated worktree edits still stop the operation for inspection.
 
 One process monitors one vendor; separate workdirs can monitor different vendors.
 `--consumer-repo`, `--base-branch`, and `--upstream-branch` also support consumers

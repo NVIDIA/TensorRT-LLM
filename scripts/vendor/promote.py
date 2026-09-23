@@ -49,7 +49,7 @@ def _run(
     strip: bool = True,
     binary_output: bool = False,
 ) -> str:
-    # Do not use vendor_sources._run_git here: its synthetic identity is for
+    # Do not use manage._run_git here: its synthetic identity is for
     # patch generation. Real promotion commits must use the maintainer's identity.
     env = os.environ.copy()
     for key in vendor._GIT_LOCAL_ENVIRONMENT_VARIABLES:
@@ -313,21 +313,8 @@ def _check_current(gh: GitHub, plan: Promotion) -> None:
         )
 
 
-def _make_plan(
-    args: argparse.Namespace,
-    gh: GitHub,
-    *,
-    auto_match: bool = False,
-    resolutions: dict[str, dict] | None = None,
-) -> Promotion:
-    if args.unpaired_reason is not None:
-        if not args.unpaired_reason.strip() or args.upstream_pr or args.map_upstream:
-            raise ValueError(
-                "--unpaired-reason requires a nonempty reason and cannot be combined "
-                "with --upstream-pr or --map-upstream."
-            )
-    elif not args.upstream_pr:
-        raise ValueError("Provide --upstream-pr or an explicit --unpaired-reason.")
+def _plan_identity(args: argparse.Namespace, gh: GitHub) -> Promotion:
+    """Identify an operation from immutable consumer history, without live attribution."""
     number = _pr_number(args.source_pr, gh.consumer_repo)
     pr = gh.get(f"repos/{gh.consumer_repo}/pulls/{number}")
     if not pr.get("merged") or pr["base"]["ref"] != gh.base_branch:
@@ -370,7 +357,7 @@ def _make_plan(
         "source_url": reviewed.url,
         "source_branch": reviewed.branch,
     }
-    plan = Promotion(
+    return Promotion(
         number,
         _main_sha(gh),
         previous,
@@ -381,6 +368,27 @@ def _make_plan(
         consumer_repo=gh.consumer_repo,
         base_branch=gh.base_branch,
     )
+
+
+def _make_plan(
+    args: argparse.Namespace,
+    gh: GitHub,
+    *,
+    auto_match: bool = False,
+    resolutions: dict[str, dict] | None = None,
+) -> Promotion:
+    if args.unpaired_reason is not None:
+        if not args.unpaired_reason.strip() or args.upstream_pr or args.map_upstream:
+            raise ValueError(
+                "--unpaired-reason requires a nonempty reason and cannot be combined "
+                "with --upstream-pr or --map-upstream."
+            )
+    elif not args.upstream_pr:
+        raise ValueError("Provide --upstream-pr or an explicit --unpaired-reason.")
+    plan = _plan_identity(args, gh)
+    previous, reviewed, record = plan.previous, plan.reviewed, plan.record
+    canonical_repo, fork = plan.canonical_repo, plan.fork
+    source_repo = _repo_name(reviewed.url)
     # A completed operation is historical: later promotions, deleted temporary
     # forks, or changed upstream PR state must not make it run again or fail.
     existing = _find_followup(gh, plan)
@@ -491,6 +499,68 @@ def _find_followup(gh: GitHub, plan: Promotion) -> dict | None:
     return prs[0] if prs else None
 
 
+def _local_branch(repo: Path, branch: str) -> str | None:
+    reference = f"refs/heads/{branch}"
+    for line in _git(
+        repo, "for-each-ref", "--format=%(refname) %(objectname)", reference
+    ).splitlines():
+        name, sha = line.split()
+        if name == reference:
+            return _sha(sha)
+    return None
+
+
+def _recover_plan(args: argparse.Namespace, gh: GitHub, plan: Promotion) -> bool:
+    """Restore verified provenance from Git/GitHub before consulting mutable metadata."""
+    existing = _find_followup(gh, plan)
+    if existing:
+        existing = gh.get(f"repos/{gh.consumer_repo}/pulls/{existing['number']}")
+        sha = existing["merge_commit_sha"] if existing.get("merged") else existing["head"]["sha"]
+        _verify_remote_commit(gh, plan, gh.consumer_repo, sha)
+        if existing.get("merged"):
+            plan.completed_pr = existing
+            return True
+    else:
+        remote = gh.optional(f"repos/{plan.fork}/git/ref/heads/{plan.branch}")
+        if remote:
+            _verify_remote_commit(gh, plan, plan.fork, remote["object"]["sha"])
+        else:
+            sha = _local_branch(args.repo, plan.branch)
+            if sha is None:
+                return False
+            _git(
+                args.repo,
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                f"https://github.com/{plan.consumer_repo}.git",
+                plan.main_sha,
+            )
+            if _git(args.repo, "merge-base", sha, plan.main_sha) == sha:
+                return False
+            parents = _git(args.repo, "show", "-s", "--format=%P", sha).split()
+            if (
+                len(parents) != 1
+                or _git(args.repo, "diff", "--name-only", parents[0], sha) != _LOCK
+            ):
+                raise ValueError("Local promotion commit must change only the vendor lock.")
+            _git(args.repo, "merge-base", "--is-ancestor", parents[0], plan.main_sha)
+            _check_document_change(
+                _local_lock_document(args.repo, parents[0]),
+                _local_lock_document(args.repo, sha),
+                plan,
+            )
+            message = _git(args.repo, "show", "-s", "--format=%B", sha)
+            _adopt_record(plan, message)
+            if not re.search(r"^Signed-off-by: .+ <.+>$", message, re.MULTILINE):
+                raise ValueError("Local promotion commit has no DCO sign-off.")
+    _check_source_repo(gh, plan.canonical_repo)
+    _check_source_repo(gh, _repo_name(plan.reviewed.url))
+    _check_fork(gh, plan.fork, gh.consumer_repo)
+    _check_current(gh, plan)
+    return True
+
+
 def _adopt_record(plan: Promotion, message: str) -> None:
     """Keep the original upstream snapshot when resuming an already-published run."""
     existing = _record_from_message(message)
@@ -499,7 +569,7 @@ def _adopt_record(plan: Promotion, message: str) -> None:
         raise ValueError("Existing promotion metadata does not describe this source update.")
     _validate_snapshot(existing, plan.record["upstream_repository"])
     if "changes" not in plan.record:
-        # Only the read-only, already-merged path restores an entire snapshot.
+        # A verified operation identity can restore its entire durable snapshot.
         plan.record = existing
         return
     expected = {
@@ -628,6 +698,19 @@ def _prepare_commit(args: argparse.Namespace, plan: Promotion, source: Path) -> 
     )
     worktree = args.worktree or args.repo.parent / plan.branch.removeprefix("chore/")
     worktree = worktree.resolve()
+    branch_exists = _local_branch(args.repo, plan.branch) is not None
+    missing_worktree = False
+    if branch_exists and not worktree.exists():
+        for block in _git(args.repo, "worktree", "list", "--porcelain", "-z").split("\0\0"):
+            fields = dict(line.split(" ", 1) for line in block.split("\0") if " " in line)
+            if fields.get("branch") != f"refs/heads/{plan.branch}":
+                continue
+            registered = Path(fields["worktree"])
+            if registered.exists():
+                worktree = registered
+            else:
+                missing_worktree = True
+            break
     if worktree.exists():
         if _git(worktree, "branch", "--show-current") != plan.branch or _git(
             worktree, "rev-parse", "--path-format=absolute", "--git-common-dir"
@@ -653,6 +736,12 @@ def _prepare_commit(args: argparse.Namespace, plan: Promotion, source: Path) -> 
         print(f"Resuming incomplete promotion in {worktree}...", flush=True)
     else:
         print(f"Creating promotion worktree {worktree} (LFS downloads disabled)...", flush=True)
+        if branch_exists:
+            # Force is restricted to a registration whose directory is gone;
+            # existing worktrees are reused and validated above, never replaced.
+            flags = ("--force",) if missing_worktree else ()
+            _git(args.repo, "worktree", "add", *flags, str(worktree), plan.branch)
+            return _prepare_commit(args, plan, source)
         _git(args.repo, "worktree", "add", "-b", plan.branch, str(worktree), plan.main_sha)
     before = _local_lock_document(worktree, "HEAD")
     if before["vendors"][plan.previous.name] != plan.reviewed.to_mapping():
@@ -907,6 +996,16 @@ def _publish(args: argparse.Namespace, gh: GitHub, plan: Promotion) -> dict:
             worktree, sha = _prepare_commit(args, plan, source)
             message = _git(worktree, "log", "-1", "--format=%B")
         _check_current(gh, plan)
+        # Persist provenance remotely before changing the canonical source branch.
+        if remote is None:
+            print(f"Publishing follow-up branch {plan.fork}:{plan.branch}...", flush=True)
+            _git(
+                worktree,
+                "push",
+                f"https://github.com/{plan.fork}.git",
+                f"{sha}:refs/heads/{plan.branch}",
+            )
+        _check_current(gh, plan)
         # No force push: Git also enforces the fast-forward constraint remotely.
         print(f"Ensuring canonical branch points to {plan.reviewed.commit}...", flush=True)
         _git(
@@ -916,14 +1015,6 @@ def _publish(args: argparse.Namespace, gh: GitHub, plan: Promotion) -> dict:
             f"{plan.reviewed.commit}:refs/heads/{plan.previous.branch}",
         )
         print(f"Canonical branch now contains reviewed revision {plan.reviewed.commit}.")
-        if remote is None:
-            print(f"Publishing follow-up branch {plan.fork}:{plan.branch}...", flush=True)
-            _git(
-                worktree,
-                "push",
-                f"https://github.com/{plan.fork}.git",
-                f"{sha}:refs/heads/{plan.branch}",
-            )
     _check_current(gh, plan)
     if existing is None:
         print("Creating the lock-only follow-up PR...", flush=True)
