@@ -3145,19 +3145,21 @@ class PyTorchModelEngine(ModelEngine):
                     )
                     if self.breakable_cuda_graph_runner is not None:
                         runner = self.breakable_cuda_graph_runner
-                        runner.capture(
-                            num_tokens, lambda: self.forward(
-                                batch,
-                                new_tensors_device=None,
-                                resource_manager=resource_manager))
-                        self._metrics[
-                            "ctx_cuda_graph_warmup_seconds"] += runner.metrics.get(
-                                BreakableCUDAGraphRunner.
-                                CUDA_GRAPH_WARMUP_METRIC, 0.0)
-                        self._metrics[
-                            "ctx_cuda_graph_capture_seconds"] += runner.metrics.get(
-                                BreakableCUDAGraphRunner.
-                                CUDA_GRAPH_CAPTURE_METRIC, 0.0)
+                        try:
+                            runner.capture(
+                                num_tokens, lambda: self.forward(
+                                    batch,
+                                    new_tensors_device=None,
+                                    resource_manager=resource_manager))
+                        finally:
+                            self._metrics[
+                                "ctx_cuda_graph_warmup_seconds"] += runner.metrics.get(
+                                    BreakableCUDAGraphRunner.
+                                    CUDA_GRAPH_WARMUP_METRIC, 0.0)
+                            self._metrics[
+                                "ctx_cuda_graph_capture_seconds"] += runner.metrics.get(
+                                    BreakableCUDAGraphRunner.
+                                    CUDA_GRAPH_CAPTURE_METRIC, 0.0)
                     else:
                         with timing_metric("ctx_cuda_graph_warmup_seconds",
                                            self._metrics):
@@ -3172,9 +3174,6 @@ class PyTorchModelEngine(ModelEngine):
                                          new_tensors_device=None,
                                          resource_manager=resource_manager)
                             torch.cuda.synchronize()
-
-                    gc.collect()
-                    torch.cuda.empty_cache()
 
         # The logits allocations grow with the number of requests and are not
         # part of the captured model body. Warm up the largest request count so
