@@ -138,22 +138,25 @@ class _CacheReuseAdapterV1(CacheReuseAdapter):
         return np.asarray(pool_indices, dtype=np.int64)
 
     def _translate_chain(self, req, chain, window_size) -> np.ndarray:
-        """Positional pool slots for one beam chain, SWA-evicted front masked to -1.
+        """Positional pool slots for one beam chain, SWA-stale front masked to -1.
 
-        V1 keeps the whole pre-eviction chain in order (detachFrontBlock only
-        bumps a counter, never drops the id), so index == ordinal. The evicted
-        ids are released to the free pool and may already belong to another
-        request -- possibly offloaded to host, which the primary-pool translation
-        rejects -- so mask them *before* translating and only translate the
-        in-window ids.
+        V1 keeps the whole pre-eviction chain in order (index == ordinal), and
+        only detaches front blocks during generation (``adjustBlocksIfNeeded``),
+        so ``get_num_front_blocks_removed`` can still read 0 here. Mask the
+        larger of that physical count and the logically stale count derived
+        from window/prompt length, then translate only what's left -- evicted
+        ids are back in the free pool and may be offloaded, which the
+        primary-pool translation rejects.
         """
         ordinals = np.full(len(chain), -1, dtype=np.int64)
         if not chain:
             return ordinals
-        stale = min(
-            self._mgr.get_num_front_blocks_removed(req.py_request_id, window_size=window_size),
-            len(chain),
+        tpb = self.tokens_per_block
+        physically_removed = self._mgr.get_num_front_blocks_removed(
+            req.py_request_id, window_size=window_size
         )
+        logically_stale = max(0, (req.prompt_len + 1 - window_size) // tpb)
+        stale = min(max(physically_removed, logically_stale), len(chain))
         live = list(chain[stale:])
         if live:
             ordinals[stale:] = self._mgr.get_memory_pool_block_indices(

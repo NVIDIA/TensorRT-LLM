@@ -23,12 +23,12 @@ coordinator:
     in a ``CoordinatorDelegatingRouter`` whose ``get_next_server`` computes the
     routing key locally and POSTs it to the coordinator's ``/select``;
     ``finish_request`` releases coordinator-side state via ``/finish`` and the
-    returned handle. *Stateless* routers (round_robin) are used as-is and place
-    locally in the worker.
+    returned handle. ``round_robin`` is used as-is and places locally in the
+    worker.
 
-This proves the routing split: stateful routers (conversation, kv_cache_aware)
-delegate to the coordinator via ``routing_key`` + ``get_next_server_by_key``,
-while stateless routers never touch the coordinator.
+This proves the routing split: globally stateful routers (load_balancing,
+conversation, kv_cache_aware) delegate to the coordinator via ``routing_key`` +
+``get_next_server_by_key``, while round-robin routing remains local.
 """
 
 import asyncio
@@ -68,6 +68,7 @@ from tensorrt_llm.serve.router import (
     KV_CACHE_HASH_ALGO_V2,
     CoordinatorDelegatingRouter,
     KvCacheAwareRouter,
+    LoadBalancingRouter,
 )
 from tensorrt_llm.serve.router_utils import BlockHashMixin as SharedBlockHashMixin
 
@@ -141,7 +142,9 @@ class _FakeWorker:
         self._httpd.shutdown()
 
 
-def _make_config(ctx_urls, gen_urls, ctx_router_type, gen_router_type):
+def _make_config(
+    ctx_urls, gen_urls, ctx_router_type, gen_router_type, ctx_router_args=None, gen_router_args=None
+):
     server_configs = [
         CtxGenServerConfig(type="ctx", hostname=u.split(":")[0], port=int(u.split(":")[1]))
         for u in ctx_urls
@@ -151,8 +154,12 @@ def _make_config(ctx_urls, gen_urls, ctx_router_type, gen_router_type):
     ]
     return DisaggServerConfig(
         server_configs=server_configs,
-        ctx_router_config=RouterConfig(type=ctx_router_type, server_role=ServerRole.CONTEXT),
-        gen_router_config=RouterConfig(type=gen_router_type, server_role=ServerRole.GENERATION),
+        ctx_router_config=RouterConfig(
+            type=ctx_router_type, server_role=ServerRole.CONTEXT, args=ctx_router_args or {}
+        ),
+        gen_router_config=RouterConfig(
+            type=gen_router_type, server_role=ServerRole.GENERATION, args=gen_router_args or {}
+        ),
     )
 
 
@@ -270,6 +277,84 @@ async def test_coordinator_expires_stale_reservation():
     assert coordinator._reservation_tasks == {}
 
 
+def _active_gen_load(coordinator) -> int:
+    """Requests the generation router still counts as in flight.
+
+    ServerState exposes no accessor for it, so the tests read the counter the
+    load-balancing router increments and decrements directly.
+    """
+    return sum(
+        state._num_active_requests for state in coordinator.gen_router._server_state.values()
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_select_replaces_same_reservation_without_leaking_load():
+    config = _make_config([], ["gen0:8000", "gen1:8000"], "round_robin", "load_balancing")
+    coordinator = DisaggCoordinatorService(config, _client_factory, reservation_timeout_secs=60)
+    assert isinstance(coordinator.gen_router, LoadBalancingRouter)
+
+    await asyncio.gather(
+        coordinator.select("generation", {}, 123, None),
+        coordinator.select("generation", {}, 123, None),
+    )
+
+    assert _active_gen_load(coordinator) == 1
+    await coordinator.finish("generation", 123)
+    assert _active_gen_load(coordinator) == 0
+
+
+@pytest.mark.asyncio
+async def test_coordinator_renew_replaces_reservation_timer():
+    config = _make_config([], ["gen:8000"], "round_robin", "load_balancing")
+    coordinator = DisaggCoordinatorService(config, _client_factory, reservation_timeout_secs=60)
+
+    await coordinator.select("generation", {}, 123, None)
+    reservation_key = ("generation", 123)
+    original_reservation = coordinator._reservation_tasks[reservation_key]
+
+    await coordinator.renew("generation", 123)
+
+    assert coordinator._reservation_tasks[reservation_key] is not original_reservation
+    await coordinator.finish("generation", 123)
+    assert coordinator._reservation_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_coordinator_renew_restarts_the_full_expiration_period():
+    """Renewing must reset the deadline, not merely swap the expiration task.
+
+    A renewal that kept the original deadline would still pass an
+    identity-only assertion, so this drives the observable behaviour: the
+    reservation has to outlive the deadline it was created with and only drop
+    once a full timeout has elapsed since the renewal.
+    """
+    # Generous margins: the assertions sit half a timeout away from either
+    # deadline so a loaded CI machine oversleeping a little cannot flip them.
+    timeout = 1.0
+    config = _make_config([], ["gen:8000"], "round_robin", "load_balancing")
+    coordinator = DisaggCoordinatorService(
+        config, _client_factory, reservation_timeout_secs=timeout
+    )
+
+    await coordinator.select("generation", {}, 123, None)
+    assert _active_gen_load(coordinator) == 1
+
+    # Renew shortly before the original deadline would have fired.
+    await asyncio.sleep(timeout * 0.75)
+    await coordinator.renew("generation", 123)
+
+    # Past the original deadline, but inside the renewed one: still reserved.
+    await asyncio.sleep(timeout * 0.5)
+    assert ("generation", 123) in coordinator._reservation_tasks
+    assert _active_gen_load(coordinator) == 1
+
+    # Past the renewed deadline: released.
+    await asyncio.sleep(timeout)
+    assert coordinator._reservation_tasks == {}
+    assert _active_gen_load(coordinator) == 0
+
+
 def test_coordinator_compacts_route_info():
     compact = DisaggCoordinatorService._compact_route_info(
         {
@@ -298,6 +383,18 @@ def test_coordinator_reservation_timeout_env(monkeypatch):
 
     monkeypatch.setenv(COORDINATOR_RESERVATION_TIMEOUT_ENV, "60")
     assert coordinator_reservation_timeout() == 60
+
+
+def test_coordinator_reservation_covers_request_timeout():
+    config = _make_config([], [], "round_robin", "round_robin")
+    coordinator = DisaggCoordinatorService(
+        config,
+        _client_factory,
+        reservation_timeout_secs=60,
+        request_timeout_secs=300,
+    )
+
+    assert coordinator._reservation_timeout_secs == 300
 
 
 def test_coordinator_client_configures_empty_delegating_kv_router():
@@ -372,7 +469,7 @@ def test_service_discovery_sets_coordinator_state_sync_interval():
 
 
 @pytest.mark.asyncio
-async def test_cluster_info_updates_readiness_and_stateless_servers():
+async def test_cluster_info_updates_readiness_and_local_servers():
     config = _make_config(["ctx-old:8001"], [], "round_robin", "round_robin")
     client = CoordinatorClient("http://coordinator", config)
     client.ctx_router.remove_server = AsyncMock(wraps=client.ctx_router.remove_server)
@@ -456,6 +553,111 @@ def test_stateless_router_places_locally_in_worker():
             )
 
 
+def test_load_balancing_router_uses_global_coordinator_state():
+    """Two fleet workers choose different servers while both requests are active."""
+    from tensorrt_llm.serve.router import LoadBalancingRouter
+
+    with _FakeWorker() as ctx0, _FakeWorker() as gen0, _FakeWorker() as gen1:
+        config = _make_config([ctx0.url], [gen0.url, gen1.url], "round_robin", "load_balancing")
+        with _CoordinatorThread(config) as coord:
+            assert asyncio.run(_wait_coord_ready(coord.url)), "coordinator never became healthy"
+
+            def _request(request_id):
+                return CompletionRequest(
+                    model="m",
+                    prompt="hello",
+                    disaggregated_params=DisaggregatedParams(
+                        request_type="generation_only",
+                        ctx_request_id=request_id,
+                    ),
+                )
+
+            async def drive():
+                first_worker = None
+                second_worker = None
+                try:
+                    first_worker = CoordinatorClient(coord.url, config)
+                    second_worker = CoordinatorClient(coord.url, config)
+                    assert isinstance(first_worker.gen_router, CoordinatorDelegatingRouter)
+                    assert isinstance(first_worker.gen_router._local, LoadBalancingRouter)
+                    first_request, second_request = _request(1), _request(2)
+                    first, _ = await first_worker.gen_router.get_next_server(first_request)
+                    second, _ = await second_worker.gen_router.get_next_server(second_request)
+                    await first_worker.gen_router.finish_request(first_request)
+                    await second_worker.gen_router.finish_request(second_request)
+                    return first, second
+                finally:
+                    if first_worker is not None:
+                        await first_worker.stop()
+                    if second_worker is not None:
+                        await second_worker.stop()
+
+            first, second = asyncio.run(drive())
+            assert {first, second} == {gen0.url, gen1.url}
+
+
+def test_token_weighted_router_releases_global_load():
+    """A delegated finish releases the selected context server's token load."""
+    from tensorrt_llm.serve.router import LoadBalancingRouter
+
+    with _FakeWorker() as ctx0, _FakeWorker() as ctx1, _FakeWorker() as gen0:
+        config = _make_config(
+            [ctx0.url, ctx1.url],
+            [gen0.url],
+            "load_balancing",
+            "round_robin",
+            ctx_router_args={"use_tokens": True},
+        )
+        with _CoordinatorThread(config) as coord:
+            assert asyncio.run(_wait_coord_ready(coord.url)), "coordinator never became healthy"
+
+            def _request(request_id, num_tokens):
+                return CompletionRequest(
+                    model="m",
+                    prompt=list(range(num_tokens)),
+                    disaggregated_params=DisaggregatedParams(
+                        request_type="context_only",
+                        disagg_request_id=request_id,
+                    ),
+                )
+
+            async def drive():
+                worker = CoordinatorClient(coord.url, config)
+                try:
+                    assert isinstance(worker.ctx_router, CoordinatorDelegatingRouter)
+                    assert isinstance(worker.ctx_router._local, LoadBalancingRouter)
+                    large_request = _request(1, 100)
+                    small_request = _request(2, 1)
+                    released_request = _request(3, 1)
+                    large_server, _ = await worker.ctx_router.get_next_server(large_request)
+                    await worker.ctx_router.get_next_server(small_request)
+                    await worker.ctx_router.finish_request(large_request)
+                    await worker.ctx_router._finish_queue.join()
+                    released_server, _ = await worker.ctx_router.get_next_server(released_request)
+                    await worker.ctx_router.finish_request(small_request)
+                    await worker.ctx_router.finish_request(released_request)
+                    return large_server, released_server
+                finally:
+                    await worker.stop()
+
+            large_server, released_server = asyncio.run(drive())
+            assert released_server == large_server
+
+
+@pytest.mark.asyncio
+async def test_delegating_router_syncs_coordinator_server_list():
+    config = _make_config(["ctx-old:8000"], [], "load_balancing", "round_robin")
+    client = CoordinatorClient("http://coordinator", config)
+
+    assert isinstance(client.ctx_router, CoordinatorDelegatingRouter)
+    await client._sync_router_server_lists(
+        {"server_lists": {"context": ["ctx-new:8001"], "generation": []}}
+    )
+
+    assert client.ctx_router.servers == ["ctx-new:8001"]
+    await client.stop()
+
+
 def test_static_stateless_router_prepares_generation_first_server_info():
     """Fleet startup prepares static local routers for generation-first."""
     from tensorrt_llm.serve.router import RoundRobinRouter
@@ -492,7 +694,7 @@ async def test_stateless_router_syncs_coordinator_server_add_remove():
     client = CoordinatorClient("http://coordinator", config)
     client.ctx_router._fetch_server_info = AsyncMock(return_value={})
 
-    await client._sync_stateless_routers(
+    await client._sync_router_server_lists(
         {"server_lists": {"context": ["ctx-new:8001"], "generation": []}}
     )
 
@@ -511,7 +713,7 @@ async def test_stateless_router_keeps_old_server_when_replacement_is_unprepared(
     )
 
     with pytest.raises(RuntimeError, match="Failed to prepare ctx-new:8001"):
-        await client._sync_stateless_routers(
+        await client._sync_router_server_lists(
             {"server_lists": {"context": ["ctx-new:8001"], "generation": []}}
         )
 

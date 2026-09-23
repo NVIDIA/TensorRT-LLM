@@ -341,6 +341,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                  output_dtype: torch.dtype = torch.bfloat16,
                  scaling_vector_size: int = 16,
                  use_direct_expert_metadata: bool = False,
+                 use_locality_domain: bool = False,
                  workload_identity: Optional[Tuple] = None):
         super().__init__()
         self.forward_impl = forward_impl
@@ -351,6 +352,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.enable_finalize_fusion = enable_finalize_fusion
         self.enable_alltoall = enable_alltoall
         self.use_direct_expert_metadata = use_direct_expert_metadata
+        self.use_locality_domain = use_locality_domain
 
         assert output_dtype == torch.bfloat16
         self.output_dtype = output_dtype
@@ -471,13 +473,15 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             deep_ep_expert_capacity = num_rows // self.num_local_experts
         else:
             deep_ep_expert_capacity = None
-        return self.forward_impl(
-            *forward_inputs,
-            enable_alltoall=self.enable_alltoall,
-            tile_size=tile_size,
+        # The locality-domain impl does not take the count-native arguments.
+        count_native_kwargs = {} if self.use_locality_domain else dict(
             recv_expert_count=recv_expert_count,
             deep_ep_expert_capacity=deep_ep_expert_capacity,
             use_count_native_expert_metadata=self.use_direct_expert_metadata)
+        return self.forward_impl(*forward_inputs,
+                                 enable_alltoall=self.enable_alltoall,
+                                 tile_size=tile_size,
+                                 **count_native_kwargs)
 
     @AutoTuner.TacticsCapture.register_runner_tactic_comb_checker
     @staticmethod
@@ -1162,6 +1166,7 @@ class CuteDslFusedMoE(MoEImplBase):
             enable_alltoall=enable_alltoall,
             workload_identity=workload_identity,
             use_direct_expert_metadata=use_direct_expert_metadata,
+            use_locality_domain=use_locality_domain,
         )
 
         if use_direct_expert_metadata:
@@ -1350,7 +1355,7 @@ class CuteDslFusedMoE(MoEImplBase):
                 if use_rubin else torch.ops.trtllm.
                 cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell)
 
-            finalize_inplace_op(
+            finalize_inplace_kwargs = dict(
                 input=x.view(torch.float4_e2m1fn_x2),
                 weight=weight_view.w2_weight.view(torch.float4_e2m1fn_x2),
                 input_scale=x_sf.view(torch.uint8),
@@ -1368,11 +1373,25 @@ class CuteDslFusedMoE(MoEImplBase):
                 local_expert_offset=slot_start,
                 tile_size=tile_size,
                 output_dtype=output_dtype,
-                expert_counts=(recv_expert_count
-                               if use_count_native_expert_metadata else None),
-                expert_capacity=(deep_ep_expert_capacity
-                                 if use_count_native_expert_metadata else 0),
             )
+            if use_rubin:
+                # The Rubin op has no count-native variant, so it does not
+                # accept the expert-count arguments at all. Reaching here with
+                # count-native metadata would mean can_use_deep_ep_direct_metadata
+                # stopped excluding SM107.
+                if use_count_native_expert_metadata:
+                    raise NotImplementedError(
+                        "Count-native DeepEP expert metadata is not supported "
+                        "by the Rubin (SM107) fused-finalize grouped GEMM.")
+            else:
+                finalize_inplace_kwargs["expert_counts"] = (
+                    recv_expert_count
+                    if use_count_native_expert_metadata else None)
+                finalize_inplace_kwargs["expert_capacity"] = (
+                    deep_ep_expert_capacity
+                    if use_count_native_expert_metadata else 0)
+
+            finalize_inplace_op(**finalize_inplace_kwargs)
         else:
             if use_rubin:
                 # Rubin does not have a basic grouped GEMM kernel (without
