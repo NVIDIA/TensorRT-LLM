@@ -1,0 +1,11 @@
+DeepSeekSparseAttentionConfig
+=============================
+
+.. autoclass:: tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+    :exclude-members: validate,model_parametrized_name,schema_json,model_fields_set,copy,from_orm,model_json_schema,model_rebuild,construct,model_config,schema,model_extra,model_dump_json,model_construct,parse_raw,update_forward_refs,model_copy,parse_obj,model_computed_fields,model_dump,json,parse_file,model_validate_strings,Config,model_post_init,model_validate,dict,model_fields,model_validate_json

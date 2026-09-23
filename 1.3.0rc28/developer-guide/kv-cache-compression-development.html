@@ -1,0 +1,1406 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>KV Cache Compression Development Guide &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="../_static/config_selector.css?v=4351f35f" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../_static/scripts/fontawesome.js?digest=cb8930eaaf36d9849b67"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67" />
+
+
+
+    <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../_static/config_selector.js?v=db50c9f4"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../_static/togglebutton.js?v=b8b12719"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'developer-guide/kv-cache-compression-development';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc28';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+
+    <link rel="icon" href="../_static/favicon.png"/>
+
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Sparse Attention Development Guide" href="sparse-attention-development-guide.html" />
+    <link rel="prev" title="KVCacheManagerV2 Cold-Page Codec Design" href="kv-cache-cold-page-codec.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.3.0rc28" />
+  
+    
+    <script src="../_static/searchtools.js"></script>
+    <script src="../_static/language_data.js"></script>
+    <script src="../searchindex.js"></script>
+  
+
+
+  </head>
+
+  <body data-default-mode="">
+
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/containers.html">Container Images</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../supported-hardware.html">Supported Hardware</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_sparse_attention.html">Sparse Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector_vswa.html">KV Cache Connector under VSWA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/visual_gen_examples.html">VisualGen Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/api_walkthrough.html">API walkthrough</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_responses_client.html">Curl Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/prometheus_metrics.html">Prometheus Metrics</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../models/supported-models.html">Supported Models</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../models/visual-generation.html">Visual Generation (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-bench.html">trtllm-bench</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LLM.html">LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestError.html">RequestError</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BatchingType.html">BatchingType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/NGramDecodingConfig.html">NGramDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PARDDecodingConfig.html">PARDDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SADecodingConfig.html">SADecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SAEnhancerConfig.html">SAEnhancerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TorchCompileConfig.html">TorchCompileConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LlmArgs.html">LlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TorchLlmArgs.html">TorchLlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AutoDecodingConfig.html">AutoDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AttentionDpConfig.html">AttentionDpConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LoRARequest.html">LoRARequest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalConfig.html">MultimodalConfig</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/subagent-routing.html">Sub-agent Routing</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-compression.html">KV Cache Compression</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/post-processor-hook.html">Post-Processing Hook</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../features/auto_deploy/transforms.html">AutoDeploy Transforms</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/core.html">Core Transform APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/factory.html">Factory Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/export.html">Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/post_export.html">Post-Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/pattern_matcher.html">Pattern Matching Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/sharding.html">Sharding Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/weight_load.html">Weight Loading Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/post_load_fusion.html">Post-Load Fusion Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/cache_init.html">Cache Initialization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/visualize.html">Visualization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/compile.html">Compilation Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/additional.html">Additional Registered Transforms</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-connector.html">KV Cache Connector</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../features/visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/prefix-tokenization-cache.html">Prefix-Tokenization Cache</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">KV Cache Compression Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="telemetry.html">Telemetry</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog09_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog07_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog06_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog05_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">KV Cache Compression Development Guide</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+<section class="tex2jax_ignore mathjax_ignore" id="kv-cache-compression-development-guide">
+<h1>KV Cache Compression Development Guide<a class="headerlink" href="#kv-cache-compression-development-guide" title="Link to this heading">#</a></h1>
+<p>This guide is for contributors adding a KV cache compression method to the
+TensorRT-LLM PyTorch backend. It describes the common compression-manager
+lifecycle, the two extension models, and the ownership boundary with
+<code class="docutils literal notranslate"><span class="pre">KVCacheManagerV2</span></code> (KVCM V2).</p>
+<p>For user-facing configuration and method selection, see
+<a class="reference internal" href="../features/kv-cache-compression.html"><span class="std std-doc">KV Cache Compression</span></a>. For the C++ hot/cold
+storage ABI, page-index lifetime, staging, and migration transaction, see the
+<a class="reference internal" href="kv-cache-cold-page-codec.html"><span class="std std-doc">KVCM V2 Cold-Page Codec Design</span></a>.</p>
+<ul class="simple">
+<li><p><a class="reference internal" href="#architecture">Architecture</a></p></li>
+<li><p><a class="reference internal" href="#configuration-and-construction">Configuration and construction</a></p></li>
+<li><p><a class="reference internal" href="#iteration-driven-methods">Iteration-driven methods</a></p></li>
+<li><p><a class="reference internal" href="#storage-bound-methods">Storage-bound methods</a></p></li>
+<li><p><a class="reference internal" href="#ownership-and-failure-boundaries">Ownership and failure boundaries</a></p></li>
+<li><p><a class="reference internal" href="#calibration-and-offline-artifacts">Calibration and offline artifacts</a></p></li>
+<li><p><a class="reference internal" href="#adding-a-compression-method">Adding a compression method</a></p></li>
+<li><p><a class="reference internal" href="#validation">Validation</a></p></li>
+</ul>
+<section id="architecture">
+<h2>Architecture<a class="headerlink" href="#architecture" title="Link to this heading">#</a></h2>
+<p>KV cache compression works through <code class="docutils literal notranslate"><span class="pre">KVCacheManagerV2</span></code> (KVCM V2). A compression
+method defines when compression runs and which method-specific transformation
+it applies. All KV-cache interactions go through KVCM V2, which remains the
+authority for Pages, Slots, cache levels, allocation, migration, reuse,
+completion ordering, and mapping publication.</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>KvCacheCompressionConfig
+        |
+        v
+factory and compatibility checks
+        |
+        v
+KVCacheCompressionManager
+        |
+        +-- iteration-driven method
+        |     lifecycle hook -&gt; method-specific compression action
+        |
+        `-- storage-bound method
+              codec provider -&gt; native codec adapter -&gt; KVCM migration
+</pre></div>
+</div>
+<p>The framework provides two integration paths. A manager selects either or both
+paths through class attributes.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Integration path</p></th>
+<th class="head"><p>Manager attribute</p></th>
+<th class="head"><p>Execution point</p></th>
+<th class="head"><p>Example</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Iteration-driven</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">uses_iteration_lifecycle</span> <span class="pre">=</span> <span class="pre">True</span></code></p></td>
+<td><p>PyExecutor resource-manager callbacks around model iterations</p></td>
+<td><p>TriAttention periodic token eviction</p></td>
+</tr>
+<tr class="row-odd"><td><p>Storage-bound</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">provides_cold_page_codec</span> <span class="pre">=</span> <span class="pre">True</span></code></p></td>
+<td><p>KVCM hot/cold migration</p></td>
+<td><p>NVFP4 cold-page quantization</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>An iteration-driven method runs compression logic at request or model-iteration
+lifecycle boundaries. A storage-bound method runs when KVCM moves Pages across
+a representation boundary.</p>
+<p>Keep the two mechanisms separate. Do not add migration policy to an iteration
+hook, and do not make a cold-page provider allocate or publish KVCM Pages.</p>
+</section>
+<section id="configuration-and-construction">
+<h2>Configuration and construction<a class="headerlink" href="#configuration-and-construction" title="Link to this heading">#</a></h2>
+<p>Public method configurations inherit from <code class="docutils literal notranslate"><span class="pre">KvCacheCompressionConfig</span></code> in
+<code class="docutils literal notranslate"><span class="pre">tensorrt_llm/llmapi/llm_args.py</span></code>. The <code class="docutils literal notranslate"><span class="pre">algorithm</span></code> field selects a concrete
+configuration and manager. Method-specific options remain on the concrete
+configuration rather than the common base.</p>
+<p><code class="docutils literal notranslate"><span class="pre">create_kv_cache_compression_manager()</span></code> in
+<code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/pyexecutor/_util.py</span></code> validates the selected configuration
+and creates the concrete manager before model execution or storage migration.</p>
+<p>To support construction and compatibility checks, compression configurations
+expose the following contract.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Member</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Purpose</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">changes_physical_kv_length</span></code></p></td>
+<td><p>Class attribute</p></td>
+<td><p>Tells KVCM whether compression manages physical-history reconciliation</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">supports_block_reuse()</span></code></p></td>
+<td><p>Method</p></td>
+<td><p>Reports whether block reuse remains valid</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">supports_speculative_decoding()</span></code></p></td>
+<td><p>Method</p></td>
+<td><p>Reports whether the current configuration supports speculative decoding; method-specific mode checks still apply</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">changes_physical_kv_length</span></code> does not conflict with
+<code class="docutils literal notranslate"><span class="pre">supports_block_reuse()</span></code>. They describe independent properties. A method can
+change or compact only the generation/decode suffix while preserving the
+reusable prompt-prefix blocks and their identity. Such a method can set
+<code class="docutils literal notranslate"><span class="pre">changes_physical_kv_length</span> <span class="pre">=</span> <span class="pre">True</span></code> and still return <code class="docutils literal notranslate"><span class="pre">True</span></code> from
+<code class="docutils literal notranslate"><span class="pre">supports_block_reuse()</span></code>. A method should report block reuse as unsupported
+only when it cannot preserve the reusable prefix or its mapping contract.</p>
+<p>Compatibility methods are admission predicates, not runtime fallbacks. A method
+may still impose narrower mode, backend, or model-layout checks in the common
+compatibility validator or its construction path.</p>
+<p>The factory runs before KVCM construction because a storage-bound manager must
+be available as a codec provider while KVCM builds its cold layout. The two
+integration paths are wired differently:</p>
+<ul class="simple">
+<li><p>An iteration-driven manager is registered for lifecycle callbacks. If it
+needs access to KVCM, <code class="docutils literal notranslate"><span class="pre">bind_kv_cache_managers()</span></code> binds it after KVCM
+construction.</p></li>
+<li><p>A storage-bound manager provides a <code class="docutils literal notranslate"><span class="pre">NativeColdPageCodec</span></code> during KVCM
+construction and is not registered for iteration callbacks.</p></li>
+</ul>
+</section>
+<section id="iteration-driven-methods">
+<h2>Iteration-driven methods<a class="headerlink" href="#iteration-driven-methods" title="Link to this heading">#</a></h2>
+<p>KV cache compression can run at stable boundaries in the inference lifecycle.
+During a prefill or decode forward pass, Attention consumes a stable view of the
+KV cache. Once that stage completes and before the next one begins, the
+framework can update the physical KV state used by subsequent execution.</p>
+<p>After the final prefill chunk, a method can compress the completed context cache
+before generation begins, reducing the KV footprint carried into decode.
+Between decode iterations, a method can periodically compress newly accumulated
+KV state to control cache growth during long generation.</p>
+<p>Compression methods that operate at these lifecycle boundaries are
+iteration-driven. For example, TriAttention periodically evicts selected decode
+KV between generation iterations.</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>request initialization
+  -&gt; prepare method state
+
+prefill / chunked prefill
+  -&gt; final context chunk completes
+  -&gt; optional context-final compression
+
+each decode iteration
+  -&gt; iteration begins
+  -&gt; model forward and KVCM update
+  -&gt; optional compression before the next iteration
+
+request completes or aborts
+  -&gt; release method state
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">KVCacheCompressionManager</span></code> exposes five semantic hooks at these lifecycle
+points. Algorithms override only the hooks they need.</p>
+<section id="lifecycle-hooks">
+<h3>Lifecycle hooks<a class="headerlink" href="#lifecycle-hooks" title="Link to this heading">#</a></h3>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Hook</p></th>
+<th class="head"><p>Exact trigger</p></th>
+<th class="head"><p>Appropriate work</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">on_request_init(request)</span></code></p></td>
+<td><p>Before a request’s first prefill chunk</p></td>
+<td><p>Initialize request-local compression state</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">on_context_step_end(requests)</span></code></p></td>
+<td><p>After a request’s final prefill chunk</p></td>
+<td><p>Compress the completed context before generation, when needed</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">on_generation_step_begin(scheduled_batch)</span></code></p></td>
+<td><p>Before each scheduled forward iteration</p></td>
+<td><p>Prepare an iteration-level compression action, when needed</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">on_generation_step_end(scheduled_batch)</span></code></p></td>
+<td><p>After each scheduled forward iteration and KV-cache update</p></td>
+<td><p>Compress the updated KV state before the next iteration, when needed</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">on_request_finish(request)</span></code></p></td>
+<td><p>When a request completes or aborts</p></td>
+<td><p>Release request-local compression state</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>All five hooks default to no-op. For example, an algorithm that can derive all
+round inputs at generation end does not need a generation-begin snapshot.</p>
+<p>These lifecycle points reuse PyExecutor’s existing request cycle. When
+iteration-driven compression is enabled, the framework registers the
+compression manager and invokes the corresponding hooks. Developers only need
+to subclass <code class="docutils literal notranslate"><span class="pre">KVCacheCompressionManager</span></code> and implement the hooks their method
+uses; the framework handles registration and callback wiring.</p>
+</section>
+</section>
+<section id="storage-bound-methods">
+<h2>Storage-bound methods<a class="headerlink" href="#storage-bound-methods" title="Link to this heading">#</a></h2>
+<p>Cold-page compression is a storage-bound method that encodes KV Pages into a
+compressed format during offloading and decodes them during onboarding. Each
+method defines a compressed layout for the target cold tier, such as Host
+memory or Disk. The compression and transfer kernels can also be fused or
+co-optimized.</p>
+<p>Quantization is one concrete compression approach: quantization runs during
+offloading and dequantization runs during onboarding. Other compression
+approaches use the same storage-bound flow by defining their compressed layout
+and encode/decode operations.</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>GPU hot Page
+  -&gt; offloading: encode
+  -&gt; Host or Disk cold Page
+  -&gt; onboarding: decode
+  -&gt; GPU hot Page
+</pre></div>
+</div>
+<section id="cold-page-compression-apis">
+<h3>Cold-page compression APIs<a class="headerlink" href="#cold-page-compression-apis" title="Link to this heading">#</a></h3>
+<p>KVCM manages Page allocation and migration. A storage-bound compression method
+defines its compressed format and implements the relevant APIs below.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>API</p></th>
+<th class="head"><p>Purpose</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">create_cold_page_codec()</span></code></p></td>
+<td><p>Create the cold-page codec</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">build_codec_state()</span></code></p></td>
+<td><p>Define the format state and the layers it handles</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">build_lifecycle_metadata()</span></code></p></td>
+<td><p>Define and validate the cold-page layout</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">encode_cold_pages()</span></code></p></td>
+<td><p>Encode a batch of KV Pages into the cold-page representation</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">decode_cold_pages()</span></code></p></td>
+<td><p>Decode a batch of cold Pages back into the hot KV representation</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+</section>
+<section id="ownership-and-failure-boundaries">
+<h2>Ownership and failure boundaries<a class="headerlink" href="#ownership-and-failure-boundaries" title="Link to this heading">#</a></h2>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Component</p></th>
+<th class="head"><p>Owns</p></th>
+<th class="head"><p>Does not own</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/llmapi/llm_args.py#L3783"><code class="docutils literal notranslate"><span class="pre">KvCacheCompressionConfig</span></code></a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/pyexecutor/_util.py#L2830"><code class="docutils literal notranslate"><span class="pre">create_kv_cache_compression_manager()</span></code></a></p></td>
+<td><p>Method selection and supported-combination admission</p></td>
+<td><p>Pages, kernels, or request mappings</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/pyexecutor/resource_manager.py#L2775"><code class="docutils literal notranslate"><span class="pre">KVCacheCompressionManager</span></code></a></p></td>
+<td><p>Algorithm cadence, request state, decisions, format metadata, and algorithm launches</p></td>
+<td><p>KVCM allocation policy or Attention runtime state</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/batch_manager/kv_cache_compression/nativeColdPageCodec.h#L61"><code class="docutils literal notranslate"><span class="pre">NativeColdPageCodec</span></code></a></p></td>
+<td><p>KVCM-layout resolution, provider routing, fallback routing, and Python/native lifetime bridge</p></td>
+<td><p>Format-specific quantization policy</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py#L936"><code class="docutils literal notranslate"><span class="pre">KVCacheManagerV2</span></code></a></p></td>
+<td><p>Pages, Slots, pools, mappings, migration streams, events, publication, release, rollback, and cold storage</p></td>
+<td><p>Algorithm scores or quantization decisions</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/attention/backends/interface.py#L1008"><code class="docutils literal notranslate"><span class="pre">AttentionBackend</span></code></a></p></td>
+<td><p>Consumption of the published active GPU representation</p></td>
+<td><p>Cold storage and migration</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Before physical mutation, a method may reject, defer, or perform a legal no-op.
+After it submits work or moves bytes, it must follow the framework’s completion
+and failure contract; it must not silently fall back while leaving visible state
+partially updated.</p>
+</section>
+<section id="calibration-and-offline-artifacts">
+<h2>Calibration and offline artifacts<a class="headerlink" href="#calibration-and-offline-artifacts" title="Link to this heading">#</a></h2>
+<p>Some compression methods require calibration or other offline artifacts.
+TensorRT-LLM is an inference platform, so a compression method must not perform
+model calibration, corpus collection, parameter fitting, or calibration-file
+generation in the inference critical path. Users should produce any required
+artifacts before serving with the method’s upstream tooling,
+<a class="reference external" href="https://nvidia.github.io/Model-Optimizer/">NVIDIA ModelOpt</a>, or another
+documented offline workflow.</p>
+<p>The runtime may accept an artifact path in the method configuration, then load
+and validate that artifact during manager or model initialization. Once request
+execution begins, lifecycle hooks and cold-page <code class="docutils literal notranslate"><span class="pre">encode()</span></code>/<code class="docutils literal notranslate"><span class="pre">decode()</span></code> calls must
+consume ready-to-use immutable state. They must not launch a calibration
+workflow from prefill, generation, Page migration, or request teardown.</p>
+<p>Fail fast during initialization when a required artifact is missing,
+incompatible with the model, or malformed. Loading optional checkpoint metadata
+is also an initialization concern. Dynamic quantities that are mathematically
+part of each compression operation, such as per-block scales computed while
+encoding a Page, are runtime transform state rather than model calibration.</p>
+</section>
+<section id="adding-a-compression-method">
+<h2>Adding a compression method<a class="headerlink" href="#adding-a-compression-method" title="Link to this heading">#</a></h2>
+<section id="define-the-configuration-and-telemetry">
+<h3>1. Define the configuration and telemetry<a class="headerlink" href="#define-the-configuration-and-telemetry" title="Link to this heading">#</a></h3>
+<ol class="arabic simple">
+<li><p>Add a <code class="docutils literal notranslate"><span class="pre">KvCacheCompressionConfig</span></code> subclass in <code class="docutils literal notranslate"><span class="pre">llm_args.py</span></code>.</p></li>
+<li><p>Choose a unique <code class="docutils literal notranslate"><span class="pre">algorithm</span></code> value and keep method-specific fields on the
+concrete class.</p></li>
+<li><p>Declare physical-length, block-reuse, and speculative-decoding capabilities.</p></li>
+<li><p>Add the class to <code class="docutils literal notranslate"><span class="pre">KvCacheCompressionConfigType</span></code>.</p></li>
+<li><p>If the method requires calibration, expose only the path or identifier of a
+precomputed artifact. Document the external offline workflow; do not add
+calibration execution to TensorRT-LLM.</p></li>
+<li><p>Add the algorithm value to the existing compression-algorithm telemetry
+allowlist. Opt in only safe, low-cardinality method fields; model paths,
+calibration paths, and other user data must remain excluded.</p></li>
+<li><p>Run <code class="docutils literal notranslate"><span class="pre">python3</span> <span class="pre">scripts/generate_llm_args_golden_manifest.py</span></code>, review the
+generated schema change, and run the telemetry manifest tests. Public
+configuration is not complete until the manifest is updated deliberately.</p></li>
+</ol>
+</section>
+<section id="register-python-admission-and-construction">
+<h3>2. Register Python admission and construction<a class="headerlink" href="#register-python-admission-and-construction" title="Link to this heading">#</a></h3>
+<ol class="arabic simple">
+<li><p>Extend <code class="docutils literal notranslate"><span class="pre">validate_kv_cache_compression_compatibility()</span></code> with only the
+method’s real unsupported combinations.</p></li>
+<li><p>Add a factory branch in <code class="docutils literal notranslate"><span class="pre">create_kv_cache_compression_manager()</span></code>.</p></li>
+<li><p>Keep optional heavy algorithm imports local to the selected factory branch.</p></li>
+<li><p>Fail before construction for an explicitly requested unsupported method or
+combination.</p></li>
+</ol>
+<p>The KV cache compression framework owns a method’s configuration dispatch,
+compatibility policy, manager construction, lifecycle integration, and
+algorithm policy. Keep that method-specific Python logic in <code class="docutils literal notranslate"><span class="pre">llm_args.py</span></code>,
+<code class="docutils literal notranslate"><span class="pre">_util.py</span></code>, and the method’s package under
+<code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/kv_cache_compression/</span></code>, together with only the native
+launchers or bindings it needs. Use the existing executor and KVCM V2
+interfaces; do not add method-specific branches to the runtime or KVCM C++.
+Change those shared components only when extending an algorithm-neutral
+framework contract.</p>
+</section>
+<section id="a-implement-an-iteration-driven-method">
+<h3>3A. Implement an iteration-driven method<a class="headerlink" href="#a-implement-an-iteration-driven-method" title="Link to this heading">#</a></h3>
+<ol class="arabic simple">
+<li><p>Subclass <code class="docutils literal notranslate"><span class="pre">KVCacheCompressionManager</span></code>; retain the default
+<code class="docutils literal notranslate"><span class="pre">uses_iteration_lifecycle</span> <span class="pre">=</span> <span class="pre">True</span></code>.</p></li>
+<li><p>If needed, bind stable KVCM geometry in <code class="docutils literal notranslate"><span class="pre">bind_kv_cache_managers()</span></code>.</p></li>
+<li><p>Override only the required semantic hooks.</p></li>
+<li><p>Keep selection policy separate from generic movement or compaction.</p></li>
+<li><p>Publish completion before resizing or releasing KVCM-owned capacity.</p></li>
+</ol>
+</section>
+<section id="b-implement-a-storage-bound-method">
+<h3>3B. Implement a storage-bound method<a class="headerlink" href="#b-implement-a-storage-bound-method" title="Link to this heading">#</a></h3>
+<ol class="arabic simple">
+<li><p>Set <code class="docutils literal notranslate"><span class="pre">provides_cold_page_codec</span> <span class="pre">=</span> <span class="pre">True</span></code>. Set
+<code class="docutils literal notranslate"><span class="pre">uses_iteration_lifecycle</span> <span class="pre">=</span> <span class="pre">False</span></code> when the method does not use iteration
+hooks.</p></li>
+<li><p>Implement the relevant APIs from
+<a class="reference internal" href="#cold-page-compression-apis">Cold-page compression APIs</a>.</p></li>
+<li><p>Define the method’s format state, supported layers, compressed layout, and
+batched encode/decode operations through those APIs.</p></li>
+</ol>
+<p>The framework connects storage-bound compression to KVCM V2 through the
+existing interfaces. A new compression format implements its provider APIs and
+algorithm launcher.</p>
+</section>
+<section id="add-method-specific-kernels">
+<h3>4. Add method-specific kernels<a class="headerlink" href="#add-method-specific-kernels" title="Link to this heading">#</a></h3>
+<p>Keep the manager responsible for policy and the kernel responsible for a
+batched transform. Put Python launchers with the method implementation. Triton
+and CuTe DSL kernels can live in the method package; a CUDA implementation can
+live under <code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/kernels/</span></code> with the smallest required binding.</p>
+<p>For a storage-bound method, the launcher must consume the resolved lifecycle
+metadata, Page-index batch, cold base pointer, and CUDA stream provided through
+the existing codec adapter. Adding a CUDA kernel or binding does not require
+changing the KVCM storage or migration code. Preserve non-contiguous Pages,
+partial Pages, batching, supplied-stream execution, pointer lifetime, and the
+asynchronous failure contract.</p>
+<p>Prefer an existing production primitive when its numerical and layout contract
+matches. Keep backend-specific imports local, provide an actionable unsupported
+architecture error, and test the launcher separately before wiring it into a
+manager lifecycle.</p>
+</section>
+<section id="preserve-reuse-and-serving-compatibility-where-possible">
+<h3>5. Preserve reuse and serving compatibility where possible<a class="headerlink" href="#preserve-reuse-and-serving-compatibility-where-possible" title="Link to this heading">#</a></h3>
+<p>KV-cache block reuse and disaggregated serving are important compression use
+cases. Preserve and test them when the algorithm’s semantics permit it; they
+are not unconditional requirements for every method. Declare
+<code class="docutils literal notranslate"><span class="pre">supports_block_reuse()</span></code> truthfully, validate context/generation ownership and
+transfer behavior for disaggregated serving, and avoid silently disabling
+either feature. If a combination cannot be supported, reject it during
+compatibility validation and document the limitation.</p>
+</section>
+<section id="document-the-method">
+<h3>6. Document the method<a class="headerlink" href="#document-the-method" title="Link to this heading">#</a></h3>
+<p>Add a concise method section to the user-facing feature page and a complete,
+runnable example under <code class="docutils literal notranslate"><span class="pre">examples/kv_cache_compression/</span></code>. Document the method’s
+measured accuracy or output-quality impact, tested model and workload scope,
+performance evidence, and known unsupported combinations. Keep algorithm
+details out of the KVCM storage-ABI document.</p>
+</section>
+</section>
+<section id="validation">
+<h2>Validation<a class="headerlink" href="#validation" title="Link to this heading">#</a></h2>
+<p>Validation is an evidence workflow, not only a collection of unit tests. A new
+method is not ready when its kernels merely run or its configuration parses.
+Complete the following stages in order, then preserve the validated behavior
+with automated regression tests.</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>Accuracy and output quality
+  -&gt; real end-to-end activation and compatibility
+  -&gt; end-to-end performance
+  -&gt; automated regression gates
+</pre></div>
+</div>
+<section id="establish-the-accuracy-and-output-quality-contract">
+<h3>1. Establish the accuracy and output-quality contract<a class="headerlink" href="#establish-the-accuracy-and-output-quality-contract" title="Link to this heading">#</a></h3>
+<p>Choose the uncompressed or full-KV path as the reference before measuring
+performance. Define the method’s acceptance criterion and evaluate the real
+end-to-end model path on representative models, cache layouts, context lengths,
+and workloads. Lossy compression is allowed, but its impact must be measured;
+do not assume that a numerically small tensor error implies unchanged model
+output.</p>
+<p>Record enough information to reproduce the comparison:</p>
+<ul class="simple">
+<li><p>exact model checkpoint, backend, runtime KV dtype, and compression settings;</p></li>
+<li><p>calibration artifact and generation workflow, when the method requires one;</p></li>
+<li><p>dataset or traffic trace, prompt/chat template, context and output lengths,
+sampling parameters, and repeat protocol;</p></li>
+<li><p>reference and compressed scores, absolute and relative deltas, and run-to-run
+variation; and</p></li>
+<li><p>compression pressure or frequency, including repeated lossy transforms when
+they can occur in production.</p></li>
+</ul>
+<p>Lossless behavior is preferred when the method can provide it, but it is not a
+universal requirement. The acceptable trade-off is method- and
+workload-specific. Publish the measured quality impact, tested scope, and known
+limitations in the user-facing method documentation so users do not have to
+infer them from unit tests.</p>
+</section>
+<section id="prove-real-end-to-end-behavior-and-compatibility">
+<h3>2. Prove real end-to-end behavior and compatibility<a class="headerlink" href="#prove-real-end-to-end-behavior-and-compatibility" title="Link to this heading">#</a></h3>
+<p>Run supported models through the production executor, model engine, KVCM, and
+native kernels. Prove that compression actually activated; a successfully
+parsed configuration is not activation evidence. Use counters, traces, or
+other route evidence to show that the intended lifecycle hook or hot/cold codec
+ran and that the compressed state was later consumed correctly.</p>
+<p>Exercise the combinations the method claims to support, including:</p>
+<ul class="simple">
+<li><p>prefill and generation lifecycles, request completion and abort;</p></li>
+<li><p>non-contiguous and partial Pages, suspend/resume, rewind, and repeated
+compression where applicable;</p></li>
+<li><p>block reuse, including reuse of a previously compressed or restored prefix;</p></li>
+<li><p>disaggregated serving, including context/generation ownership and KV
+transfer boundaries;</p></li>
+<li><p>target and independent draft caches for supported speculative modes; and</p></li>
+<li><p>every supported model layout, runtime KV dtype, and cold-tier route,
+including secondary GPU, Host, or Disk as applicable.</p></li>
+</ul>
+<p>Block reuse and disaggregated serving are high-value compression scenarios.
+Preserve and validate them whenever the method’s semantics permit it. If a
+combination is unsupported, reject it before execution and document the
+limitation instead of silently disabling the feature. A kernel round-trip test
+alone does not establish end-to-end compatibility.</p>
+</section>
+<section id="measure-end-to-end-performance">
+<h3>3. Measure end-to-end performance<a class="headerlink" href="#measure-end-to-end-performance" title="Link to this heading">#</a></h3>
+<p>Measure performance only after the accuracy and functional gates pass. Start
+with an uninstrumented A/B comparison against the uncompressed path in which
+only the compression setting changes. Hold the model, workload, sampling
+contract, parallel topology, cache quotas, and serving duration constant. When
+capacity is the expected benefit, state whether the comparison holds physical
+bytes or logical Page capacity constant.</p>
+<p>Report the metrics affected by the method, such as TTFT, inter-token latency,
+request and token throughput, cache hit rate, retained KV capacity, migration
+bytes, and Host/Disk traffic. Use repeated runs and report variation rather
+than selecting one favorable sample. A transform or migration microbenchmark
+is useful for kernel development, but it is not evidence of end-to-end benefit.</p>
+<p>After the unprofiled result is established, profile the same workload to
+separate kernel-work sum, GPU-busy critical path, exposed CPU submission, and
+application wall time. Preserve the raw profiler artifacts and distinguish
+work that overlaps model execution from latency exposed to the request.</p>
+</section>
+<section id="turn-validated-behavior-into-regression-gates">
+<h3>4. Turn validated behavior into regression gates<a class="headerlink" href="#turn-validated-behavior-into-regression-gates" title="Link to this heading">#</a></h3>
+<p>Automated tests should protect the contracts established above. Keep focused
+CPU tests fast, add native and kernel tests for data-path contracts, and retain
+small end-to-end smoke gates for activation and integration. These tests catch
+regressions; they do not replace the documented accuracy and performance
+validation.</p>
+<section id="common-framework-tests">
+<h4>Common framework tests<a class="headerlink" href="#common-framework-tests" title="Link to this heading">#</a></h4>
+<ul class="simple">
+<li><p>configuration parsing, serialization, and factory dispatch;</p></li>
+<li><p>telemetry allowlisting, privacy exclusions, and golden-manifest parity;</p></li>
+<li><p>admission of supported combinations and early rejection of unsupported ones;</p></li>
+<li><p>target-only and independent target/draft construction;</p></li>
+<li><p>resource-manager ordering and exact lifecycle-hook cadence;</p></li>
+<li><p>block-reuse and disaggregated-serving paths when the method declares them
+supported;</p></li>
+<li><p>request completion and abort cleanup; and</p></li>
+<li><p>proof that compression activated rather than merely parsing a configuration.</p></li>
+</ul>
+</section>
+<section id="iteration-driven-tests">
+<h4>Iteration-driven tests<a class="headerlink" href="#iteration-driven-tests" title="Link to this heading">#</a></h4>
+<ul class="simple">
+<li><p>stable-prefix and protected-tail boundaries;</p></li>
+<li><p>repeated compression, Page reuse, rewind, suspend/resume, and overlap;</p></li>
+<li><p>byte-correct movement or compaction against a CPU oracle;</p></li>
+<li><p>completion ordering before published lengths and KVCM resize; and</p></li>
+<li><p>aligned end-to-end accuracy and performance checks.</p></li>
+</ul>
+</section>
+<section id="storage-bound-tests">
+<h4>Storage-bound tests<a class="headerlink" href="#storage-bound-tests" title="Link to this heading">#</a></h4>
+<ul class="simple">
+<li><p>independent codec state for every KVCM construction;</p></li>
+<li><p>hot-layout resolution, provider/fallback lifecycle routing, and rejection of
+mixed ownership;</p></li>
+<li><p>fixed cold-page geometry and byte-exact preservation of buffers or spans
+declared lossless;</p></li>
+<li><p>encode/decode round-trip accuracy for every supported runtime dtype;</p></li>
+<li><p>non-contiguous, partial, and large multi-Page batches;</p></li>
+<li><p>non-default stream behavior and pointer lifetime;</p></li>
+<li><p>Host and Disk offload/onboard paths, including failure rollback; and</p></li>
+<li><p>activation evidence that hot/cold conversion invoked the intended codec.</p></li>
+</ul>
+</section>
+</section>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="kv-cache-cold-page-codec.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">KVCacheManagerV2 Cold-Page Codec Design</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="sparse-attention-development-guide.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Sparse Attention Development Guide</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#architecture">Architecture</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#configuration-and-construction">Configuration and construction</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#iteration-driven-methods">Iteration-driven methods</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#lifecycle-hooks">Lifecycle hooks</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#storage-bound-methods">Storage-bound methods</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cold-page-compression-apis">Cold-page compression APIs</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#ownership-and-failure-boundaries">Ownership and failure boundaries</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#calibration-and-offline-artifacts">Calibration and offline artifacts</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#adding-a-compression-method">Adding a compression method</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#define-the-configuration-and-telemetry">1. Define the configuration and telemetry</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#register-python-admission-and-construction">2. Register Python admission and construction</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#a-implement-an-iteration-driven-method">3A. Implement an iteration-driven method</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#b-implement-a-storage-bound-method">3B. Implement a storage-bound method</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#add-method-specific-kernels">4. Add method-specific kernels</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#preserve-reuse-and-serving-compatibility-where-possible">5. Preserve reuse and serving compatibility where possible</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#document-the-method">6. Document the method</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#validation">Validation</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#establish-the-accuracy-and-output-quality-contract">1. Establish the accuracy and output-quality contract</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#prove-real-end-to-end-behavior-and-compatibility">2. Prove real end-to-end behavior and compatibility</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#measure-end-to-end-performance">3. Measure end-to-end performance</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#turn-validated-behavior-into-regression-gates">4. Turn validated behavior into regression gates</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#common-framework-tests">Common framework tests</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#iteration-driven-tests">Iteration-driven tests</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#storage-bound-tests">Storage-bound tests</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on September 21, 2026.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e">fca831e</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

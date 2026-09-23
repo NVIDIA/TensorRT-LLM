@@ -1,0 +1,1316 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>KV Cache Connector &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="../_static/config_selector.css?v=4351f35f" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../_static/scripts/fontawesome.js?digest=cb8930eaaf36d9849b67"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67" />
+
+
+
+    <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../_static/config_selector.js?v=db50c9f4"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../_static/togglebutton.js?v=b8b12719"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'features/kv-cache-connector';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc28';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+
+    <link rel="icon" href="../_static/favicon.png"/>
+
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Sparse Attention" href="sparse-attention.html" />
+    <link rel="prev" title="Helix Parallelism" href="helix.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.3.0rc28" />
+  
+    
+    <script src="../_static/searchtools.js"></script>
+    <script src="../_static/language_data.js"></script>
+    <script src="../searchindex.js"></script>
+  
+
+
+  </head>
+
+  <body data-default-mode="">
+
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/containers.html">Container Images</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../supported-hardware.html">Supported Hardware</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_sparse_attention.html">Sparse Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector_vswa.html">KV Cache Connector under VSWA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/visual_gen_examples.html">VisualGen Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/api_walkthrough.html">API walkthrough</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_responses_client.html">Curl Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/prometheus_metrics.html">Prometheus Metrics</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../models/supported-models.html">Supported Models</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../models/visual-generation.html">Visual Generation (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-bench.html">trtllm-bench</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LLM.html">LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestError.html">RequestError</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BatchingType.html">BatchingType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/NGramDecodingConfig.html">NGramDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PARDDecodingConfig.html">PARDDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SADecodingConfig.html">SADecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SAEnhancerConfig.html">SAEnhancerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TorchCompileConfig.html">TorchCompileConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LlmArgs.html">LlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TorchLlmArgs.html">TorchLlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AutoDecodingConfig.html">AutoDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AttentionDpConfig.html">AttentionDpConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LoRARequest.html">LoRARequest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalConfig.html">MultimodalConfig</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="subagent-routing.html">Sub-agent Routing</a></li>
+<li class="toctree-l1"><a class="reference internal" href="embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-cache-compression.html">KV Cache Compression</a></li>
+<li class="toctree-l1"><a class="reference internal" href="long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="post-processor-hook.html">Post-Processing Hook</a></li>
+<li class="toctree-l1"><a class="reference internal" href="guided-decoding.html">Guided Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="auto_deploy/transforms.html">AutoDeploy Transforms</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="auto_deploy/transforms/core.html">Core Transform APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="auto_deploy/transforms/factory.html">Factory Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="auto_deploy/transforms/export.html">Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="auto_deploy/transforms/post_export.html">Post-Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="auto_deploy/transforms/pattern_matcher.html">Pattern Matching Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="auto_deploy/transforms/sharding.html">Sharding Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="auto_deploy/transforms/weight_load.html">Weight Loading Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="auto_deploy/transforms/post_load_fusion.html">Post-Load Fusion Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="auto_deploy/transforms/cache_init.html">Cache Initialization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="auto_deploy/transforms/visualize.html">Visualization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="auto_deploy/transforms/compile.html">Compilation Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="auto_deploy/transforms/additional.html">Additional Registered Transforms</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">KV Cache Connector</a></li>
+<li class="toctree-l1"><a class="reference internal" href="sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="prefix-tokenization-cache.html">Prefix-Tokenization Cache</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog09_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog07_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog06_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog05_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">KV Cache Connector</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="kv-cache-connector">
+<h1>KV Cache Connector<a class="headerlink" href="#kv-cache-connector" title="Link to this heading">#</a></h1>
+<p>The KV Cache Connector is a flexible interface in TensorRT-LLM that enables remote or external access to the Key-Value (KV) cache. It allows developers to implement custom logic for loading, saving, and managing KV cache blocks, extending the capabilities of the standard KV cache manager.</p>
+<p>This document explains the KV Cache Connector architecture, common use cases, and provides a detailed walkthrough of the included example.</p>
+<section id="use-cases">
+<h2>Use Cases<a class="headerlink" href="#use-cases" title="Link to this heading">#</a></h2>
+<p>The KV Cache Connector is designed to support a variety of advanced serving scenarios:</p>
+<ol class="arabic simple">
+<li><p><strong>KV Cache Offloading</strong>: Move KV cache blocks from GPU memory to cheaper/larger storage (CPU RAM, NVMe SSD, or network storage) when they are not immediately needed, and reload them when required.</p></li>
+<li><p><strong>Custom Disaggregated Serving</strong>: Separate the prefill (context processing) and decode (token generation) phases onto different instances or machines. The connector can be used to transmit the KV cache generated during prefill to the decode instances.</p></li>
+<li><p><strong>KV Cache Sharing / P2P Transfer</strong>: Share KV cache states between different model instances or across peer-to-peer connections.</p></li>
+</ol>
+</section>
+<section id="architecture">
+<h2>Architecture<a class="headerlink" href="#architecture" title="Link to this heading">#</a></h2>
+<p>The connector architecture is split into two main components:</p>
+<ul class="simple">
+<li><p><strong>Scheduler (Leader)</strong>: Responsible for orchestration. It decides <em>what</em> needs to be loaded or saved and builds metadata instructions. It runs only on the leader rank (rank 0).</p></li>
+<li><p><strong>Worker</strong>: Responsible for execution. It receives metadata from the scheduler and performs the actual data transfers (loading/saving) on the KV cache tensors. It runs on all ranks.</p></li>
+</ul>
+<section id="api-reference">
+<h3>API Reference<a class="headerlink" href="#api-reference" title="Link to this heading">#</a></h3>
+<p>To implement a custom connector, you must subclass <code class="docutils literal notranslate"><span class="pre">KvCacheConnectorScheduler</span></code> and <code class="docutils literal notranslate"><span class="pre">KvCacheConnectorWorker</span></code>.</p>
+<section id="scheduler-leader-interface-kvcacheconnectorscheduler">
+<h4>1. Scheduler (Leader) Interface (<code class="docutils literal notranslate"><span class="pre">KvCacheConnectorScheduler</span></code>)<a class="headerlink" href="#scheduler-leader-interface-kvcacheconnectorscheduler" title="Link to this heading">#</a></h4>
+<p>These methods run on the leader process and drive the connector’s behavior.</p>
+<ul>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">build_connector_meta(self,</span> <span class="pre">scheduler_output:</span> <span class="pre">SchedulerOutput)</span> <span class="pre">-&gt;</span> <span class="pre">object</span></code></strong></p>
+<ul class="simple">
+<li><p><strong>Description</strong>: The core orchestration method. Called during the scheduling phase. It examines the current requests and decides which blocks need to be loaded from or saved to the external store.</p></li>
+<li><p><strong>Arguments</strong>: <code class="docutils literal notranslate"><span class="pre">scheduler_output</span></code> contains information about new requests, blocks allocated, current request states, and the cumulative <code class="docutils literal notranslate"><span class="pre">RequestData.block_hashes</span></code> chain. <code class="docutils literal notranslate"><span class="pre">block_hashes</span></code> is read directly from each KV cache block’s stored hash, which the KV cache manager commits as soon as a block becomes full – the value matches the hash that KV cache events will subsequently emit for the same block. The chain only covers beam 0; the executor rejects <code class="docutils literal notranslate"><span class="pre">kv_connector_config</span></code> at startup when <code class="docutils literal notranslate"><span class="pre">max_beam_width</span> <span class="pre">&gt;</span> <span class="pre">1</span></code>, so connectors may assume beam-width-1 inputs.</p></li>
+<li><p><strong>Returns</strong>: An arbitrary metadata object (picklable) that describes the tasks for the workers. This object is broadcasted to all workers.</p></li>
+</ul>
+</li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">get_num_new_matched_tokens(self,</span> <span class="pre">request:</span> <span class="pre">LlmRequest,</span> <span class="pre">num_computed_tokens:</span> <span class="pre">int)</span> <span class="pre">-&gt;</span> <span class="pre">tuple[int,</span> <span class="pre">bool]</span></code></strong></p>
+<ul class="simple">
+<li><p><strong>Description</strong>: Called when a new request arrives. It checks to see if any KV cache can be loaded from an external KV store.</p></li>
+<li><p><strong>Returns</strong>: A tuple <code class="docutils literal notranslate"><span class="pre">(num_tokens,</span> <span class="pre">is_async)</span></code>. <code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> is the number of tokens found in the external cache. <code class="docutils literal notranslate"><span class="pre">is_async</span></code> indicates if the loading will happen asynchronously (background) or requires blocking.</p></li>
+</ul>
+</li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">request_finished(self,</span> <span class="pre">request:</span> <span class="pre">LlmRequest,</span> <span class="pre">cache_block_ids:</span> <span class="pre">list[int])</span> <span class="pre">-&gt;</span> <span class="pre">bool</span></code></strong></p>
+<ul class="simple">
+<li><p><strong>Description</strong>: Called when a request completes generation.</p></li>
+<li><p><strong>Returns</strong>: A boolean indicating if an asynchronous save operation is underway. If <code class="docutils literal notranslate"><span class="pre">True</span></code>, the system waits for the operation to complete before releasing the KV cache blocks.</p></li>
+<li><p><strong>Note</strong>: under sliding-window attention <code class="docutils literal notranslate"><span class="pre">cache_block_ids</span></code> covers the live window, not the whole prompt. See <a class="reference internal" href="#what-a-connector-can-persist-under-a-sliding-window">What a connector can persist under a sliding window</a>.</p></li>
+</ul>
+</li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">update_state_after_alloc(self,</span> <span class="pre">request:</span> <span class="pre">LlmRequest,</span> <span class="pre">block_ids:</span> <span class="pre">list[int])</span></code></strong></p>
+<ul>
+<li><p><strong>Description</strong>: a callback to update internal state after KV cache blocks have been allocated for the prefill.</p></li>
+<li><p><strong>Note</strong>: with chunked prefill, <code class="docutils literal notranslate"><span class="pre">block_ids</span></code> covers only the blocks allocated for the first chunk. The remaining blocks arrive as append-deltas in <code class="docutils literal notranslate"><span class="pre">RequestData.new_block_ids</span></code> on later calls to <code class="docutils literal notranslate"><span class="pre">build_connector_meta</span></code>, on the entries under <code class="docutils literal notranslate"><span class="pre">scheduler_output.cached_requests</span></code>. A connector that treats this callback as its only source of block ids will under-plan. Read both lists:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">build_connector_meta</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">scheduler_output</span><span class="p">):</span>
+    <span class="k">for</span> <span class="n">req</span> <span class="ow">in</span> <span class="n">scheduler_output</span><span class="o">.</span><span class="n">new_requests</span><span class="p">:</span>      <span class="c1"># the first chunk</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_plan</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">new_block_ids</span><span class="p">)</span>
+    <span class="k">for</span> <span class="n">req</span> <span class="ow">in</span> <span class="n">scheduler_output</span><span class="o">.</span><span class="n">cached_requests</span><span class="p">:</span>   <span class="c1"># every later chunk</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_plan</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">new_block_ids</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Both example connectors walk <code class="docutils literal notranslate"><span class="pre">new_requests</span></code> only, so neither one demonstrates this.</p>
+</li>
+</ul>
+</li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">update_state_after_alloc_by_layer_group(self,</span> <span class="pre">request:</span> <span class="pre">LlmRequest,</span> <span class="pre">block_ids_by_layer_group:</span> <span class="pre">list[list[int]])</span></code></strong></p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">request_finished_by_layer_group(self,</span> <span class="pre">request:</span> <span class="pre">LlmRequest,</span> <span class="pre">cache_block_ids_by_layer_group:</span> <span class="pre">list[list[int]])</span> <span class="pre">-&gt;</span> <span class="pre">bool</span></code></strong></p>
+<ul>
+<li><p><strong>Description</strong>: the per-layer-group forms of the two callbacks above, indexed by layer group id. Entry <code class="docutils literal notranslate"><span class="pre">[g][i]</span></code> is the page slot of block ordinal <code class="docutils literal notranslate"><span class="pre">i</span></code> in layer group <code class="docutils literal notranslate"><span class="pre">g</span></code>.</p></li>
+<li><p><strong>When they are called</strong>: whenever the KV cache reports page indices per layer group. A page index is scoped to its group — one group per attention window size — so a cache with more than one group can be described no other way, and the flat <code class="docutils literal notranslate"><span class="pre">block_ids</span></code> / <code class="docutils literal notranslate"><span class="pre">cache_block_ids</span></code> are empty there. With a single layer group the flat lists carry that group’s indices as well, so a connector that implements only the flat forms keeps working on those models.</p></li>
+<li><p><strong>Which form to implement</strong>: implement exactly one complete set.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Set</p></th>
+<th class="head"><p>Models it covers</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>per-layer-group</p></td>
+<td><p>every model, VSWA included</p></td>
+</tr>
+<tr class="row-odd"><td><p>flat</p></td>
+<td><p>non-VSWA, non-hybrid only</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>A set is complete when both of its methods are defined. Mixing the two — one method from each — is rejected during executor bring-up, naming the method that is missing. An existing flat connector needs no change on the models it already covers: with a single layer group the base per-layer-group implementation folds back to the flat call. Hybrid / linear-attention models are not enabled for the connector yet; the per-layer-group set is the shape their cache will need. See <a class="reference internal" href="#running-under-vswa">Running under VSWA</a>.</p>
+</li>
+</ul>
+</li>
+</ul>
+<section id="running-under-vswa">
+<h5>Running under VSWA<a class="headerlink" href="#running-under-vswa" title="Link to this heading">#</a></h5>
+<p>Under variable sliding-window attention the KV cache allocates one pool per attention window size, and a page index only means something inside its own layer group. A single tensor and a single flat block list cannot describe that, so three methods have to be implemented together:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Method</p></th>
+<th class="head"><p>Replaces</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">KvCacheConnectorWorker.register_kv_cache_layout</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">register_kv_caches</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">KvCacheConnectorScheduler.update_state_after_alloc_by_layer_group</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">update_state_after_alloc</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">KvCacheConnectorScheduler.request_finished_by_layer_group</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">request_finished</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Implementing the per-layer-group form of a pair is enough — the flat method it replaces does not also have to be defined.</p>
+<p>All three are checked during executor bring-up, before any request is admitted. <code class="docutils literal notranslate"><span class="pre">register_kv_cache_layout</span></code> refuses there, naming the group and region counts it could not describe, and the two scheduler methods are checked alongside it. Nothing is deferred to the first request, so a partial implementation costs a start-up failure rather than one after the model is loaded.</p>
+<p><code class="docutils literal notranslate"><span class="pre">examples/llm-api/llm_kv_cache_connector_vswa.py</span></code> is a worked connector for this case. A VSWA connector has to do five things:</p>
+<ol class="arabic simple">
+<li><p><strong>Address pages per group.</strong> <code class="docutils literal notranslate"><span class="pre">layout.groups[g].regions[r]</span></code> gives the byte ranges; <code class="docutils literal notranslate"><span class="pre">region.slot_tensor(i)</span></code> is page slot <code class="docutils literal notranslate"><span class="pre">i</span></code> <em>of that group</em>. <code class="docutils literal notranslate"><span class="pre">layout.group_of_layer(layer_id)</span></code> maps a model layer back to its group, which is what the per-layer <code class="docutils literal notranslate"><span class="pre">wait_for_layer_load</span></code> / <code class="docutils literal notranslate"><span class="pre">save_kv_layer</span></code> hooks need.</p></li>
+<li><p><strong>Read the per-group block lists.</strong> <code class="docutils literal notranslate"><span class="pre">RequestData.new_block_ids_by_layer_group[g]</span></code> carries the page slots; the flat <code class="docutils literal notranslate"><span class="pre">new_block_ids</span></code> is empty.</p></li>
+<li><p><strong>Carry the layer group in the cache key, and in every transfer target.</strong> This one is a correctness requirement, not a convenience. The same token range exists in <em>every</em> layer group holding <strong>different</strong> KV, so a key derived from the token sequence alone collides across groups and one group’s bytes will overwrite another’s — then be loaded back into the wrong group. Mix <code class="docutils literal notranslate"><span class="pre">layer_group_id</span></code> (or the window size, or the layer set) into the identifier, and carry <code class="docutils literal notranslate"><span class="pre">(layer_group_id,</span> <span class="pre">page_slot)</span></code> rather than <code class="docutils literal notranslate"><span class="pre">page_slot</span></code> alone as the transfer target.</p></li>
+<li><p><strong>Filter out-of-window blocks through <code class="docutils literal notranslate"><span class="pre">valid_page_slots</span></code></strong>, and size the store for the window rather than the prompt. See below.</p></li>
+<li><p><strong>Serve a block only when every group holds it.</strong> A full-attention group keeps the whole prompt while a sliding group keeps only its window, so the prefix that can be served back is bounded by the smallest window. Stop the lookup at the first block ordinal any group misses.</p></li>
+</ol>
+</section>
+<section id="kvcachelayout-reference">
+<h5><code class="docutils literal notranslate"><span class="pre">KvCacheLayout</span></code> reference<a class="headerlink" href="#kvcachelayout-reference" title="Link to this heading">#</a></h5>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout</span><span class="w"> </span><span class="kn">import</span> <span class="n">KvCacheLayout</span>
+</pre></div>
+</div>
+<p>The type is passed to <code class="docutils literal notranslate"><span class="pre">register_kv_cache_layout</span></code>; importing it is only needed for a type annotation.</p>
+<p>A layout describes the byte ranges that repeat once per page slot. It describes ranges rather than
+implying them, which is what lets one type cover MLA (a pool simply has no <code class="docutils literal notranslate"><span class="pre">value</span></code> buffer), block
+scales, sliding-window attention and hybrid models without any of them being a special case.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Attribute</p></th>
+<th class="head"><p>Meaning</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">layout.tokens_per_block</span></code></p></td>
+<td><p>Tokens covered by one page.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">layout.dtype</span></code></p></td>
+<td><p>Element type of the KV data, for a typed view over a region.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">layout.groups</span></code></p></td>
+<td><p>The layer groups, as <code class="docutils literal notranslate"><span class="pre">KvCacheLayerGroupLayout</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">layout.group(layer_group_id)</span></code></p></td>
+<td><p>One group by id. Raises <code class="docutils literal notranslate"><span class="pre">KeyError</span></code> if absent.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">layout.group_of_layer(layer_id)</span></code></p></td>
+<td><p>The group owning a model layer — what the per-layer hooks route on.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">layout.as_single_pool_tensor()</span></code></p></td>
+<td><p>The <code class="docutils literal notranslate"><span class="pre">[num_blocks,</span> <span class="pre">num_layers,</span> <span class="pre">kv_factor,</span> <span class="pre">block_size]</span></code> view a single-pool cache hands <code class="docutils literal notranslate"><span class="pre">register_kv_caches</span></code>, or <code class="docutils literal notranslate"><span class="pre">None</span></code> when the cache cannot be described that way. This is what the default <code class="docutils literal notranslate"><span class="pre">register_kv_cache_layout</span></code> calls.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Each <code class="docutils literal notranslate"><span class="pre">KvCacheLayerGroupLayout</span></code>:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Attribute</p></th>
+<th class="head"><p>Meaning</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">group.layer_group_id</span></code></p></td>
+<td><p>The index page slots are scoped to. Dense, starting at 0.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">group.window_size</span></code></p></td>
+<td><p>Attention window for the group, or <code class="docutils literal notranslate"><span class="pre">None</span></code> for full attention.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">group.layer_ids</span></code></p></td>
+<td><p>Global model layer indices in the group — the same index space <code class="docutils literal notranslate"><span class="pre">wait_for_layer_load</span></code> and <code class="docutils literal notranslate"><span class="pre">save_kv_layer</span></code> receive.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">group.regions</span></code></p></td>
+<td><p>The <code class="docutils literal notranslate"><span class="pre">KvCacheRegion</span></code>s making up one page of this group.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">group.bytes_per_page</span></code></p></td>
+<td><p>Total bytes the group occupies for one page slot.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Each <code class="docutils literal notranslate"><span class="pre">KvCacheRegion</span></code> is a contiguous byte range that repeats once per page slot:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Attribute</p></th>
+<th class="head"><p>Meaning</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">region.base</span></code></p></td>
+<td><p>Device address of page slot 0.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">region.size</span></code></p></td>
+<td><p>Bytes the region covers within one slot.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">region.stride</span></code></p></td>
+<td><p>Distance between consecutive slots.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">region.num_slots</span></code></p></td>
+<td><p>Number of page slots.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">region.buffers</span></code></p></td>
+<td><p>The <code class="docutils literal notranslate"><span class="pre">(layer_id,</span> <span class="pre">role,</span> <span class="pre">expansion)</span></code> tuples the region covers, in memory order. <code class="docutils literal notranslate"><span class="pre">role</span></code> is the cache manager’s own name, e.g. <code class="docutils literal notranslate"><span class="pre">&quot;key&quot;</span></code> / <code class="docutils literal notranslate"><span class="pre">&quot;value&quot;</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">region.address_of(slot)</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">base</span> <span class="pre">+</span> <span class="pre">stride</span> <span class="pre">*</span> <span class="pre">slot</span></code>. Raises <code class="docutils literal notranslate"><span class="pre">IndexError</span></code> outside <code class="docutils literal notranslate"><span class="pre">[0,</span> <span class="pre">num_slots)</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">region.as_tensor(dtype=torch.uint8)</span></code></p></td>
+<td><p>A strided <code class="docutils literal notranslate"><span class="pre">[num_slots,</span> <span class="pre">size</span> <span class="pre">//</span> <span class="pre">itemsize]</span></code> view; row <code class="docutils literal notranslate"><span class="pre">i</span></code> is page slot <code class="docutils literal notranslate"><span class="pre">i</span></code>. Accepts any subscript, including <code class="docutils literal notranslate"><span class="pre">-1</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">region.slot_tensor(slot_id,</span> <span class="pre">dtype=torch.uint8)</span></code></p></td>
+<td><p>The bytes of one page slot, raising <code class="docutils literal notranslate"><span class="pre">IndexError</span></code> outside <code class="docutils literal notranslate"><span class="pre">[0,</span> <span class="pre">num_slots)</span></code>. The guarded form of <code class="docutils literal notranslate"><span class="pre">as_tensor(dtype)[slot_id]</span></code>.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">size</span></code> is not necessarily <code class="docutils literal notranslate"><span class="pre">stride</span></code>: a region covers one run of adjacent buffers within a slot, and a
+slot may hold several runs. For a model with uniform layer shapes the buffers coalesce into a single
+region spanning the whole slot, which is the whole-page transfer. A group with more than one region
+must be addressed region by region.</p>
+<p>The addresses are device addresses, and they stay valid because every cache tier below GPU is
+rejected at bring-up while a connector is attached. See <a class="reference internal" href="#kv-cache-tiers-are-gpu-only-under-a-connector">KV cache tiers</a>.</p>
+</section>
+<section id="kv-cache-tiers-are-gpu-only-under-a-connector">
+<h5>KV cache tiers are GPU-only under a connector<a class="headerlink" href="#kv-cache-tiers-are-gpu-only-under-a-connector" title="Link to this heading">#</a></h5>
+<p>A connector registers device addresses and holds them across iterations. Evicting a page to another
+tier reassigns its GPU slot underneath the connector, so with a connector attached:</p>
+<ul class="simple">
+<li><p>Setting <code class="docutils literal notranslate"><span class="pre">KvCacheConfig.host_cache_size</span></code> or <code class="docutils literal notranslate"><span class="pre">KvCacheConfig.disk_cache_size</span></code> above zero <strong>fails at
+bring-up</strong>, with a message naming both settings.</p></li>
+<li><p>Leaving <code class="docutils literal notranslate"><span class="pre">host_cache_size</span></code> unset <strong>drops the host tier</strong> rather than failing, with a log line. That
+tier is provisioned automatically only to give the <code class="docutils literal notranslate"><span class="pre">MAX_UTILIZATION</span></code> scheduler somewhere to spill
+to via suspend/resume, which a connector run does not use.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">enable_kv_pool_rebalance</span></code> is <strong>ignored</strong> — startup and inference continue, and the rebalance
+simply never runs. Rebalance suspends every active request and runs a defragmenting migration that
+reassigns the same page slots a tier eviction would.</p></li>
+</ul>
+<p>The practical consequence is that a KV-exhausted connector deployment has no secondary tier to
+fall back on. The remedies are <code class="docutils literal notranslate"><span class="pre">kv_cache_config.max_tokens</span></code>,
+<code class="docutils literal notranslate"><span class="pre">kv_cache_config.free_gpu_memory_fraction</span></code>, or lowering <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> to hand memory back to the
+KV pool; the scheduler’s exhaustion error says so directly when a connector is attached.</p>
+</section>
+<section id="block-reuse-alongside-the-connector">
+<h5>Block reuse alongside the connector<a class="headerlink" href="#block-reuse-alongside-the-connector" title="Link to this heading">#</a></h5>
+<ul class="simple">
+<li><p>Specify <code class="docutils literal notranslate"><span class="pre">KvCacheConfig.enable_block_reuse=True</span></code> alongside a connector. Without it the connector’s
+prefix is never honoured: either the combination is rejected at start-up, or the lookup, the reads
+and the device copies are performed and discarded, at no correctness cost but at full latency
+cost.</p></li>
+<li><p>The start-up check reads the value the cache resolved, not the one you passed: some quantization
+algorithms, some SM versions and hybrid linear models turn block reuse off on their own, so this
+error can appear without the flag being set anywhere in your configuration.</p></li>
+</ul>
+</section>
+<section id="a-page-slot-must-not-be-reassigned-underneath-the-connector">
+<h5>A page slot must not be reassigned underneath the connector<a class="headerlink" href="#a-page-slot-must-not-be-reassigned-underneath-the-connector" title="Link to this heading">#</a></h5>
+<p>The connector holds page indices across iterations, and <code class="docutils literal notranslate"><span class="pre">RequestData</span></code> reports only the pages appended
+since the last call. Anything that hands a slot the connector already knows about to a different
+request therefore goes unreported and corrupts the next transfer against it. Three configurations do
+that, and each is rejected at bring-up.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Configuration</p></th>
+<th class="head"><p>Mechanism</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Speculative decoding</p></td>
+<td><p>Rejected draft tokens shrink a request’s page list, and the freed slot goes to whichever request allocates next. The connector is never told the tail block moved.</p></td>
+</tr>
+<tr class="row-odd"><td><p>A capacity scheduler policy other than <code class="docutils literal notranslate"><span class="pre">GUARANTEED_NO_EVICT</span></code></p></td>
+<td><p>A destroyed-and-replayed request comes back on different pages, and the connector’s per-request block delta is then measured against pages that were freed with it.</p></td>
+</tr>
+<tr class="row-even"><td><p>A host or disk cache tier</p></td>
+<td><p>Tier eviction reassigns the GPU slot. See <a class="reference internal" href="#kv-cache-tiers-are-gpu-only-under-a-connector">KV cache tiers are GPU-only under a connector</a>.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The exact set the runtime refuses depends on your cache configuration; the bring-up error is
+authoritative. Speculative decoding is unsupported with a connector wherever it is not refused —
+the same page-list shrink happens there.</p>
+</section>
+<section id="requestdata-fields-that-may-not-be-populated">
+<h5><code class="docutils literal notranslate"><span class="pre">RequestData</span></code> fields that may not be populated<a class="headerlink" href="#requestdata-fields-that-may-not-be-populated" title="Link to this heading">#</a></h5>
+<p>Two <code class="docutils literal notranslate"><span class="pre">RequestData</span></code> fields can be reported empty depending on the cache configuration. A connector must tolerate both.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Field</p></th>
+<th class="head"><p>When empty</p></th>
+<th class="head"><p>Consequence</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">block_hashes</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[]</span></code></p></td>
+<td><p>No block-hash accessor exists on this path. Nothing in the runtime reads the field, and neither example connector uses it — both hash the token sequence themselves. A connector that keys its external store on <code class="docutils literal notranslate"><span class="pre">block_hashes</span></code> gets no key and therefore no hits and no saves; it does not mis-address a transfer.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">priorities</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">KvCacheRetentionConfig</span></code> is not honoured, so every page carries the default priority. A warning is logged the first time a request carrying a retention config is reported. The gap is wider than the connector: the retention config has no effect either way in that configuration.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Both are gaps to be closed rather than intended behaviour.</p>
+</section>
+<section id="blocks-with-no-page">
+<h5>Blocks with no page<a class="headerlink" href="#blocks-with-no-page" title="Link to this heading">#</a></h5>
+<p>A block that has no page in a layer group is reported as <code class="docutils literal notranslate"><span class="pre">-1</span></code> (<code class="docutils literal notranslate"><span class="pre">BAD_PAGE_INDEX</span></code>) <strong>in place</strong>, not dropped from the list. This keeps each entry aligned with its block ordinal, so entry <code class="docutils literal notranslate"><span class="pre">i</span></code> always describes tokens <code class="docutils literal notranslate"><span class="pre">[i</span> <span class="pre">*</span> <span class="pre">tokens_per_block,</span> <span class="pre">(i+1)</span> <span class="pre">*</span> <span class="pre">tokens_per_block)</span></code> and an append-delta over successive calls stays valid.</p>
+<p>That alignment is also why the list is not safe to index with directly: <code class="docutils literal notranslate"><span class="pre">-1</span></code> is a valid Python and PyTorch subscript, so it resolves to the <em>last</em> page slot of the pool rather than raising — a transfer against another request’s KV. Two API points keep a page index from reaching device memory unchecked.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p></p></th>
+<th class="head"><p></p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">valid_page_slots(page_indices)</span></code></p></td>
+<td><p>Yields <code class="docutils literal notranslate"><span class="pre">(block_ordinal,</span> <span class="pre">page_slot)</span></code> for the entries that address a page. The ordinal is preserved, so the token range a page covers is still recoverable.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">region.slot_tensor(slot_id)</span></code></p></td>
+<td><p>The bytes of one page slot, raising <code class="docutils literal notranslate"><span class="pre">IndexError</span></code> on a slot outside <code class="docutils literal notranslate"><span class="pre">[0,</span> <span class="pre">num_slots)</span></code>.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Build transfer targets with <code class="docutils literal notranslate"><span class="pre">valid_page_slots</span></code> and address them with <code class="docutils literal notranslate"><span class="pre">slot_tensor</span></code>. This covers <code class="docutils literal notranslate"><span class="pre">block_ids</span></code>, <code class="docutils literal notranslate"><span class="pre">cache_block_ids</span></code>, <code class="docutils literal notranslate"><span class="pre">RequestData.new_block_ids</span></code>, and both <code class="docutils literal notranslate"><span class="pre">*_by_layer_group</span></code> forms.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout</span><span class="w"> </span><span class="kn">import</span> <span class="n">valid_page_slots</span>
+
+<span class="k">for</span> <span class="n">ordinal</span><span class="p">,</span> <span class="n">slot</span> <span class="ow">in</span> <span class="n">valid_page_slots</span><span class="p">(</span><span class="n">cache_block_ids</span><span class="p">):</span>
+    <span class="n">tokens</span> <span class="o">=</span> <span class="n">all_tokens</span><span class="p">[</span><span class="n">ordinal</span> <span class="o">*</span> <span class="n">tokens_per_block</span><span class="p">:(</span><span class="n">ordinal</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">tokens_per_block</span><span class="p">]</span>
+    <span class="n">store</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_key</span><span class="p">(</span><span class="n">tokens</span><span class="p">),</span> <span class="n">region</span><span class="o">.</span><span class="n">slot_tensor</span><span class="p">(</span><span class="n">slot</span><span class="p">))</span>
+</pre></div>
+</div>
+<p>Alignment is not the same as stability. Under a sliding window an entry that was reported with a page reads back as <code class="docutils literal notranslate"><span class="pre">-1</span></code> once the window passes its block, and the delta — which carries only the ordinals appended since the last call — does not restate it. Save a block when its tokens complete rather than deferring: a completed block is far inside the window for any usable window size, whereas a deferred save can reach a slot the cache has already reclaimed.</p>
+</section>
+<section id="what-a-connector-can-persist-under-a-sliding-window">
+<h5>What a connector can persist under a sliding window<a class="headerlink" href="#what-a-connector-can-persist-under-a-sliding-window" title="Link to this heading">#</a></h5>
+<p>Under sliding-window attention, a connector can persist <strong>at most <code class="docutils literal notranslate"><span class="pre">window_size</span></code> tokens per sequence</strong>, not <code class="docutils literal notranslate"><span class="pre">prompt_len</span></code>.</p>
+<p>The KV cache manager reclaims a block’s page once the window has moved past it, so by the time <code class="docutils literal notranslate"><span class="pre">request_finished</span></code> runs there is no readable KV for anything older than the last <code class="docutils literal notranslate"><span class="pre">window_size</span></code> tokens. Those ordinals report no page (see <a class="reference internal" href="#blocks-with-no-page">Blocks with no page</a>), and the page slots offered to save from cover the live window only. A prefix-caching connector on such a model therefore caches a tail rather than a prefix, and the prefix it can serve back on a later request is bounded the same way.</p>
+<p>This is a property of the cache, not of the connector: the blocks are gone whether or not a connector is attached. The same bound applies to the KV cache transceiver, which drops the same range before sending.</p>
+</section>
+<section id="serving-a-prefix">
+<h5>Serving a prefix<a class="headerlink" href="#serving-a-prefix" title="Link to this heading">#</a></h5>
+<p>A connector that implements only the flat callbacks and <code class="docutils literal notranslate"><span class="pre">register_kv_caches</span></code> runs unchanged on any model with a single <em>non-sliding</em> attention window. Where the cache describes itself as pools rather than one tensor it calls <code class="docutils literal notranslate"><span class="pre">register_kv_cache_layout</span></code> instead — but that method’s default reconstructs the single-pool tensor, in the same <code class="docutils literal notranslate"><span class="pre">[num_blocks,</span> <span class="pre">num_layers,</span> <span class="pre">kv_factor,</span> <span class="pre">block_size]</span></code> shape and KV dtype, and forwards it to <code class="docutils literal notranslate"><span class="pre">register_kv_caches</span></code>. The same applies to the two block-id callbacks: their per-layer-group forms default to the flat ones when there is a single layer group.</p>
+<p>Variable sliding-window attention is the case where that stops working, because the cache then allocates one pool per window size and a page index is scoped to a layer group. See <a class="reference internal" href="#running-under-vswa">Running under VSWA</a>.</p>
+<p>A model whose layers all share one sliding window stays a single layer group, so the flat callbacks still apply and such a connector is not refused. What differs is that the callbacks cover the <strong>live window only</strong>. Blocks the window has passed report <code class="docutils literal notranslate"><span class="pre">-1</span></code> (<code class="docutils literal notranslate"><span class="pre">BAD_PAGE_INDEX</span></code>) in place — the list stays aligned to block ordinals, so entry <code class="docutils literal notranslate"><span class="pre">i</span></code> still describes tokens <code class="docutils literal notranslate"><span class="pre">[i</span> <span class="pre">*</span> <span class="pre">tokens_per_block,</span> <span class="pre">(i+1)</span> <span class="pre">*</span> <span class="pre">tokens_per_block)</span></code>, but the up-front blocks carry no page and are not available to load into or save from. Filter with <code class="docutils literal notranslate"><span class="pre">valid_page_slots</span></code>, described in <a class="reference internal" href="#blocks-with-no-page">Blocks with no page</a>; without it a <code class="docutils literal notranslate"><span class="pre">-1</span></code> resolves to the last page slot of the pool. A warning naming the window size is logged at start-up when a flat-only connector is attached to such a model.</p>
+<p><code class="docutils literal notranslate"><span class="pre">get_num_new_matched_tokens</span></code> is asked once the batch for the upcoming forward pass is final. A request that is asked is therefore a request that runs, and the connector can take ownership of remote blocks in the query and release it in <code class="docutils literal notranslate"><span class="pre">request_finished</span></code>.</p>
+<p>Two things are worth knowing when tuning a deployment.</p>
+<ul class="simple">
+<li><p><strong>The runtime may honour less than you offer.</strong> With chunked prefill the cache is allocated per context chunk, which is what bounds its memory, so an offer reaching past the current chunk requires the runtime to grow the allocation and that can fail under pressure. The runtime then serves the part it can cover and computes the rest locally. The amount actually served is what <code class="docutils literal notranslate"><span class="pre">RequestData.computed_position</span></code> reflects; the unserved remainder needs no action from the connector beyond its usual <code class="docutils literal notranslate"><span class="pre">request_finished</span></code> cleanup.</p></li>
+<li><p><strong>The query is not part of the scheduler’s budget.</strong> The scheduler sizes a request’s chunk as if the connector will serve nothing, so a served prefix reduces the work in the forward pass but does not free budget for another request in the same iteration.</p></li>
+</ul>
+<p>Specify <code class="docutils literal notranslate"><span class="pre">enable_block_reuse=True</span></code> alongside the connector for any of this to run; see <a class="reference internal" href="#block-reuse-alongside-the-connector">Block reuse alongside the connector</a>.</p>
+<p><code class="docutils literal notranslate"><span class="pre">get_num_new_matched_tokens</span></code> is called <strong>at most once per KV allocation</strong>. This is the precise form of the “once per request” rule: if a request’s KV cache is destroyed and the request is replayed – which <code class="docutils literal notranslate"><span class="pre">MAX_UTILIZATION</span></code> does under memory pressure – the replay asks again, because the pages the first answer described are gone.</p>
+<p><strong>Deployment note.</strong> Under a connector, a workload that was token-bound becomes KV-bound: the connector removes forward-pass tokens but its prefix still occupies GPU pages. Lowering <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> to hand memory back to the KV pool is usually the right adjustment, the opposite of the guidance for a connector-free deployment.</p>
+</section>
+</section>
+<section id="worker-interface-kvcacheconnectorworker">
+<h4>2. Worker Interface (<code class="docutils literal notranslate"><span class="pre">KvCacheConnectorWorker</span></code>)<a class="headerlink" href="#worker-interface-kvcacheconnectorworker" title="Link to this heading">#</a></h4>
+<p>These methods run on all workers (GPU processes) and interact with the actual GPU data.</p>
+<ul class="simple">
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">register_kv_caches(self,</span> <span class="pre">kv_cache_tensor:</span> <span class="pre">torch.Tensor)</span></code></strong></p>
+<ul>
+<li><p><strong>Description</strong>: Called at initialization. Provides the worker with the GPU KV cache tensors.</p></li>
+<li><p><strong>Arguments</strong>: <code class="docutils literal notranslate"><span class="pre">kv_cache_tensor</span></code> is the underlying storage tensor for the KV cache, shaped <code class="docutils literal notranslate"><span class="pre">[num_blocks,</span> <span class="pre">num_layers,</span> <span class="pre">kv_factor,</span> <span class="pre">block_size]</span></code>. Row <code class="docutils literal notranslate"><span class="pre">block_id</span></code> is that block’s KV for every layer. Dimension 1 is indexed by model layer in ascending order, so the <code class="docutils literal notranslate"><span class="pre">layer_idx</span></code> passed to <code class="docutils literal notranslate"><span class="pre">wait_for_layer_load</span></code> and <code class="docutils literal notranslate"><span class="pre">save_kv_layer</span></code> indexes it directly — no mapping is supplied, and none is needed.</p></li>
+</ul>
+</li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">register_kv_cache_layout(self,</span> <span class="pre">layout:</span> <span class="pre">KvCacheLayout)</span></code></strong></p>
+<ul>
+<li><p><strong>Description</strong>: Called at initialization <em>instead of</em> <code class="docutils literal notranslate"><span class="pre">register_kv_caches</span></code> when the cache describes itself as pools rather than one tensor. <code class="docutils literal notranslate"><span class="pre">KvCacheLayout</span></code> gives byte ranges per layer group: <code class="docutils literal notranslate"><span class="pre">layout.groups[g].regions[r]</span></code>, where the data for page slot <code class="docutils literal notranslate"><span class="pre">i</span></code> is at <code class="docutils literal notranslate"><span class="pre">region.base</span> <span class="pre">+</span> <span class="pre">region.stride</span> <span class="pre">*</span> <span class="pre">i</span></code> for <code class="docutils literal notranslate"><span class="pre">region.size</span></code> bytes, or <code class="docutils literal notranslate"><span class="pre">region.slot_tensor(i,</span> <span class="pre">dtype)</span></code>. Full attribute reference: <a class="reference internal" href="#kvcachelayout-reference"><code class="docutils literal notranslate"><span class="pre">KvCacheLayout</span></code> reference</a>.</p></li>
+<li><p><strong>Default</strong>: reconstructs the single-pool tensor and forwards it to <code class="docutils literal notranslate"><span class="pre">register_kv_caches</span></code>, so a connector that does not override this needs no changes for any single-window model. It raises when the cache cannot be described as one tensor — several layer groups (VSWA), or several regions (block scales, layers of differing size).</p></li>
+</ul>
+</li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">start_load_kv(self,</span> <span class="pre">stream:</span> <span class="pre">torch.cuda.Stream)</span></code></strong></p>
+<ul>
+<li><p><strong>Description</strong>: Initiates the loading of KV blocks from the external source into the GPU memory.</p></li>
+<li><p><strong>Arguments</strong>: <code class="docutils literal notranslate"><span class="pre">stream</span></code> is the CUDA stream where the forward pass is executed in.</p></li>
+</ul>
+</li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">wait_for_layer_load(self,</span> <span class="pre">layer_idx:</span> <span class="pre">int,</span> <span class="pre">stream:</span> <span class="pre">torch.cuda.Stream)</span></code></strong></p>
+<ul>
+<li><p><strong>Description</strong>: A synchronization point. Ensures that the KV cache for a specific layer is fully loaded before the model attempts to perform the forward pass on that layer.</p></li>
+</ul>
+</li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">save_kv_layer(self,</span> <span class="pre">layer_idx:</span> <span class="pre">int,</span> <span class="pre">stream:</span> <span class="pre">torch.cuda.Stream)</span></code></strong></p>
+<ul>
+<li><p><strong>Description</strong>: Triggers the saving of a specific layer’s KV cache.</p></li>
+</ul>
+</li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">wait_for_save(self,</span> <span class="pre">stream:</span> <span class="pre">torch.cuda.Stream)</span></code></strong></p>
+<ul>
+<li><p><strong>Description</strong>: A synchronization point to ensure all save operations are enqueued or completed.</p></li>
+</ul>
+</li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">get_finished(self,</span> <span class="pre">finished_gen_req_ids,</span> <span class="pre">started_loading_req_ids)</span> <span class="pre">-&gt;</span> <span class="pre">tuple[list[int],</span> <span class="pre">list[int]]</span></code></strong></p>
+<ul>
+<li><p><strong>Description</strong>: Polled by the runtime to check the status of asynchronous operations.</p></li>
+<li><p><strong>Returns</strong>: Two lists of request IDs: those that have finished saving, and those that have finished loading.</p></li>
+</ul>
+</li>
+</ul>
+</section>
+</section>
+</section>
+<section id="example-implementation">
+<h2>Example Implementation<a class="headerlink" href="#example-implementation" title="Link to this heading">#</a></h2>
+<p>The file <code class="docutils literal notranslate"><span class="pre">examples/llm-api/llm_kv_cache_connector.py</span></code> provides a reference implementation of a <strong>Persistent KV Cache</strong>.</p>
+<section id="overview">
+<h3>Overview<a class="headerlink" href="#overview" title="Link to this heading">#</a></h3>
+<p>This example implements a file-system based KV cache.</p>
+<ol class="arabic simple">
+<li><p><strong>Save</strong>: When a request finishes or needs to be swapped out, its KV blocks are saved to disk as <code class="docutils literal notranslate"><span class="pre">.pt</span></code> files.</p></li>
+<li><p><strong>Load</strong>: When a new request arrives with the same prompt prefix, the connector identifies the cached files and loads them back into GPU memory, skipping re-computation.</p></li>
+</ol>
+</section>
+<section id="implementation-details">
+<h3>Implementation Details<a class="headerlink" href="#implementation-details" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p><strong>Metadata</strong>: The example defines a <code class="docutils literal notranslate"><span class="pre">PersistentKvCacheConnectorMetadata</span></code> dataclass containing lists of <code class="docutils literal notranslate"><span class="pre">(file_path,</span> <span class="pre">block_id)</span></code> tuples for both loading and saving. This simple structure allows the Scheduler to tell the Worker exactly which file corresponds to which GPU block index.</p></li>
+<li><p><strong>Hashing Strategy</strong>: The <code class="docutils literal notranslate"><span class="pre">PersistentKvCacheConnectorLeader</span></code> hashes the token sequence of a block to generate a unique filename (e.g., <code class="docutils literal notranslate"><span class="pre">hash_value.pt</span></code>). This acts as the lookup key.</p></li>
+<li><p><strong>Worker Logic</strong>:</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">start_load_kv</span></code>: Iterates through the load list provided in the metadata, loads the <code class="docutils literal notranslate"><span class="pre">.pt</span></code> file to CPU, and copies it to the specific <code class="docutils literal notranslate"><span class="pre">block_id</span></code> in the GPU tensor.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">wait_for_save</span></code>: Performs the reverse. It copies data from the GPU <code class="docutils literal notranslate"><span class="pre">block_id</span></code> to CPU and saves it to disk using <code class="docutils literal notranslate"><span class="pre">torch.save</span></code>.</p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="limitations-patterns">
+<h3>Limitations &amp; Patterns<a class="headerlink" href="#limitations-patterns" title="Link to this heading">#</a></h3>
+<p>This example illustrates the API mechanics but has several limitations that make it unsuitable for high-performance production use without modification:</p>
+<ol class="arabic simple">
+<li><p><strong>Blocking I/O</strong>: The example uses <code class="docutils literal notranslate"><span class="pre">torch.load</span></code> and <code class="docutils literal notranslate"><span class="pre">torch.save</span></code> synchronously. In a real implementation, these should be offloaded to a background thread or asynchronous I/O handler to avoid stalling the GPU.</p></li>
+<li><p><strong>Simplified Block Matching</strong>: The <code class="docutils literal notranslate"><span class="pre">get_num_new_matched_tokens</span></code> implementation in the example only matches full blocks. It does not handle partial cache hits.</p></li>
+<li><p><strong>FileSystem Latency</strong>: Storing one file per block can create high filesystem overhead.</p></li>
+</ol>
+</section>
+<section id="usage">
+<h3>Usage<a class="headerlink" href="#usage" title="Link to this heading">#</a></h3>
+<p>To run the example:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>examples/llm-api/llm_kv_cache_connector.py<span class="w"> </span>&lt;model_path&gt;
+</pre></div>
+</div>
+<p>The script demonstrates:</p>
+<ol class="arabic simple">
+<li><p>Generating text for a prompt (First run).</p></li>
+<li><p>Destroying the LLM instance.</p></li>
+<li><p>Creating a new LLM instance with the same connector config.</p></li>
+<li><p>Generating text for the same prompt (Second run).</p></li>
+<li><p>Asserting that the outputs match, proving the state was correctly restored from the disk cache.</p></li>
+</ol>
+</section>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="helix.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Helix Parallelism</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="sparse-attention.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Sparse Attention</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#use-cases">Use Cases</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#architecture">Architecture</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#api-reference">API Reference</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#scheduler-leader-interface-kvcacheconnectorscheduler">1. Scheduler (Leader) Interface (<code class="docutils literal notranslate"><span class="pre">KvCacheConnectorScheduler</span></code>)</a><ul class="nav section-nav flex-column">
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#running-under-vswa">Running under VSWA</a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#kvcachelayout-reference"><code class="docutils literal notranslate"><span class="pre">KvCacheLayout</span></code> reference</a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#kv-cache-tiers-are-gpu-only-under-a-connector">KV cache tiers are GPU-only under a connector</a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#block-reuse-alongside-the-connector">Block reuse alongside the connector</a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#a-page-slot-must-not-be-reassigned-underneath-the-connector">A page slot must not be reassigned underneath the connector</a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#requestdata-fields-that-may-not-be-populated"><code class="docutils literal notranslate"><span class="pre">RequestData</span></code> fields that may not be populated</a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#blocks-with-no-page">Blocks with no page</a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#what-a-connector-can-persist-under-a-sliding-window">What a connector can persist under a sliding window</a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-a-prefix">Serving a prefix</a></li>
+</ul>
+</li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#worker-interface-kvcacheconnectorworker">2. Worker Interface (<code class="docutils literal notranslate"><span class="pre">KvCacheConnectorWorker</span></code>)</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#example-implementation">Example Implementation</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">Overview</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#implementation-details">Implementation Details</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#limitations-patterns">Limitations &amp; Patterns</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#usage">Usage</a></li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on September 21, 2026.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fca831e">fca831e</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>
