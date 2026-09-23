@@ -208,6 +208,7 @@ def test_repeated_metrics_directory_setup_preserves_executor_files(monkeypatch):
         assert _utils.prometheus_multiproc_dir is owner
         assert metric_file.read_text() == "preserved"
     finally:
+        os.environ.pop("PROMETHEUS_MULTIPROC_DIR", None)
         owner.cleanup()
 
 
