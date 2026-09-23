@@ -123,8 +123,7 @@ class MegaMoESharedMLP(GatedMLP):
             swiglu_beta=swiglu_beta,
             mxfp8_reserved_sms=mxfp8_reserved_sms,
         )
-        if not self.gate_up_proj.has_fp8_block_scales or not self.down_proj.has_fp8_block_scales:
-            raise ValueError("Shared FC12 requires FP8_BLOCK_SCALES for both projections")
+        self._validate_fp8_quantization()
         self._fc12_max_tokens = int(config.max_num_tokens)
         if self._fc12_max_tokens <= 0:
             raise ValueError("Shared FC12 max_num_tokens must be positive")
@@ -136,6 +135,12 @@ class MegaMoESharedMLP(GatedMLP):
     kernel_name = "BlockScaledSwapAbFc12Kernel"
     quantization_kind = "mxfp8_e4m3"
 
+    def _validate_fp8_quantization(self) -> None:
+        for projection in (self.gate_up_proj, self.down_proj):
+            quant_config = projection.quant_config
+            if quant_config is None or not quant_config.layer_quant_mode.has_fp8_block_scales():
+                raise ValueError("Shared FC12 requires FP8_BLOCK_SCALES for both projections")
+
     @property
     def mxfp8_reserved_sms(self) -> int:
         reserved = self.gate_up_proj.mxfp8_reserved_sms
@@ -145,6 +150,8 @@ class MegaMoESharedMLP(GatedMLP):
 
     @property
     def sm_count(self) -> int:
+        if not self.gate_up_proj._weights_created:
+            raise RuntimeError("Shared FC12 SM count requires materialized CUDA weights")
         device = self.gate_up_proj.weight.device
         if device.type != "cuda":
             raise RuntimeError("Shared FC12 SM count requires CUDA weights")
@@ -167,6 +174,7 @@ class MegaMoESharedMLP(GatedMLP):
     def prepare_fc12_weights(self) -> None:
         """Cache FC12 layouts after both Linear post-load transformations finish."""
         gate_up, down = self.gate_up_proj, self.down_proj
+        self._validate_fp8_quantization()
         if not gate_up._weights_transformed or not down._weights_transformed:
             raise RuntimeError("Shared FC12 requires both Linear post_load_weights calls first")
         sources = (gate_up.weight, gate_up.weight_scale, down.weight, down.weight_scale)
