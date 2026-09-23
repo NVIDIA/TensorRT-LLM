@@ -110,3 +110,52 @@ not prove accuracy. Earlier slots4 cached-winner MLP checks were elementwise
 identical in 136 comparisons; they cover one 8,192-token bucket and one layer,
 not slots3, every tactic, or full-model quality. Full raw evidence is retained
 with the MR's external validation artifacts.
+
+## Design proposal: SM-partitioned streams (2026-09-23)
+
+**Status: recorded for evaluation; not implemented or GPU-validated.** The
+ordinary-stream implementation described above remains the current baseline.
+
+Keep one CPU submitter, but create two Green Context streams backed by disjoint
+SM resources: COMPUTE for quantization, shared FC1/FC2 and MegaMoE; high-priority
+COPY for HALO-Q and in-switch TMA weight-copy kernels. The target is `N-8 + 8`
+SMs, where `N` is queried from the device. `204 + 8` is the 212-SM example,
+not a hard-coded GB200 configuration. Query the actual partitions and verify
+cluster compatibility before treating this split as supported. Ordinary stream
+priority alone does not partition SMs.
+
+This separates two objectives:
+
+| Objective | Is changing the stream sufficient? |
+| --- | --- |
+| Restrict execution to a provisioned SM partition | Yes, for kernels launched on the corresponding Green Context stream. |
+| Change quantization grid size from 848 to 816 CTAs | No; grid sizing must use the partition's SM count. |
+
+The current FP4/MXFP8 wrappers cache `getMultiProcessorCount()` in thread-local
+storage. That helper queries the device, without a stream argument; the launch
+code receives the SM count and stream separately. With a cached count of 212,
+zero reservation, 512 threads/block and sufficient rows, the grid is still 848
+CTAs even if execution is restricted to 204 SMs. This can retain a tail wave.
+Changing the stream does not rewrite the cached count or launch geometry.
+
+For resource isolation alone, this approach could remove the added
+`reserved_sms` quantizer overloads. If a grid matched to the partition remains
+necessary, assess a stream-resource-aware launch calculation separately.
+Do not remove the existing overloads before that decision and validation.
+Green Context creation can be exposed at the Python integration boundary, but
+the installed CUDA/PyTorch versions and stream/context lifetime need validation.
+
+Preserve the existing route/READY dependencies, single submitter and enlarged
+launch queues. SM partitioning does not by itself solve host driver stalls or
+isolate memory bandwidth. Validate actual SM placement, GEMM cluster occupancy,
+quantization grids and correctness before comparing performance. For CUDA
+graphs, capture/create nodes with the intended execution context; merely
+changing the replay stream is insufficient.
+
+Compare OFF, current ON and partitioned ON on the same hardware and workload:
+quantization/shared-expert latency, scheduler/copy overlap, host enqueue cost,
+iteration tails and unprofiled E2E throughput. Retune partition-dependent tactics
+and keep their caches distinct. No performance improvement is claimed yet.
+
+References: [CUDA Green Contexts](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/green-contexts.html)
+and [SM resource partitioning API](https://docs.nvidia.com/cuda/cuda-driver-api/cuda_driver_api/group__CUDA__GREEN__CONTEXTS.html).
