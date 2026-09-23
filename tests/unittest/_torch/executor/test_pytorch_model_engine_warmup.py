@@ -1075,7 +1075,9 @@ class TestWarmupCleanup(unittest.TestCase):
                             with self.assertRaisesRegex(RuntimeError, "warmup failed"):
                                 model_engine._capture_prefill_cuda_graphs(resource_manager)
                         self.assertEqual(runner.metrics, {warmup_scope: 1.0})
-                        self.assertEqual(model_engine.metrics, {})
+                        self.assertEqual(
+                            model_engine.metrics, {warmup_metric: 1.0, capture_metric: 0.0}
+                        )
                         self.assertFalse(runner.is_warming_up)
                         self.assertFalse(runner.is_capturing)
 
