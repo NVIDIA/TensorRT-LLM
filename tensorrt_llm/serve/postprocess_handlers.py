@@ -925,9 +925,6 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
                                     total_tokens=output.length + prompt_tokens,
                                     prompt_tokens_details=PromptTokensDetails(
                                         cached_tokens=rsp.cached_tokens,
-                                        image_tokens=args.image_tokens,
-                                        video_tokens=args.video_tokens,
-                                        audio_tokens=args.audio_tokens,
                                     ))
             rewrite_usage_info_from_ctx(chunk.usage, ctx_usage)
         data = chunk.model_dump_json(exclude_unset=False)
@@ -941,9 +938,6 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
             total_tokens=prompt_tokens + completion_tokens,
             prompt_tokens_details=PromptTokensDetails(
                 cached_tokens=rsp.cached_tokens,
-                image_tokens=args.image_tokens,
-                video_tokens=args.video_tokens,
-                audio_tokens=args.audio_tokens,
             ),
         )
         rewrite_usage_info_from_ctx(final_usage, ctx_usage)
@@ -1002,9 +996,6 @@ def completion_response_post_processor(
                       total_tokens=completion_tokens + prompt_tokens,
                       prompt_tokens_details=PromptTokensDetails(
                           cached_tokens=rsp.cached_tokens,
-                          image_tokens=args.image_tokens,
-                          video_tokens=args.video_tokens,
-                          audio_tokens=args.audio_tokens,
                       ))
     response = CompletionResponse(choices=choices,
                                   model=args.model,

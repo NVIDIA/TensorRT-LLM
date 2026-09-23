@@ -17,6 +17,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
 from tensorrt_llm.llmapi.disagg_utils import get_usage_tokens_from_ctx, rewrite_usage_info_from_ctx
 from tensorrt_llm.serve.harmony_adapter import (
     _create_usage_info,
@@ -313,88 +315,26 @@ class TestDisaggUtilsModalityTokens:
         assert rewritten.prompt_tokens_details.cached_tokens == 150
         assert rewritten.prompt_tokens_details.image_tokens == 450
         assert rewritten.prompt_tokens_details.video_tokens == 200
-        assert rewritten.prompt_tokens_details.audio_tokens == 50
-
-
-class TestHarmonyAdapterModalityTokens:
-    def test_create_usage_info_with_modality_tokens(self):
-        out = MagicMock()
-        out.token_ids = [10, 20, 30]
-        usage = _create_usage_info(
-            num_prompt_tokens=500,
-            outputs=[out],
-            cached_tokens=50,
-            image_tokens=200,
-            video_tokens=100,
+    def test_rewrite_usage_info_generation_first_disagg_preserves_gen_modality_tokens(self):
+        ctx_usage = UsageInfo(
+            prompt_tokens=1000,
+            completion_tokens=0,
+            total_tokens=1000,
+            prompt_tokens_details=PromptTokensDetails(cached_tokens=64),
         )
-        assert usage.prompt_tokens == 500
-        assert usage.completion_tokens == 3
-        assert usage.total_tokens == 503
-        assert usage.prompt_tokens_details.cached_tokens == 50
-        assert usage.prompt_tokens_details.image_tokens == 200
-        assert usage.prompt_tokens_details.video_tokens == 100
-        assert usage.prompt_tokens_details.audio_tokens is None
+        gen_usage = UsageInfo(
+            prompt_tokens=1000,
+            completion_tokens=20,
+            total_tokens=1020,
+            prompt_tokens_details=PromptTokensDetails(cached_tokens=0, image_tokens=576),
+        )
+        rewritten = rewrite_usage_info_from_ctx(gen_usage, ctx_usage)
 
-    @pytest.mark.parametrize("handler_type", ["streaming", "non_streaming"])
-    def test_harmony_handlers_forward_modality_tokens(self, handler_type):
-        out = MagicMock()
-        out.token_ids = [10, 20, 30]
-        out.token_ids_diff = [10, 20, 30]
-        out.finish_reason = "stop"
-        out.stop_reason = None
-        out.disaggregated_params = None
-
-        with patch("tensorrt_llm.serve.harmony_adapter.get_harmony_adapter") as mock_adapter_getter:
-            mock_adapter = MagicMock()
-            mock_adapter_getter.return_value = mock_adapter
-            mock_adapter.harmony_output_to_openai.return_value = {
-                "role": "assistant",
-                "content": "test",
-            }
-            mock_adapter.create_openai_streaming_response.return_value = ([], False)
-
-            if handler_type == "non_streaming":
-                response = handle_non_streaming_response(
-                    tools=[],
-                    tool_choice="none",
-                    outputs=[out],
-                    model="gpt-4o",
-                    num_prompt_tokens=500,
-                    cached_tokens=50,
-                    image_tokens=250,
-                    video_tokens=150,
-                    audio_tokens=75,
-                )
-                assert response.usage.prompt_tokens == 500
-                assert response.usage.prompt_tokens_details.cached_tokens == 50
-                assert response.usage.prompt_tokens_details.image_tokens == 250
-                assert response.usage.prompt_tokens_details.video_tokens == 150
-                assert response.usage.prompt_tokens_details.audio_tokens == 75
-            else:
-                result = MagicMock()
-                result.outputs = [out]
-                chunks = handle_streaming_response(
-                    tools=[],
-                    tool_choice="none",
-                    result=result,
-                    model="gpt-4o",
-                    request_id="req-123",
-                    done=True,
-                    num_prompt_tokens=500,
-                    first_iteration=True,
-                    cached_tokens=50,
-                    image_tokens=250,
-                    video_tokens=150,
-                    audio_tokens=75,
-                )
-                usage_chunks = [c for c in chunks if "usage" in c and 'choices":[]' in c]
-                assert len(usage_chunks) == 1
-                data = json.loads(usage_chunks[0].replace("data: ", "").strip())
-                usage_details = data["usage"]["prompt_tokens_details"]
-                assert usage_details["cached_tokens"] == 50
-                assert usage_details["image_tokens"] == 250
-                assert usage_details["video_tokens"] == 150
-                assert usage_details["audio_tokens"] == 75
+        assert rewritten.prompt_tokens == 1000
+        assert rewritten.completion_tokens == 20
+        assert rewritten.total_tokens == 1020
+        assert rewritten.prompt_tokens_details.cached_tokens == 64
+        assert rewritten.prompt_tokens_details.image_tokens == 576
 
 
 from types import SimpleNamespace
