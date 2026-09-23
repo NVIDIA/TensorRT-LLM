@@ -51,6 +51,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     TaskStatus,
     TxSession,
 )
+from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 
 pytestmark = pytest.mark.cpu_only
 
@@ -701,6 +702,37 @@ def test_receive_session_failure_precedes_later_cancel_without_an_observer() -> 
     assert isinstance(outcome, Failed)
     assert "first publication failure" in outcome.reason
     assert outcome.reports_pending is True
+
+
+def test_receive_aux_failure_precedes_late_kv_success() -> None:
+    session = RxSession(
+        request_id=31,
+        params=DisaggregatedParams(
+            disagg_request_id=31, schedule_style=DisaggScheduleStyle.GENERATION_FIRST
+        ),
+        receiver=_stub_receiver(),
+        prompt_len=TOKENS,
+    )
+    session.receive(_sole_piece())
+    task = session._kv_tasks[0]
+    task.expected_transfers = 1
+    session.mark_transferring(task.slice_id)
+    handle = TaskHandle(session, task, TOKENS)
+
+    session.process_aux_agent_result(0, AgentResult.FAILED)
+    outcome = handle.poll()
+    assert isinstance(outcome, Failed)
+    assert "aux transfer failed" in outcome.reason
+    assert outcome.reports_pending is True
+
+    _report(session, 0, AgentResult.SUCCESS)
+
+    assert task.status is TaskStatus.TRANSFERRED
+    for observer in (handle, TaskHandle(session, task, TOKENS)):
+        outcome = observer.poll()
+        assert isinstance(outcome, Failed)
+        assert "aux transfer failed" in outcome.reason
+        assert outcome.reports_pending is False
 
 
 def _sending_pieces(count: int = 1) -> tuple[Sender, TxSession]:
