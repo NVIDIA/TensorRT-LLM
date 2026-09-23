@@ -356,7 +356,7 @@ def mooncake_donor(
         donate_segment(
             resolved,
             donating,
-            protocol=protocol or raw.get("protocol", "rdma"),
+            protocol=protocol or raw.get("protocol") or "rdma",
             device_name=device_name or raw.get("device_name", "") or "",
             metadata_server=(
                 metadata_server or raw.get("metadata_server") or DEFAULT_METADATA_SERVER

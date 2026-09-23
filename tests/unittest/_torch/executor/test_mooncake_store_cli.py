@@ -31,7 +31,10 @@ import click
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.connectors import mooncake_store
-from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import CONFIG_PATH_ENV
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
+    CONFIG_PATH_ENV,
+    DEFAULT_METADATA_SERVER,
+)
 from tensorrt_llm.commands import _telemetry
 from tensorrt_llm.commands import mooncake as mooncake_commands
 from tensorrt_llm.usage.config import UsageContext
@@ -275,6 +278,167 @@ def test_a_donor_rejects_a_size_it_cannot_parse(monkeypatch, segment, size):
         ).run()
 
     assert segment.taken_with is None
+
+
+# ---- how the donor resolves its flags against a config ----
+
+
+class RecordingDonation:
+    """Records the arguments the donor resolves before donate_segment is called.
+
+    The command idles inside the donation context, so a test breaks the loop
+    with a signal once the resolved arguments and the ready file are in hand.
+    """
+
+    def __init__(self, host: str = "10.0.0.1:12345"):
+        self.host = host
+        self.resolved: dict = {}
+
+    @contextlib.contextmanager
+    def holding(self, master, segment, **kwargs):
+        self.resolved = dict(master=master, segment=segment, **kwargs)
+        yield self.host
+
+
+@pytest.fixture
+def donation(monkeypatch) -> RecordingDonation:
+    """Drive the donor to the point of donation, capturing what it resolved."""
+    recorder = RecordingDonation()
+    monkeypatch.setattr(mooncake_store, "donate_segment", recorder.holding)
+    monkeypatch.setattr(mooncake_store, "resolve_master_address", lambda address, _t: address)
+    monkeypatch.setattr(mooncake_store, "wait_for_master", lambda _address: None)
+    return recorder
+
+
+def _config_file(tmp_path, **entries) -> str:
+    path = tmp_path / "pool.json"
+    path.write_text(json.dumps(entries))
+    return str(path)
+
+
+def test_the_donor_uses_its_documented_defaults_without_a_config(monkeypatch, donation):
+    """With only the required master, transport and buffer defaults apply."""
+    signal_on_idle(monkeypatch, signal.SIGTERM)
+
+    with pytest.raises(_telemetry.SignalExit):
+        donor_running(donation, "--master_server_address", "10.0.0.1:50051").run()
+
+    assert donation.resolved["protocol"] == "rdma"
+    assert donation.resolved["device_name"] == ""
+    assert donation.resolved["metadata_server"] == DEFAULT_METADATA_SERVER
+    assert donation.resolved["local_buffer_size"] == mooncake_store.DEFAULT_DONOR_LOCAL_BUFFER_SIZE
+
+
+def test_the_donor_resolves_every_option_from_the_cli(monkeypatch, donation):
+    """Flags alone describe the donation, with no config on hand."""
+    signal_on_idle(monkeypatch, signal.SIGTERM)
+
+    with pytest.raises(_telemetry.SignalExit):
+        donor_running(
+            donation,
+            "--master_server_address",
+            "10.0.0.1:50051",
+            "--segment_size",
+            "2GiB",
+            "--protocol",
+            "tcp",
+            "--device_name",
+            "mlx5_0",
+            "--metadata_server",
+            "http://cli:8080/metadata",
+        ).run()
+
+    assert donation.resolved["master"] == "10.0.0.1:50051"
+    assert donation.resolved["segment"] == 2 * 1024**3
+    assert donation.resolved["protocol"] == "tcp"
+    assert donation.resolved["device_name"] == "mlx5_0"
+    assert donation.resolved["metadata_server"] == "http://cli:8080/metadata"
+
+
+def test_the_donor_falls_back_to_the_config_for_unset_options(monkeypatch, donation, tmp_path):
+    """A config names the master and the transport when no flag overrides it."""
+    config = _config_file(
+        tmp_path,
+        master_server_address="10.0.0.9:50051",
+        protocol="tcp",
+        device_name="mlx5_1",
+        metadata_server="http://config:8080/metadata",
+    )
+    signal_on_idle(monkeypatch, signal.SIGTERM)
+
+    with pytest.raises(_telemetry.SignalExit):
+        donor_running(donation, "--config", config, "--segment_size", "1GiB").run()
+
+    assert donation.resolved["master"] == "10.0.0.9:50051"
+    assert donation.resolved["protocol"] == "tcp"
+    assert donation.resolved["device_name"] == "mlx5_1"
+    assert donation.resolved["metadata_server"] == "http://config:8080/metadata"
+
+
+def test_the_donor_prefers_the_cli_over_the_config(monkeypatch, donation, tmp_path):
+    """A flag wins over the same setting in the config."""
+    config = _config_file(
+        tmp_path,
+        master_server_address="10.0.0.9:50051",
+        protocol="tcp",
+        device_name="mlx5_1",
+        metadata_server="http://config:8080/metadata",
+    )
+    signal_on_idle(monkeypatch, signal.SIGTERM)
+
+    with pytest.raises(_telemetry.SignalExit):
+        donor_running(
+            donation,
+            "--config",
+            config,
+            "--master_server_address",
+            "10.0.0.1:50051",
+            "--segment_size",
+            "1GiB",
+            "--protocol",
+            "rdma",
+            "--device_name",
+            "mlx5_0",
+            "--metadata_server",
+            "http://cli:8080/metadata",
+        ).run()
+
+    assert donation.resolved["master"] == "10.0.0.1:50051"
+    assert donation.resolved["protocol"] == "rdma"
+    assert donation.resolved["device_name"] == "mlx5_0"
+    assert donation.resolved["metadata_server"] == "http://cli:8080/metadata"
+
+
+def test_the_donor_defaults_the_protocol_to_rdma_when_the_config_value_is_null(
+    monkeypatch, donation, tmp_path
+):
+    """A null protocol in the config must not reach setup unnormalized."""
+    config = _config_file(tmp_path, master_server_address="10.0.0.9:50051", protocol=None)
+    signal_on_idle(monkeypatch, signal.SIGTERM)
+
+    with pytest.raises(_telemetry.SignalExit):
+        donor_running(donation, "--config", config, "--segment_size", "1GiB").run()
+
+    assert donation.resolved["protocol"] == "rdma"
+
+
+def test_the_donor_announces_the_mounted_segment_in_its_ready_file(monkeypatch, donation, tmp_path):
+    """A launcher waits on this file before letting prefill fill the pool."""
+    ready_file = tmp_path / "ready"
+    signal_on_idle(monkeypatch, signal.SIGTERM)
+
+    with pytest.raises(_telemetry.SignalExit):
+        donor_running(
+            donation,
+            "--master_server_address",
+            "10.0.0.1:50051",
+            "--segment_size",
+            "2GiB",
+            "--ready_file",
+            str(ready_file),
+        ).run()
+
+    assert ready_file.read_text() == f"{donation.host} {2 * 1024**3}\n"
 
 
 # ---- describing the pool from the master's own run directory ----
