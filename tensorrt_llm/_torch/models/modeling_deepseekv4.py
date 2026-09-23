@@ -1604,7 +1604,21 @@ class DeepseekV4MoE(nn.Module):
 
             shared_mxfp8_reserved_sms = TMA_COPY_SM_COUNT
 
-        self.shared_experts = GatedMLP(
+        shared_mlp_cls = GatedMLP
+        descriptor = getattr(rebalance_backend, "descriptor", None)
+        if (
+            descriptor is not None
+            and descriptor.impl_id == "trtllm.cutedsl.mega_moe.nvfp4"
+            and get_sm_version() == 107
+            and model_config.get_quant_config().quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            and not model_config.use_cuda_graph
+        ):
+            from ..modules.megamoe_shared_mlp import MegaMoESharedMLP
+
+            # Keep the shared kernel identical for OFF and ON; only its SM budget changes.
+            shared_mlp_cls = MegaMoESharedMLP
+
+        self.shared_experts = shared_mlp_cls(
             hidden_size=hidden_size,
             intermediate_size=shared_expert_intermediate_size,
             bias=False,
