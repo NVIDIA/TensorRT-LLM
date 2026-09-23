@@ -17,6 +17,7 @@
 #include "tensorrt_llm/common/attentionWorkspace.h"
 #include "tensorrt_llm/common/attentionOp.h"
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/workspace.h"
 
 #include <gtest/gtest.h>
@@ -107,6 +108,17 @@ size_t getUnfusedContextWorkspace(tcop::AttentionOp const& op)
 }
 
 } // namespace
+
+TEST(AttentionOpTest, InitializePropagatesValidationError)
+{
+    tcop::AttentionOp op;
+    op.mNumHeads = 1;
+    op.mNumKVHeads = 1;
+    op.mEnableContextFMHA = false;
+    op.mFuseFp4Quant = true;
+
+    EXPECT_THROW(op.initialize(), tc::TllmException);
+}
 
 TEST(AttentionWorkspaceManagerTest, RaggedUnfusedSelfAttentionUsesPaddedTokenCounts)
 {

@@ -256,11 +256,12 @@ def test_worker_publishes_identities_before_backend_construction(monkeypatch):
             return [identity]
 
     class _FakeInitStatusQueue:
-        succeeds = True
+        def __init__(self):
+            self.notification_results = [True, True]
 
         def notify_with_retry(self, message):
             events.append(("notify", message[0]))
-            return self.succeeds
+            return self.notification_results.pop(0)
 
     class _FailingWorker:
         def __init__(self, *args, **kwargs):
@@ -304,7 +305,7 @@ def test_worker_publishes_identities_before_backend_construction(monkeypatch):
     ]
 
     events.clear()
-    init_status_queue.succeeds = False
+    init_status_queue.notification_results = [False]
     with pytest.raises(RuntimeError, match="Failed to deliver worker process identities to proxy"):
         worker_module.worker_main(
             engine=object(),
@@ -318,6 +319,29 @@ def test_worker_publishes_identities_before_backend_construction(monkeypatch):
         )
 
     assert events == [("notify", GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL)]
+
+    events.clear()
+    init_status_queue.notification_results = [True, False]
+    with pytest.raises(RuntimeError, match="Failed to initialize executor on rank 0") as exc_info:
+        worker_module.worker_main(
+            engine=object(),
+            worker_queues=worker_queues,
+            log_level=worker_module.logger.level,
+            worker_cls=_FailingWorker,
+            ready_signal=GenerationExecutorProxy.READY_SIGNAL,
+            worker_process_identities_signal=(
+                GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL
+            ),
+        )
+
+    assert "expected construction failure" in str(exc_info.value)
+    assert "Traceback (most recent call last)" in str(exc_info.value)
+    assert events[:2] == [
+        ("notify", GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL),
+        ("construct", None),
+    ]
+    assert events[2][0] == "notify"
+    assert isinstance(events[2][1], RuntimeError)
 
 
 def test_non_leader_worker_propagates_backend_initialization_error(monkeypatch):
