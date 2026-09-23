@@ -50,6 +50,14 @@ class _FakeCudaStream:
     cuda_stream = 0
 
 
+class _FakeCompiledModel:
+    """Minimal torch.compile-style wrapper that changes the model's type."""
+
+    def __init__(self, original_model):
+        self._orig_mod = original_model
+        self.model_config = original_model.model_config
+
+
 class _FakeKVCacheManagerCpp:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -141,6 +149,7 @@ def _make_mock_model_engine(model_config):
     engine.dtype = torch.bfloat16
     engine.is_draft_model = False
     engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+    engine.input_processor = SimpleNamespace(requires_encoder_features=False)
     return engine
 
 
@@ -293,11 +302,12 @@ class TestSplitKvCacheBudgetForCross:
         assert self_config.free_gpu_memory_fraction == pytest.approx(0.4)
         assert config.free_gpu_memory_fraction == pytest.approx(0.8)
 
-    def test_feature_encoder_disables_reuse_for_both_pools(self):
-        """Feature inputs cannot safely key self- or cross-KV reuse."""
+    def test_wrapped_feature_encoder_disables_reuse_for_both_pools(self):
+        """Feature detection survives a torch.compile-style model wrapper."""
         config = _make_kv_cache_config(cross_kv_cache_fraction=0.5)
         creator = _make_creator(config, is_enc_dec=True)
-        creator._encoder_input_is_features = Mock(return_value=True)
+        creator._model_engine.model = _FakeCompiledModel(creator._model_engine.model)
+        creator._model_engine.input_processor.requires_encoder_features = True
 
         self_config, cross_config = creator._split_kv_cache_budget_for_cross()
 
@@ -310,7 +320,6 @@ class TestSplitKvCacheBudgetForCross:
         """Token inputs retain reusable identities for both KV pools."""
         config = _make_kv_cache_config(cross_kv_cache_fraction=0.5)
         creator = _make_creator(config, is_enc_dec=True)
-        creator._encoder_input_is_features = Mock(return_value=False)
 
         self_config, cross_config = creator._split_kv_cache_budget_for_cross()
 
@@ -724,7 +733,7 @@ class TestCrossKvCacheConstruction:
         )
         creator = _make_creator(config, is_enc_dec=True)
         creator.configure_kv_cache_capacity = Mock()
-        creator._encoder_input_is_features = Mock(return_value=True)
+        creator._model_engine.input_processor.requires_encoder_features = True
         creator._should_create_separate_draft_kv_cache = Mock(return_value=False)
         creator._create_kv_cache_manager = Mock(return_value=Mock())
         creator._create_cross_kv_cache_manager = Mock(return_value=Mock())

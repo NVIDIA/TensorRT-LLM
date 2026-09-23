@@ -25,8 +25,6 @@ from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
                                  is_sm_100f, prefer_pinned,
                                  str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.inputs.multimodal import MultimodalParams
-from tensorrt_llm.inputs.registry import \
-    input_processor_requires_encoder_features
 
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
@@ -2230,8 +2228,9 @@ class KvCacheCreator:
         return self._model_engine.model.model_config.is_encoder_decoder
 
     def _encoder_input_is_features(self) -> bool:
-        return input_processor_requires_encoder_features(
-            type(self._model_engine.model))
+        return bool(
+            getattr(self._model_engine.input_processor,
+                    "requires_encoder_features", False))
 
     @staticmethod
     def _get_config_int_attr(config, names: tuple[str, ...]) -> Optional[int]:

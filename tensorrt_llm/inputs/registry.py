@@ -1074,18 +1074,6 @@ def support_multimodal_disaggregated(model_cls: Type[nn.Module]):
     return model_cls
 
 
-def input_processor_requires_encoder_features(
-        model_cls: Type[nn.Module]) -> bool:
-    """Whether ``model_cls``'s input processor feeds the encoder a feature tensor.
-
-    Feature-driven encoders (e.g. Whisper's audio encoder) take no encoder
-    token ids, so such requests have nothing to key cross-KV blocks on.
-    """
-    processor_cls = INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_model_type.get(
-        model_cls)
-    return bool(getattr(processor_cls, "requires_encoder_features", False))
-
-
 def register_input_processor(
         processor_cls: Type[InputProcessor],
         model_type: str,
