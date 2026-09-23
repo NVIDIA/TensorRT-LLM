@@ -28,6 +28,7 @@
 # SOFTWARE.
 # --------------------------------------------------
 
+import contextlib
 import copy
 import math
 import os
@@ -70,7 +71,8 @@ from ..moe.fused_moe.routing import Deepseekv3RoutingImpl
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightsLoadingConfig,
                               is_static_nvfp4_input_eligible)
-from ..modules.multi_stream_utils import maybe_execute_in_parallel
+from ..modules.multi_stream_utils import (do_multi_stream,
+                                          maybe_execute_in_parallel)
 from ..modules.rms_norm import RMSNorm
 from ..peft.lora.layer import LoraLayer
 from ..speculative import SpecMetadata
@@ -1195,6 +1197,13 @@ class Deepseekv3MoE(nn.Module):
             assert not self.use_dp
 
         def _compute_shared_output():
+            nvtx_range = (torch.cuda.nvtx.range("shared_expert")
+                          if os.environ.get("TRTLLM_MOE_REBALANCE_NVTX") == "1"
+                          else contextlib.nullcontext())
+            with nvtx_range:
+                return _compute_shared_output_inner()
+
+        def _compute_shared_output_inner():
             shared_input = (hidden_states_fp4 if
                             (hidden_states_fp4 is not None
                              and self.shared_experts_use_fp4) else
@@ -1213,7 +1222,43 @@ class Deepseekv3MoE(nn.Module):
 
         # NOTE: define compiled helpers at module scope to avoid defining decorators inside compiled frames
 
-        if self.shared_experts is not None:
+        # Run shared experts after HALO-Q/TMA submission, overlapping COPY.
+        # Select this ordering identically across ranks using the backend slot
+        # count and stream policy, never local token/chunk counts.
+        _plan_gap_slots = getattr(
+            getattr(self.experts, "backend", self.experts),
+            "_rebalance_slots_active", 0)
+        _plan_gap_default = "1" if type(
+            _plan_gap_slots) is int and _plan_gap_slots > 0 else "0"
+        _plan_gap_installed = False
+        if (self.shared_experts is not None
+                and not do_multi_stream() and os.environ.get(
+                    "TRTLLM_MOE_REBALANCE_PLAN_GAP", _plan_gap_default) == "1"):
+            _shared_box = {}
+
+            def _plan_gap_shared():
+                # Shared-expert scaling must run at most once per forward.
+                if "out" not in _shared_box:
+                    _shared_box["out"] = _compute_shared_output()
+
+            _experts = getattr(self, "experts", None)
+            if _experts is not None and hasattr(_experts, "__dict__"):
+                setattr(_experts, "_rebalance_plan_gap_hook", _plan_gap_shared)
+                _plan_gap_installed = True
+
+        if _plan_gap_installed:
+            try:
+                routed_output = _compute_routed_output()
+            finally:
+                # Clear the hook even when the routed path exits early.
+                _e = getattr(self, "experts", None)
+                if _e is not None:
+                    setattr(_e, "_rebalance_plan_gap_hook", None)
+            # Compute shared experts here if the routed path skipped the hook.
+            if "out" not in _shared_box:
+                _shared_box["out"] = _compute_shared_output()
+            shared_output = _shared_box["out"]
+        elif self.shared_experts is not None:
             routed_output, shared_output = maybe_execute_in_parallel(
                 _compute_routed_output,
                 _compute_shared_output,

@@ -1138,6 +1138,12 @@ class PyTorchModelEngine(ModelEngine):
         _set_moe_a2a_warmup(value)
 
         self.moe_load_balancer_iter_info = (not value, not value)
+        # The backend controls helper migration during warmup and tactic tuning.
+        model = getattr(self, "model", None)
+        if model is not None:
+            for module in model.modules():
+                if getattr(module, "_rebalance_slots_active", 0) > 0:
+                    module._rebalance_warmup = bool(value)
 
     @property
     def moe_load_balancer_iter_info(self):

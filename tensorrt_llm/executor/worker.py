@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import gc
 import os
 import sys
@@ -13,6 +15,7 @@ import zmq
 from tensorrt_llm.logger import logger
 
 from .._utils import mpi_comm, mpi_rank, print_all_stacks
+from ..llmapi._load_balance_env import configure_moe_launch_queues
 from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tokenizer import TokenizerBase
@@ -204,6 +207,13 @@ def worker_main(
     rpc_addr: Optional[str] = None,
     hmac_key: bytes = b"",
 ) -> None:
+
+    # Set ON's queue before MPI setup or replaying worker environment overrides.
+    if llm_args is not None and llm_args.backend == "pytorch":
+        queue_overrides = configure_moe_launch_queues(
+            getattr(llm_args, "moe_config", None), llm_args.env_overrides)
+        if queue_overrides is not llm_args.env_overrides:
+            llm_args.env_overrides = queue_overrides
 
     def _print_stacks():
         counter = 0

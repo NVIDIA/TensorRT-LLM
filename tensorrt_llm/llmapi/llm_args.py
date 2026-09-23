@@ -1650,6 +1650,28 @@ class MoeLoadBalancerConfig(StrictBaseModel):
         return assignments
 
 
+class MoeRebalanceConfig(StrictBaseModel):
+    """Configure opt-in prefill expert rebalancing.
+
+    Each rank retains H resident experts and allocates S runtime helper slots.
+    The seven live weight planes use the same H + S slot axis; weight transfers
+    publish a READY generation before the kernel reads a helper slot.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description=
+        "Whether MoE prefill rebalance is enabled. When False, the MoE slot axis stays equal to the number of experts this rank owns and no helper slots are allocated."
+    )
+
+    helper_slots_per_rank: int = Field(
+        default=0,
+        ge=0,
+        description=
+        "Number of extra helper slots (S) each rank hosts on top of the experts it owns (H). Every live weight plane grows to M = H + S rows: [0, H) are the resident experts, [H, M) are runtime-only helper slots. 0 means no helper capacity, which is equivalent to leaving rebalance disabled."
+    )
+
+
 _MoeBackend = Literal["AUTO", "CUTLASS", "CUTEDSL", "CUTEDSL_FC12", "TRTLLM",
                       "DEEPGEMM", "DENSEGEMM", "VANILLA", "TRITON", "MARLIN",
                       "MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"]
@@ -1673,6 +1695,12 @@ class MoeConfig(StrictBaseModel):
         default=None,
         description="Configuration for MoE load balancing.",
         json_schema_extra={"type": "Union[MoeLoadBalancerConfig, dict, str]"})
+
+    rebalance: Optional[MoeRebalanceConfig] = Field(
+        default=None,
+        description=
+        "Configuration for MoE prefill rebalance. None (the default) leaves every rebalance code path short-circuited."
+    )
 
     disable_finalize_fusion: bool = Field(
         default=False,

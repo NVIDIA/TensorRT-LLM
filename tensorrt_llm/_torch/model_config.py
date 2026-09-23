@@ -42,7 +42,7 @@ from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
                                           DeepSeekV4SparseAttentionConfig,
                                           KvCacheConfig, MoeLoadBalancerConfig,
-                                          MultimodalConfig)
+                                          MoeRebalanceConfig, MultimodalConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -249,6 +249,7 @@ class ModelConfig(Generic[TConfig]):
                                                            repr=False,
                                                            compare=False)
     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None
+    moe_rebalance: Optional[MoeRebalanceConfig] = None
 
     attn_backend: str = 'TRTLLM'
     # Effective threshold requested for trtllm-gen MLA skip-correction. Zero
