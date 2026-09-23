@@ -20,10 +20,10 @@ then places blocks in it. In a disaggregated deployment only the context servers
 configure the connector, so the pool is entirely prefill-node memory, which
 overlaps what TensorRT-LLM's own host offload already does.
 
-Donating alongside a generation server puts that node's memory into the same
-pool, so prefill writes blocks that land on decode-side DRAM. The generation
-engine stays free of any connector and keeps its single cache transceiver for
-the prefill-to-decode handoff.
+Running `trtllm-serve mooncake_donor` on a generation node puts that node's
+memory into the same pool, so prefill writes blocks that land on decode-side
+DRAM. The generation engine stays free of any connector and keeps its single
+cache transceiver for the prefill-to-decode handoff.
 
 Donation is not a `StoreRole`. The roles describe an engine's traffic and none
 of them means "contribute memory only", so capacity and traffic stay separate
@@ -35,23 +35,16 @@ node's `kv_cache_config.host_cache_size`.
 
 import contextlib
 import time
-from typing import Any, Iterator, Optional
+from typing import Iterator, Optional
 
 from tensorrt_llm.logger import logger
 
-from .config import DEFAULT_METADATA_SERVER, parse_size
-from .master import (
-    local_address,
-    master_timeout,
-    resolve_device_name,
-    resolve_master_address,
-    wait_for_master,
-)
+from .config import DEFAULT_METADATA_SERVER
+from .master import local_address
 
 __all__ = [
     "DEFAULT_DONOR_LOCAL_BUFFER_SIZE",
     "donate_segment",
-    "maybe_donate_segment",
 ]
 
 #: A donor never transfers, but `setup` rejects a zero-sized transfer buffer.
@@ -136,36 +129,3 @@ def donate_segment(
             f"mooncake-store: withdrew the {donated} lent from {host}; the "
             "master will report blocks that lived there as lost"
         )
-
-
-@contextlib.contextmanager
-def maybe_donate_segment(donation: Any) -> Iterator[Optional[str]]:
-    """Lend memory for this process's lifetime if the config asked to.
-
-    Args:
-        donation: A `MooncakeDonationConfig`, or `None` to do nothing, so
-            callers need no condition of their own.
-
-    Yields the host the segment is registered under, or `None`.
-    """
-    if donation is None:
-        yield None
-        return
-
-    # Bringup blocks here on a master that may belong to a different job, so
-    # name the address before waiting on it.
-    logger.info(
-        "mooncake-store: mooncake_donation is set, so this server lends host "
-        f"memory to the pool at {donation.master_server_address} without using "
-        "it; resolving the master now"
-    )
-    master_address = resolve_master_address(donation.master_server_address, master_timeout())
-    wait_for_master(master_address)
-    with donate_segment(
-        master_server_address=master_address,
-        segment_size=parse_size(donation.segment_size),
-        protocol=donation.protocol,
-        device_name=resolve_device_name(donation.protocol, donation.device_name),
-        metadata_server=donation.metadata_server,
-    ) as host:
-        yield host

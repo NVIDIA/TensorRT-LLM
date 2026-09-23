@@ -781,8 +781,7 @@
       "allowed_values": [
         "lmcache",
         "lmcache-mp",
-        "kvbm",
-        "mooncake-store"
+        "kvbm"
       ],
       "capture_policy": "allowlist|none",
       "kind": "categorical",

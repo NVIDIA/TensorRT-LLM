@@ -18,8 +18,8 @@ import uuid
 from importlib.util import find_spec
 from pathlib import Path
 from types import FrameType
-from typing import (TYPE_CHECKING, Any, Dict, Iterator, NamedTuple, NoReturn,
-                    Optional, Sequence, Set)
+from typing import (TYPE_CHECKING, Any, Dict, NamedTuple, NoReturn, Optional,
+                    Sequence, Set)
 
 import click
 import torch
@@ -45,9 +45,7 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file,
                                               validate_config_bool)
-from tensorrt_llm.llmapi.llm_args import (KvCacheConnectorConfig,
-                                          MooncakeDonationConfig,
-                                          MultimodalConfig, TorchLlmArgs)
+from tensorrt_llm.llmapi.llm_args import MultimodalConfig, TorchLlmArgs
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr, split_mpi_env
 from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
@@ -614,49 +612,6 @@ def _terminate_attached_frontends(children: list) -> None:
             child.kill()
 
 
-@contextlib.contextmanager
-def _provision_kv_cache_pool(llm_args: dict,
-                             owns_engine: bool = True) -> Iterator[None]:
-    """Bring up the shared cache this server needs or feeds, for its lifetime.
-
-    A connector backed by a cluster-wide pool needs that pool reachable before
-    any rank opens a handle, and the ranks are spawned by the LLM constructor,
-    so this wraps the construction. A deployment that provisions the pool
-    externally is detected and left alone.
-
-    A server may also lend the pool host memory without using it, which is how
-    a pool spans nodes whose engines have no connector. That segment has to be
-    mounted before traffic arrives and held for as long as the pages placed in
-    it are expected to be there.
-
-    Only the process that owns the engine does either. An attached frontend
-    re-execs this command line but shares the launcher's executor, so it would
-    otherwise stand up a second pool and lend a second segment.
-    """
-    if not owns_engine:
-        yield
-        return
-
-    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import (
-        maybe_donate_segment, maybe_provision_pool)
-
-    connector_config = llm_args.get("kv_connector_config")
-    if isinstance(connector_config, dict):
-        # A YAML config section arrives unvalidated, and the pool has to be
-        # described before the LLM constructor would coerce it. Hand the
-        # validated model on so it is not parsed twice.
-        connector_config = KvCacheConnectorConfig(**connector_config)
-        llm_args["kv_connector_config"] = connector_config
-
-    donation = llm_args.get("mooncake_donation")
-    if isinstance(donation, dict):
-        donation = MooncakeDonationConfig(**donation)
-        llm_args["mooncake_donation"] = donation
-
-    with maybe_provision_pool(connector_config), maybe_donate_segment(donation):
-        yield
-
-
 def launch_server(
         host: str,
         port: int,
@@ -738,56 +693,54 @@ def launch_server(
         # until uvicorn takes it over, so no one can steal the port in between.
         _publish_bound_address(report_addr, host, port)
 
-        with _provision_kv_cache_pool(
-                llm_args, owns_engine=not multi_frontend.is_attached_frontend):
-            if backend == 'pytorch':
-                llm_args.pop("build_config", None)
-                llm = PyTorchLLM(**llm_args)
-            elif backend == '_autodeploy':
-                from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
+        if backend == 'pytorch':
+            llm_args.pop("build_config", None)
+            llm = PyTorchLLM(**llm_args)
+        elif backend == '_autodeploy':
+            from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 
-                # AutoDeploy does not support build_config
-                llm_args.pop("build_config", None)
-                llm = AutoDeployLLM(**llm_args)
-            else:
-                raise click.BadParameter(
-                    f"{backend} is not a known backend, check help for available options.",
-                    param_hint="backend")
+            # AutoDeploy does not support build_config
+            llm_args.pop("build_config", None)
+            llm = AutoDeployLLM(**llm_args)
+        else:
+            raise click.BadParameter(
+                f"{backend} is not a known backend, check help for available options.",
+                param_hint="backend")
 
-            # The finally below is the cleanup boundary for the attached
-            # frontends: it must cover everything from their spawn through
-            # server construction, middleware registration, and runtime, or a
-            # failure in between leaks the child processes.
-            frontend_children = []
-            try:
-                if multi_frontend.is_launcher:
-                    frontend_children = _spawn_attached_frontends(
-                        llm, multi_frontend.num_frontends)
+        # The finally below is the cleanup boundary for the attached
+        # frontends: it must cover everything from their spawn through
+        # server construction, middleware registration, and runtime, or a
+        # failure in between leaks the child processes.
+        frontend_children = []
+        try:
+            if multi_frontend.is_launcher:
+                frontend_children = _spawn_attached_frontends(
+                    llm, multi_frontend.num_frontends)
 
-                server = OpenAIServer(
-                    generator=llm,
-                    model=model,
-                    tool_parser=tool_parser,
-                    server_role=server_role,
-                    metadata_server_cfg=metadata_server_cfg,
-                    disagg_cluster_config=disagg_cluster_config,
-                    multimodal_server_config=multimodal_server_config,
-                    chat_template=chat_template,
-                    allow_request_chat_template=allow_request_chat_template,
-                    input_processor_workers=num_input_processor_workers,
-                    media_load_workers=num_media_load_workers,
-                    internal_disagg_auth_key=internal_disagg_auth_key)
-                _apply_fastapi_middlewares(server.app, middleware)
+            server = OpenAIServer(
+                generator=llm,
+                model=model,
+                tool_parser=tool_parser,
+                server_role=server_role,
+                metadata_server_cfg=metadata_server_cfg,
+                disagg_cluster_config=disagg_cluster_config,
+                multimodal_server_config=multimodal_server_config,
+                chat_template=chat_template,
+                allow_request_chat_template=allow_request_chat_template,
+                input_processor_workers=num_input_processor_workers,
+                media_load_workers=num_media_load_workers,
+                internal_disagg_auth_key=internal_disagg_auth_key)
+            _apply_fastapi_middlewares(server.app, middleware)
 
-                # Optionally disable GC (default: not disabled)
-                if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
-                    gc.disable()
+            # Optionally disable GC (default: not disabled)
+            if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
+                gc.disable()
 
-                _signal_frontend_ready(multi_frontend)
-                uvloop.run(server(host, port, sockets=[s]))
-            finally:
-                if frontend_children:
-                    _terminate_attached_frontends(frontend_children)
+            _signal_frontend_ready(multi_frontend)
+            uvloop.run(server(host, port, sockets=[s]))
+        finally:
+            if frontend_children:
+                _terminate_attached_frontends(frontend_children)
 
 
 def launch_mm_encoder_server(
@@ -1608,16 +1561,10 @@ def serve(
                         "https://buf.build/gen/python "
                         "\"tensorrt_llm[openengine]\"`.") from error
 
-                # launch_smg_server provisions from inside itself; OpenEngine's
-                # server is an optional package this repo does not own, so the
-                # pool is brought up around it here instead. Either way the
-                # context has to outlive engine construction, which happens
-                # inside the launch call.
-                with _provision_kv_cache_pool(llm_args):
-                    launch_grpc_server(host,
-                                       port,
-                                       llm_args,
-                                       served_model_name=served_model_name)
+                launch_grpc_server(host,
+                                   port,
+                                   llm_args,
+                                   served_model_name=served_model_name)
         else:
             # Default: launch OpenAI HTTP server
             launch_server(

@@ -15,16 +15,14 @@
 """Unit tests for the Mooncake store pieces every deployment shares.
 
 Covers how a block of tokens becomes a store key, how the JSON config is read,
-which deployments are refused at startup, and the pinned host slots pages pass
-through where GPUDirect RDMA is unavailable.
+and the pinned host slots pages pass through where GPUDirect RDMA is
+unavailable.
 
 Runs without a Mooncake installation: the store handle is replaced by an
 in-process fake that records what it was handed.
 """
 
-import importlib
 import json
-from types import SimpleNamespace
 
 import pytest
 
@@ -49,9 +47,6 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.staging import (
     stage_batch_for_put,
     unstage_batch_after_get,
 )
-from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.validation import validate_llm_args
-from tensorrt_llm._torch.pyexecutor.connectors.registry import uses_connector
-from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig
 
 TOKENS_PER_BLOCK = 4
 
@@ -109,17 +104,6 @@ def store_config(tmp_path, monkeypatch):
     monkeypatch.delenv("TRTLLM_MOONCAKE_STORE_MODEL_KEY", raising=False)
     monkeypatch.delenv("TRTLLM_MOONCAKE_STORE_STAGE_THROUGH_HOST", raising=False)
     return path
-
-
-def make_llm_args():
-    return SimpleNamespace(
-        model="/models/test-model",
-        kv_cache_config=SimpleNamespace(tokens_per_block=TOKENS_PER_BLOCK),
-        tensor_parallel_size=1,
-        pipeline_parallel_size=1,
-        context_parallel_size=1,
-        sparse_attention_config=None,
-    )
 
 
 @pytest.fixture
@@ -348,75 +332,9 @@ def test_config_rejects_a_non_boolean_staging_env(store_config, monkeypatch):
         MooncakeStoreConnectorConfig.from_env()
 
 
-# ---- validation ----
-
-
-@pytest.mark.parametrize(
-    "field,value,match",
-    [
-        ("context_parallel_size", 2, "context parallelism"),
-        ("pipeline_parallel_size", 2, "pipeline parallelism"),
-    ],
-)
-def test_validate_llm_args_rejects_unsupported_parallelism(field, value, match):
-    args = make_llm_args()
-    setattr(args, field, value)
-    with pytest.raises(NotImplementedError, match=match):
-        validate_llm_args(args)
-
-
-def test_validate_llm_args_rejects_m3_index_value_cache():
-    args = make_llm_args()
-    args.sparse_attention_config = SimpleNamespace(sparse_disable_index_value=False)
-    with pytest.raises(NotImplementedError, match="sparse_disable_index_value"):
-        validate_llm_args(args)
-
-    args.sparse_attention_config = SimpleNamespace(sparse_disable_index_value=True)
-    validate_llm_args(args)
-
-
-# ---- connector identification ----
-#
-# py_executor_creator turns partial reuse off for this connector and finds it
-# through uses_connector. Failing to recognize the config would silently cost
-# the reuse the store exists to provide.
-
-
-@pytest.mark.parametrize(
-    "config, expected",
-    [
-        (KvCacheConnectorConfig(connector="mooncake-store"), True),
-        (
-            KvCacheConnectorConfig(
-                connector_module="tensorrt_llm._torch.pyexecutor.connectors.mooncake_store",
-                connector_scheduler_class="MooncakeStoreConnectorScheduler",
-                connector_worker_class="MooncakeStoreConnectorWorker",
-            ),
-            True,
-        ),
-        (KvCacheConnectorConfig(connector="kvbm"), False),
-        (None, False),
-    ],
-    ids=["preset", "hand_written_module", "another_connector", "no_connector"],
-)
-def test_uses_connector_recognizes_the_connector_however_it_is_spelled(config, expected):
-    assert uses_connector(config, "mooncake-store") is expected
-
-
-def test_uses_connector_rejects_an_unknown_preset():
-    config = KvCacheConnectorConfig(connector="mooncake-store")
-    with pytest.raises(ValueError, match="Unknown connector preset"):
-        uses_connector(config, "mooncake-stroe")
-
-
-def test_the_registered_preset_resolves_to_refusing_classes():
-    """py_executor_creator resolves both by name from the package."""
-    config = KvCacheConnectorConfig(connector="mooncake-store")
-    module = importlib.import_module(config.connector_module)
-
-    for class_name in (config.connector_scheduler_class, config.connector_worker_class):
-        with pytest.raises(NotImplementedError, match="not available in this build"):
-            getattr(module, class_name)(llm_args=None)
+# The connector itself, the registry preset that selects it, and the startup
+# gates on parallelism and index-V caching land with the KV cache manager V2
+# support they depend on.
 
 
 # ---- host staging ----

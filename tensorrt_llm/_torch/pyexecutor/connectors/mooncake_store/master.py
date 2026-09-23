@@ -12,22 +12,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Bring the Mooncake store's pool up as part of a server's own startup.
+"""Bring a Mooncake store's pool up and tell its workers where to find it.
 
 The connector needs two things that are not the engine's to produce: a reachable
 `mooncake_master`, and a JSON client config named by `MOONCAKE_CONFIG_PATH` that
 points every worker at it.
 
-`provision_pool` does that work inside the serving process. It resolves the
-master, either launching one here or checking that the configured one answers,
-renders the client config, and exports `MOONCAKE_CONFIG_PATH`, which reaches the
-ranks because the LLM constructor spawns them from this process. Everything it
-started is torn down when the context exits.
+`provision_pool` produces both. It resolves the master, either launching one or
+checking that the configured one answers, renders the client config, and exports
+`MOONCAKE_CONFIG_PATH`. Everything it started is torn down when the context
+exits.
 
-A master launched here lives and dies with the server, so it suits one engine
-talking to its own pool. Several engines sharing a pool, or a pool meant to
-survive a restart, need a master with its own lifetime named by
-`master_server_address`.
+A master launched by the process that provisions lives and dies with it, so it
+suits one engine talking to its own pool. Several engines sharing a pool, or a
+pool meant to survive a restart, want `trtllm-serve mooncake_master`, which
+holds one for as long as that command runs and publishes its address for the
+rest of the deployment to read back.
 """
 
 import contextlib
@@ -38,23 +38,23 @@ import socket
 import subprocess  # nosec B404
 import tempfile
 import time
-from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from dataclasses import dataclass, fields
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 from tensorrt_llm.logger import logger
 
-from ..registry import uses_connector
-from .config import CLIENT_CONFIG_NAME, CONFIG_PATH_ENV, RUN_DIR_ENV
+from .config import CLIENT_CONFIG_NAME, CONFIG_PATH_ENV, DEFAULT_METADATA_SERVER, RUN_DIR_ENV
 
 __all__ = [
+    "PoolSpec",
     "local_address",
-    "maybe_provision_pool",
     "master_timeout",
     "provision_pool",
     "resolve_device_name",
     "resolve_master_address",
     "running_master",
     "wait_for_master",
+    "write_client_config",
 ]
 
 #: Override the binary that `launch_master` runs.
@@ -73,6 +73,69 @@ ADDRESS_FILE_SCHEME = "file://"
 #: Lines of the master's log to quote when startup fails, since its last words
 #: (a port in use, a bad flag) are usually the whole diagnosis.
 LOG_TAIL_LINES = 20
+
+
+@dataclass(frozen=True)
+class PoolSpec:
+    """A pool to provision: whose master owns it, and what its workers are told.
+
+    Deliberately internal. The settings below end up in the Mooncake client
+    config, whose schema is vLLM's and is the contract the connector reads;
+    this is only the shape `provision_pool` takes them in. Keeping it out of
+    `LlmArgs` leaves the user-facing spelling to be settled alongside the
+    connector that gives these fields meaning.
+
+    Exactly one of `master_server_address` and `launch_master` says where the
+    master is, which `provision_pool` enforces rather than this class, since a
+    caller may fill the two in from different places.
+    """
+
+    #: `host:port`, or `file://<path>` naming a file that holds one. The file
+    #: is how to reach a master whose host a scheduler chose.
+    master_server_address: Optional[str] = None
+    #: Start a `mooncake_master` and use it, instead of joining one.
+    launch_master: bool = False
+    #: Extra path to publish a launched master's address to, beyond the copy
+    #: always written to the run directory.
+    master_address_file: Optional[str] = None
+    master_port: int = 50051
+    master_metrics_port: int = 9004
+    master_eviction_ratio: float = 0.05
+    metadata_server: str = DEFAULT_METADATA_SERVER
+    #: `rdma` or `tcp`. TCP is for bring-up only.
+    protocol: str = "rdma"
+    #: RDMA device to transfer over, from `ibv_devinfo`. Empty auto-detects.
+    device_name: str = ""
+    #: Host memory each worker process contributes. Pool capacity is this times
+    #: the number of processes that open a store handle.
+    global_segment_size: Union[int, str] = "16GiB"
+    #: Per-process Mooncake transfer buffer, not pool capacity.
+    local_buffer_size: Union[int, str] = "1GiB"
+    transfer_batch_size: int = 64
+    #: Left unset so the rendered config omits the key and the connector's own
+    #: default applies, rather than carrying a second copy of it here.
+    cache_prefix: Optional[str] = None
+    #: Identity the keys are namespaced by. Engines sharing a pool read each
+    #: other's pages exactly when they agree on this, so there is no safe
+    #: default; see `MooncakeStoreConnectorConfig.resolve_model_key`.
+    model_key: Optional[str] = None
+    #: Copy pages through a pinned host buffer instead of registering the KV
+    #: pools, for hosts without GPUDirect RDMA.
+    stage_through_host: bool = False
+    staging_buffer_bytes: Optional[Union[int, str]] = None
+
+    @staticmethod
+    def from_json(raw: Dict[str, Any], **overrides: Any) -> "PoolSpec":
+        """Build a spec from a Mooncake client config, plus what a caller adds.
+
+        Lets a deployment describe its pool in the same JSON the connector
+        reads, rather than in a second format, and lets the CLI layer on the
+        parts that are the command's rather than the pool's.
+        """
+        known = {f.name for f in fields(PoolSpec)}
+        settings = {key: value for key, value in raw.items() if key in known}
+        settings.update({key: value for key, value in overrides.items() if value is not None})
+        return PoolSpec(**settings)
 
 
 def _log_tail(path: str, lines: int = LOG_TAIL_LINES) -> str:
@@ -319,7 +382,7 @@ def wait_for_master(master_address: str, timeout: Optional[float] = None) -> Opt
 
 
 def _client_config(
-    pool: Any, master_address: str, device_name: Optional[str] = None
+    pool: PoolSpec, master_address: str, device_name: Optional[str] = None
 ) -> Dict[str, Any]:
     """Render the Mooncake client config for a pool.
 
@@ -349,6 +412,27 @@ def _client_config(
     return config
 
 
+def write_client_config(pool: PoolSpec, master_address: str, run_dir: str) -> str:
+    """Render `pool`'s client config into `run_dir` and return its path.
+
+    Workers reach it either through `MOONCAKE_CONFIG_PATH`, which
+    `provision_pool` exports, or by looking in `$TRTLLM_MOONCAKE_RUN_DIR` when
+    an external launcher started them too early to inherit it; see
+    `provisioned_config_path`. Writing it next to the master's address file is
+    what lets `trtllm-serve mooncake_master --run_dir` describe a whole pool
+    without any engine having to.
+    """
+    os.makedirs(run_dir, exist_ok=True)
+    config_path = os.path.join(run_dir, CLIENT_CONFIG_NAME)
+    config = _client_config(
+        pool, master_address, resolve_device_name(pool.protocol, pool.device_name)
+    )
+    with open(config_path, "w") as handle:
+        json.dump(config, handle, indent=2)
+    logger.info(f"mooncake-store: wrote {config_path} ({json.dumps(config, sort_keys=True)})")
+    return config_path
+
+
 @dataclass
 class LaunchedMaster:
     """A `mooncake_master` owned by this process."""
@@ -368,7 +452,7 @@ class LaunchedMaster:
             self.process.wait()
 
 
-def _launch_master(pool: Any, run_dir: str) -> LaunchedMaster:
+def _launch_master(pool: PoolSpec, run_dir: str) -> LaunchedMaster:
     """Start a master on this host and wait for it to answer."""
     binary = os.getenv(MASTER_BINARY_ENV) or DEFAULT_MASTER_BINARY
     resolved = shutil.which(binary)
@@ -466,7 +550,7 @@ def _address_files(run_dir: str, extra: Optional[str] = None) -> List[str]:
 
 @contextlib.contextmanager
 def running_master(
-    pool: Any, run_dir: str, address_file: Optional[str] = None
+    pool: PoolSpec, run_dir: str, address_file: Optional[str] = None
 ) -> Iterator[LaunchedMaster]:
     """Run a master whose lifetime is this process's rather than an engine's.
 
@@ -489,24 +573,25 @@ def running_master(
 
 
 @contextlib.contextmanager
-def provision_pool(pool: Any, run_dir: Optional[str] = None) -> Iterator[Optional[str]]:
+def provision_pool(pool: PoolSpec, run_dir: Optional[str] = None) -> Iterator[Optional[str]]:
     """Make `pool` reachable and name it in this process's environment.
 
     Yields the path of the client config written, or `None` when an inherited
     `MOONCAKE_CONFIG_PATH` was left in charge.
 
     Args:
-        pool: A `MooncakeStoreConfig`.
+        pool: The pool to bring up.
         run_dir: Where to write the client config and the master's log.
             Defaults to `TRTLLM_MOONCAKE_RUN_DIR`, else a temporary directory
             that is removed on exit.
     """
+    _check_exactly_one_master(pool)
+
     inherited = os.getenv(CONFIG_PATH_ENV)
     if inherited:
         logger.info(
             f"mooncake-store: {CONFIG_PATH_ENV}={inherited} is already set, so "
-            "kv_connector_config.mooncake_store is ignored and the pool it "
-            "names is used as is."
+            "the pool it names is used as is and nothing is provisioned here."
         )
         yield None
         return
@@ -544,29 +629,21 @@ def provision_pool(pool: Any, run_dir: Optional[str] = None) -> Iterator[Optiona
                 wait_for_master(master_address)
                 logger.info(f"mooncake-store: using the master at {master_address}")
 
-            config_path = os.path.join(run_dir, CLIENT_CONFIG_NAME)
-            config = _client_config(
-                pool, master_address, resolve_device_name(pool.protocol, pool.device_name)
-            )
-            with open(config_path, "w") as handle:
-                json.dump(config, handle, indent=2)
+            config_path = write_client_config(pool, master_address, run_dir)
             # Inherited by the ranks the LLM constructor spawns. Ranks an
             # external launcher started were already running, so they read the
             # config out of the run directory instead; see
             # provisioned_config_path.
             os.environ[CONFIG_PATH_ENV] = config_path
             exported = True
-            logger.info(
-                f"mooncake-store: {CONFIG_PATH_ENV}={config_path} "
-                f"({json.dumps(config, sort_keys=True)})"
-            )
+            logger.info(f"mooncake-store: {CONFIG_PATH_ENV}={config_path}")
             # Capacity is what explains a low hit rate, so state the
             # arithmetic instead of leaving it to be derived later.
             logger.info(
-                "mooncake-store: this server's ranks will each contribute "
+                "mooncake-store: each rank that opens a handle will contribute "
                 f"global_segment_size={pool.global_segment_size} to the pool; "
-                "total capacity is that times the number of ranks that open a "
-                "handle, plus whatever any mooncake_donation adds"
+                "total capacity is that times the number of such ranks, plus "
+                "whatever any donor lends"
             )
             yield config_path
         finally:
@@ -579,20 +656,28 @@ def provision_pool(pool: Any, run_dir: Optional[str] = None) -> Iterator[Optiona
                 shutil.rmtree(run_dir, ignore_errors=True)
 
 
-@contextlib.contextmanager
-def maybe_provision_pool(kv_connector_config: Any) -> Iterator[None]:
-    """Provision the pool if this deployment asked the server to.
+def _check_exactly_one_master(pool: PoolSpec) -> None:
+    """Reject a pool that names no master, or two.
 
-    A no-op for every other connector, and for a `mooncake-store` config that
-    left `mooncake_store` unset, since such a deployment is told about its pool
-    through `MOONCAKE_CONFIG_PATH` instead.
+    Checked here rather than on `PoolSpec` because a caller may fill the two
+    fields in from different places, such as a command line and a config file,
+    and is entitled to an incomplete spec until it has read both.
     """
-    if not uses_connector(kv_connector_config, "mooncake-store"):
-        yield
-        return
-    pool = kv_connector_config.mooncake_store
-    if pool is None:
-        yield
-        return
-    with provision_pool(pool):
-        yield
+    if pool.launch_master and pool.master_server_address:
+        raise ValueError(
+            "mooncake-store: set either launch_master or master_server_address, "
+            "not both. launch_master starts a master here; "
+            "master_server_address joins an existing pool."
+        )
+    if not pool.launch_master and not pool.master_server_address:
+        raise ValueError(
+            "mooncake-store: needs a master. Set master_server_address to join "
+            "an existing pool, or launch_master to start one."
+        )
+    if pool.master_address_file and not pool.launch_master:
+        raise ValueError(
+            "mooncake-store: master_address_file publishes the address of a "
+            "master started here, so it needs launch_master. To read an "
+            "address a master elsewhere published, set master_server_address "
+            "to file://<path>."
+        )

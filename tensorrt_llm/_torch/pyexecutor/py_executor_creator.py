@@ -46,7 +46,6 @@ from .config_utils import (is_hybrid_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
                            uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
-from .connectors.registry import uses_connector
 from .dwdp import DwdpManager, get_global_dwdp_manager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .hang_diagnostics import monitor_executor_initialization
@@ -393,19 +392,6 @@ def _create_py_executor_impl(
     if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
         # Disable KV cache reuse for deterministic mode
         kv_cache_config.enable_block_reuse = False
-        kv_cache_config.enable_partial_reuse = False
-
-    # Must happen before the KV cache manager is built, since the manager reads
-    # enable_partial_reuse to construct its block pools.
-    if (kv_cache_config.enable_partial_reuse
-            and uses_connector(kv_connector_config, "mooncake-store")):
-        logger.warning(
-            "Disabling partial reuse: it is not usable with the mooncake-store "
-            "connector. The store is addressed by whole blocks, so a partial "
-            "device match leaves the matched length off a block boundary and "
-            "the connector declines the lookup rather than resume a block from "
-            "the middle. Partial reuse therefore trades part of one block for "
-            "every stored block of the remaining prefix.")
         kv_cache_config.enable_partial_reuse = False
 
     # The tokenizer is stripped from MPI kwargs in proxy.py to avoid pickle

@@ -34,13 +34,13 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import master as m
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
     CONFIG_PATH_ENV,
     MooncakeStoreConnectorConfig,
+    provisioned_config_path,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
-    maybe_provision_pool,
+    PoolSpec,
     provision_pool,
     resolve_master_address,
 )
-from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig, MooncakeStoreConfig
 
 
 def free_port() -> int:
@@ -175,34 +175,12 @@ def running_master():
     ],
     ids=["two_masters", "no_master", "publishing_without_launching"],
 )
-def test_pool_needs_exactly_one_master(kwargs, message):
+def test_provisioning_needs_exactly_one_master(kwargs, message):
+    """Rejected before anything is launched, dialed, or written."""
     with pytest.raises(ValueError, match=message):
-        MooncakeStoreConfig(**kwargs)
-
-
-def test_pool_is_rejected_unless_the_connector_is_mooncake_store():
-    """The validator keys off the connector, however that was spelled."""
-    with pytest.raises(ValueError, match="mooncake_store describes a Mooncake pool"):
-        KvCacheConnectorConfig(
-            connector="lmcache",
-            mooncake_store=MooncakeStoreConfig(launch_master=True, model_key="m"),
-        )
-    # Naming the module rather than the preset selects the same connector.
-    KvCacheConnectorConfig(
-        connector_module="tensorrt_llm._torch.pyexecutor.connectors.mooncake_store",
-        connector_scheduler_class="MooncakeStoreConnectorScheduler",
-        connector_worker_class="MooncakeStoreConnectorWorker",
-        mooncake_store=MooncakeStoreConfig(launch_master=True, model_key="m"),
-    )
-
-
-def test_a_described_pool_needs_a_model_key():
-    """Two checkpoints that agree on the namespace read each other's pages."""
-    with pytest.raises(ValueError, match="mooncake_store.model_key is required"):
-        KvCacheConnectorConfig(
-            connector="mooncake-store",
-            mooncake_store=MooncakeStoreConfig(launch_master=True),
-        )
+        with provision_pool(PoolSpec(**kwargs)):
+            pytest.fail("provisioning should not have yielded")
+    assert CONFIG_PATH_ENV not in os.environ
 
 
 # ---- the rendered client config ----
@@ -210,7 +188,7 @@ def test_a_described_pool_needs_a_model_key():
 
 def test_client_config_is_what_the_connector_reads_back(tmp_path):
     """The generated JSON has to survive the connector's own parser."""
-    pool = MooncakeStoreConfig(
+    pool = PoolSpec(
         master_server_address="10.0.0.1:50051",
         protocol="rdma",
         device_name="mlx5_0",
@@ -241,11 +219,47 @@ def test_client_config_is_what_the_connector_reads_back(tmp_path):
 
 def test_client_config_omits_the_fields_the_pool_left_unset():
     """An absent key leaves the connector its own default; a null would not."""
-    pool = MooncakeStoreConfig(master_server_address="host:50051")
+    pool = PoolSpec(master_server_address="host:50051")
     written = master_module._client_config(pool, "host:50051")
     assert "cache_prefix" not in written
     assert "model_key" not in written
     assert "staging_buffer_bytes" not in written
+
+
+def test_a_written_client_config_is_where_the_ranks_look_for_it(tmp_path, monkeypatch):
+    """A rank an external launcher started never inherits MOONCAKE_CONFIG_PATH.
+
+    Writing the config into the run directory is what lets
+    'trtllm-serve mooncake_master --run_dir' describe a pool to servers it
+    did not spawn.
+    """
+    pool = PoolSpec(master_server_address="10.0.0.1:50051", model_key="m")
+
+    written = master_module.write_client_config(pool, "10.0.0.1:50051", str(tmp_path))
+
+    monkeypatch.setenv(master_module.RUN_DIR_ENV, str(tmp_path))
+    assert provisioned_config_path() == written
+    assert MooncakeStoreConnectorConfig.from_file(written).model_key == "m"
+
+
+def test_a_spec_takes_the_pool_settings_from_the_json_the_connector_reads():
+    """One schema for the pool, rather than a second spelling of it."""
+    pool = PoolSpec.from_json(
+        {
+            "protocol": "tcp",
+            "global_segment_size": "8GiB",
+            "model_key": "m",
+            # Not a PoolSpec field; the client config carries settings that
+            # only the connector reads, and they must not break the parse.
+            "role": "both",
+        },
+        launch_master=True,
+    )
+
+    assert pool.protocol == "tcp"
+    assert pool.global_segment_size == "8GiB"
+    assert pool.model_key == "m"
+    assert pool.launch_master is True
 
 
 @pytest.mark.parametrize(
@@ -265,7 +279,7 @@ def test_master_addresses_are_split_or_declined(address, expected):
 
 
 def test_provisioning_points_the_workers_at_a_running_master(running_master):
-    pool = MooncakeStoreConfig(master_server_address=running_master)
+    pool = PoolSpec(master_server_address=running_master)
 
     with provision_pool(pool) as config_path:
         # The workers are spawned inside this window and are told about the
@@ -280,7 +294,7 @@ def test_provisioning_points_the_workers_at_a_running_master(running_master):
 
 def test_a_staging_buffer_can_be_sized_where_staging_is_turned_on(running_master):
     """Undersizing it silently shrinks the transfer batch, so it must be settable."""
-    pool = MooncakeStoreConfig(
+    pool = PoolSpec(
         master_server_address=running_master,
         stage_through_host=True,
         staging_buffer_bytes="4GiB",
@@ -294,7 +308,7 @@ def test_a_staging_buffer_can_be_sized_where_staging_is_turned_on(running_master
 
 def test_provisioning_fails_before_the_model_loads_if_the_master_is_absent(monkeypatch):
     monkeypatch.setenv(master_module.MASTER_TIMEOUT_ENV, "1")
-    pool = MooncakeStoreConfig(master_server_address=f"127.0.0.1:{free_port()}")
+    pool = PoolSpec(master_server_address=f"127.0.0.1:{free_port()}")
 
     with pytest.raises(TimeoutError, match="did not accept connections"):
         with provision_pool(pool):
@@ -304,7 +318,7 @@ def test_provisioning_fails_before_the_model_loads_if_the_master_is_absent(monke
 
 def test_an_unparseable_master_address_is_left_to_the_workers():
     """Not every address is host:port, so an unprobeable one passes through."""
-    pool = MooncakeStoreConfig(master_server_address="unix:///var/run/mooncake")
+    pool = PoolSpec(master_server_address="unix:///var/run/mooncake")
 
     with provision_pool(pool) as config_path:
         written = json.loads(open(config_path).read())
@@ -316,7 +330,7 @@ def test_an_inherited_config_path_wins(monkeypatch, tmp_path):
     harness_config = tmp_path / "harness.json"
     harness_config.write_text("{}")
     monkeypatch.setenv(CONFIG_PATH_ENV, str(harness_config))
-    pool = MooncakeStoreConfig(launch_master=True)
+    pool = PoolSpec(launch_master=True)
 
     with provision_pool(pool) as config_path:
         assert config_path is None
@@ -331,7 +345,7 @@ def test_an_inherited_config_path_wins(monkeypatch, tmp_path):
 def test_a_launched_master_is_named_in_the_config_and_stopped_on_exit(fake_master):
     port = free_port()
     fake_master.arm(listen_on=port)
-    pool = MooncakeStoreConfig(launch_master=True, master_port=port)
+    pool = PoolSpec(launch_master=True, master_port=port)
 
     with provision_pool(pool) as config_path:
         written = json.loads(open(config_path).read())
@@ -349,7 +363,7 @@ def test_a_launched_master_is_named_in_the_config_and_stopped_on_exit(fake_maste
 def test_a_launched_master_gets_the_flags_and_logging_it_needs(fake_master):
     port = free_port()
     fake_master.arm(listen_on=port)
-    pool = MooncakeStoreConfig(
+    pool = PoolSpec(
         launch_master=True,
         master_port=port,
         master_metrics_port=free_port(),
@@ -370,7 +384,7 @@ def test_a_launched_master_gets_the_flags_and_logging_it_needs(fake_master):
 
 def test_a_master_that_dies_during_startup_says_so(fake_master):
     fake_master.arm(exit_code=3)
-    pool = MooncakeStoreConfig(launch_master=True, master_port=free_port())
+    pool = PoolSpec(launch_master=True, master_port=free_port())
 
     with pytest.raises(RuntimeError, match="exited with code 3"):
         with provision_pool(pool):
@@ -381,7 +395,7 @@ def test_a_master_that_dies_during_startup_says_so(fake_master):
 def test_a_master_that_never_listens_times_out(monkeypatch, fake_master):
     monkeypatch.setenv(master_module.MASTER_TIMEOUT_ENV, "1")
     fake_master.arm()
-    pool = MooncakeStoreConfig(launch_master=True, master_port=free_port())
+    pool = PoolSpec(launch_master=True, master_port=free_port())
 
     with pytest.raises(TimeoutError, match="did not accept connections"):
         with provision_pool(pool):
@@ -395,7 +409,7 @@ def test_a_missing_master_binary_names_the_alternatives(monkeypatch):
         "shutil",
         SimpleNamespace(which=lambda _name: None, rmtree=shutil.rmtree),
     )
-    pool = MooncakeStoreConfig(launch_master=True)
+    pool = PoolSpec(launch_master=True)
 
     with pytest.raises(FileNotFoundError, match="master_server_address"):
         with provision_pool(pool):
@@ -406,7 +420,7 @@ def test_a_run_dir_keeps_the_master_log_and_the_config(fake_master, tmp_path):
     port = free_port()
     fake_master.arm(listen_on=port)
     run_dir = tmp_path / "pool"
-    pool = MooncakeStoreConfig(launch_master=True, master_port=port)
+    pool = PoolSpec(launch_master=True, master_port=port)
 
     with provision_pool(pool, run_dir=str(run_dir)) as config_path:
         assert config_path == str(run_dir / master_module.CLIENT_CONFIG_NAME)
@@ -415,37 +429,6 @@ def test_a_run_dir_keeps_the_master_log_and_the_config(fake_master, tmp_path):
     # master's log is where pool occupancy and eviction are read from.
     assert (run_dir / master_module.MASTER_LOG_NAME).exists()
     assert (run_dir / master_module.CLIENT_CONFIG_NAME).exists()
-
-
-# ---- the entry point servers call ----
-
-
-@pytest.mark.parametrize(
-    "config",
-    [
-        KvCacheConnectorConfig(connector="lmcache"),
-        None,
-        KvCacheConnectorConfig(connector="mooncake-store"),
-    ],
-    ids=["another_connector", "no_connector", "pool_left_undescribed"],
-)
-def test_provisioning_is_a_no_op_unless_a_pool_is_described(config):
-    """Without `mooncake_store`, MOONCAKE_CONFIG_PATH is still the only input."""
-    with maybe_provision_pool(config):
-        assert CONFIG_PATH_ENV not in os.environ
-
-
-def test_a_described_pool_is_provisioned(running_master):
-    config = KvCacheConnectorConfig(
-        connector="mooncake-store",
-        mooncake_store=MooncakeStoreConfig(
-            master_server_address=running_master, model_key="test-model"
-        ),
-    )
-    with maybe_provision_pool(config):
-        written = json.loads(open(os.environ[CONFIG_PATH_ENV]).read())
-        assert written["master_server_address"] == running_master
-    assert CONFIG_PATH_ENV not in os.environ
 
 
 # ---- reaching a master whose host nobody knew in advance ----
@@ -492,7 +475,7 @@ def test_a_standalone_master_publishes_an_address_that_can_be_dialed(fake_master
     port = free_port()
     fake_master.arm(listen_on=port)
     address_file = tmp_path / "master.addr"
-    pool = MooncakeStoreConfig(launch_master=True, master_port=port)
+    pool = PoolSpec(launch_master=True, master_port=port)
 
     with master_module.running_master(
         pool, str(tmp_path / "run"), address_file=str(address_file)
@@ -509,7 +492,7 @@ def test_a_stopped_master_leaves_no_address_behind(fake_master, tmp_path):
     port = free_port()
     fake_master.arm(listen_on=port)
     address_file = tmp_path / "master.addr"
-    pool = MooncakeStoreConfig(launch_master=True, master_port=port)
+    pool = PoolSpec(launch_master=True, master_port=port)
 
     with master_module.running_master(pool, str(tmp_path / "run"), address_file=str(address_file)):
         assert address_file.exists()
@@ -523,7 +506,7 @@ def test_a_standalone_master_keeps_its_log(fake_master, tmp_path):
     port = free_port()
     fake_master.arm(listen_on=port)
     run_dir = tmp_path / "run"
-    pool = MooncakeStoreConfig(launch_master=True, master_port=port)
+    pool = PoolSpec(launch_master=True, master_port=port)
 
     with master_module.running_master(pool, str(run_dir)):
         pass
@@ -536,8 +519,8 @@ def test_provisioning_joins_a_master_it_was_never_given_the_address_of(fake_mast
     port = free_port()
     fake_master.arm(listen_on=port)
     address_file = tmp_path / "master.addr"
-    standalone = MooncakeStoreConfig(launch_master=True, master_port=port)
-    worker = MooncakeStoreConfig(master_server_address=f"file://{address_file}")
+    standalone = PoolSpec(launch_master=True, master_port=port)
+    worker = PoolSpec(master_server_address=f"file://{address_file}")
 
     with master_module.running_master(
         standalone, str(tmp_path / "run"), address_file=str(address_file)
@@ -557,7 +540,7 @@ def test_a_launched_master_publishes_where_its_run_left_its_logs(fake_master, tm
     port = free_port()
     fake_master.arm(listen_on=port)
     run_dir = tmp_path / "run"
-    pool = MooncakeStoreConfig(launch_master=True, master_port=port)
+    pool = PoolSpec(launch_master=True, master_port=port)
 
     with provision_pool(pool, run_dir=str(run_dir)):
         address = (run_dir / master_module.MASTER_ADDRESS_NAME).read_text().strip()
@@ -571,9 +554,7 @@ def test_a_launched_master_can_be_published_where_the_donors_look(fake_master, t
     port = free_port()
     fake_master.arm(listen_on=port)
     shared = tmp_path / "shared" / "master.addr"
-    pool = MooncakeStoreConfig(
-        launch_master=True, master_port=port, master_address_file=str(shared)
-    )
+    pool = PoolSpec(launch_master=True, master_port=port, master_address_file=str(shared))
 
     with provision_pool(pool, run_dir=str(tmp_path / "run")):
         assert resolve_master_address(f"file://{shared}", timeout=5.0).endswith(f":{port}")
@@ -613,7 +594,7 @@ def test_a_master_that_died_starting_is_reported_with_its_last_words(fake_master
     """The reason is in the master's log, which is only read if the error quotes it."""
     run_dir = tmp_path / "run"
     fake_master.arm(exit_code=1, log_text="E0903 bind(50051) failed: Address already in use\n")
-    pool = MooncakeStoreConfig(launch_master=True, master_port=free_port())
+    pool = PoolSpec(launch_master=True, master_port=free_port())
 
     with pytest.raises(RuntimeError, match="Address already in use"):
         with provision_pool(pool, run_dir=str(run_dir)):
@@ -664,7 +645,7 @@ def test_the_detected_device_is_what_the_workers_are_told(fake_master, tmp_path,
     monkeypatch.setattr(master_module, "IB_SYSFS_ROOT", str(sysfs))
     port = free_port()
     fake_master.arm(listen_on=port)
-    pool = MooncakeStoreConfig(launch_master=True, master_port=port, protocol="rdma")
+    pool = PoolSpec(launch_master=True, master_port=port, protocol="rdma")
 
     with provision_pool(pool, run_dir=str(tmp_path / "run")) as config_path:
         assert json.loads(open(config_path).read())["device_name"] == "mlx5_0"
