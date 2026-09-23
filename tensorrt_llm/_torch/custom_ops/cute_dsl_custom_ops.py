@@ -17403,7 +17403,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # One runner owns the tactic space and launches both shards. The
             # shards skip their own workspace reset: the parent reset (the
             # prologue below) clears both partitions' workspaces, the output
-            # and quantizes raw input in one launch before the fork.
+            # and quantizes raw input in one launch before the fork. The FC2
+            # cache policy follows stream_weights like the full-GPU op's: the
+            # cached-FC2 tactic only wins when the profiler replays one layer
+            # on L2-resident weights (concurrent partition tuning cannot use
+            # the cold-L2 mode), and measured cold it lost 0.3-0.8 us.
             op_runner = Sm107Mxfp8FusedFc12MoeRunner(
                 num_experts,
                 top_k,
@@ -17412,7 +17416,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 tile_size,
                 swiglu_limit=swiglu_limit,
                 zero_output=False,
-                decouple_fc2_cache_policy=True,
                 skip_reset=True,
             )
             # Input order matches Sm107Mxfp8FusedFc12InputsHelper (shard 0).

@@ -4876,8 +4876,9 @@ def test_rubin_mxfp8_fused_fc12_locality_domain_composite_fake_signature():
     reason="MXFP8 fused FC12 MoE requires a CuTe DSL build that supports the fused FC12 kernel",
 )
 def test_rubin_mxfp8_fused_fc12_locality_domain_composite_owns_concurrent_tuning(monkeypatch):
-    """The composite tunes one decoupled-policy, skip-reset runner concurrently, registers the
-    parent-reset prologue and launches the runner directly with shard-specific weights."""
+    """The composite tunes one skip-reset runner (FC2 cache policy tied to stream_weights)
+    concurrently, registers the parent-reset prologue and launches the runner directly with
+    shard-specific weights."""
     composite_op = getattr(
         cute_dsl_custom_ops, "cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin", None
     )
@@ -4961,7 +4962,9 @@ def test_rubin_mxfp8_fused_fc12_locality_domain_composite_owns_concurrent_tuning
     assert len(runner_instances) == 1
     args, kwargs = runner_instances[0].init_call
     assert args == (16, 2, 2, 0, 128)
-    assert kwargs["decouple_fc2_cache_policy"] is True
+    # No cached-FC2 tactic for the split: its tuning runs warm, where that
+    # tactic always looks best and measured cold it loses.
+    assert "decouple_fc2_cache_policy" not in kwargs
     # The parent reset owns output clearing and the workspaces of both shards.
     assert kwargs["zero_output"] is False
     assert kwargs["skip_reset"] is True

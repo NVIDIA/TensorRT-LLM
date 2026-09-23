@@ -341,8 +341,10 @@ operands. TensorRT-LLM currently drives it for **MXFP8 only**, through
   `mma_tiler_m == routing tile_size in {128, 256}`, `mma_n in {128, 256}`,
   `mma_tiler_k in {128, 256}`, cluster `(cta_group, 1)`, scheduler
   `l2_atomic` / `static`, and L2 evict-first weight loads for both GEMMs
-  (`stream_weights`) or for FC2 alone (`fc2_stream_weights`; only decoupled
-  for locality-domain shards). Shorter tactics from older caches normalize.
+  (`stream_weights`) or for FC2 alone (`fc2_stream_weights`; the runner can
+  decouple it via `decouple_fc2_cache_policy`, but no caller does: the
+  locality-domain split tunes warm, where a cached-FC2 tactic always looks
+  best and measured cold it loses). Shorter tactics from older caches normalize.
   The outer `CuteDslFusedMoEMxfp8Runner` tunes the routing tile and the comb
   checker pins the inner `mma_tiler_m` to it.
 - **Locality domains** (`enable_locality_domains`, `plan_moe` op
