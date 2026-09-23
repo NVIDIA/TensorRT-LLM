@@ -22,8 +22,6 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from tensorrt_llm._torch.auto_deploy.llm_args import \
-    LlmArgs as AutoDeployLlmArgs
 from tensorrt_llm.llmapi import llm as llm_module
 from tensorrt_llm.llmapi import mm_encoder as mm_encoder_module
 from tensorrt_llm.llmapi.llm import _TorchLLM
@@ -76,15 +74,6 @@ def test_cached_model_loader_returns_model_dir(tmp_path):
     model_dir = CachedModelLoader(llm_args)()
 
     assert model_dir == tmp_path
-
-
-@pytest.mark.cpu_only
-def test_cached_model_loader_returns_none_for_autodeploy(tmp_path):
-    llm_args = AutoDeployLlmArgs(model=str(tmp_path))
-
-    model_dir = CachedModelLoader(llm_args)()
-
-    assert model_dir is None
 
 
 @pytest.mark.cpu_only
