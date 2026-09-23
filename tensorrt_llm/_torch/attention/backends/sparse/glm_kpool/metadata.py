@@ -21,6 +21,8 @@ import torch
 from tensorrt_llm._torch.modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from tensorrt_llm._utils import prefer_pinned
 
+from .cache_manager import Glm5NextCacheManager
+
 
 class Glm5NextMamba2Metadata(KimiK3MambaMetadata):
     def __init__(self, max_batch_size: int, chunk_size: int, max_num_tokens: int) -> None:
@@ -47,13 +49,15 @@ class Glm5NextMamba2Metadata(KimiK3MambaMetadata):
             )
 
     def prepare(self, attn_metadata) -> None:
-        super().prepare(attn_metadata)
         manager = attn_metadata.kv_cache_manager
+        assert manager is None or isinstance(manager, Glm5NextCacheManager), (
+            "glm5_next metadata requires Glm5NextCacheManager"
+        )
+        super().prepare(attn_metadata)
         kv_params = attn_metadata.kv_cache_params
         request_ids = attn_metadata.request_ids
         if (
             manager is None
-            or not hasattr(manager, "get_batch_slot_tables")
             or kv_params is None
             or kv_params.num_cached_tokens_per_seq is None
             or request_ids is None

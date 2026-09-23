@@ -42,8 +42,9 @@ from ...interface import (
 )
 from ...trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from .kernels import gather_fp8_kv_rows, kpool_expand, kpool_score, kpool_update
+from .metadata import Glm5NextMamba2Metadata
 from .native_decode import GlmKpoolNativeDecode
-from .params import INDEX_SENTINEL, GlmKpoolSparseParams
+from .params import INDEX_SENTINEL, GlmKpoolBackendForwardArgs, GlmKpoolSparseParams
 
 try:
     from tensorrt_llm.flash_mla import flash_mla_sparse_fwd
@@ -230,11 +231,9 @@ class GlmKpoolSparseAttention(TrtllmAttention):
                 "KVCacheManagerV2 owns the latent/indexer pools"
             )
         mamba_metadata = metadata.mamba_metadata
-        if mamba_metadata is None or mamba_metadata is False:
-            raise ValueError(
-                "glm_kpool requires prepared metadata: call metadata.prepare() "
-                "with the Glm5NextCacheManager attached (mamba_metadata is missing)"
-            )
+        assert isinstance(mamba_metadata, Glm5NextMamba2Metadata), (
+            "glm_kpool requires Glm5NextMamba2Metadata"
+        )
         latent = manager.get_latent_state_buffer(self.layer_idx)
         index = manager.get_index_state_buffer(self.layer_idx)
         if latent is None or index is None:
@@ -248,7 +247,7 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         batch = int(metadata.seq_lens.shape[0])
         num_contexts = int(metadata.num_contexts)
 
-        tables = getattr(mamba_metadata, "glm_block_tables", None)
+        tables = mamba_metadata.glm_block_tables
         if tables is None:
             raise RuntimeError(
                 "glm_kpool requires prepared glm_block_tables; call metadata.prepare() "
@@ -555,7 +554,10 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         """
         forward_args = merge_attention_forward_args(forward_args, kwargs)
         sparse_args = forward_args.sparse_backend_args
-        topk_rows = getattr(sparse_args, "topk_rows", None)
+        assert isinstance(sparse_args, GlmKpoolBackendForwardArgs), (
+            "glm_kpool requires GlmKpoolBackendForwardArgs"
+        )
+        topk_rows = sparse_args.topk_rows
         if topk_rows is None:
             raise ValueError(
                 "glm_kpool requires pool-expanded selection in sparse_backend_args.topk_rows"

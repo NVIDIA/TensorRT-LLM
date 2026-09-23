@@ -9,6 +9,7 @@ import pytest
 import torch
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import Glm5NextMamba2Metadata
 from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.glm5_next_weight_mapper import (
@@ -159,11 +160,10 @@ def test_layer_masks_accept_composite_and_text_configs():
 @pytest.mark.parametrize("is_cuda_graph", [False, True])
 def test_runtime_context_uses_prepared_schedules_and_live_lengths(is_cuda_graph):
     live_lengths = torch.tensor([6, 9], dtype=torch.int32)
-    prepared = SimpleNamespace(
-        glm_block_tables=torch.tensor([[0, 1], [2, 3]]),
-        glm_ctx_cu_seqlens=[0, 3],
-        glm_cached_lens_host=[3, 5],
-    )
+    prepared = object.__new__(Glm5NextMamba2Metadata)
+    prepared.glm_block_tables = torch.tensor([[0, 1], [2, 3]])
+    prepared.glm_ctx_cu_seqlens = [0, 3]
+    prepared.glm_cached_lens_host = [3, 5]
     metadata = SimpleNamespace(
         kv_cache_manager=object(),
         mamba_metadata=prepared,
@@ -192,6 +192,11 @@ def test_runtime_context_uses_prepared_schedules_and_live_lengths(is_cuda_graph)
     metadata.kv_lens_cuda = None
     with pytest.raises(ValueError, match="kv_lens_cuda"):
         build_glm5_next_runtime_context(metadata)
+    metadata.kv_lens_cuda = live_lengths
+    for invalid in (None, False, SimpleNamespace(glm_block_tables=prepared.glm_block_tables)):
+        metadata.mamba_metadata = invalid
+        with pytest.raises(AssertionError, match="Glm5NextMamba2Metadata"):
+            build_glm5_next_runtime_context(metadata)
 
 
 @pytest.mark.cpu_only
@@ -450,6 +455,8 @@ def test_sparse_prefill_continuation_preserves_partial_pools():
         )
         outputs = []
         cached = 0
+        prepared = object.__new__(Glm5NextMamba2Metadata)
+        prepared.glm_block_tables = tables
         for length in lengths:
             if cached and discard_prefix:
                 latent.zero_()
@@ -459,7 +466,7 @@ def test_sparse_prefill_continuation_preserves_partial_pools():
                 seq_lens=torch.tensor([length]),
                 num_contexts=1,
                 kv_lens_cuda=torch.tensor([cached + length], device="cuda", dtype=torch.int32),
-                mamba_metadata=SimpleNamespace(glm_block_tables=tables),
+                mamba_metadata=prepared,
             )
             outputs.append(
                 layer.forward_prefill(

@@ -25,6 +25,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
 )
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import (
+    Glm5NextMamba2Metadata,
     GlmKpoolSparseAttention,
     GlmKpoolSparseParams,
     latent_pool_rows,
@@ -135,6 +136,8 @@ def test_forward_dispatches_latent_rows_and_preserves_output(forward_case, route
     "invalid",
     [
         "selection",
+        "selection_type",
+        "missing_rows",
         "legacy_indices",
         "v",
         "out_scale",
@@ -155,7 +158,13 @@ def test_forward_rejects_invalid_arguments_before_cache_access(forward_case, inv
     error, message = ValueError, "quantized attention output"
     if invalid == "selection":
         args.sparse_backend_args = None
-        error, message = ValueError, "pool-expanded selection"
+        error, message = AssertionError, "GlmKpoolBackendForwardArgs"
+    elif invalid == "selection_type":
+        args.sparse_backend_args = SimpleNamespace(topk_rows=case.indices, topk_indices=None)
+        error, message = AssertionError, "GlmKpoolBackendForwardArgs"
+    elif invalid == "missing_rows":
+        args.sparse_backend_args = GlmKpoolBackendForwardArgs()
+        message = "pool-expanded selection"
     elif invalid == "legacy_indices":
         args.sparse_backend_args.topk_indices = case.indices
         message = "not request-local topk_indices"
@@ -213,6 +222,8 @@ def test_cache_state_uses_prepared_metadata_without_fallback(is_cuda_graph):
     index = torch.zeros(4, 8, 1, 384, dtype=torch.bfloat16)
     tables = torch.tensor([[2, 0], [3, 1]], dtype=torch.long)
     live_lengths = torch.tensor([5, 8], dtype=torch.int32)
+    prepared = object.__new__(Glm5NextMamba2Metadata)
+    prepared.glm_block_tables = tables
     metadata = SimpleNamespace(
         kv_cache_manager=SimpleNamespace(
             tokens_per_block=8,
@@ -223,7 +234,7 @@ def test_cache_state_uses_prepared_metadata_without_fallback(is_cuda_graph):
         num_contexts=0,
         is_cuda_graph=is_cuda_graph,
         kv_lens_cuda=live_lengths,
-        mamba_metadata=SimpleNamespace(glm_block_tables=tables),
+        mamba_metadata=prepared,
     )
     state = backend._cache_state(metadata)
     assert state.block_tables.data_ptr() == tables.data_ptr()
@@ -237,6 +248,19 @@ def test_cache_state_uses_prepared_metadata_without_fallback(is_cuda_graph):
     metadata.kv_lens_cuda = None
     with pytest.raises(ValueError, match="kv_lens_cuda"):
         backend._cache_state(metadata)
+    metadata.kv_lens_cuda = live_lengths
+    for invalid in (None, False, SimpleNamespace(glm_block_tables=tables)):
+        metadata.mamba_metadata = invalid
+        with pytest.raises(AssertionError, match="Glm5NextMamba2Metadata"):
+            backend._cache_state(metadata)
+
+
+def test_metadata_prepare_rejects_non_glm_cache_manager():
+    prepared = object.__new__(Glm5NextMamba2Metadata)
+    manager = SimpleNamespace(get_batch_slot_tables=Mock())
+    with pytest.raises(AssertionError, match="Glm5NextCacheManager"):
+        prepared.prepare(SimpleNamespace(kv_cache_manager=manager))
+    manager.get_batch_slot_tables.assert_not_called()
 
 
 @pytest.mark.parametrize("heads", [16, 64])
