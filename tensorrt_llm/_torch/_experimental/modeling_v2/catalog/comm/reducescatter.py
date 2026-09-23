@@ -12,6 +12,24 @@ import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtl
 
 from .._op import Arch, Cell, OpWrapper
 
+#: The dtypes whose NCCL mapping performs the sum the caller means by it.
+#: `getDtypeMap` in `cpp/tensorrt_llm/common/opUtils.cpp` is the whole table:
+#: these entries land on a native NCCL float or int type, so `ncclSum` is a
+#: float or integer sum of the values. Every other entry, and every dtype the
+#: table omits, is refused below -- see `is_valid` for the two distinct ways
+#: they go wrong.
+_SUMMABLE_DTYPES = frozenset(
+    {
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+        torch.int32,
+        torch.int64,
+        torch.int8,
+        torch.uint8,
+    }
+)
+
 
 class _Reducescatter(OpWrapper):
     """Sum `input` across every rank in `group`, then keep this rank's slice.
@@ -117,10 +135,26 @@ class _Reducescatter(OpWrapper):
             "input must be contiguous; the op reads it as packed memory and a "
             "strided view is silently reduced over the wrong elements"
         )
-        assert input.dtype is not torch.float8_e4m3fn, (
-            "float8_e4m3fn is accepted by the op but summed as raw unsigned bytes, "
-            "not as floats, so the result is meaningless; reduce in bf16/fp16/fp32 "
-            "and quantize afterwards"
+        # An allowlist rather than a list of known-bad dtypes, because the two
+        # ways a dtype goes wrong here are both silent and the second is not
+        # confined to this call:
+        #
+        #   mapped to the wrong arithmetic -- float8_e4m3fn and bool both land
+        #   on ncclInt8, so ncclSum adds their raw bytes. fp8 comes back as
+        #   nonsense and bool behaves like OR, neither with an error.
+        #
+        #   not in the map at all -- float64, quint4x2 and the rest reach
+        #   `TorchUtils::dataType()`, which throws. That call is *inside* the
+        #   group: reducescatterOp.cpp opens with ncclGroupStart() on line 21,
+        #   converts on line 25, and the matching ncclGroupEnd() on line 57 is
+        #   never reached. The communicator is left mid-group, and the
+        #   collectives after this one return invalid data. A guard here turns
+        #   that into a Python error before the group opens.
+        assert input.dtype in _SUMMABLE_DTYPES, (
+            f"{input.dtype} is not summable by this op; it is accepted and then "
+            f"either summed as raw bytes or thrown on inside an open NCCL group, "
+            f"which corrupts later collectives. Reduce in one of "
+            f"{sorted(str(d) for d in _SUMMABLE_DTYPES)} and cast afterwards"
         )
         if sizes is None:
             assert input.shape[0] % len(group) == 0, (
