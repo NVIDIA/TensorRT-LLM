@@ -20,6 +20,7 @@ These tests allocate device memory pools.
 """
 
 import gc
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -53,6 +54,13 @@ class FakeConnectorManager:
     """Records what the prefix path tells the connector, in order."""
 
     def __init__(self, num_matched=OFFER_TOKENS, load_async=False):
+        self.prefix_reservations_enabled = False
+        self.reservations = {}
+        self.reservation_requests = {}
+        self.next_reservation_id = 1
+        self.releases = []
+        self.accepted = []
+        self.dispatched = set()
         self.num_matched = num_matched
         self.load_async = load_async
         self.queries = []
@@ -60,6 +68,63 @@ class FakeConnectorManager:
         self.allocs = []
         self.allocs_by_group = []
         self.forgotten = []
+
+    def reserve_prefix(self, request: LlmRequest, local_end: int) -> SimpleNamespace | None:
+        if request.request_id in self.reservations:
+            return self.reservations[request.request_id]
+        self.queries.append((request.request_id, local_end))
+        if not self.num_matched:
+            return None
+        reservation = SimpleNamespace(
+            reservation_id=self.next_reservation_id,
+            request_id=request.request_id,
+            start=local_end,
+            end=local_end + self.num_matched,
+            is_async=self.load_async,
+        )
+        self.next_reservation_id += 1
+        self.reservations[request.request_id] = reservation
+        self.reservation_requests[request.request_id] = request
+        return reservation
+
+    def get_prefix_reservation(self, request: LlmRequest) -> SimpleNamespace | None:
+        return self.reservations.get(request.request_id)
+
+    def trim_prefix_reservation(self, request: LlmRequest, start: int, end: int) -> SimpleNamespace:
+        reservation = self.reservations[request.request_id]
+        if reservation.start < start:
+            self.releases.append((reservation.reservation_id, reservation.start, start))
+        if end < reservation.end:
+            self.releases.append((reservation.reservation_id, end, reservation.end))
+        reservation.start, reservation.end = start, end
+        return reservation
+
+    def release_prefix_reservation(self, request: LlmRequest) -> None:
+        reservation = self.reservations.pop(request.request_id, None)
+        self.reservation_requests.pop(request.request_id, None)
+        if reservation is not None:
+            self.releases.append((reservation.reservation_id, reservation.start, reservation.end))
+
+    def pending_prefix_requests(self) -> list[LlmRequest]:
+        return list(self.reservation_requests.values())
+
+    def accept_prefix_load(
+        self, request: LlmRequest, start: int, end: int, block_ids_by_layer_group: list[list[int]]
+    ) -> None:
+        reservation = self.reservations.pop(request.request_id)
+        self.reservation_requests.pop(request.request_id)
+        self.accepted.append((reservation, block_ids_by_layer_group))
+        request.py_num_connector_matched_tokens = end - start
+
+    def release_unstarted_prefix_loads(self, request: LlmRequest) -> None:
+        self.accepted = [
+            entry
+            for entry in self.accepted
+            if entry[0].request_id != request.request_id or request.request_id in self.dispatched
+        ]
+
+    def has_pending_load(self, request: LlmRequest) -> bool:
+        return any(entry[0].request_id == request.request_id for entry in self.accepted)
 
     def query_num_new_matched_tokens(self, request, num_computed_tokens):
         self.queries.append((request.py_request_id, num_computed_tokens))
@@ -634,3 +699,167 @@ def test_a_served_prefix_survives_re_entry_under_a_sliding_window():
         del mgr
         gc.collect()
         torch.cuda.empty_cache()
+
+
+@pytest.mark.parametrize("preallocated", [False, True])
+def test_rejected_connector_candidate_releases_and_rewinds(
+    manager: KVCacheManagerV2, connector: FakeConnectorManager, preallocated: bool
+) -> None:
+    request = make_request()
+    if preallocated:
+        assert schedule(manager, request)
+    connector.prefix_reservations_enabled = True
+    assert schedule(manager, request)
+    cache = manager.kv_cache_map[request.request_id]
+    assert cache.history_length == OFFER_TOKENS
+    if preallocated:
+        assert request.py_ctx_pre_resize_cap is None
+    assert connector.accepted == []
+
+    manager.release_unused_connector_reservations(set())
+
+    assert request.request_id not in manager.kv_cache_map
+    assert connector.releases == [(1, 0, OFFER_TOKENS)]
+    assert request.context_current_position == 0
+    assert request.prepopulated_prompt_len == 0
+    assert request.context_chunk_size == PROMPT_LEN
+    assert request.py_connector_served_position == 0
+    assert schedule(manager, request)
+    assert connector.get_prefix_reservation(request).reservation_id == 2
+    assert connector.queries == [(request.request_id, 0), (request.request_id, 0)]
+
+
+def test_token_budget_rejection_releases_real_cache(
+    manager: KVCacheManagerV2, connector: FakeConnectorManager
+) -> None:
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
+    from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
+
+    connector.prefix_reservations_enabled = True
+    request = make_request()
+    scheduler = KVCacheV2Scheduler(
+        max_batch_size=4,
+        max_num_tokens=32,
+        kv_cache_manager=manager,
+        scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+    )
+
+    output = scheduler.schedule_request([request], set())
+
+    assert output.context_requests == []
+    assert request.request_id not in manager.kv_cache_map
+    assert connector.releases == [(1, 0, OFFER_TOKENS)]
+    assert request.context_current_position == 0
+    assert connector.accepted == []
+
+
+def test_reserved_prefix_tracks_range_and_allocation(
+    manager: KVCacheManagerV2, connector: FakeConnectorManager
+) -> None:
+    from tensorrt_llm._torch.pyexecutor.llm_request import rewind_context_after_cache_drop
+
+    connector.prefix_reservations_enabled = True
+    connector.num_matched = PROMPT_LEN
+    request = make_request()
+    assert schedule(manager, request)
+    batch = run(manager, request)
+    assert connector.accepted == []
+    manager.report_batch_to_connector(batch)
+    first, first_groups = connector.accepted[0]
+    assert (first.start, first.end) == (0, 64)
+    assert connector.releases == [(first.reservation_id, 64, PROMPT_LEN)]
+    assert all(slot >= 0 for _, slot in valid_page_slots(first_groups[0]))
+    assert len(first_groups[0]) == 3
+
+    manager.free_resources(request)
+    rewind_context_after_cache_drop(request, TOKENS_PER_BLOCK)
+    assert schedule(manager, request)
+    manager.report_batch_to_connector(run(manager, request))
+
+    replay, replay_groups = connector.accepted[0]
+    assert replay.reservation_id != first.reservation_id
+    assert (replay.start, replay.end) == (first.start, first.end)
+    assert len(replay_groups[0]) == 3
+    assert connector.queries == [(request.request_id, 0), (request.request_id, 0)]
+    assert len(connector.allocs) == 2
+
+
+def test_dispatched_load_retains_real_destination_pages(
+    manager: KVCacheManagerV2, connector: FakeConnectorManager
+) -> None:
+    connector.prefix_reservations_enabled = True
+    connector.load_async = True
+    request = make_request()
+    assert schedule(manager, request)
+    manager.report_batch_to_connector(run(manager, request))
+    connector.dispatched.add(request.request_id)
+    pages_before = manager.get_page_indices_by_layer_group(request)
+
+    with pytest.raises(RuntimeError, match="while request .* is loading"):
+        manager.free_resources(request)
+
+    other = make_request(request_id=2)
+    assert schedule(manager, other)
+    pages_after = manager.get_page_indices_by_layer_group(request)
+    other_pages = manager.get_page_indices_by_layer_group(other)
+    assert pages_after == pages_before
+    for held, allocated in zip(pages_before, other_pages):
+        assert {slot for _, slot in valid_page_slots(held)}.isdisjoint(
+            slot for _, slot in valid_page_slots(allocated)
+        )
+    assert manager.kv_cache_map[request.request_id].is_active
+
+
+def test_reserved_vswa_prefix_reports_live_group_ordinals(
+    vswa_manager: KVCacheManagerV2, vswa_connector: FakeConnectorManager
+) -> None:
+    vswa_connector.prefix_reservations_enabled = True
+    request = make_request(prompt_len=VSWA_PROMPT_LEN)
+    assert schedule(vswa_manager, request)
+    vswa_manager.report_batch_to_connector(run(vswa_manager, request))
+    reservation, groups = vswa_connector.accepted[0]
+    sliding, full = _sliding_and_full(vswa_manager)
+    assert (reservation.start, reservation.end) == (0, VSWA_OFFER)
+    assert len(groups[sliding]) == len(groups[full]) == VSWA_PROMPT_LEN // TOKENS_PER_BLOCK
+    stale_end = (VSWA_OFFER + 1 - VSWA_WINDOW) // TOKENS_PER_BLOCK
+    assert groups[sliding][:stale_end] == [BAD_PAGE_INDEX] * stale_end
+    assert all(slot >= 0 for slot in groups[sliding][stale_end:])
+    assert all(slot >= 0 for slot in groups[full])
+
+
+def test_real_kv_pressure_rejects_reserved_prefix_without_transmission() -> None:
+    connector = FakeConnectorManager(num_matched=64)
+    connector.prefix_reservations_enabled = True
+    manager = make_manager(
+        connector,
+        kv_cache_config=KvCacheConfig(max_tokens=64, enable_block_reuse=True),
+    )
+    blocker = None
+    try:
+        available_blocks = manager.get_num_free_blocks()
+        assert available_blocks > 0
+        request = make_request()
+        assert manager.prepare_context(request)
+        assert request.context_current_position == 64
+
+        # Preparation can already hold pages. Fill the remaining pool until
+        # the allocator refuses another block, preserving those real holds.
+        blocker = manager.impl.create_kv_cache()
+        assert blocker.resume(manager._stream.cuda_stream)
+        for num_blocks in range(1, available_blocks + 2):
+            if not blocker.resize(num_blocks * TOKENS_PER_BLOCK):
+                break
+        else:
+            pytest.fail("The blocker did not exhaust the resolved KV pool")
+        assert blocker.capacity > 0
+
+        assert not manager.resize_context(request, 32)
+        assert blocker.is_active
+        assert connector.accepted == []
+        assert connector.releases == [(1, 0, 64)]
+        assert request.request_id not in manager.kv_cache_map
+        assert request.context_current_position == 0
+    finally:
+        if blocker is not None:
+            blocker.close()
+        manager.shutdown()

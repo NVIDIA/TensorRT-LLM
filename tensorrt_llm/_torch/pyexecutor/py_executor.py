@@ -81,7 +81,8 @@ from .connectors.kv_cache_layout import build_kv_cache_layout_v2
 from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
 from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
-from .executor_request_queue import (ExecutorRequestQueue,
+from .executor_request_queue import (PREFIX_LOAD_COMPLETION_REQUEST_ID,
+                                     ExecutorRequestQueue,
                                      RequestAdmissionState, RequestQueueItem)
 from .gpu_keepalive import GpuKeepalive
 from .guided_decoder import GuidedDecoder
@@ -1154,6 +1155,11 @@ class PyExecutor:
                     "per-layer load/save hooks have nothing meaningful to "
                     "transfer for those layers.")
 
+            self.kv_connector_manager.configure_prefix_reservations(
+                is_kv_cache_manager_v2
+                and (scheduler_config is None
+                     or scheduler_config.enable_prefix_aware_scheduling))
+
             if is_kv_cache_manager_v2:
                 # Registered regions are device addresses, so every page has
                 # to stay pinned to GPU for as long as the connector holds
@@ -1720,6 +1726,8 @@ class PyExecutor:
             logger.error("Hang detected, shutting down immediately.")
             return
         self.worker_thread.join()
+        if self.kv_connector_manager is not None:
+            self.kv_connector_manager.shutdown()
         if self.dist.pp_size > 1:
             self.executed_batch_queue.put(None)
             self.broadcast_sample_state_handler.join()
@@ -1895,7 +1903,16 @@ class PyExecutor:
     @property
     def should_stop_processing(self):
         return self.is_shutdown and len(self.active_requests) == 0 and \
-            len(self.waiting_queue) == 0
+            len(self.waiting_queue) == 0 and not self._has_pending_connector_transfers()
+
+    def _has_pending_connector_transfers(self) -> bool:
+        connector = getattr(self, "kv_connector_manager", None)
+        if connector is None:
+            return False
+        transfers = getattr(self, "async_transfer_manager", None)
+        return (connector.has_pending_loads()
+                or (transfers is not None
+                    and transfers.has_any_inflight_requests()))
 
     @contextmanager
     def _profiler(self):
@@ -3784,6 +3801,7 @@ class PyExecutor:
         return all_ranks_fetched and any_rank_terminal_no_fit
 
     def _prepare_and_schedule_batch(self):
+        self._release_unused_connector_reservations()
         self._poll_encoder_steps()
         new_requests = self._fetch_and_activate_new_requests()
         if self.should_stop_processing:
@@ -3932,19 +3950,67 @@ class PyExecutor:
             f'{scheduled_batch.num_generation_requests} generation requests')
         return scheduled_batch, iter_stats
 
+    def _release_unused_connector_reservations(
+            self, scheduled_batch: Optional[ScheduledRequests] = None) -> None:
+        connector = getattr(self, "kv_connector_manager", None)
+        if connector is None or not connector.prefix_reservations_enabled:
+            return
+        accepted = ({
+            req.py_request_id
+            for req in scheduled_batch.context_requests
+        } if scheduled_batch is not None else set())
+        self.kv_cache_manager.release_unused_connector_reservations(accepted)
+
     def _kv_connector_start_batch(self, scheduled_batch):
         if self.kv_connector_manager:
             self.kv_connector_manager.take_scheduled_requests_pending_load(
                 scheduled_batch)
             self.kv_connector_manager.handle_metadata()
+            self.kv_connector_manager.mark_prefix_loads_dispatched()
             self.kv_connector_manager.worker.start_load_kv(
                 torch.cuda.current_stream())
 
+    def _defer_connector_load_cancellations(self) -> None:
+        # A cancelled load must drain without becoming schedulable again.
+        cancelled = set(self.canceled_req_ids)
+        for req in self.active_requests:
+            req_id = (req.parent_request_id
+                      if req.is_child else req.py_request_id)
+            if req_id in cancelled:
+                self.kv_connector_manager.defer_load_termination(req)
+
     def _kv_connector_terminate_requests(self):
         if self.kv_connector_manager:
+            self._defer_connector_load_cancellations()
             reqs_to_terminate = self.kv_connector_manager.get_finished()
             for req in reqs_to_terminate:
                 self._release_transfer(req)
+            for req in self.kv_connector_manager.take_finished_load_terminations(
+            ):
+                self._finish_connector_load_termination(req)
+
+    def _finish_connector_load_termination(self, request: LlmRequest) -> None:
+        """Finish a cancelled load or reclaim a load whose error was reported."""
+        if not request.is_finished:
+            request.py_kv_transfer_timed_out = False
+            request.finish_by_reason(FinishReason.CANCELLED)
+            request.decoding_iter = request.py_decoding_iter
+            response = request.create_response(False, self.dist.rank)
+            if response is not None:
+                response.result.cached_tokens = request.cached_tokens
+                self._enqueue_responses([(request.py_request_id, response)])
+        self.active_requests[:] = [
+            req for req in self.active_requests if req is not request
+        ]
+        cancel_id = (request.parent_request_id
+                     if request.is_child else request.py_request_id)
+        if not any((req.parent_request_id if req.is_child else req.py_request_id
+                    ) == cancel_id for req in self.active_requests):
+            self.canceled_req_ids[:] = [
+                req_id for req_id in self.canceled_req_ids
+                if req_id != cancel_id
+            ]
+        self._terminate_request(request)
 
     def _kv_connector_wait_for_save(self):
         if self.kv_connector_manager is not None:
@@ -4291,6 +4357,7 @@ class PyExecutor:
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
                     scheduled_batch, can_forward)
                 if should_retry:
+                    self._release_unused_connector_reservations()
                     if self._is_kv_manager_v2:
                         self._revert_gen_alloc(scheduled_batch)
                         self._terminate_recompute_paused_requests(
@@ -4323,6 +4390,8 @@ class PyExecutor:
                 gpu_forward_events_from_perf_pool = False
 
                 can_queue, _ = self._can_queue(scheduled_batch)
+                self._release_unused_connector_reservations(
+                    scheduled_batch if can_queue else None)
 
                 if can_queue:
                     self._prepare_disagg_gen_transmission_complete(
@@ -4573,8 +4642,9 @@ class PyExecutor:
 
         pending = self.control_requests[0]
 
-        if pending.control_requires_drain and (len(self.active_requests) != 0
-                                               or len(self.waiting_queue) != 0):
+        if pending.control_requires_drain and (
+                len(self.active_requests) != 0 or len(self.waiting_queue) != 0
+                or self._has_pending_connector_transfers()):
             # drain=True: keep the sentinel parked until the engine drains.
             return
 
@@ -5131,6 +5201,7 @@ class PyExecutor:
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
                     scheduled_batch, can_forward)
                 if should_retry:
+                    self._release_unused_connector_reservations()
                     if self._is_kv_manager_v2:
                         self._revert_gen_alloc(scheduled_batch)
                         self._terminate_recompute_paused_requests(
@@ -5163,6 +5234,8 @@ class PyExecutor:
 
                 can_queue, can_queue_this_rank = self._can_queue(
                     scheduled_batch)
+                self._release_unused_connector_reservations(
+                    scheduled_batch if can_queue else None)
 
                 if can_queue:
                     self._prepare_disagg_gen_transmission_complete(
@@ -5715,8 +5788,12 @@ class PyExecutor:
     def _fetch_and_enqueue_requests(self, waiting_queue: WaitingQueue,
                                     total_num_live_requests: int) -> None:
         """Fetch requests from request_queue and enqueue to waiting_queue."""
-        # Block new requests while control requests are pending
-        if len(self.control_requests) != 0:
+        connector = self.kv_connector_manager
+        control_pending = len(self.control_requests) != 0
+        # A draining control request must still receive transfer completions.
+        if control_pending and not (connector is not None
+                                    and connector.prefix_reservations_enabled
+                                    and connector.has_pending_loads()):
             return
 
         # Calculate timeout. Never wait once the shutdown sentinel has been
@@ -5725,7 +5802,8 @@ class PyExecutor:
         # `should_stop_processing` check that ends it, deadlocking shutdown()
         # on `shutdown_event`.
         idle = (total_num_live_requests == 0 and len(waiting_queue) == 0
-                and not self.is_shutdown)
+                and not self.is_shutdown
+                and not self._has_pending_connector_transfers())
         if idle:
             # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
             # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
@@ -5736,7 +5814,7 @@ class PyExecutor:
 
         # Fetch requests from rank 0
         new_requests = []
-        if self.dist.rank == 0:
+        if self.dist.rank == 0 and not control_pending:
             # Process accumulated requests that were queued during control request handling.
             if len(self.request_accumulated) != 0:
                 new_requests.extend(self.request_accumulated)
@@ -5746,6 +5824,16 @@ class PyExecutor:
             with self.hang_detector.pause():
                 new_requests.extend(
                     self.executor_request_queue.get_from_request_queue(timeout))
+
+        if connector is not None and self.dist.rank == 0:
+            completed = connector.take_finished_prefix_loads()
+            if completed:
+                # Apply completions even when a shutdown or control item stops
+                # consumption of the rest of this request envelope.
+                new_requests.insert(
+                    0,
+                    RequestQueueItem(PREFIX_LOAD_COMPLETION_REQUEST_ID,
+                                     finished_prefix_load_ids=completed))
 
         # Broadcast requests and handle Python objects. RequestBroadcaster probes
         # the request count first and can skip the heavy payload broadcast on
@@ -5991,8 +6079,12 @@ class PyExecutor:
             new_requests: List[RequestQueueItem]) -> List[RequestQueueItem]:
         """Handle special signals."""
         accepted_new_requests = []
+        finished_prefix_load_ids = []
         for idx, req_item in enumerate(new_requests):
-            if req_item.is_shutdown_request:
+            if req_item.is_prefix_load_completion_request:
+                finished_prefix_load_ids.extend(
+                    req_item.finished_prefix_load_ids)
+            elif req_item.is_shutdown_request:
                 self.is_shutdown = True
                 break
             elif req_item.is_canceled_request:
@@ -6013,6 +6105,10 @@ class PyExecutor:
             else:
                 accepted_new_requests.append(req_item)
 
+        if finished_prefix_load_ids:
+            self._defer_connector_load_cancellations()
+            self.kv_connector_manager.finish_prefix_loads(
+                finished_prefix_load_ids)
         return accepted_new_requests
 
     def _update_new_active_requests_queue_latency(
@@ -7179,7 +7275,10 @@ class PyExecutor:
         # so the connector's per-request state advances exactly as before.
         kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        if hasattr(kv_cache_manager, "report_batch_to_connector"):
+        if isinstance(kv_cache_manager, KVCacheManagerV2):
+            kv_cache_manager.report_batch_to_connector(
+                disagg_gen_init_to_prepare, finalize_prefix_reservations=False)
+        elif hasattr(kv_cache_manager, "report_batch_to_connector"):
             kv_cache_manager.report_batch_to_connector(
                 disagg_gen_init_to_prepare)
 
@@ -7967,6 +8066,15 @@ class PyExecutor:
                 raise self._fatal_error
 
     def _terminate_request(self, request: LlmRequest) -> None:
+        connector = getattr(self, "kv_connector_manager", None)
+        if connector is not None:
+            connector.release_unstarted_prefix_loads(request)
+            if connector.defer_load_termination(request):
+                return
+            transfers = getattr(self, "async_transfer_manager", None)
+            if (self._is_kv_manager_v2 and transfers is not None and
+                    request.py_request_id in transfers.requests_in_transfer()):
+                return
         # Dummy requests don't participate in disagg KV cache transfers,
         # so they must bypass the PP termination handler to avoid stale
         # sequences in the KV cache manager (the handler delays removal,
@@ -8033,6 +8141,11 @@ class PyExecutor:
         Returns:
             bool: True if the request can be canceled (either successfully cancelled or doesn't need cancellation).
         """
+        connector = getattr(self, "kv_connector_manager", None)
+        if connector is not None:
+            connector.release_unstarted_prefix_loads(request)
+            if connector.defer_load_termination(request):
+                return False
         if self.kv_cache_transceiver is None:
             return True
 
