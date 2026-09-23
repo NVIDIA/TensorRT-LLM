@@ -51,9 +51,17 @@ def add_arguments(parser: ArgumentParser):
                         "container carry optimized binaries. Omit to install "
                         "the wheel as built. Fatal if set and no branch has a "
                         "usable bundle.")
+    parser.add_argument("--bolt-profile-ref",
+                        default=None,
+                        help="Pin to one immutable profile bundle by ref, so "
+                        "the image's wheel is optimized with the same profiles "
+                        "as the tested build and the released wheel. Collapses "
+                        "--bolt-branch to its first entry, since a ref names "
+                        "one bundle under one branch. Omit to take whatever is "
+                        "currently promoted as latest.")
 
 
-def bolt_optimize_wheels(build_dir, arch, bolt_branch):
+def bolt_optimize_wheels(build_dir, arch, bolt_branch, bolt_profile_ref=None):
     """Apply the latest promoted BOLT bundle to each wheel in `build_dir`.
 
     Deliberately uses the branch's last promoted bundle rather than one
@@ -69,6 +77,15 @@ def bolt_optimize_wheels(build_dir, arch, bolt_branch):
     apply_latest = str(bolt_internal / "apply_latest.sh")
     triple = "x86_64-linux-gnu" if arch == "x86_64" else "aarch64-linux-gnu"
     branches = [b.strip() for b in bolt_branch.split(",") if b.strip()]
+    env = os.environ.copy()
+    if bolt_profile_ref:
+        # The branch walk is kept under a pin. The ref is a commit SHA, so the
+        # same ref under another branch's promote directory is the bundle built
+        # from that same commit -- whichever candidate resolves it, the profiles
+        # are the pinned ones. Narrowing the list would instead risk looking in
+        # a directory the pin was never resolved against.
+        env["BOLT_PROFILE_REF"] = bolt_profile_ref
+        print(f"Pinned to BOLT bundle {bolt_profile_ref}")
 
     for wheel in sorted(Path(build_dir).glob("tensorrt_llm*.whl")):
         bolted = wheel.with_suffix(".whl.bolted")
@@ -81,7 +98,7 @@ def bolt_optimize_wheels(build_dir, arch, bolt_branch):
                 str(bolted)
             ]
             # 3 = that branch has nothing promoted; anything else is decisive.
-            rc = subprocess.run(cmd).returncode
+            rc = subprocess.run(cmd, env=env).returncode
             if rc == 0:
                 os.replace(bolted, wheel)
                 print(f"BOLT optimized {wheel.name} ({branch}/{triple})")
@@ -92,12 +109,21 @@ def bolt_optimize_wheels(build_dir, arch, bolt_branch):
             print(f"No promoted bundle for {branch}/{triple}; "
                   "trying next branch")
         else:
+            if bolt_profile_ref:
+                raise RuntimeError(
+                    f"Pinned BOLT bundle {bolt_profile_ref} ({triple}) not "
+                    f"found under any of {branches}; refusing to build an "
+                    f"image whose wheel is optimized with anything else")
             raise RuntimeError(
                 f"No promoted BOLT bundle for any of {branches} ({triple}); "
                 f"refusing to build an unoptimized release image")
 
 
-def get_wheel_from_package(arch, artifact_path, timeout, bolt_branch=None):
+def get_wheel_from_package(arch,
+                           artifact_path,
+                           timeout,
+                           bolt_branch=None,
+                           bolt_profile_ref=None):
     if arch == "x86_64":
         tarfile_name = "TensorRT-LLM.tar.gz"
     else:
@@ -149,7 +175,7 @@ def get_wheel_from_package(arch, artifact_path, timeout, bolt_branch=None):
     # After the move, before the Dockerfile's release stage pip installs
     # whatever is in build/.
     if bolt_branch:
-        bolt_optimize_wheels(build_dir, arch, bolt_branch)
+        bolt_optimize_wheels(build_dir, arch, bolt_branch, bolt_profile_ref)
 
 
 if __name__ == "__main__":
