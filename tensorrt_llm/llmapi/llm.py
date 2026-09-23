@@ -423,6 +423,8 @@ class BaseLLM:
                                      tokenizer_revision=tokenizer_revision,
                                      **kwargs)
 
+            self._capture_usage_startup(llm_args=self.args)
+
         except Exception as e:
             logger.error(
                 f"Failed to parse the arguments for the LLM constructor: {e}")
@@ -505,6 +507,25 @@ class BaseLLM:
 
         exception_handler.register(self, 'shutdown')
         atexit.register(LLM._shutdown_wrapper, weakref.ref(self))
+
+    def _capture_usage_startup(self, **context: Any) -> None:
+        """Capture optional startup context without affecting model construction."""
+        try:
+            from tensorrt_llm.usage import record_llm_initialization_attempt
+            from tensorrt_llm.usage.usage_lib import _capture_startup_context
+
+            args = context.get("llm_args")
+            if (args is not None and hasattr(self, "_usage_startup_token")
+                    and not self._usage_attempt_tracked):
+                self._usage_attempt_tracked = record_llm_initialization_attempt(
+                    args.telemetry_config)
+                if self._usage_attempt_tracked:
+                    _capture_startup_context(self._usage_startup_token,
+                                             requested={})
+            _capture_startup_context(
+                getattr(self, "_usage_startup_token", None), **context)
+        except Exception as exc:
+            logger.debug("Usage telemetry startup capture failed: %s", exc)
 
     def _start_usage_reporting(self) -> None:
         """Start the success-only initial report and heartbeat stream."""
@@ -1873,13 +1894,13 @@ class _TorchLLM(BaseLLM):
         self._usage_lifecycle_active = False
         self._usage_lifecycle_lock = threading.Lock()
         telemetry_config = kwargs.get("telemetry_config")
-        usage_attempt_tracked = False
+        self._usage_attempt_tracked = False
         _usage = None
         # Telemetry: Track before construction so initialization failures are visible.
         try:
             import tensorrt_llm.usage as _usage
 
-            usage_attempt_tracked = _usage.record_llm_initialization_attempt(
+            self._usage_attempt_tracked = _usage.record_llm_initialization_attempt(
                 telemetry_config,
                 default_usage_context=_usage.UsageContext.LLM_CLASS.value,
             )
@@ -1888,6 +1909,14 @@ class _TorchLLM(BaseLLM):
                 f"Usage telemetry initialization tracking failed: {exc}")
 
         backend = kwargs.pop("backend", "pytorch")
+
+        self._usage_startup_token = object()
+        if self._usage_attempt_tracked:
+            self._capture_usage_startup(
+                requested=dict(kwargs,
+                               backend=backend,
+                               tensor_parallel_size=tensor_parallel_size,
+                               dtype=dtype))
 
         try:
             # Validate that only arguments supported by the PyTorch backend are passed.
@@ -1905,18 +1934,18 @@ class _TorchLLM(BaseLLM):
                              backend=backend,
                              **kwargs)
         except Exception:
-            if usage_attempt_tracked:
+            if self._usage_attempt_tracked and _usage is not None:
                 _usage.record_llm_initialization_failure()
             raise
 
         try:
-            if not usage_attempt_tracked and _usage is not None:
-                usage_attempt_tracked = _usage.record_llm_initialization_attempt(
+            if not self._usage_attempt_tracked and _usage is not None:
+                self._usage_attempt_tracked = _usage.record_llm_initialization_attempt(
                     getattr(self.args, 'telemetry_config', None),
                     default_usage_context=_usage.UsageContext.LLM_CLASS.value,
                 )
 
-            if usage_attempt_tracked:
+            if self._usage_attempt_tracked:
                 self._usage_lifecycle_active = _usage.record_llm_initialized()
         except Exception as exc:
             logger.debug(f"Usage telemetry completion tracking failed: {exc}")
@@ -2004,6 +2033,7 @@ class _TorchLLM(BaseLLM):
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
         self._tokenizer = self._try_load_tokenizer()
         self._hf_model_config = self._try_load_hf_model_config()
+        self._capture_usage_startup(pretrained_config=self._hf_model_config)
         self._reject_token_encoder_config_without_buckets()
         self._generation_config = self._try_load_generation_config()
         self._generation_config_explicit_values = self._try_load_generation_config_explicit_values(
