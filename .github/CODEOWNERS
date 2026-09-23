@@ -94,6 +94,7 @@
 /SECURITY.md @NVIDIA/trt-llm-doc-owners
 /docs @NVIDIA/trt-llm-doc-owners
 /examples @NVIDIA/trt-llm-doc-owners
+/tests/unittest/docs @NVIDIA/trt-llm-doc-owners
 
 # ===== QA =====
 /tests/integration/defs @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-qa-function @NVIDIA/trt-llm-infra-devs
