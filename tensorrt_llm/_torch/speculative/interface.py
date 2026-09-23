@@ -136,6 +136,11 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
     if (spec_config.spec_dec_mode.is_dspark()
             and spec_config.draft_is_embedded_in_target):
         return False
+    # Suffix automaton (SA) drafts from a dedicated suffix-automaton state pool
+    # and never reads a paged draft KV cache manager, so it needs no separate
+    # draft KV cache despite reaching this one-engine path.
+    if spec_config.spec_dec_mode.is_sa():
+        return False
     return spec_config._allow_separate_draft_kv_cache
 
 

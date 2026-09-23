@@ -1637,6 +1637,7 @@ class KVCacheManagerV2(BaseResourceManager):
         }
 
         self.kv_cache_map: dict[int, _KVCache] = {}
+        self._disagg_receive_ready: dict[int, torch.cuda.Event] = {}
         self._request_stats_enabled_ids: set[int] = set()
 
         # Lazily built map of layer-group id -> sliding window size, restricted
@@ -2698,6 +2699,22 @@ class KVCacheManagerV2(BaseResourceManager):
             non_blocking=True,
         )
 
+    def _get_buffer_roles_for_layer(self, local_layer_idx: int) -> List[DataRole]:
+        """Return the primary cache roles allocated for one local layer."""
+        roles = [Role.KEY]
+        if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
+            roles.append(Role.VALUE)
+        if self.dtype == DataType.NVFP4:
+            head_dim = self.head_dim_per_layer[local_layer_idx]
+            assert head_dim % 2 == 0, (
+                f"head_dim must be divisible by 2 for nvfp4 kv cache, "
+                f"but layer {local_layer_idx} has head_dim={head_dim}"
+            )
+            roles.append(Role.KEY_BLOCK_SCALE)
+            if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
+                roles.append(Role.VALUE_BLOCK_SCALE)
+        return roles
+
     def _build_base_config(
         self,
         kv_cache_config: KvCacheConfig,
@@ -2793,18 +2810,6 @@ class KVCacheManagerV2(BaseResourceManager):
                         )
                     )
 
-        buffer_type = [Role.KEY]
-        if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
-            buffer_type.append(Role.VALUE)
-        if self.dtype == DataType.NVFP4:
-            for layer_idx, hd in enumerate(self.head_dim_per_layer):
-                assert hd % 2 == 0, (
-                    f"head_dim must be divisible by 2 for nvfp4 kv cache, but layer {layer_idx} has head_dim={hd}"
-                )
-            buffer_type.append(Role.KEY_BLOCK_SCALE)
-            if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
-                buffer_type.append(Role.VALUE_BLOCK_SCALE)
-
         # Subclasses (e.g. MiniMax-M3 sparse cache) can register additional
         # per-layer BufferConfig entries — for example a sparse index-K
         # buffer — without overriding the K/V/NVFP4 scale wiring above.
@@ -2818,6 +2823,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         layer_configs: List[AttentionLayerConfig] = []
         for layer_id in typed_range(LayerId(self.num_local_layers)):
+            buffer_type = self._get_buffer_roles_for_layer(layer_id)
             buffers = [
                 BufferConfig(
                     role=role,
@@ -3690,6 +3696,12 @@ class KVCacheManagerV2(BaseResourceManager):
         self._fill_fresh_kv_pages(req.py_request_id)
         self._log_window_crossing(req, kv_cache, pre_cap, capacity, "disagg_gen_init")
         req.py_ctx_pre_resize_cap = pre_cap if capacity > pre_cap else None
+        # RDMA cannot observe cache-stream ordering. Capture readiness here so
+        # receive publication waits for admission's copies and recycled-slot
+        # dependencies without waiting for later execution-stream work.
+        ready = torch.cuda.Event()
+        ready.record(self._stream)
+        self._disagg_receive_ready[req.py_request_id] = ready
         return True
 
     def get_history_length(self, req: LlmRequest) -> int | None:
@@ -3824,6 +3836,12 @@ class KVCacheManagerV2(BaseResourceManager):
 
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        for request in scheduled_batch.context_requests:
+            ready = self._disagg_receive_ready.get(request.py_request_id)
+            if ready is not None:
+                ready.synchronize()
+                del self._disagg_receive_ready[request.py_request_id]
+
         if self.is_draft:
             # Mirror the main manager. Under one-model spec decoding the
             # scheduler may already have created the context cache.
@@ -5100,6 +5118,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # The next owner of these pages fills them again; keeping the set would
         # both leak and let a recycled page skip its fill.
         self._fresh_pages_filled.pop(request.py_request_id, None)
+        self._disagg_receive_ready.pop(request.py_request_id, None)
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
         if kv_cache is None:
             self.impl.clear_stats_excluded(request.py_request_id)
@@ -5352,6 +5371,7 @@ class KVCacheManagerV2(BaseResourceManager):
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()
+        self._disagg_receive_ready.clear()
         self._request_stats_enabled_ids.clear()
         self._fresh_pages_filled.clear()
         # Drop the outstanding plans before the manager shuts down: discarding a handle applies
