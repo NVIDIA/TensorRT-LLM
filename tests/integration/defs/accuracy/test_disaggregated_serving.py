@@ -905,16 +905,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
             "cuda_graph_config": None,
-            # DEFAULT drops the per-test UCX pinning but still runs UCX, since
-            # launch_disaggregated_llm sets TRTLLM_USE_UCX_KVCACHE=1 for every
-            # backend but NIXL. Transport coverage is unchanged by this move.
-            # CPP is explicit: this test runs on UCX (see the DEFAULT note
-            # above), and DeepSeek's Python preference would otherwise be
-            # adopted verbatim and fail at creation on a non-NIXL backend.
+            # NIXL (not DEFAULT) skips the harness's TRTLLM_USE_UCX_KVCACHE=1
+            # fallback; the Python transceiver requires NIXL.
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
-                "max_tokens_in_buffer": 8192,
-                "transceiver_runtime": "CPP",
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
             },
         }
         gen_server_config = {
@@ -933,9 +928,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "enable_chunked_prefill": False,
             "cuda_graph_config": cuda_graph_config,
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
-                "max_tokens_in_buffer": 8192,
-                "transceiver_runtime": "CPP",
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
             },
             "enable_attention_dp": enable_attention_dp,
         }
@@ -1488,9 +1482,11 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "enable_partial_reuse": False,
             "tokens_per_block": 32,
         }
+        # NIXL (not DEFAULT) skips the harness's TRTLLM_USE_UCX_KVCACHE=1
+        # fallback; the Python transceiver requires NIXL.
         cache_transceiver_config = {
-            "backend": "DEFAULT",
-            "max_tokens_in_buffer": 8192,
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
         }
         ctx_server_config = {
             "pipeline_parallel_size": 1,
