@@ -362,12 +362,12 @@ def test_scheduler_publishes_prepared_batch(
         "_collect_scheduled_batch_stats",
     ):
         setattr(executor, name, Mock())
-    batch = _batch(context=2, generation=5)
-    batch.encoder_requests = []
-    batch.paused_requests = []
-    batch.num_encoder_requests = 0
-    batch.num_context_requests = 2
-    batch.num_generation_requests = 5
+    def request():
+        return SimpleNamespace(is_dummy=False, is_attention_dp_dummy=False, py_batch_idx=None)
+
+    batch = py_executor.ScheduledRequests()
+    batch.context_requests_last_chunk = [request() for _ in range(2)]
+    batch.generation_requests = [request() for _ in range(5)]
     executor._prepare_and_schedule_batch = Mock(return_value=(batch, None))
     executor._pp_schedule_and_propagate = Mock(return_value=(batch, [], None, None))
     # An outstanding PP microbatch does not make this a total-in-flight gauge.
@@ -378,9 +378,8 @@ def test_scheduler_publishes_prepared_batch(
         assert scheduled is batch
         assert executor._batch_metrics._batch_size._value.get() == 11
         # Resource preparation may change the batch that actually runs.
-        scheduled.context_requests = [SimpleNamespace(is_dummy=False)]
-        scheduled.generation_requests = [SimpleNamespace(is_dummy=False, py_batch_idx=None)]
-        scheduled.batch_size = 2
+        scheduled.context_requests_last_chunk = scheduled.context_requests_last_chunk[:1]
+        scheduled.generation_requests = scheduled.generation_requests[:1]
 
     executor.resource_manager.prepare_resources.side_effect = prepare_resources
     executor._revert_gen_alloc = Mock(side_effect=_ReachedForward)
