@@ -37,7 +37,7 @@ _TARGETS = {
 
 # Synthetic architecture name -> the module whose import registers it.
 TARGET_MODULES = {
-    "ModelingV2GptOss120bSm103Tp1": "models.gpt_oss.targets.gpt_oss_120b.sm_103.tp1.modeling",
+    "ModelingV2GptOss120bSm103Tp1": "models.gpt_oss.gpt_oss_120b__sm_103__tp1.modeling",
 }
 
 

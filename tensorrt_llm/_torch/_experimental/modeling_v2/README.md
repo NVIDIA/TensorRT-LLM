@@ -100,8 +100,8 @@ _router_index.py    architectures[0] -> routing module. Small, stable, test-guar
 explain.py          why a configuration routed where it did
 models/<family>/
   routing.py        one forward-reading decision tree per architecture family
-  targets/<checkpoint>/<gpu arch>/<parallel>/
-                    modeling.py  weights.py
+  <checkpoint>__<gpu arch>__<parallel>/
+                      modeling.py  weights.py
 catalog/            the kernel vocabulary: contract .md + wrapper .py
 ```
 
@@ -132,9 +132,11 @@ by absolute import -- so neither needs a package to live in. Neither those
 file names nor their `check_*` bodies match pytest's collection patterns:
 each is one fixed 4-rank sequence that cannot run as independent cases.
 
-Identity is the path. `targets/` keeps all three segments rather than
-flattening them, and the class name carries the same triple;
-`test_modeling_v2_claims.py` asserts they agree.
+Identity is the directory name, and it carries all three segments:
+`gpt_oss_120b__sm_103__tp1`. They were three nested directories once, which
+read as a hierarchy that was never one -- every level had exactly one child,
+and each needed an `__init__.py` whose only job was to exist. The class name
+carries the same triple; `test_modeling_v2_claims.py` asserts they agree.
 
 ### Why beside `_torch/models/`, not inside it
 
