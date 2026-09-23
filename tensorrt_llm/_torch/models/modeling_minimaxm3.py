@@ -838,6 +838,54 @@ def _minimax_m3_qkv_index_proj_fake(
     return hidden_states.new_empty((hidden_states.shape[0], sum(qkv_proj.local_output_sizes)))
 
 
+# Projection and cache insertion inspect runtime shapes and layouts. Keep those
+# checks opaque to avoid Dynamo specialization or graph breaks while PCG captures
+# the fused kernels; explicit mutable cache inputs keep their writes visible.
+@torch.library.custom_op(
+    "trtllm::minimax_m3_fused_sparse_qkv_producer",
+    mutates_args=("kv_cache", "index_k_cache"),
+)
+def minimax_m3_fused_sparse_qkv_producer(
+    hidden_states: torch.Tensor,
+    position_ids: Optional[torch.Tensor],
+    kv_cache: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    layer_idx: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Capture projection, norm, RoPE and FP8 cache insertion together."""
+    attn_metadata, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
+    packed = attn_layer.qkv_proj(hidden_states)
+    result = attn_layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(
+        packed,
+        position_ids,
+        attn_metadata,
+        cache_tensors=(kv_cache, index_k_cache, out_cache_loc),
+    )
+    if result is None:
+        raise RuntimeError("MiniMax-M3 piecewise graph requires the fused FP8 sparse QKV producer.")
+    return result
+
+
+@minimax_m3_fused_sparse_qkv_producer.register_fake
+def _minimax_m3_fused_sparse_qkv_producer_fake(
+    hidden_states: torch.Tensor,
+    position_ids: Optional[torch.Tensor],
+    kv_cache: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    layer_idx: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Infer FP8 query shapes while retaining the symbolic token dimension."""
+    del position_ids
+    _, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
+    num_tokens = hidden_states.shape[0]
+    return (
+        hidden_states.new_empty((num_tokens, attn_layer.q_size), dtype=torch.float8_e4m3fn),
+        hidden_states.new_empty((num_tokens, attn_layer.index_q_size), dtype=torch.float8_e4m3fn),
+    )
+
+
 @torch.library.custom_op("trtllm::minimax_m3_attn_custom_op_inplace", mutates_args=("output",))
 def minimax_m3_attn_custom_op_inplace(
     q: Optional[torch.Tensor],
@@ -852,11 +900,10 @@ def minimax_m3_attn_custom_op_inplace(
 ) -> None:
     """Run MiniMax-M3 cache and attention work behind a compile boundary.
 
-    The horizontal producer needs live paged-cache tensors and cache-slot
-    metadata, which are intentionally resolved inside this opaque attention
-    boundary rather than traced through Dynamo.  Projection remains in the
-    captured segment; only the cache-writing producer and MSA attention stay
-    on the eager side of the existing piecewise boundary.
+    The captured horizontal producer can populate both caches before this
+    boundary. The packed-projection fallback runs that producer here instead,
+    while separate projections leave their cache writes here. Slice padded
+    inputs to live tokens before request-dependent cache and MSA work.
     """
     attn_metadata, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
     num_tokens = attn_metadata.num_tokens
@@ -1292,6 +1339,8 @@ class MiniMaxM3Attention(Attention):
         packed: torch.Tensor,
         position_ids: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
+        *,
+        cache_tensors: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Run the vLLM-style horizontal producer for every sparse batch.
 
@@ -1337,12 +1386,15 @@ class MiniMaxM3Attention(Attention):
         if any(weight.dtype != torch.bfloat16 or not weight.is_cuda for weight in norm_weights):
             return None
 
-        kv_cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
-        if kv_cache_manager is None:
-            return None
-        buffers = kv_cache_manager.get_buffers(self.layer_idx, kv_layout="HND")
-        index_k_cache = attn_metadata.msa_idx_k_cache(self.layer_idx)
-        out_cache_loc = getattr(attn_metadata, "msa_out_cache_loc", None)
+        if cache_tensors is None:
+            kv_cache_manager = attn_metadata.kv_cache_manager
+            if kv_cache_manager is None:
+                return None
+            buffers = kv_cache_manager.get_buffers(self.layer_idx, kv_layout="HND")
+            index_k_cache = attn_metadata.msa_idx_k_cache(self.layer_idx)
+            out_cache_loc = getattr(attn_metadata, "msa_out_cache_loc", None)
+        else:
+            buffers, index_k_cache, out_cache_loc = cache_tensors
         num_tokens = int(packed.shape[0])
         supported_main_cache = (
             buffers is not None
@@ -1839,25 +1891,28 @@ class MiniMaxM3Attention(Attention):
         FMHA forward; this layer selects the top-k blocks (sparse only) and
         builds the forward_args the FMHA reads.
 
-        This layer owns the cache write: write_layer_caches stores the
-        new-token K/V (and, on the bf16 indexer path, index-K) in one launch
-        before the indexer's proxy pass reads the index-K cache. forward()
-        then receives k=v=None, which is the backend's contract for "K/V are
-        already resident", so neither FMHA phase writes them again.
+        Unless a producer has already populated the caches, write_layer_caches
+        stores new-token K/V and any live index-K before the indexer's proxy
+        pass reads the cache. FP8 index-K is then omitted from run_indexer;
+        BF16 retains its live tensor with idx_k_prewritten=True. forward()
+        receives k=v=None so neither FMHA phase writes them again.
         """
         assert (k is None) == (v is None)
         if self.is_sparse_attention_layer:
             assert idx_q is not None
-            # On the FP8 indexer path idx_k is None: the fused producer already
-            # inserted E4M3 index-K into the side cache, so only K/V are written.
+            # Unfused PCG supplies live FP8 index-K; eager FP8 producers may
+            # already have inserted it and supply None instead.
             if k is not None:
                 self.attn.write_layer_caches(k, v, idx_k, attn_metadata)
+                if self.attn.indexer_kv_dtype == "fp8":
+                    # The FP8 indexer accepts only an already-populated cache.
+                    idx_k = None
             else:
                 # The horizontal producer has already written both caches.
                 assert idx_k is None
             # Publish the selected blocks so the FMHA runs the sparse path.
-            # idx_k_prewritten: index-K is already in the cache (written above
-            # on bf16, or by the FP8 producer), so run_indexer must not write it.
+            # idx_k_prewritten: index-K is already in the cache (written here
+            # or by an FP8 producer), so run_indexer must not write it.
             kv_block_indexes = self.attn.run_indexer(
                 idx_q, idx_k, attn_metadata, idx_k_prewritten=True
             )
@@ -1929,6 +1984,26 @@ class MiniMaxM3Attention(Attention):
         packed_qkv = None
         packed_idx_qk = None
         if self.enable_fused_qkv_index_projection:
+            if (
+                self.register_to_config
+                and is_torch_compiling()
+                and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
+                and self._emit_fp8_main_qkv()
+                and self.attn.indexer_kv_dtype == "fp8"
+            ):
+                # Metadata stages these zero-copy views before compilation;
+                # tracing the cache manager's native pointer access is unsafe.
+                kv_cache, index_k_cache = attn_metadata.msa_layer_cache_tensors[self.layer_idx]
+                q, idx_q = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer(
+                    hidden_states,
+                    position_ids,
+                    kv_cache,
+                    index_k_cache,
+                    attn_metadata.msa_out_cache_loc,
+                    self.layer_idx_str,
+                )
+                o = self._forward_attention_core(q, None, None, idx_q, None, attn_metadata)
+                return self.o_proj(o, all_reduce_params=all_reduce_params)
             if self.register_to_config and (is_torch_compiling() or is_in_breakable_cuda_graph()):
                 # Keep the projection in the captured segment while hiding
                 # its shape-specializing MXFP8 internals behind a symbolic
@@ -2000,13 +2075,23 @@ class MiniMaxM3Attention(Attention):
             return q, k, v
 
         def _index_norm_rope():
+            """Project and normalize index queries, with RoPE and cache updates."""
             idx_qk = (
                 packed_idx_qk if packed_idx_qk is not None else self.index_qk_proj(hidden_states)
             )
-            fp8_idx_q = self._fused_fp8_index_qk_norm_rope(idx_qk, position_ids, attn_metadata)
-            if fp8_idx_q is not None:
-                # Index-K was inserted directly into the paged side cache.
-                return fp8_idx_q, None
+            graph_fp8_indexer = (
+                self.register_to_config
+                and is_torch_compiling()
+                and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
+                and self.attn.indexer_kv_dtype == "fp8"
+            )
+            if not graph_fp8_indexer:
+                fp8_idx_q = self._fused_fp8_index_qk_norm_rope(idx_qk, position_ids, attn_metadata)
+                if fp8_idx_q is not None:
+                    # Index-K was inserted directly into the paged side cache.
+                    return fp8_idx_q, None
+            # During compilation keep norm/RoPE/FP8 conversion captured, but
+            # leave dynamic index-K cache insertion in the attention boundary.
             fused_idx = self._fused_qk_norm_rope(
                 idx_qk,
                 position_ids,
@@ -2016,6 +2101,7 @@ class MiniMaxM3Attention(Attention):
                 head_dim=self.sparse_index_dim,
                 q_norm=self.index_q_norm,
                 k_norm=self.index_k_norm,
+                out_fp8=graph_fp8_indexer,
             )
             if fused_idx is not None:
                 return self._split_index_qk(fused_idx)
@@ -2606,6 +2692,10 @@ def _fold_gemma_boundary_norm_weights(weights):
 @register_auto_model("MiniMaxM3SparseForCausalLM")
 class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, PretrainedConfig]):
     """Text-only M3 model."""
+
+    # Preserve M3's hand-fused eager decode and above-ceiling prefill paths,
+    # including MXFP8 decode-graph backend tuning, instead of the FX fallback.
+    use_fx_for_pcg_fallback = False
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:

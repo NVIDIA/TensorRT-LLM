@@ -24,6 +24,8 @@ class UsageInfo:
     context_tokens: int | None = None
     context_window: int | None = None
     context_percentage: float | None = None
+    # Optional cumulative thread estimate; never add this to per-turn cost_usd.
+    estimated_thread_cost_usd: float | None = None
 
 
 @dataclass

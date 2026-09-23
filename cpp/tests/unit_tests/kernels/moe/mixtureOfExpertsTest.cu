@@ -1151,8 +1151,8 @@ protected:
         // Handle the case with no parallelism to not require the extra alloc
         if (parallelism_config.tp_size == 1 && parallelism_config.ep_size == 1)
         {
-            return std::tuple{(void*) slice_weight_1, (void*) slice_weight_2, mExpertBias1, mExpertBias2, ep_scale_1,
-                ep_scale_2, ep_scale_3};
+            return std::make_tuple((void*) slice_weight_1, (void*) slice_weight_2, mExpertBias1, mExpertBias2,
+                ep_scale_1, ep_scale_2, ep_scale_3);
         }
 
         // Slice weights for EP
@@ -1231,7 +1231,7 @@ protected:
 
         bias_1 = mUseBias ? bias_1 : nullptr;
 
-        return std::tuple{(void*) weight_1, (void*) weight_2, bias_1, bias2_ptr, scale_1, scale_2, scale_3};
+        return std::make_tuple((void*) weight_1, (void*) weight_2, bias_1, bias2_ptr, scale_1, scale_2, scale_3);
     }
 
     auto getFilteredConfigs(int sm, MoeGemmId gemm_id)

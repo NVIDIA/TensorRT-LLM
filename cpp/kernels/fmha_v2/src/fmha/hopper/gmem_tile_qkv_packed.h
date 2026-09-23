@@ -43,67 +43,37 @@ template <
 struct Gmem_tile_tma_qkv
 {
     // The size of each LDG.
-    enum
-    {
-        BYTES_PER_LDG = 16
-    };
+    static constexpr int BYTES_PER_LDG = 16;
 
     // The size of a row in bytes.
-    enum
-    {
-        BYTES_PER_ROW = COLS * BITS_PER_ELEMENT / 8
-    };
+    static constexpr int BYTES_PER_ROW = COLS * BITS_PER_ELEMENT / 8;
 
     // The number of threads to load a "row" of the matrix.
-    enum
-    {
-        THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_LDG
-    };
+    static constexpr int THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_LDG;
 
     // The number of "rows" loaded per LDG.
-    enum
-    {
-        ROWS_PER_LDG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW
-    };
+    static constexpr int ROWS_PER_LDG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW;
 
     // The number of rows.
-    enum
-    {
-        ROWS = ROWS_
-    };
+    static constexpr int ROWS = ROWS_;
 
     // The number of LDGs needed to load a chunk of the Q matrix.
-    enum
-    {
-        LDGS = fmha::Div_up<ROWS, ROWS_PER_LDG>::VALUE
-    };
+    static constexpr int LDGS = fmha::Div_up<ROWS, ROWS_PER_LDG>::VALUE;
 
     // The number of predicate registers.
-    enum
-    {
-        PRED_REGS = fmha::Compute_number_of_pred_regs<LDGS>::VALUE
-    };
+    static constexpr int PRED_REGS = fmha::Compute_number_of_pred_regs<LDGS>::VALUE;
 
     // Is it Hopper?
-    enum
-    {
-        IS_HOPPER = std::is_same<typename Traits::Gpu_arch, typename fmha::Hopper>::value == true
-    };
+    static constexpr int IS_HOPPER = std::is_same<typename Traits::Gpu_arch, typename fmha::Hopper>::value == true;
 
     // Make sure we use a single register to store predicates. Do not throw for Hopper for now.
     static_assert(!USE_LDGSTS_ || PRED_REGS == 1 || IS_HOPPER, "");
 
     // We do not use LDGSTS (for the moment).
-    enum
-    {
-        USE_LDGSTS = USE_LDGSTS_
-    };
+    static constexpr int USE_LDGSTS = USE_LDGSTS_;
 
     // TMA DIMS, hard coded for now
-    enum
-    {
-        TMA_DIMS = 3
-    };
+    static constexpr int TMA_DIMS = 3;
 
     // TMA DESC type, hard coded for now
     static constexpr fmha::cudaTmaDescType TMA_DESC_TYPE = fmha::cudaTmaDescType::TILED;

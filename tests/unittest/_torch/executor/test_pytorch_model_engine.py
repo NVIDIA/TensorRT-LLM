@@ -55,6 +55,76 @@ from tensorrt_llm.llmapi import (CudaGraphConfig, SADecodingConfig,
 from tensorrt_llm.mapping import CpType, Mapping
 
 
+class TestCachedKvTokenLogging(unittest.TestCase):
+
+    def setUp(self) -> None:
+        self.engine = object.__new__(PyTorchModelEngine)
+        self.engine.iter_states = {}
+        self.real = SimpleNamespace(is_cuda_graph_dummy=False)
+        self.padding = SimpleNamespace(is_cuda_graph_dummy=True)
+
+    def check_counts(
+        self,
+        counts: list[int],
+        groups: tuple[tuple[list[SimpleNamespace], int], ...],
+        expected: list[int],
+        padding: int,
+    ) -> None:
+        self.engine.iter_states['cached_kv_tokens'] = sum(counts)
+        self.engine._record_cached_kv_tokens_per_req(counts, groups)
+        self.assertEqual(
+            self.engine.iter_states, {
+                'cached_kv_tokens': sum(counts),
+                'cached_kv_tokens_per_req': expected,
+                'cached_kv_tokens_cuda_graph_padding': padding,
+            })
+        counts[:] = [999]
+        self.assertEqual(self.engine.iter_states['cached_kv_tokens_per_req'],
+                         expected)
+
+    def test_mtp_padding_before_first_draft_and_generation(self) -> None:
+        # Input packing is context, extend (including padding), first draft, gen.
+        self.check_counts([10, 100, 7, 200, 300],
+                          (([self.real], 1), ([self.real, self.padding], 1),
+                           ([self.real], 1), ([self.real], 1)),
+                          [10, 100, 200, 300], 7)
+
+    def test_beams_preserved_after_context_and_padding(self) -> None:
+        self.check_counts([10, 100, 101, 7, 7, 200, 201],
+                          (([self.real], 1),
+                           ([self.real, self.padding, self.real], 2)),
+                          [10, 100, 101, 200, 201], 14)
+
+    def test_attention_dp_dummy_is_not_graph_padding(self) -> None:
+        adp_dummy = SimpleNamespace(is_dummy=True,
+                                    is_attention_dp_dummy=True,
+                                    is_cuda_graph_dummy=False)
+        self.check_counts([10, 1, 7],
+                          (([self.real, adp_dummy, self.padding], 1), ),
+                          [10, 1], 7)
+
+    def test_padding_only(self) -> None:
+        self.check_counts([7, 7], (([self.padding, self.padding], 1), ), [], 14)
+
+    def test_group_row_count_must_match_counts(self) -> None:
+        for counts, groups in (
+            ([100, 200], (([self.real], 1), )),
+            ([100, 101, 200], (([self.real, self.real], 2), )),
+        ):
+            with self.subTest(counts=counts, groups=groups):
+                with self.assertRaises(AssertionError):
+                    self.engine._record_cached_kv_tokens_per_req(counts, groups)
+
+    def test_steady_batch_clears_previous_padding(self) -> None:
+        self.engine.iter_states['cached_kv_tokens_cuda_graph_padding'] = 7
+        self.check_counts([100, 200], (), [100, 200], 0)
+
+    def test_empty_batch_clears_previous_values(self) -> None:
+        self.engine.iter_states['cached_kv_tokens_per_req'] = [100]
+        self.engine.iter_states['cached_kv_tokens_cuda_graph_padding'] = 7
+        self.check_counts([], (([], 1), ), [], 0)
+
+
 @dataclass
 class Config:
     torch_dtype: torch.dtype

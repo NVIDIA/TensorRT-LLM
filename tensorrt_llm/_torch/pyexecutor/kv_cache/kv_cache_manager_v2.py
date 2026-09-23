@@ -27,7 +27,7 @@ from strenum import StrEnum
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
-from tensorrt_llm._torch.utils import maybe_compile
+from tensorrt_llm._torch.utils import helix_local_len, maybe_compile
 from tensorrt_llm._utils import (
     TensorWrapper,
     binding_to_torch_dtype,
@@ -1635,6 +1635,7 @@ class KVCacheManagerV2(BaseResourceManager):
         }
 
         self.kv_cache_map: dict[int, _KVCache] = {}
+        self._disagg_receive_ready: dict[int, torch.cuda.Event] = {}
         self._request_stats_enabled_ids: set[int] = set()
 
         # Lazily built map of layer-group id -> sliding window size, restricted
@@ -2675,6 +2676,22 @@ class KVCacheManagerV2(BaseResourceManager):
             non_blocking=True,
         )
 
+    def _get_buffer_roles_for_layer(self, local_layer_idx: int) -> List[DataRole]:
+        """Return the primary cache roles allocated for one local layer."""
+        roles = [Role.KEY]
+        if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
+            roles.append(Role.VALUE)
+        if self.dtype == DataType.NVFP4:
+            head_dim = self.head_dim_per_layer[local_layer_idx]
+            assert head_dim % 2 == 0, (
+                f"head_dim must be divisible by 2 for nvfp4 kv cache, "
+                f"but layer {local_layer_idx} has head_dim={head_dim}"
+            )
+            roles.append(Role.KEY_BLOCK_SCALE)
+            if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
+                roles.append(Role.VALUE_BLOCK_SCALE)
+        return roles
+
     def _build_base_config(
         self,
         kv_cache_config: KvCacheConfig,
@@ -2770,18 +2787,6 @@ class KVCacheManagerV2(BaseResourceManager):
                         )
                     )
 
-        buffer_type = [Role.KEY]
-        if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
-            buffer_type.append(Role.VALUE)
-        if self.dtype == DataType.NVFP4:
-            for layer_idx, hd in enumerate(self.head_dim_per_layer):
-                assert hd % 2 == 0, (
-                    f"head_dim must be divisible by 2 for nvfp4 kv cache, but layer {layer_idx} has head_dim={hd}"
-                )
-            buffer_type.append(Role.KEY_BLOCK_SCALE)
-            if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
-                buffer_type.append(Role.VALUE_BLOCK_SCALE)
-
         # Subclasses (e.g. MiniMax-M3 sparse cache) can register additional
         # per-layer BufferConfig entries — for example a sparse index-K
         # buffer — without overriding the K/V/NVFP4 scale wiring above.
@@ -2795,6 +2800,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         layer_configs: List[AttentionLayerConfig] = []
         for layer_id in typed_range(LayerId(self.num_local_layers)):
+            buffer_type = self._get_buffer_roles_for_layer(layer_id)
             buffers = [
                 BufferConfig(
                     role=role,
@@ -3251,10 +3257,15 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _helix_local_len(self, global_len: int) -> int:
         """Tokens of the first ``global_len`` owned by this CP rank
-        (continuation round-robin: page b lives on rank b %% cp)."""
-        phys = self.tokens_per_block
-        full, rem = divmod(global_len, self._ledger_tokens_per_block)
-        return full * phys + min(max(rem - self._helix_cp_rank * phys, 0), phys)
+        (continuation round-robin: page b lives on rank b %% cp).
+
+        The rule itself lives in ``_torch.utils.helix_local_len`` so the host
+        packing in model_engine and the tensor form in the attention metadata
+        cannot drift from it.
+        """
+        return helix_local_len(
+            global_len, self.tokens_per_block, self._helix_cp_size, self._helix_cp_rank
+        )
 
     def _set_helix_rank_fields(self, req: LlmRequest) -> None:
         """Derive the per-rank helix fields from the global position.
@@ -3264,8 +3275,20 @@ class KVCacheManagerV2(BaseResourceManager):
         from ``py_decoding_iter``: the sampler advances that counter after
         scheduling under the overlap loop, so a schedule-time read is one
         step behind and would repeat the first decode position, overwriting
-        the first generated token's KV. Assumes one new token per step
-        (draft-token modes are rejected under helix).
+        the first generated token's KV.
+
+        The counter advances by one per successful allocation, so ``pos`` is
+        exact only while each iteration commits exactly one token. Under
+        speculation an iteration can commit ``1 + accepted`` tokens and this
+        estimate falls behind, taking ``py_helix_is_inactive_rank`` and
+        ``seqlen_this_rank_cp`` with it. That is tolerable today only because
+        the speculative path never reads these fields: ``_helix_pack_extend``
+        in model_engine rebuilds the global position from
+        ``total_input_len_cp`` plus the rank-invariant generated count. A
+        request that falls back to the plain generation loop mid-run (a step
+        that yields no draft tokens) would read a stale value -- advancing the
+        counter by the committed token count is the fix, and needs the
+        acceptance count to be available at schedule time.
         """
         step = req.py_helix_decode_group_index + 1
         pos = req.total_input_len_cp + step - 1
@@ -3650,6 +3673,12 @@ class KVCacheManagerV2(BaseResourceManager):
         self._fill_fresh_kv_pages(req.py_request_id)
         self._log_window_crossing(req, kv_cache, pre_cap, capacity, "disagg_gen_init")
         req.py_ctx_pre_resize_cap = pre_cap if capacity > pre_cap else None
+        # RDMA cannot observe cache-stream ordering. Capture readiness here so
+        # receive publication waits for admission's copies and recycled-slot
+        # dependencies without waiting for later execution-stream work.
+        ready = torch.cuda.Event()
+        ready.record(self._stream)
+        self._disagg_receive_ready[req.py_request_id] = ready
         return True
 
     def get_history_length(self, req: LlmRequest) -> int | None:
@@ -3784,6 +3813,12 @@ class KVCacheManagerV2(BaseResourceManager):
 
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        for request in scheduled_batch.context_requests:
+            ready = self._disagg_receive_ready.get(request.py_request_id)
+            if ready is not None:
+                ready.synchronize()
+                del self._disagg_receive_ready[request.py_request_id]
+
         if self.is_draft:
             # Mirror the main manager. Under one-model spec decoding the
             # scheduler may already have created the context cache.
@@ -5060,6 +5095,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # The next owner of these pages fills them again; keeping the set would
         # both leak and let a recycled page skip its fill.
         self._fresh_pages_filled.pop(request.py_request_id, None)
+        self._disagg_receive_ready.pop(request.py_request_id, None)
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
         if kv_cache is None:
             self.impl.clear_stats_excluded(request.py_request_id)
@@ -5312,6 +5348,7 @@ class KVCacheManagerV2(BaseResourceManager):
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()
+        self._disagg_receive_ready.clear()
         self._request_stats_enabled_ids.clear()
         self._fresh_pages_filled.clear()
         # Drop the outstanding plans before the manager shuts down: discarding a handle applies

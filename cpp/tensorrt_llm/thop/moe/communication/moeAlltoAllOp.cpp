@@ -20,7 +20,7 @@
 #include "tensorrt_llm/kernels/moe/communication/moeAlltoAllKernels.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
-#include "tensorrt_llm/thop/moe/moeAlltoAllMeta.h"
+#include "tensorrt_llm/thop/moe/communication/moeAlltoAllMeta.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <atomic>

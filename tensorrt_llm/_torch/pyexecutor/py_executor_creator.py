@@ -35,7 +35,8 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..distributed import Distributed
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
-                           get_spec_resource_manager)
+                           get_spec_resource_manager,
+                           should_use_separate_draft_kv_cache)
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     compute_max_num_sequences, create_py_executor_instance,
@@ -43,10 +44,11 @@ from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     validate_feature_combination)
 from .config_utils import (is_hybrid_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
-                           uses_vswa_kv_cache_layout)
+                           uses_fp4_mla_attention, uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager, get_global_dwdp_manager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
+from .hang_diagnostics import monitor_executor_initialization
 from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
@@ -59,6 +61,7 @@ _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS_STR = "/".join(
 _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR = "/".join(
     f"SM{sm_version}"
     for sm_version in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS)
+FP4_MLA_TOKENS_PER_BLOCK = 128
 
 
 class _ExecutorMemoryMonitor:
@@ -188,6 +191,24 @@ class _ExecutorMemoryMonitor:
                     free_gpu_memory_bytes_pre=free_gpu_memory_bytes_pre,
                     free_gpu_memory_bytes_post=free_gpu_memory_bytes_post,
                 ))
+
+
+def _flashinfer_one_engine_spec_supported(attn_backend: str,
+                                          spec_config) -> bool:
+    """Whether this speculation is qualified on the FlashInfer target backend.
+
+    DFlash remains unqualified regardless of its draft attention backend or
+    cache ownership. Its VANILLA and FA4 backends own private context buffers,
+    but that does not establish FlashInfer serving-scale qualification.
+
+    Other speculative modes are admitted when they do not need a separate
+    draft KV cache manager.
+    """
+    if spec_config is None or attn_backend != "FLASHINFER":
+        return True
+    if spec_config.spec_dec_mode.is_dflash():
+        return False
+    return not should_use_separate_draft_kv_cache(spec_config)
 
 
 def _set_model_engines_cache_reuse(model_engines, cache_reuse: bool):
@@ -439,12 +460,18 @@ def _create_py_executor_impl(
             )
             llm_args.disable_overlap_scheduler = True
 
-    if (spec_config is not None and llm_args.attn_backend == "FLASHINFER"
-            and spec_config.spec_dec_mode.use_one_engine()
-            and not spec_config._use_shared_kv_cache):
+    if not _flashinfer_one_engine_spec_supported(llm_args.attn_backend,
+                                                 spec_config):
+        if spec_config.spec_dec_mode.is_dflash():
+            raise ValueError(
+                "FLASHINFER target attention is not qualified for DFlash, "
+                "regardless of the draft attention backend or cache ownership. "
+                "Use TRTLLM target attention for DFlash.")
         raise ValueError(
-            "FLASHINFER attention backend supports one-engine speculative "
-            "decoding only when the draft model shares the target KV cache.")
+            f"FLASHINFER target attention is not qualified for "
+            f"{spec_config.spec_dec_mode.name}: this one-engine speculative "
+            "mode needs a separate draft KV cache manager, which FLASHINFER "
+            "does not support. Use TRTLLM target attention.")
 
     if mm_encoder_only:
         llm_args.mm_encoder_only = True
@@ -642,7 +669,20 @@ def _create_py_executor_impl(
             enable_overlap_headroom=getattr(model_engine,
                                             "_enable_overlap_headroom", False))
     if is_mla(config):
-        if model_engine.model.model_config.enable_flash_mla:
+        if uses_fp4_mla_attention(model_engine.model.model_config):
+            tokens_per_block = FP4_MLA_TOKENS_PER_BLOCK
+            kv_cache_config.tokens_per_block = tokens_per_block
+            logger.info(
+                f"Change tokens_per_block to: {tokens_per_block} for using FP4 MLA attention"
+            )
+            if kv_cache_config.enable_block_reuse:
+                logger.warning(
+                    "FP4 MLA cached-context attention is not supported yet; "
+                    "disabling KV cache block reuse.")
+                kv_cache_config.enable_block_reuse = False
+                _set_model_engines_cache_reuse(
+                    [model_engine, draft_model_engine], False)
+        elif model_engine.model.model_config.enable_flash_mla:
             tokens_per_block = 64
             # Propagate the override back to kv_cache_config so any consumer
             # that later reads llm_args.kv_cache_config.tokens_per_block sees
@@ -1078,13 +1118,14 @@ def create_py_executor(
     """Create a PyExecutor and roll back a partially initialized DWDP runtime."""
     previous_dwdp_manager = get_global_dwdp_manager()
     try:
-        return _create_py_executor_impl(
-            llm_args=llm_args,
-            checkpoint_dir=checkpoint_dir,
-            tokenizer=tokenizer,
-            profiling_stage_data=profiling_stage_data,
-            resource_governor_queue=resource_governor_queue,
-        )
+        with monitor_executor_initialization():
+            return _create_py_executor_impl(
+                llm_args=llm_args,
+                checkpoint_dir=checkpoint_dir,
+                tokenizer=tokenizer,
+                profiling_stage_data=profiling_stage_data,
+                resource_governor_queue=resource_governor_queue,
+            )
     except BaseException:
         current_dwdp_manager = get_global_dwdp_manager()
         if (current_dwdp_manager is not None
