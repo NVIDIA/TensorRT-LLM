@@ -2372,6 +2372,9 @@ class KvCacheCreator:
                 "encoder tokens or input discriminator to key cache entries.")
             self_kv_cache_config.enable_block_reuse = False
             cross_kv_cache_config.enable_block_reuse = False
+            # The attention backend reads this shared runtime flag rather than
+            # either derived manager config when selecting paged-context FMHA.
+            self._model_engine.attn_runtime_features.cache_reuse = False
         split_any_budget = False
 
         free_fraction = base_kv_cache_config.free_gpu_memory_fraction

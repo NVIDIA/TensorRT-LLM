@@ -161,6 +161,9 @@ def _make_creator(
     if model_config is None:
         model_config = _make_model_config(is_encoder_decoder=is_enc_dec)
     model_engine = _make_mock_model_engine(model_config)
+    model_engine.attn_runtime_features = SimpleNamespace(
+        cache_reuse=kv_cache_config.enable_block_reuse
+    )
 
     if manager_cls is None:
         manager_cls = (
@@ -301,6 +304,7 @@ class TestSplitKvCacheBudgetForCross:
         assert config.enable_block_reuse
         assert not self_config.enable_block_reuse
         assert not cross_config.enable_block_reuse
+        assert not creator._model_engine.attn_runtime_features.cache_reuse
 
     def test_token_encoder_preserves_reuse_for_both_pools(self) -> None:
         """Token inputs retain reusable identities for both KV pools."""
@@ -312,6 +316,7 @@ class TestSplitKvCacheBudgetForCross:
 
         assert self_config.enable_block_reuse
         assert cross_config.enable_block_reuse
+        assert creator._model_engine.attn_runtime_features.cache_reuse
 
     def test_is_encoder_decoder_helper(self):
         dec_config = _make_model_config(is_encoder_decoder=False)
@@ -731,6 +736,7 @@ class TestCrossKvCacheConstruction:
         assert config.enable_block_reuse
         assert not self_config.enable_block_reuse
         assert not cross_config.enable_block_reuse
+        assert not creator._model_engine.attn_runtime_features.cache_reuse
 
     def test_build_managers_skips_cross_pool_for_decoder_only(self):
         creator = _make_creator(
