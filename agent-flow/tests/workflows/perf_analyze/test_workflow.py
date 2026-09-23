@@ -772,7 +772,8 @@ def test_analyzer_prompt_instructs_the_ncu_deep_dive(tmp_path):
     for prompt in (without, with_sol):
         assert "perf-nsight-compute-analysis" in prompt
         assert "trtllm-agent-toolkit:perf-nsight-compute-analysis" in prompt
-        assert "server_ncu.ncu-rep" in prompt
+        assert "ncu_<hotspot>.ncu-rep[z]" in prompt
+        assert "never wrap the full server" in prompt
         assert "ncu kernel analysis" in prompt
         assert "default both" in prompt
 

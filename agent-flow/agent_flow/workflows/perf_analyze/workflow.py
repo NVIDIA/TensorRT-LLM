@@ -591,8 +591,9 @@ class PerfAnalyzeWorkflow:
             f"`server_nsys.nsys-rep`, the `nsys stats` output, the "
             f"`nsys_analysis/` directory, "
             f"`server_nsys_metrics.nsys-rep` and `server_nsys_stacks.nsys-rep` "
-            f"from the Run A2 passes, `server_ncu.ncu-rep` + its "
-            f"`ncu_details.txt` / `ncu_raw.csv` summaries, and "
+            f"from the Run A2 passes, the `microbench_<hotspot>.py` sources, "
+            f"`ncu_<hotspot>.ncu-rep[z]` reports and their details / raw CSV "
+            f"summaries, and "
             f"`perf_metrics.json` if available. Tear "
             f"every server down.\n\n"
             + correlation_instruction

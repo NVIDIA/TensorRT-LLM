@@ -2386,14 +2386,20 @@ class PerfOptimizeWorkflow:
                 f"as the `## Kernel disposition ledger` section of your "
                 f"findings"
             )
-            ncu_artifacts = "the per-pass `server_ncu_pass<k>.ncu-rep` reports + their summaries"
+            ncu_artifacts = (
+                "the per-hotspot microbenchmark sources, `ncu_<hotspot>.ncu-rep[z]` "
+                "reports, and their summaries"
+            )
         else:
             ncu_scope = (
-                "on the top nsys kernels: keep the canonical ncu flags "
-                "(`--launch-count` bounded), and classify each profiled "
+                "on faithful standalone microbenchmarks for the top nsys kernels: "
+                "keep the canonical ncu flags (`--launch-count` bounded), and classify each profiled "
                 "kernel (SOL%, bound class, occupancy, stalls)"
             )
-            ncu_artifacts = "`server_ncu.ncu-rep` + its summaries"
+            ncu_artifacts = (
+                "the `microbench_<hotspot>.py` sources, `ncu_<hotspot>.ncu-rep[z]` "
+                "reports, and their summaries"
+            )
         projection_context = ""
         if self._sol_enabled():
             projection_context = (

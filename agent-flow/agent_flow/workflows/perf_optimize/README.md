@@ -528,9 +528,9 @@ running the CLI.
   checked-in TRT-LLM taxonomy
   (`perf_analyze/assets/taxonomy_trtllm.json`), which the analyzer
   extends per workload before quoting any category number. The
-  analyzer's ncu deep dive is bounded
-  (`--launch-count`, kernel filter from the top decomposition kernels)
-  and
+  analyzer's ncu deep dive uses faithful standalone microbenchmarks and is
+  bounded (`--launch-count`, kernel filter from the top decomposition kernels),
+  rather than wrapping the full server, and is
   interpreted with the `perf-nsight-compute-analysis` skill; both
   degrade gracefully when the tool or the skill is unavailable.
 - **Multi-rank capture (`profile.profile_ranks`, default `[0]`).**

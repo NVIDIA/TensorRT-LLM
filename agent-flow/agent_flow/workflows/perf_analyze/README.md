@@ -114,7 +114,8 @@ workspace/perf-analyze/<name>/
 ├── server_nsys.nsys-rep, nsys_stats.txt   # ← analyzer (nsys)
 ├── nsys_analysis/                         # ← analyzer (nsys timeline decomposition + items.json)
 ├── perf_metrics.json                      # ← analyzer (request breakdown)
-├── server_ncu.ncu-rep, ncu_details.txt, ncu_raw.csv   # ← analyzer (ncu)
+├── microbench_<hotspot>.py, ncu_<hotspot>.ncu-rep[z] # ← analyzer (ncu)
+├── ncu_<hotspot>_details.txt / _raw.csv               # ← analyzer (ncu exports)
 ├── profile_findings.md               # ← analyzer
 ├── performance_report.md / .html     # ← reporter (the deliverable)
 └── progress.yaml                     # append-only audit log
@@ -142,8 +143,9 @@ workspace/perf-analyze/<name>/
   `--trace-fork-before-exec=true`; and for ncu
   `--target-processes all`, `--profile-from-start off`, a bounded
   `--launch-count`, and a `--kernel-name` filter built from the top
-  kernels of the nsys timeline decomposition) rather than improvising
-  per run; only
+  kernels of the nsys timeline decomposition). Ncu runs on faithful
+  standalone hotspot microbenchmarks rather than wrapping the full server;
+  only
   the paths and the `benchmark` / `profile` values are filled in.
 - **Multi-rank capture (`profile.profile_ranks`, default `[0]`).** Where
   the nsys wrap goes decides whether a multi-GPU run yields any model
