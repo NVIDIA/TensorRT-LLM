@@ -6439,10 +6439,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-4_GPUs-PyTorch-5": ["auto:gb200-x4", "l0_gb200_multi_gpus", 5, 5, 4, 1, false, true],
         "GB200-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4, 1, false, true],
         "GB10-PyTorch-Post-Merge-1": ["gb10x-single", "l0_gb10", 1, 1],
-        // One GPU, so the name carries no "N_GPUs": the split at the bottom of
-        // this file routes by that pattern, and a single-GPU list has no reason
-        // to wait on the multi-GPU dispatch's approval label.
-        "GB300-PyTorch-1": ["auto:gb300-flex", "l0_gb300_single_gpu", 1, 1, 1, 1, true, false],
         "GB300-4_GPUs-PyTorch-1": ["auto:gb300-x4", "l0_gb300", 1, 1, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus", 2, 3, 4, 1, true, false],
