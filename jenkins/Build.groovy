@@ -154,6 +154,8 @@ def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 def BOLT_CONSUME_BUILD = "bolt_consume_build"
 @Field
 def BOLT_PROFILE_REF = "bolt_profile_ref"
+@Field
+def BOLT_PUBLISH_VARIANT_KEY = "bolt_publish_variant"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -168,6 +170,7 @@ def globalVars = [
     // silently dropped -- which for this one would mean running unpinned
     // without saying so.
     (BOLT_PROFILE_REF): "",
+    (BOLT_PUBLISH_VARIANT_KEY): false,
 ]
 
 // TODO: Move common variables to an unified location
@@ -720,6 +723,18 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         if (globalVars[BOLT_PROFILE_REF]) {
             BOLT_PINNED_REF = globalVars[BOLT_PROFILE_REF].toString()
             echo "[bolt-consume] pinned to profile bundle ${BOLT_PINNED_REF}"
+        }
+        // Same reason as boltConsume directly above: boltPublishVariant is not
+        // registered on the remote build jobs, so the Parameterized Remote
+        // Trigger drops it and the param resolution at the top of this file
+        // leaves it false. Post-merge that is the worst possible default --
+        // consume is on (it comes through globalVars and survives), so
+        // applyLatestBolt would take the else branch and REPLACE canonical,
+        // feeding already-BOLTed binaries to BoltProfileGen, while the test
+        // stages fetch a bolted- variant that was never uploaded.
+        if (globalVars[BOLT_PUBLISH_VARIANT_KEY]?.toString() == "true") {
+            BOLT_PUBLISH_VARIANT = true
+            echo "[bolt-consume] publishing bolted- variant via globalVars.bolt_publish_variant"
         }
     }
 
