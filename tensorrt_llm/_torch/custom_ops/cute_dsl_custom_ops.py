@@ -12002,8 +12002,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     inputs[8] (softmax_stats): Optional contiguous float32 tensor
                         of shape (B * S_q, H, 2). The kernel writes an equivalent
                         softmax (max, sum) pair for Helix reduction.
-                    inputs[9] (kv_bounds): Reserved per-query local KV bounds.
-                        Only None is currently supported.
+                    inputs[9] (kv_bounds): Optional contiguous int32 per-query
+                        local KV bounds of shape (B * S_q,).
                 tactic: Tuple containing (mma_qk_tiler_mn, mma_pv_tiler_mn,
                     split_kv, is_persistent).
                 **kwargs: Optional softmax_scale and output_scale values.
@@ -12017,10 +12017,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # inputs[9] (optional): helix per-token attention bounds of shape
             # (B * S_q,), int32 — speculative verify groups only.
             kv_bounds = inputs[9] if len(inputs) > 9 else None
-            if kv_bounds is not None:
-                raise NotImplementedError(
-                    "Helix per-query kv_bounds are not supported by the "
-                    "packed-query MLA kernel yet")
             softmax_scale = float(kwargs.get("softmax_scale", 1.0))
             output_scale = float(kwargs.get("output_scale", 1.0))
 
@@ -12285,10 +12281,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kv_bounds: helix speculative verify groups -- per-token rank-local
         attention bounds of shape (B * seq_len_q,), int32.
         """
-        if kv_bounds is not None:
-            raise NotImplementedError(
-                "Helix per-query kv_bounds are not supported by the "
-                "packed-query MLA kernel yet")
         if (sm_version := get_sm_version()) not in (100, 103):
             raise ValueError(
                 f"trtllm::cute_dsl_mla_decode_fp8_blackwell requires SM 100 or "
@@ -12346,10 +12338,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         softmax_stats: Optional[torch.Tensor],
         kv_bounds: Optional[torch.Tensor],
     ) -> None:
-        if kv_bounds is not None:
-            raise NotImplementedError(
-                "Helix per-query kv_bounds are not supported by the "
-                "packed-query MLA kernel yet")
         return None
 
     @torch.library.custom_op(
@@ -12381,10 +12369,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kv_bounds: helix speculative verify groups — per-token rank-local
         attention bounds of shape (B * seq_len_q,), int32.
         """
-        if kv_bounds is not None:
-            raise NotImplementedError(
-                "Helix per-query kv_bounds are not supported by the "
-                "packed-query MLA kernel yet")
         if (sm_version := get_sm_version()) not in (100, 103):
             raise ValueError(
                 f"trtllm::cute_dsl_mla_decode_fp16_blackwell requires SM 100 "
@@ -12459,10 +12443,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         softmax_stats: Optional[torch.Tensor],
         kv_bounds: Optional[torch.Tensor],
     ) -> None:
-        if kv_bounds is not None:
-            raise NotImplementedError(
-                "Helix per-query kv_bounds are not supported by the "
-                "packed-query MLA kernel yet")
         return None
 
     # ============================================================================
