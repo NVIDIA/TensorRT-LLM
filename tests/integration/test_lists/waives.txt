@@ -155,6 +155,7 @@ full:GB300/accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_bf16 SKIP (htt
 full:GB300/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[forced_chunked_prefill] SKIP (https://nvbugs/6597570)
 full:GB300/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[full_budget] SKIP (https://nvbugs/6597570)
 full:GB300/disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/6581064)
+full:GB300/perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_deepseek-v4-pro-fp4_8k1k_con8_ctx1_dep4_gen4_tep8_eplb0_mtp3_ccb-NIXL] SKIP (https://nvbugs/6670230)
 full:GB300/test_e2e.py::test_openai_disagg_multi_nodes_completion[ctx_tp1pp2-gen_tp1pp2] SKIP (https://nvbugs/6812588)
 full:GB300/test_e2e.py::test_openai_disagg_multi_nodes_completion[ctx_tp2pp1-gen_tp2pp1] SKIP (https://nvbugs/6812588)
 full:GB300/test_e2e.py::test_openai_disagg_multi_nodes_completion_service_discovery[etcd] SKIP (https://nvbugs/6812591)
