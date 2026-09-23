@@ -569,6 +569,22 @@ def preparation(pipeline, testFilter, globalVars)
         stage("Setup Environment") {
             setupPipelineEnvironment(pipeline, testFilter, globalVars)
         }
+        // Must resolve BEFORE launchStages, not inside any branch of it.
+        // launchStages forks Release-Check, SBSA and x86_64 in parallel and
+        // launchJob serializes globalVars per child job, so a pin assigned in
+        // one branch races the jobs in the others: whichever serializes first
+        // receives an empty pin and resolves `latest` on its own -- the drift
+        // this exists to remove, now with the added property of being
+        // nondeterministic. Release Check is also skippable, which would leave
+        // the whole pipeline unpinned.
+        //
+        // preparation() is the earliest correct home: the script-level BOLT
+        // setup runs outside any node and cannot shell out, while the stage
+        // above has already checked the repo out into ${LLM_ROOT}, which is
+        // where the resolver's script lives.
+        stage("Pin BOLT Profile Bundle") {
+            globalVars[BOLT_PROFILE_REF] = resolveBoltProfileRef(globalVars[BUILD_BRANCH])
+        }
         stage("Upload Build Info") {
             try {
                 def branch = globalVars[BUILD_BRANCH]
@@ -604,14 +620,6 @@ def launchReleaseCheck(pipeline, globalVars)
         // Step 1: Clone TRT-LLM source codes
         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
         sh "cd ${LLM_ROOT} && git config --unset-all core.hooksPath"
-
-        // Pin the BOLT profile bundle for the whole pipeline, before any consumer
-        // can resolve `latest` on its own. Resolved here because this is the first
-        // point with both a node and a checkout -- the script-level BOLT setup
-        // above runs outside any node and cannot shell out.
-        stage("Pin BOLT Profile Bundle") {
-            globalVars[BOLT_PROFILE_REF] = resolveBoltProfileRef(globalVars[BUILD_BRANCH])
-        }
 
         // Step 2: Run guardwords scan
         def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
@@ -1978,7 +1986,8 @@ def resolveBoltProfileRef(String branch, String triple = "aarch64-linux-gnu")
         echo "BOLT profile pin: nothing promoted for ${branch}/${triple}; running unpinned."
         return ""
     }
-    echo "BOLT profile pin: ${branch}/${triple} -> ${ref}. Every consumer in this pipeline uses this bundle."
+    echo "BOLT profile pin: ${branch}/${triple} -> ${ref}. Consumers honouring the pin use this bundle; " +
+         "the image profile-bundle overlay still resolves latest independently."
     return ref
 }
 
