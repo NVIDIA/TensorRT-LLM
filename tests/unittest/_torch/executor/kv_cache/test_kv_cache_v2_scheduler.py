@@ -1686,6 +1686,77 @@ class TestDeadlockDetection:
         with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
             sched.schedule_request([blocked], set())
 
+    def test_inflight_send_that_left_active_list_is_not_a_deadlock(self):
+        """A sender off the active list but still in flight is not a deadlock.
+
+        The sender never appears in active_requests, so only the transfer
+        manager can tell the detector its pinned pages are coming back.
+        """
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: False,
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        sched._DEADLOCK_STALL_ITERS = 3
+        transfer_mgr = Mock()
+        transfer_mgr.has_any_inflight_requests.return_value = True
+        sched.set_async_transfer_manager(transfer_mgr)
+        # Only the blocked request is on the active list; the sender has left.
+        blocked = make_ctx_request(0, 100, is_first_context_chunk=False)
+
+        for _ in range(sched._DEADLOCK_STALL_ITERS + 2):
+            sched.schedule_request([blocked], set())
+
+        assert sched._stalled_schedules == 0
+
+    def test_blocked_request_schedules_after_send_completes(self):
+        """Once the off-list send lands, its pages free the blocked request."""
+        pages_held = [True]
+
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: not pages_held[0],
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        sched._DEADLOCK_STALL_ITERS = 3
+        transfer_mgr = Mock()
+        transfer_mgr.has_any_inflight_requests.return_value = True
+        sched.set_async_transfer_manager(transfer_mgr)
+        blocked = make_ctx_request(0, 100, is_first_context_chunk=False)
+
+        for _ in range(sched._DEADLOCK_STALL_ITERS + 2):
+            out = sched.schedule_request([blocked], set())
+            assert len(out.context_requests) == 0
+        assert sched._stalled_schedules == 0
+
+        # The send lands: the transfer manager drops it and its pages return.
+        transfer_mgr.has_any_inflight_requests.return_value = False
+        pages_held[0] = False
+        out = sched.schedule_request([blocked], set())
+        assert ids(out.context_requests) == [0]
+
+    def test_finished_send_still_deadlocks_with_transfer_manager_wired(self):
+        """The transfer-manager reprieve ends the moment no send is in flight.
+
+        With the manager wired but reporting nothing in flight, a still-full
+        pool must deadlock exactly as it does without a manager attached.
+        """
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: False,
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        sched._DEADLOCK_STALL_ITERS = 3
+        transfer_mgr = Mock()
+        transfer_mgr.has_any_inflight_requests.return_value = False
+        sched.set_async_transfer_manager(transfer_mgr)
+        blocked = make_ctx_request(0, 100, is_first_context_chunk=False)
+
+        for _ in range(sched._DEADLOCK_STALL_ITERS - 1):
+            sched.schedule_request([blocked], set())
+        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+            sched.schedule_request([blocked], set())
+
 
 # ===========================================================================
 # PEFT / LoRA
