@@ -136,6 +136,11 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
     if (spec_config.spec_dec_mode.is_dspark()
             and spec_config.draft_is_embedded_in_target):
         return False
+    # Suffix automaton (SA) drafts from a dedicated suffix-automaton state pool
+    # and never reads a paged draft KV cache manager, so it needs no separate
+    # draft KV cache despite reaching this one-engine path.
+    if spec_config.spec_dec_mode.is_sa():
+        return False
     return spec_config._allow_separate_draft_kv_cache
 
 
@@ -1707,8 +1712,7 @@ class SpecWorkerBase(nn.Module, ABC):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
 
-        if self.guided_decoder is not None:
-            self.guided_decoder.execute(logits)
+        self._execute_guided_decoder_if_present(logits)
 
         target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
                                                       num_contexts, batch_size)
@@ -2869,7 +2873,14 @@ class SpecWorkerBase(nn.Module, ABC):
         return tokens.type(torch.int32)
 
     def _execute_guided_decoder_if_present(self, logits):
-        """Execute guided decoder on target model logits if available."""
+        """Execute the guided decoder on the target logits, if configured.
+
+        ``CapturableGuidedDecoder.execute`` drains its own CUDA host functions
+        before returning (see ``_drain_host_functions``). Every one-engine
+        drafter runs a draft forward immediately after this, and a host
+        function still pending when that forward enters a GIL-holding native
+        extension call deadlocks the rank.
+        """
         if self.guided_decoder is not None:
             self.guided_decoder.execute(logits)
 
