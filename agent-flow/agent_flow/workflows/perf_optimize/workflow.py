@@ -47,6 +47,7 @@ from .prompts import DEFAULT_PROMPTS, PromptBundle
 from .roadmap_schema import RoadmapError
 from .sol_track import (
     GEN_TRACK,
+    WORKSPACE_SWEEP_DIR,
     adopt_sweep,
     ctx_json_path,
     has_sol_track,
@@ -294,6 +295,15 @@ class PerfOptimizeWorkflow:
                 self.final_verification_dir,
                 self.reuse_dir,
                 self.sol_work_dir,
+                # The adopted sweep copy. `adopt_sweep` leaves an existing
+                # copy alone -- which is what a RESUME needs, and what makes
+                # `--clean` the only thing that can restore the original.
+                # Left here, `apply_overlay` has already written the previous
+                # campaign's accepted tuning into it, so the "fresh" run would
+                # seed its baseline from the last accepted optimization and
+                # book the result as the sweep's own: exactly the failure
+                # copying into the workspace was introduced to prevent.
+                self.workspace / WORKSPACE_SWEEP_DIR,
             ):
                 shutil.rmtree(directory, ignore_errors=True)
 

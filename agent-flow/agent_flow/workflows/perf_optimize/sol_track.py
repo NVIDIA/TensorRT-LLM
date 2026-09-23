@@ -389,6 +389,13 @@ def sweep_accept_rate(sweep: Mapping[str, Any]) -> str | None:
 
 #: Where a campaign keeps the sweep it actually measured.
 WORKSPACE_SWEEP_DIR = "sweep"
+#: Where the adopted copy came from. Written once, on the first adopt, and
+#: preserved across resumes -- it is what `--clean` restores from.
+ADOPTED_FROM_KEY = "adopted_from"
+#: Set only when the spec's sweep was gone and `ADOPTED_FROM_KEY` supplied a
+#: live original. Carries why, because the re-adopted file may have changed
+#: since the copy was taken.
+READOPTED_KEY = "readopted_from_origin"
 
 
 def adopt_sweep(task_data: dict[str, Any], workspace: Path) -> Path | None:
@@ -416,11 +423,36 @@ def adopt_sweep(task_data: dict[str, Any], workspace: Path) -> Path | None:
     Returns the copied sweep file, or ``None`` when there is nothing to
     adopt. Idempotent by design: an existing copy is left alone, so a
     resumed run keeps measuring what it started with, and ``--clean``
-    (which removes the workspace) is what starts over from the original.
+    (which removes that copy along with the rest of the managed workspace)
+    is what starts over from the original.
+
+    ``--clean`` is also the one case where the spec's own ``sweep`` can
+    dangle: a run resumed with ``--task <workspace>/task.yaml`` names the
+    copy, and ``--clean`` has just deleted it. That is recoverable rather
+    than fatal -- ``adopted_from`` still records where the copy came from --
+    so the original is re-adopted and the redirection is written into the
+    block, for the same reason a redirected design directory is: a reader
+    must not have to already know.
     """
+    block = dict(task_data.get(SOL_TRACK_FIELD) or {})
+    origin = block.get(ADOPTED_FROM_KEY)
+    origin = origin.strip() if isinstance(origin, str) else ""
+
     source = sweep_path(task_data)
+    readopted = ""
+    if source is not None and not source.is_file() and origin:
+        candidate = Path(origin).expanduser()
+        if candidate.is_file():
+            readopted = (
+                f"{source} is gone -- the workspace copy, removed by --clean -- so the "
+                f"campaign was re-adopted from {candidate}, which '{ADOPTED_FROM_KEY}' "
+                f"recorded. What this run measures therefore comes from the original "
+                f"sweep as it is NOW, not as the deleted copy had it."
+            )
+            source = candidate
     if source is None or not source.is_file():
         return None
+
     destination = workspace / WORKSPACE_SWEEP_DIR
     target = destination / source.name
     if not destination.exists():
@@ -437,9 +469,15 @@ def adopt_sweep(task_data: dict[str, Any], workspace: Path) -> Path | None:
             f"the sweep copy at {destination} has no {source.name}; remove it and "
             f"re-run, or pass --clean to rebuild the workspace from {source}"
         )
-    block = dict(task_data.get(SOL_TRACK_FIELD) or {})
     block[SWEEP_KEY] = str(target)
-    block["adopted_from"] = str(source)
+    # Only when there is nothing to keep. On a resume the spec's sweep is
+    # already the workspace copy, and overwriting the origin with that path
+    # would erase the only pointer back to the file this campaign was cut
+    # from -- after which --clean has nothing left to restore it from.
+    if not origin or readopted:
+        block[ADOPTED_FROM_KEY] = str(source)
+    if readopted:
+        block[READOPTED_KEY] = readopted
     task_data[SOL_TRACK_FIELD] = block
     return target
 
@@ -664,9 +702,12 @@ def apply_plan(task_data: dict[str, Any], plan: Mapping[str, Any], user_set: set
         )
     task_data["optimize"] = optimize
 
-    # Recorded so "which code were these points planned against" is
-    # answerable from the resolved spec, not only from the workspace.
-    notes.append(f"code_id at plan time: {plan.get('code_id')!r}")
+    # No `code_id` note. The previous CLI digested the config and the
+    # checkout into one fingerprint and reported it on the plan; this one
+    # does not, so `plan.get("code_id")` was `None` on every spec this has
+    # ever written -- a provenance line that answered its own question with
+    # a shrug, in the one place a reader goes to find out what was measured.
+    # An absent note is better than a note that is always absent.
     return notes
 
 
@@ -686,10 +727,7 @@ def apply_overlay(task_data: Mapping[str, Any], tuning: Path) -> Path:
     Doing it here rather than in a prompt is the same argument as
     everything else this campaign moved into code: forgetting it does not
     fail, it measures the previous attempt's configuration and books the
-    result against the new one. It is also what makes the tuning edit show
-    up in ``code_id``, since the CLI digests that key into the code
-    fingerprint — which is what keeps the case names, and therefore
-    ``frontier compare``'s alignment, unchanged.
+    result against the new one.
 
     Returns the stage config it wrote.
     """

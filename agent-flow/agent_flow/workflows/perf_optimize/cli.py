@@ -183,6 +183,21 @@ def main(argv: list[str] | None = None) -> None:
     if isinstance(_raw, dict) and "disagg_sol" in _raw:
         _run_disagg_sol(args)
         return
+    # Refused rather than ignored. The flag is on the shared parser because
+    # argparse cannot know which path the spec takes until the file is read,
+    # and only the staged path implements it -- so on a single-track spec it
+    # used to be accepted and then silently dropped, which turns "show me
+    # what this would do" into a full multi-hour campaign on real hardware.
+    # The one failure mode a dry run must not have.
+    if getattr(args, "dry_run", False):
+        print(
+            "error: --dry-run is implemented for the staged disagg path only "
+            f"(a spec with a 'disagg_sol' block); {args.task} is a single-track "
+            "campaign, and running it without the flag would start it for real. "
+            "Re-run without --dry-run when you mean to.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     try:
         task_data = load_and_validate_task_yaml(
             args.task,

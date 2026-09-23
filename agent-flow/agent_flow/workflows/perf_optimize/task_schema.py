@@ -527,10 +527,13 @@ def _validate_sol_track_block(data: dict[str, Any], errors: list[str]) -> dict[s
     # asks for a measurement of a constant.
     if track == GEN_TRACK and _uses_speculation(sweep) and sweep_accept_rate(sweep) is None:
         errors.append(
-            f"{path} sets no 'options.accept_rate'. Every `process frontier` requires it "
-            f"and none is inferred: the acceptance length scales both the numerator and "
-            f"the ctx term of the frontier metric, so a wrong one tilts the whole curve "
-            f"with no symptom. Freeze the measured value in the sweep's options."
+            f"{path} sets no top-level 'accept_rate'. Every `process frontier` requires "
+            f"it and none is inferred: the acceptance length scales both the numerator "
+            f"and the ctx term of the frontier metric, so a wrong one tilts the whole "
+            f"curve with no symptom. Freeze the measured value at the sweep's TOP "
+            f"LEVEL -- `accept_rate: {{rate: <measured>, source: <where>}}` -- which is "
+            f"where the harness has read it since v0.4.7, and where "
+            f"`sweep_accept_rate` looks."
         )
         return None
     if track == GEN_TRACK:

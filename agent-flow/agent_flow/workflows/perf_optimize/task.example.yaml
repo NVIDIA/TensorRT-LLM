@@ -212,55 +212,51 @@ profile:
 # SOL track. Mutually exclusive with `disagg` above: that measures the whole
 # cluster end-to-end, this measures one role, over the same tuning knobs.
 #
-# The campaign drives `bench-disagg`, the CLI the benchmark repo ships as its
-# only supported agent-facing interface (`pip install trtllm-disagg-bench`).
-# Everything about *how* a measurement happens — re-measuring rather than
-# skipping, naming a run, recording which image and config produced it,
-# aligning two runs case-by-case — belongs to that tool. This block only says
-# which sweep, which half, and which workspace.
+# The campaign drives `ibc-bench`, the CLI the harness repo ships as its only
+# supported agent-facing interface. Everything about *how* a measurement
+# happens — submitting, re-measuring rather than skipping, naming a run,
+# recording which image and config produced it — belongs to that tool. This
+# block only says which sweep, which half, and which workspace.
 #
 #   track      ctx | gen. `ctx` is prefill-only aggregate (trtllm-bench at
 #              output_length 1 — no disaggregation at all), scored on
 #              `avg_request_throughput_req_s`. `gen` is a 1-ctx-1-gen
 #              deployment read only on the generation worker's decode
 #              iterations, scored on `throughput_per_user`.
-#   sweep      the orchestration sweep.yaml: `stages:` naming the ctx and gen
-#              stage configs, `server_config:`, and `options.accept_rate`.
-#              Paths inside it resolve relative to itself. The stage for
-#              `track` must be enabled or the campaign would measure nothing —
-#              refused at validation, which runs `bench-disagg sweep plan`.
-#   ctx_json   an existing ctx.json. A GEN track needs a CTX anchor and has no
-#              other source unless the sweep enables its ctx stage: the gate's
-#              metric is purely generation-side, but the only thing that
-#              reports it is `frontier build`, which rate-matches the whole
-#              curve. Missing, it raises ANCHOR_MISSING after the gen jobs
-#              have run — so validation refuses up front. Borrowing an anchor
-#              is legitimate (a gen campaign freezes the ctx side anyway), but
-#              its digest enters the snapshot's view_id, so `frontier compare`
-#              will not call two curves built against different anchors
-#              comparable.
-#   workspace  the bench-disagg workspace. It fixes one workload on one
-#              cluster and refuses to continue if that changed; a new image,
-#              build or tuning overlay is NOT a change — it appends, so an
-#              attempt and the baseline it must beat land on one curve.
+#   sweep      the harness sweep yaml. Paths inside it resolve relative to
+#              itself, and the harness imports the model's
+#              `gen_worker_config.py` from beside it — so the unit is the
+#              DIRECTORY, not the file. It is copied into `<workspace>/sweep/`
+#              at startup and the campaign measures the copy; the original is
+#              never rewritten by the per-attempt tuning overlay.
+#   ctx_json   OPTIONAL, and what it decides is which QUESTION the campaign can
+#              answer — not whether it can be scored. A gen campaign is scored
+#              anchor-free, from the `gen_only_perf.csv` that
+#              `ibc_trtllm_harness.process_data.get_gen_only_perf` writes:
+#              `throughput_per_user = accept_rate / avg_iteration_time`, which
+#              has no context term at all. Naming a ctx.json additionally buys
+#              the rate-matched end-to-end view. WITHOUT it,
+#              `output_tput_per_gpu`, the ctx:gen ratio and the frontier
+#              elasticity are ABSENT — not zero, not unchanged — and nothing
+#              the campaign reports says what a gain is worth end to end.
+#   workspace  the harness workspace name. It fixes one workload on one
+#              cluster; a new image, build or tuning overlay is not a change.
 #
-# Where the workspace and the benchmark output live is the CLI's own
-# business: it reads BENCH_DISAGG_STORE (bookkeeping, small, back it up) and
-# BENCH_DISAGG_ARTIFACTS (output, large, put it on scratch). Saying it twice
-# is a second way for the two to disagree.
+# `accept_rate` lives in the SWEEP, at its TOP LEVEL (`accept_rate: {rate,
+# source}`, where the harness has read it since v0.4.7) — and it is required
+# only when the sweep actually has `mtp > 0` cases. At mtp 0 the acceptance
+# length is 1.0 by definition, so requiring one would ask for a measurement of
+# a constant; the harness's own post-processor draws the line in the same
+# place. Where it IS required, it is because the length multiplies the metric
+# linearly and a wrong one is invisible.
 #
-# `accept_rate` lives in the SWEEP, not here: every `frontier build` requires
-# it and none is inferred, because the acceptance length scales both the
-# numerator and the ctx term of the frontier metric — a wrong one tilts the
-# whole curve with no symptom. Validation refuses a sweep without it.
-#
-# `benchmark` fields you omit are filled from `sweep plan` — the same expansion
-# that will run — and any you set that disagree are an error. Note that a sweep
-# row's concurrency is per generation server, so `benchmark.concurrency` is
-# `concurrency x gen_num`, while the case name keeps the listed value.
-# Profiling is nsys-only. `optimize.target_metric` defaults to the track's.
-# Leave `optimize.max_regression_pct` unset and every point can veto an
-# attempt, which is the gate a frozen-point campaign wants.
+# `benchmark` fields you omit are filled from the sweep's own plan — the same
+# expansion that will run — and any you set that disagree are an error. Note
+# that a sweep row's concurrency is per generation server, so
+# `benchmark.concurrency` is `concurrency x gen_num`, while the row keeps the
+# listed value. Profiling is nsys-only. `optimize.target_metric` defaults to
+# the track's. Leave `optimize.max_regression_pct` unset and every point can
+# veto an attempt, which is the gate a frozen-point campaign wants.
 #
 # The optimizer edits `<workspace>/tuning/extra_llm_api_options.yaml`, which is
 # a PARTIAL overlay deep-merged onto the worker config the sweep row generates
@@ -268,5 +264,7 @@ profile:
 # sol_track:
 #   track: gen
 #   sweep: /path/to/campaign/sweep.yaml
-#   workspace: dsv4pro-200k1k-frontier-2pt
-#   ctx_json: /path/to/a/measured/ctx.json
+#   workspace: dsv4pro-8k1k-gen
+#   # ctx_json: /path/to/a/measured/ctx.json   # omit for an anchor-free gen
+#   #                                          # campaign; see above for what
+#   #                                          # that makes ABSENT
