@@ -880,6 +880,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "enable_partial_reuse": False,
             "tokens_per_block": 32,
         }
+        if enable_attention_dp:
+            # KVCacheManagerV2 rejects attention-DP with helix CP (its disagg
+            # transfer-completion consensus is skipped under attention-DP).
+            # The Python transceiver drives V1 as well, so pin V1 here; the
+            # C++ runtime used to force this fallback implicitly.
+            kv_cache_config["use_kv_cache_manager_v2"] = False
         ctx_server_config = {
             "pipeline_parallel_size": 1,
             "tensor_parallel_size": 4,
