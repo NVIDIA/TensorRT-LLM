@@ -4203,6 +4203,139 @@ def test_moe_module_bf16_locality_domain_lifecycle_and_run_moe_rubin():
 
 
 @pytest.mark.skipif(
+    get_sm_version() != 107 or not IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE,
+    reason="MXFP8 fused FC12 MoE requires Rubin (SM107) with a CuTe DSL build that supports the fused FC12 kernel",
+)
+@pytest.mark.parametrize("num_tokens", [16, 4096])
+def test_moe_module_mxfp8_locality_domain_static_split_rubin(num_tokens: int):
+    """Locality domains for an MXFP8 layer are a static planner decision, as for NVFP4/BF16.
+
+    ``post_load_weights`` shards the weights onto the two partitions and
+    releases the full parameters (the shards are the only copy), and every
+    shape runs the split -- including 4096 rows, far beyond the former
+    runtime admission rule. A refit reload after the release re-creates the
+    full parameters transiently, re-shards and releases them again.
+    """
+    _skip_if_no_locality_domain()
+
+    from _torch.moe.quantize_utils import get_test_quant_params
+    from transformers.configuration_utils import PretrainedConfig
+
+    from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.moe.fused_moe import RenormalizeMoeRoutingMethod
+    from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
+    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+    from tensorrt_llm._utils import mpi_rank
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.models.modeling_utils import QuantAlgo
+
+    hidden_size, intermediate_size, num_experts, top_k = 2048, 1536, 64, 4
+    dtype = torch.bfloat16
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        x = torch.randn((num_tokens, hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((num_tokens, num_experts), dtype=dtype, device="cuda")
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.MXFP8, x, "CUTEDSL"
+        )
+        weights = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+        ).create_weights(**quant_kwargs)
+        pretrained_config = PretrainedConfig()
+        pretrained_config.num_experts = num_experts
+        pretrained_config.hidden_size = hidden_size
+        pretrained_config.intermediate_size = intermediate_size
+        pretrained_config.torch_dtype = dtype
+
+        def create_backend(enable_locality_domains: bool):
+            model_config = ModelConfig(
+                pretrained_config=pretrained_config,
+                quant_config=quant_config,
+                mapping=mapping,
+                moe_backend="CUTEDSL",
+                locality_domain_policy=LocalityDomainPolicy(enabled=enable_locality_domains),
+            )
+            backend = create_moe_backend(
+                moe_cls=CuteDslFusedMoE,
+                routing_method=routing_method,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                dtype=dtype,
+                reduce_results=True,
+                model_config=model_config,
+                init_load_balancer=False,
+            )
+            backend.load_weights([weights])
+            backend.post_load_weights()
+            backend.cuda()
+            return backend
+
+        base_backend = create_backend(False)
+        split_backend = create_backend(True)
+        assert base_backend._locality_domain_weight_shards is None
+        shards = split_backend._locality_domain_weight_shards
+        assert shards is not None and len(shards) == 2
+
+        def assert_released(backend):
+            for name in ("w3_w1_weight", "w2_weight", "w3_w1_weight_scale", "w2_weight_scale"):
+                assert getattr(backend, name).numel() == 0, name
+            assert backend.quant_scales.fc31_weight_block_scale.numel() == 0
+            assert backend.quant_scales.fc2_weight_block_scale.numel() == 0
+
+        assert_released(split_backend)
+        # The shards together are exactly one copy of the full weights.
+        assert torch.equal(
+            torch.cat([s["w3_w1_weight"] for s in shards], dim=1).view(torch.uint8),
+            base_backend.w3_w1_weight.view(torch.uint8),
+        )
+        assert torch.equal(
+            torch.cat([s["w2_weight"] for s in shards], dim=2), base_backend.w2_weight
+        )
+
+        # The test weights drive outputs to ~1e5, where one BF16 ulp is 512-1024.
+        # Each shard rounds its partial FC2 sum to BF16 before the atomic add,
+        # one more rounding than the single kernel, and the two shards' atomic
+        # accumulation order alone moves ~2% of the elements by one ulp between
+        # runs. Measured: 0.5% RMS relative, cosine 0.99999 (the MXFP8
+        # quantization itself sits at ~2.7% RMS from exact math). Compare on
+        # the scale of the output rather than elementwise.
+        def assert_matches(out, ref, label):
+            out, ref = out.float(), ref.float()
+            rms_rel = ((out - ref).norm() / ref.norm()).item()
+            cos = torch.nn.functional.cosine_similarity(out.flatten(), ref.flatten(), dim=0).item()
+            assert rms_rel <= 1e-2 and cos >= 0.9999, (
+                f"{label}: rms_rel={rms_rel:.5f} cos={cos:.6f}"
+            )
+
+        with torch.inference_mode():
+            out_base = _run_moe_module(base_backend, x, router_logits)
+            out_split = _run_moe_module(split_backend, x, router_logits)
+        torch.cuda.synchronize()
+        assert_matches(out_split, out_base, "static split vs full GPU")
+
+        # Refit: the full parameters were released; a reload re-creates them
+        # for the load, and post_load_weights re-shards and releases again.
+        split_backend.load_weights([weights])
+        split_backend.post_load_weights()
+        assert_released(split_backend)
+        assert len(split_backend._locality_domain_weight_shards) == 2
+        with torch.inference_mode():
+            out_refit = _run_moe_module(split_backend, x, router_logits)
+        torch.cuda.synchronize()
+        assert_matches(out_refit, out_base, "static split after refit vs full GPU")
+
+
+@pytest.mark.skipif(
     get_sm_version() != 107,
     reason="This test is only supported on SM 107 (Rubin) GPUs",
 )
@@ -4700,73 +4833,6 @@ def test_mxfp8_fused_fc12_tactic_roundtrips_through_autotuner_cache():
     not IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE,
     reason="MXFP8 fused FC12 MoE requires a CuTe DSL build that supports the fused FC12 kernel",
 )
-def test_mxfp8_fused_fc12_sparse_gather_selection():
-    """The gather variant is chosen from static shapes, scaled by the rank's expert share.
-
-    Qwen3.5-397B geometry: 512 experts, top-k 10. ``padded_routes`` is the
-    static ``permuted_idx_to_expanded_idx`` length the backend hands the op.
-    """
-    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import Sm107Mxfp8FusedFc12MoeRunner
-
-    def runner(num_local_experts):
-        return Sm107Mxfp8FusedFc12MoeRunner(512, 10, num_local_experts, 0, 128)
-
-    # EP16 decode: 32 tokens, ~20 local routes spread over ~20 tiles -> sparse.
-    assert runner(32)._use_sparse_gather(num_rows=32, padded_routes=20 * 128)
-    # EP16 mid range, 2048 tokens: ~1280 local routes but heavy per-expert
-    # padding (32 experts x 127 rows) -> still sparse; the old rank-agnostic
-    # rule (tokens * top_k * 2 = 40960) would have kept the static gather.
-    assert runner(32)._use_sparse_gather(num_rows=2048, padded_routes=1280 + 32 * 127)
-    # EP4 prefill, 16384 tokens: routes dominate the padding -> static.
-    assert not runner(128)._use_sparse_gather(
-        num_rows=16384, padded_routes=16384 * 10 // 4 + 128 * 127
-    )
-    # No EP: a single 128-row tile per expert, all full -> static.
-    assert not runner(512)._use_sparse_gather(num_rows=8192, padded_routes=8192 * 10)
-    # The estimate never drops below one route per arriving row (alltoall).
-    assert runner(1)._use_sparse_gather(num_rows=4, padded_routes=128)
-    assert not runner(1)._use_sparse_gather(num_rows=100, padded_routes=128)
-
-
-def test_mxfp8_moe_locality_domain_admission_rule():
-    """The inner-channel split is profiled up to the measured neutral point, never on prefill.
-
-    Qwen3.5-397B geometry (512 experts, top-k 10). ``num_tokens`` is the
-    number of rows this rank processes. Measured at the peak HBM clock with
-    the strict 100+100 SM split: wins from 2 to 1024 rows, neutral at 2048,
-    losses from 3072 rows up.
-    """
-    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoEMxfp8Runner
-
-    def admits(num_tokens, num_local_experts):
-        return CuteDslFusedMoEMxfp8Runner.admits_locality_domain(
-            num_tokens, 10, num_local_experts, 512
-        )
-
-    # TEP8 (64 local experts), replicated input: measured wins 2..1024 rows,
-    # neutral at 2048 -> admitted; losses from 3072 up -> not profiled.
-    for tokens in (1, 2, 4, 8, 16, 21, 32, 64, 128, 256, 512, 1024, 2048):
-        assert admits(tokens, 64), tokens
-    for tokens in (3072, 4096, 16384):
-        assert not admits(tokens, 64), tokens
-    # DEP16 after alltoall dispatch (~340 rows) and DEP4 decode (~320 rows)
-    # are now profiled; DEP4 prefill (16K rows) is not.
-    assert admits(337, 32)
-    assert admits(320, 128)
-    assert not admits(16384, 128)
-    # Empty shapes stay on the full path.
-    assert not admits(0, 64)
-    assert admits(1, 64)
-    # With all experts local the estimated route count caps admission at 409
-    # rows (4096 routes); a full expert sweep of 2048 rows is not profiled.
-    assert admits(409, 512)
-    assert not admits(410, 512)
-
-
-@pytest.mark.skipif(
-    not IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE,
-    reason="MXFP8 fused FC12 MoE requires a CuTe DSL build that supports the fused FC12 kernel",
-)
 def test_rubin_mxfp8_fused_fc12_locality_domain_composite_fake_signature():
     try:
         from torch._subclasses.fake_tensor import FakeTensorMode
@@ -4810,7 +4876,9 @@ def test_rubin_mxfp8_fused_fc12_locality_domain_composite_fake_signature():
     reason="MXFP8 fused FC12 MoE requires a CuTe DSL build that supports the fused FC12 kernel",
 )
 def test_rubin_mxfp8_fused_fc12_locality_domain_composite_owns_concurrent_tuning(monkeypatch):
-    """The composite tunes one decoupled-policy runner concurrently and launches shard-specific weights."""
+    """The composite tunes one skip-reset runner (FC2 cache policy tied to stream_weights)
+    concurrently, registers the parent-reset prologue and launches the runner directly with
+    shard-specific weights."""
     composite_op = getattr(
         cute_dsl_custom_ops, "cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin", None
     )
@@ -4830,6 +4898,9 @@ def test_rubin_mxfp8_fused_fc12_locality_domain_composite_owns_concurrent_tuning
         def get_tuning_config(self):
             return "tuning-config"
 
+        def __call__(self, inputs, *, tactic):
+            leaf_calls.append((list(inputs), tactic))
+
     class FakeRuntime:
         def __init__(self, num_partitions: int):
             self.num_partitions = num_partitions
@@ -4842,19 +4913,15 @@ def test_rubin_mxfp8_fused_fc12_locality_domain_composite_owns_concurrent_tuning
             for partition_id in range(2):
                 self.launch_partition(partition_id, inputs, tactic)
 
-    def fake_tune(op_name, op_runner, runtime, num_partitions, launch_partition, inputs, cfg):
-        tune_calls.append((op_name, op_runner, runtime, num_partitions, inputs, cfg))
+    def fake_tune(
+        op_name, op_runner, runtime, num_partitions, launch_partition, inputs, cfg, prologue_fn
+    ):
+        tune_calls.append((op_name, op_runner, runtime, num_partitions, inputs, cfg, prologue_fn))
         return FakeConcurrentRunner(launch_partition), chosen_tactic
-
-    def fake_leaf_op(*args, **kwargs):
-        leaf_calls.append(kwargs)
 
     monkeypatch.setattr(cute_dsl_custom_ops, "Sm107Mxfp8FusedFc12MoeRunner", FakeOpRunner)
     monkeypatch.setattr(cute_dsl_custom_ops, "LocalityDomainRuntime", FakeRuntime)
     monkeypatch.setattr(cute_dsl_custom_ops, "tune_locality_domain_concurrent", fake_tune)
-    monkeypatch.setattr(
-        torch.ops.trtllm, "cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin", fake_leaf_op
-    )
 
     def shard(shape, dtype=torch.float8_e4m3fn):
         return torch.empty(shape, dtype=dtype, device="cuda")
@@ -4895,26 +4962,32 @@ def test_rubin_mxfp8_fused_fc12_locality_domain_composite_owns_concurrent_tuning
     assert len(runner_instances) == 1
     args, kwargs = runner_instances[0].init_call
     assert args == (16, 2, 2, 0, 128)
-    assert kwargs["decouple_fc2_cache_policy"] is True
+    # No cached-FC2 tactic for the split: its tuning runs warm, where that
+    # tactic always looks best and measured cold it loses.
+    assert "decouple_fc2_cache_policy" not in kwargs
+    # The parent reset owns output clearing and the workspaces of both shards.
     assert kwargs["zero_output"] is False
+    assert kwargs["skip_reset"] is True
     assert len(tune_calls) == 1
-    op_name, op_runner, runtime, num_partitions, inputs, cfg = tune_calls[0]
+    op_name, op_runner, runtime, num_partitions, inputs, cfg, prologue_fn = tune_calls[0]
     assert op_name.endswith("::locality_domain")
     assert op_runner is runner_instances[0]
     assert runtime.num_partitions == 2 and num_partitions == 2
     assert cfg == "tuning-config"
+    assert callable(prologue_fn)
     assert inputs[1] is fc1_w[0] and inputs[10] is fc2_w[0]
-    # Both partitions launch the single-partition op with their own shards,
-    # the precomputed tactic, and without clearing the shared output.
+    # Both partitions launch the same skip-reset runner directly (no nested
+    # custom op, no per-shard tuning) with their own shards, the chosen
+    # tactic, the shared output and the already-E4M3 input.
     assert len(leaf_calls) == 2
-    for partition_id, call in enumerate(leaf_calls):
-        assert call["fc1_weight"] is fc1_w[partition_id]
-        assert call["fc1_weight_scale"] is fc1_s[partition_id]
-        assert call["fc2_weight"] is fc2_w[partition_id]
-        assert call["fc2_weight_scale"] is fc2_s[partition_id]
-        assert call["output"] is output
-        assert call["zero_output"] is False
-        assert call["precomputed_tactic"] == repr(chosen_tactic)
+    for partition_id, (shard_inputs, tactic) in enumerate(leaf_calls):
+        assert tactic == chosen_tactic
+        assert shard_inputs[0] is inputs[0] and shard_inputs[2] is inputs[2]
+        assert shard_inputs[1] is fc1_w[partition_id]
+        assert shard_inputs[3] is fc1_s[partition_id]
+        assert shard_inputs[10] is fc2_w[partition_id]
+        assert shard_inputs[11] is fc2_s[partition_id]
+        assert shard_inputs[13] is output
 
 
 def _split_mxfp8_fused_fc12_shards(w31_kernel, w31_sf_kernel, w2_q, w2_sf_kernel):
@@ -4980,7 +5053,9 @@ def test_mxfp8_fused_fc12_locality_domain_op_matches_full_gpu(
     along K, exactly as ``CuteDslFusedMoE._split_mxfp8_weights_for_locality_domain``
     does, then both accumulate into one pre-zeroed output. FC2's accumulation
     order changes, so the comparison uses the MoE tolerances, not bitwise
-    equality.
+    equality. A second split call feeds raw BF16 activations and a dirty
+    output with ``zero_output``: the parent reset must quantize once for both
+    shards and clear the output, reproducing the E4M3-input split exactly.
     """
     _skip_if_no_locality_domain()
     torch.manual_seed(0)
@@ -5107,6 +5182,29 @@ def test_mxfp8_fused_fc12_locality_domain_op_matches_full_gpu(
             **common,
         )
     torch.cuda.synchronize()
+    # Raw BF16 input and a dirty output: the parent reset quantizes (matching
+    # mxfp8_quantize byte for byte, so the shard GEMMs see identical operands)
+    # and clears the output before both shards accumulate into it.
+    # The two shards scatter-add concurrently with BF16 atomics, so even two
+    # E4M3 runs differ in accumulation order; compare within the split
+    # tolerance (an uncleared output would carry the 3.0 fill and fail it).
+    split_raw = torch.full((num_tokens, hidden_size), 3.0, dtype=torch.bfloat16, device="cuda")
+    raw_common = dict(common, input=a, input_scale=torch.empty_like(a_sf))
+    with torch.inference_mode():
+        torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin(
+            fc1_weight_0=shards[0]["fc1_weight"],
+            fc1_weight_1=shards[1]["fc1_weight"],
+            fc1_weight_scale_0=shards[0]["fc1_weight_scale"],
+            fc1_weight_scale_1=shards[1]["fc1_weight_scale"],
+            fc2_weight_0=shards[0]["fc2_weight"],
+            fc2_weight_1=shards[1]["fc2_weight"],
+            fc2_weight_scale_0=shards[0]["fc2_weight_scale"],
+            fc2_weight_scale_1=shards[1]["fc2_weight_scale"],
+            output=split_raw,
+            zero_output=True,
+            **raw_common,
+        )
+    torch.cuda.synchronize()
 
     for out, label in ((full, "full GPU"), (split, "locality domain split")):
         out_f32 = out.float()
@@ -5116,6 +5214,8 @@ def test_mxfp8_fused_fc12_locality_domain_op_matches_full_gpu(
         ).item()
         assert match >= 0.95 and cos >= 0.99, f"{label}: match={match:.4f} cosine={cos:.5f}"
     torch.testing.assert_close(split.float(), full.float(), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(split_raw.float(), split.float(), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(split_raw.float(), full.float(), rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.skipif(
@@ -5172,7 +5272,6 @@ def test_mxfp8_local_input_quantization_deferred(monkeypatch, hidden, dtype):
     The cutoff is an element count, so the largest deferred row count follows
     from the hidden size rather than being tied to one model.
     """
-    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoEMxfp8Runner
 
     backend = SimpleNamespace(
         has_nvfp4=False,
@@ -5184,9 +5283,6 @@ def test_mxfp8_local_input_quantization_deferred(monkeypatch, hidden, dtype):
         MXFP8_FUSED_INPUT_QUANT_MAX_ELEMENTS=CuteDslFusedMoE.MXFP8_FUSED_INPUT_QUANT_MAX_ELEMENTS,
     )
     backend._fuses_mxfp8_input_quant = CuteDslFusedMoE._fuses_mxfp8_input_quant.__get__(backend)
-    backend._mxfp8_full_gpu_path_selected = CuteDslFusedMoE._mxfp8_full_gpu_path_selected.__get__(
-        backend
-    )
     max_rows = CuteDslFusedMoE.MXFP8_FUSED_INPUT_QUANT_MAX_ELEMENTS // hidden
     scale_cols = hidden // 32
     calls = []
@@ -5209,43 +5305,20 @@ def test_mxfp8_local_input_quantization_deferred(monkeypatch, hidden, dtype):
     assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 1
     assert calls[0][0] is x and calls[0][1:] == (False, 512)
     assert sf.shape == (max_rows, scale_cols)
-    # Locality domains: the fusion stacks on the full-GPU path only. No
-    # recorded decision -> separate launch (the split may still be profiled);
-    # decision "split" -> separate launch; decision "full GPU" -> fused;
-    # outside the static admission rule -> fused (the split never runs).
+    # Locality domains: the split's parent reset quantizes raw input for both
+    # shards, so the fusion applies to the split exactly as to the full op.
     backend._locality_domain_runtime = object()
-    backend.routing_method = SimpleNamespace(experts_per_token=10)
-    backend.expert_size_per_partition = 64
-    backend.num_slots = 512
-    backend._mxfp8_locality_domain_decisions = {}
     small = torch.empty((8, hidden), dtype=dtype)
-    quantized, _ = CuteDslFusedMoE.quantize_input(backend, small, post_quant_comm=False)
-    assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 2
-    backend._mxfp8_locality_domain_decisions[8] = True
-    quantized, _ = CuteDslFusedMoE.quantize_input(backend, small, post_quant_comm=False)
-    assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 3
-    backend._mxfp8_locality_domain_decisions[8] = False
     raw, _ = CuteDslFusedMoE.quantize_input(backend, small, post_quant_comm=False)
-    assert raw is small and len(calls) == 3
-    assert not CuteDslFusedMoEMxfp8Runner.admits_locality_domain(
-        CuteDslFusedMoEMxfp8Runner.LOCALITY_DOMAIN_MAX_TOKENS + 1, 10, 64, 512
-    )
-    if (CuteDslFusedMoEMxfp8Runner.LOCALITY_DOMAIN_MAX_TOKENS + 1) * hidden <= (
-        CuteDslFusedMoE.MXFP8_FUSED_INPUT_QUANT_MAX_ELEMENTS
-    ):
-        outside = torch.empty(
-            (CuteDslFusedMoEMxfp8Runner.LOCALITY_DOMAIN_MAX_TOKENS + 1, hidden), dtype=dtype
-        )
-        raw, _ = CuteDslFusedMoE.quantize_input(backend, outside, post_quant_comm=False)
-        assert raw is outside and len(calls) == 3
+    assert raw is small and len(calls) == 1
     backend._locality_domain_runtime = None
     larger = torch.empty((max_rows + 1, hidden), dtype=dtype)
     quantized, _ = CuteDslFusedMoE.quantize_input(backend, larger, post_quant_comm=False)
-    assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 4
+    assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 2
     # Non-contiguous rows cannot be vector-loaded by the reset kernel.
     strided = torch.empty((2, hidden * 2), dtype=dtype)[:, :hidden]
     quantized, _ = CuteDslFusedMoE.quantize_input(backend, strided, post_quant_comm=False)
-    assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 5
+    assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 3
 
 
 def test_mxfp8_input_quantization_tuning_cache_isolation():
@@ -5256,5 +5329,3 @@ def test_mxfp8_input_quantization_tuning_cache_isolation():
             for dtype in (torch.float8_e4m3fn, torch.bfloat16, torch.float16)
         }
         assert len(keys) == 3
-    assert CuteDslFusedMoE._mxfp8_decision_key(8, torch.float8_e4m3fn) == 8
-    assert CuteDslFusedMoE._mxfp8_decision_key(8, torch.bfloat16) != 8

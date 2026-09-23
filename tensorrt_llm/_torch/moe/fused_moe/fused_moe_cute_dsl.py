@@ -81,8 +81,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
 _DISABLE_DIRECT_DEEP_EP_METADATA_ENV = "TRTLLM_DISABLE_CUTEDSL_DEEP_EP_DIRECT_METADATA"
 
-_Mxfp8DecisionKey = Union[int, Tuple[int, torch.dtype]]
-
 
 def _unwrap_locality_domain_runner(runner: TunableRunner) -> TunableRunner:
     """Return the kernel runner wrapped by the shared locality domain tuning adapter."""
@@ -673,23 +671,13 @@ class CuteDslFusedMoEMxfp8Runner(TunableRunner):
     Selects the routing tile size from {128, 256} and delegates to
     ``forward_impl`` (``run_moe_mxfp8_impl`` for the full-GPU fused FC1+FC2
     kernel, ``_run_moe_mxfp8_locality_domain`` for the inner-channel split
-    across two locality domains). The fused kernel has no B-reuse geometry,
-    so the routing tile is exactly the MMA tile M: 128 (1-CTA MMA) or 256
-    (2-CTA MMA). ``workload_identity`` distinguishes the localized runner's
-    tuning cache entries (shard shapes and compute topology).
+    across two locality domains, chosen statically by the planner). The fused
+    kernel has no B-reuse geometry, so the routing tile is exactly the MMA
+    tile M: 128 (1-CTA MMA) or 256 (2-CTA MMA). ``workload_identity``
+    distinguishes the localized runner's tuning cache entries (shard shapes
+    and compute topology).
     """
     tuning_config_cache = dict()
-    # Static admission rule for profiling the locality-domain split. The
-    # measured selection (1% margin against the full-GPU op) decides whether
-    # it runs; this rule only bounds the extra autotuner warmup by excluding
-    # shapes where the split cannot win. Paired Rubin measurements at the peak
-    # HBM clock with the engine's strict 100+100 SM split (TEP8, 64 local
-    # experts): the split wins from 2 to 1024 rows (-3 to -15% vs the tuned
-    # full-GPU kernel), is neutral at 2048 and loses from 3072 rows up,
-    # reaching +22% at 16K, so the cap sits at the neutral point. The route
-    # cap keeps prefill-like full expert sweeps out regardless of EP layout.
-    LOCALITY_DOMAIN_MAX_TOKENS = 2048
-    LOCALITY_DOMAIN_MAX_LOCAL_ROUTES = 4096
 
     def __init__(self,
                  forward_impl: Callable,
@@ -712,24 +700,6 @@ class CuteDslFusedMoEMxfp8Runner(TunableRunner):
         self.output_dtype = output_dtype
         self.tune_max_num_tokens = tune_max_num_tokens
         self.workload_identity = workload_identity
-
-    @classmethod
-    def admits_locality_domain(cls, num_tokens: int, top_k: int,
-                               num_local_experts: int,
-                               num_experts: int) -> bool:
-        """Static shape rule for profiling the locality-domain split.
-
-        ``num_tokens`` is the number of rows this rank processes (after
-        alltoall dispatch, if any). The valid local route count is
-        estimated as in ``Sm107Mxfp8FusedFc12MoeRunner._use_sparse_gather``:
-        ``num_tokens * top_k`` scaled by the rank's share of the experts,
-        never below one route per row.
-        """
-        if num_tokens <= 0 or num_tokens > cls.LOCALITY_DOMAIN_MAX_TOKENS:
-            return False
-        local_routes = -(-num_tokens * top_k * num_local_experts // num_experts)
-        local_routes = max(num_tokens, local_routes)
-        return local_routes <= cls.LOCALITY_DOMAIN_MAX_LOCAL_ROUTES
 
     def unique_id(self):
         return (
@@ -1095,9 +1065,6 @@ class CuteDslFusedMoE(MoEImplBase):
         # Weight splitting happens in post_load_weights after normal loading.
         self._locality_domain_runtime = None
         self._locality_domain_weight_shards = None  # set in post_load_weights
-        # num_tokens -> use the localized MXFP8 MoE (see _select_mxfp8_locality_domain)
-        self._mxfp8_locality_domain_decisions: Dict[_Mxfp8DecisionKey,
-                                                    bool] = {}
         planner = LocalityDomainExecutionPlanner(
             model_config.locality_domain_policy)
         self._locality_domain_plan = planner.plan_moe(
@@ -1207,25 +1174,6 @@ class CuteDslFusedMoE(MoEImplBase):
     # routes are equal, so prefill-sized inputs keep the native launch.
     MXFP8_FUSED_INPUT_QUANT_MAX_ELEMENTS = 1 << 24
 
-    def _mxfp8_full_gpu_path_selected(self, num_tokens: int) -> bool:
-        """Whether ``run_moe_mxfp8`` will run the full-GPU op for this row count.
-
-        Without locality domains it always does. With them, the inner-channel
-        split runs only for row counts inside the static admission rule whose
-        recorded autotuner decision favours it. A row count with no recorded
-        decision yet may still profile the split on its first forward, so it
-        keeps the separate quantize launch until the decision exists; raw
-        activations therefore never reach the split shards. The lookup is a
-        host-side dict read that is baked into the CUDA graph per bucket.
-        """
-        if self._locality_domain_runtime is None:
-            return True
-        if not CuteDslFusedMoEMxfp8Runner.admits_locality_domain(
-                num_tokens, self.routing_method.experts_per_token,
-                self.expert_size_per_partition, self.num_slots):
-            return True
-        return self._mxfp8_locality_domain_decisions.get(num_tokens) is False
-
     def _fuses_mxfp8_input_quant(self, x: torch.Tensor) -> bool:
         """Whether ``x`` is quantized inside the fused FC12 workspace reset.
 
@@ -1282,12 +1230,9 @@ class CuteDslFusedMoE(MoEImplBase):
             x_row = x.shape[0]
             sf_vec_size = self.quant_method.BLOCK_SIZE
             # Communication keeps the separate quantizer (E4M3 travels on
-            # the wire). With locality domains the fusion is used only where
-            # the full-GPU op is known to run; the split shards keep the
-            # separate launch until their concurrent quantize/reset path is
-            # benchmarked.
-            if (not post_quant_comm and self._fuses_mxfp8_input_quant(x)
-                    and self._mxfp8_full_gpu_path_selected(x_row)):
+            # the wire). Locally, both the full-GPU op and the locality-domain
+            # split quantize inside their (single) workspace-reset launch.
+            if not post_quant_comm and self._fuses_mxfp8_input_quant(x):
                 # Defer local input quantization to the FC12 workspace reset.
                 # This tensor carries shape metadata for the op/autotuner;
                 # the runner owns the actual scale scratch and never reads it.
@@ -1746,43 +1691,16 @@ class CuteDslFusedMoE(MoEImplBase):
 
         effective_top_k = token_selected_experts.size(-1)
         tuner = AutoTuner.get()
-        runner = CuteDslFusedMoEMxfp8Runner(
-            forward_impl=self.run_moe_mxfp8_impl,
-            num_experts=self.num_slots,
-            top_k=effective_top_k,
-            num_local_experts=self.expert_size_per_partition,
-            local_expert_offset=self.slot_start,
-            enable_alltoall=enable_alltoall,
-            tune_max_num_tokens=self.tune_max_num_tokens,
-        )
-        inputs = [
-            x, token_selected_experts, token_final_scales, x_sf, moe_output
-        ]
-        tuning_config = runner.get_tuning_config()
-        _, best_tactic = tuner.choose_one(
-            self._mxfp8_tuner_key(x.dtype),
-            [runner],
-            tuning_config,
-            inputs,
-        )
-        # Raw (unquantized) activations mean quantize_input already
-        # determined that the full-GPU op runs for this row count; the split
-        # shards never receive them (see _mxfp8_full_gpu_path_selected).
-        if (self._locality_domain_runtime is not None
-                and self._locality_domain_weight_shards is not None
-                and x.dtype == torch.float8_e4m3fn
-                and self._mxfp8_locality_domain_decisions.get(
-                    self._mxfp8_decision_key(x.size(0), x.dtype), True)
-                and CuteDslFusedMoEMxfp8Runner.admits_locality_domain(
-                    x.size(0), effective_top_k, self.expert_size_per_partition,
-                    self.num_slots)):
-            # The inner-channel split is a separate autotuned op with its own
-            # tactic space. It is measured against the full-GPU op through the
-            # autotuner's recorded best times and only used where it wins by
-            # a margin, so shapes where it does not win run exactly the
-            # full-GPU path above. Shapes outside the admission rule never
-            # reach this branch.
-            locality_runner = CuteDslFusedMoEMxfp8Runner(
+        # Like the NVFP4 and BF16 paths, the locality-domain split is a static
+        # planner decision (``enable_locality_domains`` / ``plan_moe``), not a
+        # per-shape runtime choice: the full weights are released after
+        # sharding, so only the shards exist and every shape runs the split.
+        use_locality_domain = self._locality_domain_runtime is not None
+        if use_locality_domain:
+            assert self._locality_domain_weight_shards is not None, (
+                "locality-domain MXFP8 MoE needs post_load_weights before the "
+                "first forward")
+            runner = CuteDslFusedMoEMxfp8Runner(
                 forward_impl=self._run_moe_mxfp8_locality_domain,
                 num_experts=self.num_slots,
                 top_k=effective_top_k,
@@ -1793,19 +1711,25 @@ class CuteDslFusedMoE(MoEImplBase):
                 workload_identity=self._locality_domain_workload_identity(
                     x.dtype),
             )
-            locality_tuning_config = locality_runner.get_tuning_config()
-            _, locality_tactic = tuner.choose_one(
-                self._mxfp8_tuner_key(x.dtype, locality=True),
-                [locality_runner],
-                locality_tuning_config,
-                inputs,
+        else:
+            runner = CuteDslFusedMoEMxfp8Runner(
+                forward_impl=self.run_moe_mxfp8_impl,
+                num_experts=self.num_slots,
+                top_k=effective_top_k,
+                num_local_experts=self.expert_size_per_partition,
+                local_expert_offset=self.slot_start,
+                enable_alltoall=enable_alltoall,
+                tune_max_num_tokens=self.tune_max_num_tokens,
             )
-            if self._select_mxfp8_locality_domain(tuner, x.size(0), runner,
-                                                  tuning_config,
-                                                  locality_runner,
-                                                  locality_tuning_config,
-                                                  inputs):
-                return locality_runner(inputs, tactic=locality_tactic)
+        inputs = [
+            x, token_selected_experts, token_final_scales, x_sf, moe_output
+        ]
+        _, best_tactic = tuner.choose_one(
+            self._mxfp8_tuner_key(x.dtype, locality=use_locality_domain),
+            [runner],
+            runner.get_tuning_config(),
+            inputs,
+        )
         return runner(inputs, tactic=best_tactic)
 
     @staticmethod
@@ -1817,59 +1741,6 @@ class CuteDslFusedMoE(MoEImplBase):
         if dtype != torch.float8_e4m3fn:
             key += f"::input_quant::{dtype}"
         return key
-
-    @staticmethod
-    def _mxfp8_decision_key(num_tokens: int,
-                            dtype: torch.dtype) -> _Mxfp8DecisionKey:
-        """Preserve existing E4M3 decisions and isolate raw-input decisions."""
-        return (num_tokens if dtype == torch.float8_e4m3fn else
-                (num_tokens, dtype))
-
-    # Minimum relative gain of the localized MXFP8 MoE over the full-GPU
-    # kernel (both as measured by the autotuner) before it is used for a
-    # token count. Measured decode gains are 2-16%; noise between two
-    # profiled ops is well under 1%.
-    _MXFP8_LOCALITY_DOMAIN_MIN_GAIN = 0.01
-
-    def _select_mxfp8_locality_domain(self, tuner, num_tokens: int, full_runner,
-                                      full_tuning_config, locality_runner,
-                                      locality_tuning_config,
-                                      inputs: List[torch.Tensor]) -> bool:
-        """Decide per token count whether the localized MXFP8 MoE runs.
-
-        Reads the best times the autotuner recorded for the full-GPU and the
-        localized op (persisted with the tuning cache, so the decision
-        survives a cache reload) and keeps the full-GPU op unless the
-        localized one is faster by ``_MXFP8_LOCALITY_DOMAIN_MIN_GAIN``.
-        Missing or unusable measurements (untuned shape, the distributed
-        no-measurement marker ``0.0``) keep the full-GPU op. The decision is
-        cached per token count (a cached ``False`` also skips the localized
-        op's tuner lookup on later forwards); it runs only for shapes that
-        passed the static admission rule.
-        """
-        decisions = self._mxfp8_locality_domain_decisions
-        decision_key = self._mxfp8_decision_key(num_tokens, inputs[0].dtype)
-        if decision_key in decisions:
-            return decisions[decision_key]
-        input_shapes = tuple(tuner._get_input_sizes(inputs))
-        hit_full, _, _, full_time = tuner.profiling_cache.search_cache(
-            self._mxfp8_tuner_key(inputs[0].dtype), [full_runner], input_shapes,
-            full_tuning_config)
-        hit_local, _, _, local_time = tuner.profiling_cache.search_cache(
-            self._mxfp8_tuner_key(inputs[0].dtype, locality=True),
-            [locality_runner], input_shapes, locality_tuning_config)
-        use_locality = bool(
-            hit_full and hit_local and full_time > 0.0
-            and math.isfinite(full_time) and local_time > 0.0
-            and math.isfinite(local_time) and local_time
-            < (1.0 - self._MXFP8_LOCALITY_DOMAIN_MIN_GAIN) * full_time)
-        if hit_full and hit_local:
-            logger.info(
-                f"CuteDslFusedMoE MXFP8 locality domain: num_tokens={num_tokens} "
-                f"full={full_time:.4f}ms localized={local_time:.4f}ms -> "
-                f"{'localized' if use_locality else 'full GPU'}")
-            decisions[decision_key] = use_locality
-        return use_locality
 
     def _run_moe_mxfp8_locality_domain(
         self,
@@ -1885,8 +1756,10 @@ class CuteDslFusedMoE(MoEImplBase):
 
         Each shard holds half of every expert's inner channels (FC1 columns
         as whole gate/up pairs, FC2 rows of K) and both scatter-add their
-        partial FC2 result into the shared ``moe_output``, which the memset
-        below clears first. Routing metadata is shared. The split changes
+        partial FC2 result into the shared ``moe_output``, which the op's
+        parent reset launch clears first (dense case). Routing metadata is
+        shared and raw activations are quantized by that same launch. The
+        split changes
         the BF16 accumulation order relative to the full-GPU kernel.
         """
         effective_top_k = token_selected_experts.size(1)
@@ -1904,9 +1777,11 @@ class CuteDslFusedMoE(MoEImplBase):
             tile_tokens_dim=tile_size,
         )
 
-        # Both shards accumulate into moe_output concurrently, so the op
-        # cannot clear it inside its own reset launch; use the backend
-        # memset (overlapped on the aux stream when available).
+        # Same rule as run_moe_mxfp8_impl: in the dense case the op's parent
+        # reset launch clears the whole output for both shards before the
+        # fork; alltoall with ep > top_k keeps the sparse row memset.
+        zero_output_in_kernel = (not enable_alltoall
+                                 or self.mapping.moe_ep_size <= effective_top_k)
         memset_kwargs = dict(
             input=moe_output,
             tile_idx_to_mn_limit=tile_idx_to_mn_limit,
@@ -1918,7 +1793,9 @@ class CuteDslFusedMoE(MoEImplBase):
             ep_size=self.mapping.moe_ep_size,
             enable_alltoall=enable_alltoall,
         )
-        if self._has_moe_output_memset_aux_stream():
+        if zero_output_in_kernel:
+            pass
+        elif self._has_moe_output_memset_aux_stream():
             memset_stream = self._moe_output_memset_run_stream()
             self.event_dict[EventType.Main].record()
             moe_output.record_stream(memset_stream)
@@ -1963,6 +1840,7 @@ class CuteDslFusedMoE(MoEImplBase):
             local_expert_offset=slot_start,
             tile_size=tile_size,
             swiglu_limit=swiglu_limit,
+            zero_output=zero_output_in_kernel,
         )
         return moe_output
 
@@ -2681,6 +2559,16 @@ class CuteDslFusedMoE(MoEImplBase):
     def load_weights(self,
                      weights: List[Dict],
                      allow_partial_loading: bool = False):
+        if (self._locality_domain_weight_shards is not None
+                and self.w3_w1_weight.numel() == 0):
+            # Refit (e.g. RLHF) after the full parameters were released in
+            # favour of the locality-domain shards: re-create them for this
+            # load as a transient copy; post_load_weights re-shards and
+            # releases them again. Partial (bucketed) loads re-create once,
+            # on the first bucket.
+            self._weights_created = False
+            self._weights_transformed = False
+            self.create_weights()
         super().load_weights(weights,
                              allow_partial_loading=allow_partial_loading)
         # Keep DWDP registration after base weight loading. This preserves
@@ -2699,12 +2587,10 @@ class CuteDslFusedMoE(MoEImplBase):
             # Weight splitting initializes the process-lifetime locality domain resource.
             # Resolve the borrowed remainder stream now, never during capture.
             self._get_reserved_moe_output_memset_stream()
-            # RLHF refit reloads the full parameters and re-runs this hook,
-            # which rebuilds the shards; the MXFP8 path therefore keeps the
-            # full weights resident (one extra copy of the expert weights).
-            # The NVFP4/BF16 paths release them as before.
-            if not self.has_mxfp8:
-                self._release_full_weights_after_locality_domain_split()
+            # The shards are the only copy of the expert weights from here on
+            # (same as the NVFP4/BF16 paths): keeping the full parameters as
+            # well would double the MoE weight memory.
+            self._release_full_weights_after_locality_domain_split()
 
     def _release_full_weights_after_locality_domain_split(self):
         """Release full tensors that are replaced by localized locality domain shards."""
@@ -2791,7 +2677,9 @@ class CuteDslFusedMoE(MoEImplBase):
             raise ValueError(
                 "MXFP8 locality domain MoE supports two partitions, got "
                 f"{num_p}")
-        sf_vec = self.scaling_vector_size  # 32 for MXFP8
+        # MXFP8 block scales cover 32 elements (``self.scaling_vector_size``
+        # is the NVFP4 value, 16, and must not be used here).
+        sf_vec = self.quant_method.BLOCK_SIZE
         hidden = self.w2_weight.size(1)
         inner = self.w2_weight.size(2)
         fc1_n = self.w3_w1_weight.size(1)
