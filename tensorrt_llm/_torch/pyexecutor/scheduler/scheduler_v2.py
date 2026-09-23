@@ -256,6 +256,20 @@ class KVCacheV2Scheduler(RequestScheduler):
             os.environ.get("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", "0") == "1"
         )
 
+        # Registered by PyExecutor; see set_async_transfer_manager.
+        self._async_transfer_manager = None
+
+    def set_async_transfer_manager(self, mgr) -> None:
+        """Register the AsyncTransferManager the deadlock detector consults.
+
+        A finished disaggregated context sender leaves active_requests once its
+        response is emitted, but the transfer manager still owns it and its
+        pinned KV pages until the send lands. Without this reference the
+        detector cannot see those pages and may report a false deadlock on a
+        context server whose pool is full of in-flight sends.
+        """
+        self._async_transfer_manager = mgr
+
     @property
     def scheduling_state_range(
         self,
@@ -1521,7 +1535,18 @@ class KVCacheV2Scheduler(RequestScheduler):
         # lands. None of those states are schedulable, so a context server
         # whose pool is full of pending sends shows no progress here at all. A
         # send that never lands is the transfer layer's timeout to report.
-        if any(req.state_value in self._TRANSFER_HOLDING_STATE_VALUES for req in active_requests):
+        #
+        # The active_requests scan covers senders still on the list and the
+        # generation-side receiver. The transfer manager covers finished
+        # senders that have already left active_requests (see
+        # set_async_transfer_manager).
+        transfer_holding = any(
+            req.state_value in self._TRANSFER_HOLDING_STATE_VALUES for req in active_requests
+        ) or (
+            self._async_transfer_manager is not None
+            and self._async_transfer_manager.has_any_inflight_requests()
+        )
+        if transfer_holding:
             self._stalled_schedules = 0
             return
 
