@@ -23,6 +23,7 @@ import torch
 import torch.nn.functional as F
 from triton_kernels.matmul import FlexCtx, FnSpecs, FusedActivation, PrecisionConfig, matmul
 from triton_kernels.numerics import InFlexData
+from triton_kernels.numerics_details.mxfp import MXFP_BLOCK_SIZE
 from triton_kernels.swiglu import swiglu_fn
 from triton_kernels.target_info import cuda_capability_geq
 from triton_kernels.tensor import FP4, Tensor, convert_layout, wrap_torch_tensor
@@ -275,9 +276,15 @@ def _run_mxfp4_mlp_core(
     )
 
     gate_pc = PrecisionConfig(
-        b_mx_scale=gate_up_w_scale_raw, flex_ctx=FlexCtx(rhs_data=InFlexData())
+        b_mx_scale=gate_up_w_scale_raw,
+        b_microblock_size=MXFP_BLOCK_SIZE.value,
+        flex_ctx=FlexCtx(rhs_data=InFlexData()),
     )
-    down_pc = PrecisionConfig(b_mx_scale=down_w_scale_raw, flex_ctx=FlexCtx(rhs_data=InFlexData()))
+    down_pc = PrecisionConfig(
+        b_mx_scale=down_w_scale_raw,
+        b_microblock_size=MXFP_BLOCK_SIZE.value,
+        flex_ctx=FlexCtx(rhs_data=InFlexData()),
+    )
 
     act = FusedActivation(
         FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
