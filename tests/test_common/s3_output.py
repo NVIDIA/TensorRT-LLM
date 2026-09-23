@@ -39,6 +39,7 @@ _STREAM_FILENAMES = {
 _SPOOL_ROOT_NAME = ".s3-spool"
 _SPOOL_CONFIG_NAME = "upload-config.json"
 _SPOOL_WRITE_CHARS = 1024 * 1024
+_SPOOL_PATH_ATTEMPTS = 3
 _FAILED_OUTPUT_MAX_LINES = 200
 _FAILED_OUTPUT_MAX_BYTES = 65536
 
@@ -207,10 +208,6 @@ def drain_pending_uploads(output_path: str, secret_key: str | None = None) -> bo
                 if config_success:
                     config_path.unlink(missing_ok=True)
                     _remove_empty_parents(config_path, spool_dir)
-                    try:
-                        spool_dir.parent.rmdir()
-                    except OSError:
-                        pass
         except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
             success = False
             logger.warning("Failed to read S3 spool config %s: %s", config_path, exc)
@@ -256,9 +253,11 @@ class UploadLogPlugin:
                 aws_secret_access_key,
             )
 
-        suffix = f"{socket.gethostname()}-{os.getpid()}-{time.time_ns()}"
+        self._hostname = socket.gethostname()
+        suffix = f"{self._hostname}-{os.getpid()}-{time.time_ns()}"
         self._spool_dir = str(_spool_root(output_path) / suffix)
         self._spool_config_path = os.path.join(self._spool_dir, _SPOOL_CONFIG_NAME)
+        self._spool_available = True
         self._test_names: dict[str, str] = {}
         self._used_test_names: set[str] = set()
         self._captured_sections: dict[str, dict[tuple[str, str, int], CapturedSection]] = {}
@@ -269,12 +268,50 @@ class UploadLogPlugin:
         self._pending_uploads: dict[Future, PendingUpload] = {}
         self._max_pending_uploads = self.upload_workers * 2
         if not self.skip_upload:
-            self._write_spool_config()
-            if self.upload_mode == "deferred":
+            try:
+                self._write_spool_config()
+            except OSError as exc:
+                self._disable_spooling("initializing spool config", exc)
+            if self._spool_available and self.upload_mode == "deferred":
                 self._executor = ThreadPoolExecutor(
                     max_workers=self.upload_workers,
                     thread_name_prefix="s3-test-log-upload",
                 )
+
+    def _disable_spooling(self, operation: str, exc: OSError) -> None:
+        if not self._spool_available:
+            return
+        self._spool_available = False
+        path_states = {}
+        for label, path in (
+            ("output_parent", os.path.dirname(os.path.abspath(self.output_path))),
+            ("spool_root", os.path.dirname(self._spool_dir)),
+        ):
+            try:
+                os.stat(path)
+            except FileNotFoundError:
+                path_states[label] = "missing"
+            except OSError as stat_exc:
+                path_states[label] = f"stat_errno={stat_exc.errno}"
+            else:
+                path_states[label] = "present"
+        message = (
+            f"S3 log spooling disabled while {operation}; original pytest captures are preserved. "
+            f"output_path={self.output_path!r}, spool_dir={self._spool_dir!r}, "
+            f"failed_path={exc.filename!r}, hostname={self._hostname!r}, "
+            f"pid={os.getpid()}, errno={exc.errno}, error={exc}, "
+            f"output_parent_state={path_states['output_parent']}, "
+            f"spool_root_state={path_states['spool_root']}"
+        )
+        try:
+            logger.warning("%s", message)
+        except (OSError, ValueError):
+            pass
+        if sys.__stderr__ is not None:
+            try:
+                sys.__stderr__.write(f"WARNING: {message}\n")
+            except (OSError, ValueError):
+                pass
 
     def normalize_test_name(self, nodeid: str) -> str:
         test_name = re.sub(r"[^\w\-]", "_", nodeid)
@@ -285,7 +322,6 @@ class UploadLogPlugin:
         return f"{test_name}-{suffix}-{timestamp}"
 
     def _write_spool_config(self) -> None:
-        os.makedirs(self._spool_dir, exist_ok=True)
         config = {
             "endpoint_url": self.endpoint_url,
             "aws_access_key_id": self.aws_access_key_id,
@@ -296,9 +332,16 @@ class UploadLogPlugin:
             "upload_workers": self.upload_workers,
         }
         temporary_path = f"{self._spool_config_path}.{os.getpid()}.tmp"
-        with open(temporary_path, "w", encoding="utf-8") as config_file:
-            json.dump(config, config_file)
-        os.replace(temporary_path, self._spool_config_path)
+        for attempt in range(_SPOOL_PATH_ATTEMPTS):
+            try:
+                os.makedirs(self._spool_dir, exist_ok=True)
+                with open(temporary_path, "w", encoding="utf-8") as config_file:
+                    json.dump(config, config_file)
+                os.replace(temporary_path, self._spool_config_path)
+                return
+            except FileNotFoundError:
+                if attempt == _SPOOL_PATH_ATTEMPTS - 1:
+                    raise
 
     def _test_name(self, nodeid: str) -> str:
         test_name = self._test_names.get(nodeid)
@@ -328,13 +371,19 @@ class UploadLogPlugin:
         if not self.skip_upload and not os.path.exists(self._spool_config_path):
             self._write_spool_config()
         test_dir = os.path.join(self._spool_dir, test_name)
-        os.makedirs(test_dir, exist_ok=True)
         source_path = os.path.join(test_dir, filename)
-        file_descriptor = os.open(
-            source_path,
-            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-            0o600,
-        )
+        for attempt in range(_SPOOL_PATH_ATTEMPTS):
+            try:
+                os.makedirs(test_dir, exist_ok=True)
+                file_descriptor = os.open(
+                    source_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                    0o600,
+                )
+                break
+            except FileNotFoundError:
+                if attempt == _SPOOL_PATH_ATTEMPTS - 1:
+                    raise
         with os.fdopen(file_descriptor, "a", encoding="utf-8", errors="replace") as output:
             for offset in range(0, len(content), _SPOOL_WRITE_CHARS):
                 output.write(content[offset : offset + _SPOOL_WRITE_CHARS])
@@ -350,10 +399,6 @@ class UploadLogPlugin:
             logger.warning("Failed to remove local S3 log file %s: %s", source_path, exc)
             return
         _remove_empty_parents(path, Path(self._spool_dir))
-        try:
-            Path(self._spool_dir).parent.rmdir()
-        except OSError:
-            pass
 
     def _upload_source(self, source_path: str, object_key: str) -> None:
         self.s3.upload_file(
@@ -627,12 +672,20 @@ class UploadLogPlugin:
 
     @pytest.hookimpl(wrapper=True, tryfirst=True)
     def pytest_runtest_logreport(self, report):
-        self._process_report(report, getattr(report, "when", "call"))
+        if self._spool_available:
+            try:
+                self._process_report(report, getattr(report, "when", "call"))
+            except OSError as exc:
+                self._disable_spooling("processing a test report", exc)
         return (yield)
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_collectreport(self, report) -> None:
-        self._process_report(report, "collect")
+        if self._spool_available:
+            try:
+                self._process_report(report, "collect")
+            except OSError as exc:
+                self._disable_spooling("processing a collection report", exc)
         nodeid = getattr(report, "nodeid", "unknown")
         self._test_names.pop(nodeid, None)
         self._captured_sections.pop(nodeid, None)
@@ -640,7 +693,11 @@ class UploadLogPlugin:
         self._pending_reruns.discard(nodeid)
 
     def pytest_runtest_logfinish(self, nodeid: str, location) -> None:
-        self._finalize_node(nodeid)
+        if self._spool_available:
+            try:
+                self._finalize_node(nodeid)
+            except OSError as exc:
+                self._disable_spooling("finishing a test report", exc)
         self._test_names.pop(nodeid, None)
         if nodeid in self._pending_reruns:
             self._pending_reruns.remove(nodeid)
@@ -650,17 +707,21 @@ class UploadLogPlugin:
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_sessionfinish(self, session, exitstatus) -> None:
-        for nodeid in tuple(self._captured_streams):
-            self._finalize_node(nodeid)
+        if self._spool_available:
+            for nodeid in tuple(self._captured_streams):
+                try:
+                    self._finalize_node(nodeid)
+                except OSError as exc:
+                    self._disable_spooling("finishing the test session", exc)
+                    break
         if self._executor is not None:
             self._executor.shutdown(wait=True)
             self._executor = None
             self._finish_uploads(set(self._pending_uploads))
-        if not self.skip_upload and not self._upload_failed:
+        if self._spool_available and not self.skip_upload and not self._upload_failed:
             try:
                 Path(self._spool_config_path).unlink(missing_ok=True)
                 Path(self._spool_dir).rmdir()
-                Path(self._spool_dir).parent.rmdir()
             except OSError:
                 pass
         self._captured_sections.clear()
