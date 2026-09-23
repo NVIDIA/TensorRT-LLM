@@ -95,8 +95,9 @@ from .engine.runners import (apply_position_id_offset, get_all_rank_num_tokens,
 from .engine.runners.encoder import EncoderRunner, EncoderRunnerConfig
 from .engine.runners.encoder_decoder import (EncoderDecoderRunner,
                                              EncoderDecoderRunnerConfig)
-from .engine.runners.interface import (PackedInputs, PackedModelRunner,
-                                       ScheduledInputs, ScheduledModelRunner)
+from .engine.runners.interface import (ModelRunner, PackedInputs,
+                                       PackedModelRunner, ScheduledInputs,
+                                       ScheduledModelRunner)
 from .engine.runners.no_kv_cache import NoKVCacheRunner, NoKVCacheRunnerConfig
 from .engine.runners.pooling import PoolingRunner
 from .guided_decoder import CapturableGuidedDecoder
@@ -338,8 +339,7 @@ class PyTorchModelEngine(ModelEngine):
         self.forward_pass_callable = None
         self._cleanup_done = False
         self._model_caller: Optional[ModelCaller] = None
-        self._runner: Optional[Union[ScheduledModelRunner,
-                                     PackedModelRunner]] = None
+        self._runner: Optional[ModelRunner] = None
         # Transitional snapshot for decoder capture and encoder scheduling.
         # Encoder graph resources and lifecycle remain entirely runner-owned.
         self._encoder_graph_shapes: frozenset[tuple[int, int]] = frozenset()
@@ -935,9 +935,8 @@ class PyTorchModelEngine(ModelEngine):
         return BreakableCUDAGraphRunner(decoder_model.model)
 
     def _initialize_runner(
-        self, runner_cls: Optional[Type[Union[ScheduledModelRunner,
-                                              PackedModelRunner]]]
-    ) -> Optional[Union[ScheduledModelRunner, PackedModelRunner]]:
+            self,
+            runner_cls: Optional[Type[ModelRunner]]) -> Optional[ModelRunner]:
         if runner_cls is None:
             return None
         assert self._model_caller is not None

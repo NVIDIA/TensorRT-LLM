@@ -17,6 +17,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners import resolve_runner_type
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import EncoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import (
+    ModelRunner,
     PreparedInputs,
     RunnerConfig,
     ScheduledInputs,
@@ -134,7 +135,7 @@ def test_resolve_runner_dispatches_startup_families(
     mm_encoder_only: bool,
     is_generation: bool,
     is_encoder_decoder: bool,
-    runner_type: type[Any] | None,
+    runner_type: type[ModelRunner] | None,
 ) -> None:
     args = SimpleNamespace(encode_only=encode_only, mm_encoder_only=mm_encoder_only)
 
@@ -173,7 +174,7 @@ def test_resolve_runner_checks_mm_encoder_before_non_generation() -> None:
     ],
 )
 def test_model_engine_initializes_runner_by_family(
-    runner_type: type[Any], initializer_name: str
+    runner_type: type[ModelRunner], initializer_name: str
 ) -> None:
     engine = object.__new__(PyTorchModelEngine)
     engine._model_caller = Mock()
