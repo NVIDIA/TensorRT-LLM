@@ -319,6 +319,13 @@ def _set_moe_a2a_warmup(in_warmup: bool) -> None:
             f"budget was not switched: {type(e).__name__}: {e}")
 
 
+def _set_mega_moe_warmup_launch_fence(in_warmup: bool) -> None:
+    """Fence DeepGEMM MegaMoE launches with an EP barrier during warmup."""
+    from ..moe.fused_moe.mega_moe.mega_moe_deepgemm import \
+        set_warmup_launch_fence
+    set_warmup_launch_fence(in_warmup)
+
+
 class PyTorchModelEngine(ModelEngine):
 
     def __init__(
@@ -1136,8 +1143,9 @@ class PyTorchModelEngine(ModelEngine):
 
         # This setter is the one choke point every warmup transition passes
         # through, including PyExecutor's, so select the MoE all-to-all budget
-        # here rather than in set_warmup_flag().
+        # and the MegaMoE launch fence here rather than in set_warmup_flag().
         _set_moe_a2a_warmup(value)
+        _set_mega_moe_warmup_launch_fence(value)
 
         self.moe_load_balancer_iter_info = (not value, not value)
 

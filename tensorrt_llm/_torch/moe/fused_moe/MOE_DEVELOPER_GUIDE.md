@@ -139,6 +139,8 @@ EPLB hooks fire only at the first/last chunk of the first/last `repeat_idx`. Mul
 
 No external `Communication.dispatch` / `.combine`. Zero-token chunks still launch the kernel so peer EP ranks can cross the in-kernel NVLink barrier.
 
+The DeepGEMM kernel's in-kernel barrier traps after `DG_BARRIER_TIMEOUT_SECONDS` (60 s by default), and first-touch work in warmup can leave one rank that far behind its peers. `DeepgemmCudaW4a8Mxfp4Mxfp8Impl.run_moe` therefore waits on a host-side EP barrier before each launch while the model engine is in warmup (`set_warmup_launch_fence`, switched by the engine's `is_warmup` setter); serving launches are not fenced.
+
 ### Core Design Principles
 
 1. **Composition over inheritance** — Backend, Communication, EPLB, and Scheduler are independent, composable components
