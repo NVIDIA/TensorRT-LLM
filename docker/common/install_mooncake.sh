@@ -70,14 +70,17 @@ MOONCAKE_CMAKE_PACKAGE="$(python3 -c "import sys; print([s for s in sys.path if 
 echo "removing CMake-generated mooncake package: ${MOONCAKE_CMAKE_PACKAGE}"
 rm -rf "${MOONCAKE_CMAKE_PACKAGE}"
 
-# The `mooncake-transfer-engine` wheel is built against CUDA 12 while these
-# images ship CUDA 13 only, so its extensions cannot resolve libcudart.so.12.
-# `mooncake-transfer-engine-cuda13` is the same project built for CUDA 13. It
-# is versioned independently, with releases starting at 0.3.9, so it cannot
-# track MOONCAKE_VERSION above. The store client only has to agree with the
-# mooncake_master it connects to, and this wheel supplies both.
-MOONCAKE_WHEEL_VERSION="0.3.13"
-pip3 install --no-cache-dir "mooncake-transfer-engine-cuda13==${MOONCAKE_WHEEL_VERSION}"
+# The Mooncake Python client (MooncakeDistributedStore) is installed from
+# requirements-mooncake.txt, the pin shared with the standalone wheel's
+# `tensorrt-llm[mooncake]` extra. That file explains why the pin is independent
+# of MOONCAKE_VERSION above and why the CUDA 13 wheel is required.
+# The Docker build bind-mounts the file at /opt; a run from a checkout finds it
+# relative to this script instead.
+MOONCAKE_REQUIREMENTS="${MOONCAKE_REQUIREMENTS:-/opt/requirements-mooncake.txt}"
+if [ ! -f "${MOONCAKE_REQUIREMENTS}" ]; then
+    MOONCAKE_REQUIREMENTS="$(dirname "${BASH_SOURCE[0]}")/../../requirements-mooncake.txt"
+fi
+pip3 install --no-cache-dir -r "${MOONCAKE_REQUIREMENTS}"
 
 # Fail the build rather than ship an image whose import is broken.
 python3 - <<'PY'

@@ -29,8 +29,8 @@ and renders the client config the workers read. Capacity comes only from
 processes that open a store handle, which in a disaggregated deployment is the
 context servers alone, so `donor.py` lends a node's memory to the pool without
 giving it a connector. `trtllm-serve mooncake_master` and `mooncake_donor`
-expose both. Both need the Mooncake Python bindings (`pip install
-mooncake-transfer-engine`).
+expose both. Both need the Mooncake Python bindings, an optional dependency
+installed with `pip install tensorrt-llm[mooncake]`.
 
 `keys.py` and `staging.py` hold what the store side shares with the connector
 that moves pages in and out of the pool: how a block of tokens becomes a store
