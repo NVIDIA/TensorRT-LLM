@@ -119,6 +119,12 @@ STANDALONE_DEPS = [
     "pydantic-settings",
     "triton",
     "flashinfer-python",
+    # flashinfer only range-requires its CuTe DSL toolchain, so listing these
+    # directly inherits the requirements.txt pins instead of resolving whatever
+    # is newest on PyPI. An unvalidated DSL retargets codegen and raises past
+    # flashinfer's ImportError-only fallback.
+    "nvidia-cutlass-dsl[cu13]",
+    "apache-tvm-ffi",
     "safetensors",
     "accelerate",
     "huggingface-hub",
