@@ -1957,6 +1957,10 @@ def getCommonParameters()
 // build that already ran against this exact commit hash, so a retriggered
 // pipeline (e.g. a manual "/bot run" rerun with no new commits pushed) can
 // reuse that result instead of re-running the scan.
+// Must be @NonCPS: it walks live Jenkins domain objects (Job/Run/ParametersAction)
+// and uses a closure over them, which CPS transformation does not handle reliably
+// (the match silently never succeeds instead of throwing).
+@NonCPS
 def findCachedPLCSourceScanResult(commit) {
     def plcJob = Jenkins.instance.getItemByFullName("LLM/helpers/PLCScanningSetup")
     if (!plcJob) {
