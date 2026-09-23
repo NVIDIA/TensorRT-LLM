@@ -751,6 +751,9 @@ class PyTorchModelEngine(ModelEngine):
             EagerWorkspaceReclaimer] = None
         self.spec_metadata = None
         self.iter_states = {}
+        # Log cached prefixes in model-input sequence order when enabled.
+        self._log_cached_kv_tokens_per_req = os.getenv(
+            'TLLM_LOG_CACHED_KV_TOKENS_PER_REQ', '0') == '1'
         # Let the first CUDA graph capture create its private pool. Piecewise
         # CUDA graphs use a separate pool owned by their runners, so sharing a
         # pre-created pool handle with the outer graph runner is unnecessary.
@@ -4272,6 +4275,31 @@ class PyTorchModelEngine(ModelEngine):
         pool.append(buffers)
         return buffers
 
+    def _record_cached_kv_tokens_per_req(
+        self,
+        num_cached_tokens_per_seq: Sequence[int],
+        request_groups: Sequence[tuple[Sequence[LlmRequest], int]] = (),
+    ) -> None:
+        """Log post-prepare (backend-adjusted) counts in packed order, retaining
+        ADP dummies to match num_scheduled_requests at beam width one and
+        separating CUDA graph padding.
+        """
+        counts = []
+        if request_groups:
+            offset = 0
+            for requests, rows_per_request in request_groups:
+                for request in requests:
+                    end = offset + rows_per_request
+                    if not request.is_cuda_graph_dummy:
+                        counts.extend(num_cached_tokens_per_seq[offset:end])
+                    offset = end
+            assert offset == len(num_cached_tokens_per_seq)
+        else:
+            counts = list(num_cached_tokens_per_seq)
+        self.iter_states['cached_kv_tokens_per_req'] = counts
+        self.iter_states['cached_kv_tokens_cuda_graph_padding'] = (
+            sum(num_cached_tokens_per_seq) - sum(counts))
+
     @nvtx_range("_prepare_encoder_decoder_inputs_fast")
     def _prepare_encoder_decoder_inputs_fast(
             self, scheduled_requests: ScheduledRequests,
@@ -4438,6 +4466,11 @@ class PyTorchModelEngine(ModelEngine):
         self.iter_states['num_ctx_tokens'] = num_context_tokens
         self.iter_states['num_generation_tokens'] = num_generation_requests
         self.iter_states['cached_kv_tokens'] = cached_kv_tokens
+        if self._log_cached_kv_tokens_per_req:
+            self._record_cached_kv_tokens_per_req(
+                buffers['cached_token_lengths'][:num_sequences].tolist(),
+                ((scheduled_requests.context_requests, 1),
+                 (scheduled_requests.generation_requests, 1)))
         if not self.is_warmup:
             self.previous_request_ids = generation_request_ids
 
@@ -4580,6 +4613,8 @@ class PyTorchModelEngine(ModelEngine):
         self.iter_states['num_ctx_tokens'] = 0
         self.iter_states['num_generation_tokens'] = num_requests
         self.iter_states['cached_kv_tokens'] = sum(num_cached_tokens_per_seq)
+        if self._log_cached_kv_tokens_per_req:
+            self._record_cached_kv_tokens_per_req(num_cached_tokens_per_seq)
 
         if use_mrope:
             final_position_ids = \
@@ -5953,6 +5988,13 @@ class PyTorchModelEngine(ModelEngine):
         self.iter_states['num_generation_tokens'] = num_generation_tokens
         # Count the already-cached prefix for the sequences scheduled this iteration.
         self.iter_states['cached_kv_tokens'] = sum(num_cached_tokens_per_seq)
+        if self._log_cached_kv_tokens_per_req:
+            self._record_cached_kv_tokens_per_req(
+                num_cached_tokens_per_seq,
+                ((scheduled_requests.context_requests, 1), (extend_requests, 1),
+                 (first_draft_requests, 1),
+                 (generation_requests,
+                  beam_width if generation_requests else 1)))
 
         if not self.is_warmup:
             self.previous_request_ids = all_gen_request_ids
