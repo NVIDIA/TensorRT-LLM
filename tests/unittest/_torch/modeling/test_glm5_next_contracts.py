@@ -7,7 +7,7 @@ from unittest.mock import Mock, create_autospec, patch
 
 import pytest
 import torch
-from transformers import PretrainedConfig
+from transformers import AutoConfig, PretrainedConfig
 
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import Glm5NextMamba2Metadata
 from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
@@ -33,6 +33,94 @@ from tensorrt_llm._torch.models.modeling_glm5_next_vision import (
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import get_glm5_next_layer_masks, is_glm5_next
 from tensorrt_llm.mapping import Mapping
+
+
+@pytest.mark.cpu_only
+def test_config_fallback_round_trip(tmp_path):
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    from tensorrt_llm._torch.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
+    from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
+
+    fields = _config().to_dict()
+    fields["architectures"] = ["Glm5NextForConditionalGeneration"]
+    fields["quantization_config"] = {"quant_method": "fp8", "weight_block_size": [128, 128]}
+    config = Glm5NextConfig.from_dict(fields)
+    config.save_pretrained(tmp_path)
+    loaded = load_pretrained_config(str(tmp_path))
+    assert isinstance(loaded, CONFIG_MAPPING["glm5_next"])
+    assert isinstance(AutoConfig.from_pretrained(tmp_path), type(loaded))
+    assert loaded.text_config.layer_types == fields["text_config"]["layer_types"]
+    assert loaded.text_config.linear_attn_config == fields["text_config"]["linear_attn_config"]
+    assert loaded.text_config.qk_head_dim == 256
+    assert loaded.text_config.head_dim == 0
+    assert loaded.vision_config.spatial_merge_size == 2
+    assert loaded.quantization_config == fields["quantization_config"]
+    assert get_glm5_next_layer_masks(loaded) == ([False, True], [True, False])
+    # Registration must prefer native classes when the installed Transformers has them.
+    if "transformers.models.glm5_next" in type(loaded).__module__:
+        assert type(loaded) is not Glm5NextConfig
+    else:
+        assert type(loaded.text_config) is Glm5NextTextConfig
+
+
+@pytest.mark.cpu_only
+def test_config_fallback_matches_native():
+    from tensorrt_llm._torch.configs.glm5_next import Glm5NextConfig
+
+    native = pytest.importorskip("transformers.models.glm5_next.configuration_glm5_next")
+    fields = _config().to_dict()
+    fallback = Glm5NextConfig.from_dict(fields)
+    reference = native.Glm5NextConfig.from_dict(fields)
+    for key in (
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "hidden_size",
+        "q_lora_rank",
+        "kv_lora_rank",
+        "qk_head_dim",
+        "head_dim",
+        "v_head_dim",
+        "index_topk",
+        "index_kpool",
+        "indexer_types",
+        "linear_attn_config",
+        "linear_head_dim",
+        "linear_num_heads",
+        "linear_conv_kernel_dim",
+        "linear_lower_bound",
+        "layer_types",
+        "mlp_layer_types",
+        "hc_mult",
+        "hc_eps",
+        "hc_sinkhorn_iters",
+        "swiglu_limit",
+    ):
+        assert getattr(fallback.text_config, key) == getattr(reference.text_config, key), key
+    for key in ("depth", "num_heads", "hidden_size", "spatial_merge_size", "patch_size"):
+        assert getattr(fallback.vision_config, key) == getattr(reference.vision_config, key), key
+
+
+@pytest.mark.cpu_only
+def test_text_processing_without_native_processor(monkeypatch):
+    from transformers.models.auto.processing_auto import PROCESSOR_MAPPING_NAMES
+
+    from tensorrt_llm._torch.models.modeling_glm5_next_vision import Glm5NextInputProcessor
+    from tensorrt_llm.llmapi import SamplingParams
+
+    monkeypatch.delitem(PROCESSOR_MAPPING_NAMES, "glm5_next", raising=False)
+    tokenizer = Mock(return_value=SimpleNamespace(input_ids=torch.tensor([[1, 2, 3]])))
+    with patch(
+        "tensorrt_llm._torch.models.modeling_glm5_next_vision.AutoProcessor.from_pretrained"
+    ) as load_processor:
+        processor = Glm5NextInputProcessor("unused", _config(), tokenizer=tokenizer)
+        tokens, extra = processor.call_with_text_prompt({"prompt": "hello"}, SamplingParams())
+        assert tokens == [1, 2, 3]
+        assert extra is None
+        load_processor.assert_not_called()
+        with pytest.raises(RuntimeError, match="transformers==5.17.0"):
+            processor.get_mm_max_tokens_per_item()
 
 
 def _config():

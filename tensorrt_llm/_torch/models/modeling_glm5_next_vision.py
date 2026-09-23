@@ -799,9 +799,7 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         self._tokenizer = (
             tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(model_path)
         )
-        self._processor = AutoProcessor.from_pretrained(
-            model_path, use_fast=self._use_fast, trust_remote_code=trust_remote_code
-        )
+        self._processor = None
         vision = config.vision_config
         self._merge_size = int(vision.spatial_merge_size)
         self._patch_size = int(vision.patch_size)
@@ -820,6 +818,17 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
 
     @property
     def processor(self) -> AutoProcessor:
+        if self._processor is None:
+            from transformers.models.auto.processing_auto import PROCESSOR_MAPPING_NAMES
+
+            if "glm5_next" not in PROCESSOR_MAPPING_NAMES:
+                raise RuntimeError(
+                    "GLM-5.3-Flash image/video processing requires transformers==5.17.0. "
+                    "For text-only inference on older Transformers, set disable_mm_encoder=True."
+                )
+            self._processor = AutoProcessor.from_pretrained(
+                self.model_path, use_fast=self._use_fast, trust_remote_code=self._trust_remote_code
+            )
         return self._processor
 
     @property
@@ -873,7 +882,7 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         if video_grid_thw is None:
             meta = dict(video_metadata or {})
             meta["total_num_frames"] = len(video)
-            video_grid_thw = self._processor.video_processor(
+            video_grid_thw = self.processor.video_processor(
                 videos=[video], video_metadata=[meta], do_sample_frames=False, return_tensors="pt"
             )["video_grid_thw"]
         grid = torch.as_tensor(video_grid_thw)
@@ -889,7 +898,7 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
 
     def _processor_max_patches(self) -> int:
         """HF's image-token budget expressed in pre-merge patch rows."""
-        processor = self._processor.image_processor
+        processor = self.processor.image_processor
         return int(processor.max_image_tokens) * int(processor.merge_size) ** 2
 
     def get_mm_max_tokens_per_item(
@@ -915,7 +924,7 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         side = self._max_grid_side(min(per_item, self._processor_max_patches()))
         pixels_side = side * self._patch_size
         image = Image.new("RGB", (pixels_side, pixels_side), (127, 127, 127))
-        out = self._processor.image_processor(images=[image] * num_images, return_tensors="pt")
+        out = self.processor.image_processor(images=[image] * num_images, return_tensors="pt")
         return {
             "image": {
                 "pixel_values": out["pixel_values"].to(dtype or self._dtype),
@@ -964,8 +973,8 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         # mismatch must surface as a ValueError (an HTTP error at the serving
         # boundary), not as the HF processor's iterator exhaustion.
         for placeholder, items, what in (
-            (self._processor.image_token, images or [], "image"),
-            (self._processor.video_token, video_datas or [], "video"),
+            (self.processor.image_token, images or [], "image"),
+            (self.processor.video_token, video_datas or [], "video"),
         ):
             n_placeholders = text_prompt.count(placeholder)
             if n_placeholders != len(items):
@@ -975,7 +984,7 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                     "refusing the mismatched request"
                 )
 
-        processed = self._processor(
+        processed = self.processor(
             text=[text_prompt],
             images=images,
             videos=videos,

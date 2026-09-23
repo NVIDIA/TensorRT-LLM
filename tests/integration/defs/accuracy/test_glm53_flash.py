@@ -40,7 +40,7 @@ from .accuracy_core import (
 
 
 class TestGLM53FlashFP8(LlmapiAccuracyTestHarness):
-    """GLM-5.3-Flash FP8 accuracy and runtime tests on B200.
+    """GLM-5.3-Flash FP8 accuracy and runtime tests on Blackwell.
 
     Block reuse is enabled only in the periodic-snapshot test.
     """
@@ -60,6 +60,8 @@ class TestGLM53FlashFP8(LlmapiAccuracyTestHarness):
             max_seq_len=8192,
             cuda_graph_config=CudaGraphConfig(max_batch_size=64, enable_padding=True),
             disable_overlap_scheduler=False,
+            enable_chunked_prefill=True,
+            disable_mm_encoder=True,
         )
 
     @staticmethod
@@ -68,6 +70,7 @@ class TestGLM53FlashFP8(LlmapiAccuracyTestHarness):
         assert llm.args.kv_cache_config.enable_block_reuse is False
         assert llm.args.cuda_graph_config is not None
         assert llm.args.cuda_graph_config.enable_padding is True
+        assert llm.args.disable_overlap_scheduler is False
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(4)
@@ -157,6 +160,7 @@ class TestGLM53FlashFP8(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
     def test_mmmu(self, tp_size, ep_size):
         kwargs = self._llm_kwargs(tp_size, ep_size)
+        kwargs["disable_mm_encoder"] = False
         # MMMU prompts fit in 8K (MAX_INPUT_LEN); a smaller token budget and
         # batch keep the run cheap. Profiling peaks are the same as the text
         # tests' (about 92 GiB per GPU at 16K / batch 64 on B200).
@@ -278,6 +282,7 @@ class TestGLM53FlashFP8(LlmapiAccuracyTestHarness):
         ) as llm:
             self._assert_glm5_next_stack(llm)
             assert llm.args.speculative_config.max_draft_len == 3
+            assert llm.args.enable_chunked_prefill is True
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
             assert_acceptance_length_for_llm("TestGLM53FlashFP8::test_mtp", llm)
@@ -290,7 +295,7 @@ class TestGLM53FlashFP8(LlmapiAccuracyTestHarness):
         ids=["adp-mtp3", "tp-fp8-kv", "adp-mtp3-fp8-kv"],
     )
     def test_attention_dp_mtp_and_fp8_kv(self, attention_dp, draft_len, cache_dtype):
-        """Manual regressions for the supported attention-DP, MTP and KV-cache combinations."""
+        """Regressions for the supported attention-DP, MTP and KV-cache combinations."""
         kwargs = self._llm_kwargs(4, 4)
         kwargs.update(
             enable_attention_dp=attention_dp,
@@ -337,6 +342,7 @@ class TestGLM53FlashFP8(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=True,
             enable_autotuner=False,
             return_perf_metrics=True,
+            disable_mm_encoder=True,
         ) as llm:
             assert llm.args.enable_chunked_prefill is True
             assert llm.args.max_num_tokens == max_num_tokens

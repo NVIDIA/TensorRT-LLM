@@ -1030,6 +1030,13 @@ def load_pretrained_config(model_name_or_path: str,
         model_config.text_config = transformers.Qwen3NextConfig.from_dict(
             Qwen35ConfigCompat.normalize(config_dict, require_text_config=True))
         _normalize_qwen35_quantization_config(model_config)
+    elif model_type in ("glm5_next", "glm5_next_text"):
+        from tensorrt_llm._torch import configs
+        config_name = ("Glm5NextConfig"
+                       if model_type == "glm5_next" else "Glm5NextTextConfig")
+        config_class = getattr(transformers, config_name,
+                               getattr(configs, config_name))
+        model_config = config_class.from_dict(config_dict, **kwargs)
     elif model_type == "glm_moe_dsa":
         # GLM-MoE-DSA configs tag every layer with
         # layer_types=['deepseek_sparse_attention', ...] for HF bookkeeping.
