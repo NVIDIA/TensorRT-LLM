@@ -499,8 +499,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type split_kv: cutlass.Int32
         :param cache_seqs: The cache sequences tensor with shape [batch_size]
         :type cache_seqs: cute.Tensor
-        :param kv_bounds: Reserved per-query local KV bounds for Helix.
-            Only None is supported until the packed-query path is adapted.
+        :param kv_bounds: Optional int32 per-query local KV bounds for Helix,
+            shaped [batch_size * seq_len_q], or [total_q] for compact Q.
+            Each bound lies in [max(0, K - q_len), K].
         :type kv_bounds: Optional[cute.Tensor]
         :param cum_seq_lens_q: Query indptr with shape [batch_size + 1] for
             compact variable-Q tensors; unused for fixed Q.
@@ -515,13 +516,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type stream: cuda.CUstream
 
         :raises TypeError: If tensor data types don't match or aren't supported
-        :raises NotImplementedError: If kv_bounds is not None
         """
-
-        if cutlass.const_expr(kv_bounds is not None):
-            raise NotImplementedError(
-                "Helix per-query kv_bounds are not supported by the "
-                "packed-query MLA kernel yet")
 
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = q_latent.element_type
@@ -1065,6 +1060,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 acc_lse,
                 split_kv,
                 cache_seqs,
+                kv_bounds,
                 cum_seq_lens_q,
                 block_split_kvs,
                 softmax_scale_log2,
@@ -1103,6 +1099,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 acc_lse,
                 split_kv,
                 cache_seqs,
+                kv_bounds,
                 cum_seq_lens_q,
                 block_split_kvs,
                 softmax_scale_log2,
@@ -1137,6 +1134,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     acc_lse,
                     split_kv,
                     cache_seqs,
+                    kv_bounds,
                     cum_seq_lens_q,
                     block_split_kvs,
                 )
@@ -1148,6 +1146,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     acc_lse,
                     split_kv,
                     cache_seqs,
+                    kv_bounds,
                     cum_seq_lens_q,
                     block_split_kvs,
                 )
@@ -1223,6 +1222,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         mAccLSE: Optional[cute.Tensor],
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
+        kv_bounds: Optional[cute.Tensor],
         cum_seq_lens_q: Optional[cute.Tensor],
         block_split_kvs: cute.Tensor,
         softmax_scale_log2: cutlass.Float32,
@@ -1717,7 +1717,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     k_index,
                     k_tile_count,
                     local_split_kv,
-                    _,
+                    q_begin,
                     q_len,
                     _,
                 ) = self.get_k_tile_count(
@@ -1736,6 +1736,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         mAccO=mAccO,
                         mO=mO,
                         K=cache_seqs[blk_coord[2]],
+                        kv_bounds=kv_bounds,
+                        q_begin=q_begin,
                         q_len=q_len,
                         L=mCL.shape[1],
                         tmem_ptr=tmem_ptr,
@@ -1797,7 +1799,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     k_index,
                     k_tile_count,
                     local_split_kv,
-                    _,
+                    q_begin,
                     q_len,
                     _,
                 ) = self.get_k_tile_count(
@@ -1816,6 +1818,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         mAccO=mAccO,
                         mO=mO,
                         K=cache_seqs[blk_coord[2]],
+                        kv_bounds=kv_bounds,
+                        q_begin=q_begin,
                         q_len=q_len,
                         L=mCL.shape[1],
                         tmem_ptr=tmem_ptr,
@@ -1887,6 +1891,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         mAccO=mAccO,
                         mO=mO,
                         K=cache_seqs[blk_coord[2]],
+                        kv_bounds=kv_bounds,
                         q_begin=q_begin,
                         q_len=q_len,
                         L=mCL.shape[1],
@@ -1932,6 +1937,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         mAccLSE: cute.Tensor,
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
+        kv_bounds: Optional[cute.Tensor],
         cum_seq_lens_q: Optional[cute.Tensor],
         block_split_kvs: cute.Tensor,
     ):
@@ -1986,6 +1992,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             lse_scale_ptr, cute.make_layout(self.reducer_max_splits))
 
         if is_active:
+            has_local_kv = cache_seqs[bidz] > 0
+            if cutlass.const_expr(kv_bounds is not None):
+                q_offset = bidz * self.seq_len_q
+                if cutlass.const_expr(self.is_var_q):
+                    q_offset = q_begin
+                has_local_kv = kv_bounds[q_offset + bidy] > 0
             flat_q_row = bidy * self.num_heads + head_idx
             # The physical M tile is fixed at 128 rows, so map with shift/mask.
             q_tile = flat_q_row >> 7
@@ -1995,6 +2007,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 local_split_kv = block_split_kvs[bidz]
             k_tile_total = cute.ceil_div(cache_seqs[bidz], self.mma_qk_tiler[1])
             k_tile_per_cta = cute.ceil_div(k_tile_total, local_split_kv)
+            if cutlass.const_expr(kv_bounds is not None):
+                k_tile_per_cta = cutlass.max(k_tile_per_cta, 1)
             local_split_kv = cute.ceil_div(k_tile_total, k_tile_per_cta)
 
             gLSE = mAccLSE[q_tile_row, None, q_tile, bidz]
@@ -2030,7 +2044,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     if cutlass.const_expr(self.is_var_q):
                         mLSE[head_idx, q_begin + bidy] = global_lse
                         if cutlass.const_expr(self.emit_softmax_stats):
-                            if cache_seqs[bidz] > 0:
+                            if has_local_kv:
                                 mSoftmaxStats[head_idx, q_begin + bidy,
                                               0] = (global_lse / LOG2_E)
                                 mSoftmaxStats[head_idx, q_begin + bidy, 1] = 1.0
@@ -2041,7 +2055,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     else:
                         mLSE[head_idx, bidy, bidz] = global_lse
                         if cutlass.const_expr(self.emit_softmax_stats):
-                            if cache_seqs[bidz] > 0:
+                            if has_local_kv:
                                 mSoftmaxStats[head_idx, bidy, bidz,
                                               0] = (global_lse / LOG2_E)
                                 mSoftmaxStats[head_idx, bidy, bidz, 1] = 1.0
@@ -2090,6 +2104,17 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 else:
                     mO[head_idx, element_idx, bidy, bidz] = rO[j]
         return
+
+    @cute.jit
+    def get_query_kv_bound(self, common_params: SimpleNamespace,
+                           flat_q_row: cutlass.Int32) -> cutlass.Int32:
+        # Padding rows must not read beyond this request's bounds.
+        q_token = cutlass.min(flat_q_row // self.num_heads,
+                              common_params.q_len - 1)
+        q_offset = common_params.blk_coord[2] * self.seq_len_q
+        if cutlass.const_expr(self.is_var_q):
+            q_offset = common_params.q_begin
+        return common_params.kv_bounds[q_offset + q_token]
 
     @cute.jit
     def get_valid_q_rows(self, q_tile_idx: cutlass.Int32) -> cutlass.Int32:
@@ -2985,11 +3010,18 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         if cutlass.const_expr(self.num_q_tiles > 1):
             first_q_token = (common_params.blk_coord[1] *
                              self.mma_qk_tiler[0]) // self.num_heads
-        first_mask_tile_idx = cutlass.max(
-            (common_params.K - common_params.q_len + 1 + first_q_token) //
-            tile_n,
-            cutlass.Int32(0),
-        )
+        if cutlass.const_expr(common_params.kv_bounds is not None):
+            # Helix bounds can start at K - q_len, before the causal bound.
+            first_mask_tile_idx = cutlass.max(
+                (common_params.K - common_params.q_len) // tile_n,
+                cutlass.Int32(0),
+            )
+        else:
+            first_mask_tile_idx = cutlass.max(
+                (common_params.K - common_params.q_len + 1 + first_q_token) //
+                tile_n,
+                cutlass.Int32(0),
+            )
 
         # The non-split two-softmax path still needs its global final tile in
         # phase 2 for final metadata exchange, even when that tile is dense.
@@ -3485,10 +3517,17 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         common_params.blk_coord[1] * self.mma_qk_tiler[0] +
                         common_params.blk_coord[0] * cta_m_rows + tTR_tS[i][0])
                     key_pos = tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index
-                    mask_threshold = self.num_heads * (
-                        key_pos - common_params.K + common_params.q_len)
-                    tTR_rAcc[i] = (tTR_rAcc[i] if not cute.elem_less(
-                        flat_q_row, mask_threshold) else self.acc_dtype(-1.0e6))
+                    if cutlass.const_expr(common_params.kv_bounds is not None):
+                        k_bound = self.get_query_kv_bound(
+                            common_params, flat_q_row)
+                        tTR_rAcc[i] = (tTR_rAcc[i] if cute.elem_less(
+                            key_pos, k_bound) else self.acc_dtype(-1.0e6))
+                    else:
+                        mask_threshold = self.num_heads * (
+                            key_pos - common_params.K + common_params.q_len)
+                        tTR_rAcc[i] = (tTR_rAcc[i] if not cute.elem_less(
+                            flat_q_row, mask_threshold) else
+                                       self.acc_dtype(-1.0e6))
             # reduction for row_max
             row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX,
                                                  row_max_new, 0)
@@ -3527,10 +3566,17 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         common_params.blk_coord[1] * self.mma_qk_tiler[0] +
                         common_params.blk_coord[0] * cta_m_rows + tTR_tS[i][0])
                     key_pos = tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index
-                    mask_threshold = self.num_heads * (
-                        key_pos - common_params.K + common_params.q_len)
-                    tTR_rAcc[i] = (tTR_rAcc[i] if not cute.elem_less(
-                        flat_q_row, mask_threshold) else self.acc_dtype(-1.0e6))
+                    if cutlass.const_expr(common_params.kv_bounds is not None):
+                        k_bound = self.get_query_kv_bound(
+                            common_params, flat_q_row)
+                        tTR_rAcc[i] = (tTR_rAcc[i] if cute.elem_less(
+                            key_pos, k_bound) else self.acc_dtype(-1.0e6))
+                    else:
+                        mask_threshold = self.num_heads * (
+                            key_pos - common_params.K + common_params.q_len)
+                        tTR_rAcc[i] = (tTR_rAcc[i] if not cute.elem_less(
+                            flat_q_row, mask_threshold) else
+                                       self.acc_dtype(-1.0e6))
                 # reduction for row_max after manual masking
                 row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX,
                                                      row_max_new, 0)
@@ -4150,27 +4196,41 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                    epilogue_params.softmax_scale_log2 * row_max)
             if cutlass.const_expr(self.warps_in_n == 2):
                 if cute.elem_less(cLSE[tidx][0], common_params.H):
+                    has_local_kv = True
+                    if cutlass.const_expr(common_params.kv_bounds is not None):
+                        flat_q_row = (
+                            common_params.blk_coord[1] * self.mma_qk_tiler[0] +
+                            cLSE[tidx][0])
+                        k_bound = self.get_query_kv_bound(
+                            common_params, flat_q_row)
+                        has_local_kv = k_bound > 0
                     gLSE[tidx] = lse
                     if cutlass.const_expr(self.emit_softmax_stats
                                           and epilogue_params.mAccLSE is None
                                           and iter_n == 0):
-                        if self.is_var_q:
+                        if cutlass.const_expr(self.is_var_q):
                             flat_q_row = (
                                 common_params.q_begin * self.num_heads +
                                 common_params.blk_coord[1] *
                                 self.mma_qk_tiler[0] + cLSE[tidx][0])
-                            epilogue_params.mSoftmaxStats[flat_q_row, 0, 0,
-                                                          0] = lse / LOG2_E
-                            epilogue_params.mSoftmaxStats[flat_q_row, 0, 0,
-                                                          1] = 1.0
+                            epilogue_params.mSoftmaxStats[
+                                flat_q_row, 0, 0,
+                                0] = (lse / LOG2_E
+                                      if has_local_kv else -self.lse_dtype.inf)
+                            epilogue_params.mSoftmaxStats[
+                                flat_q_row, 0, 0,
+                                1] = 1.0 if has_local_kv else 0.0
                         else:
                             head_idx = cLSE[tidx][0]
                             epilogue_params.mSoftmaxStats[
                                 head_idx, common_params.blk_coord[1],
-                                common_params.blk_coord[2], 0] = lse / LOG2_E
+                                common_params.blk_coord[2],
+                                0] = (lse / LOG2_E
+                                      if has_local_kv else -self.lse_dtype.inf)
                             epilogue_params.mSoftmaxStats[
                                 head_idx, common_params.blk_coord[1],
-                                common_params.blk_coord[2], 1] = 1.0
+                                common_params.blk_coord[2],
+                                1] = 1.0 if has_local_kv else 0.0
 
             cute.arch.fence_view_async_tmem_load()
             common_params.mma_o_pipeline.consumer_release(mma_o_consumer_state)
