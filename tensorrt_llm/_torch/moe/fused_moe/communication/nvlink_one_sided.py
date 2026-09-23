@@ -25,9 +25,11 @@ NVLINK One-Sided supports post-quant dispatch.
 """
 
 import os
+import re
 import sys
 from typing import Callable, Dict, List, Optional, Tuple
 
+import pynvml
 import torch
 
 from tensorrt_llm._mnnvl_utils import CftMnnvlMemory, MnnvlCheckpointCommunicator, MnnvlMemory
@@ -57,6 +59,7 @@ _CFT_DEFAULT_MAX_BATCH_FOR_COMBINE = 128
 _CFT_MAX_BATCH_FOR_COMBINE_ENV = "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_COMBINE"
 FORCE_CFT_ENV = "TRTLLM_MOE_A2A_FORCE_CFT"
 _CFT_ALIGNMENT_BYTES = 16
+_CFT_MIN_DRIVER_BRANCH = 615
 
 
 def get_force_cft() -> bool | None:
@@ -79,6 +82,46 @@ def resolve_can_use_cft(can_use_cft_counted_writes: bool) -> bool:
     if force_cft is None:
         return can_use_cft_counted_writes
     return force_cft
+
+
+def _get_nvidia_driver_version() -> str | None:
+    try:
+        try:
+            pynvml.nvmlDeviceGetCount()
+        except pynvml.NVMLError_Uninitialized:
+            pynvml.nvmlInit()
+        value = pynvml.nvmlSystemGetDriverVersion()
+    except pynvml.NVMLError as error:
+        tllm_logger.warning_once(
+            "CFT counted writes disabled: failed to query the NVIDIA driver "
+            f"version via NVML ({error}). Falling back to fence-based dispatch.",
+            key="moe_a2a_cft_driver_query_failed",
+        )
+        return None
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return str(value)
+
+
+def cft_driver_is_supported(driver_version: str | bytes | None) -> bool:
+    if isinstance(driver_version, bytes):
+        driver_version = driver_version.decode(errors="replace")
+    if not driver_version:
+        return False
+    match = re.match(r"^(\d+)(?:\.|$)", driver_version.strip())
+    return bool(match and int(match.group(1)) >= _CFT_MIN_DRIVER_BRANCH)
+
+
+def resolve_cft_counted_writes(
+    can_use_cft: bool,
+    force_cft: bool | None,
+    driver_version: str | bytes | None,
+) -> bool:
+    if not can_use_cft or force_cft is False:
+        return False
+    if force_cft is True:
+        return True
+    return cft_driver_is_supported(driver_version)
 
 
 def should_use_cft(
@@ -347,6 +390,27 @@ class NVLinkOneSided(Communication):
         # without the override the CFT path cannot be reached at all. Leaving
         # the variable unset keeps CFT disabled, as before.
         can_use_cft_counted_writes = resolve_can_use_cft(can_use_cft_counted_writes)
+
+
+        driver_version = None
+        if can_use_cft_counted_writes and self._force_cft is None:
+            driver_version = _get_nvidia_driver_version()
+        can_use_cft_counted_writes = resolve_cft_counted_writes(
+            can_use_cft_counted_writes,
+            self._force_cft,
+            driver_version,
+        )
+        if (
+            not can_use_cft_counted_writes
+            and self._force_cft is None
+            and driver_version is not None
+        ):
+            tllm_logger.warning_once(
+                "CFT counted writes disabled: NVIDIA driver "
+                f"{driver_version} is below required {_CFT_MIN_DRIVER_BRANCH}.00. "
+                "Falling back to fence-based dispatch.",
+                key=f"moe_a2a_cft_driver_unsupported_{driver_version}",
+            )
         self.can_use_cft_counted_writes = can_use_cft_counted_writes
         if self._force_cft is None:
             self.cft_max_batch_for_dispatch = _get_cft_max_batch_for_dispatch()
