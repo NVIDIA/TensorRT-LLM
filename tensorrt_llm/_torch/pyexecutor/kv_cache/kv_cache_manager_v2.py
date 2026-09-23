@@ -4658,6 +4658,17 @@ class KVCacheManagerV2(BaseResourceManager):
 
         return kv_cache_stats
 
+    def get_primary_block_counts(self) -> tuple[int, int]:
+        """Return used and total GPU slots for scheduler-owned load sampling."""
+        if KV_CACHE_MANAGER_V2_BACKEND == "python":
+            stats = self._get_storage_statistics(GPU_LEVEL)
+            return (
+                sum(stat.total - stat.available for stat in stats),
+                sum(stat.total for stat in stats),
+            )
+        used, total = self.impl.get_block_counts(GPU_LEVEL)
+        return int(used), int(total)
+
     def flush_iteration_events(self):
         event_manager = self.event_manager
         if event_manager is not None:

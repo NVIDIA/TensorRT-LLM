@@ -14,6 +14,8 @@
 # limitations under the License.
 
 import socket
+import threading
+import uuid
 from types import SimpleNamespace
 from typing import Callable
 
@@ -62,15 +64,19 @@ def _await_subscription(publisher: ZmqEventPublisher, subscriber: zmq.Socket) ->
     A PUB socket silently drops everything published before a subscriber's
     subscription has propagated, and that window is not bounded by any delay the test
     can pick -- so synchronise on an actual received message instead of sleeping.
-    Returns the number of probes published, which is the sequence number the next real
-    batch will carry.
+    Returns the sequence number the next real batch will carry. Sequence origins
+    identify publisher incarnations and need not start at zero.
     """
-    for probes in range(1, _SUBSCRIBE_ATTEMPTS + 1):
-        publisher.publish(KVEventBatch(ts=0.0, events=[]))
+    for attempt in range(_SUBSCRIBE_ATTEMPTS):
+        # Match the latest probe, not an earlier queued one: encoding is async.
+        marker = -float(attempt + 1)
+        publisher.publish(KVEventBatch(ts=marker, events=[]))
         if subscriber.poll(_PROBE_TIMEOUT_MS):
+            frames = subscriber.recv_multipart()
             while subscriber.poll(0):
-                subscriber.recv_multipart()
-            return probes
+                frames = subscriber.recv_multipart()
+            if msgspec.msgpack.decode(frames[2])[0] == marker:
+                return int.from_bytes(frames[1], "big") + 1
     raise _NotReceived("subscription never propagated")
 
 
@@ -227,8 +233,7 @@ def test_streaming_fast_path_publishes_only_full_max_window_blocks() -> None:
     first_wire_hash = int.from_bytes(first_hash[:8], "big") - 2**64
     second_wire_hash = int.from_bytes(second_hash[:8], "big")
 
-    # A fresh manager per attempt restarts sequence numbers at 0 and clears the
-    # stored-block dedup state, so a retry replays the scenario exactly.
+    # A fresh manager per attempt clears the stored-block dedup state.
     def scenario(port: int) -> None:
         bind_endpoint = f"tcp://*:{port}"
         subscriber = context.socket(zmq.SUB)
@@ -335,6 +340,42 @@ def test_streaming_fast_path_publishes_only_full_max_window_blocks() -> None:
     _run_on_fresh_port(scenario)
 
 
+def test_replay_preserves_live_wire_frames() -> None:
+    """Reconnect recovery must retain wire identity without a gRPC bridge."""
+    identity = uuid.uuid4().hex
+    endpoint = f"inproc://kv-live-{identity}"
+    replay_endpoint = f"inproc://kv-replay-{identity}"
+    publisher = ZmqEventPublisher(0, endpoint=endpoint, replay_endpoint=replay_endpoint)
+    context = zmq.Context.instance()
+    subscriber = context.socket(zmq.SUB)
+    subscriber.setsockopt(zmq.SUBSCRIBE, b"")
+    subscriber.connect(endpoint)
+    replay = context.socket(zmq.DEALER)
+    replay.connect(replay_endpoint)
+    try:
+        publisher.start()
+        _await_subscription(publisher, subscriber)
+        frames = []
+        for timestamp in (41.0, 42.0):
+            assert publisher.publish(KVEventBatch(ts=timestamp, events=[]))
+            assert subscriber.poll(_RECEIVE_TIMEOUT_MS)
+            frames.append(subscriber.recv_multipart())
+        # Receiving the second batch guarantees the first entered the replay ring.
+        replay.send_multipart([b"", frames[0][1]])
+        assert replay.poll(_RECEIVE_TIMEOUT_MS)
+        assert replay.recv_multipart() == [b"", *frames[0]]
+        while True:
+            assert replay.poll(_RECEIVE_TIMEOUT_MS)
+            response = replay.recv_multipart()
+            if response[2] == publisher.END_SEQ:
+                break
+            assert response == [b"", *frames[1]]
+    finally:
+        publisher.shutdown()
+        subscriber.close(linger=0)
+        replay.close(linger=0)
+
+
 def test_streaming_removals_are_never_dropped_by_the_entry_cap() -> None:
     """Removals must survive the per-iteration cap or the consumer desyncs."""
     manager = StreamingKVCacheEventManager(
@@ -387,30 +428,107 @@ def test_streaming_removals_are_never_dropped_by_the_entry_cap() -> None:
         manager.shutdown()
 
 
-def test_dropped_batches_leave_a_sequence_gap() -> None:
-    """A batch lost to a full queue must be observable as a missing sequence number."""
-    # Left unstarted on purpose: publish() only touches the queue, so the drop path is
-    # exercised without binding a socket or draining the queue from a live thread.
+def test_dropped_batches_schedule_resynchronization() -> None:
+    """Queue loss invalidates buffered history instead of hiding stale cache state."""
     publisher = ZmqEventPublisher(
         data_parallel_rank=0,
         endpoint="inproc://kv-events-drop-test",
         max_queue_size=1,
     )
     try:
-        assert publisher.publish(KVEventBatch(ts=0.0, events=[])) is True
-        assert publisher.publish(KVEventBatch(ts=1.0, events=[])) is False
+        assert publisher.publish(KVEventBatch(ts=0.0, events=[]))
+        assert not publisher.publish(KVEventBatch(ts=1.0, events=[]))
         assert publisher.dropped_batches == 1
-
-        # The accepted batch kept seq 0 and the dropped batch consumed seq 1, so the
-        # next batch is seq 2: subscribers see a hole rather than a contiguous stream
-        # that hides the loss.
-        seq, _ = publisher._event_queue.get_nowait()
-        assert seq == 0
-        assert publisher.publish(KVEventBatch(ts=2.0, events=[])) is True
-        next_seq, _ = publisher._event_queue.get_nowait()
-        assert next_seq == 2
+        assert publisher._resync_required.is_set()
+        epoch, _, _ = publisher._event_queue.get_nowait()
+        assert epoch < publisher._queue_epoch
     finally:
         publisher.shutdown()
+
+
+def test_overflow_during_encoding_fences_the_inflight_batch(monkeypatch) -> None:
+    """Encoding stays off the caller, remains charged, and cannot cross a reset."""
+    from tensorrt_llm._torch.pyexecutor import kv_cache_events as module
+
+    batch = KVEventBatch(ts=41.0, events=[])
+    monkeypatch.setattr(module, "MAX_PUBLISH_QUEUE_BYTES", module._batch_memory_charge(batch))
+    publisher = ZmqEventPublisher(0, endpoint=f"inproc://kv-encode-{uuid.uuid4().hex}")
+    encoding = threading.Event()
+    release = threading.Event()
+    drained = threading.Event()
+    received = []
+    encode = msgspec.msgpack.encode
+    caller = threading.get_ident()
+
+    def delayed_encode(value):
+        if value is batch:
+            assert threading.get_ident() != caller
+            encoding.set()
+            assert release.wait(5)
+        return encode(value)
+
+    def capture(payload):
+        decoded = msgspec.msgpack.decode(payload)
+        received.append(decoded)
+        if decoded[0] == 43.0:
+            drained.set()
+        return True
+
+    monkeypatch.setattr(msgspec.msgpack, "encode", delayed_encode)
+    monkeypatch.setattr(publisher, "_send_payload", capture)
+    try:
+        publisher.start()
+        assert publisher.publish(batch)
+        assert encoding.wait(2)
+        # The queue is empty, but its in-flight batch still owns the byte budget.
+        assert not publisher.publish(KVEventBatch(ts=42.0, events=[]))
+        release.set()
+        publisher._event_queue.join()
+        assert publisher.publish(KVEventBatch(ts=43.0, events=[]))
+        assert drained.wait(2)
+        assert not any(value[0] in (41.0, 42.0) for value in received)
+        assert received[-2][1] == [{"type": "AllBlocksCleared"}]
+        assert received[-1][0] == 43.0
+    finally:
+        release.set()
+        publisher.shutdown()
+
+
+def test_native_capture_loss_invalidates_incomplete_batch(monkeypatch) -> None:
+    """A native capture overflow must reach the wire as a reset, even when idle."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache_events import AllBlocksCleared
+
+    stats = SimpleNamespace(
+        stored_blocks=0,
+        removed_blocks=0,
+        partial_blocks_suppressed=0,
+        non_target_life_cycles_ignored=0,
+        dropped_events=1,
+    )
+    sink = SimpleNamespace(drain_iteration_events=lambda: [], stats=stats)
+    from tensorrt_llm._torch.pyexecutor import kv_cache_events as module
+
+    monkeypatch.setattr(
+        module.kv_cache_manager_v2_runtime,
+        "StreamingEventSink",
+        lambda **kwargs: sink,
+        raising=False,
+    )
+    manager = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=2,
+        max_window_size=128,
+        backend="cpp",
+    )
+    published = []
+    monkeypatch.setattr(
+        manager._publisher, "publish", lambda batch: published.append(batch) or True
+    )
+    manager.flush_iteration_events()
+    manager.flush_iteration_events()
+    assert len(published) == 1
+    assert isinstance(published[0].events[0], AllBlocksCleared)
 
 
 def test_construction_binds_nothing_until_start() -> None:

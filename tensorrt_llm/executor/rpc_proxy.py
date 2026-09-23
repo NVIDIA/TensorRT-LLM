@@ -121,12 +121,25 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
     def get_kv_cache_capacity(self) -> dict:
         """Get static primary/GPU KV cache capacity from the runtime via RPC."""
         try:
-            capacity = self.rpc_client.fetch_kv_cache_capacity_async().remote()
+            capacity = self.rpc_client.fetch_kv_cache_capacity_async().remote(
+                timeout=1.0)
             if isinstance(capacity, str):
                 capacity = json.loads(capacity)
             return capacity if isinstance(capacity, dict) else {}
         except (RPCError, json.JSONDecodeError) as e:
             logger.debug(f"Error fetching kv cache capacity via RPC: {e}")
+            return {}
+
+    def get_kv_cache_load(self) -> dict:
+        """Get a primary/GPU KV cache load snapshot via RPC."""
+        try:
+            load = self.rpc_client.fetch_kv_cache_load_async().remote(
+                timeout=1.0)
+            if isinstance(load, str):
+                load = json.loads(load)
+            return load if isinstance(load, dict) else {}
+        except (RPCError, json.JSONDecodeError) as e:
+            logger.debug(f"Error fetching kv cache load via RPC: {e}")
             return {}
 
     def get_startup_metrics(self) -> dict | None:

@@ -2435,6 +2435,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("get_page_index_upper_bound", &kv::KvCacheManager::getPageIndexUpperBound, nb::arg("layer_id"),
             nb::arg("data_role"), nb::call_guard<nb::gil_scoped_release>())
         .def(
+            "get_block_counts",
+            [](kv::KvCacheManager const& self, int cacheLevel)
+            { return self.getBlockCounts(kv::CacheLevel{cacheLevel}); },
+            nb::arg("cache_level") = kv::kHotLevel.value(), nb::call_guard<nb::gil_scoped_release>())
+        .def(
             "resize",
             [](kv::KvCacheManager& self, int cacheLevel, size_t quota, bool bestEfforts)
             { return self.resize(kv::CacheLevel{cacheLevel}, quota, bestEfforts); },

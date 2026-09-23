@@ -294,6 +294,20 @@ size_t KvCacheManager::getPageIndexUpperBound(LayerId layerId, DataRole role) co
         * static_cast<size_t>(attr.expansion);
 }
 
+std::pair<int64_t, int64_t> KvCacheManager::getBlockCounts(CacheLevel level) const
+{
+    auto const apiLock = lockShared();
+    int64_t used = 0;
+    int64_t total = 0;
+    for (PoolGroupIndex poolGroup{0}; poolGroup < mStorage->numPoolGroups(level); ++poolGroup)
+    {
+        auto const stats = mStorage->getStatistics(level, poolGroup);
+        used += stats.unavailable();
+        total += stats.total;
+    }
+    return {used, total};
+}
+
 int KvCacheManager::getPageIndexScale(LayerId layerId, DataRole role) const
 {
     auto const& attr = mStorage->getBufferAttr(layerId, role);

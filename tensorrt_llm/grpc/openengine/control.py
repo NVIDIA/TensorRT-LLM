@@ -7,8 +7,10 @@ Reported capabilities describe what ``Generate`` accepts, not how the engine was
 built: a capability a client acts on and ``Generate`` then rejects turns
 discovery into a per-request failure.
 
-The LoRA lifecycle and KV-event RPCs return ``UNIMPLEMENTED`` -- the LLM API has
-no runtime adapter load/unload, and KV events are published out of band.
+The LoRA lifecycle RPCs return ``UNIMPLEMENTED``: the LLM API has no runtime
+adapter load/unload. KV-event discovery advertises the engine's streaming
+publisher, which is off unless ``kv_cache_config.kv_events_config`` enables it.
+Event delivery is direct ZMQ; ``SubscribeKvEvents`` remains unimplemented.
 """
 
 import asyncio
@@ -27,11 +29,20 @@ from openengine.v1 import (
 )
 
 from tensorrt_llm import __version__ as trtllm_version
+from tensorrt_llm._torch.pyexecutor.kv_cache_events import HEARTBEAT_INTERVAL_SECONDS
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import MAX_TOP_LOGPROBS
 
 from .capabilities import supported_guides
 from .errors import AbortFailedError
+from .kv_events import (
+    KvEventsUnavailableError,
+    data_parallel_size,
+    events_config,
+    resolve_advertise_host,
+    resolve_sources,
+    to_proto_source,
+)
 
 __all__ = ["OpenEngineControlServicer"]
 
@@ -66,6 +77,7 @@ _MODE_BY_GUIDE_FIELD = {
 }
 
 _INFERENCE_PROBE_TIMEOUT_SECONDS = 30.0
+_LOAD_SNAPSHOT_CACHE_SECONDS = 0.05
 
 
 def _abort_quietly(handle: Any, reason: str) -> None:
@@ -100,6 +112,8 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         inference: The paired inference servicer, whose in-flight request table
             backs ``Abort`` and ``GetLoad``.
         kv_transfer_backend: KV cache transfer backend name, when configured.
+        bind_host: Interface the server listens on. Used to name a routable host
+            for KV event sources when the publishers bind a wildcard.
     """
 
     def __init__(
@@ -108,12 +122,34 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         model: str,
         inference: Any,
         kv_transfer_backend: str = "",
+        bind_host: str = "",
     ) -> None:
         self._llm = llm
         self._model = model
         self._inference = inference
         self._kv_transfer_backend = kv_transfer_backend
+        self._advertise_host = resolve_advertise_host(bind_host)
         self._probe: Optional[asyncio.Future] = None
+        self._load_snapshot: dict = {}
+        self._load_snapshot_deadline = 0.0
+        self._load_snapshot_lock = asyncio.Lock()
+        self._load_reporting_enabled = bool(getattr(llm.args, "_enable_routing_load", False))
+
+    async def _get_kv_cache_load(self) -> dict:
+        """Coalesce concurrent control-plane polls into one engine query."""
+        if not self._load_reporting_enabled:
+            return {}
+        now = time.monotonic()
+        if now < self._load_snapshot_deadline:
+            return self._load_snapshot
+        async with self._load_snapshot_lock:
+            now = time.monotonic()
+            if now >= self._load_snapshot_deadline:
+                executor = getattr(self._llm, "_executor", None)
+                getter = getattr(executor, "get_kv_cache_load", None)
+                self._load_snapshot = await asyncio.to_thread(getter) if callable(getter) else {}
+                self._load_snapshot_deadline = now + _LOAD_SNAPSHOT_CACHE_SECONDS
+        return self._load_snapshot
 
     def _engine_is_healthy(self) -> bool:
         """Readiness via the predicate the engine's own HTTP /health uses.
@@ -162,6 +198,10 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             ("tensor_parallel_size", args.tensor_parallel_size),
             ("pipeline_parallel_size", args.pipeline_parallel_size),
             ("decode_context_parallel_size", args.context_parallel_size),
+            # One KV event publisher binds per attention-DP rank, so a client
+            # subscribing to GetKvEventSources needs this to tell a complete set
+            # of sources from a partial one.
+            ("data_parallel_size", data_parallel_size(self._llm)),
         ):
             size = _positive_int(value)
             if size is not None:
@@ -197,7 +237,29 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         block_size = _positive_int(self._llm.args.kv_cache_config.tokens_per_block)
         if block_size is not None:
             capacity.kv_block_size = block_size
+        executor = getattr(self._llm, "_executor", None)
+        capacity_getter = getattr(executor, "get_kv_cache_capacity", None)
+        if callable(capacity_getter):
+            kv_capacity = await asyncio.to_thread(capacity_getter)
+            node = kv_capacity.get("openEngineNode")
+            if node is not None:
+                info.extra.update({"trtllm_node": node})
+            local_blocks = _positive_int(kv_capacity.get("maxNumBlocks"))
+            if local_blocks is not None:
+                capacity.total_kv_blocks = local_blocks * data_parallel_size(self._llm)
         info.capacity.CopyFrom(capacity)
+
+        # Optional engine metadata, not a routing policy or a protocol extension.
+        # The request handler still validates every strict DP-rank hint.
+        info.extra.update({"trtllm_supports_dp_rank_targeting": True})
+        if events_config(self._llm) is not None:
+            info.extra.update(
+                {"kv_event_heartbeat_interval_ms": int(HEARTBEAT_INTERVAL_SECONDS * 1000)}
+            )
+        if self._load_reporting_enabled:
+            snapshot = await self._get_kv_cache_load()
+            if snapshot.get("ranks"):
+                info.capacity.total_kv_blocks = snapshot["totalKvBlocks"]
 
         return info
 
@@ -268,14 +330,39 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         request: server_pb2.GetLoadRequest,
         context: grpc.aio.ServicerContext,
     ) -> server_pb2.LoadInfo:
-        load = server_pb2.LoadInfo(
-            instance_id=str(getattr(self._llm, "llm_id", "") or ""),
-            timestamp_unix_nanos=time.time_ns(),
-        )
-        # Scheduler internals are only available through the streaming stats
-        # iterator, which a point query cannot sample without blocking, so they
-        # stay unset.
+        snapshot = await self._get_kv_cache_load()
+        if self._load_reporting_enabled and not snapshot.get("ranks"):
+            await context.abort(
+                grpc.StatusCode.UNAVAILABLE,
+                "KV occupancy is enabled but no load snapshot is available",
+            )
+        load = server_pb2.LoadInfo(instance_id=str(getattr(self._llm, "llm_id", "") or ""))
+        # This timestamp describes when the RPC observed the snapshot. The
+        # scheduler sample itself may remain unchanged while a healthy engine is
+        # idle; exposing its age here would make routers reject healthy workers.
+        load.timestamp_unix_nanos = time.time_ns()
         load.running_requests = self._inference.active_request_count()
+        used_blocks = snapshot.get("usedKvBlocks")
+        total_blocks = snapshot.get("totalKvBlocks")
+        if isinstance(used_blocks, int) and used_blocks >= 0:
+            load.used_kv_blocks = used_blocks
+        if isinstance(total_blocks, int) and total_blocks > 0:
+            load.total_kv_blocks = total_blocks
+        if request.include_per_rank:
+            for rank in snapshot.get("ranks", []):
+                rank_load = load.ranks.add()
+                rank_load.data_parallel_rank = int(rank["rank"])
+                rank_used = rank.get("usedKvBlocks")
+                rank_total = rank.get("totalKvBlocks")
+                rank_running = rank.get("runningRequests")
+                if data_parallel_size(self._llm) == 1:
+                    rank_running = load.running_requests
+                if isinstance(rank_used, int) and rank_used >= 0:
+                    rank_load.used_kv_blocks = rank_used
+                if isinstance(rank_total, int) and rank_total > 0:
+                    rank_load.total_kv_blocks = rank_total
+                if isinstance(rank_running, int) and rank_running >= 0:
+                    rank_load.running_requests = rank_running
         return load
 
     # -- Health and lifecycle ----------------------------------------------
@@ -473,14 +560,64 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             "runtime LoRA enumeration is not supported",
         )
 
+    async def _requested_sources(
+        self,
+        ranks: Any,
+        context: grpc.aio.ServicerContext,
+    ) -> list:
+        """Resolve the publishers for `ranks`, or every rank when it is empty.
+
+        Returns an empty list when KV events are disabled: the RPC is
+        implemented, there is simply nothing to publish, and a client can tell
+        that from "not supported" by the absence of an UNIMPLEMENTED status.
+        """
+        try:
+            rank_hosts = None
+            capacity = {}
+            if events_config(self._llm) is not None:
+                executor = getattr(self._llm, "_executor", None)
+                getter = getattr(executor, "get_kv_cache_capacity", None)
+                if callable(getter):
+                    capacity = await asyncio.to_thread(getter)
+                    rank_hosts = capacity.get("kvEventRankHosts")
+            if "kvEventSources" in capacity:
+                sources = [kv_pb2.KvEventSource(**source) for source in capacity["kvEventSources"]]
+            else:
+                sources = resolve_sources(self._llm, self._advertise_host, rank_hosts)
+        except KvEventsUnavailableError as error:
+            await context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(error))
+        if not sources:
+            return []
+        if not ranks:
+            return sources
+        by_rank = {source.data_parallel_rank: source for source in sources}
+        unknown = sorted(set(ranks) - by_rank.keys())
+        if unknown:
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"no KV event source for data-parallel rank(s) {unknown}; this engine "
+                f"publishes ranks 0..{len(sources) - 1}",
+            )
+        # Deduplicated and ordered by rank: a client repeating a rank must not
+        # get two subscriptions to the same socket.
+        return [by_rank[rank] for rank in sorted(set(ranks))]
+
     async def GetKvEventSources(
         self,
         request: kv_pb2.GetKvEventSourcesRequest,
         context: grpc.aio.ServicerContext,
     ) -> kv_pb2.GetKvEventSourcesResponse:
-        await context.abort(
-            grpc.StatusCode.UNIMPLEMENTED,
-            "KV cache events are not published over the OpenEngine Control service",
+        sources = await self._requested_sources(request.data_parallel_ranks, context)
+        if not sources:
+            return kv_pb2.GetKvEventSourcesResponse()
+        config = events_config(self._llm)
+        return kv_pb2.GetKvEventSourcesResponse(
+            sources=[
+                source
+                if isinstance(source, kv_pb2.KvEventSource)
+                else to_proto_source(source, config, _SCHEMA_REVISION)
+                for source in sources
+            ]
         )
 
     async def SubscribeKvEvents(
@@ -490,5 +627,5 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
     ):
         await context.abort(
             grpc.StatusCode.UNIMPLEMENTED,
-            "KV cache events are not published over the OpenEngine Control service",
+            "SubscribeKvEvents is not implemented; use GetKvEventSources and subscribe directly over ZMQ",
         )

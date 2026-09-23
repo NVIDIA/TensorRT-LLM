@@ -166,6 +166,9 @@ public:
     int getPageStride(LayerId layerId, DataRole role) const;
     size_t getPageIndexUpperBound(LayerId layerId, DataRole role) const;
 
+    // Return {used, total} slots for one cache level.
+    std::pair<int64_t, int64_t> getBlockCounts(CacheLevel level = kHotLevel) const;
+
     // Scale factor: base_page_index * scale → kernel page index.
     int getPageIndexScale(LayerId layerId, DataRole role) const;
 

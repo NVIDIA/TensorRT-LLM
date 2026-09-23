@@ -73,6 +73,18 @@ TOKENS_PER_BLOCK = 4
 MAX_SEQ_LEN = 16
 
 
+def test_python_backend_primary_block_counts(monkeypatch):
+    """Python KVCM2 must sample all groups without a C++-only method."""
+    monkeypatch.setattr(kv_cache_v2_module, "KV_CACHE_MANAGER_V2_BACKEND", "python")
+    manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    manager.impl = object()
+    manager._get_storage_statistics = lambda level: [
+        SimpleNamespace(total=10, available=3),
+        SimpleNamespace(total=20, available=5),
+    ]
+    assert manager.get_primary_block_counts() == (22, 30)
+
+
 class _CacheTierInitError(Exception):
     pass
 

@@ -436,6 +436,10 @@ class GenerationExecutor(ABC):
         """
         return {}
 
+    def get_kv_cache_load(self) -> dict:
+        """Get a non-destructive primary/GPU KV cache load snapshot."""
+        return {}
+
     def aget_stats(self, timeout: float) -> IterationResult:
         """Get iteration statistics from the runtime.
 

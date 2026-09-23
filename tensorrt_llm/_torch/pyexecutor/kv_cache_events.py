@@ -16,11 +16,7 @@
 # This module defines TensorRT-LLM's KV cache event wire format: msgpack event batches
 # published over ZeroMQ in the three-frame (topic, seq, payload) framing that external
 # KV-cache-aware routers expect. Each event encodes as a map tagged with a "type" key,
-# the form documented for custom router backends, so routers consume these batches
-# without translation. This differs from vLLM's vllm/distributed/kv_events.py, whose
-# structs set array_like=True and encode as tagged positional arrays; keeping the map
-# form leaves field order out of the wire contract. The batch envelope is positional
-# in both.
+# keeping field order out of the event contract. The batch envelope is positional.
 
 from __future__ import annotations
 
@@ -30,7 +26,6 @@ import time
 import traceback
 from abc import ABC, abstractmethod
 from collections import deque
-from itertools import count
 from queue import Queue
 from typing import Any, Optional
 
@@ -43,8 +38,19 @@ from tensorrt_llm.runtime import kv_cache_manager_v2 as kv_cache_manager_v2_runt
 from tensorrt_llm.runtime.kv_cache_hash import truncate_sha256_hash_to_int64
 from tensorrt_llm.runtime.kv_cache_manager_v2._event_manager import KVCacheEvent, KVCacheEventDiff
 
-# Subscribers decode block hashes as 64-bit ints, so a bytes value would fail the
-# decode for the entire batch.
+# Bound retained payload memory independently of the number of batches.
+MAX_PUBLISH_QUEUE_BYTES = 64 * 1024 * 1024
+MAX_REPLAY_BUFFER_BYTES = 64 * 1024 * 1024
+HEARTBEAT_INTERVAL_SECONDS = 5.0
+
+
+def _enable_ipv6_for_endpoint(socket_: zmq.Socket, endpoint: str) -> None:
+    """Enable IPv6 on a socket whose TCP endpoint names an IPv6 host."""
+    if endpoint.startswith("tcp://") and ":" in endpoint[len("tcp://") :].rpartition(":")[0]:
+        socket_.setsockopt(zmq.IPV6, 1)
+
+
+# Subscribers decode block hashes as 64-bit ints, not bytes.
 ExternalBlockHash = int
 EventTokenId = int | str
 
@@ -121,6 +127,28 @@ class KVEventBatch(EventBatch):
     events: list[BlockStored | BlockRemoved | AllBlocksCleared]
 
 
+def _batch_memory_charge(batch: EventBatch) -> int:
+    """Conservatively charge engine DTOs and their in-flight encoding together.
+
+    Engine tokens are int64 IDs or 64-character SHA256 hex digests. The charge
+    includes Python objects, overallocated lists, and wire bytes without walking
+    every token. Engine DTOs leave variable-size optional metadata unset; this is
+    not a size estimator for arbitrary wire messages or a process RSS limit.
+    Ownership passes to the publisher; producers must not mutate an accepted
+    batch. Replay storage has its own independent byte budget.
+    """
+    charge = 1024
+    for event in batch.events:
+        charge += 1024
+        if isinstance(event, (BlockStored, BlockRemoved)):
+            charge += 64 * len(event.block_hashes)
+        if isinstance(event, BlockStored):
+            charge += 256 * len(event.token_ids)
+            if event.mm_keys is not None:
+                charge += sum(128 + 256 * len(keys) for keys in event.mm_keys)
+    return charge
+
+
 class EventPublisher(ABC):
     """Publishes KV cache event wire batches for one cache rank."""
 
@@ -157,10 +185,9 @@ class NullEventPublisher(EventPublisher):
 class ZmqEventPublisher(EventPublisher):
     """Publishes event batches over the three-frame ZeroMQ wire protocol.
 
-    Delivery is best effort, but loss is observable: :meth:`publish` reserves a sequence
-    number per accepted batch, so a dropped batch leaves a gap. Subscribers must treat a
-    gap -- including a replay that starts above the requested ``start_seq`` because
-    ``buffer_steps`` evicted older batches -- as lost KV-cache state and resynchronize.
+    Delivery is best effort. Internally detected queue or send loss schedules an
+    ``AllBlocksCleared`` control batch. ZeroMQ may independently drop for a slow
+    subscriber at its HWM; that subscriber observes the next sequence gap.
     """
 
     SHUTDOWN_TIMEOUT = 1.0
@@ -172,24 +199,43 @@ class ZmqEventPublisher(EventPublisher):
         endpoint: str = "tcp://*:5557",
         replay_endpoint: str | None = None,
         buffer_steps: int = 10_000,
-        hwm: int = 100_000,
+        hwm: int = 256,
         max_queue_size: int = 100_000,
         topic: str = "",
     ) -> None:
         super().__init__(data_parallel_rank)
-        self._event_queue = Queue[Optional[tuple[int, EventBatch]]](maxsize=max_queue_size)
-        self._buffer = deque[tuple[int, bytes]](maxlen=buffer_steps)
+        self._event_queue = Queue[Optional[tuple[int, EventBatch, int]]](maxsize=max_queue_size)
+        self._buffer_steps = buffer_steps
+        self._buffer_bytes = 0
+        self._queue_lock = threading.Lock()
+        self._retained_batch_bytes = 0
+        self._queue_epoch = 0
+        self._published_epoch = -1
         self._ctx = zmq.Context.instance()
         self._pub: Optional[zmq.Socket] = None
         self._replay: Optional[zmq.Socket] = None
         self._rank = data_parallel_rank
         self._endpoint = self.offset_endpoint_port(endpoint, self._rank)
         self._replay_endpoint = self.offset_endpoint_port(replay_endpoint, self._rank)
+        self._buffer: deque[tuple[int, bytes]] | None = (
+            deque() if self._replay_endpoint is not None else None
+        )
+        self._buffer_lock: threading.Lock | None = (
+            threading.Lock() if self._buffer is not None else None
+        )
         self._hwm = hwm
-        self._seq_gen = count()
+        # A wall-clock epoch keeps resume sequence numbers increasing across
+        # publisher restarts while leaving ample uint64 headroom for batches.
+        self._next_sequence_number = time.time_ns()
         self._topic_bytes = topic.encode("utf-8")
         self._running = True
         self._shutdown_lock = threading.Lock()
+        self._resync_required = threading.Event()
+        self._startup_complete = threading.Event()
+        self._publisher_error: Exception | None = None
+        self._last_send_monotonic = 0.0
+        self._replay_ready = threading.Event()
+        self._replay_error: Exception | None = None
         self.enqueued_batches = 0
         self.published_batches = 0
         self._queue_full_drops = 0
@@ -197,6 +243,7 @@ class ZmqEventPublisher(EventPublisher):
         self._topic = topic
         # Nothing is bound and no thread runs until start(); see EventPublisher.start().
         self._thread: Optional[threading.Thread] = None
+        self._replay_thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
         if self._thread is not None:
@@ -204,21 +251,38 @@ class ZmqEventPublisher(EventPublisher):
         try:
             self._socket_setup()
         except Exception:
-            # start() never returns on failure, so close whatever was opened rather
-            # than leaking it on the shared context.
-            if self._pub is not None:
-                self._pub.close(linger=0)
-                self._pub = None
-            if self._replay is not None:
-                self._replay.close(linger=0)
-                self._replay = None
             raise
         self._thread = threading.Thread(
             target=self._publisher_thread,
             daemon=True,
             name=f"trtllm-kv-events-rank-{self._rank}",
         )
-        self._thread.start()
+        try:
+            if self._replay_endpoint is not None:
+                self._replay_thread = threading.Thread(
+                    target=self._replay_service_thread,
+                    daemon=True,
+                    name=f"trtllm-kv-events-replay-rank-{self._rank}",
+                )
+                self._replay_thread.start()
+                if not self._replay_ready.wait(timeout=self.SHUTDOWN_TIMEOUT):
+                    raise RuntimeError("KV event replay thread did not initialize")
+                if self._replay_error is not None:
+                    raise self._replay_error
+            self._resync_required.set()
+            self._thread.start()
+            if not self._startup_complete.wait(timeout=self.SHUTDOWN_TIMEOUT):
+                raise RuntimeError("KV event publisher thread did not initialize")
+            if self._publisher_error is not None:
+                raise self._publisher_error
+        except Exception:
+            self._running = False
+            if self._thread is not None and self._thread.is_alive():
+                self._thread.join()
+            if self._replay_thread is not None and self._replay_thread.is_alive():
+                self._replay_thread.join()
+            self._thread = None
+            raise
         logger.info(
             f"Started streaming KV event publisher rank={self._rank} "
             f"endpoint={self._endpoint} topic={self._topic!r}"
@@ -236,42 +300,51 @@ class ZmqEventPublisher(EventPublisher):
             return False
         if events.data_parallel_rank is None:
             events.data_parallel_rank = self._data_parallel_rank
-        # Reserve the sequence number here rather than in the publisher thread, so a
-        # batch lost to a full queue or a failed send leaves a detectable gap instead of
-        # a contiguous stream that hides the loss. publish() is the only allocator.
-        seq = next(self._seq_gen)
-        try:
-            self._event_queue.put_nowait((seq, events))
-            self.enqueued_batches += 1
-            return True
-        except queue.Full:
-            self._queue_full_drops += 1
-            drops = self._queue_full_drops
-            if drops == 1 or (drops & (drops - 1) == 0):
-                logger.warning(
-                    f"Dropping streaming KV event batch on rank={self._rank} because "
-                    f"the publisher queue is full; seq={seq} will be missing from the "
-                    f"stream; dropped_batches={self.dropped_batches}"
-                )
-            return False
+        charge = _batch_memory_charge(events)
+        with self._queue_lock:
+            if (
+                self._event_queue.full()
+                or self._retained_batch_bytes + charge > MAX_PUBLISH_QUEUE_BYTES
+            ):
+                self._queue_full_drops += 1
+                self._queue_epoch += 1
+                self._resync_required.set()
+                drops = self._queue_full_drops
+                if drops == 1 or (drops & (drops - 1) == 0):
+                    logger.warning(
+                        f"Dropping streaming KV event batch on rank={self._rank} because "
+                        "the bounded publisher queue is full; an AllBlocksCleared recovery "
+                        f"batch will be published; dropped_batches={self.dropped_batches}"
+                    )
+                return False
+            queued = (self._queue_epoch, events, charge)
+            self._event_queue.put_nowait(queued)
+            self._retained_batch_bytes += charge
+        self.enqueued_batches += 1
+        return True
 
     def shutdown(self) -> None:
         with self._shutdown_lock:
             if not self._running:
                 return
+            with self._queue_lock:
+                self._queue_epoch += 1
+                self._resync_required.set()
             self._running = False
             try:
                 self._event_queue.put_nowait(None)
             except queue.Full:
-                # The thread exits after draining the full queue.
+                # The publisher thread abandons queued data and fences it with a clear.
                 pass
         if self._thread is not None:
-            self._thread.join(timeout=self.SHUTDOWN_TIMEOUT)
-            if self._thread.is_alive():
-                logger.warning(
-                    f"Streaming KV event publisher rank={self._rank} did not stop "
-                    f"within {self.SHUTDOWN_TIMEOUT:.1f}s"
-                )
+            self._thread.join()
+        if self._replay_thread is not None:
+            self._replay_thread.join()
+        if self._buffer is not None:
+            assert self._buffer_lock is not None
+            with self._buffer_lock:
+                self._buffer.clear()
+                self._buffer_bytes = 0
         logger.info(
             f"Stopped streaming KV event publisher rank={self._rank} "
             f"enqueued_batches={self.enqueued_batches} "
@@ -280,68 +353,201 @@ class ZmqEventPublisher(EventPublisher):
         )
 
     def _socket_setup(self) -> None:
-        self._pub = self._ctx.socket(zmq.PUB)
-        self._pub.set_hwm(self._hwm)
         if not self._endpoint:
             raise ValueError("KV event publisher endpoint must not be empty")
         if not self._endpoint.startswith(("tcp://", "ipc://", "inproc://")):
             raise ValueError(f"Unsupported KV event endpoint scheme: {self._endpoint!r}")
-        # The publisher owns its endpoint and subscribers connect to it, so the
-        # PUB socket always binds -- including explicit-host TCP binds like
-        # tcp://0.0.0.0:5557 that the previous '*'-only heuristic wrongly
-        # treated as connect targets (silently dropping every event).
-        self._pub.bind(self._endpoint)
-
-        if self._replay_endpoint is not None:
-            self._replay = self._ctx.socket(zmq.ROUTER)
-            self._replay.bind(self._replay_endpoint)
 
     def _publisher_thread(self) -> None:
-        encoder = msgspec.msgpack.Encoder()
-        assert self._pub is not None
+        # Keep the PUB socket on its owning thread for its entire lifetime.
+        publisher = self._ctx.socket(zmq.PUB)
+        self._pub = publisher
+        bound = False
         try:
-            while self._running or not self._event_queue.empty():
-                if self._replay is not None and self._replay.poll(0):
-                    try:
-                        self._service_replay()
-                    except Exception:
-                        logger.error(
-                            "Failed to service streaming KV event replay request\n"
-                            f"{traceback.format_exc()}"
-                        )
+            _enable_ipv6_for_endpoint(publisher, self._endpoint)
+            publisher.set_hwm(self._hwm)
+            publisher.setsockopt(zmq.SNDTIMEO, int(self.SHUTDOWN_TIMEOUT * 1000))
+            # The publisher owns its endpoint and subscribers connect to it, so
+            # PUB always binds, including an explicit 0.0.0.0 host.
+            publisher.bind(self._endpoint)
+            bound = True
+            while self._running:
+                if self._publish_recovery_if_needed():
+                    self._startup_complete.set()
                 try:
-                    item = self._event_queue.get(timeout=0.1)
+                    item = self._event_queue.get(timeout=min(0.1, HEARTBEAT_INTERVAL_SECONDS))
                 except queue.Empty:
+                    if time.monotonic() - self._last_send_monotonic >= HEARTBEAT_INTERVAL_SECONDS:
+                        self._send_payload(self._heartbeat_payload())
                     continue
                 if item is None:
                     self._event_queue.task_done()
                     break
-                seq, event = item
+                epoch, events, charge = item
                 try:
-                    payload = encoder.encode(event)
-                    self._pub.send_multipart(
-                        (
-                            self._topic_bytes,
-                            seq.to_bytes(8, "big"),
-                            payload,
+                    with self._queue_lock:
+                        current_epoch = self._queue_epoch
+                    if epoch != current_epoch:
+                        continue
+                    try:
+                        payload = msgspec.msgpack.encode(events)
+                    except (TypeError, ValueError, OverflowError):
+                        self._send_error_drops += 1
+                        self._signal_loss()
+                        logger.error(
+                            f"Failed to encode streaming KV event batch\n{traceback.format_exc()}"
                         )
-                    )
-                    self._buffer.append((seq, payload))
-                    self.published_batches += 1
+                        continue
+                    self._publish_recovery_if_needed()
+                    with self._queue_lock:
+                        if epoch != self._queue_epoch or epoch != self._published_epoch:
+                            continue
+                    self._send_payload(payload)
+                finally:
+                    # Keep the charge until encoding and sending are finished.
+                    # Otherwise a producer can fill the budget while this batch
+                    # is still retained by the publisher thread.
+                    del events
+                    del item
+                    payload = None
+                    with self._queue_lock:
+                        self._retained_batch_bytes -= charge
+                    self._event_queue.task_done()
+        except Exception as error:
+            if not self._startup_complete.is_set():
+                self._publisher_error = error
+            else:
+                logger.error(
+                    f"Streaming KV event publisher thread failed\n{traceback.format_exc()}"
+                )
+            self._running = False
+        finally:
+            self._startup_complete.set()
+            while True:
+                try:
+                    abandoned = self._event_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if abandoned is not None:
+                    _, _, charge = abandoned
+                    with self._queue_lock:
+                        self._retained_batch_bytes -= charge
+                    self._queue_full_drops += 1
+                self._event_queue.task_done()
+            if bound:
+                # A final clear fences any batch abandoned during bounded shutdown.
+                self._send_payload(self._clear_payload())
+            publisher.close(linger=0)
+            self._pub = None
+
+    def _publish_recovery_if_needed(self) -> bool:
+        with self._queue_lock:
+            target_epoch = self._queue_epoch
+        if target_epoch == self._published_epoch:
+            return False
+        if self._send_payload(self._clear_payload()):
+            with self._queue_lock:
+                self._published_epoch = target_epoch
+                if self._queue_epoch == target_epoch:
+                    self._resync_required.clear()
+            return True
+        return False
+
+    def _clear_payload(self) -> bytes:
+        return msgspec.msgpack.encode(
+            KVEventBatch(
+                ts=time.time(),
+                events=[AllBlocksCleared()],
+                data_parallel_rank=self._rank,
+            )
+        )
+
+    def _heartbeat_payload(self) -> bytes:
+        return msgspec.msgpack.encode(
+            KVEventBatch(
+                ts=time.time(),
+                events=[],
+                data_parallel_rank=self._rank,
+            )
+        )
+
+    def _signal_loss(self) -> None:
+        with self._queue_lock:
+            self._queue_epoch += 1
+            self._resync_required.set()
+
+    def _send_payload(self, payload: bytes) -> bool:
+        assert self._pub is not None
+        seq = self._next_sequence_number
+        self._next_sequence_number += 1
+        try:
+            self._pub.send_multipart(
+                (
+                    self._topic_bytes,
+                    seq.to_bytes(8, "big"),
+                    payload,
+                ),
+                flags=zmq.NOBLOCK,
+            )
+            if self._buffer is not None:
+                assert self._buffer_lock is not None
+                with self._buffer_lock:
+                    while self._buffer and (
+                        len(self._buffer) >= self._buffer_steps
+                        or self._buffer_bytes + len(payload) > MAX_REPLAY_BUFFER_BYTES
+                    ):
+                        _, evicted = self._buffer.popleft()
+                        self._buffer_bytes -= len(evicted)
+                    if len(payload) <= MAX_REPLAY_BUFFER_BYTES:
+                        self._buffer.append((seq, payload))
+                        self._buffer_bytes += len(payload)
+            self.published_batches += 1
+            self._last_send_monotonic = time.monotonic()
+            return True
+        except Exception:
+            self._send_error_drops += 1
+            self._signal_loss()
+            logger.error(
+                f"Failed to publish streaming KV event batch rank={self._rank}; "
+                "an AllBlocksCleared recovery batch will be retried\n"
+                f"{traceback.format_exc()}"
+            )
+            time.sleep(0.1)
+            return False
+
+    def _replay_service_thread(self) -> None:
+        # Create, bind, use, and close the ROUTER socket on this thread. ZeroMQ
+        # sockets are not thread-safe and must not migrate between threads.
+        replay = self._ctx.socket(zmq.ROUTER)
+        self._replay = replay
+        try:
+            assert self._replay_endpoint is not None
+            _enable_ipv6_for_endpoint(replay, self._replay_endpoint)
+            replay.setsockopt(zmq.SNDTIMEO, int(self.SHUTDOWN_TIMEOUT * 1000))
+            replay.bind(self._replay_endpoint)
+            self._replay_ready.set()
+            while self._running:
+                if not self._replay.poll(100):
+                    continue
+                try:
+                    self._service_replay()
+                except zmq.Again:
+                    logger.warning(f"Aborting stalled KV event replay request on rank={self._rank}")
                 except Exception:
-                    self._send_error_drops += 1
                     logger.error(
-                        f"Failed to publish streaming KV event batch rank={self._rank}; "
-                        f"seq={seq} will be missing from the stream\n"
+                        "Failed to service streaming KV event replay request\n"
                         f"{traceback.format_exc()}"
                     )
-                    time.sleep(0.1)
-                finally:
-                    self._event_queue.task_done()
+        except Exception as error:
+            if not self._replay_ready.is_set():
+                self._replay_error = error
+                self._replay_ready.set()
+            else:
+                logger.error(f"KV event replay service failed\n{traceback.format_exc()}")
         finally:
-            self._pub.close(linger=0)
-            if self._replay is not None:
-                self._replay.close(linger=0)
+            self._replay_ready.set()
+            replay.close(linger=0)
+            self._replay = None
 
     def _service_replay(self) -> None:
         assert self._replay is not None
@@ -351,18 +557,38 @@ class ZmqEventPublisher(EventPublisher):
             return
         client_id, _, start_seq_bytes = frame
         start_seq = int.from_bytes(start_seq_bytes, "big")
-        for seq, payload in self._buffer:
+        assert self._buffer is not None
+        assert self._buffer_lock is not None
+        with self._buffer_lock:
+            buffered = tuple(self._buffer)
+        for seq, payload in buffered:
+            if not self._running:
+                return
             if seq >= start_seq:
-                self._replay.send_multipart(
+                self._send_replay_frames(
                     (
                         client_id,
                         b"",
                         self._topic_bytes,
                         seq.to_bytes(8, "big"),
                         payload,
-                    )
+                    ),
                 )
-        self._replay.send_multipart((client_id, b"", b"", self.END_SEQ, b""))
+        self._send_replay_frames((client_id, b"", b"", self.END_SEQ, b""))
+
+    def _send_replay_frames(self, frames: tuple[bytes, ...]) -> None:
+        assert self._replay is not None
+        deadline = time.monotonic() + self.SHUTDOWN_TIMEOUT
+        while self._running:
+            try:
+                self._replay.send_multipart(frames, flags=zmq.NOBLOCK)
+                return
+            except zmq.Again:
+                remaining_ms = int(max(0.0, deadline - time.monotonic()) * 1000)
+                if remaining_ms <= 0 or not self._replay.poll(min(remaining_ms, 100), zmq.POLLOUT):
+                    if time.monotonic() >= deadline:
+                        raise
+        raise zmq.Again()
 
     @staticmethod
     def offset_endpoint_port(endpoint: str | None, data_parallel_rank: int) -> str | None:
@@ -872,6 +1098,22 @@ class StreamingKVCacheEventManager:
         self.enqueued_batches = 0
         self.enqueued_events = 0
         self.dropped_batches = 0
+        self._reported_dropped_events = 0
+
+    def get_source_descriptor(self) -> dict[str, str | int] | None:
+        """Describe an initialized subscribable publisher, never an inferred rank."""
+        publisher = self._publisher
+        if not isinstance(publisher, ZmqEventPublisher):
+            return None
+        if not publisher._startup_complete.is_set() or not publisher._running:
+            return None
+        if publisher._publisher_error is not None:
+            raise RuntimeError("KV event publisher failed") from publisher._publisher_error
+        return {
+            "rank": self._rank,
+            "endpoint": publisher._endpoint,
+            "replay_endpoint": publisher._replay_endpoint or "",
+        }
 
     @property
     def stored_blocks(self) -> int:
@@ -936,6 +1178,11 @@ class StreamingKVCacheEventManager:
         if self._closed:
             return
         events = self._event_source.drain_events()
+        if self.dropped_events != self._reported_dropped_events:
+            # The batch may contain stores whose removals were lost. Invalidate
+            # the consumer's view rather than replaying an incomplete history.
+            self._reported_dropped_events = self.dropped_events
+            events = [AllBlocksCleared()]
         if not events:
             return
         batch = KVEventBatch(

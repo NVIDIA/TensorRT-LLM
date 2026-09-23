@@ -1062,7 +1062,17 @@ def _create_py_executor_impl(
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
 
-    py_executor.start_worker()
+    # Only the final executor advertises ready publishers. The disposable KV
+    # sizing executor above must never expose discovery or bind another port.
+    if llm_args._openengine_discovery is not None:
+        from tensorrt_llm.grpc.openengine.node import initialize_node_discovery
+        initialize_node_discovery(py_executor)
+    try:
+        py_executor.start_worker()
+    except BaseException:
+        if py_executor._openengine_node_server is not None:
+            py_executor._openengine_node_server.close()
+        raise
 
     return py_executor
 

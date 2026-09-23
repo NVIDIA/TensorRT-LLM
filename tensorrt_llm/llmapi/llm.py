@@ -367,6 +367,9 @@ class BaseLLM:
                  **kwargs: Any) -> None:
 
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
+        enable_routing_load = kwargs.pop("_enable_routing_load", False)
+        enable_event_source_discovery = kwargs.pop("_enable_event_source_discovery", False)
+        openengine_discovery = kwargs.pop("_openengine_discovery", None)
         self._orchestrator_type = kwargs.get("orchestrator_type", None)
         self._llm_id = None
         self._disaggregated_params: dict | None = None
@@ -423,6 +426,9 @@ class BaseLLM:
                                      revision=revision,
                                      tokenizer_revision=tokenizer_revision,
                                      **kwargs)
+            self.args._enable_routing_load = enable_routing_load
+            self.args._enable_event_source_discovery = enable_event_source_discovery
+            self.args._openengine_discovery = openengine_discovery
 
         except Exception as e:
             logger.error(
@@ -2102,7 +2108,7 @@ class _TorchLLM(BaseLLM):
         # Values of removed args are vetted by TorchLlmArgs._drop_removed_args.
         accepted_keys = (set(TorchLlmArgs.model_fields.keys())
                          | TORCH_LLMARGS_REMOVED_ARGS
-                         | {'_mpi_session', 'backend'})
+                         | {'_mpi_session', '_enable_routing_load', '_enable_event_source_discovery', '_openengine_discovery', 'backend'})
 
         # Check if any arguments not supported by the PyTorch backend are passed.
         unsupported_args = [key for key in kwargs if key not in accepted_keys]

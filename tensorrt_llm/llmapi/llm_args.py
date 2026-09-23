@@ -4849,6 +4849,12 @@ class BaseLlmArgs(StrictBaseModel):
     """Base class for the LLM arguments. It contains all the common arguments."""
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
+    # Internal serving policy, carried with the pickled args to every worker.
+    # Deliberately absent from the public LLM configuration/telemetry schema.
+    _enable_routing_load: bool = PrivateAttr(default=False)
+    _enable_event_source_discovery: bool = PrivateAttr(default=False)
+    _openengine_discovery: dict[str, str | int] | None = PrivateAttr(default=None)
+
     # Explicit arguments
     model: Union[str, Path] = Field(
         description=
