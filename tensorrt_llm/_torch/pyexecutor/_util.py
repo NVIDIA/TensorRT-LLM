@@ -42,6 +42,7 @@ from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention.backends import get_sparse_attn_kv_cache_manager
+from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..disaggregation.kv_cache_transceiver import (
     AttentionTypeCpp, create_kv_cache_transceiver,
     maybe_enable_fabric_memory_for_python_transceiver)
@@ -3213,19 +3214,15 @@ def _create_kv_cache_manager(
             ))
         num_mamba_layers = (0 if is_draft and mamba_params.num_draft_layers > 0
                             else mamba_params.num_mamba_layers)
-        # Replay state update for GDN MTP: mirrors the nemotron_hybrid gating
-        # above, minus the Mamba2-specific stochastic-rounding/Philox gate.
-        # The GDN replay kernel does a plain cast on checkpoint commit, so
-        # quantized SSM cache dtypes stay on the legacy path.
         sm = get_sm_version()
-        use_replay = spec_config is not None and sm >= 80
+        use_replay = spec_config is not None
         if spec_config is None:
             logger.info(
                 "GDN replay kernel requires speculative decoding; using "
                 "non-replay path")
         elif spec_config.tokens_per_gen_step > 8:
-            logger.info("GDN cached replay supports at most 8 tokens per "
-                        "generation step; using non-replay path")
+            logger.info("GDN replay supports at most 8 tokens per generation "
+                        "step; using non-replay path")
             use_replay = False
 
         # Tree attention: replay assumes a linear token sequence.
@@ -3235,29 +3232,37 @@ def _create_kv_cache_manager(
                         "using legacy MTP path")
             use_replay = False
 
-        if mamba_params.mamba_ssm_cache_dtype not in (torch.float32,
-                                                      torch.bfloat16,
-                                                      torch.float16):
-            logger.info(
-                "GDN replay kernel does not support quantized SSM cache "
-                f"dtype {mamba_params.mamba_ssm_cache_dtype}; using legacy "
-                "MTP path")
+        # GDN replay is specialized for BF16 Qwen GDN on datacenter
+        # Blackwell and uses Cache Manager V2 for its split all-layer commit.
+        if not is_sm_100f(sm):
+            logger.info("GDN MTP replay currently requires datacenter "
+                        "Blackwell; using non-replay path")
+            use_replay = False
+        if not IS_CUTLASS_DSL_AVAILABLE:
+            logger.info("GDN MTP replay requires CUTLASS DSL; using "
+                        "non-replay path")
+            use_replay = False
+        if (mamba_params.mamba_ssm_cache_dtype != torch.bfloat16
+                or mamba_params.dtype != torch.bfloat16):
+            logger.info("GDN MTP replay requires BF16 activations and "
+                        "recurrent states; using non-replay path")
+            use_replay = False
+        if (mamba_params.state_size != 128 or mamba_params.head_dim != 128
+                or mamba_params.conv_kernel != 4 or mamba_params.n_groups <= 0
+                or mamba_params.num_heads % mamba_params.n_groups != 0):
+            logger.info("GDN MTP replay requires Conv4, K=V=128, and an "
+                        "integral value/key head ratio; using non-replay path")
             use_replay = False
 
         # Replay is enabled by default for eligible GDN MTP workloads.
         if not is_gdn_replay_enabled():
             use_replay = False
 
-        # GDN replay supports the contiguous C++ V1 state pool and the indirect
-        # per-layer state views exposed by V2. Mixed/Python does not expose an
-        # all-layer commit, so keep that manager but use non-replay MTP.
-        replay_manager_types = (CppMambaHybridCacheManager,
-                                MambaHybridCacheManagerV2)
         if use_replay and not issubclass(kv_cache_manager_cls,
-                                         replay_manager_types):
-            logger.info("GDN replay requires C++ V1 or V2 Mamba cache manager; "
-                        f"{kv_cache_manager_cls.__name__} was selected, so the "
-                        "non-replay MTP path will be used")
+                                         MambaHybridCacheManagerV2):
+            logger.info("GDN replay requires MambaHybridCacheManagerV2; "
+                        f"{kv_cache_manager_cls.__name__} was selected, so "
+                        "the non-replay MTP path will be used")
             use_replay = False
         logger.info("GDN replay state update: " +
                     ("ENABLED" if use_replay else "DISABLED"))
