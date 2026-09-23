@@ -362,6 +362,7 @@ def test_scheduler_publishes_prepared_batch(
         "_collect_scheduled_batch_stats",
     ):
         setattr(executor, name, Mock())
+
     def request():
         return SimpleNamespace(is_dummy=False, is_attention_dp_dummy=False, py_batch_idx=None)
 
