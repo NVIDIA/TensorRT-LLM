@@ -340,6 +340,7 @@ class TestSplitGpuBudgetForDraft:
         creator._max_num_tokens = 128
         creator._max_beam_width = 1
         creator._mapping = Mock(enable_attention_dp=False, tp_size=1)
+        creator._mapping.has_cp_helix.return_value = False
         creator._mapping.pp_layers.return_value = [0, 1, 2, 3]
         creator._mapping.is_last_pp_rank.return_value = True
         # Neutral speculative fields: _get_generation_kv_capacity reads them
