@@ -216,6 +216,107 @@ class CoverageArtifactTest(unittest.TestCase):
         self.assertIsNone(selected)
         drift.assert_not_called()
 
+    def test_resolve_pin_reuses_matching_artifactory_pin(self) -> None:
+        commit = "a" * 40
+        pin = {
+            "version": artifact.PIN_VERSION,
+            "pr_number": "18802",
+            "pr_head": "b" * 40,
+            "coverage_db_build": 42,
+            "coverage_db_commit": commit,
+        }
+        with (
+            mock.patch.object(artifact, "_get", return_value=(200, json.dumps(pin).encode())),
+            mock.patch.object(artifact, "select_tarball") as select_latest,
+        ):
+            plan = artifact.resolve_pin(
+                "unused.json",
+                "18802",
+                "b" * 40,
+                "pr-base",
+            )
+
+        self.assertEqual(
+            plan,
+            {
+                "status": "ready",
+                "build": 42,
+                "commit": commit,
+                "pin_upload_required": False,
+            },
+        )
+        select_latest.assert_not_called()
+
+    def test_resolve_pin_creates_file_for_jenkins_upload(self) -> None:
+        commit = "a" * 40
+        selection = {"build": 42, "commit": commit}
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            mock.patch.object(artifact, "_get", return_value=(404, None)),
+            mock.patch.object(artifact, "select_tarball", return_value=selection),
+        ):
+            pin_path = Path(temp_dir) / artifact.PIN_NAME
+            plan = artifact.resolve_pin(
+                str(pin_path),
+                "18802",
+                "b" * 40,
+                "pr-base",
+            )
+            pin = json.loads(pin_path.read_text())
+
+        self.assertEqual(pin["coverage_db_build"], 42)
+        self.assertEqual(pin["coverage_db_commit"], commit)
+        self.assertTrue(plan["pin_upload_required"])
+        self.assertEqual(plan["pin_path"], str(pin_path))
+        self.assertEqual(
+            plan["pin_target"],
+            f"{artifact.PIN_BASE}/18802/{'b' * 40}/",
+        )
+
+    def test_resolve_pin_declines_invalid_or_unavailable_pin(self) -> None:
+        with mock.patch.object(artifact, "_get", return_value=(200, b"{}")):
+            invalid = artifact.resolve_pin("unused.json", "18802", "b" * 40, "pr-base")
+        with mock.patch.object(artifact, "_get", return_value=(None, None)):
+            unavailable = artifact.resolve_pin("unused.json", "18802", "b" * 40, "pr-base")
+
+        self.assertEqual(invalid["status"], "declined")
+        self.assertIn("invalid coverage DB pin", invalid["decline_reason"])
+        self.assertEqual(unavailable["status"], "declined")
+        self.assertIn("pin query failed", unavailable["decline_reason"])
+
+    def test_resolve_pin_cli_prints_upload_plan(self) -> None:
+        plan = {
+            "status": "ready",
+            "build": 42,
+            "commit": "a" * 40,
+            "pin_upload_required": True,
+        }
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(artifact, "merge_base", return_value="c" * 40),
+            mock.patch.object(artifact, "resolve_pin", return_value=plan) as resolve_pin,
+            mock.patch("sys.stdout", stdout),
+        ):
+            status = artifact.main(
+                [
+                    "--resolve-pin",
+                    "cbts_db_pin.json",
+                    "--pr-number",
+                    "18802",
+                    "--pr-head",
+                    "b" * 40,
+                ]
+            )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), plan)
+        resolve_pin.assert_called_once_with(
+            "cbts_db_pin.json",
+            "18802",
+            "b" * 40,
+            "c" * 40,
+        )
+
     def test_resolve_build_prints_metadata_without_residual_paths(self) -> None:
         selection = {
             "build": 42,

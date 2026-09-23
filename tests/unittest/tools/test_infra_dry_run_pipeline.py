@@ -109,6 +109,14 @@ class InfraDryRunPipelineTest(unittest.TestCase):
             parser,
         )
 
+    def test_cbts_pin_policy_is_owned_by_python(self) -> None:
+        audit = _function_body(L0_PARENT, "_cbtsCoverageAudit", "_cbtsPrNumber")
+
+        self.assertIn("--resolve-pin cbts_db_pin.json", audit)
+        self.assertIn("pinPlan.pin_upload_required", audit)
+        self.assertIn("trtllm_utils.uploadArtifacts", audit)
+        self.assertNotIn("curl --noproxy", audit)
+
 
 if __name__ == "__main__":
     unittest.main()

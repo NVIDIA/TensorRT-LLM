@@ -23,11 +23,12 @@ anonymous quota being per-IP and exhausted by shared CI egress.
 The selected architecture DBs are merged locally through the compact coverage
 schema, producing the one DB consumed by `main.py`.
 
-Three entry points. `--resolve-build` prints the newest (or explicitly pinned)
-build metadata without checking or downloading the PR diff. `--print-selection`
-also checks diff compatibility and stops. `--prepare DIR` downloads, unpacks,
-and merges the winner, drops that JSON beside it, and prints the two paths
-consumed by CBTS.
+Four entry points. `--resolve-pin FILE` reuses or creates the stable build pin
+for a PR head. `--resolve-build` prints the newest (or explicitly pinned) build
+metadata without checking or downloading the PR diff. `--print-selection` also
+checks diff compatibility and stops. `--prepare DIR` downloads, unpacks, and
+merges the winner, drops that JSON beside it, and prints the two paths consumed
+by CBTS.
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -63,6 +65,12 @@ META_NAME = "cbts_coverage_db.json"
 # Per-build metadata carrying `commit=<sha>`; absent on some builds.
 BUILD_INFO_NAME = "build_info.txt"
 
+# Stable coverage selection per PR head. Jenkins uploads newly created pin files
+# through its Artifactory credential; this module owns lookup, schema, and paths.
+PIN_VERSION = 1
+PIN_BASE = "sw-tensorrt-generic/llm-artifacts/LLM/main/cbts/coverage-db-pins/v1"
+PIN_NAME = "cbts_db_pin.json"
+
 # Branch the DB is collected from; must match ARTIFACT_BASE.
 COVERAGE_BRANCH = "main"
 # Read by `compare_distance`; the anonymous quota is unusable from shared CI egress IPs.
@@ -85,6 +93,8 @@ _GIT_TIMEOUT = 120
 _RETRIES = 3
 
 _PatchApplyStatus = Literal["clean", "conflict", "unknown"]
+_COMMIT_RE = re.compile(r"[0-9a-fA-F]{40}")
+_PR_NUMBER_RE = re.compile(r"[1-9][0-9]*")
 
 
 def _get(url: str, headers: Optional[dict] = None) -> tuple[Optional[int], Optional[bytes]]:
@@ -146,6 +156,98 @@ def build_commit(build: int, artifact_base: str = ARTIFACT_BASE) -> Optional[str
         if key.strip() == "commit" and value.strip():
             return value.strip()
     return None
+
+
+def _pin_decline(reason: str) -> dict:
+    """Return a machine-readable, fail-closed pin resolution result."""
+    return {
+        "status": "declined",
+        "compatibility": "unknown",
+        "decline_reason": f"coverage tier declined: {reason}",
+        "pin_upload_required": False,
+    }
+
+
+def _valid_pin(pin: object, pr_number: str, pr_head: str) -> bool:
+    """Whether an Artifactory pin matches this PR identity and schema."""
+    if not isinstance(pin, dict):
+        return False
+    build = pin.get("coverage_db_build")
+    commit = pin.get("coverage_db_commit")
+    return (
+        pin.get("version") == PIN_VERSION
+        and str(pin.get("pr_number")) == pr_number
+        and pin.get("pr_head") == pr_head
+        and type(build) is int
+        and build > 0
+        and isinstance(commit, str)
+        and _COMMIT_RE.fullmatch(commit) is not None
+    )
+
+
+def resolve_pin(
+    pin_path: str,
+    pr_number: str,
+    pr_head: str,
+    pr_base_commit: str,
+) -> dict:
+    """Reuse a PR-head coverage pin or create the local file Jenkins must upload."""
+    if _PR_NUMBER_RE.fullmatch(pr_number) is None or _COMMIT_RE.fullmatch(pr_head) is None:
+        return _pin_decline("invalid PR identity for coverage DB pin")
+    target = f"{PIN_BASE}/{pr_number}/{pr_head}/"
+    status, data = _get(f"{_URM}/{target}{PIN_NAME}")
+    if status == 200:
+        try:
+            pin = json.loads(data) if data else None
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            pin = None
+        if not _valid_pin(pin, pr_number, pr_head):
+            return _pin_decline("invalid coverage DB pin")
+        assert isinstance(pin, dict)
+        return {
+            "status": "ready",
+            "build": pin["coverage_db_build"],
+            "commit": pin["coverage_db_commit"],
+            "pin_upload_required": False,
+        }
+    if status != 404:
+        return _pin_decline("coverage DB pin query failed")
+
+    selected = select_tarball(pr_base_commit)
+    if selected is None:
+        return _pin_decline("coverage DB could not be resolved")
+    build = selected.get("build")
+    commit = selected.get("commit")
+    if (
+        type(build) is not int
+        or build <= 0
+        or not isinstance(commit, str)
+        or _COMMIT_RE.fullmatch(commit) is None
+    ):
+        return _pin_decline("selected coverage DB metadata invalid")
+
+    pin = {
+        "version": PIN_VERSION,
+        "pr_number": pr_number,
+        "pr_head": pr_head,
+        "coverage_db_build": build,
+        "coverage_db_commit": commit,
+    }
+    try:
+        output = Path(pin_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(pin))
+    except OSError as e:
+        print(f"[artifact] coverage DB pin could not be written: {e}", file=sys.stderr)
+        return _pin_decline("coverage DB pin could not be written")
+    return {
+        "status": "ready",
+        "build": build,
+        "commit": commit,
+        "pin_upload_required": True,
+        "pin_path": pin_path,
+        "pin_target": target,
+    }
 
 
 @lru_cache(maxsize=None)
@@ -607,6 +709,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument(
+        "--resolve-pin",
+        metavar="FILE",
+        default=None,
+        help="reuse a PR-head build pin or write a new pin to FILE for Jenkins upload",
+    )
+    ap.add_argument(
         "--resolve-build",
         action="store_true",
         help="resolve and print build metadata without checking or downloading the PR diff",
@@ -639,14 +747,32 @@ def main(argv: Optional[list[str]] = None) -> int:
         "the diff checked against the selected coverage revision",
     )
     ap.add_argument(
+        "--pr-number",
+        default=None,
+        help="PR number used by --resolve-pin to address the stable Artifactory path",
+    )
+    ap.add_argument(
         "--paths-json",
         default=None,
         help="JSON list of Tier-2 residual paths; required for the compatibility check",
     )
     args = ap.parse_args(argv)
 
-    if sum((args.resolve_build, args.print_selection, args.prepare is not None)) != 1:
-        ap.error("exactly one of --resolve-build / --print-selection / --prepare is required")
+    if (
+        sum(
+            (
+                args.resolve_pin is not None,
+                args.resolve_build,
+                args.print_selection,
+                args.prepare is not None,
+            )
+        )
+        != 1
+    ):
+        ap.error(
+            "exactly one of --resolve-pin / --resolve-build / --print-selection / "
+            "--prepare is required"
+        )
     if args.expected_commit is not None and args.build is None:
         ap.error("--expected-commit requires --build")
 
@@ -672,6 +798,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     pr_base_commit = merge_base(args.pr_head)
     if not pr_base_commit:
         return 1
+
+    if args.resolve_pin is not None:
+        if not args.pr_number:
+            print("[artifact] --pr-number is required by --resolve-pin", file=sys.stderr)
+            return 1
+        print(
+            json.dumps(
+                resolve_pin(
+                    args.resolve_pin,
+                    str(args.pr_number),
+                    args.pr_head,
+                    pr_base_commit,
+                )
+            )
+        )
+        return 0
 
     if args.build is not None:
         best = select_build(
