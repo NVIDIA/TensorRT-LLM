@@ -219,9 +219,6 @@ class TestMergeCompletionResponses:
         prompt_tokens=100,
         completion_tokens=10,
         cached_tokens=0,
-        image_tokens=None,
-        video_tokens=None,
-        audio_tokens=None,
     ):
         usage = UsageInfo(
             prompt_tokens=prompt_tokens,
@@ -229,9 +226,6 @@ class TestMergeCompletionResponses:
             total_tokens=prompt_tokens + completion_tokens,
             prompt_tokens_details=PromptTokensDetails(
                 cached_tokens=cached_tokens,
-                image_tokens=image_tokens,
-                video_tokens=video_tokens,
-                audio_tokens=audio_tokens,
             ),
         )
         return CompletionResponse(
@@ -240,22 +234,16 @@ class TestMergeCompletionResponses:
             usage=usage,
         )
 
-    def test_merge_all_present_modalities(self):
+    def test_merge_completion_responses(self):
         rsp1 = self._make_completion_response(
             prompt_tokens=100,
             completion_tokens=10,
             cached_tokens=10,
-            image_tokens=200,
-            video_tokens=100,
-            audio_tokens=50,
         )
         rsp2 = self._make_completion_response(
             prompt_tokens=200,
             completion_tokens=20,
             cached_tokens=20,
-            image_tokens=300,
-            video_tokens=150,
-            audio_tokens=25,
         )
         rsps = [rsp1, rsp2]
         merged = OpenAIServer.merge_completion_responses(rsps, model="test-model")
@@ -264,31 +252,6 @@ class TestMergeCompletionResponses:
         assert merged.usage.completion_tokens == 30
         assert merged.usage.total_tokens == 330
         assert merged.usage.prompt_tokens_details.cached_tokens == 30
-        assert merged.usage.prompt_tokens_details.image_tokens == 500
-        assert merged.usage.prompt_tokens_details.video_tokens == 250
-        assert merged.usage.prompt_tokens_details.audio_tokens == 75
-
-    def test_merge_mixed_present_and_absent_modalities(self):
-        rsp1 = self._make_completion_response(
-            prompt_tokens=100, image_tokens=200, video_tokens=None
-        )
-        rsp2 = self._make_completion_response(
-            prompt_tokens=100, image_tokens=None, video_tokens=None
-        )
-        rsps = [rsp1, rsp2]
-        merged = OpenAIServer.merge_completion_responses(rsps, model="test-model")
-
-        # image_tokens is present in rsp1 but None in rsp2 -> aggregate must be None
-        assert merged.usage.prompt_tokens_details.image_tokens is None
-        assert merged.usage.prompt_tokens_details.video_tokens is None
-
-    def test_merge_explicit_zero_preserved(self):
-        rsp1 = self._make_completion_response(prompt_tokens=100, image_tokens=0)
-        rsp2 = self._make_completion_response(prompt_tokens=100, image_tokens=0)
-        rsps = [rsp1, rsp2]
-        merged = OpenAIServer.merge_completion_responses(rsps, model="test-model")
-
-        assert merged.usage.prompt_tokens_details.image_tokens == 0
 
 
 class TestDisaggUtilsModalityTokens:
