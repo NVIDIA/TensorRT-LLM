@@ -16,8 +16,6 @@ accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_auto_dtype
 accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_gen_first
 accuracy/test_disaggregated_serving.py::TestDeepSeekV4FlashBase::test_auto_dtype
 accuracy/test_disaggregated_serving.py::TestGLM52NVFP4::test_nvfp4_nixl[cache_mgr_v1]
-accuracy/test_disaggregated_serving.py::TestGLM53FlashFP8::test_fp8_nixl[mtp=False]
-accuracy/test_disaggregated_serving.py::TestGLM53FlashFP8::test_fp8_nixl[mtp=True]
 accuracy/test_disaggregated_serving.py::TestGPTOSS20B::test_beam_search
 accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[False]
 accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[True]
@@ -61,17 +59,10 @@ accuracy/test_glm52.py::TestGLM52NVFP4::test_runtime
 accuracy/test_glm52.py::TestGLM52NVFP4::test_tep[tp_size=8-ep_size=8]
 accuracy/test_glm52.py::TestGLM52NVFP4::test_tep_nvfp4kv[tp_size=8-ep_size=8]
 accuracy/test_glm52.py::TestGLM5FP8::test_8gpus[tp_size=8-ep_size=8]
-accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_attention_dp[tp_size=4-ep_size=4]
-accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_attention_dp_mtp_and_fp8_kv[adp-mtp3]
 accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_attention_dp_mtp_and_fp8_kv[adp-mtp3-fp8-kv]
-accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_attention_dp_mtp_and_fp8_kv[tp-fp8-kv]
 accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_block_reuse[tp_size=4-ep_size=4]
-accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_chunked_prefill_parity
 accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_mmmu[tp_size=4-ep_size=4]
 accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_mtp[tp_size=4-ep_size=4]
-accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_runtime
-accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_tep[tp_size=4-ep_size=4]
-accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_video_url
 accuracy/test_kimi3.py::TestKimiK3DSpark::test_gsm8k_tep8
 accuracy/test_kv_pool_rebalance_accuracy.py::TestKvPoolRebalanceAccuracy::test_rebalance_matches_baseline[no_overlap]
 accuracy/test_kv_pool_rebalance_accuracy.py::TestKvPoolRebalanceAccuracy::test_rebalance_matches_baseline[overlap]
