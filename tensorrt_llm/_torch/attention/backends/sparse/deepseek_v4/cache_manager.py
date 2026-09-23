@@ -1176,6 +1176,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         self._num_manager_layers = len(layers)
 
         constraints = list(config.constraints)
+        # _build_base_config copies kv_cache_config.pool_ratio to initial_pool_ratio.
         if config.initial_pool_ratio is None:
             # DeepSeek-V4's windowed and compressed pools must also support
             # the longest decode request alongside the short decode requests.
