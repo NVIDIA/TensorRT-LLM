@@ -4963,7 +4963,10 @@ class KVCacheManagerV2(BaseResourceManager):
                     return None
                 kv_cache.stop_committing()
                 dummy_capacity = token_num + self.num_extra_kv_tokens
-                if is_gen and not materialize_history:
+                # Generation dummies grow once more below. Scratch reuse constrains
+                # that growth using committed history, including when the caller
+                # materializes history and intentionally leaves the hint unset.
+                if is_gen:
                     kv_cache.enable_swa_scratch_reuse = False
                 # Need to hint the committed history to activate stale-block
                 # optimization and match the solver's pool budget.
