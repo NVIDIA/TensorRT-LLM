@@ -443,6 +443,10 @@ $$
 
 ## Performance
 
+### ISL 1024 / OSL 1024
+
+This sweep was recorded before the small-batch MoE and native 16-head attention optimizations used in the long-input measurements below.
+
 The chart compares TP4 / EP4 and attention DP4 / EP4, each with and without MTP3, on 4x B200 with FP8 weights and a BF16 KV cache. Measurements use the `benchmark_serving` client above, ISL 1024 / OSL 1024, random token IDs, seed 0, and greedy decoding. Each run sends `5 * concurrency` requests. Points combine all matching runs; faint dots show individual runs and bars show their minimum and maximum, not confidence intervals.
 
 To reproduce the curve, use the serving configurations above with `--max_batch_size 128`, `--max_seq_len 8192`, and `cuda_graph_config.max_batch_size: 128`. Keep CUDA graph padding, chunked prefill, and the overlap scheduler enabled; use a cache memory fraction of 0.5 and disable block reuse. Set `--max_num_tokens 16384` for TP4 / EP4 or `4096` for attention DP4 / EP4, with or without MTP3.
@@ -451,4 +455,34 @@ The horizontal axis is `1000 / mean_tpot_ms`, excluding TTFT. The vertical axis 
 
 ![GLM-5.3-Flash FP8 performance on 4x B200](../media/glm_5_3_flash_fp8_perf.png)
 
-With TP4 / EP4, MTP3 improves single-user decode speed from approximately 153 to 372 tok/s/user. At concurrency 128, the four configurations deliver approximately 5.9K–6.3K output tok/s in aggregate. MTP acceptance and speedup depend on the workload; these measurements use random-token prompts.
+In this sweep, TP4 / EP4 with MTP3 achieved approximately 372 tok/s/user versus 153 without MTP. At concurrency 128, the four configurations delivered approximately 5.9K–6.3K output tok/s in aggregate. MTP acceptance and speedup depend on the workload; these measurements use random-token prompts.
+
+### ISL 13312 / OSL 33
+
+The following results were recorded on September 21, 2026, with the implementation committed as `26f2f5bc67`, which included a dedicated FP32 router kernel that has since been removed. These results apply to that revision and have not been revalidated on the current implementation. They use 4x B200, official FP8 weights, BF16 KV cache, and no MTP. Each row combines three runs of 64 requests with random token-ID prompts, seed 0, and greedy decoding.
+
+| Concurrency | Configuration | `max_num_tokens` | TTFT p50 (ms) | TPOT p50 (ms) | Aggregate output tok/s |
+|---|---|---:|---:|---:|---:|
+| 1 | TP4 / EP4 | 16384 | 307.38 | 5.57 | 67.91 |
+| 8 | TP4 / EP4 | 16384 | 909.18 | 54.33 | 99.58 |
+| 8 | Attention DP4 / EP4 | 4096 per rank | 1214.69 | 23.46 | 133.71 |
+
+At concurrency 1, decode speed is approximately 179.6 tok/s/user, calculated as `1000 / p50_tpot_ms` from the unrounded value and excluding TTFT. Aggregate output throughput includes both prefill and decode time. At concurrency 8, attention DP increases aggregate throughput by approximately 34% relative to TP, with higher TTFT.
+
+Use the serving configurations above without `speculative_config`, with `--max_batch_size 128`, `--max_seq_len 16384`, and `cuda_graph_config.max_batch_size: 128`. Keep CUDA graph padding, chunked prefill, and the overlap scheduler enabled; set the cache memory fraction to 0.5 and disable block reuse. Select the attention mode and token budget from the table.
+
+After a separate warmup, run this benchmark three times for each configuration, setting concurrency to 1 or 8 and saving each run to a separate result directory:
+
+```bash
+python -m tensorrt_llm.serve.scripts.benchmark_serving \
+    --model zai-org/GLM-5.3-Flash --backend openai \
+    --host 127.0.0.1 --port 8000 \
+    --dataset-name random --random-input-len 13312 --random-output-len 33 \
+    --random-prefix-len 0 --random-ids \
+    --num-prompts 64 --max-concurrency 1 \
+    --ignore-eos --tokenize-on-client --seed 0 --temperature 0 \
+    --percentile-metrics ttft,tpot,itl,e2el \
+    --save-result --save-detailed --result-dir ./glm53_c1_run1
+```
+
+Compute TTFT and TPOT p50 over all 192 request samples. Aggregate output throughput is total generated tokens divided by the sum of the three run durations.
