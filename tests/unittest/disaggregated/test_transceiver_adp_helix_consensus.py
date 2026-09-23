@@ -44,6 +44,7 @@ def _mapping(**overrides) -> SimpleNamespace:
 
 
 def test_adp_without_cp_or_pp_skips_gen_sync() -> None:
+    """Attention-DP with pp == cp == 1 keeps the no-sync fast path."""
     dist = SimpleNamespace(
         allgather=Mock(side_effect=AssertionError("must not sync")),
         pp_allgather=Mock(side_effect=AssertionError("must not sync")),
@@ -56,21 +57,21 @@ def test_adp_without_cp_or_pp_skips_gen_sync() -> None:
 
 
 def test_adp_with_helix_cp_syncs_across_cp_group() -> None:
+    """Attention-DP + helix CP gathers over the CP group only."""
     # Two helix CP ranks of one DP group: only rid 1 has arrived on both.
     dist = SimpleNamespace(
         allgather=Mock(side_effect=AssertionError("world allgather must be skipped")),
         pp_allgather=Mock(side_effect=AssertionError("pp allgather must be skipped")),
         cp_allgather=lambda payload: [payload, [1]],
     )
-    tc = _transceiver(
-        _mapping(tp_size=2, cp_size=2, world_size=4, enable_attention_dp=True), dist
-    )
+    tc = _transceiver(_mapping(tp_size=2, cp_size=2, world_size=4, enable_attention_dp=True), dist)
 
     assert tc._gen_need_sync is True
     assert tc._gen_consensus([1, 2]) == [1]
 
 
 def test_adp_with_helix_cp_and_pp_syncs_across_both() -> None:
+    """Attention-DP + helix CP + PP gathers over CP first, then PP."""
     # cp=2, pp=2: cp_allgather returns the two CP ranks of this PP stage,
     # pp_allgather then stacks the other PP stage's CP pair on top.
     dist = SimpleNamespace(
@@ -89,15 +90,14 @@ def test_adp_with_helix_cp_and_pp_syncs_across_both() -> None:
 
 
 def test_adp_consensus_outcome_completes_only_when_every_cp_rank_completed() -> None:
+    """Completion needs every CP rank of the DP group to report the request done."""
     dist = SimpleNamespace(
         allgather=Mock(side_effect=AssertionError("world allgather must be skipped")),
         pp_allgather=Mock(side_effect=AssertionError("pp allgather must be skipped")),
         # Peer CP rank: nothing cancelled/failed, only rid 5 completed.
         cp_allgather=lambda payload: [payload, [[], [], [5]]],
     )
-    tc = _transceiver(
-        _mapping(tp_size=2, cp_size=2, world_size=4, enable_attention_dp=True), dist
-    )
+    tc = _transceiver(_mapping(tp_size=2, cp_size=2, world_size=4, enable_attention_dp=True), dist)
 
     cancelled, failed, completed = tc._consensus_outcome(
         [5, 6], [], [], [5, 6], tc._gen_allgather, tc._gen_need_sync
@@ -108,6 +108,7 @@ def test_adp_consensus_outcome_completes_only_when_every_cp_rank_completed() -> 
 
 
 def test_non_adp_still_uses_world_allgather() -> None:
+    """Without attention-DP the world allgather path is unchanged."""
     dist = SimpleNamespace(
         allgather=lambda payload: [payload, payload],
         pp_allgather=Mock(side_effect=AssertionError("pp allgather must be skipped")),
@@ -117,3 +118,41 @@ def test_non_adp_still_uses_world_allgather() -> None:
 
     assert tc._gen_need_sync is True
     assert tc._gen_consensus([4]) == [4]
+
+
+def test_adp_with_pp_only_syncs_across_pp_group() -> None:
+    """Attention-DP + PP without CP wraps the local payload and gathers over PP only."""
+    dist = SimpleNamespace(
+        allgather=Mock(side_effect=AssertionError("world allgather must be skipped")),
+        cp_allgather=Mock(side_effect=AssertionError("cp allgather must be skipped")),
+        # Other PP rank of this DP group only has rid 2.
+        pp_allgather=lambda gathered: [gathered, [[2]]],
+    )
+    tc = _transceiver(_mapping(tp_size=2, pp_size=2, world_size=4, enable_attention_dp=True), dist)
+
+    assert tc._gen_need_sync is True
+    assert tc._gen_consensus([1, 2]) == [2]
+
+
+def test_adp_gen_consensus_outcome_retires_cancellation_only_when_every_cp_rank_drained() -> None:
+    """A cancelled request retires only once both CP ranks report their resources drained."""
+
+    def run(local_drained: bool):
+        session = SimpleNamespace(
+            _enforce_physical_ownership=True,
+            resources_drained=lambda: local_drained,
+        )
+        dist = SimpleNamespace(
+            allgather=Mock(side_effect=AssertionError("world allgather must be skipped")),
+            pp_allgather=Mock(side_effect=AssertionError("pp allgather must be skipped")),
+            # Peer CP rank: rid 9 cancelled and already retirable there.
+            cp_allgather=lambda payload: [payload, [[9], [], [], [9]]],
+        )
+        tc = _transceiver(
+            _mapping(tp_size=2, cp_size=2, world_size=4, enable_attention_dp=True), dist
+        )
+        tc._recv_sessions = {9: session}
+        return tc._gen_consensus_outcome([9], [9], [], [])
+
+    assert run(local_drained=False) == ([], [], [])
+    assert run(local_drained=True) == ([9], [], [])
