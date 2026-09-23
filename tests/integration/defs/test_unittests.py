@@ -162,6 +162,98 @@ def _fail_unittests(reason: str, output_xml: str, output_dir: str,
     raise AssertionError(reason)
 
 
+_FORENSICS_PER_FILE_MAX_BYTES = 64 * 1024
+_FORENSICS_TOTAL_MAX_BYTES = 2 * 1024 * 1024
+
+# Captured on the first call and reused. os.environ["TLLM_FORENSICS_DIR"] is
+# rewritten to the per-lane path below, so re-reading the env var on a later
+# lane in the same process would nest lane2 inside lane1.
+_FORENSICS_BASE = None
+_FORENSICS_BASE_DERIVED = False
+
+
+def _resolve_forensics_dir(output_dir, lane):
+    """Return this lane's forensics directory, deriving a base if CI set none.
+
+    jenkins/L0_Test.groovy exports TLLM_FORENSICS_DIR, but the Jenkins pipeline
+    script is configured outside this repository, so a PR cannot prove its own
+    groovy edit is the version that runs. Without a fallback that uncertainty
+    becomes a single point of failure: no env var means sitecustomize installs
+    nothing, and the run comes back green with zero instrumentation, which is
+    indistinguishable from "the probe found nothing".
+
+    The base directory is shared by every lane of a stage, and the files are
+    never cleaned up between lanes, so counting a shared directory attributes
+    earlier lanes' processes to the current one: a measured run reported
+    armed=10 for a lane that armed 5 itself. Each lane therefore gets its own
+    subdirectory, which keeps armed/stacks counts per-lane and comparable.
+
+    Written back into os.environ so the collector below resolves the same path.
+    """
+    global _FORENSICS_BASE, _FORENSICS_BASE_DERIVED
+    if _FORENSICS_BASE is None:
+        base = os.environ.get("TLLM_FORENSICS_DIR", "").strip()
+        _FORENSICS_BASE_DERIVED = not base
+        _FORENSICS_BASE = base or os.path.join(output_dir, "forensics")
+    lane_dir = os.path.join(_FORENSICS_BASE, lane)
+    os.environ["TLLM_FORENSICS_DIR"] = lane_dir
+    # Short enough that a process which lives only as long as a passing test
+    # still records a stack: the dump loop sleeps before its first dump, so a
+    # 60s interval left all four MPI workers with no stack at all on a healthy
+    # run, and would delay the first frame of a real hang by a full minute.
+    os.environ.setdefault("TLLM_FORENSICS_INTERVAL", "15")
+    if _FORENSICS_BASE_DERIVED:
+        print(
+            f"FORENSICS_DIR_DERIVED: {lane_dir} (TLLM_FORENSICS_DIR was unset)")
+    else:
+        print(f"FORENSICS_DIR_LANE: {lane_dir}")
+    return lane_dir
+
+
+def _print_forensics_dumps():
+    """Surface per-process stack dumps through this process's stdout.
+
+    Ranks 1..3 are started with MPI_Comm_spawn (tests/unittest/sitecustomize.py
+    explains the mechanism), so their own stdout has no collection path and
+    nothing they print is archived. Their dumps only reach CI if a process whose
+    stdout *is* captured reads the files and prints them, which is what this does.
+
+    Called from a finally block because a hang does not end with a clean return:
+    the inner pytest is killed by its own timeout and the exception propagates.
+    """
+    forensics_dir = os.environ.get("TLLM_FORENSICS_DIR", "").strip()
+    if not forensics_dir or not os.path.isdir(forensics_dir):
+        return
+    try:
+        names = sorted(os.listdir(forensics_dir))
+    except OSError as exc:
+        print(f"FORENSICS_COLLECT_FAILED: {exc}")
+        return
+    # Counted separately on purpose: "the probe was installed" (armed-*) must
+    # never be inferred from "a dump exists" (stack-*), or a dead probe would
+    # look identical to a healthy one.
+    armed = [n for n in names if n.startswith("armed-")]
+    stacks = [n for n in names if n.startswith("stack-")]
+    print(f"FORENSICS_COLLECT: armed={len(armed)} stacks={len(stacks)} "
+          f"dir={forensics_dir}")
+    budget = _FORENSICS_TOTAL_MAX_BYTES
+    for name in armed + stacks:
+        if budget <= 0:
+            print("FORENSICS_COLLECT_TRUNCATED: total budget exhausted")
+            break
+        path = os.path.join(forensics_dir, name)
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                content = handle.read(_FORENSICS_PER_FILE_MAX_BYTES)
+        except OSError as exc:
+            print(f"FORENSICS_FILE_UNREADABLE {name}: {exc}")
+            continue
+        budget -= len(content)
+        print(f"----- FORENSICS FILE {name} -----")
+        print(content)
+    print("FORENSICS_COLLECT_END")
+
+
 def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     import pandas as pd
     import pynvml
@@ -351,6 +443,16 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     def run_command(cmd, num_workers=1):
         try:
             env = {'PYTHONPATH': build_pythonpath()}
+            # Reaches MPI_Comm_spawn workers: they inherit this environment,
+            # and tests/unittest (which holds sitecustomize.py) is already on
+            # the PYTHONPATH built above.
+            forensics_dir = _resolve_forensics_dir(output_dir, case_fn)
+            env['TLLM_FORENSICS_DIR'] = forensics_dir
+            # _resolve_forensics_dir above already setdefault'd this, so the
+            # fallback is unreachable; it is kept equal to the value there so a
+            # future edit cannot introduce two different default intervals.
+            env['TLLM_FORENSICS_INTERVAL'] = os.environ.get(
+                'TLLM_FORENSICS_INTERVAL', '15')
             if s3_secret_key:
                 env["S3_SECRET_KEY"] = s3_secret_key
             if num_workers > 1:
@@ -375,6 +477,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
             print(f"{'='*60}\n")
             return False
         finally:
+            _print_forensics_dumps()
             if s3_output_module is not None:
                 try:
                     drained = s3_output_module.drain_pending_uploads(
