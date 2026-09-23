@@ -26,6 +26,7 @@ from torch import nn
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.modules.multi_stream_utils import \
     maybe_execute_in_parallel
+from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -44,6 +45,7 @@ from .fuse_elementwise_ops import (extract_transpose_xbc_prefill,
                                    fused_split_rearrange_after_conv1d)
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .layernorm_gated import fused_gated_rmsnorm_quant_shape_ok
+from .mamba2_tp import Mamba2TpShard, ReplicatedGroupRMSNormGated
 from .replay_selective_state_update import replay_selective_state_update
 from .selective_state_update import \
     selective_state_update as selective_state_update_native
@@ -213,15 +215,20 @@ class Mamba2Mixer(nn.Module):
             self.mapping = config.mapping
             tp_size = config.mapping.tp_size
 
-        d_inner = head_dim * nheads
-        d_in_proj = 2 * d_inner + 2 * n_groups * d_state + nheads
-        conv_dim = d_inner + 2 * n_groups * d_state
-
-        # TP
-        self.tp_conv_dim = conv_dim // tp_size
-        self.tp_d_inner = d_inner // tp_size
-        self.tp_nheads = nheads // tp_size
-        self.tp_ngroups = n_groups // tp_size
+        # TP layout. When tp_size > n_groups every B/C group is replicated on
+        # the ranks whose heads it serves; see mamba2_tp.py for the math.
+        self.shard = Mamba2TpShard(
+            tp_size=tp_size,
+            nheads=nheads,
+            n_groups=n_groups,
+            head_dim=head_dim,
+            d_state=d_state,
+        )
+        d_inner = self.shard.d_inner
+        self.tp_conv_dim = self.shard.tp_conv_dim
+        self.tp_d_inner = self.shard.tp_d_inner
+        self.tp_nheads = self.shard.tp_nheads
+        self.tp_ngroups = self.shard.tp_ngroups
         self.num_heads = nheads
         self.tp_size = tp_size
 
@@ -242,12 +249,15 @@ class Mamba2Mixer(nn.Module):
         self.in_proj_lora = None
         if config.lora_config is not None:
             self.in_proj_lora = LoraLayer([LoraModuleType.MAMBA_IN_PROJ],
-                                          [d_in_proj // tp_size])
+                                          [self.shard.tp_d_in_proj])
 
-        # in_proj
+        # in_proj. out_features is the padded "virtual full" size: the
+        # tp_size-way column-parallel split below must land on the per-rank
+        # rows produced by Mamba2TpShard.rearrange_in_proj_rows on the
+        # checkpoint's [z|x|B|C|dt] rows.
         self.in_proj = Linear(
             d_model,
-            d_in_proj,
+            self.shard.padded_d_in_proj,
             bias=bias,
             dtype=dtype,
             mapping=self.mapping,
@@ -262,7 +272,7 @@ class Mamba2Mixer(nn.Module):
         # conv1d, reuse Linear to store weights since it has support for TP > 1 already
         self.conv1d = Linear(
             d_conv,
-            conv_dim,
+            self.shard.padded_conv_dim,
             bias=conv_bias,
             dtype=dtype,
             mapping=self.mapping,
@@ -288,8 +298,7 @@ class Mamba2Mixer(nn.Module):
         # https://github.com/flashinfer-ai/flashinfer/blob/v0.6.14/include/flashinfer/mamba/kernel_selective_state_update_stp.cuh#L1338
         supported_head_group_ratios = [1, 2, 4, 8, 16, 32, 64]
         supported_d_states = [64, 128, 256]
-        head_group_ratio = (self.tp_nheads //
-                            self.tp_ngroups if self.tp_ngroups > 0 else 0)
+        head_group_ratio = self.tp_nheads // self.tp_ngroups
         self._use_flashinfer = (head_dim in supported_head_dims and
                                 head_group_ratio in supported_head_group_ratios
                                 and d_state in supported_d_states)
@@ -358,16 +367,31 @@ class Mamba2Mixer(nn.Module):
                          and config.quant_config.quant_mode.has_nvfp4())
 
         # norm
-        self.norm = RMSNormGated(
-            self.tp_d_inner,
-            eps=rms_norm_eps,
-            norm_before_gate=False,
-            group_size=self.tp_d_inner // self.tp_ngroups,
-            dtype=dtype,
-            # Enable fused NVFP4 quantization if possible.
-            # It might be overridden in `_try_attach_nvfp4_scale` function.
-            is_nvfp4=self.is_nvfp4,
-        )
+        if self.shard.replicated:
+            # The fused gated-norm(+quant) kernels normalize over the local
+            # rows only; a group spread over several ranks needs the
+            # cross-rank statistics, so use the all-reducing norm and let
+            # out_proj quantize its own input.
+            self.is_nvfp4 = False
+            self.norm = ReplicatedGroupRMSNormGated(
+                self.shard,
+                self.mapping.tp_rank,
+                self.mapping,
+                eps=rms_norm_eps,
+                dtype=dtype,
+                allreduce_strategy=AllReduceStrategy.NCCL,
+            )
+        else:
+            self.norm = RMSNormGated(
+                self.tp_d_inner,
+                eps=rms_norm_eps,
+                norm_before_gate=False,
+                group_size=self.tp_d_inner // self.tp_ngroups,
+                dtype=dtype,
+                # Enable fused NVFP4 quantization if possible.
+                # It might be overridden in `_try_attach_nvfp4_scale` function.
+                is_nvfp4=self.is_nvfp4,
+            )
 
         self.out_proj_lora = None
         if config.lora_config is not None:

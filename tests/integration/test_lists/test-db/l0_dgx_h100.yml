@@ -97,6 +97,10 @@ l0_dgx_h100:
   # TP x PP, attention-DP over CP) always skip with "need 4 GPUs, have 2". Name
   # the file here so those compositions actually run.
   - unittest/_torch/multi_gpu/test_kv_pool_rebalance_tp.py
+  # Same reason: the Mamba2 group-replication cases (tp4 > n_groups) only exist
+  # at 4 ranks, so they always skip in the 2-GPU stage that collects the
+  # directory. Name the file here so they actually run.
+  - unittest/_torch/multi_gpu/test_mamba2_mixer_tp.py
   # Exercise VisualGen worker-failure containment with live CUDA allocations
   # spread across four local processes.
   - unittest/_torch/visual_gen/test_executor_lifecycle_multi_gpu.py::test_sigkill_one_worker_contains_real_multi_gpu_group

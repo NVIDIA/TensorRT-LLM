@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import re
 from typing import Optional
 
@@ -8,6 +22,7 @@ import tensorrt_llm.logger as logger
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import \
     HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
+from tensorrt_llm._torch.modules.mamba.mamba2_tp import Mamba2TpShard
 from tensorrt_llm._torch.utils import split
 
 
@@ -19,39 +34,23 @@ class NemotronHHfWeightMapper(HfWeightMapper):
         config = self.config.pretrained_config
         tp_size = 1 if self.config.mapping.enable_attention_dp else self.config.mapping.tp_size
         tp_rank = self.config.mapping.tp_rank
-        d_inner = config.mamba_head_dim * config.mamba_num_heads
-
-        def _split_mamba2_mixer_in_proj(w: torch.Tensor) -> torch.Tensor:
-            # Special handling for Mamba2 mixer in_proj.weights and scales.
-            in_proj_z, in_proj_x, in_proj_b, in_proj_c, in_proj_dt = torch.split(
-                w, [
-                    d_inner, d_inner, n_groups * d_state, n_groups * d_state,
-                    nheads
-                ],
-                dim=0)
-            w = []
-            for rank in range(tp_size):
-                in_proj_z_rank = split(in_proj_z, tp_size, rank)
-                in_proj_x_rank = split(in_proj_x, tp_size, rank)
-                in_proj_b_rank = split(in_proj_b, tp_size, rank)
-                in_proj_c_rank = split(in_proj_c, tp_size, rank)
-                in_proj_dt_rank = split(in_proj_dt, tp_size, rank)
-                y = torch.concat([
-                    in_proj_z_rank, in_proj_x_rank, in_proj_b_rank,
-                    in_proj_c_rank, in_proj_dt_rank
-                ])
-                w.append(y)
-            w = torch.concat(w).contiguous()
-            return w
 
         n_groups = config.n_groups
         d_state = config.ssm_state_size
         nheads = config.mamba_num_heads
+        d_inner = config.mamba_head_dim * config.mamba_num_heads
         # Full in_proj out_features = concat([z, x, B, C, dt]). Only its
         # per-output-row block scale spans this dim 0 and takes the same
         # structured split as the weight; per-tensor scalars (weight_scale_2,
         # input_scale) do not and are left alone.
         d_in_proj = 2 * d_inner + 2 * n_groups * d_state + nheads
+        # Per-rank row layout, including replicated B/C groups when
+        # tp_size > n_groups (see mamba2_tp.py).
+        shard = Mamba2TpShard(tp_size=tp_size,
+                              nheads=nheads,
+                              n_groups=n_groups,
+                              head_dim=config.mamba_head_dim,
+                              d_state=d_state)
 
         new_weights = {}
         for name, _ in weights.items():
@@ -79,7 +78,7 @@ class NemotronHHfWeightMapper(HfWeightMapper):
 
             if "mixer.in_proj" in key and "_scale" in key:
                 if self._num_rows(weights[name]) == d_in_proj:
-                    new_weights[key] = _split_mamba2_mixer_in_proj(
+                    new_weights[key] = shard.rearrange_in_proj_rows(
                         weights[name])
                 else:
                     new_weights[key] = weights[name]
@@ -104,25 +103,13 @@ class NemotronHHfWeightMapper(HfWeightMapper):
                 # ``weight_scale``, ``weight_scale_2``, …) under ``mixer.in_proj.*``
                 # — those are scalars / 1-D scales and must not go through the
                 # Mamba2 split rearrangement.
-                new_weights[key] = _split_mamba2_mixer_in_proj(weights[name])
+                new_weights[key] = shard.rearrange_in_proj_rows(weights[name])
             elif "conv1d" in key:
                 w = weights[name]
                 # removing dim(1) because we are using Linear to store conv1d weights
                 if "weight" in key:
                     w = w.squeeze(1)
-
-                conv_x, conv_b, conv_c = torch.split(
-                    w, [d_inner, n_groups * d_state, n_groups * d_state], dim=0)
-
-                w = []
-                for rank in range(tp_size):
-                    conv_x_rank = split(conv_x, tp_size, rank)
-                    conv_b_rank = split(conv_b, tp_size, rank)
-                    conv_c_rank = split(conv_c, tp_size, rank)
-                    y = torch.concat([conv_x_rank, conv_b_rank, conv_c_rank])
-                    w.append(y)
-                w = torch.concat(w).contiguous()
-                new_weights[key] = w
+                new_weights[key] = shard.rearrange_conv1d_rows(w)
             elif "mixer.norm.weight" in key:
                 w = split(weights[name], tp_size, tp_rank)
                 new_weights[key] = w
