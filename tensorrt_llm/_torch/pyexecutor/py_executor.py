@@ -1805,6 +1805,13 @@ class PyExecutor:
     def fail_sleep_wakeup_transition(self) -> None:
         self.executor_request_queue.fail_sleep_wakeup_transition()
 
+    def get_memory_status(self) -> dict[str, object]:
+        state, parked_tags = self.executor_request_queue.get_memory_status()
+        return {
+            "state": state.value,
+            "parked_tags": sorted(parked_tags),
+        }
+
     def get_request_admission_state(self) -> RequestAdmissionState:
         return self.executor_request_queue.get_admission_state()
 
@@ -3274,6 +3281,7 @@ class PyExecutor:
                             elif target_action == _SleepWakeupAction.SLEEP:
                                 self._run_mnnvl_checkpoint_resources(
                                     target_action, tags)
+                                self.invalidate_v1_prefix_cache_for_sleep(tags)
                                 release_with_tag(*tags)
                                 torch.cuda.synchronize()
                                 gc.collect()
@@ -8546,6 +8554,27 @@ class PyExecutor:
                                 "route_capture", None)
         if route_capture is not None:
             route_capture.clear_shared()
+
+    def validate_sleep_tags(self, tags: List[ExecutorMemoryType]) -> None:
+        """Reject runtime-memory tags unsupported by the active KV manager."""
+        if (self._is_kv_manager_v2 and ExecutorMemoryType.KV_CACHE in tags):
+            raise ValueError(
+                "KV_CACHE sleep is not supported with KVCacheManagerV2 because "
+                "its main pools are not managed by tagged virtual memory.")
+
+    def invalidate_v1_prefix_cache_for_sleep(
+            self, tags: List[ExecutorMemoryType]) -> None:
+        """Invalidate V1 reuse metadata before destructive KV-cache sleep."""
+        if (self._is_kv_manager_v2 or not self.enable_kv_cache_reuse
+                or ExecutorMemoryType.KV_CACHE not in tags):
+            return
+
+        from tensorrt_llm._torch.virtual_memory import RestoreMode
+
+        restore_mode = self.llm_args.sleep_config.restore_modes[
+            ExecutorMemoryType.KV_CACHE]
+        if restore_mode in (RestoreMode.NONE, RestoreMode.MEMSET):
+            self.reset_prefix_cache()
 
     def _handle_guided_decoder_errors(
             self, scheduled_batch: ScheduledRequests,

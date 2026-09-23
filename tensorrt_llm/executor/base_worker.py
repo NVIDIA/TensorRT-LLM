@@ -620,6 +620,18 @@ class BaseWorker(GenerationExecutor):
                 "Sleep feature is not enabled, please set sleep_config in "
                 "the LLM arguments.")
 
+    def _validate_sleep_tags(self, tags: list[ExecutorMemoryType]) -> None:
+        validator = getattr(self.engine, "validate_sleep_tags", None)
+        if validator is not None:
+            validator(tags)
+
+    def _invalidate_v1_prefix_cache_for_sleep(
+            self, tags: list[ExecutorMemoryType]) -> None:
+        invalidator = getattr(self.engine,
+                              "invalidate_v1_prefix_cache_for_sleep", None)
+        if invalidator is not None:
+            invalidator(tags)
+
     def _multi_rank_sleep_wakeup(
         self,
         action: Literal["sleep", "wakeup"],
@@ -847,6 +859,7 @@ class BaseWorker(GenerationExecutor):
                             None) if has_mnnvl_resources else None)
                         if run_mnnvl is not None:
                             run_mnnvl(target_action, tags)
+                        self._invalidate_v1_prefix_cache_for_sleep(tags)
                         release_with_tag(*tags)
                         torch.cuda.synchronize()
                         gc.collect()
@@ -909,6 +922,55 @@ class BaseWorker(GenerationExecutor):
         finally:
             propagate_hard_kill()
 
+    def get_memory_status(self) -> dict[str, object]:
+        """Return the authoritative runtime-memory state for this worker."""
+        self._check_sleep_wakeup_preconditions("get_memory_status")
+        return self.engine.get_memory_status()
+
+    def _prepare_sleep_tags(
+        self,
+        tags: list[ExecutorMemoryType],
+    ) -> list[ExecutorMemoryType]:
+        get_status = getattr(self.engine, "get_memory_status", None)
+        if get_status is None:
+            return tags
+
+        status = get_status()
+        state = status["state"]
+        parked_tags = {ExecutorMemoryType(tag) for tag in status["parked_tags"]}
+        requested_tags = set(tags)
+        if state == "running":
+            return tags
+        if state == "parked":
+            if requested_tags.issubset(parked_tags):
+                return []
+            additional_tags = requested_tags - parked_tags
+            raise RuntimeError(
+                "Runtime memory is already parked; resume it before releasing "
+                f"additional tags: {sorted(tag.value for tag in additional_tags)}"
+            )
+        raise RuntimeError(
+            f"Cannot release runtime memory while state is '{state}'.")
+
+    def _prepare_wakeup_tags(
+        self,
+        tags: list[ExecutorMemoryType],
+    ) -> list[ExecutorMemoryType]:
+        get_status = getattr(self.engine, "get_memory_status", None)
+        if get_status is None:
+            return tags
+
+        status = get_status()
+        state = status["state"]
+        if state == "running":
+            return []
+        if state != "parked":
+            raise RuntimeError(
+                f"Cannot resume runtime memory while state is '{state}'.")
+
+        parked_tags = {ExecutorMemoryType(tag) for tag in status["parked_tags"]}
+        return [tag for tag in tags if tag in parked_tags]
+
     def sleep(self, sleep_tags: list[str]) -> None:
         """Release GPU virtual memory for the specified memory type tags.
 
@@ -947,6 +1009,10 @@ class BaseWorker(GenerationExecutor):
         from tensorrt_llm._torch.virtual_memory import release_with_tag
 
         tags = [ExecutorMemoryType(tag) for tag in sleep_tags]
+        tags = self._prepare_sleep_tags(tags)
+        if not tags:
+            return
+        self._validate_sleep_tags(tags)
         logger.info(f"Sleep: {tags}")
         self.engine.begin_sleep_transition(tags)
         local_mutation_started = False
@@ -958,6 +1024,7 @@ class BaseWorker(GenerationExecutor):
                 ):
                     torch.cuda.synchronize()
                     local_mutation_started = True
+                    self._invalidate_v1_prefix_cache_for_sleep(tags)
                     release_with_tag(*tags)
                     torch.cuda.synchronize()
                     gc.collect()
@@ -1001,6 +1068,9 @@ class BaseWorker(GenerationExecutor):
         from tensorrt_llm._torch.virtual_memory import materialize_with_tag
 
         tags = [ExecutorMemoryType(tag) for tag in wakeup_tags]
+        tags = self._prepare_wakeup_tags(tags)
+        if not tags:
+            return
         logger.info(f"Wakeup: {tags}")
         self.engine.begin_wakeup_transition(tags)
         local_mutation_started = False

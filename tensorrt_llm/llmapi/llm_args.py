@@ -3397,6 +3397,22 @@ class ExecutorMemoryType(StrEnum):
     MODEL_WEIGHTS_DRAFT = "draft_model_weights"
 
 
+class RuntimeMemoryStatus(StrictBaseModel):
+    """Status of runtime memory managed by sleep and wakeup."""
+
+    state: Literal["running", "parking", "parked", "waking", "failed"] = Field(
+        description="Current runtime-memory admission state.")
+    parked_tags: list[ExecutorMemoryType] = Field(
+        default_factory=list,
+        description=
+        "Memory tags that remain released, sorted lexicographically by value.")
+
+    @field_validator("parked_tags")
+    @classmethod
+    def sort_parked_tags(cls, parked_tags):
+        return sorted(parked_tags, key=lambda tag: tag.value)
+
+
 @dataclass
 class _SleepConfigDefaultFactory:
     """Picklable replacement for ``lambda: default_mode`` in SleepConfig's defaultdict."""
