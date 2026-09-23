@@ -18,7 +18,7 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-from .engine.runners.interface import PackedRequests
+from .engine.runners.interface import PackedInputs
 
 
 class EncoderExecutor:
@@ -59,13 +59,14 @@ class EncoderExecutor:
         input_ids = model_inputs.pop("input_ids")
         if isinstance(input_ids, torch.Tensor):
             input_ids = input_ids.tolist()
-        batch = PackedRequests(
+        packed_inputs = PackedInputs(
             input_ids=input_ids,
             sequence_lengths=[int(length) for length in model_inputs.pop("seq_lens")],
             multi_item_part_lens=model_inputs.pop("multi_item_part_lens", None),
             model_inputs=model_inputs,
+            gather_context_logits=kwargs.pop("gather_context_logits", False),
         )
-        return self.model_engine.forward(batch, **kwargs)
+        return self.model_engine.forward(packed_inputs, **kwargs)
 
     def shutdown(self):
         """No background thread to stop — just release model engine resources."""

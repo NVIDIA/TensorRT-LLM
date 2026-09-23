@@ -14,15 +14,18 @@ from torch import nn
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttentionMetadata
+from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.memory_buffer_utils import with_shared_pool
+from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancer
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import nvtx_range, prefer_pinned
+from tensorrt_llm.mapping import Mapping
 
 from .common import apply_position_id_offset, get_top_level_model
 from .encoder import EncoderConfigMixin, EncoderMixin, EncoderPreparedInputs
-from .interface import RunnerConfig, RunnerDeps, ScheduledForwardInputs, ScheduledModelRunner
+from .interface import RunnerConfig, ScheduledInputs, ScheduledModelRunner
 
 
 @dataclass(frozen=True)
@@ -40,12 +43,17 @@ class EncoderDecoderRunner(EncoderMixin, ScheduledModelRunner):
     def __init__(
         self,
         model: nn.Module,
-        deps: RunnerDeps,
         config: EncoderDecoderRunnerConfig,
+        *,
+        mapping: Mapping,
+        dist: Distributed | None,
+        moe_load_balancer: MoeLoadBalancer | None,
     ) -> None:
         if not config.is_encoder_decoder:
             raise ValueError("EncoderDecoderRunner requires an encoder-decoder model.")
-        self._initialize_encoder(model, deps, config)
+        self._initialize_encoder(
+            model, config, mapping=mapping, dist=dist, moe_load_balancer=moe_load_balancer
+        )
         self._feature_staging: torch.Tensor | None = None
         self._feature_staging_event: torch.cuda.Event | None = None
         self._feature_copy_stream: torch.cuda.Stream | None = None
@@ -308,21 +316,21 @@ class EncoderDecoderRunner(EncoderMixin, ScheduledModelRunner):
     @nvtx_range("encoder_decoder_forward")
     def forward(
         self,
-        batch: ScheduledRequests,
+        inputs: ScheduledInputs,
         *,
-        inputs: ScheduledForwardInputs,
         resource_manager: ResourceManager,
         is_dummy: bool = False,
     ) -> dict[str, Any]:
-        del inputs, is_dummy
+        del is_dummy
         prepared = self.prepare_inputs(
-            batch,
+            inputs.batch,
             resource_manager=resource_manager,
         )
         hidden_states = self._execute_prepared(prepared)
         return {
             "encoder_hidden_states": hidden_states,
             "encoder_seq_lens": prepared.sequence_lengths,
+            "runtime_draft_len": inputs.runtime_draft_len,
         }
 
     def _forward_encoder_stack(self, inputs: dict[str, Any]) -> torch.Tensor:

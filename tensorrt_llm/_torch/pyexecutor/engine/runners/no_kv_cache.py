@@ -13,8 +13,12 @@ from torch import nn
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttentionMetadata
+from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
-from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancerIterContext
+from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
+    MoeLoadBalancer,
+    MoeLoadBalancerIterContext,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative import SpecMetadata, get_spec_metadata
@@ -22,6 +26,7 @@ from tensorrt_llm._torch.utils import set_per_request_prefill_cuda_graph_flag
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, PrefillCudaGraphBackend
+from tensorrt_llm.mapping import Mapping
 
 from ..input_buffers import InputBuffers
 from ..lora import LoraParamBuilder
@@ -34,13 +39,7 @@ from .common import (
     set_spec_metadata_all_rank_num_tokens,
     ship_multimodal_indices,
 )
-from .interface import (
-    PreparedInputs,
-    RunnerConfig,
-    RunnerDeps,
-    ScheduledForwardInputs,
-    ScheduledModelRunner,
-)
+from .interface import PreparedInputs, RunnerConfig, ScheduledInputs, ScheduledModelRunner
 
 
 @dataclass(frozen=True)
@@ -66,11 +65,16 @@ class NoKVCacheRunner(ScheduledModelRunner):
     def __init__(
         self,
         model: nn.Module,
-        deps: RunnerDeps,
         config: NoKVCacheRunnerConfig,
+        *,
+        mapping: Mapping,
+        dist: Distributed | None,
+        moe_load_balancer: MoeLoadBalancer | None,
     ) -> None:
         self._model = model
-        self._deps = deps
+        self._mapping = mapping
+        self._dist = dist
+        self._moe_load_balancer = moe_load_balancer
         self._buffers = InputBuffers.allocate(
             max_num_tokens=config.max_num_tokens,
             max_batch_size=config.max_batch_size,
@@ -102,7 +106,7 @@ class NoKVCacheRunner(ScheduledModelRunner):
             max_beam_width=self._config.max_beam_width,
             attention_backend=self._config.attention_backend,
             attention_runtime_features=self._config.attention_runtime_features,
-            mapping=self._deps.mapping,
+            mapping=self._mapping,
             cache_indirection=self._buffers.cache_indirection,
             kv_cache_manager=None,
         )
@@ -279,15 +283,15 @@ class NoKVCacheRunner(ScheduledModelRunner):
         attn_all_rank_num_tokens = get_all_rank_num_tokens(
             attn_metadata,
             enable_attention_dp=runner_config.enable_attention_dp,
-            mapping=self._deps.mapping,
-            dist=self._deps.dist,
+            mapping=self._mapping,
+            dist=self._dist,
         )
         padded_num_tokens, can_run_prefill_cuda_graph, attn_all_rank_num_tokens = (
             get_padding_params(
                 num_tokens,
                 attn_metadata.num_contexts,
                 attn_all_rank_num_tokens,
-                dist=self._deps.dist,
+                dist=self._dist,
                 enable_attention_dp=runner_config.enable_attention_dp,
                 prefill_cuda_graph_backend=runner_config.prefill_cuda_graph_backend,
                 prefill_cuda_graph_num_tokens=runner_config.prefill_cuda_graph_num_tokens,
@@ -363,9 +367,9 @@ class NoKVCacheRunner(ScheduledModelRunner):
 
         # support attention dp
         if runner_config.enable_attention_dp:
-            assert self._deps.dist is not None, "attention DP requires a distributed communicator"
+            assert self._dist is not None, "attention DP requires a distributed communicator"
             if spec_metadata is not None:
-                all_rank_num_tokens = self._deps.dist.tp_cp_allgather_int64(
+                all_rank_num_tokens = self._dist.tp_cp_allgather_int64(
                     [
                         attn_metadata.num_tokens,
                         spec_metadata.num_tokens,
@@ -381,9 +385,9 @@ class NoKVCacheRunner(ScheduledModelRunner):
                     [item[3] for item in all_rank_num_tokens],
                 )
             else:
-                all_rank_num_tokens = self._deps.dist.tp_cp_allgather_int64(
-                    [attn_metadata.num_tokens]
-                )[:, 0].tolist()
+                all_rank_num_tokens = self._dist.tp_cp_allgather_int64([attn_metadata.num_tokens])[
+                    :, 0
+                ].tolist()
                 attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
         return PreparedInputs(inputs)
@@ -404,26 +408,28 @@ class NoKVCacheRunner(ScheduledModelRunner):
 
     def forward(
         self,
-        batch: ScheduledRequests,
+        inputs: ScheduledInputs,
         *,
-        inputs: ScheduledForwardInputs,
         resource_manager: ResourceManager,
         is_dummy: bool = False,
     ) -> dict[str, Any]:
         del is_dummy
+        batch = inputs.batch
         self._validate_resources(resource_manager)
         prepared = self.prepare_inputs(
             batch,
             resource_manager=resource_manager,
             runtime_draft_len=inputs.runtime_draft_len,
         )
-        with MoeLoadBalancerIterContext(self._deps.moe_load_balancer):
-            return self._forward_step(
+        with MoeLoadBalancerIterContext(self._moe_load_balancer):
+            outputs = self._forward_step(
                 prepared.kwargs,
                 batch,
                 gather_ids=prepared.gather_ids,
                 gather_context_logits=inputs.gather_context_logits,
             )
+        outputs["runtime_draft_len"] = inputs.runtime_draft_len
+        return outputs
 
     @abstractmethod
     def _forward_step(

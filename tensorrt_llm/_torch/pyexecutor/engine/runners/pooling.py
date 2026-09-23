@@ -6,11 +6,16 @@
 from typing import Any
 
 import torch
+from torch import nn
 
+from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancer
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.mapping import Mapping
 
-from .no_kv_cache import NoKVCacheRunner
+from ..model_call import ModelCaller
+from .no_kv_cache import NoKVCacheRunner, NoKVCacheRunnerConfig
 
 
 class PoolingRunner(NoKVCacheRunner):
@@ -19,6 +24,21 @@ class PoolingRunner(NoKVCacheRunner):
     This is a model runner because the family diverges during input preparation. It is
     distinct from vLLM's output-stage ``PoolingRunner``, which corresponds to a sampler.
     """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        config: NoKVCacheRunnerConfig,
+        *,
+        mapping: Mapping,
+        dist: Distributed | None,
+        moe_load_balancer: MoeLoadBalancer | None,
+        model_caller: ModelCaller,
+    ) -> None:
+        super().__init__(
+            model, config, mapping=mapping, dist=dist, moe_load_balancer=moe_load_balancer
+        )
+        self._model_caller = model_caller
 
     @nvtx_range("_forward_step")
     def _forward_step(
@@ -35,7 +55,7 @@ class PoolingRunner(NoKVCacheRunner):
         if inputs.get("spec_metadata") is not None:
             gather_ids = inputs["spec_metadata"].gather_ids
 
-        outputs = self._deps.model_caller(
+        outputs = self._model_caller(
             **inputs,
             return_context_logits=gather_ids is not None or gather_context_logits,
         )

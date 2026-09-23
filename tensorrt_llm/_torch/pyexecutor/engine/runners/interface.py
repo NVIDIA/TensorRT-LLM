@@ -16,16 +16,11 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionBackend,
     AttentionRuntimeFeatures,
 )
-from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm.mapping import Mapping
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancer
     from tensorrt_llm._torch.pyexecutor.sampler.sampler import SampleStateTensors
-
-    from ..model_call import ModelCaller
 
 
 @dataclass(frozen=True)
@@ -37,8 +32,8 @@ class PreparedInputs:
 
 
 @dataclass(frozen=True)
-class PackedRequests:
-    """An encode-only batch whose tokens the caller already packed.
+class PackedInputs:
+    """Packed encode-only inputs and per-call output options.
 
     The token lists are referenced, not copied, so callers must not mutate them
     while a forward pass is in flight. ``model_inputs`` carries model-specific
@@ -50,30 +45,19 @@ class PackedRequests:
     sequence_lengths: list[int]
     multi_item_part_lens: list[list[int]] | None = None
     model_inputs: dict[str, Any] = field(default_factory=dict)
+    gather_context_logits: bool = False
 
 
-@dataclass
-class ScheduledForwardInputs:
-    """Borrowed execution data and options for one scheduled forward.
+@dataclass(frozen=True)
+class ScheduledInputs:
+    """Inputs for one scheduled forward; batch and tensors are borrowed.
 
-    Tensor storage is not copied or owned here. The caller keeps it alive and
-    preserves its slot alignment until the consuming device work completes.
-    Runners must not retain this record between calls.
-
-    ``new_tensors_device`` retains the sampler's layout and optional spec fields.
-    ``cache_indirection_buffer`` is the sampler's integer beam mapping with shape
-    [sequence slots, beam width, max sequence length], not the runner's staging
-    buffer. ``num_accepted_tokens_device`` contains integer acceptance counts
-    indexed by sequence slot. ``previous_request_slots`` optionally maps request
-    IDs to the slots of those cross-round inputs; it carries no request objects.
-
-    ``enable_spec_decode`` is the caller's per-call decision, independent of
-    whether ``runtime_draft_len`` is zero. The caller supplies the selected
-    width; preparation may update it after graph selection. The effective width
-    remains visible even if execution raises. Runners may update that field,
-    but must leave the other inputs unchanged.
+    Keep borrowed data valid until GPU consumption completes. Spec enablement
+    is independent of draft length; the effective length is returned through
+    outputs["runtime_draft_len"] without modifying this record.
     """
 
+    batch: ScheduledRequests
     new_tensors_device: SampleStateTensors | None = None
     cache_indirection_buffer: torch.Tensor | None = None
     num_accepted_tokens_device: torch.Tensor | None = None
@@ -94,16 +78,6 @@ class RunnerConfig:
     without_logits: bool
     attention_backend: type[AttentionBackend]
     attention_runtime_features: AttentionRuntimeFeatures
-
-
-@dataclass(frozen=True)
-class RunnerDeps:
-    """Shared execution collaborators, separate from input storage and call data."""
-
-    dist: Distributed | None
-    mapping: Mapping
-    moe_load_balancer: MoeLoadBalancer | None
-    model_caller: ModelCaller
 
 
 class ModelRunner(ABC):
@@ -130,14 +104,14 @@ class ScheduledModelRunner(ModelRunner):
     @abstractmethod
     def forward(
         self,
-        batch: ScheduledRequests,
+        inputs: ScheduledInputs,
         *,
-        inputs: ScheduledForwardInputs,
         resource_manager: ResourceManager,
         is_dummy: bool = False,
     ) -> dict[str, Any]:
         """Execute a batch using per-call inputs and borrowed runtime resources.
 
+        The output dictionary includes the effective ``runtime_draft_len``.
         Model/graph collaborators belong to the runner's dependencies.
         ``is_dummy`` is True for warmup and memory-profiling passes, not for
         serving batches that merely contain padding requests. Callers establish
@@ -160,8 +134,6 @@ class PackedModelRunner(ModelRunner):
     @abstractmethod
     def forward(
         self,
-        batch: PackedRequests,
-        *,
-        gather_context_logits: bool = False,
+        inputs: PackedInputs,
     ) -> dict[str, Any]:
         """Validate and execute the packed inputs without silently ignoring them."""

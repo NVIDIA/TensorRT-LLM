@@ -96,10 +96,10 @@ from .engine.runners import (apply_position_id_offset, get_all_rank_num_tokens,
 from .engine.runners.encoder import EncoderRunner, EncoderRunnerConfig
 from .engine.runners.encoder_decoder import (EncoderDecoderRunner,
                                              EncoderDecoderRunnerConfig)
-from .engine.runners.interface import (PackedModelRunner, PackedRequests,
-                                       RunnerDeps, ScheduledForwardInputs,
-                                       ScheduledModelRunner)
+from .engine.runners.interface import (PackedInputs, PackedModelRunner,
+                                       ScheduledInputs, ScheduledModelRunner)
 from .engine.runners.no_kv_cache import NoKVCacheRunner, NoKVCacheRunnerConfig
+from .engine.runners.pooling import PoolingRunner
 from .guided_decoder import CapturableGuidedDecoder
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
@@ -942,6 +942,7 @@ class PyTorchModelEngine(ModelEngine):
     ) -> Optional[Union[ScheduledModelRunner, PackedModelRunner]]:
         if runner_cls is None:
             return None
+        assert self._model_caller is not None
         if issubclass(runner_cls, EncoderRunner):
             return self._initialize_encoder_runner(runner_cls)
         if issubclass(runner_cls, EncoderDecoderRunner):
@@ -970,8 +971,11 @@ class PyTorchModelEngine(ModelEngine):
         )
         return runner_cls(
             self.model,
-            self._create_runner_deps(),
             runner_config,
+            mapping=self.mapping,
+            dist=self.dist,
+            moe_load_balancer=self.moe_load_balancer,
+            model_caller=self._model_caller,
         )
 
     def _initialize_encoder_decoder_runner(
@@ -994,8 +998,10 @@ class PyTorchModelEngine(ModelEngine):
         )
         runner = runner_cls(
             self.model,
-            self._create_runner_deps(),
             runner_config,
+            mapping=self.mapping,
+            dist=self.dist,
+            moe_load_balancer=self.moe_load_balancer,
         )
         # Remove this bridge when decoder graph ownership moves into the runner.
         # Only immutable planning data is shared; graph resources stay private.
@@ -1028,19 +1034,21 @@ class PyTorchModelEngine(ModelEngine):
                 self._spec_dec_max_total_draft_tokens),
             max_draft_loop_tokens=self.max_draft_loop_tokens,
         )
+        if issubclass(runner_cls, PoolingRunner):
+            return runner_cls(
+                self.model,
+                runner_config,
+                mapping=self.mapping,
+                dist=self.dist,
+                moe_load_balancer=self.moe_load_balancer,
+                model_caller=self._model_caller,
+            )
         return runner_cls(
             self.model,
-            self._create_runner_deps(),
             runner_config,
-        )
-
-    def _create_runner_deps(self) -> RunnerDeps:
-        assert self._model_caller is not None
-        return RunnerDeps(
-            dist=self.dist,
             mapping=self.mapping,
+            dist=self.dist,
             moe_load_balancer=self.moe_load_balancer,
-            model_caller=self._model_caller,
         )
 
     def register_forward_pass_callable(self, callable: Callable):
@@ -1406,9 +1414,8 @@ class PyTorchModelEngine(ModelEngine):
         scheduled_requests = ScheduledRequests()
         scheduled_requests.encoder_requests = list(encoder_requests)
         outputs = self._runner.forward(
-            scheduled_requests,
+            ScheduledInputs(batch=scheduled_requests),
             resource_manager=resource_manager,
-            inputs=ScheduledForwardInputs(),
             is_dummy=self.is_warmup,
         )
         return (
@@ -6113,21 +6120,21 @@ class PyTorchModelEngine(ModelEngine):
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self.model.extra_attrs)
     def forward(self,
-                batch: Union[ScheduledRequests, PackedRequests],
+                batch: Union[ScheduledRequests, PackedInputs],
                 resource_manager: Optional[ResourceManager] = None,
                 new_tensors_device: Optional[SampleStateTensors] = None,
                 gather_context_logits: bool = False,
                 cache_indirection_buffer: Optional[torch.Tensor] = None,
                 num_accepted_tokens_device: Optional[torch.Tensor] = None,
                 req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None):
-        if isinstance(batch, PackedRequests):
+        if isinstance(batch, PackedInputs):
             assert isinstance(self._runner, PackedModelRunner), (
                 "a packed batch requires a packed-batch runner")
-            return self._runner.forward(
-                batch, gather_context_logits=gather_context_logits)
+            return self._runner.forward(batch)
         assert resource_manager is not None, (
             "scheduled execution requires a resource manager")
-        inputs = ScheduledForwardInputs(
+        inputs = ScheduledInputs(
+            batch=batch,
             new_tensors_device=new_tensors_device,
             cache_indirection_buffer=cache_indirection_buffer,
             num_accepted_tokens_device=num_accepted_tokens_device,
@@ -6141,21 +6148,18 @@ class PyTorchModelEngine(ModelEngine):
         )
         # Both model warmup and executor memory profiling establish this flag.
         # Padding requests in a serving batch do not make the pass dummy.
-        try:
-            return self._forward_scheduled(
-                batch,
-                inputs=inputs,
-                resource_manager=resource_manager,
-                is_dummy=self.is_warmup,
-            )
-        finally:
-            self.runtime_draft_len = inputs.runtime_draft_len
+        outputs = self._forward_scheduled(
+            inputs,
+            resource_manager=resource_manager,
+            is_dummy=self.is_warmup,
+        )
+        self.runtime_draft_len = outputs.pop("runtime_draft_len")
+        return outputs
 
     def _forward_scheduled(
         self,
-        batch: ScheduledRequests,
+        inputs: ScheduledInputs,
         *,
-        inputs: ScheduledForwardInputs,
         resource_manager: ResourceManager,
         is_dummy: bool = False,
     ) -> Dict[str, Any]:
@@ -6163,8 +6167,7 @@ class PyTorchModelEngine(ModelEngine):
             assert isinstance(self._runner, ScheduledModelRunner), (
                 "scheduled execution requires a scheduled runner")
             return self._runner.forward(
-                batch,
-                inputs=inputs,
+                inputs,
                 resource_manager=resource_manager,
                 is_dummy=is_dummy,
             )
@@ -6175,17 +6178,16 @@ class PyTorchModelEngine(ModelEngine):
         assert is_dummy == self.is_warmup
         self.enable_spec_decode = inputs.enable_spec_decode
         self.runtime_draft_len = inputs.runtime_draft_len
-        try:
-            return self._forward_decoder(batch, inputs, resource_manager)
-        finally:
-            inputs.runtime_draft_len = self.runtime_draft_len
+        outputs = self._forward_decoder(inputs, resource_manager)
+        outputs["runtime_draft_len"] = self.runtime_draft_len
+        return outputs
 
     def _forward_decoder(
         self,
-        scheduled_requests: ScheduledRequests,
-        forward_inputs: ScheduledForwardInputs,
+        forward_inputs: ScheduledInputs,
         resource_manager: ResourceManager,
     ) -> Dict[str, Any]:
+        scheduled_requests = forward_inputs.batch
         new_tensors_device = forward_inputs.new_tensors_device
         cache_indirection_buffer = forward_inputs.cache_indirection_buffer
         num_accepted_tokens_device = forward_inputs.num_accepted_tokens_device
