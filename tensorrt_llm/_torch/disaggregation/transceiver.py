@@ -25,6 +25,7 @@ import torch
 
 import tensorrt_llm.bindings
 from tensorrt_llm import logger
+from tensorrt_llm._torch.disaggregation import diagnostics as disagg_diagnostics
 from tensorrt_llm._torch.disaggregation.base import CacheExtent, CacheKind, Chunk, TokenRange
 from tensorrt_llm._torch.disaggregation.base.agent import use_pure_python_transfer_agent
 from tensorrt_llm._torch.disaggregation.base.transfer import (
@@ -772,6 +773,61 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"refusing to retire {outcome} KV transfer rid={rid}: session close refused"
             )
 
+    def _emit_transfer_settled(
+        self,
+        side: str,
+        rid: Optional[int],
+        req: Optional[LlmRequest],
+        session: Optional[object],
+        outcome: str,
+    ) -> None:
+        """Report a transfer only after its session has been physically retired."""
+        with disagg_diagnostics.suppress_diagnostic_errors():
+            request_id_scope = "unknown"
+            if req is not None:
+                rid = disagg_diagnostics.get_request_id(req)
+                request_id_scope = disagg_diagnostics.get_request_id_scope(
+                    req.py_disaggregated_params
+                )
+            elif session is not None:
+                rid = session.disagg_request_id
+                request_id_scope = disagg_diagnostics.get_request_id_scope(
+                    session._base_args.params
+                )
+            disagg_diagnostics.emit_event(
+                f"{side}_transfer_settled",
+                side=side,
+                request_id=rid,
+                request_id_scope=request_id_scope,
+                local_request_id=(req.py_request_id if req is not None else None),
+                rank=self._mapping.rank,
+                instance=self._instance_name,
+                outcome=outcome,
+                session_status=(session.status.value if session is not None else None),
+                resources_drained=(session is None or not session.has_transferring_tasks()),
+                tp_rank=self._mapping.tp_rank,
+                pp_rank=self._mapping.pp_rank,
+                cp_rank=self._mapping.cp_rank,
+                dp_rank=self._dp_rank,
+            )
+
+    def _emit_receive_start(
+        self, req: LlmRequest, transfer_bytes: int, *, timeout_expected: bool
+    ) -> None:
+        """Record the receive publication boundary using existing payload metadata."""
+        with disagg_diagnostics.suppress_diagnostic_errors():
+            disagg_diagnostics.emit_request_event(
+                "gen_receive_start",
+                req,
+                side="gen",
+                dist=self._mapping,
+                instance=self._instance_name,
+                slice_id=0,
+                transfer_bytes=transfer_bytes,
+                timeout_expected=timeout_expected,
+                dp_rank=self._dp_rank,
+            )
+
     def _apply_aux(self, session, req: LlmRequest):
         """Unpack aux tokens from session into request's context_phase_params."""
         session.unpack_aux(req)
@@ -955,9 +1011,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
         session = None
         fetches = None
+        receive_started = False
+        settlement_outcome = None
         try:
             extent = self._create_cache_extent(req)
             fetches = self._open_peer_source(req)
+            if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                with disagg_diagnostics.suppress_diagnostic_errors():
+                    diagnostic_transfer_bytes = (
+                        self._chunk_num_bytes(extent.local) * self._kv_size_rank_factor
+                    )
+                    self._emit_receive_start(req, diagnostic_transfer_bytes, timeout_expected=False)
+            receive_started = True
             # Same submission the asynchronous entry makes; what differs is who waits. The session
             # underneath is read back for the blocking wait, the auxiliary buffer and the close.
             fetches.fetch(extent)
@@ -975,10 +1040,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     self._apply_aux(session, req)
                 self._assert_disagg_history_declared(req)
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+                settlement_outcome = "completed"
             else:
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
+                settlement_outcome = "failed"
         except Exception:
             req.state = LlmRequestState.DISAGG_TRANS_ERROR
+            settlement_outcome = "failed"
             raise
         finally:
             # The adapter opens the session before it submits, so a submission that raises leaves
@@ -989,6 +1057,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if close_succeeded:
                 self._recv_sessions.pop(rid, None)
                 self._recv_reqs.pop(rid, None)
+                if (
+                    disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED
+                    and receive_started
+                    and settlement_outcome is not None
+                ):
+                    self._emit_transfer_settled("gen", rid, req, session, settlement_outcome)
             else:
                 logger.error(
                     f"request_and_receive_sync: retaining rid={rid} because receive "
@@ -1041,6 +1115,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # failed publication as a session the sweep can see but cannot pair with a request.
         self._recv_reqs[rid] = req
         try:
+            if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                with disagg_diagnostics.suppress_diagnostic_errors():
+                    self._emit_receive_start(
+                        req,
+                        req.py_kv_cache_xfer_bytes,
+                        timeout_expected=self.kv_transfer_timeout_ms is not None,
+                    )
             # The handle that comes back is the contract's answer about this piece. What retires
             # the request is the sweep over the session tables, as it was before.
             fetches.fetch(extent)
@@ -1124,16 +1205,43 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         quiesced = set(quiesced_ids)
         cancelled = [rid for rid in cancelled if rid in quiesced]
         failed = [rid for rid in failed if rid in quiesced]
+        diagnostics_enabled = disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED
 
         for rid in cancelled:
+            diagnostic_record = None
+            if diagnostics_enabled:
+                with disagg_diagnostics.suppress_diagnostic_errors():
+                    diagnostic_record = (
+                        self._send_reqs.get(rid),
+                        self._send_sessions[rid],
+                    )
             self._retire_send_session(rid, outcome="cancelled")
+            if diagnostic_record is not None:
+                req, session = diagnostic_record
+                self._emit_transfer_settled("ctx", rid, req, session, "cancelled")
 
         for rid in completed:
             req = self._send_reqs[rid]
+            diagnostic_session = None
+            if diagnostics_enabled:
+                with disagg_diagnostics.suppress_diagnostic_errors():
+                    diagnostic_session = self._send_sessions[rid]
             self._retire_send_session(rid, outcome="completed")
             if mark_complete:
                 req.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
+            if diagnostic_session is not None:
+                self._emit_transfer_settled("ctx", rid, req, diagnostic_session, "completed")
+
+        failed_records = []
+        if diagnostics_enabled:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                for rid in failed:
+                    session = self._send_sessions.get(rid)
+                    if session is not None:
+                        failed_records.append((rid, self._send_reqs.get(rid), session))
         self._close_failed_sessions(self._send_sessions, self._send_reqs, failed, mark_retired=True)
+        for rid, req, session in failed_records:
+            self._emit_transfer_settled("ctx", rid, req, session, "failed")
 
         # Sweep orphaned RecvReqInfo entries from ADP broadcast on non-assigned
         # DP ranks (entries that will never have a TxSession created for them).
@@ -1197,14 +1305,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         cancelled, failed, completed = self._gen_consensus_outcome(
             to_process, cancelled, failed, completed
         )
+        diagnostics_enabled = disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED
 
         cancelled_reqs = []
         for rid in cancelled:
             session = self._recv_sessions[rid]
+            req = self._recv_reqs[rid]
             self._close_session_or_raise(session, rid, "cancelled")
-            cancelled_reqs.append(self._recv_reqs[rid])
+            cancelled_reqs.append(req)
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
+            if diagnostics_enabled:
+                self._emit_transfer_settled("gen", rid, req, session, "cancelled")
 
         # Log gen-side transfer summary after consensus.
         if completed and os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH"):
@@ -1232,12 +1344,23 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
+            if diagnostics_enabled:
+                self._emit_transfer_settled("gen", rid, req, session, "completed")
         if failed:
             logger.warning(
                 f"Disagg gen transfer FAILED rank={self._dist.rank} "
                 f"rids={failed} gen_need_sync={self._gen_need_sync}"
             )
+        failed_records = []
+        if diagnostics_enabled:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                for rid in failed:
+                    session = self._recv_sessions.get(rid)
+                    if session is not None:
+                        failed_records.append((rid, self._recv_reqs.get(rid), session))
         self._close_failed_sessions(self._recv_sessions, self._recv_reqs, failed)
+        for rid, req, session in failed_records:
+            self._emit_transfer_settled("gen", rid, req, session, "failed")
 
         return GenTransferStatus(completed, failed, cancelled_reqs)
 
@@ -1325,16 +1448,35 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """
         rid = get_unique_rid(req)
 
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                for side, sessions in (
+                    ("ctx", self._send_sessions),
+                    ("gen", self._recv_sessions),
+                ):
+                    if rid not in sessions:
+                        continue
+                    disagg_diagnostics.emit_request_event(
+                        "transfer_cancel_requested",
+                        req,
+                        side=side,
+                        dist=self._mapping,
+                        instance=self._instance_name,
+                        session_status=sessions[rid].status.value,
+                        dp_rank=self._dp_rank,
+                    )
+
         # Not yet started (generation-first wait queue).
         self._wait_reqs.pop(rid, None)
 
         has_transferring = False
 
         if rid in self._send_sessions:
-            self._send_sessions[rid].cancel()
-            if self._send_sessions[rid].has_transferring_tasks():
+            session = self._send_sessions[rid]
+            session.cancel()
+            if session.has_transferring_tasks():
                 has_transferring = True
-            elif self._send_sessions[rid].close() is False:
+            elif session.close() is False:
                 has_transferring = True
             else:
                 self._retire_send_session(
@@ -1343,16 +1485,21 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     outcome="cancelled",
                     session_already_closed=True,
                 )
+                if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                    self._emit_transfer_settled("ctx", rid, req, session, "cancelled")
 
         if rid in self._recv_sessions:
-            self._recv_sessions[rid].cancel()
-            if self._recv_sessions[rid].has_transferring_tasks():
+            session = self._recv_sessions[rid]
+            session.cancel()
+            if session.has_transferring_tasks():
                 has_transferring = True
-            elif self._recv_sessions[rid].close() is False:
+            elif session.close() is False:
                 has_transferring = True
             else:
                 del self._recv_reqs[rid]
                 del self._recv_sessions[rid]
+                if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                    self._emit_transfer_settled("gen", rid, req, session, "cancelled")
 
         if has_transferring:
             return False
