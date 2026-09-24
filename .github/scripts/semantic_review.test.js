@@ -78,6 +78,20 @@ test('missing or wrong-repository evidence is inconclusive, never PASS', () => {
   assert.equal(parseResult(reply(20, r, 'INCONCLUSIVE', false), r, repo).verdict, 'INCONCLUSIVE');
 });
 
+test('Markdown result headings publish verdicts without accepting quoted or duplicate sections', async () => {
+  const r = request();
+  for (const heading of ['# SEMANTIC_REVIEW', '## SEMANTIC_REVIEW', '###### SEMANTIC_REVIEW']) {
+    const message = reply(20, r, 'FAIL');
+    message.body = message.body.replace('SEMANTIC_REVIEW', heading);
+    const {state, deliver} = harness(r);
+    state.comments.push(message);
+    await deliver(message);
+    assert.equal(state.check.conclusion, 'failure');
+    assert.equal(parseResult({...message, body: message.body.replace(heading, `> ${heading}`)}, r, repo), undefined);
+    assert.equal(parseResult({...message, body: `${message.body}\nSEMANTIC_REVIEW\n`}, r, repo), undefined);
+  }
+});
+
 test('conflicting records and missing protocol markers are rejected', () => {
   const r = request();
   const message = reply(20, r);

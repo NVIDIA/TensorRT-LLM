@@ -63,7 +63,7 @@ function awaiting(request) {
 
 function parseResult(comment, request, repo) {
   if (!isReviewer(comment.user)) return;
-  const parts = (comment.body || '').split(/^SEMANTIC_REVIEW[ \t]*\r?$/m);
+  const parts = (comment.body || '').split(/^(?:#{1,6}[ \t]+)?SEMANTIC_REVIEW[ \t]*\r?$/m);
   if (parts.length !== 2) return;
   const records = [...parts[1].matchAll(/^SEMANTIC_RESULT request_id=([^\s]+) head=([^\s]+) target=([^\s]+) merge_base=([^\s]+) verdict=(PASS|FAIL|INCONCLUSIVE)[ \t]*\r?$/gmi)];
   if (records.length !== 1) return;
