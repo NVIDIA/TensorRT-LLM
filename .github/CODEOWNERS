@@ -477,7 +477,7 @@
 ### Usage telemetry / privacy review
 /tensorrt_llm/usage/ @NVIDIA/trt-llm-usage-telemetry-devs
 /tests/unittest/usage/ @NVIDIA/trt-llm-usage-telemetry-devs
-/tensorrt_llm/usage/llm_args_golden_manifest.json @NVIDIA/trt-llm-usage-telemetry-devs @NVIDIA/trt-llm-oss-compliance @NVIDIA/trt-llm-noncommitted-api-review-committee
+/tensorrt_llm/usage/llm_args_golden_manifest.json @NVIDIA/trt-llm-usage-telemetry-devs
 
 # Uncomment only on release branches (e.g. release/0.19):
 # * @NVIDIA/trt-llm-release-branch-approval
