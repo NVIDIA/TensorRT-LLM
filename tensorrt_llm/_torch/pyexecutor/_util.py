@@ -286,7 +286,7 @@ def get_kv_cache_manager_cls(
                 # results. Model loading resolves ``auto`` to PYTHON via
                 # KimiLinearForCausalLM.get_preferred_transceiver_runtime
                 # (NIXL-gated); this rejects explicit non-Python routes and
-                # paths that skip model defaults (e.g. AutoDeploy).
+                # paths that skip model defaults.
                 raise ValueError(
                     "Kimi K3 disaggregated serving requires the Python "
                     "transceiver: set cache_transceiver_config "
@@ -3389,7 +3389,7 @@ def validate_kv_cache_compression_compatibility(
         if config.quant == "nvfp4" and not is_sm_100f():
             raise RuntimeError(
                 "NVFP4 cold-page quantization requires an SM100-family device "
-                "(SM100 or SM103).")
+                "(SM100, SM103 or SM107).")
     elif config.algorithm == "triattention" and not is_sm_100f():
         raise RuntimeError(
             "TriAttention requires an SM100-family device (SM100 or SM103).")

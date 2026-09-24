@@ -36,7 +36,7 @@ from tensorrt_llm._utils import get_sm_version
 
 @lru_cache(maxsize=1)
 def _fused_hc_mma_supported() -> bool:
-    """tcgen05 TF32 MMA paths (Path B / Path D, "fused_*_mma") require SM100.
+    """tcgen05 TF32 MMA paths (Path B / Path D, "fused_*_mma") require the SM100 family.
 
     They also require BUILD_DEEP_GEMM=ON so the C++ extension compiles the
     DeepGEMM-backed TF32 kernels. On unsupported builds or GPU generations, only

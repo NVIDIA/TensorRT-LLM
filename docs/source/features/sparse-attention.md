@@ -50,7 +50,7 @@ including mixed batches.
 
 | Parameter | Support |
 |---|---|
-| GPU architecture | SM90, SM100, SM103, SM120, and SM121 |
+| GPU architecture | SM90, SM100, SM103, SM107, SM120, and SM121 |
 | Compute phase | Packed prefill and generation, including mixed batches |
 | Attention type | MLA |
 | Head counts | Checkpoint-defined |
