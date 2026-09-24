@@ -561,3 +561,48 @@ def test_prefetch_fallback_identity_timeout_matches_mpi_default():
     from test_common.session_prefetcher import _FALLBACK_IDENTITY_TIMEOUT
 
     assert _FALLBACK_IDENTITY_TIMEOUT == _DEFAULT_IDENTITY_TIMEOUT
+
+
+class _FakeRemoteQueue:
+    """In-process stand-in for the client's ZeroMqQueue (no server needed)."""
+
+    def __init__(self, response):
+        self.response = response
+        self.sent = []
+
+    def put(self, obj):
+        self.sent.append(obj)
+
+    def poll(self, timeout):
+        return True
+
+    def get(self):
+        return self.response
+
+
+def _remote_client_with_response(response):
+    # Bypass __new__/__init__: the singleton would open a real PAIR socket.
+    client = object.__new__(RemoteMpiCommSessionClient)
+    client.addr = "inproc://fake"
+    client.queue = _FakeRemoteQueue(response)
+    client._is_shutdown = False
+    client._pending_responses = []
+    client._initialized = True
+    return client
+
+
+def test_remote_submit_sync_raises_forwarded_worker_exception():
+    # RemoteMpiCommSessionServer.mpi_future_callback forwards a failed
+    # worker's future.exception() as the response payload itself.
+    error = ValueError("worker failed")
+    client = _remote_client_with_response(error)
+    with pytest.raises(ValueError, match="worker failed") as excinfo:
+        client.submit_sync(simple_task, 1)
+    assert excinfo.value is error
+    assert len(client.queue.sent) == 1 and client.queue.sent[0].sync
+
+
+def test_remote_submit_sync_returns_results_unchanged():
+    response = [10, 20]
+    client = _remote_client_with_response(response)
+    assert client.submit_sync(simple_task, 1) is response
