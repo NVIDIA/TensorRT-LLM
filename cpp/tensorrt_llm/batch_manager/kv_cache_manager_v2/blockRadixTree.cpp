@@ -193,8 +193,8 @@ BlockKey Hasher::digest() const
 // genMultimodalCacheKeyTokens
 // ---------------------------------------------------------------------------
 
-std::vector<TokenIdExt> genMultimodalCacheKeyTokens(
-    int idOffset, std::vector<uint8_t> const& multiModalDataDigest, int numTokens, int tokenOffset)
+std::vector<TokenIdExt> genMultimodalCacheKeyTokens(int idOffset, std::vector<uint8_t> const& multiModalDataDigest,
+    int numTokens, int tokenOffset, std::optional<std::string> uuid)
 {
     TLLM_CHECK(numTokens > 0);
     TLLM_CHECK(tokenOffset >= 0);
@@ -207,7 +207,7 @@ std::vector<TokenIdExt> genMultimodalCacheKeyTokens(
         {
             Digest digest;
             std::memcpy(digest.data(), multiModalDataDigest.data(), kDIGEST_LEN);
-            result.emplace_back(digest);
+            result.emplace_back(digest, std::move(uuid));
         }
         else
         {
@@ -330,13 +330,13 @@ Block::Block(BlockKey k, std::vector<TokenIdExt> toks, NodeBase* prevNode)
     {
         if (prevNode->type() == Type::kBLOCK)
         {
-            mLastTokenDigest = static_cast<Block const*>(prevNode)->getLastTokenDigest();
+            mLastMmItemContext = static_cast<Block const*>(prevNode)->getLastMmItemContext();
         }
         for (auto iter = tokens.rbegin(); iter != tokens.rend(); ++iter)
         {
             if (iter->isDigest())
             {
-                mLastTokenDigest = std::make_shared<Digest const>(iter->digest());
+                mLastMmItemContext = iter->sharedMmItemContext();
                 break;
             }
         }

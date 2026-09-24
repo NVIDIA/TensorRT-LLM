@@ -1197,9 +1197,13 @@ class KVCacheEventSerializer:
 
     @staticmethod
     def _mm_key_to_json(data):
-        # MmKey is a tuple of (hash_bytes, start_offset, uuid)
-        # where uuid is optional (None if content-hashed)
-        if len(data) == 3:
+        # V2 uses a four-element internal form to mark UUID as additive:
+        # (digest_bytes, start_offset, uuid, preserve_digest_hash). V1 retains
+        # the legacy three-element form where UUID replaces the hash field.
+        preserve_digest_hash = len(data) == 4 and data[3]
+        if len(data) == 4:
+            hash_array, start_offset, uuid, _ = data
+        elif len(data) == 3:
             hash_array, start_offset, uuid = data
         else:
             # Backward compatibility: old format (hash_array, start_offset)
@@ -1209,14 +1213,14 @@ class KVCacheEventSerializer:
         # Convert array to hex string
         hash_hex = ''.join(f'{b:02x}' for b in hash_array)
 
-        # Use UUID from C++ if available, otherwise use hash_hex
-        hash_or_uuid = uuid if uuid is not None else hash_hex
-
-        return {
+        result = {
             "type": "mm_key",
-            "hash": hash_or_uuid,
+            "hash": hash_hex if preserve_digest_hash or uuid is None else uuid,
             "start_offset": start_offset
         }
+        if preserve_digest_hash and uuid is not None:
+            result["uuid"] = uuid
+        return result
 
     @staticmethod
     def _mm_keys_to_json(data):

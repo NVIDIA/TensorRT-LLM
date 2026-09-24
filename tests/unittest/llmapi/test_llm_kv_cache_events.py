@@ -246,6 +246,26 @@ def test_mm_key_with_uuid():
         mock_mm_key_old_format)
     assert result_old_format["hash"] == expected_hash
 
+    # V2 marks UUID as additive: hash remains the digest and UUID is emitted
+    # separately for routing identity.
+    mock_mm_key_v2 = (mock_hash, mock_offset, test_uuid, True)
+    result_v2 = KVCacheEventSerializer._mm_key_to_json(mock_mm_key_v2)
+    assert result_v2 == {
+        "type": "mm_key",
+        "hash": expected_hash,
+        "uuid": test_uuid,
+        "start_offset": 42,
+    }
+
+    mock_mm_key_v2_without_uuid = (mock_hash, mock_offset, None, True)
+    result_v2_without_uuid = KVCacheEventSerializer._mm_key_to_json(
+        mock_mm_key_v2_without_uuid)
+    assert result_v2_without_uuid == {
+        "type": "mm_key",
+        "hash": expected_hash,
+        "start_offset": 42,
+    }
+
 
 def test_apply_mm_hashes_with_uuids():
     """Test apply_mm_hashes with user-provided UUIDs."""

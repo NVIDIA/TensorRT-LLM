@@ -12,7 +12,9 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
+    ReuseScope,
     gen_multimodal_cache_key_tokens,
+    sequence_to_blockchain_keys,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -47,6 +49,26 @@ def test_gen_multimodal_cache_key_tokens_uses_token_offset():
         vocab_size + 2,
         vocab_size + 3,
         vocab_size + 4,
+    ]
+
+
+def test_multimodal_uuid_metadata_does_not_change_digest_token_identity_or_block_keys():
+    vocab_size = 1000
+    digest = b"".join(v.to_bytes(4, "big", signed=True) for v in _HASH_INTS)
+    uuid = "frontend-routing-identity"
+    without_uuid = gen_multimodal_cache_key_tokens(vocab_size, digest, 3)
+    with_uuid = gen_multimodal_cache_key_tokens(vocab_size, digest, 3, uuid=uuid)
+    with_other_uuid = gen_multimodal_cache_key_tokens(
+        vocab_size, digest, 3, uuid="other-routing-identity"
+    )
+
+    assert with_uuid == with_other_uuid == without_uuid
+    assert with_uuid[0].digest == digest
+    assert with_uuid[0].uuid == uuid
+    assert hash(with_uuid[0]) == hash(with_other_uuid[0]) == hash(without_uuid[0])
+    assert len({with_uuid[0], with_other_uuid[0], without_uuid[0]}) == 1
+    assert [key for _, key in sequence_to_blockchain_keys(2, ReuseScope(), with_uuid)] == [
+        key for _, key in sequence_to_blockchain_keys(2, ReuseScope(), without_uuid)
     ]
 
 
@@ -110,8 +132,10 @@ def test_augment_tokens_for_block_reuse_uses_two_item_exact_multimodal_runs():
 def test_augment_tokens_for_block_reuse_skips_out_of_slice_runs(monkeypatch):
     calls = []
 
-    def fake_gen_multimodal_cache_key_tokens(vocab_size, digest, num_tokens, token_offset=0):
-        calls.append((vocab_size, digest, num_tokens, token_offset))
+    def fake_gen_multimodal_cache_key_tokens(
+        vocab_size, digest, num_tokens, token_offset=0, uuid=None
+    ):
+        calls.append((vocab_size, digest, num_tokens, token_offset, uuid))
         return [digest, *range(vocab_size + 1, vocab_size + num_tokens)]
 
     monkeypatch.setattr(
@@ -165,7 +189,7 @@ def test_hash_to_digest_rejects_malformed_hashes():
         resource_manager._hash_to_digest([*_HASH_INTS[:-1], "8"])
 
 
-def test_augment_tokens_for_block_reuse_preserves_supplied_item_digest():
+def test_augment_tokens_for_block_reuse_preserves_supplied_item_digest_and_uuid():
     vocab_size = 1000
     tokens = list(range(8))
     manager = _make_manager(vocab_size)
@@ -190,8 +214,33 @@ def test_augment_tokens_for_block_reuse_preserves_supplied_item_digest():
     content_digest = resource_manager._hash_to_digest(_HASH_INTS)
     assert no_uuid[2:5] == gen_multimodal_cache_key_tokens(vocab_size, content_digest, 3)
     # Input preprocessing owns item identity, including any UUID contribution.
-    # The cache must use that digest without applying another UUID hash.
+    # The cache must use that digest without applying another UUID hash, while
+    # retaining the external identity independently of token equality.
     assert uuid_a == no_uuid == uuid_b
+    assert uuid_a[2].digest == content_digest
+    assert uuid_a[2].uuid == "image-a"
+    assert uuid_b[2].digest == content_digest
+    assert uuid_b[2].uuid == "image-b"
+
+
+def test_augment_tokens_for_block_reuse_handles_partial_uuid_list():
+    vocab_size = 1000
+    tokens = list(range(10))
+    manager = _make_manager(vocab_size)
+    req = _make_request(
+        tokens,
+        multimodal_hashes=[_HASH_INTS, _OTHER_HASH_INTS],
+        multimodal_positions=[1, 6],
+        multimodal_lengths=[2, 2],
+        multimodal_uuids=["first-item"],
+        multimodal_item_run_cu_offsets=None,
+        multimodal_run_positions=None,
+        multimodal_run_lengths=None,
+    )
+
+    augmented = KVCacheManagerV2._augment_tokens_for_block_reuse(manager, tokens, req)
+    assert augmented[1].uuid == "first-item"
+    assert isinstance(augmented[6], bytes)
 
 
 def test_augment_tokens_for_block_reuse_canonicalizes_adjacent_runs():
@@ -249,6 +298,7 @@ def test_multimodal_events_keep_chunked_commit_incremental(hybrid):
         py_request_id=req.py_request_id,
         is_dummy_request=False,
         multimodal_hashes=req.multimodal_hashes,
+        multimodal_uuids=req.multimodal_uuids,
         multimodal_positions=req.multimodal_positions,
         multimodal_lengths=req.multimodal_lengths,
         multimodal_item_run_cu_offsets=None,
