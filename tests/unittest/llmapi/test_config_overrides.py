@@ -56,7 +56,9 @@ def _parse(*assignments: str) -> tuple[ConfigOverride, ...]:
     ],
 )
 def test_parse_config_overrides_supports_yaml_values(assignment: str, expected: object) -> None:
-    assert _parse(assignment)[0].value == expected
+    actual = _parse(assignment)[0].value
+    assert actual == expected
+    assert type(actual) is type(expected)
 
 
 @pytest.mark.parametrize(
