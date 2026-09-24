@@ -807,6 +807,9 @@ def setup_disagg_cluster(
     ctx_worker_config["internal_request_auth_key"] = internal_request_auth_key
     gen_worker_config["internal_request_auth_key"] = internal_request_auth_key
 
+    cluster_start = time.perf_counter()
+    print("[startup] cluster_launch_to_ready: start", flush=True)
+
     # Launch workers
     model = model_name or config.get("model")
     if model:
@@ -835,7 +838,7 @@ def setup_disagg_cluster(
             ctx_workers.append(w)
             log_suffix = f", logging to {w.log_path}" if w.log_path else ""
             print(
-                f"Launching ctx worker {i + 1}/{num_ctx_instances} on device {device_ids}{log_suffix}"
+                f"Launching ctx worker {i + 1}/{num_ctx_instances} on device {device_ids}, pid={w.process.pid}{log_suffix}"
             )
             next_device += gpus_per_ctx
 
@@ -856,7 +859,7 @@ def setup_disagg_cluster(
             gen_workers.append(w)
             log_suffix = f", logging to {w.log_path}" if w.log_path else ""
             print(
-                f"Launching gen worker {i + 1}/{num_gen_instances} on device {device_ids}{log_suffix}"
+                f"Launching gen worker {i + 1}/{num_gen_instances} on device {device_ids}, pid={w.process.pid}{log_suffix}"
             )
             next_device += gpus_per_gen
 
@@ -990,7 +993,13 @@ def setup_disagg_cluster(
                     raise t.exception()
 
         asyncio.run(_wait_with_ticker())
+        print(
+            f"[startup] cluster_launch_to_ready: done in {time.perf_counter() - cluster_start:.3f}s",
+            flush=True)
     except Exception:
+        print(
+            f"[startup] cluster_launch_to_ready: failed after {time.perf_counter() - cluster_start:.3f}s",
+            flush=True)
         terminate(*ctx_workers, *gen_workers, disagg_server)
         if not save_log:
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -1765,11 +1774,14 @@ def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
                                      llama_model_root):
     setup_model_symlink(llm_venv, llama_model_root,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    # Cold model initialization and JIT across eight Blackwell ranks took
+    # about 640s on B300; allow headroom for CI variability (NVBug 6771023).
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp4_genpp4",
                            env=llm_venv._new_env,
                            model_path=llama_model_root,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           server_start_timeout=900)
 
 
 #tiny llama pp4 will have uneven layer per pp. pp4
