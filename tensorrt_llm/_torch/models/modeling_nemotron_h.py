@@ -562,7 +562,7 @@ class NemotronHLayer(DecoderLayer):
             if fuse_allreduce_norm:
                 self.mixer.out_proj.reduce_output = False
             # Hopper: route RMSNormGated to its bf16 Triton fallback
-            # (fused_gated_rmsnorm_quant is SM100-only).
+            # (fused_gated_rmsnorm_quant is SM100+ only).
             if not _has_fp4_hw:
                 self.mixer.is_nvfp4 = False
                 self.mixer.norm.is_nvfp4 = False
@@ -877,7 +877,7 @@ def _use_w4a16_for_nvfp4_on_hopper():
 
     def _patched_mlp_create_weights(self):
         # Original sets _use_fused_relu2_quant=True for NVFP4 ckpts; off here
-        # so MLP.forward emits bf16 (the SM100-only fused kernel never runs).
+        # so MLP.forward emits bf16 (the SM100+ only fused kernel never runs).
         original_mlp_create_weights(self)
         self._use_fused_relu2_quant = False
 

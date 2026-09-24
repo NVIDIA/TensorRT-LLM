@@ -70,8 +70,6 @@ _CODER_GUIDANCE = """\
 - If your changes touch C++/CUDA/header/CMake files, rebuild TensorRT-LLM and
   ensure validation uses the rebuilt package before reporting tests as
   passing. A stale wheel is not pass evidence.
-- Do not read, cite, or use `auto_deploy/` as a technical source. Do not
-  edit `auto_deploy/` or `tests/.../auto_deploy/`.
 """
 
 _STAGE_GOAL_CODER_PROTOCOL = """\

@@ -60,7 +60,6 @@ from coverage_tier import (  # noqa: E402
 )
 from rules._helpers import strip_noop_diff_lines  # noqa: E402
 from rules.agent_flow_rule import AgentFlowRule  # noqa: E402
-from rules.auto_deploy_rule import AutoDeployRule  # noqa: E402
 from rules.base import PRInputs, Rule, RuleResult, format_reason  # noqa: E402
 from rules.openengine_rule import OpenEngineRule  # noqa: E402
 from rules.out_of_scope_rule import OutOfScopeRule  # noqa: E402
@@ -80,7 +79,6 @@ RULE_CLASSES: list[type[Rule]] = [
     WaivesRule,
     TestsDefRule,
     TestListRule,
-    AutoDeployRule,
     VisualGenRule,
     SpecDecRule,
     AgentFlowRule,
@@ -98,7 +96,6 @@ def build_rules(
         WaivesRule(yaml_index, stages),
         TestsDefRule(yaml_index, stages, repo_root=repo_root),
         TestListRule(yaml_index, stages, repo_root=repo_root),
-        AutoDeployRule(yaml_index, stages),
         VisualGenRule(yaml_index, stages),
         SpecDecRule(yaml_index, stages),
         AgentFlowRule(yaml_index, stages),
@@ -218,7 +215,6 @@ _TESTSONLY_FAMILY: frozenset[str] = frozenset(
         "waiveonly",
         "testdefonly",
         "testlistonly",
-        "autodeployonly",
         "visualgenonly",
         "specdeconly",
         "agentflowonly",
