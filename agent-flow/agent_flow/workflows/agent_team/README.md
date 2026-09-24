@@ -207,11 +207,17 @@ no `ask_human`; only the backend's own built-in tools remain (reading,
 editing, and running commands are not MCP servers, so they are
 unaffected).
 
-**The system prompts change too.** The five base prompts in
-[`prompts/`](prompts) are *transport-neutral*: they describe what each
-role reads and records (the rolling status snapshot, the progress entry
-and its `summary` / `decision` / `weighted_score` fields) without naming
-a mechanism. The tool-level half — `read_latest_progress`,
+**The prompts change too — system and per-turn alike.** The five base
+prompts in [`prompts/`](prompts) are *transport-neutral*: they describe
+what each role reads and records (the rolling status snapshot, the
+progress entry and its `summary` / `decision` / `weighted_score` fields)
+without naming a mechanism. The same split applies to the *per-turn*
+prompts the orchestrator builds for each turn — `_LINEAR_MCP_PROTOCOL` in
+[`workflow.py`](workflow.py) for the linear path, `_NODE_MCP_PROTOCOL` in
+[`node_runner.py`](node_runner.py) for the concurrent one: the turn body
+says what this turn reads and records, and the tool names live in a block
+appended only when the run registers them. The tool-level half —
+`read_latest_progress`,
 `read_human_feedback`, `read_status` / `update_status`,
 `append_*_progress`, `ask_human` — lives in
 [`prompts/mcp_tools.py`](prompts/mcp_tools.py) and is appended per role
@@ -245,6 +251,34 @@ and `--build-human-review` are rejected at construction time rather than
 silently ignored, and `HUMAN_APPROVED` — which the MCP block is what
 introduces — is absent from the PlanDrafter's accepted decisions.
 
+#### With `--concurrent`
+
+The two combine. Every per-node agent is built with `tools=None` and no
+required-tool stop hooks, and each node's turn is recorded through the
+same handoff protocol — scoped to that node:
+
+| | linear path | `--concurrent` |
+|---|---|---|
+| handoff file | `<workspace>/.turn/<role>.yaml` | `<workspace>/nodes/<id>/.turn/<role>.yaml` |
+| recorded into | `<workspace>/progress.yaml` | `<workspace>/nodes/<id>/progress.yaml` |
+| `status.md` overwritten | `<workspace>/status.md` | `<workspace>/nodes/<id>/status.md` |
+
+The handoff directory is node-private for the same reason the progress
+log is: nodes run in parallel, and one shared `.turn/coder.yaml` would
+have them clobber each other's handoffs mid-turn.
+
+The per-turn prompts in [`node_runner.py`](node_runner.py) follow the
+same split as the system prompts — a transport-neutral body plus a
+protocol block that is either the MCP tool list or `mcpless`'s preamble,
+never both and never neither.
+
+Human feedback is the one read that deliberately crosses the node
+boundary: `--feedback` is only ever appended to the *shared*
+`progress.yaml`, so a node reads its progress entries from its own log
+but its `human_feedback` from the shared file
+(`ProgressContext.feedback_path`). Without that split a node agent would
+be told to take in user guidance and always find an empty list.
+
 ### Injecting mid-run feedback
 
 To correct course while the workflow is running:
@@ -257,7 +291,9 @@ To correct course while the workflow is running:
    the next iteration and the active stage, then resumes.
 3. On the next coder/reviewer/qa turn, the agents call
    `read_human_feedback` and address the new entry along with any
-   prior, still-unresolved entries.
+   prior, still-unresolved entries. Under `--no-mcp-tools` the same
+   entries arrive inlined in the turn's `CONTEXT` block instead. Under
+   `--concurrent` every node reads this same shared list.
 
 Each `--feedback` invocation **appends** — old feedback is preserved.
 There is no auto-clear: entries remain visible to every subsequent
