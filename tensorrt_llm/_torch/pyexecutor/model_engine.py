@@ -19,6 +19,7 @@ import torch._dynamo.config
 import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
+from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._utils import (global_mpi_rank, is_trace_enabled,
                                  maybe_pin_memory, nvtx_range, prefer_pinned,
                                  release_gc, trace_func)
@@ -425,7 +426,6 @@ class PyTorchModelEngine(ModelEngine):
 
         if checkpoint_loader is None:
             checkpoint_loader = _construct_checkpoint_loader(
-                llm_args.backend,
                 llm_args.checkpoint_loader,
                 llm_args.checkpoint_format,
                 mx_config=llm_args.mx_config,
@@ -886,6 +886,7 @@ class PyTorchModelEngine(ModelEngine):
         self.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER if is_draft_model else ResourceManagerType.KV_CACHE_MANAGER
         self.lora_model_config: Optional[LoraModelConfig] = None
         self._trtllm_gen_jit_warmup = False
+        self._warmup_timer = _WarmupTimer(self.mapping.rank)
 
         self.cuda_graph_lora_manager: Optional[CudaGraphLoraManager] = None
         self._force_lora_graph_for_capture: Optional[bool] = None
@@ -1486,18 +1487,26 @@ class PyTorchModelEngine(ModelEngine):
             runner.capture_graphs(resource_manager)
             return
 
+        # Retain a partial summary when a phase raises.
+        with self._warmup_timer:
+            self._warmup_scheduled(resource_manager, kv_cache_manager)
+
+    def _warmup_scheduled(self, resource_manager: ResourceManager,
+                          kv_cache_manager) -> None:
+        """Body of ``warmup`` for the scheduled (KV-cache-backed) path."""
         # Ahead of the legacy early returns below: only the advanced-sampling
         # CUDA graph capture pass exercises the non-greedy sampler, so with
         # cuda_graph_config=None flashinfer's sampling kernels would be
         # JIT-built mid-serving.
         self._eager_workspace_reclaimer = None
-        warmup_sampling_module()
-        if self.enable_in_graph_sampling:
-            # The fast tier samples inside the captured graph via a
-            # torch.compile'd op; compile it now so capture does not.
-            warmup_sample_from_logits_op(self.model.config.vocab_size,
-                                         torch.device('cuda'), self.dtype,
-                                         self._cuda_graph_batch_sizes or [])
+        with self._warmup_timer.phase("sampling_module_prewarm"):
+            warmup_sampling_module()
+            if self.enable_in_graph_sampling:
+                # The fast tier samples inside the captured graph via a
+                # torch.compile'd op; compile it now so capture does not.
+                warmup_sample_from_logits_op(self.model.config.vocab_size,
+                                             torch.device('cuda'), self.dtype,
+                                             self._cuda_graph_batch_sizes or [])
 
         if kv_cache_manager is None:
             logger.info("Skipping warm up as no KV Cache manager allocated.")
@@ -1533,38 +1542,45 @@ class PyTorchModelEngine(ModelEngine):
         # Compile the DSv4 indexer-Q CuTe DSL kernels before the first
         # collective-bearing forward, so their JIT cost is not charged against the
         # MoE all-to-all completion-flag deadline.
-        self._prewarm_cute_dsl_indexer_q()
+        with self._warmup_timer.phase("cute_dsl_indexer_q"):
+            self._prewarm_cute_dsl_indexer_q()
         log_mem_snapshot("warmup/after_cute_dsl_indexer_q")
         if not is_enc_dec:
-            self._run_attention_warmup(resource_manager, can_run_general_warmup)
+            with self._warmup_timer.phase("attention_jit"):
+                self._run_attention_warmup(resource_manager,
+                                           can_run_general_warmup)
 
         if can_run_general_warmup:
             # Specialize torch.compile graphs across the key input shapes before CUDA graph capture.
-            warmup_requests_configs = self._agree_warmup_shapes(
-                self._get_full_general_warmup_requests(resource_manager))
-            # Currently graph has not been captured, disable cuda graph for this warmup.
-            with self.no_cuda_graph():
-                self._general_warmup(resource_manager, warmup_requests_configs)
-                # Release C++ MoE workspace buffers so the autotuner can
-                # reclaim the memory.  They will be re-allocated on next use.
-                from ..custom_ops.torch_custom_ops import MoERunner
-                MoERunner.clear_all_workspaces()
-                # Clear Cache now as autotuner may use additional memory.
-                # Memory pool will be warmed up later.
-                gc.collect()
-                torch.cuda.empty_cache()
+            with self._warmup_timer.phase("general"):
+                warmup_requests_configs = self._agree_warmup_shapes(
+                    self._get_full_general_warmup_requests(resource_manager))
+                # Currently graph has not been captured, disable cuda graph for this warmup.
+                with self.no_cuda_graph():
+                    self._general_warmup(resource_manager,
+                                         warmup_requests_configs)
+                    # Release C++ MoE workspace buffers so the autotuner can
+                    # reclaim the memory.  They will be re-allocated on next use.
+                    from ..custom_ops.torch_custom_ops import MoERunner
+                    MoERunner.clear_all_workspaces()
+                    # Clear Cache now as autotuner may use additional memory.
+                    # Memory pool will be warmed up later.
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
         # Helix CP is decode-only and runs into issues with the
         # autotuner warmup's context requests.
         if not is_enc_dec and not self.mapping.has_cp_helix():
-            self._run_autotuner_warmup(resource_manager)
+            with self._warmup_timer.phase("autotuner"):
+                self._run_autotuner_warmup(resource_manager)
             log_mem_snapshot("warmup/after_autotuner")
             # Pre-JIT Mamba SSD multi-seq + HAS_INITSTATES=True Triton kernels
             # for Mamba hybrid models. Runs regardless of enable_autotuner,
             # since MambaHybridCacheManager skips _general_warmup and the
             # default autotuner shape is single-seq / no-initstates. Safe
             # no-op for non-Mamba models.
-            self._run_mamba_hybrid_warmup(resource_manager)
+            with self._warmup_timer.phase("mamba_hybrid"):
+                self._run_mamba_hybrid_warmup(resource_manager)
             log_mem_snapshot("warmup/after_mamba_hybrid")
             # Release the autotuner's exploration-mode intermediates. The
             # exploration leftovers are pure waste that hide tens of GiB from
@@ -1579,7 +1595,8 @@ class PyTorchModelEngine(ModelEngine):
         # captures without resizing the workspace.
         # Capture with the steady-state MoE all-to-all budget: the timeout is a
         # launch argument and is baked into every later replay.
-        with _moe_a2a_steady_state_budget_for_capture():
+        with self._warmup_timer.phase("cuda_graph_capture"), \
+                _moe_a2a_steady_state_budget_for_capture():
             with self.cuda_graph_runner.allow_capture():
                 self.cuda_graph_runner.is_warmup_only = True
                 try:
@@ -1601,24 +1618,27 @@ class PyTorchModelEngine(ModelEngine):
         # warmup. No-op on non-DSA models.
         # Both DSA hooks read attn_metadata, which only a warmup forward
         # creates; build it when every forward above was skipped.
-        self._ensure_dsa_attn_metadata_for_warmup(resource_manager)
-        self._warmup_dg_paged_mqa_logits_metadata()
-        log_mem_snapshot("warmup/after_dg_paged_mqa_logits_metadata")
-        self._warmup_cute_dsl_radix_topk()
+        with self._warmup_timer.phase("dsa_prewarm"):
+            self._ensure_dsa_attn_metadata_for_warmup(resource_manager)
+            self._warmup_dg_paged_mqa_logits_metadata()
+            log_mem_snapshot("warmup/after_dg_paged_mqa_logits_metadata")
+            self._warmup_cute_dsl_radix_topk()
         log_mem_snapshot("warmup/after_cute_dsl_radix_topk")
         if can_run_general_warmup:
             # Pre-populate the memory pool with max-shape allocations to reduce
             # fragmentation at runtime.
-            warmup_requests_configs = self._get_max_shape_warmup_requests(
-                resource_manager)
-            self._general_warmup(resource_manager, warmup_requests_configs)
+            with self._warmup_timer.phase("memory_pool_prepop"):
+                warmup_requests_configs = self._get_max_shape_warmup_requests(
+                    resource_manager)
+                self._general_warmup(resource_manager, warmup_requests_configs)
             log_mem_snapshot("warmup/after_memory_pool_prepop")
 
         # Allocate the CUDA graph padding dummies now, while the KV cache is
         # empty. Waiting for the first padded step can race KV saturation:
         # once the cache is full, the lazy allocation in _get_padded_batch
         # fails every step and padded batches silently run eager.
-        self.cuda_graph_runner.preallocate_padding_dummies(resource_manager)
+        with self._warmup_timer.phase("preallocate_padding_dummies"):
+            self.cuda_graph_runner.preallocate_padding_dummies(resource_manager)
         log_mem_snapshot("warmup/after_preallocate_padding_dummies")
 
         # If this is a BOLT-instrumented build (the profile-gen job sets
@@ -1988,8 +2008,8 @@ class PyTorchModelEngine(ModelEngine):
             # left inside a collective. This is the ordinary outcome for a
             # shape that does not fit the configuration at all, such as a
             # mixed context+generation shape under ``max_batch_size=1``.
-            logger.warning(f"Skipping warmup shape ({shape}) on all "
-                           f"{len(flags)} ranks: not enough KV cache space.")
+            logger.info(f"Skipping warmup shape ({shape}) on all "
+                        f"{len(flags)} ranks: not enough KV cache space.")
             return False
 
         all_tokens = list(allgather(num_tokens))
@@ -2051,10 +2071,15 @@ class PyTorchModelEngine(ModelEngine):
                     logger.info(
                         f"Run warmup with {num_tokens} tokens, include {num_gen_tokens} generation tokens"
                     )
-                    self.forward(batch,
-                                 new_tensors_device=None,
-                                 resource_manager=resource_manager)
-                    torch.cuda.synchronize()
+                    with self._warmup_timer.phase(
+                            f"general shape num_tokens={num_tokens}, "
+                            f"num_gen_tokens={num_gen_tokens}",
+                            record=False,
+                            log_start=False):
+                        self.forward(batch,
+                                     new_tensors_device=None,
+                                     resource_manager=resource_manager)
+                        torch.cuda.synchronize()
             except torch.OutOfMemoryError:
                 if self._is_distributed_forward():
                     # Peers are inside the same forward's collectives and
@@ -2158,11 +2183,20 @@ class PyTorchModelEngine(ModelEngine):
                         f"attention, num_tokens={num_tokens}, "
                         f"num_gen_requests={num_gen_requests}"):
                     continue
-                with trtllm_gen_fmha_jit_warmup():
-                    self.forward(batch,
-                                 new_tensors_device=None,
-                                 resource_manager=resource_manager)
-                torch.cuda.synchronize()
+                # The first forward of the process lands here, so this shape
+                # also absorbs every first-touch JIT (CuTe DSL GEMM, FMHA
+                # NVRTC grid, ...). Time it per shape so a slow startup can be
+                # attributed without a debugger.
+                with self._warmup_timer.phase(
+                        f"attention shape num_tokens={num_tokens}, "
+                        f"num_gen_requests={num_gen_requests}",
+                        record=False,
+                        log_start=True):
+                    with trtllm_gen_fmha_jit_warmup():
+                        self.forward(batch,
+                                     new_tensors_device=None,
+                                     resource_manager=resource_manager)
+                    torch.cuda.synchronize()
 
     @staticmethod
     def _release_megamoe_profiling_scratch():
@@ -2305,11 +2339,16 @@ class PyTorchModelEngine(ModelEngine):
                                 spec_resource_manager, Eagle3ResourceManager):
                             spec_resource_manager.is_first_draft = True
 
-                        self.forward(batch,
-                                     new_tensors_device=None,
-                                     resource_manager=resource_manager)
-                        ran_forward = True
-                        torch.cuda.synchronize()
+                        with self._warmup_timer.phase(
+                                f"autotuner shape num_tokens={num_tokens}, "
+                                f"num_gen_requests={num_gen_requests}",
+                                record=False,
+                                log_start=True):
+                            self.forward(batch,
+                                         new_tensors_device=None,
+                                         resource_manager=resource_manager)
+                            ran_forward = True
+                            torch.cuda.synchronize()
 
                 if ran_forward and synchronize_trtllm_cache:
                     # pp_recv in AutoTuner choose_one will never be called if there is no tuning op during the forward pass.
