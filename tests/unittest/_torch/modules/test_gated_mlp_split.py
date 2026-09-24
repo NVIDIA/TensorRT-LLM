@@ -335,15 +335,14 @@ def test_non_swiglu_activation_is_rejected_on_split_path():
 
 
 @requires_cuda
-def test_split_rejects_forced_dynamic_quantization():
-    """Dynamic quantization must use the fused topology.
-
-    The activation emits FP8 with down_proj's calibrated scale, which would make
-    down_proj skip the dynamic quantization it was configured for. Rejected at
-    construction rather than silently downgraded.
-    """
-    with pytest.raises(ValueError, match="force_dynamic_quantization"):
-        _make(True, force_dynamic=True)
+def test_split_with_forced_dynamic_quantization_does_not_share():
+    """A dynamic scale is computed per call, so there is no stored one to share."""
+    mlp = _make(True, force_dynamic=True)
+    for linear in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        _set_weights(linear)
+        _set_scales(linear)
+    mlp.post_load_weights()
+    assert mlp._maybe_share_gate_up_quantize is False
 
 
 @requires_cuda

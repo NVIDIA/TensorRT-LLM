@@ -52,17 +52,6 @@ class GatedMLP(nn.Module):
         # Keeps each projection's own calibrated scale, which fusing would
         # discard. Off by default.
         self.split_gate_up = split_gate_up
-        if split_gate_up and (config
-                              or ModelConfig()).force_dynamic_quantization:
-            # The activation emits FP8 using down_proj's calibrated input_scale,
-            # which makes down_proj skip the dynamic quantization it was asked
-            # for. The fused path has the same behaviour, but rather than carry
-            # that ambiguity into a new topology, require the fused one -- the
-            # only consumer of split_gate_up is static per-tensor FP8.
-            raise ValueError(
-                "GatedMLP: split_gate_up is incompatible with "
-                "force_dynamic_quantization; dynamic quantization requires the "
-                "fused gate/up topology")
         # Whether gate and up may consume one quantized activation. Decided by
         # post_load_weights() from the loaded scales, so a model whose loader
         # never reaches GatedMLP simply does not share. Necessary, not
@@ -328,8 +317,11 @@ class GatedMLP(nn.Module):
         of loading incorrectly.
         """
         self._maybe_share_gate_up_quantize = False
+        # Sharing hands both GEMMs a tensor quantized with the stored scale, so
+        # a dynamic scale computed per call has no way to reach them.
         if not (self.split_gate_up and self.gate_proj.has_fp8_qdq
-                and self.up_proj.has_fp8_qdq):
+                and self.up_proj.has_fp8_qdq
+                and not self.gate_proj.force_dynamic_quantization):
             return
         gate_scale, up_scale = (self.gate_proj.input_scale,
                                 self.up_proj.input_scale)
