@@ -872,10 +872,8 @@ class TestRotaryTablePrecision:
     # above 2048. cuBLAS picks a TF32 kernel for the K=1 GEMM only at some
     # problem sizes, so sweep the sizes a Cosmos3 request actually produces.
     SEQUENCE_LENGTHS = [4096, 6240, 8192, 10336, 16384]
-    # Each request feeds this two dtypes: the text tower passes one int64 ramp
-    # shared by all three axes, fps-modulated vision a fractional fp32
-    # temporal axis. Vision is int64 too when fps modulation is off.
-    POSITION_MODES = ["text_int64", "vision_fps_fp32"]
+    # Text ids are int64; fps-modulated vision, audio and action ids are fp32.
+    POSITION_DTYPES = [torch.int64, torch.float32]
 
     @pytest.fixture(autouse=True)
     def _require_tf32_capable_cuda(self):
@@ -906,26 +904,18 @@ class TestRotaryTablePrecision:
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos(), emb.sin()
 
-    @staticmethod
-    def _position_ids(mode: str, seq_len: int) -> torch.Tensor:
-        """``[3, 1, seq_len]`` mRoPE ids in one of the two production shapes."""
-        if mode == "text_int64":
-            ramp = torch.arange(seq_len, dtype=torch.long, device=DEVICE)
-            ids = ramp.unsqueeze(0).expand(3, -1).contiguous()
-        else:
-            base = torch.arange(seq_len, dtype=torch.float32, device=DEVICE)
-            ids = torch.stack([base * 24.0 / 10.0, base, base], dim=0)
-        return ids[:, None, :]
-
     @pytest.mark.parametrize("allow_tf32", [False, True])
-    @pytest.mark.parametrize("mode", POSITION_MODES)
+    @pytest.mark.parametrize("pos_dtype", POSITION_DTYPES, ids=str)
     @pytest.mark.parametrize("seq_len", SEQUENCE_LENGTHS)
-    def test_rotary_table_matches_fp64_under_tf32(self, allow_tf32: bool, mode: str, seq_len: int):
+    def test_rotary_table_matches_fp64_under_tf32(
+        self, allow_tf32: bool, pos_dtype: torch.dtype, seq_len: int
+    ):
         saved = torch.backends.cuda.matmul.allow_tf32
         torch.backends.cuda.matmul.allow_tf32 = allow_tf32
         try:
             rotary = self._rotary().to(DEVICE)
-            position_ids = self._position_ids(mode, seq_len)
+            ramp = torch.arange(seq_len, dtype=pos_dtype, device=DEVICE)
+            position_ids = ramp.expand(3, -1)[:, None, :]
             probe = torch.empty(0, dtype=torch.float32, device=DEVICE)
 
             cos, sin = rotary(probe, position_ids)
