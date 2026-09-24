@@ -25,7 +25,7 @@ A block "belongs to VG" iff any of its `tests:` entries lives under a
 dedicated `visual_gen/` test path or is the VisualGen perf-sanity entry.
 
 Outward-facing fallback:
-Unlike AutoDeploy, VG is imported eagerly (module-level) by non-VG
+VisualGen is imported eagerly (module-level) by non-VG
 code: `commands/serve.py`, `commands/utils.py`, and
 `serve/openai_server.py` import `VisualGenArgs` / `ParallelConfig` /
 `VisualGen` / `VisualGenParams` and `tensorrt_llm.media.*` at top level.
