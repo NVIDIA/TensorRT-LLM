@@ -77,6 +77,45 @@ reviews:
     drafts: false
     base_branches: ["main", "release/.+"]
 
+  # Scheduled/on-demand evaluation is requested by coderabbit-semantic-review.yml.
+  # Keep this off during ordinary reviews so they cannot bypass its cost policy.
+  pre_merge_checks:
+    custom_checks:
+      - name: "Semantic conflict with target branch"
+        mode: "off"
+        instructions: |
+          Verify the requested head, target and merge base with Git. Compare both
+          diffs from the merge base and inspect the combined code. Use only those
+          revisions and source evidence; do not infer compatibility from earlier
+          reviews.
+
+          First audit the tests: trace new or modified fixtures, fakes, mocks,
+          subclasses and monkeypatch replacements to the production functions they
+          exercise, in both directions across the two diffs. For each affected path,
+          compare actual call arguments, keywords and required attributes with the
+          replacement implementation. Report test-only incompatibilities too. Example:
+          run(x, trace=None) is incompatible with a replacement run(x); accepting
+          trace or a verified adapter resolves it.
+
+          Then audit other affected contracts: return units, defaults, tensor
+          shapes/dtypes, resource lifetimes and synchronization. Exclude unrelated
+          pre-existing defects and style. Do not stop after a different unsupported
+          feature combination.
+
+          FAIL if combining the branches breaks a concrete contract. Give the
+          triggering call/input and cite both sides. PASS requires a coverage summary
+          identifying inspected test and production paths and why they remain
+          compatible. Return INCONCLUSIVE for missing necessary evidence. Do not run
+          repository code.
+
+          Reply in a normal PR chat comment, not a custom-check table. Start with
+          SEMANTIC_REVIEW_V3 on its own line. Include the full evidence for every
+          verdict, including PASS, using immutable GitHub blob links with full SHAs
+          and line numbers from head and target. Include this record on one line:
+          SEMANTIC_RESULT head=<SHA> target=<SHA> merge_base=<SHA> verdict=<PASS|FAIL|INCONCLUSIVE>
+          Use verified full lowercase SHAs; omit the record if unavailable. A record
+          alone is insufficient.
+
   path_filters:
     # Vendored/adapted FlashInfer kernels; excluded from review.
     - "!tensorrt_llm/_torch/attention/backends/prims_ts/**"
