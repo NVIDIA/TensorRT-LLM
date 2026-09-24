@@ -84,6 +84,10 @@ class PostprocWorker:
         is_final: bool
         metrics: Optional[dict[str, float]] = None
         request_perf_metrics: Any = None
+        # Request-level time breakdown. Forwarded alongside request_perf_metrics
+        # so enabling postprocess workers does not silently drop the per-step
+        # bars (callers previously had to set num_postprocess_workers=0).
+        time_breakdown_metrics: Any = None
         disaggregated_params: Any = None
         should_abort: bool = False
         finish_reason: Optional[str] = None
@@ -156,7 +160,7 @@ class PostprocWorker:
 
     async def _handle_input(
         self, input: Union["PostprocWorker.Input", "ResponseWrapper"]
-    ) -> [Any, Optional[dict[str, float]]]:
+    ) -> tuple:
         ''' Handle a single response from await_response worker. '''
         if input.rsp.result.context_logits is not None or \
               input.rsp.result.generation_logits is not None:
@@ -187,6 +191,8 @@ class PostprocWorker:
             metrics_dict = record.metrics_dict
             perf_metrics = None
             disaggregated_params = None
+            time_breakdown_metrics = getattr(record, "time_breakdown_metrics",
+                                             None)
             if record.outputs:
                 perf_metrics = record.outputs[0].request_perf_metrics
                 disaggregated_params = record.outputs[0].disaggregated_params
@@ -201,7 +207,8 @@ class PostprocWorker:
 
             # TODO: Keep only the diff token_ids and text in streaming mode when
             # result_handler is not set
-            return out, metrics_dict, perf_metrics, disaggregated_params
+            return (out, metrics_dict, perf_metrics, disaggregated_params,
+                    time_breakdown_metrics)
 
     async def _batched_put(self):
         ''' Batched IPC send. '''
@@ -239,8 +246,8 @@ class PostprocWorker:
             try:
                 is_final = inp.rsp.result.is_final if is_llm_response(
                     inp.rsp) else True
-                res, metrics, perf_metrics, disaggregated_params = await self._handle_input(
-                    inp)
+                (res, metrics, perf_metrics, disaggregated_params,
+                 time_breakdown_metrics) = await self._handle_input(inp)
                 record = self._records.get(client_id)
                 # A `terminate` verdict forces the record done;
                 # honor it so the stream stops and the record is popped without
@@ -260,6 +267,7 @@ class PostprocWorker:
                         is_final=is_final,
                         metrics=metrics,
                         request_perf_metrics=perf_metrics,
+                        time_breakdown_metrics=time_breakdown_metrics,
                         disaggregated_params=disaggregated_params,
                         should_abort=should_abort,
                         finish_reason=finish_reason,

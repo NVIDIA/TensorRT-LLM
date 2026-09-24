@@ -363,8 +363,14 @@ def build_metrics_headers(records: List[Dict[str, Any]]) -> Dict[str, str]:
                 (STEP_METRICS_HEADER, "step_metrics", "step"),
                 (CTX_CHUNK_METRICS_HEADER, "ctx_chunk_metrics", "ctx-chunk"),
             ):
+                # step_metrics entries are consecutive decoding iterations from
+                # step_iter_base, so the absolute iteration is base + index. The
+                # per-entry "iter" is still honored if an older worker sent one.
+                iter_base = breakdown.get("step_iter_base", 0)
                 for index, metrics in enumerate(breakdown.get(key, [])):
-                    item = metrics.get("iter", index) if key == "step_metrics" else index
+                    item = (
+                        metrics.get("iter", index + iter_base) if key == "step_metrics" else index
+                    )
                     durations = (
                         ("forward", _elapsed_ms(metrics, "forward_start_time", "forward_end_time")),
                         ("sample", _elapsed_ms(metrics, "sample_start_time", "sample_end_time")),

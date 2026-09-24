@@ -305,6 +305,16 @@ class PerfTimingInfo:
     ctx_gpu_sample_time: Optional[float] = None
     # Flag: set after the last ctx chunk is saved (py_decoding_iter == 1)
     ctx_chunks_complete: bool = False
+    # The entry in step_metrics/ctx_chunk_metrics still awaiting GPU times, and
+    # whether it is a ctx chunk. Entries are shared between all requests in a
+    # batch (see PerfMetricsManager), so "which entry is mine" cannot be
+    # rediscovered by probing gpu_forward_time; it is recorded here instead.
+    pending_gpu_record: Optional[Dict] = None
+    pending_gpu_is_ctx: bool = False
+    # py_decoding_iter of this request's first generation step. The step_metrics
+    # entries are consecutive from here, so the absolute iteration of entry i is
+    # step_iter_base + i -- no need to store a per-request "iter" per step.
+    step_iter_base: Optional[int] = None
 
 
 class LogitsStorage:
@@ -1275,6 +1285,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             if self.py_perf_timing.step_metrics:
                 time_breakdown_metrics[
                     'step_metrics'] = self.py_perf_timing.step_metrics.copy()
+                if self.py_perf_timing.step_iter_base is not None:
+                    time_breakdown_metrics[
+                        'step_iter_base'] = self.py_perf_timing.step_iter_base
             if self.py_perf_timing.ctx_chunk_metrics:
                 time_breakdown_metrics[
                     'ctx_chunk_metrics'] = self.py_perf_timing.ctx_chunk_metrics.copy(
