@@ -85,7 +85,6 @@ soundfile
 # must not be reinstalled underneath the rest of the stack that was built against it. This is
 # also the version the vendored triton_kernels below track.
 triton==3.8.0 # NOTE: if you update this, you must also run scripts/vendor_triton_kernels.py to vendor the new version of triton_kernels
-xdsl>=0.59.0 # Optional: required for MLIR-based elementwise fusion in AutoDeploy
 tiktoken
 blobfile
 openai-harmony==0.0.4
@@ -97,7 +96,7 @@ jinja2 # required for MinimaxM3 MSA
 plotly
 numexpr
 partial_json_parser
-mcp<2.0.0 # 2.0.0 removed mcp.server.fastmcp; scaffolding still uses the 1.x APIs
+mcp>=1.23.0,<2.0.0 # 2.0.0 removed mcp.server.fastmcp; scaffolding still uses the 1.x APIs
 apache-tvm-ffi==0.1.13.post2 # required by the CUTLASS DSL TVM-FFI provider
 torch-c-dlpack-ext==0.1.3 # used for reduce nvidia-cutlass-dsl host overhead, optional package for improved torch tensor calling perf
 flash-attn-4==4.0.0b19
