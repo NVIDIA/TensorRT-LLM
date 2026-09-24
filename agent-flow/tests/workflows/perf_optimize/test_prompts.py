@@ -1043,6 +1043,15 @@ def test_remote_execution_prompt_is_short_and_task_specific():
         assert "Prefer one allocation for related work" in compact
         assert "retry only after a concrete correction" in compact
         assert "or when another measurement is needed" in compact
+        # The one-turn contract. Remote is the only mode where a role CAN end
+        # its turn with work outstanding -- on the cluster a foreground `srun`
+        # blocks -- and a campaign was lost to exactly that: six hours in, the
+        # analyzer armed a watcher, ended its turn saying the results needed
+        # collecting next turn, and the job it was waiting for completed
+        # twenty-one minutes later with nobody left to read it.
+        assert "You get ONE turn" in compact
+        assert "Do not end your turn with a job still running" in compact
+        assert "the turn ending IS the stage ending" in compact
         for removed_detail in (
             "Treat command output as noisy",
             "probe, control, confirmation",

@@ -1101,6 +1101,20 @@ SSH target and wait for Slurm to finish. Pull the role's required outputs and
 failure logs back for local inspection, then remove that remote job directory.
 Prefer one allocation for related work; retry only after a concrete correction
 or when another measurement is needed.
+
+You get ONE turn. There is no follow-up turn to collect anything in, so
+"wait for Slurm to finish" means stay in this turn until it has: keep polling
+until the job leaves the queue, then read its outputs. Do not end your turn
+with a job still running, and do not end it on a note describing what a later
+turn should collect — the turn ending IS the stage ending, and a stage that
+ends without its required deliverable has thrown away everything the campaign
+did before it.
+
+This is the one thing that differs from running on the cluster itself, where
+a foreground `srun` blocks and the question cannot arise. Over SSH you must
+poll, and polling makes stopping early possible. If waiting leaves you idle,
+stay idle — an idle poll loop costs the campaign nothing and ending the turn
+costs it everything.
 """
 
 

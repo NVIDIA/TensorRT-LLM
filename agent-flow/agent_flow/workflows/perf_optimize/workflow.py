@@ -132,6 +132,27 @@ _ROLES = (
 )
 
 
+class StageOutputsMissing(RuntimeError):
+    """A stage returned but did not write a deliverable the workflow requires.
+
+    Recoverable BY CONSTRUCTION, which is why it has its own type: the guard
+    that raises it runs before the checkpoint advances, so the stage that
+    failed is exactly the stage a re-run resumes into. Nothing has to be
+    undone and nothing is lost -- the role simply gets another turn.
+
+    The case this was written for: a role that submits a Slurm job, arms a
+    watcher, and ends its turn intending to collect the results "next turn".
+    In a one-shot stage there is no next turn, and before this the whole
+    campaign died there -- in one observed run six hours in, twenty-one
+    minutes before the job it was waiting for completed successfully.
+    """
+
+    def __init__(self, message: str, *, stage: str, missing: tuple[str, ...]) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.missing = missing
+
+
 class PerfOptimizeWorkflow:
     """Iterative optimization loop over a TRT-LLM serving setup.
 
@@ -1617,16 +1638,41 @@ class PerfOptimizeWorkflow:
         leaves the checkpoint un-advanced (``stage`` still names this
         role), so simply re-running the workflow retries the same stage;
         ``--clean`` starts over.
+
+        :class:`StageOutputsMissing` rather than a bare ``RuntimeError``
+        because that re-run is now automatic (see ``cli.main``), and the
+        retry must be able to tell this recoverable case apart from every
+        other ``RuntimeError`` the workflow raises. Re-running after a
+        roadmap *schema* failure, for instance, replays the same invalid
+        file; re-running after this one gives the role another turn, which
+        is the whole difference.
         """
         missing = [p.name for p in paths if not self._is_nonempty(p)]
         if missing:
-            raise RuntimeError(
+            raise StageOutputsMissing(
                 f"{stage} stage finished but left required output "
                 f"empty/missing: {', '.join(missing)}. The stage did not "
                 f"complete its work (it likely ended its turn before writing "
                 f"its deliverable). Re-run the workflow to retry this stage, "
-                f"or pass --clean to start over."
+                f"or pass --clean to start over.",
+                stage=stage,
+                missing=tuple(missing),
             )
+
+    def checkpoint_position(self) -> tuple[str, int, int, int]:
+        """Where the checkpoint on disk currently sits.
+
+        Read from the FILE, not from an in-memory ``WorkflowState``: the
+        caller that needs this is outside ``run``, and the point of the
+        question is what a re-run would resume into.
+        """
+        state = load_state(self.state_path)
+        return (
+            state.stage,
+            state.round_index,
+            state.item_index,
+            state.attempt_index,
+        )
 
     def _validate_roadmap(self) -> dict[str, Any]:
         """Structurally validate roadmap.yaml as part of the analyzer gate."""

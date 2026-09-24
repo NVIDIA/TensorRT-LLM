@@ -16,7 +16,7 @@ from .task_schema import (
     load_and_validate_task_yaml,
     sol_enabled,
 )
-from .workflow import PerfOptimizeWorkflow
+from .workflow import PerfOptimizeWorkflow, StageOutputsMissing
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -104,6 +104,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "`optimize.item_execution` mode). "
         "Ignored on resume — the checkpointed budget wins.",
     )
+    parser.add_argument(
+        "--stage-retries",
+        type=int,
+        default=1,
+        metavar="N",
+        help="How many extra turns to give a stage that returned without "
+        "writing its required deliverable, counted PER checkpoint position so "
+        "the budget resets whenever the campaign advances. The case this "
+        "exists for is a role that submits a Slurm job, ends its turn meaning "
+        "to collect the results next turn, and finds there is no next turn. "
+        "0 restores the previous behaviour: fail the campaign and leave the "
+        "re-run to a person. Only this failure is retried — a deliverable that "
+        "exists but is invalid replays identically and is never retried.",
+    )
     return parser.parse_args(argv)
 
 
@@ -148,7 +162,47 @@ def main(argv: list[str] | None = None) -> None:
         reuse_analysis=args.reuse_analysis,
         sol_methodology=methodology,
     ) as workflow:
-        workflow.run(args.task)
+        _run_with_stage_retries(workflow, args.task, args.stage_retries)
+
+
+def _run_with_stage_retries(workflow, task: str, budget: int) -> None:
+    """Run the workflow, giving a stage that wrote nothing another turn.
+
+    ``_require_stage_outputs`` raises before the checkpoint advances, and its
+    own docstring already names the fix: "simply re-running the workflow
+    retries the same stage". That instruction was addressed to a person. An
+    unattended campaign has no person, so a role that ended its turn early
+    killed hours of completed work -- and the recovery was a one-line command
+    nobody was there to type.
+
+    The budget is PER POSITION, not per run. A campaign is dozens of stages;
+    one global counter would let three unrelated hiccups over eight rounds
+    exhaust it, and would equally let a stage that can never succeed burn the
+    whole budget while looking like progress. Keying on the checkpoint means
+    the count resets the moment the campaign actually moves, and a stage that
+    is genuinely stuck stops after ``budget`` tries at the same spot.
+
+    Only :class:`StageOutputsMissing` is retried. Everything else propagates:
+    a roadmap that fails schema validation, for instance, would replay the
+    same invalid file and fail identically, so retrying it buys nothing and
+    hides the real error behind repeated attempts.
+    """
+    seen: dict[tuple, int] = {}
+    while True:
+        try:
+            workflow.run(task)
+            return
+        except StageOutputsMissing as exc:
+            position = workflow.checkpoint_position()
+            seen[position] = seen.get(position, 0) + 1
+            if seen[position] > budget:
+                raise
+            print(
+                f"retrying stage {exc.stage!r} "
+                f"(attempt {seen[position] + 1} of {budget + 1}): "
+                f"it left {', '.join(exc.missing)} unwritten",
+                file=sys.stderr,
+            )
 
 
 if __name__ == "__main__":
