@@ -1735,7 +1735,13 @@ class MiniMaxM3VLInputProcessor:
     video placeholders are framed by the image start/end tokens
     (``MINIMAX_M3_VL_VISION_START_TOKEN`` /
     ``MINIMAX_M3_VL_VISION_END_TOKEN`` above, resolved via the tokenizer).
+
+    With ``enable_tokenization_cache``, text-only prompts are tokenized through
+    the prefix-tokenization cache instead of the HF processor.
     """
+
+    # Makes create_input_processor pass enable_tokenization_cache.
+    supports_tokenization_cache = True
 
     def __init__(
         self,
@@ -1743,9 +1749,12 @@ class MiniMaxM3VLInputProcessor:
         config: Any,
         tokenizer: Any = None,
         trust_remote_code: bool = True,
+        enable_tokenization_cache: bool = False,
         **kwargs: Any,
     ):
+        from tensorrt_llm.inputs.prefix_token_cache import create_prefix_token_cache
         from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
+        from tensorrt_llm.logger import logger
 
         BaseMultimodalInputProcessor.__init__(
             self,
@@ -1770,6 +1779,18 @@ class MiniMaxM3VLInputProcessor:
             use_fast=self._use_fast,
             trust_remote_code=trust_remote_code,
         )
+        # The HF processor tokenizes a text-only prompt with add_special_tokens=True
+        # (the tokenizer default) and the cache with add_special_tokens=False, so the
+        # cache is exact only if the tokenizer adds no special tokens; MiniMax-M3's adds none.
+        self._prefix_token_cache = None
+        if enable_tokenization_cache:
+            if self._processor.tokenizer.num_special_tokens_to_add() == 0:
+                self._prefix_token_cache = create_prefix_token_cache(self._processor.tokenizer)
+            else:
+                logger.warning(
+                    "enable_tokenization_cache is ignored: the MiniMax-M3 tokenizer adds "
+                    "special tokens, so cached ids would differ from the HF processor's."
+                )
         text_cfg = getattr(config, "text_config", None)
         if isinstance(text_cfg, dict):
             self._dtype = getattr(text_cfg, "torch_dtype", torch.bfloat16)
@@ -2050,6 +2071,9 @@ class MiniMaxM3VLInputProcessor:
                 templated_text = "\n".join(explicit)
         else:
             templated_text = text_prompt or ""
+            if self._prefix_token_cache is not None:
+                ids = self._prefix_token_cache.encode(self._processor.tokenizer, templated_text)
+                return ids, {"multimodal_data": {}}
 
         # Run the HF processor. ``return_tensors='pt'`` yields tensors
         # in the BatchFeature output.
