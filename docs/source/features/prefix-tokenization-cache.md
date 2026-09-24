@@ -54,11 +54,14 @@ feature you turned on.
   shared across tokenizers.
 - The cache requires a fast (Rust-backed) tokenizer, because it relies on
   character offsets. With a slow tokenizer the cache is disabled with a warning.
-- The cache is used only when the tokenizer would be called exactly as the
-  cache calls it: `add_special_tokens=False` and no prompt truncation. Chat
-  completions apply the chat template and tokenize with
+- `DefaultInputProcessor` uses the cache only when the tokenizer would be
+  called exactly as the cache calls it: `add_special_tokens=False` and no prompt
+  truncation. Chat completions apply the chat template and tokenize with
   `add_special_tokens=False`, so they benefit. `/v1/completions` defaults to
   `add_special_tokens=True` and is not accelerated.
+- Model-specific (multimodal) input processors do not use the cache, except
+  MiniMax-M3's, which uses it for every text-only prompt. Requests with images
+  or videos bypass the cache.
 - A prompt that extends a cached entry replaces that entry, so a conversation
   costs one entry regardless of how many turns it has. Lookup is bucketed by a
   hash of the first `TLLM_PREFIX_TOKEN_CACHE_MIN_CHARS` characters, and each
