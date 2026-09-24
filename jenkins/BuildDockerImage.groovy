@@ -82,6 +82,8 @@ def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 @Field
 def BOLT_PROFILE_REF = "bolt_profile_ref"
+@Field
+def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -93,6 +95,7 @@ def globalVars = [
     // silently dropped -- which for this one would mean running unpinned
     // without saying so.
     (BOLT_PROFILE_REF): "",
+    (BOLT_PROFILE_BRANCH): "",
 ]
 
 @Field
