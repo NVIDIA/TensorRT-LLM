@@ -1574,7 +1574,8 @@ class PyTorchModelEngine(ModelEngine):
                 warmup_requests_configs = self._agree_warmup_shapes(
                     self._get_full_general_warmup_requests(resource_manager))
                 # Currently graph has not been captured, disable cuda graph for this warmup.
-                with timing_metric("general_warmup_seconds", self._metrics), self.no_cuda_graph():
+                with timing_metric("general_warmup_seconds",
+                                   self._metrics), self.no_cuda_graph():
                     self._general_warmup(resource_manager,
                                          warmup_requests_configs)
                     # Release C++ MoE workspace buffers so the autotuner can
@@ -1642,7 +1643,8 @@ class PyTorchModelEngine(ModelEngine):
             with timing_metric("dg_paged_mqa_warmup_seconds", self._metrics):
                 self._warmup_dg_paged_mqa_logits_metadata()
             log_mem_snapshot("warmup/after_dg_paged_mqa_logits_metadata")
-            with timing_metric("cute_dsl_radix_topk_warmup_seconds", self._metrics):
+            with timing_metric("cute_dsl_radix_topk_warmup_seconds",
+                               self._metrics):
                 self._warmup_cute_dsl_radix_topk()
         log_mem_snapshot("warmup/after_cute_dsl_radix_topk")
         if can_run_general_warmup:
@@ -1651,8 +1653,10 @@ class PyTorchModelEngine(ModelEngine):
             with self._warmup_timer.phase("memory_pool_prepop"):
                 warmup_requests_configs = self._get_max_shape_warmup_requests(
                     resource_manager)
-                with timing_metric("memory_pool_prepopulation_seconds", self._metrics):
-                    self._general_warmup(resource_manager, warmup_requests_configs)
+                with timing_metric("memory_pool_prepopulation_seconds",
+                                   self._metrics):
+                    self._general_warmup(resource_manager,
+                                         warmup_requests_configs)
             log_mem_snapshot("warmup/after_memory_pool_prepop")
 
         # Allocate the CUDA graph padding dummies now, while the KV cache is
