@@ -1287,6 +1287,10 @@ def test_a_shrinking_step_leaves_no_live_slot_in_the_padded_tail():
     metadata.msa_kv_indices = torch.zeros(3 * 4, dtype=torch.int32)
     metadata.msa_block_table = torch.zeros(3, 4, dtype=torch.int32)
     metadata.msa_seq_lens_cuda = torch.zeros(3, dtype=torch.int32)
+    # Non-speculative, so no on_update_kv_lens staging: the slot tail this test
+    # is about is the same either way, and the staging buffers are not part of
+    # the fixture.
+    metadata._msa_kv_lens_may_change = lambda: False
 
     def build(request_ids, qo_lens, kv_lens):
         # The host lengths are read-only properties over these.
