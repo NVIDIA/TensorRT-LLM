@@ -167,6 +167,11 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 | Test waives | `tests/integration/test_lists/waives.txt` | Skip known-failing tests with NVBug links |
 | Performance | See [benchmarking guide](docs/source/developer-guide/perf-benchmarking.md) | `trtllm-bench` and `trtllm-serve` benchmarks |
 
+### Advisory semantic review
+
+See [.github/semantic-review.md](.github/semantic-review.md) for the two-hour
+candidate scan, fixed-version AI results, and manual retry procedure.
+
 ### Triggering CI
 
 CI is triggered by posting comments on the PR. Basic commands:
