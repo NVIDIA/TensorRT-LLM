@@ -5723,7 +5723,8 @@ def checkKitmakerWheelDryRun(pipeline, kitmakerDryRunMetadata)
 // a missing bundle as a skip; it has to, because the same switch covers x86_64,
 // where nothing is promoted yet. This path is aarch64-only and the switch is
 // main-only, so there is always a bundle to find.
-def applyLatestBoltToWheel(pipeline, String wheel, String cpu_arch, String boltProfileRef = "")
+def applyLatestBoltToWheel(pipeline, String wheel, String cpu_arch, String boltProfileRef = "",
+                           String boltProfileBranch = "")
 {
     def llvmArch = (cpu_arch == AARCH64_TRIPLE) ? "ARM64" : "X64"
     // apply_latest.sh resolves exactly one branch, so try the build's own branch
@@ -5734,15 +5735,12 @@ def applyLatestBoltToWheel(pipeline, String wheel, String cpu_arch, String boltP
         .collect { it?.toString()?.trim() }
         .findAll { it }
         .unique()
-    // The candidate walk stays as-is under a pin. The pin is resolved upstream
-    // against BUILD_BRANCH (env.gitlabBranch), which is not the expression that
-    // seeds this list, so narrowing to one entry here would look in the wrong
-    // promote directory. Walking is safe precisely because the ref is a commit
-    // SHA: the same ref under another branch's directory is the bundle built
-    // from that same commit, so whichever candidate resolves it, the profiles
-    // are the ones this pipeline pinned.
-    if (boltProfileRef) {
-        echo "[bolt-wheel] pinned to BOLT bundle ${boltProfileRef}"
+    // A pin now supplies its own branch, so nothing is left to guess: the ref
+    // names one object under that branch's promote directory. Walking candidates
+    // would only add ways to fetch something other than what was pinned.
+    if (boltProfileRef && boltProfileBranch) {
+        branches = [boltProfileBranch]
+        echo "[bolt-wheel] pinned to BOLT bundle ${boltProfileRef} on ${boltProfileBranch}"
     }
 
     stage("BOLT release wheel") {
@@ -5770,8 +5768,11 @@ def applyLatestBoltToWheel(pipeline, String wheel, String cpu_arch, String boltP
             rc = sh(returnStatus: true, script: """
                 export PATH="\$PWD/.bolt-llvm/bin:\$PATH"
                 export BOLT_PROFILE_REF='${boltProfileRef}'
+                # Quoted: the branch comes from job env and the wheel name from a
+                # directory listing, so an unquoted expansion would let a shell
+                # metacharacter in either run before apply_latest.sh starts.
                 bash tensorrt_llm/scripts/bolt/internal/apply_latest.sh \
-                     ${b} ${cpu_arch} ${wheel} ${wheel}.bolted
+                     '${b}' '${cpu_arch}' '${wheel}' '${wheel}.bolted'
             """)
             if (rc != 3) {
                 appliedFrom = b
@@ -5808,7 +5809,8 @@ def runLLMBuild(
     plat_name="",
     is_dlfw=false,
     boltConsume=false,
-    boltProfileRef="")
+    boltProfileRef="",
+    boltProfileBranch="")
 {
     sh "pwd && ls -alh"
     sh "env | sort"
@@ -5871,7 +5873,8 @@ def runLLMBuild(
     // inside an already-released image to prove that image can still build from
     // source; optimizing it would prove nothing and only add a failure mode.
     if (boltConsume && cpu_arch == AARCH64_TRIPLE && !wheel_path) {
-        applyLatestBoltToWheel(pipeline, "tensorrt_llm/build/${wheelName}", cpu_arch, boltProfileRef)
+        applyLatestBoltToWheel(pipeline, "tensorrt_llm/build/${wheelName}", cpu_arch,
+                               boltProfileRef, boltProfileBranch)
     }
 
     def rootWheelUploadPath = "${cpu_arch}/${wheel_path}"
@@ -7052,11 +7055,12 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             // apply_latest.sh then takes whatever `latest` is, i.e. today's
             // behaviour.
             def boltProfileRef = globalVars[BOLT_PROFILE_REF]?.toString() ?: ""
+            def boltProfileBranch = globalVars[BOLT_PROFILE_BRANCH]?.toString() ?: ""
 
             buildRunner("[${toStageName(values[1], key)}] Build") {
                 wheelPath = runLLMBuild(
                     pipeline, cpu_arch, values[3], "", versionOverride, cpver,
-                    values[7], isDlfw, boltConsume, boltProfileRef)
+                    values[7], isDlfw, boltConsume, boltProfileRef, boltProfileBranch)
             }
 
             // TODO: Re-enable the sanity check after updating GPU testers' driver version.

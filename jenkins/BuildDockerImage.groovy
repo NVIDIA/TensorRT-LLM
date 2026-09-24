@@ -69,6 +69,8 @@ BOLT_OPTIMIZE_WHEEL = (params.boltOptimizeWheel ?: env.boltOptimizeWheel ?: "fal
 // because prepareWheelFromBuildStage runs well below the scope globalVars is
 // passed into. Empty means unpinned, i.e. take whatever `latest` is.
 BOLT_PINNED_REF = ""
+// The branch that pin lives under. Set only together with the ref.
+BOLT_PINNED_BRANCH = ""
 // <<< BOLT profile-bundle overlay <<<
 
 ENABLE_USE_WHEEL_FROM_BUILD_STAGE = params.useWheelFromBuildStage ?: false
@@ -326,16 +328,17 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
             .collect { it?.toString()?.trim() }
             .findAll { it }
             .unique()
-        echo "Release image for ${arch} will BOLT-optimize its wheel using profiles from: ${branches.join(', ')}"
-        wheelArgs += " --bolt-branch ${branches.join(',')}"
-        // With a pin the candidate list collapses to its first entry: the ref
-        // names one immutable bundle under one branch's promote directory, so
+        // Pinned, the candidate list collapses to the branch the pin came from:
+        // the ref names one immutable bundle under one promote directory, so
         // falling through to another branch would optimize the image's wheel
         // with different profiles than the release wheel and the tested build.
-        if (BOLT_PINNED_REF) {
-            echo "Release image for ${arch} is pinned to BOLT bundle ${BOLT_PINNED_REF}"
+        if (BOLT_PINNED_REF && BOLT_PINNED_BRANCH) {
+            branches = [BOLT_PINNED_BRANCH]
             wheelArgs += " --bolt-profile-ref ${BOLT_PINNED_REF}"
+            echo "Release image for ${arch} is pinned to BOLT bundle ${BOLT_PINNED_REF} on ${BOLT_PINNED_BRANCH}"
         }
+        echo "Release image for ${arch} will BOLT-optimize its wheel using profiles from: ${branches.join(', ')}"
+        wheelArgs += " --bolt-branch ${branches.join(',')}"
     }
     return " BUILD_WHEEL_SCRIPT=${wheelScript} BUILD_WHEEL_ARGS='${wheelArgs}'"
 }
@@ -402,11 +405,11 @@ def overlayBoltBundle(pairs, arch, action) {
     // rather than resolving `latest` when it happens to run. Without this the
     // released image could carry a profile bundle that no other artifact in the
     // run was built from. Empty means unpinned and pull-latest behaves exactly
-    // as before. The candidate walk is kept: the ref is a commit SHA, so the
-    // same ref under another branch's promote directory is the bundle built
-    // from that same commit.
-    if (BOLT_PINNED_REF) {
-        echo "[BOLT] overlay pinned to bundle ${BOLT_PINNED_REF}"
+    // as before; pinned, the pin supplies its own branch and the candidate walk
+    // collapses to it, because the ref names one object under one directory.
+    if (BOLT_PINNED_REF && BOLT_PINNED_BRANCH) {
+        candidates = [BOLT_PINNED_BRANCH]
+        echo "[BOLT] overlay pinned to bundle ${BOLT_PINNED_REF} on ${BOLT_PINNED_BRANCH}"
     }
     for (cand in candidates) {
         for (int attempt = 1; attempt <= 3 && !haveBundle; attempt++) {
@@ -721,6 +724,7 @@ def buildImage(config, imageKeyToTag, versionOverride)
 def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
     def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
     BOLT_PINNED_REF = globalVars[BOLT_PROFILE_REF]?.toString() ?: ""
+    BOLT_PINNED_BRANCH = globalVars[BOLT_PROFILE_BRANCH]?.toString() ?: ""
     def defaultBuildConfig = [
         target: "tritondevel",
         action: params.action,

@@ -79,13 +79,11 @@ def bolt_optimize_wheels(build_dir, arch, bolt_branch, bolt_profile_ref=None):
     branches = [b.strip() for b in bolt_branch.split(",") if b.strip()]
     env = os.environ.copy()
     if bolt_profile_ref:
-        # The branch walk is kept under a pin. The ref is a commit SHA, so the
-        # same ref under another branch's promote directory is the bundle built
-        # from that same commit -- whichever candidate resolves it, the profiles
-        # are the pinned ones. Narrowing the list would instead risk looking in
-        # a directory the pin was never resolved against.
+        # The caller already narrowed --bolt-branch to the branch the pin was
+        # resolved against, so this list is normally a single entry. Setting the
+        # ref makes apply_latest.sh fetch that exact bundle.
         env["BOLT_PROFILE_REF"] = bolt_profile_ref
-        print(f"Pinned to BOLT bundle {bolt_profile_ref}")
+        print(f"Pinned to BOLT bundle {bolt_profile_ref} on {branches}")
 
     for wheel in sorted(Path(build_dir).glob("tensorrt_llm*.whl")):
         bolted = wheel.with_suffix(".whl.bolted")
