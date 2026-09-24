@@ -356,7 +356,7 @@ python examples/scaffolding/contrib/Coder/run_coder.py \
     --base_url http://localhost:8000/v1 \
     --model Qwen3/Qwen3-30B-A3B \
     --apiary_url http://172.17.0.1:8080 \
-    --mcp_url http://127.0.0.1:8083/sse \
+    --mcp_url http://127.0.0.1:8083/mcp \
     --image ubuntu:22.04 \
     --prompt "Implement a thread-safe LRU cache in Python" \
     --max_iterations 50 \

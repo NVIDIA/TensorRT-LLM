@@ -255,7 +255,7 @@ structures. Both share the same general platform requirements.[^general-requirem
 | DeepSeek-V4 SWA, HCA, and compressor state | Preserved losslessly | Not supported |
 
 [^general-requirements]: Both methods currently require the PyTorch backend,
-    KVCM V2, and an NVIDIA GPU with compute capability SM100 or SM103.
+    KVCM V2, and an NVIDIA GPU with compute capability SM100, SM103, or SM107.
 [^deepseek-v4]: DeepSeek-V4 requires `tokens_per_block` of 128 or 256 (the
     DeepSeek-V4 cache manager's constraint) and cold-page compression does not
     cover the FP8 `fp8_ds_mla` footer-scale KV layout; use the ordinary FP8 or

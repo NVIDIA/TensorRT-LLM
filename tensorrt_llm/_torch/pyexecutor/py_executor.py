@@ -26,6 +26,7 @@ try:
 except ImportError:
     from cuda import cudart
 
+from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
                                  get_steady_clock_now_in_seconds,
                                  global_mpi_size, is_trace_enabled, mpi_comm,
@@ -739,6 +740,9 @@ class PyExecutor:
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
         self.num_scheduled_requests: int = 0
+        # Populated at schedule time (see _prepare_and_schedule_batch).
+        self.num_dummy_requests: int = 0
+        self.num_unscheduled_requests: int = 0
         self._iter_adp_dummy_ctx_tokens = 0
         self._iter_adp_dummy_gen_tokens = 0
         self._configure_benchmark_req_queues_size()
@@ -813,7 +817,8 @@ class PyExecutor:
         # by heavy initialisation (e.g. guided-decoder / llguidance tokenizer
         # creation) while earlier PP stages already start warmup forward
         # passes that require matching pp_recv on the later stages.
-        self.dist.barrier()
+        with _StartupTimer("pre_warmup_rank_barrier"):
+            self.dist.barrier()
 
         # During warmup, we don't enable the profiler
         # Run warmup on the execution_stream for proper synchronization with
@@ -2800,6 +2805,11 @@ class PyExecutor:
                 self.disagg.poll_progress_when_idle()
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
+                self.num_dummy_requests = sum(
+                    1 for r in scheduled_batch.all_requests()
+                    if r.is_attention_dp_dummy)
+                self.num_unscheduled_requests = (len(self.active_requests) -
+                                                 scheduled_batch.batch_size)
 
                 logger.debug(
                     f'iteration {self.iter_counter}, microbatch {microbatch_id}, '
@@ -3911,6 +3921,10 @@ class PyExecutor:
                 return None, None
 
         self.num_scheduled_requests = scheduled_batch.batch_size
+        self.num_dummy_requests = sum(1 for r in scheduled_batch.all_requests()
+                                      if r.is_attention_dp_dummy)
+        self.num_unscheduled_requests = (len(self.active_requests) -
+                                         scheduled_batch.batch_size)
         logger.debug(
             f'has {len(self.active_requests)} active_requests, '
             f'scheduled {scheduled_batch.num_encoder_requests} encoder requests, '
@@ -5618,13 +5632,7 @@ class PyExecutor:
                 and self.kv_cache_transceiver.pipeline_transfer_enabled
                 and disagg_params is not None and request.llm_request_type
                 == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY):
-            runtime_features = getattr(self.model_engine,
-                                       "attn_runtime_features", None)
-            enable_chunked_prefill = (getattr(
-                runtime_features,
-                "chunked_prefill") if runtime_features is not None else getattr(
-                    self.model_engine, "_enable_chunked_prefill", False))
-            if not enable_chunked_prefill:
+            if not self.model_engine.attn_runtime_features.chunked_prefill:
                 raise ValueError(
                     "enable_chunked_prefill is required when enable_pipelined_transfer is set."
                 )
@@ -8291,8 +8299,10 @@ class PyExecutor:
 
             request_done = False
             if request.is_finished:
-                route_capture = getattr(self.model_engine, "route_capture",
-                                        None)
+                # Guard the engine lookup -- minimal executors (unit tests)
+                # may have no engine.
+                route_capture = getattr(getattr(self, "model_engine", None),
+                                        "route_capture", None)
                 if route_capture is not None:
                     route_capture.attach_routes(request)  # R3: append routes
             should_emit = (request.py_decoding_iter == 1 or request.is_finished
