@@ -268,6 +268,15 @@ def BOLT_CONSUME_BUILD = "bolt_consume_build"
 // unpinned, i.e. today's read-`latest`-per-consumer behaviour.
 @Field
 def BOLT_PROFILE_REF = "bolt_profile_ref"
+// The branch whose promote directory holds that bundle. A ref alone does not
+// address an object -- the path is <branch>/<triple>/bolt-profile-<ref>-<triple>
+// -- and consumers used to supply the branch themselves from four different
+// expressions. They agree on post-merge main and nowhere guaranteed else, and a
+// disagreement is a 404, which apply_latest.sh reports as "nothing promoted":
+// indistinguishable from a cold start, so it degrades silently. Carrying the
+// branch with the ref means a pinned consumer never has to guess.
+@Field
+def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
 @Field
 def RELEASE_TARGET = "release_target"
 def globalVars = [
@@ -281,6 +290,7 @@ def globalVars = [
     (RELEASE_TARGET): runMode == "nightly_release" ?
         normalizeReleaseTargets(gitlabParamsFromBot.get(RELEASE_TARGET, null)) : [],
     (BOLT_PROFILE_REF): "",
+    (BOLT_PROFILE_BRANCH): "",
 ]
 globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
 // Compare against "true" rather than relying on Groovy truthiness: the bot phrase
@@ -583,7 +593,12 @@ def preparation(pipeline, testFilter, globalVars)
         // above has already checked the repo out into ${LLM_ROOT}, which is
         // where the resolver's script lives.
         stage("Pin BOLT Profile Bundle") {
-            globalVars[BOLT_PROFILE_REF] = resolveBoltProfileRef(globalVars[BUILD_BRANCH])
+            def pinBranch = globalVars[BUILD_BRANCH]
+            def pinRef = resolveBoltProfileRef(pinBranch)
+            globalVars[BOLT_PROFILE_REF] = pinRef
+            // Only meaningful alongside a ref, so it is left empty when the pin
+            // does not resolve -- a consumer cannot then half-honour a pin.
+            globalVars[BOLT_PROFILE_BRANCH] = pinRef ? pinBranch : ""
         }
         stage("Upload Build Info") {
             try {
@@ -1950,6 +1965,8 @@ def resolveBuildBranch(globalVars)
 //
 // Skips are announced rather than silent: a run that asked for BOLTed binaries
 // and did not get them should say so in the log.
+// (Everything above documents resolveBoltConsume, defined further down.)
+
 // Pick the single BOLT profile bundle this pipeline will use, and pin it.
 //
 // Without a pin every consumer resolves `latest` independently, at whatever
@@ -1978,6 +1995,12 @@ def resolveBoltProfileRef(String branch, String triple = "aarch64-linux-gnu")
             bash ${LLM_ROOT}/scripts/bolt/internal/artifactory.sh \
                  resolve-latest ${branch} ${triple} 2>/dev/null || true
         """).trim()
+    } catch (InterruptedException e) {
+        // Aborts and timeouts reach here as FlowInterruptedException, which
+        // extends InterruptedException. Letting the catch below swallow one
+        // would turn a cancelled pipeline into an unpinned pipeline that
+        // carries on and launches every build job.
+        throw e
     } catch (Exception e) {
         echo "BOLT profile pin: resolve failed (${e.message}); running unpinned."
         return ""

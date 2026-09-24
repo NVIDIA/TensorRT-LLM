@@ -138,7 +138,11 @@ cmd_resolve_latest() {
     local path; path="$(promote_dir "$branch" "$triple")/latest.tar.gz"
 
     local props ref=""
-    props="$(curl -fsSL --retry 3 --retry-all-errors --connect-timeout 30 \
+    # --max-time as well as --connect-timeout: the caller runs this in
+    # preparation(), before any job launches, so a stalled transfer (connected,
+    # then silent) would hold the entire pipeline rather than fall back to
+    # unpinned. Bound the whole request, retries included.
+    props="$(curl -fsSL --retry 3 --retry-all-errors --connect-timeout 30 --max-time 60 \
                   "$base/api/storage/$path?properties" 2>/dev/null || true)"
     # { "properties": { "bolt.ref": [ "<ref>" ] } } -- fixed, tiny shape, so a sed
     # extraction avoids depending on python3 or jq, neither of which is guaranteed
@@ -153,7 +157,7 @@ cmd_resolve_latest() {
 
     log "no bolt.ref property on $path; falling back to the bundle manifest"
     local tmp; tmp="$(mktemp -d)"
-    if curl -fsSL --retry 3 --retry-all-errors --connect-timeout 60 \
+    if curl -fsSL --retry 3 --retry-all-errors --connect-timeout 60 --max-time 300 \
             -o "$tmp/latest.tar.gz" "$base/$path" 2>/dev/null \
        && tar -xzf "$tmp/latest.tar.gz" -C "$tmp" manifest.json 2>/dev/null; then
         ref="$(tr -d ' \n' < "$tmp/manifest.json" \
