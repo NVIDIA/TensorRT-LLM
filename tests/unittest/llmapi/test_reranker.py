@@ -72,12 +72,12 @@ class FakeBatcher:
         return SimpleNamespace(logits=torch.tensor([next(self.logits)]))
 
 
-def _server(logits):
+def _server(logits, *, max_seq_len=4096, max_num_tokens=4096):
     server = OpenAIServer.__new__(OpenAIServer)
     server.tokenizer = CharacterTokenizer()
     server.encode_batcher = FakeBatcher(logits)
     server._input_proc_executor = None
-    engine = SimpleNamespace(max_seq_len=4096)
+    engine = SimpleNamespace(max_seq_len=max_seq_len, max_num_tokens=max_num_tokens)
     server.generator = SimpleNamespace(_encoder_executor=SimpleNamespace(model_engine=engine))
     return server
 
@@ -208,6 +208,21 @@ async def test_v1_rerank_forwards_instruction():
 
     assert response.status_code == 200
     assert f"<Instruct>: {instruction}\n" in prompt
+
+
+@pytest.mark.asyncio
+async def test_v1_rerank_truncates_to_encoder_token_budget():
+    server = _server([0.0], max_seq_len=4096, max_num_tokens=512)
+    request = RerankRequest(
+        query="query",
+        documents=["x" * 500],
+    )
+
+    response = await server._rerank(request)
+
+    assert response.status_code == 200
+    assert len(server.encode_batcher.inputs) == 1
+    assert len(server.encode_batcher.inputs[0]) <= 512
 
 
 @pytest.mark.asyncio

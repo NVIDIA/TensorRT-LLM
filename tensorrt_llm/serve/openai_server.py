@@ -1687,6 +1687,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 for doc in request.documents
             ]
             engine = self.generator._encoder_executor.model_engine
+            max_prompt_length = min(engine.max_seq_len, engine.max_num_tokens)
             loop = asyncio.get_running_loop()
             try:
                 token_ids_list = await asyncio.gather(*[
@@ -1697,7 +1698,7 @@ class OpenAIServer(_VideoRoutesMixin):
                             tokenizer=self.tokenizer,
                             query=request.query,
                             document=document,
-                            max_seq_len=engine.max_seq_len,
+                            max_seq_len=max_prompt_length,
                             instruction=request.instruction,
                             max_tokens_per_doc=request.max_tokens_per_doc))
                     for document in documents
