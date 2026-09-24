@@ -561,3 +561,123 @@ def test_prefetch_fallback_identity_timeout_matches_mpi_default():
     from test_common.session_prefetcher import _FALLBACK_IDENTITY_TIMEOUT
 
     assert _FALLBACK_IDENTITY_TIMEOUT == _DEFAULT_IDENTITY_TIMEOUT
+
+
+class _FakeCommExecutor:
+    """Stand-in for the entered MPICommExecutor context manager."""
+
+    def __init__(self, block: bool = False, fail: bool = False):
+        self.block = block
+        self.fail = fail
+        self.release = threading.Event()
+        self.exited = threading.Event()
+
+    def __exit__(self, exc_type, exc_value, tb):
+        if self.block:
+            # A wedged worker rank: the join does not return until the test
+            # releases it (so the closer thread does not leak past the test).
+            self.release.wait(30)
+        self.exited.set()
+        if self.fail:
+            raise RuntimeError("simulated executor close failure")
+
+
+def _wait_closer_thread_gone(timeout: float = 5.0) -> None:
+    import time as _time
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        if not any(t.name == "MpiCommExecutorCloser"
+                   for t in threading.enumerate()):
+            return
+        _time.sleep(0.02)
+    raise AssertionError("MpiCommExecutorCloser remained alive after "
+                         f"{timeout}s")
+
+
+@pytest.fixture
+def _global_executor_state():
+    """Snapshot/restore the module-global executor slots around a test."""
+    saved = (MPINodeState._global_comm_executor, MPINodeState._global_mpi_pool)
+    yield
+    (MPINodeState._global_comm_executor, MPINodeState._global_mpi_pool) = saved
+
+
+@pytest.mark.cpu_only
+def test_server_close_releases_the_global_comm_executor(_global_executor_state):
+    """The server's final shutdown must close the shared COMM_WORLD executor.
+
+    ``MpiCommSession.shutdown()`` deliberately leaves the shared pool running
+    (multiple LLM instances reuse it), so without this close the non-leader
+    ranks stay blocked in the executor's task loop after the client is gone
+    -- the teardown hang behind a serve that could only die by hard kill.
+    """
+    from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionServer
+
+    fake = _FakeCommExecutor()
+    MPINodeState._global_comm_executor = fake
+    MPINodeState._global_mpi_pool = object()
+    aborted = []
+
+    RemoteMpiCommSessionServer._close_global_comm_executor(
+        grace=5.0, abort=lambda: aborted.append(True))
+
+    assert fake.exited.is_set()
+    assert not aborted
+    _wait_closer_thread_gone()
+    assert MPINodeState._global_comm_executor is None
+    assert MPINodeState._global_mpi_pool is None
+
+
+@pytest.mark.cpu_only
+def test_server_close_escalates_to_abort_when_the_join_wedges(
+        _global_executor_state):
+    """A worker stranded in a collective must not block teardown forever."""
+    from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionServer
+
+    fake = _FakeCommExecutor(block=True)
+    MPINodeState._global_comm_executor = fake
+    aborted = []
+
+    RemoteMpiCommSessionServer._close_global_comm_executor(
+        grace=0.2, abort=lambda: aborted.append(True))
+
+    assert aborted == [True]
+    # Release the wedged join so the closer thread ends inside the test
+    # (pytest-threadleak checks for leaked threads per test).
+    fake.release.set()
+    fake.exited.wait(5)
+    _wait_closer_thread_gone()
+
+
+@pytest.mark.cpu_only
+def test_server_close_escalates_to_abort_when_exit_raises(
+        _global_executor_state):
+    """Escalate to abort when the executor's ``__exit__`` raises.
+
+    A raised ``__exit__`` means the executor did not cleanly release, so peers
+    can stay blocked; the global refs are already cleared, so nothing else will
+    close them -- escalate the same way a timeout does.
+    """
+    from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionServer
+
+    fake = _FakeCommExecutor(fail=True)
+    MPINodeState._global_comm_executor = fake
+    aborted = []
+
+    RemoteMpiCommSessionServer._close_global_comm_executor(
+        grace=5.0, abort=lambda: aborted.append(True))
+
+    assert fake.exited.is_set()
+    assert aborted == [True]
+    _wait_closer_thread_gone()
+    assert MPINodeState._global_comm_executor is None
+
+
+@pytest.mark.cpu_only
+def test_server_close_is_a_noop_without_a_global_executor(
+        _global_executor_state):
+    from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionServer
+
+    MPINodeState._global_comm_executor = None
+    # Must not touch MPI at all (no abort callable is even constructed).
+    RemoteMpiCommSessionServer._close_global_comm_executor(grace=0.1)
