@@ -63,6 +63,11 @@ class GatedMLP(nn.Module):
                 "GatedMLP: split_gate_up is incompatible with "
                 "force_dynamic_quantization; dynamic quantization requires the "
                 "fused gate/up topology")
+        # Whether gate and up may consume one quantized activation. Decided by
+        # post_load_weights() from the loaded scales, so a model whose loader
+        # never reaches GatedMLP simply does not share. Necessary, not
+        # sufficient: _can_share_gate_up_quantization() adds the per-call gates.
+        self._maybe_share_gate_up_quantize = False
         self.swiglu_limit = float(
             swiglu_limit) if swiglu_limit is not None else None
         # SwiGLU-OAI shape parameters, left None for plain SwiGLU, where the
@@ -262,7 +267,7 @@ class GatedMLP(nn.Module):
             raise NotImplementedError(
                 f"split_gate_up requires SwiGLU activation, got {self.activation}"
             )
-        # As in _shares_gate_up_quantization: a method running this call in
+        # As in _can_share_gate_up_quantization: a method running this call in
         # higher precision needs a 16-bit activation, so do not emit FP8 for it.
         down_proj_is_fp8 = (
             self.down_proj.has_fp8_qdq or self.down_proj.has_w4a8_nvfp4_fp8
@@ -281,35 +286,19 @@ class GatedMLP(nn.Module):
                           swiglu_alpha=self.swiglu_alpha,
                           swiglu_beta=self.swiglu_beta)
 
-    def _shares_gate_up_quantization(self) -> bool:
-        """Config-only half of the condition, so post_load_weights() can reuse it.
-
-        Dynamic quantization derives a scale per call, so differing calibrated
-        scales are legitimate there rather than an error.
-        """
-        return (
-            self.split_gate_up and self.gate_proj.has_fp8_qdq
-            and self.up_proj.has_fp8_qdq
-            and not self.gate_proj.force_dynamic_quantization
-            and not self.up_proj.force_dynamic_quantization
-            and self.gate_proj.input_scale is not None
-            and self.up_proj.input_scale is not None
-            # A quantization method may run a given call in higher
-            # precision than its checkpoint recipe -- Cosmos3 does this on
-            # the outer denoising steps -- by publishing ``requires_unquantized_activation``.
-            # Quantizing the shared activation here would hand such a call
-            # a tensor it must not receive, so leave it in its input dtype.
-            and not self.gate_proj.requires_unquantized_activation)
-
     def _can_share_gate_up_quantization(self, x) -> bool:
         """Whether gate and up can consume one quantized activation.
 
         Reads no tensor values: that would sync the device every forward and
         make the graph data-dependent. Scale equality is checked at load.
         """
-        return (self._shares_gate_up_quantization()
-                and not isinstance(x, Fp4QuantizedTensor)
-                and x.dtype != torch.float8_e4m3fn)
+        if not self._maybe_share_gate_up_quantize:
+            return False
+        if isinstance(x, Fp4QuantizedTensor) or x.dtype == torch.float8_e4m3fn:
+            return False
+        # requires_unquantized_activation is per-call state rather than a
+        # property of the checkpoint.
+        return not self.gate_proj.requires_unquantized_activation
 
     def _split_gate_up_forward(self, x):
         """Run the split projections, quantizing their shared input once.
@@ -328,22 +317,32 @@ class GatedMLP(nn.Module):
         return self._apply_activation_2in(self.gate_proj(x), self.up_proj(x))
 
     def post_load_weights(self) -> None:
-        """Check the shared-activation invariant here, never in forward().
+        """Settle the shared-activation decision here, never in forward().
 
-        Reading scale tensors on the hot path would sync the device and break
-        fullgraph compilation. Only runs if the model's post-load walk includes
-        GatedMLP; several models restrict theirs to Linear.
+        gate and up each apply their own input_scale in the GEMM epilogue, so
+        quantizing once with gate's scale is only correct when both agree.
+        Reading the scales on the hot path would sync the device and break
+        fullgraph compilation, so it happens once, here.
+
+        A checkpoint whose scales disagree quantizes each projection instead
+        of loading incorrectly.
         """
-        if not self._shares_gate_up_quantization():
+        self._maybe_share_gate_up_quantize = False
+        if not (self.split_gate_up and self.gate_proj.has_fp8_qdq
+                and self.up_proj.has_fp8_qdq):
             return
         gate_scale, up_scale = (self.gate_proj.input_scale,
                                 self.up_proj.input_scale)
+        if gate_scale is None or up_scale is None:
+            return
         if not torch.equal(gate_scale, up_scale):
-            raise ValueError(
-                "split gate/up share one quantized activation, so they must "
-                f"carry the same calibrated input_scale; got {gate_scale.item()} "
-                f"(gate) and {up_scale.item()} (up) at layer_idx="
-                f"{self.layer_idx}")
+            logger.warning(
+                "gate/up carry different calibrated input_scales "
+                f"({gate_scale.item()} vs {up_scale.item()}) at layer_idx="
+                f"{self.layer_idx}; quantizing each projection separately "
+                "instead of sharing one quantized activation.")
+            return
+        self._maybe_share_gate_up_quantize = True
 
     def _can_fuse_gate_up_swiglu(self):
         """Check if fused GEMM + SwiGLU path is available.

@@ -61,6 +61,8 @@ def _make_mlp(split=True):
         linear.weight_scale.data.fill_(WEIGHT_SCALE)
         linear.input_scale.data.fill_(INPUT_SCALE)
         linear.inv_input_scale.data.fill_(1.0 / INPUT_SCALE)
+    # What the model loader does once weights are in; decides the sharing.
+    mlp.post_load_weights()
     return mlp
 
 

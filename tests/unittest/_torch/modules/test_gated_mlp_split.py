@@ -242,22 +242,27 @@ def test_fp8_output_feeds_down_proj():
 
 
 @requires_cuda
-def test_post_load_weights_rejects_mismatched_input_scales():
+def test_post_load_weights_revokes_on_mismatched_input_scales():
     """The shared quantization is only valid if both scales agree.
 
     Checked once here rather than in forward: reading the tensors on the hot path
     would synchronize the device and make the graph data-dependent, which breaks
-    fullgraph compilation.
+    fullgraph compilation. A checkpoint that violates it keeps working, one
+    quantize per projection, instead of being rejected.
     """
     mlp = _make(True)
     for linear in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
         _set_weights(linear)
         _set_scales(linear)
     mlp.post_load_weights()
+    assert mlp._maybe_share_gate_up_quantize is True
 
     mlp.up_proj.input_scale.data.fill_(INPUT_SCALE * 2)
-    with pytest.raises(ValueError, match="same calibrated input_scale"):
-        mlp.post_load_weights()
+    mlp.post_load_weights()
+    assert mlp._maybe_share_gate_up_quantize is False
+
+    x = torch.randn(TOKENS, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    assert mlp._can_share_gate_up_quantization(x) is False
 
 
 @requires_cuda
