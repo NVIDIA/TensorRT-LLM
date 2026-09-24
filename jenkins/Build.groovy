@@ -79,6 +79,9 @@ BOLT_PUBLISH_VARIANT = (params.boltPublishVariant ?: env.boltPublishVariant ?: "
 // is not in scope inside applyLatestBolt, so the value is hoisted here the same way
 // BOLT_CONSUME_ENABLED is.
 BOLT_PINNED_REF = (params.boltProfileRef ?: env.boltProfileRef ?: "").toString()
+// The branch the pin was resolved against. Only ever set together with the ref,
+// and authoritative when set -- see the hoist in launchStages.
+BOLT_PINNED_BRANCH = ""
 
 // Literals for easier access.
 @Field
@@ -576,7 +579,11 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
     // forwards neither of these, so a build launched by L0_MergeRequest.groovy lands
     // on "main" -- the only branch with a promoted bundle. Revisit together with the
     // parent's main-only gate if either name starts being forwarded.
-    def branch = env.gitlabTargetBranch ?: env.branch_name ?: "main"
+    // The pinned branch wins when there is one: the pin names an object under
+    // exactly that branch's promote directory, and the expression below is not
+    // the one the pin was resolved with, so re-deriving could look in the wrong
+    // place and find nothing.
+    def branch = BOLT_PINNED_BRANCH ?: (env.gitlabTargetBranch ?: env.branch_name ?: "main")
     def triple = is_linux_x86_64 ? "x86_64-linux-gnu" : "aarch64-linux-gnu"
     // The bundle this pipeline pinned, or "" to take whatever `latest` is now.
     // Exported to apply_latest.sh, which passes it to artifactory.sh; also stamped
@@ -605,6 +612,18 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
             bash ${LLM_ROOT}/scripts/bolt/internal/apply_latest.sh \
                  ${branch} ${triple} ${tarName} bolted-${tarName}
         """)
+        if (rc == 3 && boltRef) {
+            // rc=3 means apply_latest.sh could not pull a bundle. Unpinned that
+            // legitimately means "this branch has nothing promoted" -- true for
+            // x86_64 today -- and skipping is right. Pinned it cannot mean that:
+            // the pipeline read this exact ref minutes ago, so absence is a real
+            // failure. Skipping would leave bolted-${tarName} unpublished, and
+            // the test stages fetch it by name, so an Artifactory blip here would
+            // surface as a pile of unexplained 404s in a different job.
+            error("[bolt-consume] pinned BOLT bundle ${boltRef} not found under ${branch}/${triple}. " +
+                  "The pipeline pinned a bundle this build cannot fetch; refusing to silently produce " +
+                  "an un-BOLTed build that downstream stages expect to be optimized.")
+        }
         if (rc == 3) {
             echo "[bolt-consume] no promoted bundle for ${branch}/${triple}; skipping (build stays un-BOLTed)"
             return
@@ -725,7 +744,8 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         }
         if (globalVars[BOLT_PROFILE_REF]) {
             BOLT_PINNED_REF = globalVars[BOLT_PROFILE_REF].toString()
-            echo "[bolt-consume] pinned to profile bundle ${BOLT_PINNED_REF}"
+            BOLT_PINNED_BRANCH = globalVars[BOLT_PROFILE_BRANCH]?.toString() ?: ""
+            echo "[bolt-consume] pinned to profile bundle ${BOLT_PINNED_REF} on ${BOLT_PINNED_BRANCH}"
         }
         // Same reason as boltConsume directly above: boltPublishVariant is not
         // registered on the remote build jobs, so the Parameterized Remote
