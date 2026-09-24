@@ -1721,3 +1721,40 @@ class TestErrorClassificationIsOptIn:
         # Unclassified stays unclassified: an internal fault is not the
         # caller's fault.
         assert pipeline.classify_request_failure(RuntimeError("internal")) is None
+
+
+class TestStepPrecisionSelection:
+    """The pipeline drives the transformer's per-step precision, except in warmup."""
+
+    @staticmethod
+    def _pipeline(*, is_warmup, transformer):
+        pipeline = object.__new__(Cosmos3OmniMoTPipeline)
+        pipeline._is_warmup = is_warmup
+        pipeline.transformer = transformer
+        pipeline.scheduler = SimpleNamespace(timesteps=torch.arange(5))
+        return pipeline
+
+    def test_request_selects_every_step_against_the_full_schedule(self):
+        calls = []
+        transformer = SimpleNamespace(
+            set_denoising_step=lambda step_index, num_steps: calls.append((step_index, num_steps))
+        )
+        pipeline = self._pipeline(is_warmup=False, transformer=transformer)
+        for step in range(5):
+            pipeline._select_step_precision(step)
+        assert calls == [(step, 5) for step in range(5)]
+
+    def test_warmup_leaves_the_native_path_selected(self):
+        """Warmup's short schedule is all edge steps; it must not steer precision."""
+
+        def refuse(step_index, num_steps):
+            raise AssertionError(f"warmup selected step {step_index} of {num_steps}")
+
+        transformer = SimpleNamespace(set_denoising_step=refuse)
+        pipeline = self._pipeline(is_warmup=True, transformer=transformer)
+        for step in range(5):
+            pipeline._select_step_precision(step)
+
+    def test_transformer_without_a_policy_is_left_alone(self):
+        pipeline = self._pipeline(is_warmup=False, transformer=SimpleNamespace())
+        pipeline._select_step_precision(0)
