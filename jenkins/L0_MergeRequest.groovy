@@ -2628,20 +2628,13 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             // x86_64 (no promoted bundle) and whenever the wheel is
                             // built from source rather than downloaded.
                             'boltOptimizeWheel': true,
-                            // boltOptimizeWheel is read inside
-                            // prepareWheelFromBuildStage(), which returns early
-                            // unless this is set -- so without it the image
-                            // silently installs an unoptimized wheel and logs
-                            // nothing unusual. The parameter was read but never
-                            // declared from Aug 2025 (nvbug 5433581) until it was
-                            // declared alongside this line.
-                            'useWheelFromBuildStage': true,
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [
                                 'buildInternalRelease': false,
                                 'buildCiImage': false,
                                 'buildNgcRelease': true,
+                                'useWheelFromBuildStage': false,
                                 'wait_success_seconds': "",
                             ]
                         }
@@ -2700,9 +2693,6 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'boltOverlayEnabled': true,
                             'boltProfilesRequired': true,
                             'boltOptimizeWheel': true,
-                            // Same reason as the launch above: boltOptimizeWheel
-                            // does nothing unless the build-stage wheel path runs.
-                            'useWheelFromBuildStage': true,
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [
