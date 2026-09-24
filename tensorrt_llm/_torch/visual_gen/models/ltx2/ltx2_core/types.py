@@ -18,15 +18,20 @@ class VideoPixelShape(NamedTuple):
 
 
 class SpatioTemporalScaleFactors(NamedTuple):
-    """Spatiotemporal downscaling between pixel and VAE latent grid."""
+    """Spatiotemporal downscaling between pixel and VAE latent grid.
+
+    Field order matches tensor-axis order (time, height, width): latent_coords
+    in get_pixel_coords carries axes in that order and converts this tuple to
+    a tensor positionally, so the declared order must track it.
+    """
 
     time: int
-    width: int
     height: int
+    width: int
 
     @classmethod
     def default(cls) -> "SpatioTemporalScaleFactors":
-        return cls(time=8, width=32, height=32)
+        return cls(time=8, height=32, width=32)
 
 
 VIDEO_SCALE_FACTORS = SpatioTemporalScaleFactors.default()
@@ -60,9 +65,9 @@ class VideoLatentShape(NamedTuple):
         latent_channels: int = 128,
         scale_factors: "SpatioTemporalScaleFactors" = VIDEO_SCALE_FACTORS,
     ) -> "VideoLatentShape":
-        frames = (shape.frames - 1) // scale_factors[0] + 1
-        height = shape.height // scale_factors[1]
-        width = shape.width // scale_factors[2]
+        frames = (shape.frames - 1) // scale_factors.time + 1
+        height = shape.height // scale_factors.height
+        width = shape.width // scale_factors.width
         return VideoLatentShape(
             batch=shape.batch,
             channels=latent_channels,
