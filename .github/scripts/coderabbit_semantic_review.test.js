@@ -269,22 +269,14 @@ test('dispatch rejects malformed or missing PRs without touching other PRs', asy
   await assert.rejects(h.run('push'), /Unsupported event/);
 });
 
-test('PR event thresholds use the last completed analysis, not the original old base', async () => {
-  const h = harness(); h.setLag(80, 3 * DAY); await h.run(); h.reply();
-  h.setTarget(NEW_BASE); h.setNow(NOW + 2 * HOUR); h.setProgress(1); await h.run();
-  assert.equal(h.posted.length, 1);
-  assert.equal(h.checks[0].conclusion, 'neutral');
-  assert.match(h.checks[0].output.title, /stale/);
-  h.setProgress(30); await h.run(); assert.equal(h.posted.length, 2);
-});
-
-test('PR events require target progress even after 24 hours', async () => {
-  for (const [progress, expected] of [[0, 1], [1, 2]]) {
-    const h = harness(); await h.run(); h.reply(); h.setNow(NOW + DAY);
-    if (progress) h.setTarget(NEW_BASE);
-    else h.pr.head.sha = MERGED;
-    h.setProgress(progress); await h.run();
-    assert.equal(h.posted.length, expected);
+test('events and scans count target progress from the last analysis, not the old merge base', async () => {
+  for (const event of ['pull_request_target', 'schedule']) {
+    const h = harness(); h.setLag(80, 3 * DAY); await h.run(); h.reply();
+    h.setTarget(NEW_BASE); h.setNow(NOW + 2 * HOUR); h.setProgress(29); await h.run(event);
+    assert.equal(h.posted.length, 1);
+    assert.equal(h.checks[0].conclusion, 'neutral');
+    assert.match(h.checks[0].output.title, /stale/);
+    h.setProgress(30); await h.run(event); assert.equal(h.posted.length, 2);
   }
 });
 
@@ -297,7 +289,7 @@ test('a PR head update invalidates the verdict without bypassing the target thre
 });
 
 for (const changed of ['head', 'target', 'both']) {
-  test(`scheduled refresh bypasses thresholds after a ${changed} change`, async () => {
+  test(`events and scans require 24 hours for a ${changed} change below 30 target commits`, async () => {
     for (const branch of ['main', 'release/1.2']) {
       for (const verdict of ['PASS', 'FAIL']) {
         const h = harness({base: {ref: branch}}); await h.run(); await h.publish(h.reply(verdict));
@@ -307,15 +299,17 @@ for (const changed of ['head', 'target', 'both']) {
         h.setProgress(changed === 'head' ? 0 : 1);
         await h.run('pull_request_target', 'synchronize');
         assert.equal(h.posted.length, 1);
-        await h.run('schedule');
+        await h.run('schedule'); assert.equal(h.posted.length, 1);
+        h.setNow(NOW + DAY - 1); await h.run('schedule'); assert.equal(h.posted.length, 1);
+        h.setNow(NOW + DAY); await h.run();
         assert.equal(h.posted.length, 2);
         const pair = requests(h.comments)[0];
         assert.equal(pair.head, changed === 'target' ? HEAD : MERGED);
         assert.equal(pair.target, changed === 'head' ? BASE : NEW_BASE);
         assert.equal(pair.branch, branch);
-        assert.equal(pair.reason, 'Scheduled refresh of changed revisions');
+        assert.equal(pair.reason, '24-hour / 30-commit threshold');
         assert.equal(h.checks.at(-1).conclusion, 'neutral');
-        h.setNow(NOW + 12 * HOUR); await h.run('schedule');
+        h.setNow(NOW + DAY + HOUR); await h.run('schedule');
         assert.equal(h.posted.length, 2); // Await the new pair's reply.
       }
     }
@@ -323,29 +317,31 @@ for (const changed of ['head', 'target', 'both']) {
 }
 
 test('scheduled refresh deduplicates an unchanged completed pair across scans', async () => {
-  const h = harness(); await h.run(); await h.publish(h.reply());
-  for (const elapsed of [6 * HOUR, DAY, 2 * DAY]) {
-    h.setNow(NOW + elapsed); await h.run('schedule');
-    assert.equal(h.posted.length, 1);
-    assert.equal(h.checks[0].conclusion, 'success');
+  for (const verdict of ['PASS', 'FAIL']) {
+    const h = harness(); await h.run(); await h.publish(h.reply(verdict));
+    for (const elapsed of [6 * HOUR, DAY, 2 * DAY]) {
+      h.setNow(NOW + elapsed); await h.run('schedule');
+      assert.equal(h.posted.length, 1);
+      assert.equal(h.checks[0].conclusion, verdict === 'PASS' ? 'success' : 'failure');
+    }
   }
 });
 
-test('scheduled refresh respects cooldown and catches a head-only change in a later scan', async () => {
+test('scheduled refresh respects cooldown even when 30 target commits qualify', async () => {
   const h = harness(); await h.run(); h.reply();
-  h.pr.head.sha = MERGED; h.setProgress(0); h.setNow(NOW + HOUR - 1);
+  h.setTarget(NEW_BASE); h.setProgress(30); h.setNow(NOW + HOUR - 1);
   await h.run('schedule'); assert.equal(h.posted.length, 1);
   assert.match(h.checks.at(-1).output.summary, /cooldown/);
   h.setNow(NOW + HOUR); await h.run('schedule');
   assert.equal(h.posted.length, 2);
 });
 
-test('an older PASS does not bypass a pending newer request during scheduled refresh', async () => {
-  const h = harness(); await h.run(); h.reply(); await h.run('workflow_dispatch');
-  h.pr.head.sha = MERGED; h.setProgress(0); h.setNow(NOW + 6 * HOUR);
+test('new revisions use the latest request time when that request has no valid reply', async () => {
+  const h = harness(); await h.run(); h.reply(); h.setNow(NOW + 2 * HOUR);
+  await h.run('workflow_dispatch');
+  h.pr.head.sha = MERGED; h.setProgress(0); h.setNow(NOW + DAY);
   await h.run('schedule'); assert.equal(h.posted.length, 2);
-  assert.match(h.checks.at(-1).output.summary, /no verified verdict/);
-  h.reply('PASS', requests(h.comments)[0]); await h.run('schedule');
+  h.setNow(NOW + DAY + 2 * HOUR); await h.run('schedule');
   assert.equal(h.posted.length, 3);
 });
 
@@ -641,7 +637,7 @@ test('chat transport preserves author, revision, citation and unique-record vali
   }
 });
 
-test('missing, truncated or inconclusive replies cannot cause daily new-pair AI retries', async () => {
+test('missing, truncated or inconclusive replies get one scheduled retry after six hours', async () => {
   for (const kind of ['missing', 'truncated-record', 'truncated-evidence', 'inconclusive']) {
     const h = harness(); await h.run();
     if (kind !== 'missing') {
@@ -653,14 +649,56 @@ test('missing, truncated or inconclusive replies cannot cause daily new-pair AI 
           `| Semantic conflict with target branch | ✅ Passed | ${explanation.slice(0, 201)} |`;
       }
     }
-    for (let day = 1; day <= 7; day++) {
-      h.setNow(NOW + day * DAY); h.setTarget(day.toString().repeat(40)); await h.run('schedule');
-    }
+    h.setNow(NOW + 6 * HOUR - 1); await h.run('schedule');
     assert.equal(h.posted.length, 1, kind);
-    assert.match(h.checks.at(-1).output.summary, /manual retry/);
-    await h.run('workflow_dispatch'); assert.equal(h.posted.length, 2);
+    h.setNow(NOW + 6 * HOUR); await h.run(); assert.equal(h.posted.length, 1);
+    await h.run('schedule'); assert.equal(h.posted.length, 2, kind);
+    assert.equal(requests(h.comments)[0].retry, true);
+    assert.equal(h.checks.at(-1).conclusion, 'neutral');
+    h.reply('INCONCLUSIVE');
+    for (const elapsed of [12 * HOUR, DAY, 7 * DAY]) {
+      h.setNow(NOW + elapsed); await h.run('schedule');
+      assert.equal(h.posted.length, 2, kind);
+    }
+    await h.run('workflow_dispatch'); assert.equal(h.posted.length, 3);
     await h.publish(chatReply(h.reply())); assert.equal(h.checks.at(-1).conclusion, 'success');
   }
+});
+
+test('changed revisions are reassessed after an unavailable result and receive a fresh retry allowance', async () => {
+  const h = harness(); h.setLag(80, 3 * DAY); await h.run(); h.reply('INCONCLUSIVE');
+  h.setNow(NOW + 6 * HOUR); await h.run('schedule'); assert.equal(h.posted.length, 2);
+  h.pr.head.sha = MERGED; h.setProgress(0);
+  h.setNow(NOW + DAY); await h.run('schedule'); assert.equal(h.posted.length, 2);
+  h.setNow(NOW + DAY + 6 * HOUR); await h.run('schedule'); assert.equal(h.posted.length, 3);
+  assert.equal(requests(h.comments)[0].retry, undefined);
+  h.setNow(NOW + DAY + 12 * HOUR); await h.run('schedule'); assert.equal(h.posted.length, 4);
+  assert.equal(requests(h.comments)[0].retry, true);
+  h.setNow(NOW + 3 * DAY); await h.run('schedule'); assert.equal(h.posted.length, 4);
+});
+
+test('30 new target commits allow a new version after an unavailable reply', async () => {
+  const h = harness(); await h.run(); h.reply('INCONCLUSIVE');
+  h.setTarget(NEW_BASE); h.setNow(NOW + 2 * HOUR); h.setProgress(29);
+  await h.run('schedule'); assert.equal(h.posted.length, 1);
+  h.setProgress(30); await h.run('schedule'); assert.equal(h.posted.length, 2);
+});
+
+test('a valid reply arriving before the retry scan prevents a second request', async () => {
+  const h = harness(); await h.run(); h.setNow(NOW + 6 * HOUR); h.reply('FAIL');
+  await h.run('schedule'); assert.equal(h.posted.length, 1);
+  assert.equal(h.checks[0].conclusion, 'failure');
+});
+
+test('post-merge audits allow one retry without changing their fixed merged revisions', async () => {
+  const h = harness({merged: true, state: 'closed', merged_at: new Date(NOW).toISOString(),
+    updated_at: new Date(NOW).toISOString()});
+  await h.run('pull_request_target', 'closed'); h.reply('INCONCLUSIVE');
+  h.setTarget(NEW_BASE); h.setNow(NOW + 6 * HOUR); await h.run('schedule');
+  assert.equal(h.posted.length, 2);
+  const pair = requests(h.comments)[0];
+  assert.equal(pair.merged, MERGED); assert.equal(pair.target, BASE); assert.equal(pair.retry, true);
+  h.setNow(NOW + 12 * HOUR); await h.run('schedule'); assert.equal(h.posted.length, 2);
 });
 
 test('commands require the pinned User account and never fall back to the Actions bot', async () => {
@@ -683,10 +721,17 @@ test('scheduled scans cap new AI requests at 20 and later scans consider the rem
   for (let n = 13; n < 57; n++) h.prs.push({...h.pr, number: n});
   await h.run('schedule'); assert.equal(h.posted.length, 20);
   assert.match(h.warnings.at(-1), /20 new AI requests/);
-  h.setNow(NOW + 6 * HOUR); await h.run('schedule');
-  assert.equal(h.posted.length, 40);
-  assert.equal(new Set(h.posted.map(p => p.issue_number)).size, 40);
-  await h.run('workflow_dispatch'); assert.equal(h.posted.length, 41);
+  for (let round = 1; round <= 6; round++) {
+    const before = h.posted.length;
+    h.setNow(NOW + round * 6 * HOUR); await h.run('schedule');
+    assert.ok(h.posted.length - before <= 20);
+  }
+  assert.equal(new Set(h.posted.map(p => p.issue_number)).size, 45);
+  for (const number of h.prs.map(p => p.number)) {
+    assert.ok(h.posted.filter(p => p.issue_number === number).length <= 2);
+  }
+  const beforeManual = h.posted.length;
+  await h.run('workflow_dispatch'); assert.equal(h.posted.length, beforeManual + 1);
 });
 
 test('scheduled scans prioritize recent merge recovery over open PR requests', async () => {

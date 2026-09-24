@@ -80,49 +80,50 @@ async function requestOne({github, commandGithub, context, core, number, manual,
         external_id: currentId, status: 'completed', conclusion: 'neutral', output}));
     }
   }
+  let retry = false;
   if (reusable && !manual) {
     const result = resultFor(reusable);
     // Reuse an in-flight exact pair too. The publisher can complete the audit
     // when its pre-merge reply arrives, provided the final tree also matches.
     if (!pair.merged || reusable.merged || !result || result.verdict !== 'INCONCLUSIVE') {
-      await ensureCheck('This version already has an analysis request.');
-      if (result) await publish({github, core, context: {...context, eventName: 'issue_comment',
-        payload: {issue: {number}}}});
-      core.info(`PR #${number}: reusing the exact revision pair.`);
-      return;
+      retry = context.eventName === 'schedule' && !['PASS', 'FAIL'].includes(result?.verdict) &&
+        now - Date.parse(reusable.created_at) >= 6 * HOUR &&
+        !history.some(r => r.retry && matches(r, pair));
+      if (!retry) {
+        await ensureCheck('This version already has an analysis request.');
+        if (result) await publish({github, core, context: {...context, eventName: 'issue_comment',
+          payload: {issue: {number}}}});
+        core.info(`PR #${number}: reusing the exact revision pair.`);
+        return;
+      }
     }
   }
   const intent = context.eventName === 'pull_request_target' &&
     (context.payload.action === 'auto_merge_enabled' && pr.auto_merge ||
      context.payload.action === 'labeled' && context.payload.label?.name === APPROVED &&
      pr.labels.some(l => l.name === APPROVED) && process.env.SEMANTIC_APPROVAL_VALIDATED === 'true');
-  let reason = manual ? 'Manual retry' : pair.merged ? 'Post-merge audit' : intent ? 'Merge intent' : '';
+  let reason = manual ? 'Manual retry' : retry ? 'Automatic retry after unavailable analysis' :
+    pair.merged ? 'Post-merge audit' : intent ? 'Merge intent' : '';
   const last = history.find(r => !r.merged);
   if (!reason) {
-    const previous = last && resultFor(last);
-    if (last && !['PASS', 'FAIL'].includes(previous?.verdict)) {
-      await ensureCheck('Previous analysis has no verified verdict; use a manual retry. Routine requests are paused.');
+    let count = pair.comparison.behind_by;
+    let since = Date.parse(pair.comparison.merge_base_commit.commit.committer.date);
+    let changed = count > 0;
+    if (last) {
+      const previous = resultFor(last);
+      const progress = await compare(github, repo, last.target, pair.target);
+      if (['ahead', 'identical'].includes(progress.status)) {
+        count = progress.ahead_by;
+        since = Date.parse(['PASS', 'FAIL'].includes(previous?.verdict) ?
+          previous.comment.created_at : last.created_at);
+        changed = last.head !== pair.head || last.target !== pair.target;
+      }
+    }
+    if (!changed || (count < 30 && now - since < DAY)) {
+      await ensureCheck('Below the 24-hour / 30-commit threshold; waiting for changed revisions to qualify.');
       return;
     }
-    if (previous && context.eventName === 'schedule' &&
-        (last.head !== pair.head || last.target !== pair.target)) {
-      reason = 'Scheduled refresh of changed revisions';
-    } else {
-      let count = pair.comparison.behind_by;
-      let since = Date.parse(pair.comparison.merge_base_commit.commit.committer.date);
-      if (previous) {
-        const progress = await compare(github, repo, last.target, pair.target);
-        if (['ahead', 'identical'].includes(progress.status)) {
-          count = progress.ahead_by;
-          since = Date.parse(previous.comment.created_at);
-        }
-      }
-      if (!count || (count < 30 && now - since < DAY)) {
-        await ensureCheck('Below the 24-hour / 30-commit threshold; waiting for target changes.');
-        return;
-      }
-      reason = '24-hour / 30-commit threshold';
-    }
+    reason = '24-hour / 30-commit threshold';
   }
   // Approval and auto-merge share this budget even when the branch SHAs change.
   // Count any recent pre-merge request, so a routine scan cannot double the cost.
@@ -152,7 +153,7 @@ async function requestOne({github, commandGithub, context, core, number, manual,
   if (!pair.merged) pair.tree = await candidateTree(github, repo, current, pair.target);
   const {comparison, ...record} = pair;
   const {data: comment} = await commandGithub.rest.issues.createComment({...repo, issue_number: number,
-    body: `${command(pair)}\n\n<!-- semantic-request-v2:${JSON.stringify({...record, reason})} -->\n\n` +
+    body: `${command(pair)}\n\n<!-- semantic-request-v2:${JSON.stringify({...record, reason, ...(retry ? {retry: true} : {})})} -->\n\n` +
       `${reason} for PR #${number}. ${NOTICE} No AI verdict is asserted by posting this request.`});
   core.info(`PR #${number}: ${reason}; ${comment.html_url}`);
   await core.summary.addRaw(`PR #${number}: [${reason}](${comment.html_url}). No AI verdict is asserted.\n\n`).write();

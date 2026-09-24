@@ -10,30 +10,28 @@ compatibility analysis for open, non-draft PRs targeting `main` or `release/**`.
 It compares both branches from their merge base and
 follows affected callers, contracts, configuration, and tests across files.
 
-- PR creation, reopening, commit updates, becoming ready, and target-branch changes
-  evaluate the threshold; they do not automatically spend an AI call. Title and
-  description edits skip the request job before checkout or PR API reads.
+- PR creation, reopening, commit updates, becoming ready, target-branch changes
+  and six-hour scans evaluate the same threshold.
 - The first analysis needs new target commits and either 24 hours since the
   merge-base commit or at least 30 target commits beyond that base. After a
-  completed PASS/FAIL analysis, PR events count from its target SHA and completion
-  time. PR updates invalidate the old verdict but do not bypass these thresholds
-  in the event handler.
-- Every six hours, a scan refreshes a completed PASS/FAIL analysis when either
-  the PR head or target SHA has changed. It bypasses the 24-hour / 30-commit
-  threshold, including when only the PR changes. The first analysis still uses
-  the threshold. Deduplication, the one-hour cooldown, unusable-reply protection
-  and scan limits still apply, so a refresh is not guaranteed in the next scan.
+  completed PASS/FAIL analysis, a changed head or target qualifies after 24 hours
+  from that reply or 30 additional target commits. A head-only change therefore
+  qualifies after 24 hours even when the target has not advanced. If the latest
+  request has no valid verdict, use its request time and target as the baseline.
+  Rewritten target history falls back to the merge-base threshold.
 - An authorized `ci: full pre-merge approved` label or enabling auto-merge
   bypasses the threshold. Approval-label authors are checked against the existing
-  `trt-llm-ci-approvers` team using its existing token. All pre-merge requests
-  share a one-hour cooldown, including when the SHA pair changes. A signal
+  `trt-llm-ci-approvers` team using its existing token. Automatic pre-merge requests
+  for each PR and target branch share a one-hour cooldown, even across SHA changes. A signal
   during cooldown is skipped; ordinary scans and the post-merge audit remain.
-- Exact revision pairs, including requests still awaiting a reply, are deduplicated.
-  A missing, truncated or inconclusive latest reply pauses routine requests,
-  including for new revision pairs, until a verified reply or a manual/merge-intent
-  retry. This avoids repeatedly paying for unusable replies. Workflow dispatch
-  accepts one PR number and bypasses the thresholds, cooldown and deduplication
-  for that PR only.
+- Exact revision pairs are deduplicated. When a reply is missing, incomplete or
+  Inconclusive, a scheduled scan may retry that version once, at least six hours
+  after its latest request. This applies to pre-merge analysis and audits. A
+  verified FAIL is a completed analysis, not a reason to retry. After the one
+  automatic retry, the same version needs a manual retry; changed versions are
+  evaluated under the ordinary threshold and get their own retry allowance.
+  Workflow dispatch accepts one PR number and bypasses the thresholds, cooldown
+  and deduplication for that PR only.
 - Merge events request a post-merge audit regardless of thresholds or cooldown.
   The six-hour scan recovers merges from the preceding 24 hours. The audit pins
   the actual merge commit and historical target, including for release PRs;
@@ -62,22 +60,27 @@ PRs, requires a deployment pilot. Missing replies never imply semantic success.
 Scheduled scans run at minute 23 every six hours (UTC). Each scan sends at most
 20 new AI requests, including audits, to avoid an initial burst across all open
 PRs. Recent merged PRs are considered first; open PRs use a rotating starting
-point. Exact-pair deduplication avoids resending completed or in-flight requests.
+point. The single automatic retry also counts toward the 20-request limit.
 Scans restart from live state, not a saved cursor. Saturation can delay PRs;
 use a manual dispatch for a specific PR rather than relying on a resume guarantee.
 
 Each token's remaining REST budget is read once, then tracked from response
 headers, including pagination. A scan stops below a 100-request reserve or on
 primary/secondary rate limiting and reports processed PRs and new requests.
-Ordinary permission errors remain failures. Limits on a scheduled scan do not
-change single-PR event or manual-dispatch behavior. Frequency reduction does not
-reduce the peak cost of one scan. A rate-limited or missed scan can also delay
+Ordinary permission errors remain failures. The 20-request cap and 100-request
+reserve apply only to scheduled scans; GitHub's own rate limits can affect every
+API operation, including single-PR events, manual requests and result publication.
+Frequency reduction does not reduce the peak cost of one scan. A rate-limited or missed scan can also delay
 post-merge recovery beyond its 24-hour lookback.
 
 ## Result verification
 
 The `Semantic conflict with target branch` Check starts neutral. Stale results
 become neutral when the PR event or scheduled scan observes a version change.
+This rule applies to every pre-merge verdict; historical audit verdicts stay
+attached to their fixed merged revisions. Only formatted CodeRabbit analysis
+replies update the Check. Receiving a reply publishes a result, not another AI
+request.
 The verifier checks the bot identity, most recent trusted request, exact revision
 record, and GitHub merge base. Publication and preview select the newest applicable
 reply after that request; delayed events cannot restore an older verdict, and
