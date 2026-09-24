@@ -1470,7 +1470,6 @@
    "unittest/_torch/weight_sharing": 25.065849735449735,
    "unittest/_torch/weight_sharing/test_mx_source_identity_gate.py": 20.05385616438356,
    "unittest/api_stability": 25.576606878306876,
-   "unittest/auto_deploy/standalone/test_standalone_package.py::TestStandalonePackage::test_run_unit_tests": 273.2161314917127,
    "unittest/bindings": 25.152348029045644,
    "unittest/disaggregated": 86.40891819571866,
    "unittest/disaggregated/test_agent_multi_backends.py": 73.47832930232558,
