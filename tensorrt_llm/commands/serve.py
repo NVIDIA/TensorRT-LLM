@@ -888,10 +888,9 @@ def launch_visual_gen_server(
     # must become workers before binding, else every rank on a multi-GPU node
     # races the same port and all but one die EADDRINUSE. VisualGen() on a
     # worker rank never returns (sys.exit in __init__).
-    from tensorrt_llm._torch.visual_gen.executor import _detect_external_launch
+    from tensorrt_llm._torch.visual_gen.launch import is_external_worker_rank
     from tensorrt_llm.visual_gen import VisualGen
-    ext = _detect_external_launch()
-    if ext is not None and ext[0] != 0:
+    if is_external_worker_rank():
         VisualGen(model=model, args=visual_gen_args)
         return
 

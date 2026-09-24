@@ -11,9 +11,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tensorrt_llm._torch.visual_gen.executor import run_diffusion_worker
+from tensorrt_llm._torch.visual_gen.executor import DiffusionRemoteClient, run_diffusion_worker
+from tensorrt_llm._torch.visual_gen.launch import _detect_external_launch
 from tensorrt_llm.visual_gen.args import VisualGenArgs
-from tensorrt_llm.visual_gen.visual_gen import DiffusionRemoteClient, _detect_external_launch
 
 pytestmark = pytest.mark.cpu_only
 
@@ -227,9 +227,9 @@ class TestSingleNodeSpawnLocalRank:
 
         with (
             patch(
-                "tensorrt_llm._torch.visual_gen.executor._detect_external_launch", return_value=None
+                "tensorrt_llm._torch.visual_gen.launch._detect_external_launch", return_value=None
             ),
-            patch("tensorrt_llm._torch.visual_gen.executor._get_mp_context", return_value=mock_ctx),
+            patch("tensorrt_llm._torch.visual_gen.launch._get_mp_context", return_value=mock_ctx),
             patch("tensorrt_llm._torch.visual_gen.executor._Thread") as mock_thread_cls,
             patch("tensorrt_llm._torch.visual_gen.executor._Event", side_effect=pre_set_event),
             patch.object(DiffusionRemoteClient, "_wait_ready"),
