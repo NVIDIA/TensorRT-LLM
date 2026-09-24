@@ -103,8 +103,7 @@ def test_target_identity_matches_its_path(arch):
         assert parts[-1] == "modeling", dotted
         segments = parts[-2].split("__")
         assert len(segments) == 3, (
-            f"{arch}: {parts[-2]!r} is not a <checkpoint>__<sm>__<parallel> "
-            f"directory name"
+            f"{arch}: {parts[-2]!r} is not a <checkpoint>__<sm>__<parallel> directory name"
         )
         checkpoint, sm_segment, parallel = segments
 

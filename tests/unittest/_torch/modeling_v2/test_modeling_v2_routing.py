@@ -139,9 +139,7 @@ def test_resolving_registers_the_target_class():
     cls = get_registered_model_class(name)
     assert cls is not None, f"{name} resolved to no class"
     assert cls.__name__ == name
-    assert cls.__module__.endswith(
-        "modeling_v2.models.gpt_oss.gpt_oss_120b__sm_103__tp1.modeling"
-    )
+    assert cls.__module__.endswith("modeling_v2.models.gpt_oss.gpt_oss_120b__sm_103__tp1.modeling")
 
 
 def test_the_target_registration_counts_as_external():
