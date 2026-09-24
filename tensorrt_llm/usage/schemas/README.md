@@ -136,12 +136,12 @@ heartbeat, and the terminal report. Cumulative counters saturate at uint32 max;
 
 ### `trtllm_heartbeat`
 
-Sent periodically (default: every 600s) to track session duration. Up to 1000
-heartbeats per session.
+Sent periodically (default: every 600s) to track session duration until process
+exit, a terminal report, or telemetry opt-out, with no heartbeat-count limit.
 
 | Field | Type | Description | Example |
 |-------|------|-------------|---------|
-| `seq` | PositiveInt | Zero-based heartbeat sequence number. | `0`, `1`, `42` |
+| `seq` | PositiveInt | Zero-based heartbeat sequence number, saturating at uint32 max. | `0`, `1`, `42` |
 | `ingressPoint` | ShortString | Invocation boundary for the process session. | `"cli_serve"` |
 | `disaggRole` | ShortString | Disaggregated role: `context`, `generation`, `coordinator`, `server_coordinator`, or compatible legacy values such as `ctx0`/`gen0`. | `"context"` |
 | `deploymentId` | ShortString | Optional shared disaggregated deployment ID. | `"dep-abc123"` |

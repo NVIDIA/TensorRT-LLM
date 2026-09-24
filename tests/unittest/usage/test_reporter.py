@@ -622,6 +622,33 @@ class TestRankGuard:
 class TestReporterShutdown:
     """Verify _REPORTER_STOP event exits the heartbeat loop."""
 
+    @pytest.mark.parametrize("sequence_limit", [usage_lib.schema._UINT32_MAX, 2])
+    def test_heartbeats_continue_until_stopped(self, reporter_session, sequence_limit):
+        """Long-lived sessions keep reporting without overflowing the wire counter."""
+        heartbeat_count = 10_001
+        sent = []
+        with (
+            patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append),
+            patch.object(usage_lib.schema, "_UINT32_MAX", sequence_limit),
+            patch.object(usage_lib, "_get_heartbeat_interval", return_value=600),
+            patch.object(
+                usage_lib._REPORTER_STOP,
+                "wait",
+                side_effect=[False] * heartbeat_count + [True],
+            ) as wait,
+        ):
+            usage_lib._background_reporter(None, None, "")
+
+        assert sent[0]["events"][0]["name"] == "trtllm_initial_report"
+        heartbeats = [payload["events"][0] for payload in sent[1:]]
+        assert len(heartbeats) == heartbeat_count
+        assert all(event["name"] == "trtllm_heartbeat" for event in heartbeats)
+        assert [event["parameters"]["seq"] for event in heartbeats] == [
+            min(seq, sequence_limit) for seq in range(heartbeat_count)
+        ]
+        assert wait.call_count == heartbeat_count + 1
+        assert all(call.kwargs == {"timeout": 600} for call in wait.call_args_list)
+
     def test_reporter_stop_event_exits_heartbeat_loop(self, reporter_session):
         """Setting _REPORTER_STOP causes the heartbeat loop to exit."""
         send_count = {"n": 0}
