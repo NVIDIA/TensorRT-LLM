@@ -510,6 +510,11 @@ class NVLinkOneSided(Communication):
             ep_size=self.ep_size,
             health=self.ep_group_health,
         )
+        # Keep combine storage at a fixed offset across changing dispatch
+        # payloads, so a later dispatch cannot overwrite a peer's live combine.
+        if hidden_size is not None and dtype is not None:
+            self._reserve_combine_region(hidden_size, dtype)
+
         self._workspace_lifecycle.register(
             self,
             watchdog_timeout_s=alltoall_watchdog_timeout_s,
@@ -702,6 +707,49 @@ class NVLinkOneSided(Communication):
     def _mnnvl_checkpoint_reset(self) -> None:
         self._dispatch_state = {"phase": "idle"}
 
+    def _reserve_combine_region(self, hidden_size: int, dtype: torch.dtype) -> int:
+        """Keep dispatch and combine storage disjoint across workspace reuse."""
+        layout = (hidden_size, dtype.itemsize)
+        old_layout = self._workspace_state.get("combine_storage_layout")
+        if old_layout is not None:
+            if old_layout != layout:
+                raise ValueError(
+                    "shared A2A workspace requires a stable combine shape and dtype size"
+                )
+            return self._workspace_state["combine_storage_offset"]
+
+        # Native combine stores a dense [EP, runtime_max_tokens, hidden] tensor.
+        # Match the existing allocation: reserve a second full-size region only
+        # for CFT-capable workspaces. Low-precision combine fits in this bound.
+        region_bytes = pad_up(
+            self.ep_size * self.max_num_tokens_per_rank * hidden_size * dtype.itemsize, 128
+        )
+        num_regions = 2 if self.can_use_cft_counted_writes else 1
+        offset = (self.workspace_size_per_rank - num_regions * region_bytes) // 128 * 128
+        aux_bytes = int(self.moe_a2a_metainfo[self.PAYLOAD_DATA_OFFSET_INDEX])
+        if offset < aux_bytes:
+            raise ValueError("A2A workspace is too small for stable combine regions")
+        dispatch_end = getattr(self, "_dispatch_state", {}).get("dispatch_payload_end", aux_bytes)
+        if dispatch_end > offset:
+            raise ValueError("A2A dispatch payload overlaps the reserved combine region")
+        self._workspace_state["combine_storage_layout"] = layout
+        self._workspace_state["combine_storage_offset"] = offset
+        return offset
+
+    def _check_dispatch_region(self, payloads: List[torch.Tensor], max_tokens: int) -> int:
+        if not 0 < max_tokens <= self.max_num_tokens_per_rank:
+            raise ValueError("runtime token count exceeds the configured A2A capacity")
+        end = int(self.moe_a2a_metainfo[self.PAYLOAD_DATA_OFFSET_INDEX])
+        for payload in payloads:
+            end = pad_up(
+                end + self.ep_size * max_tokens * payload.shape[1] * payload.element_size(), 128
+            )
+        limit = self._workspace_state.get("combine_storage_offset", self.workspace_size_per_rank)
+        # Check before the native dispatch can write into any peer's memory.
+        if end > limit:
+            raise ValueError("A2A dispatch payload overlaps the reserved combine region")
+        return end
+
     def dispatch(
         self,
         hidden_states: torch.Tensor,
@@ -752,6 +800,7 @@ class NVLinkOneSided(Communication):
         payloads.append(token_selected_slots)
         if token_final_scales is not None:
             payloads.append(token_final_scales)
+        dispatch_payload_end = self._check_dispatch_region(payloads, runtime_max_tokens_per_rank)
         can_use_cft_for_dispatch = _use_cft_for_dispatch_payloads(
             can_use_cft_for_dispatch, payloads
         )
@@ -798,7 +847,12 @@ class NVLinkOneSided(Communication):
         if eplb_gathered_stats.numel() == 0:
             eplb_gathered_stats = None
         self._dispatch_state["eplb_gathered_stats"] = eplb_gathered_stats
-        self._dispatch_state["combine_payload_offset"] = int(combine_payload_offset)
+        if int(combine_payload_offset) != dispatch_payload_end:
+            raise RuntimeError("native A2A dispatch layout disagrees with the reserved layout")
+        self._dispatch_state["dispatch_payload_end"] = dispatch_payload_end
+        self._dispatch_state["combine_payload_offset"] = self._workspace_state.get(
+            "combine_storage_offset", dispatch_payload_end
+        )
         self._dispatch_state["local_num_tokens"] = token_selected_slots.size(0)
         self._dispatch_state["runtime_max_tokens_per_rank"] = runtime_max_tokens_per_rank
         self._dispatch_state["active_rank_mask_snapshot"] = active_rank_mask_snapshot
@@ -919,6 +973,9 @@ class NVLinkOneSided(Communication):
             final_hidden_states,
             self.use_low_precision_combine,
         )
+        combine_payload_offset = self._reserve_combine_region(
+            final_hidden_states.shape[-1], final_hidden_states.dtype
+        )
         output = torch.ops.trtllm.moe_a2a_combine(
             final_hidden_states,
             int(local_num_tokens),
@@ -980,6 +1037,8 @@ class NVLinkOneSided(Communication):
         if combine_payload_offset is None:
             raise RuntimeError("combine_payload_offset not found in dispatch state")
 
+        combine_payload_offset = self._reserve_combine_region(hidden_size, dtype)
+        self._dispatch_state["combine_payload_offset"] = combine_payload_offset
         result = torch.ops.trtllm.moe_a2a_get_combine_payload_tensor(
             self.workspace,
             int(self.ep_rank),

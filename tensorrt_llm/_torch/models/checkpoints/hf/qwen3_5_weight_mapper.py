@@ -47,7 +47,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
        For FP8_BLOCK_SCALES checkpoints, the packed qkvz tensor is then
        dequantized to bf16 as a temporary workaround for TP loading
        (handled in _dequantize_linear_attn_fp8_qkvz).  For MIXED_PRECISION
-       checkpoints with per-tensor FP8 in_proj, the projections are
+       checkpoints and global FP8 checkpoints with per-tensor FP8 in_proj, the projections are
        requantized onto one shared scale and kept FP8
        (_requantize_linear_attn_fp8_qkvz), falling back to bf16 dequant
        (_dequantize_linear_attn_fp8_per_tensor) when the fused module has no
@@ -339,13 +339,13 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
     def _requantize_linear_attn_fp8_qkvz(self, weights: dict) -> dict:
         """Requantize split per-tensor FP8 in_proj projections onto one scale.
 
-        When _normalize_qwen35_quant_config_dict synthesized an FP8 entry for
-        the fused ``in_proj_qkvz`` module (i.e. the checkpoint quantizes every
-        split projection per-tensor FP8), keep the weights FP8 instead of
-        dequantizing to bf16: rescale each projection onto the max
-        ``weight_scale`` so the packed fused weight shares a single per-tensor
-        scale, drop the per-projection scalar scales (they must not reach
-        _pack_split_projections), and emit fused ``weight_scale`` /
+        When the fused ``in_proj_qkvz`` module uses FP8, either through the
+        global quant config or an entry synthesized by
+        _normalize_qwen35_quant_config_dict, keep the split per-tensor FP8
+        weights instead of dequantizing to bf16: rescale each projection onto
+        the max ``weight_scale`` so the packed fused weight shares a single
+        per-tensor scale, drop the per-projection scalar scales (they must not
+        reach _pack_split_projections), and emit fused ``weight_scale`` /
         ``input_scale`` keys -- the same key set out_proj already loads
         through the per-tensor FP8 Linear path.
 
@@ -365,7 +365,15 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         drop_keys = set()
         for prefix, projs in grouped_names.items():
             fused_cfg = qcd.get(f"{prefix}.in_proj_qkvz")
-            if fused_cfg is None or fused_cfg.quant_algo != QuantAlgo.FP8:
+            globally_quantized = (
+                self.config.quant_config.quant_algo == QuantAlgo.FP8
+                and not self.config.quant_config.is_module_excluded_from_quantization(
+                    f"{prefix}.in_proj_qkvz"
+                )
+            )
+            if not globally_quantized and (
+                fused_cfg is None or fused_cfg.quant_algo != QuantAlgo.FP8
+            ):
                 continue
             weight_scales = {}
             input_scales = []
@@ -672,14 +680,12 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
             normalized_weights, quant_algo
         )
 
-        # ModelOpt MIXED_PRECISION checkpoints quantize the split linear-attn
-        # in_proj to per-tensor FP8.  When the fused in_proj_qkvz module is
-        # FP8 (entry synthesized by _normalize_qwen35_quant_config_dict),
-        # requantize the split projections onto one shared scale and keep them
-        # FP8; whatever remains (in_proj_ba, prefixes without a fused FP8
-        # entry) is dequantized to bf16 so scalar scales don't reach
-        # _pack_split_projections.
-        if quant_algo == QuantAlgo.MIXED_PRECISION:
+        # ModelOpt MIXED_PRECISION and global FP8 checkpoints can store split
+        # linear-attn in_proj weights with per-tensor FP8 scales.  When the
+        # fused in_proj_qkvz module is FP8, requantize the split projections
+        # onto one shared scale; dequantize any remaining FP8 projections to
+        # bf16 so scalar scales don't reach _pack_split_projections.
+        if quant_algo in (QuantAlgo.MIXED_PRECISION, QuantAlgo.FP8):
             normalized_weights = self._requantize_linear_attn_fp8_qkvz(normalized_weights)
             normalized_weights = self._dequantize_linear_attn_fp8_per_tensor(normalized_weights)
 
