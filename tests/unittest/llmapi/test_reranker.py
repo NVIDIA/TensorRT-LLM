@@ -194,6 +194,23 @@ async def test_v1_rerank_sorts_top_n_and_returns_documents():
 
 
 @pytest.mark.asyncio
+async def test_v1_rerank_forwards_instruction():
+    server = _server([0.0])
+    instruction = "custom task"
+    request = RerankRequest(
+        query="query",
+        documents=["document"],
+        instruction=instruction,
+    )
+
+    response = await server._rerank(request)
+    prompt = server.tokenizer.decode(server.encode_batcher.inputs[0])
+
+    assert response.status_code == 200
+    assert f"<Instruct>: {instruction}\n" in prompt
+
+
+@pytest.mark.asyncio
 async def test_v1_top_n_zero_returns_all_results():
     server = _server([-1.0, 1.0])
     request = RerankRequest(
