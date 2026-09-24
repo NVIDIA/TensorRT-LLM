@@ -75,8 +75,6 @@ should make) when:
 - Implementation touches `cpp/` (C++/CUDA/header) without rebuild
   evidence, or CMake without clean rebuild evidence, or rebuild evidence
   but validation used a stale wheel.
-- Implementation touches `auto_deploy/` or `tests/.../auto_deploy/`.
-  These paths are out of scope for modeling bring-up.
 - Reference tests use local `transformers` shims, monkeypatches, or
   environment-installed `transformers` imports as pass evidence instead
   of copying the minimal HF/vLLM semantics into local helpers.
