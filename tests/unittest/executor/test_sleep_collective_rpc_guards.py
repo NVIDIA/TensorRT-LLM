@@ -44,7 +44,7 @@ def _make_worker(backend="pytorch", world_size=1, sleep_config=_SLEEP_CONFIG_DEF
 
     w = object.__new__(BaseWorker)
     w._backend = backend
-    w._is_pytorch_backend = backend in ("pytorch", "_autodeploy")
+    w._is_pytorch_backend = backend == "pytorch"
     w.llm_args = SimpleNamespace(
         backend=backend,
         parallel_config=SimpleNamespace(world_size=world_size),
@@ -86,16 +86,6 @@ class TestBaseWorkerSleepGuards:
     def test_wrong_backend_raises(self, method):
         """Raises ValueError when backend is not 'pytorch'."""
         w = _make_worker(backend="tensorrt")
-        with pytest.raises(ValueError, match="only available for the PyTorch"):
-            getattr(w, method)(["kv_cache"])
-
-    def test_autodeploy_backend_raises(self, method):
-        """AutoDeploy must be excluded.
-
-        Its allocations aren't tagged under sleep_config VMM scopes, so
-        release_with_tag would silently no-op instead of freeing GPU memory.
-        """
-        w = _make_worker(backend="_autodeploy")
         with pytest.raises(ValueError, match="only available for the PyTorch"):
             getattr(w, method)(["kv_cache"])
 

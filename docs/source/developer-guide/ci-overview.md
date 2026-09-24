@@ -40,7 +40,7 @@ Pull requests do not start testing by themselves. Developers trigger the CI by c
 Integration tests are listed under `tests/integration/test_lists/test-db/`. Most YAML files are named after the GPU or configuration they run on (for example `l0_a100.yml`). Some files, like `l0_sanity_check.yml`, use wildcards and can run on multiple hardware types. Entries contain conditions and a list of tests. Two important terms in each entry are:
 
 - `stage`: either `pre_merge` or `post_merge`.
-- `backend`: for example `pytorch`, `autodeploy`, `cpp` or `fmha`. Grep the YAML files for `backend:` to see the values currently in use.
+- `backend`: for example `pytorch`, `cpp`, or `fmha`. Grep the YAML files for `backend:` to see the values currently in use.
 
 Example from `l0_a30.yml`:
 
