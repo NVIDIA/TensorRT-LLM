@@ -1,0 +1,18 @@
+{
+  "controller": {
+    "type": "MajorityVoteController",
+    "args": {
+      "default_sample_num": 3,
+      "generation_controller": {
+        "type": "NativeGenerationController",
+        "args": {
+          "sampling_params": {
+            "max_tokens": 1024,
+            "temperature": 0.9,
+            "top_p": 0.9
+          }
+        }
+      }
+    }
+  }
+}
