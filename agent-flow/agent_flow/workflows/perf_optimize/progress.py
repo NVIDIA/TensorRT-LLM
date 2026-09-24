@@ -454,6 +454,12 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
                     "values — over optimize.focus_concurrencies when "
                     "task.yaml sets it. 0 if the benchmark could not run.",
                 },
+                "has_native_changes": {
+                    "type": "boolean",
+                    "description": "Whether this attempt changes compiled TRT-LLM "
+                    "code or native build inputs, including C++, CUDA, headers, "
+                    "bindings, CMake, and native code generators.",
+                },
                 "curve": _CURVE_FIELD_SCHEMA,
             },
             "required": [
@@ -462,6 +468,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
                 "reason_category",
                 "measured_gain_pct",
                 "measured_value",
+                "has_native_changes",
             ],
         },
     )
@@ -472,6 +479,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
         entry["reason_category"] = args["reason_category"]
         entry["measured_gain_pct"] = float(args["measured_gain_pct"])
         entry["measured_value"] = float(args["measured_value"])
+        entry["has_native_changes"] = args["has_native_changes"]
         if args.get("curve"):
             entry["curve"] = _coerce_curve(args["curve"])
         stored = _append_for_context(entry)
@@ -520,6 +528,12 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
                 "measured_value": {"type": "number"},
                 "required_gain_pct": {"type": "number"},
                 "best_candidate_id": {"type": "string"},
+                "has_native_changes": {
+                    "type": "boolean",
+                    "description": "Whether the final retained integration state "
+                    "contains native changes from an included candidate or conflict "
+                    "resolution.",
+                },
                 "curve": _CURVE_FIELD_SCHEMA,
             },
             "required": [
@@ -532,6 +546,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
                 "measured_value",
                 "required_gain_pct",
                 "best_candidate_id",
+                "has_native_changes",
             ],
         },
     )
@@ -548,6 +563,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
                 "measured_value": float(args["measured_value"]),
                 "required_gain_pct": float(args["required_gain_pct"]),
                 "best_candidate_id": str(args["best_candidate_id"]),
+                "has_native_changes": args["has_native_changes"],
             }
         )
         if args.get("curve"):
