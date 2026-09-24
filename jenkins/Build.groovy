@@ -145,6 +145,8 @@ def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 def BOLT_CONSUME_BUILD = "bolt_consume_build"
 @Field
 def BOLT_PROFILE_REF = "bolt_profile_ref"
+@Field
+def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -159,6 +161,7 @@ def globalVars = [
     // silently dropped -- which for this one would mean running unpinned
     // without saying so.
     (BOLT_PROFILE_REF): "",
+    (BOLT_PROFILE_BRANCH): "",
 ]
 
 // TODO: Move common variables to an unified location
