@@ -47,6 +47,7 @@ class PRInputs:
     changed_files: list[str]
     diffs: dict[str, str]
     post_merge: bool = False
+    raw_diffs: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
