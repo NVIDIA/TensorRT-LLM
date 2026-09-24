@@ -112,8 +112,7 @@ reviews:
           SEMANTIC_REVIEW_V3 on its own line. Include the full evidence for every
           verdict, including PASS, using immutable GitHub blob links with full SHAs
           and line numbers from head and target. Include this record on one line:
-          SEMANTIC_RESULT
-          head=<SHA> target=<SHA> merge_base=<SHA> verdict=<PASS|FAIL|INCONCLUSIVE>
+          SEMANTIC_RESULT head=<SHA> target=<SHA> merge_base=<SHA> verdict=<PASS|FAIL|INCONCLUSIVE>
           Use verified full lowercase SHAs; omit the record if unavailable. A record
           alone is insufficient.
 
