@@ -28,7 +28,12 @@ from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .activation import ActivationParamShape, MoEActivation, activation_constant_names
+from .activation import (
+    ActivationParamShape,
+    MoEActivation,
+    SwigluActivation,
+    activation_constant_names,
+)
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from .fused_moe_cute_dsl_fc12 import TrtllmCutedslFusedFc12Nvfp4Impl
@@ -315,6 +320,9 @@ def build_moe_problem(
         bias=bias,
         activation=canonical_activation(activation_kind),
         activation_constants=activation_constant_names(activation),
+        clamp_after_silu=(
+            activation.clamp_after_silu if isinstance(activation, SwigluActivation) else False
+        ),
         routing=canonical_routing(routing),
     )
 
@@ -490,6 +498,13 @@ def _reject_unsupported_activation(
             _legacy_backend_name(candidate),
             MoERejectReason.ACTIVATION_UNSUPPORTED,
             f"{candidate.__name__} does not execute {kind.name} (executes: {executes})",
+        )
+
+    if problem.clamp_after_silu and not support.clamp_after_silu:
+        return MoERejection(
+            _legacy_backend_name(candidate),
+            MoERejectReason.ACTIVATION_UNSUPPORTED,
+            f"{candidate.__name__} does not implement post-SiLU clamping",
         )
 
     # Sorted so the rejection names the same register every run.
