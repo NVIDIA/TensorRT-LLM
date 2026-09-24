@@ -70,7 +70,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheEventManager,
     KVCacheIterationStatsDelta,
     LayerId,
-    LifeCycleId,
     PageIndexMode,
     PlannedDropHandle,
     PoolGroupPeakBlockStats,
@@ -1291,8 +1290,8 @@ class KVCacheManagerV2(BaseResourceManager):
                     "will return no events."
                 )
             assert kv_events_config is not None
-            # Rejects unsupported parallelism, a non-Python V2 backend and colliding
-            # publish/replay port ranges, all before any socket is bound.
+            # Reject unsupported parallelism and colliding publish/replay port ranges
+            # before any socket is bound.
             validate_streaming_support(
                 kv_events_config,
                 pp_size=mapping.pp_size,
@@ -1311,6 +1310,8 @@ class KVCacheManagerV2(BaseResourceManager):
                     data_parallel_rank=event_rank,
                     block_size=self.tokens_per_block,
                     max_window_size=event_window_size,
+                    mm_token_id_offset=vocab_size,
+                    backend=KV_CACHE_MANAGER_V2_BACKEND,
                 )
         elif self.event_buffer_max_size > 0:
             if mapping.enable_attention_dp:
@@ -1525,10 +1526,15 @@ class KVCacheManagerV2(BaseResourceManager):
             )
 
         candidate: Optional[KVCacheManagerPy] = None
+        event_sink = (
+            self.event_manager.event_sink
+            if isinstance(self.event_manager, StreamingKVCacheEventManager)
+            else self.event_manager
+        )
         if not has_host_cache_tier:
             candidate = KVCacheManagerPy(
                 config,
-                event_manager=self.event_manager,
+                event_manager=event_sink,
                 cold_page_codec=create_cold_page_codec(config),
             )
         else:
@@ -1537,7 +1543,7 @@ class KVCacheManagerV2(BaseResourceManager):
             try:
                 candidate = KVCacheManagerPy(
                     config,
-                    event_manager=self.event_manager,
+                    event_manager=event_sink,
                     cold_page_codec=create_cold_page_codec(config),
                 )
             except Exception as error:
@@ -1577,7 +1583,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
                     candidate = KVCacheManagerPy(
                         config,
-                        event_manager=self.event_manager,
+                        event_manager=event_sink,
                         cold_page_codec=create_cold_page_codec(config),
                     )
                 except Exception as error:
@@ -2427,18 +2433,21 @@ class KVCacheManagerV2(BaseResourceManager):
         # tying with the attention life cycle and being selected as the event target.
         # The buffered manager keeps every layer group, so its windows are unchanged.
 
-        def get_event_window_size(layer_id: int) -> int:
-            layer_config = self.kv_cache_manager_py_config.layers[layer_id]
+        def get_event_window_size(layer_config: object) -> int:
             window_size = getattr(layer_config, "sliding_window_size", None)
             return self.max_seq_len if window_size is None else int(window_size)
 
         window_sizes: Dict[int, int] = {}
         for layer_group_id, layer_ids in enumerate(self.impl.layer_grouping):
+            layer_config = self.kv_cache_manager_py_config.layers[int(layer_ids[0])]
             if attention_only:
-                life_cycle = self.impl._life_cycles.get_life_cycle(LifeCycleId(layer_group_id))
-                if not isinstance(life_cycle, AttnLifeCycle):
+                # The Python implementation exposes its internal life-cycle
+                # registry, but the C++ backend deliberately does not. The
+                # public layer configuration carries the same distinction and
+                # keeps this selection backend-independent.
+                if not isinstance(layer_config, AttentionLayerConfig):
                     continue
-            window_sizes[int(layer_group_id)] = get_event_window_size(int(layer_ids[0]))
+            window_sizes[int(layer_group_id)] = get_event_window_size(layer_config)
         return window_sizes
 
     def _format_kv_cache_pool_lifecycle_entry(self, layer_id: LayerId, role: DataRole) -> str:

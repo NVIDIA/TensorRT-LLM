@@ -172,6 +172,42 @@ def event_manager_add_stored_life_cycle(event_manager: Any, block: Any, life_cyc
     event_manager.add_stored_life_cycle_event_from_block(block.block, life_cycle_id)
 
 
+def streaming_event_sink_add_stored_block(event_sink: Any, block: Any) -> None:
+    """Feed a real test block to the native streaming sink."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is None:
+        raise RuntimeError("the streaming event sink requires the C++ backend")
+    cpp_introspection.streaming_event_sink_add_stored_block(event_sink, block)
+
+
+def streaming_event_sink_add_stored_life_cycle(
+    event_sink: Any, block: Any, life_cycle_id: int
+) -> None:
+    """Feed one lifecycle of a real test block to the native streaming sink."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is None:
+        raise RuntimeError("the streaming event sink requires the C++ backend")
+    cpp_introspection.streaming_event_sink_add_stored_life_cycle(event_sink, block, life_cycle_id)
+
+
+def streaming_event_sink_add_removed_block(event_sink: Any, block: Any) -> None:
+    """Remove a real test block from the native streaming sink."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is None:
+        raise RuntimeError("the streaming event sink requires the C++ backend")
+    cpp_introspection.streaming_event_sink_add_removed_block(event_sink, block)
+
+
+def streaming_event_sink_add_removed_life_cycle(
+    event_sink: Any, block: Any, life_cycle_id: int
+) -> None:
+    """Remove one lifecycle of a real test block from the native streaming sink."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is None:
+        raise RuntimeError("the streaming event sink requires the C++ backend")
+    cpp_introspection.streaming_event_sink_add_removed_life_cycle(event_sink, block, life_cycle_id)
+
+
 def active_page_stats(kv_cache: Any) -> tuple[list[int], list[int]]:
     """Return active pages and unscheduled evictable active pages by cache level."""
     cpp_introspection = _cpp_introspection_module()
