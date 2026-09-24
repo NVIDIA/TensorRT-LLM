@@ -152,8 +152,8 @@ def test_reserved_prefix_matching_is_structural() -> None:
     assert overrides[0].path == ("telemetry_configuration", "enabled")
 
 
-def test_parse_config_overrides_rejects_unknown_backend_root() -> None:
-    with pytest.raises(ConfigOverrideError, match="selected backend"):
+def test_parse_config_overrides_rejects_unknown_root() -> None:
+    with pytest.raises(ConfigOverrideError, match="not a supported LlmArgs field"):
         _parse("unknown_config.enabled=true")
 
 

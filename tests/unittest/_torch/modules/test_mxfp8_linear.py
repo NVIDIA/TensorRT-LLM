@@ -20,6 +20,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+import tensorrt_llm._torch.custom_ops.flashinfer_custom_ops as flashinfer_ops_module
 import tensorrt_llm._torch.custom_ops.torch_custom_ops as custom_ops_module
 import tensorrt_llm._torch.modules.linear as linear_module
 from tensorrt_llm._torch.autotuner import AutoTuner
@@ -34,6 +35,9 @@ from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
 from tensorrt_llm._torch.modules.linear import (
     Linear,
     MXFP8LinearMethod,
+    WeightMode,
+    WeightsLoadingConfig,
+    _load_kv_cache_scales,
     flashinfer_mxfp8_autotune,
     flashinfer_mxfp8_decode_graph_capture,
     get_quant_method,
@@ -76,7 +80,80 @@ def test_mxfp8_dispatch_returns_mxfp8_method(monkeypatch):
     assert not method.use_native_autotuner
 
 
-def _mock_mxfp8_ops(monkeypatch):
+@pytest.mark.cpu_only
+def test_mxfp8_fused_qkv_creates_nvfp4_kv_scales(monkeypatch):
+    """MXFP8 QKV weights retain the scales required by an NVFP4 KV cache."""
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: False)
+    quant_config = QuantConfig(
+        quant_algo=QuantAlgo.MXFP8,
+        kv_cache_quant_algo=QuantAlgo.NVFP4,
+        group_size=32,
+    )
+    linear = Linear(
+        in_features=128,
+        out_features=384,
+        bias=False,
+        dtype=torch.bfloat16,
+        quant_config=quant_config,
+        weights_loading_config=WeightsLoadingConfig(weight_mode=WeightMode.FUSED_QKV_LINEAR),
+    )
+
+    torch.testing.assert_close(linear.kv_scales, torch.ones(3))
+    torch.testing.assert_close(linear.inv_kv_scales, torch.ones(3))
+    pointers = (linear.kv_scales.data_ptr(), linear.inv_kv_scales.data_ptr())
+
+    linear.quant_method.load_kv_cache_scales(
+        linear, [{"k_scale": torch.tensor(0.5)}, {"v_scale": torch.tensor(0.25)}]
+    )
+    torch.testing.assert_close(linear.kv_scales, torch.tensor([1.0, 0.5, 0.25]))
+    torch.testing.assert_close(linear.inv_kv_scales, torch.tensor([1.0, 2.0, 4.0]))
+    assert (linear.kv_scales.data_ptr(), linear.inv_kv_scales.data_ptr()) == pointers
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("loader", ["shared", "mxfp8"])
+def test_kv_scale_loading_defaults_validation_and_reload(monkeypatch, loader):
+    """Both loader inputs obey the same calibration and storage contract."""
+    module = torch.nn.Module()
+    module.kv_scales = torch.nn.Parameter(torch.ones(3), requires_grad=False)
+    module.inv_kv_scales = torch.nn.Parameter(torch.ones(3), requires_grad=False)
+    pointers = (module.kv_scales.data_ptr(), module.inv_kv_scales.data_ptr())
+
+    def load(k, v):
+        if loader == "shared":
+            _load_kv_cache_scales(module, k, v)
+        else:
+            MXFP8LinearMethod.load_kv_cache_scales(
+                None, module, [{"k_scale": s} for s in k] + [{"v_scale": s} for s in v]
+            )
+
+    monkeypatch.setenv("TRTLLM_LOAD_KV_SCALES", "1")
+    load([], [])
+    torch.testing.assert_close(module.kv_scales, torch.ones(3))
+    for k, v in [([torch.tensor(0.5)], []), ([], [torch.tensor(0.25)])]:
+        with pytest.raises(AssertionError, match="must be loaded together"):
+            load(k, v)
+    load([torch.tensor(0.25), torch.tensor(0.5)], [torch.tensor(0.25)])
+    torch.testing.assert_close(module.kv_scales, torch.tensor([1.0, 0.5, 0.25]))
+    torch.testing.assert_close(module.inv_kv_scales, torch.tensor([1.0, 2.0, 4.0]))
+    monkeypatch.setenv("TRTLLM_LOAD_KV_SCALES", "0")
+    load([torch.tensor(0.125)], [])
+    load([torch.ones(2)], [])
+    torch.testing.assert_close(module.kv_scales, torch.tensor([1.0, 0.5, 0.25]))
+    monkeypatch.setenv("TRTLLM_LOAD_KV_SCALES", "1")
+    load([torch.tensor(0.125)], [torch.tensor(0.5)])
+    torch.testing.assert_close(module.kv_scales, torch.tensor([1.0, 0.125, 0.5]))
+    torch.testing.assert_close(module.inv_kv_scales, torch.tensor([1.0, 8.0, 2.0]))
+    assert (module.kv_scales.data_ptr(), module.inv_kv_scales.data_ptr()) == pointers
+
+
+def _mock_mxfp8_ops(
+    monkeypatch: pytest.MonkeyPatch,
+    flashinfer_gemm: Mock | None = None,
+    *,
+    flashinfer_op_available: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, Mock, Mock, torch.Tensor, Mock, torch.Tensor]:
+    """Replace MXFP8 kernels with CPU doubles and optional FlashInfer registration."""
     quantized = torch.empty((2, 4), dtype=torch.float8_e4m3fn)
     activation_scale = torch.empty(512, dtype=torch.uint8)
     quantize = Mock(return_value=(quantized, activation_scale))
@@ -89,6 +166,8 @@ def _mock_mxfp8_ops(monkeypatch):
         mxfp8_mxfp8_gemm=native_gemm,
         mxfp8_mxfp8_gemm_autotuned=autotuned_gemm,
     )
+    if flashinfer_op_available:
+        fake_trtllm_ops.flashinfer_mm_mxfp8 = flashinfer_gemm or Mock()
     fake_torch = SimpleNamespace(
         ops=SimpleNamespace(trtllm=fake_trtllm_ops),
         ones=torch.ones,
@@ -106,8 +185,62 @@ def _mock_mxfp8_ops(monkeypatch):
     )
 
 
+@pytest.mark.cpu_only
+def test_registered_flashinfer_mxfp8_wrapper_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise the real registered wrapper, mocking only the FlashInfer kernel."""
+    expected = torch.full((2, 3), 7, dtype=torch.bfloat16)
+    kernel = Mock(return_value=expected)
+    monkeypatch.setattr(flashinfer_ops_module, "mm_mxfp8", kernel)
+    act = torch.empty((2, 4), dtype=torch.float8_e4m3fn)
+    weight = torch.arange(12, dtype=torch.float32).reshape(3, 4).to(torch.float8_e4m3fn)
+    act_scale = torch.ones(512, dtype=torch.uint8)
+    weight_scale = torch.ones(512, dtype=torch.uint8)
+
+    output = torch.ops.trtllm.flashinfer_mm_mxfp8(
+        act, act_scale, weight, weight_scale, torch.bfloat16
+    )
+
+    torch.testing.assert_close(output, expected)
+    kernel.assert_called_once()
+    args = kernel.call_args.args
+    assert args[0] is act
+    assert args[1].shape == (4, 3)
+    assert args[1].stride() == weight.t().stride()
+    assert args[1].data_ptr() == weight.data_ptr()
+    torch.testing.assert_close(args[1].float(), weight.t().float())
+    assert args[2] is act_scale and args[3] is weight_scale
+    assert kernel.call_args.kwargs == {
+        "out_dtype": torch.bfloat16,
+        "use_8x4_sf_layout": False,
+        "backend": "cutlass",
+    }
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", ["auto", "flashinfer"])
+def test_mxfp8_missing_registered_flashinfer_op(
+    monkeypatch: pytest.MonkeyPatch, backend: str
+) -> None:
+    """Allow automatic fallback but reject an unavailable explicitly chosen op."""
+    monkeypatch.setenv("TRTLLM_MXFP8_GEMM_BACKEND", backend)
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
+    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(autotune=Mock()))
+    _mock_mxfp8_ops(monkeypatch, flashinfer_op_available=False)
+    if backend == "flashinfer":
+        with pytest.raises(
+            RuntimeError, match="requires the pinned flashinfer-python package"
+        ) as exc:
+            MXFP8LinearMethod()
+        assert str(exc.value.__cause__) == "trtllm::flashinfer_mm_mxfp8 is unavailable"
+    else:
+        method = MXFP8LinearMethod()
+        assert method.backend == "trtllm"
+        assert not method.uses_flashinfer
+        assert method._flashinfer_mxfp8 is None
+
+
 def test_mxfp8_flashinfer_call_contract(monkeypatch):
-    """The forced backend reuses TRT tensors and a zero-copy weight transpose."""
+    """The forced backend passes native-layout tensors to the opaque op."""
     monkeypatch.setenv("TRTLLM_MXFP8_GEMM_BACKEND", "flashinfer")
     monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
 
@@ -118,7 +251,7 @@ def test_mxfp8_flashinfer_call_contract(monkeypatch):
         "flashinfer",
         SimpleNamespace(mm_mxfp8=mm_mxfp8, autotune=Mock()),
     )
-    quantized, activation_scale, quantize, _, _, _, _ = _mock_mxfp8_ops(monkeypatch)
+    quantized, activation_scale, quantize, _, _, _, _ = _mock_mxfp8_ops(monkeypatch, mm_mxfp8)
 
     weight = torch.empty((3, 4), dtype=torch.float8_e4m3fn)
     weight_scale = torch.empty(512, dtype=torch.uint8)
@@ -133,18 +266,15 @@ def test_mxfp8_flashinfer_call_contract(monkeypatch):
     args = mm_mxfp8.call_args.args
     kwargs = mm_mxfp8.call_args.kwargs
     assert args[0] is quantized
-    assert args[1].shape == (4, 3)
-    assert args[1].data_ptr() == weight.data_ptr()
-    assert args[2] is activation_scale
+    assert args[1] is activation_scale
+    assert args[2] is weight
     assert args[3] is weight_scale
-    assert kwargs == {
-        "out_dtype": torch.bfloat16,
-        "use_8x4_sf_layout": False,
-        "backend": "cutlass",
-    }
+    assert args[4] == torch.bfloat16
+    assert kwargs == {}
 
 
 def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
+    """Keep native eager GEMM while routing captured work to the opaque wrapper."""
     monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
     monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
 
@@ -156,8 +286,9 @@ def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
         SimpleNamespace(mm_mxfp8=mm_mxfp8, autotune=Mock()),
     )
     _, _, _, native_gemm, native_output, autotuned_gemm, autotuned_output = _mock_mxfp8_ops(
-        monkeypatch
+        monkeypatch, mm_mxfp8
     )
+    monkeypatch.setattr(linear_module, "is_torch_compiling", lambda: False)
 
     module = SimpleNamespace(
         weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
@@ -185,6 +316,40 @@ def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
     # Leaving the decode-capture scope restores the eager/native path.
     assert method.apply(module, activation, bias=None) is native_output
     assert native_gemm.call_count == 2
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", ["auto", "flashinfer"])
+def test_mxfp8_compile_skips_context_dispatch(
+    monkeypatch: pytest.MonkeyPatch, backend: str
+) -> None:
+    """Compilation must not read Python ContextVars, even after decode tuning."""
+    monkeypatch.setenv("TRTLLM_MXFP8_GEMM_BACKEND", backend)
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
+    monkeypatch.setattr(linear_module, "is_torch_compiling", lambda: True)
+    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(autotune=Mock()))
+    flashinfer_output = torch.empty((2, 3), dtype=torch.bfloat16)
+    flashinfer_gemm = Mock(return_value=flashinfer_output)
+    _, _, _, native_gemm, native_output, _, _ = _mock_mxfp8_ops(monkeypatch, flashinfer_gemm)
+    for name in (
+        "_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE",
+        "_FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE",
+    ):
+        monkeypatch.setattr(
+            linear_module, name, SimpleNamespace(get=Mock(side_effect=AssertionError))
+        )
+    method = MXFP8LinearMethod()
+    method.tune_decode_graph_backends = True
+    method.mark_flashinfer_autotuned()
+    module = SimpleNamespace(
+        weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
+        weight_scale=torch.empty(512, dtype=torch.uint8),
+        dtype=torch.bfloat16,
+    )
+    result = method.apply(module, torch.empty((2, 4), dtype=torch.bfloat16), bias=None)
+    assert result is (native_output if backend == "auto" else flashinfer_output)
+    assert native_gemm.call_count == (backend == "auto")
+    assert flashinfer_gemm.call_count == (backend == "flashinfer")
 
 
 def test_mxfp8_auto_fallback_does_not_rearm_native_autotuning(monkeypatch):

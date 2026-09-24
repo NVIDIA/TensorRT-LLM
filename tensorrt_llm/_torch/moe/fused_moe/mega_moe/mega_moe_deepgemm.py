@@ -263,7 +263,7 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
     """``deepgemm.cuda.mega_moe.w4a8_mxfp4_mxfp8``.
 
     DeepGEMM fused ``fp8_fp4_mega_moe``: MXFP4 weights, MXFP8 activations,
-    SM100/SM103. One class carries the identity and the whole contract, which
+    SM100/SM103/SM107. One class carries the identity and the whole contract, which
     is the shape ``MOE_DEVELOPER_GUIDE.md`` asks for while a backend serves a
     single quantization format.
 
@@ -279,7 +279,7 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
         # Static and dynamic EPLB both work: see ``_supports_load_balancer``
         # below for why slot-id routing and DG-tensor migration are safe here.
         capabilities=MoEStaticCapability(supports_eplb=True),
-        doc="DeepGEMM fused fp8_fp4_mega_moe: MXFP4 weights, MXFP8 activations, SM100/SM103.",
+        doc="DeepGEMM fused fp8_fp4_mega_moe: MXFP4 weights, MXFP8 activations, SM100/SM103/SM107.",
     )
 
     # Taken off the descriptor, not restated: the scheduler reads these three
@@ -324,7 +324,7 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
         if not is_sm_100f(d.env.sm):
             return _reject(
                 MoERejectReason.SM_UNSUPPORTED,
-                f"MegaMoEDeepGemm requires SM100 family (SM100 or SM103) "
+                f"MegaMoEDeepGemm requires SM100 family (SM100, SM103 or SM107) "
                 f"for DeepGEMM's fp8_fp4_mega_moe kernel; got SM{d.env.sm}",
             )
         if p.dtype_act not in cls._SUPPORTED_ACTIVATION_DTYPES:

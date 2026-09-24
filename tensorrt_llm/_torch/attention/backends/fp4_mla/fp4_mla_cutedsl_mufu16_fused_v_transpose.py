@@ -2,9 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # ruff: noqa: E501, E741, F841
 
-import contextlib
 import math
-import os
 import sys
 import threading
 from collections import OrderedDict
@@ -21,11 +19,12 @@ import cutlass.pipeline as pipeline
 import torch
 from cutlass._mlir.dialects import llvm
 from cutlass.base_dsl.array import EvictPriority
-from cutlass.base_dsl.dsl import BaseDSL
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx as cute_inline_ptx
 from cutlass.cute.runtime import make_ptr
 from cutlass.experimental import cuda as cuda_tma
 from cutlass.experimental import primitives as prims
+
+from .cute_dsl_utils import _compile_cutedsl, _current_cu_stream
 
 nvvm_add_packed_f32x2 = partial(prims.add_packed_f32x2, rnd=prims.FPRoundingMode.RN)
 nvvm_mul_packed_f32x2 = partial(prims.mul_packed_f32x2, rnd=prims.FPRoundingMode.RN)
@@ -33,15 +32,6 @@ nvvm_fma_packed_f32x2 = partial(prims.fma_packed_f32x2, rnd=prims.FPRoundingMode
 PREPARED_BUFFER_ALIGNMENT_BYTES = 32
 CUDA_GRID_Z_MAX = 65535
 INT32_MAX = (1 << 31) - 1
-_CUTEDSL_VERBOSE_COMPILE_ENV = "TRTLLM_CUTEDSL_VERBOSE_COMPILE"
-_PYIR_STDOUT_LINES = frozenset(
-    {
-        "Enabling PyIR, it was False",
-        "Enabling PyIR, it is now True",
-        "Disabling PyIR, it was True",
-        "Disabling PyIR, it is now False",
-    }
-)
 
 
 @ctm.dsl_user_op
@@ -69,45 +59,6 @@ def _mbarrier_arrive_shared_cluster(mbar, count=1, *, loc=None, ip=None) -> None
         loc=loc,
         ip=ip,
     )
-
-
-class _PyIRStdoutFilter:
-    def __init__(self, output):
-        self._output = output
-        self._pending = ""
-
-    def write(self, text):
-        lines = (self._pending + text).split("\n")
-        self._pending = lines.pop()
-        for line in lines:
-            if line.rstrip("\r") not in _PYIR_STDOUT_LINES:
-                self._output.write(f"{line}\n")
-        return len(text)
-
-    def flush(self):
-        self._output.flush()
-
-    def finish(self):
-        if self._pending and self._pending.rstrip("\r") not in _PYIR_STDOUT_LINES:
-            self._output.write(self._pending)
-        self._pending = ""
-        self._output.flush()
-
-    def __getattr__(self, name):
-        return getattr(self._output, name)
-
-
-def _compile_cutedsl(*args, **kwargs):
-    verbose = os.getenv(_CUTEDSL_VERBOSE_COMPILE_ENV, "").strip().lower()
-    if verbose in {"1", "true", "yes", "on"}:
-        with BaseDSL.enable_pyir():
-            return cute.compile(*args, **kwargs)
-    stdout_filter = _PyIRStdoutFilter(sys.stdout)
-    try:
-        with contextlib.redirect_stdout(stdout_filter), BaseDSL.enable_pyir():
-            return cute.compile(*args, **kwargs)
-    finally:
-        stdout_filter.finish()
 
 
 def _scale_words_for_k(k_dim: int, sf_vec_size: int) -> int:
@@ -500,43 +451,6 @@ SMEM_P4_PV_SFB_EXTRA_COL_STRIDE = -1
 SMEM_P4_PV_SFB_S2T_STRIDE_BYTES = 128
 SMEM_P4_PV_SFB_CP_GROUP_ONE = False
 SMEM_P4_QK_COMPLETION_MBARS = SMEM_P4_TMEM_SCORE_PIPELINE_STAGES
-_EXPLICIT_TORCH_STREAM: torch.cuda.Stream | None = None
-
-
-@contextlib.contextmanager
-def _launch_stream():
-    """Yield the CUDA driver stream these kernels should launch on.
-
-    cuda2ctl capture cannot reliably query the default null stream, so SMART
-    wrappers can ask for an explicit one through DKG_MLA_EXPLICIT_STREAM. The
-    substitution must be bracketed rather than assigned: the caller's stream
-    already carries the RoPE, Q quantization and KV-cache writes these kernels
-    read, and it is also the stream their consumers read the output from.
-    Entering waits on the caller's work, leaving publishes ours back to it, and
-    ``torch.cuda.stream`` restores the thread's current stream on the way out.
-    A bare ``set_stream`` does none of the three.
-
-    Switching the current stream is illegal while a CUDA graph is capturing, so
-    the knob is ignored under capture and the caller's stream is used as-is.
-    """
-    entry_stream = torch.cuda.current_stream()
-    if os.environ.get("DKG_MLA_EXPLICIT_STREAM") != "1" or torch.cuda.is_current_stream_capturing():
-        yield cuda.CUstream(entry_stream.cuda_stream)
-        return
-
-    global _EXPLICIT_TORCH_STREAM
-    if _EXPLICIT_TORCH_STREAM is None:
-        _EXPLICIT_TORCH_STREAM = torch.cuda.Stream()
-    start_event = torch.cuda.Event()
-    done_event = torch.cuda.Event()
-    start_event.record(entry_stream)
-    with torch.cuda.stream(_EXPLICIT_TORCH_STREAM):
-        _EXPLICIT_TORCH_STREAM.wait_event(start_event)
-        try:
-            yield cuda.CUstream(_EXPLICIT_TORCH_STREAM.cuda_stream)
-        finally:
-            done_event.record(_EXPLICIT_TORCH_STREAM)
-    entry_stream.wait_event(done_event)
 
 
 @dataclass(frozen=True)
@@ -8114,179 +8028,179 @@ def run_trtllm_fp4_mla_decode_page_native(
         raise TypeError("q_global_scale must be a scalar FP32 CUDA tensor")
     if kv_global_scale.dtype != torch.float32 or kv_global_scale.numel() != 1:
         raise TypeError("kv_global_scale must be a scalar FP32 CUDA tensor")
-    with _launch_stream() as stream:
-        device_index = torch.cuda.current_device()
-        context_result, current_context = cuda.cuCtxGetCurrent()
-        if context_result != cuda.CUresult.CUDA_SUCCESS:
+    stream = _current_cu_stream()
+    device_index = torch.cuda.current_device()
+    context_result, current_context = cuda.cuCtxGetCurrent()
+    if context_result != cuda.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(
+            f"Failed to query the current CUDA context for FP4 MLA launch: {context_result}."
+        )
+    q_data_ptr = q_internal.data_ptr()
+    k_data_ptr = kv_cache.data_ptr()
+    q_sf_data_ptr = q_sf_internal.data_ptr()
+    k_sf_data_ptr = sf_cache.data_ptr()
+    # Legacy V tensor-map operands are dead in this specialization. Reuse the
+    # canonical KV pointer so the compiled call carries no sidecar allocation.
+    b_data_ptr = kv_cache.data_ptr()
+    scratch_ptr = output.data_ptr()
+    row_max_data_ptr = softmax_row_max.data_ptr() if write_softmax_stats else scratch_ptr
+    row_sum_data_ptr = softmax_row_sum.data_ptr() if write_softmax_stats else scratch_ptr
+    sfb_data_ptr = v_sf.data_ptr()
+    page_table_data_ptr = src_page_ids.data_ptr()
+    valid_k_data_ptr = valid_k.data_ptr()
+    helix_kv_bounds_data_ptr = (
+        helix_kv_bounds.data_ptr() if helix_kv_bounds is not None else valid_k_data_ptr
+    )
+    c_data_ptr = output.data_ptr()
+    page_indptr_data_ptr = paged_kv_indptr_decode.data_ptr()
+    q_global_scale_data_ptr = q_global_scale.data_ptr()
+    kv_global_scale_data_ptr = kv_global_scale.data_ptr()
+    kv_page_stride_bytes = cache_layout.stride_page
+    ksf_page_stride_bytes = int(sf_cache.stride(0))
+    vsf_page_stride_bytes = int(v_sf.stride(0))
+    softmax_scale_log2 = sm_scale * LOG2_E
+    fused = _compile_fused(
+        q_data_ptr,
+        k_data_ptr,
+        q_sf_data_ptr,
+        k_sf_data_ptr,
+        b_data_ptr,
+        scratch_ptr,
+        sfb_data_ptr,
+        page_table_data_ptr,
+        valid_k_data_ptr,
+        helix_kv_bounds_data_ptr,
+        c_data_ptr,
+        scratch_ptr,
+        row_max_data_ptr,
+        row_sum_data_ptr,
+        page_indptr_data_ptr,
+        q_global_scale_data_ptr,
+        kv_global_scale_data_ptr,
+        physical_m,
+        TRTLLM_V_HEAD_DIM,
+        physical_k,
+        l_batch,
+        page_size,
+        use_mixed_imlp=enable_mxi_imlp,
+        output_dtype=output.dtype,
+        stream=stream,
+        num_cache_pages=num_cache_pages,
+        query_len_per_seq=query_len_per_seq,
+        kv_page_stride_bytes=kv_page_stride_bytes,
+        ksf_page_stride_bytes=ksf_page_stride_bytes,
+        vsf_page_stride_bytes=vsf_page_stride_bytes,
+        use_consecutive_page_pair=use_consecutive_page_pair,
+        write_softmax_stats=write_softmax_stats,
+        use_helix_kv_bounds=helix_kv_bounds is not None,
+    )
+    supports_prepared = _class_defines_callables(
+        fused, "to", "generate_execution_args", "run_compiled_program"
+    )
+    prepared_key = (
+        fused,
+        device_index,
+        int(current_context),
+        int(stream),
+        q_data_ptr,
+        k_data_ptr,
+        q_sf_data_ptr,
+        k_sf_data_ptr,
+        b_data_ptr,
+        sfb_data_ptr,
+        page_table_data_ptr,
+        valid_k_data_ptr,
+        helix_kv_bounds_data_ptr,
+        c_data_ptr,
+        row_max_data_ptr,
+        row_sum_data_ptr,
+        page_indptr_data_ptr,
+        q_global_scale_data_ptr,
+        kv_global_scale_data_ptr,
+        physical_m,
+        l_batch,
+        q_batch_capacity,
+        num_cache_pages,
+        num_v_cache_pages,
+        v_page_offset,
+        kv_page_stride_bytes,
+        ksf_page_stride_bytes,
+        vsf_page_stride_bytes,
+        softmax_scale_log2,
+        output.dtype,
+        enable_mxi_imlp,
+        use_consecutive_page_pair,
+    )
+    if supports_prepared:
+        prepared = _get_prepared_fused_call(prepared_key)
+        if prepared is not None:
+            prepared.run()
+            return
+    ptrs = _make_fused_ptrs(
+        q_data_ptr,
+        k_data_ptr,
+        q_sf_data_ptr,
+        k_sf_data_ptr,
+        b_data_ptr,
+        scratch_ptr,
+        sfb_data_ptr,
+        page_table_data_ptr,
+        valid_k_data_ptr,
+        helix_kv_bounds_data_ptr,
+        c_data_ptr,
+        scratch_ptr,
+        row_max_data_ptr,
+        row_sum_data_ptr,
+        page_indptr_data_ptr,
+        q_global_scale_data_ptr,
+        kv_global_scale_data_ptr,
+        output.dtype,
+    )
+    runtime_args = (
+        *ptrs,
+        (TRTLLM_V_HEAD_DIM, physical_k),
+        ctm.Int32(physical_m),
+        ctm.Int32(l_batch),
+        ctm.Int32(q_batch_capacity),
+        ctm.Int32(num_cache_pages),
+        ctm.Int32(num_v_cache_pages),
+        ctm.Int32(v_page_offset),
+        ctm.Int64(kv_page_stride_bytes),
+        ctm.Int64(ksf_page_stride_bytes),
+        ctm.Int64(vsf_page_stride_bytes),
+        ctm.Float32(softmax_scale_log2),
+        ctm.Float32(1.0),
+        stream,
+    )
+    if not supports_prepared:
+        fused(*runtime_args)
+        return
+    executor_key = (fused, device_index, int(current_context))
+    executor = _get_fused_executor(executor_key)
+    if executor is None:
+        if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                f"Failed to query the current CUDA context for FP4 MLA launch: {context_result}."
+                "FP4 MLA CUDA Graph capture requires an eager warmup for the "
+                "compiled kernel, device, and CUDA context."
             )
-        q_data_ptr = q_internal.data_ptr()
-        k_data_ptr = kv_cache.data_ptr()
-        q_sf_data_ptr = q_sf_internal.data_ptr()
-        k_sf_data_ptr = sf_cache.data_ptr()
-        # Legacy V tensor-map operands are dead in this specialization. Reuse the
-        # canonical KV pointer so the compiled call carries no sidecar allocation.
-        b_data_ptr = kv_cache.data_ptr()
-        scratch_ptr = output.data_ptr()
-        row_max_data_ptr = softmax_row_max.data_ptr() if write_softmax_stats else scratch_ptr
-        row_sum_data_ptr = softmax_row_sum.data_ptr() if write_softmax_stats else scratch_ptr
-        sfb_data_ptr = v_sf.data_ptr()
-        page_table_data_ptr = src_page_ids.data_ptr()
-        valid_k_data_ptr = valid_k.data_ptr()
-        helix_kv_bounds_data_ptr = (
-            helix_kv_bounds.data_ptr() if helix_kv_bounds is not None else valid_k_data_ptr
-        )
-        c_data_ptr = output.data_ptr()
-        page_indptr_data_ptr = paged_kv_indptr_decode.data_ptr()
-        q_global_scale_data_ptr = q_global_scale.data_ptr()
-        kv_global_scale_data_ptr = kv_global_scale.data_ptr()
-        kv_page_stride_bytes = cache_layout.stride_page
-        ksf_page_stride_bytes = int(sf_cache.stride(0))
-        vsf_page_stride_bytes = int(v_sf.stride(0))
-        softmax_scale_log2 = sm_scale * LOG2_E
-        fused = _compile_fused(
-            q_data_ptr,
-            k_data_ptr,
-            q_sf_data_ptr,
-            k_sf_data_ptr,
-            b_data_ptr,
-            scratch_ptr,
-            sfb_data_ptr,
-            page_table_data_ptr,
-            valid_k_data_ptr,
-            helix_kv_bounds_data_ptr,
-            c_data_ptr,
-            scratch_ptr,
-            row_max_data_ptr,
-            row_sum_data_ptr,
-            page_indptr_data_ptr,
-            q_global_scale_data_ptr,
-            kv_global_scale_data_ptr,
-            physical_m,
-            TRTLLM_V_HEAD_DIM,
-            physical_k,
-            l_batch,
-            page_size,
-            use_mixed_imlp=enable_mxi_imlp,
-            output_dtype=output.dtype,
-            stream=stream,
-            num_cache_pages=num_cache_pages,
-            query_len_per_seq=query_len_per_seq,
-            kv_page_stride_bytes=kv_page_stride_bytes,
-            ksf_page_stride_bytes=ksf_page_stride_bytes,
-            vsf_page_stride_bytes=vsf_page_stride_bytes,
-            use_consecutive_page_pair=use_consecutive_page_pair,
-            write_softmax_stats=write_softmax_stats,
-            use_helix_kv_bounds=helix_kv_bounds is not None,
-        )
-        supports_prepared = _class_defines_callables(
-            fused, "to", "generate_execution_args", "run_compiled_program"
-        )
-        prepared_key = (
-            fused,
-            device_index,
-            int(current_context),
-            int(stream),
-            q_data_ptr,
-            k_data_ptr,
-            q_sf_data_ptr,
-            k_sf_data_ptr,
-            b_data_ptr,
-            sfb_data_ptr,
-            page_table_data_ptr,
-            valid_k_data_ptr,
-            helix_kv_bounds_data_ptr,
-            c_data_ptr,
-            row_max_data_ptr,
-            row_sum_data_ptr,
-            page_indptr_data_ptr,
-            q_global_scale_data_ptr,
-            kv_global_scale_data_ptr,
-            physical_m,
-            l_batch,
-            q_batch_capacity,
-            num_cache_pages,
-            num_v_cache_pages,
-            v_page_offset,
-            kv_page_stride_bytes,
-            ksf_page_stride_bytes,
-            vsf_page_stride_bytes,
-            softmax_scale_log2,
-            output.dtype,
-            enable_mxi_imlp,
-            use_consecutive_page_pair,
-        )
-        if supports_prepared:
-            prepared = _get_prepared_fused_call(prepared_key)
-            if prepared is not None:
-                prepared.run()
-                return
-        ptrs = _make_fused_ptrs(
-            q_data_ptr,
-            k_data_ptr,
-            q_sf_data_ptr,
-            k_sf_data_ptr,
-            b_data_ptr,
-            scratch_ptr,
-            sfb_data_ptr,
-            page_table_data_ptr,
-            valid_k_data_ptr,
-            helix_kv_bounds_data_ptr,
-            c_data_ptr,
-            scratch_ptr,
-            row_max_data_ptr,
-            row_sum_data_ptr,
-            page_indptr_data_ptr,
-            q_global_scale_data_ptr,
-            kv_global_scale_data_ptr,
-            output.dtype,
-        )
-        runtime_args = (
-            *ptrs,
-            (TRTLLM_V_HEAD_DIM, physical_k),
-            ctm.Int32(physical_m),
-            ctm.Int32(l_batch),
-            ctm.Int32(q_batch_capacity),
-            ctm.Int32(num_cache_pages),
-            ctm.Int32(num_v_cache_pages),
-            ctm.Int32(v_page_offset),
-            ctm.Int64(kv_page_stride_bytes),
-            ctm.Int64(ksf_page_stride_bytes),
-            ctm.Int64(vsf_page_stride_bytes),
-            ctm.Float32(softmax_scale_log2),
-            ctm.Float32(1.0),
-            stream,
-        )
-        if not supports_prepared:
+        candidate = fused.to(device_index)
+        if not _class_defines_callables(
+            candidate, "generate_execution_args", "run_compiled_program"
+        ):
             fused(*runtime_args)
             return
-        executor_key = (fused, device_index, int(current_context))
-        executor = _get_fused_executor(executor_key)
-        if executor is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "FP4 MLA CUDA Graph capture requires an eager warmup for the "
-                    "compiled kernel, device, and CUDA context."
-                )
-            candidate = fused.to(device_index)
-            if not _class_defines_callables(
-                candidate, "generate_execution_args", "run_compiled_program"
-            ):
-                fused(*runtime_args)
-                return
-            executor = _cache_fused_executor(executor_key, candidate)
-        execution_args, adapted_args = executor.generate_execution_args(*runtime_args)
-        prepared = _cache_prepared_fused_call(
-            prepared_key,
-            _PreparedFusedCall(
-                executor=executor,
-                runtime_args=runtime_args,
-                execution_args=execution_args,
-                adapted_args=adapted_args,
-            ),
-        )
-        prepared.run()
+        executor = _cache_fused_executor(executor_key, candidate)
+    execution_args, adapted_args = executor.generate_execution_args(*runtime_args)
+    prepared = _cache_prepared_fused_call(
+        prepared_key,
+        _PreparedFusedCall(
+            executor=executor,
+            runtime_args=runtime_args,
+            execution_args=execution_args,
+            adapted_args=adapted_args,
+        ),
+    )
+    prepared.run()
 
 
 def run_trtllm_fp4_mla_decode_page_native_from_raw(

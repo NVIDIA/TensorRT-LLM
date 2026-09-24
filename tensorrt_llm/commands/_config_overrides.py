@@ -89,8 +89,7 @@ def _validate_path_policy(path: tuple[str, ...], allowed_roots: Collection[str])
 
     if path[0] not in allowed_roots:
         raise ConfigOverrideError(
-            f"Configuration path '{_format_path(path)}' is not a supported "
-            "LlmArgs field for the selected backend."
+            f"Configuration path '{_format_path(path)}' is not a supported LlmArgs field."
         )
 
 
