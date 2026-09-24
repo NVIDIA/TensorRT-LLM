@@ -996,9 +996,14 @@ class Qwen3VLTextRotaryEmbedding(nn.Module):
             .expand(3, position_ids.shape[1], -1, 1)
             .to(x.device)
         )
-        position_ids_expanded = position_ids[:, :, None, :].float()  # shape (3, bs, 1, positions)
+        position_ids_expanded = position_ids[:, :, None, :]  # shape (3, bs, 1, positions)
 
-        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)
+        # The diffusers/transformers reference writes this outer product as
+        # `inv_freq @ position_ids`. That is a K=1 GEMM, and a GEMM may run in
+        # TF32, which cannot represent positions above 2048 and skews the
+        # rotary phase of late tokens. The broadcast multiply is the same
+        # arithmetic with no GEMM dispatch, so no precision mode applies.
+        freqs = (inv_freq_expanded * position_ids_expanded).transpose(2, 3)
         freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
         emb = torch.cat((freqs, freqs), dim=-1)
         cos = emb.cos() * self.attention_scaling
