@@ -43,6 +43,21 @@ def test_unknown_architecture_is_left_alone(tmp_path):
     assert override is None
 
 
+def test_config_load_failure_is_best_effort(monkeypatch):
+    from transformers import AutoConfig
+
+    from tensorrt_llm.commands.serve import _resolve_rerank_architecture_override
+
+    def fail_to_load_config(*args, **kwargs):
+        raise RuntimeError("custom config failed")
+
+    monkeypatch.setattr(AutoConfig, "from_pretrained", fail_to_load_config)
+
+    override = _resolve_rerank_architecture_override("reranker", trust_remote_code=True)
+
+    assert override is None
+
+
 def test_user_supplied_architecture_override_wins(monkeypatch):
     from tensorrt_llm.commands import serve
     from tensorrt_llm.llmapi.disagg_utils import ServerRole

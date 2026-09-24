@@ -46,7 +46,11 @@ def _post(server, path, **overrides):
         "documents": DOCUMENTS,
     }
     request.update(overrides)
-    return requests.post(server.url_for(*path.split("/")), json=request)
+    return requests.post(
+        server.url_for(*path.split("/")),
+        json=request,
+        timeout=300,
+    )
 
 
 def test_v1_rerank_aliases_and_top_n(server):
@@ -74,15 +78,33 @@ def test_v2_wire_shape(server):
     assert body["meta"]["api_version"] == {"version": "2"}
 
 
-def test_custom_instruction_and_document_truncation(server):
+def test_custom_instruction(server):
     response = _post(
         server,
         "v1/rerank",
         instruction="Judge whether the document is about a country's capital",
-        max_tokens_per_doc=8,
     )
     assert response.status_code == 200
     assert len(response.json()["results"]) == len(DOCUMENTS)
+
+
+def test_max_tokens_per_doc_reduces_prompt_tokens(server):
+    document = "Beijing is the capital of China. " * 64
+    uncapped_response = _post(server, "v1/rerank", documents=[document])
+    capped_response = _post(
+        server,
+        "v1/rerank",
+        documents=[document],
+        max_tokens_per_doc=8,
+    )
+
+    assert uncapped_response.status_code == 200
+    assert capped_response.status_code == 200
+    uncapped_body = uncapped_response.json()
+    capped_body = capped_response.json()
+    assert len(uncapped_body["results"]) == 1
+    assert len(capped_body["results"]) == 1
+    assert capped_body["usage"]["prompt_tokens"] < uncapped_body["usage"]["prompt_tokens"]
 
 
 def test_v2_rejects_unsupported_priority(server):

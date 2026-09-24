@@ -837,7 +837,7 @@ def _resolve_rerank_architecture_override(
         hf_config = AutoConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code, revision=revision)
         architectures = getattr(hf_config, "architectures", None) or []
-    except (OSError, ValueError) as e:
+    except Exception as e:  # noqa: BLE001 - config read is best-effort
         logger.warning(
             f"Could not read model config for rerank routing ({model}): {e}")
         return None
