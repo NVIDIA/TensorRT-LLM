@@ -1781,6 +1781,50 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
     return mounts
 }
 
+// Which build of <tarName> this stage tests.
+//
+// Deterministic, not discovered. The pipeline already decided whether the build
+// published a BOLTed variant, so there is nothing to probe for: fetch
+// bolted-<tarName> and let a missing object fail the stage. A probe-and-fall-back
+// shape cannot distinguish "no BOLTed build was published" from "the probe
+// itself failed", and both outcomes produce a normal-looking log while the stage
+// quietly tests un-BOLTed binaries.
+//
+// Also asserts the artifact carries the bundle this pipeline pinned. Addressing
+// by name proves only that something is there; the property proves it is the
+// right something, which is what keeps the tested build and the released wheel
+// on one profile set. Absent property means an artifact predating the label:
+// reported and allowed rather than failed.
+def boltedTarUrl(String config, String tarName)
+{
+    def base = "${URM_ARTIFACTORY_BASE}/${ARTIFACT_PATH}"
+    // Only the SBSA build is BOLTed, so only its tarball has a bolted- variant.
+    // Asking for one on any other config would 404 the stage rather than fail
+    // honestly, so the arch gate has to match the build's exactly.
+    if (!BOLT_TEST_BOLTED_TARBALL || config != LINUX_AARCH64_CONFIG) {
+        return "${base}/${tarName}"
+    }
+    if (BOLT_PINNED_REF) {
+        def propsUrl = "${URM_ARTIFACTORY_BASE}/api/storage/${ARTIFACT_PATH}/bolted-${tarName}?properties"
+        // -L: Artifactory redirects metadata reads, and without it curl returns
+        // the redirect rather than the document.
+        def got = sh(returnStdout: true, script: """
+            curl -fsSL --retry 3 --retry-all-errors --connect-timeout 30 '${propsUrl}' 2>/dev/null \\
+              | tr -d ' \\n' \\
+              | sed -n 's/.*"bolt\\.ref":\\["\\([^"]*\\)"\\].*/\\1/p' || true
+        """).trim()
+        if (got && got != BOLT_PINNED_REF) {
+            error("[BOLT] bolted-${tarName} carries bolt.ref=${got}, but this pipeline pinned ${BOLT_PINNED_REF}. " +
+                  "Refusing to test a build optimized with a different profile bundle than the release artifacts use.")
+        }
+        if (!got) {
+            echo "[BOLT] bolted-${tarName} carries no bolt.ref (artifact predates the label); proceeding on pin ${BOLT_PINNED_REF}"
+        }
+    }
+    echo "[BOLT] testing the BOLTed build: bolted-${tarName}"
+    return "${base}/bolted-${tarName}"
+}
+
 def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false, Map placementContext=null, Map retryContext=null)
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
@@ -1824,7 +1868,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
         ]) {
             CloudManager.withSlurmFrontendFailover(pipeline, partition.clusterName, cluster) { remote ->
             def tarName = BUILD_CONFIGS[config][TARNAME]
-            def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
+            def llmTarfile = boltedTarUrl(config, tarName)
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def resourcePathNode = "/tmp"
             def llmSrcNode = "${resourcePathNode}/TensorRT-LLM/src"
@@ -3155,6 +3199,18 @@ def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 @Field
 def RUN_MODE = "run_mode"
+@Field
+def BOLT_PROFILE_REF = "bolt_profile_ref"
+@Field
+def BOLT_PUBLISH_VARIANT = "bolt_publish_variant"
+@Field
+def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
+// Hoisted out of globalVars into BINDING variables in launchTestJobs. globalVars
+// is not a parameter of runLLMTestlistWithSbatch or runLLMTestlistOnPlatformImpl,
+// so reading it inside them throws MissingPropertyException; Build.groovy handles
+// BOLT_CONSUME_ENABLED the same way.
+BOLT_PINNED_REF = ""
+BOLT_TEST_BOLTED_TARBALL = false
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -3162,6 +3218,13 @@ def globalVars = [
     (IMAGE_KEY_TO_TAG): [:],
     (TRTLLM_VERSION_OVERRIDE): null,
     (RUN_MODE): null,
+    // Pre-declared so updateMapWithJson() populates it from the parent: that
+    // helper only updates keys already present here, so an absent key is
+    // silently dropped -- which for this one would mean running unpinned
+    // without saying so.
+    (BOLT_PROFILE_REF): "",
+    (BOLT_PUBLISH_VARIANT): false,
+    (BOLT_PROFILE_BRANCH): "",
 ]
 
 class GlobalState {
@@ -5080,7 +5143,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh "rm -rf results-${stageName}.tar.gz ${stageName}/*"
         // download TRT-LLM tarfile
         def tarName = BUILD_CONFIGS[config][TARNAME]
-        def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
+        def llmTarfile = boltedTarUrl(config, tarName)
         timeout(time: 30, unit: 'MINUTES') {
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv -O '${tarName}' '${llmTarfile}'")
         }
@@ -6238,6 +6301,8 @@ def infraDeferPredicate(Map stageScopes) {
 def launchTestJobs(pipeline, testFilter, globalVars)
 {
     def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
+    BOLT_PINNED_REF = globalVars[BOLT_PROFILE_REF]?.toString() ?: ""
+    BOLT_TEST_BOLTED_TARBALL = globalVars[BOLT_PUBLISH_VARIANT] ?: false
     // IMPORTANT: Stage Configuration Syntax Requirement
     //
     // The test_to_stage_mapping.py script expects stage definitions in the following format:

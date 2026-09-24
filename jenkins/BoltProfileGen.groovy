@@ -760,7 +760,13 @@ def promoteBundle(pipeline, remote, String bundle)
         cat > "${netrc}"
         chmod 600 "${netrc}"
         curl -fsS --netrc-file "${netrc}" --retry 5 --retry-all-errors -T "${bundle}" "${base}/${bundleName}"
-        curl -fsS --netrc-file "${netrc}" --retry 5 --retry-all-errors -T "${bundle}" "${base}/latest.tar.gz"
+        # Matrix parameters label latest.tar.gz with the ref it now points at, so a
+        # consumer can resolve "which bundle is current" with a small metadata GET
+        # instead of downloading the bundle to read its manifest. Set in the SAME
+        # request as the upload, so the label and the bytes can never disagree --
+        # a separate pointer object would leave a window where they do.
+        curl -fsS --netrc-file "${netrc}" --retry 5 --retry-all-errors -T "${bundle}" \\
+             "${base}/latest.tar.gz;bolt.ref=${BOLT_REF};bolt.branch=${BRANCH};bolt.triple=${TRIPLE}"
     """.stripIndent()
     pipeline.withCredentials([pipeline.usernamePassword(credentialsId: 'urm-artifactory-creds',
             usernameVariable: 'ART_USER', passwordVariable: 'ART_PASS')]) {
@@ -769,7 +775,7 @@ def promoteBundle(pipeline, remote, String bundle)
         Utils.exec(pipeline, timeout: false, numRetries: 2, noNVDFEvent: true,
             script: feed + Utils.sshUserCmd(remote, b64BashRemoteCmdStdin(promote, "${bundle}.promote.sh")))
     }
-    pipeline.echo("Promoted. latest = ${base}/latest.tar.gz")
+    pipeline.echo("Promoted. latest = ${base}/latest.tar.gz (bolt.ref=${BOLT_REF})")
 }
 
 // ---------------------------------------------------------------------------
