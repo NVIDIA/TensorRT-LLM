@@ -51,9 +51,10 @@ def check_trtllm_gen_capabilities(
     format and then defers here.
     """
     # The cubin drop is sm_100f (family-compatible) plus arch-specific
-    # sm_100a/sm_103a, so the whole SM100 family is servable; the C++
+    # sm_100a/sm_103a/sm_107a, so the whole SM100 family is servable; the C++
     # selector (KernelRunner.cpp isSMCompatible) picks sm_100f on family
-    # members without their own arch build.
+    # members without their own arch build. A leaf whose dtype pair has no
+    # sm_100f build (W4A8 NVFP4 FP8) narrows this in its own can_implement.
     if not is_sm_100f(d.env.sm):
         return _reject(
             MoERejectReason.SM_UNSUPPORTED,

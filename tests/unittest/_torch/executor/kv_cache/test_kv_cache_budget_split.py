@@ -339,8 +339,8 @@ class TestSplitGpuBudgetForDraft:
         creator._max_batch_size = max_batch_size
         creator._max_num_tokens = 128
         creator._max_beam_width = 1
-        creator._cache_transceiver_config = None
         creator._mapping = Mock(enable_attention_dp=False, tp_size=1)
+        creator._mapping.has_cp_helix.return_value = False
         creator._mapping.pp_layers.return_value = [0, 1, 2, 3]
         creator._mapping.is_last_pp_rank.return_value = True
         # Neutral speculative fields: _get_generation_kv_capacity reads them
@@ -360,12 +360,12 @@ class TestSplitGpuBudgetForDraft:
         creator._draft_config = draft_model_config
         creator._kv_cache_manager_cls = RecordingKVCacheManager
         creator._is_disagg = False
+        creator._cache_transceiver_config = None
         creator._should_create_separate_draft_kv_cache = Mock(return_value=True)
         creator._get_effective_draft_config = Mock(return_value=draft_model_config)
         creator._get_num_draft_layers = Mock(return_value=1)
 
-        # Record both estimators now that draft manager selection is independent
-        # of the target manager class.
+        # Both target and draft estimates must pass through the recording manager.
         mocker.patch(
             "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",
             autospec=True,
