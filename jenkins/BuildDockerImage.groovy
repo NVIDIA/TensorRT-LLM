@@ -288,14 +288,48 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
 
 
 def prepareWheelFromBuildStage(dockerfileStage, arch) {
-    if (!ENABLE_USE_WHEEL_FROM_BUILD_STAGE) {
-        echo "useWheelFromBuildStage is false, skip preparing wheel from build stage"
-        return ""
-    }
+    // Whether THIS image has to ship a BOLT-optimized wheel. Answered before the
+    // gates below, and deliberately not subject to them.
+    //
+    // Optimizing the installed wheel is only possible on this path: the wheel is
+    // BOLTed by get_wheel_from_package.py as it is unpacked from the build
+    // tarball, so an image that compiles its own wheel in-container has nothing
+    // to optimize. That makes the two gates below load-bearing for BOLT, and
+    // both are unreliable for reasons that have nothing to do with BOLT:
+    //
+    //   useWheelFromBuildStage -- a kill switch added for nvbug 5433581 in Aug
+    //       2025 and never reverted. It was also read without being declared, so
+    //       it was not merely false but incapable of being true.
+    //   triggerType -- read from env and not a declared parameter of this job,
+    //       so whether it survives the launch is a property of job registration
+    //       rather than of this repo. When it does not, TRIGGER_TYPE is "manual"
+    //       and this returns early no matter what the caller asked for.
+    //
+    // boltOptimizeWheel, by contrast, IS declared, so it reliably arrives. Key
+    // off it and let a BOLT request carry itself past both gates. The bypass is
+    // deliberately narrow -- one arch, one dockerfile stage, only when BOLT was
+    // asked for -- so the nvbug's blast radius stays at the SBSA release image
+    // instead of being reopened for every image this job builds.
+    def boltWheelRequired = BOLT_OPTIMIZE_WHEEL && arch == "sbsa" && dockerfileStage == "release"
 
-    if (!(TRIGGER_TYPE in ["post-merge", "nightly-release"])) {
-        echo "Trigger type does not use the build stage wheel"
-        return ""
+    if (!boltWheelRequired) {
+        if (!ENABLE_USE_WHEEL_FROM_BUILD_STAGE) {
+            echo "useWheelFromBuildStage is false, skip preparing wheel from build stage"
+            return ""
+        }
+
+        if (!(TRIGGER_TYPE in ["post-merge", "nightly-release"])) {
+            echo "Trigger type does not use the build stage wheel"
+            return ""
+        }
+    } else if (!ENABLE_USE_WHEEL_FROM_BUILD_STAGE ||
+               !(TRIGGER_TYPE in ["post-merge", "nightly-release"])) {
+        // Say so rather than doing it quietly: this is the one place the image
+        // build departs from what its parameters literally asked for.
+        echo "[BOLT] boltOptimizeWheel is set for the ${arch} release image, so the " +
+             "build-stage wheel path runs even though useWheelFromBuildStage=" +
+             "${ENABLE_USE_WHEEL_FROM_BUILD_STAGE} and triggerType=${TRIGGER_TYPE} would " +
+             "otherwise skip it. Optimizing the installed wheel is not possible any other way."
     }
 
     if (!dockerfileStage || !arch) {
@@ -942,7 +976,7 @@ pipeline {
         booleanParam(
             name: "useWheelFromBuildStage",
             defaultValue: false,
-            description: "Install the wheel from the build-stage tarball instead of compiling one inside the image. Read since Aug 2025 but never DECLARED, so params.useWheelFromBuildStage was always null and prepareWheelFromBuildStage() returned early on every run -- see nvbug 5433581, whose temporary kill switch was never reverted. Declaring it puts the decision in the repo. boltOptimizeWheel depends on this path running."
+            description: "Install the wheel from the build-stage tarball instead of compiling one inside the image. Read since Aug 2025 but never DECLARED, so params.useWheelFromBuildStage was always null and prepareWheelFromBuildStage() returned early on every run -- see nvbug 5433581, whose temporary kill switch was never reverted. Declared here so the flag is at least capable of being set; it stays false by default, and nothing turns it on. boltOptimizeWheel does NOT depend on it: a BOLT request carries itself past this gate for the SBSA release image only."
         )
         booleanParam(
             name: "boltOptimizeWheel",
