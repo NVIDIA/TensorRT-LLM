@@ -1176,10 +1176,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # denominator: it is padded for CUDA graphs and, in the one-model
         # flow, already holds the NEXT step's drafts by response time.
         self.py_num_draft_tokens_verified = 0
-        # One-model rejection: set per-iteration by _handle_dynamic_draft_len when
-        # this gen request produced 0 real draft tokens, so _prepare_tp_inputs
-        # one-hots its stale draft_probs slot. Consumed (and cleared) there.
+        # One-model rejection: set per-iteration by _handle_dynamic_draft_len
+        # when the drafter wrote fewer draft_probs rows than the runtime draft
+        # length; _prepare_tp_inputs one-hots rows [start, K), then clears it.
         self.py_needs_onehot_draft_probs = False
+        self.py_onehot_draft_probs_start = 0
         self.py_num_accepted_draft_tokens_indices = []
         self.py_rewind_draft_token_separate_adjustment = 0
         self.py_decoding_iter = 0

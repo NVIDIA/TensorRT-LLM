@@ -1569,7 +1569,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                          [context.py_request_id, generation.py_request_id])
         self.assertFalse(generation.py_needs_onehot_draft_probs)
         spec_metadata.write_padding_onehot_draft_probs.assert_called_once_with(
-            [generation.py_seq_slot], 0)
+            [generation.py_seq_slot], 0, 0)
         kv_cache_manager.shutdown()
 
     def test_multimodal_encoder_max_seq_len(self) -> None:
