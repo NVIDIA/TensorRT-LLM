@@ -1299,7 +1299,7 @@ def _cbtsCoverageAudit(pipeline, globalVars, String residualPath)
         ]) {
             readyJson = sh(
                 script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
-                        "--prepare cbts_cov --paths-json ${residualPath}" +
+                        "--prepare cbts_cov --paths-json cbts_coverage_residual.json" +
                         " --pr-head ${prHead}" +
                         " --build ${pinPlan.build}" +
                         " --expected-commit ${pinPlan.commit} || true",
