@@ -13,7 +13,7 @@ module.
 import sys
 import weakref
 from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, create_autospec
 
 import pytest
 import torch
@@ -407,7 +407,7 @@ def _buffer_metadata(**manager_fields):
     metadata.kv_cache_manager = SimpleNamespace(
         max_blocks_per_seq=MAX_BLOCKS_PER_SEQ,
         tokens_per_block=128,
-        get_index_k_buffer=lambda layer_idx, kv_layout=None: None,
+        get_index_k_buffer=lambda layer_idx: None,
         **manager_fields,
     )
     metadata.is_cuda_graph = True
@@ -451,7 +451,10 @@ def test_msa_buffers_stage_local_cache_views(monkeypatch: pytest.MonkeyPatch) ->
     index_cache = torch.zeros(2, 1, 128, 128)
     manager = metadata.kv_cache_manager
     manager.get_buffers = Mock(return_value=main_cache)
-    manager.get_index_k_buffer = Mock(return_value=index_cache)
+    manager.get_index_k_buffer = create_autospec(
+        MiniMaxM3KVCacheManagerV2, instance=True, spec_set=True
+    ).get_index_k_buffer
+    manager.get_index_k_buffer.return_value = index_cache
     monkeypatch.setattr(
         metadata,
         "get_empty",
@@ -461,7 +464,7 @@ def test_msa_buffers_stage_local_cache_views(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(msa_backend, "uniform_subpages_per_slot", lambda manager: 0)
     metadata._create_msa_buffers()
     manager.get_buffers.assert_called_once_with(3, kv_layout="HND")
-    manager.get_index_k_buffer.assert_called_once_with(3, kv_layout="HND")
+    manager.get_index_k_buffer.assert_called_once_with(3)
     assert set(metadata.msa_layer_cache_tensors) == {3}
     main, index = metadata.msa_layer_cache_tensors[3]
     assert main is main_cache and index is index_cache

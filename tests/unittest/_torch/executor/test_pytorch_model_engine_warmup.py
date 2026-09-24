@@ -95,6 +95,7 @@ def test_pcg_fx_fallback_policy_is_model_specific(
         encoder_max_batch_size=None,
         encoder_max_num_tokens=None,
         enable_in_graph_sampling=False,
+        enable_return_routed_experts=False,
         multimodal_config=SimpleNamespace(video_pruning_rate=None),
         checkpoint_format="HF",
         trust_remote_code=False,
@@ -345,6 +346,7 @@ def test_compiled_mxfp8_warmup_backend_selection(
         _torch_compile_prefill_only=prefill_only,
         _torch_compile_backend=None,
         _eager_workspace_reclaimer=None,
+        _warmup_timer=_WarmupTimer(rank=0),
         is_warmup=True,
         cuda_graph_runner=SimpleNamespace(enabled=True),
         model=SimpleNamespace(
