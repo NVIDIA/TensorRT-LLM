@@ -156,6 +156,8 @@ def BOLT_CONSUME_BUILD = "bolt_consume_build"
 def BOLT_PROFILE_REF = "bolt_profile_ref"
 @Field
 def BOLT_PUBLISH_VARIANT_KEY = "bolt_publish_variant"
+@Field
+def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -171,6 +173,7 @@ def globalVars = [
     // without saying so.
     (BOLT_PROFILE_REF): "",
     (BOLT_PUBLISH_VARIANT_KEY): false,
+    (BOLT_PROFILE_BRANCH): "",
 ]
 
 // TODO: Move common variables to an unified location
