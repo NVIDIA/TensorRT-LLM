@@ -78,7 +78,7 @@ class _QwenImageBenchModelMixin:
         weights: Dict[str, torch.Tensor],
         weight_mapper: Optional[BaseWeightMapper] = None,
     ):
-        if not _is_mm_disagg():
+        if not _is_mm_disagg() and self.mm_encoder is not None:
             self.mm_encoder.load_weights(weights)
 
         qwen3_5_weight_mapper = Qwen3_5MoeHfWeightMapper()
