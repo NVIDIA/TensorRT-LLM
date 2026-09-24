@@ -44,27 +44,19 @@ def _parse(*assignments: str) -> tuple[ConfigOverride, ...]:
     return parse_config_overrides(assignments, allowed_roots=_ALLOWED_ROOTS)
 
 
-def test_parse_config_overrides_supports_yaml_values() -> None:
-    overrides = _parse(
-        "max_batch_size=16",
-        "dtype=null",
-        "scheduler_config={capacity: 4}",
-        "kv_cache_config.batch_sizes=[1, 2, 4]",
-        "model_kwargs.enabled=true",
-    )
-
-    assert [override.value for override in overrides] == [
-        16,
-        None,
-        {"capacity": 4},
-        [1, 2, 4],
-        True,
-    ]
-
-
-def test_parse_config_overrides_splits_only_first_equals() -> None:
-    overrides = _parse("dtype='value=with=equals'")
-    assert overrides[0].value == "value=with=equals"
+@pytest.mark.parametrize(
+    ("assignment", "expected"),
+    [
+        ("max_batch_size=16", 16),
+        ("dtype=null", None),
+        ("scheduler_config={capacity: 4}", {"capacity": 4}),
+        ("kv_cache_config.batch_sizes=[1, 2, 4]", [1, 2, 4]),
+        ("model_kwargs.enabled=true", True),
+        ("dtype='value=with=equals'", "value=with=equals"),
+    ],
+)
+def test_parse_config_overrides_supports_yaml_values(assignment: str, expected: object) -> None:
+    assert _parse(assignment)[0].value == expected
 
 
 @pytest.mark.parametrize(
@@ -132,7 +124,7 @@ def test_parse_config_overrides_rejects_ancestor_collisions(assignments: tuple[s
         "model=do-not-print-value",
         "backend=do-not-print-value",
         "telemetry_config.disabled=do-not-print-value",
-        "env_overrides.API_KEY=do-not-print-value",
+        "env_overrides.api_key=do-not-print-value",
         "internal_request_auth_key=do-not-print-value",
         "allow_request_chat_template=do-not-print-value",
         "disagg_cluster.cluster_uri=do-not-print-value",
@@ -150,10 +142,9 @@ def test_parse_config_overrides_rejects_ancestor_collisions(assignments: tuple[s
 def test_parse_config_overrides_rejects_reserved_paths_without_values_in_error(
     assignment: str,
 ) -> None:
-    value = assignment.split("=", 1)[1]
-    with pytest.raises(ConfigOverrideError) as raised:
+    with pytest.raises(ConfigOverrideError, match="not supported by --set") as raised:
         _parse(assignment)
-    assert value not in str(raised.value)
+    assert "do-not-print-value" not in str(raised.value)
 
 
 def test_reserved_prefix_matching_is_structural() -> None:

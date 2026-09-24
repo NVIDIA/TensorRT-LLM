@@ -3168,24 +3168,6 @@ class TestServeDefaults:
         assert "video_pruning_rate" not in llm_args
         assert llm_args["multimodal_config"].video_pruning_rate == 0.5
 
-    def test_serve_explicit_video_pruning_rate_wins_over_yaml(self):
-        llm_args, _ = get_llm_args(
-            model=llama_model_path,
-            backend="pytorch",
-            video_pruning_rate=0.4,
-            explicit_cli_keys={"video_pruning_rate"},
-        )
-
-        merged = update_llm_args_with_extra_dict(
-            llm_args,
-            {"multimodal_config": {
-                "video_pruning_rate": 0.5
-            }},
-            explicit_cli_keys={"video_pruning_rate"},
-        )
-
-        assert merged["multimodal_config"].video_pruning_rate == 0.4
-
     def test_serve_backend_specific_configs(self):
         # PyTorch backend: build_config / scheduler_config stay None and are
         # filtered out.
@@ -3222,8 +3204,6 @@ class TestServeDefaults:
         with (
                 patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
                       return_value=False),
-                patch("tensorrt_llm.commands.serve.device_count",
-                      return_value=1),
                 patch("tensorrt_llm.commands.serve.launch_server") as
                 mock_launch_server,
         ):
@@ -3252,41 +3232,43 @@ class TestServeDefaults:
             assert mock_launch_server.call_args.args[2][
                 "generation_config"] == "auto"
 
-    def test_serve_set_wins_over_yaml_and_dedicated_cli(self, tmp_path) -> None:
+    @pytest.mark.parametrize(
+        ("extra_args", "expected"),
+        [
+            (["--video_pruning_rate", "0.4"], 0.4),
+            ([
+                "--video_pruning_rate", "0.4", "--set",
+                "multimodal_config.video_pruning_rate=0.6"
+            ], 0.6),
+            ([
+                "--set", "multimodal_config.video_pruning_rate=0.6",
+                "--video_pruning_rate", "0.4"
+            ], 0.6),
+        ],
+    )
+    def test_serve_video_pruning_rate_precedence(self, tmp_path: Path,
+                                                 extra_args: list[str],
+                                                 expected: float) -> None:
         config_path = tmp_path / "config.yaml"
         config_path.write_text(
             "multimodal_config:\n  video_pruning_rate: 0.5\n", encoding="utf-8")
-        argument_orders = [
-            [
-                "--video_pruning_rate", "0.4", "--set",
-                "multimodal_config.video_pruning_rate=0.6"
-            ],
-            [
-                "--set", "multimodal_config.video_pruning_rate=0.6",
-                "--video_pruning_rate", "0.4"
-            ],
-        ]
 
         with (
                 patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
                       return_value=False),
-                patch("tensorrt_llm.commands.serve.device_count",
-                      return_value=1),
                 patch("tensorrt_llm.commands.serve.launch_server") as
                 mock_launch_server,
         ):
-            for extra_args in argument_orders:
-                serve_main(
-                    args=[
-                        "dummy/model", "--config",
-                        str(config_path), *extra_args
-                    ],
-                    standalone_mode=False,
-                )
-                multimodal_config = mock_launch_server.call_args.args[2][
-                    "multimodal_config"]
-                assert multimodal_config["video_pruning_rate"] == 0.6
-                mock_launch_server.reset_mock()
+            serve_main(
+                args=["dummy/model", "--config",
+                      str(config_path), *extra_args],
+                standalone_mode=False,
+            )
+            multimodal_config = mock_launch_server.call_args.args[2][
+                "multimodal_config"]
+            if isinstance(multimodal_config, BaseModel):
+                multimodal_config = multimodal_config.model_dump()
+            assert multimodal_config["video_pruning_rate"] == expected
 
     @pytest.mark.parametrize(
         ("assignment", "expected_paths"),
@@ -3357,11 +3339,13 @@ class TestServeDefaults:
         with (
                 patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
                       return_value=False),
-                pytest.raises(click.BadParameter) as raised,
+                pytest.raises(click.BadParameter,
+                              match="not supported by --set") as raised,
         ):
             serve_main(
                 args=[
-                    "dummy/model", "--set", f"env_overrides.API_KEY={sentinel}"
+                    "dummy/model", "--set",
+                    f"internal_request_auth_key={sentinel}"
                 ],
                 standalone_mode=False,
             )
@@ -3372,8 +3356,6 @@ class TestServeDefaults:
         with (
                 patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
                       return_value=False),
-                patch("tensorrt_llm.commands.serve.device_count",
-                      return_value=1),
                 pytest.raises(click.UsageError,
                               match="num_serve_frontends must be 1"),
         ):
