@@ -100,6 +100,12 @@ def set_torch_compiling(enable: bool):
 
 
 def is_torch_compiling() -> bool:
+    """Return the runtime compile-dispatch policy, not Dynamo tracing state.
+
+    Prefill-only models scope this process-global flag to each full forward:
+    eligible prefill/mixed batches use True, original eager fallbacks False.
+    Other compiled models retain the engine-wide value.
+    """
     global is_torch_compiling_flag
     return is_torch_compiling_flag
 

@@ -244,8 +244,8 @@ def test_process_group_comm_barrier_uses_cpu_backend(
     """Barrier must go straight to the CPU backend.
 
     The public ProcessGroup.barrier() is a c10d operator, so MetaInitMode
-    intercepts it before it reaches Gloo; ops.py::_mnnvl_workspace_barrier takes
-    the same shortcut.
+    intercepts it before it reaches Gloo; ops.py::_mnnvl_workspace_all_succeeded
+    takes the same shortcut.
     """
     waited = []
 
