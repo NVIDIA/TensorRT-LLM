@@ -261,6 +261,22 @@ def RUN_MODE = "run_mode"
 def BUILD_BRANCH = "build_branch"
 @Field
 def BOLT_CONSUME_BUILD = "bolt_consume_build"
+// The one BOLT profile bundle every consumer in this pipeline applies. Resolved
+// once (see resolveBoltProfileRef) rather than each consumer reading the mutable
+// `latest` pointer whenever it happens to run -- which made two stages in the
+// same pipeline able to disagree about which profiles they used. Empty means
+// unpinned, i.e. today's read-`latest`-per-consumer behaviour.
+@Field
+def BOLT_PROFILE_REF = "bolt_profile_ref"
+// The branch whose promote directory holds that bundle. A ref alone does not
+// address an object -- the path is <branch>/<triple>/bolt-profile-<ref>-<triple>
+// -- and consumers used to supply the branch themselves from four different
+// expressions. They agree on post-merge main and nowhere guaranteed else, and a
+// disagreement is a 404, which apply_latest.sh reports as "nothing promoted":
+// indistinguishable from a cold start, so it degrades silently. Carrying the
+// branch with the ref means a pinned consumer never has to guess.
+@Field
+def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
 @Field
 def RELEASE_TARGET = "release_target"
 def globalVars = [
@@ -273,6 +289,8 @@ def globalVars = [
     (RUN_MODE): runMode,
     (RELEASE_TARGET): runMode == "nightly_release" ?
         normalizeReleaseTargets(gitlabParamsFromBot.get(RELEASE_TARGET, null)) : [],
+    (BOLT_PROFILE_REF): "",
+    (BOLT_PROFILE_BRANCH): "",
 ]
 globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
 // Compare against "true" rather than relying on Groovy truthiness: the bot phrase
@@ -560,6 +578,27 @@ def preparation(pipeline, testFilter, globalVars)
     trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
         stage("Setup Environment") {
             setupPipelineEnvironment(pipeline, testFilter, globalVars)
+        }
+        // Must resolve BEFORE launchStages, not inside any branch of it.
+        // launchStages forks Release-Check, SBSA and x86_64 in parallel and
+        // launchJob serializes globalVars per child job, so a pin assigned in
+        // one branch races the jobs in the others: whichever serializes first
+        // receives an empty pin and resolves `latest` on its own -- the drift
+        // this exists to remove, now with the added property of being
+        // nondeterministic. Release Check is also skippable, which would leave
+        // the whole pipeline unpinned.
+        //
+        // preparation() is the earliest correct home: the script-level BOLT
+        // setup runs outside any node and cannot shell out, while the stage
+        // above has already checked the repo out into ${LLM_ROOT}, which is
+        // where the resolver's script lives.
+        stage("Pin BOLT Profile Bundle") {
+            def pinBranch = globalVars[BUILD_BRANCH]
+            def pinRef = resolveBoltProfileRef(pinBranch)
+            globalVars[BOLT_PROFILE_REF] = pinRef
+            // Only meaningful alongside a ref, so it is left empty when the pin
+            // does not resolve -- a consumer cannot then half-honour a pin.
+            globalVars[BOLT_PROFILE_BRANCH] = pinRef ? pinBranch : ""
         }
         stage("Upload Build Info") {
             try {
@@ -1925,6 +1964,55 @@ def resolveBuildBranch(globalVars)
 //
 // Skips are announced rather than silent: a run that asked for BOLTed binaries
 // and did not get them should say so in the log.
+// (Everything above documents resolveBoltConsume, defined further down.)
+
+// Pick the single BOLT profile bundle this pipeline will use, and pin it.
+//
+// Without a pin every consumer resolves `latest` independently, at whatever
+// moment it happens to run. Post-merge promotes a new bundle mid-pipeline, so a
+// stage that pulls before the promote and one that pulls after legitimately get
+// different profiles -- and parallel post-merge pipelines make it worse. That is
+// invisible: each consumer succeeds, and the run is green having tested
+// something other than what it shipped.
+//
+// Pinning is post-merge only. Pre-merge keeps reading `latest` (requirement: its
+// drift is acceptable and its behaviour must not change), and returning "" leaves
+// every consumer on exactly today's path.
+//
+// Best-effort by design. A branch with nothing promoted, or a bundle too old to
+// carry the label, yields "" and the pipeline runs unpinned rather than failing
+// -- an unresolvable pin is a reason to keep the old behaviour, not to break the
+// build.
+def resolveBoltProfileRef(String branch, String triple = "aarch64-linux-gnu")
+{
+    if (!(env.JOB_NAME ==~ /.*PostMerge.*/)) {
+        return ""
+    }
+    def ref = ""
+    try {
+        ref = sh(returnStdout: true, script: """
+            bash ${LLM_ROOT}/scripts/bolt/internal/artifactory.sh \
+                 resolve-latest ${branch} ${triple} 2>/dev/null || true
+        """).trim()
+    } catch (InterruptedException e) {
+        // Aborts and timeouts reach here as FlowInterruptedException, which
+        // extends InterruptedException. Letting the catch below swallow one
+        // would turn a cancelled pipeline into an unpinned pipeline that
+        // carries on and launches every build job.
+        throw e
+    } catch (Exception e) {
+        echo "BOLT profile pin: resolve failed (${e.message}); running unpinned."
+        return ""
+    }
+    if (!ref) {
+        echo "BOLT profile pin: nothing promoted for ${branch}/${triple}; running unpinned."
+        return ""
+    }
+    echo "BOLT profile pin: ${branch}/${triple} -> ${ref}. Consumers honouring the pin use this bundle; " +
+         "the image profile-bundle overlay still resolves latest independently."
+    return ref
+}
+
 def resolveBoltConsume(boolean requested, String targetBranch)
 {
     if (!requested) {

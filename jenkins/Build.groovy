@@ -143,6 +143,10 @@ def ACTION_INFO = "action_info"
 def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 @Field
 def BOLT_CONSUME_BUILD = "bolt_consume_build"
+@Field
+def BOLT_PROFILE_REF = "bolt_profile_ref"
+@Field
+def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -152,6 +156,12 @@ def globalVars = [
     // that helper only updates keys already present in the target map, so a key that
     // is absent here (like this one previously) is silently dropped during the merge.
     (BOLT_CONSUME_BUILD): false,
+    // Pre-declared so updateMapWithJson() populates it from the parent: that
+    // helper only updates keys already present here, so an absent key is
+    // silently dropped -- which for this one would mean running unpinned
+    // without saying so.
+    (BOLT_PROFILE_REF): "",
+    (BOLT_PROFILE_BRANCH): "",
 ]
 
 // TODO: Move common variables to an unified location
