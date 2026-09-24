@@ -219,7 +219,7 @@ at::Tensor mxfp8Mxfp8GemmImpl(at::Tensor const& act, at::Tensor const& actScale,
 } // namespace
 
 // MXFP8 (e4m3 + UE8M0 1x32 block scales) x MXFP8 (e4m3 + UE8M0 1x32 block
-// scales) GEMM on Blackwell sm_100/103.
+// scales) GEMM on the sm_100 family (sm_100/103/107).
 //
 // Operands (matching the CUTLASS block-scaled tensor-op convention):
 //   act:          [M, K] Float8_e4m3fn, row-major.

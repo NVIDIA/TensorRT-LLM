@@ -56,7 +56,7 @@ commands:
         flags:
         - "--allow_request_chat_template"
       backend:
-        type: Choice(['_autodeploy', 'pytorch'])
+        type: Choice(['pytorch'])
         default: pytorch
         status: deprecated
         required: false

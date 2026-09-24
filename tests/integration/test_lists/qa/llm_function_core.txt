@@ -1,4 +1,3 @@
-accuracy/test_llm_api_autodeploy.py::TestGLM4Flash::test_guided_decoding TIMEOUT (60)
 accuracy/test_disaggregated_serving.py::TestDeepSeekR1::test_kv_cache_v2_nixl_python[cache_mgr_v1]
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=0-overlap_scheduler=False]
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=0-overlap_scheduler=True]
@@ -776,6 +775,9 @@ test_e2e.py::test_qwen_e2e_cpprunner_large_new_tokens[Qwen3/Qwen3-0.6B-Qwen3/Qwe
 test_e2e.py::test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus[DeepSeek-R1-DeepSeek-R1/DeepSeek-R1]
 test_e2e.py::test_trtllm_benchmark_serving[gpt_oss/gpt-oss-20b]
 test_e2e.py::test_trtllm_multimodal_benchmark_serving
+
+# Dense FP4 MLA accuracy (SM107 only)
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_mla
 
 # fine-grained sync tests (SM107+ only)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_fine_grained_sync[enable_autotuner=False-moe_backend=TRTLLM-mtp_nextn=0-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]

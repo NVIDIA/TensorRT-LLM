@@ -1,11 +1,10 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-# http://www.apache.org/licenses/LICENSE-2.0
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -181,16 +180,7 @@ def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
                              "Must be a class or an async function.")
 
 
-def _get_llm_args_class(backend: str):
-    if backend == "_autodeploy":
-        from tensorrt_llm._torch.auto_deploy.llm_args import \
-            LlmArgs as AutoDeployLlmArgs
-
-        return AutoDeployLlmArgs
-    return TorchLlmArgs
-
-
-def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
+def is_non_default_or_required(param_name, value, explicit_cli_keys):
     """
     Check if a parameter should be explicitly included in llm_args.
 
@@ -226,7 +216,7 @@ def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
            for s in cli_derived_fields.get(param_name, ())):
         return True
 
-    llm_args_class = _get_llm_args_class(backend)
+    llm_args_class = TorchLlmArgs
 
     field_info = llm_args_class.model_fields.get(param_name)
     if not field_info:
@@ -244,53 +234,15 @@ def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
 # CLI/API defaults are sourced from the TorchLlmArgs field defaults so they stay
 # in lock-step with the args class and can't drift.
 _LLM_ARGS_FIELDS = TorchLlmArgs.model_fields
-_MISSING_CONFIG_OVERRIDE = object()
 
 
-def _config_value_at_path(config: Dict[str, Any],
-                          target_path: tuple[str, ...]) -> Any:
-    value: Any = config
-    for component in target_path:
-        if not isinstance(value, dict) or component not in value:
-            return _MISSING_CONFIG_OVERRIDE
-        value = value[component]
-    return value
-
-
-def _expand_autodeploy_config_overrides(
-        overrides: tuple[ConfigOverride, ...]) -> tuple[ConfigOverride, ...]:
-    from tensorrt_llm._torch.auto_deploy.llm_args import \
-        _TRANSFORMS_SHORTCUT_LOOKUP
-
-    expanded = list(overrides)
-    override_patch = apply_config_overrides({}, overrides)
-    for shortcut, transform_paths in _TRANSFORMS_SHORTCUT_LOOKUP.items():
-        alias_paths = [(shortcut, )] + [("transforms", *path.split("."))
-                                        for path in transform_paths]
-        writes = [(path, value) for path in alias_paths
-                  if (value := _config_value_at_path(override_patch, path)
-                      ) is not _MISSING_CONFIG_OVERRIDE]
-        if len(writes) > 1:
-            conflicting_paths = " and ".join(f"'{'.'.join(path)}'"
-                                             for path, _ in writes)
-            raise ConfigOverrideError(
-                f"AutoDeploy configuration paths {conflicting_paths} refer "
-                "to the same setting and cannot be used together.")
-        if writes and writes[0][0] != (shortcut, ):
-            expanded.append(ConfigOverride((shortcut, ), writes[0][1]))
-    return tuple(expanded)
-
-
-def _parse_config_overrides(assignments: Sequence[str],
-                            backend: str) -> tuple[ConfigOverride, ...]:
+def _parse_config_overrides(
+        assignments: Sequence[str]) -> tuple[ConfigOverride, ...]:
     try:
-        overrides = parse_config_overrides(
+        return parse_config_overrides(
             assignments,
-            allowed_roots=_get_llm_args_class(backend).model_fields,
+            allowed_roots=_LLM_ARGS_FIELDS,
         )
-        if backend == "_autodeploy":
-            overrides = _expand_autodeploy_config_overrides(overrides)
-        return overrides
     except ConfigOverrideError as error:
         raise click.BadParameter(str(error), param_hint="--set") from error
 
@@ -427,7 +379,7 @@ def get_llm_args(
     llm_args = {
         param: value
         for param, value in cli_maybe_overrides.items()
-        if is_non_default_or_required(param, value, backend, explicit_cli_keys)
+        if is_non_default_or_required(param, value, explicit_cli_keys)
     }
 
     return llm_args, llm_args_extra_dict
@@ -776,12 +728,6 @@ def launch_server(
         if backend == 'pytorch':
             llm_args.pop("build_config", None)
             llm = PyTorchLLM(**llm_args)
-        elif backend == '_autodeploy':
-            from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-
-            # AutoDeploy does not support build_config
-            llm_args.pop("build_config", None)
-            llm = AutoDeployLLM(**llm_args)
         else:
             raise click.BadParameter(
                 f"{backend} is not a known backend, check help for available options.",
@@ -1071,11 +1017,9 @@ def launch_visual_gen_server(
                   status="beta")
 @stability_option(
     "--backend",
-    type=click.Choice(["pytorch", "_autodeploy"]),
+    type=click.Choice(["pytorch"]),
     default="pytorch",
-    help="The backend to use to serve the model. Default is pytorch backend. "
-    "Note: the '_autodeploy' backend is deprecated and will be discontinued "
-    "in a future release; please use the 'pytorch' backend instead.",
+    help="The backend to use to serve the model. Default is pytorch backend.",
     status="deprecated")
 @stability_option(
     "--generation-config",
@@ -1443,13 +1387,6 @@ def serve(
     """
     logger.set_level(log_level)
 
-    if backend == "_autodeploy":
-        logger.warning(
-            "The '_autodeploy' backend is deprecated and will be discontinued in a "
-            "future release. No new features or models will be added. Please migrate "
-            "to the 'pytorch' backend. See "
-            "https://github.com/NVIDIA/TensorRT-LLM/issues/15638 for details.")
-
     if not grpc and grpc_protocol != "smg":
         raise click.UsageError("--grpc-protocol requires --grpc")
 
@@ -1523,7 +1460,7 @@ def serve(
         raise click.BadParameter(
             "--set configures LlmArgs and is not supported by VisualGen.",
             param_hint="--set")
-    parsed_config_overrides = _parse_config_overrides(config_overrides, backend)
+    parsed_config_overrides = _parse_config_overrides(config_overrides)
 
     def _serve_llm():
         nonlocal server_role, allow_request_chat_template
@@ -2368,6 +2305,27 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     coord_url = f"unix:{coord_uds}" if coord_uds else \
         f"http://{public_host}:{coord_port}"
 
+    # Bind the coordinator's TCP socket here rather than letting uvicorn bind the
+    # hostname, so this listener starts the same way as the standalone server and
+    # the fleet workers. uvicorn would resolve the name itself, and a hostname
+    # whose AAAA record is link-local resolves to fe80:: with scope id 0 -- which
+    # the kernel always rejects with "invalid argument", because the scope id can
+    # only be derived from an interface name. Binding AF_INET here also surfaces a
+    # port conflict with the same diagnostics as the other two listeners.
+    coord_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    coord_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        coord_socket.bind((public_host, coord_port))
+    except OSError as e:
+        coord_socket.close()
+        holder = _diagnose_port_in_use(coord_port)
+        logger.error(f"Failed to bind coordinator socket to "
+                     f"{public_host}:{coord_port} (pid={os.getpid()}): {e}. "
+                     f"Current port holder(s): {holder}")
+        raise RuntimeError(
+            f"Failed to bind socket to {public_host}:{coord_port}: {e}. "
+            f"Port holder(s): {holder}")
+
     # 1. Launch the delegating fleet pointed at the implicit coordinator we start
     #    below (port-1 for TCP; UDS for the hot path). Workers hold
     #    CoordinatorClients (no core), so they can't race the ZMQ ingest bind.
@@ -2403,7 +2361,8 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
                 public_host,
                 coord_port,
                 uds=coord_uds,
-                keep_alive_timeout=disagg_cfg.server_keep_alive_timeout))
+                keep_alive_timeout=disagg_cfg.server_keep_alive_timeout,
+                sockets=[coord_socket]))
 
         async def _monitor_fleet():
             while True:
@@ -2431,6 +2390,7 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     try:
         asyncio.run(_serve_and_monitor())
     finally:
+        coord_socket.close()
         for process in fleet:
             if process.poll() is None:
                 process.terminate()

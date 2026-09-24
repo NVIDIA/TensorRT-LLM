@@ -24,8 +24,6 @@ import tensorrt_llm.bindings.executor as tle
 import tensorrt_llm.llmapi as public_llmapi
 import tensorrt_llm.llmapi.llm_args as llm_args_mod
 from tensorrt_llm import LLM as TorchLLM
-from tensorrt_llm._torch.auto_deploy.llm_args import \
-    LlmArgs as AutoDeployLlmArgs
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import \
     HfCheckpointLoader
@@ -33,8 +31,7 @@ from tensorrt_llm._torch.models.modeling_gemma3 import Gemma3ForCausalLM
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.virtual_memory import RestoreMode
-from tensorrt_llm.commands.serve import (_parse_config_overrides, get_llm_args,
-                                         is_non_default_or_required)
+from tensorrt_llm.commands.serve import get_llm_args, is_non_default_or_required
 from tensorrt_llm.commands.serve import main as serve_main
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy, SchedulerConfig
 # fmt: off
@@ -86,13 +83,6 @@ def test_generation_config_mode_defaults_and_validation() -> None:
 
     with pytest.raises(ValidationError, match="generation_config"):
         TorchLlmArgs(model=llama_model_path, generation_config="invalid")
-
-
-@pytest.mark.cpu_only
-def test_generation_config_auto_rejects_autodeploy() -> None:
-    with pytest.raises(ValidationError,
-                       match="AutoDeploy does not support generation_config"):
-        AutoDeployLlmArgs(model=llama_model_path, generation_config="auto")
 
 
 @pytest.mark.cpu_only
@@ -160,21 +150,6 @@ def test_rank_striped_checkpoint_io_accepts_best_effort_config(
 
 
 @pytest.mark.cpu_only
-def test_rank_striped_checkpoint_io_warns_and_preserves_request_for_autodeploy(
-) -> None:
-    with patch.object(llm_args_mod.logger, "warning") as warning:
-        args = AutoDeployLlmArgs(
-            model=llama_model_path,
-            checkpoint_io_policy="rank_striped_read_ahead",
-        )
-    assert args.checkpoint_io_policy == "rank_striped_read_ahead"
-    serialized_args = args.model_dump()
-    assert serialized_args["checkpoint_io_policy"] == "rank_striped_read_ahead"
-    assert any("selected=native" in call.args[0]
-               for call in warning.call_args_list)
-
-
-@pytest.mark.cpu_only
 def test_MTPDecodingConfig_default_draft_len_is_not_user_set():
     config = MTPDecodingConfig()
 
@@ -228,13 +203,6 @@ moe_backend: TRTLLM
         assert isinstance(restored, MTPDecodingConfig)
         assert restored.moe_backend == "TRTLLM"
         assert restored.model_dump()["moe_backend"] == "TRTLLM"
-
-    def test_autodeploy_rejects_override(self) -> None:
-        spec_config = MTPDecodingConfig(max_draft_len=1, moe_backend="CUTLASS")
-
-        with pytest.raises(ValidationError,
-                           match="available only with the PyTorch backend"):
-            AutoDeployLlmArgs(model="/target", speculative_config=spec_config)
 
     def test_accepts_explicit_vanilla_mtp_override(self) -> None:
         spec_config = MTPDecodingConfig(max_draft_len=1,
@@ -3270,51 +3238,6 @@ class TestServeDefaults:
                 multimodal_config = multimodal_config.model_dump()
             assert multimodal_config["video_pruning_rate"] == expected
 
-    @pytest.mark.parametrize(
-        ("assignment", "expected_paths"),
-        [
-            (
-                "transforms.compile_model.backend=torch-simple",
-                [
-                    ("transforms", "compile_model", "backend"),
-                    ("compile_backend", ),
-                ],
-            ),
-            (
-                "transforms={compile_model: {backend: torch-simple}}",
-                [("transforms", ), ("compile_backend", )],
-            ),
-            ("compile_backend=torch-simple", [("compile_backend", )]),
-        ],
-    )
-    def test_serve_set_expands_autodeploy_aliases(
-            self, assignment: str, expected_paths: list[tuple[str,
-                                                              ...]]) -> None:
-        overrides = _parse_config_overrides((assignment, ), "_autodeploy")
-
-        assert [override.path for override in overrides] == expected_paths
-        assert overrides[-1].value == "torch-simple"
-
-    @pytest.mark.parametrize(
-        "assignments",
-        [
-            (
-                "compile_backend=torch-simple",
-                "transforms.compile_model.backend=torch-compile",
-            ),
-            (
-                "transforms.insert_cached_attention.backend=triton",
-                "transforms.transformers_replace_cached_attn.backend=flashinfer",
-            ),
-            ("transforms={insert_cached_attention: {backend: triton}, "
-             "transformers_replace_cached_attn: {backend: flashinfer}}", ),
-        ],
-    )
-    def test_serve_set_rejects_autodeploy_alias_collisions(
-            self, assignments: tuple[str, ...]) -> None:
-        with pytest.raises(click.BadParameter, match="same setting"):
-            _parse_config_overrides(assignments, "_autodeploy")
-
     def test_serve_set_rejects_visual_gen(self) -> None:
         with (
                 patch("tensorrt_llm.commands.serve.launch_server") as
@@ -3375,35 +3298,27 @@ class TestServeDefaults:
 
     def test_serve_is_non_default_or_required_helper(self):
         # Test always_include parameters
-        assert is_non_default_or_required("model", "test-model", "pytorch",
-                                          set())
-        assert is_non_default_or_required("backend", "pytorch", "pytorch",
-                                          set())
-        assert is_non_default_or_required("tokenizer", "test-tokenizer",
-                                          "pytorch", set())
+        assert is_non_default_or_required("model", "test-model", set())
+        assert is_non_default_or_required("backend", "pytorch", set())
+        assert is_non_default_or_required("tokenizer", "test-tokenizer", set())
 
         # Test None values
-        assert not is_non_default_or_required("max_batch_size", None, "pytorch",
-                                              set())
+        assert not is_non_default_or_required("max_batch_size", None, set())
 
         # Test default values (should return False)
-        assert not is_non_default_or_required("tensor_parallel_size", 1,
-                                              "pytorch", set())
+        assert not is_non_default_or_required("tensor_parallel_size", 1, set())
         assert not is_non_default_or_required("pipeline_parallel_size", 1,
-                                              "pytorch", set())
+                                              set())
 
         # Test non-default values (should return True)
-        assert is_non_default_or_required("tensor_parallel_size", 4, "pytorch",
-                                          set())
-        assert is_non_default_or_required("max_batch_size", 128, "pytorch",
-                                          set())
+        assert is_non_default_or_required("tensor_parallel_size", 4, set())
+        assert is_non_default_or_required("max_batch_size", 128, set())
 
         # Test explicit CLI source overrides the default-equals-value check
-        assert is_non_default_or_required("tensor_parallel_size", 1, "pytorch",
+        assert is_non_default_or_required("tensor_parallel_size", 1,
                                           {"tensor_parallel_size"})
         # Test CLI-derived field (--free_gpu_memory_fraction -> kv_cache_config)
         assert is_non_default_or_required("kv_cache_config", KvCacheConfig(),
-                                          "pytorch",
                                           {"free_gpu_memory_fraction"})
 
 
@@ -3618,12 +3533,6 @@ class TestPydanticBestPractices:
         ],
         TorchLlmArgs: [
             "checkpoint_loader",  # abstract base class type
-        ],
-        AutoDeployLlmArgs: [
-            "transforms",  # typed as Dict[str, Dict[str, Any]] for flexibility
-            "model_kwargs",  # typed as Dict[str, Any] for flexibility
-            "speculative_model_kwargs",  # typed as Dict[str, Any] for flexibility (overrides draft model HF config)
-            "tokenizer_kwargs",  # typed as Dict[str, Any] for flexibility
         ],
         UserProvidedDecodingConfig: [
             "drafter",  # abstract base class type

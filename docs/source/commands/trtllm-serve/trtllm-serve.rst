@@ -437,8 +437,8 @@ characters. An assignment replaces exactly the addressed value; assigning a
 mapping or list replaces it entirely. The last duplicate path wins, while
 conflicting parent and child paths are rejected.
 
-``--set`` supports public, YAML-serializable fields in the selected backend's
-``LlmArgs`` schema, with the following exceptions:
+``--set`` supports public, YAML-serializable fields in ``TorchLlmArgs``, with
+the following exceptions:
 
 * ``model`` and ``backend``: use ``MODEL`` and ``--backend``.
 * ``telemetry_config``: use ``--telemetry`` or ``--no-telemetry``.
@@ -459,8 +459,6 @@ and ``disaggregated_mpi_worker`` subcommands. Server-only YAML keys, list
 indexes, escaped dots, and Hydra/OmegaConf interpolation are also unsupported.
 Replace an enclosing mapping to set free-form keys that cannot be expressed as
 a path.
-For ``_autodeploy``, shortcut and long-form transform paths are aliases;
-specifying multiple aliases for one setting is an error.
 
 Do not pass secrets through ``--set`` because arguments may appear in shell
 history, process listings, or logs. Eligible configuration fields may also be

@@ -31,8 +31,8 @@ which lives outside `_SPEC_SRC_PREFIXES` and therefore is never claimed
 by this rule. Such PRs naturally fall back to baseline.
 
 PerfSanity policy: `perfsanity_relevant` is dynamic — True only when a
-matched block lives in a `*_perf_sanity*` yaml (mirrors AutoDeployRule /
-VisualGenRule). Spec-dec PRs whose entry matches don't land in any
+matched block lives in a `*_perf_sanity*` yaml (mirrors VisualGenRule).
+Spec-dec PRs whose entry matches don't land in any
 perf-sanity yaml will have `perfsanity_required=False` aggregated,
 letting Groovy Layer 2 drop the force-keep of `*-PerfSanity-*` stages.
 PRs whose entries do reach perf-sanity blocks keep those stages.

@@ -765,7 +765,7 @@ class CuteDslFusedMoE(MoEImplBase):
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
-        """CuteDSL grouped GEMM: NVFP4 on SM100/SM103, bfloat16 activations."""
+        """CuteDSL grouped GEMM: NVFP4 on SM100/SM103/SM107, bfloat16 activations."""
         sm_version = d.env.sm
         quant_algo = p.quant_algo
 
@@ -856,7 +856,7 @@ class CuteDslFusedMoE(MoEImplBase):
         # exists, but its GEMM is ``cute_dsl_fp8_group_blockwise_gemm_ref`` --
         # an fp32 einsum-per-expert reference, not a CuteDSL kernel -- so
         # claiming the algorithm here would advertise a reference path as a
-        # backend. DeepGemm / TRTLLMGen own it on SM100/103, Cutlass on
+        # backend. DeepGemm / TRTLLMGen own it on SM100/103/107, Cutlass on
         # SM90/SM120. See the FP8-block note in MOE_DEVELOPER_GUIDE.md.
         return _reject(
             MoERejectReason.QUANT_UNSUPPORTED,

@@ -5,7 +5,7 @@
 import math
 from dataclasses import dataclass, replace
 from types import MethodType
-from typing import Iterable, List, Optional
+from typing import TYPE_CHECKING, Iterable, List, Optional
 
 import torch
 
@@ -15,15 +15,21 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType, KVCacheManager
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BufferConfig,
     DataRole,
+    KVCacheManagerConfig,
     LayerId,
     PageIndexMode,
 )
 
-from . import (
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
+
+from .config import (
     _FP4_MLA_CUTEDSL_BACKEND,
     _FP4_MLA_K_RESIDUAL_BACKENDS,
     FP4_BLOCK_SIZE,
@@ -32,8 +38,8 @@ from . import (
     HP_BLOCK_SIZE,
     _fp4_mla_attention_backend,
     _fp4_mla_cutedsl_fused_v_transpose_enabled,
-    get_fp4_mla_v_scale_pool_size,
 )
+from .layout import get_fp4_mla_v_scale_pool_size
 
 
 @dataclass(frozen=True)
@@ -172,6 +178,7 @@ class Fp4MlaV2CacheLayoutPolicy:
         """Attach attention-layout hooks to a non-policy lifecycle manager."""
         if isinstance(manager, Fp4MlaV2CacheLayoutPolicy):
             return
+        manager.fp4_mla_hp_pool_size = manager._fp4_mla_hp_pool_size
         method_names = (
             "_bf16_mla_local_layer_indices",
             "_fp4_mla_local_layer_indices",
@@ -223,6 +230,11 @@ class Fp4MlaV2CacheLayoutPolicy:
         with torch.cuda.stream(manager._stream):
             Fp4MlaV2CacheLayoutPolicy.get_mla_v_scale_pool_base(manager).zero_()
         manager._stream.synchronize()
+
+    @property
+    def fp4_mla_hp_pool_size(self) -> int:
+        """Number of BF16 tokens in each layer's rewind-capable HP ring."""
+        return self._fp4_mla_hp_pool_size
 
     def _bf16_mla_local_layer_indices(self) -> list[int]:
         fallback_layers = getattr(self, "_bf16_mla_global_layer_ids", frozenset())
@@ -343,7 +355,7 @@ class Fp4MlaV2CacheLayoutPolicy:
             * torch.empty((), dtype=torch.bfloat16).element_size()
         )
 
-    def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: DataRole):
+    def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: DataRole) -> int:
         if local_layer_idx in self._bf16_mla_local_layer_indices():
             if data_role in (Role.KEY, Role.ALL):
                 return self._bf16_mla_bytes_per_token(local_layer_idx)
@@ -390,7 +402,7 @@ class Fp4MlaV2CacheLayoutPolicy:
             result[local_layer] = buffers
         return result
 
-    def _build_cache_config(self, config):
+    def _build_cache_config(self, config: KVCacheManagerConfig) -> KVCacheManagerConfig:
         cache_layers = list(config.layers)
         bf16_local_layers = self._bf16_mla_local_layer_indices()
         fp4_local_layers = self._fp4_mla_local_layer_indices()
@@ -905,7 +917,7 @@ class Fp4MlaV2CacheLayoutPolicy:
                 raise ValueError(f"Unknown FP4 MLA V2 internal layer {internal_layer}.")
         return result
 
-    def _get_runtime_cache_size_layer_components(self):
+    def _get_runtime_cache_size_layer_components(self) -> tuple[list[int], list[Optional[int]]]:
         fp4_local_layers = self._fp4_mla_local_layer_indices()
         bf16_local_layers = self._bf16_mla_local_layer_indices()
         sizes = [
@@ -935,7 +947,16 @@ class Fp4MlaV2CacheLayoutPolicy:
         return sum(sizes)
 
     @staticmethod
-    def get_cache_size_per_token(model_config, mapping, num_layers=None, **kwargs):
+    def get_cache_size_per_token(
+        model_config: "ModelConfig",
+        mapping: Mapping,
+        num_layers: Optional[int] = None,
+        *,
+        tokens_per_block: int,
+        spec_config: Optional["DecodingBaseConfig"] = None,
+        max_batch_size: Optional[int] = None,
+        **kwargs: object,
+    ) -> tuple[int, int]:
         config = model_config.pretrained_config
         logical_head_dim = int(config.kv_lora_rank + config.qk_rope_head_dim)
         backend = _fp4_mla_attention_backend()
@@ -946,7 +967,6 @@ class Fp4MlaV2CacheLayoutPolicy:
             )
         residual = FP4_MLA_K_RESIDUAL_DIM if backend in _FP4_MLA_K_RESIDUAL_BACKENDS else 0
         storage_head_dim = logical_head_dim + residual
-        tokens_per_block = int(kwargs["tokens_per_block"])
         v_scale_page = get_fp4_mla_v_scale_pool_size(config.kv_lora_rank, tokens_per_block)
         per_layer = (
             math.ceil(storage_head_dim / 2)
@@ -969,10 +989,9 @@ class Fp4MlaV2CacheLayoutPolicy:
         else:
             num_bf16_layers = 0
         num_fp4_layers = local_layers - num_bf16_layers
-        spec_config = kwargs.get("spec_config")
         rewind = int(spec_config.tokens_per_gen_step - 1) if spec_config else 0
         hp_bytes = (HP_BLOCK_SIZE + rewind) * logical_head_dim * 2 * num_fp4_layers
-        max_batch_size = int(kwargs.get("max_batch_size") or 0)
+        max_batch_size = int(max_batch_size or 0)
         cache_bytes = (
             per_layer * num_fp4_layers
             + logical_head_dim
