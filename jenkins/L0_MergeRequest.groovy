@@ -1295,7 +1295,6 @@ def _cbtsCoverageAudit(pipeline, globalVars, String residualPath)
                 credentialsId: 'github-cred-trtllm-ci',
                 usernameVariable: 'NOT_USED_YET',
                 passwordVariable: 'GITHUB_API_TOKEN'),
-            string(credentialsId: 'default-llm-repo', variable: 'CBTS_COVERAGE_GIT_REPO'),
         ]) {
             readyJson = sh(
                 script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
@@ -1312,7 +1311,7 @@ def _cbtsCoverageAudit(pipeline, globalVars, String residualPath)
         }
         def ready = new groovy.json.JsonSlurper().parseText(readyJson)
         if (!ready.path) {
-            pipeline.echo("CBTS audit: Tier-2 residual conflicts with the selected coverage DB")
+            pipeline.echo("CBTS audit: Tier-2 residual compatibility check did not pass")
             return [db: ready, pilotEligible: pilotEligible]
         }
         pipeline.echo("CBTS audit: Tier-2 residual applies cleanly to the selected coverage DB")

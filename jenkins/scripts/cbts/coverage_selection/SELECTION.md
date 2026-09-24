@@ -211,9 +211,9 @@ mean the revision is no longer on `main` at all (history rewritten).
 There is no local-git path for measuring lag. The CI checkout is `depth: 1, noTags: true` with a
 single-SHA refspec (`trtllm_utils.checkoutSpec`), so the coverage revision is not available there.
 The conflict check creates a temporary repository and fetches the checked-out PR head locally.
-The base and DB revisions come from `CBTS_COVERAGE_GIT_REPO`, bound to the same authenticated
-`default-llm-repo` internal mirror used by normal CI checkouts. A missing mirror setting fails the
-check closed instead of falling back to the public Git repository. The temporary repository never
+The base and DB revisions come from the authoritative public
+`https://github.com/NVIDIA/TensorRT-LLM.git` repository. This avoids depending on the replication
+delay or commit availability of the internal checkout mirror. The temporary repository never
 changes the CI checkout or its index.
 
 The compare API answers unless the revision has not reached the public mirror yet (404) or the
@@ -227,12 +227,12 @@ already uses — bound around the artifact selection call in `_cbtsCoverageAudit
 
 This number reports overall freshness. It does not select the DB.
 
-### 8.2b Measuring the drift (gating)
+### 8.2b Measuring the drift (reporting)
 
 The PR base is `merge_base_commit.sha` from `main...<PR head>`. The selected DB is compared as
-`<db sha>...<PR base>`, and drift is `ahead_by + behind_by`: an absolute distance used only by the
-freshness gate and telemetry. `ahead`, `behind`, and `identical` describe valid positions on main;
-diverged and unknown relations decline Tier 2.
+`<db sha>...<PR base>`, and drift is `ahead_by + behind_by`: an absolute distance retained for
+telemetry. `ahead`, `behind`, and `identical` describe valid positions on main; diverged and
+unknown relations decline Tier 2 because the selector cannot establish a shared main history.
 
 `commit-tree` represents the complete base-to-head PR change as one commit, and `cherry-pick`
 tests that commit against the selected DB without serializing through patch format. When the
@@ -240,8 +240,6 @@ cherry-pick reports conflicts, only unmerged paths in the Tier-2 residual count;
 Tier-1-owned files are ignored. This check is independent of whether the DB is older than, equal
 to, or newer than the PR base. A residual conflict or an unmeasurable check declines before the
 large DB artifacts are downloaded. If it passes, Tier 2 uses the original forge PR payload.
-`--coverage-max-drift` applies a second fail-closed bound: beyond 30 commits Tier 2 declines and
-the PR runs in full.
 
 
 ### 8.3 What happens with the result
@@ -258,11 +256,8 @@ On a residual conflict it returns `{path: null, meta}` so the decline remains ob
 downloading the DB. Any failure is non-fatal: Tier 2 never runs and the PR gets a full run.
 
 The metadata path always reaches `main.py`; the DB path is added only when compatibility is clean.
-`main.py` records all of it and **gates on the drift**: past
-`--coverage-max-drift` (default 30) the tier declines and the PR runs in full, on the grounds that
-a DB that far from the PR's base no longer describes who touches what in the code under test. A
-drift that could not be measured — including a meta file that is missing or unreadable — is
-treated the same way.
+`main.py` records the drift but does not gate on its size. The residual compatibility check is the
+authority for whether a DB collected before or after the PR base can safely be used.
 
 All of it lands in the decision and in OpenSearch:
 
@@ -272,9 +267,9 @@ All of it lands in the decision and in OpenSearch:
 | `coverage_db_commit` | `s_coverage_db_commit` | |
 | `coverage_db_lag` | `l_coverage_db_lag` | overall freshness only; `null` / `-1` when unmeasurable |
 | `coverage_db_base_commit` | `s_coverage_db_base_commit` | the PR's merge base |
-| `coverage_db_drift` | `l_coverage_db_drift` | **the gated number**; `null` / `-1` when unmeasurable |
+| `coverage_db_drift` | `l_coverage_db_drift` | distance from the PR base; `null` / `-1` when unmeasurable |
 | `coverage_db_drift_status` | `s_coverage_db_drift_status` | `ahead` / `behind` / `identical` for every selected DB |
-| `coverage_freshness` | `s_coverage_freshness` | `ok` / `stale` / `unknown`, empty when no DB |
+| `coverage_freshness` | `s_coverage_freshness` | drift measurement status: `ok` / `unknown`, empty when no DB |
 | `coverage_compatibility` | `s_coverage_compatibility` | `clean` / `conflict` / `unknown` / `not_attempted` |
 | `coverage_decline_reason` | `s_coverage_decline_reason` | human-readable Tier-2 decline detail |
 | `coverage_decline_category` | `s_coverage_decline_category` | aggregation-safe decline category |

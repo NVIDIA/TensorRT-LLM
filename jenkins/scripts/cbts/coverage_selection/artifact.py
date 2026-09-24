@@ -75,13 +75,13 @@ PIN_NAME = "cbts_db_pin.json"
 COVERAGE_BRANCH = "main"
 # Read by `compare_distance`; the anonymous quota is unusable from shared CI egress IPs.
 GITHUB_TOKEN_ENV = "GITHUB_API_TOKEN"
-# The normal CI checkout's authenticated repository URL, bound by Jenkins.
-COVERAGE_GIT_REPO_ENV = "CBTS_COVERAGE_GIT_REPO"
+# Authoritative source of the main-branch revisions represented by coverage DBs.
+COVERAGE_GIT_REPO = "https://github.com/NVIDIA/TensorRT-LLM.git"
 
 _URM = "https://urm.nvidia.com/artifactory"
 _GITHUB_COMPARE = "https://api.github.com/repos/NVIDIA/TensorRT-LLM/compare"
 _JENKINS_BASE = "https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/main/job/L0_PostMerge"
-# Cover the 30-commit freshness window plus missing or unsuccessful builds.
+# Cover missing or unsuccessful recent builds.
 _MAX_PROBE = 50
 # Per-request timeout in seconds, for the small JSON/metadata calls.
 _TIMEOUT = 15
@@ -349,13 +349,7 @@ def _patch_apply_status(
 ) -> _PatchApplyStatus:
     """Check the relevant paths of a squashed PR commit against the DB revision."""
     repo_source = repo_root.resolve()
-    main_repo = upstream_url or os.environ.get(COVERAGE_GIT_REPO_ENV)
-    if not main_repo:
-        print(
-            f"[artifact] {COVERAGE_GIT_REPO_ENV} is required for the patch check",
-            file=sys.stderr,
-        )
-        return "unknown"
+    main_repo = upstream_url or COVERAGE_GIT_REPO
     checked_out_head = _run_git(["rev-parse", "HEAD"], cwd=repo_source)
     if (
         checked_out_head is None
@@ -373,7 +367,7 @@ def _patch_apply_status(
             return "unknown"
 
         # The PR head is guaranteed to be the checked-out revision. The base and coverage
-        # commits come from the same authenticated internal mirror as normal CI checkouts.
+        # commits come from the authoritative upstream repository.
         fetched_head = _run_git(
             ["fetch", "--no-tags", "--depth=1", str(repo_source), "HEAD"], cwd=repo
         )

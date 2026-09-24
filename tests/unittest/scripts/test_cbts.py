@@ -165,10 +165,6 @@ class CoverageArtifactTest(unittest.TestCase):
                 ),
                 "conflict",
             )
-            with mock.patch.dict(artifact.os.environ, {artifact.COVERAGE_GIT_REPO_ENV: ""}):
-                self.assertEqual(
-                    artifact._patch_apply_status(base, head, clean_db, repo), "unknown"
-                )
 
     def test_accepts_artifact_collected_at_pr_base(self) -> None:
         with (

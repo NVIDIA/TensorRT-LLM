@@ -340,9 +340,6 @@ CBTS defers to the existing filter chain when:
   freshest complete build on a PR head's first run, then pinned for that head)
   revision (or the check cannot be completed) — Tier 1-owned file conflicts are ignored, while
   residual conflicts decline Tier 2 before download
-- The resolved DB sits more than `--coverage-max-drift` commits from the PR's
-  base commit, on either side, or an unmeasurable distance from it — Tier 2
-  declines (`coverage_freshness` = `stale` / `unknown`)
 - Layer 3 narrowing would empty a block — block keeps original tests
 - `cbts_test_db` tarball upload or download/extraction fails — renderTestDB falls back to source
 - Narrowed YAML missing/empty on a stage agent — renderTestDB falls back
