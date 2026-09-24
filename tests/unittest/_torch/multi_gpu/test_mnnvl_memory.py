@@ -43,10 +43,13 @@ class TestMnnvlMemory(unittest.TestCase):
         assert self.local_world_size <= local_dev_count, "ntasks_per_node should be less than local device count"
         torch.cuda.set_device(self.local_rank)
         tllm.MnnvlMemory.initialize()
+        # MnnvlMemory splits its communicator per MoE expert-parallel group, so
+        # an allocation is shared across ranks only when moe_ep_size spans them.
         self.mapping = Mapping(self.world_size,
                                self.rank,
                                self.local_world_size,
-                               tp_size=self.world_size)
+                               tp_size=self.world_size,
+                               moe_ep_size=self.world_size)
 
     @staticmethod
     def align_memory(size: int):
@@ -69,9 +72,11 @@ class TestMnnvlMemory(unittest.TestCase):
             start=self.rank, end=self.rank + numel_per_rank, device='cuda')
         tllm.mpi_barrier()
         for r in range(self.world_size):
-            torch.equal(
+            assert torch.equal(
                 tensor0[(r + 1) % self.world_size],
-                torch.arange(start=r, end=r + numel_per_rank, device='cuda'))
+                torch.arange(
+                    start=r, end=r + numel_per_rank,
+                    device='cuda')), f"segment written by rank {r} mismatched"
 
         allocate1_size = 30 * 1024 * 1024 - 2 * 1024
         mnnvl_memory1 = tllm.MnnvlMemory(self.mapping, allocate1_size)
@@ -86,12 +91,13 @@ class TestMnnvlMemory(unittest.TestCase):
             device='cuda')
         tllm.mpi_barrier()
         for r in range(self.world_size):
-            torch.equal(
+            assert torch.equal(
                 tensor1[(r + 5) % self.world_size],
-                torch.arange(start=r,
-                             end=r + numel_per_rank,
-                             dtype=torch.float32,
-                             device='cuda'))
+                torch.arange(
+                    start=r,
+                    end=r + numel_per_rank,
+                    dtype=torch.float32,
+                    device='cuda')), f"segment written by rank {r} mismatched"
         tllm.mpi_barrier()
         del tensor0, mnnvl_memory0
         tllm.mpi_barrier()

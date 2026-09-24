@@ -1026,11 +1026,67 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     usage: Optional[UsageInfo] = Field(default=None)
 
 
+# Maximum total number of `enum` values across all properties of one tool
+# function's parameters schema. Mirrors the cap reference OpenAI-compatible
+# platforms enforce; unbounded enums also inflate the guided-decoding
+# grammar compiled for strict tool calls.
+TOOL_PARAM_MAX_ENUM_VALUES = 1000
+
+# JSON Schema keywords whose value is instance data rather than a subschema.
+# An `enum` key nested inside these is a value (e.g. a default that happens to
+# be `{"enum": [...]}`), not an enum constraint, so it must not count.
+_SCHEMA_INSTANCE_KEYWORDS = frozenset({"default", "const", "examples"})
+# JSON Schema keywords whose value is a map of {name: subschema}. The names are
+# user-controlled (a property can be literally named `default` or `enum`), so
+# recurse into the values as subschemas without treating the names as keywords.
+_SCHEMA_MAP_KEYWORDS = frozenset({
+    "properties", "patternProperties", "$defs", "definitions",
+    "dependentSchemas"
+})
+
+
+def _count_schema_enum_values(schema: Any) -> int:
+    """Recursively count `enum` *constraint* entries in a JSON-schema fragment.
+
+    Only `enum` keywords in schema positions are counted. `enum` keys that are
+    instance data -- nested under `default`/`const`/`examples`, or the name of a
+    property -- are ignored, so a valid schema is not rejected for values that
+    are not enum constraints.
+    """
+    count = 0
+    if isinstance(schema, dict):
+        for key, value in schema.items():
+            if key == "enum" and isinstance(value, list):
+                count += len(value)
+            elif key in _SCHEMA_INSTANCE_KEYWORDS:
+                continue
+            elif key in _SCHEMA_MAP_KEYWORDS and isinstance(value, dict):
+                for subschema in value.values():
+                    count += _count_schema_enum_values(subschema)
+            else:
+                count += _count_schema_enum_values(value)
+    elif isinstance(schema, list):
+        for item in schema:
+            count += _count_schema_enum_values(item)
+    return count
+
+
 class FunctionDefinition(OpenAIBaseModel):
     name: str
     description: Optional[str] = None
     parameters: Optional[Dict[str, Any]] = None
     strict: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def check_enum_value_cap(self):
+        if self.parameters is not None:
+            num_enum_values = _count_schema_enum_values(self.parameters)
+            if num_enum_values > TOOL_PARAM_MAX_ENUM_VALUES:
+                raise ValueError(
+                    f"tool function {self.name!r} declares {num_enum_values} "
+                    f"enum values across its parameters schema; the maximum "
+                    f"is {TOOL_PARAM_MAX_ENUM_VALUES}.")
+        return self
 
 
 class ChatCompletionToolsParam(OpenAIBaseModel):
@@ -1089,6 +1145,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     tools: Optional[List[ChatCompletionToolsParam]] = None
     tool_choice: Optional[Union[Literal["none", "auto", "required"],
                                 ChatCompletionNamedToolChoiceParam]] = "none"
+    # Standard OpenAI field, accepted for compatibility. `false` is not
+    # enforced: the engine does not restrict how many tool calls the model
+    # emits per turn, so parallel emission remains model behavior either way.
+    parallel_tool_calls: Optional[bool] = None
     user: Optional[str] = None
     reasoning_effort: Optional[ReasoningEffort | Literal[
         "low", "medium", "high", "max", "none"]] = Field(
