@@ -1593,12 +1593,23 @@ class BaseLLM:
         self._hf_model_dir = model_loader()
 
     def _try_load_tokenizer(self) -> Optional[TokenizerBase]:
+        """Resolve the tokenizer for this LLM instance.
+
+        Prefers an explicitly supplied tokenizer, then a single LoRA
+        directory on the PyTorch backends, and otherwise falls back to the
+        downloaded model directory or the configured model reference.
+
+        Returns:
+            The resolved tokenizer, or None when tokenizer init is skipped.
+        """
         if self.args.skip_tokenizer_init:
             return None
 
         if self.args.tokenizer is not None:
             assert isinstance(self.args.tokenizer, TokenizerBase)
             return self.args.tokenizer
+
+        model_path = self._hf_model_dir or self.args.model
 
         # TODO smor- need to refine what is the desired behavior if lora is enabled
         # in terms of the tokenizer initialization process
@@ -1613,15 +1624,15 @@ class BaseLLM:
                         trust_remote_code=self.args.trust_remote_code,
                         use_fast=self.args.tokenizer_mode != 'slow')
                     if tokenizer is None:
-                        tokenizer_path = self.args.model
+                        tokenizer_path = model_path
                     else:
                         return tokenizer
                 except Exception:
-                    tokenizer_path = self.args.model
+                    tokenizer_path = model_path
             else:
-                tokenizer_path = self.args.model
+                tokenizer_path = model_path
         else:
-            tokenizer_path = self.args.model
+            tokenizer_path = model_path
         return ModelLoader.load_hf_tokenizer(
             tokenizer_path,
             trust_remote_code=self.args.trust_remote_code,
@@ -1640,7 +1651,16 @@ class BaseLLM:
 
     def _try_load_generation_config(
             self) -> Optional[transformers.GenerationConfig]:
-        return ModelLoader.load_hf_generation_config(self.args.model)
+        """Load the Hugging Face generation config for this model.
+
+        Reads from the downloaded model directory when one is available so
+        that remotely fetched snapshots are not re-resolved.
+
+        Returns:
+            The generation config, or None when the model does not ship one.
+        """
+        model_dir = self._hf_model_dir or self.args.model
+        return ModelLoader.load_hf_generation_config(model_dir)
 
     def _try_load_generation_config_explicit_values(self) -> dict[str, Any]:
         if self.args.backend != "pytorch" or self.args.generation_config != "auto":
@@ -1650,8 +1670,17 @@ class BaseLLM:
 
     def _try_load_hf_model_config(
             self) -> Optional[transformers.PretrainedConfig]:
+        """Load the Hugging Face model config for this model.
+
+        Reads from the downloaded model directory when one is available so
+        that remotely fetched snapshots are not re-resolved.
+
+        Returns:
+            The model config, or None when the model does not ship one.
+        """
+        model_dir = self._hf_model_dir or self.args.model
         return ModelLoader.load_hf_model_config(
-            self.args.model, trust_remote_code=self.args.trust_remote_code)
+            model_dir, trust_remote_code=self.args.trust_remote_code)
 
     @set_api_status("prototype")
     def start_profile(self,
