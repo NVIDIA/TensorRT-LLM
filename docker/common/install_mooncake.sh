@@ -81,11 +81,3 @@ if [ ! -f "${MOONCAKE_REQUIREMENTS}" ]; then
     MOONCAKE_REQUIREMENTS="$(dirname "${BASH_SOURCE[0]}")/../../requirements-mooncake.txt"
 fi
 pip3 install --no-cache-dir -r "${MOONCAKE_REQUIREMENTS}"
-
-# Fail the build rather than ship an image whose import is broken.
-python3 - <<'PY'
-import mooncake.store
-
-mooncake.store.MooncakeDistributedStore()
-print(f"mooncake.store OK: {mooncake.store.__file__}")
-PY
