@@ -217,12 +217,38 @@ test('creation and ready events use the threshold; drafts and unrelated targets 
   }
 });
 
-test('release PRs use their actual target and need no opt-in label', async () => {
+test('release PRs use their actual target branch', async () => {
   const h = harness({base: {ref: 'release/1.2'}}); await h.run();
   assert.equal(h.posted.length, 1);
   assert.ok(h.calls.filter(([kind]) => kind === 'ref').every(([, args]) => args.ref === 'heads/release/1.2'));
   const reply = h.reply(); await h.publish(reply);
   assert.equal(h.checks[0].conclusion, 'success');
+});
+
+test('the request job accepts base-branch edits and skips title, description and absent changes', () => {
+  const text = fs.readFileSync(path.join(__dirname, '../workflows/coderabbit-semantic-review.yml'), 'utf8');
+  const condition = text.match(/request-review:[\s\S]*?    if: >-\n((?: {6}[^\n]+\n)+)/)[1];
+  // Missing GitHub context properties evaluate as empty; optional chaining models that here.
+  const evaluate = new Function('github', 'contains', 'fromJSON',
+    `return Boolean(${condition.replace('github.event.changes.base.ref', 'github.event.changes?.base?.ref')});`);
+  const github = {repository: 'NVIDIA/TensorRT-LLM', event_name: 'pull_request_target', event: {}};
+  const allowed = event => {
+    github.event = event;
+    return evaluate(github, (list, value) => list.includes(value), JSON.parse);
+  };
+  for (const changes of [undefined, {}, {title: {from: 'Old title'}}, {body: {from: 'Old body'}},
+    {title: {from: 'Old title'}, body: {from: 'Old body'}}, {base: {sha: {from: BASE}}}]) {
+    assert.equal(allowed({action: 'edited', changes}), false);
+  }
+  for (const from of ['main', 'release/1.2']) {
+    assert.equal(allowed({action: 'edited', changes: {base: {ref: {from}}}}), true);
+  }
+  for (const action of ['opened', 'reopened', 'synchronize', 'ready_for_review', 'auto_merge_enabled']) {
+    assert.equal(allowed({action}), true);
+  }
+  for (const event_name of ['schedule', 'workflow_dispatch']) {
+    github.event_name = event_name; assert.equal(allowed({}), true);
+  }
 });
 
 test('a six-hour scan visits eligible PRs; a PR event or manual retry visits only its PR', async () => {

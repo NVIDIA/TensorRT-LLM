@@ -45,6 +45,7 @@ jobs:
       github.repository == 'NVIDIA/TensorRT-LLM' &&
       contains(fromJSON('["schedule", "pull_request_target", "workflow_dispatch"]'), github.event_name) &&
       (github.event.action != 'closed' || github.event.pull_request.merged) &&
+      (github.event.action != 'edited' || github.event.changes.base.ref) &&
       (github.event.action != 'labeled' || github.event.label.name == 'ci: full pre-merge approved')
     # Requests and publications share a queue: scheduled scans cannot race PR events.
     # ponytail: one queue, 100 pending; use per-PR dispatch if scans delay events.

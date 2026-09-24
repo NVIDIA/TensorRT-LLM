@@ -7,11 +7,12 @@ SPDX-License-Identifier: Apache-2.0
 
 The `CodeRabbit Semantic Conflict Review` workflow performs best-effort semantic
 compatibility analysis for open, non-draft PRs targeting `main` or `release/**`.
-No opt-in label is needed. It compares both branches from their merge base and
+It compares both branches from their merge base and
 follows affected callers, contracts, configuration, and tests across files.
 
-- PR creation, reopening, updates, and becoming ready evaluate the threshold;
-  they do not automatically spend an AI call.
+- PR creation, reopening, commit updates, becoming ready, and target-branch changes
+  evaluate the threshold; they do not automatically spend an AI call. Title and
+  description edits skip the request job before checkout or PR API reads.
 - The first analysis needs new target commits and either 24 hours since the
   merge-base commit or at least 30 target commits beyond that base. After a
   completed PASS/FAIL analysis, PR events count from its target SHA and completion
