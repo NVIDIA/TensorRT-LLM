@@ -20,7 +20,7 @@ on:
     branches: [main, 'release/**']
     types: [opened, reopened, synchronize, ready_for_review, labeled, edited, auto_merge_enabled, closed]
   schedule:
-    - cron: '23 * * * *'
+    - cron: '23 */6 * * *'
   issue_comment:
     types: [created, edited]
   workflow_dispatch:
@@ -46,7 +46,7 @@ jobs:
       contains(fromJSON('["schedule", "pull_request_target", "workflow_dispatch"]'), github.event_name) &&
       (github.event.action != 'closed' || github.event.pull_request.merged) &&
       (github.event.action != 'labeled' || github.event.label.name == 'ci: full pre-merge approved')
-    # Requests and publications share a queue: hourly scans cannot race PR events.
+    # Requests and publications share a queue: scheduled scans cannot race PR events.
     # ponytail: one queue, 100 pending; use per-PR dispatch if scans delay events.
     concurrency:
       group: coderabbit-semantic-state
@@ -97,10 +97,15 @@ jobs:
         env:
           DISPATCH_PULL_NUMBER: ${{ inputs.pull_number }}
           SEMANTIC_APPROVAL_VALIDATED: ${{ steps.approval.outputs.result }}
+          SEMANTIC_COMMAND_TOKEN: ${{ secrets.TRTLLM_AGENT_SHARED_TOKEN }}
         with:
           script: |
             const request = require('./.github/scripts/coderabbit_semantic_review_request.js');
-            await request({github, context, core});
+            if (!process.env.SEMANTIC_COMMAND_TOKEN) throw new Error('Missing semantic command token.');
+            const commandGithub = new github.constructor({
+              auth: process.env.SEMANTIC_COMMAND_TOKEN, retry: {enabled: false},
+            });
+            await request({github, commandGithub, context, core});
 
   publish-result:
     name: Publish advisory semantic result
@@ -114,7 +119,8 @@ jobs:
       github.event_name == 'issue_comment' &&
       github.event.issue.pull_request &&
       github.event.comment.user.login == 'coderabbitai[bot]' &&
-      (contains(github.event.comment.body, 'pre-merge-checks-results') ||
+      (contains(github.event.comment.body, 'SEMANTIC_REVIEW_V3') ||
+       contains(github.event.comment.body, 'pre-merge-checks-results') ||
        contains(github.event.comment.body, 'pre_merge_checks_walkthrough_start'))
     concurrency:
       group: coderabbit-semantic-state

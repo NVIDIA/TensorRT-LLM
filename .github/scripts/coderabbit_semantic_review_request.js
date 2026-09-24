@@ -15,7 +15,7 @@
 
 const fs = require('node:fs');
 const publish = require('./coderabbit_semantic_review_result.js');
-const {NAME, AUDIT, NOTICE, supported, compare, requests, parseResult, matches, identity, evidence, candidateTree} = publish;
+const {NAME, AUDIT, NOTICE, supported, compare, requests, parseResult, matches, identity, evidence, candidateTree, isCommandUser} = publish;
 const HOUR = 60 * 60 * 1000;
 const DAY = 24 * HOUR;
 const APPROVED = 'ci: full pre-merge approved';
@@ -30,11 +30,11 @@ function command(pair) {
       `Include SEMANTIC_MERGED sha=${pair.merged} immediately after the result line. ` +
       'Later changes to the target branch do not invalidate this historical audit.' :
       `This is a pre-merge analysis against ${pair.branch}. The result applies only to this pair.`);
-  return `@coderabbitai evaluate custom pre-merge check --name "${NAME}" --mode warning ` +
-    `--instructions ${JSON.stringify(instructions.replace(/\s+/g, ' '))}`;
+  return `@coderabbitai\nPlease perform this advisory semantic analysis and reply in a normal PR chat comment. ` +
+    `Do not invoke the custom pre-merge check command or submit a review/request changes.\n\n${instructions}`;
 }
 
-async function requestOne({github, context, core, number, manual, now}) {
+async function requestOne({github, commandGithub, context, core, number, manual, now}) {
   const repo = context.repo;
   const {data: pr} = await github.rest.pulls.get({...repo, pull_number: number});
   if (!supported(pr.base.ref) || (!pr.merged && (pr.state !== 'open' || pr.draft))) {
@@ -99,18 +99,18 @@ async function requestOne({github, context, core, number, manual, now}) {
   let reason = manual ? 'Manual retry' : pair.merged ? 'Post-merge audit' : intent ? 'Merge intent' : '';
   const last = history.find(r => !r.merged);
   if (!reason) {
-    const completed = history.find(r => !r.merged && ['PASS', 'FAIL'].includes(resultFor(r)?.verdict));
-    if (last && !completed && now - Date.parse(last.created_at) < DAY) {
-      await ensureCheck('No completed analysis; new-pair requests wait 24 hours. Manual retry remains available.');
+    const previous = last && resultFor(last);
+    if (last && !['PASS', 'FAIL'].includes(previous?.verdict)) {
+      await ensureCheck('Previous analysis has no verified verdict; use a manual retry. Routine requests are paused.');
       return;
     }
     let count = pair.comparison.behind_by;
     let since = Date.parse(pair.comparison.merge_base_commit.commit.committer.date);
-    if (completed) {
-      const progress = await compare(github, repo, completed.target, pair.target);
+    if (previous) {
+      const progress = await compare(github, repo, last.target, pair.target);
       if (['ahead', 'identical'].includes(progress.status)) {
         count = progress.ahead_by;
-        since = Date.parse(resultFor(completed).comment.created_at);
+        since = Date.parse(previous.comment.created_at);
       }
     }
     if (!count || (count < 30 && now - since < DAY)) {
@@ -146,14 +146,24 @@ async function requestOne({github, context, core, number, manual, now}) {
       summary: `${reason}: head ${pair.head}, target ${pair.target}. ${NOTICE}`}});
   if (!pair.merged) pair.tree = await candidateTree(github, repo, current, pair.target);
   const {comparison, ...record} = pair;
-  const {data: comment} = await github.rest.issues.createComment({...repo, issue_number: number,
+  const {data: comment} = await commandGithub.rest.issues.createComment({...repo, issue_number: number,
     body: `${command(pair)}\n\n<!-- semantic-request-v2:${JSON.stringify({...record, reason})} -->\n\n` +
       `${reason} for PR #${number}. ${NOTICE} No AI verdict is asserted by posting this request.`});
   core.info(`PR #${number}: ${reason}; ${comment.html_url}`);
   await core.summary.addRaw(`PR #${number}: [${reason}](${comment.html_url}). No AI verdict is asserted.\n\n`).write();
+  return true;
 }
 
-module.exports = async ({github, context, core, now = Date.now()}) => {
+class ScanStopped extends Error {}
+
+function rateLimited(error) {
+  const headers = error.response?.headers || {};
+  return error.status === 429 || error.status === 403 &&
+    (headers['x-ratelimit-remaining'] === '0' || headers['retry-after'] !== undefined ||
+     /rate limit|abuse detection/i.test(error.message));
+}
+
+async function run({github, commandGithub, context, core, now, progress}) {
   let numbers;
   const manual = context.eventName === 'workflow_dispatch';
   if (manual) {
@@ -169,7 +179,10 @@ module.exports = async ({github, context, core, now = Date.now()}) => {
     const pulls = await github.paginate(github.rest.pulls.list, {
       ...context.repo, state: 'open', per_page: 100,
     });
-    numbers = pulls.filter(p => !p.draft && supported(p.base.ref)).map(p => p.number);
+    const open = pulls.filter(p => !p.draft && supported(p.base.ref)).map(p => p.number).sort((a, b) => a - b);
+    // Rotate the starting PR each scan; no persistent cursor or exact resume is implied.
+    const offset = Math.floor(now / (6 * HOUR)) % (open.length || 1);
+    numbers = [];
     // Recover recent merges if an event was dropped or a release branch still
     // lacks the workflow. Do not backfill the repository's entire merge history.
     for await (const response of github.paginate.iterator(github.rest.pulls.list, {
@@ -179,15 +192,56 @@ module.exports = async ({github, context, core, now = Date.now()}) => {
         Date.parse(p.merged_at) >= now - DAY).map(p => p.number));
       if (!response.data.length || Date.parse(response.data.at(-1).updated_at) < now - DAY) break;
     }
-    numbers = [...new Set(numbers)];
+    numbers = [...new Set([...numbers, ...open.slice(offset), ...open.slice(0, offset)])];
   } else throw new Error(`Unsupported event: ${context.eventName}`);
   for (const number of numbers) {
+    if (context.eventName === 'schedule' && progress.requested >= 20) {
+      throw new ScanStopped('Reached the limit of 20 new AI requests for this scan.');
+    }
     try {
-      await requestOne({github, context, core, number, manual, now});
+      if (await requestOne({github, commandGithub, context, core, number, manual, now})) progress.requested++;
+      progress.processed++;
     } catch (error) {
-      if (context.eventName !== 'schedule') throw error;
+      if (context.eventName !== 'schedule' || error instanceof ScanStopped || rateLimited(error)) throw error;
       core.error(`PR #${number}: ${error.message}`);
       core.setFailed('Some PRs could not be scanned; see per-PR errors.');
     }
   }
+}
+
+module.exports = async ({github, commandGithub, context, core, now = Date.now()}) => {
+  const scheduled = context.eventName === 'schedule';
+  const progress = {processed: 0, requested: 0};
+  const guards = [];
+  let stopReason = 'Complete';
+  try {
+    if (scheduled) {
+      for (const client of [github, commandGithub]) {
+        let remaining = Infinity;
+        const guard = async (request, options) => {
+          if (remaining < 100) throw new ScanStopped('REST quota is below the 100-request reserve.');
+          const response = await request(options);
+          const value = response.headers?.['x-ratelimit-remaining'];
+          if (value !== undefined) remaining = Number(value);
+          return response;
+        };
+        client.hook.wrap('request', guard);
+        guards.push([client, guard]);
+        const {data} = await client.rest.rateLimit.get();
+        remaining = data.resources.core.remaining;
+      }
+    }
+    const {data: user} = await commandGithub.rest.users.getAuthenticated();
+    if (!isCommandUser(user)) throw new Error('Semantic commands require the trtllm-agent User account.');
+    await run({github, commandGithub, context, core, now, progress});
+  } catch (error) {
+    if (!scheduled || !(error instanceof ScanStopped || rateLimited(error))) throw error;
+    stopReason = error.message;
+    core.warning(`Scheduled scan stopped: ${stopReason} Unvisited PRs wait for a later scan or manual dispatch.`);
+  } finally {
+    for (const [client, guard] of guards) client.hook.remove('request', guard);
+    if (scheduled) await core.summary.addRaw(`Scheduled scan: ${progress.processed} PRs processed; ` +
+      `${progress.requested} new AI requests. ${stopReason}. Scans restart from live state, not a saved cursor.\n`).write();
+  }
 };
+Object.assign(module.exports, {command});

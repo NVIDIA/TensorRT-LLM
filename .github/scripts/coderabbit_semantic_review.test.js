@@ -20,6 +20,7 @@ const path = require('node:path');
 const request = require('./coderabbit_semantic_review_request.js');
 const publish = require('./coderabbit_semantic_review_result.js');
 const {AUDIT, requests} = publish;
+const COMMAND_USER = {login: 'trtllm-agent', id: 296075020, type: 'User'};
 const APPROVED = 'ci: full pre-merge approved';
 const HEAD = 'a'.repeat(40), BASE = 'b'.repeat(40), NEW_BASE = 'c'.repeat(40);
 const MERGED = 'd'.repeat(40), MERGE_BASE = 'e'.repeat(40), TREE = 'f'.repeat(40);
@@ -106,12 +107,57 @@ function harness(overrides = {}) {
   github.paginate.iterator = async function* () {
     yield {data: prs.filter(p => p.state === 'closed')};
   };
+  const createComment = github.rest.issues.createComment;
+  const commandGithub = {rest: {
+    users: {getAuthenticated: async () => ({data: {...COMMAND_USER}})},
+    issues: {createComment: async args => {
+      const response = await createComment(args);
+      response.data.user = {...COMMAND_USER};
+      return response;
+    }},
+  }};
+  // Exercise the production Octokit hook around API reads, writes and pagination.
+  for (const client of [github, commandGithub]) {
+    const hooks = [];
+    client.hook = {
+      wrap: (name, fn) => {assert.equal(name, 'request'); hooks.push(fn);},
+      remove: (name, fn) => {assert.equal(name, 'request'); hooks.splice(hooks.indexOf(fn), 1);},
+    };
+    client.remaining = 15000;
+    client.apiError = null;
+    client.rest.rateLimit = {get: async () => ({data: {resources: {core: {remaining: client.remaining}}}})};
+    const invoke = async fn => {
+      const perform = async () => {
+        if (client.apiError) throw client.apiError;
+        const response = await fn();
+        response.headers = {'x-ratelimit-remaining': String(client.remaining)};
+        return response;
+      };
+      return hooks.reduceRight((next, hook) => () => hook(next, {}), perform)();
+    };
+    for (const group of Object.values(client.rest)) {
+      for (const [name, fn] of Object.entries(group)) {
+        if (typeof fn === 'function') group[name] = (...args) => invoke(() => fn(...args));
+      }
+    }
+    if (client.request) {
+      const original = client.request;
+      client.request = (...args) => invoke(() => original(...args));
+    }
+    if (client.paginate) {
+      const original = client.paginate, iterator = original.iterator;
+      client.paginate = async (...args) => (await invoke(async () => ({data: await original(...args)}))).data;
+      client.paginate.iterator = async function* (...args) {
+        for await (const response of iterator(...args)) yield await invoke(async () => response);
+      };
+    }
+  }
   const core = {setOutput: (k, v) => {outputs[k] = v;}, info() {},
     warning: v => warnings.push(v), error: v => warnings.push(v), setFailed: v => failures.push(v),
     summary: {addRaw(v) {summaries.push(v); return this;}, async write() {}}};
   const context = {repo: {owner: 'example', repo: 'repo'}, eventName: 'pull_request_target',
     payload: {action: 'opened', pull_request: {number: 12, head: {sha: HEAD}}}};
-  return {pr, prs, comments, checks, posted, writes, calls, outputs, warnings, failures, summaries, github, core,
+  return {pr, prs, comments, checks, posted, writes, calls, outputs, warnings, failures, summaries, github, commandGithub, core,
     setTarget: v => {target = v;}, setNow: v => {now = v;}, setLag: (n, a) => {count = n; age = a;},
     setProgress: v => {progressCount = v;}, setTree: v => {mergeTree = v;},
     setRules: v => {rules = v;}, setParents: v => {mergeParents = v;},
@@ -120,7 +166,7 @@ function harness(overrides = {}) {
       process.env.DISPATCH_PULL_NUMBER = manual;
       process.env.SEMANTIC_APPROVAL_VALIDATED = String(authorized);
       try {
-        await request({github, core, now, context: {...context, eventName,
+        await request({github, commandGithub, core, now, context: {...context, eventName,
           payload: {...context.payload, action, label: {name: APPROVED}}}});
       } finally {
         delete process.env.DISPATCH_PULL_NUMBER;
@@ -148,8 +194,9 @@ for (const [count, age, expected] of [[0, 3 * DAY, 0], [29, DAY - 1, 0],
     assert.equal(h.posted.length, expected);
     assert.equal(h.checks[0].conclusion, 'neutral');
     if (expected) {
-      assert.match(h.posted[0].body, /^@coderabbitai evaluate custom pre-merge check/);
-      assert.match(h.posted[0].body, /--mode warning/);
+      assert.match(h.posted[0].body, /^@coderabbitai\n/);
+      assert.match(h.posted[0].body, /normal PR chat comment/);
+      assert.match(h.posted[0].body, /SEMANTIC_REVIEW_V3/);
       assert.match(h.posted[0].body, /No AI verdict is asserted/);
       assert.ok(h.posted[0].body.includes(HEAD) && h.posted[0].body.includes(BASE));
     }
@@ -176,7 +223,7 @@ test('release PRs use their actual target and need no opt-in label', async () =>
   assert.equal(h.checks[0].conclusion, 'success');
 });
 
-test('an hourly scan visits eligible PRs; a PR event or manual retry visits only its PR', async () => {
+test('a six-hour scan visits eligible PRs; a PR event or manual retry visits only its PR', async () => {
   const h = harness(); h.prs.push({...h.pr, number: 13}); await h.run();
   assert.deepEqual(h.posted.map(c => c.issue_number), [12]);
   await h.run('schedule'); assert.deepEqual(h.posted.map(c => c.issue_number), [12, 13]);
@@ -434,7 +481,7 @@ test('a new audit request cannot be overwritten by an older pre-merge result', a
   await h.publish(oldReply); assert.equal(h.checks.at(-1).conclusion, 'failure');
 });
 
-test('the hourly scan recovers recent merged PRs without auditing old closed history', async () => {
+test('the six-hour scan recovers recent merged PRs without auditing old closed history', async () => {
   const h = harness({merged: true, state: 'closed', merged_at: new Date(NOW - HOUR).toISOString(),
     updated_at: new Date(NOW).toISOString()});
   h.prs.push({...h.pr, number: 13, merged_at: new Date(NOW - 2 * DAY).toISOString()});
@@ -477,4 +524,149 @@ test('approval validation checks the current label, actor and active membership'
       payload: {pull_request: {number: 12}, sender: {login: 'maintainer'}}}, {warning() {}});
     assert.equal(actual, expected);
   }
+});
+
+function chatReply(reply) {
+  const details = reply.body.match(/<summary>Full details:[^\n]+\n([\s\S]*?)<\/details>/)[1];
+  reply.body = `SEMANTIC_REVIEW_V3\n${details}`;
+  return reply;
+}
+
+test('full chat PASS and FAIL retain source evidence beyond the native 201-character cell', async () => {
+  for (const verdict of ['PASS', 'FAIL']) {
+    const h = harness(); await h.run();
+    const reply = chatReply(h.reply(verdict));
+    assert.ok(reply.body.length > 201);
+    await h.publish(reply);
+    assert.equal(h.checks[0].conclusion, verdict === 'PASS' ? 'success' : 'failure');
+    await h.publish(null, true); assert.equal(h.outputs.verdict, verdict);
+  }
+});
+
+test('chat transport preserves author, revision, citation and unique-record validation', async () => {
+  for (const corrupt of [
+    c => {c.user.type = 'User';}, c => {c.user.login = 'someone-else';},
+    c => {c.body = c.body.replace('SEMANTIC_REVIEW_V3', '');},
+    c => {c.body = c.body.replaceAll(HEAD, NEW_BASE);},
+    c => {c.body = c.body.replaceAll(MERGE_BASE, NEW_BASE);},
+    c => {c.body = c.body.replace(/https:\/\/github.com\/\S+/g, '');},
+    c => {c.body += c.body.replace('verdict=PASS', 'verdict=FAIL');},
+  ]) {
+    const h = harness(); await h.run();
+    const reply = chatReply(h.reply()); corrupt(reply); await h.publish(reply);
+    assert.equal(h.checks[0].conclusion, 'neutral');
+  }
+});
+
+test('missing, truncated or inconclusive replies cannot cause daily new-pair AI retries', async () => {
+  for (const kind of ['missing', 'truncated-record', 'truncated-evidence', 'inconclusive']) {
+    const h = harness(); await h.run();
+    if (kind !== 'missing') {
+      const reply = h.reply(kind === 'inconclusive' ? 'INCONCLUSIVE' : 'PASS');
+      if (kind.startsWith('truncated')) {
+        const record = reply.body.match(/SEMANTIC_RESULT[^\n]+/)[0];
+        const explanation = kind === 'truncated-record' ? 'coverage '.repeat(30) + record : record + ' evidence '.repeat(30);
+        reply.body = '<!-- pre-merge-checks-results -->\n' +
+          `| Semantic conflict with target branch | ✅ Passed | ${explanation.slice(0, 201)} |`;
+      }
+    }
+    for (let day = 1; day <= 7; day++) {
+      h.setNow(NOW + day * DAY); h.setTarget(day.toString().repeat(40)); await h.run('schedule');
+    }
+    assert.equal(h.posted.length, 1, kind);
+    assert.match(h.checks.at(-1).output.summary, /manual retry/);
+    await h.run('workflow_dispatch'); assert.equal(h.posted.length, 2);
+    await h.publish(chatReply(h.reply())); assert.equal(h.checks.at(-1).conclusion, 'success');
+  }
+});
+
+test('commands require the pinned User account and never fall back to the Actions bot', async () => {
+  for (const user of [
+    {...COMMAND_USER, id: 1}, {...COMMAND_USER, login: 'another-user'},
+    {...COMMAND_USER, type: 'Bot'}, {login: 'github-actions[bot]', type: 'Bot'},
+  ]) {
+    const h = harness(); h.commandGithub.rest.users.getAuthenticated = async () => ({data: user});
+    await assert.rejects(h.run('schedule'), /require the trtllm-agent/);
+    assert.equal(h.writes.length, 0);
+  }
+  const h = harness(); await h.run();
+  assert.deepEqual(h.comments[0].user, COMMAND_USER);
+  assert.equal(requests(h.comments).length, 1);
+  h.comments[0].user.id = 1; assert.equal(requests(h.comments).length, 0);
+});
+
+test('scheduled scans cap new AI requests at 20 and later scans consider the remaining PRs', async () => {
+  const h = harness();
+  for (let n = 13; n < 57; n++) h.prs.push({...h.pr, number: n});
+  await h.run('schedule'); assert.equal(h.posted.length, 20);
+  assert.match(h.warnings.at(-1), /20 new AI requests/);
+  h.setNow(NOW + 6 * HOUR); await h.run('schedule');
+  assert.equal(h.posted.length, 40);
+  assert.equal(new Set(h.posted.map(p => p.issue_number)).size, 40);
+  await h.run('workflow_dispatch'); assert.equal(h.posted.length, 41);
+});
+
+test('scheduled scans prioritize recent merge recovery over open PR requests', async () => {
+  const h = harness();
+  for (let n = 13; n < 40; n++) h.prs.push({...h.pr, number: n});
+  h.prs.push({...h.pr, number: 100, state: 'closed', merged: true,
+    merged_at: new Date(NOW).toISOString(), updated_at: new Date(NOW).toISOString()});
+  await h.run('schedule'); assert.equal(h.posted[0].issue_number, 100);
+  assert.match(h.posted[0].body, /Post-merge audit/);
+  assert.equal(h.posted.length, 20);
+});
+
+test('either token below its reserve stops scanning before PR reads; hooks are removed afterward', async () => {
+  for (const token of ['github', 'commandGithub']) {
+    const h = harness(); h[token].remaining = 99; await h.run('schedule');
+    assert.equal(h.calls.length, 0); assert.equal(h.writes.length, 0);
+    assert.match(h.warnings.at(-1), /100-request reserve/);
+    await h.run('workflow_dispatch'); assert.equal(h.posted.length, 1);
+  }
+});
+
+test('response headers can stop a scan mid-PR before further pagination or writes', async () => {
+  const h = harness(); h.prs.push({...h.pr, number: 13});
+  h.afterCompare(() => {h.github.remaining = 99;}); await h.run('schedule');
+  assert.equal(h.calls.filter(([kind]) => kind === 'pull').length, 1);
+  assert.equal(h.calls.filter(([kind]) => kind === 'comments').length, 0);
+  assert.equal(h.writes.length, 0); assert.equal(h.failures.length, 0);
+  assert.match(h.warnings.at(-1), /100-request reserve/);
+});
+
+test('quota guard covers closed-list pagination and rotates open-PR starts', async () => {
+  const visited = [];
+  for (let round = 0; round < 2; round++) {
+    const h = harness(); h.prs.push({...h.pr, number: 13}); h.setNow(NOW + round * 6 * HOUR);
+    h.afterCompare(() => {h.github.remaining = 99;}); await h.run('schedule');
+    visited.push(h.calls.find(([kind]) => kind === 'pull')[1].pull_number);
+  }
+  assert.notEqual(visited[0], visited[1]);
+  const h = harness(); let pages = 0;
+  h.github.paginate.iterator = async function* () {
+    await h.github.rest.pulls.get({pull_number: 12});
+    h.github.remaining = 99;
+    await h.github.rest.pulls.get({pull_number: 12}); pages++;
+    yield {data: [{...h.pr, updated_at: new Date(NOW).toISOString()}]};
+    await h.github.rest.pulls.get({pull_number: 12}); pages++;
+    yield {data: []};
+  };
+  await h.run('schedule'); assert.equal(pages, 1); assert.equal(h.writes.length, 0);
+});
+
+test('rate-limit exits stop the scan, while unrelated permission errors remain failures', async () => {
+  for (const error of [
+    {status: 403, response: {headers: {'x-ratelimit-remaining': '0'}}},
+    {status: 403, response: {headers: {'retry-after': '60'}}},
+    {status: 403, message: 'You have exceeded a secondary rate limit'}, {status: 429},
+  ]) {
+    const h = harness(); h.prs.push({...h.pr, number: 13});
+    h.afterCompare(() => {h.github.apiError = Object.assign(new Error('Limited'), error);});
+    await h.run('schedule'); assert.equal(h.writes.length, 0); assert.equal(h.failures.length, 0);
+    assert.equal(h.calls.filter(([kind]) => kind === 'pull').length, 1);
+    assert.match(h.warnings.at(-1), /Scheduled scan stopped/);
+  }
+  const h = harness(); h.prs.push({...h.pr, number: 13});
+  h.afterCompare(() => {h.github.apiError = Object.assign(new Error('Resource not accessible'), {status: 403});});
+  await h.run('schedule'); assert.ok(h.failures.length > 0);
 });

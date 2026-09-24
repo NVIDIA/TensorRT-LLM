@@ -20,13 +20,15 @@ const NOTICE = 'CodeRabbit can make mistakes, including false positives. Review 
   'under that configuration. Other merge requirements still apply.';
 const supported = ref => ref === 'main' || /^release\/.+/.test(ref);
 const isBot = (comment, login) => comment.user?.login === login && comment.user?.type === 'Bot';
+// Pin the existing service account by ID as well as login; never trust arbitrary PAT users.
+const isCommandUser = user => user?.login === 'trtllm-agent' && user.id === 296075020 && user.type === 'User';
 const compare = async (github, repo, base, head) => (await github.request(
   'GET /repos/{owner}/{repo}/compare/{basehead}', {...repo, basehead: `${base}...${head}`}
 )).data;
 
 // Request metadata is written only by the trusted workflow, never accepted from PR authors.
 function requests(comments) {
-  return comments.filter(c => isBot(c, 'github-actions[bot]')).flatMap(c => {
+  return comments.filter(c => isCommandUser(c.user) || isBot(c, 'github-actions[bot]')).flatMap(c => {
     const text = c.body?.match(/<!-- semantic-request-v2:(.+) -->/);
     if (!text) return [];
     try {
@@ -40,21 +42,24 @@ function requests(comments) {
 
 function parseResult(comment) {
   const body = comment.body || '';
-  if (!isBot(comment, 'coderabbitai[bot]') ||
-      (!body.includes('<!-- pre-merge-checks-results -->') &&
+  if (!isBot(comment, 'coderabbitai[bot]')) return;
+  // Chat replies retain full evidence for PASS as well as FAIL. Native custom
+  // checks may truncate PASS to a 201-character cell; keep old replies readable.
+  const standalone = body.match(/^SEMANTIC_REVIEW_V3[ \t]*\r?$/m);
+  if (!standalone && (!body.includes('<!-- pre-merge-checks-results -->') &&
        !body.includes('<!-- pre_merge_checks_walkthrough_start -->'))) return;
   const row = body.split('\n').map(line => line.split('|').map(cell => cell.trim()))
     .find(cells => cells[1]?.toLowerCase() === NAME.toLowerCase());
-  if (!row) return;
+  if (!standalone && !row) return;
   const details = body.match(/<summary>Full details: Semantic conflict with target branch<\/summary>([\s\S]*?)<\/details>/i);
-  const result = details ? details[1] : row.join('|');
+  const result = standalone ? body.slice(standalone.index + standalone[0].length) : details ? details[1] : row.join('|');
   const pattern = /semantic_result head=([a-f0-9]{40}) target=([a-f0-9]{40}) merge_base=([a-f0-9]{40}) verdict=(pass|fail|inconclusive)\b/g;
   const matches = [...new Map([...result.toLowerCase().matchAll(pattern)].map(m => [m[0], m])).values()];
   if (matches.length !== 1) return;
   const [, head, target, mergeBase, rawVerdict] = matches[0];
   let verdict = rawVerdict.toUpperCase();
   const status = {PASS: /Passed/i, FAIL: /Warning|Error/i, INCONCLUSIVE: /Inconclusive/i};
-  if (!status[verdict].test(row[2])) return;
+  if (!standalone && !status[verdict].test(row[2])) return;
   const merged = [...new Set([...result.toLowerCase().matchAll(/semantic_merged sha=([a-f0-9]{40})\b/g)].map(m => m[1]))];
   if (merged.length > 1) return;
   // This checks citation presence, not the correctness of the AI's reasoning.
@@ -151,7 +156,7 @@ async function publish({github, context, core}) {
   if (!result) {
     if (preview) {
       const message = `No verified CodeRabbit verdict for head ${pair.head} + ${pair.branch} ${pair.target}. ` +
-        'Request a custom evaluation and rerun the tests and result lookup job after the reply arrives.';
+        'Request a semantic evaluation and rerun the tests and result lookup job after the reply arrives.';
       core.warning(message);
       await core.summary.addRaw(`${message}\n\n${NOTICE}`).write();
     }
@@ -208,4 +213,4 @@ async function publish({github, context, core}) {
 }
 
 module.exports = publish;
-Object.assign(module.exports, {NAME, AUDIT, NOTICE, supported, compare, requests, parseResult, matches, identity, evidence, candidateTree});
+Object.assign(module.exports, {NAME, AUDIT, NOTICE, supported, compare, requests, parseResult, matches, identity, evidence, candidateTree, isCommandUser});
