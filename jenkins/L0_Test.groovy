@@ -3203,6 +3203,8 @@ def RUN_MODE = "run_mode"
 def BOLT_PROFILE_REF = "bolt_profile_ref"
 @Field
 def BOLT_PUBLISH_VARIANT = "bolt_publish_variant"
+@Field
+def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
 // Hoisted out of globalVars into BINDING variables in launchTestJobs. globalVars
 // is not a parameter of runLLMTestlistWithSbatch or runLLMTestlistOnPlatformImpl,
 // so reading it inside them throws MissingPropertyException; Build.groovy handles
@@ -3222,6 +3224,7 @@ def globalVars = [
     // without saying so.
     (BOLT_PROFILE_REF): "",
     (BOLT_PUBLISH_VARIANT): false,
+    (BOLT_PROFILE_BRANCH): "",
 ]
 
 class GlobalState {
