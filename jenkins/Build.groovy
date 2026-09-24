@@ -551,7 +551,6 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
     def branch = env.gitlabTargetBranch ?: env.branch_name ?: "main"
     def triple = is_linux_x86_64 ? "x86_64-linux-gnu" : "aarch64-linux-gnu"
     def llvmArch = is_linux_x86_64 ? "X64" : "ARM64"
-    def llvmVer = "21.1.5"   // keep in sync with scripts/bolt internal/slurm_*.sh
     stage("BOLT consume") {
         // apply_latest.sh exit codes: 3 = no promoted bundle for branch/triple,
         // 2 = apply error, 0 = applied. Capture the code so a MISSING bundle (e.g.
@@ -561,11 +560,12 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
             set -e
             export PATH="\$PWD/.bolt-llvm/bin:\$PATH"
             if ! command -v llvm-bolt >/dev/null 2>&1; then
-                echo '[bolt-consume] staging llvm-bolt ${llvmVer}'
-                tb=LLVM-${llvmVer}-Linux-${llvmArch}.tar.xz
+                . ${LLM_ROOT}/scripts/bolt/internal/llvm_bolt_version.sh
+                echo "[bolt-consume] staging llvm-bolt \${LLVM_BOLT_VERSION}"
+                tb=LLVM-\${LLVM_BOLT_VERSION}-Linux-${llvmArch}.tar.xz
                 mkdir -p .bolt-llvm
                 curl -fSL --retry 10 --retry-all-errors --retry-delay 15 --connect-timeout 60 \
-                     -o /tmp/\$tb https://github.com/llvm/llvm-project/releases/download/llvmorg-${llvmVer}/\$tb
+                     -o /tmp/\$tb "https://github.com/llvm/llvm-project/releases/download/llvmorg-\${LLVM_BOLT_VERSION}/\$tb"
                 tar -xJf /tmp/\$tb -C .bolt-llvm --strip-components=1
                 rm -f /tmp/\$tb
             fi

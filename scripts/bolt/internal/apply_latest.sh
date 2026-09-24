@@ -17,20 +17,25 @@
 # apply_latest.sh - premerge "consume the latest bundle" step.
 #
 # Pulls the branch-keyed `latest` BOLT profile bundle promoted by postmerge and
-# applies it to a BOLT-compatible tarball, producing a bolted tarball
-# (no recompile; apply_bolt.py swaps bolted ELFs into the wheel + tree).
+# applies it to a BOLT-compatible artifact, producing a bolted one (no
+# recompile; apply_bolt.py swaps bolted ELFs into the wheel + tree).
+#
+# The artifact is either a release tarball or a standalone .whl -- the released
+# SBSA manylinux wheel is built and uploaded outside any tarball, so it has to
+# be BOLTed on its own. The mode is picked from the input extension.
 #
 # STRICT/FATAL by design. This runs only when the caller has opted into BOLT
 # consumption (premerge BOLT_CONSUME), i.e. it expects a BOLTed build. Silently
 # proceeding un-BOLTed would let premerge "pass" while actually testing the wrong
 # binary, so every failure here is fatal (distinct non-zero codes for triage):
-#   1  usage / input tarball missing
+#   1  usage / input artifact missing
 #   2  apply_bolt failed (bundle present but did not apply cleanly)
 #   3  no bundle promoted for the branch (cold start / new branch): nothing to
 #      consume -- await/trigger a postmerge BoltProfileGen (PROMOTE=true), or turn
 #      BOLT_CONSUME off for this build.
 #
-# Usage: apply_latest.sh <branch> <triple> <in_tarball> <out_bolted_tarball>
+# Usage: apply_latest.sh <branch> <triple> <in_artifact> <out_bolted_artifact>
+#        <in_artifact> is a release tarball or a .whl.
 # Requires: llvm-bolt on PATH; urm-artifactory-creds for artifactory.sh pull-latest.
 
 set -euo pipefail
@@ -38,13 +43,13 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../scripts/bolt/internal
 TOOLKIT="$(dirname "$HERE")"                            # .../scripts/bolt
 
-BRANCH="${1:?apply_latest: <branch> <triple> <in_tarball> <out_bolted_tarball>}"
+BRANCH="${1:?apply_latest: <branch> <triple> <in_artifact> <out_bolted_artifact>}"
 TRIPLE="${2:?triple required}"
-IN_TAR="${3:?in_tarball required}"
-OUT_TAR="${4:?out_bolted_tarball required}"
+IN_ARTIFACT="${3:?in_artifact required}"
+OUT_ARTIFACT="${4:?out_bolted_artifact required}"
 
-if [ ! -f "$IN_TAR" ]; then
-    echo "[apply_latest] FATAL: input tarball not found: $IN_TAR" >&2
+if [ ! -f "$IN_ARTIFACT" ]; then
+    echo "[apply_latest] FATAL: input artifact not found: $IN_ARTIFACT" >&2
     exit 1
 fi
 
@@ -59,15 +64,21 @@ if ! bash "$HERE/artifactory.sh" pull-latest "$BRANCH" "$TRIPLE" "$DEST"; then
     exit 3
 fi
 
-# 2) Apply the pulled profiles to the tarball. Fatal on failure -- do NOT fall
-#    back to the un-BOLTed tarball (that would silently test the wrong binary).
+# 2) Apply the pulled profiles. Fatal on failure -- do NOT fall back to the
+#    un-BOLTed artifact (that would silently test/ship the wrong binary).
+#    --manifest verifies ELF hashes against the release layout, which only the
+#    tarball has; a standalone wheel has no tree to walk, so it is omitted there.
+case "$IN_ARTIFACT" in
+    *.whl) APPLY_ARGS=(--wheel "$IN_ARTIFACT") ;;
+    *)     APPLY_ARGS=(--tarball "$IN_ARTIFACT" --manifest "$DEST/manifest.json") ;;
+esac
+
 if ! python3 "$TOOLKIT/apply_bolt.py" \
-        --tarball "$IN_TAR" \
+        "${APPLY_ARGS[@]}" \
         --profiles "$DEST" \
-        --manifest "$DEST/manifest.json" \
-        --output "$OUT_TAR"; then
+        --output "$OUT_ARTIFACT"; then
     echo "[apply_latest] FATAL: apply_bolt failed for ${BRANCH}/${TRIPLE}" >&2
     exit 2
 fi
 
-echo "[apply_latest] bolted tarball -> $OUT_TAR"
+echo "[apply_latest] bolted artifact -> $OUT_ARTIFACT"
