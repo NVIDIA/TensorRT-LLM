@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -46,6 +46,12 @@ std::string getLocalIpByNic(std::string const& interface, int rank)
         return std::string{};
     }
 
+    // IPv6 is only a fallback: the address ends up in a UCX TCP bind, and an
+    // address the NIC carries is not necessarily bindable -- a ULA with no scope
+    // id fails with "Cannot assign requested address". getifaddrs reports the
+    // families in kernel order, so keep scanning for IPv4 instead of taking
+    // whichever one happens to come first.
+    std::string ipv6Address;
     for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next)
     {
         if (ifa->ifa_addr == nullptr)
@@ -65,21 +71,24 @@ std::string getLocalIpByNic(std::string const& interface, int rank)
                     return std::string(ip);
                 }
             }
-            else if (ifa->ifa_addr->sa_family == AF_INET6)
+            else if (ifa->ifa_addr->sa_family == AF_INET6 && ipv6Address.empty())
             {
                 char ip[INET6_ADDRSTRLEN]{};
                 void* addr = &((reinterpret_cast<struct sockaddr_in6*>(ifa->ifa_addr))->sin6_addr);
                 if ((inet_ntop(AF_INET6, addr, ip, sizeof(ip)) != nullptr) && std::strncmp(ip, "fe80::", 6) != 0
                     && std::strcmp(ip, "::1") != 0)
                 {
-                    freeifaddrs(ifaddr);
-                    return std::string(ip);
+                    ipv6Address = ip;
                 }
             }
         }
     }
 
     freeifaddrs(ifaddr);
+    if (!ipv6Address.empty())
+    {
+        return ipv6Address;
+    }
     TLLM_LOG_ERROR(
         rank, "Can't get local ip from NIC Interface. Please check whether corresponding INTERFACE is set correctly.");
     return std::string{};
@@ -106,6 +115,10 @@ std::string getLocalIpByHostname(int rank)
         return std::string{};
     }
 
+    // IPv6 is only a fallback; see getLocalIpByNic. getaddrinfo orders the
+    // answers by the resolver's rules (RFC 6724), which can put an AAAA record
+    // first, so scan the whole list before settling for one.
+    std::string ipv6Address;
     for (struct addrinfo* p = res; p != nullptr; p = p->ai_next)
     {
 
@@ -121,7 +134,7 @@ std::string getLocalIpByHostname(int rank)
                 return std::string(ip);
             }
         }
-        else if (p->ai_family == AF_INET6)
+        else if (p->ai_family == AF_INET6 && ipv6Address.empty())
         { // IPv6
             char ip[INET6_ADDRSTRLEN]{};
             struct sockaddr_in6* ipv6 = reinterpret_cast<struct sockaddr_in6*>(p->ai_addr);
@@ -129,13 +142,16 @@ std::string getLocalIpByHostname(int rank)
             if ((inet_ntop(AF_INET6, addr, ip, sizeof(ip)) != nullptr) && std::strncmp(ip, "fe80::", 6) != 0
                 && std::strcmp(ip, "::1") != 0)
             {
-                freeaddrinfo(res);
-                return std::string(ip);
+                ipv6Address = ip;
             }
         }
     }
 
     freeaddrinfo(res);
+    if (!ipv6Address.empty())
+    {
+        return ipv6Address;
+    }
     TLLM_LOG_WARNING(rank, "getLocalIpByHostname: Can't get local ip from hostname");
     return std::string{};
 }

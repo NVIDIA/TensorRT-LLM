@@ -188,6 +188,26 @@ def get_kv_cache_manager_cls(
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
     sparse_attn_algorithm = getattr(sparse_attn_config, "algorithm", None)
+    quant_config = getattr(model_config, "quant_config", None)
+    if (sparse_attn_config is None and is_mla(config)
+            and quant_config is not None
+            and quant_config.quant_mode.has_fp4_kv_cache()):
+        if kv_cache_config.use_kv_cache_manager_v2 is False:
+            raise ValueError("FP4 MLA requires use_kv_cache_manager_v2=True.")
+        if model_config.attn_backend != "TRTLLM":
+            raise ValueError("FP4 MLA requires the TRTLLM attention backend.")
+        if is_disagg:
+            raise NotImplementedError(
+                "FP4 MLA disaggregated serving requires the follow-up "
+                "Python NIXL integration.")
+        if is_hybrid_linear(config):
+            raise NotImplementedError(
+                "FP4 MLA requires Fp4MlaKVCacheManagerV2, which does not "
+                "support hybrid linear-attention models.")
+        from ..attention.backends.fp4_mla.cache_manager import \
+            Fp4MlaKVCacheManagerV2
+
+        return Fp4MlaKVCacheManagerV2
     use_v2 = kv_cache_config.use_kv_cache_manager_v2 is True
     if is_hybrid_linear(config):
         # Degenerate case: model is flagged as hybrid but the config has zero
@@ -266,7 +286,7 @@ def get_kv_cache_manager_cls(
                 # results. Model loading resolves ``auto`` to PYTHON via
                 # KimiLinearForCausalLM.get_preferred_transceiver_runtime
                 # (NIXL-gated); this rejects explicit non-Python routes and
-                # paths that skip model defaults (e.g. AutoDeploy).
+                # paths that skip model defaults.
                 raise ValueError(
                     "Kimi K3 disaggregated serving requires the Python "
                     "transceiver: set cache_transceiver_config "
@@ -886,6 +906,14 @@ class KvCacheCreator:
                         f"Gemma4 hybrid attention requires KVCacheManagerV2, "
                         f"which is not yet supported with {incompat_str}. "
                         f"Disable these features to run Gemma4 hybrid models.")
+                quant_config = getattr(model_config, "quant_config", None)
+                if (sparse_attn_config is None and is_mla(config)
+                        and quant_config is not None
+                        and quant_config.quant_mode.has_fp4_kv_cache()):
+                    raise NotImplementedError(
+                        "FP4 MLA requires Fp4MlaKVCacheManagerV2, which is "
+                        f"not yet supported with {incompat_str}. Disable these "
+                        "features to run FP4 MLA.")
                 if is_hybrid_linear(config):
                     raise NotImplementedError(
                         "Hybrid Mamba cache managers do not support "
@@ -3361,7 +3389,7 @@ def validate_kv_cache_compression_compatibility(
         if config.quant == "nvfp4" and not is_sm_100f():
             raise RuntimeError(
                 "NVFP4 cold-page quantization requires an SM100-family device "
-                "(SM100 or SM103).")
+                "(SM100, SM103 or SM107).")
     elif config.algorithm == "triattention" and not is_sm_100f():
         raise RuntimeError(
             "TriAttention requires an SM100-family device (SM100 or SM103).")

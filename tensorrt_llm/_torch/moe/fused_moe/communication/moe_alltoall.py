@@ -61,6 +61,19 @@ def get_force_cft() -> bool | None:
     return None
 
 
+def resolve_can_use_cft(can_use_cft_counted_writes: bool) -> bool:
+    """Apply the TRTLLM_MOE_A2A_FORCE_CFT override to a caller's request.
+
+    Workspace sizing and workspace layout both depend on this, so they must
+    resolve it identically: a caller that sizes without the override and then
+    constructs with it would lay out the CFT region in an undersized buffer.
+    """
+    force_cft = get_force_cft()
+    if force_cft is None:
+        return can_use_cft_counted_writes
+    return force_cft
+
+
 def should_use_cft(
     can_use_cft: bool,
     force_cft: bool | None,
@@ -177,6 +190,8 @@ class MoeAlltoAll:
             eplb_stats_num_experts: Optional[int] = None,
             extra_payload_bytes_per_token: int = 0,
             can_use_cft_counted_writes: bool = False) -> int:
+        can_use_cft_counted_writes = resolve_can_use_cft(
+            can_use_cft_counted_writes)
         element_size = dtype.itemsize
 
         # Auxiliary data size
@@ -322,8 +337,11 @@ class MoeAlltoAll:
         self.enable_eplb = num_experts is not None
         self.eplb_stats_num_experts = num_experts
         self._force_cft = get_force_cft()
-        if self._force_cft is False:
-            can_use_cft_counted_writes = False
+        # Opt-in only: no caller passes can_use_cft_counted_writes=True, so
+        # without the override the CFT path cannot be reached at all. Leaving
+        # the variable unset keeps CFT disabled, as before.
+        can_use_cft_counted_writes = resolve_can_use_cft(
+            can_use_cft_counted_writes)
         self.can_use_cft_counted_writes = can_use_cft_counted_writes
         if self._force_cft is None:
             self.cft_max_batch_for_dispatch = _get_cft_max_batch_for_dispatch()

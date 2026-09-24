@@ -86,9 +86,6 @@ DYNAMO_IMPORTS = [
     ("tensorrt_llm._torch.visual_gen.executor", "DiffusionRequest"),
     ("tensorrt_llm._torch.visual_gen.output", "PipelineOutput"),
     ("tensorrt_llm._torch.visual_gen.pipeline", "BasePipeline"),
-    # -- _torch / auto_deploy --
-    ("tensorrt_llm._torch.auto_deploy", "LLM"),
-    ("tensorrt_llm._torch.auto_deploy", "LlmArgs"),
     # -- _torch / shared_tensor --
     ("tensorrt_llm._torch.shared_tensor", "SharedTensorContainer"),
     ("tensorrt_llm._torch.shared_tensor.shared_tensor", "SharedTensorContainer"),
