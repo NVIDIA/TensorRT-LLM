@@ -53,7 +53,7 @@ allocations.
   external request queues and must not bypass `forward` to access model weights
   during sleep/wake. The pipeline is not a concurrent request scheduler.
 
-## Local Validation
+## Tests and Validation
 
 Unit tests are in `tests/unittest/_torch/visual_gen/test_sleep.py`; small real-GPU
 allocator tests are in `test_sleep_gpu.py` alongside it, including two independent
@@ -63,9 +63,19 @@ checkpoint-backed test is
 `LLM_MODELS_ROOT` (or `MINIMAX_H3_CHECKPOINT` for the local checkpoint override).
 The full-model test needs a GPU with at least 140 GiB and sufficient host RAM
 for H3 plus its allocation backup; the development run reserves 320 GiB.
-These tests add no CI registration and are intended for local/QA validation.
+The state/loader unit tests run in CPU CI, and the small GPU allocator tests run
+in A10 CI. The checkpoint-backed test is listed in
+`tests/integration/test_lists/qa/llm_function_core.txt`, not in pre-merge CI.
+Use a large-memory single GPU with the host-RAM budget above for that test.
+The QA list also selects the non-H3 regressions below.
 `test_sleep_non_h3.py` creates tiny local Wan/FLUX checkpoints and exercises
 real default loading, weight materialization, transformer forwards, and rejection
 of unsupported sleep requests without downloading pretrained checkpoints.
 Full-model coverage currently exercises text-to-video/audio; keyframe-conditioned
 generation and non-FP8 model configurations have not been validated with sleep.
+
+The sleep test checks lifecycle integrity: post-wake video and audio must match
+the same pipeline's pre-sleep output exactly. This is not an independent
+golden-output quality comparison. H3's existing Diffusers-reference LPIPS and
+audio tests in `tests/integration/defs/examples/visual_gen/test_minimax_h3_e2e.py`
+are separately registered in B200 CI and do not enable sleep.

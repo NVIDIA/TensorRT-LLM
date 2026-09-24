@@ -829,3 +829,12 @@ examples/visual_gen/test_visual_gen_wan.py::test_wan_i2v_example
 # Wan 2.2 I2V serving: synchronous and asynchronous video-generation requests.
 unittest/_torch/visual_gen/test_trtllm_serve_e2e.py::TestWanImageToVideo::test_ti2v_sync
 unittest/_torch/visual_gen/test_trtllm_serve_e2e.py::TestWanImageToVideo::test_ti2v_async_lifecycle
+
+# ------------- VisualGen sleep/wake ---------------
+
+# Single-GPU H3: >= 140 GiB GPU memory, 320 GiB host RAM budget, MiniMax-H3 checkpoint.
+# Smaller GPUs are skipped by the test.
+visual_gen/test_minimax_h3_sleep.py::test_minimax_h3_sleep_preserves_video_and_audio TIMEOUT (30)
+
+# Tiny local Wan/FLUX checkpoints; one CUDA GPU, no pretrained model download.
+unittest/_torch/visual_gen/test_sleep_non_h3.py

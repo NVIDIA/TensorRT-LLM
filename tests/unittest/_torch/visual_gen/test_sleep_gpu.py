@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Local/QA allocator regression tests; no model checkpoint required."""
+"""Allocator regression tests; no model checkpoint required."""
 
 import gc
 
