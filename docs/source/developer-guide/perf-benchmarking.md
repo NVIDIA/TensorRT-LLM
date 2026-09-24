@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 (perf-benchmarking)=
 
 # TensorRT LLM Benchmarking
@@ -37,6 +42,7 @@ The following guidance will mostly focus on benchmarks using `trtllm-bench` CLI.
       - [Supported Quantization Modes](#supported-quantization-modes)
     - [Preparing a Dataset](#preparing-a-dataset)
     - [Running with the PyTorch Workflow](#running-with-the-pytorch-workflow)
+      - [Running on multi-node launchers and Kubernetes LWS](#running-on-multi-node-launchers-and-kubernetes-lws)
       - [Benchmarking with LoRA Adapters in PyTorch workflow](#benchmarking-with-lora-adapters-in-pytorch-workflow)
       - [Running multi-modal models in the PyTorch Workflow](#running-multi-modal-models-in-the-pytorch-workflow)
       - [Quantization in the PyTorch Flow](#quantization-in-the-pytorch-flow)
@@ -250,6 +256,83 @@ trtllm-bench --model meta-llama/Llama-3.1-8B \
   --dataset /tmp/synthetic_128_128.txt \
   --backend pytorch
 ```
+
+#### Running on multi-node launchers and Kubernetes LWS
+
+`trtllm-bench` uses the LLM API under the hood. For a multi-node benchmark,
+launch it through `trtllm-llmapi-launch` with one rank per GPU, the same as the
+multi-node LLM API examples. The provided
+[`examples/llm-api/llm_mgmn_trtllm_bench.sh`](../../../examples/llm-api/llm_mgmn_trtllm_bench.sh)
+Slurm script is the canonical reference for this launch shape.
+
+For Kubernetes `LeaderWorkerSet` (LWS), use LWS to allocate the leader and
+worker Pods, then have the leader start the MPI-style benchmark command across
+all Pods. LWS handles Pod placement; the MPI launcher or your entrypoint script
+must still provide one rank per GPU and make the model, dataset, and config file
+available at the same path in every Pod. LWS injects `LWS_LEADER_ADDRESS` and
+`LWS_GROUP_SIZE`; entrypoint scripts commonly combine those values with the
+stable Pod DNS names from the LWS headless service to generate an MPI hostfile
+with one line per Pod and `slots=<GPUs exposed to that Pod>`.
+
+For a two-node, four-GPU-per-node benchmark (eight total ranks), the benchmark
+command should look like this after the LWS entrypoint has generated that
+hostfile or an equivalent MPI host list:
+
+```shell
+# Generated once and shared by all Pods, for example on a mounted volume.
+trtllm-bench --model <model-or-tokenizer> prepare-dataset \
+  --output /workspace/bench/synthetic_128_128.jsonl \
+  token-norm-dist \
+  --num-requests 1000 \
+  --input-mean 128 \
+  --output-mean 128 \
+  --input-stdev 0 \
+  --output-stdev 0
+
+cat > /workspace/bench/trtllm_bench_extra.yaml <<'EOF'
+# Optional: keep only when torch.cuda.device_count() inside each worker
+# process differs from the GPUs exposed to each Pod.
+gpus_per_node: 4
+cuda_graph_config: null
+EOF
+
+# Run from the leader Pod. Replace the hostfile command with the MPI launcher
+# convention used by your LWS image/cluster.
+mpirun -np 8 --hostfile /workspace/bench/hostfile \
+  trtllm-llmapi-launch \
+  trtllm-bench \
+    --model <model-name-for-reporting> \
+    --model_path /models/<model-checkpoint> \
+    throughput \
+    --dataset /workspace/bench/synthetic_128_128.jsonl \
+    --backend pytorch \
+    --tp 8 \
+    --config /workspace/bench/trtllm_bench_extra.yaml
+```
+
+The important invariants are:
+
+- `mpirun -np` (or the equivalent rank count from the launcher) equals the
+  total number of GPUs allocated to the benchmark.
+- `--tp * --pp * cp_size` equals the number of ranks that participate in the
+  LLM world; with the default `cp_size=1`, this reduces to `--tp * --pp`. For
+  the two-node, four-GPU-per-node case, `--tp 8` is the simplest layout. If a
+  TP/PP split better matches the model and network topology, `--tp 4 --pp 2`
+  keeps each TP group within one node and still uses eight ranks.
+- Treat `gpus_per_node` as a per-node override. Pass it through `--config` only
+  when the number of GPUs visible to the worker process differs from the actual
+  GPUs exposed to each Pod. The default fallback is `torch.cuda.device_count()`
+  (or `tensor_parallel_size` when `RAY_LOCAL_WORLD_SIZE` is set), not the MPI
+  rank layout. `trtllm-bench` does not expose `gpus_per_node` as a top-level
+  throughput CLI flag.
+- Prefer local or pre-mounted model checkpoints for multi-node Kubernetes runs.
+  Do not rely on every rank downloading the checkpoint independently.
+- Keep the dataset and YAML config on a shared volume or copy them to identical
+  paths before launching the multi-rank command.
+
+If your Kubernetes environment cannot provide passwordless SSH or an equivalent
+MPI process manager across LWS Pods, use the Slurm MGMN script as the closest
+supported reference and adapt only the scheduler-specific host discovery layer.
 
 #### Benchmarking with LoRA Adapters in PyTorch workflow
 
