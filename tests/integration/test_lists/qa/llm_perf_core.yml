@@ -172,6 +172,24 @@ llm_perf_core:
   #deepseek_v4_flash (post-trained, FP4+FP8 mixed, 4-GPU)
   - perf/test_perf.py::test_perf[deepseek_v4_flash-bench-pytorch-float4-maxbs:128-maxnt:4096-kv_frac:0.5-input_output_len:8192,1024-ep:4-tp:4-gpus:4] TIMEOUT(120)
   - perf/test_perf.py::test_perf[deepseek_v4_flash-bench-pytorch-float4-maxbs:128-maxnt:4096-kv_frac:0.5-input_output_len:1000,2000-ep:4-tp:4-gpus:4] TIMEOUT(120)
+  #deepseek_v4_pro_base_fp8 (1.6T MoE, FP8 block-scale, 4-GPU on VR200's larger per-GPU HBM;
+  #same DEP4 throughput / TEP4 latency shapes as the B300 ep:8-tp:8-gpus:8 cases)
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_base_fp8-serve-pytorch-streaming-float8-maxbs:32-maxnt:8448-kv_frac:0.5-input_output_len:8192,1024-reqs:1024-con:512-ep:4-tp:4-gpus:4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_base_fp8-serve-pytorch-streaming-float8-maxbs:32-maxnt:8448-kv_frac:0.5-input_output_len:1000,2000-reqs:512-con:256-ep:4-tp:4-gpus:4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_base_fp8-serve-pytorch-streaming-float8-maxbs:128-maxnt:8448-kv_frac:0.9-input_output_len:8192,1024-reqs:10-con:1-ep:4-tp:4-gpus:4] TIMEOUT(120) #min_latency
+  #deepseek_v4_pro_fp4 (1.6T MoE, sparse MLA + mHC, FP4+FP8 mixed, 4-GPU on VR200; serve
+  #backend to match the other VR200 4-GPU DeepSeek V4 Pro cases above)
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_fp4-serve-pytorch-streaming-float4-maxbs:32-maxnt:8448-kv_frac:0.6-input_output_len:8192,1024-reqs:1024-con:512-ep:4-tp:4-gpus:4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_fp4-serve-pytorch-streaming-float4-maxbs:32-maxnt:8448-kv_frac:0.6-input_output_len:1000,2000-reqs:512-con:256-ep:4-tp:4-gpus:4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_fp4-serve-pytorch-float4-maxbs:128-maxnt:8448-input_output_len:8192,1024-reqs:10-con:1-ep:4-tp:4-gpus:4] TIMEOUT(120) #min_latency
+  #kimi_k3 (TEP4 interactive serving, 4-GPU on VR200's larger per-GPU HBM;
+  #B300 needs TEP8 minimum per the deployment guide, VR200 fits the same shapes at ep=tp=4)
+  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-streaming-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:20-con:4-ep:4-tp:4-gpus:4] TIMEOUT (120)
+  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:5-con:1-ep:4-tp:4-gpus:4] TIMEOUT (120) #min_latency
+  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:80-con:16-ep:4-tp:4-gpus:4] TIMEOUT (120) #max_throughput
+  # kimi_k3 short-context (1k/2k) scenario, same TEP4 4-GPU deployment
+  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:1000,2000-reqs:5-con:1-ep:4-tp:4-gpus:4] TIMEOUT (120) #min_latency
+  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:1000,2000-reqs:80-con:16-ep:4-tp:4-gpus:4] TIMEOUT (120) #max_throughput
   #minimax_m3_fp4 (block-sparse MoE, MXFP8 base + NVFP4 experts 233G, 4-GPU ep=4)
   #mirrors accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True] (tp=ep=4).
   #ISL+OSL is kept <= 2048 because the M3 sparse path caps max_seq_len for CUDA-graph capture.
