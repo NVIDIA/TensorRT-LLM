@@ -128,6 +128,292 @@ class FusedSmemStageConfig:
     fc1_c: int
 
 
+@dataclass(frozen=True)
+class SeparatePhaseSmemStageBytes:
+    """Byte model for phase-specific AB pipelines with optional FC2 C aliasing.
+
+    SFA remains a separate low-address allocation because FC1 gathers it with
+    ``cp.async.cg``. A is also kept contiguous at the start of the mainloop
+    allocation for the same reason. With FC2 C aliasing, B and SFB are paired
+    by stage: the FC1-only A tail followed by the same number of leading B/SFB
+    stage pairs forms one contiguous region that FC2 can reinterpret as its
+    block-reduce source after the FC1 pipelines have drained. Without aliasing,
+    A, B, and SFB retain their separate, aligned operand-major regions.
+    """
+
+    a_per_stage: int
+    b_per_stage: int
+    sfa_per_stage: int
+    sfb_per_stage: int
+    fc1_c_per_stage: int
+    fc2_c: int
+    metadata: int
+    header_fixed: int
+    fc1_header_per_stage: int
+    fc2_header_per_stage: int
+    alignment: int
+
+    @property
+    def operand_bytes_per_stage(self) -> int:
+        """Return the total A/B/SFB bytes contributed by one stage."""
+
+        return self.a_per_stage + self.b_per_stage + self.sfb_per_stage
+
+    @property
+    def bsfb_stage_bytes(self) -> int:
+        """Return bytes in one physical stage pair of B and SFB."""
+
+        return self.b_per_stage + self.sfb_per_stage
+
+    def overlay_bytes(
+        self, *, fc1_ab_stages: int, fc2_ab_stages: int
+    ) -> int:
+        """Return FC1-only A/B/SFB bytes available to the FC2 epilogue."""
+
+        return (
+            max(fc1_ab_stages - fc2_ab_stages, 0)
+            * self.operand_bytes_per_stage
+        )
+
+    def total(
+        self,
+        *,
+        fc1_ab_stages: int,
+        fc2_ab_stages: int,
+        fc1_c_stages: int,
+        overlay_fc2_c: bool,
+    ) -> int:
+        """Return aligned shared storage required by one stage configuration."""
+
+        def align_up(value: int) -> int:
+            return (
+                (value + self.alignment - 1) // self.alignment
+            ) * self.alignment
+
+        operand_stages = max(fc1_ab_stages, fc2_ab_stages)
+        header = align_up(
+            self.header_fixed
+            + fc1_ab_stages * self.fc1_header_per_stage
+            + fc2_ab_stages * self.fc2_header_per_stage
+        )
+        epilogue_bytes = fc1_c_stages * self.fc1_c_per_stage
+        if not overlay_fc2_c:
+            epilogue_bytes = max(epilogue_bytes, self.fc2_c)
+        mainloop_bytes = align_up(
+            operand_stages * self.operand_bytes_per_stage
+        )
+        if not overlay_fc2_c:
+            mainloop_bytes = sum(
+                align_up(operand_stages * bytes_per_stage)
+                for bytes_per_stage in (
+                    self.a_per_stage,
+                    self.b_per_stage,
+                    self.sfb_per_stage,
+                )
+            )
+        return align_up(
+            header
+            + mainloop_bytes
+            + align_up(operand_stages * self.sfa_per_stage)
+            + align_up(epilogue_bytes)
+            + self.metadata
+        )
+
+
+@dataclass(frozen=True)
+class SeparatePhaseSmemStageConfig:
+    """Selected FC1/FC2 operand depths and epilogue ownership policy."""
+
+    fc1_ab: int
+    fc2_ab: int
+    fc1_c: int
+    overlay_fc2_c: bool
+
+
+@dataclass(frozen=True)
+class SeparatePhaseSmemLayout:
+    """Operand offsets and stage strides, pairing B/SFB only for FC2 C aliasing.
+
+    Offsets are relative to the mainloop allocation, not the SMEM base.
+    """
+
+    a_smem_offset_bytes: int
+    a_smem_alloc_bytes: int
+    fc1_b_smem_offset_bytes: int
+    fc1_sfb_smem_offset_bytes: int
+    fc2_b_smem_offset_bytes: int
+    fc2_sfb_smem_offset_bytes: int
+    b_stage_stride_bytes: int
+    sfb_stage_stride_bytes: int
+    fc2_bsfb_stage_offset: int
+    fc2_c_smem_offset_bytes: int
+    fc2_c_overlay_bytes: int
+    mainloop_smem_alloc_bytes: int
+
+
+def derive_separate_phase_smem_layout(
+    *,
+    stage_config: SeparatePhaseSmemStageConfig,
+    stage_bytes: SeparatePhaseSmemStageBytes,
+) -> SeparatePhaseSmemLayout:
+    """Derive physical operand offsets for one separate-phase specialization.
+
+    Without FC2 C aliasing, preserve the split-alpha layout:
+    ``[A stages][B stages][SFB stages]``, with each operand region aligned.
+    With aliasing, use ``[A stages][(B, SFB) stage pairs]``. FC2 C begins at
+    the first FC1-only A stage, and FC2 B/SFB skips the leading stage pairs
+    covered by FC2 C.
+    """
+
+    operand_stages = max(stage_config.fc1_ab, stage_config.fc2_ab)
+    a_smem_alloc_bytes = operand_stages * stage_bytes.a_per_stage
+    if not stage_config.overlay_fc2_c:
+
+        def align_up(value: int) -> int:
+            return (
+                (value + stage_bytes.alignment - 1) // stage_bytes.alignment
+            ) * stage_bytes.alignment
+
+        b_smem_offset_bytes = align_up(a_smem_alloc_bytes)
+        sfb_smem_offset_bytes = b_smem_offset_bytes + align_up(
+            operand_stages * stage_bytes.b_per_stage
+        )
+        return SeparatePhaseSmemLayout(
+            a_smem_offset_bytes=0,
+            a_smem_alloc_bytes=a_smem_alloc_bytes,
+            fc1_b_smem_offset_bytes=b_smem_offset_bytes,
+            fc1_sfb_smem_offset_bytes=sfb_smem_offset_bytes,
+            fc2_b_smem_offset_bytes=b_smem_offset_bytes,
+            fc2_sfb_smem_offset_bytes=sfb_smem_offset_bytes,
+            b_stage_stride_bytes=stage_bytes.b_per_stage,
+            sfb_stage_stride_bytes=stage_bytes.sfb_per_stage,
+            fc2_bsfb_stage_offset=0,
+            fc2_c_smem_offset_bytes=0,
+            fc2_c_overlay_bytes=0,
+            mainloop_smem_alloc_bytes=sfb_smem_offset_bytes
+            + align_up(operand_stages * stage_bytes.sfb_per_stage),
+        )
+
+    bsfb_smem_offset_bytes = a_smem_alloc_bytes
+    mainloop_smem_alloc_bytes = (
+        a_smem_alloc_bytes + operand_stages * stage_bytes.bsfb_stage_bytes
+    )
+
+    fc2_bsfb_stage_offset = 0
+    fc2_c_smem_offset_bytes = 0
+    fc2_c_overlay_bytes = 0
+    if stage_config.overlay_fc2_c:
+        if stage_config.fc1_ab < stage_config.fc2_ab:
+            raise ValueError(
+                "FC2 C cannot alias FC1-only operand stages when FC1 has "
+                "fewer stages than FC2"
+            )
+        fc2_bsfb_stage_offset = stage_config.fc1_ab - stage_config.fc2_ab
+        fc2_c_smem_offset_bytes = (
+            stage_config.fc2_ab * stage_bytes.a_per_stage
+        )
+        fc2_c_overlay_end_bytes = (
+            a_smem_alloc_bytes
+            + fc2_bsfb_stage_offset * stage_bytes.bsfb_stage_bytes
+        )
+        fc2_c_overlay_bytes = (
+            fc2_c_overlay_end_bytes - fc2_c_smem_offset_bytes
+        )
+        if fc2_c_overlay_bytes < stage_bytes.fc2_c:
+            raise ValueError(
+                "FC1-only operand stages do not hold FC2 C: "
+                f"available={fc2_c_overlay_bytes}, required={stage_bytes.fc2_c}"
+            )
+
+    fc1_b_smem_offset_bytes = bsfb_smem_offset_bytes
+    fc1_sfb_smem_offset_bytes = (
+        fc1_b_smem_offset_bytes + stage_bytes.b_per_stage
+    )
+    fc2_b_smem_offset_bytes = (
+        bsfb_smem_offset_bytes
+        + fc2_bsfb_stage_offset * stage_bytes.bsfb_stage_bytes
+    )
+    fc2_sfb_smem_offset_bytes = (
+        fc2_b_smem_offset_bytes + stage_bytes.b_per_stage
+    )
+    fc2_bsfb_end_bytes = (
+        fc2_b_smem_offset_bytes
+        + stage_config.fc2_ab * stage_bytes.bsfb_stage_bytes
+    )
+    if fc2_bsfb_end_bytes > mainloop_smem_alloc_bytes:
+        raise ValueError(
+            "FC2 B/SFB view exceeds mainloop shared memory: "
+            f"end={fc2_bsfb_end_bytes}, size={mainloop_smem_alloc_bytes}"
+        )
+
+    return SeparatePhaseSmemLayout(
+        a_smem_offset_bytes=0,
+        a_smem_alloc_bytes=a_smem_alloc_bytes,
+        fc1_b_smem_offset_bytes=fc1_b_smem_offset_bytes,
+        fc1_sfb_smem_offset_bytes=fc1_sfb_smem_offset_bytes,
+        fc2_b_smem_offset_bytes=fc2_b_smem_offset_bytes,
+        fc2_sfb_smem_offset_bytes=fc2_sfb_smem_offset_bytes,
+        b_stage_stride_bytes=stage_bytes.bsfb_stage_bytes,
+        sfb_stage_stride_bytes=stage_bytes.bsfb_stage_bytes,
+        fc2_bsfb_stage_offset=fc2_bsfb_stage_offset,
+        fc2_c_smem_offset_bytes=fc2_c_smem_offset_bytes,
+        fc2_c_overlay_bytes=fc2_c_overlay_bytes,
+        mainloop_smem_alloc_bytes=mainloop_smem_alloc_bytes,
+    )
+
+
+def select_separate_phase_smem_stages(
+    *,
+    capacity: int,
+    preferred_fc1_ab: int,
+    preferred_fc2_ab: int,
+    preferred_fc1_c: int,
+    minimum_fc1_c: int,
+    stage_bytes: SeparatePhaseSmemStageBytes,
+) -> SeparatePhaseSmemStageConfig:
+    """Select FC1 depth while preserving the preferred FC2 pipeline depth.
+
+    The FC2 depth is kept fixed: sacrificing FC2 stages merely to create a
+    larger alias would trade one mainloop regression for another. For each FC1
+    candidate, prefer the tail-stage alias when it can hold the complete FC2 C
+    tile; otherwise retain a separate FC2 C allocation.
+    """
+
+    for fc1_ab_stages in range(preferred_fc1_ab, 0, -1):
+        can_overlay_fc2_c = (
+            stage_bytes.overlay_bytes(
+                fc1_ab_stages=fc1_ab_stages,
+                fc2_ab_stages=preferred_fc2_ab,
+            )
+            >= stage_bytes.fc2_c
+        )
+        for fc1_c_stages in range(
+            preferred_fc1_c, minimum_fc1_c - 1, -1
+        ):
+            for overlay_fc2_c in (True, False):
+                if overlay_fc2_c and not can_overlay_fc2_c:
+                    continue
+                if stage_bytes.total(
+                    fc1_ab_stages=fc1_ab_stages,
+                    fc2_ab_stages=preferred_fc2_ab,
+                    fc1_c_stages=fc1_c_stages,
+                    overlay_fc2_c=overlay_fc2_c,
+                ) <= capacity:
+                    return SeparatePhaseSmemStageConfig(
+                        fc1_ab=fc1_ab_stages,
+                        fc2_ab=preferred_fc2_ab,
+                        fc1_c=fc1_c_stages,
+                        overlay_fc2_c=overlay_fc2_c,
+                    )
+    raise ValueError(
+        "no separate-phase FC12 shared-memory stage configuration fits: "
+        f"capacity={capacity}, preferred_fc1_ab={preferred_fc1_ab}, "
+        f"preferred_fc2_ab={preferred_fc2_ab}, "
+        f"preferred_fc1_c={preferred_fc1_c}, "
+        f"minimum_fc1_c={minimum_fc1_c}"
+    )
+
+
 def select_fused_smem_stages(
     *,
     capacity: int,
@@ -845,8 +1131,9 @@ Compute:
   fc2_acc = fc2_alpha * (SFC * C) * (FC2_SFB * FC2_B)
   + optional NVFP4 quantization (generates SFC) when c_dtype == Float4E2M1FN.
 
-Shapes: A is M×K×1; B is N×K×L (L = num experts), interleaved [up, gate] at
-granularity=64; C is M×(N/2)×1 (N halved by SwiGLU). SFA/SFB layouts follow
+Shapes: A is M×K×1; B is N×K×L (L = num experts), with FC1 N ordered as
+[gate16, up16] groups. B and SFB must use the same N order;
+C is M×(N/2)×1 in logical channel order. SFA/SFB layouts follow
 BlockScaledBasicChunk. ``permuted_idx_to_expanded_idx`` is shared by both
 phases: FC1 divides by ``topk`` to recover the receive row, while FC2 also
 uses the remainder to select the route scale.
@@ -855,7 +1142,7 @@ Within a tile, valid_m varies per group; padding rows are handled at load by
 predicating CpAsync on `abs_row < mn_limit`.
 
 Constraints: A/B share dtype (mxf8 | mxf4 | nvf4); mma_tiler M in {128, 256};
-mma_tiler N in {64, 128, 192, 256}; cluster M/N pow-2, total ≤ 16;
+mma_tiler N in {128, 256}; cluster M/N pow-2, total ≤ 16;
 contiguous dim ≥ 16B aligned (16/32 elems for f8/f4).
 
 For CUDA graph, A/C/SFA/permuted_idx_to_expanded_idx/tile_idx_to_expert_idx can
@@ -882,8 +1169,8 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
       - A/SFA load: four gather warps issue CpAsync128.CG into a shared
         fc1_a_pipeline. SFA is consumed directly by a Cp128x128b UTCCP in the MMA
         warp using the 128dp_Unique layout.
-      - SwiGLU epilogue: C = up * silu(gate), where up/gate come from
-        interleaved accumulator at granularity=64 → output N is halved.
+      - SwiGLU epilogue: C = up * silu(gate), where up/gate come from the
+        gate16/up16 FC1 weight layout → output N is halved.
       - Optional NVFP4 quant: when c_dtype == Float4E2M1FN, the epilogue
         also generates SFC and quantizes the output.
 
@@ -903,6 +1190,8 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
     :param topk: Experts selected per token.
     :param swiglu_limit: DS-v4 SwiGLU clamp limit; ``+inf`` disables clamp.
     :param scheduler: Persistent work-ID scheduler: ``static`` or ``l2_atomic``.
+    FC1 B and SFB must already use gate16/up16 order (tile N 128/256).
+    FC1 output remains in logical channel order; FC2 weight layout is unchanged.
     """
 
     def __init__(
@@ -1168,12 +1457,13 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         self.num_mcast_ctas_a = cute.size(self.cluster_layout_vmnk.shape[2])
         self.is_a_mcast = self.num_mcast_ctas_a > 1
 
-        # Fixed epilogue tile (128, 64). SwiGLU halves N, so the default
+        # Logical output tile (128, 64). Each output subtile consumes two
+        # packed N64 accumulator chunks, not separate up64/gate64 chunks.
+        # SwiGLU halves N, so the default
         # SM107_TILES lookup (keyed on full cta_n) can pick epi_tile_n too
         # small (wrong TMA store strides + insufficient SFC for cvt_fptrunc
         # 32-bit alignment). (128, 64) works for all configs.
         self.fc1_epi_tile = (128, 64)
-        self.fc1_epi_tile_n = cute.size(self.fc1_epi_tile[1])
         self.fc1_epi_tile_cnt = (
             self.fc1_cta_tile_shape_mnk_c[0] // cute.size(self.fc1_epi_tile[0]),
             self.fc1_cta_tile_shape_mnk_c[1] // cute.size(self.fc1_epi_tile[1]),
@@ -1215,9 +1505,12 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         # Setup A/B/C/Scale stage count in shared memory and ACC stage count in tensor memory
         (
             self.num_acc_stage,
-            self.num_ab_stage,
+            self.fc1_num_ab_stage,
+            self.fc2_num_ab_stage,
             self.fc1_num_c_stage,
             self.num_tile_stage,
+            self.overlay_fc2_c_on_fc1_ab_tail,
+            separate_phase_stage_bytes,
         ) = self._compute_stages(
             tiled_mma,
             self.mma_tiler,
@@ -1239,24 +1532,139 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
             self.mma_cta_group_int,
         )
 
-        # Compute A/B/C/Scale shared memory layout
+        # Keep every A stage contiguous at the low end of the mainloop buffer:
+        # FC1 gathers A with cp.async.cg, whose cache-mode hint requires a low
+        # SMEM destination address. Only an FC2 C overlay pairs B/SFB by stage
+        # and skips the leading pairs for FC2, forming one contiguous alias
+        # with the FC1-only A tail. Otherwise preserve the original separate
+        # B and SFB regions and their compact stage strides.
+        a_smem_layout_stage_one = sm100_utils.make_smem_layout_a(
+            tiled_mma,
+            self.mma_tiler,
+            self.a_dtype,
+            1,
+        )
+        b_smem_layout_stage_one = sm100_utils.make_smem_layout_b(
+            tiled_mma,
+            self.mma_tiler,
+            self.b_dtype,
+            1,
+        )
+        sfb_smem_layout_stage_one = blockscaled_utils.make_smem_layout_sfb(
+            tiled_mma,
+            self.mma_tiler,
+            self.sf_vec_size,
+            1,
+        )
+        self.a_smem_bytes_per_stage = cute.size_in_bytes(
+            self.a_dtype, a_smem_layout_stage_one
+        )
+        self.b_smem_bytes_per_stage = cute.size_in_bytes(
+            self.b_dtype, b_smem_layout_stage_one
+        )
+        self.sfb_smem_bytes_per_stage = cute.size_in_bytes(
+            self.sf_dtype, sfb_smem_layout_stage_one
+        )
+        self.mainloop_stage_bytes = (
+            self.a_smem_bytes_per_stage
+            + self.b_smem_bytes_per_stage
+            + self.sfb_smem_bytes_per_stage
+        )
+        assert (
+            separate_phase_stage_bytes.a_per_stage
+            == self.a_smem_bytes_per_stage
+        )
+        assert (
+            separate_phase_stage_bytes.b_per_stage
+            == self.b_smem_bytes_per_stage
+        )
+        assert (
+            separate_phase_stage_bytes.sfb_per_stage
+            == self.sfb_smem_bytes_per_stage
+        )
+        separate_phase_layout = derive_separate_phase_smem_layout(
+            stage_config=SeparatePhaseSmemStageConfig(
+                fc1_ab=self.fc1_num_ab_stage,
+                fc2_ab=self.fc2_num_ab_stage,
+                fc1_c=self.fc1_num_c_stage,
+                overlay_fc2_c=self.overlay_fc2_c_on_fc1_ab_tail,
+            ),
+            stage_bytes=separate_phase_stage_bytes,
+        )
+
+        self.a_smem_offset_bytes = separate_phase_layout.a_smem_offset_bytes
+        self.a_smem_alloc_bytes = separate_phase_layout.a_smem_alloc_bytes
+        self.fc1_b_smem_offset_bytes = (
+            separate_phase_layout.fc1_b_smem_offset_bytes
+        )
+        self.fc1_sfb_smem_offset_bytes = (
+            separate_phase_layout.fc1_sfb_smem_offset_bytes
+        )
+        self.fc2_b_smem_offset_bytes = (
+            separate_phase_layout.fc2_b_smem_offset_bytes
+        )
+        self.fc2_sfb_smem_offset_bytes = (
+            separate_phase_layout.fc2_sfb_smem_offset_bytes
+        )
+        self.fc2_bsfb_stage_offset = (
+            separate_phase_layout.fc2_bsfb_stage_offset
+        )
+        self.mainloop_smem_alloc_bytes = (
+            separate_phase_layout.mainloop_smem_alloc_bytes
+        )
+
+        operand_stages = max(self.fc1_num_ab_stage, self.fc2_num_ab_stage)
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
             tiled_mma,
             self.mma_tiler,
             self.a_dtype,
-            self.num_ab_stage,
+            operand_stages,
         )
-        self.b_smem_layout_staged = sm100_utils.make_smem_layout_b(
-            tiled_mma,
-            self.mma_tiler,
-            self.b_dtype,
-            self.num_ab_stage,
+        b_outer_stage_one = cute.select(
+            b_smem_layout_stage_one.outer,
+            mode=list(range(cute.rank(b_smem_layout_stage_one.outer) - 1)),
         )
-        self.sfb_smem_layout_staged = blockscaled_utils.make_smem_layout_sfb(
-            tiled_mma,
-            self.mma_tiler,
-            self.sf_vec_size,
-            self.num_ab_stage,
+        sfb_stage_one = cute.select(
+            sfb_smem_layout_stage_one,
+            mode=list(range(cute.rank(sfb_smem_layout_stage_one) - 1)),
+        )
+        b_stage_stride = (
+            separate_phase_layout.b_stage_stride_bytes
+            * 8
+            // self.b_dtype.width
+        )
+        sfb_stage_stride = (
+            separate_phase_layout.sfb_stage_stride_bytes
+            * 8
+            // self.sf_dtype.width
+        )
+        self.fc1_b_smem_layout_staged = cute.make_composed_layout(
+            b_smem_layout_stage_one.inner,
+            b_smem_layout_stage_one.offset,
+            cute.append(
+                b_outer_stage_one,
+                cute.make_layout(
+                    self.fc1_num_ab_stage, stride=b_stage_stride
+                ),
+            ),
+        )
+        self.fc2_b_smem_layout_staged = cute.make_composed_layout(
+            b_smem_layout_stage_one.inner,
+            b_smem_layout_stage_one.offset,
+            cute.append(
+                b_outer_stage_one,
+                cute.make_layout(
+                    self.fc2_num_ab_stage, stride=b_stage_stride
+                ),
+            ),
+        )
+        self.fc1_sfb_smem_layout_staged = cute.append(
+            sfb_stage_one,
+            cute.make_layout(self.fc1_num_ab_stage, stride=sfb_stage_stride),
+        )
+        self.fc2_sfb_smem_layout_staged = cute.append(
+            sfb_stage_one,
+            cute.make_layout(self.fc2_num_ab_stage, stride=sfb_stage_stride),
         )
 
         # SFA SMEM is plain linear (M_per_cta, tile_K_sf, stage), no pad.
@@ -1266,15 +1674,19 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         sf_bytes_per_row = sfa_tile_k_sf * self.sf_dtype.width // 8
         sfa_bytes_per_stage = self.cta_tile_shape_mnk[0] * sf_bytes_per_row
         self.fc1_sfa_smem_layout_staged = cute.make_layout(
-            (self.cta_tile_shape_mnk[0], sfa_tile_k_sf, self.num_ab_stage),
+            (
+                self.cta_tile_shape_mnk[0],
+                sfa_tile_k_sf,
+                self.fc1_num_ab_stage,
+            ),
             stride=(sf_bytes_per_row, 1, sfa_bytes_per_stage),
         )
-        self.sfa_smem_alloc_bytes = self.num_ab_stage * sfa_bytes_per_stage
+        self.sfa_smem_alloc_bytes = self.fc1_num_ab_stage * sfa_bytes_per_stage
         self.fc2_sfa_smem_layout_staged = blockscaled_utils.make_smem_layout_sfa(
             tiled_mma,
             self.mma_tiler,
             self.sf_vec_size,
-            self.num_ab_stage,
+            self.fc2_num_ab_stage,
         )
         self.sfa_smem_alloc_bytes = max(
             self.sfa_smem_alloc_bytes,
@@ -1289,16 +1701,27 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
             self.fc1_epi_tile,
             self.fc1_num_c_stage,
         )
-        # FC1 and FC2 are sequential within one CTA, so their epilogue views
-        # alias one allocation sized for the larger phase.
-        self.epilogue_smem_alloc_bytes = max(
-            cute.size_in_bytes(
-                self.fc1_c_dtype, self.fc1_c_smem_layout_staged.outer
-            ),
-            cute.size_in_bytes(
-                self.fc2_c_dtype, self.fc2_c_smem_layout_staged
-            ),
+        fc1_c_smem_bytes = cute.size_in_bytes(
+            self.fc1_c_dtype, self.fc1_c_smem_layout_staged.outer
         )
+        self.fc2_c_smem_bytes = cute.size_in_bytes(
+            self.fc2_c_dtype, self.fc2_c_smem_layout_staged
+        )
+        self.fc2_c_smem_offset_bytes = (
+            separate_phase_layout.fc2_c_smem_offset_bytes
+        )
+        if self.overlay_fc2_c_on_fc1_ab_tail:
+            assert (
+                separate_phase_layout.fc2_c_overlay_bytes
+                >= self.fc2_c_smem_bytes
+            )
+            self.epilogue_smem_alloc_bytes = fc1_c_smem_bytes
+        else:
+            # Other tile shapes keep the original phase-sequential epilogue
+            # alias when the FC1-only operand tail cannot contain FC2 C.
+            self.epilogue_smem_alloc_bytes = max(
+                fc1_c_smem_bytes, self.fc2_c_smem_bytes
+            )
         self.fc2_c_copy_size = (
             self.cta_tile_shape_mnk[1] * self.fc2_c_dtype.width // 8
         )
@@ -1308,7 +1731,10 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
             tiled_mma,
             self.mma_tiler,
             self.sf_vec_size,
-            cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0)),
+            cute.slice_(
+                self.fc1_sfb_smem_layout_staged,
+                (None, None, None, 0),
+            ),
         )
 
         # SFA 128dp_Unique TMEM layout. Each of the 128 M-rows (tokens) maps
@@ -1542,13 +1968,13 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
 
         This method performs FC1 layer computation:
         1. GEMM: acc = fc1_alpha * (SFA * A[token_ids]) * (SFB * B)
-        2. SwiGLU: C = up * silu(gate), where up/gate are extracted from interleaved acc (granularity=64)
+        2. SwiGLU: C = up * silu(gate), decoded from gate16/up16 accumulator groups
         3. Optional Quant: When c_dtype is Float4E2M1FN, generates SFC and quantizes output
 
         Data loading:
         - A and SFA are loaded using CpAsync instructions with token-based gather
         - B and SFB are loaded using TMA instructions with multicast
-        - B weights are interleaved: [up_0:64, gate_64:128, up_128:192, gate_192:256, ...]
+        - FC1 B and SFB both use gate16/up16 N order
 
         Execution steps:
         1. Setup static attributes before smem/grid computation
@@ -1566,7 +1992,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
 
         :param fc1_a: FC1 input A (MxKx1), gathered with the shared route mapping
         :type fc1_a: cute.Tensor
-        :param fc1_b: FC1 expert weight B (NxKxL), interleaved for SwiGLU
+        :param fc1_b: FC1 expert weight B (NxKxL), in gate16/up16 N order
         :type fc1_b: cute.Tensor
         :param fc1_c: Quantized FC1 SwiGLU output and FC2 input (Mx(N/2)x1)
         :type fc1_c: cute.Tensor
@@ -1754,7 +2180,9 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         fc1_b_op = sm100_utils.cluster_shape_to_tma_atom_B(
             self.cluster_shape_mn, tiled_mma.thr_id
         )
-        b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
+        b_smem_layout = cute.slice_(
+            self.fc1_b_smem_layout_staged, (None, None, None, 0)
+        )
         tma_atom_fc1_b, tma_tensor_fc1_b = cute.nvgpu.make_tiled_tma_atom_B(
             fc1_b_op,
             fc1_b,
@@ -1769,7 +2197,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
             self.cluster_shape_mn, tiled_mma.thr_id
         )
         sfb_smem_layout = cute.slice_(
-            self.sfb_smem_layout_staged, (None, None, None, 0)
+            self.fc1_sfb_smem_layout_staged, (None, None, None, 0)
         )
         tma_atom_fc1_sfb, tma_tensor_fc1_sfb = cute.nvgpu.make_tiled_tma_atom_B(
             fc1_sfb_op,
@@ -1844,8 +2272,10 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
             self.cluster_shape_mn, tiled_mma.thr_id
         )
         fc2_b_smem_layout = cute.select(
-            self.b_smem_layout_staged,
-            mode=list(range(cute.rank(self.b_smem_layout_staged) - 1)),
+            self.fc2_b_smem_layout_staged,
+            mode=list(
+                range(cute.rank(self.fc2_b_smem_layout_staged) - 1)
+            ),
         )
         tma_atom_fc2_b, tma_tensor_fc2_b = cute.nvgpu.make_tiled_tma_atom_B(
             fc2_b_op,
@@ -1859,7 +2289,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
             self.cluster_shape_mn, tiled_mma.thr_id
         )
         fc2_sfb_smem_layout = cute.slice_(
-            self.sfb_smem_layout_staged, (None, None, None, 0)
+            self.fc2_sfb_smem_layout_staged, (None, None, None, 0)
         )
         tma_atom_fc2_sfb, tma_tensor_fc2_sfb = cute.nvgpu.make_tiled_tma_atom_B(
             fc2_sfb_op,
@@ -1971,14 +2401,18 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
             ]
             # cpasync mode: A and B use separate pipelines (CpAsync A is
             # CpAsync type, B is TmaUmma type — they can't share one mbar).
-            # Each mbar set holds num_ab_stage * 2 (full + empty per stage).
-            fc1_a_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
-            fc1_b_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+            # Each mbar set holds two barriers (full + empty) per phase stage.
+            fc1_a_mbar_ptr: cute.struct.MemRange[
+                cutlass.Int64, self.fc1_num_ab_stage * 2
+            ]
+            fc1_b_mbar_ptr: cute.struct.MemRange[
+                cutlass.Int64, self.fc1_num_ab_stage * 2
+            ]
             fc2_a_mbar_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.num_ab_stage * 2
+                cutlass.Int64, self.fc2_num_ab_stage * 2
             ]
             fc2_b_mbar_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.num_ab_stage * 2
+                cutlass.Int64, self.fc2_num_ab_stage * 2
             ]
             acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
             tile_info_mbar_ptr: cute.struct.MemRange[
@@ -2018,21 +2452,9 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                 cute.struct.MemRange[self.sf_dtype, self.sfa_smem_alloc_bytes],
                 self.buffer_align_bytes,
             ]
-            sA: cute.struct.Align[
+            sMainloop: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.a_dtype, cute.cosize(self.a_smem_layout_staged.outer)
-                ],
-                self.buffer_align_bytes,
-            ]
-            sB: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.b_dtype, cute.cosize(self.b_smem_layout_staged.outer)
-                ],
-                self.buffer_align_bytes,
-            ]
-            sSFB: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.sf_dtype, cute.cosize(self.sfb_smem_layout_staged)
+                    cutlass.Uint8, self.mainloop_smem_alloc_bytes
                 ],
                 self.buffer_align_bytes,
             ]
@@ -2056,16 +2478,20 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                 cute.struct.MemRange[cutlass.Int32, 6 * self.num_tile_stage],
                 1,
             ]
-            fc1_a_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
-            fc1_b_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+            fc1_a_mbar_ptr: cute.struct.MemRange[
+                cutlass.Int64, self.fc1_num_ab_stage * 2
+            ]
+            fc1_b_mbar_ptr: cute.struct.MemRange[
+                cutlass.Int64, self.fc1_num_ab_stage * 2
+            ]
             fc1_a_sync_transform_mbar_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.num_ab_stage * 2
+                cutlass.Int64, self.fc1_num_ab_stage * 2
             ]
             fc2_a_mbar_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.num_ab_stage * 2
+                cutlass.Int64, self.fc2_num_ab_stage * 2
             ]
             fc2_b_mbar_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.num_ab_stage * 2
+                cutlass.Int64, self.fc2_num_ab_stage * 2
             ]
             acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
             tile_info_mbar_ptr: cute.struct.MemRange[
@@ -2102,21 +2528,9 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                 cute.struct.MemRange[self.sf_dtype, self.sfa_smem_alloc_bytes],
                 self.buffer_align_bytes,
             ]
-            sA: cute.struct.Align[
+            sMainloop: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.a_dtype, cute.cosize(self.a_smem_layout_staged.outer)
-                ],
-                self.buffer_align_bytes,
-            ]
-            sB: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.b_dtype, cute.cosize(self.b_smem_layout_staged.outer)
-                ],
-                self.buffer_align_bytes,
-            ]
-            sSFB: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.sf_dtype, cute.cosize(self.sfb_smem_layout_staged)
+                    cutlass.Uint8, self.mainloop_smem_alloc_bytes
                 ],
                 self.buffer_align_bytes,
             ]
@@ -2174,10 +2588,12 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
-            self.b_smem_layout_staged,
+            self.fc1_b_smem_layout_staged,
+            self.fc2_b_smem_layout_staged,
             self.fc1_sfa_smem_layout_staged,
             self.fc2_sfa_smem_layout_staged,
-            self.sfb_smem_layout_staged,
+            self.fc1_sfb_smem_layout_staged,
+            self.fc2_sfb_smem_layout_staged,
             self.tCtFC1SFA_layout,
             self.tCtFC2SFA_layout,
             self.tCtSFB_layout,
@@ -2240,10 +2656,12 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
-        b_smem_layout_staged: cute.ComposedLayout,
+        fc1_b_smem_layout_staged: cute.ComposedLayout,
+        fc2_b_smem_layout_staged: cute.ComposedLayout,
         fc1_sfa_smem_layout_staged: cute.Layout,
         fc2_sfa_smem_layout_staged: cute.Layout,
-        sfb_smem_layout_staged: cute.Layout,
+        fc1_sfb_smem_layout_staged: cute.Layout,
+        fc2_sfb_smem_layout_staged: cute.Layout,
         tCtFC1SFA_layout: cute.Layout,
         tCtFC2SFA_layout: cute.Layout,
         tCtSFB_layout: cute.Layout,
@@ -2317,7 +2735,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         )
         fc1_a_pipeline = PipelineCpAsyncUmma.create(
             barrier_storage=storage.fc1_a_mbar_ptr.data_ptr(),
-            num_stages=self.num_ab_stage,
+            num_stages=self.fc1_num_ab_stage,
             producer_group=fc1_a_pipeline_producer_group,
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             cta_layout_vmnk=cluster_layout_vmnk,
@@ -2331,7 +2749,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
             )
             fc1_a_sync_transform_pipeline = pipeline.PipelineAsyncUmma.create(
                 barrier_storage=storage.fc1_a_sync_transform_mbar_ptr.data_ptr(),
-                num_stages=self.num_ab_stage,
+                num_stages=self.fc1_num_ab_stage,
                 producer_group=fc1_a_sync_transform_pipeline_producer_group,
                 consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
                 cta_layout_vmnk=cluster_layout_vmnk,
@@ -2345,7 +2763,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         )
         fc1_b_pipeline = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.fc1_b_mbar_ptr.data_ptr(),
-            num_stages=self.num_ab_stage,
+            num_stages=self.fc1_num_ab_stage,
             producer_group=fc1_b_pipeline_producer_group,
             consumer_group=fc1_b_pipeline_consumer_group,
             tx_count=self.fc1_b_tma_load_bytes,
@@ -2356,7 +2774,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
 
         fc2_a_pipeline = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.fc2_a_mbar_ptr.data_ptr(),
-            num_stages=self.num_ab_stage,
+            num_stages=self.fc2_num_ab_stage,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             consumer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread, self.num_mcast_ctas_a
@@ -2368,7 +2786,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         )
         fc2_b_pipeline = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.fc2_b_mbar_ptr.data_ptr(),
-            num_stages=self.num_ab_stage,
+            num_stages=self.fc2_num_ab_stage,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             consumer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread, self.num_mcast_ctas_b
@@ -2499,17 +2917,48 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
             ),
             fc1_c_smem_layout_staged.outer,
         )
+        sMainloopBytes = storage.sMainloop.get_tensor(
+            cute.make_layout((self.mainloop_smem_alloc_bytes,))
+        )
+        fc2_c_smem_ptr = sEpilogueBytes.iterator
+        if cutlass.const_expr(self.overlay_fc2_c_on_fc1_ab_tail):
+            # No additional hand-off barrier is required. Both FC2 operand
+            # producers execute the corresponding FC1 ``producer_tail`` before
+            # publishing their first FC2 stage. FC2 MMA therefore cannot make
+            # an accumulator available to this epilogue until every aliased
+            # FC1 operand stage has been released by its consumer.
+            fc2_c_smem_ptr = (
+                sMainloopBytes.iterator + self.fc2_c_smem_offset_bytes
+            )
         sFC2C = cute.make_tensor(
-            cute.recast_ptr(sEpilogueBytes.iterator, dtype=self.fc2_c_dtype),
+            cute.recast_ptr(fc2_c_smem_ptr, dtype=self.fc2_c_dtype),
             fc2_c_smem_layout_staged,
         )
         # (MMA, MMA_M, MMA_K, STAGE)
-        sA = storage.sA.get_tensor(
-            a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner
+        sA = cute.make_tensor(
+            cute.recast_ptr(
+                sMainloopBytes.iterator + self.a_smem_offset_bytes,
+                a_smem_layout_staged.inner,
+                dtype=self.a_dtype,
+            ),
+            a_smem_layout_staged.outer,
         )
         # (MMA, MMA_N, MMA_K, STAGE)
-        sB = storage.sB.get_tensor(
-            b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
+        sFC1B = cute.make_tensor(
+            cute.recast_ptr(
+                sMainloopBytes.iterator + self.fc1_b_smem_offset_bytes,
+                fc1_b_smem_layout_staged.inner,
+                dtype=self.b_dtype,
+            ),
+            fc1_b_smem_layout_staged.outer,
+        )
+        sFC2B = cute.make_tensor(
+            cute.recast_ptr(
+                sMainloopBytes.iterator + self.fc2_b_smem_offset_bytes,
+                fc2_b_smem_layout_staged.inner,
+                dtype=self.b_dtype,
+            ),
+            fc2_b_smem_layout_staged.outer,
         )
         # SFA SMEM (linear+pad layout for the cp.async gather).
         sFC1SFA = storage.sSFAStorage.get_tensor(fc1_sfa_smem_layout_staged)
@@ -2517,7 +2966,20 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         # layout expected by TMA and the FC2 MMA descriptor.
         sFC2SFA = storage.sSFAStorage.get_tensor(fc2_sfa_smem_layout_staged)
         # (granularity_n, repeat_n), (granularity_k, repeat_k), num_scale_stage)
-        sSFB = storage.sSFB.get_tensor(sfb_smem_layout_staged)
+        sFC1SFB = cute.make_tensor(
+            cute.recast_ptr(
+                sMainloopBytes.iterator + self.fc1_sfb_smem_offset_bytes,
+                dtype=self.sf_dtype,
+            ),
+            fc1_sfb_smem_layout_staged,
+        )
+        sFC2SFB = cute.make_tensor(
+            cute.recast_ptr(
+                sMainloopBytes.iterator + self.fc2_sfb_smem_offset_bytes,
+                dtype=self.sf_dtype,
+            ),
+            fc2_sfb_smem_layout_staged,
+        )
         # (bidx, bidy, bidz, valid, mn_limit)
         # (m_tile, n_tile, expert, valid, mn_limit, phase)
         info_layout = cute.make_layout((6, self.num_tile_stage), stride=(1, 6))
@@ -2652,7 +3114,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
             tma_atom_fc1_b,
             block_in_cluster_coord_vmnk[1],
             b_cta_layout,
-            cute.group_modes(sB, 0, 3),
+            cute.group_modes(sFC1B, 0, 3),
             cute.group_modes(tCgFC1B, 0, 3),
         )
 
@@ -2666,7 +3128,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
             tma_atom_fc1_sfb,
             block_in_cluster_coord_sfb_vmnk[1],
             sfb_cta_layout,
-            cute.group_modes(sSFB, 0, 3),
+            cute.group_modes(sFC1SFB, 0, 3),
             cute.group_modes(tCgFC1SFB, 0, 3),
         )
         tFC1BsSFB = cute.filter_zeros(tFC1BsSFB)
@@ -2695,14 +3157,14 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
             tma_atom_fc2_b,
             block_in_cluster_coord_vmnk[1],
             b_cta_layout,
-            cute.group_modes(sB, 0, 3),
+            cute.group_modes(sFC2B, 0, 3),
             cute.group_modes(tCgFC2B, 0, 3),
         )
         tFC2BsSFB, tFC2BgSFB = cute.nvgpu.cpasync.tma_partition(
             tma_atom_fc2_sfb,
             block_in_cluster_coord_sfb_vmnk[1],
             sfb_cta_layout,
-            cute.group_modes(sSFB, 0, 3),
+            cute.group_modes(sFC2SFB, 0, 3),
             cute.group_modes(tCgFC2SFB, 0, 3),
         )
         tFC2BsSFB = cute.filter_zeros(tFC2BsSFB)
@@ -2714,7 +3176,8 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         # (MMA, MMA_M, MMA_K, STAGE)
         tCrA = tiled_mma.make_fragment_A(sA)
         # (MMA, MMA_N, MMA_K, STAGE)
-        tCrB = tiled_mma.make_fragment_B(sB)
+        tCrFC1B = tiled_mma.make_fragment_B(sFC1B)
+        tCrFC2B = tiled_mma.make_fragment_B(sFC2B)
         # (MMA, MMA_M, MMA_N)
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
         # (MMA, MMA_M, MMA_N, STAGE)
@@ -2991,12 +3454,12 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                     (
                         self.cta_tile_shape_mnk[0],
                         self.cta_tile_shape_mnk[2],
-                        self.num_ab_stage,
+                        self.fc1_num_ab_stage,
                     ),
                     stride=(
                         self.cta_tile_shape_mnk[2],
                         1,
-                        self.cta_tile_shape_mnk[0] * self.cta_tile_shape_mnk[2],
+                        self.a_smem_bytes_per_stage * 8 // self.a_dtype.width,
                     ),
                 ),
             )
@@ -3033,7 +3496,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                     (
                         self.cta_tile_shape_mnk[0],
                         sfa_tile_k_sf,
-                        self.num_ab_stage,
+                        self.fc1_num_ab_stage,
                     ),
                     stride=(
                         sfa_tile_k_sf,
@@ -3044,7 +3507,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
             )
 
             fc1_a_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.num_ab_stage
+                pipeline.PipelineUserType.Producer, self.fc1_num_ab_stage
             )
             tile_info_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_tile_stage
@@ -3195,7 +3658,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
             fc1_a_pipeline.producer_tail(fc1_a_producer_state)
 
             fc2_a_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.num_ab_stage
+                pipeline.PipelineUserType.Producer, self.fc2_num_ab_stage
             )
 
             # The descriptor that ended the FC1 loop is either the first
@@ -3305,10 +3768,10 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
 
             if cutlass.const_expr(self.use_2cta_instrs):
                 fc1_a_consumer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer, self.num_ab_stage
+                    pipeline.PipelineUserType.Consumer, self.fc1_num_ab_stage
                 )
                 a_sync_transform_producer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer, self.num_ab_stage
+                    pipeline.PipelineUserType.Producer, self.fc1_num_ab_stage
                 )
                 is_valid_fc1_tile = (tile_info[3] == 1) and (
                     tile_info[5] == FC1_PHASE
@@ -3427,7 +3890,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         # TMA B/SFB load warp (warp 9). Loads B/SFB GMEM → SMEM with multicast.
         if warp_idx == self.tma_b_warp_id:
             fc1_b_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.num_ab_stage
+                pipeline.PipelineUserType.Producer, self.fc1_num_ab_stage
             )
 
             tile_info_consumer_state = pipeline.make_pipeline_state(
@@ -3567,7 +4030,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
 
             fc1_b_pipeline.producer_tail(fc1_b_producer_state)
             fc2_b_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.num_ab_stage
+                pipeline.PipelineUserType.Producer, self.fc2_num_ab_stage
             )
             is_valid_fc2_tile = tile_info[3] == 1
             while is_valid_fc2_tile:
@@ -3698,17 +4161,22 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
             fc2_sfa_s2t_bundle = self._mainloop_s2t_copy_and_partition(
                 sFC2SFA, tCtFC2SFA
             )
-            sfb_s2t_bundle = self._mainloop_s2t_copy_and_partition(sSFB, tCtSFB)
+            fc1_sfb_s2t_bundle = self._mainloop_s2t_copy_and_partition(
+                sFC1SFB, tCtSFB
+            )
+            fc2_sfb_s2t_bundle = self._mainloop_s2t_copy_and_partition(
+                sFC2SFB, tCtSFB
+            )
 
             fc1_a_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.num_ab_stage
+                pipeline.PipelineUserType.Consumer, self.fc1_num_ab_stage
             )
             fc1_b_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.num_ab_stage
+                pipeline.PipelineUserType.Consumer, self.fc1_num_ab_stage
             )
             if cutlass.const_expr(self.use_2cta_instrs):
                 a_sync_transform_consumer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer, self.num_ab_stage
+                    pipeline.PipelineUserType.Consumer, self.fc1_num_ab_stage
                 )
             acc_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_acc_stage
@@ -3852,7 +4320,9 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                             sfa_s2t_bundle.sSF_compact[sfa_s2t_stage_coord],
                             sfa_s2t_bundle.tSF_compact,
                         )
-                        self._mainloop_s2t_copies(b_stage_idx, sfb_s2t_bundle)
+                        self._mainloop_s2t_copies(
+                            b_stage_idx, fc1_sfb_s2t_bundle
+                        )
 
                         num_kblocks = cute.size(tCrA, mode=[2])
 
@@ -3885,7 +4355,10 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                                         tCrA[a_kblk_crd_keep],
                                         tCtFC1SFA[sfa_kblk_crd_keep],
                                     ],
-                                    [tCrB[b_kblk_crd], tCtSFB_mma[sfb_kblk_crd]],
+                                    [
+                                        tCrFC1B[b_kblk_crd],
+                                        tCtSFB_mma[sfb_kblk_crd],
+                                    ],
                                     tCtAcc_bkeep,
                                 )
                                 # Breuse
@@ -3900,7 +4373,10 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                                         tCrA[a_kblk_crd_reuse],
                                         tCtFC1SFA[sfa_kblk_crd_reuse],
                                     ],
-                                    [tCrB[b_kblk_crd], tCtSFB_mma[sfb_kblk_crd]],
+                                    [
+                                        tCrFC1B[b_kblk_crd],
+                                        tCtSFB_mma[sfb_kblk_crd],
+                                    ],
                                     tCtAcc_breuse,
                                 )
                             else:
@@ -3914,7 +4390,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                                     acc_frag=tCtAcc,
                                     a_frag=tCrA[a_kblock_coord],
                                     sfa_frag=tCtFC1SFA_mma[sf_kblock_coord],
-                                    b_frag=tCrB[b_kblock_coord],
+                                    b_frag=tCrFC1B[b_kblock_coord],
                                     sfb_frag=tCtSFB_mma[sf_kblock_coord],
                                     static_idesc_base=self.static_idesc_base,
                                     accumulate=(k_tile != 0 or kblock_idx != 0),
@@ -3988,10 +4464,10 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
 
             acc_pipeline.producer_tail(acc_producer_state)
             fc2_a_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.num_ab_stage
+                pipeline.PipelineUserType.Consumer, self.fc2_num_ab_stage
             )
             fc2_b_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.num_ab_stage
+                pipeline.PipelineUserType.Consumer, self.fc2_num_ab_stage
             )
             is_valid_fc2_tile = tile_info[3] == 1
             while is_valid_fc2_tile:
@@ -4042,7 +4518,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                             fc2_sfa_s2t_bundle.tSF_compact,
                         )
                         self._mainloop_s2t_copies(
-                            b_stage_idx, sfb_s2t_bundle
+                            b_stage_idx, fc2_sfb_s2t_bundle
                         )
 
                         num_kblocks = cute.size(tCrA, mode=[2])
@@ -4075,7 +4551,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                                     tCtFC2SFA[sf_kblock_coord],
                                 ],
                                 [
-                                    tCrB[b_kblock_coord],
+                                    tCrFC2B[b_kblock_coord],
                                     tCtSFB[sf_kblock_coord],
                                 ],
                                 tCtAcc,
@@ -4143,8 +4619,8 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
             (
                 tiled_copy_t2r,
                 tFC1TR_tAcc_base,
-                tFC1TR_rAcc_up,
-                tFC1TR_rAcc_gate,
+                tFC1TR_rPackedLo,
+                tFC1TR_rPackedHi,
             ) = self.fc1_epilogue_tmem_copy_and_partition(
                 epi_tidx,
                 tCtAcc_transformed,
@@ -4183,7 +4659,9 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
             tFC1RS_sC = None
             bSG_sC = None
             bSG_gC_partitioned = None
-            tFC1TR_rC = cute.make_rmem_tensor(tFC1TR_rAcc_up.shape, self.fc1_c_dtype)
+            # One logical output fragment has the same shape as one packed
+            # load fragment: two packed chunks become gate/up, then one C.
+            tFC1TR_rC = cute.make_rmem_tensor(tFC1TR_rPackedLo.shape, self.fc1_c_dtype)
             tiled_copy_r2s, tFC1RS_rC, tFC1RS_sC = (
                 self.fc1_epilogue_smem_copy_and_partition(
                     tiled_copy_t2r, tFC1TR_rC, epi_tidx, sFC1C
@@ -4313,44 +4791,52 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                 #
                 acc_pipeline.consumer_wait(acc_consumer_state)
 
-                # SwiGLU epilogue. Acc has full N cols with interleaved
-                # [up, gate] at granularity=64; C has N/2 cols. Iterate M and
-                # N output subtiles → up * silu(gate).
+                # Each N64 output subtile consumes two consecutive N64
+                # accumulator chunks, each [gate16, up16, gate16, up16].
                 # tFC1TR_tAcc: (T2R, T2R_M, T2R_N, EPI_M, EPI_N,
                 # STAGE), sliced on STAGE. bSG_gC: ((ATOM_V, REST_V),
                 # EPI_M, EPI_N, loopM, loopN, loopL).
-                interleave_granularity = 64
-                gate_offset = interleave_granularity // self.fc1_epi_tile_n
                 epi_m_cnt = cute.size(tFC1TR_tAcc.shape, mode=[3])
-                acc_n_subtile_cnt = cute.size(tFC1TR_tAcc.shape, mode=[4])
-                out_n_subtile_cnt = (
-                    acc_n_subtile_cnt // 2
-                )  # N/2 output subtiles per M subtile
+                packed_n_chunk_cnt = cute.size(tFC1TR_tAcc.shape, mode=[4])
+                out_n_subtile_cnt = packed_n_chunk_cnt // 2
 
                 for epi_m_idx in cutlass.range(epi_m_cnt):
                     for out_n_idx in cutlass.range(out_n_subtile_cnt):
-                        # Map output N subtile → acc N subtile. Each
-                        # interleave block of 2*gate_offset subtiles is
-                        # [up*gate_offset, gate*gate_offset].
-                        real_out_n_idx = out_n_idx
-                        block_idx = real_out_n_idx // gate_offset
-                        within_block = real_out_n_idx % gate_offset
-                        up_n_subtile = block_idx * 2 * gate_offset + within_block
-                        gate_n_subtile = (
-                            block_idx * 2 * gate_offset + gate_offset + within_block
-                        )
-                        #
-                        # Load accumulator from tensor memory buffer to register
-                        #
-                        tFC1TR_tAcc_mn_up = tFC1TR_tAcc[
-                            (None, None, None, epi_m_idx, up_n_subtile)
+                        # N128 has one output subtile; N256 has two. Each
+                        # reads consecutive low/high halves of its N128 input.
+                        tFC1TR_tAcc_mn_lo = tFC1TR_tAcc[
+                            (None, None, None, epi_m_idx, 2 * out_n_idx)
                         ]
-                        tFC1TR_tAcc_mn_gate = tFC1TR_tAcc[
-                            (None, None, None, epi_m_idx, gate_n_subtile)
+                        tFC1TR_tAcc_mn_hi = tFC1TR_tAcc[
+                            (None, None, None, epi_m_idx, 2 * out_n_idx + 1)
                         ]
 
-                        cute.copy(tiled_copy_t2r, tFC1TR_tAcc_mn_up, tFC1TR_rAcc_up)
-                        cute.copy(tiled_copy_t2r, tFC1TR_tAcc_mn_gate, tFC1TR_rAcc_gate)
+                        cute.copy(tiled_copy_t2r, tFC1TR_tAcc_mn_lo, tFC1TR_rPackedLo)
+                        cute.copy(tiled_copy_t2r, tFC1TR_tAcc_mn_hi, tFC1TR_rPackedHi)
+
+                        # Preserve immutable packed values before reusing the
+                        # two load buffers as logical up64/gate64 destinations.
+                        # These aliases mark the change of meaning; they do
+                        # not allocate another pair of register fragments.
+                        packed_lo = tFC1TR_rPackedLo.load()
+                        packed_hi = tFC1TR_rPackedHi.load()
+                        tFC1TR_rAcc_up = tFC1TR_rPackedLo
+                        tFC1TR_rAcc_gate = tFC1TR_rPackedHi
+                        # Packed axes: (channel within N16, gate/up, group).
+                        # Logical axes: (channel within N16, group, lo/hi).
+                        packed_lo = packed_lo.reshape((16, 2, 2))
+                        packed_hi = packed_hi.reshape((16, 2, 2))
+                        gate_up_layout = cute.make_layout((16, 2, 2))
+                        gate = cute.make_tensor(
+                            tFC1TR_rAcc_gate.iterator, gate_up_layout
+                        )
+                        up = cute.make_tensor(
+                            tFC1TR_rAcc_up.iterator, gate_up_layout
+                        )
+                        gate[None, None, 0].store(packed_lo[None, 0, None])
+                        gate[None, None, 1].store(packed_hi[None, 0, None])
+                        up[None, None, 0].store(packed_lo[None, 1, None])
+                        up[None, None, 1].store(packed_hi[None, 1, None])
 
                         acc_vec_up = tFC1TR_rAcc_up.load()
                         acc_vec_gate = tFC1TR_rAcc_gate.load()
@@ -4460,7 +4946,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                             sfc_subtile_idx_mn = (
                                 tile_info[0] * self.fc1_epi_tile_cnt[0] + epi_m_idx,
                                 tile_info[1] * self.fc1_epi_tile_cnt[1]
-                                + real_out_n_idx,
+                                + out_n_idx,
                             )
                             tCgFC1SFC = tCgFC1SFC_mn[
                                 (
@@ -4623,7 +5109,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                             cute.copy(
                                 tma_atom_fc1_c,
                                 bSG_sC[(None, c_buffer)],
-                                bSG_gC[(None, epi_m_idx, real_out_n_idx)],
+                                bSG_gC[(None, epi_m_idx, out_n_idx)],
                             )
                             # Fence and barrier to make sure shared memory store is visible to TMA store
                             fc1_c_pipeline.producer_commit()
@@ -4841,8 +5327,11 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         use_2cta_instrs: Union[cutlass.Boolean, bool],
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor, cute.Tensor]:
         """
-        Make tiledCopy for tensor memory load, then use it to partition tensor memory
-        (source) and register array (destination).
+        Partition packed gate16/up16 TMEM into N64 load chunks.
+
+        A pair of chunks supplies one logical N64 output subtile. Neither
+        load destination is a gate-only or up-only fragment. The epilogue
+        decodes the packed values into logical gate/up before SwiGLU.
 
         :param tidx: The thread index in epilogue warp groups
         :type tidx: cutlass.Int32
@@ -4856,11 +5345,11 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         :type use_2cta_instrs: bool
 
         :return: A tuple containing tiled_copy_t2r, tFC1TR_tAcc,
-            tFC1TR_rAcc_up, and tFC1TR_rAcc_gate, where:
+            tFC1TR_rPackedLo, and tFC1TR_rPackedHi, where:
             - tiled_copy_t2r: The tiled copy operation for tmem to register copy(t2r)
             - tFC1TR_tAcc: The partitioned accumulator tensor
-            - tFC1TR_rAcc_up: The partitioned accumulator tensor for acc up
-            - tFC1TR_rAcc_gate: The partitioned accumulator tensor for acc gate
+            - tFC1TR_rPackedLo: First packed N64 chunk of an N128 input subtile
+            - tFC1TR_rPackedHi: Second packed N64 chunk of that input subtile
         :rtype: Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor, cute.Tensor]
         """
         # Make tiledCopy for tensor memory load (Rubin uses transformed layout)
@@ -4896,14 +5385,14 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         tFC1TR_gC = thr_copy_t2r.partition_D(gFC1C_mnl_epi)
 
         # (T2R, T2R_M, T2R_N)
-        tFC1TR_rAcc_up = cute.make_rmem_tensor(
+        tFC1TR_rPackedLo = cute.make_rmem_tensor(
             tFC1TR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
         )
         # (T2R, T2R_M, T2R_N)
-        tFC1TR_rAcc_gate = cute.make_rmem_tensor(
+        tFC1TR_rPackedHi = cute.make_rmem_tensor(
             tFC1TR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
         )
-        return tiled_copy_t2r, tFC1TR_tAcc, tFC1TR_rAcc_up, tFC1TR_rAcc_gate
+        return tiled_copy_t2r, tFC1TR_tAcc, tFC1TR_rPackedLo, tFC1TR_rPackedHi
 
     def fc1_epilogue_smem_copy_and_partition(
         self,
@@ -5010,7 +5499,15 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         fc2_num_meta_stage: int,
         buffer_align_bytes: int,
         mma_cta_group_size: int,
-    ) -> Tuple[int, int, int, int]:
+    ) -> Tuple[
+        int,
+        int,
+        int,
+        int,
+        int,
+        bool,
+        SeparatePhaseSmemStageBytes,
+    ]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 
         :param tiled_mma: The tiled MMA object defining the core computation.
@@ -5048,9 +5545,12 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         :param mma_cta_group_size: Number of CTAs participating in one MMA.
         :type mma_cta_group_size: int
 
-        :return: A tuple containing the computed number of stages for:
-                 (ACC stages, A/B operand stages, C stages, tile-info stages)
-        :rtype: tuple[int, int, int, int]
+        :return: A tuple containing the computed stage configuration:
+                 (ACC stages, FC1 AB stages, FC2 AB stages, FC1 C stages,
+                 tile-info stages, whether FC2 C aliases the FC1 AB tail,
+                 and the byte model used to derive the physical layout)
+        :rtype: tuple[int, int, int, int, int, bool,
+                      SeparatePhaseSmemStageBytes]
         """
         # Default ACC stages
         num_acc_stage = 1 if (with_breuse and mma_tiler_mnk[1] in {192, 256}) else 2
@@ -5173,14 +5673,50 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
             header_per_ab_stage=header_per_ab_stage,
             alignment=buffer_align_bytes,
         )
-        selected = select_fused_smem_stages(
+        common_selected = select_fused_smem_stages(
             capacity=num_smem_capacity // occupancy,
             preferred_ab=preferred_num_ab_stage,
             preferred_fc1_c=preferred_fc1_num_c_stage,
             minimum_fc1_c=fc1_num_c_stage,
             stage_bytes=stage_bytes,
         )
-        return num_acc_stage, selected.ab, selected.fc1_c, num_tile_stage
+        # Preserve the common selector's depth for FC2. FC1 may recover its
+        # standalone depth when its extra stage-major tail can replace the
+        # standalone FC2 C allocation.
+        fc1_header_per_stage = (
+            2 + (mma_cta_group_size - 1)
+        ) * 2 * int64_bytes
+        fc2_header_per_stage = 2 * 2 * int64_bytes
+        separate_stage_bytes = SeparatePhaseSmemStageBytes(
+            a_per_stage=a_bytes_per_stage,
+            b_per_stage=b_bytes_per_stage,
+            sfa_per_stage=sfa_bytes_per_stage_one,
+            sfb_per_stage=sfb_bytes_per_stage,
+            fc1_c_per_stage=fc1_c_bytes_per_stage,
+            fc2_c=fc2_c_smem_bytes,
+            metadata=fc2_metadata_smem_bytes,
+            header_fixed=header_fixed,
+            fc1_header_per_stage=fc1_header_per_stage,
+            fc2_header_per_stage=fc2_header_per_stage,
+            alignment=buffer_align_bytes,
+        )
+        separate_selected = select_separate_phase_smem_stages(
+            capacity=num_smem_capacity // occupancy,
+            preferred_fc1_ab=preferred_num_ab_stage,
+            preferred_fc2_ab=common_selected.ab,
+            preferred_fc1_c=preferred_fc1_num_c_stage,
+            minimum_fc1_c=fc1_num_c_stage,
+            stage_bytes=separate_stage_bytes,
+        )
+        return (
+            num_acc_stage,
+            separate_selected.fc1_ab,
+            separate_selected.fc2_ab,
+            separate_selected.fc1_c,
+            num_tile_stage,
+            separate_selected.overlay_fc2_c,
+            separate_stage_bytes,
+        )
 
     @staticmethod
     def _compute_tile_sched_params(
