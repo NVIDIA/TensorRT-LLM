@@ -58,6 +58,19 @@ BOLT_OVERLAY_ENABLED = (params.boltOverlayEnabled ?: env.boltOverlayEnabled ?: "
 // carries profiles). Left false until the enable PR wires it true for the
 // release/nightly path; premerge/new-branch stays lenient (retag plain build).
 BOLT_PROFILES_REQUIRED = (params.boltProfilesRequired ?: env.boltProfilesRequired ?: "false").toString() == "true"
+// Separate from the two above: those govern the profile BUNDLE baked in as a
+// thin layer (Dockerfile.bolt), which documents how to reproduce a BOLTed build
+// but does NOT optimize the binaries the image actually installs. This one
+// governs the INSTALLED wheel -- when true, the wheel unpacked from the build
+// tarball is BOLT-optimized in the image build, before the release stage pip
+// installs it. Kept independent so it can be rolled back on its own.
+BOLT_OPTIMIZE_WHEEL = (params.boltOptimizeWheel ?: env.boltOptimizeWheel ?: "false").toString() == "true"
+// The bundle this pipeline pinned, hoisted out of globalVars in launchBuildJobs
+// because prepareWheelFromBuildStage runs well below the scope globalVars is
+// passed into. Empty means unpinned, i.e. take whatever `latest` is.
+BOLT_PINNED_REF = ""
+// The branch that pin lives under. Set only together with the ref.
+BOLT_PINNED_BRANCH = ""
 // <<< BOLT profile-bundle overlay <<<
 
 ENABLE_USE_WHEEL_FROM_BUILD_STAGE = params.useWheelFromBuildStage ?: false
@@ -80,12 +93,22 @@ def ACTION_INFO = "action_info"
 def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 @Field
 def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
+@Field
+def BOLT_PROFILE_REF = "bolt_profile_ref"
+@Field
+def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): null,
     (IMAGE_KEY_TO_TAG): [:],
     (TRTLLM_VERSION_OVERRIDE): null,
+    // Pre-declared so updateMapWithJson() populates it from the parent: that
+    // helper only updates keys already present here, so an absent key is
+    // silently dropped -- which for this one would mean running unpinned
+    // without saying so.
+    (BOLT_PROFILE_REF): "",
+    (BOLT_PROFILE_BRANCH): "",
 ]
 
 @Field
@@ -286,8 +309,47 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
     }
 
     def wheelScript = 'scripts/get_wheel_from_package.py'
-    def wheelArgs = "--arch ${arch} --timeout ${WAIT_TIME_FOR_BUILD_STAGE} --artifact_path " + env.uploadPath
+    // UPLOAD_PATH, not env.uploadPath: they agree whenever the parent passed the
+    // parameter, but an unset env leaves the raw reference interpolating to
+    // "null" and the download then polls .../null/<tarball> until it times out.
+    def wheelArgs = "--arch ${arch} --timeout ${WAIT_TIME_FOR_BUILD_STAGE} --artifact_path ${UPLOAD_PATH}"
+
+    // Only aarch64 has a promoted profile bundle, so only the SBSA image has
+    // anything to apply; x86 installs the wheel as built.
+    if (BOLT_OPTIMIZE_WHEEL && arch == "sbsa") {
+        // The branch whose promoted bundle to apply, resolved the same way the
+        // image overlay resolves it: an explicit override, else this build's own
+        // branch, else main. Deliberately NOT this run's own profiles -- those
+        // are not published until BoltProfileGen finishes, hours after this
+        // build starts, and waiting on them would serialize every release
+        // behind a multi-hour GPU job. get_wheel_from_package.py tries these in
+        // order and fails if none has a bundle.
+        def branches = [params.boltProfileBranch, LLM_BRANCH, "main"]
+            .collect { it?.toString()?.trim() }
+            .findAll { it }
+            .unique()
+        // Pinned, the candidate list collapses to the branch the pin came from:
+        // the ref names one immutable bundle under one promote directory, so
+        // falling through to another branch would optimize the image's wheel
+        // with different profiles than the release wheel and the tested build.
+        if (BOLT_PINNED_REF && BOLT_PINNED_BRANCH) {
+            branches = [BOLT_PINNED_BRANCH]
+            wheelArgs += " --bolt-profile-ref ${BOLT_PINNED_REF}"
+            echo "Release image for ${arch} is pinned to BOLT bundle ${BOLT_PINNED_REF} on ${BOLT_PINNED_BRANCH}"
+        }
+        echo "Release image for ${arch} will BOLT-optimize its wheel using profiles from: ${branches.join(', ')}"
+        wheelArgs += " --bolt-branch ${branches.join(',')}"
+    }
     return " BUILD_WHEEL_SCRIPT=${wheelScript} BUILD_WHEEL_ARGS='${wheelArgs}'"
+}
+
+// Whether a docker build that failed WITH the downloaded-wheel args may be
+// retried without them. The retry rebuilds the wheel from source in-container,
+// which is a fine recovery for an ordinary build but silently defeats the point
+// when that build was also responsible for optimizing the wheel -- the retry
+// would produce an unoptimized release image that looks identical.
+def mayRetryWithoutBuildStageWheel(arch) {
+    return !(BOLT_OPTIMIZE_WHEEL && arch == "sbsa")
 }
 
 // Produce each CANONICAL image from its raw `-noprofiles` build by
@@ -339,10 +401,21 @@ def overlayBoltBundle(pairs, arch, action) {
     //    (manifest + >=1 profile) so "pulled but empty" is not accepted. First hit wins.
     def haveBundle = false
     def branch = null
+    // The overlay is a consumer like any other, so it takes the pipeline's pin
+    // rather than resolving `latest` when it happens to run. Without this the
+    // released image could carry a profile bundle that no other artifact in the
+    // run was built from. Empty means unpinned and pull-latest behaves exactly
+    // as before; pinned, the pin supplies its own branch and the candidate walk
+    // collapses to it, because the ref names one object under one directory.
+    if (BOLT_PINNED_REF && BOLT_PINNED_BRANCH) {
+        candidates = [BOLT_PINNED_BRANCH]
+        echo "[BOLT] overlay pinned to bundle ${BOLT_PINNED_REF} on ${BOLT_PINNED_BRANCH}"
+    }
     for (cand in candidates) {
         for (int attempt = 1; attempt <= 3 && !haveBundle; attempt++) {
             def rc = sh(script: """
                 rm -rf ${ctxDir} && mkdir -p ${ctxDir}/${bundleSub} && \
+                export BOLT_PROFILE_REF='${BOLT_PINNED_REF}' && \
                 cd ${LLM_ROOT} && bash scripts/bolt/internal/artifactory.sh pull-latest ${cand} ${triple} ${ctxDir}/${bundleSub}
             """, returnStatus: true)
             if (rc == 0) {
@@ -587,6 +660,11 @@ def buildImage(config, imageKeyToTag, versionOverride)
                 if (buildWheelArgs.trim().isEmpty()) {
                     throw ex
                 }
+                if (!mayRetryWithoutBuildStageWheel(arch)) {
+                    echo "Build failed with wheel arguments and the BOLT-optimized wheel is required for ${arch}; " +
+                         "NOT retrying from source (that would publish an unoptimized release image)"
+                    throw ex
+                }
                 echo "Build failed with wheel arguments, retrying without them"
                 buildWheelArgs = ""
                 trtllm_utils.llmExecStepWithRetry(this, script: """
@@ -645,6 +723,8 @@ def buildImage(config, imageKeyToTag, versionOverride)
 
 def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
     def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
+    BOLT_PINNED_REF = globalVars[BOLT_PROFILE_REF]?.toString() ?: ""
+    BOLT_PINNED_BRANCH = globalVars[BOLT_PROFILE_BRANCH]?.toString() ?: ""
     def defaultBuildConfig = [
         target: "tritondevel",
         action: params.action,
@@ -858,6 +938,11 @@ pipeline {
             name: "boltProfilesRequired",
             defaultValue: false,
             description: "When boltOverlayEnabled is true, treat a missing/empty BOLT bundle as a FATAL error instead of retagging the plain build as canonical. Enable for the release/nightly path to guarantee canonical images carry profiles."
+        )
+        booleanParam(
+            name: "boltOptimizeWheel",
+            defaultValue: false,
+            description: "BOLT-optimize the wheel the SBSA release image installs, applying the branch's latest promoted profile bundle during the image build, and fail if no bundle can be applied. Independent of boltOverlayEnabled, which only bakes the bundle in as a layer and leaves the installed binaries unoptimized. Uses the last promoted bundle rather than this run's, so the image build never waits on BoltProfileGen. Ignored on x86_64, which has no promoted bundle."
         )
         string(
             name: "boltProfileBranch",
