@@ -20,9 +20,17 @@ from collections.abc import Sequence
 
 import torch
 
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.pyexecutor.config_utils import (
+    extract_mamba_kv_cache_params,
+    unwrap_glm5_next_text_config,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig
+from tensorrt_llm._torch.pyexecutor.resource_manager import get_pp_layers
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole
 
 
 class Glm5NextCacheManager(MambaHybridCacheManagerV2):
@@ -50,13 +58,97 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
 
     def _extra_buffers_per_layer(self, *, tokens_per_block: int) -> dict[int, list[BufferConfig]]:
         """One ``Role.INDEX_KEY`` buffer per sparse layer, keyed by local id."""
-        elem_bytes = torch.tensor([], dtype=torch.bfloat16).element_size()
-        size_per_block = self.index_state_dim * elem_bytes * tokens_per_block
         return {
-            self.layer_offsets[layer_id]: [BufferConfig(role=Role.INDEX_KEY, size=size_per_block)]
+            self.layer_offsets[layer_id]: [
+                BufferConfig(
+                    role=Role.INDEX_KEY,
+                    size=self.get_layer_bytes_per_token(
+                        self.layer_offsets[layer_id], Role.INDEX_KEY
+                    )
+                    * tokens_per_block,
+                )
+            ]
             for layer_id in self.sparse_layer_ids
             if layer_id in self.layer_offsets
         }
+
+    def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: DataRole) -> int:
+        index_bytes = (
+            self.index_state_dim * torch.bfloat16.itemsize
+            if self.pp_layers[local_layer_idx] in self.sparse_layer_ids
+            else 0
+        )
+        if data_role == Role.INDEX_KEY:
+            return index_bytes
+        cache_bytes = super().get_layer_bytes_per_token(local_layer_idx, data_role)
+        return cache_bytes + index_bytes if data_role == Role.ALL else cache_bytes
+
+    def _attention_cache_bytes_per_token(self) -> int:
+        return sum(
+            self.get_layer_bytes_per_token(local_layer_idx, Role.ALL)
+            for local_layer_idx in range(self.num_local_layers)
+        )
+
+    @staticmethod
+    def get_cache_size_per_token(
+        model_config: ModelConfig,
+        mapping: Mapping,
+        *,
+        max_batch_size: int,
+        kv_cache_config: KvCacheConfig,
+        tokens_per_block: int = 32,
+        max_seq_len: int | None = None,
+        **kwargs,
+    ) -> tuple[int, int]:
+        slope, fixed_cost = MambaHybridCacheManagerV2.get_cache_size_per_token(
+            model_config,
+            mapping,
+            max_batch_size=max_batch_size,
+            kv_cache_config=kv_cache_config,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            **kwargs,
+        )
+        spec_config = kwargs.get("spec_config")
+        params = extract_mamba_kv_cache_params(
+            model_config.pretrained_config,
+            spec_config=spec_config,
+            quant_config=model_config.quant_config,
+        )
+        kda_mask, attention_mask = params.get_layer_masks(
+            is_draft=kwargs.get("is_draft", False),
+            use_separate_draft_kv_cache=kwargs.get("use_separate_draft_kv_cache", False),
+        )
+        layer_mask = [kda or attention for kda, attention in zip(kda_mask, attention_mask)]
+        local_layers, _ = get_pp_layers(
+            sum(layer_mask), mapping, spec_config=spec_config, layer_mask=layer_mask
+        )
+        local_attention_layers = sum(attention_mask[layer] for layer in local_layers)
+        config = unwrap_glm5_next_text_config(model_config.pretrained_config)
+        # All GLM full-attention layers, including MTP layers, use the sparse indexer.
+        # Indexer pages remain BF16 even when latent KV is quantized.
+        index_bytes_per_token = (
+            local_attention_layers * 3 * config.index_head_dim * torch.bfloat16.itemsize
+        )
+        state_config = kv_cache_config.mamba_state_config
+        seq_limit = max_seq_len if max_seq_len is not None else float("inf")
+        has_snapshots = kv_cache_config.enable_block_reuse and (
+            0 < state_config.periodic_snapshot_interval <= seq_limit
+            or any(
+                offset <= seq_limit
+                for offset in state_config.additional_snapshot_offsets_from_start
+            )
+            or any(
+                offset < seq_limit for offset in state_config.additional_snapshot_offsets_from_end
+            )
+        )
+        # V2 reserves one partial attention page per resident lineage when snapshots
+        # are reachable. Include the indexer section of those retained pages.
+        if has_snapshots:
+            fixed_cost += (
+                max_batch_size * mapping.pp_size * tokens_per_block * index_bytes_per_token
+            )
+        return slope + index_bytes_per_token, fixed_cost
 
     def get_index_state_buffer(self, layer_idx: int) -> torch.Tensor | None:
         """Paged indexer state for ``layer_idx``, NHD-shaped."""
