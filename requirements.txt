@@ -116,3 +116,4 @@ cache-dit>=1.3.5
 librosa
 msgpack
 uvloop>=0.19.0
+python-gvm
