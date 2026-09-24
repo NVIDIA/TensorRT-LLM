@@ -241,7 +241,7 @@ def test_worker_error_status_is_not_treated_as_identities():
     assert proxy.worker_init_status_queue.acks == ["ACK"]
 
 
-def test_worker_publishes_identities_before_backend_construction(monkeypatch):
+def test_worker_publishes_identities_and_preserves_initialization_error(monkeypatch):
     identity = WorkerProcessIdentity(
         rank=0, pid=12345, start_time=67890, hostname="localhost", pid_namespace=1
     )
@@ -266,7 +266,7 @@ def test_worker_publishes_identities_before_backend_construction(monkeypatch):
     class _FailingWorker:
         def __init__(self, *args, **kwargs):
             events.append(("construct", None))
-            raise RuntimeError("expected construction failure")
+            raise ValueError("expected construction failure")
 
     init_status_queue = _FakeInitStatusQueue()
 
@@ -303,6 +303,9 @@ def test_worker_publishes_identities_before_backend_construction(monkeypatch):
         ("notify", GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL),
         ("construct", None),
     ]
+    assert events[2][0] == "notify"
+    assert isinstance(events[2][1], ValueError)
+    assert str(events[2][1]) == "expected construction failure"
 
     events.clear()
     init_status_queue.notification_results = [False]
@@ -336,12 +339,13 @@ def test_worker_publishes_identities_before_backend_construction(monkeypatch):
 
     assert "expected construction failure" in str(exc_info.value)
     assert "Traceback (most recent call last)" in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, ValueError)
     assert events[:2] == [
         ("notify", GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL),
         ("construct", None),
     ]
     assert events[2][0] == "notify"
-    assert isinstance(events[2][1], RuntimeError)
+    assert isinstance(events[2][1], ValueError)
 
 
 def test_non_leader_worker_propagates_backend_initialization_error(monkeypatch):

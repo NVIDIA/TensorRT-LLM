@@ -420,7 +420,9 @@ def worker_main(
         logger_debug(f"error: {error_trace}", "red")
         if is_leader:
             # Send error message with confirmation
-            error_msg = (error, error_trace)
+            # Preserve the original exception for callers that inspect the
+            # proxy initialization error's cause.
+            error_msg = (e, error_trace)
             if worker_init_status_queue.notify_with_retry(error_msg):
                 return
             logger.error("Failed to deliver error message to proxy")
