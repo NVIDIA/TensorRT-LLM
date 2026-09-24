@@ -872,6 +872,10 @@ class TestRotaryTablePrecision:
     # above 2048. cuBLAS picks a TF32 kernel for the K=1 GEMM only at some
     # problem sizes, so sweep the sizes a Cosmos3 request actually produces.
     SEQUENCE_LENGTHS = [4096, 6240, 8192, 10336, 16384]
+    # Each request feeds this two dtypes: the text tower passes one int64 ramp
+    # shared by all three axes, fps-modulated vision a fractional fp32
+    # temporal axis. Vision is int64 too when fps modulation is off.
+    POSITION_MODES = ["text_int64", "vision_fps_fp32"]
 
     @pytest.fixture(autouse=True)
     def _require_tf32_capable_cuda(self):
@@ -902,21 +906,34 @@ class TestRotaryTablePrecision:
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos(), emb.sin()
 
+    @staticmethod
+    def _position_ids(mode: str, seq_len: int) -> torch.Tensor:
+        """``[3, 1, seq_len]`` mRoPE ids in one of the two production shapes."""
+        if mode == "text_int64":
+            ramp = torch.arange(seq_len, dtype=torch.long, device=DEVICE)
+            ids = ramp.unsqueeze(0).expand(3, -1).contiguous()
+        else:
+            base = torch.arange(seq_len, dtype=torch.float32, device=DEVICE)
+            ids = torch.stack([base * 24.0 / 10.0, base, base], dim=0)
+        return ids[:, None, :]
+
     @pytest.mark.parametrize("allow_tf32", [False, True])
+    @pytest.mark.parametrize("mode", POSITION_MODES)
     @pytest.mark.parametrize("seq_len", SEQUENCE_LENGTHS)
-    def test_rotary_table_matches_fp64_under_tf32(self, allow_tf32: bool, seq_len: int):
+    def test_rotary_table_matches_fp64_under_tf32(self, allow_tf32: bool, mode: str, seq_len: int):
         saved = torch.backends.cuda.matmul.allow_tf32
         torch.backends.cuda.matmul.allow_tf32 = allow_tf32
         try:
             rotary = self._rotary().to(DEVICE)
-            base = torch.arange(seq_len, dtype=torch.float32, device=DEVICE)
-            # Text ids share one integer ramp across all three axes; vision
-            # scales the temporal axis by fps, so that axis can be fractional.
-            position_ids = torch.stack([base * 24.0 / 10.0, base, base], dim=0)[:, None, :]
+            position_ids = self._position_ids(mode, seq_len)
             probe = torch.empty(0, dtype=torch.float32, device=DEVICE)
 
             cos, sin = rotary(probe, position_ids)
             ref_cos, ref_sin = self._reference_cos_sin(rotary, position_ids)
+
+            # The returned dtype follows the probe, not the position ids.
+            assert cos.dtype == probe.dtype
+            assert sin.dtype == probe.dtype
 
             # fp32 evaluates angles of ~4e4 rad with ~6e-8 relative precision, so
             # a few 1e-3 absolute is the honest fp32 floor; TF32 breakage is O(1).
