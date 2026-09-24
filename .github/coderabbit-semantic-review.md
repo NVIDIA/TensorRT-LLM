@@ -11,11 +11,17 @@ No opt-in label is needed. It compares both branches from their merge base and
 follows affected callers, contracts, configuration, and tests across files.
 
 - PR creation, reopening, updates, and becoming ready evaluate the threshold;
-  they do not automatically spend an AI call. A scan every six hours also evaluates it.
+  they do not automatically spend an AI call.
 - The first analysis needs new target commits and either 24 hours since the
   merge-base commit or at least 30 target commits beyond that base. After a
-  completed PASS/FAIL analysis, count from its target SHA and completion time.
-  PR updates invalidate the old verdict but do not bypass these thresholds.
+  completed PASS/FAIL analysis, PR events count from its target SHA and completion
+  time. PR updates invalidate the old verdict but do not bypass these thresholds
+  in the event handler.
+- Every six hours, a scan refreshes a completed PASS/FAIL analysis when either
+  the PR head or target SHA has changed. It bypasses the 24-hour / 30-commit
+  threshold, including when only the PR changes. The first analysis still uses
+  the threshold. Deduplication, the one-hour cooldown, unusable-reply protection
+  and scan limits still apply, so a refresh is not guaranteed in the next scan.
 - An authorized `ci: full pre-merge approved` label or enabling auto-merge
   bypasses the threshold. Approval-label authors are checked against the existing
   `trt-llm-ci-approvers` team using its existing token. All pre-merge requests

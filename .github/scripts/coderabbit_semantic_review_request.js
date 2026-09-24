@@ -104,20 +104,25 @@ async function requestOne({github, commandGithub, context, core, number, manual,
       await ensureCheck('Previous analysis has no verified verdict; use a manual retry. Routine requests are paused.');
       return;
     }
-    let count = pair.comparison.behind_by;
-    let since = Date.parse(pair.comparison.merge_base_commit.commit.committer.date);
-    if (previous) {
-      const progress = await compare(github, repo, last.target, pair.target);
-      if (['ahead', 'identical'].includes(progress.status)) {
-        count = progress.ahead_by;
-        since = Date.parse(previous.comment.created_at);
+    if (previous && context.eventName === 'schedule' &&
+        (last.head !== pair.head || last.target !== pair.target)) {
+      reason = 'Scheduled refresh of changed revisions';
+    } else {
+      let count = pair.comparison.behind_by;
+      let since = Date.parse(pair.comparison.merge_base_commit.commit.committer.date);
+      if (previous) {
+        const progress = await compare(github, repo, last.target, pair.target);
+        if (['ahead', 'identical'].includes(progress.status)) {
+          count = progress.ahead_by;
+          since = Date.parse(previous.comment.created_at);
+        }
       }
+      if (!count || (count < 30 && now - since < DAY)) {
+        await ensureCheck('Below the 24-hour / 30-commit threshold; waiting for target changes.');
+        return;
+      }
+      reason = '24-hour / 30-commit threshold';
     }
-    if (!count || (count < 30 && now - since < DAY)) {
-      await ensureCheck('Below the 24-hour / 30-commit threshold; waiting for target changes.');
-      return;
-    }
-    reason = '24-hour / 30-commit threshold';
   }
   // Approval and auto-merge share this budget even when the branch SHAs change.
   // Count any recent pre-merge request, so a routine scan cannot double the cost.

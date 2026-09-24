@@ -190,15 +190,17 @@ function harness(overrides = {}) {
 for (const [count, age, expected] of [[0, 3 * DAY, 0], [29, DAY - 1, 0],
   [30, 0, 1], [1, DAY, 1], [29, DAY, 1]]) {
   test(`first analysis: ${count} target commits, age ${age} => ${expected} requests`, async () => {
-    const h = harness(); h.setLag(count, age); await h.run();
-    assert.equal(h.posted.length, expected);
-    assert.equal(h.checks[0].conclusion, 'neutral');
-    if (expected) {
-      assert.match(h.posted[0].body, /^@coderabbitai\n/);
-      assert.match(h.posted[0].body, /normal PR chat comment/);
-      assert.match(h.posted[0].body, /SEMANTIC_REVIEW_V3/);
-      assert.match(h.posted[0].body, /No AI verdict is asserted/);
-      assert.ok(h.posted[0].body.includes(HEAD) && h.posted[0].body.includes(BASE));
+    for (const event of ['pull_request_target', 'schedule']) {
+      const h = harness(); h.setLag(count, age); await h.run(event);
+      assert.equal(h.posted.length, expected);
+      assert.equal(h.checks[0].conclusion, 'neutral');
+      if (expected) {
+        assert.match(h.posted[0].body, /^@coderabbitai\n/);
+        assert.match(h.posted[0].body, /normal PR chat comment/);
+        assert.match(h.posted[0].body, /SEMANTIC_REVIEW_V3/);
+        assert.match(h.posted[0].body, /No AI verdict is asserted/);
+        assert.ok(h.posted[0].body.includes(HEAD) && h.posted[0].body.includes(BASE));
+      }
     }
   });
 }
@@ -241,19 +243,21 @@ test('dispatch rejects malformed or missing PRs without touching other PRs', asy
   await assert.rejects(h.run('push'), /Unsupported event/);
 });
 
-test('subsequent thresholds use the last completed analysis, not the original old base', async () => {
+test('PR event thresholds use the last completed analysis, not the original old base', async () => {
   const h = harness(); h.setLag(80, 3 * DAY); await h.run(); h.reply();
-  h.setTarget(NEW_BASE); h.setNow(NOW + 2 * HOUR); h.setProgress(1); await h.run('schedule');
+  h.setTarget(NEW_BASE); h.setNow(NOW + 2 * HOUR); h.setProgress(1); await h.run();
   assert.equal(h.posted.length, 1);
   assert.equal(h.checks[0].conclusion, 'neutral');
   assert.match(h.checks[0].output.title, /stale/);
-  h.setProgress(30); await h.run('schedule'); assert.equal(h.posted.length, 2);
+  h.setProgress(30); await h.run(); assert.equal(h.posted.length, 2);
 });
 
-test('24 hours with new target commits triggers, while an unchanged target never does', async () => {
+test('PR events require target progress even after 24 hours', async () => {
   for (const [progress, expected] of [[0, 1], [1, 2]]) {
     const h = harness(); await h.run(); h.reply(); h.setNow(NOW + DAY);
-    h.setTarget(NEW_BASE); h.setProgress(progress); await h.run('schedule');
+    if (progress) h.setTarget(NEW_BASE);
+    else h.pr.head.sha = MERGED;
+    h.setProgress(progress); await h.run();
     assert.equal(h.posted.length, expected);
   }
 });
@@ -264,6 +268,59 @@ test('a PR head update invalidates the verdict without bypassing the target thre
   assert.equal(h.posted.length, 1);
   assert.equal(h.checks.at(-1).head_sha, MERGED);
   assert.equal(h.checks.at(-1).conclusion, 'neutral');
+});
+
+for (const changed of ['head', 'target', 'both']) {
+  test(`scheduled refresh bypasses thresholds after a ${changed} change`, async () => {
+    for (const branch of ['main', 'release/1.2']) {
+      for (const verdict of ['PASS', 'FAIL']) {
+        const h = harness({base: {ref: branch}}); await h.run(); await h.publish(h.reply(verdict));
+        h.setNow(NOW + 6 * HOUR); h.setLag(1, 0);
+        if (changed !== 'target') h.pr.head.sha = MERGED;
+        if (changed !== 'head') h.setTarget(NEW_BASE);
+        h.setProgress(changed === 'head' ? 0 : 1);
+        await h.run('pull_request_target', 'synchronize');
+        assert.equal(h.posted.length, 1);
+        await h.run('schedule');
+        assert.equal(h.posted.length, 2);
+        const pair = requests(h.comments)[0];
+        assert.equal(pair.head, changed === 'target' ? HEAD : MERGED);
+        assert.equal(pair.target, changed === 'head' ? BASE : NEW_BASE);
+        assert.equal(pair.branch, branch);
+        assert.equal(pair.reason, 'Scheduled refresh of changed revisions');
+        assert.equal(h.checks.at(-1).conclusion, 'neutral');
+        h.setNow(NOW + 12 * HOUR); await h.run('schedule');
+        assert.equal(h.posted.length, 2); // Await the new pair's reply.
+      }
+    }
+  });
+}
+
+test('scheduled refresh deduplicates an unchanged completed pair across scans', async () => {
+  const h = harness(); await h.run(); await h.publish(h.reply());
+  for (const elapsed of [6 * HOUR, DAY, 2 * DAY]) {
+    h.setNow(NOW + elapsed); await h.run('schedule');
+    assert.equal(h.posted.length, 1);
+    assert.equal(h.checks[0].conclusion, 'success');
+  }
+});
+
+test('scheduled refresh respects cooldown and catches a head-only change in a later scan', async () => {
+  const h = harness(); await h.run(); h.reply();
+  h.pr.head.sha = MERGED; h.setProgress(0); h.setNow(NOW + HOUR - 1);
+  await h.run('schedule'); assert.equal(h.posted.length, 1);
+  assert.match(h.checks.at(-1).output.summary, /cooldown/);
+  h.setNow(NOW + HOUR); await h.run('schedule');
+  assert.equal(h.posted.length, 2);
+});
+
+test('an older PASS does not bypass a pending newer request during scheduled refresh', async () => {
+  const h = harness(); await h.run(); h.reply(); await h.run('workflow_dispatch');
+  h.pr.head.sha = MERGED; h.setProgress(0); h.setNow(NOW + 6 * HOUR);
+  await h.run('schedule'); assert.equal(h.posted.length, 2);
+  assert.match(h.checks.at(-1).output.summary, /no verified verdict/);
+  h.reply('PASS', requests(h.comments)[0]); await h.run('schedule');
+  assert.equal(h.posted.length, 3);
 });
 
 test('approval and auto-merge bypass thresholds but share a one-hour cooldown across SHAs', async () => {
