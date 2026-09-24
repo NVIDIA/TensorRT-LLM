@@ -65,7 +65,7 @@ Attention-visible GPU layout.
 | DeepSeek-V4 SWA, HCA, and compressor state | Preserved losslessly |
 
 The current implementation requires the PyTorch backend, native C++
-KVCacheManagerV2, and an SM100 or SM103 GPU. Hot Attention KV can use FP16,
+KVCacheManagerV2, and an SM100, SM103, or SM107 GPU. Hot Attention KV can use FP16,
 BF16, or FP8. Host and Disk cold tiers share the same compact representation,
 and KV-cache block reuse remains supported because Page and token identity are
 unchanged. One-model MTP-EAGLE and EAGLE3 are supported; HELIX context
@@ -372,7 +372,7 @@ Pages currently use identity global scales.
 
 ## Enablement Checklist
 
-1. Run the PyTorch backend on an SM100 or SM103 GPU.
+1. Run the PyTorch backend on an SM100, SM103, or SM107 GPU.
 2. Select the native C++ KVCacheManagerV2 with
    `use_kv_cache_manager_v2: true`.
 3. Keep `kv_cache_config.dtype` at the model's intended runtime KV type:

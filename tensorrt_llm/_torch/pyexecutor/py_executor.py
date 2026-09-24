@@ -26,6 +26,7 @@ try:
 except ImportError:
     from cuda import cudart
 
+from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
                                  get_steady_clock_now_in_seconds,
                                  global_mpi_size, is_trace_enabled, mpi_comm,
@@ -816,7 +817,8 @@ class PyExecutor:
         # by heavy initialisation (e.g. guided-decoder / llguidance tokenizer
         # creation) while earlier PP stages already start warmup forward
         # passes that require matching pp_recv on the later stages.
-        self.dist.barrier()
+        with _StartupTimer("pre_warmup_rank_barrier"):
+            self.dist.barrier()
 
         # During warmup, we don't enable the profiler
         # Run warmup on the execution_stream for proper synchronization with
