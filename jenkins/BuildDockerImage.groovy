@@ -940,6 +940,11 @@ pipeline {
             description: "When boltOverlayEnabled is true, treat a missing/empty BOLT bundle as a FATAL error instead of retagging the plain build as canonical. Enable for the release/nightly path to guarantee canonical images carry profiles."
         )
         booleanParam(
+            name: "useWheelFromBuildStage",
+            defaultValue: false,
+            description: "Install the wheel from the build-stage tarball instead of compiling one inside the image. Read since Aug 2025 but never DECLARED, so params.useWheelFromBuildStage was always null and prepareWheelFromBuildStage() returned early on every run -- see nvbug 5433581, whose temporary kill switch was never reverted. Declaring it puts the decision in the repo. boltOptimizeWheel depends on this path running."
+        )
+        booleanParam(
             name: "boltOptimizeWheel",
             defaultValue: false,
             description: "BOLT-optimize the wheel the SBSA release image installs, applying the branch's latest promoted profile bundle during the image build, and fail if no bundle can be applied. Independent of boltOverlayEnabled, which only bakes the bundle in as a layer and leaves the installed binaries unoptimized. Uses the last promoted bundle rather than this run's, so the image build never waits on BoltProfileGen. Ignored on x86_64, which has no promoted bundle."
