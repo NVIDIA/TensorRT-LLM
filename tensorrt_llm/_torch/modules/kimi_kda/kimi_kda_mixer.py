@@ -609,7 +609,6 @@ class KimiKDALinearAttention(nn.Module):
             cu_seqlens=cu_seqlens,
             num_sequences=num_prefills,
             num_tokens=x2d.shape[0],
-            chunk_indices=chunk_indices,
         )
         recurrent_in = None
         if use_indexed_state:
