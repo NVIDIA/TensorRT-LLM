@@ -393,10 +393,12 @@ class NVLinkOneSided(Communication):
         dtype: torch.dtype,
         eplb_stats_num_experts: Optional[int] = None,
         extra_payload_bytes_per_token: int = 0,
-        can_use_cft_counted_writes: bool = False,
+        can_use_cft_counted_writes: Optional[bool] = None,
         use_low_precision_combine: bool = False,
     ) -> int:
-        can_use_cft_counted_writes = select_cft_counted_writes(get_force_cft())
+        # None sizes for what the constructor would select on this platform.
+        if can_use_cft_counted_writes is None:
+            can_use_cft_counted_writes = select_cft_counted_writes(get_force_cft())
         layout = NVLinkOneSided._make_workspace_layout(
             ep_size,
             top_k,
