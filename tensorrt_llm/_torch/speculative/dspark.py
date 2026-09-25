@@ -508,6 +508,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._valid_len[scratch].zero_()
         self._position_initialized[scratch].zero_()
         old = torch.where(self._position_initialized[slots], self._ctx_len[slots], input_positions)
+        # Padding and ADP-idle requests have no persistent decode position.
+        # Their shared scratch row must not grow across graph replays.
+        old = old.masked_fill(slots == self._scratch_slot, 0)
         start_pos = old + num_accepted_tokens
         # Bound both positions by the RoPE table they index. Warmup reaches this
         # through a captured graph replay, and prepare() cannot tell a synthetic
