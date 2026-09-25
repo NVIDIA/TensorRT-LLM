@@ -148,6 +148,9 @@ struct AttentionLayerConfig
     // nullopt or 0 = no sink tokens.
     std::optional<int> numSinkTokens;
 
+    // Layers in different ownership domains must not share lifecycle or storage pools.
+    std::string cacheDomain = "target";
+
     [[nodiscard]] std::optional<int> windowSize() const noexcept
     {
         return slidingWindowSize;

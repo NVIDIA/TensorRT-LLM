@@ -57,6 +57,7 @@ from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_mixin import (MultimodalModelMixin,
                                                 _build_request_multimodal_input)
+from ..models.modeling_speculative import SpecDecOneEngineForCausalLM
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.mamba.mamba2_metadata import Mamba2Metadata
 from ..moe.expert_statistic import ExpertStatistic
@@ -6427,6 +6428,13 @@ class PyTorchModelEngine(ModelEngine):
                 can_run_graph,
                 execution_promoted_context_ids,
                 use_lora_graph=use_lora_graph)
+            spec_worker = (self.model.spec_worker if isinstance(
+                self.model, SpecDecOneEngineForCausalLM) else None)
+            if spec_worker is not None:
+                spec_worker.prepare_managed_draft_cache(self.model.draft_model,
+                                                        spec_metadata,
+                                                        attn_metadata,
+                                                        resource_manager)
             if execution_promoted_context_ids:
                 self.iter_states[
                     'num_ctx_requests'] = scheduled_requests.num_context_requests
@@ -6509,6 +6517,16 @@ class PyTorchModelEngine(ModelEngine):
                         finally:
                             restore_attn_metadata_after_draft_replay(
                                 attn_metadata, saved_draft)
+
+            if (spec_worker is not None and not self.is_warmup
+                    and not self.cuda_graph_runner.is_warmup_only):
+                draft_history_update = spec_worker.snapshot_managed_draft_history(
+                )
+                if draft_history_update is not None:
+                    # Graph output dictionaries persist across replays. Each
+                    # overlapped iteration must retain its own host readback.
+                    outputs = dict(outputs)
+                    outputs['draft_history_update'] = draft_history_update
 
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()

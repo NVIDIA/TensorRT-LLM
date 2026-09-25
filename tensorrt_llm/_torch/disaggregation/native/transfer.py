@@ -1640,7 +1640,7 @@ class Sender(SenderBase):
     @nvtx_range("_respond_with_kv")
     def _respond_with_kv(self, _send_id: bytes, message: list[bytes]):
         # _sessions_lock prevents a race between session lookup and req_info save.
-        # session.lock atomically saves peer info and snapshots tasks against send().
+        # session.lock saves peer info and snapshots tasks against send() and send_aux().
         info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
         with self._sessions_lock:
             session = self._get_session(info.unique_rid)
@@ -1657,6 +1657,8 @@ class Sender(SenderBase):
                     self._save_peer_req_info(info)
                     tasks = list(session.kv_tasks)
                     terminal = session.has_failed()
+                    if not terminal and session.aux_task is not None:
+                        tasks.append(session.aux_task)
                     include_aux = terminal and bool(
                         session._claim_unsubmitted_aux_failures_locked((info,))
                     )
@@ -1907,7 +1909,9 @@ class TxSession(TxSessionBase):
         self._timeout_s = timeout_s
         self._overall_timeout_s = overall_timeout_s
         self._deadline_monotonic_s: Optional[float] = None
-        self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+        self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST or (
+            aux_buffer is not None and aux_buffer.has_draft_history
+        )
         self._enforce_physical_ownership = getattr(sender, "_enforce_physical_ownership", False)
         self._sender: Sender  # narrow base class type for Pylance
         self.request_id = request_id
@@ -3018,7 +3022,9 @@ class RxSession(RxSessionBase):
     ):
         super().__init__(receiver, SessionArgsBase(params, prompt_len=prompt_len))
         self._timeout_s = timeout_s
-        self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+        self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST or (
+            aux_buffer is not None and aux_buffer.has_draft_history
+        )
         self._enforce_physical_ownership = getattr(receiver, "_enforce_physical_ownership", False)
         self._receiver: Receiver  # narrow base class type for Pylance
         self.request_id = request_id
@@ -3482,6 +3488,8 @@ class RxSession(RxSessionBase):
         """Read token data from the aux buffer slot into the given request."""
         assert self._aux_buffer is not None, "No aux_buffer set for this session"
         assert self.aux_slot is not None, "No aux_slot set for this session"
+        if self._aux_buffer.has_draft_history:
+            self.unpack_draft_history(request)
         first_gen_tokens, draft_tokens, (prompt_tokens, cached_tokens) = (
             self._aux_buffer.get_slot_data(self.aux_slot)
         )
@@ -3496,6 +3504,12 @@ class RxSession(RxSessionBase):
                     "cached_tokens": cached_tokens,
                 },
             }
+
+    def unpack_draft_history(self, request: LlmRequest) -> None:
+        """Read standalone history without changing context-first token fields."""
+        if self._aux_buffer is None or self.aux_slot is None:
+            raise ValueError("Standalone draft transfer requires an auxiliary buffer slot")
+        request.py_draft_transfer_history = self._aux_buffer.get_slot_draft_history(self.aux_slot)
 
     def is_completed(self) -> bool:
         """Non-blocking check: has the transfer completed successfully?
@@ -3751,7 +3765,10 @@ def _create_nixl_agent(
 def _make_aux_buffer(
     kvm: KVCacheManager, max_slots: int, max_draft_len: Optional[int] = None
 ) -> Optional[AuxBuffer]:
+    draft_history = getattr(kvm, "draft_layout", None) is not None
     if max_slots <= 0:
+        if draft_history:
+            raise ValueError("Standalone draft transfer requires auxiliary buffer slots")
         return None
     if max_draft_len is None:
         max_draft_len = max(0, int(getattr(kvm, "max_draft_len", 0)))
@@ -3760,6 +3777,7 @@ def _make_aux_buffer(
         beam_width=max(1, int(getattr(kvm, "max_beam_width", 1))),
         max_draft_len=max_draft_len,
         device="cpu",
+        draft_history=draft_history,
     )
 
 

@@ -396,12 +396,14 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
 
     TypedVec<LifeCycleId, PoolGroupIndex> coldGrouping(numLifeCycles());
     TypedVec<PoolGroupIndex, SlotDesc> coldSlotDescList;
-    std::map<size_t, PoolGroupIndex> coldGroupByPageBytes;
+    std::map<std::pair<std::string, size_t>, PoolGroupIndex> coldGroupByLayout;
     for (LifeCycleId lifeCycle{0}; lifeCycle < numLifeCycles(); ++lifeCycle)
     {
+        auto const* attn = std::get_if<AttnLifeCycle>(&lifeCycles[lifeCycle]);
+        std::string const cacheDomain = attn ? attn->cacheDomain : "target";
         size_t const coldPageBytes = coldPageBytesByLifeCycle[lifeCycle];
-        auto [it, inserted] = coldGroupByPageBytes.emplace(
-            coldPageBytes, PoolGroupIndex{static_cast<int>(coldSlotDescList.size().value())});
+        auto [it, inserted] = coldGroupByLayout.emplace(
+            std::pair{cacheDomain, coldPageBytes}, PoolGroupIndex{static_cast<int>(coldSlotDescList.size().value())});
         PoolGroupIndex const coldPgIdx = it->second;
         if (inserted)
         {

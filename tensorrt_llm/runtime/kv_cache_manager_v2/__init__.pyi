@@ -194,6 +194,7 @@ class AttentionLayerConfig:
     buffers: list[BufferConfig]
     sliding_window_size: int | None = None
     num_sink_tokens: int | None = None
+    cache_domain: str = "target"
     @property
     def window_size(self) -> int | None: ...
 

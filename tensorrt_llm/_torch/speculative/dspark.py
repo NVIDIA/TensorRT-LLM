@@ -24,17 +24,81 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+import triton
+import triton.language as tl
 
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from ..pyexecutor.kv_cache.standalone_draft_cache import DraftHistoryUpdate, StandaloneDraftHistory
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
+from ..pyexecutor.resource_manager import ResourceManagerType
 from .dflash import DFlashWorker, dflash_draft_slot_ids
 from .interface import SpecMetadata, SpecWorkerBase
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DSparkDecodingConfig
+
+
+@triton.jit
+def _store_managed_window_kernel(
+    windows,
+    pool,
+    slots,
+    lengths,
+    positions,
+    block_tables,
+    real_rows,
+    capacities,
+    window_slot_stride: tl.constexpr,
+    window_stage_stride: tl.constexpr,
+    window_token_stride: tl.constexpr,
+    window_head_stride: tl.constexpr,
+    pool_page_stride: tl.constexpr,
+    pool_token_stride: tl.constexpr,
+    pool_head_stride: tl.constexpr,
+    table_stride: tl.constexpr,
+    page_size: tl.constexpr,
+    window_size: tl.constexpr,
+    head_dim: tl.constexpr,
+    stage: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    indices = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    token = indices // head_dim
+    head = indices % head_dim
+    slot = tl.load(slots + row)
+    length = tl.load(lengths + slot)
+    position = tl.load(positions + slot) - length + token
+    real = tl.load(real_rows + row)
+    capacity = tl.load(capacities + row)
+    valid = real & (token < length) & (token < window_size)
+    valid = valid & (position >= 0) & (position < capacity)
+    page = tl.load(
+        block_tables + row * table_stride + position // page_size,
+        mask=valid,
+        other=-1,
+    )
+    valid = valid & (page >= 0)
+    values = tl.load(
+        windows
+        + slot * window_slot_stride
+        + stage * window_stage_stride
+        + ((position + 1) % window_size) * window_token_stride
+        + head * window_head_stride,
+        mask=valid,
+        other=0,
+    )
+    tl.store(
+        pool
+        + page * pool_page_stride
+        + (position % page_size) * pool_token_stride
+        + head * pool_head_stride,
+        values,
+        mask=valid,
+    )
 
 
 def _dspark_position_ceiling(max_ctx: int, block_size: int, max_draft_len: int) -> int:
@@ -130,15 +194,7 @@ class DSparkSpecMetadata(SpecMetadata):
         # ``DFlashSpecMetadata.prepare`` (dflash.py:96-113).
         worker = getattr(self, "_dspark_worker", None)
         if worker is not None and worker._win_inited:
-            current = set(self.request_ids)
-            for rid in list(worker._req_to_slot.keys()):
-                if rid not in current:
-                    slot = worker._req_to_slot.pop(rid)
-                    worker._ctx_len[slot] = 0
-                    worker._valid_len[slot] = 0
-                    worker._position_initialized[slot] = False
-                    worker._kv_windows[slot].zero_()
-                    worker._free_slots.append(slot)
+            worker._release_inactive_slots(self.request_ids)
             # Assign a persistent rolling-window slot to every real generation
             # request that never ran a context/seed forward on this worker. In
             # disaggregated serving the prompt is prefilled (and the window
@@ -228,9 +284,10 @@ class DSv4DSparkWorker(SpecWorkerBase):
     window, refines the per-position logits with the Markov head, and predicts a
     per-position acceptance confidence used to truncate the proposed prefix.
 
-    Unlike DFlash, the draft does NOT use the paged KV cache or mask-token
-    cross-attention: its attention K/V come from the worker-owned rolling window
-    of projected captured context (one ``main_kv`` per decode step, per stage).
+    Unlike DFlash, attention reads a rolling window of projected captured
+    context (one ``main_kv`` per decode step, per stage). With unified V2,
+    manager-owned pages preserve that history and the rolling tensors are kernel
+    staging; legacy aggregate execution keeps the windows in the worker.
     Acceptance of the previous block goes through the unified
     :meth:`SpecWorkerBase.sample_and_accept_draft_tokens` (strict target-verify,
     or rejection sampling for a non-greedy batch), so greedy parity with no-spec
@@ -273,6 +330,13 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._valid_len: Optional[torch.Tensor] = None  # [max_batch] written window entries
         self._position_initialized: Optional[torch.Tensor] = None  # [max_batch] bool
         self._win = 0
+        self._draft_kv_manager = None
+        self._draft_kv_buffers = ()
+        self._draft_block_tables = None
+        self._draft_real_rows = None
+        self._draft_capacities = None
+        self._managed_residency = {}
+        self._prepared_managed_request_ids = ()
         # Set in _lazy_init from the RoPE table the drafter will build; None
         # leaves positions unbounded (direct construction in tests).
         self._position_cap: Optional[int] = None
@@ -430,8 +494,11 @@ class DSv4DSparkWorker(SpecWorkerBase):
 
     def _assign_slot(self, req_id: int, reset: bool) -> int:
         """Get (or refresh) the slot for a request; reset clears its window."""
+        if self._draft_kv_manager is not None and not self._is_managed_request(req_id):
+            return self._scratch_slot
         if reset and req_id in self._req_to_slot:
             old = self._req_to_slot.pop(req_id)
+            self._managed_residency.pop(req_id, None)
             self._ctx_len[old] = 0
             self._valid_len[old] = 0
             self._position_initialized[old] = False
@@ -450,6 +517,195 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._position_initialized[slot] = False
             self._kv_windows[slot].zero_()
         return self._req_to_slot[req_id]
+
+    def _release_inactive_slots(self, request_ids: list[int]) -> None:
+        current = set(request_ids)
+        for request_id in list(self._req_to_slot):
+            if request_id not in current:
+                slot = self._req_to_slot.pop(request_id)
+                self._managed_residency.pop(request_id, None)
+                self._ctx_len[slot] = 0
+                self._valid_len[slot] = 0
+                self._position_initialized[slot] = False
+                self._kv_windows[slot].zero_()
+                self._free_slots.append(slot)
+
+    def _is_managed_request(self, request_id: int) -> bool:
+        return (
+            request_id != ATTENTION_DP_DUMMY_REQUEST_ID
+            and request_id < self._graph_dummy_id_floor
+            and request_id not in self._draft_kv_manager._draft_dummy_request_ids
+        )
+
+    def _bind_managed_history(self, resource_manager) -> None:
+        manager = (
+            resource_manager.get_resource_manager(ResourceManagerType.KV_CACHE_MANAGER)
+            if resource_manager is not None
+            else None
+        )
+        layout = getattr(manager, "draft_layout", None)
+        if layout is None:
+            manager = None
+        if manager is self._draft_kv_manager:
+            return
+        buffers = ()
+        if manager is not None:
+            if (
+                layout.window_size != self._win
+                or layout.kv_factor != 1
+                or layout.num_layers != self._kv_windows.shape[1]
+                or layout.head_dim != self._kv_windows.shape[-1]
+            ):
+                raise ValueError("Embedded DSpark draft cache does not match its rolling window")
+            buffers = tuple(manager.get_draft_buffers(stage) for stage in range(layout.num_layers))
+        self._draft_kv_manager = manager
+        self._draft_kv_buffers = buffers
+        self._managed_residency.clear()
+        if manager is not None:
+            self._draft_block_tables = torch.zeros(
+                (self._batch_to_slot.shape[0], manager.max_blocks_per_seq),
+                dtype=torch.int32,
+                device=self._kv_windows.device,
+            )
+            self._draft_real_rows = torch.zeros(
+                self._batch_to_slot.shape[0], dtype=torch.bool, device=self._kv_windows.device
+            )
+            self._draft_capacities = torch.zeros(
+                self._batch_to_slot.shape[0], dtype=torch.long, device=self._kv_windows.device
+            )
+
+    def prepare_managed_draft_cache(
+        self, draft_model, spec_metadata, attn_metadata, resource_manager
+    ) -> None:
+        """Refresh persistent draft inputs before eager execution or graph replay."""
+        self._lazy_init(draft_model, spec_metadata, attn_metadata)
+        spec_metadata._dspark_worker = self
+        self._bind_managed_history(resource_manager)
+        if self._draft_kv_manager is not None:
+            self._prepare_managed_history(spec_metadata.request_ids, attn_metadata.num_contexts)
+
+    def snapshot_managed_draft_history(self):
+        """Copy this iteration's history before another batch can reuse its slots."""
+        if self._draft_kv_manager is None:
+            return None
+        request_ids = tuple(self._prepared_managed_request_ids)
+        if not request_ids:
+            return None
+        slots = torch.tensor(
+            [self._req_to_slot[request_id] for request_id in request_ids],
+            dtype=torch.long,
+            device=self._ctx_len.device,
+        )
+        values = torch.stack((self._valid_len[slots], self._ctx_len[slots]), dim=1)
+        return DraftHistoryUpdate.capture(self._draft_kv_manager, request_ids, values)
+
+    def _managed_window_indices(self, row: int, position: int, length: int):
+        """Map logical token p to a local page and DSpark's frame (p + 1) % W."""
+        positions = torch.arange(position - length, position, device=self._kv_windows.device)
+        page_size = self._draft_kv_manager.tokens_per_block
+        pages = self._draft_block_tables[row, positions // page_size].long()
+        if torch.any(pages < 0).item():
+            raise ValueError("Embedded DSpark committed window contains an unallocated page")
+        return pages, positions % page_size, (positions + 1) % self._win
+
+    def _prepare_managed_history(self, request_ids: list[int], num_contexts: int) -> None:
+        """Restore newly resident histories without rewinding overlapping iterations."""
+        # Startup probes and graph/ADP padding never publish synthetic history.
+        real_rows = [
+            row
+            for row, request_id in enumerate(request_ids)
+            if self._is_managed_request(request_id)
+        ]
+        real_ids = [request_ids[row] for row in real_rows]
+        self._release_inactive_slots(real_ids)
+        validation_histories = []
+        for request_id in real_ids:
+            cache = self._draft_kv_manager.kv_cache_map[request_id]
+            history = self._draft_kv_manager.get_draft_history(request_id)
+            resident = self._managed_residency.get(request_id)
+            if (
+                resident is not None
+                and resident[0] is cache
+                and resident[1] == self._req_to_slot.get(request_id)
+            ):
+                # Context completion can retire pages before its history
+                # readback is published. Its retained frames are already in
+                # the resident device window on the execution stream.
+                position = max(history.position if history is not None else 0, cache.history_length)
+                history = StandaloneDraftHistory(min(self._win, position), position)
+            validation_histories.append(history or StandaloneDraftHistory(0, 0))
+        table = self._draft_kv_manager.get_draft_block_table(real_ids, validation_histories)
+        tables_host = torch.zeros_like(self._draft_block_tables, device="cpu")
+        tables_host[real_rows] = table
+        self._draft_block_tables.copy_(tables_host, non_blocking=True)
+        real_host = torch.zeros_like(self._draft_real_rows, device="cpu")
+        real_host[real_rows] = True
+        self._draft_real_rows.copy_(real_host, non_blocking=True)
+        capacities_host = torch.zeros_like(self._draft_capacities, device="cpu")
+        capacities_host[real_rows] = torch.tensor(
+            [self._draft_kv_manager.kv_cache_map[rid].capacity for rid in real_ids],
+            dtype=torch.long,
+        )
+        self._draft_capacities.copy_(capacities_host, non_blocking=True)
+        self._kv_windows[self._scratch_slot].zero_()
+        self._ctx_len[self._scratch_slot] = 0
+        self._valid_len[self._scratch_slot] = 0
+        self._position_initialized[self._scratch_slot] = False
+        batch_slots = [self._scratch_slot] * len(request_ids)
+        for row in real_rows:
+            request_id = request_ids[row]
+            cache = self._draft_kv_manager.kv_cache_map[request_id]
+            slot = self._assign_slot(request_id, reset=False)
+            batch_slots[row] = slot
+            resident = self._managed_residency.get(request_id)
+            if resident is not None and resident[0] is cache and resident[1] == slot:
+                continue
+            history = self._draft_kv_manager.get_draft_history(request_id)
+            if row >= num_contexts and history is None:
+                raise ValueError(
+                    f"Embedded DSpark generation request {request_id} has no committed draft history"
+                )
+            self._kv_windows[slot].zero_()
+            self._ctx_len[slot] = history.position if history is not None else 0
+            self._valid_len[slot] = history.valid_length if history is not None else 0
+            self._position_initialized[slot] = history is not None
+            if history is not None:
+                pages, offsets, frames = self._managed_window_indices(
+                    row, history.position, history.valid_length
+                )
+                for stage, pool in enumerate(self._draft_kv_buffers):
+                    self._kv_windows[slot, stage, frames] = pool[pages, 0, 0, offsets]
+            self._managed_residency[request_id] = (cache, slot)
+        self._batch_to_slot.fill_(self._scratch_slot)
+        self._batch_to_slot[: len(request_ids)].copy_(
+            torch.tensor(batch_slots, dtype=torch.long, device=self._batch_to_slot.device)
+        )
+        self._prepared_managed_request_ids = tuple(real_ids)
+
+    def _write_managed_history(self, batch_size: int) -> None:
+        """Store accepted rolling frames in their pages with replay-time device indices."""
+        head_dim = self._kv_windows.shape[-1]
+        for stage, pool in enumerate(self._draft_kv_buffers):
+            _store_managed_window_kernel[(batch_size, triton.cdiv(self._win * head_dim, 128))](
+                self._kv_windows,
+                pool,
+                self._batch_to_slot,
+                self._valid_len,
+                self._ctx_len,
+                self._draft_block_tables,
+                self._draft_real_rows,
+                self._draft_capacities,
+                *self._kv_windows.stride(),
+                pool.stride(0),
+                pool.stride(3),
+                pool.stride(4),
+                self._draft_block_tables.stride(0),
+                self._draft_kv_manager.tokens_per_block,
+                self._win,
+                head_dim,
+                stage,
+                BLOCK=128,
+            )
 
     def _seed_context_windows(
         self,
@@ -477,7 +733,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
 
             req_id = spec_metadata.request_ids[i]
             first_position = int(chunk_positions[0].item())
-            slot = self._assign_slot(req_id, reset=first_position == 0)
+            slot = self._assign_slot(
+                req_id, reset=first_position == 0 and self._draft_kv_manager is None
+            )
             self._ctx_len[slot] = chunk_positions[-1] + 1
             self._position_initialized[slot] = True
 
@@ -671,10 +929,18 @@ class DSv4DSparkWorker(SpecWorkerBase):
         raw_logits = logits
         K = self.max_draft_len
 
-        self._lazy_init(draft_model, spec_metadata, attn_metadata)
-        # Backref so DSparkSpecMetadata.prepare() can maintain the host slot map
-        # and mirror it into _batch_to_slot for the CUDA-graph-safe gen path.
-        spec_metadata._dspark_worker = self
+        if self._draft_kv_manager is None:
+            if resource_manager is not None:
+                manager = resource_manager.get_resource_manager(
+                    ResourceManagerType.KV_CACHE_MANAGER
+                )
+                if getattr(manager, "draft_layout", None) is not None:
+                    raise RuntimeError(
+                        "Unified DSpark KV cache must be prepared before worker forward"
+                    )
+            self._lazy_init(draft_model, spec_metadata, attn_metadata)
+            spec_metadata._dspark_worker = self
+
         self._execute_guided_decoder_if_present(logits)
 
         # Target-verify acceptance via the unified SpecWorkerBase entry: it
@@ -813,12 +1079,14 @@ class DSv4DSparkWorker(SpecWorkerBase):
             num_accepted_tokens,
         )
 
+        if self._draft_kv_manager is not None:
+            self._write_managed_history(batch_size)
+
         if is_warmup:
             self._ctx_len.copy_(saved_ctx_len)
             self._valid_len.copy_(saved_valid_len)
             self._position_initialized.copy_(saved_position_initialized)
             self._kv_windows.copy_(saved_windows)
-
         return {
             "logits": raw_logits,
             "new_tokens": accepted_tokens,
