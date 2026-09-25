@@ -88,8 +88,7 @@ def _format_module(name: str) -> str:
     applied, so short names print at their natural width.
     """
     display = _MODULE_ABBREVIATIONS.get(name, name)
-    formatted = display[:_MODULE_WIDTH]
-    return formatted
+    return display[:_MODULE_WIDTH]
 
 
 # Cache: filename -> module name (avoids repeated frame inspection).
