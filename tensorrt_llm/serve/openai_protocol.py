@@ -285,7 +285,9 @@ class ErrorResponse(OpenAIBaseModel):
     message: str
     type: str
     param: Optional[str] = None
-    code: int
+    # HTTP status by default; a machine-readable string for conditions that
+    # define one (e.g. "context_length_exceeded", matching OpenAI).
+    code: Union[int, str]
 
 
 class CompletionLogProbs(OpenAIBaseModel):

@@ -138,6 +138,40 @@ class RequestError(RuntimeError):
     ''' The error raised when the request is failed. '''
 
 
+# Machine-readable error code the OpenAI-compatible server attaches to
+# over-length-prompt rejections (mirrors OpenAI's "context_length_exceeded").
+CONTEXT_LENGTH_EXCEEDED_CODE = "context_length_exceeded"
+
+
+def context_length_exceeded_message(max_context_length: int,
+                                    num_prompt_tokens: int) -> str:
+    """Client-facing message for a prompt that exceeds the model context.
+
+    Mirrors OpenAI's wording so agent frameworks that pattern-match it (to
+    trigger context compaction) work unchanged. Keep in sync with
+    ``is_context_length_exceeded_message``.
+    """
+    return (
+        f"This model's maximum context length is {max_context_length} tokens. "
+        f"However, your messages resulted in {num_prompt_tokens} tokens. "
+        "Please reduce the length of the messages.")
+
+
+_CONTEXT_LENGTH_EXCEEDED_RE = re.compile(
+    r"This model's maximum context length is \d+ tokens\. "
+    r"However, your messages resulted in \d+ tokens\.")
+
+
+def is_context_length_exceeded_message(message: str) -> bool:
+    """True if ``message`` contains a ``context_length_exceeded_message``.
+
+    Substring search rather than equality: the message crosses the executor
+    IPC boundary as a plain string (``RequestError``) and may arrive wrapped
+    in extra context.
+    """
+    return bool(_CONTEXT_LENGTH_EXCEEDED_RE.search(message))
+
+
 class EngineDeadError(RuntimeError):
     """Raised by pending and new requests once the engine is known dead.
 
