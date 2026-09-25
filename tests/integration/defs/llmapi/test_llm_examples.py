@@ -52,9 +52,9 @@ def _run_llmapi_example(llm_root, engine_dir, llm_venv, script_name: str,
 
     # Create llm models softlink to avoid duplicated downloading for llm api example
     src_dst_dict = {
-        # TinyLlama-1.1B-Chat-v1.0
-        f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0":
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        # Qwen3-0.6B
+        f"{llm_models_root()}/Qwen3/Qwen3-0.6B":
+        f"{llm_venv.get_working_directory()}/Qwen3/Qwen3-0.6B",
         # vicuna-7b-v1.3
         f"{llm_models_root()}/vicuna-7b-v1.3":
         f"{llm_venv.get_working_directory()}/lmsys/vicuna-7b-v1.3",

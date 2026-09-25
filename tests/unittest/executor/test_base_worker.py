@@ -17,7 +17,7 @@ from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.sampling_params import SamplingParams
 
-default_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+default_model_name = "Qwen3/Qwen3-0.6B"
 model_path = llm_models_root() / default_model_name
 
 
