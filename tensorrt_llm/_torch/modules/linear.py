@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 from __future__ import annotations
 
@@ -55,7 +43,8 @@ from ...models.modeling_utils import QuantConfig
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                               IS_CUTLASS_DSL_RUBIN_AVAILABLE)
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     replace_parameter_and_save_metadata, unswizzle_sf)
+                     is_torch_compiling, replace_parameter_and_save_metadata,
+                     unswizzle_sf)
 from .low_m_gemm import _should_apply_low_m_gemm, apply_low_m_gemm
 
 
@@ -1560,6 +1549,10 @@ class NVFP4LinearMethod(LinearMethodBase):
 
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
     quantizes_nvfp4_activations: ClassVar[bool] = True
+    # Scale block widths this method can consume: the W4A4 GEMMs are
+    # hardware-bound to 16; the weight-only subclass widens this.
+    supported_scaling_vector_sizes: ClassVar[tuple[int, ...]] = (
+        fp4_utils.NVFP4_SF_VEC_SIZE, )
 
     # Temporary workaround which will be resolved by TRTLLM-11958
     # When True, use tunable_fp4_quantize (AutoTuner selects TRTLLM vs
@@ -1574,9 +1567,19 @@ class NVFP4LinearMethod(LinearMethodBase):
         # row's packed weight K dimension needs 16-alignment.
         return 32
 
+    def resolve_scaling_vector_size(self, module: Linear) -> int:
+        """Scale block width for ``module``, validated against this method."""
+        size = fp4_utils.nvfp4_scaling_vector_size(module.quant_config)
+        if size not in self.supported_scaling_vector_sizes:
+            raise ValueError(
+                f"{type(self).__name__} supports NVFP4 scale blocks of "
+                f"{self.supported_scaling_vector_sizes} elements, but the "
+                f"checkpoint declares group_size={size}")
+        return size
+
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
-        module.scaling_vector_size = 16
+        module.scaling_vector_size = self.resolve_scaling_vector_size(module)
         assert in_features % module.scaling_vector_size == 0, f"in_features {in_features} must be divisible by scaling_vector_size {module.scaling_vector_size}"
 
         # Quantized weights
@@ -1636,6 +1639,13 @@ class NVFP4LinearMethod(LinearMethodBase):
             Tuple of (act_fp4, act_sf, alpha) - quantized activation, per-block scales, and alpha
         """
         if isinstance(input, Fp4QuantizedTensor):
+            if input.reciprocal_scale is not None:
+                if module.pre_quant_scale is not None:
+                    raise RuntimeError(
+                        "Received pre-quantized FP4 input with reciprocal_scale for a layer with pre_quant_scale."
+                    )
+                alpha = input.reciprocal_scale * module.weight_scale_2
+                return input.fp4_tensor, input.scaling_factor, alpha
             # Input is already quantized - this should not happen if pre_quant_scale exists
             if module.pre_quant_scale is not None or module.force_dynamic_quantization:
                 raise RuntimeError(
@@ -1692,20 +1702,13 @@ class NVFP4LinearMethod(LinearMethodBase):
                 input.fp4_tensor.reshape(-1, input.fp4_tensor.shape[-1]),
                 input.scaling_factor,
                 input.is_sf_swizzled,
+                unquantized_hidden_states=input.unquantized_hidden_states,
+                reciprocal_scale=input.reciprocal_scale,
             )
         elif not isinstance(input,
                             (tuple, Fp4QuantizedTensor)) and input.dim() > 2:
             original_shape = input.shape
             input = input.reshape(-1, input.shape[-1])
-        elif isinstance(input,
-                        Fp4QuantizedTensor) and input.fp4_tensor.dim() > 2:
-            original_shape = input.fp4_tensor.shape
-            input = Fp4QuantizedTensor(
-                fp4_tensor=input.fp4_tensor.reshape(-1,
-                                                    input.fp4_tensor.shape[-1]),
-                scaling_factor=input.scaling_factor,
-                is_sf_swizzled=input.is_sf_swizzled,
-            )
 
         act_fp4, act_sf, alpha = self._input_prepare(module, input)
 
@@ -1793,7 +1796,8 @@ class NVFP4LinearMethod(LinearMethodBase):
         """
         device = torch.device("cuda")
 
-        scale_span = 16 if module.tp_mode == TensorParallelMode.ROW else 1
+        scale_span = (module.scaling_vector_size
+                      if module.tp_mode == TensorParallelMode.ROW else 1)
         # Per-shard weight_scale: load, TP-shard, store in tmp dict keyed by shard
         if shard_keys is not None:
             if not hasattr(module, "tmp_nvfp4_weight_scales"):
@@ -2204,9 +2208,16 @@ class NVFP4LinearMethod(LinearMethodBase):
 
 
 class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
-    """W4A16 NVFP4 linear using on-the-fly weight dequantization."""
+    """W4A16 NVFP4 linear using on-the-fly weight dequantization.
+
+    Dequantizing in software also admits the 32-element scale blocks that
+    ModelOpt's ``nvfp4_*_weight_only`` recipes may export (``group_size=32``
+    in hf_quant_config.json); the W4A4 GEMMs remain 16-only.
+    """
 
     quantizes_nvfp4_activations: ClassVar[bool] = False
+    supported_scaling_vector_sizes: ClassVar[tuple[int, ...]] = (
+        fp4_utils.W4A16_NVFP4_LINEAR_SF_VEC_SIZES)
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
@@ -2317,6 +2328,10 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
 class MarlinNVFP4LinearMethod(W4A16NVFP4LinearMethod):
     """W4A16 NVFP4 linear backed by Marlin."""
 
+    # The Marlin NVFP4 kernel is written for 16-element scale blocks.
+    supported_scaling_vector_sizes: ClassVar[tuple[int, ...]] = (
+        fp4_utils.NVFP4_SF_VEC_SIZE, )
+
     # ``apply`` always allocates a plain output buffer (the Marlin GEMM has no
     # NCCL-window output path) and ``apply_linear_allreduce`` is unsupported, so
     # this must not inherit the True from NVFP4LinearMethod: Linear.forward reads
@@ -2336,9 +2351,12 @@ class MarlinNVFP4LinearMethod(W4A16NVFP4LinearMethod):
     @staticmethod
     def is_supported(module: Linear) -> bool:
         sm_version = get_sm_version()
+        block_width = fp4_utils.nvfp4_scaling_vector_size(module.quant_config)
         return ((89 <= sm_version < 100 or sm_version in (120, 121))
                 and getattr(module, "dtype", None) == torch.bfloat16
                 and not getattr(module, "use_fused_gemm_allreduce", False)
+                and block_width
+                in MarlinNVFP4LinearMethod.supported_scaling_vector_sizes
                 and hasattr(torch.ops.trtllm, "marlin_nvfp4_gemm")
                 and hasattr(torch.ops.trtllm, "gptq_marlin_repack"))
 
@@ -3425,6 +3443,7 @@ class MXFP8LinearMethod(LinearMethodBase):
                 and self.use_cutlass)
 
     def _load_flashinfer(self, *, required: bool) -> bool:
+        """Load the optional GEMM backend, raising only when explicitly required."""
         if not self.use_cutlass:
             if required:
                 raise RuntimeError(
@@ -3432,9 +3451,13 @@ class MXFP8LinearMethod(LinearMethodBase):
                     "quantization ops on Blackwell")
             return False
         try:
-            from flashinfer import autotune, mm_mxfp8
+            from flashinfer import autotune
             if not callable(autotune):
                 raise ImportError("flashinfer.autotune is unavailable")
+            flashinfer_mxfp8 = getattr(torch.ops.trtllm, "flashinfer_mm_mxfp8",
+                                       None)
+            if flashinfer_mxfp8 is None:
+                raise ImportError("trtllm::flashinfer_mm_mxfp8 is unavailable")
         except ImportError as error:
             if required:
                 raise RuntimeError(
@@ -3445,7 +3468,7 @@ class MXFP8LinearMethod(LinearMethodBase):
                 "TensorRT-LLM GEMM backend.",
                 key="flashinfer_mxfp8_unavailable")
             return False
-        self._flashinfer_mxfp8 = mm_mxfp8
+        self._flashinfer_mxfp8 = flashinfer_mxfp8
         return True
 
     def enable_flashinfer_auto(self) -> bool:
@@ -3511,13 +3534,14 @@ class MXFP8LinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        """Apply MXFP8 linear projection with eager or capture-safe dispatch."""
         original_shape = input.shape
         if input.dim() > 2:
             input = input.reshape(-1, input.shape[-1])
 
         if self.use_cutlass:
             input = input.contiguous()
-            if (self.tune_decode_graph_backends
+            if (self.tune_decode_graph_backends and not is_torch_compiling()
                     and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()):
                 # Tune only in the warmup-only pass (flashinfer_mxfp8_autotune).
                 output = mxfp8_quantize_gemm_autotuned(
@@ -3532,7 +3556,7 @@ class MXFP8LinearMethod(LinearMethodBase):
                 # then the CUTLASS block-scaled e4m3xe4m3 GEMM.
                 act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(input, True)
                 use_flashinfer = self.backend == "flashinfer" or (
-                    self.backend == "auto" and
+                    self.backend == "auto" and not is_torch_compiling() and
                     (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get() or
                      (self._flashinfer_autotuned
                       and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get())))
@@ -3541,12 +3565,10 @@ class MXFP8LinearMethod(LinearMethodBase):
                     assert flashinfer_mxfp8 is not None
                     output = flashinfer_mxfp8(
                         act_e4m3,
-                        module.weight.t(),
                         act_sf,
+                        module.weight,
                         module.weight_scale,
-                        out_dtype=module.dtype,
-                        use_8x4_sf_layout=False,
-                        backend="cutlass",
+                        module.dtype,
                     )
                 else:
                     # globalScale is the alpha multiplier; pure MXFP8xMXFP8
@@ -4322,6 +4344,17 @@ def is_static_nvfp4_input_eligible(linear) -> bool:
             and not getattr(linear, "force_dynamic_quantization", False)
             and getattr(linear, "input_scale", None) is not None
             and getattr(linear, "pre_quant_scale", None) is None)
+
+
+def is_dynamic_nvfp4_input_eligible(linear) -> bool:
+    """Whether `linear` consumes a dynamic NVFP4 input carrying reciprocal_scale,
+    making it eligible to receive pre-quantized input from a deferred scale producer."""
+    if linear is None:
+        return False
+    return (getattr(linear, "has_nvfp4_activation_quantization", False)
+            and getattr(linear, "force_dynamic_quantization", False)
+            and getattr(linear, "pre_quant_scale", None) is None
+            and getattr(linear, "weight_scale_2", None) is not None)
 
 
 class NVFP4ARCLinearMethod(NVFP4LinearMethod):

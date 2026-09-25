@@ -32,11 +32,62 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils 
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.paged_cache import (
     write_kv_slots,
 )
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import MsaDecodeSpan
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import (
+    MiniMaxM3MsaSparseAttentionMetadata,
+    MsaDecodeSpan,
+)
 from tensorrt_llm._torch.attention.backends.sparse.registry import _resolve_minimax_m3_backend_cls
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("empty_state", ["empty_batch", "no_requests", "no_lengths"])
+def test_msa_metadata_clears_padded_cache_slot_tail(
+    monkeypatch: pytest.MonkeyPatch, empty_state: str
+) -> None:
+    """A smaller replay must not reuse the previous step's live cache slots."""
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
+
+    monkeypatch.setattr(msa_backend, "maybe_pin_memory", lambda tensor: tensor)
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    metadata._msa_buffers_ready = True
+    metadata.request_ids = [0]
+    metadata.kv_cache_manager = SimpleNamespace(
+        tokens_per_block=4,
+        get_buffers=lambda layer_idx: torch.empty(1),
+        get_block_ids_per_seq=lambda request_ids: torch.tensor([[3]], dtype=torch.int32),
+    )
+    metadata.msa_out_cache_loc = torch.full((4,), 99, dtype=torch.int32)
+    metadata.msa_block_table = torch.zeros((1, 1), dtype=torch.int32)
+    metadata.msa_seq_lens_cuda = torch.zeros(1, dtype=torch.int32)
+    metadata.msa_subpage_block_table = None
+    metadata._msa_runs_no_fmha = lambda: True
+    metadata._msa_kv_lens_may_change = lambda: False
+    original_ptr = metadata.msa_out_cache_loc.data_ptr()
+
+    for count in (4, 2, 0, 1):
+        metadata._msa_qo_lens_cpu = torch.tensor([count], dtype=torch.int32)
+        metadata._msa_kv_lens_cpu = metadata._msa_qo_lens_cpu.clone()
+        metadata._msa_qo_offset_cpu = torch.zeros(1, dtype=torch.int32)
+        metadata._build_msa_fields()
+        assert metadata.msa_out_cache_loc.tolist() == list(range(12, 12 + count)) + [-1] * (
+            4 - count
+        )
+        assert metadata.msa_out_cache_loc.data_ptr() == original_ptr
+        assert metadata._msa_fields_ready
+
+    if empty_state == "empty_batch":
+        metadata.request_ids = []
+        metadata._msa_qo_lens_cpu = torch.empty(0, dtype=torch.int32)
+    elif empty_state == "no_requests":
+        metadata.request_ids = None
+    else:
+        metadata._msa_qo_lens_cpu = None
+    metadata._build_msa_fields()
+    assert metadata.msa_out_cache_loc.tolist() == [-1] * 4
 
 
 def test_msa_package_availability_installs_cutlass_compatibility_aliases(monkeypatch):
@@ -158,7 +209,7 @@ def test_cache_manager_honors_executor_sparse_attention_config(
         del args, kwargs
         self.is_disagg = False
         self.dtype = base_dtype
-        self.layer_offsets = {}
+        self.layer_offsets = {3: 0}
 
     def fake_get_index_k_buffer(self, layer_idx, **kwargs):
         del self, layer_idx
@@ -184,6 +235,87 @@ def test_cache_manager_honors_executor_sparse_attention_config(
     assert manager.get_index_k_buffer(3) is None
     assert observed_index_buffer_args["head_dim"] == expected_sparse_index_dim
     assert observed_index_buffer_args["dtype"] is expected_dtype
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("indexer_kv_dtype", ["bf16", "fp8"])
+@pytest.mark.parametrize("implementation", ["msa", "triton"])
+def test_index_k_views_are_fullgraph_safe(
+    monkeypatch: pytest.MonkeyPatch, indexer_kv_dtype: str, implementation: str
+) -> None:
+    """Compiled cache reads/writes preserve per-layer and per-manager aliases."""
+    dtype = torch.float8_e4m3fn if indexer_kv_dtype == "fp8" else torch.bfloat16
+    pools = []
+
+    def fake_base_init(self: KVCacheManagerV2, *args: object, **kwargs: object) -> None:
+        self.is_disagg = False
+        # Dense layer 0 and draft layer 60 have no INDEX_KEY; sparse layer 5
+        # is non-local. Two local sparse layers share an interleaved pool.
+        self.layer_offsets = {0: 0, 3: 1, 4: 2, 60: 3}
+        self._test_index_pool = torch.zeros((3, 2, 4, 1, 8), dtype=dtype)
+        pools.append(self._test_index_pool)
+
+    @torch.compiler.disable
+    def resolve_index_view(
+        self: KVCacheManagerV2, layer_idx: int, **kwargs: object
+    ) -> torch.Tensor:
+        # Model the eager-only nanobind/TensorWrapper boundary. Entering this
+        # resolver from forward must fail with fullgraph=True.
+        view = self._test_index_pool[:, layer_idx - 3]
+        return view.permute(0, 2, 1, 3) if kwargs["kv_layout"] == "HND" else view
+
+    monkeypatch.setattr(KVCacheManagerV2, "__init__", fake_base_init)
+    monkeypatch.setattr(KVCacheManagerV2, "get_index_k_buffer", resolve_index_view)
+    monkeypatch.setattr(MiniMaxM3KVCacheManagerV2, "_compute_num_total_slots", lambda self: 0)
+    config = SimpleNamespace(implementation=implementation, indexer_kv_dtype=indexer_kv_dtype)
+    managers = [
+        MiniMaxM3KVCacheManagerV2(
+            num_layers=61,
+            sparse_layer_ids=[3, 4, 5],
+            sparse_index_dim=8,
+            sparse_attention_config=config,
+        )
+        for _ in range(2)
+    ]
+    metadata = [object.__new__(MiniMaxM3MsaSparseAttentionMetadata) for _ in managers]
+    for manager, meta in zip(managers, metadata):
+        meta.kv_cache_manager = manager
+        for layer in (0, 5, 60):
+            assert manager.get_index_k_buffer(layer) is None
+        cache = manager.get_index_k_buffer(3)
+        expected_shape = (3, 1, 4, 8) if implementation == "msa" else (3, 4, 1, 8)
+        assert cache.shape == expected_shape
+        assert cache.data_ptr() == manager._test_index_pool.data_ptr()
+        assert cache.stride(0) == 2 * 4 * 8
+        if implementation == "msa":
+            assert meta.msa_idx_k_cache(3) is cache
+
+    def forward(meta: MiniMaxM3MsaSparseAttentionMetadata, value: torch.Tensor) -> torch.Tensor:
+        get_cache = (
+            meta.msa_idx_k_cache
+            if implementation == "msa"
+            else meta.kv_cache_manager.get_index_k_buffer
+        )
+        first = get_cache(3)
+        second = get_cache(4)
+        first.copy_(value.to(first.dtype))
+        return first.float() + second.float()
+
+    compiled = torch.compile(forward, backend="eager", fullgraph=True)
+    value = torch.full(expected_shape, 2.0)
+    try:
+        pools[0].fill_(1)
+        torch.testing.assert_close(compiled(metadata[0], value), torch.full_like(value, 3))
+        # A later replay must see writes to the underlying pool without a
+        # cloned or stale tensor. The other layer must remain independent.
+        pools[0][:, 1].fill_(7)
+        torch.testing.assert_close(compiled(metadata[0], value + 2), torch.full_like(value, 11))
+        torch.testing.assert_close(pools[0][:, 0].float(), torch.full((3, 4, 1, 8), 4.0))
+        pools[1].fill_(9)
+        torch.testing.assert_close(compiled(metadata[1], value + 4), torch.full_like(value, 15))
+        torch.testing.assert_close(pools[0][:, 0].float(), torch.full((3, 4, 1, 8), 4.0))
+    finally:
+        torch._dynamo.reset()
 
 
 @pytest.mark.parametrize("sparse_index_dim", [0, -1])
@@ -270,6 +402,36 @@ def test_msa_buffers_include_graph_stable_block_table():
         True,
     )
     assert requested["msa_seq_lens_cuda"] == ((MAX_NUM_SEQUENCES,), torch.int32, True)
+
+
+@pytest.mark.cpu_only
+def test_msa_buffers_stage_local_cache_views(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stage zero-copy cache views only for sparse layers on the local rank."""
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
+
+    metadata = _buffer_metadata(sparse_layer_ids=[3, 4], layer_offsets={3: 0})
+    main_cache = torch.zeros(2, 2, 1, 128, 128)
+    index_cache = torch.zeros(2, 1, 128, 128)
+    manager = metadata.kv_cache_manager
+    manager.get_buffers = Mock(return_value=main_cache)
+    manager.get_index_k_buffer = Mock(return_value=index_cache)
+    monkeypatch.setattr(
+        metadata,
+        "get_empty",
+        lambda buffers, shape, **kwargs: torch.empty(shape, dtype=kwargs["dtype"]),
+    )
+    # No native pool in this CPU test; only zero-copy cache-view staging is under test.
+    monkeypatch.setattr(msa_backend, "uniform_subpages_per_slot", lambda manager: 0)
+    metadata._create_msa_buffers()
+    manager.get_buffers.assert_called_once_with(3, kv_layout="HND")
+    manager.get_index_k_buffer.assert_called_once_with(3, kv_layout="HND")
+    assert set(metadata.msa_layer_cache_tensors) == {3}
+    main, index = metadata.msa_layer_cache_tensors[3]
+    assert main is main_cache and index is index_cache
+    main.fill_(2)
+    index.fill_(3)
+    torch.testing.assert_close(main_cache, torch.full_like(main_cache, 2))
+    torch.testing.assert_close(index_cache, torch.full_like(index_cache, 3))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -475,8 +637,8 @@ def test_msa_index_k_uses_hnd_cache_view_and_writer():
         def __init__(self):
             self.calls = []
 
-        def get_index_k_buffer(self, layer_idx, kv_layout="NHD"):
-            self.calls.append((layer_idx, kv_layout))
+        def get_index_k_buffer(self, layer_idx):
+            self.calls.append(layer_idx)
             return hnd_cache
 
     manager = FakeCacheManager()
@@ -489,7 +651,7 @@ def test_msa_index_k_uses_hnd_cache_view_and_writer():
 
     assert returned.data_ptr() == hnd_cache.data_ptr()
     assert not returned.is_contiguous()
-    assert manager.calls == [(3, "HND"), (3, "HND")]
+    assert manager.calls == [3, 3]
     torch.testing.assert_close(hnd_cache[0, 0, 2], values[0, 0].to(torch.bfloat16))
     torch.testing.assert_close(hnd_cache[1, 0, 5], values[1, 0].to(torch.bfloat16))
 
@@ -1664,13 +1826,13 @@ def test_fused_scatter_matches_reference(src_dtype, cache_dtype, with_idx):
     torch.testing.assert_close(idx_pool, ref_idx_pool)
 
 
-@pytest.mark.parametrize("sparse", [True, False])
-def test_msa_attention_core_owns_the_cache_write(sparse):
+@pytest.mark.parametrize("sparse,indexer_dtype", [(True, "fp8"), (True, "bf16"), (False, "fp8")])
+def test_msa_attention_core_owns_the_cache_write(sparse: bool, indexer_dtype: str) -> None:
     """The model layer's MSA core must write the caches exactly once and in
     the right place: write_layer_caches runs before run_indexer (whose proxy
     pass reads the index-K cache), run_indexer is told index-K is already
-    resident, and forward() receives k=v=None so no FMHA phase writes K/V
-    again."""
+    resident (with no live index-K for FP8), and forward() receives k=v=None
+    so no FMHA phase writes K/V again."""
     from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3Attention
 
     num_tokens, width = 3, 128
@@ -1679,6 +1841,7 @@ def test_msa_attention_core_owns_the_cache_write(sparse):
 
     class FakeBackend:
         layer_idx = 7
+        indexer_kv_dtype = indexer_dtype
 
         def write_layer_caches(self, k, v, idx_k, metadata):
             events.append(("write", k, v, idx_k, metadata))
@@ -1704,7 +1867,11 @@ def test_msa_attention_core_owns_the_cache_write(sparse):
     if sparse:
         assert names == ["write", "indexer", "forward"]
         _, indexer_q, indexer_k, indexer_metadata, prewritten = events[1]
-        assert indexer_q is idx_q and indexer_k is idx_k and indexer_metadata is metadata
+        assert indexer_q is idx_q and indexer_metadata is metadata
+        if indexer_dtype == "fp8":
+            assert indexer_k is None
+        else:
+            assert indexer_k is idx_k
         assert prewritten is True
     else:
         assert names == ["write", "forward"]

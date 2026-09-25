@@ -62,10 +62,12 @@ l0_h100:
   # function's leaves on Hopper, keep the rest of the sampler dir.
   - unittest/_torch/sampler -k "not test_speculative_d2h_parity_real_predictor"
   - unittest/_torch/speculative/test_eagle3.py
+  - unittest/_torch/speculative/test_fused_sampling_op.py
   - unittest/_torch/speculative/test_rejection_buffers_guard.py
   - unittest/_torch/speculative/test_sa_hybrid_state_promotion.py
   - unittest/_torch/speculative/test_spec_slot_pool_sizing.py
   - unittest/_torch/speculative/hw_agnostic
+  - unittest/_torch/speculative/test_capture_buffer_cuda.py
   - unittest/_torch/speculative/test_capture_sampling_params.py
   - unittest/_torch/thop/parallel
   - unittest/_torch/visual_gen/kernels/parallel
@@ -79,6 +81,7 @@ l0_h100:
   - unittest/_torch/modeling -k "modeling_gpt_oss"
   - unittest/_torch/modeling -k "modeling_gemma4"
   - unittest/_torch/modeling -k "modeling_whisper"  # CPU-only log-mel parity
+  - unittest/_torch/modeling/test_modeling_deepseekv32.py
   - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_sanity
   # Real-weight Nano CG/overlap and chunked-prefill path smoke (MoE L0 cannot
   # reuse dense-8B greedy/logprob equality; accuracy stays on GSM8K/MMLU).
@@ -97,6 +100,8 @@ l0_h100:
   - unittest/_torch/modeling/test_modeling_qwen3_5_vl_moe.py::TestQwen3_5MoeVL::test_all
   # Dense Qwen3.5-VL is the same hybrid family (sm90+ GDN kernel), so it lands here too.
   - unittest/_torch/modeling/test_modeling_qwen3_5_vl.py::TestQwen3_5VL::test_all
+  - unittest/_torch/modeling/test_modeling_qwen3_5_vl.py::test_qwen35_dense_vl_normalizes_native_nvfp4_mlp_paths
+  - unittest/_torch/modeling/test_modeling_qwen3_5_vl.py::test_qwen35_dense_vl_preserves_w4a16_nvfp4_behavior
   - unittest/disaggregated/test_agent_multi_backends.py
   - unittest/disaggregated/test_extractor.py
   - unittest/disaggregated/test_bounce.py
@@ -126,12 +131,19 @@ l0_h100:
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_v1_masked_dsa_indexer_across_asymmetric_pp
   # Python transceiver with the C++ NIXL agent's bounce v2 enabled.
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_python_nixl_cache_transceiver_uses_cpp_bounce
+  # Helix CP
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_helix_cp
+  # V1 host offload: the send path must address primary slots, not block IDs.
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_v1_sends_primary_slots_under_host_offload
+  # Real scheduler/resource lifecycle: pending pins, capacity recovery and host-prefix replay.
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_host_offload_scheduler_lifecycle
   - unittest/disaggregated/test_cache_transceiver_harness_report.py
   - unittest/disaggregated/test_cache_transceiver_harness.py
   - unittest/disaggregated/test_cache_transceiver_precheck_e2e.py
   - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mha-ctx_fp16_gen_fp16]
   - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mla-ctx_fp16_gen_fp16]
   - unittest/llmapi/test_llm_telemetry.py
+  - unittest/llmapi/test_return_routed_experts.py
   - unittest/scaffolding
   - unittest/usage/test_transport.py
   - unittest/usage/test_e2e_capture.py
@@ -167,8 +179,6 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_fp8
   - accuracy/test_llm_api_pytorch.py::TestLagunaXS_2_1::test_fp8_dflash
   - accuracy/test_llm_api_pytorch.py::TestNemotron35Lightning::test_nvfp4_marlin_mtp3_chunked_prefill
-  - test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-llama-3.1-8b-False-False]
-  - test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-llama-3.1-8b-instruct-hf-fp8-True-True]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1_two_mtp[DeepSeek-V3-Lite-fp8]
@@ -183,7 +193,7 @@ l0_h100:
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[True-False-Qwen3-8B-FP8]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[True-True-Qwen3-8B-FP8]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_llama_context_capacity[False-False-DeepSeek-V3-Lite-fp8/fp8]
-  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_spec_dec_batch_slot_limit[False-EAGLE3-LLaMA3.1-Instruct-8B-Llama-3.1-8B-Instruct]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_spec_dec_batch_slot_limit[False-Qwen3-8B-eagle3-Qwen3-8B]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_cancel_gen_requests[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[False-TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[True-TinyLlama-1.1B-Chat-v1.0]
@@ -199,15 +209,10 @@ l0_h100:
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_transcribe_end_to_end
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[bf16-kv-v2-decoder-graphs-on-greedy]
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_beam_search[bf16-kv-v1-decoder-graphs-on-beam2]
-  - test_e2e.py::test_trtllm_bench_iteration_log[PyTorch-streaming-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
-  - test_e2e.py::test_trtllm_bench_iteration_log[PyTorch-non-streaming-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
-  - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-enable_request_rate] # negative test
-  - test_e2e.py::test_trtllm_bench_help_sanity[meta-llama/Llama-3.1-8B]
   - test_e2e.py::test_openai_chat_harmony
   - test_e2e.py::test_openai_chat_harmony_perf_metrics
   - test_e2e.py::test_openai_responses
   - test_e2e.py::test_anthropic_messages
-  - test_e2e.py::test_openai_chat_guided_decoding[meta-llama/Llama-3.1-8B-Instruct]
   - kv_cache/test_final_single_token_context_cuda_graph.py::test_final_token_reuse_cuda_graph[v1]
   - kv_cache/test_final_single_token_context_cuda_graph.py::test_final_token_reuse_cuda_graph[v2]
   - kv_cache/test_final_single_token_context_cuda_graph.py::test_changed_final_token_reuse_cuda_graph[v1]
@@ -244,7 +249,6 @@ l0_h100:
   tests:
     - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[mtp=disable-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=True]
     - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_fp8_block_scales[latency]
-    - test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-llama-3.1-8b-False-False]
     - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-False-TinyLlama-1.1B-Chat-v1.0]
     - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-False-DeepSeek-V3-Lite-fp8/fp8]
     - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[False-False-Qwen3-8B-FP8]

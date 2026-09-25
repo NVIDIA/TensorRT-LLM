@@ -38,8 +38,6 @@ class MultimodalEncoder(_TorchLLM):
 
     def _build_model(self):
         BaseLLM._build_model(self)
-        assert self._engine_dir is None
-
         # Tokenizer loading should be after calling model_loader(), since model_loader() may download the model from HF hub.
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
         self._tokenizer = self._try_load_tokenizer()
@@ -60,7 +58,7 @@ class MultimodalEncoder(_TorchLLM):
         self.args.mm_encoder_only = True
 
         self._executor = self._executor_cls.create(
-            self._engine_dir,
+            None,
             model_world_size=self.args.parallel_config.world_size,
             mpi_session=self.mpi_session,
             reuse_mpi_comm=external_mpi_comm_available(

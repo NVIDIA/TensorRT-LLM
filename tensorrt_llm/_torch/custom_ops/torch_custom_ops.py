@@ -2106,7 +2106,7 @@ _USE_FUSED_FP8_QUANT_PACK = os.environ.get("TRTLLM_FUSED_FP8_QUANT_PACK",
 def _fp8_quantize_1x128_ue8m0(input: torch.Tensor, tactic: int):
     """Dispatch FP8 1x128 quantization to CUDA or Triton kernel.
 
-    On SM100 with ``TRTLLM_FUSED_FP8_QUANT_PACK=1``, the fused
+    On SM100/SM103/SM107 with ``TRTLLM_FUSED_FP8_QUANT_PACK=1``, the fused
     ``fp8_quantize_1x128_packed_ue8m0`` op already emits the legacy packed-UE8M0
     (int32) layout deep_gemm expects, so the follow-on
     ``get_mn_major_tma_aligned_packed_ue8m0_tensor`` call is skipped.

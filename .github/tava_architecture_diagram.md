@@ -49,17 +49,6 @@ graph TB
         CustomOps --> CUDAKernel
     end
 
-    subgraph "AutoDeploy_Flow"
-        ADExecutor[ADExecutor]
-        ADEngine[ADEngine]
-        GraphTransforms[Graph Transforms]
-        TorchExport[torch.export]
-        LLMAPI --> ADExecutor
-        ADExecutor --> ADEngine
-        ADEngine --> GraphTransforms
-        GraphTransforms --> TorchExport
-    end
-
     subgraph "Visual_Gen_Flow"
         VisualGenAPI[VisualGen API]
         DiffusionClient[DiffusionRemoteClient]
@@ -83,8 +72,6 @@ graph TB
         KVCache[KV Cache Manager]
         PyScheduler --> |Nanobind|Shared_Scheduler
         PyDecoder --> |Nanobind|Shared_Decoder
-        ADExecutor --> Shared_Scheduler
-        ADExecutor --> Shared_Decoder
         Shared_Decoder --> Sampling
         Executor --> Shared_Scheduler[Scheduler]
         Shared_Scheduler --> |In-flight Batching| BatchManager
@@ -115,10 +102,7 @@ graph TB
 
     TensorRT_Flow --> Output_Results
     PyTorch_Flow --> Output_Results
-    AutoDeploy_Flow --> Output_Results
     Visual_Gen_Flow --> Output_Results
-
-    AutoDeploy_Flow ~~~ Usage_Telemetry
 
     %% Force Output_Results to be between PyTorch_flow and TensorRT_flow
     PyTorch_Flow ~~~ Output_Results
@@ -138,10 +122,6 @@ graph TB
     %% PyTorch flow format
     classDef pytorch fill:#8bf,stroke:#333,stroke-width:2px;
     class PyExecutor,PyEngine,CustomOps,PyTorchOps,KernelLibs,PyScheduler,PyDecoder,CUDAKernel pytorch;
-
-    %% AutoDeploy flow format
-    classDef autodeploy fill:#9f8,stroke:#333,stroke-width:2px;
-    class ADExecutor,ADEngine,GraphTransforms,TorchExport autodeploy;
 
     %% Visual Gen flow format
     classDef visualgen fill:#d9c,stroke:#333,stroke-width:2px;
