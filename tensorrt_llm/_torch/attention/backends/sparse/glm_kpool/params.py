@@ -30,6 +30,15 @@ from ..params import SparseBackendForwardArgs, SparseParams
 INDEX_SENTINEL = -1
 
 
+def glm_kpool_cache_row_dim(index_head_dim: int) -> int:
+    """Width of one indexer cache row, ``[k | gate | pool key]``.
+
+    Each field is ``index_head_dim`` wide. The cache manager sizes the paged
+    indexer buffers with this width.
+    """
+    return 3 * index_head_dim
+
+
 @dataclass(frozen=True)
 class GlmKpoolSparseParams(SparseParams):
     """Lowered runtime parameters for the GLM k-pool sparse-MLA backend."""
@@ -72,7 +81,7 @@ class GlmKpoolSparseParams(SparseParams):
         it is maintained incrementally by :meth:`GlmKpoolSparseAttention.
         update_pool_keys` so decode never rebuilds pools from scratch.
         """
-        return 3 * self.index_head_dim
+        return glm_kpool_cache_row_dim(self.index_head_dim)
 
     @property
     def select_k(self) -> int:

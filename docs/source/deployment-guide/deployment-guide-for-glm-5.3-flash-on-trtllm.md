@@ -34,8 +34,8 @@ See the [Model-Feature Support Matrix](../models/supported-models.md#model-featu
 * OS: Linux
 * Drivers: CUDA Driver 575 or later
 * Docker with NVIDIA Container Toolkit installed
-* Minimum TensorRT LLM version: 1.3.0rc26
-* Install `transformers==5.17.0` in the GLM deployment environment for model configuration and image/video processing:
+* Minimum TensorRT LLM version: 1.3.0rc29
+* Text-only serving works with the Transformers version installed with TensorRT LLM. Image and video inputs require the native `Glm5NextProcessor` from `transformers==5.17.0`; install it in the GLM deployment environment:
 
   ```bash
   pip install "transformers==5.17.0"
@@ -76,7 +76,7 @@ docker run --rm -it \
     -p 8000:8000 \
     -v /path/to/your/models:/models \
     --name tensorrt_llm \
-    nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc26 \
+    nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc29 \
     /bin/bash
 ```
 

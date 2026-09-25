@@ -5,7 +5,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -43,6 +43,7 @@ from ..attention.backends.sparse.glm_kpool import (
     Glm5NextMamba2Metadata,
     GlmKpoolBackendForwardArgs,
     GlmKpoolSparseParams,
+    glm_kpool_cache_row_dim,
 )
 from ..attention.backends.utils import create_attention
 from ..distributed import AllReduceStrategy
@@ -962,7 +963,7 @@ class Glm5NextIndexer(nn.Module):
     @property
     def cache_state_dim(self) -> int:
         """Width of a cached [key | compression gate | pooled key] row."""
-        return 3 * self.head_dim
+        return glm_kpool_cache_row_dim(self.head_dim)
 
     def project_state(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """``(packed [k(head_dim) | gate(head_dim)], head weights [n_heads])``

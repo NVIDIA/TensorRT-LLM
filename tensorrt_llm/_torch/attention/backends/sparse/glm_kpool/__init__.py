@@ -17,7 +17,7 @@
 from .backend import INDEX_SENTINEL, GlmKpoolSparseAttention, latent_pool_rows, paged_slot_indices
 from .cache_manager import Glm5NextCacheManager
 from .metadata import Glm5NextMamba2Metadata
-from .params import GlmKpoolBackendForwardArgs, GlmKpoolSparseParams
+from .params import GlmKpoolBackendForwardArgs, GlmKpoolSparseParams, glm_kpool_cache_row_dim
 
 __all__ = [
     "INDEX_SENTINEL",
@@ -26,6 +26,7 @@ __all__ = [
     "GlmKpoolBackendForwardArgs",
     "GlmKpoolSparseAttention",
     "GlmKpoolSparseParams",
+    "glm_kpool_cache_row_dim",
     "latent_pool_rows",
     "paged_slot_indices",
 ]
