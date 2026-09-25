@@ -1104,6 +1104,17 @@ class BaseWorker(GenerationExecutor):
     # Define a Callable to join iteration and request stats
     @staticmethod
     def _stats_serializer(stats) -> str:
+        from .iteration_stats import (IterationStatsFrame,
+                                      materialize_stats_batch)
+
+        if isinstance(stats, IterationStatsFrame):
+            reports = materialize_stats_batch([stats])
+            if len(reports) != 1:
+                raise ValueError(
+                    "A multi-rank statistics frame requires batch materialization"
+                )
+            return json.dumps(reports[0])
+
         # Per-rank path: stats is ("per_rank_dict", {..., "rank": N}).
         # Already serialized on the producing rank via allgather — just emit.
         if (isinstance(stats, tuple) and len(stats) == 2

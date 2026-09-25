@@ -7,10 +7,12 @@ import json
 import math
 import time
 import weakref
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from queue import Empty, Queue
-from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Literal,
-                    NamedTuple, Optional, TypeAlias, Union)
+from threading import Lock
+from typing import (TYPE_CHECKING, Any, Awaitable, Callable, Dict, List,
+                    Literal, NamedTuple, Optional, TypeAlias, Union)
 from weakref import WeakMethod
 
 import torch
@@ -1244,6 +1246,73 @@ class GenerationResult(GenerationResultBase):
         return hash(self.request_id)
 
 
+class _StatsBatchFetcher:
+    """Retain a destructive RPC batch until consumers claim every report."""
+
+    def __init__(self) -> None:
+        self._pending: Future[list] | None = None
+        self._lock = Lock()
+        self.results: Queue[dict] = Queue()
+
+    def _get_pending(self,
+                     submit: Callable[[], Future[list]]) -> Future[list] | None:
+        with self._lock:
+            if not self.results.empty():
+                return None
+            if self._pending is None:
+                self._pending = submit()
+            return self._pending
+
+    def _discard(self, pending: Future[list]) -> None:
+        with self._lock:
+            if self._pending is pending:
+                self._pending = None
+
+    def _publish(self, pending: Future[list],
+                 materialize: Callable[[list], list[dict]]) -> None:
+        with self._lock:
+            if self._pending is not pending:
+                return
+            try:
+                reports = materialize(pending.result())
+                for report in reports:
+                    self.results.put_nowait(report)
+            finally:
+                self._pending = None
+
+    def get(self, submit: Callable[[], Future[list]],
+            materialize: Callable[[list], list[dict]]) -> list[dict]:
+        pending = self._get_pending(submit)
+        if pending is not None:
+            try:
+                pending.result()
+            except Exception:
+                self._discard(pending)
+                raise
+            self._publish(pending, materialize)
+        reports = []
+        while True:
+            try:
+                reports.append(self.results.get_nowait())
+            except Empty:
+                return reports
+
+    async def aget(self, submit: Callable[[], Future[list]],
+                   materialize: Callable[[list], list[dict]]) -> None:
+        pending = self._get_pending(submit)
+        if pending is None:
+            return
+        try:
+            # Cancellation must not discard a batch already drained by the worker.
+            await asyncio.shield(asyncio.wrap_future(pending))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._discard(pending)
+            raise
+        self._publish(pending, materialize)
+
+
 class IterationResult:
     """Runtime results for all available iterations.
     """
@@ -1251,6 +1320,10 @@ class IterationResult:
     def __init__(self):
         self._done = False
         self._timeout = 2
+        self._async_fetch: Callable[[], Awaitable[None]] | None = None
+        self._sync_fetch: Callable[[], list[dict]] | None = None
+        self._batch_queue: Queue[dict] | None = None
+        self._fetch_lock = asyncio.Lock()
 
         if has_event_loop():
             self.aqueue = AsyncQueue()
@@ -1258,6 +1331,20 @@ class IterationResult:
         else:
             self.queue = Queue()
             self.aqueue = None
+
+    @classmethod
+    def from_async_fetch(
+        cls,
+        fetch: Callable[[], Awaitable[None]],
+        results: Queue[dict],
+        sync_fetch: Callable[[], list[dict]] | None = None,
+    ) -> "IterationResult":
+        """Fetch one batch on first consumption without starting a background task."""
+        result = cls()
+        result._async_fetch = fetch
+        result._sync_fetch = sync_fetch
+        result._batch_queue = results
+        return result
 
     def set_timeout(self, timeout: float):
         self._timeout = timeout
@@ -1269,11 +1356,31 @@ class IterationResult:
     def get_results(self) -> List[dict]:
         """Return all runtime results in the queue.
         """
+        if self._async_fetch is not None:
+            if self._sync_fetch is None:
+                raise RuntimeError(
+                    "This statistics batch requires async iteration")
+            results = self._sync_fetch()
+            self._async_fetch = None
+            self._sync_fetch = None
+            self._done = True
+            return results
+        if self._batch_queue is not None:
+            if self._done:
+                return []
+            self._done = True
+            results = []
+            while True:
+                try:
+                    results.append(self._batch_queue.get_nowait())
+                except Empty:
+                    return results
         results = []
         while not self._done:
             try:
                 data = self.queue.get(timeout=self._timeout)
-                results.append(json.loads(data))
+                results.append(
+                    json.loads(data) if isinstance(data, str) else data)
             except Empty:
                 self._done = True
         return results
@@ -1285,11 +1392,24 @@ class IterationResult:
         if self._done:
             raise StopAsyncIteration
 
+        if self._async_fetch is not None:
+            async with self._fetch_lock:
+                if self._async_fetch is not None:
+                    await self._async_fetch()
+                    self._async_fetch = None
+                    self._sync_fetch = None
+        if self._batch_queue is not None:
+            try:
+                return self._batch_queue.get_nowait()
+            except Empty:
+                self._done = True
+                raise StopAsyncIteration from None
+
         assert self.aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
 
         try:
             data = await self.aqueue.get(timeout=self._timeout)
-            return json.loads(data)
+            return json.loads(data) if isinstance(data, str) else data
         except asyncio.TimeoutError:
             self._done = True
             raise StopAsyncIteration
