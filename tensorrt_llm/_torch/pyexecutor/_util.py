@@ -241,24 +241,15 @@ def get_kv_cache_manager_cls(
                              "periodic_snapshot_interval.")
 
         if config_utils.is_glm5_next(config):
-            # GLM-5.3-Flash: one Glm5NextCacheManager (a
-            # MambaHybridCacheManagerV2 subclass) owns the KDA recurrent/conv
-            # states, the sparse-MLA latent pages, and the per-sparse-layer
-            # INDEX_KEY indexer buffers. The indexer state is a V2 extra
-            # buffer, so no V1/Mixed/Cpp manager can express it: conflicting
-            # knobs fail loudly instead of silently selecting a manager that
-            # would drop the indexer cache.
+            # glm5_next indexer state is a V2 extra buffer: reject any knob
+            # that would select a non-V2 manager.
             if use_py_mamba_cache_manager() or os.environ.get(
                     'TLLM_MAMBA_MANAGER_PREFERENCE'):
                 raise ValueError(
                     "glm5_next supports only its V2 cache manager; unset "
                     "TRTLLM_USE_PY_MAMBA / TLLM_MAMBA_MANAGER_PREFERENCE.")
             if is_disagg:
-                # Only the Python NIXL transceiver moves the KDA recurrent
-                # state and the V2 extra (indexer) buffers; the C++
-                # transceiver would silently drop both. Same rule as the
-                # hybrid V2 branch below, checked here so the message names
-                # the model.
+                # Only the Python NIXL transceiver moves KDA and indexer state.
                 backend, runtime = _resolve_disagg_transceiver_route(
                     cache_transceiver_config)
                 if runtime != "PYTHON" or backend != "NIXL":
