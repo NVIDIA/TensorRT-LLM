@@ -1053,8 +1053,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         sm_version = get_sm_version()
         if sm_version not in (100, 103):
             pytest.skip(
-                "CuTe DSL NVFP4 GEMM+SwiGLU act fusion supports SM 100 and 103 only"
-            )
+                "CuTe DSL NVFP4 GEMM+SwiGLU act fusion and CUTEDSL MoE backend "
+                "support SM 100 and 103 only")
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
@@ -1107,8 +1107,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         sm_version = get_sm_version()
         if sm_version not in (100, 103):
             pytest.skip(
-                "CuTe DSL NVFP4 GEMM+SwiGLU act fusion supports SM 100 and 103 only"
-            )
+                "CuTe DSL NVFP4 GEMM+SwiGLU act fusion and CUTEDSL MoE backend "
+                "support SM 100 and 103 only")
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
