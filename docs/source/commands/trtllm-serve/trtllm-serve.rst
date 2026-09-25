@@ -35,6 +35,18 @@ The following abbreviated command syntax shows the commonly used arguments to st
 
 For the full syntax and argument descriptions, refer to :ref:`syntax`.
 
+Multiple HTTP Frontends
+-----------------------
+
+At high concurrency a single serving process is host-bound: one asyncio event loop parses every request and writes every streamed chunk, and queuing on that loop rather than GPU time starts to dominate first-token latency. ``trtllm-serve`` therefore runs **8 HTTP frontend processes** against one executor by default (``--num_serve_frontends``, prototype). The launcher process owns the engine; the other frontends attach to it and share the serving port via ``SO_REUSEPORT``, so clients still see a single URL.
+
+.. note::
+
+   * Pass ``--num_serve_frontends 1`` (or set ``num_serve_frontends: 1`` in the ``--config`` YAML) to run a single frontend.
+   * Multiple frontends only work on the default executor path behind the OpenAI HTTP server on a fixed port. With ``--grpc``, ``--port 0`` / ``--report_addr``, ``orchestrator_type`` (``rpc`` / ``ray``) or ``enable_resource_governor`` the default falls back to one frontend and logs why; an explicit ``--num_serve_frontends`` greater than 1 fails instead.
+   * Each request is handled entirely by the frontend that accepted its connection, and per-process state is not shared: the stateful Responses API store (``store`` / ``previous_response_id``) is disabled, and ``/metrics``, ``/perf_metrics``, ``/prometheus/metrics`` and ``/health`` describe the frontend that happened to answer rather than the whole server.
+   * Every extra frontend is a full Python process that imports TensorRT LLM and loads the tokenizer, so budget host memory accordingly.
+
 Inference Endpoints
 -------------------
 
