@@ -68,6 +68,7 @@ These methods run on all workers (GPU processes) and interact with the actual GP
   * **Description**: Called at initialization **instead of** `register_kv_caches` when the KV cache manager is `KVCacheManagerV2`, whose memory cannot be expressed as one tensor: there is one slot address space per pool and one page-index space per layer group. The default implementation raises, so a connector that does not implement it can only run on V1.
   * **Arguments**: `layout` describes the byte ranges that repeat per page slot. Each `KvCacheLayerGroupLayout` carries a tuple of `KvCacheRegion`s, and the bytes for page slot `i` of a region live at `region.base + region.stride * i` for `region.size` bytes, or equivalently at `region.as_tensor()[i]`. Page indices arriving in `RequestData.new_block_ids_by_layer_group` are scoped to a layer group and index that group's regions.
   * **Why regions rather than a tensor**: because the ranges are described rather than implied, the same structure covers MLA (a pool simply has no `value` buffer), sliding-window and hybrid models (one layer group per window size), and non-uniform slots such as MiniMax-M3's index-K buffer sitting beside K/V, without any of them being a special case.
+  * **Replicated roles**: a group's ranges come in two sets. `regions` holds bytes particular to one attention shard, while `replicated_regions` holds bytes identical on every shard — MiniMax-M3's index-K is computed from a replicated projection, so all TP ranks hold the same values. The manager declares which roles those are through `get_replicated_roles()`, itself derived from the `get_disagg_role_mapper_kinds()` declaration that the native disaggregation path already uses. V2 may interleave the two classes within one pool, so the split is produced by aggregating each class separately rather than by slicing a merged range; a connector that ignores `replicated_regions` will simply not transfer those bytes.
 
 * **`start_load_kv(self, stream: torch.cuda.Stream)`**
   * **Description**: Initiates the loading of KV blocks from the external source into the GPU memory.
@@ -138,7 +139,8 @@ explicitly opt in.
 The built-in `mooncake-store` adapter shares one unsharded attention namespace
 across ADP owners. Each owner opens its own store client and contributes its
 configured segment to the common master. TP uses separate keys for each
-attention shard and still requires all shards for a prefix hit. A disaggregated
+attention shard and still requires all shards for a prefix hit, except for roles
+the manager declares replicated, which the whole TP group stores once. A disaggregated
 DEP4 prefill / TEP8 decode deployment attaches the store connector to prefill;
 decode can donate host memory while keeping its native KV transceiver. The
 store does not convert attention shard layouts during prefill-to-decode handoff.
@@ -294,9 +296,15 @@ The store is addressed by whole blocks. The connector is handed the device match
 
 #### How it keys pages
 
-`KVCacheManagerV2` reports `RequestData.block_hashes` empty, so the connector derives block identity itself: a blake2b chain where each block's hash covers its own tokens *and* every token before it, seeded by the request's `cache_salt`. A key is `<prefix>/<model>/w<attention shard count>r<attention shard rank>/lg<layer group>/t<tokens per block>b<bytes per page>/<block hash>`. Under ADP all owners use `w1r0`, since each holds complete attention KV; the MPI owner rank remains local transfer state. The namespace pins down everything that would make the stored bytes mean something different, so a mismatched shard count, layer group or page geometry reads as a cache miss rather than as garbage.
+`KVCacheManagerV2` reports `RequestData.block_hashes` empty, so the connector derives block identity itself: a blake2b chain where each block's hash covers its own tokens *and* every token before it, seeded by the request's `cache_salt`. A key is `<prefix>/<model>/<shard>/lg<layer group>/t<tokens per block>b<bytes per page>/<block hash>`. The namespace pins down everything that would make the stored bytes mean something different, so a mismatched shard count, layer group or page geometry reads as a cache miss rather than as garbage.
 
 The value for one key is the concatenation of that layer group's regions for one page slot, handed to Mooncake's multi-buffer batch APIs as a list of `(address, size)` pairs.
+
+The `<shard>` component is `w<attention shard count>r<attention shard rank>` for pages whose bytes depend on the shard that produced them. Under ADP all owners use `w1r0`, since each holds complete attention KV; the MPI owner rank remains local transfer state.
+
+A layer group carrying a replicated role stores a second page under `replicated` in place of that component, covering the group's `replicated_regions`. Those bytes are identical on every rank, so one copy serves the whole TP group instead of one per rank — for MiniMax-M3 at TP=8, where K, V and index-K are each 256 B/token, that removes about 29% of the store footprint and of the bytes written. One rank writes it and every rank reads it, since each still needs the bytes in its own GPU memory. A prefix hit requires the replicated page alongside every shard's page, so a block whose shared copy was dropped reads as a miss rather than loading half-initialized.
+
+Because the shard component is part of the key, workers with different attention sharding never share entries: an ADP worker keys under `w1r0` and a TP=8 worker under `w8r0`–`w8r7`. That is deliberate — their pages hold different heads — but it means a mixed deployment gets no cross-reuse through the store.
 
 #### Transfer behavior
 

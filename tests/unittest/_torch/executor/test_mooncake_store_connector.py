@@ -21,6 +21,7 @@ plain integers, which is all the addressing arithmetic needs.
 
 import contextlib
 import json
+import re
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -50,8 +51,10 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
     StoreRole,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.keys import (
+    REPLICATED_SHARD_KEY,
     BlockHashChain,
     KeyNamespace,
+    sharded_shard_key,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import (
     PageTransfer,
@@ -117,31 +120,44 @@ class FakeStore:
         self.closed = True
 
 
-def make_layout(*, num_groups=1, regions_per_group=1, num_slots=8, window_size=None):
-    """A layout whose regions are laid out back to back in a fake address space."""
+def make_layout(
+    *,
+    num_groups=1,
+    regions_per_group=1,
+    num_slots=8,
+    window_size=None,
+    replicated_per_group=0,
+):
+    """A layout whose regions are laid out back to back in a fake address space.
+
+    `replicated_per_group` adds that many index-K style regions per group,
+    standing in for a role the manager declared identical on every shard.
+    """
     groups = []
     base = 0x1000
+
+    def region(size, role, layer_id):
+        nonlocal base
+        built = KvCacheRegion(
+            base=base,
+            size=size,
+            stride=size,
+            num_slots=num_slots,
+            buffers=(KvCacheBufferRef(layer_id=layer_id, role=role),),
+        )
+        base += size * num_slots
+        return built
+
     for group_id in range(num_groups):
-        regions = []
-        for region_id in range(regions_per_group):
-            size = 64 * (region_id + 1)
-            stride = size
-            regions.append(
-                KvCacheRegion(
-                    base=base,
-                    size=size,
-                    stride=stride,
-                    num_slots=num_slots,
-                    buffers=(KvCacheBufferRef(layer_id=group_id, role="key"),),
-                )
-            )
-            base += stride * num_slots
+        regions = [region(64 * (i + 1), "key", group_id) for i in range(regions_per_group)]
+        replicated = [region(32, "index_key", group_id) for _ in range(replicated_per_group)]
         groups.append(
             KvCacheLayerGroupLayout(
                 layer_group_id=group_id,
                 layer_ids=(group_id,),
                 window_size=window_size,
                 regions=tuple(regions),
+                replicated_regions=tuple(replicated),
             )
         )
     return KvCacheLayout(tokens_per_block=TOKENS_PER_BLOCK, groups=tuple(groups))
@@ -277,8 +293,7 @@ def test_key_namespace_separates_every_dimension():
     base = dict(
         cache_prefix="trtllm",
         model_key="m",
-        rank=0,
-        world_size=2,
+        shard_key=sharded_shard_key(0, 2),
         layer_group_id=0,
         tokens_per_block=32,
         bytes_per_page=1024,
@@ -288,13 +303,25 @@ def test_key_namespace_separates_every_dimension():
     for field, value in [
         ("cache_prefix", "other"),
         ("model_key", "n"),
-        ("rank", 1),
-        ("world_size", 4),
+        ("shard_key", sharded_shard_key(1, 2)),
         ("layer_group_id", 1),
         ("tokens_per_block", 64),
         ("bytes_per_page", 2048),
     ]:
         assert KeyNamespace(**{**base, field: value}).key(block_hash) != reference
+
+
+def test_shard_key_distinguishes_rank_and_world_size():
+    # rank 3 of 8 holds different heads than rank 3 of 4, so both components
+    # have to appear.
+    assert sharded_shard_key(3, 8) != sharded_shard_key(3, 4)
+    assert sharded_shard_key(0, 2) != sharded_shard_key(1, 2)
+
+
+def test_replicated_shard_key_cannot_collide_with_a_sharded_one():
+    # A sharded component is always w<int>r<int>; the replicated one is a
+    # literal, so no rank/world-size pair can produce it.
+    assert not re.fullmatch(r"w\d+r\d+", REPLICATED_SHARD_KEY)
 
 
 # ---- addressing ----
@@ -365,6 +392,69 @@ def test_page_addressing_rejects_mixed_slot_counts():
     )
     with pytest.raises(ValueError, match="slot counts"):
         PageAddressing(layout)
+
+
+def test_page_addressing_rejects_a_replicated_region_with_its_own_slot_count():
+    # Both classes are indexed by the group's one page-index space, so a
+    # replicated region that disagrees would silently address the wrong slot.
+    layout = KvCacheLayout(
+        tokens_per_block=TOKENS_PER_BLOCK,
+        groups=(
+            KvCacheLayerGroupLayout(
+                layer_group_id=0,
+                layer_ids=(0,),
+                window_size=None,
+                regions=(KvCacheRegion(base=0, size=8, stride=8, num_slots=4, buffers=()),),
+                replicated_regions=(
+                    KvCacheRegion(base=64, size=8, stride=8, num_slots=8, buffers=()),
+                ),
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="slot counts"):
+        PageAddressing(layout)
+
+
+def test_page_addressing_resolves_the_two_classes_separately():
+    layout = make_layout(regions_per_group=2, replicated_per_group=2, num_slots=4)
+    addressing = PageAddressing(layout)
+    group = layout.groups[0]
+
+    addresses, sizes = addressing.buffers(0, 2)
+    assert addresses == [region.base + region.stride * 2 for region in group.regions]
+    assert sizes == [region.size for region in group.regions]
+
+    rep_addresses, rep_sizes = addressing.replicated_buffers(0, 2)
+    assert rep_addresses == [
+        region.base + region.stride * 2 for region in group.replicated_regions
+    ]
+    assert rep_sizes == [region.size for region in group.replicated_regions]
+
+    # The two payloads are disjoint, so their sizes do not overlap-count.
+    assert addressing.has_replicated(0)
+    assert addressing.bytes_per_page(0) == sum(region.size for region in group.regions)
+    assert addressing.replicated_bytes_per_page(0) == sum(
+        region.size for region in group.replicated_regions
+    )
+
+
+def test_page_addressing_reports_no_replicated_page_without_the_role():
+    addressing = PageAddressing(make_layout(regions_per_group=2))
+    assert not addressing.has_replicated(0)
+    assert addressing.replicated_bytes_per_page(0) == 0
+    assert addressing.replicated_buffers(0, 0) == ([], [])
+
+
+def test_page_addressing_registers_replicated_regions_too():
+    # Unregistered memory cannot be RDMA'd, so omitting the replicated span
+    # would fail every transfer that touches it.
+    layout = make_layout(regions_per_group=1, replicated_per_group=1, num_slots=4)
+    replicated = layout.groups[0].replicated_regions[0]
+    span_end = (
+        replicated.base + replicated.stride * (replicated.num_slots - 1) + replicated.size
+    )
+    covered = PageAddressing(layout).registration_ranges()
+    assert any(start <= replicated.base and span_end <= end for start, end in covered)
 
 
 # ---- config ----
@@ -621,6 +711,107 @@ def test_worker_save_skips_pages_already_in_the_store(store_config, fake_store):
         )
         assert len(fake_store.put_calls) == 1
         assert fake_store.put_calls[0][0] == [worker._namespaces[0].key(hashes[1])]
+
+
+def test_worker_names_the_replicated_page_without_a_rank(
+    store_config: Path, fake_store: FakeStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The point of the split: one key for index-K across the whole TP group."""
+    layout = make_layout(replicated_per_group=1)
+    block_hash = b"\x03" * 16
+    monkeypatch.setattr(worker_module, "mpi_world_size", lambda: 8)
+
+    monkeypatch.setattr(worker_module, "mpi_rank", lambda: 0)
+    with make_worker(fake_store, layout=layout) as first:
+        first_sharded = first._namespaces[0].key(block_hash)
+        first_replicated = first._replicated_namespaces[0].key(block_hash)
+    monkeypatch.setattr(worker_module, "mpi_rank", lambda: 7)
+    with make_worker(fake_store, layout=layout) as last:
+        assert last._namespaces[0].key(block_hash) != first_sharded
+        assert last._replicated_namespaces[0].key(block_hash) == first_replicated
+        assert REPLICATED_SHARD_KEY in first_replicated
+
+
+def test_worker_has_no_replicated_namespace_without_the_role(store_config, fake_store):
+    with make_worker(fake_store, layout=make_layout(num_groups=2)) as worker:
+        assert worker._replicated_namespaces == {}
+        # And nothing resolves, so neither path gains a key.
+        transfers = [RequestTransfers(1, [PageTransfer(b"\x00" * 16, 0, 0)])]
+        assert worker._resolve(transfers, replicated=True)[0] == []
+
+
+def test_worker_saves_and_loads_both_classes(store_config, fake_store):
+    layout = make_layout(replicated_per_group=1)
+    addressing = PageAddressing(layout)
+    block_hash = b"\x04" * 16
+    with make_worker(fake_store, layout=layout) as worker:
+        worker._put([RequestTransfers(1, [PageTransfer(block_hash, 0, 2)])])
+
+        keys, addresses, sizes = fake_store.put_calls[0]
+        assert keys == [
+            worker._namespaces[0].key(block_hash),
+            worker._replicated_namespaces[0].key(block_hash),
+        ]
+        assert addresses == [addressing.buffers(0, 2)[0], addressing.replicated_buffers(0, 2)[0]]
+        assert sizes == [addressing.buffers(0, 2)[1], addressing.replicated_buffers(0, 2)[1]]
+
+        transfers = RequestTransfers(2, [PageTransfer(block_hash, 0, 5)])
+        worker.bind_connector_meta(SimpleNamespace(loads=[transfers], saves=[]))
+        worker.start_load_kv(None)
+        loaded_keys, loaded_addresses, _ = fake_store.get_calls[-1]
+        assert loaded_keys == keys
+        assert loaded_addresses == [
+            addressing.buffers(0, 5)[0],
+            addressing.replicated_buffers(0, 5)[0],
+        ]
+
+
+def test_worker_saves_the_replicated_page_from_one_rank_only(
+    store_config: Path, fake_store: FakeStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layout = make_layout(replicated_per_group=1)
+    block_hash = b"\x05" * 16
+    monkeypatch.setattr(worker_module, "mpi_world_size", lambda: 4)
+    monkeypatch.setattr(worker_module, "mpi_rank", lambda: 2)
+    with make_worker(fake_store, layout=layout) as worker:
+        replicated_key = worker._replicated_namespaces[0].key(block_hash)
+        worker._put([RequestTransfers(1, [PageTransfer(block_hash, 0, 0)])])
+        # Its own shard still goes out; the shared copy is rank 0's to write.
+        assert fake_store.put_calls[0][0] == [worker._namespaces[0].key(block_hash)]
+
+        # But it still reads the shared copy, since it needs its own GPU copy.
+        fake_store.objects.add(replicated_key)
+        fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        transfers = RequestTransfers(2, [PageTransfer(block_hash, 0, 1)])
+        worker.bind_connector_meta(SimpleNamespace(loads=[transfers], saves=[]))
+        worker.start_load_kv(None)
+        assert replicated_key in fake_store.get_calls[-1][0]
+
+
+def test_adp_owners_all_save_the_replicated_page(
+    store_config: Path, fake_store: FakeStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADP owners serve different requests, so gating them on rank would drop pages."""
+    monkeypatch.setattr(worker_module, "mpi_world_size", lambda: 4)
+    monkeypatch.setattr(worker_module, "mpi_rank", lambda: 3)
+    layout = make_layout(replicated_per_group=1)
+    block_hash = b"\x06" * 16
+    with make_worker(fake_store, layout=layout, enable_attention_dp=True) as worker:
+        worker._put([RequestTransfers(1, [PageTransfer(block_hash, 0, 0)])])
+        assert worker._replicated_namespaces[0].key(block_hash) in fake_store.put_calls[0][0]
+
+
+def test_worker_prefix_hit_needs_the_replicated_page(store_config, fake_store):
+    layout = make_layout(replicated_per_group=1)
+    with make_worker(fake_store, layout=layout) as worker:
+        block_hash = b"\x07" * 16
+        fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        # The shard's own page landed but rank 0's shared write did not, so the
+        # block is unusable rather than half-loadable.
+        assert worker.count_prefix_hit([block_hash]) == 0
+
+        fake_store.objects.add(worker._replicated_namespaces[0].key(block_hash))
+        assert worker.count_prefix_hit([block_hash]) == 1
 
 
 def test_worker_reports_a_request_finished_once_its_saves_drain(store_config, fake_store):

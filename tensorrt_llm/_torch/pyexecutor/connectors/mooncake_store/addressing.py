@@ -23,6 +23,12 @@ Region order is therefore the value's serialization, and it is stable for a
 given model and parallel layout because `build_kv_cache_layout_v2` derives it
 from the allocator's own aggregation. `bytes_per_page` goes into
 the key namespace to keep a geometry change from being read as a valid page.
+
+A layer group yields two pages rather than one. Most roles hold bytes belonging
+to a single attention shard; roles the manager declares replicated hold bytes
+identical on every shard. They are addressed separately so the connector can
+key the replicated page once for the whole TP group. Groups with no replicated
+role report an empty second page, which the worker skips.
 """
 
 from typing import Dict, Iterable, List, Sequence, Tuple
@@ -37,9 +43,10 @@ def merge_intervals(intervals: Iterable[Tuple[int, int]]) -> List[Tuple[int, int
 
     Registration is per range and a range may not be registered twice, but
     several regions routinely live inside one pool allocation: sliding-window
-    layer groups share it, and a non-uniform slot (MiniMax-M3's index-K sitting
-    beside K/V) splits one pool into several regions. Merging first means the
-    caller does not have to know which case it is in.
+    layer groups share it, and separating replicated roles from shard-specific
+    ones (MiniMax-M3's index-K sitting beside K/V) splits one pool into
+    interleaved regions of both classes. Merging first means the caller does
+    not have to know which case it is in.
     """
     ordered = sorted((int(start), int(end)) for start, end in intervals if end > start)
     merged: List[Tuple[int, int]] = []
@@ -58,7 +65,9 @@ class PageAddressing:
     def __init__(self, layout: KvCacheLayout):
         self._layout = layout
         self._regions: Dict[int, Tuple[KvCacheRegion, ...]] = {}
+        self._replicated_regions: Dict[int, Tuple[KvCacheRegion, ...]] = {}
         self._bytes_per_page: Dict[int, int] = {}
+        self._replicated_bytes_per_page: Dict[int, int] = {}
         self._num_slots: Dict[int, int] = {}
         for group in layout.groups:
             if not group.regions:
@@ -67,11 +76,18 @@ class PageAddressing:
                     "is nothing for the connector to transfer"
                 )
             self._regions[group.layer_group_id] = group.regions
+            self._replicated_regions[group.layer_group_id] = group.replicated_regions
             self._bytes_per_page[group.layer_group_id] = group.bytes_per_page
+            self._replicated_bytes_per_page[group.layer_group_id] = (
+                group.replicated_bytes_per_page
+            )
             # Every region of a group is drawn from the same pool group, so they
             # share a slot count; disagreement would mean the page index space is
-            # not the single space the layout documents.
-            slot_counts = {region.num_slots for region in group.regions}
+            # not the single space the layout documents. Replicated regions are
+            # indexed by that same space, so they are held to it too.
+            slot_counts = {
+                region.num_slots for region in (*group.regions, *group.replicated_regions)
+            }
             if len(slot_counts) != 1:
                 raise ValueError(
                     f"layer group {group.layer_group_id} mixes slot counts "
@@ -95,15 +111,23 @@ class PageAddressing:
         return self._layout.tokens_per_block
 
     def bytes_per_page(self, layer_group_id: int) -> int:
-        """Total payload size of one page of `layer_group_id`."""
+        """Payload size of one shard-specific page of `layer_group_id`."""
         return self._bytes_per_page[layer_group_id]
+
+    def replicated_bytes_per_page(self, layer_group_id: int) -> int:
+        """Payload size of one replicated page of `layer_group_id`, or 0."""
+        return self._replicated_bytes_per_page[layer_group_id]
+
+    def has_replicated(self, layer_group_id: int) -> bool:
+        """Whether `layer_group_id` holds any replicated-role bytes."""
+        return bool(self._replicated_regions[layer_group_id])
 
     def num_slots(self, layer_group_id: int) -> int:
         """Number of page slots addressable in `layer_group_id`."""
         return self._num_slots[layer_group_id]
 
     def buffers(self, layer_group_id: int, page_index: int) -> Tuple[List[int], List[int]]:
-        """Addresses and sizes of one page, in the order they concatenate.
+        """Addresses and sizes of one shard-specific page, in concatenation order.
 
         Args:
             layer_group_id: Layer group the page index is scoped to.
@@ -112,7 +136,29 @@ class PageAddressing:
         Returns:
             Parallel lists of device addresses and byte counts.
         """
-        regions = self._regions[layer_group_id]
+        return self._locate(self._regions[layer_group_id], layer_group_id, page_index)
+
+    def replicated_buffers(
+        self, layer_group_id: int, page_index: int
+    ) -> Tuple[List[int], List[int]]:
+        """Addresses and sizes of one replicated page, in concatenation order.
+
+        These bytes are identical on every attention shard, so the same page is
+        described here on every rank even though each rank names its own copy.
+
+        Args:
+            layer_group_id: Layer group the page index is scoped to.
+            page_index: Page slot index within that group.
+
+        Returns:
+            Parallel lists of device addresses and byte counts. Both are empty
+            when the group holds no replicated roles.
+        """
+        return self._locate(self._replicated_regions[layer_group_id], layer_group_id, page_index)
+
+    def _locate(
+        self, regions: Sequence[KvCacheRegion], layer_group_id: int, page_index: int
+    ) -> Tuple[List[int], List[int]]:
         num_slots = self._num_slots[layer_group_id]
         if not 0 <= page_index < num_slots:
             raise IndexError(
@@ -129,11 +175,13 @@ class PageAddressing:
         A region's slots are strided rather than packed, so the range covering it
         is the whole span from the first slot to the end of the last. Registering
         the span is what makes every slot's address valid for RDMA, and merging
-        keeps a shared pool from being registered once per region.
+        keeps a shared pool from being registered once per region. Both region
+        classes are covered: replicated bytes are transferred like any other, so
+        leaving them unregistered would fail every transfer that touches them.
         """
         spans: List[Tuple[int, int]] = []
-        for regions in self._regions.values():
-            for region in regions:
+        for layer_group_id, regions in self._regions.items():
+            for region in (*regions, *self._replicated_regions[layer_group_id]):
                 span_end = region.base + region.stride * (region.num_slots - 1) + region.size
                 spans.append((region.base, span_end))
         return merge_intervals(spans)
@@ -145,6 +193,8 @@ class PageAddressing:
             f"layers={len(group.layer_ids)}, "
             f"regions={len(group.regions)}, "
             f"bytes/page={group.bytes_per_page}, "
+            f"replicated_regions={len(group.replicated_regions)}, "
+            f"replicated_bytes/page={group.replicated_bytes_per_page}, "
             f"slots={self._num_slots[group.layer_group_id]}, "
             f"window={group.window_size})"
             for group in self._layout.groups
