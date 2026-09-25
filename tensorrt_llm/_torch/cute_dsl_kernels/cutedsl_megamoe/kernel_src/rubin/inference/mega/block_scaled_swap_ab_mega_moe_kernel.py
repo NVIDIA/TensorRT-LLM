@@ -473,7 +473,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             raise ValueError("mma_tiler K must be divisible by four scale-factor vectors.")
         if self.quant_kind == QuantKind.nvfp4 and (mma_n, mma_k) == (256, 512):
             raise ValueError(
-                "Rubin MegaMoE excludes NVFP4 N256 K512 because its multi-window path has no measured gain."
+                "Rubin MegaMoE excludes NVFP4 N256 K512 because that multi-window configuration is unsupported."
             )
         if self.quant_kind == QuantKind.mxfp4_mxfp8:
             sf_atom_size = self.sf_vec_size * 4

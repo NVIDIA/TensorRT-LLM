@@ -6,7 +6,7 @@ import torch
 from utils.util import isSM100Family
 
 pytestmark = pytest.mark.skipif(
-    not isSM100Family(), reason="Requires Blackwell or Rubin quantization kernels"
+    not isSM100Family(), reason="Requires supported SM100-family quantization kernels"
 )
 
 
@@ -24,11 +24,23 @@ def _input(rows):
     return torch.randn((rows, 7168), device="cuda", dtype=torch.bfloat16, generator=generator)
 
 
-@pytest.mark.parametrize("rows", [129, 816, 817, 8096, 8192])
+def _rows_for_case(case, reserved_sms):
+    if case == "empty":
+        return 0
+    if case == "small":
+        return 129
+    if case == "capacity":
+        return 8192
+    available_sms = torch.cuda.get_device_properties("cuda").multi_processor_count - reserved_sms
+    grid_edge = 4 * available_sms
+    return grid_edge if case == "grid_edge" else grid_edge + 1
+
+
+@pytest.mark.parametrize("row_case", ["small", "grid_edge", "grid_edge_plus_one", "capacity"])
 @pytest.mark.parametrize("swizzled", [False, True])
 @pytest.mark.parametrize("reserved_sms", [0, 8])
-def test_fp4_quantize_sm_budget_matches_default(rows, swizzled, reserved_sms):
-    x = _input(rows)
+def test_fp4_quantize_sm_budget_matches_default(row_case, swizzled, reserved_sms):
+    x = _input(_rows_for_case(row_case, reserved_sms))
     scale = torch.ones((1,), device="cuda", dtype=torch.float32)
     expected = torch.ops.trtllm.fp4_quantize(x, scale, 16, False, swizzled)
     actual = torch.ops.trtllm.fp4_quantize.sm_budget(
@@ -37,10 +49,12 @@ def test_fp4_quantize_sm_budget_matches_default(rows, swizzled, reserved_sms):
     _assert_same_bytes(actual, expected)
 
 
-@pytest.mark.parametrize("rows", [0, 129, 816, 817, 8096, 8192])
+@pytest.mark.parametrize(
+    "row_case", ["empty", "small", "grid_edge", "grid_edge_plus_one", "capacity"]
+)
 @pytest.mark.parametrize("reserved_sms", [0, 8])
-def test_shared_fp8_quantize_sm_budget_matches_default(rows, reserved_sms):
-    x = _input(rows)
+def test_shared_fp8_quantize_sm_budget_matches_default(row_case, reserved_sms):
+    x = _input(_rows_for_case(row_case, reserved_sms))
     expected = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(x)
     actual = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0.sm_budget(
         x, reserved_sms=reserved_sms

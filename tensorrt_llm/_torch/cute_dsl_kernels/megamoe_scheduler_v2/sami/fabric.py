@@ -10,9 +10,9 @@ build_hierarchical_live_arena, imports FabricAllocation and MulticastGroup back
 out of here. In TensorRT-LLM that is rebalance_live_arena_v2.py, which reaches
 it through _HierarchicalRegion.__init__.
 
-That import sits inside a function body on purpose -- importing this package at
-module scope triggers the nvcc JIT of halo_q_scheduler.cu, measured at 6.9 s --
-so a module-level grep or AST closure does not see it and will conclude, again,
+That import sits inside a function body on purpose: importing this package at
+module scope triggers an eager native build. A module-level grep or AST closure
+therefore does not see it and may conclude
 that nothing uses this. Walk consumers with ast.walk before touching it.
 
 megamoe_scheduler/sami/_driver.py carries the one helper shared with production.

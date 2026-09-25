@@ -416,7 +416,7 @@ class SharedFc12TunableRunner(TunableRunner):
             return None
         if tactic == -1:
             if AutoTuner.get().is_tuning_mode:
-                raise RuntimeError("shared FC12 profiling did not select a valid measured tactic")
+                raise RuntimeError("shared FC12 profiling did not select a valid tactic")
             tactic = (
                 (1, 256, 128, "atomic_counter", True)
                 if self.reserved_sms > 0

@@ -2,10 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 Subject: Preserve the target branch FC1 claim-exhaustion fix
 
-Upstream base: jintaop/cutedsl_megamoe 522fbb019942ad6bbe0f418dba02541f837ea46c
-Target repository: https://gitlab-master.nvidia.com/ftp/tekit.git
-Target branch snapshot: user/lizhiz/rubin-advance at 06c3af7315b944015c593a1bebeafc3907c6e421
-Target diff base: 1926426ce3bba0ac384fb894602762a68462435a
+Upstream revision: 522fbb019942ad6bbe0f418dba02541f837ea46c
+Reference revision: 06c3af7315b944015c593a1bebeafc3907c6e421
+Reference diff base: 1926426ce3bba0ac384fb894602762a68462435a
 
 The target change removes the prologue's early fc1_exhausted assignment.
 The claim watermark wait remains; actual claim/map exhaustion still terminates

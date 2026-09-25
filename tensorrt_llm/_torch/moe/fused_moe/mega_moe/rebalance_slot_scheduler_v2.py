@@ -159,8 +159,8 @@ class RebalanceSlotSchedulerGroupV2:
 
         logical_expert_count = self.home_experts * ep_size
 
-        # Use the EP rank, not the CUDA ordinal. HALO-Q defaults to the same
-        # eight-SM budget as TMA; an override may reduce that budget.
+        # Use the EP rank, not the CUDA ordinal. HALO-Q shares the configured
+        # copy-stream launch budget with TMA.
         ctas_env = os.environ.get("TRTLLM_MOE_REBALANCE_CTAS_V2", "").strip()
         cfg = CudaSchedulerConfig(
             ep_size=ep_size,
@@ -246,14 +246,8 @@ class RebalanceSlotSchedulerGroupV2:
         self.lease = _V2LiveBankLeaseProvider(self)
         self.broadcaster.bind_generation_reuse_authority(self.lease)
 
-        logger.info(
-            f"[MegaMoECuteDsl] layer={layer_idx} rebalance producer group up: "
-            f"HALO-Q algorithm={cfg.algorithm} ctas={cfg.ctas} "
-            f"arch={_halo_q_arch} + "
-            f"TMA in-switch copy sm={TMA_COPY_SM_COUNT} pairs=7 "
-            f"route=plan gpu-direct single-main levels={len(arena.provider.group_sizes)} "
-            f"groups={arena.provider.group_sizes}, EP={ep_size} rank={ep_rank} "
-            f"H={home_experts} S={helper_slots} maxT={max_tokens_per_rank}"
+        logger.debug(
+            "[MegaMoECuteDsl] layer=%s rebalance producer initialized", layer_idx
         )
 
     def _check_owner(self) -> None:

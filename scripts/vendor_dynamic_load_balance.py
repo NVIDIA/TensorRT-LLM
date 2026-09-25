@@ -6,7 +6,9 @@ import argparse
 import ast
 import hashlib
 import json
+import re
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 HEADER = (
@@ -50,6 +52,261 @@ def _read_downstream_patches(target: Path, source: Path, *, header: bool) -> lis
     return patches
 
 
+def _replace_text(path: Path, transform: Callable[[str], str]) -> None:
+    before = path.read_text()
+    after = transform(before)
+    if after != before:
+        path.write_text(after)
+
+
+def _prepare_patch_input(target: Path, patch_name: str) -> None:
+    """Normalize upstream benchmark comments before replaying public patches."""
+    if target.name != "cutedsl_megamoe" or patch_name != "TENSORRT_LLM_MAIN_COMPAT.patch":
+        return
+
+    topk = target / "kernel_src/blackwell/inference/mega/topk_reduce.py"
+    _replace_text(
+        topk,
+        lambda text: re.sub(
+            r"(# lowers to an ALU subnormal-normalization path) \(~[^)]*\)(\. Both helpers)",
+            r"\1\2",
+            text,
+        ),
+    )
+    mainloop = target / (
+        "kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py"
+    )
+
+    def normalize_mainloop(text: str) -> str:
+        text = text.replace(
+            "from ....schedulers.fc12_mapping import BlockPhase\nfrom . import dynamic_mainloop\n",
+            "from ....schedulers.fc12_mapping import BlockPhase\n"
+            "from ..local_mega.tma_gather import sm107_tma_gather4_load\n"
+            "from . import dynamic_mainloop\n",
+        ).replace("from .tma_gather import sm107_tma_gather4_load\n", "")
+        text = re.sub(
+            r"    # Token-side depth once the operands stop sharing one\..*?suggests\.\n",
+            "    # Pin the token-side pipeline depth so wider token tiles do not consume the\n"
+            "    # weight-side staging budget. Revalidate this specialization when its tile or\n"
+            "    # shared-memory plan changes.\n",
+            text,
+            flags=re.S,
+        )
+        text = re.sub(
+            r"    # The token tile this specialization applies to\..*?\n"
+            r"    # already reaches .*?\n",
+            "    # The token tile this specialization applies to; other tiles use the shared plan.\n",
+            text,
+        )
+        return re.sub(
+            r"        # Only the .*? token tile is specialized:.*?\n"
+            r"        # already reaches .*?\n",
+            "        # Only the selected token tile uses asymmetric operand stages.\n",
+            text,
+        )
+
+    _replace_text(mainloop, normalize_mainloop)
+
+
+def _sanitize_vendored_comments(target: Path) -> None:
+    """Remove source-specific benchmark evidence while preserving implementation."""
+    if target.name == "megamoe_scheduler_v2":
+        halo = target / "cuda_scheduler/csrc/halo_q_scheduler.cu"
+
+        def sanitize_halo(text: str) -> str:
+            text = re.sub(
+                r"/\* Pure-CUDA fused physical-slot scheduler for GB\d+ \(sm_\d+\)\.",
+                "/* Pure-CUDA fused physical-slot scheduler for supported architectures.",
+                text,
+            )
+            text = text.replace(
+                "the\n         * measured CuTe reset-free rendezvous.",
+                "the\n         * reset-free rendezvous.",
+            )
+            text = re.sub(
+                r"/\* `routes` is cold on every iteration.*?"
+                r"atomicAdd regrouping is safe because integer addition commutes\. \*/",
+                "/* Issue a small load group before consuming it to expose memory-level\n"
+                "     * parallelism. The binning is unchanged, and atomicAdd regrouping is\n"
+                "     * safe because integer addition commutes. */",
+                text,
+                flags=re.S,
+            )
+            text = re.sub(
+                r"/\* Four-way unrolling this.*?compiler already pipelines it\. \*/",
+                "/* Keep the simple accumulation loop; the compiler provides the required\n"
+                "     * pipelining without explicit batching. */",
+                text,
+                flags=re.S,
+            )
+            text = re.sub(
+                r"/\* Widening these to int4.*?see below\.\) \*/",
+                "/* Keep scalar remote stores for the publication path; the local mirror\n"
+                "         * copy below uses vector transfers when alignment permits. */",
+                text,
+                flags=re.S,
+            )
+            text = re.sub(
+                r"/\* Same 4-byte issue limit.*?\*/",
+                "/* Vectorize the local mirror copy when shape and alignment permit. */",
+                text,
+                flags=re.S,
+            )
+            text = re.sub(
+                r" \* Replaces a single-threaded.*?elements\.\n",
+                " * This replaces serial insertion-sort and mask-construction loops while\n"
+                " * preserving the same stable order.\n",
+                text,
+                flags=re.S,
+            )
+            text = re.sub(
+                r"/\* The rank scan reads.*?write nothing\. \*/",
+                "/* Read p_expert cooperatively and distribute values with shuffles. All\n"
+                "     * lanes must participate before inactive lanes return; inactive lanes\n"
+                "     * carry INT_MAX and never contribute to a real comparison. */",
+                text,
+                flags=re.S,
+            )
+            text = re.sub(
+                r"/\* EP\d+ used to run one round.*?delta 0\. \*/",
+                "/* Use two unconditional repair rounds. Phases with no required repair\n"
+                "                 * are no-ops, so this preserves the conditional algorithm's result. */",
+                text,
+                flags=re.S,
+            )
+            text = re.sub(
+                r"/\* The EP\d+ .*? repair scan lived here;.*?equivalent\. \*/",
+                "/* The unconditional repair rounds above replace the conditional scan. */",
+                text,
+                flags=re.S,
+            )
+            text = re.sub(
+                r"/\* build_route_prefix reads.*?kernel time\. \*/",
+                "/* build_route_prefix is independent of warp 8's outputs. Defer their\n"
+                "             * rendezvous until both paths reach their first shared consumer so\n"
+                "             * prefix construction and coloring can overlap safely. */",
+                text,
+                flags=re.S,
+            )
+            return re.sub(r"/\* Release the \d+ worker CTAs", "/* Release the worker CTAs", text)
+
+        _replace_text(halo, sanitize_halo)
+        _replace_text(
+            target / "csrc/in_switch_copy/tma_copy.h",
+            lambda text: re.sub(
+                r"the kernel/device thread limit \(GB\d+: at most \d+ warps with \d+ total slots\)\.",
+                "the active kernel and device limits.",
+                text,
+            ),
+        )
+        _replace_text(
+            target / "cuda_scheduler/runtime.py",
+            lambda text: re.sub(
+                r'"""Return the measured pure-CUDA CTA policy',
+                '"""Return the bounded pure-CUDA CTA policy',
+                text,
+            )
+            if "# The latency-oriented" not in text
+            else re.sub(
+                r"        # The latency-oriented EP\d+ policy.*?unoccupied\.\n",
+                "        # Bound scheduler occupancy so independent same-stream work retains\n"
+                "        # launch capacity.\n",
+                re.sub(
+                    r'"""Return the measured pure-CUDA CTA policy',
+                    '"""Return the bounded pure-CUDA CTA policy',
+                    text,
+                ),
+                flags=re.S,
+            ),
+        )
+        _replace_text(
+            target / "sami/fabric.py",
+            lambda text: re.sub(
+                r"That import sits inside a function body on purpose.*?conclude, again,\n",
+                "That import sits inside a function body on purpose: importing this package at\n"
+                "module scope triggers an eager native build. A module-level grep or AST closure\n"
+                "therefore does not see it and may conclude\n",
+                text,
+                flags=re.S,
+            ),
+        )
+        hierarchical = target / "sami/hierarchical.py"
+
+        def sanitize_timeout(text: str) -> str:
+            text = re.sub(
+                r"# Bound on waiting for every peer.*?HierarchicalCopyEndpoint\.submit\.\n",
+                "# Bound on waiting for every peer to publish its mapped plan. Steady state\n"
+                "# surfaces a lost peer promptly; the first generation allows for compilation\n"
+                "# inside the rendezvous and the resulting arrival skew.\n",
+                text,
+                flags=re.S,
+            )
+            start = "        ``timeout_ns=None`` picks the bound automatically, and the first\n"
+            end = '        """\n\n        if timeout_ns is None:'
+            if start not in text:
+                return text
+            prefix, tail = text.split(start, 1)
+            _, suffix = tail.split(end, 1)
+            neutral = (
+                "        ``timeout_ns=None`` selects a wider first-generation bound because\n"
+                "        ranks can enter the rendezvous at different times while required kernels are\n"
+                "        compiled. Later generations use the steady-state bound so a lost peer surfaces\n"
+                "        promptly. ``MEGAMOE_SAMI_PLAN_TIMEOUT_NS`` can raise both defaults; callers may\n"
+                "        pass ``timeout_ns`` explicitly when a different diagnostic bound is required.\n"
+                "        The timeout is an error bound, not a correctness barrier.\n"
+                '        """\n\n        if timeout_ns is None:'
+            )
+            return prefix + neutral + suffix
+
+        _replace_text(hierarchical, sanitize_timeout)
+        _replace_text(
+            target / "integrations/megamoe/README.md",
+            lambda text: re.sub(
+                r"native\n\d+-argument AOT\. Both Rubin token-tile",
+                "native\nAOT interface. Supported token-tile",
+                text,
+            ),
+        )
+        return
+
+    if target.name != "cutedsl_megamoe":
+        return
+    for rel in (
+        "kernel_src/rubin/inference/local_mega/block_scaled_swap_ab_local_mega_moe_kernel.py",
+        "kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py",
+    ):
+        _replace_text(
+            target / rel,
+            lambda text: text.replace(
+                "because its multi-window path has no measured gain.",
+                "because that multi-window configuration is unsupported.",
+            ),
+        )
+    _replace_text(
+        target
+        / "kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py",
+        lambda text: re.sub(
+            r"    # Token-side depth once the operands stop sharing one\..*?suggests\.\n",
+            "    # Pin the token-side pipeline depth so wider token tiles do not consume the\n"
+            "    # weight-side staging budget. Revalidate this specialization when its tile or\n"
+            "    # shared-memory plan changes.\n",
+            text,
+            flags=re.S,
+        ),
+    )
+    _replace_text(
+        target
+        / "kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py",
+        lambda text: re.sub(
+            r"    # Tuned for Rubin, not portable\..*?cluster capacity\.\n",
+            "    # The communication grid must preserve full residency of the persistent main\n"
+            "    # kernel. Revalidate this specialization when device or cluster capacity changes.\n",
+            text,
+            flags=re.S,
+        ),
+    )
+
+
 def _apply_downstream_patches(root: Path, target: Path, patches: list[dict]) -> None:
     for patch in patches:
         patch_path = target / patch["patch"]
@@ -63,8 +320,11 @@ def _apply_downstream_patches(root: Path, target: Path, patches: list[dict]) -> 
                 cwd=root,
                 check=True,
             )
-        subprocess.run(["git", "apply", "--check", str(patch_path)], cwd=root, check=True)
-        subprocess.run(["git", "apply", str(patch_path)], cwd=root, check=True)
+        _prepare_patch_input(target, patch["patch"])
+        subprocess.run(
+            ["git", "apply", "--recount", "--check", str(patch_path)], cwd=root, check=True
+        )
+        subprocess.run(["git", "apply", "--recount", str(patch_path)], cwd=root, check=True)
         for file in patch.get("files", [patch]):
             digest = hashlib.sha256((target / file["file"]).read_bytes()).hexdigest()
             if digest != file["patched_sha256"]:
@@ -93,6 +353,7 @@ def main() -> None:
         scheduler_files.append(str(rel))
 
     _apply_downstream_patches(root, scheduler_dst, scheduler_patches)
+    _sanitize_vendored_comments(scheduler_dst)
 
     pending = [
         path.relative_to(mega_dst) for path in mega_dst.rglob("*.py") if path.name != "__init__.py"
@@ -131,20 +392,21 @@ def main() -> None:
                 pending.append(candidate)
 
     _apply_downstream_patches(root, mega_dst, mega_patches)
+    _sanitize_vendored_comments(mega_dst)
     for repo, target, files, kind, upstream in (
         (
             args.scheduler,
             scheduler_dst,
             scheduler_files,
             "complete scheduler package",
-            "https://gitlab-master.nvidia.com/jintaop/cutedsl_eplb_scheduler_copy.git",
+            "external scheduler source",
         ),
         (
             args.megamoe,
             mega_dst,
             [str(path) for path in sorted(copied)],
             "inference closure",
-            "https://gitlab-master.nvidia.com/jintaop/cutedsl_megamoe.git",
+            "external MegaMoE source",
         ),
     ):
         source_subdir = "next/sources" if repo == args.megamoe else "megamoe_scheduler"

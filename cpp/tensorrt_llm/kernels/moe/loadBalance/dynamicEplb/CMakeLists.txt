@@ -54,7 +54,7 @@ list(REMOVE_DUPLICATES DYNAMIC_EPLB_SOURCES)
 add_library(moe_dynamic_eplb_src OBJECT ${DYNAMIC_EPLB_SOURCES})
 
 if(DYNAMIC_EPLB_ARCHS)
-  # These kernels use Blackwell-specific PTX. The SM100 family target avoids
+  # These kernels use SM100-family PTX. The family target avoids
   # inheriting the generic kernels_src SM80/SM90 compilation passes.
   set_cuda_architectures(moe_dynamic_eplb_src 100f)
 endif()

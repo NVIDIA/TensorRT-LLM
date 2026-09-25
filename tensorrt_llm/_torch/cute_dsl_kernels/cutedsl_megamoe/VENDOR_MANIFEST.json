@@ -34,16 +34,16 @@
     "kernel_src/rubin/inference/local_mega/block_scaled_swap_ab_fc12_epilogue.py": "99b99a377639d9618bd20cde14f27c7586b009201a336f80db4af0271b498d99",
     "kernel_src/rubin/inference/local_mega/block_scaled_swap_ab_fc12_extension.py": "3d048fc0633c1d7ae6fa795ade1689065ecc5527f6652bc548d6641f4f21dee7",
     "kernel_src/rubin/inference/local_mega/block_scaled_swap_ab_fc12_mainloop.py": "fd1cd35ab973b5875b489ccfc5c31d658a88d5feb2e1c3a09af8b4cf95481444",
-    "kernel_src/rubin/inference/local_mega/block_scaled_swap_ab_local_mega_moe_kernel.py": "c5f4b979b26c8a47223c6554ccbe5e0f40e360e339756b492371132f201ccc1c",
+    "kernel_src/rubin/inference/local_mega/block_scaled_swap_ab_local_mega_moe_kernel.py": "8ec21f635e23d468292795ec12ba75a28bdaff313e61e934ffa5ae5db130a860",
     "kernel_src/rubin/inference/local_mega/local_routing.py": "f0f244fe09e94c371804cb65b807d043e29c38dc4b155812e6f830e88442962f",
     "kernel_src/rubin/inference/local_mega/tma_gather.py": "d77218d0172211505445f8f4549fe5fb15cd68abc7110748d06a9b63ed87bd47",
     "kernel_src/rubin/inference/local_mega/topk_reduce.py": "1c4a766bdf76f5b726e321b140e46ea98794b1455cd09b8537a6a434c53b6347",
     "kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_epilogue.py": "d0f1894b2294f92bce7788209d2d4d30ba28035bed1d89f3d6013771482e926e",
     "kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_extension.py": "cd8f5446b74b38b3e622b587ae8b7a54a43fedd3d5a4017007bb39bc72b0519a",
     "kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py": "ce03d3a4c786bf653fe8fc7e32a76b83adbc1eb354813f0a5d8ad0c4098164ed",
-    "kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py": "982d81875a9ff9351e028591cfae5ccd7a4eadaf9ecda17d18106baff7bdda20",
-    "kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py": "8fd8cc4c4aabaeca2a9a2df9c1a43ad8b21b257792f0bf99e949ed1956ce4add",
-    "kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py": "0bf09db36f5ff897d8d2b28cdd71c5abd3c9ef2f5e912809b08ea6211ffc87b0",
+    "kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py": "e99b472281ecd3e4284146b9682524b3a1a2cace3e47a56a528072ccda5b6e98",
+    "kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py": "62861d72d7861b8d5358f2ca74fb4c78719aa15cb7ae6f77ca79959c3ea847ab",
+    "kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py": "e396dcc1a29fa1073b3374253030de009c4df8ba52c225a0d1368011b8c1c205",
     "kernel_src/rubin/inference/mega/dynamic_mainloop.py": "3e32cd6c295795a61ab904d0a988cc301abeb2f9b0b54ba5e6ca8e0cd61d2128",
     "kernel_src/rubin/inference/mega/tma_gather.py": "a6a19b35b15ed2909750d7be08067d8ad5268ed05e6584568613810848ff72c5",
     "kernel_src/rubin/inference/mega/token_comm_gen_specialized.py": "a136853957c9c0c11ea23a61dc3a3086f06aae0f918b5b71e5698dd39df18423",
@@ -61,19 +61,17 @@
   "downstream_patches": [
     {
       "patch": "FC12_CLAIM_EXHAUSTION.patch",
-      "patch_sha256": "11fe2b4007ce4ae09b2156432e7a8cadb55e8ec696319c8b166dbd91db7bdb67",
+      "patch_sha256": "e4a69d8b454e5022cc53a12713deee3cc8310e4633fdbde70adea0c0622c8704",
       "file": "kernel_src/schedulers/fc12_scheduler.py",
       "unpatched_vendored_sha256": "6e3ec2efe83a13e04636055aa505d2065da96022f5f50983cf113cd63d78ec74",
       "patched_sha256": "46ca708d62d9ffa5154abe483fd0972f2ee42235212ae04ec95f00294154563e",
-      "source_repository": "https://gitlab-master.nvidia.com/ftp/tekit.git",
-      "source_branch": "user/lizhiz/rubin-advance",
       "source_revision": "06c3af7315b944015c593a1bebeafc3907c6e421",
       "source_diff_base": "1926426ce3bba0ac384fb894602762a68462435a",
       "description": "Retain FC1 claim watermark wait; determine exhaustion from actual claim/map results instead of the prologue watermark."
     },
     {
       "patch": "TENSORRT_LLM_MAIN_COMPAT.patch",
-      "patch_sha256": "114eff4860e7565b8793150e5261dbf2aad8d8b2dff4e1907975350d89aa3e8e",
+      "patch_sha256": "913cc727eed2670efe7fa4874dffaf4cec0bce96d1dd66295823e1560a1caa43",
       "format_before": "ruff 0.9.4",
       "files": [
         {
@@ -204,7 +202,7 @@
         {
           "file": "kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py",
           "unpatched_vendored_sha256": "3273d50b2eab07b68914161d3c92ff70fa685e8389e3f0ab6d3431efe1eb90c8",
-          "patched_sha256": "982d81875a9ff9351e028591cfae5ccd7a4eadaf9ecda17d18106baff7bdda20"
+          "patched_sha256": "e99b472281ecd3e4284146b9682524b3a1a2cace3e47a56a528072ccda5b6e98"
         },
         {
           "file": "kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py",
@@ -267,7 +265,6 @@
           "patched_sha256": "fea73fbc3dec939617b2504672156a08f1a4371bedf55e23e9c93e708ae432ac"
         }
       ],
-      "source_repository": "https://github.com/NVIDIA/TensorRT-LLM.git",
       "source_revision": "3cfcb0d9622e2ef7a926436dc174c96ebc9367af",
       "description": "Preserve TensorRT-LLM main APIs and shared implementations while adding DynamicEPLB."
     },
@@ -277,7 +274,6 @@
       "file": "kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_kernel.py",
       "unpatched_vendored_sha256": "1d73bbdd1c43052bba7ce7449c5dff641a1047d1b3200c87ddc9c8496ca13e9f",
       "patched_sha256": "3dcd9f4e6abb08ccce8d3736f547eea4ee5cac844abc525249c1f3072c6e0b27",
-      "source_repository": "https://gitlab-master.nvidia.com/jintaop/cutedsl_megamoe.git",
       "source_revision": "522fbb019942ad6bbe0f418dba02541f837ea46c",
       "source_path": "next/sources/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_kernel.py",
       "description": "Include the complete standalone fused FC12 top-level from the same pinned upstream source; add the standard vendor SPDX header and apply import normalization after Ruff 0.9.4 formatting.",

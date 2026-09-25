@@ -433,7 +433,7 @@ def default_megamoe_tactic(num_tokens: int) -> Tuple:
     """Deterministic token-bucket fallback when no shape-tuned default
     exists; never profiled by the autotuner."""
     if num_tokens <= 1024:
-        # decode winner: N128 only helps epi_warps + bulk.
+        # Deterministic fallback for the smallest token bucket.
         return (
             [256, 128, 256],
             [2, 1, 1],
@@ -459,7 +459,7 @@ def default_megamoe_tactic(num_tokens: int) -> Tuple:
             4,
             (1, 1),
         )
-    # prefill: atomic_counter only helps the very large tail (>=16384).
+    # Use the atomic work distributor for the upper token bucket.
     return (
         [256, 256, 256],
         [2, 1, 1],
@@ -474,10 +474,9 @@ def default_megamoe_tactic(num_tokens: int) -> Tuple:
     )
 
 
-# Static defaults for the SM107 DSv4 Pro DEP4 and DEP8 shapes.
-# Routing distribution is not a
-# rank-identical runtime input, so each bucket uses one static tactic. The full
-# runner key prevents applying the table beyond the measured shape and codegen modes.
+# Static defaults for the explicitly keyed SM107 configurations. Routing is not
+# rank-identical, so each bucket uses one deterministic tactic. The complete
+# runner key prevents applying an entry to a different shape or codegen mode.
 _SM107_DSV4_PRO_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
     (
         107,
@@ -1419,11 +1418,8 @@ def enumerate_megamoe_candidate_tactics(
                             continue
                         candidates.append(tactic)
 
-    # These additions are intentionally curated instead of crossed with every
-    # legacy axis: staged FC2 UBLK and mixed-CGA/phase scheduling are expensive
-    # to compile and autotuning is opt-in. These entries expose the upstream
-    # performance mechanisms while preserving the existing deterministic
-    # production defaults.
+    # Add a bounded set of valid staged and mixed-scheduling candidates rather
+    # than crossing every independent tactic axis.
     if num_tokens >= 2048:
         for fc2_tma_stages in (2, 4):
             tactic = (
@@ -1440,8 +1436,7 @@ def enumerate_megamoe_candidate_tactics(
             )
             validate_megamoe_tactic(tactic, sm_version=sm_version)
             candidates.append(tactic)
-        # Local TMA stage 2 was the only consistently useful depth in B200
-        # A/B tests: stage 1 tied it while stage 4 regressed from extra SMEM.
+        # Include the resource-balanced local TMA configuration.
         tactic = (
             [256, 256, 256],
             [2, 1, 1],
@@ -2380,18 +2375,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 )
                 topk_idx.copy_(valid.to(topk_idx.dtype))
                 if self.local_rank == 0 and alpha > 0:
-                    logger.info(
-                        "[MegaMoE] autotune workload: tokens_per_source=%s topk=%s "
-                        "ep=%s physical_slots_per_rank=%s helper_slots=%s alpha=%s "
-                        "rank_balance=exact local_expert_order=ascending "
-                        "timing=router_megamoe_reduce",
-                        T,
-                        K,
-                        self.world_size,
-                        self.num_experts_per_rank,
-                        self.helper_expert_count,
-                        alpha,
-                    )
+                    logger.debug("[MegaMoE] helper-bearing autotune workload prepared")
 
             scratch = self._profiling_scratch
             if scratch is not None:

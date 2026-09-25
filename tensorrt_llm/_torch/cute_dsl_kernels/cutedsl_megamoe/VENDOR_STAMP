@@ -1,4 +1,4 @@
-upstream: https://gitlab-master.nvidia.com/jintaop/cutedsl_megamoe.git
+upstream: external MegaMoE source
 commit: 522fbb019942ad6bbe0f418dba02541f837ea46c
 source_tree_dirty: false
 kind: inference closure

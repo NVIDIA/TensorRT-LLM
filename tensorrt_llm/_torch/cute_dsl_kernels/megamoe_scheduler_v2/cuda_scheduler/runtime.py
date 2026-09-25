@@ -46,7 +46,7 @@ def recommend_cuda_scheduler_ctas(
     topk: int = 6,
     threads: int = 512,
 ) -> int:
-    """Return the measured pure-CUDA CTA policy without importing CuTe."""
+    """Return the bounded pure-CUDA CTA policy without importing CuTe."""
 
     for name, value in {
         "ep_size": ep_size,
@@ -60,9 +60,8 @@ def recommend_cuda_scheduler_ctas(
         raise ValueError("the pure-CUDA scheduler currently requires threads=512")
     routes = max_tokens_per_rank * topk
     if ep_size == 8:
-        # The latency-oriented EP8 policy uses at most 32 CTAs. At the
-        # acceptance shape (T=8192, K=6), this fixes the grid at 32 while
-        # leaving at least 120 of GB200's 152 SMs unoccupied.
+        # Bound scheduler occupancy so independent same-stream work retains
+        # launch capacity.
         workers = min(31, max(1, (routes + 3 * threads - 1) // (3 * threads)))
         return 1 + workers
     target_rounds = max(3, (96 + (ep_size + 6) // 2) // (ep_size + 6))

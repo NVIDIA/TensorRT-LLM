@@ -342,7 +342,7 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
             raise ValueError("mma_tiler K must be divisible by four scale-factor vectors.")
         if (mma_n, mma_k) == (256, 512):
             raise ValueError(
-                "Rubin Local MegaMoE excludes NVFP4 N256 K512 because its multi-window path has no measured gain."
+                "Rubin Local MegaMoE excludes NVFP4 N256 K512 because that multi-window configuration is unsupported."
             )
         if self.intermediate_gateup_size % (self.sf_vec_size * 4) != 0:
             raise ValueError(
