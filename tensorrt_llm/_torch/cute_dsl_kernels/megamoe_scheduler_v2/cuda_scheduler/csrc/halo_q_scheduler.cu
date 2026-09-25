@@ -1,4 +1,4 @@
-/* Pure-CUDA fused physical-slot scheduler for GB200 (sm_100).
+/* Pure-CUDA fused physical-slot scheduler for supported architectures.
  *
  * One launch performs stable local-route ordinal counting, an in-kernel
  * peer-visible histogram exchange, either legacy GAR-N or HALO-M + HALO-Q,
@@ -134,7 +134,7 @@ __device__ int grid_rendezvous(
     if (threadIdx.x == 0) {
         success = 1;
         /* One monotonic counter is graph-replay safe and exactly mirrors the
-         * measured CuTe reset-free rendezvous. */
+         * reset-free rendezvous. */
         int old = fetch_add_release_device(sync, 1);
         int target = (old / blocks + 1) * blocks;
         generation = target / blocks;
@@ -176,11 +176,9 @@ __device__ void local_histogram_pass(
     const int warp_span = ((cta_span + warps * 32 - 1) / (warps * 32)) * 32;
     const int begin = cta_begin + warp * warp_span;
     const int end = imin(cta_end, begin + warp_span);
-    /* `routes` is cold on every iteration -- MegaMoE runs in between and evicts
-     * it -- and each warp only had four trips through this loop, so there were
-     * never more than one or two loads in flight and the phase ran at 122 GB/s.
-     * Issue four before consuming any.  The binning is unchanged, and the
-     * atomicAdd regrouping is safe because integer addition commutes. */
+    /* Issue a small load group before consuming it to expose memory-level
+     * parallelism. The binning is unchanged, and atomicAdd regrouping is
+     * safe because integer addition commutes. */
     constexpr int kBatch = 4;
     for (int base_index = begin; base_index < end; base_index += 32 * kBatch) {
         int expert[kBatch];
@@ -295,8 +293,8 @@ __device__ bool exchange_counts(
     __shared__ int wait_failed;
     if (tid == 0)
         wait_failed = 0;
-    /* Four-way unrolling this to put more loads in flight was measured and
-     * changed nothing (1.75 -> 1.80 us), so the compiler already pipelines it. */
+    /* Keep the simple accumulation loop; the compiler provides the required
+     * pipelining without explicit batching. */
     for (int expert = tid; expert < expert_count; expert += blockDim.x) {
         int count = 0;
         for (int cta = 0; cta < ctas; ++cta)
@@ -316,9 +314,8 @@ __device__ bool exchange_counts(
         int *peer = reinterpret_cast<int *>(peer_bases[destination]);
         int *row = peer + kSymPayloadOffset
             + (parity * exchange_ep + local_rank) * expert_count;
-        /* Widening these to int4 was measured and changed nothing: the cost is
-         * the remote write path, not this CTA's store issue rate.  (The mirror
-         * copy on the way back in, which is local, does halve -- see below.) */
+        /* Keep scalar remote stores for the publication path; the local mirror
+         * copy below uses vector transfers when alignment permits. */
         for (int expert = lane; expert < expert_count; expert += 32)
             row[expert] = shared[expert];
         /* Warp synchronization orders every lane's row stores before lane
@@ -350,7 +347,7 @@ __device__ bool exchange_counts(
         return false;
     const int *payload = local + kSymPayloadOffset + parity * exchange_ep * expert_count;
     const int total = exchange_ep * expert_count;
-    /* Same 4-byte issue limit on the way back in: 12 KB in 1.76 us is 6.8 GB/s. */
+    /* Vectorize the local mirror copy when shape and alignment permit. */
     if ((total & 3) == 0
         && (reinterpret_cast<uintptr_t>(payload) & 15) == 0) {
         const int4 *source = reinterpret_cast<const int4 *>(payload);
@@ -1153,9 +1150,8 @@ __device__ __forceinline__ void scheduler_tail_barrier() {
 
 /* Build order[] and host_mask[] with one lane per broadcast.
  *
- * Replaces a single-threaded O(k^2) insertion sort plus an O(k*g) mask loop.
- * Measured at EP8/CTA32 that serial setup cost 1.987 us -- 34 % of run_halo_q
- * and 7.7 % of the whole CTA0 critical path -- for k <= 8 elements.
+ * This replaces serial insertion-sort and mask-construction loops while
+ * preserving the same stable order.
  *
  * order[]:  lane b's position is the number of broadcasts that sort before it.
  *           The `j < lane` tiebreak makes this the same stable order the
@@ -1181,13 +1177,9 @@ __device__ __forceinline__ void halo_q_build_order_and_masks(
         }
         return;
     }
-    /* The rank scan reads p_expert[j] for every j on every lane, and p_expert is
-     * GLOBAL and cold -- the same pattern that cost 2.69 us in
-     * publish_plan_channel.  One coalesced read plus shuffles replaces it.  The
-     * early `return` had to go first: a __shfl_sync under it would have an
-     * incomplete participating mask.  Only warp 0 calls this, so all 32 lanes
-     * are converged here.  Inactive lanes carry INT_MAX, are never the `other`
-     * of a real comparison because j < broadcasts, and write nothing. */
+    /* Read p_expert cooperatively and distribute values with shuffles. All
+     * lanes must participate before inactive lanes return; inactive lanes
+     * carry INT_MAX and never contribute to a real comparison. */
     const bool active = lane < broadcasts;
     const int mine = active ? p_expert[lane] : INT_MAX;
     int position = 0;
@@ -1229,13 +1221,8 @@ __device__ void run_halo_q(
             const int my_expert = my_b >= 0 ? p_expert[my_b] : -1;
             if (broadcasts >= 2) {
                 const int ring_size = plan_ep - 1;
-                /* EP8 used to run one round and then decide, with a 28-pair
-                 * scan, which phases of round two were needed.  The scan cost
-                 * more than the round it skipped.  Two unconditional rounds --
-                 * what every other EP already does -- give an identical result:
-                 * the scan only ever skipped phases it had proven need no
-                 * repair, and running such a phase is a no-op, since
-                 * halo_q_pair8 writes each quota back unchanged at delta 0. */
+                /* Use two unconditional repair rounds. Phases with no required repair
+                 * are no-ops, so this preserves the conditional algorithm's result. */
                 const int repair_rounds = 2;
                 for (int round = 0; round < repair_rounds; ++round) {
                     for (int phase = 0; phase < plan_ep - 1; ++phase) {
@@ -1270,8 +1257,7 @@ __device__ void run_halo_q(
                 }
             }
         }
-        /* The EP8 28-pair repair scan lived here; `repair_rounds = 2` above
-         * replaces it.  See the comment there for why the two are equivalent. */
+        /* The unconditional repair rounds above replace the conditional scan. */
         return;
     }
     if (warp == 0)
@@ -1757,15 +1743,9 @@ __global__ __launch_bounds__(512, 1) void halo_q_scheduler_kernel(
                           ring, order, host_mask);
         if (ctas > 1) {
             const int warp = threadIdx.x >> 5;
-            /* build_route_prefix reads p_expert, counts and quota, none of
-             * which warp 8 touches -- warp 8 writes p_helper, out_ids/levels/
-             * owners and the recv_used scratch.  The first consumers of those
-             * are publish_plan_channel and the worker CTAs after the release
-             * below, so the rendezvous with warp 8 belongs after the prefix,
-             * not before it.  Warp 8's colouring (~0.5 us) then hides behind
-             * the prefix (~2.3 us) instead of being waited on, and because
-             * this is upstream of the worker release the saving is 1:1 in
-             * kernel time. */
+            /* build_route_prefix is independent of warp 8's outputs. Defer their
+             * rendezvous until both paths reach their first shared consumer so
+             * prefix construction and coloring can overlap safely. */
             if (warp == 0) {
                 build_route_prefix(counts, quota, route_prefix, plan, broadcasts,
                                    ep, experts, local_rank, 32);
@@ -1774,7 +1754,7 @@ __global__ __launch_bounds__(512, 1) void halo_q_scheduler_kernel(
             if (warp == 0 || warp == 8)
                 scheduler_tail_barrier();
             if (warp == 0) {
-                /* Release the 55 worker CTAs here rather than after the channel
+                /* Release the worker CTAs here rather than after the channel
                  * publish.  They gate on grid_sync+1 and consume route_prefix,
                  * which is complete above; plan_channel is consumed only by the
                  * copy stack, which acquires on the channel's own epoch word

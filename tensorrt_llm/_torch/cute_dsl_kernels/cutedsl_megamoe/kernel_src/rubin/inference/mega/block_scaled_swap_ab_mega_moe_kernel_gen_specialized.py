@@ -97,13 +97,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
     other_warp_register_count: ClassVar[int] = 80
     tail_barrier_id: ClassVar[int] = 8
 
-    # Tuned for Rubin, not portable. VR200 carries 212 SMs and this kernel's 46
-    # four-CTA clusters occupy 184, leaving 28 for the communication grid; go over that
-    # and the main kernel loses its last cluster, which is not optional because the
-    # tail barrier needs every CTA resident at once. The communication exchange CTAs
-    # exit as soon as their count rows are published, so the resident set is one helper
-    # plus these pushers. Porting to Blackwell means deriving this number again from
-    # that part's SM count and cluster capacity.
+    # The communication grid must preserve full residency of the persistent main
+    # kernel. Revalidate this specialization when device or cluster capacity changes.
     pusher_cta_count: ClassVar[int] = 27
     refine_participant_groups: ClassVar[int] = 2
     refine_output_stages: ClassVar[int] = 4

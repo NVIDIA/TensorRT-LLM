@@ -683,8 +683,7 @@ diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/bla
  # fp4 (e2m1) -> fp32 register decode.
  #
  # Blackwell has no e2m1->f32 upconvert: the framework's ``term.load().to(f32)``
--# lowers to an ALU subnormal-normalization path (~60% DRAM SOL). Both helpers
-+# lowers to an ALU subnormal-normalization path. Both helpers
+ # lowers to an ALU subnormal-normalization path. Both helpers
  # below force a table-driven decode instead; ``e2m1_reg`` (N e2m1 codes, N % 8
  # == 0) is read as packed b32 words and N fp32 values are written into
  # ``fp32_reg`` in code order. The 16 e2m1 values are exact in fp32, so the two
@@ -1100,40 +1099,7 @@ diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rub
  from . import dynamic_mainloop
  from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
  
-diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py
---- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py
-+++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py
-@@ -52,9 +52,9 @@
- from .....quant_def import QuantKind
- from ....schedulers.base import SchedulerConsumer
- from ....schedulers.fc12_mapping import BlockPhase
-+from ..local_mega.tma_gather import sm107_tma_gather4_load
- from . import dynamic_mainloop
- from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
--from .tma_gather import sm107_tma_gather4_load
- 
- 
- class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
-@@ -111,8 +111,7 @@
-     # profiling put it -- the token operand is read out of L2, so a handful of
-     # stages covers its latency, but not as few as the L2 latency alone suggests.
-     asymmetric_token_stages: ClassVar[int] = 6
--    # The token tile this specialization applies to. At 128 the shared plan
--    # already reaches 93% of DRAM peak and is left alone.
-+    # The token tile this specialization applies to; other tiles use the shared plan.
-     asymmetric_token_tile: ClassVar[int] = 256
- 
-     @classmethod
-@@ -236,8 +235,7 @@
-         self.is_a_mcast = self.num_mcast_ctas_a > 1
-         self.is_b_mcast = self.num_mcast_ctas_b > 1
- 
--        # Only the 256-wide token tile is specialized: at 128 the shared plan
--        # already reaches 93% of DRAM peak, so it stays byte-for-byte as it was.
-+        # Only the selected token tile uses asymmetric operand stages.
-         self.uses_asymmetric_ab_stages = self.cta_tile_n == self.asymmetric_token_tile
-         self._select_ab_stage_plan()
-         self.num_tma_load_bytes = self.ab_stage_tma_bytes * self.mma_cta_count
+
 diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
 --- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
 +++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py

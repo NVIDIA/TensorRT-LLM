@@ -84,7 +84,7 @@ class CpuContractTests(unittest.TestCase):
         self.tuner = SimpleNamespace(
             is_tuning_mode=False, _active_capture=None, profiling_cache=ProfilingCache()
         )
-        properties = SimpleNamespace(multi_processor_count=212, major=10, minor=7)
+        properties = SimpleNamespace(multi_processor_count=80, major=10, minor=7)
         torch = SimpleNamespace(
             Tensor=Tensor,
             bfloat16="bf16",
@@ -133,7 +133,7 @@ class CpuContractTests(unittest.TestCase):
 
         self.ns["_get_runner"] = factory
 
-    def runner(self, sms=204, capacity=8192, clamp=10.0, stream=17):
+    def runner(self, sms=72, capacity=8192, clamp=10.0, stream=17):
         return self.ns["SharedFc12TunableRunner"](
             0, 7168, 3072, capacity, sms, clamp, stream, ("fixed_weight_layout",)
         )
@@ -153,7 +153,7 @@ class CpuContractTests(unittest.TestCase):
                 raise ValueError("insufficient test resource")
 
         self.ns["_make_kernel"] = resource_check
-        for sms in (204, 212):
+        for sms in (72, 80):
             runner = self.runner(sms)
             valid = runner.get_valid_tactics([], None)
             self.assertEqual(set(valid), set(catalog) - {rejected})
@@ -172,7 +172,7 @@ class CpuContractTests(unittest.TestCase):
             [1, 128, 128, 256, 8192, 8192],
         )
         self.assertEqual(self.runner(capacity=300).buckets, (1, 128, 256, 300))
-        self.assertNotEqual(r.unique_id(), self.runner(212).unique_id())
+        self.assertNotEqual(r.unique_id(), self.runner(80).unique_id())
         self.assertNotEqual(r.unique_id(), self.runner(clamp=None).unique_id())
         self.assertNotEqual(r.unique_id(), self.runner(capacity=4096).unique_id())
         self.assertEqual(r.unique_id(), self.runner(stream=18).unique_id())
@@ -212,7 +212,7 @@ class CpuContractTests(unittest.TestCase):
 
         self.tuner.choose_one = choose
         for tokens in (129, 200):
-            self.ns["run_shared_fc12"](*inputs(tokens), swiglu_limit=10.0, sm_count=204)
+            self.ns["run_shared_fc12"](*inputs(tokens), swiglu_limit=10.0, sm_count=72)
         state = self.ns["shared_fc12_autotune_state"]()
         row = state["instances"][0]["selections"][0]
         self.assertEqual(len(choices), 2)

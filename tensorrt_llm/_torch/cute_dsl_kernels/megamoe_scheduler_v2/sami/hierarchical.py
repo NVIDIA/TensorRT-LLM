@@ -17,12 +17,9 @@ from ._util import check_cuda
 from ..geometry import hierarchy_group_sizes
 from .geometry import BundleLayout
 
-# Bound on waiting for every peer to publish its mapped plan.
-#
-# Steady state keeps the original 2 s: that is what makes a lost peer surface
-# quickly. The first generation gets 120 s because the S>0 arm JIT-compiles the
-# M = H + S MegaMoE shape inside the rendezvous, which takes seconds and skews
-# arrival across ranks. See HierarchicalCopyEndpoint.submit.
+# Bound on waiting for every peer to publish its mapped plan. Steady state
+# surfaces a lost peer promptly; the first generation allows for compilation
+# inside the rendezvous and the resulting arrival skew.
 _DEFAULT_PLAN_TIMEOUT_NS = 2_000_000_000
 _DEFAULT_FIRST_PLAN_TIMEOUT_NS = 120_000_000_000
 
@@ -856,32 +853,12 @@ class HierarchicalSamiWeightBroadcast:
         correctness barrier, so widening it costs only how long a genuine hang
         takes to surface.
 
-        ``timeout_ns=None`` picks the bound automatically, and the first
-        generation gets a much larger one. Reason: the first forward of an S>0
-        arm compiles the M = H + S MegaMoE shape *inside* this rendezvous --
-        ``_prime_ladder`` warms only the S=0 shape, as its own comment states.
-        That JIT runs for seconds (the autotuner alone reports ~4.4 s for a
-        single op), so ranks reach ``submit()`` seconds apart on frame 1 and a
-        steady-state bound fires on whichever arrive first. Observed at EP8 on
-        VR200 before this was handled: ranks 2,3,4,5 raised
-
-            TimeoutError: hierarchical scheduler plan publication timed out
-
-        on the very first forward, and the surviving ranks then hung in the
-        collective. Startup skew, not a lost peer -- so the fix belongs in the
-        default, not in something the caller has to know to set.
-
-        Steady-state generations keep the tight bound, which is what makes a
-        real lost peer surface quickly. ``MEGAMOE_SAMI_PLAN_TIMEOUT_NS`` raises
-        both and is only an escape hatch: it cannot lower the first generation
-        below the 120 s floor, so it is not a way to make a suspected frame-1
-        hang fail fast. Pass ``timeout_ns`` explicitly for that.
-
-        Note the widening is per broadcaster, and the consumer builds one per
-        layer, so a model with L layers can spend L x 120 s in the worst case
-        before the first forward gives up. The wait is a pause-spin with no
-        sleep (see wait_plan in sami_hierarchical_release.c), so those seconds
-        are a busy core per rank, competing with the very JIT being waited on.
+        ``timeout_ns=None`` selects a wider first-generation bound because
+        ranks can enter the rendezvous at different times while required kernels are
+        compiled. Later generations use the steady-state bound so a lost peer surfaces
+        promptly. ``MEGAMOE_SAMI_PLAN_TIMEOUT_NS`` can raise both defaults; callers may
+        pass ``timeout_ns`` explicitly when a different diagnostic bound is required.
+        The timeout is an error bound, not a correctness barrier.
         """
 
         if timeout_ns is None:

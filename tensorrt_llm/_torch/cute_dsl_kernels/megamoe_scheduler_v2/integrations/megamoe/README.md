@@ -159,7 +159,7 @@ continuing with a half-installed generation.
 ## Scope
 
 The example covers the ordinary helper-bearing EP NVFP4 pipeline with its native
-18-argument AOT. Both Rubin token-tile return modes are kernel specialization
+AOT interface. Supported token-tile return modes are kernel specialization
 choices; this host API preserves their arguments. LocalMegaMoE has no EP token
 communication or peer mapper and uses its own call interface. GenPhase also
 has a separate kernel path; its helper support alone is not qualification of

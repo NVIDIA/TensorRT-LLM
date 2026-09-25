@@ -15,26 +15,25 @@ python3 scripts/verification/dynamic_load_balance/check_rebalance_owner_handoff.
 python3 scripts/verification/dynamic_load_balance/check_on_autotune.py --output /tmp/on-autotune.json
 ```
 
-The 34 unittest cases cover direct route submission, late route waits, generation
-pairing, static/CLC eligibility and cache identity, eight-SM budgets, launch-queue
-policy/worker propagation, and native source/header packaging. The handoff check
-covers eight ownership contracts; autotune checks 32 gate states plus equal rank
-totals, increasing expert counts, unique top-k, deterministic power-law inputs,
-helper coverage, and unchanged uniform OFF inputs. `--skip-torch` on the autotune
+The unittest suite covers direct route submission, late route waits, generation
+pairing, static/CLC eligibility, cache identity, SM budgets, and launch-queue
+policy/worker propagation, and native source/header packaging. The handoff and
+autotune checks also cover ownership, rank balance,
+deterministic helper-bearing inputs, and unchanged uniform OFF inputs.
+`--skip-torch` on the autotune
 command reports `partial_no_torch` and omits tensor validation.
 
-GPU checks require Rubin, a compatible TensorRT-LLM build with the new native quantizer
-overloads, and the repository's normal test dependencies:
+GPU checks require a supported SM100-family device, a compatible TensorRT-LLM
+build with the native quantizer overloads, and the normal test dependencies:
 
 ```bash
 python3 -m pytest -q tests/unittest/_torch/thop/parallel/test_quantization_sm_budget.py
-python3 -m pytest -q tests/unittest/_torch/thop/parallel/test_fp8_block_scale_gemm.py::test_cute_dsl_mxfp8_gemm_rubin_clc_dynamic_prefetch_multi_wave
 ```
 
-These select 23 quantization cases (byte equality, scale padding, invalid budgets,
-FakeTensor/opcheck, CUDA Graph) and two static/CLC numerical cases (`reserved_sms=0/8`).
+These cover byte equality, scale padding, invalid budgets, FakeTensor/opcheck,
+CUDA Graph, and representative reserved-SM settings.
 CPU stand-ins cannot establish GPU completion, kernel accuracy, or performance;
 the queue guards detect PyTorch initialization, not every external CUDA context.
 These commands do not run full EP8/model accuracy or E2E performance. See the
 [integration guide](../../../DYNAMIC_LOAD_BALANCE_SUBMIT_OPT.md) for configuration
-and the distinction between current validation requirements and historical tekit results.
+and the current validation requirements.

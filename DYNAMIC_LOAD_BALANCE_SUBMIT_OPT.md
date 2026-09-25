@@ -19,9 +19,8 @@ moe_config:
 ```
 
 Set `enabled: false` for OFF. Helper slots are fixed for a model instance;
-changing their count requires a separately tuned MegaMoE cache. For example,
-48 resident experts plus four helpers is M=52/S=4; three helpers is M=51/S=3.
-Use a separate per-rank `TLLM_AUTOTUNER_CACHE_PATH` for each configuration.
+changing their count requires a separately tuned MegaMoE cache. Use a separate
+per-rank `TLLM_AUTOTUNER_CACHE_PATH` for each configuration.
 
 Rebuild TensorRT-LLM's native operators: the FP4/FP8 quantizers add SM-budget overloads,
 so deploying these Python sources onto an older wheel is insufficient.
@@ -47,21 +46,20 @@ already initialized CUDA without 4x, startup rejects the configuration. That
 guard cannot detect every external CUDA context; applications that initialize
 CUDA elsewhere first must export `CUDA_SCALE_LAUNCH_QUEUES=4x` before startup.
 
-For eager DeepSeek V4 on Rubin with the MegaMoE CuTe DSL routed backend and
-FP8 shared weights, both OFF and ON use the upstream complete
+For supported eager DeepSeek V4 configurations with the MegaMoE CuTe DSL
+routed backend and FP8 shared weights, both OFF and ON use the complete
 `BlockScaledSwapAbFc12Kernel`. FC1, clamped SwiGLU, and FC2 execute in one
 kernel. Checkpoint loading, TP shards, shared-output scaling, and the enclosing
 MoE reduction retain their existing contracts. Other backend/precision/graph
 configurations keep their existing shared path.
 
-ON leaves eight SMs outside the shared kernel's launch budget: 102 two-CTA
-clusters on a 212-SM device, versus OFF's 106. Shared-input MXFP8 and routed-input
-NVFP4 quantization retain `reserved_sms=8`: 816 CTAs for sufficient input rows,
-versus OFF's 848. These are launch budgets, not hardware partitions.
+ON derives the shared-kernel and quantization launch budgets from the runtime
+device size and the configured copy-stream reservation. These are launch
+budgets, not hardware partitions.
 
 The shared forward enqueues input quantization, a small same-stream asynchronous
-counter memset, and the complete FC12 kernel. The memset clears 272 bytes at
-capacity 8192 and is required before every invocation; it introduces no host
+counter memset, and the complete FC12 kernel. The reset is required before
+every invocation; it introduces no host
 wait or global grid barrier. Token count is dynamic; an initialized count-table
 slice supplies metadata without a per-forward fill/copy or shape-specific compile.
 Loaded FP8 weight values are preserved while gate/up rows and scales are
@@ -88,12 +86,11 @@ therefore be validated with explicit tolerances rather than asserted bitwise.
    context or steady-state host wait for the scheduler. Cold warmup-to-worker
    ownership transfer drains bound work once and preserves stream and generation state.
 
-ON tactic tuning requires `MEGAMOE_TACTIC_AUTOTUNE=1`. Its default workload has
-equal per-rank token totals and within-rank power-law alpha 0.8, increasing by
-expert ID. `MEGAMOE_AUTOTUNE_PL_ALPHA` overrides alpha; leave it unset for the
-unchanged uniform OFF workload. ON evaluates MixCGA and `expert`/`token_tile`
-READY candidates with the actual HALO/TMA producer and helper-slot ABI. This
-synthetic tuning input does not replace the inference dataset.
+ON tactic tuning requires `MEGAMOE_TACTIC_AUTOTUNE=1` and uses a deterministic,
+rank-balanced helper-bearing workload. The workload distribution can be
+overridden explicitly; OFF retains its uniform workload. ON evaluates the
+supported READY candidates with the actual HALO/TMA producer and helper-slot
+ABI. This synthetic tuning input does not replace the inference dataset.
 
 Upstream pins and file hashes are in the [scheduler manifest](tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/VENDOR_MANIFEST.json)
 and [MegaMoE manifest](tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/VENDOR_MANIFEST.json).
@@ -117,77 +114,14 @@ Check repeated calls, dynamic token shapes, actual launch grids, and the single
 FC12 kernel in a GPU trace. Then run EP8 helper-slot accuracy and same-node
 unprofiled OFF/ON E2E with the same shared implementation.
 The ON accuracy check must use the tactics selected by its own E2E autotune
-cache. Earlier tekit checks and measurements below are historical references,
-not validation of this main-branch port.
+cache. Keep benchmark results in the controlled validation artifacts rather
+than in production source documentation.
 
-## Pre-rebase E2E reference
+## Performance validation
 
-One unprofiled run per configuration at tekit `5cf076ea80c0ba49b8293b5207ab1d916e4b1173`:
-DeepSeek V4 NVFP4, eight Rubin GPUs, TP8/EP8 with attention DP, max 8,192 tokens,
-batch size 128, CUDA graphs disabled, overlap scheduler enabled. Each completed
-2,048 formal requests; startup and separate warmup are excluded.
-
-| Configuration | Wall time (s) | Input + output tokens/s | Throughput vs OFF |
-| --- | ---: | ---: | ---: |
-| OFF | 290.225462 | 275,373.3715 | baseline |
-| ON, four helper slots | 277.793245 | 287,697.2907 | +4.4753% |
-| ON, three helper slots | 276.927916 | 288,596.2719 | +4.8018% |
-
-These runs used the same nodes, model, dataset, and source-matching quantization
-wrapper overlay, not a full rebuilt wheel. They predate the target rebase and
-optional CLC selection. One run does not establish variance or a stable ranking
-of helper counts. Completion/protocol checks passed on all eight ranks, but do
-not prove accuracy. Earlier slots4 cached-winner MLP checks were elementwise
-identical in 136 comparisons; they cover one 8,192-token bucket and one layer,
-not slots3, every tactic, or full-model quality. Full raw evidence is retained
-with the MR's external validation artifacts.
-
-## Design proposal: SM-partitioned streams (2026-09-23)
-
-**Status: recorded for evaluation; not implemented or GPU-validated.** The
-ordinary-stream implementation described above remains the current baseline.
-
-Keep one CPU submitter, but create two Green Context streams backed by disjoint
-SM resources: COMPUTE for quantization, shared FC1/FC2 and MegaMoE; high-priority
-COPY for the scheduler (HALO-Q by default) and in-switch TMA weight-copy
-kernels. The target is `N-8 + 8` SMs, where `N` is queried from the device.
-`204 + 8` is the 212-SM example,
-not a hard-coded GB200 configuration. Query the actual partitions and verify
-cluster compatibility before treating this split as supported. Ordinary stream
-priority alone does not partition SMs.
-
-This separates two objectives:
-
-| Objective | Is changing the stream sufficient? |
-| --- | --- |
-| Restrict execution to a provisioned SM partition | Yes, for kernels launched on the corresponding Green Context stream. |
-| Change quantization grid size from 848 to 816 CTAs | No; grid sizing must use the partition's SM count. |
-
-The current FP4/MXFP8 wrappers cache `getMultiProcessorCount()` in thread-local
-storage. That helper queries the device, without a stream argument; the launch
-code receives the SM count and stream separately. With a cached count of 212,
-zero reservation, 512 threads/block and sufficient rows, the grid is still 848
-CTAs even if execution is restricted to 204 SMs. This can retain a tail wave.
-Changing the stream does not rewrite the cached count or launch geometry.
-
-For resource isolation alone, this approach could remove the added
-`reserved_sms` quantizer overloads. If a grid matched to the partition remains
-necessary, assess a stream-resource-aware launch calculation separately.
-Do not remove the existing overloads before that decision and validation.
-Green Context creation can be exposed at the Python integration boundary, but
-the installed CUDA/PyTorch versions and stream/context lifetime need validation.
-
-Preserve the existing route/READY dependencies, single submitter and enlarged
-launch queues. SM partitioning does not by itself solve host driver stalls or
-isolate memory bandwidth. Validate actual SM placement, GEMM cluster occupancy,
-quantization grids and correctness before comparing performance. For CUDA
-graphs, capture/create nodes with the intended execution context; merely
-changing the replay stream is insufficient.
-
-Compare OFF, current ON and partitioned ON on the same hardware and workload:
-quantization/shared-expert latency, scheduler/copy overlap, host enqueue cost,
-iteration tails and unprofiled E2E throughput. Retune partition-dependent tactics
-and keep their caches distinct. No performance improvement is claimed yet.
-
-References: [CUDA Green Contexts](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/green-contexts.html)
-and [SM resource partitioning API](https://docs.nvidia.com/cuda/cuda-driver-api/cuda_driver_api/group__CUDA__GREEN__CONTEXTS.html).
+Run OFF and ON on the same allocation with independent autotune caches, identical
+model and request inputs, profiling disabled, and no sample removal. Report the
+raw per-run durations, aggregate request throughput, correctness scope, source
+identity, and runtime identity in the associated validation artifact. Performance
+results are hardware- and workload-specific and are intentionally not embedded in
+production source documentation.

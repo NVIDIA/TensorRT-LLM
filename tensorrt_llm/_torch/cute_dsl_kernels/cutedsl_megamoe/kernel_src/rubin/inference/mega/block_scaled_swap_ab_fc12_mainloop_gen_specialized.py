@@ -99,17 +99,9 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
     # nothing in this kernel wants a different major mode for the wider dtypes.
     a_major_mode: ClassVar[OperandMajorMode] = OperandMajorMode.K
     b_major_mode: ClassVar[OperandMajorMode] = OperandMajorMode.K
-    # Token-side depth once the operands stop sharing one. Only the token tile
-    # scales B, so a 256-wide tile drags the weight depth down with it even though
-    # A's per-stage bytes never change: the shared plan drops from ten stages at
-    # 128 to seven at 256. Pinning the token side here and spending the remainder
-    # on the weight side is what recovers weight depth.
-    #
-    # Six leaves the weights nine stages, two more than the shared plan's seven
-    # and one short of what the 128 tile gets. The trade runs the other way too:
-    # five would give the weights ten, four eleven, three thirteen. Six is where
-    # profiling put it -- the token operand is read out of L2, so a handful of
-    # stages covers its latency, but not as few as the L2 latency alone suggests.
+    # Pin the token-side pipeline depth so wider token tiles do not consume the
+    # weight-side staging budget. Revalidate this specialization when its tile or
+    # shared-memory plan changes.
     asymmetric_token_stages: ClassVar[int] = 6
     # The token tile this specialization applies to; other tiles use the shared plan.
     asymmetric_token_tile: ClassVar[int] = 256

@@ -1,4 +1,4 @@
-upstream: https://gitlab-master.nvidia.com/jintaop/cutedsl_eplb_scheduler_copy.git
+upstream: external scheduler source
 commit: fa6e81ed048a2afc023fda717fbfcf15514b0684
 source_tree_dirty: false
 kind: complete scheduler package

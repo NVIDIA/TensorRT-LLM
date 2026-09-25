@@ -70,7 +70,6 @@ from __future__ import annotations
 
 import os
 import socket
-import time
 import weakref
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
@@ -1393,8 +1392,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             empty_x = torch.empty((0, hidden // 2), dtype=torch.uint8, device=x_bf16.device)
             empty_sf = torch.empty((0, sf_cols), dtype=torch.uint8, device=x_bf16.device)
             return empty_x, empty_sf
-        # Budget the same eight SMs as the concurrent HALO-Q/TMA stream.
-        # The default overload remains unchanged for load balance OFF.
+        # Match the concurrent scheduler/copy reservation. The default overload
+        # remains unchanged when load balancing is disabled.
         if self._quantize_reserved_sms:
             x_fp4, x_sf = torch.ops.trtllm.fp4_quantize.sm_budget(
                 x_bf16,
@@ -1489,8 +1488,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         device = x.device
 
         topk_weights_f32 = token_final_scales.to(torch.float32).contiguous()
-        # Rubin borrows the contiguous int32 scheduler output without a GPU
-        # operation. A conversion on another architecture is itself a reader.
+        # The direct scheduler path borrows contiguous int32 output without a GPU
+        # operation. Any required conversion is itself a route reader.
         if (
             token_selected_experts.dtype != self._topk_idx_dtype
             or not token_selected_experts.is_contiguous()
@@ -2022,7 +2021,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         )
         if key in _MEGAMOE_PRIMED_LADDERS:
             return
-        t0 = time.perf_counter()
         primed = []
         # Bucket priming must disarm rebalance itself, not just skip finish:
         # the arm determines whether the kernel includes the READY ABI. Restore
@@ -2057,9 +2055,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 self._rebalance_plan_ran = _prev_plan_ran
         _MEGAMOE_PRIMED_LADDERS.add(key)
         if self.ep_rank == 0:
-            logger.info(
-                f"[MegaMoECuteDsl] primed adaptive buckets {primed} (live bucket "
-                f"{live_T}) in {time.perf_counter() - t0:.1f}s"
+            logger.debug(
+                "[MegaMoECuteDsl] adaptive bucket priming complete: count=%s",
+                len(primed),
             )
 
     def _prime_ladder_buckets(
