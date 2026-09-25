@@ -1,5 +1,6 @@
 import bisect
 import contextlib
+import os
 from dataclasses import dataclass
 from typing import (Any, Callable, Dict, Iterator, List, NamedTuple, Optional,
                     Tuple, TypeAlias)
@@ -29,6 +30,16 @@ from .resource_manager import (BaseResourceManager, ResourceManager,
 from .sampler import SampleStateTensors
 from .sampler.sampler_common import SampleType
 from .scheduler import ScheduledRequests
+
+
+# Opt-in: catches attn_metadata/spec_metadata tensors rebound between capture
+# and replay. Off by default since replay() is on the per-token critical path.
+def _strict_buffer_check_enabled() -> bool:
+    """Whether TLLM_CUDA_GRAPH_STRICT_BUFFERS enables strict buffer checking."""
+    return os.getenv("TLLM_CUDA_GRAPH_STRICT_BUFFERS", "0") == "1"
+
+
+_STRICT_BUFFER_CHECK = _strict_buffer_check_enabled()
 
 # A large prime number used for dummy request IDs to avoid collisions
 CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
@@ -756,6 +767,8 @@ class CUDAGraphRunner:
             _restore_spec_decode_capture_state(attn_metadata,
                                                saved_kv_lens_cuda)
 
+        self._record_strict_buffer_snapshot(key)
+
         self.graphs[key] = graph
         graph_output = make_weak_ref(output)
         self.graph_outputs[key] = graph_output
@@ -771,6 +784,7 @@ class CUDAGraphRunner:
         if stored_meta["spec_metadata"] is not None:
             assert current_inputs.get(
                 "spec_metadata") is stored_meta["spec_metadata"]
+        self._check_strict_buffer_stability(stored_meta)
 
         static_tensors = self.shared_static_tensors
 
@@ -867,6 +881,65 @@ class CUDAGraphRunner:
         padded size itself.
         """
         return min(self.max_supported_batch_size, self.config.batch_size)
+
+    @staticmethod
+    def _snapshot_graph_tensor_ptrs(obj: Any) -> Dict[str, int]:
+        """Record the data_ptr() of every CUDA tensor attribute on obj.
+
+        These are the addresses the captured graph's kernels may have baked
+        in; any of them changing before a later replay means the graph would
+        read stale (or freed) memory.
+        """
+        return {
+            name: value.data_ptr()
+            for name, value in vars(obj).items()
+            if isinstance(value, torch.Tensor) and value.is_cuda
+        }
+
+    @staticmethod
+    def _assert_graph_tensor_ptrs_stable(obj: Any,
+                                         expected_ptrs: Dict[str, int]) -> None:
+        """Raise if any tensor captured by _snapshot_graph_tensor_ptrs has moved."""
+        for name, expected_ptr in expected_ptrs.items():
+            value = getattr(obj, name, None)
+            if not isinstance(value, torch.Tensor):
+                raise RuntimeError(
+                    f"CUDA graph metadata attribute `{type(obj).__name__}."
+                    f"{name}` was a tensor at capture time but is now "
+                    f"{type(value).__name__}. Graph-visible buffers must be "
+                    "updated in place, not rebound.")
+            if value.data_ptr() != expected_ptr:
+                raise RuntimeError(
+                    f"CUDA graph metadata tensor `{type(obj).__name__}."
+                    f"{name}` was reallocated between capture and replay "
+                    f"(data_ptr 0x{expected_ptr:x} -> 0x{value.data_ptr():x}). "
+                    "Graph-visible buffers must be updated in place; "
+                    "rebinding invalidates addresses baked into the captured "
+                    "CUDA graph.")
+
+    def _record_strict_buffer_snapshot(self, key: KeyType) -> None:
+        """Snapshot graph-visible tensor addresses for key, if strict checking is enabled."""
+        if not _STRICT_BUFFER_CHECK:
+            return
+        stored_meta = self.graph_metadata[key]
+        stored_meta["attn_metadata_ptrs"] = self._snapshot_graph_tensor_ptrs(
+            stored_meta["attn_metadata"])
+        if stored_meta["spec_metadata"] is not None:
+            stored_meta[
+                "spec_metadata_ptrs"] = self._snapshot_graph_tensor_ptrs(
+                    stored_meta["spec_metadata"])
+
+    def _check_strict_buffer_stability(self, stored_meta: Dict[str,
+                                                               Any]) -> None:
+        """Assert graph-visible tensors are unchanged since capture, if strict checking is enabled."""
+        if not _STRICT_BUFFER_CHECK:
+            return
+        if "attn_metadata_ptrs" in stored_meta:
+            self._assert_graph_tensor_ptrs_stable(
+                stored_meta["attn_metadata"], stored_meta["attn_metadata_ptrs"])
+        if "spec_metadata_ptrs" in stored_meta:
+            self._assert_graph_tensor_ptrs_stable(
+                stored_meta["spec_metadata"], stored_meta["spec_metadata_ptrs"])
 
     def _get_padded_batch(self, batch: ScheduledRequests,
                           resource_manager: ResourceManager,

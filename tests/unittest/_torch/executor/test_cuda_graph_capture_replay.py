@@ -12,37 +12,32 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for CUDAGraphRunner.capture()/replay() and the shared_static_tensors they share.
+"""Tests for CUDAGraphRunner.capture()/replay(), the shared_static_tensors they
+share, the opt-in strict buffer-stability check, and the capture-allowed gate.
 
-These guard against a static input being added without a corresponding copy
-in replay(): a captured graph reads from shared_static_tensors at fixed
-addresses, and replay() is responsible for copying every live input into
-those buffers before each graph.replay() call. A missed copy_ silently
-leaves stale (or poisoned) data in the region the graph reads.
+TestCaptureReplayStaticTensors guards against a missing copy_ in replay()
+leaving shared_static_tensors stale or poisoned at the fixed addresses the
+captured graph reads from.
 
-Five invariants, six tests:
-  - Poison-fill completeness: replay() must overwrite every sentinel-poisoned
-    static tensor. Catches a key whose copy_ was dropped entirely.
-  - input_ids extent agreement: replay() must reject an input_ids whose
-    length doesn't match the key's captured extent, rather than silently
-    under-copying and leaving a stale tail.
-  - mrope_delta_read_seq_slots extent agreement: same invariant, but for
-    mrope_delta_read_seq_slots, whose copy extent comes from the caller's
-    tensor shape rather than from input_ids' seqlen.
-  - mrope_delta_read_seq_slots omission fill: a replay that omits
-    mrope_delta_read_seq_slots entirely must still fill the static buffer
-    with the dummy seq slot's permanently-zero delta, both right after
-    capture (uninitialized buffer) and after a prior replay left real slot
-    values in the buffer (two tests, same invariant, two starting states).
-  - Staleness detection: two replays with different inputs must produce
-    different outputs. A dropped copy_ makes them identical.
+TestStrictBufferCheck guards a different staleness class: attn_metadata/
+spec_metadata tensor attributes aren't copied into by replay() at all, so
+TLLM_CUDA_GRAPH_STRICT_BUFFERS checks their data_ptr() stays stable across
+replay() calls, catching a rebind (vs. an in-place update) to stale memory.
+
+TestCaptureAllowedGate guards allow_capture(): live capture must stay
+confined to warmup, since capturing outside it could resize shared buffers
+and invalidate addresses already baked into other graphs.
 """
+
+from types import SimpleNamespace
 
 import pytest
 import torch
 from _torch.helpers import create_mock_cuda_graph_runner
 
+from tensorrt_llm._torch.pyexecutor import cuda_graph_runner as cuda_graph_runner_module
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
@@ -330,3 +325,227 @@ class TestCaptureReplayStaticTensors:
         logits_eager = forward_fn(self._make_inputs(attn_metadata, num_tokens, batch_size, value=2))
 
         torch.testing.assert_close(logits_cuda_graph, logits_eager)
+
+
+class _MetadataStub:
+    """Minimal stand-in for attn_metadata carrying one graph-visible CUDA tensor.
+
+    Real attn_metadata/spec_metadata objects have many more attributes, but
+    the strict-buffer check is a generic vars()-walk over every CUDA tensor
+    attribute, so a stub with a single tracked tensor exercises the same
+    code path.
+    """
+
+    def __init__(self, value: int):
+        self.some_buf = torch.full((1,), value, device="cuda", dtype=torch.int32)
+
+
+class TestStrictBufferCheck:
+    """CUDAGraphRunner._STRICT_BUFFER_CHECK: attn_metadata/spec_metadata tensor
+    attributes must keep the same data_ptr() from capture through every
+    replay, since the captured graph's kernels read from those fixed
+    addresses. In-place updates are fine; rebinding the attribute (to a new
+    tensor, or to a non-tensor) invalidates the address the graph reads and
+    must raise immediately rather than silently replaying against stale
+    memory.
+    """
+
+    def _make_runner_and_inputs(self, monkeypatch, value):
+        monkeypatch.setattr(cuda_graph_runner_module, "_STRICT_BUFFER_CHECK", True)
+        batch_size = 1
+        runner = create_mock_cuda_graph_runner(batch_size)
+        key = KeyType(batch_size=batch_size, draft_len=0, is_first_draft=False)
+        num_tokens = runner._get_num_tokens_for_key(key)
+        attn_metadata = _MetadataStub(value)
+        input_ids = torch.zeros((num_tokens,), device="cuda", dtype=torch.int32)
+        position_ids = torch.zeros((1, num_tokens), device="cuda", dtype=torch.int32)
+        inputs = {
+            "attn_metadata": attn_metadata,
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+        }
+        return runner, key, attn_metadata, inputs
+
+    def test_replay_accepts_in_place_update_to_graph_tensor(self, monkeypatch):
+        """A .copy_() into the same tensor object is accepted, and the
+        replayed graph output reflects the new contents.
+        """
+        runner, key, attn_metadata, inputs = self._make_runner_and_inputs(monkeypatch, value=10)
+
+        def forward_fn(fn_inputs):
+            return fn_inputs["input_ids"].clone() + fn_inputs["attn_metadata"].some_buf
+
+        runner.capture(key, forward_fn, inputs)
+
+        attn_metadata.some_buf.copy_(torch.full_like(attn_metadata.some_buf, 99))
+
+        output = runner.replay(key, inputs)
+
+        assert output.item() == 99
+
+    def test_replay_rejects_rebound_graph_tensor(self, monkeypatch):
+        """Rebinding the attribute to a freshly allocated tensor must raise,
+        naming the attribute, instead of replaying against the old buffer.
+        """
+        runner, key, attn_metadata, inputs = self._make_runner_and_inputs(monkeypatch, value=10)
+
+        def forward_fn(fn_inputs):
+            return fn_inputs["input_ids"].clone() + fn_inputs["attn_metadata"].some_buf
+
+        runner.capture(key, forward_fn, inputs)
+
+        attn_metadata.some_buf = torch.full((1,), 99, device="cuda", dtype=torch.int32)
+
+        with pytest.raises(RuntimeError, match="some_buf"):
+            runner.replay(key, inputs)
+
+    def test_replay_rejects_non_tensor_graph_attr(self, monkeypatch):
+        """Replacing a graph-visible tensor attribute with a non-tensor is
+        rejected, naming the attribute.
+        """
+        runner, key, attn_metadata, inputs = self._make_runner_and_inputs(monkeypatch, value=10)
+
+        def forward_fn(fn_inputs):
+            return fn_inputs["input_ids"].clone() + fn_inputs["attn_metadata"].some_buf
+
+        runner.capture(key, forward_fn, inputs)
+
+        attn_metadata.some_buf = None
+
+        with pytest.raises(RuntimeError, match="some_buf"):
+            runner.replay(key, inputs)
+
+    def test_replay_rejects_rebound_spec_metadata_tensor(self, monkeypatch):
+        """Rebinding a spec_metadata tensor attribute must raise, naming the
+        attribute. Exercises the spec_metadata_ptrs snapshot/validation path,
+        which the attn_metadata-only tests above never touch.
+        """
+        runner, key, attn_metadata, inputs = self._make_runner_and_inputs(monkeypatch, value=10)
+        spec_metadata = _MetadataStub(value=20)
+        inputs["spec_metadata"] = spec_metadata
+
+        def forward_fn(fn_inputs):
+            return fn_inputs["input_ids"].clone() + fn_inputs["attn_metadata"].some_buf
+
+        runner.capture(key, forward_fn, inputs)
+
+        spec_metadata.some_buf = torch.full((1,), 99, device="cuda", dtype=torch.int32)
+
+        with pytest.raises(RuntimeError, match="some_buf"):
+            runner.replay(key, inputs)
+
+
+class TestStrictBufferCheckEnvVar:
+    """TLLM_CUDA_GRAPH_STRICT_BUFFERS must actually control
+    _strict_buffer_check_enabled(); TestStrictBufferCheck above patches
+    _STRICT_BUFFER_CHECK directly and never exercises this parsing.
+    """
+
+    def test_env_var_absent_disables_check(self, monkeypatch):
+        monkeypatch.delenv("TLLM_CUDA_GRAPH_STRICT_BUFFERS", raising=False)
+        assert cuda_graph_runner_module._strict_buffer_check_enabled() is False
+
+    def test_env_var_set_to_one_enables_check(self, monkeypatch):
+        monkeypatch.setenv("TLLM_CUDA_GRAPH_STRICT_BUFFERS", "1")
+        assert cuda_graph_runner_module._strict_buffer_check_enabled() is True
+
+    def test_env_var_set_to_other_value_disables_check(self, monkeypatch):
+        monkeypatch.setenv("TLLM_CUDA_GRAPH_STRICT_BUFFERS", "true")
+        assert cuda_graph_runner_module._strict_buffer_check_enabled() is False
+
+
+class _AttnMetadataStub:
+    """Minimal stand-in for attn_metadata's create_cuda_graph_metadata() contract.
+
+    maybe_get_cuda_graph() only calls this when capture is allowed for a new
+    key. The real implementation returns a copy of self with
+    is_cuda_graph=True; this stub does the same, ignoring its arguments since
+    nothing here reads them, only the interface's full signature matters,
+    so a caller passing by keyword still works.
+    """
+
+    def __init__(self, is_cuda_graph: bool = False):
+        self.is_cuda_graph = is_cuda_graph
+
+    def create_cuda_graph_metadata(
+        self,
+        max_batch_size,
+        sub_cross_metadata=False,
+        max_draft_tokens=0,
+        buffers=None,
+        encode_only=False,
+    ):
+        del max_batch_size, sub_cross_metadata, max_draft_tokens, buffers, encode_only
+        return _AttnMetadataStub(is_cuda_graph=True)
+
+
+def _make_generation_only_batch(req_id: int = 1) -> ScheduledRequests:
+    """A batch with no context requests, so ScheduledRequests.can_run_cuda_graph
+    is True, the precondition maybe_get_cuda_graph needs before it will even
+    consult the _capture_allowed gate.
+    """
+    request = SimpleNamespace(
+        py_request_id=req_id,
+        py_draft_tokens=[],
+        py_batch_idx=None,
+    )
+    batch = ScheduledRequests()
+    batch.generation_requests = [request]
+    return batch
+
+
+class TestCaptureAllowedGate:
+    """CUDAGraphRunner._capture_allowed / allow_capture(): the guard that
+    keeps live, on-the-fly capture from resizing the shared workspace/static
+    buffers and invalidating addresses baked into every graph captured
+    before it. Capture must only be possible inside allow_capture(), and the
+    flag must reset even if warmup raises partway through.
+    """
+
+    def test_maybe_get_cuda_graph_falls_back_to_eager_outside_allow_capture(self):
+        """Requesting an uncaptured key outside allow_capture() must return
+        the eager-fallback triple, not start a new capture.
+        """
+        runner = create_mock_cuda_graph_runner(batch_size=1)
+        batch = _make_generation_only_batch()
+        assert runner._capture_allowed is False
+
+        result = runner.maybe_get_cuda_graph(
+            batch, enable_spec_decode=False, attn_metadata=object()
+        )
+
+        assert result == (None, None, None)
+
+    def test_maybe_get_cuda_graph_prepares_capture_inside_allow_capture(self):
+        """The same uncaptured key, requested inside allow_capture(), must
+        return real graph-ready metadata and a key, proving the eager
+        fallback above is the gate blocking capture, not a broken method.
+        """
+        runner = create_mock_cuda_graph_runner(batch_size=1)
+        batch = _make_generation_only_batch()
+
+        with runner.allow_capture():
+            attn_metadata, spec_metadata, key = runner.maybe_get_cuda_graph(
+                batch, enable_spec_decode=False, attn_metadata=_AttnMetadataStub()
+            )
+
+        assert key is not None
+        assert attn_metadata is not None and attn_metadata.is_cuda_graph
+        assert spec_metadata is None
+
+    def test_allow_capture_resets_flag_on_exception(self):
+        """The _capture_allowed reset must run even when the warmup body
+        inside allow_capture() raises, not just on a clean exit, otherwise
+        an exception mid-warmup would leave capture permanently unguarded.
+        """
+        runner = create_mock_cuda_graph_runner(batch_size=1)
+
+        class _Boom(Exception):
+            pass
+
+        with pytest.raises(_Boom):
+            with runner.allow_capture():
+                assert runner._capture_allowed is True
+                raise _Boom()
+
+        assert runner._capture_allowed is False
