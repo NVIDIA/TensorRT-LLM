@@ -772,7 +772,7 @@ def test_cft_selection(
     device_supported: bool,
     expected: bool,
 ) -> None:
-    from tensorrt_llm._torch.modules.fused_moe.communication import nvlink_one_sided
+    from tensorrt_llm._torch.moe.fused_moe.communication import nvlink_one_sided
 
     if force_env is None:
         monkeypatch.delenv(FORCE_CFT_ENV, raising=False)
@@ -812,7 +812,7 @@ def test_cft_device_support(
     capability: tuple[int, int],
     unsupported_index: int | None,
 ) -> None:
-    from tensorrt_llm._torch.modules.fused_moe.communication import nvlink_one_sided
+    from tensorrt_llm._torch.moe.fused_moe.communication import nvlink_one_sided
 
     cuda = nvlink_one_sided.cuda
     attributes = (

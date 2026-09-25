@@ -17,7 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/config.h"
-#include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
+#include "tensorrt_llm/kernels/moe/communication/moeAlltoAllKernels.h"
 
 #include <array>
 #include <cstdint>
