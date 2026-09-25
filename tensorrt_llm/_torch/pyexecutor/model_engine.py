@@ -356,7 +356,7 @@ def _set_moe_a2a_warmup(in_warmup: bool) -> None:
 
     No-op when the op is unavailable (older bindings).
     """
-    from ..modules.fused_moe.communication.nvlink_one_sided import (
+    from ..moe.fused_moe.communication.nvlink_one_sided import (
         NVLinkOneSided, get_timeout_seconds)
 
     timeout_sec = get_timeout_seconds(in_warmup)
