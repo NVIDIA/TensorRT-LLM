@@ -456,10 +456,6 @@
 /constraints.txt @NVIDIA/trt-llm-oss-compliance
 /cpp/CMakeLists.txt @NVIDIA/trt-llm-oss-compliance
 /cpp/cmake/** @NVIDIA/trt-llm-oss-compliance
-/cpp/conan.lock @NVIDIA/trt-llm-oss-compliance
-/cpp/conandata.yml @NVIDIA/trt-llm-oss-compliance
-/cpp/conanfile.py @NVIDIA/trt-llm-oss-compliance
-/cpp/libnuma_conan.py @NVIDIA/trt-llm-oss-compliance
 /docker/common/** @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 /jenkins/license_cpp.json @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 /pyproject.toml @NVIDIA/trt-llm-oss-compliance
