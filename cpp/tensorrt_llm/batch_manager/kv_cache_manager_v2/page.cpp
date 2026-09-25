@@ -18,6 +18,7 @@
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/exceptions.h"
+#include "kv_cache_manager_v2/hostPageCopy.h"
 #include "kv_cache_manager_v2/kvCache.h"        // for KvCache
 #include "kv_cache_manager_v2/storageManager.h" // for StorageManager
 
@@ -52,7 +53,16 @@ Page::~Page()
                 s.setSlotId(slotId());
                 s.readyEvent = std::move(readyEvent);
                 resetSlot();
-                manager->releaseSlot(lifeCycle, cacheLevel, std::move(s));
+                // The retained copy owns the host slot even when it is also the page's primary slot.
+                if (!mHostCopy || !mHostCopy->matches(cacheLevel, s.slotId()))
+                {
+                    manager->releaseSlot(lifeCycle, cacheLevel, std::move(s));
+                }
+                else
+                {
+                    mHostCopy->recordUse(std::move(s.readyEvent));
+                    s.resetSlot();
+                }
             }
         });
 }
@@ -192,11 +202,17 @@ SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(
         "Block slot for this lifecycle already has a page covering more tokens");
     TLLM_CHECK_DEBUG_WITH_INFO(status() == PageStatus::DROPPABLE, "Release holder/lock before converting");
 
-    // Set the ready event before transfer (matches Python: self.ready_event = ready_event).
-    this->readyEvent = std::move(readyEv);
+    // A held page may have migrated on another stream since its last write.
+    // Preserve that completion as well as the committing request's finish event.
+    if (this->readyEvent.handle() != readyEv.handle())
+    {
+        std::vector<CachedCudaEvent> events{this->readyEvent, std::move(readyEv)};
+        this->readyEvent = mergeEvents(events);
+    }
 
     auto committed = makeShared<CommittedPage>(manager, blk, lifeCycle, cacheLevel, numTokensInBlock, priority);
     // Move slot id to the committed page; invalidate our slot.
+    committed->mHostCopy = std::move(mHostCopy);
     committed->setSlotId(slotId()); // asserts valid
     committed->readyEvent = std::move(readyEvent);
     resetSlot();
@@ -233,6 +249,12 @@ PageHolder::~PageHolder()
             // If it's a committed page, schedule for eviction (if evictable).
             if (page->isCommitted())
             {
+                // Release the extra host allocation after the last request lets go.
+                // Open readers retain it independently.
+                if (page->mHostCopy && !page->mHostCopy->matches(page->cacheLevel, page->slotId()))
+                {
+                    page->mHostCopy.reset();
+                }
                 if (!page->scheduledForEviction())
                     manager->scheduleForEviction(*page);
 

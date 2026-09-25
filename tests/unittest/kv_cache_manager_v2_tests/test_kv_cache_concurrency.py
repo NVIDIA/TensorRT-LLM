@@ -41,6 +41,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BufferConfig,
     CudaStream,
     GpuCacheTierConfig,
+    HostCacheTierConfig,
     KVCacheManager,
     KVCacheManagerConfig,
 )
@@ -519,5 +520,56 @@ def test_priority_callback_under_the_lock_does_not_deadlock_stats_queries() -> N
 
         assert callback_hits["n"] > 0, "priority callback never ran; test proves nothing"
         assert stats_polls["n"] > 0
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("explicit_close", [True, False])
+def test_host_copy_operations_with_concurrent_requests(explicit_close: bool) -> None:
+    """Host APIs and reader cleanup release the GIL before taking the manager lock."""
+    config = _make_config()
+    config.cache_tiers = [*config.cache_tiers, HostCacheTierConfig(quota=8 << 20)]
+    manager = KVCacheManager(config)
+    try:
+        stream = CudaStream(torch.cuda.Stream().cuda_stream)
+        cache = manager.create_kv_cache()
+        assert cache.resume(stream)
+        assert cache.resize(20, 16)
+        group = manager.get_layer_group_id(0)
+        stop = threading.Event()
+        hits = {"n": 0}
+        antagonist = _priority_callback_antagonist(manager, stop, hits)
+        reader = None
+        antagonist.start()
+        try:
+            _await_antagonist(antagonist, hits)
+            for _ in range(100):
+                cache._invalidate_host_copy(group, 1)
+                cache._backup_to_host(group, 1, 4)
+                reader = cache._acquire_host_copy(group, 1)
+                assert reader.valid_tokens == 4
+                assert reader.cache_level == 1
+                assert reader.pool_group_index == 0
+                assert reader.page_bytes == 4096
+                assert reader.pool_bytes >= reader.page_bytes
+                assert (
+                    reader.address == reader.pool_base_address + reader.slot_id * reader.page_bytes
+                )
+                assert isinstance(reader.ready, bool)
+                assert reader.completed_tokens in (0, 4)
+                cache._set_residency_window(group, 5, num_sink_tokens=4)
+                cache._offload_to_host(group, 1)
+                if explicit_close:
+                    reader.close()
+                # Exercise tp_dealloc while another thread can hold the API lock.
+                reader = None
+                cache._set_residency_window(group, None)
+        finally:
+            stop.set()
+            _join(antagonist)
+            if reader is not None:
+                reader.close()
+            cache.close()
+        assert hits["n"] > 0
     finally:
         manager.shutdown()
