@@ -48,6 +48,7 @@ from ..disaggregation.kv_cache_transceiver import (
 from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
+from ..modules.mamba.mamba2_tp import Mamba2TpShard
 from ..speculative import (draft_prompt_lookahead, get_num_extra_kv_tokens,
                            get_num_spec_layers, get_spec_decoder,
                            should_use_separate_draft_kv_cache)
@@ -2960,7 +2961,14 @@ def _create_kv_cache_manager(
             "kv_cache_config.kv_events_config is set but streaming KV event "
             "publishing requires KV cache manager V2; events will not be "
             f"published for {kv_cache_manager_cls.__name__}.")
-    if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+    # All three hybrid managers reject layouts their disaggregated transfer
+    # cannot express (e.g. replicated Mamba2 B/C groups when tp_size >
+    # n_groups), so all three need to know whether disagg is on.  The Mixed
+    # manager is reachable under disagg through the Python-transceiver route
+    # above and through TLLM_MAMBA_MANAGER_PREFERENCE=MIXED.
+    if issubclass(kv_cache_manager_cls,
+                  (MambaHybridCacheManagerV2, CppMambaHybridCacheManager,
+                   MixedMambaHybridCacheManager)):
         manager_extra_kwargs["is_disagg"] = is_disagg
 
     if is_kimi_linear(config):
@@ -3701,20 +3709,24 @@ def create_py_executor_instance(
         if moe_intermediate is not None and moe_intermediate > 0:
             moe_hidden_size = moe_intermediate // mapping.tp_size
 
-        # Mamba dimensions for hybrid models (e.g., Nemotron-H)
-        # d_inner = mamba_head_dim * mamba_num_heads
-        # d_in_proj = 2 * d_inner + 2 * n_groups * d_state + mamba_num_heads
+        # Mamba dimensions for hybrid models (e.g., Nemotron-H). The per-rank
+        # in_proj and inner sizes come from Mamba2TpShard, which also covers
+        # the replicated-group layout used when tp_size > n_groups
+        # (see tensorrt_llm/_torch/modules/mamba/mamba2_tp.py).
         mamba_in_proj_size = 0
         mamba_inner_size = 0
         mamba_head_dim = getattr(pretrained_config, 'mamba_head_dim', 0)
         mamba_num_heads = getattr(pretrained_config, 'mamba_num_heads', 0)
         if mamba_head_dim > 0 and mamba_num_heads > 0:
-            d_inner = mamba_head_dim * mamba_num_heads
-            mamba_inner_size = d_inner // mapping.tp_size
             n_groups = getattr(pretrained_config, 'n_groups', 1)
             d_state = getattr(pretrained_config, 'ssm_state_size', 128)
-            d_in_proj = 2 * d_inner + 2 * n_groups * d_state + mamba_num_heads
-            mamba_in_proj_size = d_in_proj // mapping.tp_size
+            shard = Mamba2TpShard(tp_size=mapping.tp_size,
+                                  nheads=mamba_num_heads,
+                                  n_groups=n_groups,
+                                  head_dim=mamba_head_dim,
+                                  d_state=d_state)
+            mamba_inner_size = shard.tp_d_inner
+            mamba_in_proj_size = shard.tp_d_in_proj
 
         # MoE latent size for latent MoE models (e.g., Nemotron-H SuperV3).
         # Latent projections are replicated (not TP-sharded), so pass the
