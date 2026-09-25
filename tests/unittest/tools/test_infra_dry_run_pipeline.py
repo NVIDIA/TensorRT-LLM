@@ -88,11 +88,55 @@ class InfraDryRunPipelineTest(unittest.TestCase):
                 self.assertLess(body.index(infra_dry_run_check), body.index("def githubPrApiUrl"))
                 self.assertLess(body.index(empty_result), body.index("def githubPrApiUrl"))
 
-    def test_docs_skip_junit_after_a_successful_build(self) -> None:
+    def test_docs_skip_results_only_after_a_successful_build(self) -> None:
+        result_handler = _function_body(
+            L0_TEST, "cacheErrorAndUploadResult", "createKubernetesPodConfig"
+        )
         self.assertIn(
-            'cacheErrorAndUploadResult("${key}", values[1], {}, true, attemptTag, '
+            'cacheErrorAndUploadResult(pipeline, "${key}", values[1], {}, true, attemptTag, '
             "isFinalAttempt, retryContext)",
             L0_TEST,
+        )
+        process_results = "boolean shouldProcessResults = !noResultIfSuccess || stageIsFailed"
+        process_results_branch = "if (shouldProcessResults) {"
+        self.assertIn(f"{process_results}\n            {process_results_branch}", result_handler)
+        self.assertLess(
+            result_handler.index(process_results_branch),
+            result_handler.index('junit(testResults: "${stageName}/results*.xml")'),
+        )
+
+    def test_failure_evidence_match_is_logged_before_caching(self) -> None:
+        classifier = _function_body(L0_TEST, "classifyFailure", "preservePrimaryFailure")
+
+        self.assertIn("[FAILURE-EVIDENCE]", classifier)
+        self.assertIn("evidence.matchedQueryId", classifier)
+        self.assertLess(
+            classifier.index("[FAILURE-EVIDENCE]"),
+            classifier.index("retryContext.failureEvidence = evidence"),
+        )
+
+    def test_post_actions_keep_interruptions_higher_priority_than_primary_failures(self) -> None:
+        result_handler = _function_body(
+            L0_TEST, "cacheErrorAndUploadResult", "createKubernetesPodConfig"
+        )
+        preserve_primary = _function_body(
+            L0_TEST, "preservePrimaryFailure", "rememberAvoidedKubernetesHostNodes"
+        )
+
+        self.assertIn("caughtError = e\n        stageIsInterrupted = true", result_handler)
+        self.assertIn("catch (InterruptedException e) {\n        throw e", preserve_primary)
+        self.assertIn(
+            "FailureClassifier.classify(e, InfraFailure.BOTH) instanceof PipelineInterruption",
+            preserve_primary,
+        )
+
+    def test_slurm_upload_skips_a_missing_result_directory(self) -> None:
+        upload_results = _function_body(L0_TEST, "uploadResults", "runIsolatedTests")
+
+        self.assertIn("if (!fileExists(stageName))", upload_results)
+        self.assertLess(
+            upload_results.index("if (!fileExists(stageName))"),
+            upload_results.index('sh "tar -czvf results-${stageName}${postTag}.tar.gz'),
         )
 
 
