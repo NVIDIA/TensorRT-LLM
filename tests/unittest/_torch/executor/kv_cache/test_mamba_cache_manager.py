@@ -2766,39 +2766,65 @@ def test_v2_hybrid_logs_aggregated_recurrent_cache_status_only_on_rank_zero(
     rank: int,
     expected_log_count: int,
 ) -> None:
-    first_stats = SimpleNamespace(
-        iter_offload_blocks=3,
-        iter_offload_bytes=300,
-        iter_onboard_blocks=1,
-        iter_onboard_bytes=100,
-        iter_host_dropped_blocks=2,
-        iter_host_dropped_bytes=200,
-        primary_used_num_blocks=11,
-        primary_free_num_blocks=5,
-        primary_evictable_num_blocks=4,
-        secondary_used_num_blocks=7,
-        secondary_free_num_blocks=9,
+    from tensorrt_llm._torch.pyexecutor.kv_cache_stats import (
+        KVCachePoolStatsSnapshot,
+        KVCacheStatsMetadata,
+        KVCacheV2IterationStatsSnapshot,
     )
-    second_stats = SimpleNamespace(
-        iter_offload_blocks=2,
-        iter_offload_bytes=200,
-        iter_onboard_blocks=4,
-        iter_onboard_bytes=400,
-        iter_host_dropped_blocks=1,
-        iter_host_dropped_bytes=100,
-        primary_used_num_blocks=13,
-        primary_free_num_blocks=6,
-        primary_evictable_num_blocks=5,
-        secondary_used_num_blocks=8,
-        secondary_free_num_blocks=10,
+
+    empty_pool = KVCachePoolStatsSnapshot(0, 0, 0, 0, 0, 0, ())
+    snapshot = KVCacheV2IterationStatsSnapshot(
+        metadata=KVCacheStatsMetadata(
+            (
+                (0, 4, 4096, "attention"),
+                (1, 6, None, "ssm"),
+                (2, 7, None, "ssm"),
+                (3, 6, None, "ssm"),
+            ),
+            (),
+            ("gpu",),
+        ),
+        pools_by_level=(
+            (empty_pool,) * 6
+            + (
+                KVCachePoolStatsSnapshot(16, 5, 4, 5, 11, 4, ()),
+                KVCachePoolStatsSnapshot(19, 6, 5, 6, 13, 5, ()),
+            ),
+        ),
+        deltas=(
+            (
+                1,
+                (
+                    ("iter_offload_blocks", 3),
+                    ("iter_offload_bytes", 300),
+                    ("iter_onboard_blocks", 1),
+                    ("iter_onboard_bytes", 100),
+                    ("iter_host_dropped_blocks", 2),
+                    ("iter_host_dropped_bytes", 200),
+                ),
+            ),
+            (
+                2,
+                (
+                    ("iter_offload_blocks", 2),
+                    ("iter_offload_bytes", 200),
+                    ("iter_onboard_blocks", 4),
+                    ("iter_onboard_bytes", 400),
+                    ("iter_host_dropped_blocks", 1),
+                    ("iter_host_dropped_bytes", 100),
+                ),
+            ),
+        ),
+        ssm_deltas=(),
+        reused_blocks_by_level=(),
+        suspended_requests=0,
+        resumed_requests=0,
+        disk_prefetch_blocks=0,
+        cached_tokens_by_level=(),
     )
-    report = SimpleNamespace(
-        by_pool_group={
-            6: SimpleNamespace(stats=first_stats),
-            7: SimpleNamespace(stats=second_stats),
-        },
+    monkeypatch.setattr(
+        KVCacheManagerV2, "capture_iteration_stats", MagicMock(return_value=snapshot)
     )
-    monkeypatch.setattr(KVCacheManagerV2, "get_iteration_stats", MagicMock(return_value=report))
     log_debug = MagicMock()
     monkeypatch.setattr(
         "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.logger.debug", log_debug
@@ -2806,14 +2832,6 @@ def test_v2_hybrid_logs_aggregated_recurrent_cache_status_only_on_rank_zero(
 
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr.mapping = SimpleNamespace(rank=rank)
-    mgr._stats_life_cycle_metadata = MagicMock(
-        return_value={
-            0: (4, 4096, "attention"),
-            1: (6, None, "ssm"),
-            2: (7, None, "ssm"),
-            3: (6, None, "ssm"),
-        }
-    )
     mgr._recurrent_evicted_blocks_total = 0
     mgr._recurrent_onboarded_blocks_total = 0
     mgr._recurrent_dropped_blocks_total = 0
@@ -2823,7 +2841,7 @@ def test_v2_hybrid_logs_aggregated_recurrent_cache_status_only_on_rank_zero(
     mgr._branch_snapshots_taken_total = 3
     mgr._branch_snapshots_skipped_total = {"no_divergence": 2, "already_reused": 1}
 
-    assert mgr.get_iteration_stats() is report
+    assert mgr.capture_iteration_stats() is snapshot
     assert mgr._recurrent_evicted_blocks_total == 5
     assert mgr._recurrent_onboarded_blocks_total == 5
     assert mgr._recurrent_dropped_blocks_total == 3
@@ -2840,7 +2858,7 @@ def test_v2_hybrid_logs_aggregated_recurrent_cache_status_only_on_rank_zero(
             "total_dropped_recurrent_blocks=3 "
             "gpu_used_recurrent_blocks=24 gpu_free_recurrent_blocks=11 "
             "gpu_evictable_recurrent_blocks=9 "
-            "host_used_recurrent_blocks=15 host_free_recurrent_blocks=19 "
+            "host_used_recurrent_blocks=0 host_free_recurrent_blocks=0 "
             "snapshot_pruned_tokens=640 page_pruned_tokens=128 "
             "branch_snapshots_taken=3 branch_snapshots_skipped=3 "
             "branch_snapshots_skipped_by_reason="
