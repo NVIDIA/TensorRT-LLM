@@ -75,6 +75,7 @@ extensions = [
     'sphinxcontrib.mermaid',
     'llmapi_config_telemetry',
     'trtllm_config_selector',
+    'trtllm_moe_dashboard',
 ]
 
 if HAS_CPP_XML:
