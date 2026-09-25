@@ -1816,6 +1816,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 stats.append(stat)
             return JSONResponse(content=stats)
 
+        if not getattr(self.generator.args, "enable_iter_perf_stats", True):
+            return JSONResponse(content=[])
+
         # When the background collector loop is active it is the sole
         # consumer of the engine stats queue; serve /metrics from the tee
         # buffer it populates so we do not race it for queue items. Racing
