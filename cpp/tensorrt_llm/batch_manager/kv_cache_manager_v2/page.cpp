@@ -192,8 +192,13 @@ SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(
         "Block slot for this lifecycle already has a page covering more tokens");
     TLLM_CHECK_DEBUG_WITH_INFO(status() == PageStatus::DROPPABLE, "Release holder/lock before converting");
 
-    // Set the ready event before transfer (matches Python: self.ready_event = ready_event).
-    this->readyEvent = std::move(readyEv);
+    // A held page may have migrated on another stream since its last write.
+    // Preserve that completion as well as the committing request's finish event.
+    if (this->readyEvent.handle() != readyEv.handle())
+    {
+        std::vector<CachedCudaEvent> events{this->readyEvent, std::move(readyEv)};
+        this->readyEvent = mergeEvents(events);
+    }
 
     auto committed = makeShared<CommittedPage>(manager, blk, lifeCycle, cacheLevel, numTokensInBlock, priority);
     // Move slot id to the committed page; invalidate our slot.
