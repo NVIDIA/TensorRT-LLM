@@ -57,9 +57,6 @@ OUT_OF_SCOPE_PREFIXES: tuple[str, ...] = (
     "tests/integration/defs/agg_unit_mem_df.csv",
     "tests/microbenchmarks/",
     "jenkins/scripts/cbts/",
-    # TEMPORARY: let PR #18802 exercise coverage-pin integration end to end.
-    # Remove together with the core-Python probe after the repeated-run test.
-    "jenkins/L0_MergeRequest.groovy",
 )
 
 # Path suffixes (extensions) with no test-execution impact, anywhere in
