@@ -2284,18 +2284,26 @@ class KvCacheCreator:
             head_dim = encoder_hidden_size // encoder_num_heads
 
         max_seq_len = fallback_max_seq_len or self._max_seq_len
-        max_input_len = getattr(self._llm_args, "max_input_len", None)
-        if isinstance(max_input_len, int) and max_input_len > 0:
-            max_seq_len = max_input_len
         encoder_limit = self._get_config_int_attr(
             config,
             ("max_encoder_input_len", "encoder_max_input_length",
              "max_encoder_position_embeddings",
-             "encoder_max_position_embeddings", "max_position_embeddings",
-             "n_positions"),
+             "encoder_max_position_embeddings", "max_source_positions",
+             "max_position_embeddings", "n_positions"),
         )
         if encoder_limit is not None:
-            max_seq_len = min(max_seq_len, encoder_limit)
+            # The cross pool holds the encoder output, so the encoder's own
+            # position limit is the authoritative length. Do not let
+            # max_input_len (a decoder-side prompt limit, default 1024)
+            # shrink it below that: Whisper's encoder emits
+            # max_source_positions=1500 frames for every clip, and the
+            # request would fail in prepare_cross_metadata with "max KV cache
+            # length of input sequences (1500) exceeds ... (1024)".
+            max_seq_len = encoder_limit
+        else:
+            max_input_len = getattr(self._llm_args, "max_input_len", None)
+            if isinstance(max_input_len, int) and max_input_len > 0:
+                max_seq_len = max_input_len
 
         return num_layers, num_kv_heads, head_dim, max_seq_len
 
