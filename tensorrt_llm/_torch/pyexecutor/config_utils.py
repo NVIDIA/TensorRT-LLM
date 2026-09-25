@@ -765,7 +765,7 @@ def extract_mamba_kv_cache_params(
             config, torch.bfloat16)
     validate_kimi_kda_state_dtype(config, mamba_ssm_cache_dtype)
     if is_glm5_next(config) and mamba_ssm_cache_dtype != torch.float32:
-        logger.info(f"GLM KDA: overriding mamba_ssm_cache_dtype "
+        logger.info(f"glm5_next KDA: overriding mamba_ssm_cache_dtype "
                     f"{mamba_ssm_cache_dtype} -> torch.float32")
         mamba_ssm_cache_dtype = torch.float32
 

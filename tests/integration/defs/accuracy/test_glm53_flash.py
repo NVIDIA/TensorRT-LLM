@@ -159,6 +159,7 @@ class TestGLM53FlashFP8(LlmapiAccuracyTestHarness):
     @pytest.mark.timeout(7200)
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
     def test_mmmu(self, tp_size, ep_size):
+        pytest.importorskip("transformers.models.glm5_next.processing_glm5_next")
         kwargs = self._llm_kwargs(tp_size, ep_size)
         kwargs["disable_mm_encoder"] = False
         # MMMU prompts fit in 8K (MAX_INPUT_LEN); a smaller token budget and

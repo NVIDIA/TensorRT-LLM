@@ -32,6 +32,8 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole
 
+from .params import glm_kpool_cache_row_dim
+
 
 class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     """Manage KDA state, latent KV and indexer buffers in one V2 lifecycle.
@@ -43,10 +45,31 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     """
 
     def __init__(
-        self, *args, sparse_layer_ids: Sequence[int] = (), index_state_dim: int = 0, **kwargs
+        self,
+        *args,
+        sparse_layer_ids: Sequence[int] | None = None,
+        index_state_dim: int = 0,
+        **kwargs,
     ) -> None:
+        """Build the hybrid manager with one indexer buffer per sparse layer.
+
+        Args:
+            sparse_layer_ids: Global layer ids that carry an indexer buffer.
+                Defaults to every attention layer in ``layer_mask``: each GLM
+                attention layer, including appended MTP layers, is sparse.
+            index_state_dim: BF16 width of one indexer cache row, see
+                :func:`glm_kpool_cache_row_dim`.
+        """
         # Set before super().__init__: the base _build_base_config calls
         # _extra_buffers_per_layer, which reads both of these.
+        if sparse_layer_ids is None:
+            layer_mask = kwargs.get("layer_mask")
+            if layer_mask is None:
+                raise ValueError(
+                    "Glm5NextCacheManager needs layer_mask or sparse_layer_ids "
+                    "to place the indexer buffers"
+                )
+            sparse_layer_ids = [i for i, is_attention in enumerate(layer_mask) if is_attention]
         self.sparse_layer_ids = sorted(int(i) for i in sparse_layer_ids)
         self.index_state_dim = int(index_state_dim)
         if self.sparse_layer_ids and self.index_state_dim <= 0:
@@ -128,7 +151,9 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         # All GLM full-attention layers, including MTP layers, use the sparse indexer.
         # Indexer pages remain BF16 even when latent KV is quantized.
         index_bytes_per_token = (
-            local_attention_layers * 3 * config.index_head_dim * torch.bfloat16.itemsize
+            local_attention_layers
+            * glm_kpool_cache_row_dim(int(config.index_head_dim))
+            * torch.bfloat16.itemsize
         )
         state_config = kv_cache_config.mamba_state_config
         seq_limit = max_seq_len if max_seq_len is not None else float("inf")
