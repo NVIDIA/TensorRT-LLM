@@ -148,6 +148,14 @@ def _scalar_fields(snapshot: object) -> dict:
 
 def _request_report(snapshot: RequestStatsSnapshot) -> dict:
     report = _scalar_fields(snapshot)
+    # The public JSON schema maps stages without an explicit entry to QUEUED.
+    if snapshot.stage not in (
+        "QUEUED",
+        "CONTEXT_IN_PROGRESS",
+        "GENERATION_IN_PROGRESS",
+        "GENERATION_COMPLETE",
+    ):
+        report["stage"] = "QUEUED"
     disagg = snapshot.dis_serving_stats
     report["disServingStats"] = (
         {"kvCacheTransferMS": disagg.kv_cache_transfer_ms, "kvCacheSize": disagg.kv_cache_size}

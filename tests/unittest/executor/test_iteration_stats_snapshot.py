@@ -113,12 +113,22 @@ def test_public_report_matches_native_json_contract():
     assert actual == json.loads(native_stats.to_json_str())
 
 
-def test_request_report_matches_native_json_contract():
+@pytest.mark.parametrize(
+    "stage",
+    [
+        "QUEUED",
+        "ENCODER_IN_PROGRESS",
+        "CONTEXT_IN_PROGRESS",
+        "GENERATION_IN_PROGRESS",
+        "GENERATION_COMPLETE",
+    ],
+)
+def test_request_report_matches_native_json_contract(stage):
     from tensorrt_llm.bindings import executor as native
 
     request = RequestStatsSnapshot(
         id=25,
-        stage="GENERATION_COMPLETE",
+        stage=stage,
         context_prefill_position=128,
         num_generated_tokens=32,
         avg_num_decoded_tokens_per_iter=1.5,
@@ -134,7 +144,7 @@ def test_request_report_matches_native_json_contract():
     for member in fields(request):
         if member.name not in ("stage", "dis_serving_stats"):
             setattr(expected, member.name, getattr(request, member.name))
-    expected.stage = native.RequestStage.GENERATION_COMPLETE
+    expected.stage = getattr(native.RequestStage, stage)
     disagg = native.DisServingRequestStats()
     disagg.kv_cache_transfer_ms = 3.5
     disagg.kv_cache_size = 4096
@@ -187,3 +197,22 @@ def test_buffer_eviction_is_bounded_and_visible_after_drain():
     PyExecutor._append_stats_frame(executor, IterationStatsFrame(IterationStatsSnapshot(iter=9)))
     assert executor.stats[0].sequence == 6
     assert executor.stats[0].dropped_frames == 3
+
+
+@pytest.mark.parametrize(
+    ("stage", "expected"),
+    [
+        ("QUEUED", "QUEUED"),
+        ("ENCODER_IN_PROGRESS", "QUEUED"),
+        ("CONTEXT_IN_PROGRESS", "CONTEXT_IN_PROGRESS"),
+        ("GENERATION_IN_PROGRESS", "GENERATION_IN_PROGRESS"),
+        ("GENERATION_COMPLETE", "GENERATION_COMPLETE"),
+        ("UNRECOGNIZED", "QUEUED"),
+    ],
+)
+def test_request_stage_uses_public_json_mapping(stage, expected):
+    frame = IterationStatsFrame(
+        IterationStatsSnapshot(), req_stats=[RequestStatsSnapshot(stage=stage)]
+    )
+    assert materialize_stats_batch([frame])[0]["requestStats"][0]["stage"] == expected
+    assert frame.req_stats[0].stage == stage
