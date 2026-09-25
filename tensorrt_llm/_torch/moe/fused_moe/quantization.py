@@ -4172,136 +4172,6 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
     _streamed_transient_lock = threading.Lock()
 
     # -----------------------------------------------------------------
-    # MoE rebalance: resident-vs-total slot arithmetic and the live-weight
-    # arena rebind. Every helper below is a literal no-op for a process that
-    # did not configure rebalance -- ``_rebalance_home_experts`` is ``None``
-    # and ``_rebalance_arena`` is ``None`` in that case.
-    # -----------------------------------------------------------------
-    @staticmethod
-    def _home_slot_count(module: torch.nn.Module) -> int:
-        """Return the resident expert count covered by checkpoint loading.
-
-        The H + S compute axis includes helper copies absent from the checkpoint.
-        Without rebalance, use the existing expert_size_per_partition value.
-        """
-        home = getattr(module, "_rebalance_home_experts", None)
-        if home is None:
-            return int(module.expert_size_per_partition)
-        return int(home)
-
-    def _rebind_live_planes_to_rebalance_arena(self,
-                                               module: torch.nn.Module) -> None:
-        """Alias the seven live Parameters onto framework-layout arena views.
-
-        Preserve Parameter objects where possible so captured quantization scales
-        stay valid; meta Parameters require replacement and scale recapture.
-        Framework storage layout differs from the transposed kernel weight view.
-
-        All later weight updates must write in place. Reallocation or Parameter
-        replacement breaks the binding and is detected by the runtime sentinel.
-        """
-        arena = getattr(module, "_rebalance_arena", None)
-        if arena is None:
-            return
-        # Lazy: the vendored bridge lives under ``cute_dsl_kernels`` and is
-        # only meaningful to this one backend.
-        from ...cute_dsl_kernels.megamoe_scheduler_v2.integrations.megamoe.direct_live_weight_bridge import \
-            CANONICAL_WEIGHT_PLANE_NAMES
-        if tuple(arena.plane_names) != tuple(CANONICAL_WEIGHT_PLANE_NAMES):
-            raise RuntimeError(
-                "MoE rebalance arena plane order does not match the MegaMoE "
-                f"canonical order: arena={tuple(arena.plane_names)} "
-                f"canonical={tuple(CANONICAL_WEIGHT_PLANE_NAMES)}")
-        # Explicit raises rather than ``assert``: these are the only checks
-        # that can catch a transposed-twice / not-transposed alias, and
-        # ``assert`` disappears under ``python -O``.
-        _meta_rebound = []
-        for name, arena_view, alias in zip(arena.plane_names,
-                                           arena.local_plane_views,
-                                           arena.tekit_alias_views):
-            old = getattr(module, name, None)
-            if old is None:
-                raise RuntimeError(
-                    f"MoE rebalance: live weight plane '{name}' was never "
-                    "registered by create_weights, so there is nothing to "
-                    "bind to the arena.")
-            # Shape first: it is the check that separates "transposed twice"
-            # from "not transposed at all" -- both have the same numel.
-            if tuple(alias.shape) != tuple(old.shape):
-                raise RuntimeError(
-                    f"MoE rebalance: arena alias for '{name}' has shape "
-                    f"{tuple(alias.shape)} but create_weights registered "
-                    f"{tuple(old.shape)}.")
-            if tuple(alias.stride()) != tuple(old.stride()):
-                raise RuntimeError(
-                    f"MoE rebalance: arena alias for '{name}' has stride "
-                    f"{tuple(alias.stride())} but create_weights registered "
-                    f"{tuple(old.stride())}.")
-            if alias.dtype != old.dtype:
-                raise RuntimeError(
-                    f"MoE rebalance: arena alias for '{name}' has dtype "
-                    f"{alias.dtype} but create_weights registered "
-                    f"{old.dtype}.")
-            # CPU Parameters may be rebound to CUDA arena aliases before model.to("cuda").
-            if not alias.is_cuda:
-                raise RuntimeError(
-                    f"MoE rebalance: arena alias for '{name}' is on "
-                    f"{alias.device}; the UC/MC arena must be device memory.")
-            if int(alias.data_ptr()) != int(arena_view.data_ptr()):
-                raise RuntimeError(
-                    f"MoE rebalance: arena alias for '{name}' does not alias "
-                    "the allocator's own view "
-                    f"(alias=0x{int(alias.data_ptr()):x} "
-                    f"allocator=0x{int(arena_view.data_ptr()):x}).")
-            if old.is_meta:
-                # Meta Parameters require replacement and recapture of quantization scales.
-                setattr(
-                    module, name,
-                    torch.nn.Parameter(alias, requires_grad=old.requires_grad))
-                _meta_rebound.append(name)
-                continue
-            # ``set_data`` also rejects a layout mismatch, which the four
-            # guards above do not cover; say which plane when it does.
-            try:
-                old.data = alias
-            except RuntimeError as _e:
-                raise RuntimeError(
-                    f"MoE rebalance: rebinding '{name}' to the arena failed "
-                    f"(old layout={old.layout} device={old.device}, "
-                    f"alias layout={alias.layout} device={alias.device}): {_e}"
-                ) from _e
-
-        # Helper norm constants need a neutral value until the first weight copy.
-        # Rebuild scale captures if meta Parameters were replaced.
-        if _meta_rebound:
-            self.setup_quant_scales(module)
-        norm_const = getattr(module, "fc1_norm_const", None)
-        if norm_const is not None:
-            home = int(arena.home_experts)
-            if home < int(norm_const.data.shape[0]):
-                norm_const.data[home:].fill_(1.0)
-
-    def assert_rebalance_arena_binding(self, module: torch.nn.Module) -> None:
-        """Reject live Parameters whose storage no longer aliases the arena.
-
-        Allocator-side checks cannot detect framework Parameter replacement.
-        """
-        arena = getattr(module, "_rebalance_arena", None)
-        if arena is None:
-            return
-        arena.assert_identity()
-        for name, arena_view in zip(arena.plane_names, arena.local_plane_views):
-            param = getattr(module, name)
-            if int(param.data_ptr()) != int(arena_view.data_ptr()):
-                raise RuntimeError(
-                    f"MoE rebalance: live weight plane '{name}' no longer "
-                    "points at the arena "
-                    f"(param=0x{int(param.data_ptr()):x} "
-                    f"arena=0x{int(arena_view.data_ptr()):x}). Something "
-                    "re-registered or reallocated it after create_weights; "
-                    "the planes must only ever be written in place.")
-
-    # -----------------------------------------------------------------
     # create_weights: register MegaMoE-format parameters in addition to
     # the grandparent's standard NVFP4 parameters.
     # -----------------------------------------------------------------
@@ -4423,8 +4293,10 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         )
         module.register_parameter("fc1_norm_const", fc1_norm_const)
 
-        # All seven planes now exist. Bind their aliases only for an enabled live arena.
-        self._rebind_live_planes_to_rebalance_arena(module)
+        if getattr(module, "_rebalance_arena", None) is not None:
+            from .mega_moe.rebalance_slot_scheduler_v2 import bind_live_weight_planes
+
+            bind_live_weight_planes(self, module)
 
     def _materialize_source_params(self, module: torch.nn.Module):
         """Rematerialize this module's streamed source params (full shape)
@@ -4678,8 +4550,10 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
     def _check_initial_aux_scale_coverage(self,
                                           module: torch.nn.Module) -> None:
         """Reject partially populated NVFP4 auxiliary-scale families."""
-        # Checkpoint coverage includes resident experts only; helper rows arrive by copy.
-        n_slots = self._home_slot_count(module)
+        n_slots = int(
+            getattr(module, "_rebalance_home_experts", None)
+            or module.expert_size_per_partition
+        )
         # A whole-checkpoint load is handed every expert's input_scale, because
         # the weights dict holds the entire checkpoint; a streaming EP load
         # only ever reads its own rank's experts, so its complete answer is
@@ -4749,11 +4623,10 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         if module.w3_w1_weight.data.numel() == 0:
             return
 
-        # RESIDENT slots, not the widened axis -- see ``_home_slot_count``.
-        # The helper slots [H, M) are runtime copies; no checkpoint row exists
-        # for them, so counting them as "required coverage" would make every
-        # complete load look partial once S > 0.
-        n_slots = self._home_slot_count(module)
+        n_slots = int(
+            getattr(module, "_rebalance_home_experts", None)
+            or module.expert_size_per_partition
+        )
         coverage = self._streamed_coverage(module)
         incomplete = {k: v for k, v in coverage.items() if v < n_slots}
         if incomplete:
@@ -4900,14 +4773,15 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
             raw_input_scales,
             module.initial_local_expert_ids,
             device=module.fc1_norm_const.device)
-        # Load the resident prefix. Helper norm constants retain the neutral value until
-        # their weight copy arrives; without rebalance this writes the full tensor.
-        n_home = self._home_slot_count(module)
+        n_home = int(
+            getattr(module, "_rebalance_home_experts", None)
+            or module.expert_size_per_partition
+        )
         if routed_norm_const.numel() != n_home:
             raise RuntimeError(
-                "MegaMoE-CuteDSL fc1_norm_const: expected one entry per "
-                f"resident expert ({n_home}), built "
-                f"{routed_norm_const.numel()} from initial_local_expert_ids.")
+                "MegaMoE-CuteDSL fc1_norm_const expected one entry per "
+                f"resident expert ({n_home}), got {routed_norm_const.numel()}."
+            )
         module.fc1_norm_const.data[:n_home].copy_(routed_norm_const)
 
         if self.need_load_shared_weights(module):

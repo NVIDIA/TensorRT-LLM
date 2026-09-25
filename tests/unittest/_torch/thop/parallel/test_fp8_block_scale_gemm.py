@@ -785,11 +785,10 @@ def test_cute_dsl_mxfp8_gemm_rubin_mixed_clusters_clc_dynamic_prefetch_multi_wav
     getSMVersion() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
     reason="The test requires SM107 and SM107 CuTe DSL support.",
 )
-@pytest.mark.parametrize("reserved_sms", [0, 8])
-def test_cute_dsl_mxfp8_gemm_rubin_clc_dynamic_prefetch_multi_wave(
-        reserved_sms: int, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Explicit CLC opt-in matches static GEMM with either SM budget."""
-    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLMXFP8RubinLinear
+def test_cute_dsl_mxfp8_gemm_rubin_clc_dynamic_prefetch_multi_wave():
+    """CLC dynamic scheduling supports Boolean-enabled prefetch."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        CuteDSLMXFP8RubinLinear
 
     m, n, k = 2048, 8192, 1536
     torch.random.manual_seed(43)
@@ -827,36 +826,20 @@ def test_cute_dsl_mxfp8_gemm_rubin_clc_dynamic_prefetch_multi_wave(
         1,
     )
     split_k_tactic = (*dynamic_tactic[:-1], 4)
-    scheduler_env = "TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER"
-    monkeypatch.delenv(scheduler_env, raising=False)
     runner = CuteDSLMXFP8RubinLinear(output_dtype=torch.bfloat16,
-                                     use_tvm_ffi=True,
-                                     reserved_sms=reserved_sms)
-    default_tactics = runner.get_valid_tactics(inputs, None)
-    assert (split_k_tactic in default_tactics) == (reserved_sms == 0)
+                                     use_tvm_ffi=True)
+    valid_tactics = runner.get_valid_tactics(inputs, None)
+    assert static_tactic in valid_tactics
+    assert dynamic_tactic in valid_tactics
+    assert split_k_tactic in valid_tactics
     for scheduler_mode in ("static", "clc_dynamic"):
         for raster_order in ("m", "n"):
             tactic = (*static_tactic[:-3], scheduler_mode, raster_order, 1)
-            assert (tactic in default_tactics) == (scheduler_mode == "static"
-                                                   or reserved_sms == 0)
+            assert tactic in valid_tactics
 
-    outputs = {}
-    for scheduler_mode, selected_tactic in (("static", static_tactic),
-                                            ("clc_dynamic", dynamic_tactic)):
-        monkeypatch.setenv(scheduler_env, scheduler_mode)
-        valid_tactics = runner.get_valid_tactics(inputs, None)
-        assert (static_tactic in valid_tactics) == (scheduler_mode == "static")
-        assert (dynamic_tactic
-                in valid_tactics) == (scheduler_mode == "clc_dynamic")
-        assert (split_k_tactic
-                in valid_tactics) == (scheduler_mode == "clc_dynamic")
-        outputs[scheduler_mode] = runner(inputs, tactic=selected_tactic)
-        if scheduler_mode == "clc_dynamic":
-            outputs["split_k"] = runner(inputs, tactic=split_k_tactic)
-
-    static_output = outputs["static"]
-    dynamic_output = outputs["clc_dynamic"]
-    split_k_output = outputs["split_k"]
+    static_output = runner(inputs, tactic=static_tactic)
+    dynamic_output = runner(inputs, tactic=dynamic_tactic)
+    split_k_output = runner(inputs, tactic=split_k_tactic)
     torch.cuda.synchronize()
 
     expected = a @ b.t()

@@ -59,8 +59,6 @@ class MoEEnvFlag(str, Enum):
     #: many expert slots the GEMM builds: two ranks disagreeing on it would
     #: otherwise share a fingerprint while building differently shaped layers.
     SHARED_EXPERT_FUSION = "TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION"
-    #: Force-disable rebalance; false/unset leaves the environment fingerprint unchanged.
-    MOE_REBALANCE_DISABLE = "TRTLLM_MOE_REBALANCE_DISABLE"
 
 
 # Probe details are logged but excluded from the stable fingerprint.
@@ -142,21 +140,10 @@ _DEP_PROBES: Dict[MoEDep, DepProbe] = {
     MoEDep.LOCALITY_DOMAIN: _probe_locality_domain,
 }
 
-# Omit inactive opt-in flags to preserve existing environment fingerprints.
-_BOOLEAN_ENV_FLAGS: frozenset = frozenset({MoEEnvFlag.MOE_REBALANCE_DISABLE})
-
-_ENV_TRUTHY = frozenset({"1", "true", "yes", "on"})
-
-
-def env_flag_is_on(name: str) -> bool:
-    """Use the same boolean semantics in backend setup and environment collection."""
-    return os.environ.get(name, "").strip().lower() in _ENV_TRUTHY
-
-
-_ENV_FLAG_DEFAULTS: Dict[MoEEnvFlag, Optional[str]] = {
+# Preserve prior defaults when environment variables are unset.
+_ENV_FLAG_DEFAULTS: Dict[MoEEnvFlag, str] = {
     MoEEnvFlag.TRTLLM_GEN_USE_FLASHINFER: "0",
     MoEEnvFlag.SHARED_EXPERT_FUSION: "0",
-    MoEEnvFlag.MOE_REBALANCE_DISABLE: None,
 }
 
 _CACHED_ENVIRONMENT: Optional[MoEEnvironment] = None
@@ -188,21 +175,10 @@ def collect_moe_environment(force: bool = False) -> MoEEnvironment:
     available = tuple(
         sorted(dep.value for dep, probe in _DEP_PROBES.items() if _run_probe(dep, probe))
     )
-    # Flags that resolve to ``None`` drop out: an unset opt-in flag must not
-    # perturb ``MoEEnvironment.fingerprint()``. See ``_ENV_FLAG_DEFAULTS``.
     env_flags = tuple(
         sorted(
-            (name, value)
-            for name, value in (
-                (
-                    flag.value,
-                    ("1" if env_flag_is_on(flag.value) else None)
-                    if flag in _BOOLEAN_ENV_FLAGS
-                    else os.environ.get(flag.value, default),
-                )
-                for flag, default in _ENV_FLAG_DEFAULTS.items()
-            )
-            if value is not None
+            (flag.value, os.environ.get(flag.value, default))
+            for flag, default in _ENV_FLAG_DEFAULTS.items()
         )
     )
     environment = MoEEnvironment(sm=get_sm_version(), available_deps=available, env_flags=env_flags)

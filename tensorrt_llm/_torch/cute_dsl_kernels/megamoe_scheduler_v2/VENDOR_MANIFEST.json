@@ -15,7 +15,7 @@
     "cuda_scheduler/__init__.py": "dfd129c1690f404c60185d67bf68aca0a58c813178e3583cf0aaf54ce043382a",
     "cuda_scheduler/csrc/halo_q_scheduler.cu": "5a6762287214ab1405ecb88d0ca2b501ecda7cd112fd8f7efed05205e9daaeeb",
     "cuda_scheduler/multirank_dist.py": "235c89ebc641e56514ffe863849cfc185942ceebabfce644669b7362490d794a",
-    "cuda_scheduler/runtime.py": "be7c7518c8790b057f6ccf9a23a369015fec2dd696ff1f046f4979c19ffd293b",
+    "cuda_scheduler/runtime.py": "4a919baadd106d336c2203aa35314fe48d6c8ba00606a31c7ad4cb61d3c55620",
     "geometry.py": "74de927de618beffcffa69231f10d283dcf92f86f2aaf5f0ec59b56a15dae56c",
     "integrations/__init__.py": "b50ff1b5e1bef5d171dff4c487e90477aaea02a726c921fff4c6f309e74141e4",
     "integrations/megamoe/README.md": "52f3e32789c9cba0ddc24eb1e4c01a1f7ed5e63ecc450c8c6c9787378cd3a405",
@@ -28,6 +28,26 @@
     "sami/arena.py": "a3ecaf8acf30fe35e9898b694dbf37ecd0f5d7196f264948d2bc37158037776f",
     "sami/fabric.py": "53b48fdf9c51f3dc8330f38e565f0423ae5f82c0f0423bfb7959f08198eded68",
     "sami/geometry.py": "e39195802acbe498ab647fec84f651b230290432847a092a6ba31a0236781559",
-    "sami/hierarchical.py": "6d8e4ac4365bd11dcaf4c12f2d3c53b2e9b62ead3dfb0e0e6806f9645f8b60ca"
-  }
+    "sami/hierarchical.py": "f6e0af67239a066bfe3c663d4b13c949b0679d5567279e6ad913f7fea97fbce9"
+  },
+  "source_tree_dirty_scope": "Upstream checkout used for vendoring only; downstream changes are recorded separately.",
+  "downstream_modified": true,
+  "downstream_patches": [
+    {
+      "patch": "TRTLLM_STANDARD_THOP.patch",
+      "patch_sha256": "dbe3897dd7c4f7990f88759ee6500eb99a59544fe1b95025ed999418a29c4237",
+      "files": [
+        {
+          "file": "cuda_scheduler/runtime.py",
+          "unpatched_vendored_sha256": "be7c7518c8790b057f6ccf9a23a369015fec2dd696ff1f046f4979c19ffd293b",
+          "patched_sha256": "4a919baadd106d336c2203aa35314fe48d6c8ba00606a31c7ad4cb61d3c55620"
+        },
+        {
+          "file": "sami/hierarchical.py",
+          "unpatched_vendored_sha256": "6d8e4ac4365bd11dcaf4c12f2d3c53b2e9b62ead3dfb0e0e6806f9645f8b60ca",
+          "patched_sha256": "f6e0af67239a066bfe3c663d4b13c949b0679d5567279e6ad913f7fea97fbce9"
+        }
+      ]
+    }
+  ]
 }

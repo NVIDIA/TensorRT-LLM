@@ -1592,7 +1592,7 @@ class DeepseekV4MoE(nn.Module):
 
         # Warmup bypasses rebalance, so configure this before autotuning.
         # Serving must use the same budget and tuning-cache identity.
-        shared_mxfp8_reserved_sms = 0
+        shared_fc12_reserved_sms = 0
         rebalance_backend = getattr(self.experts, "backend", self.experts)
         if (
             getattr(rebalance_backend, "_rebalance_slots_active", 0) > 0
@@ -1602,9 +1602,10 @@ class DeepseekV4MoE(nn.Module):
         ):
             from ..moe.fused_moe.mega_moe.rebalance_slot_scheduler_v2 import TMA_COPY_SM_COUNT
 
-            shared_mxfp8_reserved_sms = TMA_COPY_SM_COUNT
+            shared_fc12_reserved_sms = TMA_COPY_SM_COUNT
 
         shared_mlp_cls = GatedMLP
+        shared_mlp_kwargs = {}
         descriptor = getattr(rebalance_backend, "descriptor", None)
         if (
             descriptor is not None
@@ -1617,6 +1618,7 @@ class DeepseekV4MoE(nn.Module):
 
             # Use the same complete shared FC12 path for OFF and ON.
             shared_mlp_cls = MegaMoESharedMLP
+            shared_mlp_kwargs["fc12_reserved_sms"] = shared_fc12_reserved_sms
 
         self.shared_experts = shared_mlp_cls(
             hidden_size=hidden_size,
@@ -1628,7 +1630,7 @@ class DeepseekV4MoE(nn.Module):
             reduce_output=False,
             use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
             swiglu_limit=swiglu_limit,
-            mxfp8_reserved_sms=shared_mxfp8_reserved_sms,
+            **shared_mlp_kwargs,
         )
 
         self.allreduce = None
