@@ -3,8 +3,10 @@
 
 # Dynamic load balance: configuration and validation
 
-The MegaMoE path uses HALO-Q route planning and in-switch TMA weight copies with
-one CPU submitter, an ordinary MAIN stream, and a higher-priority COPY stream.
+The MegaMoE path uses HALO-Q route planning by default and in-switch TMA
+weight copies with one CPU submitter, an ordinary MAIN stream, and a
+higher-priority COPY stream. The same scheduler path can select GAR-N through
+legacy mode.
 
 ## Configuration
 
@@ -23,6 +25,19 @@ Use a separate per-rank `TLLM_AUTOTUNER_CACHE_PATH` for each configuration.
 
 Rebuild TensorRT-LLM's native operators: the FP4/FP8 quantizers add SM-budget overloads,
 so deploying these Python sources onto an older wheel is insufficient.
+
+The GAR-N/HALO-Q scheduler and in-switch TMA use TensorRT-LLM's standard
+native-operator path: CUDA launchers live under
+`cpp/tensorrt_llm/kernels/moe/loadBalance/dynamicEplb`, the Torch bindings live
+under `cpp/tensorrt_llm/thop/moe/loadBalance`, and both are linked into
+`libth_common.so`. The scheduler uses one `trtllm::moe_rebalance_halo_q` op:
+`CudaSchedulerConfig.algorithm="legacy"` selects GAR-N, while
+`CudaSchedulerConfig.algorithm="halo_q"` selects HALO-Q and remains the default.
+Python calls `torch.ops.trtllm` directly; the production
+path does not compile these kernels at runtime. The scheduler op has a fake
+registration for `torch.compile`. TMA keeps its stateful create/bind/submit/
+destroy lifecycle eager and submits to the current CUDA stream. The legacy TMA
+loader remains only for the diagnostic host-plan fallback.
 
 ON sets `CUDA_SCALE_LAUNCH_QUEUES=4x` before configuration validators and device
 probes, and propagates it through MPI/direct/Ray workers. OFF and zero-helper
@@ -49,9 +64,6 @@ counter memset, and the complete FC12 kernel. The memset clears 272 bytes at
 capacity 8192 and is required before every invocation; it introduces no host
 wait or global grid barrier. Token count is dynamic; an initialized count-table
 slice supplies metadata without a per-forward fill/copy or shape-specific compile.
-`TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER` continues to control separate supported dense
-GEMMs; it does not select this complete FC12 kernel's scheduler.
-
 Loaded FP8 weight values are preserved while gate/up rows and scales are
 rearranged for FC12. The fused intermediate uses FP32 FC1/activation arithmetic
 and K32 MXFP8 quantization, whereas the previous split path rounded FC1 and
@@ -60,19 +72,21 @@ therefore be validated with explicit tolerances rather than asserted bitwise.
 
 ## Execution and lifetime
 
-1. MAIN produces route IDs. COPY waits for that input event, then HALO-Q receives
-   the original contiguous CUDA int32 `[tokens, topk]` tensor via `submit(ids,
+1. MAIN produces route IDs. COPY waits for that input event, then the selected
+   scheduler (HALO-Q by default) receives the original contiguous CUDA int32
+   `[tokens, topk]` tensor via `submit(ids,
    stream_handle)`. There is no route bitwise-OR, tail fill, or staging kernel.
    `record_stream` protects allocator reuse; the producer must not overwrite IDs.
-2. COPY records plan-ready after HALO-Q and then enqueues the TMA weight copy.
+2. COPY records plan-ready after the scheduler and then enqueues the TMA
+   weight copy.
    MAIN can enqueue shared experts, quantization, and independent input staging
    before waiting for plan-ready immediately before its first route read.
 3. MegaMoE consumes physical routes and observes helper-weight READY publication.
    After enqueuing the consumer, MAIN records completion; the generation lease
    orders the next producer after consumption. Events and driver handles are reused.
 4. One submitter owns MAIN and COPY; all layers share COPY. There is no green
-   context or steady-state host wait for HALO-Q. Cold warmup-to-worker ownership
-   transfer drains bound work once and preserves stream and generation state.
+   context or steady-state host wait for the scheduler. Cold warmup-to-worker
+   ownership transfer drains bound work once and preserves stream and generation state.
 
 ON tactic tuning requires `MEGAMOE_TACTIC_AUTOTUNE=1`. Its default workload has
 equal per-rank token totals and within-rank power-law alpha 0.8, increasing by
@@ -83,8 +97,9 @@ synthetic tuning input does not replace the inference dataset.
 
 Upstream pins and file hashes are in the [scheduler manifest](tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/VENDOR_MANIFEST.json)
 and [MegaMoE manifest](tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/VENDOR_MANIFEST.json).
-The latter records the FC1 claim-exhaustion fix, TensorRT-LLM main compatibility,
-and the complete shared FC12 source. Vendor refresh replays the recorded patches
+The scheduler manifest records the TensorRT-LLM native-operator adapter. The
+MegaMoE manifest records the FC1 claim-exhaustion fix, TensorRT-LLM main
+compatibility, and the complete shared FC12 source. Vendor refresh replays the recorded patches
 and verifies each file hash, including the required Ruff 0.9.4 formatting steps.
 
 The default combine format remains main's `bf16`. Set
@@ -134,8 +149,9 @@ ordinary-stream implementation described above remains the current baseline.
 
 Keep one CPU submitter, but create two Green Context streams backed by disjoint
 SM resources: COMPUTE for quantization, shared FC1/FC2 and MegaMoE; high-priority
-COPY for HALO-Q and in-switch TMA weight-copy kernels. The target is `N-8 + 8`
-SMs, where `N` is queried from the device. `204 + 8` is the 212-SM example,
+COPY for the scheduler (HALO-Q by default) and in-switch TMA weight-copy
+kernels. The target is `N-8 + 8` SMs, where `N` is queried from the device.
+`204 + 8` is the 212-SM example,
 not a hard-coded GB200 configuration. Query the actual partitions and verify
 cluster compatibility before treating this split as supported. Ordinary stream
 priority alone does not partition SMs.

@@ -1271,11 +1271,8 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                                         or module.disable_deep_gemm))
             if uses_cute_dsl_rubin:
                 output = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
-                    activation,
-                    module.weight,
-                    activation_scale,
-                    module.weight_scale,
-                    reserved_sms=module.mxfp8_reserved_sms)
+                    activation, module.weight, activation_scale,
+                    module.weight_scale)
             elif (activation_scale.dtype == torch.int32 and is_sm_100f()
                   and not module.disable_deep_gemm):
                 output = torch.ops.trtllm.fp8_prequantized_swap_ab_gemm(
@@ -1309,19 +1306,11 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                 if _fp8_block_scales_uses_cute_dsl_sm107(module):
                     # transform_weights() re-laid weight_scale out as UE8M0
                     # K32 R128c4; quantize the activation to match.
-                    if module.mxfp8_reserved_sms:
-                        act_input_fp8, act_input_sf = \
-                            torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0.sm_budget(
-                                input, reserved_sms=module.mxfp8_reserved_sms)
-                    else:
-                        act_input_fp8, act_input_sf = \
-                            torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(input)
+                    act_input_fp8, act_input_sf = \
+                        torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(input)
                     output = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
-                        act_input_fp8,
-                        module.weight,
-                        act_input_sf,
-                        module.weight_scale,
-                        reserved_sms=module.mxfp8_reserved_sms)
+                        act_input_fp8, module.weight, act_input_sf,
+                        module.weight_scale)
                 else:
                     act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                         input)
@@ -3750,7 +3739,6 @@ class Linear(nn.Module):
         override_tp_sharding: Optional[Union[tuple[int, int],
                                              Dict[str, tuple[int,
                                                              int]]]] = None,
-        mxfp8_reserved_sms: int = 0,
     ):
         """
         Args:
@@ -3781,15 +3769,6 @@ class Linear(nn.Module):
         self.gather_output = gather_output
         self.force_dynamic_quantization = force_dynamic_quantization
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
-        if type(mxfp8_reserved_sms) is not int or mxfp8_reserved_sms < 0:
-            raise ValueError("mxfp8_reserved_sms must be a nonnegative integer")
-        self.mxfp8_reserved_sms = mxfp8_reserved_sms
-        if mxfp8_reserved_sms and not hasattr(
-                torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0, "sm_budget"):
-            raise RuntimeError(
-                "Reserved-SM shared-expert quantization requires the native "
-                "trtllm::fp8_quantize_1x128_packed_ue8m0.sm_budget overload; "
-                "rebuild the TensorRT-LLM native operators.")
         self.use_cute_dsl_nvfp4_swiglu_blackwell = \
             use_cute_dsl_nvfp4_swiglu_blackwell
         self.disable_deep_gemm = disable_deep_gemm

@@ -33,7 +33,7 @@ def copy_source(source: Path, target: Path, *, header: bool) -> None:
         target.write_bytes(content)
 
 
-def _read_downstream_patches(target: Path, source: Path) -> list[dict]:
+def _read_downstream_patches(target: Path, source: Path, *, header: bool) -> list[dict]:
     manifest = json.loads((target / "VENDOR_MANIFEST.json").read_text())
     patches = manifest.get("downstream_patches", [])
     for patch in patches:
@@ -41,7 +41,7 @@ def _read_downstream_patches(target: Path, source: Path) -> list[dict]:
         if hashlib.sha256(patch_path.read_bytes()).hexdigest() != patch["patch_sha256"]:
             raise RuntimeError(f"Downstream patch digest mismatch: {patch_path}")
         for file in patch.get("files", [patch]):
-            content = _source_bytes(source / file["file"], header=True)
+            content = _source_bytes(source / file["file"], header=header)
             if hashlib.sha256(content).hexdigest() != file["unpatched_vendored_sha256"]:
                 raise RuntimeError(
                     f"Upstream source changed for {file['file']}; reconcile the downstream patch "
@@ -82,7 +82,8 @@ def main() -> None:
     scheduler_dst = target_root / "megamoe_scheduler_v2"
     mega_src = args.megamoe / "next/sources"
     mega_dst = target_root / "cutedsl_megamoe"
-    patches = _read_downstream_patches(mega_dst, mega_src)
+    scheduler_patches = _read_downstream_patches(scheduler_dst, scheduler_src, header=False)
+    mega_patches = _read_downstream_patches(mega_dst, mega_src, header=True)
     scheduler_files = []
     for source in sorted(scheduler_src.rglob("*")):
         if not source.is_file() or "__pycache__" in source.parts:
@@ -90,6 +91,8 @@ def main() -> None:
         rel = source.relative_to(scheduler_src)
         copy_source(source, scheduler_dst / rel, header=False)
         scheduler_files.append(str(rel))
+
+    _apply_downstream_patches(root, scheduler_dst, scheduler_patches)
 
     pending = [
         path.relative_to(mega_dst) for path in mega_dst.rglob("*.py") if path.name != "__init__.py"
@@ -127,7 +130,7 @@ def main() -> None:
                     continue
                 pending.append(candidate)
 
-    _apply_downstream_patches(root, mega_dst, patches)
+    _apply_downstream_patches(root, mega_dst, mega_patches)
     for repo, target, files, kind, upstream in (
         (
             args.scheduler,
@@ -158,7 +161,8 @@ def main() -> None:
                 name: hashlib.sha256((target / name).read_bytes()).hexdigest() for name in files
             },
         }
-        if target == mega_dst and patches:
+        patches = scheduler_patches if target == scheduler_dst else mega_patches
+        if patches:
             record.update(
                 source_tree_dirty_scope=(
                     "Upstream checkout used for vendoring only; downstream changes are recorded separately."
@@ -167,7 +171,7 @@ def main() -> None:
                 downstream_patches=patches,
             )
         (target / "VENDOR_MANIFEST.json").write_text(json.dumps(record, indent=2) + "\n")
-        downstream = "downstream_modified: true\n" if target == mega_dst and patches else ""
+        downstream = "downstream_modified: true\n" if patches else ""
         (target / "VENDOR_STAMP").write_text(
             f"upstream: {upstream}\ncommit: {record['commit']}\n"
             f"source_tree_dirty: {str(source_dirty).lower()}\nkind: {kind}\n"

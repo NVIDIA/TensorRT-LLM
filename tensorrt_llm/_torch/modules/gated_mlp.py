@@ -40,7 +40,6 @@ class GatedMLP(nn.Module):
         swiglu_limit: Optional[float] = None,
         swiglu_alpha: Optional[float] = None,
         swiglu_beta: Optional[float] = None,
-        mxfp8_reserved_sms: int = 0,
     ):
 
         super().__init__()
@@ -122,7 +121,6 @@ class GatedMLP(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
             use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
-            mxfp8_reserved_sms=mxfp8_reserved_sms,
             # The fused CuteDSL NVFP4 SwiGLU epilogue applies no clamp, so a
             # layer carrying a real ``swiglu_limit`` must stay on the Triton
             # kernel. ``_is_plain_swiglu`` deliberately covers only alpha/beta;
@@ -164,7 +162,6 @@ class GatedMLP(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
             use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
-            mxfp8_reserved_sms=mxfp8_reserved_sms,
             use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
             disable_deep_gemm=disable_deep_gemm,
             use_custom_cublas_mm=use_custom_cublas_mm,

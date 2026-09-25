@@ -16,6 +16,38 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
 def _register_fake():
 
+    @torch.library.register_fake("trtllm::moe_rebalance_halo_q")
+    def _(
+        routes: torch.Tensor,
+        out_slots: torch.Tensor,
+        out_ids: torch.Tensor,
+        out_levels: torch.Tensor,
+        out_owners: torch.Tensor,
+        peer_bases: torch.Tensor,
+        status: torch.Tensor,
+        partial: torch.Tensor,
+        route_aux: torch.Tensor,
+        grid_sync: torch.Tensor,
+        plan_workspace: torch.Tensor,
+        route_prefix: torch.Tensor,
+        plan_channel_ptr: int,
+        ep: int,
+        experts: int,
+        helpers: int,
+        local_rank: int,
+        route_capacity: int,
+        ctas: int,
+        threads: int,
+        algorithm: int,
+        enable_pdl: bool,
+        spin_cycles: int,
+        plan_abi_version: int,
+        plan_channel_words: int,
+        route_features: int,
+        valid_route_count: int,
+    ) -> None:
+        return None
+
     @torch.library.register_fake("trtllm::allreduce")
     def allreduce(
         input: torch.Tensor,

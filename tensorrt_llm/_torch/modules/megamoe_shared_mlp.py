@@ -88,7 +88,7 @@ class MegaMoESharedMLP(GatedMLP):
         swiglu_limit: float | None = None,
         swiglu_alpha: float | None = None,
         swiglu_beta: float | None = None,
-        mxfp8_reserved_sms: int = 0,
+        fc12_reserved_sms: int = 0,
     ):
         if bias or activation is not F.silu:
             raise ValueError("Shared FC12 requires bias=False and SwiGLU activation")
@@ -100,6 +100,8 @@ class MegaMoESharedMLP(GatedMLP):
             raise ValueError("Shared FC12 requires BF16 activations")
         if reduce_output or use_custom_cublas_mm:
             raise ValueError("Shared FC12 requires local output and the CuTe DSL backend")
+        if type(fc12_reserved_sms) is not int or fc12_reserved_sms < 0:
+            raise ValueError("Shared FC12 reserved-SM budget must be a non-negative integer")
         config = config or ModelConfig()
         if config.use_cuda_graph:
             raise ValueError("Shared FC12 currently requires eager execution")
@@ -121,9 +123,9 @@ class MegaMoESharedMLP(GatedMLP):
             swiglu_limit=swiglu_limit,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
-            mxfp8_reserved_sms=mxfp8_reserved_sms,
         )
         self._validate_fp8_quantization()
+        self._fc12_reserved_sms = fc12_reserved_sms
         self._fc12_max_tokens = int(config.max_num_tokens)
         if self._fc12_max_tokens <= 0:
             raise ValueError("Shared FC12 max_num_tokens must be positive")
@@ -142,13 +144,6 @@ class MegaMoESharedMLP(GatedMLP):
                 raise ValueError("Shared FC12 requires FP8_BLOCK_SCALES for both projections")
 
     @property
-    def mxfp8_reserved_sms(self) -> int:
-        reserved = self.gate_up_proj.mxfp8_reserved_sms
-        if type(reserved) is not int or reserved != self.down_proj.mxfp8_reserved_sms:
-            raise ValueError("Shared FC12 projections must use the same integer reserved-SM budget")
-        return reserved
-
-    @property
     def sm_count(self) -> int:
         if not self.gate_up_proj._weights_created:
             raise RuntimeError("Shared FC12 SM count requires materialized CUDA weights")
@@ -156,7 +151,7 @@ class MegaMoESharedMLP(GatedMLP):
         if device.type != "cuda":
             raise RuntimeError("Shared FC12 SM count requires CUDA weights")
         total_sms = torch.cuda.get_device_properties(device).multi_processor_count
-        reserved = self.mxfp8_reserved_sms
+        reserved = self._fc12_reserved_sms
         if not 0 <= reserved < total_sms:
             raise ValueError("Shared FC12 reserved-SM budget must leave at least one SM")
         return total_sms - reserved

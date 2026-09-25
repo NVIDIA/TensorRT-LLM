@@ -110,7 +110,7 @@ from ..impl_contract import (
     MoERunContext,
     MoEStaticCapability,
 )
-from ..impl_environment import MoEDep, MoEEnvFlag, env_flag_is_on
+from ..impl_environment import MoEDep
 from ..impl_identity import MoEImplDescriptor, MoEImplId, register_moe_impl
 from ..interface import MoESchedulerKind, MoEWeightLoadingMode, _reject
 from ..quantization import NVFP4MegaMoECuteDslMethod
@@ -431,7 +431,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # Static and dynamic EPLB both work: see ``_supports_load_balancer``
         # below for why the MegaMoE-format derived parameters migrate
         # atomically.
-        capabilities=MoEStaticCapability(supports_eplb=True, supports_prefill_rebalance=True),
+        capabilities=MoEStaticCapability(supports_eplb=True),
         doc="MegaMoE CuteDSL fused NVFP4 kernels: NVFP4 weights and activations, SM100/103/107.",
     )
 
@@ -674,7 +674,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # Resolve helper capacity once; create_weights and routing share this value.
         self._rebalance_config = getattr(model_config, "moe_rebalance", None)
         # The config and disable override must agree on every EP rank.
-        _rebalance_env_disabled = env_flag_is_on(MoEEnvFlag.MOE_REBALANCE_DISABLE.value)
+        _rebalance_env_disabled = os.environ.get(
+            "TRTLLM_MOE_REBALANCE_DISABLE", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
         _rebalance_requested = (
             self._rebalance_config is not None
             and bool(getattr(self._rebalance_config, "enabled", False))
@@ -683,7 +685,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             # receive pool to allocate and M == H anyway.
             and int(getattr(self._rebalance_config, "helper_slots_per_rank", 0)) > 0
             and not _rebalance_env_disabled
-            and bool(self.capabilities.supports_prefill_rebalance)
         )
         # S controls the weight axis, symmetric workspace, and compiled helper gate.
         self._rebalance_autotune_helpers_initialized = False

@@ -65,7 +65,6 @@ __all__ = [
     "create_moe_scheduler",
 ]
 
-
 if TYPE_CHECKING:
     from .configurable_moe import ConfigurableMoE
 
@@ -905,144 +904,6 @@ class ExternalCommMoEScheduler(MoEScheduler):
         )
 
 
-# Single-main-thread protocol:
-#   COPY: HALO-Q -> route event -> TMA copy
-#   MAIN: shared experts -> independent input work -> route wait -> MegaMoE
-#   COPY: wait for the consumer before the next producer generation
-#
-# The one-shot hook must enqueue current-stream work consistently across EP
-# ranks. Clear it before invocation; failures must leave the generation unpaired.
-_PLAN_GAP_HOOK_ATTR = "_rebalance_plan_gap_hook"
-
-
-def _maybe_apply_external_rebalance_scheduler(
-    moe: "ConfigurableMoE",
-    token_selected_slots: Optional[torch.Tensor],
-) -> Optional[torch.Tensor]:
-    """Return physical slot IDs when helper slots are enabled.
-
-    The disabled path returns the input unchanged. Enabled routing uses
-    physical IDs dst_rank * (H + S) + local_slot and preserves -1 padding.
-    The scheduler group produces both routes and the matching weight-copy
-    READY generation; it must already exist on every EP rank. EPLB cannot
-    also remap these IDs.
-
-    A one-shot shared-expert hook runs after HALO-Q/TMA submission. MAIN waits
-    for route completion only at the first route consumer.
-    """
-    # Closed path: two attribute reads, one type check, one integer compare.
-    # Keep it that way -- this runs once per MoE layer per chunk per step.
-    backend = getattr(moe, "backend", None)
-    helper_slots = getattr(backend, "_rebalance_slots_active", 0)
-    # Only a positive integer enables rebalance; avoid coercing unrelated backends.
-    if type(helper_slots) is not int or helper_slots <= 0:
-        return token_selected_slots
-
-    # The same scheduler plan supplies routes and the helper-weight copy mapping.
-    rebalance_config = getattr(moe, "_rebalance_config", None)
-    if rebalance_config is None:
-        rebalance_config = getattr(backend, "_rebalance_config", None)
-    if getattr(moe, "layer_load_balancer", None) is not None:
-        # EPLB already maps logical experts to its own slot IDs; the two remaps conflict.
-        raise RuntimeError(
-            "MoE rebalance helper slots and EPLB cannot both remap the "
-            "routing tensor: layer_load_balancer is not None while S="
-            f"{helper_slots} > 0 (layer_idx={getattr(moe, 'layer_idx', None)})."
-        )
-
-    # The collective producer is built after weights load, through either backend
-    # post_load_weights or ConfigurableMoE cache_derived_state.
-    group = getattr(backend, "_rebalance_scheduler_group", None)
-    if group is not None:
-        # Bypass must be identical across EP ranks and still widen resident slot IDs.
-        if not backend.is_rebalance_active():
-            # The widened slot axis requires the original resident-expert count.
-            bypass_home = getattr(backend, "_rebalance_home_experts", None)
-            if type(bypass_home) is not int or bypass_home <= 0:
-                raise RuntimeError(
-                    "MoE rebalance bypass requires a positive resident expert count; "
-                    f"got {bypass_home!r}. The weight axis is already H + S."
-                )
-            # Pair the bypass with a skipped consumer finish.
-            backend._rebalance_plan_ran = False
-            return _resident_slot_ids(
-                token_selected_slots,
-                home_experts=bypass_home,
-                helper_slots=int(helper_slots),
-            )
-        backend._rebalance_plan_ran = True
-        # Consume the shared-expert hook once; reject conflicting installations.
-        gap_hook = getattr(moe, _PLAN_GAP_HOOK_ATTR, None)
-        gap_hook_owner = moe
-        backend_gap_hook = getattr(backend, _PLAN_GAP_HOOK_ATTR, None)
-        if backend_gap_hook is not None:
-            if gap_hook is not None:
-                raise RuntimeError(
-                    "MoE rebalance found shared-expert hooks on both wrapper and backend "
-                    f"at layer {getattr(moe, 'layer_idx', None)}; install only one."
-                )
-            gap_hook, gap_hook_owner = backend_gap_hook, backend
-        if gap_hook is None:
-            physical_slot_ids, generation = group.plan(token_selected_slots, defer_wait=True)
-        else:
-            part = group.plan_schedule(token_selected_slots)
-            # Clear before invocation so a failure cannot leak the hook into another chunk.
-            setattr(gap_hook_owner, _PLAN_GAP_HOOK_ATTR, None)
-            try:
-                gap_hook()
-            except BaseException as exc:  # noqa: BLE001 - annotate and re-raise unchanged
-                # Preserve the original exception and do not finish an unconsumed generation.
-                # Assign notes directly for Python 3.10 compatibility.
-                _notes = getattr(exc, "__notes__", None)
-                if type(_notes) is not list:
-                    _notes = []
-                    exc.__notes__ = _notes
-                _notes.append(
-                    "Shared-expert hook failed after HALO-Q/TMA enqueue; "
-                    "the unpaired rebalance generation cannot be reused."
-                )
-                raise
-            physical_slot_ids, generation = group.plan_finish(part, defer_wait=True)
-        # The gate's generation is an INPUT to the launch, published here by
-        # the same call that performed the transport, so producer and
-        # consumer cannot disagree about which generation is live.
-        backend._rebalance_generation = int(generation)
-        return physical_slot_ids
-
-    # No production producer. The slot axis is already widened to
-    # M = H + S, so logical ids in [0, E) would address the wrong rows;
-    # fail loud instead of silently returning them unremapped.
-    raise RuntimeError(
-        f"MoE rebalance helper slots are live (S={helper_slots}, "
-        f"layer_idx={getattr(moe, 'layer_idx', None)}, "
-        f"config={rebalance_config!r}) but "
-        f"backend._rebalance_scheduler_group is absent. It is built by "
-        f"MegaMoECuteDsl._build_rebalance_scheduler_group, which runs "
-        f"from post_load_weights and from cache_derived_state. Set "
-        f"TRTLLM_MOE_REBALANCE_DISABLE=1 to run without helper slots."
-    )
-
-
-def _resident_slot_ids(
-    token_selected_slots: torch.Tensor,
-    *,
-    home_experts: int,
-    helper_slots: int,
-) -> torch.Tensor:
-    """Map logical IDs to resident physical slots without moving experts.
-
-    Even the bypass path must widen owner * H + local to owner * (H + S)
-    + local. Preserve -1 padding exactly, including for empty route tensors.
-    """
-    ids = token_selected_slots
-    slot_count = home_experts + helper_slots
-    logical = ids.long()
-    owner = torch.div(logical, home_experts, rounding_mode="floor")
-    physical = owner * slot_count + (logical - owner * home_experts)
-    physical = torch.where(logical < 0, logical, physical)
-    return physical.to(ids.dtype)
-
-
 # ============================================================================
 # Fused-comm scheduler (MegaMoE-style)
 # ============================================================================
@@ -1390,9 +1251,10 @@ class FusedCommMoEScheduler(MoEScheduler):
             moe.num_slots, token_selected_slots
         )
 
-        # Remap after statistics and calibrator replay, which operate on logical IDs.
-        # Independent quantization may proceed before the backend waits for these routes.
-        token_selected_slots = _maybe_apply_external_rebalance_scheduler(moe, token_selected_slots)
+        if getattr(moe.backend, "_rebalance_slots_active", 0):
+            from .mega_moe.rebalance_slot_scheduler_v2 import apply_rebalance_scheduler
+
+            token_selected_slots = apply_rebalance_scheduler(moe, token_selected_slots)
 
         # ----- quantize / prepare -----
         if getattr(moe.backend, "supports_fused_prepare", lambda: False)():
@@ -1415,8 +1277,12 @@ class FusedCommMoEScheduler(MoEScheduler):
         if set_adaptive is not None:
             set_adaptive(max(all_rank_num_tokens) if all_rank_num_tokens else None)
 
-        # Routes address the backend's H + S physical axis when rebalance is enabled.
-        # The fused kernel owns EP communication and needs no external comm plan.
+        # ----- MoE compute -----
+        # ``token_selected_slots`` is in [0, num_slots), matching the kernel's
+        # ``num_experts`` template parameter (SymmBuffer / weights sized to
+        # num_slots in quantization.py).
+        # Fused-comm backends own the EP exchange, so there is no comm plan:
+        # nothing outside the fused kernel decided anything about this forward.
         out = moe.backend.run_moe(
             MoERunContext(
                 token_selected_experts=token_selected_slots,

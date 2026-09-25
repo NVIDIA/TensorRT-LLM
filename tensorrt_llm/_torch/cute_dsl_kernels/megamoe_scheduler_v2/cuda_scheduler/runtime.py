@@ -1,4 +1,4 @@
-"""Host runtime for the pure-CUDA HALO-Q scheduler."""
+"""Host runtime for the pure-CUDA GAR-N and HALO-Q schedulers."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import threading
 
 import torch
 
-from ..native import load_scheduler_native
 from ..geometry import MAX_EP, MIN_EP, hierarchy_group_sizes
 
 
@@ -170,11 +169,8 @@ class CudaSchedulerConfig:
             raise ValueError("the pure-CUDA scheduler currently requires threads=512")
         if not 1 <= self.ctas <= MAX_CTAS:
             raise ValueError(f"ctas must be in [1,{MAX_CTAS}]")
-        if self.algorithm != "halo_q":
-            # legacy existed only to match v1's placement for A/B purposes; v1 is
-            # gone, so selecting it now would be silently choosing an unexercised
-            # path. Reject rather than ignore.
-            raise ValueError("algorithm must be 'halo_q' (legacy was removed)")
+        if self.algorithm not in ("legacy", "halo_q"):
+            raise ValueError("algorithm must be 'legacy' or 'halo_q'")
         if type(self.enable_pdl) is not bool:
             raise ValueError("enable_pdl must be bool")
 
@@ -246,7 +242,6 @@ class CudaPhysicalSlotScheduler:
         # Everything the kernel takes between `routes` and `stream` is fixed for
         # the endpoint's lifetime.  Cache it so a submission does not rebuild 13
         # data_ptr() calls and ~11 config lookups every generation.
-        self._static_launch_args: tuple[int, ...] | None = None
         self.partial = torch.zeros(
             config.ctas * config.logical_expert_count,
             dtype=torch.int32,
@@ -295,9 +290,6 @@ class CudaPhysicalSlotScheduler:
             device=scheduler_device,
         )
         self._connected = config.ep_size == 1
-        self._native = load_scheduler_native()
-        if int(self._native.MAX_BROADCASTS) != self.max_broadcasts:
-            raise RuntimeError("pure-CUDA scheduler plan ABI mismatch")
         self._plan_channel_lock = threading.Lock()
         self._plan_channel_ptr = 0
         self._plan_channel_abi_version = 0
@@ -387,7 +379,6 @@ class CudaPhysicalSlotScheduler:
             self._plan_channel_abi_version = abi_version
             self._plan_channel_words = words
             self._plan_channel_route_features = route_features
-            self._static_launch_args = None
             self._plan_channel_stream_handle = handle
             self._plan_channel_bound = True
 
@@ -410,7 +401,6 @@ class CudaPhysicalSlotScheduler:
             self._plan_channel_abi_version = 0
             self._plan_channel_words = 0
             self._plan_channel_route_features = 0
-            self._static_launch_args = None
             self._plan_channel_stream_handle = handle
             self._plan_channel_bound = True
             self._gpu_direct_bound = True
@@ -448,45 +438,55 @@ class CudaPhysicalSlotScheduler:
                     "CUDA scheduler uses one static stream because its workspace "
                     "and reset-free generations are shared"
                 )
-            if self._static_launch_args is None:
-                self._static_launch_args = self._build_static_launch_args()
-            with torch.cuda.device(self.device):
-                self._native.launch(
-                    int(self.logical_expert_ids.data_ptr()),
-                    *self._static_launch_args,
-                    int(handle),
-                    SPIN_CYCLES,
-                    self._plan_channel_abi_version,
-                    self._plan_channel_words,
-                    self._plan_channel_route_features,
-                )
+            self._launch_op(
+                self.logical_expert_ids,
+                int(handle),
+                valid_route_count=self.cfg.route_count,
+            )
             if self._plan_channel_bound:
                 self._plan_channel_pending = True
         return self.outputs
 
-    def _build_static_launch_args(self) -> tuple[int, ...]:
-        return (
-            int(self.outputs.physical_slot_ids.data_ptr()),
-            int(self.outputs.hot_expert_ids.data_ptr()),
-            int(self.outputs.hot_expert_group_level.data_ptr()),
-            int(self.outputs.hot_expert_source_ranks.data_ptr()),
-            int(self.peer_base.data_ptr()),
-            int(self.status.data_ptr()),
-            int(self.partial.data_ptr()),
-            int(self.route_aux.data_ptr()),
-            int(self.grid_sync.data_ptr()),
-            int(self.plan_workspace.data_ptr()),
-            int(self.route_prefix.data_ptr()),
-            int(self._plan_channel_ptr),
-            self.cfg.ep_size,
-            self.cfg.logical_expert_count,
-            self.cfg.extra_slots_per_rank,
-            self.cfg.local_rank,
-            self.cfg.route_count,
-            self.cfg.ctas,
-            self.cfg.threads,
-            int(self.cfg.enable_pdl),
-        )
+    def _launch_op(
+        self,
+        routes: torch.Tensor,
+        stream_handle: int,
+        *,
+        valid_route_count: int,
+    ) -> None:
+        stream = self._plan_channel_torch_stream
+        if stream is None or _stream_handle(stream) != stream_handle:
+            stream = torch.cuda.ExternalStream(stream_handle, device=self.device)
+        with torch.cuda.device(self.device), torch.cuda.stream(stream):
+            torch.ops.trtllm.moe_rebalance_halo_q(
+                routes,
+                self.outputs.physical_slot_ids,
+                self.outputs.hot_expert_ids,
+                self.outputs.hot_expert_group_level,
+                self.outputs.hot_expert_source_ranks,
+                self.peer_base,
+                self.status,
+                self.partial,
+                self.route_aux,
+                self.grid_sync,
+                self.plan_workspace,
+                self.route_prefix,
+                self._plan_channel_ptr,
+                self.cfg.ep_size,
+                self.cfg.logical_expert_count,
+                self.cfg.extra_slots_per_rank,
+                self.cfg.local_rank,
+                self.cfg.route_count,
+                self.cfg.ctas,
+                self.cfg.threads,
+                0 if self.cfg.algorithm == "legacy" else 1,
+                self.cfg.enable_pdl,
+                SPIN_CYCLES,
+                self._plan_channel_abi_version,
+                self._plan_channel_words,
+                self._plan_channel_route_features,
+                valid_route_count,
+            )
 
     def submit(
         self, routes: torch.Tensor, stream_handle: int, *,
@@ -543,17 +543,10 @@ class CudaPhysicalSlotScheduler:
             valid_tokens = routes.shape[0]
         if type(valid_tokens) is not int or not 0 <= valid_tokens <= routes.shape[0]:
             raise ValueError("valid_tokens must be an int in [0,T]")
-        if self._static_launch_args is None:
-            self._static_launch_args = self._build_static_launch_args()
-        self._native.launch(
-            routes.data_ptr(),
-            *self._static_launch_args,
+        self._launch_op(
+            routes,
             stream_handle,
-            SPIN_CYCLES,
-            self._plan_channel_abi_version,
-            self._plan_channel_words,
-            self._plan_channel_route_features,
-            valid_tokens * self.cfg.topk,
+            valid_route_count=valid_tokens * self.cfg.topk,
         )
 
     def run(

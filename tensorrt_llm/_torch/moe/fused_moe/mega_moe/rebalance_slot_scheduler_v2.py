@@ -425,3 +425,145 @@ def build_rebalance_slot_scheduler_group_v2(backend: Any) -> RebalanceSlotSchedu
         # Reuse: COPY waits for the consumer event, then the next HALO-Q EP exchange.
         ep_process_group=getattr(backend, "_ep_pg", None),
     )
+
+
+_PLAN_GAP_HOOK_ATTR = "_rebalance_plan_gap_hook"
+
+
+def _resident_slot_ids(
+    token_selected_slots: torch.Tensor,
+    *,
+    home_experts: int,
+    helper_slots: int,
+) -> torch.Tensor:
+    """Map logical IDs to the widened resident slots while preserving padding."""
+    ids = token_selected_slots
+    slot_count = home_experts + helper_slots
+    logical = ids.long()
+    owner = torch.div(logical, home_experts, rounding_mode="floor")
+    physical = owner * slot_count + (logical - owner * home_experts)
+    return torch.where(logical < 0, logical, physical).to(ids.dtype)
+
+
+def apply_rebalance_scheduler(
+    moe: Any,
+    token_selected_slots: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Produce physical routes and enqueue the matching helper-weight copy."""
+    backend = getattr(moe, "backend", None)
+    helper_slots = getattr(backend, "_rebalance_slots_active", 0)
+    if type(helper_slots) is not int or helper_slots <= 0:
+        return token_selected_slots
+    if getattr(moe, "layer_load_balancer", None) is not None:
+        raise RuntimeError(
+            "MoE rebalance helper slots and EPLB cannot both remap the "
+            "routing tensor: layer_load_balancer is not None while S="
+            f"{helper_slots} > 0 (layer_idx={getattr(moe, 'layer_idx', None)})."
+        )
+
+    group = getattr(backend, "_rebalance_scheduler_group", None)
+    if group is None:
+        raise RuntimeError(
+            f"MoE rebalance helper slots are live (S={helper_slots}, "
+            f"layer_idx={getattr(moe, 'layer_idx', None)}) but the scheduler "
+            "group is absent. Set TRTLLM_MOE_REBALANCE_DISABLE=1 to run "
+            "without helper slots."
+        )
+    if not backend.is_rebalance_active():
+        home_experts = getattr(backend, "_rebalance_home_experts", None)
+        if type(home_experts) is not int or home_experts <= 0:
+            raise RuntimeError(
+                "MoE rebalance bypass requires a positive resident expert count; "
+                f"got {home_experts!r}."
+            )
+        backend._rebalance_plan_ran = False
+        return _resident_slot_ids(
+            token_selected_slots,
+            home_experts=home_experts,
+            helper_slots=helper_slots,
+        )
+
+    backend._rebalance_plan_ran = True
+    gap_hook = getattr(moe, _PLAN_GAP_HOOK_ATTR, None)
+    gap_hook_owner = moe
+    backend_gap_hook = getattr(backend, _PLAN_GAP_HOOK_ATTR, None)
+    if backend_gap_hook is not None:
+        if gap_hook is not None:
+            raise RuntimeError(
+                "MoE rebalance found shared-expert hooks on both wrapper and backend"
+            )
+        gap_hook, gap_hook_owner = backend_gap_hook, backend
+    if gap_hook is None:
+        physical_slot_ids, generation = group.plan(
+            token_selected_slots, defer_wait=True
+        )
+    else:
+        part = group.plan_schedule(token_selected_slots)
+        setattr(gap_hook_owner, _PLAN_GAP_HOOK_ATTR, None)
+        try:
+            gap_hook()
+        except BaseException as error:  # noqa: BLE001
+            notes = getattr(error, "__notes__", None)
+            if type(notes) is not list:
+                notes = []
+                error.__notes__ = notes
+            notes.append(
+                "Shared-expert hook failed after HALO-Q/TMA enqueue; "
+                "the unpaired rebalance generation cannot be reused."
+            )
+            raise
+        physical_slot_ids, generation = group.plan_finish(part, defer_wait=True)
+    backend._rebalance_generation = int(generation)
+    return physical_slot_ids
+
+
+def bind_live_weight_planes(quant_method: Any, module: Any) -> None:
+    """Alias MegaMoE's seven live parameters onto its rebalance arena."""
+    arena = getattr(module, "_rebalance_arena", None)
+    if arena is None:
+        return
+    from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler_v2.integrations.megamoe.direct_live_weight_bridge import \
+        CANONICAL_WEIGHT_PLANE_NAMES
+
+    if tuple(arena.plane_names) != CANONICAL_WEIGHT_PLANE_NAMES:
+        raise RuntimeError("MoE rebalance arena plane order is not canonical")
+    rebound = False
+    for name, arena_view, alias in zip(
+        arena.plane_names, arena.local_plane_views, arena.tekit_alias_views
+    ):
+        old = getattr(module, name, None)
+        if old is None:
+            raise RuntimeError(
+                f"MoE rebalance live weight plane {name!r} was not registered"
+            )
+        if (
+            tuple(alias.shape) != tuple(old.shape)
+            or tuple(alias.stride()) != tuple(old.stride())
+            or alias.dtype != old.dtype
+        ):
+            raise RuntimeError(
+                f"MoE rebalance arena alias for {name!r} has an incompatible layout"
+            )
+        if not alias.is_cuda or int(alias.data_ptr()) != int(arena_view.data_ptr()):
+            raise RuntimeError(
+                f"MoE rebalance arena alias for {name!r} is not its allocator view"
+            )
+        if old.is_meta:
+            setattr(
+                module,
+                name,
+                torch.nn.Parameter(alias, requires_grad=old.requires_grad),
+            )
+            rebound = True
+        else:
+            try:
+                old.data = alias
+            except RuntimeError as error:
+                raise RuntimeError(
+                    f"MoE rebalance failed to bind live plane {name!r}: {error}"
+                ) from error
+    if rebound:
+        quant_method.setup_quant_scales(module)
+    norm_const = getattr(module, "fc1_norm_const", None)
+    if norm_const is not None and arena.home_experts < norm_const.data.shape[0]:
+        norm_const.data[int(arena.home_experts) :].fill_(1.0)
