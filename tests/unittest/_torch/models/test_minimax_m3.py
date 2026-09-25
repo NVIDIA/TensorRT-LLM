@@ -458,7 +458,7 @@ def test_piecewise_attention_boundary_runs_horizontal_producer(monkeypatch) -> N
 
     assert layer.producer_shapes == ((2, 5), (1, 2), 2)
     torch.testing.assert_close(output[:2], packed[:2, :3])
-    torch.testing.assert_close(output[2:], torch.full((2, 3), -1.0))
+    torch.testing.assert_close(output[2:], torch.zeros((2, 3)))
 
 
 @pytest.mark.cpu_only
