@@ -16,6 +16,10 @@ CODEX_DEFAULT_MODEL = os.environ.get("CODEX_DEFAULT_MODEL", "gpt-6-astra")
 class BackendConfig:
     kind: BackendKind
     model: str
+    # Provider reasoning tier. ``None`` retains the backend's historical
+    # maximum-effort default.
+    reasoning_effort: str | None = None
+    disabled_skills: tuple[str, ...] = ()
     tools: list[Any] | None = None
     # Native SDK hook configuration. Claude accepts HookMatcher callbacks.
     # Codex requires hooks to be configured and trusted in its native config;

@@ -446,11 +446,19 @@ def _sdk_tools(tools: list) -> list[SdkMcpTool]:
 
 
 class ClaudeCodeBackend(Backend):
+    def __init__(
+        self,
+        reasoning_effort: str | None = None,
+        disabled_skills: tuple[str, ...] = (),
+    ) -> None:
+        self._reasoning_effort = reasoning_effort or _REASONING_EFFORT
+        self._disabled_skills = disabled_skills
+
     def version(self) -> str:
         return _claude_backend_version()
 
     def reasoning_effort(self) -> str:
-        return _REASONING_EFFORT
+        return self._reasoning_effort
 
     @asynccontextmanager
     async def create_client(
@@ -490,12 +498,15 @@ class ClaudeCodeBackend(Backend):
             ),
             mcp_servers=mcp_servers,
             model=model,
-            effort=_REASONING_EFFORT,
+            effort=self._reasoning_effort,
             cwd=cwd or Path.cwd(),
             sandbox={"enabled": False},
             permission_mode="bypassPermissions",
             hooks=hooks,
-            disallowed_tools=list(disallowed_tools or []),
+            disallowed_tools=[
+                *(disallowed_tools or []),
+                *(f"Skill({name})" for name in self._disabled_skills),
+            ],
         )
 
         async with ClaudeSDKClient(options=options) as sdk_client:

@@ -567,6 +567,89 @@ def test_git_stays_local_when_slurm_is_remote(tmp_path, fake_git):
     assert fake_git.count("create_branch") == 1
 
 
+def test_resume_routes_agents_from_checkpointed_task_and_ignores_new_task(tmp_path, fake_git):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    checkpointed = {
+        "checkpoint_path": "/checkpoint",
+        "trtllm_repo_path": "/repo",
+        "agents": {
+            "defaults": {
+                "backend": "codex",
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "medium",
+            },
+            "roles": {
+                "projector": {"model": "gpt-6-astra", "reasoning_effort": "ultra"},
+                "analyzer": {"model": "gpt-6-astra", "reasoning_effort": "ultra"},
+            },
+        },
+    }
+    (ws / "task.yaml").write_text(yaml.safe_dump(checkpointed), encoding="utf-8")
+    state_module.save_state(
+        ws / state_module.STATE_FILENAME,
+        state_module.WorkflowState(
+            task_path=str(ws / "task.yaml"), stage=state_module.STAGE_BENCHMARKER
+        ),
+    )
+    new_task = _write_task(
+        tmp_path,
+        {"agents": {"defaults": {"backend": "claude-code", "model": "changed"}}},
+    )
+    workflow = Workflow(workspace=ws)
+
+    class StopAfterRouting(RuntimeError):
+        pass
+
+    workflow._ensure_optimization_branch = lambda *_: (_ for _ in ()).throw(StopAfterRouting())
+    try:
+        with pytest.raises(StopAfterRouting):
+            workflow.run(str(new_task))
+        assert workflow.projector.config.backend.model == "gpt-6-astra"
+        assert workflow.projector.config.backend.reasoning_effort == "ultra"
+        assert workflow.analyzer.config.backend.model == "gpt-6-astra"
+        assert workflow.reporter.config.backend.model == "gpt-5.6-sol"
+        before = workflow.optimizer.config.backend
+        workflow.optimizer.reset_session()
+        assert workflow.optimizer.config.backend == before
+    finally:
+        workflow.close()
+
+
+def test_casebook_disable_reaches_every_backend(tmp_path):
+    workflow = Workflow(workspace=tmp_path / "ws")
+    workflow.task_path.write_text("casebook: {enabled: false}\n", encoding="utf-8")
+    try:
+        workflow._configure_agents()
+        for role in _AGENT_ROLES:
+            assert getattr(workflow, role).config.backend.disabled_skills
+    finally:
+        workflow.close()
+
+
+def test_completed_resume_constructs_no_agents_and_close_is_safe(tmp_path, monkeypatch):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "task.yaml").write_text("agents: {defaults: {backend: codex}}\n", encoding="utf-8")
+    state_module.save_state(
+        ws / state_module.STATE_FILENAME,
+        state_module.WorkflowState(
+            task_path=str(ws / "task.yaml"),
+            stage=state_module.STAGE_REPORTER,
+            done=True,
+        ),
+    )
+    monkeypatch.setattr(
+        workflow_module,
+        "_make_agent",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("agent constructed")),
+    )
+    workflow = Workflow(workspace=ws)
+    workflow.run(str(tmp_path / "ignored.yaml"))
+    workflow.close()
+    assert all(getattr(workflow, role) is None for role in _ROLES)
+
+
 def test_resume_parked_at_projector_with_block_runs_it(tmp_path, fake_git):
     """A checkpoint parked at the projector resumes into it (sol set)."""
     task = _write_task(tmp_path, _sol_extra(tmp_path))
@@ -1457,6 +1540,8 @@ def test_each_parallel_item_uses_its_own_optimizer_session(tmp_path, fake_git):
     task = _write_task(tmp_path)
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
+    workflow.task_path.write_text(task.read_text(encoding="utf-8"), encoding="utf-8")
+    workflow._configure_agents()
     trace = _stub_agents(
         workflow,
         analyzer_items=[[_item("opt-001", gain=10.0), _item("opt-002", gain=5.0)]],
@@ -2721,6 +2806,8 @@ def test_clean_wipes_managed_files_and_dirs(tmp_path):
 def test_all_agents_use_claude_code_backend_with_scoped_sessions(tmp_path):
     workflow = Workflow(workspace=tmp_path / "ws")
     try:
+        workflow.task_path.write_text("{}\n", encoding="utf-8")
+        workflow._configure_agents()
         for role in _AGENT_ROLES:
             layer = getattr(workflow, role)
             assert layer.config.backend.kind == "claude-code", role
@@ -2742,6 +2829,8 @@ def test_all_agents_use_claude_code_backend_with_scoped_sessions(tmp_path):
 def test_each_agent_has_its_progress_tools(tmp_path):
     workflow = Workflow(workspace=tmp_path / "ws")
     try:
+        workflow.task_path.write_text("{}\n", encoding="utf-8")
+        workflow._configure_agents()
         for role in _AGENT_ROLES:
             layer = getattr(workflow, role)
             tool_names = [t.name for t in layer.config.backend.tools]
@@ -2761,6 +2850,8 @@ def test_no_role_wires_an_external_mcp_server(tmp_path):
     """
     workflow = Workflow(workspace=tmp_path / "ws")
     try:
+        workflow.task_path.write_text("{}\n", encoding="utf-8")
+        workflow._configure_agents()
         for role in _AGENT_ROLES:
             assert getattr(workflow, role).config.backend.extra_mcp_servers is None, role
     finally:

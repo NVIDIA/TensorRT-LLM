@@ -204,6 +204,27 @@ exactly when the round produced an `items.json`. A replan-only round
 runs no profiler and writes none; a round whose skill was unavailable or
 whose pipeline errored writes none either and records the reason under
 *Caveats*. Neither owes the block anything.
+## Agent backend and model routing
+
+An optional top-level `agents` block in `task.yaml` selects `codex` or
+`claude-code`, a model slug, reasoning effort, and portable external MCP
+servers. `defaults` applies to every role and `roles.<name>` overrides
+individual fields. For example, this runs projector/analyzer on Astra ultra
+and leaves every other role on the historical Claude default:
+
+```yaml
+agents:
+  roles:
+    projector: {backend: codex, model: gpt-6-astra, reasoning_effort: ultra}
+    analyzer: {backend: codex, model: gpt-6-astra, reasoning_effort: ultra}
+```
+
+For an A/B run, set `casebook.enabled: false` in the control task. The
+optimization casebook remains enabled when the block is omitted.
+
+Omitting `agents` preserves the historical assignment. On resume, the
+checkpointed workspace's `task.yaml` remains authoritative, so a different
+new `--task` cannot change models midway through a campaign.
 
 ## The acceptance gate
 

@@ -13,13 +13,8 @@ from typing import Any
 import yaml
 from rich.markup import escape
 
-from agent_flow import (
-    CLAUDE_CODE_DEFAULT_MODEL,
-    AgentLayer,
-    AgentLayerConfig,
-    BackendConfig,
-    SessionConfig,
-)
+from agent_flow import AgentLayer, AgentLayerConfig, BackendConfig, SessionConfig
+from agent_flow.agent_runtime import AgentConfig, resolve_agent_config
 from agent_flow.console import print_message, print_rule
 from agent_flow.logger import get_logger
 from agent_flow.workflows.perf_analyze.prompts._common import profile_ranks_note
@@ -28,6 +23,7 @@ from agent_flow.workflows.perf_analyze.sol_methodology import (
     output_instruction,
     projector_instruction,
 )
+from agent_flow.workflows.perf_analyze.task_schema import CASEBOOK_SKILL_NAMES, casebook_enabled
 from agent_flow.workflows.perf_analyze.workflow import clear_stale_benchmark_results
 
 from . import gitops, kernel_ledger, nsys_items, reuse, roadmap_schema
@@ -45,6 +41,7 @@ from .progress import (
 )
 from .prompts import DEFAULT_PROMPTS, PromptBundle
 from .roadmap_schema import RoadmapError
+from .roles import ROLES
 from .state import (
     ROUND_STAGES,
     STAGE_ANALYZER,
@@ -97,22 +94,25 @@ def _progress_has_entries(path: Path) -> bool:
 def _make_agent(
     name: str,
     system_prompt: str,
+    agent_config: AgentConfig,
     tools: list | None = None,
     required_tools: list[str] | None = None,
-    backend_kind: str = "claude-code",
-    model: str = CLAUDE_CODE_DEFAULT_MODEL,
     session_mode: str = "persistent",
     cwd: Path | None = None,
+    disabled_skills: tuple[str, ...] = (),
 ) -> AgentLayer:
     return AgentLayer(
         AgentLayerConfig(
             name=name,
             system_prompt=system_prompt,
             backend=BackendConfig(
-                kind=backend_kind,
-                model=model,
+                kind=agent_config.backend,
+                model=agent_config.model,
+                reasoning_effort=agent_config.reasoning_effort,
+                disabled_skills=disabled_skills,
                 tools=tools,
                 cwd=cwd,
+                extra_mcp_servers=agent_config.extra_mcp_servers,
             ),
             session=SessionConfig(mode=session_mode),
             required_tools=tuple(required_tools or ()),
@@ -120,16 +120,7 @@ def _make_agent(
     )
 
 
-_ROLES = (
-    "benchmarker",
-    "projector",
-    "analyzer",
-    "optimizer",
-    "evaluator",
-    "integrator",
-    "qa",
-    "reporter",
-)
+_ROLES = ROLES
 
 
 class PerfOptimizeWorkflow:
@@ -344,26 +335,11 @@ class PerfOptimizeWorkflow:
         )
         progress_tools = build_progress_tools(self._progress_ctx)
 
-        for role in _ROLES:
-            setattr(
-                self,
-                role,
-                _make_agent(
-                    role,
-                    getattr(self.prompts, role),
-                    progress_tools[role],
-                    required_tools=[f"append_{role}_progress"],
-                    # Sessions are scoped to each role's unit of work: the
-                    # judges (evaluator, qa) are stateless so every verdict
-                    # gets fresh eyes, uninfluenced by earlier attempts' /
-                    # rounds' conclusions; the analyzer keeps campaign-long
-                    # memory of the roadmap it authored.
-                    session_mode=(
-                        "stateless" if role in ("qa", "evaluator", "integrator") else "persistent"
-                    ),
-                ),
-            )
         self._progress_tools = progress_tools
+        self._agent_configs: dict[str, AgentConfig] = {}
+        self._disabled_skills: tuple[str, ...] = ()
+        for role in _ROLES:
+            setattr(self, role, None)
 
     def __enter__(self) -> "PerfOptimizeWorkflow":
         return self
@@ -377,6 +353,37 @@ class PerfOptimizeWorkflow:
             if hasattr(layer, "__exit__"):
                 layer.__exit__(None, None, None)
 
+    def _configure_agents(self) -> None:
+        task_data = self._task_data()
+        self._disabled_skills = () if casebook_enabled(task_data) else CASEBOOK_SKILL_NAMES
+        self._agent_configs = {
+            role: resolve_agent_config(
+                task_data,
+                role,
+            )
+            for role in _ROLES
+        }
+        for role in _ROLES:
+            if getattr(self, role) is not None:
+                continue
+            setattr(
+                self,
+                role,
+                _make_agent(
+                    role,
+                    getattr(self.prompts, role),
+                    self._agent_configs[role],
+                    self._progress_tools[role],
+                    required_tools=[f"append_{role}_progress"],
+                    # Judges are stateless; other roles retain their existing
+                    # unit-of-work session scope.
+                    session_mode=(
+                        "stateless" if role in ("qa", "evaluator", "integrator") else "persistent"
+                    ),
+                    disabled_skills=self._disabled_skills,
+                ),
+            )
+
     # ------------------------------------------------------------- orchestration
 
     def run(self, task: str) -> None:
@@ -385,6 +392,7 @@ class PerfOptimizeWorkflow:
         state = self._init_state(task, log)
         if state is None:
             return
+        self._configure_agents()
 
         try:
             self._ensure_optimization_branch(state, log)
@@ -1066,17 +1074,21 @@ class PerfOptimizeWorkflow:
         optimizer = _make_agent(
             f"optimizer-{item_id}",
             self.prompts.optimizer,
+            self._agent_configs["optimizer"],
             tools["optimizer"],
             required_tools=["append_optimizer_progress"],
             cwd=Path(item_state.item_worktree_path),
+            disabled_skills=self._disabled_skills,
         )
         evaluator = _make_agent(
             f"evaluator-{item_id}",
             self.prompts.evaluator,
+            self._agent_configs["evaluator"],
             tools["evaluator"],
             required_tools=["append_evaluator_progress"],
             session_mode="stateless",
             cwd=Path(item_state.item_worktree_path),
+            disabled_skills=self._disabled_skills,
         )
         repo = item_state.item_worktree_path
         live_config, accepted_config = self._state_tuning_paths(item_state)
@@ -1786,6 +1798,9 @@ class PerfOptimizeWorkflow:
         """
         return sol_enabled(self._task_data())
 
+    def _casebook_instruction(self, text: str) -> str:
+        return "" if self._disabled_skills else text
+
     def _focus_points(self) -> list[int] | None:
         """``optimize.focus_concurrencies`` when set, else ``None``.
 
@@ -2146,11 +2161,13 @@ class PerfOptimizeWorkflow:
             self._disagg_directive() + f"Workspace: {self.workspace}\n\n"
             f"Read `{self.task_path}` for the spec — resolve `checkpoint_path`, "
             f"`trtllm_repo_path`, and the `benchmark` / `optimize` blocks.\n\n"
-            f"Then **load the `perf-optimization-casebook` skill** (via the "
-            f"`Skill` tool) as read-only reference, as your system prompt "
-            f"directs, so your Configuration/Notes are grounded in known "
-            f"TRT-LLM performance precedents.\n\n"
-            f"Launch `trtllm-serve` with "
+            + self._casebook_instruction(
+                "Then **load the `perf-optimization-casebook` skill** (via the "
+                "`Skill` tool) as read-only reference, as your system prompt "
+                "directs, so your Configuration/Notes are grounded in known "
+                "TRT-LLM performance precedents.\n\n"
+            )
+            + f"Launch `trtllm-serve` with "
             f"`--extra_llm_api_options {self.tuning_config_path}` (the live "
             f"tuning config — always passed in this workflow), poll it to "
             f"readiness, {load_instruction}, and tear the server down "
@@ -2285,11 +2302,13 @@ class PerfOptimizeWorkflow:
             f"block).\n\n"
             + projection_context
             + prior_roadmap_context
-            + f"Then **load the `perf-optimization-casebook` skill** (via the "
-            f"`Skill` tool) as your system prompt directs, and tag each "
-            f"roadmap item's `casebook_ref` with the matching *bottleneck "
-            f"signal → candidate pattern* row.\n\n"
-            f"Two checks you still owe — both read-only, neither needs a "
+            + self._casebook_instruction(
+                "Then **load the `perf-optimization-casebook` skill** (via the "
+                "`Skill` tool) as your system prompt directs, and tag each "
+                "roadmap item's `casebook_ref` with the matching *bottleneck "
+                "signal → candidate pattern* row.\n\n"
+            )
+            + f"Two checks you still owe — both read-only, neither needs a "
             f"GPU: verify the imported analysis actually describes **this** "
             f"task (same model/checkpoint, parallel mapping in "
             f"`{self.tuning_config_path}`, and operating point as "
@@ -2434,11 +2453,13 @@ class PerfOptimizeWorkflow:
             f"recover the serve + benchmark commands and operating point.\n\n"
             f"{round_context}\n\n"
             + projection_context
-            + f"Early on, **load the `perf-optimization-casebook` skill** (via "
-            f"the `Skill` tool) as read-only reference, as your system prompt "
-            f"directs — tag each roadmap item's `casebook_ref` with the "
-            f"matching *bottleneck signal → candidate pattern* row.\n\n"
-            f"First **verify this checkout's profiling knobs** with "
+            + self._casebook_instruction(
+                "Early on, **load the `perf-optimization-casebook` skill** (via "
+                "the `Skill` tool) as read-only reference, as your system prompt "
+                "directs — tag each roadmap item's `casebook_ref` with the "
+                "matching *bottleneck signal → candidate pattern* row.\n\n"
+            )
+            + f"First **verify this checkout's profiling knobs** with "
             f"`grep -rn`/`rg` via `Bash` under `{self._trtllm_hint()}` as your "
             f"system prompt directs, then profile the current build under the "
             f"methods in `profile.methods`: relaunch `trtllm-serve` with "
@@ -2583,11 +2604,14 @@ class PerfOptimizeWorkflow:
             f"`expected_gain_pct` / `evidence` of pending items the "
             f"measurements bound, re-order what survives, and add items the "
             f"failures themselves imply (a REJECT often names the real "
-            f"constraint) — **load the `perf-optimization-casebook` skill** "
-            f"(via the `Skill` tool) as your system prompt directs before "
-            f"authoring any, and tag each new item's `casebook_ref` with the "
-            f"matching *bottleneck signal → candidate pattern* row. Never "
-            f"rewrite `accepted` / `failed` history, "
+            f"constraint). "
+            + self._casebook_instruction(
+                "Before authoring any, **load the `perf-optimization-casebook` skill** "
+                "(via the `Skill` tool) as your system prompt directs, and tag each "
+                "new item's `casebook_ref` with the matching *bottleneck signal → "
+                "candidate pattern* row. "
+            )
+            + f"Never rewrite `accepted` / `failed` history, "
             f"`baseline`, `current_best`, or existing ids; new items get "
             f"fresh ids continuing the sequence.\n\n"
             f"**If the evidence leaves nothing actionable, leave the roadmap "
@@ -2688,11 +2712,13 @@ class PerfOptimizeWorkflow:
             f"Inside the Slurm job script, before any Python command or "
             f"`trtllm-serve` launch:\n\n"
             f'`export PYTHONPATH="{repo}${{PYTHONPATH:+:$PYTHONPATH}}"`\n\n'
-            f"Read `{self.task_path}` and the roadmap item, then **load the "
-            f"`perf-optimization-casebook` skill** (via the `Skill` tool) as "
-            f"your system prompt directs and implement **exactly this one "
-            f"item** following its `how_to_apply` and the matched casebook "
-            f"case: `approach: config` → edit `{tuning_config}`; "
+            f"Read `{self.task_path}` and the roadmap item. "
+            + self._casebook_instruction(
+                "Then **load the `perf-optimization-casebook` skill** (via the `Skill` "
+                "tool) as your system prompt directs and follow the matched casebook case. "
+            )
+            + f"Implement **exactly this one item** following its `how_to_apply`: "
+            f"`approach: config` → edit `{tuning_config}`; "
             f"`approach: code` → edit the source under `{repo}` under "
             f"the git discipline in your system prompt (active-runtime "
             f"check first; locate code paths with shell `grep -rn`/`rg` via "

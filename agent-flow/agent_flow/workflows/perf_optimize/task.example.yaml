@@ -23,6 +23,32 @@ trtllm_repo_path: /path/to/TensorRT-LLM                       # always local
 # config.
 # extra_llm_api_options: /path/to/extra_llm_api_options.yaml
 
+# Optional: select the backend/model/reasoning tier globally and override
+# individual workflow roles. Omit this block to preserve the workflow's
+# historical backend assignment. A role inherits fields from defaults.
+# agents:
+#   roles:
+#     projector:
+#       backend: codex               # codex | claude-code
+#       model: gpt-6-astra
+#       reasoning_effort: ultra
+#     analyzer:
+#       backend: codex
+#       model: gpt-6-astra
+#       reasoning_effort: ultra
+#   # Optional portable external MCP servers (STDIO or streamable HTTP).
+#   # extra_mcp_servers belongs under defaults or an individual role.
+#   # defaults:
+#   #   extra_mcp_servers:
+#   #     knowledge-base:
+#   #       type: http
+#   #       url: https://example.test/mcp
+#   #       headers: {X-Environment: staging}
+
+# Optional A/B switch. The optimization casebook is enabled by default.
+# casebook:
+#   enabled: false
+
 # Optional: the benchmark operating point(s) driven by
 # benchmark_serving.py. Every measurement in the campaign (baseline,
 # evaluator, final verification) replays the same point(s).
