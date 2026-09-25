@@ -1095,6 +1095,13 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
             qc.exclude_modules = remapped
         llm_model_config = self.get_sub_model_config(model_config_cp, "text_config")
         self.llm = Gemma4ForCausalLM(llm_model_config)
+        # The decoder's attention layers register themselves into the *inner*
+        # ModelConfig.extra_attrs, but the engine publishes the *outer*
+        # model_config.extra_attrs to the thread-local at forward time (see
+        # PyTorchModelEngine.model_forward). Without propagating them, any CUDA
+        # graph capture path that takes the custom inplace attention op fails
+        # with "Attention layer is not registered".
+        self.model_config.extra_attrs.update(llm_model_config.extra_attrs)
 
         # --- Vision tower (native TRT-LLM, see modeling_gemma4_vision.py) ---
         if config.vision_config is not None:
