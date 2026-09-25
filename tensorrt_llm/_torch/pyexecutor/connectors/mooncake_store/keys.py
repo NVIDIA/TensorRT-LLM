@@ -23,6 +23,11 @@ A key is `<namespace>/<block hash>`. The namespace pins down everything else
 that decides what the stored bytes mean: the model, the shard that produced
 them, the layer group inside that shard, the tokens each page holds and how many
 bytes a page is. A change to any of those reads as a miss rather than as garbage.
+
+The shard component is where replicated roles pay off. A page whose bytes depend
+on the shard is named per rank, but one whose bytes are identical on every rank
+is named `REPLICATED_SHARD_KEY` instead, so a TP group stores it once rather
+than once per rank.
 """
 
 import hashlib
@@ -34,6 +39,8 @@ __all__ = [
     "KeyNamespace",
     "ReuseScope",
     "HASH_DIGEST_BYTES",
+    "REPLICATED_SHARD_KEY",
+    "sharded_shard_key",
 ]
 
 #: 128 bits. Collisions decide whether one request reads another's KV, so the
@@ -139,17 +146,33 @@ class BlockHashChain:
         return self._hashes
 
 
+#: Shard component for pages whose bytes do not depend on the attention shard.
+#: A literal rather than a rank, so a replicated page has one key for the whole
+#: TP group. It cannot collide with a sharded component, which is always
+#: `w<int>r<int>`.
+REPLICATED_SHARD_KEY = "replicated"
+
+
+def sharded_shard_key(rank: int, world_size: int) -> str:
+    """The shard component naming one attention shard.
+
+    Under ADP all owners pass rank 0 of 1, since each holds complete attention
+    KV. TP keeps distinct shard keys: rank 3 of 8 can hold different heads than
+    rank 3 of 4.
+    """
+    return f"w{world_size}r{rank}"
+
+
 @dataclass(frozen=True)
 class KeyNamespace:
     """The part of a store key that is fixed for one shard and layer group."""
 
     namespace: str
     model_key: str
-    #: Attention shard rank and count. Under ADP all owners use rank 0 of 1,
-    #: since each holds complete attention KV. TP keeps distinct shard keys:
-    #: rank 3 of 8 can hold different heads than rank 3 of 4.
-    rank: int
-    world_size: int
+    #: Which shard's bytes these are: `sharded_shard_key(...)` for a page whose
+    #: content depends on the shard that produced it, `REPLICATED_SHARD_KEY`
+    #: for one whose content is identical on every shard.
+    shard_key: str
     layer_group_id: int
     tokens_per_block: int
     bytes_per_page: int
@@ -159,7 +182,7 @@ class KeyNamespace:
         """The literal string every key in this namespace starts with."""
         return (
             f"{self.namespace}/{self.model_key}"
-            f"/w{self.world_size}r{self.rank}"
+            f"/{self.shard_key}"
             f"/lg{self.layer_group_id}"
             f"/t{self.tokens_per_block}b{self.bytes_per_page}"
         )

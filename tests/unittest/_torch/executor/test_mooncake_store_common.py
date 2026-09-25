@@ -23,6 +23,7 @@ in-process fake that records what it was handed.
 """
 
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -33,9 +34,11 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
     StoreRole,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.keys import (
+    REPLICATED_SHARD_KEY,
     BlockHashChain,
     KeyNamespace,
     ReuseScope,
+    sharded_shard_key,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.staging import (
     HostStagingPool,
@@ -191,8 +194,7 @@ def test_key_namespace_separates_every_dimension():
     base = dict(
         namespace="trtllm",
         model_key="m",
-        rank=0,
-        world_size=2,
+        shard_key=sharded_shard_key(0, 2),
         layer_group_id=0,
         tokens_per_block=32,
         bytes_per_page=1024,
@@ -202,13 +204,25 @@ def test_key_namespace_separates_every_dimension():
     for field, value in [
         ("namespace", "other"),
         ("model_key", "n"),
-        ("rank", 1),
-        ("world_size", 4),
+        ("shard_key", sharded_shard_key(1, 2)),
         ("layer_group_id", 1),
         ("tokens_per_block", 64),
         ("bytes_per_page", 2048),
     ]:
         assert KeyNamespace(**{**base, field: value}).key(block_hash) != reference
+
+
+def test_shard_key_distinguishes_rank_and_world_size():
+    # rank 3 of 8 holds different heads than rank 3 of 4, so both components
+    # have to appear.
+    assert sharded_shard_key(3, 8) != sharded_shard_key(3, 4)
+    assert sharded_shard_key(0, 2) != sharded_shard_key(1, 2)
+
+
+def test_replicated_shard_key_cannot_collide_with_a_sharded_one():
+    # A sharded component is always w<int>r<int>; the replicated one is a
+    # literal, so no rank/world-size pair can produce it.
+    assert not re.fullmatch(r"w\d+r\d+", REPLICATED_SHARD_KEY)
 
 
 # ---- config ----

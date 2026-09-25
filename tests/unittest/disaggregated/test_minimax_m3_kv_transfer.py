@@ -123,6 +123,9 @@ def test_minimax_disagg_role_mapper_kinds(
         Role.ALL: expected_main_mapper,
         Role.INDEX_KEY: MapperKind.REPLICATED,
     }
+    # Whichever layout the main K/V uses, index-K stays the one role a KV
+    # connector may store once for the whole TP group.
+    assert manager.get_replicated_roles() == frozenset({Role.INDEX_KEY})
 
 
 def test_minimax_disagg_rejects_unmanaged_index_value(monkeypatch) -> None:

@@ -25,9 +25,10 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import (
     KvCacheRegion,
     build_kv_cache_layout_v2,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as KvCacheConfigV2
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig
 
 DataType = tensorrt_llm.bindings.DataType
 CacheType = tensorrt_llm.bindings.internal.batch_manager.CacheType
@@ -103,6 +104,22 @@ class TestKvCacheRegionArithmetic(unittest.TestCase):
             regions=(self._region(size=256), self._region(base=8192, size=128)),
         )
         self.assertEqual(group.bytes_per_page, 384)
+        # A group without a replicated role carries no second page.
+        self.assertEqual(group.replicated_regions, ())
+        self.assertEqual(group.replicated_bytes_per_page, 0)
+
+    def test_the_two_page_classes_are_sized_independently(self):
+        group = KvCacheLayerGroupLayout(
+            layer_group_id=0,
+            layer_ids=(0, 1),
+            window_size=None,
+            regions=(self._region(size=256), self._region(base=8192, size=128)),
+            replicated_regions=(self._region(base=16384, size=64),),
+        )
+        # The replicated bytes are a page of their own, not part of the
+        # shard-specific one: a connector keys and transfers them separately.
+        self.assertEqual(group.bytes_per_page, 384)
+        self.assertEqual(group.replicated_bytes_per_page, 64)
 
     def test_layout_lookup_by_group_and_layer(self):
         group_a = KvCacheLayerGroupLayout(0, (0, 2), None, ())
@@ -272,6 +289,68 @@ class TestBuildKvCacheLayoutV2(unittest.TestCase):
                 [ref.role for ref in region.buffers],
                 ["key", "value"] * 4,
             )
+            # The base manager declares INDEX_KEY replicated but registers no
+            # such buffer, so splitting by class must leave this layout exactly
+            # as it was before the split existed.
+            self.assertEqual(group.replicated_regions, ())
+            self.assertEqual(group.replicated_bytes_per_page, 0)
+        finally:
+            mgr.shutdown()
+            del mgr
+
+    def test_a_replicated_role_is_described_as_its_own_regions(self):
+        # A manager registering an index-K buffer whose per-block size equals
+        # K/V's gets it coalesced into the same pool, interleaved per layer as
+        # K, V, INDEX_KEY. The split must still separate the classes, which is
+        # what lets a connector store the replicated bytes once per TP group
+        # rather than once per rank.
+        num_layers = 4
+        kwargs = _make_kwargs(num_layers=num_layers)
+        bytes_per_block = (
+            kwargs["num_kv_heads"]
+            * kwargs["head_dim"]
+            * kwargs["tokens_per_block"]
+            * torch.tensor([], dtype=torch.float16).element_size()
+        )
+
+        class _IndexKeyManager(KVCacheManagerV2):
+            def _extra_buffers_per_layer(self, *, tokens_per_block):
+                return {
+                    layer: [BufferConfig(role=Role.INDEX_KEY, size=bytes_per_block)]
+                    for layer in range(num_layers)
+                }
+
+        mgr = _IndexKeyManager(**kwargs)
+        try:
+            layout = build_kv_cache_layout_v2(mgr)
+            self.assertEqual(len(layout.groups), 1)
+            group = layout.groups[0]
+
+            sharded_roles = [ref.role for region in group.regions for ref in region.buffers]
+            replicated_roles = [
+                ref.role for region in group.replicated_regions for ref in region.buffers
+            ]
+            self.assertEqual(sharded_roles, ["key", "value"] * num_layers)
+            self.assertEqual(replicated_roles, ["index_key"] * num_layers)
+
+            # Interleaving means neither class is one contiguous run, so each
+            # layer contributes its own region.
+            self.assertEqual(len(group.regions), num_layers)
+            self.assertEqual(len(group.replicated_regions), num_layers)
+
+            # Together the two pages still account for the whole slot, and
+            # neither overlaps the other.
+            pool = list(mgr.impl.pool_group_descs)[0].pools[0]
+            self.assertEqual(
+                group.bytes_per_page + group.replicated_bytes_per_page,
+                int(pool.slot_bytes),
+            )
+            spans = sorted(
+                (region.base, region.base + region.size)
+                for region in (*group.regions, *group.replicated_regions)
+            )
+            for (_, prev_end), (next_start, _) in zip(spans, spans[1:]):
+                self.assertLessEqual(prev_end, next_start)
         finally:
             mgr.shutdown()
             del mgr
