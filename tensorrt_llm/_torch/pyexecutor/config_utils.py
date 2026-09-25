@@ -873,6 +873,7 @@ _CONFIG_REGISTRY: dict[str, type[transformers.PretrainedConfig]] = LazyConfigDic
     "Cosmos3Config",  # backward-compat alias for pre-rename checkpoints
     deepseek_v32="DeepseekV3Config",
     kimi_k2="DeepseekV3Config",
+    xing4_0="DeepseekV3Config",
     glm_moe_dsa="DeepseekV3Config",
     k3_dspark="K3DsparkConfig",
     laguna="LagunaConfig",

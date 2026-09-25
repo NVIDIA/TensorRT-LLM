@@ -94,6 +94,7 @@ __all__ = [
     "Step3p7ForCausalLM",
     "Step3p7VLForConditionalGeneration",
     "T5ForConditionalGeneration",
+    "Xing4_0ForCausalLM",
     "VilaModel",
     "WhisperForConditionalGeneration",
     "get_model_architecture",
