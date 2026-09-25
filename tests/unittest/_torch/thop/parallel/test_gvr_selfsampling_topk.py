@@ -27,6 +27,8 @@ Checks per case:
     values — any kernel read past ``n_valid`` fails the value comparison.
 """
 
+import os
+
 import pytest
 import torch
 from utils.util import getSMVersion
@@ -48,6 +50,9 @@ if getSMVersion() not in (100, 103):
         allow_module_level=True,
     )
 
+from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
+    gvr_topk_decode_self_sampling as ss_dev,
+)
 from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
     gvr_topk_decode_self_sampling_host as ss_host,
 )
@@ -709,7 +714,7 @@ def test_selfsampling_register_rungs_follow_available_sms() -> None:
             assert baseline["kernel"] == family
             assert ss_host.route(rows, n, n, k, num_sms) == baseline
 
-        # The default preserves the 148-SM B200 behavior exactly.
+        # The default preserves the 148-SM routing exactly.
         for rows in (148, 149, 296, 297):
             assert ss_host.route(rows, 8195, 8256, 1024) == ss_host.route(
                 rows, 8195, 8256, 1024, 148
@@ -1793,3 +1798,611 @@ def test_prefill_small_envelope_tier0_uses_sampled_plan():
         ss_host.run_prefill(lg, rs, re, out, max_row_len=n)
         torch.cuda.synchronize()
         _check_prefill_exact(lg, out, rs, re, k)
+
+
+# ---------------------------------------------------------------------------
+# block-max skip (streaming families gate their row scan by per-32-position
+# maxima; register families ignore the tensor)
+# ---------------------------------------------------------------------------
+def _host_block_max(logits, kv_lens, next_n, compress_ratio, grain=32):
+    """Reference of the FP4 indexer epilogue's block_max record: entry j = max
+    over positions [32j, 32j+32) of the row's valid prefix, -FLT_MAX beyond."""
+    rows, npad = logits.shape
+    nb = (npad + grain - 1) // grain
+    x = torch.full((rows, nb * grain), float("-inf"), dtype=torch.float32, device=logits.device)
+    x[:, :npad] = logits
+    lengths = kv_lens.tolist()
+    for row in range(rows):
+        valid = max(lengths[row // next_n] - next_n + row % next_n + 1, 0) // compress_ratio
+        x[row, min(valid, npad) :] = float("-inf")
+    return torch.clamp(
+        x.view(rows, nb, grain).amax(2), min=torch.finfo(torch.float32).min
+    ).contiguous()
+
+
+def _check_varlen_against_reference(lg, out, ref, tag=""):
+    for r in range(lg.shape[0]):
+        if (ref[r] >= 0).any():
+            row = lg[r].float()
+            got = row[out[r].long().clamp_min(0)].sort().values
+            want = row[ref[r].long().clamp_min(0)].sort().values
+            assert torch.equal(got, want), f"{tag} row {r} value multiset mismatch"
+            assert torch.equal(out[r] < 0, ref[r] < 0), f"{tag} row {r} pad mask mismatch"
+            valid = out[r][out[r] >= 0]
+            assert valid.unique().numel() == valid.numel(), f"{tag} row {r} duplicate index"
+        else:
+            assert torch.equal(out[r], ref[r]), f"{tag} row {r} expected all -1"
+
+
+@pytest.mark.parametrize(
+    "rows,msl_c,k,family,dist",
+    [
+        (128, 65536, 1024, "main", "randn"),  # single-CTA streaming main
+        (128, 65536, 1024, "main", "spiky"),  # candidates concentrated in a few blocks
+        (128, 65536, 512, "main", "ties"),  # integer plateaus: many exact ties
+        (32, 131072, 1024, "clus", "randn"),  # 4-CTA cluster
+        (64, 131072, 512, "clus", "relu"),  # 2-CTA cluster, indexer-like zero plateau
+        (64, 262144, 1024, "clus", "randn"),  # 2-CTA cluster at 1M: the enabled band
+        (4, 262144, 1024, "main", "randn"),  # SPLIT main (R=37): skip is legal, just not useful
+        (8, 32768, 1024, "reg_clus", "randn"),  # register family: block_max ignored
+    ],
+    ids=lambda v: str(v) if not isinstance(v, str) else v,
+)
+def test_selfsampling_block_skip_exact(rows, msl_c, k, family, dist):
+    """With the scorer's block maxima the streaming engines must stay tie-aware
+    exact (the skipped blocks cannot hold a candidate), including an
+    over-estimated block_max (still a valid upper bound), heterogeneous row
+    lengths with short / zero-window rows (next_n=4), and rows whose
+    candidates sit in a handful of blocks."""
+    nn, cr = 4, 4
+    npad = msl_c
+    plan = ss_host.route(rows, msl_c, npad, k)
+    assert plan["kernel"] == family, plan["kernel"]
+    torch.manual_seed(rows * 31 + msl_c // 1024 + k)
+    lg = torch.randn(rows, npad, dtype=torch.float32, device=_DEV)
+    if dist == "spiky":
+        lg.mul_(0.05)
+        for r in range(rows):
+            for j in torch.randint(0, npad // 32, (12,)).tolist():
+                lg[r, j * 32 : j * 32 + 32] += 5.0
+    elif dist == "ties":
+        lg.copy_(torch.randint(0, 40, (rows, npad), device=_DEV).float())
+    elif dist == "relu":
+        lg.copy_(torch.relu(lg * 2.0 - 1.0))
+        lg[:, : npad // 3] = 0.0
+    batch = rows // nn
+    lens = [msl_c * cr, 900, nn - 1, msl_c * cr // 2, 40000, 200000, msl_c * cr - 4 * 33]
+    kv = torch.tensor([lens[i % len(lens)] for i in range(batch)], dtype=torch.int32, device=_DEV)
+    bm = _host_block_max(lg, kv, nn, cr)
+    ref = _reference_varlen_indices(lg, kv, nn, cr, k)
+    for tag, bmx in (("bmax", bm), ("bmax+0.5", bm + 0.5)):
+        out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+        ss_host.run_varlen(
+            lg, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr, block_max=bmx
+        )
+        torch.cuda.synchronize()
+        _check_varlen_against_reference(lg, out, ref, tag)
+    key = (*_varlen_cache_key(rows, npad, k, msl_c, nn, cr), "skip")
+    assert ss_host._VARLEN_CACHE[key][0] == family, ss_host._VARLEN_CACHE[key][0]
+    # the dense engine is a separate cache entry and stays untouched
+    out_d = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(lg, kv, out_d, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
+    torch.cuda.synchronize()
+    _check_varlen_against_reference(lg, out_d, ref, "dense")
+    assert _varlen_cache_key(rows, npad, k, msl_c, nn, cr) in ss_host._VARLEN_CACHE
+
+
+@pytest.mark.parametrize(
+    "rows,k,period",
+    [(1, 512, 672), (4, 1024, 672), (1, 1024, 960)],
+    ids=["b1_k512_p672", "b4_k1024_p672", "b1_k1024_p960"],
+)
+def test_selfsampling_varlen_split_periodic_rows(rows, k, period):
+    """Long rows that repeat one passage (period commensurate with the
+    self-sample stride: gcd(896, 672) = 224, gcd(1792, 960) = 64) must stay
+    exact through the multi-CTA SPLIT main (R = 64 / 37), whichever line the
+    jittered sample picks."""
+    cr, msl_c = 4, 262144
+    plan = ss_host.route(rows, msl_c, msl_c, k)
+    assert plan["kernel"] == "main" and plan["rt"]["R"] > 1, plan
+    torch.manual_seed(period * 7 + rows)
+    base = torch.randn(rows, period, dtype=torch.float32, device=_DEV)
+    lg = base.repeat(1, (msl_c + period - 1) // period)[:, :msl_c].contiguous()
+    lg += 0.01 * torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
+    kv = torch.full((rows,), msl_c * cr - 4 * 3, dtype=torch.int32, device=_DEV)
+    ref = _reference_varlen_indices(lg, kv, 1, cr, k)
+    out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+    torch.cuda.synchronize()
+    _check_varlen_against_reference(lg, out, ref, "periodic")
+
+
+_SPLIT_MISS_GCAP = 32768  # gvr_main per-row slab capacity (C.GCAP)
+
+
+def _split_sample_positions(rt):
+    """First float index of every sample cluster of the SPLIT main's self-sample."""
+    SMP, SS2 = int(rt["SMP"]), int(rt["SS2"])
+    t = torch.arange(SMP, dtype=torch.int64)
+    h = (t * 2654435761) % (1 << 32)
+    off = (((h >> 20) & 0xFFF) * SS2) >> 12
+    return 8 * (t * SS2 + off)
+
+
+def _split_sample_line(row, n, rt):
+    """CPU mirror of the SPLIT main's one-shot line: the self-sample (cluster t
+    of SMP covers float indices 8*(t*SS2 + off_t) .. +7, off_t =
+    (((t*2654435761 mod 2^32) >> 20 & 0xFFF) * SS2) >> 12), a 256-bin linear
+    histogram over [min, max] and the descending scan_cross0 walk for TGT and
+    2*TGT.  Returns (T, count(row >= T), T_floor) with T_floor = None when the
+    rank-2*TGT floor is unavailable or not below T.  SMP/SS2/TGT are taken
+    from the host mirror (route()["rt"]); the in-kernel derivation may drift
+    by +-1 in rare rounding cases -- if the kernel's sample positions change,
+    update this mirror together with the miss tests below."""
+    TGT = int(rt["TGT"])
+    pos = _split_sample_positions(rt)[:, None] + torch.arange(8, dtype=torch.int64)[None, :]
+    samp = row[pos.reshape(-1)].float()
+    smin, smax = samp.min(), samp.max()
+    assert smax > smin
+    w = ((smax - smin) * torch.tensor(1.0 / 256.0)).float()
+    bq = ((samp - smin) * (1.0 / w)).trunc().long().clamp(0, 255)
+    hist = torch.bincount(bq, minlength=256)
+    tot = int(hist.sum())
+
+    def cross(target):
+        after = 0
+        for gb in range(255, -1, -1):
+            cq = int(hist[gb])
+            if after < target and (after + cq >= target or gb == 0):
+                return gb
+            after += cq
+        return 0
+
+    assert tot >= TGT
+    T = float(smin + cross(TGT) * w)
+    t_floor = None
+    if tot >= 2 * TGT:
+        t3 = float(smin + cross(2 * TGT) * w)
+        if t3 < T:
+            t_floor = t3
+    return T, int((row[:n].float() >= T).sum()), t_floor
+
+
+def _split_miss_plan(rows, k, msl_c=262144):
+    cr = 4
+    plan = ss_host.route(rows, msl_c, msl_c, k)
+    assert plan["kernel"] == "main" and plan["rt"]["R"] > 1, plan
+    return cr, msl_c, plan["rt"]
+
+
+def _split_miss_run(lg, k, cr, msl_c):
+    kv = torch.full((lg.shape[0],), msl_c * cr, dtype=torch.int32, device=_DEV)
+    ref = _reference_varlen_indices(lg, kv, 1, cr, k)
+    out = torch.full((lg.shape[0], k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+    torch.cuda.synchronize()
+    _check_varlen_against_reference(lg, out, ref, "split-miss")
+
+
+@pytest.mark.parametrize(
+    "rows,k,msl_c",
+    [
+        (1, 512, 262144),
+        (1, 1024, 262144),
+        (4, 512, 262144),
+        (4, 1024, 262144),
+        (1, 512, 1048576),
+        (1, 1024, 1048576),
+    ],
+    ids=lambda v: f"{v // 1024}k" if v >= 4096 else str(v),
+)
+def test_selfsampling_split_line_miss_over(rows, k, msl_c):
+    """Forced SPLIT line miss, OVER case (count(>= T) > slab capacity): a dense
+    uniform [0, 1) bulk plus a few +100 outliers planted at sampled positions
+    make the 256-bin sample histogram so coarse that the one-shot line lands
+    inside the bulk.  The alive CTA must stay tie-aware exact (R = 64 / 37)."""
+    cr, msl_c, rt = _split_miss_plan(rows, k, msl_c)
+    torch.manual_seed(1000 + rows * 7 + k)
+    lg = torch.rand(rows, msl_c, dtype=torch.float32, device=_DEV)
+    base = _split_sample_positions(rt)
+    for r in range(rows):
+        for t in range(1, 11):
+            lg[r, int(base[t * 13])] = 100.0
+    for r in range(rows):
+        T, cnt, _ = _split_sample_line(lg[r].cpu(), msl_c, rt)
+        assert T < 1.0 and cnt > _SPLIT_MISS_GCAP, (r, T, cnt)
+    _split_miss_run(lg, k, cr, msl_c)
+
+
+@pytest.mark.parametrize(
+    "rows,k,clusters,msl_c",
+    [
+        (1, 512, 2, 262144),
+        (1, 1024, 2, 262144),
+        (4, 512, 2, 262144),
+        (4, 1024, 2, 262144),
+        (1, 512, 30, 262144),
+        (4, 1024, 30, 262144),
+        (1, 512, 2, 1048576),
+        (1, 1024, 2, 1048576),
+    ],
+    ids=lambda v: f"{v // 1024}k" if v >= 4096 else str(v),
+)
+def test_selfsampling_split_line_miss_under(rows, k, clusters, msl_c):
+    """Forced SPLIT line miss, UNDER case (count(>= T) < k): `clusters` whole
+    sample clusters (8 positions each) are set to 50.0 on a randn row, so the
+    sample's TGT-th value is 50 while only 8*clusters < k row values are.
+    clusters=2 (16 >= TGT = 15) leaves 14 of the 30 ranks of the sample's
+    rank-2*TGT floor in the randn bulk (floor ~ 14/(8*SMP) of the row >= k:
+    the cheap re-stage path); clusters=30 pushes the floor to 50 as well
+    (floor unusable -> whole-row narrowing fallback).  Both must
+    be tie-aware exact.  The planted positions mirror the kernel's sampler
+    (see _split_sample_line); update them if the sampling scheme changes."""
+    cr, msl_c, rt = _split_miss_plan(rows, k, msl_c)
+    torch.manual_seed(2000 + rows * 7 + k + clusters)
+    lg = torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
+    base = _split_sample_positions(rt)
+    assert 8 * clusters >= int(rt["TGT"]) and 8 * clusters < k
+    step = max(len(base) // clusters, 1)
+    for r in range(rows):
+        for c in range(clusters):
+            p = int(base[c * step])
+            lg[r, p : p + 8] = 50.0
+    for r in range(rows):
+        T, cnt, t_floor = _split_sample_line(lg[r].cpu(), msl_c, rt)
+        assert 40.0 < T <= 50.0 and cnt < k, (r, T, cnt)
+        if clusters == 2:
+            assert t_floor is not None and int((lg[r] >= t_floor).sum()) >= k, (r, t_floor)
+        else:
+            assert t_floor is None
+    _split_miss_run(lg, k, cr, msl_c)
+
+
+def test_selfsampling_block_skip_beyond_table_runs_dense():
+    """Rows longer than the skip table (262144 compressed positions) fall back
+    to the dense scan inside the kernel and stay exact."""
+    rows, msl_c, k, cr = 64, 270336, 1024, 4  # 264 blocks of 1024 past the 8192-block table
+    torch.manual_seed(5)
+    lg = torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
+    kv = torch.full((rows,), msl_c * cr, dtype=torch.int32, device=_DEV)
+    bm = _host_block_max(lg, kv, 1, cr)
+    out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(
+        lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr, block_max=bm
+    )
+    torch.cuda.synchronize()
+    ref_v = torch.topk(lg, k, dim=1).values.sort(dim=1).values
+    got = lg.gather(1, out.long().clamp_min(0)).sort(dim=1).values
+    assert torch.equal(got, ref_v)
+
+
+def test_selfsampling_block_skip_cuda_graph():
+    """The skipping engines must be CUDA-graph capturable (warmed engine,
+    capture one launch, replay twice, exact each time), for the single-CTA
+    main and the cluster family."""
+    cr = 4
+    for rows, msl_c, k in ((128, 65536, 1024), (32, 131072, 1024)):
+        torch.manual_seed(rows)
+        lg = torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
+        kv = torch.full((rows,), msl_c * cr, dtype=torch.int32, device=_DEV)
+        bm = _host_block_max(lg, kv, 1, cr)
+        out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+        ss_host.run_varlen(
+            lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr, block_max=bm
+        )
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        out.fill_(-7)
+        with torch.cuda.graph(g):
+            ss_host.run_varlen(
+                lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr, block_max=bm
+            )
+        ref_v = torch.topk(lg, k, dim=1).values.sort(dim=1).values
+        for _ in range(2):
+            out.fill_(-7)
+            g.replay()
+            torch.cuda.synchronize()
+            got = lg.gather(1, out.long().clamp_min(0)).sort(dim=1).values
+            assert torch.equal(got, ref_v)
+
+
+def test_selfsampling_block_skip_guards():
+    """block_max contract violations raise instead of silently running dense."""
+    rows, msl_c, k, cr = 128, 65536, 1024, 4
+    lg = torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
+    kv = torch.full((rows,), msl_c * cr, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    bm = _host_block_max(lg, kv, 1, cr)
+    with pytest.raises(RuntimeError, match="float32"):
+        ss_host.run_varlen(
+            lg, kv, out, compress_ratio=cr, max_seq_len=msl_c * cr, block_max=bm.half()
+        )
+    with pytest.raises(RuntimeError, match="num_rows"):
+        ss_host.run_varlen(lg, kv, out, compress_ratio=cr, max_seq_len=msl_c * cr, block_max=bm[:8])
+    with pytest.raises(RuntimeError, match="covers"):
+        ss_host.run_varlen(
+            lg,
+            kv,
+            out,
+            compress_ratio=cr,
+            max_seq_len=msl_c * cr,
+            block_max=bm[:, :16].contiguous(),
+        )
+
+
+def test_selfsampling_block_skip_useful_families():
+    """The glue arms the skip only on the single-CTA
+    streaming main at envelopes of >= 512k raw tokens (and the 2-CTA cluster
+    family at >= 1M) when the launch writes more than 96 MB of logits; smaller
+    launches (L2-resident rows), shorter envelopes, the 4-CTA cluster, the
+    register families and the multi-CTA SPLIT main are excluded."""
+    k = 1024
+    assert ss_host.block_skip_useful(256, 131072, k, 131072)  # main R=1, 512k, 128 MB
+    assert not ss_host.block_skip_useful(128, 131072, k, 131072)  # main R=1, 512k, 64 MB
+    # length floor relative to K (n >= 120 K): a 512k prompt pads to 128144 positions
+    assert ss_host.block_skip_useful(256, 128144, 1024, 128144)  # pro 512k, 125 MB
+    assert ss_host.block_skip_useful(512, 64144, 512, 64144)  # flash 256k, 125 MB (K/nb 26 %)
+    assert not ss_host.block_skip_useful(512, 64144, 1024, 64144)  # pro 256k (K/nb 51 %)
+    assert not ss_host.block_skip_useful(1024, 32144, 512, 32144)  # flash 128k (K/nb 51 %)
+    assert ss_host.block_skip_useful(128, 262144, k, 262144)  # main R=1, 1M, 128 MB
+    assert not ss_host.block_skip_useful(128, 65536, k, 65536)  # main R=1 but 256k
+    # clus cs=2 at 1M (B 33..74) tops out at 77 MB: below the footprint floor
+    assert not ss_host.block_skip_useful(64, 262144, k, 262144)  # clus cs=2, 1M, 64 MB
+    assert not ss_host.block_skip_useful(64, 131072, k, 131072)  # clus cs=2, 512k
+    assert not ss_host.block_skip_useful(32, 262144, k, 262144)  # clus cs=4
+    assert not ss_host.block_skip_useful(1, 262144, k, 262144)  # SPLIT main R=64
+    assert not ss_host.block_skip_useful(8, 65536, k, 65536)  # reg_clus
+    assert not ss_host.block_skip_useful(1, 16384, k, 16384)  # reg
+
+
+def test_selfsampling_warmup_block_skip_populates_launchers():
+    """warmup_varlen(block_skip=True) compiles the skipping engines and fills
+    the tagged launcher keys the serving path looks up under capture."""
+    k, msl_c, cr = 1024, 65536, 4
+    ss_host.warmup_varlen(
+        k,
+        msl_c * cr,
+        compress_ratio=cr,
+        next_n=1,
+        num_rows_list=(128,),
+        row_stride=msl_c,
+        block_skip=True,
+    )
+    key = (*_varlen_cache_key(128, msl_c, k, msl_c, 1, cr), "skip")
+    assert key in ss_host._VARLEN_CACHE
+    assert ss_host._VARLEN_CACHE[key][0] == "main"
+
+
+def _bm_line_row(kind, n, seed):
+    """Row shapes that steer the block-max line.  'spread': ordinary (line
+    taken).  'tiepile': thousands of block maxima tied at the K-th boundary
+    (S > 4096 -> sampling fallback; smaller piles keep the line with S > K).
+    'allequal' / 'allzero': degenerate histogram -> sampling fallback.  'spiky':
+    400 blocks entirely high -> 12800 candidates > SCPB (overflow re-sweep on
+    the BLK=512/256 arms).  'midpile<H>': H blocks entirely high plus 1024
+    block maxima tied at 2.0 -> exactly 32 H + 1024 candidates, sized into
+    (4096, SCPB] of the small arms (staging slots >= 4096 written and consumed
+    by the coalesced path).  'tinyspread': block maxima within 2^-10 of 1.0 (bin
+    edges below fp32 resolution).  'posinf': one +inf logit (hi not finite ->
+    fallback).  'tailmax': row maximum in the scalar tail (n % 4 != 0)."""
+    g = torch.Generator(device=_DEV).manual_seed(seed)
+    x = torch.randn(n, generator=g, dtype=torch.float32, device=_DEV) * 0.05
+    nb = n // 32
+    if kind.startswith("tiepile"):
+        pile = int(kind[len("tiepile") :])
+        perm = torch.randperm(nb, generator=g, device=_DEV)
+        x[perm[:200] * 32] = 6.0
+        x[perm[200 : 200 + pile] * 32 + 5] = 4.0
+    elif kind == "allequal":
+        x[torch.arange(nb, device=_DEV) * 32 + 7] = 3.0
+    elif kind == "allzero":
+        x.zero_()
+    elif kind == "spiky":
+        perm = torch.randperm(nb, generator=g, device=_DEV)
+        for j in perm[:400].tolist():
+            x[j * 32 : j * 32 + 32] += 5.0
+    elif kind.startswith("midpile"):
+        high = int(kind[len("midpile") :])
+        perm = torch.randperm(nb, generator=g, device=_DEV)
+        for j in perm[:high].tolist():
+            x[j * 32 : j * 32 + 32] += 5.0
+        x[perm[high : high + 1024] * 32 + 5] = 2.0
+    elif kind == "tinyspread":
+        x = 1.0 + torch.rand(n, generator=g, dtype=torch.float32, device=_DEV) * (2.0**-10)
+    elif kind == "posinf":
+        x[n // 3] = float("inf")
+    return x
+
+
+def _bm_line_case(rows, msl_c, k, kind, n_valid, seed=0, next_n=1, bm_mode="exact"):
+    cr = 4
+    lg = torch.empty(rows, msl_c, dtype=torch.float32, device=_DEV)
+    for r in range(rows):
+        lg[r] = _bm_line_row(kind, msl_c, seed=1000 * rows + 7 * r + k + seed)
+    if kind == "tailmax":
+        lg[:, n_valid - 1] = 100.0  # tail position: n_valid % 4 != 0
+    lg[:, n_valid:] = 1.0e9  # garbage beyond the valid prefix (never a candidate)
+    batch = rows // next_n
+    kv = torch.full((batch,), n_valid * cr, dtype=torch.int32, device=_DEV)
+    if next_n > 1:
+        # kv % 4 in 1..3: rows rr < next_n-1 see one position fewer than the
+        # request-level block_max the scorer emits (inflated last block)
+        kv -= torch.arange(batch, device=_DEV, dtype=torch.int32) % 3 + 1
+        bm = _host_block_max(lg, (kv // cr * cr).repeat_interleave(next_n), 1, cr)
+    else:
+        bm = _host_block_max(lg, kv, 1, cr)
+    if bm_mode == "+1e-4":
+        bm = bm + 1.0e-4
+    elif bm_mode == "+0.5":
+        bm = bm + 0.5
+    elif bm_mode == "*4+0.5":
+        bm = bm * 4.0 + 0.5
+    elif bm_mode == "+3e38rec":
+        bm[:, 5] = 3.0e38
+    jlim = ((n_valid >> 2) + 7) >> 3
+    bm[:, jlim:] = 3.0e38  # stale records past the row's last block: never read
+    ref = _reference_varlen_indices(lg, kv, next_n, cr, k)
+    out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(
+        lg, kv, out, next_n=next_n, compress_ratio=cr, max_seq_len=msl_c * cr, block_max=bm
+    )
+    torch.cuda.synchronize()
+    _check_varlen_against_reference(lg, out, ref, f"{kind}/{bm_mode}/nn{next_n}")
+
+
+@pytest.mark.parametrize(
+    "rows,msl_c,k,kind,n_valid",
+    [
+        (128, 262144, 1024, "spread", 262144),  # (1024, 8, 1) arm, 1M, full row
+        (128, 262144, 1024, "spread", 262127),  # valid length not a multiple of 32
+        (128, 262144, 512, "spread", 262127),
+        (128, 262144, 1024, "spread", 10000),  # nb = 313 < K inside a 1M envelope
+        (128, 262144, 1024, "spread", 32 * 1023),  # nb = K - 1
+        (128, 262144, 1024, "spread", 32 * 1024),  # nb = K
+        (128, 262144, 1024, "spread", 32 * 1025),  # nb = K + 1
+        (128, 262144, 1024, "tailmax", 262114),  # n4 % 8 == 0: row max in the tail
+        (128, 262144, 1024, "tiepile5000", 262144),  # S > 4096 -> sampling fallback
+        (128, 262144, 1024, "tiepile1500", 262144),  # S = 1700 > K, line kept
+        (128, 262144, 1024, "allequal", 262144),  # max == min -> fallback
+        (128, 262144, 1024, "allzero", 262144),
+        (128, 262144, 1024, "tinyspread", 262144),
+        (128, 262144, 1024, "posinf", 262144),  # hi = +inf -> fallback
+        (200, 131072, 1024, "spread", 131059),  # (512, 8, 2) arm, 512k
+        (200, 131072, 1024, "spiky", 131072),  # > SCPB candidates: list re-sweep
+        (200, 131072, 1024, "midpile160", 131072),  # 6144 candidates in (4096, 8192]
+        (200, 131072, 1024, "tiepile3000", 131072),
+        (300, 131072, 1024, "spread", 131072),  # (256, 8, 4) arm, 512k
+        (300, 131072, 1024, "spiky", 131063),
+        (300, 131072, 1024, "midpile120", 131072),  # 4864 candidates in (4096, 5120]
+        (300, 131072, 512, "tiepile3000", 131063),
+        (300, 131072, 512, "spiky", 131072),
+    ],
+    ids=lambda v: str(v),
+)
+def test_selfsampling_block_skip_bm_line(rows, msl_c, k, kind, n_valid):
+    """Compacted-skip rows derive the first line from the block maxima; the
+    result must stay tie-aware exact whether the line is taken (spread rows,
+    odd valid lengths with -FLT_MAX padded records, candidate counts inside
+    (4096, SCPB] and above SCPB on the small-CTA arms) or the sampling path is
+    kept (fewer than K blocks, tie piles, all-equal / all-zero rows, +inf).
+    The default build must compile the skip engine with the block line (knob
+    on)."""
+    plan = ss_host.route(rows, msl_c, msl_c, k)
+    assert plan["kernel"] == "main" and plan["tpl"][5] is False, plan
+    if kind.startswith("midpile"):
+        cnt = 32 * int(kind[len("midpile") :]) + 1024
+        assert 4096 < cnt <= plan["rt"]["SCAP_"], (cnt, plan["rt"])
+    _bm_line_case(rows, msl_c, k, kind, n_valid)
+    assert ss_dev.BM_LINE is True
+    keys = [key for key in ss_dev._COMPILE_CACHE if key[4] is True]
+    assert keys and all(key[-1] is True for key in keys), keys
+
+
+@pytest.mark.parametrize(
+    "rows,k,blk,minb,scpb",
+    [
+        (128, 1024, 1024, 1, 16384),
+        (296, 64, 512, 2, 4096),  # 8 K < 4096: the SCPB_SMALL_MIN floor
+        (296, 256, 512, 2, 4096),
+        (296, 512, 512, 2, 4096),  # k <= 512: 8 K = SCPB_SMALL_MIN
+        (296, 1024, 512, 2, 8192),
+        (297, 64, 256, 4, 4096),  # 8 K < 4096: the SCPB_SMALL_MIN floor
+        (297, 256, 256, 4, 4096),
+        (297, 512, 256, 4, 4096),
+        (297, 1024, 256, 4, 5120),  # 8 K = 8192 capped by the 196 KB tier
+        (296, 2048, 512, 2, 8192),
+        (297, 2048, 256, 4, 8192),
+    ],
+    ids=lambda v: str(v),
+)
+def test_selfsampling_main_scpb_arms(rows, k, blk, minb, scpb):
+    """The single-CTA main arms' staging capacity (8 entries per K of the KPT
+    rung, floored at 4096, capped per arm): host SCAP == kernel SCPB (the
+    sampling ladder and the plan smem are derived from it on both sides), and
+    every engine (skip / dense) keeps its MINB CTAs per SM inside the 196 KB
+    shared-memory carveout (1 KB reserved per CTA)."""
+    assert ss_host.SCPB_SMALL_CAP == ss_dev.SCPB_SMALL_CAP
+    assert ss_host.SCPB_SMALL_MIN == ss_dev.SCPB_SMALL_MIN == 4096
+    n = 262144
+    plan = ss_host.route(rows, n, n, k)
+    assert plan["kernel"] == "main" and plan["tpl"][0] == blk and plan["tpl"][2] == minb, plan
+    assert plan["rt"]["SCAP_"] == scpb, plan["rt"]
+    tpl = plan["tpl"]
+    for block_skip in (False, True):
+        kern = ss_dev.GvrMainKernel(
+            *tpl[:6],
+            varlen=True,
+            next_n=1,
+            cr_shift=2,
+            r_const=1,
+            hint_free=True,
+            block_skip=block_skip,
+        )
+        assert kern.scpb == scpb
+        assert kern.dyn_bytes == plan["smem"]
+        static = 2048 + (2 * ss_dev.SKIP_BLOCKS if block_skip else 0)  # hist/scalars + s_list
+        if k <= 1024:  # the k > 1024 BLK=256 skip engine predates this budget (228 KB tier)
+            assert minb * (kern.dyn_bytes + static + 1024) <= 196 * 1024, (
+                block_skip,
+                kern.dyn_bytes,
+            )
+
+
+@pytest.mark.parametrize("bm_mode", ["+1e-4", "+0.5", "*4+0.5", "+3e38rec"], ids=lambda v: v)
+@pytest.mark.parametrize(
+    "rows,msl_c", [(128, 262144), (200, 131072), (300, 131072)], ids=lambda v: str(v)
+)
+def test_selfsampling_block_skip_bm_line_overestimated(rows, msl_c, bm_mode):
+    """Over-estimated block maxima (still valid upper bounds) can push the
+    block line above the K-th logit: `+1e-4` (below one level-1 bin) is
+    repaired by the TSH rung, `+0.5` / `*4+0.5` by the floor retry; a `+3e38`
+    record makes the histogram range non-finite -> sampling fallback with a
+    permanently surviving block."""
+    _bm_line_case(rows, msl_c, 1024, "spread", msl_c - 9, bm_mode=bm_mode)
+
+
+@pytest.mark.parametrize(
+    "rows,msl_c,k", [(128, 262144, 1024), (200, 131072, 512)], ids=lambda v: str(v)
+)
+def test_selfsampling_block_skip_bm_line_mtp_rows(rows, msl_c, k):
+    """next_n = 4 with kv % 4 in 1..3: the request-level block_max includes a
+    position the shorter rows exclude (inflated last block) -> exact."""
+    _bm_line_case(rows, msl_c, k, "spread", msl_c - 40, next_n=4)
+
+
+def test_selfsampling_block_skip_bm_line_env_off():
+    """TRTLLM_GVR_BM_LINE=0 compiles the skip engine with the sampling line
+    (bm_line False, distinct compile key) and stays exact on a skip-armed row."""
+    import subprocess
+    import sys
+
+    code = r"""
+import os, torch
+assert os.environ["TRTLLM_GVR_BM_LINE"] == "0"
+import tensorrt_llm  # noqa: F401
+from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import gvr_topk_decode_self_sampling as ss
+from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import gvr_topk_decode_self_sampling_host as ss_host
+assert ss.BM_LINE is False
+rows, msl_c, k, cr = 128, 65536, 1024, 4
+torch.manual_seed(11)
+lg = torch.randn(rows, msl_c, dtype=torch.float32, device="cuda")
+kv = torch.full((rows,), msl_c * cr, dtype=torch.int32, device="cuda")
+nb = msl_c // 32
+bm = lg.view(rows, nb, 32).amax(2).contiguous()
+out = torch.full((rows, k), -7, dtype=torch.int32, device="cuda")
+ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr, block_max=bm)
+torch.cuda.synchronize()
+keys = [key for key in ss._COMPILE_CACHE if key[4] is True]
+assert keys and all(key[-1] is False for key in keys), keys
+ref = torch.topk(lg, k, dim=1).values.sort(dim=1).values
+got = lg.gather(1, out.long()).sort(dim=1).values
+assert torch.equal(got, ref)
+print("BM_LINE_OFF_OK")
+"""
+    env = dict(os.environ, TRTLLM_GVR_BM_LINE="0")
+    res = subprocess.run(
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=900
+    )
+    assert res.returncode == 0 and "BM_LINE_OFF_OK" in res.stdout, (
+        res.stdout[-2000:] + res.stderr[-4000:]
+    )

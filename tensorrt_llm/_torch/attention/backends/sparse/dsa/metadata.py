@@ -24,6 +24,7 @@ from ..params import use_self_sampling_gvr
 from .cache_manager import is_dsa_cache_manager
 from .indexer import (
     _DG_SCHEDULE_BLOCK_KV,
+    _DSL_FP4_USE_DYN,
     Indexer,
     IndexerPrefillChunkMetadata,
     _compute_slot_mappings,
@@ -230,6 +231,14 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             and get_sm_version() in (100, 103)
             and not self.use_self_sampling_topk
         )
+        # Block-max skip on the self-sampling path: the indexer decides per
+        # launch geometry whether to arm it; the metadata owns the buffer.
+        self.use_gvr_block_skip = (
+            self.use_self_sampling_topk
+            and bool(getattr(sparse_metadata_params, "use_gvr_block_skip", True))
+            and bool(sparse_metadata_params.use_cute_dsl_paged_mqa_logits)
+        )
+        self.gvr_block_max: Optional[torch.Tensor] = None
 
         self.create_buffers_for_mla_rope_append(capture_graph=capture_graph)
         self.create_buffers_for_indexer(capture_graph=capture_graph)
@@ -474,6 +483,16 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 num_rows_list=tuple(sorted(rows)),
                 row_stride=row_stride,
             )
+            if getattr(self, "use_gvr_block_skip", False):
+                _ss_host.warmup_varlen(
+                    int(top_k),
+                    msl_c * cr,
+                    compress_ratio=cr,
+                    next_n=int(next_n),
+                    num_rows_list=tuple(sorted(rows)),
+                    row_stride=row_stride,
+                    block_skip=True,
+                )
         except torch.cuda.OutOfMemoryError:
             # warmup is best-effort: the dispatch works without it (engines
             # JIT lazily outside capture), so do not fail engine init
@@ -584,6 +603,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.kv_lens_cuda_2d[: self.num_generations, :next_n_cap].copy_(
                 gen_indexer_kv_lens.unsqueeze(-1).expand(-1, next_n_cap)
             )
+            if _DSL_FP4_USE_DYN and getattr(self, "dsl_dyn_state", None) is not None:
+                self.dsl_dyn_state.zero_()
             scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
                 gen_indexer_kv_lens.view(-1, 1), _DG_SCHEDULE_BLOCK_KV, self.num_sms
             )
@@ -972,6 +993,19 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        # FP4 DSL scorer work-stealing state (arrival word, per-range claim
+        # counters); the kernel restores the zeros it uses.
+        # One buffer per process: launches that share it must be stream-ordered.
+        self.dsl_dyn_state = None
+        if _DSL_FP4_USE_DYN:
+            self.dsl_dyn_state = self.get_empty(
+                self.cuda_graph_buffers,
+                (64 + (self.num_sms + 31) // 32 * 32,),
+                cache_name="dsl_dyn_state",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            self.dsl_dyn_state.zero_()
         # Pre-allocated 2D kv_lens buffer for the new DeepGEMM 2D context_lens
         # API. Shape: (max_num_sequences, 1 + max_draft_tokens). Each row
         # broadcasts the same kv_len across next_n positions; kernel reads a
@@ -1005,6 +1039,18 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.topk_indices_buffer,
                 device="cpu",
                 pin_memory=prefer_pinned(),
+            )
+        if self.use_gvr_block_skip:
+            # [gen rows, ceil(msl_c/128)*4] fp32: one max per 32 compressed
+            # positions (the FP4 epilogue's warp-partial record layout)
+            msl_c = int(self.get_indexer_max_seq_len())
+            nb4 = ((msl_c + 255) // 256 * 256) // 128 * 4
+            self.gvr_block_max = self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_sequences * (1 + self.max_draft_tokens), nb4),
+                cache_name="gvr_block_max",
+                dtype=torch.float32,
+                capture_graph=capture_graph,
             )
         if self.needs_gvr_prior:
             self.gvr_prior_indices = self.get_empty(

@@ -19,7 +19,7 @@ Three sections:
 
 1. dispatch — the CUDA host dispatch as a pure function
    ``route(b, n, npad, k, num_sms=148, sm_version=100)``;
-2. workspace — one zero-initialised per-device slab (20,973,568 B) via the
+2. workspace — one zero-initialised per-device slab (41,945,088 B) via the
    torch caching allocator, with keep-alive + double-checked locking;
 3. operator entry — ``run(logits, pre_idx, n_valid, indices)`` /
    ``run_ws(..., workspace)`` DPS forms with input hardening and a
@@ -46,10 +46,22 @@ CUDA-graph capture.
 
 import math
 import operator
+import os
 import threading
 from collections.abc import Sequence
 
 import torch
+
+try:
+    from ..utils import gvr_pdl_enabled
+except ImportError:  # standalone import of this module
+    _PDL = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    _PDL_MAX_B = int(os.environ.get("TRTLLM_GVR_PDL_MAX_B", "16"))
+    _PDL_MAX_NPAD = int(os.environ.get("TRTLLM_GVR_PDL_MAX_NPAD", "16384"))
+
+    def gvr_pdl_enabled(rows: int, npad: int) -> bool:
+        return _PDL and (int(rows) <= _PDL_MAX_B or int(npad) <= _PDL_MAX_NPAD)
+
 
 _dev_mod = None
 
@@ -105,6 +117,17 @@ QUADC = 96  # crossing-bin O(mc^2) rank gate (streaming/reg paths, every registe
 SNB = 256  # streaming-path bin count
 CMPC = 4096  # crossing-bin slots per CTA, clustered register path
 BLKC = 1024  # CTA size of the clustered register path
+# gvr_main staging capacity on the single-CTA small arms (rows 149..296 -> BLK 512,
+# rows > 296 -> BLK 256): 8 entries per K of the KPT rung, at least 4096, capped per
+# arm; mirror of the device module's scpb_small
+SCPB_SMALL_CAP = {512: 8192, 256: 5120}
+SCPB_SMALL_MIN = 4096
+
+
+def scpb_small(b: int, k: int) -> int:
+    blk = 512 if b <= 296 else 256
+    kpt = 1 if k <= blk else (2 if k <= 2 * blk else (4 if k <= 4 * blk else 8))
+    return max(min(8 * kpt * blk, SCPB_SMALL_CAP[blk]), SCPB_SMALL_MIN, 8192 if k > 1024 else 0)
 
 
 def route(
@@ -287,7 +310,7 @@ def route(
         useclus = True
 
     big = b * R <= 148
-    SCAP = (16384 if R == 1 else 8192) if big else (8192 if k > 1024 else 4096)
+    SCAP = (16384 if R == 1 else 8192) if big else scpb_small(b, k)
     CMP = (4096 if k > 1024 else 2048) if big else 1024
 
     aim = (
@@ -631,7 +654,7 @@ def route_streaming(
         R = p2
         useclus = True
     big = b * R <= 148
-    scap = (16384 if R == 1 else 8192) if big else (8192 if k > 1024 else 4096)
+    scap = (16384 if R == 1 else 8192) if big else scpb_small(b, k)
     cmp_ = (4096 if k > 1024 else 2048) if big else 1024
     aim = (
         ((4 * k if k >= 1024 else 2 * k) if R == 1 else 2 * k)
@@ -818,13 +841,16 @@ def _varlen_launcher(
     cr: int,
     num_sms: int = 148,
     sm_version: int = 100,
+    block_skip: bool = False,
 ) -> tuple:
     """Capture-time varlen plan + compiled launcher.  The gvr_main port is
     the universally correct fallback; specialist family tiers below.  Every
     choice here is a function of capture-stable quantities only — mirroring
     the in-tree runner's pick_tuning(graph_capture=...) discipline."""
     profile = _pack_device_profile(num_sms, sm_version)
-    key = (num_rows, npad, k, n_env, next_n, cr, profile)
+    # the dense key keeps its 7-tuple shape (shape + device profile); the
+    # skipping variant is a distinct engine and gets a tagged key
+    key = (num_rows, npad, k, n_env, next_n, cr, profile) + (("skip",) if block_skip else ())
     hit = _VARLEN_CACHE.get(key)
     if hit is not None:
         return hit
@@ -835,6 +861,9 @@ def _varlen_launcher(
     n_kernel = min(n_env, npad)
     n_route = max(n_kernel, k + 1)
     cr_shift = 0 if cr == 1 else 2
+    # PDL dependent launch of the top-k (shape-gated; a pure function of this
+    # cache key)
+    pdl = gvr_pdl_enabled(num_rows, npad)
     dev = _device()
     # ---- route() parity, family tier 1: clustered register-resident --------
     # Admit reg_clus exactly where the free route picks it; its whole
@@ -845,6 +874,7 @@ def _varlen_launcher(
     if plan_free["kernel"] == "reg_clus":
         fn = dev.get_compiled__regclus(
             tuple(plan_free["tpl"]),
+            pdl=pdl,
             varlen=True,
             next_n=next_n,
             cr_shift=cr_shift,
@@ -863,6 +893,7 @@ def _varlen_launcher(
     if plan_free["kernel"] in ("reg", "regimg"):
         fn = dev.get_compiled__reg(
             tuple(plan_free["tpl"]),
+            pdl=pdl,
             varlen=True,
             next_n=next_n,
             cr_shift=cr_shift,
@@ -893,6 +924,8 @@ def _varlen_launcher(
             next_n=next_n,
             cr_shift=cr_shift,
             hint_free=True,
+            block_skip=bool(block_skip),
+            pdl=pdl,
         )
         lc = (
             "clus",
@@ -908,7 +941,12 @@ def _varlen_launcher(
     # TSHG (tpl[6]) is dead under varlen (the ctor compiles the TSH
     # machinery in whenever SPLIT); normalize it out of the compile key so
     # row counts differing only in that slot share one engine
-    fn = dev.get_compiled(tpl[:6] + (False,) + (next_n, cr_shift, r_const), hint_free=True)
+    fn = dev.get_compiled(
+        tpl[:6] + (False,) + (next_n, cr_shift, r_const),
+        hint_free=True,
+        block_skip=bool(block_skip),
+        pdl=pdl,
+    )
     big = num_rows * r_const <= 148
     aim_base = (
         ((4 * k if k >= 1024 else 2 * k) if r_const == 1 else 2 * k)
@@ -932,6 +970,47 @@ def _varlen_launcher(
     lc = ("main", fn, pre, tail)
     _VARLEN_CACHE[key] = lc
     return lc
+
+
+# Length floor of the streaming-main skip, relative to K: the block line keeps K of the
+# row's n/32 blocks, so the scan reads K*32/n of the row (n >= 120 K: pro K=1024 ->
+# 122880, flash K=512 -> 61440).
+BLOCK_SKIP_MIN_N_PER_K = int(os.environ.get("TRTLLM_GVR_BLOCK_SKIP_MIN_N_PER_K", "120"))
+BLOCK_SKIP_CLUS_MIN_N = 262144  # 2-CTA cluster family: 1M raw @ cr=4
+BLOCK_SKIP_MAX_N = 262144  # skip table covers SKIP_BLOCKS * 32 compressed positions
+# Logits footprint floor of the skip: below it the rows the scorer just wrote
+# are still L2-resident.
+BLOCK_SKIP_MIN_LOGITS_MB = int(os.environ.get("TRTLLM_GVR_BLOCK_SKIP_MIN_MB", "96"))
+
+
+def block_skip_useful(
+    num_rows: int,
+    npad: int,
+    k: int,
+    n_env: int,
+    num_sms: int = 148,
+    sm_version: int = 100,
+) -> bool:
+    """True when the varlen dispatch for this geometry lands on the single-CTA
+    streaming main (R == 1) at an envelope of >= BLOCK_SKIP_MIN_N_PER_K * k
+    compressed positions or on the 2-CTA cluster family at >= BLOCK_SKIP_CLUS_MIN_N, and
+    the launch's logits (rows x positions x 4 B) exceed BLOCK_SKIP_MIN_LOGITS_MB.
+    The register families (row loaded before a line exists) and the multi-CTA
+    SPLIT main are excluded. Pure host function (mirrors _varlen_launcher's
+    tiers)."""
+    n_kernel = min(int(n_env), int(npad))
+    if n_kernel < BLOCK_SKIP_MIN_N_PER_K * int(k) or n_kernel > BLOCK_SKIP_MAX_N:
+        return False
+    if int(num_rows) * n_kernel * 4 < (BLOCK_SKIP_MIN_LOGITS_MB << 20):
+        return False
+    n_route = max(n_kernel, int(k) + 1)
+    plan_free = route(int(num_rows), n_route, int(npad), int(k), num_sms, sm_version)
+    if plan_free["kernel"] == "clus":
+        return int(plan_free["cluster"]) == 2 and n_kernel >= BLOCK_SKIP_CLUS_MIN_N
+    if plan_free["kernel"] in ("reg_clus", "reg", "regimg"):
+        return False
+    plan = route_streaming(int(num_rows), n_route, int(npad), int(k), force_main=True)
+    return int(plan["rt"]["R"]) == 1
 
 
 def route_bands(
@@ -983,7 +1062,7 @@ Concurrent STREAMS on one device that may both take the multi-CTA SPLIT path
 must pass their own workspace via run_ws().
 
 Size: workspace_bytes() = GVR_WS_BUF_OFF + MAXC*GCAP*sizeof(int2)
-    = 2048 + 160*16384*8 = 20,973,568 B.
+    = 2048 + 160*32768*8 = 41,945,088 B.
 
 Kernel-facing view: the compiled main-family signature takes the workspace
 as a 1-D contiguous int32 tensor (fake tensor dtype Int32, assumed_align=16
@@ -997,10 +1076,10 @@ the tensor's byte offset.
 # workspace geometry constants -- must match the device kernels
 GVR_MAX_DEV = 64
 _MAXC = 160
-_GCAP = 16384
+_GCAP = 32768
 _GVR_WS_BUF_OFF = 2048
-WS_BYTES = _GVR_WS_BUF_OFF + _MAXC * _GCAP * 8  # 20,973,568
-assert WS_BYTES == 20_973_568
+WS_BYTES = _GVR_WS_BUF_OFF + _MAXC * _GCAP * 8  # 41,945,088
+assert WS_BYTES == 41_945_088
 
 _mu = threading.Lock()  # slow-path mutex
 _ws_keep = {}  # device index -> keep-alive int32 view
@@ -1124,6 +1203,17 @@ _DUMMY_KV = {}
 _DEVICE_PROFILE = {}
 _DEVICE_PROFILE_SHIFT = 16
 _DEVICE_NUM_SMS_MASK = (1 << _DEVICE_PROFILE_SHIFT) - 1
+_DUMMY_BMAX = {}
+
+
+def _dummy_bmax(dev_index, device):
+    """Cached [1, 4] fp32 tensor per device -- the dead block-max slot of the
+    streaming-family ABI when block skipping is off (skip_en = 0)."""
+    t = _DUMMY_BMAX.get(dev_index)
+    if t is None:
+        t = torch.zeros((1, 4), dtype=_F32, device=device)
+        _DUMMY_BMAX[dev_index] = t
+    return t
 
 
 def _dummy_kv(dev_index, device):
@@ -1212,7 +1302,21 @@ def _build_launcher(b, n, npad, k, num_sms, sm_version=100):
         # [SCAP_/CMP_ dead, ABI parity; the trailing varlen block is dead in
         #  legacy mode — a cached dummy kv_lens tensor + five zeros]
         def fn(lg, pi, o, w, *a, _raw=raw):
-            _raw(lg, pi, o, w, *a, _dummy_kv(lg.get_device(), lg.device), 0, 0, 0, 0, 0)
+            _raw(
+                lg,
+                pi,
+                o,
+                w,
+                *a,
+                _dummy_kv(lg.get_device(), lg.device),
+                0,
+                0,
+                0,
+                0,
+                0,
+                _dummy_bmax(lg.get_device(), lg.device),
+                0,
+            )
 
         args = (
             rt["n"],
@@ -1249,7 +1353,15 @@ def _build_launcher(b, n, npad, k, num_sms, sm_version=100):
         )
 
         def _call(lg, pi, idx, _fn=fn, _args=args):
-            _fn(lg, pi, _dummy_kv(lg.get_device(), lg.device), idx, *_args)
+            _fn(
+                lg,
+                pi,
+                _dummy_kv(lg.get_device(), lg.device),
+                idx,
+                *_args,
+                _dummy_bmax(lg.get_device(), lg.device),
+                0,
+            )
 
         return (_call, (), False)
     if fam == "reg_clus":
@@ -1441,8 +1553,17 @@ def run_varlen(
     values: torch.Tensor | None = None,
     max_seq_len: int | None = None,
     workspace: torch.Tensor | None = None,
+    block_max: torch.Tensor | None = None,
 ) -> None:
     """Run hint-free self-sampling Top-K with per-request device KV lengths.
+
+    ``block_max`` (optional): the scorer's warp-partial block maxima,
+    ``[num_rows, >= ceil(n/32)]`` fp32 contiguous, entry j = max logit over
+    positions [32j, 32j+32) of that row (invalid positions -FLT_MAX). When
+    given, the streaming families (main / clus) elide the loads of every
+    32-position block whose max is below the attempt's line; exactness is
+    unaffected (a skipped block cannot hold a candidate). Rows longer than
+    262144 compressed positions run dense. Register families ignore it.
 
     Row semantics (mirror of ``heuristicTopKDecode.cu`` and the in-tree
     ``cute_dsl_gvr_topk_decode`` runner):
@@ -1524,7 +1645,7 @@ def run_varlen(
     # out of bounds).
     if not (logits.is_cuda and indices.is_cuda):
         raise RuntimeError("all tensors must be CUDA")
-    if logits.dtype is not _F32 or indices.dtype is not _I32:
+    if indices.dtype is not _I32:
         raise RuntimeError("logits must be float32; indices must be int32")
     if len(indices.shape) != 2 or indices.shape[0] != num_rows:
         raise RuntimeError(
@@ -1580,7 +1701,32 @@ def run_varlen(
         n_env = 1 << max(n_env - 1, 1).bit_length()
     n_env = min(max(n_env, 1), npad)
     profile = _device_profile_key(d)
-    key = (num_rows, npad, k, n_env, nn, cr, profile)
+    if block_max is None:
+        # dense engine: shape + device-profile key, dead block-max ABI slot
+        key = (num_rows, npad, k, n_env, nn, cr, profile)
+        bm = _DUMMY_BMAX.get(d)
+        if bm is None:
+            bm = _dummy_bmax(d, logits.device)
+        skip_en = 0
+    else:
+        if not (block_max.is_cuda and block_max.dtype is _F32 and block_max.is_contiguous()):
+            raise RuntimeError("block_max must be a contiguous CUDA float32 tensor")
+        if len(block_max.shape) != 2 or block_max.shape[0] < num_rows:
+            raise RuntimeError(
+                f"block_max must be [num_rows={num_rows}, >=ceil(n/32)], got {tuple(block_max.shape)}"
+            )
+        if block_max.shape[1] * 32 < n_env:
+            raise RuntimeError(
+                f"block_max width {block_max.shape[1]} covers {block_max.shape[1] * 32} < envelope {n_env}"
+            )
+        if block_max.data_ptr() & 15:
+            raise RuntimeError("block_max base must be 16-byte aligned")
+        if block_max.shape[1] & 3:
+            raise RuntimeError("block_max width must be a multiple of 4 (rows are read as float4)")
+        # the skipping variant is a distinct engine and gets a tagged key
+        key = (num_rows, npad, k, n_env, nn, cr, profile, "skip")
+        bm = block_max
+        skip_en = 1
     lc = _VARLEN_CACHE.get(key)
     if lc is None:
         if _is_capturing():
@@ -1588,7 +1734,9 @@ def run_varlen(
                 "varlen launcher not compiled for this shape — warm up before CUDA graph capture"
             )
         num_sms, sm_version = _unpack_device_profile(profile)
-        lc = _varlen_launcher(num_rows, npad, k, n_env, nn, cr, num_sms, sm_version)
+        lc = _varlen_launcher(
+            num_rows, npad, k, n_env, nn, cr, num_sms, sm_version, block_skip=skip_en == 1
+        )
     idx = indices
     if idx.shape[1] != k:
         idx = idx.reshape(-1)[: num_rows * k].view(num_rows, k)
@@ -1605,11 +1753,11 @@ def run_varlen(
         lc[1](lg, pre_arg, kv_lens, idx, *lc[2])
     elif lc[0] == "clus":
         # compiled ABI: (logits, pre_idx, kv_lens, out, n_env, npad, k,
-        #                SCAP, CMP, dead DYN x5)
-        lc[1](lg, pre_arg, kv_lens, idx, *lc[2])
+        #                SCAP, CMP, dead DYN x5, bmax, skip_en)
+        lc[1](lg, pre_arg, kv_lens, idx, *lc[2], bm, skip_en)
     else:
         _, fn, pre, tail = lc
-        fn(lg, pre_arg, idx, ws, *pre, kv_lens, *tail)
+        fn(lg, pre_arg, idx, ws, *pre, kv_lens, *tail, bm, skip_en)
     if vals is not None:
         idx64 = idx.to(torch.int64)
         vals.copy_(lg.gather(1, idx64.clamp_min(0)))
@@ -1709,7 +1857,17 @@ def run_prefill(
         # varlen main ABI: pre_idx slot = row_ends, kv_lens slot = row_starts;
         # only npad / k / SCAP_ / CMP_ matter (R=1), the other scalars are dead.
         pre = (0, npad, k, scap, cmp_, 1, 0, 0, 0, 0, 0)
-        fn(lg[r0:r1], row_ends[r0:r1], indices[r0:r1], ws, *pre, row_starts[r0:r1], *tail)
+        fn(
+            lg[r0:r1],
+            row_ends[r0:r1],
+            indices[r0:r1],
+            ws,
+            *pre,
+            row_starts[r0:r1],
+            *tail,
+            _dummy_bmax(lg.get_device(), lg.device),
+            0,
+        )
     return
 
 
@@ -1774,8 +1932,13 @@ def warmup_varlen(
     next_n: int = 1,
     num_rows_list: Sequence[int] = (1,),
     row_stride: int | None = None,
+    block_skip: bool = False,
 ) -> None:
     """TESTING/INIT ONLY — compile the varlen engine's envelope tuples.
+
+    ``block_skip`` additionally warms the block-max-skipping streaming
+    variants (the dispatch key the serving path uses when it passes
+    ``block_max``); a zero block_max buffer is enough for the compile.
 
     One tiny real launch per requested ``num_rows`` (compile keys do not
     depend on tensor contents). Uses the current CUDA device. The done-key
@@ -1857,6 +2020,7 @@ def warmup_varlen(
         tuple(rows_list),
         npad,
         profile,
+        bool(block_skip),
     )
     # The done key covers the GPU band launches only (one per engine compile
     # key). The exact-row launcher population below is keyed by the requested
@@ -1872,6 +2036,9 @@ def warmup_varlen(
         logits = torch.zeros((rows_max, npad), dtype=torch.float32, device=dev)
         kv_lens = torch.full((rows_max // nn,), int(max_seq_len), dtype=torch.int32, device=dev)
         out = torch.empty((rows_max, int(top_k)), dtype=torch.int32, device=dev)
+        bmx = None
+        if block_skip:
+            bmx = torch.zeros((rows_max, (npad + 31) // 32), dtype=torch.float32, device=dev)
         for rows in rows_list:
             batch = rows // nn
             run_varlen(
@@ -1881,8 +2048,9 @@ def warmup_varlen(
                 next_n=nn,
                 compress_ratio=int(compress_ratio),
                 max_seq_len=int(max_seq_len),
+                block_max=None if bmx is None else bmx[:rows],
             )
-        del logits, kv_lens, out
+        del logits, kv_lens, out, bmx
         torch.cuda.synchronize()
     # band launches compiled every ENGINE; now populate the per-row-count
     # LAUNCHER cache entries for the exact requested row counts (pure host
@@ -1899,6 +2067,7 @@ def warmup_varlen(
             int(compress_ratio),
             num_sms,
             sm_version,
+            block_skip=bool(block_skip),
         )
     if not bands_done:
         with _VARLEN_WARMUP_LOCK:

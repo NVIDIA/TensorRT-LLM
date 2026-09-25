@@ -69,6 +69,36 @@ except ImportError:
     HAS_FAST_HADAMARD = False
 
 _DG_SCHEDULE_BLOCK_KV = 64
+# Tail-only work stealing in the FP4 DSL scorer: on when
+# TRTLLM_DSL_FP4_DYN_SCHED=1; "auto" follows _DSL_FP4_DYN_DEFAULT_ON. When on,
+# the metadata owns the scheduler state buffer and every decode launch passes
+# it (the runner still applies its shape floors, see cute_dsl_custom_ops).
+# Off by default: the build is chosen at CUDA-graph capture from the engine's
+# max sequence length, and launches whose rows are far below that envelope
+# pay the scheduler's fixed cost.
+_DSL_FP4_DYN_DEFAULT_ON = False
+_DSL_FP4_DYN_SCHED = os.environ.get("TRTLLM_DSL_FP4_DYN_SCHED", "auto")
+_DSL_FP4_USE_DYN = _DSL_FP4_DYN_SCHED == "1" or (
+    _DSL_FP4_DYN_SCHED == "auto" and _DSL_FP4_DYN_DEFAULT_ON
+)
+
+_fp4_scorer_eager_fn = None
+
+
+def _fp4_scorer_eager():
+    """Body of torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits, called
+    directly outside torch.compile / export tracing (same pattern as the
+    self-sampling top-k engine): saves the torch.library dispatch on the
+    eager decode path. Lazily imported to keep the custom-op package out of
+    this module's import graph."""
+    global _fp4_scorer_eager_fn
+    if _fp4_scorer_eager_fn is None:
+        from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+            cute_dsl_fp4_paged_mqa_logits_eager,
+        )
+
+        _fp4_scorer_eager_fn = cute_dsl_fp4_paged_mqa_logits_eager
+    return _fp4_scorer_eager_fn
 
 
 def _pick_dsl_expand(
@@ -784,10 +814,53 @@ class Indexer(nn.Module):
             and self.use_cute_dsl_paged_mqa_logits
             and self.use_fp4
         )
+        # Block-max skip for the self-sampling engine (FP4 + DSL scorer): the
+        # epilogue emits per-32-position maxima and the streaming top-k
+        # (single-CTA main, 2-CTA cluster) skips the blocks below its sampled
+        # line. Armed per launch geometry (large batch at >= 512k-token
+        # envelopes; see gvr_topk_decode_self_sampling_host.block_skip_useful).
+        self.use_gvr_block_skip = (
+            getattr(sparse_params, "use_gvr_block_skip", True)
+            and self._use_self_sampling_topk
+            and decode_top_k_implementation == TopKImplementation.CUTE_DSL_GVR
+            and self.use_cute_dsl_paged_mqa_logits
+            and self.use_fp4
+        )
+        self._gvr_block_skip_cache: dict = {}
 
         # Fused wk + weights_proj weight for single FP32 cuBLAS GEMM
         # (populated in cache_derived_state; maps to TF32 tensor cores on Ampere+)
         self._fused_wk_wp_weight: Optional[torch.Tensor] = None
+
+    def _block_skip_useful(self, num_rows: int, max_seq_len_c: int) -> bool:
+        """Cached pure-host dispatch check: does the self-sampling engine's
+        family for this geometry (rows, DSL arena row stride, k, envelope)
+        gate its row scan by block maxima?"""
+        key = (int(num_rows), int(max_seq_len_c))
+        hit = self._gvr_block_skip_cache.get(key)
+        if hit is None:
+            from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_self_sampling_host import (
+                _device_profile_key,
+                _unpack_device_profile,
+                block_skip_useful,
+            )
+
+            npad = (int(max_seq_len_c) + 255) // 256 * 256  # DSL paged-MQA arena row stride
+            num_sms, sm_version = _unpack_device_profile(
+                _device_profile_key(torch.cuda.current_device())
+            )
+            hit = bool(
+                block_skip_useful(
+                    int(num_rows),
+                    npad,
+                    int(self.index_topk),
+                    int(max_seq_len_c),
+                    num_sms,
+                    sm_version,
+                )
+            )
+            self._gvr_block_skip_cache[key] = hit
+        return hit
 
     def cache_derived_state(self) -> None:
         """Fuse wk and weights_proj for F.linear with TF32 tensor cores on Ampere+."""
@@ -1183,6 +1256,11 @@ class Indexer(nn.Module):
             metadata.kv_lens_cuda_runtime[num_contexts : num_contexts + num_generations]
         )
         metadata.gen_indexer_kv_lens_cuda_runtime = gen_seq_lens
+        dyn_state = getattr(metadata, "dsl_dyn_state", None)
+        if _DSL_FP4_USE_DYN and dyn_state is not None:
+            # the kernel restores these words itself; this recovers from an
+            # aborted launch
+            dyn_state.zero_()
         if not metadata.use_expanded_buffers_for_mtp:
             next_n_cap = metadata.kv_lens_cuda_2d.shape[1]
             metadata.kv_lens_cuda_2d[:num_generations, :next_n_cap].copy_(
@@ -1763,6 +1841,17 @@ class Indexer(nn.Module):
                     and next_n == metadata.dsl_expand_factor * metadata.dsl_atom
                 )
                 gvr_emit_kwargs: dict = {}
+                gvr_block_max = None
+                if (
+                    self.use_gvr_block_skip
+                    and metadata.gvr_block_max is not None
+                    and not dsl_atom_split
+                    and self._block_skip_useful(num_gen_tokens, indexer_max_seq_len)
+                ):
+                    gvr_block_max = metadata.gvr_block_max[:num_gen_tokens]
+                    gvr_emit_kwargs = dict(
+                        emit_block_meta=True, emit_hit_stats=False, block_max_out=gvr_block_max
+                    )
                 # emitting for a step the Top-K cannot consume only churns
                 # the closed-loop state, so gate on the consumable shape
                 if (
@@ -1804,7 +1893,14 @@ class Indexer(nn.Module):
                         dsl_block_table = metadata.block_table_expanded[:exp_B]
                         dsl_schedule_meta = metadata.scheduler_metadata_buffer_expanded
 
-                    logits_decode = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
+                    if _DSL_FP4_USE_DYN and getattr(metadata, "dsl_dyn_state", None) is not None:
+                        gvr_emit_kwargs["dyn_state"] = metadata.dsl_dyn_state
+                    scorer = (
+                        torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits
+                        if torch.compiler.is_compiling()
+                        else _fp4_scorer_eager()
+                    )
+                    logits_decode = scorer(
                         dsl_q,
                         decode_q_scale,
                         k_cache,
@@ -1884,6 +1980,8 @@ class Indexer(nn.Module):
             )
             assert metadata.radix_aux_indices is not None
             assert metadata.radix_aux_logits is not None
+            if gvr_block_max is not None:
+                gvr_ext_kwargs = dict(gvr_ext_kwargs or {}, gvr_block_max=gvr_block_max)
             self.top_k(
                 logits_decode,
                 topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :],
