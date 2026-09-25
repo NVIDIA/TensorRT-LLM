@@ -1119,6 +1119,17 @@ class ChatCompletionRequest(OpenAIBaseModel):
         description=("Additional kwargs to pass to the template renderer. "
                      "Will be accessible by the chat template."),
     )
+    injected_chat_template_kwargs: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Server-populated. Keys of `chat_template_kwargs` that the server "
+            "derived from API-level fields (for example the Anthropic "
+            "`thinking` and `context_management` controls) rather than the "
+            "caller. The unused-kwargs guard exempts them, since the caller "
+            "cannot remove a control the server added. Relayed with the "
+            "request so a disaggregated worker rendering the prompt applies "
+            "the same exemption."),
+    )
 
     media_io_kwargs: Optional[Dict[MediaModality, Dict[str, Any]]] = Field(
         default=None,
