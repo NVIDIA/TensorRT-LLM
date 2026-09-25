@@ -42,8 +42,7 @@ def worker_env():
 
 @pytest.fixture
 def model_name():
-    model_path = os.path.join(llm_models_root(),
-                              "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    model_path = os.path.join(llm_models_root(), "Qwen3/Qwen3-0.6B")
     assert os.path.exists(model_path), f"Model path {model_path} does not exist"
     return model_path
 

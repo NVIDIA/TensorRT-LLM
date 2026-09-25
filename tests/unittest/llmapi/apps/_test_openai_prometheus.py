@@ -33,10 +33,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-@pytest.fixture(scope="module", ids=["TinyLlama-1.1B-Chat"])
+@pytest.fixture(scope="module", ids=["Qwen3-0.6B"])
 def model_name():
     """Return the HuggingFace model path used for all tests in this module."""
-    return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    return "Qwen3/Qwen3-0.6B"
 
 
 @pytest.fixture(scope="module")
