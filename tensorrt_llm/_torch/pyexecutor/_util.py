@@ -1876,9 +1876,6 @@ class KvCacheCreator:
         if self._llm_args.cuda_graph_config is not None:
             return ("Unified DSpark KV cache currently requires eager "
                     "execution; set cuda_graph_config=None.")
-        if self._llm_args.enable_chunked_prefill:
-            return ("Unified DSpark KV cache does not yet support "
-                    "chunked prefill; set enable_chunked_prefill=False.")
         if self._mapping.pp_size != 1 or self._mapping.cp_size != 1:
             return "Unified DSpark KV cache requires PP=1 and CP=1."
         if (self._mapping.enable_attention_dp
