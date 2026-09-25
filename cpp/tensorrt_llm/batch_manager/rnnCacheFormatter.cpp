@@ -85,6 +85,8 @@ void RnnCacheFormatter::format(TransferSession& session)
 
     auto const& blockIdsPerWindow = blockRange.getBlockIdsPerWindow();
     auto const allWindowSizes = blockRange.getWindowSizes();
+    std::vector<SizeType32> rnnWindowSizes;
+    rnnWindowSizes.reserve(allWindowSizes.size());
 
     for (auto const& ws : allWindowSizes)
     {
@@ -92,6 +94,14 @@ void RnnCacheFormatter::format(TransferSession& session)
         {
             continue;
         }
+        rnnWindowSizes.push_back(ws);
+    }
+
+    auto transferLease = kv_cache_manager::prepareBlockRangeForTransfer(
+        *mKvCacheManager, blockRange, rnnWindowSizes, bufferManager, &llmRequest);
+
+    for (auto const& ws : rnnWindowSizes)
+    {
         auto it = blockIdsPerWindow.find(ws);
         if (it == blockIdsPerWindow.end() || it->second.empty())
         {
