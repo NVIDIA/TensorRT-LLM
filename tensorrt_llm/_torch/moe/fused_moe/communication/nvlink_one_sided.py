@@ -888,17 +888,16 @@ class NVLinkOneSided(Communication):
             comm = self.mnnvl_mem.comm
         if comm is None:
             raise RuntimeError("MNNVL workspace communicator is not initialized")
-        self._require_workspace_lifecycle().checkpoint_restore(
-            comm,
-            lambda: torch.ops.trtllm.moe_a2a_initialize(
-                self.workspace,
-                self.ep_rank,
-                self.ep_size,
-                self.max_num_tokens_per_rank,
-                self.eplb_stats_num_experts,
-                self.can_use_cft_counted_writes,
-            ),
-        )
+
+        # The native op re-validates the planned layout and resets control state;
+        # the layout itself is unchanged by a restore.
+        def reinitialize_frontend() -> torch.Tensor:
+            torch.ops.trtllm.moe_a2a_initialize(
+                self.workspace, self.moe_a2a_metainfo, self.ep_rank, self.ep_size
+            )
+            return self.moe_a2a_metainfo
+
+        self._require_workspace_lifecycle().checkpoint_restore(comm, reinitialize_frontend)
 
     def _mnnvl_checkpoint_is_idle(self) -> bool:
         return self._dispatch_state.get("phase") == "idle"
