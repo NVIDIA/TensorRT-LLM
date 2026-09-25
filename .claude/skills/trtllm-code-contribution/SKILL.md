@@ -2,13 +2,14 @@
 name: trtllm-code-contribution
 tags: [tensorrt-llm, workflow, development]
 description: >
-  Best practices for contributing code to TensorRT-LLM. Covers the official
-  contribution process (issue tracking, fork workflow, DCO signing), coding
-  guidelines, implementation workflow, common mistakes, testing strategy, commit
-  hygiene, and review readiness. Incorporates rules from CONTRIBUTING.md and
+  Implementation-phase best practices for contributing code to TensorRT-LLM.
+  Covers the developer workflow (fork, DCO signing), coding guidelines, the
+  pre-implementation survey, implementation patterns, common mistakes, testing
+  strategy, and commit hygiene. Incorporates rules from CONTRIBUTING.md and
   CODING_GUIDELINES.md plus lessons distilled from real PR retrospectives.
   Use when implementing new features, optimizations, or bug fixes in the
-  TensorRT-LLM codebase.
+  TensorRT-LLM codebase. For the pre-submission review of the pull request
+  itself, use `trtllm-pr-checklist` instead.
 license: Apache-2.0
 metadata:
   author: NVIDIA Corporation
@@ -324,50 +325,15 @@ Target commit structure for a PR:
 | Semantic change + behavior change in one commit | Hard to bisect regressions | Separate bug fixes from feature changes |
 | Stale comment fix as separate commit | Shows the comment wasn't updated with the code change | Update comments in the same commit as the code |
 
-### PR Title Format (Conventional Commits)
+## Preparing the PR Itself
 
-PR titles follow [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/):
+Everything about the pull request as opposed to the code — title format, description
+structure, claims and supporting evidence, CI registration, API stability handling,
+and the pre-submission review — lives in the **`trtllm-pr-checklist`** skill.
 
-```
-type: description
-```
-
-Types: `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `chore`, `None`
-
-For breaking API changes, use `BREAKING CHANGE:` as the type to alert reviewers.
-
-For NVIDIA developers, prefix with JIRA number or NVBUG ID:
-```
-[TRTLLM-5516] perf: description
-[nvbug/5334370] fix: description
-```
-
-Examples:
-- `feat: Add support for starcoder-v2 FP8 base + FP16/BF16 LoRA`
-- `BREAKING CHANGE: Set default max batch size to 2048`
-- `chore: Remove version from plugins .so`
-- `None: Stringized enums for better error msgs`
-- `fix https://github.com/NVIDIA/TensorRT-LLM/issues/700: a Memory leak issue in C++ runtime`
-- `[TRTLLM-5516] perf: Replicate dummy request for cuda graph padding`
-
-### PR Description
-
-Address these points in the PR description:
-
-1. **Background/motivation**: Why is the change necessary?
-2. **Summary**: Summarize the changes in one paragraph.
-3. **Size justification**: If the PR is large, explain why it cannot be broken into multiple PRs.
-4. **Impact assessment**: Potential performance or functional impacts. Flag risks for reviewers.
-5. **Related PRs**: Link to any related PRs.
-
-### PR Conciseness
-
-- Avoid committing commented-out code.
-- Each PR should address a **single concern**. If there are several unrelated fixes, open separate PRs and indicate dependencies in the descriptions.
-
-### API Stability Tests
-
-Some APIs are protected by the [API stability testsuite](../../../tests/unittest/api_stability). If your PR breaks a protected API, the stability tests will fail with `API stability validation failed`. In this case, request review from the API code owners.
+Invoke `/trtllm-pr-checklist` once the implementation is stable and before
+requesting human review. It also covers reviewing someone else's PR and revising
+a PR in response to reviewer or CodeRabbit feedback.
 
 ## Quantified Impact of Common Mistakes
 
@@ -389,25 +355,29 @@ From the short-seq MHA branch (30 commits → net 2 files changed):
 
 **Total waste**: ~24 of 30 commits were fixes/reverts/cleanups of earlier work on the same branch. The final net change is ~200 lines in attention.py and ~665 lines in tests — achievable in ~4-5 clean commits.
 
-## Review Readiness Checklist
+## Implementation Readiness
 
-Before marking a PR ready for review:
+These are the implementation-level invariants to satisfy before the change is
+considered stable. They are prerequisites for the PR review pass, not a
+substitute for it.
 
 - [ ] GitHub issue created and approved
-- [ ] All parallelism modes checked (TP, PP, CP, EP)
+- [ ] Existing infrastructure surveyed and used where possible
+      (see `trtllm-codebase-exploration`)
+- [ ] All parallelism modes checked (TP, PP, CP, EP, attention DP)
 - [ ] RoPE state handled correctly (no double-application)
 - [ ] Threshold/guard semantics match the cost model
-- [ ] Existing infrastructure surveyed and used where possible
-- [ ] Shared logic extracted (no duplicated conditions)
-- [ ] Comments/docstrings updated with any semantic changes
-- [ ] Tests pass and cover key scenarios (including API stability tests if applicable)
-- [ ] Commits squashed (no fix-on-fix chains)
-- [ ] Pre-commit hooks pass (`pre-commit run --all-files`)
-- [ ] DCO sign-off on all commits (`git commit -s`)
 - [ ] Dispatch calls use the right abstraction level (dispatcher, not specific handler)
 - [ ] Method limitations understood (what the reused method does NOT handle)
 - [ ] Hardware-specific behavior tested (SM90, SM100+) or gated appropriately
 - [ ] Complex optimizations disabled by default with env var opt-in
+- [ ] Shared logic extracted (no duplicated conditions)
+- [ ] Comments/docstrings updated with any semantic changes
 - [ ] Test cases exercise distinct code paths (no redundant parametrizations)
-- [ ] PR title follows Conventional Commits format
-- [ ] PR description addresses background, summary, and impact
+- [ ] Commits squashed (no fix-on-fix chains)
+- [ ] Pre-commit hooks pass (`pre-commit run --all-files`)
+- [ ] DCO sign-off on all commits (`git commit -s`)
+
+Once these hold, run **`/trtllm-pr-checklist`** for the pre-submission review:
+design fit and blast radius, validation vs testing, CI registration, claims and
+evidence, and PR contents.
