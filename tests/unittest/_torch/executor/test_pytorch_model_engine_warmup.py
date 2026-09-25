@@ -340,6 +340,7 @@ def test_compiled_mxfp8_warmup_backend_selection(
     monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(autotune=flashinfer_tune))
     method = MXFP8LinearMethod()
     engine = SimpleNamespace(
+        _warmup_timer=_WarmupTimer(rank=0),
         llm_args=SimpleNamespace(enable_autotuner=True),
         _torch_compile_enabled=compile_enabled,
         _torch_compile_prefill_only=prefill_only,
