@@ -26,7 +26,7 @@ Simulates two chained speculative-verification rounds through
   recorded between rounds.
 
 Identical hidden states are fed to both worlds; the fused world additionally
-uses fused QKVG and [f_a|b] projections with multi-stream overlap. With mixed
+uses fused QKV(G) and full- or low-rank gate projections with multi-stream overlap. With mixed
 per-request acceptance between rounds, matching round-2 outputs proves the
 projection fusion and replay bookkeeping (shifted ``cu_seqlens`` layout,
 conv-window seeding, pending-count plumbing) reproduce the promoted-state
@@ -78,7 +78,9 @@ LB = -5.0
 
 
 @torch.no_grad()
-def _make_runtime(seed, aux_stream=None, checkpoint_fp8=False):
+def _make_runtime(
+    seed, aux_stream=None, checkpoint_fp8=False, *, num_heads=H, use_full_rank_gate=True
+):
     # A real KimiLinearConfig (not a SimpleNamespace) so the runtime sees the
     # same config surface it does in production. ``linear_attn_config`` carries
     # the per-layer KDA params the runtime reads plus the (unused here)
@@ -89,10 +91,10 @@ def _make_runtime(seed, aux_stream=None, checkpoint_fp8=False):
         linear_attn_config=dict(
             kda_layers=[1],
             full_attn_layers=[],
-            num_heads=H,
+            num_heads=num_heads,
             head_dim=K,
             short_conv_kernel_size=W,
-            use_full_rank_gate=True,
+            use_full_rank_gate=use_full_rank_gate,
             gate_lower_bound=LB,
         ),
     )
@@ -134,22 +136,22 @@ def _make_runtime(seed, aux_stream=None, checkpoint_fp8=False):
     return rt
 
 
-def _make_pools(B, seed):
+def _make_pools(B, seed, *, num_heads=H):
     gen = torch.Generator(device="cuda").manual_seed(seed)
-    d = H * K
+    d = num_heads * K
     conv_pool = (
         torch.randn(B, 3 * d, W - 1, generator=gen, device="cuda", dtype=torch.float32) * 0.5
     ).to(torch.bfloat16)
-    ssm_pool = torch.randn(B, H, K, K, generator=gen, device="cuda", dtype=torch.float32)
+    ssm_pool = torch.randn(B, num_heads, K, K, generator=gen, device="cuda", dtype=torch.float32)
     ssm_pool *= torch.linspace(0.5, 1.5, K, device="cuda").view(1, 1, K, 1)
     return conv_pool, ssm_pool
 
 
-def _make_fused_layer_cache(B, conv_pool):
+def _make_fused_layer_cache(B, conv_pool, *, num_heads=H):
     """Replay caches shaped like PythonMambaCacheManager's KDA allocation,
     with the committed conv window seeded from the base pool (the prefill
     seeding contract: the base pool stores committed columns directly)."""
-    d = H * K
+    d = num_heads * K
     S = W - 1 + M
 
     def _conv_cache(section):
@@ -163,7 +165,7 @@ def _make_fused_layer_cache(B, conv_pool):
         kda_conv_v=_conv_cache(2),
         kda_qkg_cache=torch.zeros(B, M, 3, d, device="cuda", dtype=torch.float32),
         kda_v_cache=torch.zeros(B, M, d, device="cuda", dtype=torch.float32),
-        kda_beta_cache=torch.zeros(B, M, H, device="cuda", dtype=torch.float32),
+        kda_beta_cache=torch.zeros(B, M, num_heads, device="cuda", dtype=torch.float32),
         prev_num_accepted_tokens=torch.zeros(B, dtype=torch.int32, device="cuda"),
         has_kda_replay_caches=True,
         intermediate_conv_window=None,
@@ -171,15 +173,15 @@ def _make_fused_layer_cache(B, conv_pool):
     )
 
 
-def _make_seq_layer_cache(B):
-    d = H * K
+def _make_seq_layer_cache(B, *, num_heads=H):
+    d = num_heads * K
     return SimpleNamespace(
         kda_qkg_cache=None,
         has_kda_replay_caches=False,
         intermediate_conv_window=torch.zeros(
             B, M + 1, 3 * d, W - 1, device="cuda", dtype=torch.bfloat16
         ),
-        intermediate_ssm=torch.zeros(B, M + 1, H, K, K, device="cuda", dtype=torch.float32),
+        intermediate_ssm=torch.zeros(B, M + 1, num_heads, K, K, device="cuda", dtype=torch.float32),
     )
 
 
@@ -199,16 +201,39 @@ def _rep(name, a, b):
     return cos > 0.999 and rel < 3e-2
 
 
-@pytest.mark.parametrize("checkpoint_fp8", [False, True])
 @torch.no_grad()
-def test_fused_vs_sequential_two_rounds(checkpoint_fp8):
+@pytest.mark.parametrize(
+    ("num_heads", "use_full_rank_gate", "checkpoint_fp8", "large_state_stride"),
+    [
+        (H, True, False, False),
+        (H, True, True, False),
+        (16, False, False, False),
+        (64, False, False, False),
+        (64, False, False, True),
+    ],
+    ids=["full-rank-bf16", "full-rank-fp8", "low-rank-h16", "low-rank-h64", "large-state-stride"],
+)
+def test_fused_vs_sequential_two_rounds(
+    num_heads, use_full_rank_gate, checkpoint_fp8, large_state_stride
+):
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 
     torch.manual_seed(0)
     B = 4
     T = M + 1
-    rt_seq = _make_runtime(seed=1, checkpoint_fp8=checkpoint_fp8)
-    rt_fused = _make_runtime(seed=1, aux_stream=torch.cuda.Stream(), checkpoint_fp8=checkpoint_fp8)
+    rt_seq = _make_runtime(
+        seed=1,
+        checkpoint_fp8=checkpoint_fp8,
+        num_heads=num_heads,
+        use_full_rank_gate=use_full_rank_gate,
+    )
+    rt_fused = _make_runtime(
+        seed=1,
+        aux_stream=torch.cuda.Stream(),
+        checkpoint_fp8=checkpoint_fp8,
+        num_heads=num_heads,
+        use_full_rank_gate=use_full_rank_gate,
+    )
     rt_fused.finalize_decode_weights()
     if checkpoint_fp8:
         from tensorrt_llm._torch.modules.linear import Linear
@@ -224,11 +249,23 @@ def test_fused_vs_sequential_two_rounds(checkpoint_fp8):
         assert rt_fused._bfa_proj_weight is not None
     slot_indices = torch.arange(B, dtype=torch.int32, device="cuda")
 
-    conv_pool_seq, ssm_pool_seq = _make_pools(B, seed=2)
+    conv_pool_seq, ssm_pool_seq = _make_pools(B, seed=2, num_heads=num_heads)
     conv_pool_fused = conv_pool_seq.clone()
-    ssm_pool_fused = ssm_pool_seq.clone()
-    cache_seq = _make_seq_layer_cache(B)
-    cache_fused = _make_fused_layer_cache(B, conv_pool_fused)
+    if large_state_stride:
+        # Only four small states are populated. The gaps reproduce V2's
+        # coalesced layer layout, with the last slot beyond INT32_MAX elements.
+        state_stride = ((2**31 // (B - 1)) // (K * K) + 1) * K * K
+        storage_size = (B - 1) * state_stride + num_heads * K * K
+        free_bytes, _ = torch.cuda.mem_get_info()
+        if free_bytes < storage_size * ssm_pool_seq.element_size() + 2**30:
+            pytest.skip("large-stride regression needs 9 GiB of free GPU memory")
+        storage = torch.empty(storage_size, dtype=ssm_pool_seq.dtype, device="cuda")
+        ssm_pool_fused = storage.as_strided(ssm_pool_seq.shape, (state_stride, K * K, K, 1))
+        ssm_pool_fused.copy_(ssm_pool_seq)
+    else:
+        ssm_pool_fused = ssm_pool_seq.clone()
+    cache_seq = _make_seq_layer_cache(B, num_heads=num_heads)
+    cache_fused = _make_fused_layer_cache(B, conv_pool_fused, num_heads=num_heads)
 
     gen = torch.Generator(device="cuda").manual_seed(3)
 
@@ -266,7 +303,7 @@ def test_fused_vs_sequential_two_rounds(checkpoint_fp8):
             x2, T, cache_seq, conv_pool_seq, ssm_pool_seq, slot_indices
         )
     )
-    core2_fused = x2.new_empty(B * T, H, K)
+    core2_fused = x2.new_empty(B * T, num_heads, K)
     with with_multi_stream(True):
         result2_fused = rt_fused.forward_verify(
             x2,

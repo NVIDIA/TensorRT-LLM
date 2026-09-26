@@ -52,6 +52,7 @@ from ..speculative import (draft_prompt_lookahead, get_num_extra_kv_tokens,
                            get_num_spec_layers, get_spec_decoder,
                            should_use_separate_draft_kv_cache)
 from ..utils import is_gdn_replay_enabled
+from . import config_utils
 from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
                            extract_mamba_kv_cache_params,
                            extract_qwen4_exp_ple_cache_params,
@@ -238,6 +239,35 @@ def get_kv_cache_manager_cls(
             raise ValueError("Mamba additional snapshot offsets require "
                              "use_kv_cache_manager_v2=True; V1 supports only "
                              "periodic_snapshot_interval.")
+
+        if config_utils.is_glm5_next(config):
+            # glm5_next indexer state is a V2 extra buffer: reject any knob
+            # that would select a non-V2 manager.
+            if use_py_mamba_cache_manager() or os.environ.get(
+                    'TLLM_MAMBA_MANAGER_PREFERENCE'):
+                raise ValueError(
+                    "glm5_next supports only its V2 cache manager; unset "
+                    "TRTLLM_USE_PY_MAMBA / TLLM_MAMBA_MANAGER_PREFERENCE.")
+            if is_disagg:
+                # Only the Python NIXL transceiver moves KDA and indexer state.
+                backend, runtime = _resolve_disagg_transceiver_route(
+                    cache_transceiver_config)
+                if runtime != "PYTHON" or backend != "NIXL":
+                    raise ValueError(
+                        "glm5_next disaggregated serving requires "
+                        "cache_transceiver_config backend='NIXL' with "
+                        "transceiver_runtime='PYTHON' (got "
+                        f"backend={backend!r}, transceiver_runtime={runtime!r})."
+                    )
+            if not use_v2:
+                raise ValueError(
+                    "glm5_next requires KV cache manager V2 (the sparse-layer "
+                    "indexer state is a V2 extra buffer). Leave "
+                    "kv_cache_config.use_kv_cache_manager_v2='auto' or set it "
+                    "to True.")
+            from ..attention.backends.sparse.glm_kpool import \
+                Glm5NextCacheManager
+            return Glm5NextCacheManager
 
         # Kimi K3 (KDA + MLA hybrid): block reuse uses the unified C++ pool
         # (CppMambaHybridCacheManager) like the other hybrid linear models —
@@ -2963,18 +2993,27 @@ def _create_kv_cache_manager(
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 
-    if is_kimi_linear(config):
+    if config_utils.is_glm5_next(config) or is_kimi_linear(config):
         # Kimi K3 hybrid: KDA (Kimi Delta Attention) recurrent/conv states on
         # the mamba side of the hybrid manager, absorbed-MQA MLA latent cache
         # (num_kv_heads=1, head_dim = kv_lora_rank + qk_rope_head_dim,
         # SELFKONLY) on the paged-KV side. Must come before the is_mla(...)
         # route: the kimi_linear config carries MLA fields, but only 24 of
-        # its 93 layers are MLA.
+        # its 93 layers are MLA. glm5_next has the same layout (11 of its 45
+        # layers are sparse MLA) plus paged indexer state; both families use
+        # sequential verify when replay is unavailable.
+        is_glm5_next = config_utils.is_glm5_next(config)
+        text_config = config_utils.unwrap_glm5_next_text_config(
+            config) if is_glm5_next else config
         if max_beam_width > 1:
             raise ValueError(
+                "glm5_next + beam search is not supported yet."
+                if is_glm5_next else
                 "MambaHybridCacheManager + beam search is not supported yet.")
         if not estimating_kv_cache and kv_connector_manager is not None:
             raise NotImplementedError(
+                "Connector manager is not supported for glm5_next."
+                if is_glm5_next else
                 "Connector manager is not supported for MambaHybridCacheManager."
             )
         mamba_params = extract_mamba_kv_cache_params(
@@ -2991,7 +3030,7 @@ def _create_kv_cache_manager(
             ))
         num_mamba_layers = (0 if is_draft and mamba_params.num_draft_layers > 0
                             else mamba_params.num_mamba_layers)
-        # Kimi K3 KDA state sharding follows the attention-family TP
+        # KDA state sharding follows the attention-family TP
         # semantics (Qwen3-Next pattern): replicated under attention-DP,
         # head-sharded across tp_size otherwise. That is exactly the cache
         # manager's own internal gate (`tp_size = 1 if enable_attention_dp
@@ -3003,7 +3042,7 @@ def _create_kv_cache_manager(
         # kernel replays accepted drafts from these caches and commits
         # states in place, replacing the intermediate-buffer + promotion
         # flow for KDA layers.
-        kimi_extra_kwargs = {}
+        kda_extra_kwargs = {}
         kda_replay_manager_types = (MixedMambaHybridCacheManager,
                                     MambaHybridCacheManagerV2)
         if (spec_config is not None
@@ -3011,11 +3050,17 @@ def _create_kv_cache_manager(
             from ..modules.kimi_kda._kda_kernels import \
                 is_kda_mtp_verify_available
             if is_kda_mtp_verify_available():
-                kimi_extra_kwargs["kda_replay_num_spec"] = (
+                kda_extra_kwargs["kda_replay_num_spec"] = (
                     spec_config.tokens_per_gen_step - 1)
+        if is_glm5_next:
+            # The manager places an indexer buffer on every attention layer.
+            from ..attention.backends.sparse.glm_kpool import \
+                glm_kpool_cache_row_dim
+            kda_extra_kwargs["index_state_dim"] = glm_kpool_cache_row_dim(
+                int(text_config.index_head_dim))
         # KDA's conv state is a [Q | K | V] concatenation whose three sections
         # have identical width, i.e. the qwen3_next section layout.
-        kimi_extra_kwargs.update(
+        kda_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
         kv_cache_manager = kv_cache_manager_cls(
             # mamba (KDA) cache parameters
@@ -3034,7 +3079,10 @@ def _create_kv_cache_manager(
             num_layers=sum(full_attention_layer_mask),
             layer_mask=full_attention_layer_mask,
             num_kv_heads=1,
-            head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
+            head_dim=(int(text_config.kv_lora_rank) +
+                      int(getattr(text_config, "qk_rope_head_dim", 0) or 0)
+                      if is_glm5_next else config.kv_lora_rank +
+                      config.qk_rope_head_dim),
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             max_num_tokens=max_num_tokens,
@@ -3045,7 +3093,7 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
-            **kimi_extra_kwargs,
+            **kda_extra_kwargs,
             **manager_extra_kwargs,
         )
     elif is_mla(config):

@@ -856,6 +856,8 @@ class TestKvCacheManagerV2AutoResolution:
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "GlmMoeDsaForCausalLM",
+            "Glm5NextForCausalLM",
+            "Glm5NextForConditionalGeneration",
             "GptOssForCausalLM",
             "MistralLarge3ForCausalLM",
             "DeepseekV4ForCausalLM",
@@ -884,7 +886,8 @@ class TestKvCacheManagerV2AutoResolution:
             assert model_cls is not None
             assert model_cls.get_preferred_kv_cache_manager_version() == "V2"
 
-    def test_registered_models_keep_v2_on_nixl(self) -> None:
+    @pytest.mark.parametrize("timeout_ms", [10000, None])
+    def test_registered_models_keep_v2_on_nixl(self, timeout_ms) -> None:
         """Models preferring V2 and the Python transceiver keep V2 on NIXL.
 
         Both sentinels start at 'auto'; production resolves the transceiver
@@ -892,6 +895,9 @@ class TestKvCacheManagerV2AutoResolution:
         this list: it silently resolves to V1 on this route (its
         disaggregated serving is unvalidated -- the missing preference is
         deliberate).
+
+        Even with an unsupported infinite timeout, the model preference must
+        survive resolution; transceiver creation validates the timeout later.
         """
         from tensorrt_llm._torch.models.modeling_utils import \
             get_registered_model_class
@@ -901,6 +907,8 @@ class TestKvCacheManagerV2AutoResolution:
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "GlmMoeDsaForCausalLM",
+            "Glm5NextForCausalLM",
+            "Glm5NextForConditionalGeneration",
             "MistralLarge3ForCausalLM",
             "GptOssForCausalLM",
             "KimiK25ForConditionalGeneration",
@@ -930,7 +938,9 @@ class TestKvCacheManagerV2AutoResolution:
             llm_args = TorchLlmArgs(
                 model="/tmp/dummy_model",
                 cache_transceiver_config=CacheTransceiverConfig(
-                    backend="NIXL", transceiver_runtime="auto"),
+                    backend="NIXL",
+                    transceiver_runtime="auto",
+                    kv_transfer_timeout_ms=timeout_ms),
             )
             _resolve_transceiver_runtime_auto(llm_args, model_cls)
             assert _resolve_kv_cache_manager_v2_auto(

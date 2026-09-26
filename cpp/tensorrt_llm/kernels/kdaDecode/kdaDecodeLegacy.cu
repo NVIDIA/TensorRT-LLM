@@ -1560,6 +1560,7 @@ void dispatch_kda_decode_heads(KdaDecodeLaunchParams const& p)
     case 24: dispatch_kda_decode_layout<kCompact, 24>(p); break;
     case 32: dispatch_kda_decode_layout<kCompact, 32>(p); break;
     case 48: dispatch_kda_decode_layout<kCompact, 48>(p); break;
+    case 64: dispatch_kda_decode_layout<kCompact, 64>(p); break;
     case 96: dispatch_kda_decode_layout<kCompact, 96>(p); break;
     default:
         if constexpr (kCompact)

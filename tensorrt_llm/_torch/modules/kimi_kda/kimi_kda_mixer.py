@@ -274,8 +274,13 @@ class KimiKDALinearAttention(nn.Module):
         # Fused prefill/decode/verify projection weights, built after checkpoint
         # load. BF16 uses separate fused [q | k | v | g] and [f_a | b]
         # GEMMs; FP8 fuses QKVG from checkpoint codes/scales and keeps BFA BF16.
+        # Low-rank BF16 gates instead use [q | k | v], [f_a | g_a | b],
+        # and batched [f_b; g_b]. FP8 fusion remains full-rank only.
         self._qkvg_proj_weight: Optional[torch.Tensor] = None
         self._bfa_proj_weight: Optional[torch.Tensor] = None
+        # Low-rank gate only: ``[2, head_dim, D]`` transposed view of the
+        # stacked ``[f_b; g_b]`` weights for one batched GEMM.
+        self._gate_b_t: Optional[torch.Tensor] = None
         self._w_q_t = self._w_k_t = self._w_v_t = None
         self._A_log_f32 = self._dt_bias_f32 = self._onorm_w_f32 = None
         # Fork/join state for overlapping the small [f_a | b] -> f_b chain
@@ -312,23 +317,37 @@ class KimiKDALinearAttention(nn.Module):
            transposed conv weights (bf16 ``[W, D]``) and fp32 copies of
            ``A_log`` / ``dt_bias`` / ``o_norm.weight``.
         """
-        if self._dispatch.decode_kernel_path != "optimized" or not self.use_full_rank_gate:
+        if self._dispatch.decode_kernel_path != "optimized":
             return
         if self.q_proj.weight.device.type != "cuda":
             return
         with torch.no_grad():
-            qkvg_modules = (self.q_proj, self.k_proj, self.v_proj, self.g_proj)
+            if self.use_full_rank_gate:
+                qkvg_modules = (
+                    self.q_proj,
+                    self.k_proj,
+                    self.v_proj,
+                    self.g_proj,
+                )
+                bfa_modules = (self.f_a_proj, self.b_proj)
+            else:
+                # Low-rank gate: the output gate's ``g_a`` rows ride with the
+                # other head-independent projections reading the same input
+                # (``[f_a | g_a | b]``), and ``[f_b; g_b]`` become one batched
+                # GEMM over adjacent columns of that result.
+                qkvg_modules = (self.q_proj, self.k_proj, self.v_proj)
+                bfa_modules = (self.f_a_proj, self.g_a_proj, self.b_proj)
+                gate_b = self._merge_projection_weights((self.f_b_proj, self.g_b_proj))
+                self._gate_b_t = gate_b.view(2, self.proj_size, self.head_dim).transpose(1, 2)
             if all(isinstance(module, nn.Linear) for module in qkvg_modules):
                 self._qkvg_proj_weight = self._merge_projection_weights(qkvg_modules)
-            elif all(
+            elif self.use_full_rank_gate and all(
                 isinstance(module, Linear) and module.has_fp8_block_scales
                 for module in qkvg_modules
             ):
                 self.qkvg_proj = self._fuse_checkpoint_projections(qkvg_modules)
                 self.qkvg_split_sizes = [module.out_features for module in qkvg_modules]
-            self._bfa_proj_weight = self._merge_projection_weights(
-                (self.f_a_proj, self.b_proj), pad_rows_to=8
-            )
+            self._bfa_proj_weight = self._merge_projection_weights(bfa_modules, pad_rows_to=8)
             self._build_decode_kernel_constants()
 
     @staticmethod
@@ -524,6 +543,28 @@ class KimiKDALinearAttention(nn.Module):
             return
         layer_cache.commit_conv_window(slot_indices, conv_pool)
 
+    def _project_gate_inputs(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """``(beta, forget_gate, onorm_g)`` from the fused ``[f_a | (g_a) | b]`` GEMM.
+
+        ``onorm_g`` is the low-rank output gate ``g_b(g_a(x))`` (from the
+        batched ``[f_b; g_b]`` GEMM) or ``None`` for the full-rank gate, whose
+        output gate rides in the fused qkvg projection instead. Requires
+        ``finalize_decode_weights`` to have published ``_bfa_proj_weight``.
+        """
+        hd, H = self.head_dim, self.num_heads
+        bfa = torch.nn.functional.linear(x, self._bfa_proj_weight)
+        if self.use_full_rank_gate:
+            return bfa[..., hd : hd + H], self.f_b_proj(bfa[..., :hd]), None
+        beta = bfa[..., 2 * hd : 2 * hd + H]
+        lead = bfa.shape[:-1]
+        # [N, 2, hd] -> [2, N, hd] strided view of the adjacent f_a / g_a
+        # columns; cuBLAS takes the strided batch directly (no stack copy).
+        pair = bfa[..., : 2 * hd].reshape(-1, 2, hd).transpose(0, 1)
+        gates = torch.bmm(pair, self._gate_b_t)  # [2, N, D]
+        return beta, gates[0].reshape(*lead, -1), gates[1].reshape(*lead, -1)
+
     def _project_packed_conv_input(
         self, x: torch.Tensor, x2d: torch.Tensor
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -537,7 +578,11 @@ class KimiKDALinearAttention(nn.Module):
             # Transposing the GEMM skips the repack the paths below still need.
             weight = self._qkvg_proj_weight
             packed_conv = torch.mm(weight[: 3 * d], x2d.t())
-            onorm_g = torch.nn.functional.linear(x, weight[3 * d : 4 * d])
+            onorm_g = (
+                torch.nn.functional.linear(x, weight[3 * d : 4 * d])
+                if self.use_full_rank_gate
+                else None
+            )
             return packed_conv, onorm_g
 
         onorm_g = None
@@ -639,10 +684,10 @@ class KimiKDALinearAttention(nn.Module):
         )
 
         if self._bfa_proj_weight is not None:
-            bfa = torch.nn.functional.linear(x, self._bfa_proj_weight)
-            f_a = bfa[..., : self.head_dim]
-            beta = bfa[..., self.head_dim : self.head_dim + self.num_heads].float()
-            g = self.f_b_proj(f_a)
+            beta, g, onorm_lowrank = self._project_gate_inputs(x)
+            beta = beta.float()
+            if onorm_g is None:
+                onorm_g = onorm_lowrank
         else:
             g = self.f_b_proj(self.f_a_proj(x))
             beta = self.b_proj(x).float()
@@ -799,24 +844,19 @@ class KimiKDALinearAttention(nn.Module):
                 return torch.nn.functional.linear(x2d, self._qkvg_proj_weight)
             return self.qkvg_proj(x2d)
 
-        def _project_bfa_and_fb() -> tuple[torch.Tensor, torch.Tensor]:
-            bfa = torch.nn.functional.linear(x2d, self._bfa_proj_weight)
-            f_a = bfa[:, :hd]
-            beta = bfa[:, hd : hd + H]
-            return beta, self.f_b_proj(f_a)
-
         projection_aux_stream = (
             self._projection_aux_stream if B <= _KDA_BFA_MULTISTREAM_MAX_ROWS else None
         )
-        qkvg, (beta, g) = maybe_execute_in_parallel(
+        qkvg, (beta, g, onorm_lowrank) = maybe_execute_in_parallel(
             _project_qkvg,
-            _project_bfa_and_fb,
+            lambda: self._project_gate_inputs(x2d),
             self._projection_fork_event,
             self._projection_join_event,
             projection_aux_stream,
             disable_on_compile=True,
         )
-        x_qkvg = qkvg[:, : 4 * d]
+        x_qkvg = qkvg[:, : 3 * d]
+        onorm_g = qkvg[:, 3 * d : 4 * d] if self.use_full_rank_gate else onorm_lowrank
 
         # Section views retain the live pool's slot stride, including V2
         # manager padding. The kernel uses ssm_state_indices for both pools.
@@ -842,7 +882,7 @@ class KimiKDALinearAttention(nn.Module):
             dt_bias=self._dt_bias_f32,
             beta=beta.unsqueeze(0),
             state=kernel_state,
-            onorm_g=x_qkvg[:, 3 * d :].unflatten(-1, (H, hd)).unsqueeze(0),
+            onorm_g=onorm_g.unflatten(-1, (H, hd)).unsqueeze(0),
             onorm_weight=self._onorm_w_f32,
             out=kda_out,
             ssm_state_indices=kernel_state_indices,
@@ -1077,23 +1117,16 @@ class KimiKDALinearAttention(nn.Module):
                 return torch.nn.functional.linear(x, qkvg_weight)
             return fused_qkvg(x)
 
-        bfa_weight = self._bfa_proj_weight
-        if bfa_weight is not None:
-
-            def _project_bfa_and_fb() -> tuple[torch.Tensor, torch.Tensor]:
-                bfa = torch.nn.functional.linear(x, bfa_weight)
-                f_a = bfa[..., : self.head_dim]
-                beta = bfa[..., self.head_dim : self.head_dim + self.num_heads]
-                return beta, self.f_b_proj(f_a)
-
+        onorm_lowrank = None
+        if self._bfa_proj_weight is not None:
             projection_aux_stream = (
                 self._projection_aux_stream
                 if 0 < num_rows <= _KDA_BFA_MULTISTREAM_MAX_ROWS
                 else None
             )
-            qkvg, (beta, forget_gate) = maybe_execute_in_parallel(
+            qkvg, (beta, forget_gate, onorm_lowrank) = maybe_execute_in_parallel(
                 _project_qkvg,
-                _project_bfa_and_fb,
+                lambda: self._project_gate_inputs(x),
                 self._projection_fork_event,
                 self._projection_join_event,
                 projection_aux_stream,
@@ -1107,10 +1140,15 @@ class KimiKDALinearAttention(nn.Module):
         d = self.proj_size
         q_proj, k_proj, v_proj = (part.contiguous() for part in qkvg[..., : 3 * d].split(d, dim=-1))
         qkvg_split_sizes = self.qkvg_split_sizes
-        has_onorm_gate = qkvg_weight is not None or (
-            self.use_full_rank_gate and qkvg_split_sizes is not None and len(qkvg_split_sizes) == 4
+        has_onorm_gate = self.use_full_rank_gate and (
+            qkvg_weight is not None or (qkvg_split_sizes is not None and len(qkvg_split_sizes) == 4)
         )
-        onorm_g = qkvg[..., 3 * d : 4 * d].contiguous() if has_onorm_gate else None
+        if has_onorm_gate:
+            onorm_g = qkvg[..., 3 * d : 4 * d].contiguous()
+        elif onorm_lowrank is not None:
+            onorm_g = onorm_lowrank.contiguous()
+        else:
+            onorm_g = None
         return q_proj, k_proj, v_proj, forget_gate, beta, onorm_g
 
     def forward_verify_fused(

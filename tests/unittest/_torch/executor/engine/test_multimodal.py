@@ -4,6 +4,7 @@
 from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -20,6 +21,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
 from tensorrt_llm._torch.pyexecutor.engine.multimodal import (
     MultimodalItemScheduler,
     resolve_mm_encoder_output_budget,
+    setup_mm_encoder_attn_metadata,
     validate_mm_encoder_scheduling_compatibility,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -31,11 +33,23 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.inputs.multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalParams
-from tensorrt_llm.inputs.registry import MultimodalEncoderItemMetadata
+from tensorrt_llm.inputs.registry import (
+    BaseMultimodalDummyInputsBuilder,
+    MultimodalEncoderItemMetadata,
+)
 from tensorrt_llm.llmapi.llm_args import MultimodalEncoderSchedulingPolicy
 
 # The item-scheduling surface is pure logic: no kernels, no device transfers.
 pytestmark = pytest.mark.cpu_only
+
+
+def test_disabled_encoder_does_not_initialize_processor():
+    processor = Mock(spec=BaseMultimodalDummyInputsBuilder)
+    processor.get_mm_max_tokens_per_item.side_effect = AssertionError("encoder is disabled")
+    model = torch.nn.Module()
+    model.mm_encoder = None
+    setup_mm_encoder_attn_metadata(model, processor, 1024, None)
+    processor.get_mm_max_tokens_per_item.assert_not_called()
 
 
 def _cache_request(

@@ -133,18 +133,21 @@ def setup_mm_encoder_attn_metadata(
     function rather than a ``MultimodalItemScheduler`` method: the scheduler is ``None``
     whenever item scheduling is off.
     """
+    encoders = [module for module in model.modules() if isinstance(module, MultimodalEncoderMixin)]
+    if not encoders:
+        return
+
     max_seq_len = encoder_max_num_tokens
     if isinstance(input_processor, BaseMultimodalDummyInputsBuilder):
         max_tokens_per_item = input_processor.get_mm_max_tokens_per_item()
         max_seq_len = max(max_seq_len, max(max_tokens_per_item.values(), default=0))
 
-    for module in model.modules():
-        if isinstance(module, MultimodalEncoderMixin):
-            setup_kwargs: dict[str, Any] = dict(max_num_tokens=encoder_max_num_tokens)
-            if attention_metadata_capacity is not None:
-                setup_kwargs["attention_metadata_capacity"] = attention_metadata_capacity
-            module.setup_attn_metadata(**setup_kwargs)
-            module.set_attn_max_seq_len(max_seq_len)
+    for module in encoders:
+        setup_kwargs: dict[str, Any] = dict(max_num_tokens=encoder_max_num_tokens)
+        if attention_metadata_capacity is not None:
+            setup_kwargs["attention_metadata_capacity"] = attention_metadata_capacity
+        module.setup_attn_metadata(**setup_kwargs)
+        module.set_attn_max_seq_len(max_seq_len)
 
 
 def resolve_bytes_per_mm_encoder_embedding(model: MultimodalModelMixin) -> int:
