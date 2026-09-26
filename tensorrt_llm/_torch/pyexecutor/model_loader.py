@@ -609,10 +609,14 @@ class ModelLoaderMetricNames(Enum):
     WEIGHT_MANIFEST_SECONDS = "weight_manifest_seconds"
 
 
+_CheckpointStartupMetadata = dict[str,
+                                  str | dict[str, str | bool | None] | None]
+
+
 def _checkpoint_startup_metadata(
     checkpoint_loader: BaseCheckpointLoader,
     load_format: LoadFormat | str,
-) -> dict[str, str]:
+) -> _CheckpointStartupMetadata:
     """Describe the concrete checkpoint source selected for this load."""
     weight_loader = getattr(checkpoint_loader, "weight_loader", None)
     source_kind = getattr(checkpoint_loader, "checkpoint_format", None)
@@ -627,6 +631,35 @@ def _checkpoint_startup_metadata(
         str(source_kind or "unknown"),
         "load_format":
         str(load_format_name).lower(),
+        # Explicitly unknown until a supported load session has finished.
+        "checkpoint_io_policy":
+        None,
+    }
+
+
+def _checkpoint_io_policy_metadata(
+    checkpoint_loader: BaseCheckpointLoader
+) -> dict[str, str | bool | None] | None:
+    """Snapshot observed policy for loads using the built-in HF weight loader."""
+    from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import \
+        HfCheckpointLoader
+    from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import \
+        HfWeightLoader
+
+    if (not isinstance(checkpoint_loader, HfCheckpointLoader)
+            or type(checkpoint_loader.weight_loader) is not HfWeightLoader
+            or checkpoint_loader.is_weights_preloaded()):
+        return None
+    status = checkpoint_loader.weight_loader.last_checkpoint_io_status
+    if status.effective not in (_NATIVE_CHECKPOINT_IO_POLICY,
+                                _RANK_STRIPED_CHECKPOINT_IO_POLICY):
+        return None
+    return {
+        "requested": status.requested,
+        "selected": status.selected,
+        "activated": status.activated,
+        "effective": status.effective,
+        "fallback_reason": status.fallback_reason,
     }
 
 
@@ -739,7 +772,7 @@ class ModelLoader:
         self._checkpoint_loader: Optional[BaseCheckpointLoader] = None
         # Mostly weight loading and processing time metrics, updated when load() is called.
         self._metrics: dict[str, float] = {}
-        self._startup_metadata: dict[str, str] = {}
+        self._startup_metadata: _CheckpointStartupMetadata = {}
 
     @property
     def metrics(self) -> dict[str, float]:
@@ -747,7 +780,7 @@ class ModelLoader:
         return self._metrics
 
     @property
-    def startup_metadata(self) -> dict[str, str]:
+    def startup_metadata(self) -> _CheckpointStartupMetadata:
         """Return checkpoint-source metadata captured by the latest load."""
         return self._startup_metadata
 
@@ -2021,6 +2054,7 @@ class ModelLoader:
                                         checkpoint_dir: str, model, config,
                                         load_weights_kwargs: dict) -> bool:
         """Keep loader-specific work alive through weight materialization."""
+        self._startup_metadata["checkpoint_io_policy"] = None
         with _timed_checkpoint_weight_session(
                 checkpoint_loader, checkpoint_dir, self._metrics,
                 ModelLoaderMetricNames.CHECKPOINT_PREPARATION_SECONDS.value,
@@ -2043,11 +2077,16 @@ class ModelLoader:
                                             self.weight_mapper)
                     if torch.cuda.is_available():  # CPU guard
                         torch.cuda.synchronize()
+        # Session finalization can degrade activated read-ahead to native.
+        # Snapshot before a same-engine draft load resets the shared loader.
+        self._startup_metadata["checkpoint_io_policy"] = \
+            _checkpoint_io_policy_metadata(checkpoint_loader)
         return weights_preloaded
 
     def _materialize_draft_checkpoint_weights(self, checkpoint_loader,
                                               model) -> None:
         """Keep loader-specific work alive through draft materialization."""
+        self._startup_metadata["draft_checkpoint_io_policy"] = None
         with _timed_checkpoint_weight_session(
                 checkpoint_loader,
                 self.spec_config.speculative_model,
@@ -2080,6 +2119,8 @@ class ModelLoader:
                                         draft_weight_mapper)
                 if torch.cuda.is_available():  # CPU guard
                     torch.cuda.synchronize()
+        self._startup_metadata["draft_checkpoint_io_policy"] = \
+            _checkpoint_io_policy_metadata(checkpoint_loader)
 
     def _call_load_weights(self,
                            load_method: Callable,
