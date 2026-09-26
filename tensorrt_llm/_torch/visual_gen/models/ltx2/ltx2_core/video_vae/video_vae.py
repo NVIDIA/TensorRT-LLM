@@ -340,7 +340,7 @@ class VideoDecoder(nn.Module):
         decoder_spatial_padding_mode: PaddingModeType = PaddingModeType.REFLECT,
     ):
         super().__init__()
-        self.video_downscale_factors = SpatioTemporalScaleFactors(time=8, width=32, height=32)
+        self.video_downscale_factors = SpatioTemporalScaleFactors(time=8, height=32, width=32)
         self.patch_size = patch_size
         out_channels = out_channels * patch_size**2
         self.causal = causal
