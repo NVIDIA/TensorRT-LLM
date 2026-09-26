@@ -111,6 +111,7 @@ l0_cpu:
   - unittest/api_stability
   - unittest/bindings
   - unittest/disaggregated
+  - unittest/docs/test_llmapi_reference_docs.py
   - unittest/dynamo
   - unittest/evaluate/test_image_generation_eval_cli.py
   - unittest/executor/test_base_worker.py ISOLATION
