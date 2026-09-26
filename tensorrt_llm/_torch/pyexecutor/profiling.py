@@ -98,6 +98,52 @@ def load_iteration_indexes(env_var: str):
     return frozenset(starts), frozenset(stops)
 
 
+class _LoopTimingEvents:
+    """Keep two event pairs until their loop measurements finish on the GPU."""
+
+    def __init__(self) -> None:
+        self._events: list[tuple[torch.cuda.Event, torch.cuda.Event] | None] = [None, None]
+        self._loop_ids: list[int | None] = [None, None]
+
+    def start(self, loop_id: int) -> None:
+        slot = loop_id % 2
+        if self._loop_ids[slot] is not None:
+            # An unfinished measurement owns its events. Skip this sample
+            # instead of growing the pool or waiting before the next forward.
+            return
+        events = self._events[slot]
+        if events is None:
+            events = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+            self._events[slot] = events
+        events[0].record()
+        self._loop_ids[slot] = loop_id
+
+    def finish(self, loop_id: int, *, synchronize: bool) -> float | None:
+        """Close this loop and read only the preceding loop's GPU duration."""
+        slot = loop_id % 2
+        events = self._events[slot]
+        if events is not None and self._loop_ids[slot] == loop_id:
+            events[1].record()
+
+        previous_slot = (loop_id - 1) % 2
+        previous_loop_id = self._loop_ids[previous_slot]
+        if previous_loop_id is None:
+            return None
+        previous_events = self._events[previous_slot]
+        assert previous_events is not None
+        start_event, end_event = previous_events
+        if synchronize:
+            end_event.synchronize()
+        elif not end_event.query():
+            return None
+        self._loop_ids[previous_slot] = None
+        # A delayed result no longer describes the previous loop. Reclaim
+        # its events without assigning that stale duration to a newer loop.
+        if previous_loop_id != loop_id - 1:
+            return None
+        return float(start_event.elapsed_time(end_event))
+
+
 class PyExecutorProfileManager:
     """Owns the runtime-profiling state machine for ``PyExecutor``.
 
@@ -600,14 +646,7 @@ class PyExecutorProfileManager:
         enabled = False
         start_time = None
 
-        # These events are used to record the time of the previous
-        # batch. We need two sets of start-end events so that the
-        # ping-pong pattern works with the overlap scheduler.
-        start_event_1 = None
-        end_event_1 = torch.cuda.Event(enable_timing=True)
-        start_event_2 = None
-        end_event_2 = torch.cuda.Event(enable_timing=True)
-        prev_device_step_time = None
+        loop_timing = _LoopTimingEvents()
         # Cumulative fetch counter as of the previous iter log line; the
         # per-iteration ``num_fetched`` on the log line is the delta.
         prev_fetch_requests_cur_rank = 0
@@ -661,8 +700,7 @@ class PyExecutorProfileManager:
 
         def profile_step_fn():
             nonlocal it, enabled, start_time
-            nonlocal start_event_1, end_event_1, start_event_2, end_event_2
-            nonlocal prev_device_step_time, prev_fetch_requests_cur_rank
+            nonlocal prev_fetch_requests_cur_rank
             nonlocal torch_profiler, active_torch_trace_path
             nonlocal active_enable_torch_trace
             calibrator.post_step(it)
@@ -710,26 +748,12 @@ class PyExecutorProfileManager:
                             executor._runtime_profile_pending_stop_iter = None
                 active_enable_torch_trace = False
 
-            # Capture per-loop timing whenever stats or the iter log
-            # are enabled. The reading of the OTHER parity's event
-            # pair (the ping-pong) is what keeps synchronize() from
-            # blocking the GPU — the events being read have already
-            # passed by the time we read them. Stashing on
-            # ``self`` lets the /metrics serializer pick up the
-            # values without going through the log line.
             should_capture_timing = executor.print_log or executor.enable_iter_perf_stats
             if should_capture_timing and start_time is not None:
                 end_time = time.time()
-                if it % 2 == 0:
-                    end_event_1.record()
-                    if start_event_2 is not None:
-                        end_event_2.synchronize()
-                        prev_device_step_time = start_event_2.elapsed_time(end_event_2)
-                else:
-                    end_event_2.record()
-                    if start_event_1 is not None:
-                        end_event_1.synchronize()
-                        prev_device_step_time = start_event_1.elapsed_time(end_event_1)
+                # Iteration logs require every duration. Statistics omit a
+                # GPU duration when obtaining it would delay inference.
+                prev_device_step_time = loop_timing.finish(it, synchronize=executor.print_log)
 
                 host_step_time = (end_time - start_time) * 1000  # ms
                 executor._latest_host_step_time_ms = host_step_time
@@ -848,14 +872,7 @@ class PyExecutorProfileManager:
             calibrator.pre_step(it)
             start_time = time.time()
             if should_capture_timing:
-                if it % 2 == 0:
-                    if start_event_1 is None:
-                        start_event_1 = torch.cuda.Event(enable_timing=True)
-                    start_event_1.record()
-                else:
-                    if start_event_2 is None:
-                        start_event_2 = torch.cuda.Event(enable_timing=True)
-                    start_event_2.record()
+                loop_timing.start(it)
 
         try:
             yield profile_step_fn

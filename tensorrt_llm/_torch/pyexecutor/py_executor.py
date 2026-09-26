@@ -974,13 +974,9 @@ class PyExecutor:
             getattr(self.llm_args, 'kv_cache_config', None),
             'iteration_stats_interval', 1)
         self._adp_iter_stats = ADPIterStatsBuffer()
-        # Per-loop CPU wall and GPU forward time captured by the profile_step
-        # closure (see _profiler). Populated whenever enable_iter_perf_stats or
-        # print_iter_log is on so the /metrics serializer can read them
-        # without depending on the log line. host_step_time describes the loop
-        # body that just finished; prev_device_step_time is the GPU forward
-        # time read via the ping-pong CUDA event pair (lags host by one loop
-        # under steady state — see ping-pong comment in _profiler).
+        # Loop timing is captured at the profile_step checkpoint. Host time
+        # describes the body just finished; device time describes the body
+        # before that and is absent if its GPU events are still incomplete.
         self._latest_host_step_time_ms: Optional[float] = None
         self._latest_prev_device_step_time_ms: Optional[float] = None
         self._emit_initial_stats()
