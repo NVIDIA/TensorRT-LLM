@@ -25,14 +25,14 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import AttentionConfig
 
 
-def _create_config(backend: str = "VANILLA") -> DiffusionModelConfig:
+def _create_config(backend: str = "VANILLA", tp_size: int = 1) -> DiffusionModelConfig:
     """Create a minimal DiffusionModelConfig with the given attention backend."""
     from types import SimpleNamespace
 
     return DiffusionModelConfig(
         pretrained_config=SimpleNamespace(),
         quant_config=QuantConfig(),
-        mapping=Mapping(),
+        mapping=Mapping(world_size=tp_size, rank=0, tp_size=tp_size),
         attention=AttentionConfig(backend=backend),
         skip_create_weights_in_init=False,
     )
@@ -77,6 +77,23 @@ class TestLTX2SelfAttention(unittest.TestCase):
     """Test LTX2Attention self-attention with different backends."""
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+    def test_tp_uses_unfused_qk_norm_rope(self):
+        """LTX-2 per-head RoPE must not select the WAN-specific TP fused path."""
+        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTX2Attention
+
+        config = _create_config("VANILLA", tp_size=2)
+        attn = LTX2Attention(
+            query_dim=1024,
+            context_dim=None,
+            heads=8,
+            dim_head=128,
+            config=config,
+            layer_idx=0,
+        )
+
+        self.assertFalse(attn.fuse_qk_norm_rope)
+        self.assertFalse(attn.fuse_qk_norm_rope_tp)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_vanilla_self_attention_sanity(self):

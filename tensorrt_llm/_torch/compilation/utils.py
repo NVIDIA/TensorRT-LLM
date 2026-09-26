@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 from typing import Callable, List, Optional, Union
 
@@ -82,6 +85,9 @@ def inplace_info():
             1: "qkv"
         },
         torch.ops.trtllm.fused_dit_qk_norm_rope.default: {
+            1: "qkv"
+        },
+        torch.ops.trtllm.fused_dit_qk_norm_rope_tp_apply.default: {
             1: "qkv"
         },
         torch.ops.trtllm.fused_dit_split_norm_rope.default: {
