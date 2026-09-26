@@ -37,7 +37,7 @@ filter chain.
 
 ## Rules
 
-Nine rules, registered in `main.py::RULE_CLASSES`:
+Ten rules, registered in `main.py::RULE_CLASSES`:
 
 | Rule | Scope | Files |
 |---|---|---|
@@ -46,6 +46,7 @@ Nine rules, registered in `main.py::RULE_CLASSES`:
 | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
 | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (excl. `.md`; reference images such as `cat_piano.png` ARE test fixtures and stay claimed; outward-facing files force fallback) |
 | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (excl. `.md`; other suffixes incl. images kept as potential test fixtures) |
+| `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**` (excl. `.md`) |
 | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. `.md`) |
 | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. `.md`) |
 | `OutOfScopeRule` | `noop` | QA / dev test lists, `.test_durations`, `microbenchmarks/`, `**/*.md` (image suffixes intentionally not claimed — image fixtures cannot be distinguished from doc diagrams by location, so image edits fall back to baseline) |
@@ -61,9 +62,10 @@ See `rules/README.md` for per-rule logic.
 | `testlistonly` | `TestListRule` fired solo: PR only adds entries under `tests/integration/test_lists/test-db/*.yml`. |
 | `visualgenonly` | `VisualGenRule` fired solo: PR only touches VisualGen internal source paths (`examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`; excl. `.md`; image fixtures like `cat_piano.png` are claimed). Narrows to blocks containing VG test entries. Outward-facing files under `tensorrt_llm/visual_gen/**` and `tensorrt_llm/media/**` (eagerly imported by `trtllm-serve`) force `null` fallback. |
 | `specdeconly` | `SpecDecRule` fired solo: PR only touches speculative-decoding source paths (`tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py`; excl. `.md`). Narrows to blocks containing spec-dec test entries (eagle / medusa / redrafter / ngram / draft-target-model / MTP). |
+| `modelingv2only` | `ModelingV2Rule` fired solo: PR only touches the modeling_v2 subtree (`tensorrt_llm/_torch/_experimental/modeling_v2/**`; excl. `.md`, which is a fifth of the subtree — every catalog entry carries a contract document). Narrows to blocks containing modeling_v2 test entries (`unittest/_torch/modeling_v2/`, `test_modeling_v2_*`). No outward-facing fallback is needed: nothing imports the subtree unless `TRTLLM_MODELING_V2` is set, and its one caller outside the subtree (`_torch/models/modeling_auto.py`) is left unclaimed, so touching the shared resolver falls back to baseline. |
 | `agentflowonly` | `AgentFlowRule` fired solo: PR only touches `agent-flow/**` source or test files (excl. `.md`). Runs `CPU-AgentFlow-UnitTest`. |
 | `openengineonly` | `OpenEngineRule` fired solo: PR only touches `tensorrt_llm/grpc/openengine/**` source files (excl. `.md`). Narrows to the registered OpenEngine unit tests: the stub-based ones on the always-run `CPU-Generic-*` stages, plus `test_capability_conformance.py` on `A10-PyTorch-*`, which needs a GPU. |
-| `testsonly` | Multiple rules from the testsonly family fired (`waiveonly`, `testdefonly`, `testlistonly`, `visualgenonly`, `specdeconly`, `agentflowonly`, `openengineonly`); their narrows union. |
+| `testsonly` | Multiple rules from the testsonly family fired (`waiveonly`, `testdefonly`, `testlistonly`, `visualgenonly`, `specdeconly`, `modelingv2only`, `agentflowonly`, `openengineonly`); their narrows union. |
 | `noop` | Rule(s) fired but determined no test stages need to run (QA-only path, removals-only test list, all-miss waives, in-namespace .py with no covering YAML entry, docs-only edits). Layer 2 still applies. |
 | `null` (fallback) | A rule cannot decide, scopes don't combine, or there are unhandled files. Groovy defers to baseline filter chain. |
 

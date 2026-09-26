@@ -119,6 +119,9 @@ l0_b300:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_chunked_prefill[quant_dtype=fp8-kv_cache_reuse=True-fp8kv=True-overlap_scheduler=True] # Cover nvbugs 6084445
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=True]
+  # TIMEOUT measured: 348 cases in 5m34s on one GB300, so 30 is 5x headroom.
+  - unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm TIMEOUT (30)
+  - accuracy/test_modeling_v2_gpt_oss.py::TestModelingV2GptOss120bSm103Tp1::test_gsm8k
 - condition:
     ranges:
       system_gpu_count:

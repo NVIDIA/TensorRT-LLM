@@ -15,6 +15,11 @@ l0_gb300_multi_gpus:
       stage: post_merge
       backend: pytorch
   tests:
+  # One ordered sequence in one job: the cases share module-global rank state.
+  - unittest/_torch/modeling_v2/comm
+  - accuracy/test_modeling_v2_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_gsm8k_identity_vs_mtp3
+  - accuracy/test_modeling_v2_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_mtp3_acceptance[modeling_v2]
+  - accuracy/test_modeling_v2_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_mtp3_acceptance[stock]
   # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
   # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
   # is what picks them up:
