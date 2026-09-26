@@ -34,6 +34,7 @@ files resolve their imports. See ``_check_sys_path`` below.
 
 import os
 import sys
+from pathlib import PurePath
 
 import pytest
 
@@ -59,6 +60,12 @@ _NON_TEST_TREES = (
     # layout is a separate change; exempting it keeps this check useful in the
     # meantime.
     "jenkins/scripts/cbts",
+)
+
+# Prefixes of the current installation.
+_INTERPRETER_ROOTS = frozenset(
+    os.path.realpath(prefix)
+    for prefix in (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix)
 )
 
 # Debug variable for local runs to skip this check.
@@ -150,6 +157,16 @@ def pytest_runtest_protocol(item, nextitem):
         MagicFinder.purge_magic_sys_modules()
 
 
+def _within(path: str, directory: str) -> bool:
+    """Whether ``path`` is ``directory`` itself or sits below it.
+
+    Compared as whole path components, so a sibling whose name merely starts
+    with the directory's -- ``.venv-3.12-notes`` beside ``.venv-3.12`` -- is not
+    treated as being inside it.
+    """
+    return PurePath(path).is_relative_to(directory)
+
+
 def _project_relative(entry: str) -> str | None:
     """Path of ``entry`` relative to the project root, or None if outside it.
 
@@ -158,7 +175,7 @@ def _project_relative(entry: str) -> str | None:
     """
     root = os.path.realpath(MagicFinder.project_root)
     resolved = os.path.realpath(entry or os.getcwd())
-    if resolved != root and not resolved.startswith(root + os.sep):
+    if not _within(resolved, root):
         return None
     return os.path.relpath(resolved, root)
 
@@ -192,10 +209,23 @@ def _under_exempt_tree(relative: str) -> bool:
     nested path such as a build directory matches its whole tree.
     """
     for tree in _NON_TEST_TREES:
-        prefix = tree.replace("/", os.sep)
-        if relative == prefix or relative.startswith(prefix + os.sep):
+        if _within(relative, tree.replace("/", os.sep)):
             return True
     return False
+
+
+def _under_interpreter_root(resolved: str, project_root: str) -> bool:
+    """Whether an already-resolved path is part of the interpreter's install.
+
+    Other packages may live inside them and add their paths to sys.path,
+    which is not our fault so don't report those paths.
+
+    However, we should still report paths under our project root
+    even if our project root lives inside any of them.
+    """
+    return any(
+        _within(resolved, root) for root in _INTERPRETER_ROOTS if not _within(project_root, root)
+    )
 
 
 def _expected_entries(config) -> set[str]:
@@ -244,7 +274,10 @@ def _check_sys_path(config) -> list[str]:
             continue
         if _under_exempt_tree(relative):
             continue
-        if _is_pytest_basedir(os.path.join(root, relative)):
+        resolved = os.path.join(root, relative)
+        if _under_interpreter_root(resolved, root):
+            continue
+        if _is_pytest_basedir(resolved):
             continue
         if relative not in unexpected:
             unexpected.append(relative)
