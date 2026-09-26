@@ -356,12 +356,19 @@ def _set_moe_a2a_warmup(in_warmup: bool) -> None:
 
     No-op when the op is unavailable (older bindings).
     """
+    from ..moe.fused_moe.communication.nvlink_one_sided import (
+        NVLinkOneSided, get_timeout_seconds)
+
+    timeout_sec = get_timeout_seconds(in_warmup)
     try:
-        torch.ops.trtllm.moe_a2a_set_warmup(in_warmup)
-        logger.info(f"moe_a2a completion-flag budget: in_warmup={in_warmup}")
+        NVLinkOneSided.set_timeout(timeout_sec)
+        logger.info(
+            f"moe_a2a completion-flag budget: in_warmup={in_warmup}, "
+            f"timeout={timeout_sec} s (nominal, at an assumed 2 GHz clock64 rate)"
+        )
     except (AttributeError, RuntimeError) as e:
         logger.warning(
-            f"moe_a2a_set_warmup unavailable, the all-to-all timeout "
+            f"moe_a2a_set_timeout unavailable, the all-to-all timeout "
             f"budget was not switched: {type(e).__name__}: {e}")
 
 
@@ -1778,7 +1785,7 @@ class PyTorchModelEngine(ModelEngine):
         completion-flag deadline. It is a partial mitigation only: other
         first-touch compiles remain inside collective-bearing forwards, and some
         sit on the all-to-all path itself and cannot be pre-compiled this way.
-        The runtime budget (``moeA2AGetTimeoutCycles``) covers the general case.
+        The phase-specific all-to-all timeout covers the general case.
 
         Only the fallback tactics are compiled -- what an eager, cache-miss
         forward selects. The runner's kernel cache key excludes m/n/k, so one
@@ -2100,7 +2107,7 @@ class PyTorchModelEngine(ModelEngine):
         """Reset all MoE all-to-all state machines reachable from ``self.model``.
 
         Each MoE backend keeps a small dispatch/combine phase state per layer
-        (``MoeAlltoAll`` or ``NVLinkOneSided``). A forward that calls
+        (``NVLinkOneSided``). A forward that calls
         ``dispatch`` but raises before reaching ``combine`` (e.g., a warmup
         OOM mid-MoE) leaves that state in ``dispatched``, which fails the
         invariant on the next ``dispatch`` call. This helper walks the model

@@ -102,7 +102,7 @@ class MnnvlAllReduceWorker:
         Only the hardware capability, not is_mnnvl(): off aarch64 the test bypasses that policy
         gate below, so skipping has to key off what the machine can actually do.
         """
-        from tensorrt_llm._mnnvl_utils import MnnvlMemory
+        from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 
         MnnvlMemory.initialize()
         return MnnvlMemory.supports_mnnvl()

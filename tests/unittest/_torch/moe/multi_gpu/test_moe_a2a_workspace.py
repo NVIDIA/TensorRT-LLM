@@ -15,7 +15,7 @@ from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
 import tensorrt_llm as tllm
-from tensorrt_llm._mnnvl_utils import MnnvlMemory
+from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 from tensorrt_llm.mapping import Mapping
 
@@ -93,10 +93,10 @@ def _run_worker(capture, in_workspace, use_cft, low_precision):
         with pytest.MonkeyPatch.context() as patch:
             # Pin worker-side policy rather than inheriting user/CI overrides.
             for name in (
-                "TRTLLM_MOE_A2A_FORCE_CFT",
-                "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_DISPATCH",
-                "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_COMBINE",
-                "TRTLLM_MOE_A2A_WORKSPACE_MB",
+                "TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT",
+                "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_DISPATCH",
+                "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_COMBINE",
+                "TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB",
             ):
                 patch.delenv(name, raising=False)
             try:

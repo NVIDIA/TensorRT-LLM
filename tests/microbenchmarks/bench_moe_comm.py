@@ -21,6 +21,11 @@ This benchmarks ONLY the communication kernels, specifically:
 - Communication.dispatch()
 - Communication.combine()
 
+dispatch_us and combine_us report CUPTI kernel spans, using CUDA graph replay by
+default or eager execution with --no_cuda_graph. If CUPTI is unavailable, timing
+falls back to CUDA events and benchmark_metadata.warning records the reason;
+otherwise it is null. --kernel_breakdown additionally prints per-kernel statistics.
+
 Launch (examples):
 
 ```bash
@@ -60,7 +65,6 @@ import cloudpickle
 import torch
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
-from torch.autograd import DeviceType
 
 import tensorrt_llm as tllm
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -90,19 +94,50 @@ class Profile:
 
 
 PROFILES: Dict[str, Profile] = {
-    "deepseek_v3": Profile(
-        name="deepseek_v3",
-        hidden_size=7168,
-        top_k=8,
-        num_experts=256,
-        quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
-    ),
     "gpt_oss": Profile(
         name="gpt_oss",
         hidden_size=2880,
         top_k=4,
         num_experts=128,
         quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8,
+    ),
+    "deepseek_v3": Profile(
+        name="deepseek_v3",
+        hidden_size=7168,
+        top_k=8,
+        num_experts=256,
+        # Notice: Cutlass quantize_input() is a no-op for FP8_BLOCK_SCALES: dispatch
+        # carries BF16 activations, not post-quantized FP8 payloads.
+        quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
+    ),
+    "deepseek_v4_flash": Profile(
+        name="deepseek_v4_flash",
+        hidden_size=4096,
+        top_k=6,
+        num_experts=256,
+        quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8,
+    ),
+    "deepseek_v4_pro": Profile(
+        name="deepseek_v4_pro",
+        hidden_size=7168,
+        top_k=6,
+        num_experts=384,
+        quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8,
+    ),
+    "kimi_k3": Profile(
+        name="kimi_k3",
+        # All-to-all exchanges latent MoE activations, not the model's 7168-wide states.
+        hidden_size=3584,
+        top_k=16,
+        num_experts=896,
+        quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8,
+    ),
+    "qwen3p8_2p4t_a95b": Profile(
+        name="qwen3p8_2p4t_a95b",
+        hidden_size=8192,
+        top_k=10,
+        num_experts=512,
+        quant_algo=QuantAlgo.NO_QUANT,
     ),
 }
 
@@ -211,7 +246,7 @@ def _create_model_config(
     act_dtype: torch.dtype,
     max_num_tokens_per_rank: int,
     quant_config: Optional[QuantConfig],
-    use_low_precision_moe_combine: bool = False,
+    use_low_precision_combine: bool = False,
 ) -> ModelConfig:
     # Keep it minimal: just enough fields for CommunicationFactory.
     return ModelConfig(
@@ -221,8 +256,199 @@ def _create_model_config(
         max_num_tokens=int(max_num_tokens_per_rank),
         moe_max_num_tokens=int(max_num_tokens_per_rank),
         use_cuda_graph=False,
-        use_low_precision_moe_combine=use_low_precision_moe_combine,
+        use_low_precision_moe_combine=use_low_precision_combine,
     )
+
+
+def _demangle_names(names: List[str]) -> Dict[str, str]:
+    """Demangle C++ symbol names via cxxfilt. Returns {mangled: demangled}."""
+    try:
+        import cxxfilt
+
+        return {n: cxxfilt.demangle(n) for n in names}
+    except Exception:
+        return {n: n for n in names}
+
+
+def _build_kernel_stats_cupti(
+    cupti_kernels: List[Tuple[str, int, int]],
+    cupti_events: list[tuple[int, int]],
+    phase_event_ids: list[tuple[int, int, int, int]],
+) -> Dict[str, Any]:
+    """Attribute kernels to event windows and measure each iteration's kernel span."""
+    expected_ids = {event_id for iteration in phase_event_ids for event_id in iteration}
+    if len(expected_ids) != 4 * len(phase_event_ids):
+        raise RuntimeError("Each benchmark timing event must have a distinct CUPTI event ID.")
+    event_timestamps: dict[int, int] = {}
+    for event_id, timestamp in cupti_events:
+        if event_id not in expected_ids:
+            continue
+        if timestamp <= 0 or event_id in event_timestamps:
+            raise RuntimeError(f"CUPTI returned an invalid or duplicate timing event: {event_id}")
+        event_timestamps[event_id] = timestamp
+    missing_ids = expected_ids - event_timestamps.keys()
+    if missing_ids:
+        raise RuntimeError(
+            f"CUPTI is missing {len(missing_ids)} of {len(expected_ids)} timing events. "
+            "CUDA_EVENT tracking must be enabled before CUDA context creation."
+        )
+    if not cupti_kernels:
+        raise RuntimeError("CUPTI captured no kernels for the timed run.")
+
+    phase_windows = []
+    for d_start_id, d_end_id, c_start_id, c_end_id in phase_event_ids:
+        d_start, d_end, c_start, c_end = (
+            event_timestamps[event_id] for event_id in (d_start_id, d_end_id, c_start_id, c_end_id)
+        )
+        if not d_start <= d_end <= c_start <= c_end:
+            raise RuntimeError("CUPTI timing events are not in dispatch/combine execution order.")
+        if phase_windows and d_start < phase_windows[-1][3]:
+            raise RuntimeError("CUPTI iteration timing windows overlap.")
+        phase_windows.append((d_start, d_end, c_start, c_end))
+
+    phase_bounds: dict[str, list[tuple[int, int] | None]] = {
+        phase: [None] * len(phase_windows) for phase in ("dispatch", "combine")
+    }
+
+    cupti_kernels.sort(key=lambda kernel: kernel[1])
+
+    unique_names = list({name for name, _, _ in cupti_kernels})
+    demangled_names = _demangle_names(unique_names)
+    kernel_times: Dict[str, Dict[str, List[float]]] = {
+        "dispatch": {},
+        "combine": {},
+        "other": {},
+    }
+
+    for name, kernel_start, kernel_end in cupti_kernels:
+        if kernel_start <= 0 or kernel_end <= kernel_start:
+            raise RuntimeError(f"CUPTI returned invalid kernel timestamps for {name}.")
+        category = "other"
+        for iteration, (d_start, d_end, c_start, c_end) in enumerate(phase_windows):
+            for phase, start, end in (("dispatch", d_start, d_end), ("combine", c_start, c_end)):
+                if kernel_start >= start and kernel_end <= end:
+                    category = phase
+                    bounds = phase_bounds[phase][iteration]
+                    phase_bounds[phase][iteration] = (
+                        (min(bounds[0], kernel_start), max(bounds[1], kernel_end))
+                        if bounds is not None
+                        else (kernel_start, kernel_end)
+                    )
+                    break
+                if kernel_start < end and kernel_end > start:
+                    raise RuntimeError(f"CUPTI kernel {name} crosses a {phase} timing boundary.")
+            if category != "other":
+                break
+
+        demangled_name = demangled_names.get(name, name)
+        kernel_times[category].setdefault(demangled_name, []).append(
+            (kernel_end - kernel_start) / 1e3
+        )
+
+    def _build(category: str) -> List[Dict[str, Any]]:
+        result = [
+            {"name": name, "count": len(times), "_times": times}
+            for name, times in kernel_times[category].items()
+        ]
+        result.sort(key=lambda kernel: sum(kernel["_times"]) / len(kernel["_times"]), reverse=True)
+        return result
+
+    spans = {}
+    for phase, bounds in phase_bounds.items():
+        if any(bound is None for bound in bounds):
+            raise RuntimeError(
+                f"CUPTI captured no {phase} kernels in one or more timed iterations."
+            )
+        # A span retains inter-kernel gaps but counts overlapping PDL kernels only once.
+        spans[f"{phase}_us_kernel_span"] = [
+            (bound[1] - bound[0]) / 1e3 for bound in bounds if bound is not None
+        ]
+
+    return {
+        **spans,
+        "dispatch_kernels": _build("dispatch"),
+        "combine_kernels": _build("combine"),
+        "other_kernels": _build("other"),
+    }
+
+
+def _init_cupti() -> tuple[Any, list[tuple[str, int, int]], list[tuple[int, int]]]:
+    """Enable kernel and CUDA-event tracking before CUDA context creation."""
+    from cupti import cupti
+
+    cupti_kernels: list[tuple[str, int, int]] = []
+    cupti_events: list[tuple[int, int]] = []
+
+    def _buf_requested() -> tuple[int, int]:
+        return 8 * 1024 * 1024, 0
+
+    def _buf_completed(activities) -> None:
+        for activity in activities:
+            if activity.kind == cupti.ActivityKind.CONCURRENT_KERNEL:
+                cupti_kernels.append((activity.name, activity.start, activity.end))
+            elif activity.kind == cupti.ActivityKind.CUDA_EVENT:
+                cupti_events.append((activity.event_id, activity.device_timestamp))
+
+    enabled = []
+    try:
+        cupti.activity_register_callbacks(_buf_requested, _buf_completed)
+        for kind in (cupti.ActivityKind.CONCURRENT_KERNEL, cupti.ActivityKind.CUDA_EVENT):
+            cupti.activity_enable(kind)
+            enabled.append(kind)
+        cupti.activity_enable_cuda_event_device_timestamps(1)
+    except (cupti.cuptiError, AttributeError) as exc:
+        cleanup_errors = []
+        for kind in reversed(enabled):
+            try:
+                cupti.activity_disable(kind)
+            except cupti.cuptiError as cleanup_exc:
+                cleanup_errors.append(str(cleanup_exc))
+        raise RuntimeError(
+            f"Cannot enable CUPTI kernel/event tracing: {exc}; cleanup errors: {cleanup_errors}"
+        ) from exc
+    return cupti, cupti_kernels, cupti_events
+
+
+_CUPTI_FALLBACK_WARNING_SHOWN = False
+
+
+def _warn_kernel_span_unavailable(reason: str) -> str:
+    global _CUPTI_FALLBACK_WARNING_SHOWN
+    warning = (
+        "CUPTI kernel-span timing is unavailable. "
+        "Falling back to CUDA-event timing, which may include non-kernel bubbles before "
+        "the first kernel and after the last kernel. Kernel-span timing excludes these "
+        "boundary bubbles and is generally more representative of communication-kernel "
+        f"execution time in E2E workloads. Reason: {reason}"
+    )
+    if not _CUPTI_FALLBACK_WARNING_SHOWN:
+        _maybe_warn_rank0(f"[bench_moe_comm] WARNING: {warning}")
+        _CUPTI_FALLBACK_WARNING_SHOWN = True
+    return warning
+
+
+def _init_cupti_for_workers() -> tuple[Optional[Any], str | None]:
+    """Attempt tracing before CUDA context creation; keep MPI ranks on the same path."""
+    ctx = None
+    error = None
+    try:
+        ctx = _init_cupti()
+        if ctx is None:
+            error = "CUPTI initialization returned no collector"
+    except (ImportError, OSError, RuntimeError) as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    errors = mpi_allgather(error)
+    if any(errors):
+        reasons = [f"rank{rank}: {error}" for rank, error in enumerate(errors) if error]
+        if ctx is not None:
+            cupti = ctx[0]
+            for kind in (cupti.ActivityKind.CUDA_EVENT, cupti.ActivityKind.CONCURRENT_KERNEL):
+                try:
+                    cupti.activity_disable(kind)
+                except cupti.cuptiError as exc:
+                    reasons.append(f"Local CUPTI cleanup failed: {exc}")
+        return None, _warn_kernel_span_unavailable("; ".join(reasons))
+    return ctx, None
 
 
 def _time_dispatch_and_combine(
@@ -237,414 +463,25 @@ def _time_dispatch_and_combine(
     warmup: int,
     iters: int,
     flush_l2: bool = True,
-) -> Tuple[List[float], List[float], Dict[str, Any]]:
-    """Time dispatch and combine using Kineto (torch.profiler with CUPTI).
-
-    Returns:
-        dispatch_times_us: Per-iteration dispatch GPU times in microseconds
-        combine_times_us: Per-iteration combine GPU times in microseconds
-        detailed_stats: Dict containing per-kernel timing breakdown
-    """
-    device = hidden_states.device
-
-    # L2 cache flushing buffer
-    l2_buffer = None
-    if flush_l2:
-        l2_size = torch.cuda.get_device_properties(device).L2_cache_size
-        # Use 2x L2 size to ensure complete flush
-        l2_flush_size = (l2_size * 2) // 4  # Size in int32 elements
-        l2_buffer = torch.empty(l2_flush_size, dtype=torch.int32, device=device)
-
-    # Profile with Kineto
-    with torch.profiler.profile(
-        # Include CPU so `record_function("dispatch"/"combine")` ranges appear in
-        # key_averages() / events(). Without CPU activity those ranges are missing,
-        # causing dispatch/combine attribution to fail.
-        activities=[torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU],
-        record_shapes=False,
-        with_stack=False,
-    ) as prof:
-        _sync()
-
-        # Warmup iterations (not profiled)
-        for _ in range(warmup):
-            if l2_buffer is not None:
-                l2_buffer.zero_()
-            backend.prepare_dispatch(
-                token_selected_slots, all_rank_num_tokens
-            )  # For most ranks this is no-op except for NVLINK_TWO_SIDED
-            recv_hidden_states, _, _, _ = backend.dispatch(
-                hidden_states,
-                hidden_states_sf,
-                token_selected_slots,
-                token_final_scales,
-                all_rank_num_tokens,
-            )
-            shape = list(recv_hidden_states.shape)
-            shape[-1] = hidden_size
-            recv_hidden_states_moe = torch.empty(
-                tuple(shape), dtype=torch.bfloat16, device=recv_hidden_states.device
-            )
-            _ = backend.combine(
-                recv_hidden_states_moe, all_rank_max_num_tokens=max(all_rank_num_tokens)
-            )
-
-        # Timed iterations
-        for _ in range(iters):
-            # L2 cache flushing
-            if l2_buffer is not None:
-                l2_buffer.zero_()
-
-            # Mark dispatch operation for aggregated timing
-            with torch.profiler.record_function("dispatch"):
-                backend.prepare_dispatch(
-                    token_selected_slots, all_rank_num_tokens
-                )  # For most ranks this is no-op except for NVLINK_TWO_SIDED
-                recv_hidden_states, _, _, _ = backend.dispatch(
-                    hidden_states,
-                    hidden_states_sf,
-                    token_selected_slots,
-                    token_final_scales,
-                    all_rank_num_tokens,
-                )
-
-            # Simulate MoE computation output
-            shape = list(recv_hidden_states.shape)
-            shape[-1] = hidden_size
-            recv_hidden_states_moe = torch.empty(
-                tuple(shape), dtype=torch.bfloat16, device=recv_hidden_states.device
-            )
-
-            # Mark combine operation for aggregated timing
-            with torch.profiler.record_function("combine"):
-                _ = backend.combine(
-                    recv_hidden_states_moe, all_rank_max_num_tokens=max(all_rank_num_tokens)
-                )
-
-    _sync()
-    # if mpi_rank() == 0:
-    #     print("########################################################")
-    #     print(prof.key_averages())
-    #     print("########################################################")
-    return _parse_profiler_events(list(prof.events()))
-
-
-def _parse_profiler_events(
-    events_list: list,
-) -> Tuple[List[float], List[float], Dict[str, Any]]:
-    """Parse Kineto profiler events into per-iteration times and kernel breakdown.
-
-    Expects the profiler to have been run with record_function("dispatch") and
-    record_function("combine") wrapping each operation (works for both eager
-    kernels and CUDA graph replays).
-    """
-    # if mpi_rank() == 0:
-    #     print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
-    #     for evt in events_list:
-    #         print(evt)
-    #     print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
-
-    def _is_gpu_event(evt) -> bool:
-        return getattr(evt, "device_type", None) == DeviceType.CUDA
-
-    # Step 1: Collect GPU time ranges of "dispatch"/"combine" CUDA ranges.
-    gpu_dispatch_intervals: List[Tuple[int, int]] = []
-    gpu_combine_intervals: List[Tuple[int, int]] = []
-
-    for evt in events_list:
-        if not _is_gpu_event(evt) or evt.name not in ("dispatch", "combine"):
-            continue
-        tr = getattr(evt, "time_range", None)
-        if tr is None:
-            continue
-        assert tr.end > tr.start
-        (gpu_dispatch_intervals if evt.name == "dispatch" else gpu_combine_intervals).append(
-            (tr.start, tr.end)
-        )
-    gpu_dispatch_intervals.sort()
-    gpu_combine_intervals.sort()
-
-    # Step 2: Scope resolver (GPU events only) ---------------------------------
-    def _find_scope(evt) -> Optional[str]:
-        """Return scope only when kernel range is strictly contained."""
-        tr = getattr(evt, "time_range", None)
-        if tr is None:
-            return None
-
-        # Be careful: Due to PDL, the end of dispatch and the start of combine may overlap,
-        # so we say a kernel is in dispatch/combine only if its range is strictly contained in a dispatch/combine range.
-        in_dispatch = any(s <= tr.start and tr.end <= e for s, e in gpu_dispatch_intervals)
-        in_combine = any(s <= tr.start and tr.end <= e for s, e in gpu_combine_intervals)
-
-        assert not (in_dispatch and in_combine), (
-            f"Kernel range is simultaneously inside dispatch and combine ranges: {evt.name}"
-        )
-
-        if in_dispatch:
-            return "dispatch"
-        if in_combine:
-            return "combine"
-
-        # Neither in dispatch or combine (like the element-wise kernel for L2 cache flushing) -> uncategorized.
-        return None
-
-    # Step 3: Iterate events and bucket by scope ----------------------------
-    dispatch_kernel_times: Dict[str, List[float]] = {}
-    combine_kernel_times: Dict[str, List[float]] = {}
-    other_kernel_times: Dict[str, List[float]] = {}
-
-    for evt in events_list:
-        if not _is_gpu_event(evt):
-            continue
-        if evt.device_time <= 0:
-            continue
-        if evt.name in ("dispatch", "combine"):
-            continue  # skip record_function range markers
-
-        scope = _find_scope(evt)
-        if scope == "dispatch":
-            dispatch_kernel_times.setdefault(evt.name, []).append(evt.device_time)
-        elif scope == "combine":
-            combine_kernel_times.setdefault(evt.name, []).append(evt.device_time)
-        else:
-            other_kernel_times.setdefault(evt.name, []).append(evt.device_time)
-
-    # Step 4: Build per-kernel stats ----------------------------------------
-    def _build_kernel_list(kernel_times: Dict[str, List[float]]) -> List[Dict[str, Any]]:
-        result = []
-        for name, times in kernel_times.items():
-            result.append(
-                {
-                    "name": name,
-                    "count": len(times),
-                    "_times": times,  # raw per-iteration times, gathered across ranks later
-                }
-            )
-        return result
-
-    dispatch_kernels = _build_kernel_list(dispatch_kernel_times)
-    combine_kernels = _build_kernel_list(combine_kernel_times)
-    other_kernels = _build_kernel_list(other_kernel_times)
-
-    # Step 5: Collect per-iteration dispatch/combine times (us) ---------------
-    # Use the CUDA-side "dispatch"/"combine" range events (device_type=CUDA)
-    # for direct GPU time measurement.
-    dispatch_times_us: List[float] = []
-    combine_times_us: List[float] = []
-    for evt in events_list:
-        if not _is_gpu_event(evt):
-            continue
-        if evt.name == "dispatch":
-            dispatch_times_us.append(evt.device_time)
-        elif evt.name == "combine":
-            combine_times_us.append(evt.device_time)
-
-    # Sort each category by mean time descending
-    dispatch_kernels.sort(
-        key=lambda x: sum(x["_times"]) / len(x["_times"]) if x["_times"] else 0, reverse=True
-    )
-    combine_kernels.sort(
-        key=lambda x: sum(x["_times"]) / len(x["_times"]) if x["_times"] else 0, reverse=True
-    )
-    other_kernels.sort(
-        key=lambda x: sum(x["_times"]) / len(x["_times"]) if x["_times"] else 0, reverse=True
-    )
-
-    detailed_stats = {
-        "dispatch_kernels": dispatch_kernels,
-        "combine_kernels": combine_kernels,
-        "other_kernels": other_kernels,
-    }
-
-    return dispatch_times_us, combine_times_us, detailed_stats
-
-
-def _demangle_names(names: List[str]) -> Dict[str, str]:
-    """Demangle C++ symbol names via cxxfilt. Returns {mangled: demangled}."""
-    try:
-        import cxxfilt
-
-        return {n: cxxfilt.demangle(n) for n in names}
-    except Exception:
-        return {n: n for n in names}
-
-
-def _build_cuda_graph_kernel_stats_cupti(
-    cupti_kernels: List[Tuple[str, int, int]],  # (name, start_ns, end_ns)
-    cupti_events: List[int],  # device_timestamps of EXTERNAL events, sorted
-    iters: int,
-) -> Optional[Dict[str, Any]]:
-    """Categorize GPU kernels from a CUDA graph replay into dispatch/combine/other.
-
-    Uses CUPTI kernel timestamps and CUPTI CUDA_EVENT device_timestamps, all in the
-    same GPU nanosecond clock domain.
-
-    The graph records 4 EXTERNAL events per timed iteration (no events during warmup):
-      event 4*i+0 → d_starts[i],  4*i+1 → d_ends[i]
-      event 4*i+2 → c_starts[i],  4*i+3 → c_ends[i]
-
-    Each kernel is classified by whether its (k_start, k_end) falls within a
-    dispatch or combine window; everything else (including warmup kernels) is other.
-
-    Returns None if CUPTI events are missing.
-
-    The returned dict includes:
-      dispatch_times_us / combine_times_us: per-iter kernel-span times (ns → µs),
-        computed as (last_kernel_end − first_kernel_start) within each window.
-        None for iterations where no kernels were attributed (caller should fall back
-        to CUDA-event elapsed_time for those iterations).
-    """
-    expected_events = 4 * iters
-    if len(cupti_events) != expected_events:
-        _maybe_warn_rank0(
-            f"[bench] CUPTI kernel breakdown skipped: expected {expected_events} CUDA_EVENT "
-            f"records ({iters} iters × 4) but got {len(cupti_events)}. "
-            "This usually means _try_init_cupti() was called after CUDA context creation."
-        )
-        return None
-    if not cupti_kernels:
-        return None
-
-    d_starts_abs = [cupti_events[4 * i + 0] for i in range(iters)]
-    d_ends_abs = [cupti_events[4 * i + 1] for i in range(iters)]
-    c_starts_abs = [cupti_events[4 * i + 2] for i in range(iters)]
-    c_ends_abs = [cupti_events[4 * i + 3] for i in range(iters)]
-
-    unique_names = list({name for name, _, _ in cupti_kernels})
-    dm = _demangle_names(unique_names)
-
-    dispatch_kernel_times: Dict[str, List[float]] = {}
-    combine_kernel_times: Dict[str, List[float]] = {}
-    other_kernel_times: Dict[str, List[float]] = {}
-
-    # Per-iteration [first_start_ns, last_end_ns] for kernel-span timing.
-    dispatch_iter_span: List[List[Optional[int]]] = [[None, None] for _ in range(iters)]
-    combine_iter_span: List[List[Optional[int]]] = [[None, None] for _ in range(iters)]
-
-    for name, k_start, k_end in cupti_kernels:
-        demangled = dm.get(name, name)
-        device_time_us = (k_end - k_start) / 1e3  # ns → µs
-
-        category = "other"
-        iter_idx = -1
-        for i in range(iters):
-            if k_start >= d_starts_abs[i] and k_end <= d_ends_abs[i]:
-                category = "dispatch"
-                iter_idx = i
-                break
-            if k_start >= c_starts_abs[i] and k_end <= c_ends_abs[i]:
-                category = "combine"
-                iter_idx = i
-                break
-
-        if category == "dispatch":
-            span = dispatch_iter_span[iter_idx]
-            span[0] = k_start if span[0] is None else min(span[0], k_start)
-            span[1] = k_end if span[1] is None else max(span[1], k_end)
-            dispatch_kernel_times.setdefault(demangled, []).append(device_time_us)
-        elif category == "combine":
-            span = combine_iter_span[iter_idx]
-            span[0] = k_start if span[0] is None else min(span[0], k_start)
-            span[1] = k_end if span[1] is None else max(span[1], k_end)
-            combine_kernel_times.setdefault(demangled, []).append(device_time_us)
-        else:
-            other_kernel_times.setdefault(demangled, []).append(device_time_us)
-
-    def _build(ktimes: Dict[str, List[float]]) -> List[Dict[str, Any]]:
-        result = [{"name": n, "count": len(t), "_times": t} for n, t in ktimes.items()]
-        result.sort(
-            key=lambda x: sum(x["_times"]) / len(x["_times"]) if x["_times"] else 0, reverse=True
-        )
-        return result
-
-    dispatch_times_us = [
-        (span[1] - span[0]) / 1e3 if span[0] is not None else None for span in dispatch_iter_span
-    ]
-    combine_times_us = [
-        (span[1] - span[0]) / 1e3 if span[0] is not None else None for span in combine_iter_span
-    ]
-
-    return {
-        "dispatch_kernels": _build(dispatch_kernel_times),
-        "combine_kernels": _build(combine_kernel_times),
-        "other_kernels": _build(other_kernel_times),
-        "dispatch_times_us": dispatch_times_us,
-        "combine_times_us": combine_times_us,
-    }
-
-
-def _try_init_cupti():
-    """Try to initialize CUPTI for CUDA-graph kernel breakdown.
-
-    MUST be called BEFORE the CUDA context is created (i.e. before any torch.cuda.*
-    call).  CUPTI CUDA_EVENT activities are only delivered to subscribers registered
-    before the CUDA context is initialized; late registration silently drops them.
-
-    Also must be called before any NVLINK/NVLink backend creation: NVLINK_ONE_SIDED's
-    NVLink initialization changes CUDA profiling state in a way that prevents
-    CONCURRENT_KERNEL tracking if CUPTI is enabled afterwards.
-
-    Returns (cupti_module, kernels_list, event_timestamps_list, is_available).
-    """
-    try:
-        from functools import partial as _partial
-
-        from cupti import cupti as _cupti
-
-        _cupti_kernels: List[Tuple[str, int, int]] = []
-        _cupti_events: List[int] = []  # device_timestamps of CUDA event records, in arrival order
-
-        def _buf_requested():
-            return 8 * 1024 * 1024, 0
-
-        def _buf_completed(kernels, events, activities):
-            for act in activities:
-                if act.kind == _cupti.ActivityKind.CONCURRENT_KERNEL:
-                    kernels.append((act.name, act.start, act.end))
-                elif act.kind == _cupti.ActivityKind.CUDA_EVENT:
-                    events.append(act.device_timestamp)
-
-        _cupti.activity_enable(_cupti.ActivityKind.CONCURRENT_KERNEL)
-        _cupti.activity_enable(_cupti.ActivityKind.CUDA_EVENT)
-        _cupti.activity_enable_cuda_event_device_timestamps(1)
-        _cupti.activity_register_callbacks(
-            _buf_requested, _partial(_buf_completed, _cupti_kernels, _cupti_events)
-        )
-        return _cupti, _cupti_kernels, _cupti_events, True
-    except Exception:
-        return None, [], [], False
-
-
-def _time_dispatch_and_combine_cuda_graph(
-    backend: Communication,
-    *,
-    hidden_states: torch.Tensor,
-    hidden_states_sf: Optional[torch.Tensor],
-    token_selected_slots: torch.Tensor,
-    token_final_scales: Optional[torch.Tensor],
-    all_rank_num_tokens: List[int],
-    hidden_size: int,
-    warmup: int,
-    iters: int,
-    flush_l2: bool = True,
+    use_cuda_graph: bool = True,
     cupti_ctx: Optional[Any] = None,
 ) -> Tuple[List[float], List[float], Dict[str, Any]]:
-    """Time dispatch and combine using an unrolled CUDA graph + embedded CUDA events.
+    """Measure per-iteration dispatch/combine latency with CUDA events, in microseconds.
+
+    After an eager shape-discovery run, execute warmup and timed iterations either
+    in one unrolled CUDA graph replay or eagerly. L2 flushing and simulated MoE
+    output initialization are outside each timed phase. Optional CUPTI activity
+    records are attributed using the IDs and GPU timestamps of those events.
 
     Order:
-      1. One eager dispatch+combine to discover recv shape → allocate static_moe_out → sync.
-      2. Capture a single big graph with `iters` iterations unrolled.
-         Each iteration: d_starts[i].record → dispatch → d_ends[i].record
-                         → zero_ → c_starts[i].record → combine → c_ends[i].record
-      3. Warmup: `warmup` eager iterations (no graph).
-      4. Timed: one big_graph.replay() → GPU runs all iters back-to-back with zero CPU overhead.
-      5. Sync, read per-iter timings from events.
-      6. Profiler pass (two small graphs) for kernel breakdown.
+      1. Discover the receive shape and allocate the static combine payload.
+      2. Create timing events and obtain their CUPTI IDs when profiling is enabled.
+      3. Define warmup and measured iterations; capture them together in graph mode.
+      4. Clear setup profiling records, synchronize ranks, and execute the iterations.
+      5. Read per-iteration dispatch/combine latency from CUDA events.
+      6. Attribute CUPTI kernels to phases using the timing events' GPU timestamps.
 
-    L2 cache is flushed before each iteration inside the graph (including warmup),
-    matching the eager-mode behaviour.
-
-    Returns same types as _time_dispatch_and_combine.
+    Returns event times and activity statistics containing per-iteration kernel spans.
     """
     device = hidden_states.device
     max_tokens = max(all_rank_num_tokens)
@@ -655,18 +492,10 @@ def _time_dispatch_and_combine_cuda_graph(
         l2_flush_size = (l2_size * 2) // 4
         l2_buffer = torch.empty(l2_flush_size, dtype=torch.int32, device=device)
 
-    # ---- 0. CUPTI state ----
-    # cupti_ctx is pre-initialized before backend creation (NVLINK_ONE_SIDED's NVLink
-    # init changes CUDA profiling state; CUPTI must be enabled before that call).
     if cupti_ctx is not None:
-        _cupti, _cupti_kernels, _cupti_events, _cupti_available = cupti_ctx
-    else:
-        _cupti_available = False
-        _cupti_kernels: List[Tuple[str, int, int]] = []
-        _cupti_events: List[int] = []
-        _cupti = None
+        cupti, cupti_kernels, cupti_events = cupti_ctx
 
-    # ---- 1. Shape discovery: one eager run ----
+    # ---- 1. Discover receive shape and allocate the combine payload ----
     backend.prepare_dispatch(token_selected_slots, all_rank_num_tokens)
     recv_hidden_states, _, _, _ = backend.dispatch(
         hidden_states,
@@ -683,16 +512,24 @@ def _time_dispatch_and_combine_cuda_graph(
     backend.combine(static_moe_out, all_rank_max_num_tokens=max_tokens)
     torch.cuda.synchronize()
 
-    # ---- 2. Capture big graph (iters iterations unrolled) ----
+    # ---- 2. Prepare timing events and CUPTI event IDs ----
     # cudaEventRecordExternal (0x1, CUDA 11.2+) makes events recorded inside a
     # CUDA graph queryable via elapsed_time() after replay. Without this flag,
     # graph-internal events raise cudaErrorInvalidValue on elapsed_time().
-    _cudart = ctypes.CDLL("libcudart.so")
-    _cudart.cudaEventRecordWithFlags.restype = ctypes.c_int
-    _cudart.cudaEventRecordWithFlags.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
-    _CUDA_EVENT_RECORD_EXTERNAL = 0x1
+    if use_cuda_graph:
+        _cudart = ctypes.CDLL("libcudart.so")
+        _cudart.cudaEventRecordWithFlags.restype = ctypes.c_int
+        _cudart.cudaEventRecordWithFlags.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint,
+        ]
+        _CUDA_EVENT_RECORD_EXTERNAL = 0x1
 
-    def _record_external(event: torch.cuda.Event) -> None:
+    def _record_event(event: torch.cuda.Event) -> None:
+        if not use_cuda_graph:
+            event.record()
+            return
         stream = torch.cuda.current_stream()
         ret = _cudart.cudaEventRecordWithFlags(
             event.cuda_event, stream.cuda_stream, _CUDA_EVENT_RECORD_EXTERNAL
@@ -710,11 +547,20 @@ def _time_dispatch_and_combine_cuda_graph(
         evt.record()
     torch.cuda.synchronize()
 
-    # Graph contains warmup + timed iters. Warmup iters have no events (unmeasured).
-    # Timed iters have 4 external events each. One replay() runs everything back-to-back,
-    # eliminating rank desync between warmup and timed sections.
-    big_graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(big_graph):
+    phase_event_ids = []
+    if cupti_ctx is not None:
+        for i in range(iters):
+            phase_event_ids.append(
+                (
+                    cupti.get_cuda_event_id(d_starts[i].cuda_event),
+                    cupti.get_cuda_event_id(d_ends[i].cuda_event),
+                    cupti.get_cuda_event_id(c_starts[i].cuda_event),
+                    cupti.get_cuda_event_id(c_ends[i].cuda_event),
+                )
+            )
+
+    # ---- 3. Define iterations and optionally capture the CUDA graph ----
+    def _run_iterations() -> None:
         for _ in range(warmup):
             if l2_buffer is not None:
                 l2_buffer.zero_()
@@ -733,7 +579,7 @@ def _time_dispatch_and_combine_cuda_graph(
         for i in range(iters):
             if l2_buffer is not None:
                 l2_buffer.zero_()
-            _record_external(d_starts[i])
+            _record_event(d_starts[i])
             backend.prepare_dispatch(
                 token_selected_slots, all_rank_num_tokens
             )  # For most ranks this is no-op except for NVLINK_TWO_SIDED
@@ -744,56 +590,44 @@ def _time_dispatch_and_combine_cuda_graph(
                 token_final_scales,
                 all_rank_num_tokens,
             )
-            _record_external(d_ends[i])
+            _record_event(d_ends[i])
             static_moe_out.zero_()
-            _record_external(c_starts[i])
+            _record_event(c_starts[i])
             backend.combine(static_moe_out, all_rank_max_num_tokens=max_tokens)
-            _record_external(c_ends[i])
+            _record_event(c_ends[i])
 
-    # ---- 3. Timed replay + kernel breakdown via CUPTI ----
-    if _cupti_available:
-        # Flush any activities captured before the replay (shape discovery, graph capture
-        # dry-run, etc.) and clear lists so only replay activities remain.
-        _cupti.activity_flush_all(0)
-        _cupti_kernels.clear()
-        _cupti_events.clear()
+    if use_cuda_graph:
+        # Keep warmup and timed iterations in one replay to avoid a host-side gap.
+        big_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(big_graph):
+            _run_iterations()
 
+    # ---- 4. Clear setup records, synchronize, and execute ----
+    if cupti_ctx is not None:
+        cupti.activity_flush_all(0)
+        cupti_kernels.clear()
+        cupti_events.clear()
     _sync()
-    big_graph.replay()
-
+    if use_cuda_graph:
+        big_graph.replay()
+    else:
+        _run_iterations()
     _sync()
+    if cupti_ctx is not None:
+        cupti.activity_flush_all(0)
 
-    if _cupti_available:
-        # Flush AFTER _sync() (torch.cuda.synchronize + mpi_barrier) to ensure CUPTI
-        # delivers all pending graph-replay activities. flush_all(0) is non-blocking;
-        # the preceding synchronize gives CUPTI time to process the replay's records.
-        _cupti.activity_flush_all(0)
-
+    # ---- 5. Read per-iteration CUDA-event timings ----
     dispatch_times_us = [d_starts[i].elapsed_time(d_ends[i]) * 1e3 for i in range(iters)]
     combine_times_us = [c_starts[i].elapsed_time(c_ends[i]) * 1e3 for i in range(iters)]
 
-    if _cupti_available:
-        _cupti_kernels.sort(key=lambda k: k[1])
-        _cupti_events.sort()  # sort by device_timestamp; CUPTI may deliver out of order
-
-        detailed_stats = _build_cuda_graph_kernel_stats_cupti(_cupti_kernels, _cupti_events, iters)
-        if detailed_stats is not None:
-            # Replace event-based times with tighter kernel-span times.
-            # Fall back per-iter to event timing if no kernels were attributed.
-            cupti_dispatch = detailed_stats.pop("dispatch_times_us")
-            cupti_combine = detailed_stats.pop("combine_times_us")
-            dispatch_times_us = [
-                ct if ct is not None else et
-                for ct, et in zip(cupti_dispatch, dispatch_times_us, strict=True)
-            ]
-            combine_times_us = [
-                ct if ct is not None else et
-                for ct, et in zip(cupti_combine, combine_times_us, strict=True)
-            ]
-        else:
-            detailed_stats = {"dispatch_kernels": [], "combine_kernels": [], "other_kernels": []}
-    else:
-        detailed_stats = {"dispatch_kernels": [], "combine_kernels": [], "other_kernels": []}
+    # ---- 6. Attribute CUPTI kernels to dispatch/combine phases ----
+    detailed_stats = {"dispatch_kernels": [], "combine_kernels": [], "other_kernels": []}
+    if cupti_ctx is not None:
+        try:
+            detailed_stats = _build_kernel_stats_cupti(cupti_kernels, cupti_events, phase_event_ids)
+        except RuntimeError as exc:
+            # Let every MPI rank reach the reporting collectives even if one trace is incomplete.
+            detailed_stats["cupti_error"] = str(exc)
 
     return dispatch_times_us, combine_times_us, detailed_stats
 
@@ -815,109 +649,19 @@ def _compute_stats(values: List[float]) -> Dict[str, float]:
     }
 
 
-def _gather_per_rank(times_us: List[float], iter_stats: bool = False) -> Dict[str, Any]:
+def _gather_per_rank(times_us: Optional[List[float]], iter_stats: bool = False) -> Dict[str, Any]:
     """Allgather per-iteration times from each rank, return per-rank results.
 
     If iter_stats=True, return full stats (mean/median/stdev/min/max).
     If iter_stats=False, return just the mean.
     """
     all_times = mpi_allgather(times_us)
-    if iter_stats:
-        return {f"rank{i}": _compute_stats(t) for i, t in enumerate(all_times)}
-    return {f"rank{i}": (sum(t) / len(t) if t else 0.0) for i, t in enumerate(all_times)}
-
-
-def _min_local_tokens_for_receiver_coverage(ep_size: int, top_k: int) -> int:
-    if top_k <= 0:
-        raise ValueError(f"top_k must be > 0, got {top_k}")
-    return (ep_size + top_k - 1) // top_k
-
-
-def _scale_local_batch_sizes_for_receiver_coverage(
-    local_batch_sizes: List[int], ep_size: int, top_k: int
-) -> List[int]:
-    min_tokens = _min_local_tokens_for_receiver_coverage(ep_size, top_k)
-    scaled: List[int] = []
-    for local_num_tokens in local_batch_sizes:
-        value = max(int(local_num_tokens), min_tokens)
-        if not scaled or scaled[-1] != value:
-            scaled.append(value)
-    return scaled
-
-
-def _verify_dispatch_sentinel(
-    backend: Communication,
-    *,
-    hidden_size: int,
-    top_k: int,
-    experts_per_rank: int,
-    ep_size: int,
-    act_dtype: torch.dtype,
-    device: torch.device,
-    local_num_tokens: Optional[int] = None,
-) -> Dict[str, Any]:
-    """One dispatch+combine with sender-rank-tagged hidden_states.
-
-    Each rank fills its hidden_states with the scalar ``rank + 1``. After
-    dispatch, each received row should be that integer cast to ``act_dtype``;
-    rows reading as 0 are either padding or a silently-broken peer read
-    (e.g. cross-rack MNNVL mapping that succeeded at construction but doesn't
-    actually back the peer's memory). Returns the per-rank decoded-sender
-    histogram for the caller to allgather and inspect.
-    """
-    rank = mpi_rank()
-    min_tokens = _min_local_tokens_for_receiver_coverage(ep_size, top_k)
-    local_num_tokens = min_tokens if local_num_tokens is None else max(local_num_tokens, min_tokens)
-    all_rank_num_tokens = mpi_allgather(int(local_num_tokens))
-    if not backend.is_workload_feasible(all_rank_num_tokens, num_chunks=1):
-        return {"rank": rank, "skipped": True}
-
-    sentinel = float(rank + 1)
-    hidden_states = torch.full(
-        (local_num_tokens, hidden_size),
-        sentinel,
-        dtype=act_dtype,
-        device=device,
-    )
-    flat_slots = torch.arange(local_num_tokens * top_k, device=device, dtype=torch.int64)
-    schedule = flat_slots + rank
-    target_rank = schedule % ep_size
-    local_expert = (schedule // ep_size) % experts_per_rank
-    token_selected_slots = (
-        (target_rank * experts_per_rank + local_expert)
-        .view(local_num_tokens, top_k)
-        .to(torch.int32)
-    )
-    token_final_scales = torch.ones(
-        local_num_tokens,
-        top_k,
-        dtype=torch.float32,
-        device=device,
-    )
-
-    backend.prepare_dispatch(token_selected_slots, all_rank_num_tokens)
-    recv_hs, _, _, _ = backend.dispatch(
-        hidden_states,
-        None,
-        token_selected_slots,
-        token_final_scales,
-        all_rank_num_tokens,
-    )
-    # Pair dispatch with a combine so backend state mirrors the bench's
-    # warmup->timing call pattern (NCCL_EP especially relies on this).
-    shape = list(recv_hs.shape)
-    shape[-1] = hidden_size
-    moe_out = torch.zeros(tuple(shape), dtype=torch.bfloat16, device=recv_hs.device)
-    backend.combine(moe_out, all_rank_max_num_tokens=max(all_rank_num_tokens))
-    torch.cuda.synchronize()
-
-    first_col = recv_hs[:, 0].to(torch.float32)
-    decoded = first_col.round().to(torch.int64)
-    unique, counts = decoded.unique(return_counts=True)
-    histogram: Dict[int, int] = {
-        int(u) - 1: int(c) for u, c in zip(unique.tolist(), counts.tolist(), strict=True)
+    return {
+        f"rank{i}": None
+        if t is None
+        else (_compute_stats(t) if iter_stats else (sum(t) / len(t) if t else 0.0))
+        for i, t in enumerate(all_times)
     }
-    return {"rank": rank, "histogram": histogram}
 
 
 def parse_args() -> argparse.Namespace:
@@ -1012,7 +756,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--kernel_breakdown",
         action="store_true",
-        help="Show per-kernel timing breakdown.",
+        help="Also output per-kernel details. CUPTI kernel-span timing is attempted regardless of this flag.",
     )
     parser.add_argument(
         "--iter_stats",
@@ -1037,7 +781,7 @@ def parse_args() -> argparse.Namespace:
         help="Use deterministic balanced router assignments to avoid communication load imbalance.",
     )
     parser.add_argument(
-        "--use_low_precision_moe_combine",
+        "--use_low_precision_combine",
         action="store_true",
         default=False,
         help="Enable low-precision (FP8) MoE combine path.",
@@ -1045,17 +789,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no_cuda_graph",
         action="store_true",
-        help="Disable CUDA graph mode. By default, dispatch and combine are captured into CUDA graphs for lower CPU overhead and more accurate timing.",
-    )
-    parser.add_argument(
-        "--verify",
-        action="store_true",
-        help=(
-            "Run a single sentinel dispatch per backend before timing and print a "
-            "receiver/sender contribution matrix. Detects silent cross-rack "
-            "correctness failures where dispatch appears to succeed but produces "
-            "zeros or local-only data."
-        ),
+        help="Use eager execution with CUDA event timing instead of CUDA graph replay. Kernel breakdown still uses CUPTI.",
     )
     parser.add_argument(
         "--pdl",
@@ -1131,16 +865,8 @@ _WORKER_ENV = {
 def _run_benchmark_worker_under_current_mpi(
     args: argparse.Namespace, launcher: str = "spawn"
 ) -> None:
-    # CUPTI MUST be initialized before the CUDA context is created.
-    # CUDA_EVENT activities are only delivered to CUPTI subscribers that were registered
-    # before the CUDA context was initialized; late registration captures CONCURRENT_KERNEL
-    # but silently drops CUDA_EVENT records.  _set_device_from_local_rank() (below) is
-    # the first call that creates the CUDA context, so we init CUPTI here.
-    _early_cupti_ctx: Optional[Any] = None
-    if not args.no_cuda_graph:
-        _cupti_module, _cupti_kernels_list, _cupti_events_list, _cupti_ok = _try_init_cupti()
-        if _cupti_ok:
-            _early_cupti_ctx = (_cupti_module, _cupti_kernels_list, _cupti_events_list, True)
+    # Late CUPTI initialization captures kernels but misses CUDA_EVENT records.
+    cupti_ctx, cupti_warning = _init_cupti_for_workers()
 
     # Keep benchmark output clean.
     tllm.logger.set_level("error")
@@ -1156,10 +882,6 @@ def _run_benchmark_worker_under_current_mpi(
 
     hidden_size, top_k, num_experts_total, quant_algo = _resolve_profile_args(args)
     local_batch_sizes = _iter_local_batch_sizes(args)
-    if args.verify:
-        local_batch_sizes = _scale_local_batch_sizes_for_receiver_coverage(
-            local_batch_sizes, ep_size, top_k
-        )
     act_dtype = torch.bfloat16
     quant_config = (
         QuantConfig(quant_algo=None)
@@ -1203,6 +925,8 @@ def _run_benchmark_worker_under_current_mpi(
         "device_count": torch.cuda.device_count(),
         "cuda_graph": not args.no_cuda_graph,
         "pdl": bool(args.pdl),
+        "cupti_enabled": cupti_ctx is not None,
+        "warning": cupti_warning,
     }
     if rank == 0:
         print(json.dumps(benchmark_metadata, indent=2), flush=True)
@@ -1222,14 +946,6 @@ def _run_benchmark_worker_under_current_mpi(
 
     all_results: List[Dict[str, Any]] = []
 
-    # CUPTI was initialized before the CUDA context at the top of this function.
-    # Reuse that early context; do not re-initialize here (too late for CUDA_EVENT delivery).
-    _cupti_ctx: Optional[Any] = _early_cupti_ctx
-    if not args.no_cuda_graph and _cupti_ctx is None:
-        _maybe_warn_rank0(
-            "[bench] CUPTI unavailable; dispatch_us/combine_us will use CUDA event elapsed_time."
-        )
-
     for backend_name in backends:
         try:
             model_config = _create_model_config(
@@ -1238,7 +954,7 @@ def _run_benchmark_worker_under_current_mpi(
                 act_dtype=act_dtype,
                 max_num_tokens_per_rank=max_num_tokens_per_rank,
                 quant_config=quant_config,
-                use_low_precision_moe_combine=args.use_low_precision_moe_combine,
+                use_low_precision_combine=args.use_low_precision_combine,
             )
 
             backend = CommunicationFactory._create_forced_method(  # pylint: disable=protected-access
@@ -1280,58 +996,6 @@ def _run_benchmark_worker_under_current_mpi(
             # Ensure quantization params (e.g., NVFP4 global scale) live on CUDA.
             moe = moe.to(device)
 
-        if args.verify:
-            verify_local = _verify_dispatch_sentinel(
-                backend,
-                hidden_size=hidden_size,
-                top_k=top_k,
-                experts_per_rank=experts_per_rank,
-                ep_size=ep_size,
-                act_dtype=act_dtype,
-                device=device,
-                local_num_tokens=local_batch_sizes[0],
-            )
-            all_verify = mpi_allgather(verify_local)
-            # Pass criterion: every receiver must have at least one token from
-            # every sender [0, ep_size). The verify local_num_tokens is scaled
-            # so local_num_tokens * top_k covers every receiver;
-            # any zero-column means the recv buffer was silently dropped from
-            # that sender.
-            verify_failed = False
-            for entry in all_verify:
-                if entry.get("skipped"):
-                    verify_failed = True
-                    break
-                hist = entry.get("histogram", {})
-                if any(hist.get(s, 0) == 0 for s in range(ep_size)):
-                    verify_failed = True
-                    break
-            if rank == 0:
-                status = "FAIL" if verify_failed else "PASS"
-                print(
-                    f"=== [verify] {backend_name} {status} -- sender->receiver "
-                    f"contribution (rows=receiver, cols=sender; -1 col = "
-                    f"padding/unmapped) ===",
-                    flush=True,
-                )
-                cols = [-1, *range(ep_size)]
-                header = "R\\S | " + "  ".join(f"{c:>5}" for c in cols) + "  | total"
-                print(header)
-                for entry in sorted(all_verify, key=lambda e: e.get("rank", -1)):
-                    r = entry.get("rank")
-                    if entry.get("skipped"):
-                        print(f"{r:>3} | skipped (workload not feasible at verify size)")
-                        continue
-                    hist = entry.get("histogram", {})
-                    cells = "  ".join(f"{hist.get(c, 0):>5}" for c in cols)
-                    print(f"{r:>3} | {cells}  | {sum(hist.values()):>5}")
-                sys.stdout.flush()
-            if verify_failed:
-                _maybe_warn_rank0(
-                    f"[bench_moe_comm] Skipping timing for {backend_name}: verify FAILED."
-                )
-                continue
-
         for local_num_tokens in local_batch_sizes:
             all_rank_num_tokens = mpi_allgather(int(local_num_tokens))
             if not backend.is_workload_feasible(all_rank_num_tokens, num_chunks=1):
@@ -1357,12 +1021,8 @@ def _run_benchmark_worker_under_current_mpi(
             )
 
             # Time dispatch and combine
-            _time_fn = (
-                _time_dispatch_and_combine_cuda_graph
-                if not args.no_cuda_graph
-                else _time_dispatch_and_combine
-            )
-            time_fn_kwargs: Dict[str, Any] = dict(
+            dispatch_times_us, combine_times_us, detailed_stats = _time_dispatch_and_combine(
+                backend,
                 hidden_states=hidden_states,
                 hidden_states_sf=hidden_states_sf,
                 token_selected_slots=token_selected_slots,
@@ -1372,23 +1032,34 @@ def _run_benchmark_worker_under_current_mpi(
                 warmup=int(args.warmup),
                 iters=int(args.iters),
                 flush_l2=True,
-            )
-            if not args.no_cuda_graph:
-                time_fn_kwargs["cupti_ctx"] = _cupti_ctx
-            dispatch_times_us, combine_times_us, detailed_stats = _time_fn(
-                backend, **time_fn_kwargs
+                use_cuda_graph=not args.no_cuda_graph,
+                cupti_ctx=cupti_ctx,
             )
 
             iter_stats = bool(args.iter_stats)
-            dispatch_stats = _gather_per_rank(dispatch_times_us, iter_stats=iter_stats)
-            combine_stats = _gather_per_rank(combine_times_us, iter_stats=iter_stats)
+            cupti_errors = mpi_allgather(detailed_stats.get("cupti_error"))
+            if any(cupti_errors):
+                warning = _warn_kernel_span_unavailable(
+                    f"{backend_name} @ local_batch_size={local_num_tokens}: "
+                    + "; ".join(
+                        f"rank{rank}: {error}" for rank, error in enumerate(cupti_errors) if error
+                    )
+                )
+                previous_warning = benchmark_metadata["warning"]
+                benchmark_metadata["warning"] = (
+                    f"{previous_warning}\n{warning}" if previous_warning else warning
+                )
+            elif cupti_ctx is not None:
+                # Use the same timing source on every rank for this measurement.
+                dispatch_times_us = detailed_stats["dispatch_us_kernel_span"]
+                combine_times_us = detailed_stats["combine_us_kernel_span"]
 
             # Prepare output
             output = {
                 "backend": backend_name,
                 "local_batch_size": int(local_num_tokens),
-                "dispatch_us": dispatch_stats,
-                "combine_us": combine_stats,
+                "dispatch_us": _gather_per_rank(dispatch_times_us, iter_stats=iter_stats),
+                "combine_us": _gather_per_rank(combine_times_us, iter_stats=iter_stats),
             }
 
             # Add kernel breakdown if requested and available

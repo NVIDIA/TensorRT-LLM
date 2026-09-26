@@ -25,12 +25,13 @@ NVLINK One-Sided supports post-quant dispatch.
 """
 
 import os
+import re
 import sys
 from typing import Callable, Dict, List, Optional, Tuple
 
+import pynvml
 import torch
 
-from tensorrt_llm._mnnvl_utils import CftMnnvlMemory, MnnvlCheckpointCommunicator, MnnvlMemory
 from tensorrt_llm._torch.alltoall_watchdog import (
     DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
     DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
@@ -41,6 +42,12 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     EPGroupHealthLike,
     reject_rank_mask_cuda_graph_capture,
 )
+from tensorrt_llm._torch.distributed.mnnvl_memory import (
+    CftMnnvlMemory,
+    MnnvlCheckpointCommunicator,
+    MnnvlMemory,
+    cuda,
+)
 from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
@@ -50,13 +57,44 @@ from tensorrt_llm.math_utils import pad_up
 from .base import Communication
 
 _CFT_DEFAULT_MAX_BATCH_FOR_DISPATCH = 128
-_CFT_MAX_BATCH_FOR_DISPATCH_ENV = "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_DISPATCH"
-# CFT combine wins at small/medium batch and ties/regresses at large batch, so it is gated by the
-# same per-call token-count threshold as dispatch.
+_CFT_MAX_BATCH_FOR_DISPATCH_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_DISPATCH"
 _CFT_DEFAULT_MAX_BATCH_FOR_COMBINE = 128
-_CFT_MAX_BATCH_FOR_COMBINE_ENV = "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_COMBINE"
-FORCE_CFT_ENV = "TRTLLM_MOE_A2A_FORCE_CFT"
+_CFT_MAX_BATCH_FOR_COMBINE_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_COMBINE"
+FORCE_CFT_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT"
 _CFT_ALIGNMENT_BYTES = 16
+_CFT_MIN_DRIVER_BRANCH = 615
+_TIMEOUT_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_TIMEOUT_SEC"
+_WARMUP_TIMEOUT_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_WARMUP_TIMEOUT_SEC"
+_DEFAULT_TIMEOUT_SEC = 300
+_DEFAULT_WARMUP_TIMEOUT_SEC = 1800
+_MAX_TIMEOUT_SEC = 24 * 60 * 60
+
+
+def get_timeout_seconds(in_warmup: bool = False) -> int:
+    """Resolve the nominal collective timeout for the engine's execution phase.
+
+    First-touch JIT compilation, autotuning and module loading can delay peer
+    ranks by minutes during warmup, so that phase gets a larger default budget.
+    """
+    name = _WARMUP_TIMEOUT_ENV if in_warmup else _TIMEOUT_ENV
+    default = _DEFAULT_WARMUP_TIMEOUT_SEC if in_warmup else _DEFAULT_TIMEOUT_SEC
+    value = os.environ.get(name)
+    if not value:
+        return default
+    try:
+        if re.fullmatch(r"\s*[+-]?[0-9]+", value) is not None:
+            seconds = int(value)
+            if 0 < seconds <= _MAX_TIMEOUT_SEC:
+                return seconds
+    except ValueError:
+        # Very long integer strings may exceed Python's conversion limit.
+        pass
+    tllm_logger.warning_once(
+        f'Ignoring invalid {name}="{value}" (expected 1..{_MAX_TIMEOUT_SEC} seconds); '
+        f"using {default} s",
+        key=f"{name}_invalid_{value}",
+    )
+    return default
 
 
 def get_force_cft() -> bool | None:
@@ -68,17 +106,87 @@ def get_force_cft() -> bool | None:
     return None
 
 
-def resolve_can_use_cft(can_use_cft_counted_writes: bool) -> bool:
-    """Apply the TRTLLM_MOE_A2A_FORCE_CFT override to a caller's request.
+def _get_nvidia_driver_version() -> str | None:
+    try:
+        try:
+            pynvml.nvmlDeviceGetCount()
+        except pynvml.NVMLError_Uninitialized:
+            pynvml.nvmlInit()
+        value = pynvml.nvmlSystemGetDriverVersion()
+    except pynvml.NVMLError as error:
+        tllm_logger.warning_once(
+            "CFT counted writes disabled: failed to query the NVIDIA driver "
+            f"version via NVML ({error}). Falling back to fence-based dispatch.",
+            key="moe_a2a_cft_driver_query_failed",
+        )
+        return None
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return str(value)
 
-    Workspace sizing and workspace layout both depend on this, so they must
-    resolve it identically: a caller that sizes without the override and then
-    constructs with it would lay out the CFT region in an undersized buffer.
-    """
-    force_cft = get_force_cft()
-    if force_cft is None:
-        return can_use_cft_counted_writes
-    return force_cft
+
+def cft_driver_is_supported(driver_version: str | bytes | None) -> bool:
+    if isinstance(driver_version, bytes):
+        driver_version = driver_version.decode(errors="replace")
+    if not driver_version:
+        return False
+    match = re.match(r"^(\d+)(?:\.|$)", driver_version.strip())
+    return bool(match and int(match.group(1)) >= _CFT_MIN_DRIVER_BRANCH)
+
+
+def resolve_cft_counted_writes(
+    force_cft: bool | None,
+    driver_version: str | bytes | None,
+) -> bool:
+    """Allow automatic or forced CFT only on a supported driver."""
+    return force_cft is not False and cft_driver_is_supported(driver_version)
+
+
+def _cft_device_support_reason() -> str | None:
+    """Return why the current device cannot use counted-write fabric endpoints."""
+    major, minor = torch.cuda.get_device_capability()
+    if major < 10:
+        return f"SM{major}{minor} requires SM100 or newer"
+    try:
+        attributes = (
+            cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
+            cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_LOGICAL_ENDPOINT_UNICAST_SUPPORTED,
+            cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_LOGICAL_ENDPOINT_COUNTED_OPS_SUPPORTED,
+        )
+    except AttributeError:
+        return "CUDA Python bindings do not expose Logical Endpoint capabilities"
+    device = torch.cuda.current_device()
+    for attribute in attributes:
+        status, supported = cuda.cuDeviceGetAttribute(attribute, device)
+        if status != cuda.CUresult.CUDA_SUCCESS:
+            return f"querying {attribute.name} failed with {status.name}"
+        if not supported:
+            return f"device does not support {attribute.name}"
+    return None
+
+
+def select_cft_counted_writes(force_cft: bool | None) -> bool:
+    """Resolve CFT availability identically for workspace sizing and construction."""
+    driver_version = None
+    if force_cft is not False:
+        driver_version = _get_nvidia_driver_version()
+    if not resolve_cft_counted_writes(force_cft, driver_version):
+        if driver_version is not None:
+            tllm_logger.warning_once(
+                "CFT counted writes disabled: NVIDIA driver "
+                f"{driver_version} is below required {_CFT_MIN_DRIVER_BRANCH}.00. "
+                "Falling back to fence-based dispatch.",
+                key=f"moe_a2a_cft_driver_unsupported_{driver_version}",
+            )
+        return False
+    unsupported_reason = _cft_device_support_reason()
+    if unsupported_reason is not None:
+        tllm_logger.warning_once(
+            f"CFT counted writes disabled: {unsupported_reason}. Falling back to fence.",
+            key=f"moe_a2a_cft_device_unsupported_{unsupported_reason}",
+        )
+        return False
+    return True
 
 
 def should_use_cft(
@@ -143,11 +251,11 @@ def _get_cft_max_batch(env_name: str, default: int) -> int:
     return threshold
 
 
-def _get_cft_max_batch_for_dispatch() -> int | None:
+def _get_cft_max_batch_for_dispatch() -> int:
     return _get_cft_max_batch(_CFT_MAX_BATCH_FOR_DISPATCH_ENV, _CFT_DEFAULT_MAX_BATCH_FOR_DISPATCH)
 
 
-def _get_cft_max_batch_for_combine() -> int | None:
+def _get_cft_max_batch_for_combine() -> int:
     return _get_cft_max_batch(_CFT_MAX_BATCH_FOR_COMBINE_ENV, _CFT_DEFAULT_MAX_BATCH_FOR_COMBINE)
 
 
@@ -164,14 +272,32 @@ class NVLinkOneSided(Communication):
     """
 
     # Constants from C++ (must match moeAlltoAllKernels.h)
-    MAX_RANKS = 256
-    MAX_TOP_K = 8
-    MAX_PAYLOADS = 8
+    MAX_RANKS = int(_tllm_internal.thop.MOE_A2A_MAX_RANKS)
+    MAX_TOP_K = int(_tllm_internal.thop.MOE_A2A_MAX_TOP_K)
+    MAX_PAYLOADS = int(_tllm_internal.thop.MOE_A2A_MAX_PAYLOADS)
 
     # Shared workspaces/memory across the process, keyed by payload layout and CFT mode.
     _WORKSPACES: Dict[Tuple[object, ...], dict] = {}
     _WORKSPACE_REFCOUNTS: Dict[Tuple[object, ...], int] = {}
     _WORKSPACE: dict | None = None
+    _timeout_initialized = False
+
+    @staticmethod
+    def set_timeout(timeout_sec: int) -> None:
+        """Set the process-wide timeout for subsequent one-sided A2A launches.
+
+        Args:
+            timeout_sec: Integer in [1, 86400], nominal seconds at an assumed
+                2 GHz SM clock. Applies to both dispatch/combine and CFT/fence.
+
+        Existing CUDA graphs retain the budget recorded at capture time.
+        """
+        if isinstance(timeout_sec, bool) or not isinstance(timeout_sec, int):
+            raise TypeError("timeout_sec must be an integer number of seconds")
+        if not 0 < timeout_sec <= _MAX_TIMEOUT_SEC:
+            raise ValueError(f"timeout_sec must be in 1..{_MAX_TIMEOUT_SEC} seconds")
+        torch.ops.trtllm.moe_a2a_set_timeout(timeout_sec)
+        NVLinkOneSided._timeout_initialized = True
 
     # MetaInfo indices - initialized from C++ constants
     FLAG_VAL_OFFSET_INDEX = None
@@ -181,7 +307,61 @@ class NVLinkOneSided(Communication):
     DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX = None
     COMBINE_COMPLETION_FLAGS_OFFSET_INDEX = None
     EPLB_GATHERED_STATS_OFFSET_INDEX = None
-    PAYLOAD_DATA_OFFSET_INDEX = None
+    DISPATCH_PAYLOAD_OFFSET_INDEX = None
+    DISPATCH_PAYLOAD_SIZE_INDEX = None
+    COMBINE_INPUT_OFFSET_INDEX = None
+    COMBINE_INPUT_SIZE_INDEX = None
+    COMBINE_RECV_OFFSET_INDEX = None
+    COMBINE_RECV_SIZE_INDEX = None
+    WORKSPACE_SIZE_INDEX = None
+
+    @staticmethod
+    def _make_workspace_layout(
+        ep_size: int,
+        top_k: int,
+        max_num_tokens: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        eplb_stats_num_experts: Optional[int],
+        extra_payload_bytes_per_token: int,
+        can_use_cft_counted_writes: bool,
+        use_low_precision_combine: bool,
+    ) -> torch.Tensor:
+        """Plan per-rank control buffers and independently sized payload regions."""
+        if hidden_size <= 0 or extra_payload_bytes_per_token < 0:
+            raise ValueError("hidden_size must be positive and extra payload size non-negative")
+        tokens = ep_size * max_num_tokens
+        # The wrapper accepts raw activations or quantized activations plus scales.
+        # A FP32 scale per 16 elements bounds the supported block-scale formats;
+        # accounting for its separate alignment also covers very small payloads.
+        activations = pad_up(tokens * hidden_size * dtype.itemsize, 128)
+        quantized = pad_up(tokens * hidden_size, 128) + pad_up(
+            tokens * ((hidden_size + 15) // 16) * 4, 128
+        )
+        dispatch_bytes = (
+            max(activations, quantized)
+            + 2 * pad_up(tokens * top_k * 4, 128)
+            + pad_up(tokens * extra_payload_bytes_per_token, 128)
+        )
+        # MoE may write its original-dtype output directly into the input region,
+        # even when the communication wire format is FP8.
+        combine_element_size = max(dtype.itemsize, 2)
+        combine_input_bytes = tokens * hidden_size * combine_element_size
+        combine_recv_bytes = (
+            tokens * hidden_size * (1 if use_low_precision_combine else combine_element_size)
+            if can_use_cft_counted_writes
+            else 0
+        )
+        return torch.ops.trtllm.moe_a2a_get_workspace_layout(
+            ep_size,
+            max_num_tokens,
+            top_k,
+            dispatch_bytes,
+            combine_input_bytes,
+            combine_recv_bytes,
+            eplb_stats_num_experts,
+            can_use_cft_counted_writes,
+        )
 
     @staticmethod
     def get_aux_data_size(
@@ -189,10 +369,20 @@ class NVLinkOneSided(Communication):
         max_num_tokens: int,
         eplb_stats_num_experts: Optional[int] = None,
         can_use_cft_counted_writes: bool = False,
+        top_k: Optional[int] = None,
     ) -> int:
-        return torch.ops.trtllm.moe_a2a_get_aux_data_size(
-            ep_size, max_num_tokens, eplb_stats_num_experts, can_use_cft_counted_writes
+        """Control-buffer bytes; omitted top_k reserves the native routing limit."""
+        layout = torch.ops.trtllm.moe_a2a_get_workspace_layout(
+            ep_size,
+            max_num_tokens,
+            NVLinkOneSided.MAX_TOP_K if top_k is None else top_k,
+            0,
+            0,
+            0,
+            eplb_stats_num_experts,
+            can_use_cft_counted_writes,
         )
+        return int(layout[_tllm_internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX])
 
     @staticmethod
     def calculate_required_workspace_size(
@@ -203,41 +393,24 @@ class NVLinkOneSided(Communication):
         dtype: torch.dtype,
         eplb_stats_num_experts: Optional[int] = None,
         extra_payload_bytes_per_token: int = 0,
-        can_use_cft_counted_writes: bool = False,
+        can_use_cft_counted_writes: Optional[bool] = None,
+        use_low_precision_combine: bool = False,
     ) -> int:
-        can_use_cft_counted_writes = resolve_can_use_cft(can_use_cft_counted_writes)
-        element_size = dtype.itemsize
-
-        # Auxiliary data size
-        workspace_size = NVLinkOneSided.get_aux_data_size(
-            ep_size, max_num_tokens, eplb_stats_num_experts, can_use_cft_counted_writes
+        # None sizes for what the constructor would select on this platform.
+        if can_use_cft_counted_writes is None:
+            can_use_cft_counted_writes = select_cft_counted_writes(get_force_cft())
+        layout = NVLinkOneSided._make_workspace_layout(
+            ep_size,
+            top_k,
+            max_num_tokens,
+            hidden_size,
+            dtype,
+            eplb_stats_num_experts,
+            extra_payload_bytes_per_token,
+            can_use_cft_counted_writes,
+            use_low_precision_combine,
         )
-
-        # Dispatch needs workspace for [ep_size, max_tokens] tokens,
-        # but due to the variety of quantization recipes, we cannot know the exact size, so we conservatively estimate assuming no quantization.
-        # Meanwhile, we consider the alignment requirement as in moeA2ADispatchOp and moeA2ACombineOp.
-        # (Unquantized) token hidden states
-        workspace_size += ep_size * max_num_tokens * hidden_size * element_size
-        workspace_size = pad_up(workspace_size, 128)
-        # token_selected_experts
-        workspace_size += ep_size * max_num_tokens * top_k * 4
-        workspace_size = pad_up(workspace_size, 128)
-        # token_final_scales
-        workspace_size += ep_size * max_num_tokens * top_k * 4
-        workspace_size = pad_up(workspace_size, 128)
-        # Required workspace for combine [ep_size, max_tokens] tokens
-        workspace_size += ep_size * max_num_tokens * hidden_size * element_size
-        workspace_size = pad_up(workspace_size, 128)
-        # CFT combine: dedicated combine RECEIVE region C (peer pushes land here;
-        # prepareCombine never touches it -> no proxy aliasing). Same size as the combine region.
-        if can_use_cft_counted_writes:
-            workspace_size += ep_size * max_num_tokens * hidden_size * element_size
-            workspace_size = pad_up(workspace_size, 128)
-        # extra payload bytes per token
-        workspace_size += ep_size * max_num_tokens * extra_payload_bytes_per_token
-        workspace_size = pad_up(workspace_size, 128)
-
-        return workspace_size
+        return int(layout[_tllm_internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX])
 
     @classmethod
     def _init_constants(cls):
@@ -259,7 +432,13 @@ class NVLinkOneSided(Communication):
             cls.EPLB_GATHERED_STATS_OFFSET_INDEX = int(
                 thop.MOE_A2A_EPLB_GATHERED_STATS_OFFSET_INDEX
             )
-            cls.PAYLOAD_DATA_OFFSET_INDEX = int(thop.MOE_A2A_PAYLOAD_DATA_OFFSET_INDEX)
+            cls.DISPATCH_PAYLOAD_OFFSET_INDEX = int(thop.MOE_A2A_DISPATCH_PAYLOAD_OFFSET_INDEX)
+            cls.DISPATCH_PAYLOAD_SIZE_INDEX = int(thop.MOE_A2A_DISPATCH_PAYLOAD_SIZE_INDEX)
+            cls.COMBINE_INPUT_OFFSET_INDEX = int(thop.MOE_A2A_COMBINE_INPUT_OFFSET_INDEX)
+            cls.COMBINE_INPUT_SIZE_INDEX = int(thop.MOE_A2A_COMBINE_INPUT_SIZE_INDEX)
+            cls.COMBINE_RECV_OFFSET_INDEX = int(thop.MOE_A2A_COMBINE_RECV_OFFSET_INDEX)
+            cls.COMBINE_RECV_SIZE_INDEX = int(thop.MOE_A2A_COMBINE_RECV_SIZE_INDEX)
+            cls.WORKSPACE_SIZE_INDEX = int(thop.MOE_A2A_WORKSPACE_SIZE_INDEX)
 
     def __init__(
         self,
@@ -272,7 +451,6 @@ class NVLinkOneSided(Communication):
         dtype: Optional[torch.dtype] = None,
         num_experts: Optional[int] = None,
         use_low_precision_combine: bool = False,
-        can_use_cft_counted_writes: bool = False,
         ep_group_health: EPGroupHealthLike | None = None,
         alltoall_watchdog_timeout_s: Optional[float] = None,
         alltoall_watchdog_poll_interval_s: float = DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
@@ -280,6 +458,14 @@ class NVLinkOneSided(Communication):
     ) -> None:
         """
         Initialize NVLinkOneSided with workspace allocation.
+
+        CFT is selected automatically on supported platforms using separate
+        dispatch/combine token-count thresholds (128 by default).
+        TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT=0 selects fence; 1 bypasses the thresholds,
+        but not capability or payload-alignment requirements. CFT requires
+        sm_100+, a build against CUDA 13.4+, an NVLink fabric, and a driver
+        exporting the Logical Endpoint API (615.00+). Unsupported devices or
+        payloads fall back to fence with a one-time warning.
 
         Args:
             mapping: TensorRT-LLM Mapping object containing rank information
@@ -295,14 +481,6 @@ class NVLinkOneSided(Communication):
             use_low_precision_combine: If True, quantize the combine payload to FP8 for NVLink
                 transfer (halves NVLink bandwidth usage, output precision is preserved).
                 Corresponds to model_config.use_low_precision_moe_combine.
-            can_use_cft_counted_writes: If True, allow CFT handle-based counted
-                writes (fabric.try_put.counted via Logical Endpoints) for dispatch.
-                Requires sm_100+ (Blackwell or later), a build against CUDA 13.4+, an
-                NVLink fabric, and a driver exporting the CUDA logical endpoint API.
-                Defaults to False: CFT is opt-in, so the fence-based path remains the
-                default on every architecture. Callers that have verified the CFT
-                prerequisites may pass True, or set TRTLLM_MOE_A2A_FORCE_CFT=1 to force
-                CFT for supported workloads (0 forces the fence path).
             ep_group_health: Optional read-only committed EP membership. When present, rank-mask handling is
                 enabled in the CUDA kernels, and its mask defines the peers expected by the watchdog. Timeout
                 detection never mutates it. CUDA graphs are rejected until membership-scoped recapture lands.
@@ -326,6 +504,11 @@ class NVLinkOneSided(Communication):
                 f"NVLinkOneSided supports at most {self.MAX_RANKS} EP ranks, got ep_size={self.ep_size}."
             )
 
+        # Standalone callers have no engine phase transitions. Initialize their
+        # steady-state budget without overwriting an explicit or warmup timeout.
+        if not NVLinkOneSided._timeout_initialized:
+            NVLinkOneSided.set_timeout(get_timeout_seconds())
+
         # Store needed parameters
         self.num_experts = num_slots
         self.top_k = top_k
@@ -343,10 +526,7 @@ class NVLinkOneSided(Communication):
         self.enable_eplb = num_experts is not None
         self.eplb_stats_num_experts = num_experts
         self._force_cft = get_force_cft()
-        # Opt-in only: no caller passes can_use_cft_counted_writes=True, so
-        # without the override the CFT path cannot be reached at all. Leaving
-        # the variable unset keeps CFT disabled, as before.
-        can_use_cft_counted_writes = resolve_can_use_cft(can_use_cft_counted_writes)
+        can_use_cft_counted_writes = select_cft_counted_writes(self._force_cft)
         self.can_use_cft_counted_writes = can_use_cft_counted_writes
         if self._force_cft is None:
             self.cft_max_batch_for_dispatch = _get_cft_max_batch_for_dispatch()
@@ -355,15 +535,13 @@ class NVLinkOneSided(Communication):
             self.cft_max_batch_for_dispatch = None
             self.cft_max_batch_for_combine = None
         if can_use_cft_counted_writes:
-            tllm_logger.info(
-                "NVLinkOneSided AlltoAll: CFT handle-based counted writes enabled for dispatch"
-            )
             if self._force_cft is True:
                 tllm_logger.info("NVLinkOneSided AlltoAll: CFT forced for supported workloads")
-            elif self.cft_max_batch_for_dispatch is not None:
+            else:
                 tllm_logger.info(
-                    "NVLinkOneSided AlltoAll: CFT dispatch disabled above "
-                    f"runtime_max_tokens_per_rank={self.cft_max_batch_for_dispatch}"
+                    "NVLinkOneSided AlltoAll: automatic CFT enabled with token-count limits "
+                    f"dispatch={self.cft_max_batch_for_dispatch}, "
+                    f"combine={self.cft_max_batch_for_combine}"
                 )
         else:
             tllm_logger.info(
@@ -375,23 +553,31 @@ class NVLinkOneSided(Communication):
 
         # Get workspace size
         auto_workspace_size = None
+        metainfo = None
         if hidden_size is not None and dtype is not None:
-            auto_workspace_size = self.calculate_required_workspace_size(
+            metainfo = self._make_workspace_layout(
                 self.ep_size,
                 self.top_k,
                 max_num_tokens_per_rank,
                 hidden_size,
                 dtype,
-                eplb_stats_num_experts=self.eplb_stats_num_experts,
-                can_use_cft_counted_writes=self.can_use_cft_counted_writes,
+                self.eplb_stats_num_experts,
+                0,
+                self.can_use_cft_counted_writes,
+                self.use_low_precision_combine,
             )
-        workspace_mb_env = os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB")
+            auto_workspace_size = int(metainfo[self.WORKSPACE_SIZE_INDEX])
+        workspace_mb_env = os.environ.get("TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB")
         if workspace_mb_env:
             self.workspace_size_per_rank = int(workspace_mb_env) * 1024 * 1024
-            msg = f"NVLinkOneSided: Forcing workspace size to {self.workspace_size_per_rank} bytes (TRTLLM_MOE_A2A_WORKSPACE_MB={workspace_mb_env})."
+            msg = f"NVLinkOneSided: Forcing workspace size to {self.workspace_size_per_rank} bytes (TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB={workspace_mb_env})."
             if auto_workspace_size is not None:
                 msg += f"Automatically calculated workspace size is {auto_workspace_size} bytes."
-                msg += "Auto calculation is conservative, so only consider overriding it if you have a specific reason."
+                if self.workspace_size_per_rank < auto_workspace_size:
+                    raise ValueError(
+                        f"Workspace override is too small: {self.workspace_size_per_rank} bytes, "
+                        f"layout requires {auto_workspace_size} bytes per rank"
+                    )
             tllm_logger.warning(msg)
         elif auto_workspace_size is not None:
             self.workspace_size_per_rank = auto_workspace_size
@@ -402,11 +588,35 @@ class NVLinkOneSided(Communication):
             )
             self.workspace_size_per_rank = 2048 * 1024 * 1024
 
-        # Initialize or reuse workspace.  The C++ op computes payload offsets
-        # from the current tensors at dispatch time, while the Python singleton
-        # owns the symmetric memory backing those offsets.  Keep separate
-        # workspaces for different payload layouts so one test/layer cannot
-        # reuse stale one-sided state from another shape.
+        if metainfo is None:
+            # Without a model shape, distribute the explicit/default byte budget
+            # conservatively. The resulting boundaries are still fixed at initialization.
+            alignment = int(_tllm_internal.thop.MOE_A2A_WORKSPACE_ALIGNMENT)
+            control_bytes = self.get_aux_data_size(
+                self.ep_size,
+                max_num_tokens_per_rank,
+                self.eplb_stats_num_experts,
+                self.can_use_cft_counted_writes,
+                self.top_k,
+            )
+            regions = 3 if self.can_use_cft_counted_writes else 2
+            capacity = (
+                (self.workspace_size_per_rank - control_bytes) // regions // alignment * alignment
+            )
+            if capacity <= 0:
+                raise ValueError("Workspace byte budget leaves no room for payloads")
+            metainfo = torch.ops.trtllm.moe_a2a_get_workspace_layout(
+                self.ep_size,
+                max_num_tokens_per_rank,
+                self.top_k,
+                capacity,
+                capacity,
+                capacity if self.can_use_cft_counted_writes else 0,
+                self.eplb_stats_num_experts,
+                self.can_use_cft_counted_writes,
+            )
+        # Fixed region capacities are shared by allocation, native bounds checks,
+        # and workspace-backed views. Runtime shapes only pack tokens inside them.
         MnnvlMemory.initialize()
         self._workspace_key = (
             self.workspace_size_per_rank,
@@ -420,6 +630,7 @@ class NVLinkOneSided(Communication):
             dtype,
             self.use_low_precision_combine,
             self.can_use_cft_counted_writes,
+            tuple(metainfo.tolist()),
         )
 
         workspace_state = NVLinkOneSided._WORKSPACES.get(self._workspace_key)
@@ -432,14 +643,7 @@ class NVLinkOneSided(Communication):
             )
             mnnvl_mem = memory_cls(mapping, self.workspace_size_per_rank)
             workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
-            metainfo = torch.ops.trtllm.moe_a2a_initialize(
-                workspace,
-                self.ep_rank,
-                self.ep_size,
-                self.max_num_tokens_per_rank,
-                self.eplb_stats_num_experts,
-                self.can_use_cft_counted_writes,
-            )
+            torch.ops.trtllm.moe_a2a_initialize(workspace, metainfo, self.ep_rank, self.ep_size)
             workspace_state = {
                 "workspace_size_per_rank": self.workspace_size_per_rank,
                 "max_num_tokens_per_rank": self.max_num_tokens_per_rank,
@@ -510,11 +714,6 @@ class NVLinkOneSided(Communication):
             ep_size=self.ep_size,
             health=self.ep_group_health,
         )
-        # Keep combine storage at a fixed offset across changing dispatch
-        # payloads, so a later dispatch cannot overwrite a peer's live combine.
-        if hidden_size is not None and dtype is not None:
-            self._reserve_combine_region(hidden_size, dtype)
-
         self._workspace_lifecycle.register(
             self,
             watchdog_timeout_s=alltoall_watchdog_timeout_s,
@@ -579,7 +778,7 @@ class NVLinkOneSided(Communication):
         return True
 
     def destroy(self):
-        """Release shared state during explicit, rank-coordinated teardown."""
+        """Release this instance's reference after all ranks finish using the workspace."""
         if getattr(self, "_destroyed", False):
             return
 
@@ -600,6 +799,8 @@ class NVLinkOneSided(Communication):
         if refcount > 0:
             NVLinkOneSided._WORKSPACE_REFCOUNTS[workspace_key] = refcount
         else:
+            if self._workspace_state.get("cft_initialized", False):
+                torch.ops.trtllm.moe_a2a_cft_destroy(self.workspace, self.ep_rank)
             NVLinkOneSided._WORKSPACE_REFCOUNTS.pop(workspace_key, None)
             workspace_state = NVLinkOneSided._WORKSPACES.pop(workspace_key, None)
             if NVLinkOneSided._WORKSPACE is workspace_state:
@@ -689,66 +890,22 @@ class NVLinkOneSided(Communication):
             comm = self.mnnvl_mem.comm
         if comm is None:
             raise RuntimeError("MNNVL workspace communicator is not initialized")
-        self._require_workspace_lifecycle().checkpoint_restore(
-            comm,
-            lambda: torch.ops.trtllm.moe_a2a_initialize(
-                self.workspace,
-                self.ep_rank,
-                self.ep_size,
-                self.max_num_tokens_per_rank,
-                self.eplb_stats_num_experts,
-                self.can_use_cft_counted_writes,
-            ),
-        )
+
+        # The native op re-validates the planned layout and resets control state;
+        # the layout itself is unchanged by a restore.
+        def reinitialize_frontend() -> torch.Tensor:
+            torch.ops.trtllm.moe_a2a_initialize(
+                self.workspace, self.moe_a2a_metainfo, self.ep_rank, self.ep_size
+            )
+            return self.moe_a2a_metainfo
+
+        self._require_workspace_lifecycle().checkpoint_restore(comm, reinitialize_frontend)
 
     def _mnnvl_checkpoint_is_idle(self) -> bool:
         return self._dispatch_state.get("phase") == "idle"
 
     def _mnnvl_checkpoint_reset(self) -> None:
         self._dispatch_state = {"phase": "idle"}
-
-    def _reserve_combine_region(self, hidden_size: int, dtype: torch.dtype) -> int:
-        """Keep dispatch and combine storage disjoint across workspace reuse."""
-        layout = (hidden_size, dtype.itemsize)
-        old_layout = self._workspace_state.get("combine_storage_layout")
-        if old_layout is not None:
-            if old_layout != layout:
-                raise ValueError(
-                    "shared A2A workspace requires a stable combine shape and dtype size"
-                )
-            return self._workspace_state["combine_storage_offset"]
-
-        # Native combine stores a dense [EP, runtime_max_tokens, hidden] tensor.
-        # Match the existing allocation: reserve a second full-size region only
-        # for CFT-capable workspaces. Low-precision combine fits in this bound.
-        region_bytes = pad_up(
-            self.ep_size * self.max_num_tokens_per_rank * hidden_size * dtype.itemsize, 128
-        )
-        num_regions = 2 if self.can_use_cft_counted_writes else 1
-        offset = (self.workspace_size_per_rank - num_regions * region_bytes) // 128 * 128
-        aux_bytes = int(self.moe_a2a_metainfo[self.PAYLOAD_DATA_OFFSET_INDEX])
-        if offset < aux_bytes:
-            raise ValueError("A2A workspace is too small for stable combine regions")
-        dispatch_end = getattr(self, "_dispatch_state", {}).get("dispatch_payload_end", aux_bytes)
-        if dispatch_end > offset:
-            raise ValueError("A2A dispatch payload overlaps the reserved combine region")
-        self._workspace_state["combine_storage_layout"] = layout
-        self._workspace_state["combine_storage_offset"] = offset
-        return offset
-
-    def _check_dispatch_region(self, payloads: List[torch.Tensor], max_tokens: int) -> int:
-        if not 0 < max_tokens <= self.max_num_tokens_per_rank:
-            raise ValueError("runtime token count exceeds the configured A2A capacity")
-        end = int(self.moe_a2a_metainfo[self.PAYLOAD_DATA_OFFSET_INDEX])
-        for payload in payloads:
-            end = pad_up(
-                end + self.ep_size * max_tokens * payload.shape[1] * payload.element_size(), 128
-            )
-        limit = self._workspace_state.get("combine_storage_offset", self.workspace_size_per_rank)
-        # Check before the native dispatch can write into any peer's memory.
-        if end > limit:
-            raise ValueError("A2A dispatch payload overlaps the reserved combine region")
-        return end
 
     def dispatch(
         self,
@@ -800,7 +957,6 @@ class NVLinkOneSided(Communication):
         payloads.append(token_selected_slots)
         if token_final_scales is not None:
             payloads.append(token_final_scales)
-        dispatch_payload_end = self._check_dispatch_region(payloads, runtime_max_tokens_per_rank)
         can_use_cft_for_dispatch = _use_cft_for_dispatch_payloads(
             can_use_cft_for_dispatch, payloads
         )
@@ -847,12 +1003,7 @@ class NVLinkOneSided(Communication):
         if eplb_gathered_stats.numel() == 0:
             eplb_gathered_stats = None
         self._dispatch_state["eplb_gathered_stats"] = eplb_gathered_stats
-        if int(combine_payload_offset) != dispatch_payload_end:
-            raise RuntimeError("native A2A dispatch layout disagrees with the reserved layout")
-        self._dispatch_state["dispatch_payload_end"] = dispatch_payload_end
-        self._dispatch_state["combine_payload_offset"] = self._workspace_state.get(
-            "combine_storage_offset", dispatch_payload_end
-        )
+        self._dispatch_state["combine_payload_offset"] = int(combine_payload_offset)
         self._dispatch_state["local_num_tokens"] = token_selected_slots.size(0)
         self._dispatch_state["runtime_max_tokens_per_rank"] = runtime_max_tokens_per_rank
         self._dispatch_state["active_rank_mask_snapshot"] = active_rank_mask_snapshot
@@ -973,9 +1124,6 @@ class NVLinkOneSided(Communication):
             final_hidden_states,
             self.use_low_precision_combine,
         )
-        combine_payload_offset = self._reserve_combine_region(
-            final_hidden_states.shape[-1], final_hidden_states.dtype
-        )
         output = torch.ops.trtllm.moe_a2a_combine(
             final_hidden_states,
             int(local_num_tokens),
@@ -1025,7 +1173,7 @@ class NVLinkOneSided(Communication):
             dtype: Data type
 
         Returns:
-            Tensor view into workspace [ep_size, max_tokens_per_rank, hidden_size]
+            Tensor view into combine input [ep_size * runtime_max_tokens_per_rank, hidden_size]
         """
         self._require_mapped()
         if self._dispatch_state.get("phase") != "dispatched":
@@ -1037,14 +1185,12 @@ class NVLinkOneSided(Communication):
         if combine_payload_offset is None:
             raise RuntimeError("combine_payload_offset not found in dispatch state")
 
-        combine_payload_offset = self._reserve_combine_region(hidden_size, dtype)
-        self._dispatch_state["combine_payload_offset"] = combine_payload_offset
         result = torch.ops.trtllm.moe_a2a_get_combine_payload_tensor(
             self.workspace,
+            self.moe_a2a_metainfo,
             int(self.ep_rank),
             int(self.ep_size),
             int(runtime_max_tokens_per_rank),
-            int(combine_payload_offset),
             dtype,
             int(hidden_size),
         )

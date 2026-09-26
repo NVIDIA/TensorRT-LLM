@@ -19,8 +19,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-import tensorrt_llm._mnnvl_utils as mnnvl
-from tensorrt_llm._torch.moe.fused_moe.communication.moe_alltoall import MoeAlltoAll
+import tensorrt_llm._torch.distributed.mnnvl_memory as mnnvl
+from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import NVLinkTwoSided
 from tensorrt_llm.mapping import Mapping
 
@@ -721,7 +721,7 @@ def test_create_and_map_handles_close_failure_does_not_mask_original_error(monke
 
 
 def _make_moe_alltoall_for_lifecycle():
-    obj = MoeAlltoAll.__new__(MoeAlltoAll)
+    obj = NVLinkOneSided.__new__(NVLinkOneSided)
     obj._destroyed = True
     obj.mnnvl_mem = Mock(mapped=True)
     return obj
