@@ -15,6 +15,7 @@
 
 import json
 import os
+from typing import Any, Optional
 
 import pytest
 
@@ -334,6 +335,42 @@ def test_qwen3_reasoning_parser(text: str, content: str,
     assert result.reasoning_content == reasoning_context
 
 
+def test_qwen3_5_reasoning_parser_enable_thinking_false() -> None:
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "qwen3_5", {"enable_thinking": False})
+    result = reasoning_parser.parse("visible")
+    assert result.content == "visible"
+    assert result.reasoning_content == ""
+
+
+def test_qwen3_reasoning_parser_enable_thinking_true() -> None:
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "qwen3", {"enable_thinking": True})
+    result = reasoning_parser.parse("reasoning")
+    assert result.content == "reasoning"
+    assert result.reasoning_content == ""
+
+
+@pytest.mark.parametrize(
+    ("parser_name", "expected_content", "expected_reasoning"),
+    [
+        ("deepseek-r1", "", "visible"),
+        ("qwen3", "visible", ""),
+        ("qwen3_5", "", "visible"),
+    ])
+@pytest.mark.parametrize("chat_template_kwargs", [None, {}])
+def test_reasoning_parser_default_unchanged(
+        parser_name: str,
+        expected_content: str,
+        expected_reasoning: str,
+        chat_template_kwargs: Optional[dict[str, Any]]) -> None:
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        parser_name, chat_template_kwargs)
+    result = reasoning_parser.parse("visible")
+    assert result.content == expected_content
+    assert result.reasoning_content == expected_reasoning
+
+
 @pytest.mark.parametrize(("delta_texts", "content", "reasoning_context"), [
     (["<think>a", "l</think>r", "b"], ["", "r", "b"], ["a", "l", ""]),
     (["<th", "ink>a</think>b"], ["", "b"], ["", "a"]),
@@ -350,6 +387,16 @@ def test_qwen3_reasoning_parser_stream(delta_texts: list, content: list,
         result = reasoning_parser.parse_delta(delta_text)
         assert result.content == content[i]
         assert result.reasoning_content == reasoning_context[i]
+
+
+def test_qwen3_5_reasoning_parser_stream_enable_thinking_false() -> None:
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "qwen3_5", {"enable_thinking": False})
+
+    result = reasoning_parser.parse_delta("visible")
+
+    assert result.content == "visible"
+    assert result.reasoning_content == ""
 
 
 @pytest.mark.parametrize(("text", "content", "reasoning_context"), [
