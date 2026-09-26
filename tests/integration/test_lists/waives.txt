@@ -286,7 +286,6 @@ unittest/_torch/moe/test_moe_backend.py::test_moe_backend[act=Relu2-e60_k4_h2048
 unittest/_torch/multi_gpu/test_linear.py::test_row_linear_norm_fusion[2-hidden:16-seqlen:2] SKIP (https://nvbugs/6501404)
 unittest/_torch/multimodal/test_mm_encoder_standalone.py::test_epd_disagg_mm_hash_kv_cache_reuse[prompts0] SKIP (https://nvbugs/6812085)
 unittest/_torch/multimodal/test_mm_encoder_standalone.py::test_pd_disagg_multimodal_no_reuse_when_disabled SKIP (https://nvbugs/6813129)
-unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_update_weights_nemotron_h SKIP (https://nvbugs/6729495)
 unittest/_torch/speculative/hw_agnostic/test_dflash.py::test_dflash_qwen3_5_4b[False] SKIP (https://nvbugs/6535767)
 unittest/_torch/speculative/hw_agnostic/test_dflash.py::test_dflash_qwen3_5_4b[True] SKIP (https://nvbugs/6535767)
 unittest/_torch/speculative/test_eagle3.py SKIP (https://nvbugs/5461761)
