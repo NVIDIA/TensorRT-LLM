@@ -50,6 +50,14 @@ class _FakeCudaStream:
     cuda_stream = 0
 
 
+class _FakeCompiledModel:
+    """Minimal torch.compile-style wrapper that changes the model's type."""
+
+    def __init__(self, original_model):
+        self._orig_mod = original_model
+        self.model_config = original_model.model_config
+
+
 class _FakeKVCacheManagerCpp:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -141,6 +149,7 @@ def _make_mock_model_engine(model_config):
     engine.dtype = torch.bfloat16
     engine.is_draft_model = False
     engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+    engine.input_processor = SimpleNamespace(requires_encoder_features=False)
     return engine
 
 
@@ -161,6 +170,9 @@ def _make_creator(
     if model_config is None:
         model_config = _make_model_config(is_encoder_decoder=is_enc_dec)
     model_engine = _make_mock_model_engine(model_config)
+    model_engine.attn_runtime_features = SimpleNamespace(
+        cache_reuse=kv_cache_config.enable_block_reuse
+    )
 
     if manager_cls is None:
         manager_cls = (
@@ -289,6 +301,31 @@ class TestSplitKvCacheBudgetForCross:
         assert cross_config.free_gpu_memory_fraction == pytest.approx(0.4)
         assert self_config.free_gpu_memory_fraction == pytest.approx(0.4)
         assert config.free_gpu_memory_fraction == pytest.approx(0.8)
+
+    def test_wrapped_feature_encoder_disables_reuse_for_both_pools(self):
+        """Feature detection survives a torch.compile-style model wrapper."""
+        config = _make_kv_cache_config(cross_kv_cache_fraction=0.5)
+        creator = _make_creator(config, is_enc_dec=True)
+        creator._model_engine.model = _FakeCompiledModel(creator._model_engine.model)
+        creator._model_engine.input_processor.requires_encoder_features = True
+
+        self_config, cross_config = creator._split_kv_cache_budget_for_cross()
+
+        assert config.enable_block_reuse
+        assert not self_config.enable_block_reuse
+        assert not cross_config.enable_block_reuse
+        assert not creator._model_engine.attn_runtime_features.cache_reuse
+
+    def test_token_encoder_preserves_reuse_for_both_pools(self) -> None:
+        """Token inputs retain reusable identities for both KV pools."""
+        config = _make_kv_cache_config(cross_kv_cache_fraction=0.5)
+        creator = _make_creator(config, is_enc_dec=True)
+
+        self_config, cross_config = creator._split_kv_cache_budget_for_cross()
+
+        assert self_config.enable_block_reuse
+        assert cross_config.enable_block_reuse
+        assert creator._model_engine.attn_runtime_features.cache_reuse
 
     def test_is_encoder_decoder_helper(self):
         dec_config = _make_model_config(is_encoder_decoder=False)
@@ -683,6 +720,32 @@ class TestCrossKvCacheConstruction:
             (pytest.approx(0.45), expected_split),
             (pytest.approx(0.45), expected_split),
         ]
+
+    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
+    def test_build_managers_disables_feature_encoder_reuse(
+        self, use_kv_cache_manager_v2: bool
+    ) -> None:
+        """Pass reuse-disabled configs to both feature-encoder managers."""
+        config = _make_kv_cache_config(
+            cross_kv_cache_fraction=0.5,
+            max_gpu_total_bytes=8 * (1 << 30),
+            use_kv_cache_manager_v2=use_kv_cache_manager_v2,
+        )
+        creator = _make_creator(config, is_enc_dec=True)
+        creator.configure_kv_cache_capacity = Mock()
+        creator._model_engine.input_processor.requires_encoder_features = True
+        creator._should_create_separate_draft_kv_cache = Mock(return_value=False)
+        creator._create_kv_cache_manager = Mock(return_value=Mock())
+        creator._create_cross_kv_cache_manager = Mock(return_value=Mock())
+
+        creator.build_managers({}, estimating_kv_cache=False)
+
+        self_config = creator._create_kv_cache_manager.call_args.kwargs["kv_cache_config_override"]
+        cross_config = creator._create_cross_kv_cache_manager.call_args.args[0]
+        assert config.enable_block_reuse
+        assert not self_config.enable_block_reuse
+        assert not cross_config.enable_block_reuse
+        assert not creator._model_engine.attn_runtime_features.cache_reuse
 
     def test_build_managers_skips_cross_pool_for_decoder_only(self):
         creator = _make_creator(

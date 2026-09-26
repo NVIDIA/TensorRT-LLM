@@ -2227,6 +2227,11 @@ class KvCacheCreator:
     def _is_encoder_decoder(self) -> bool:
         return self._model_engine.model.model_config.is_encoder_decoder
 
+    def _encoder_input_is_features(self) -> bool:
+        return bool(
+            getattr(self._model_engine.input_processor,
+                    "requires_encoder_features", False))
+
     @staticmethod
     def _get_config_int_attr(config, names: tuple[str, ...]) -> Optional[int]:
         for name in names:
@@ -2354,6 +2359,21 @@ class KvCacheCreator:
 
         self_kv_cache_config = base_kv_cache_config.model_copy()
         cross_kv_cache_config = base_kv_cache_config.model_copy()
+        if (base_kv_cache_config.enable_block_reuse
+                and self._encoder_input_is_features()):
+            # Decoder self-KV is conditioned on the encoder output, while
+            # cross-KV is keyed on encoder token ids. Feature-driven encoders
+            # provide neither reusable token ids nor an input discriminator,
+            # so neither pool can safely reuse blocks between requests.
+            logger.info(
+                "Disabling block reuse for the self- and cross-KV caches: "
+                "the encoder takes feature tensors, so requests carry no "
+                "encoder tokens or input discriminator to key cache entries.")
+            self_kv_cache_config.enable_block_reuse = False
+            cross_kv_cache_config.enable_block_reuse = False
+            # The attention backend reads this shared runtime flag rather than
+            # either derived manager config when selecting paged-context FMHA.
+            self._model_engine.attn_runtime_features.cache_reuse = False
         split_any_budget = False
 
         free_fraction = base_kv_cache_config.free_gpu_memory_fraction
