@@ -512,6 +512,8 @@ def test_integrated_gpu_estimation_ignores_affine_intercept():
         enable_attention_dp=False,
         tp_size=1,
     )
+    # This regression covers the V1 memory-budget path; V2 returns before it.
+    c._is_kv_cache_manager_v2 = False
 
     with (
         patch("torch.cuda.mem_get_info", return_value=(100, 100)),
