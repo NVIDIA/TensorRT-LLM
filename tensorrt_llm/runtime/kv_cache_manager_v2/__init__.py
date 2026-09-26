@@ -61,6 +61,7 @@ if _BACKEND == "python":
         HostCacheTierConfig,
         KVCacheDesc,
         KVCacheManagerConfig,
+        PoolRebalanceConfig,
         SsmLayerConfig,
         SwaScratchReuseConfig,
     )
@@ -225,6 +226,7 @@ else:
         commit_min_snapshot: bool = False
         enable_stats: bool = True
         text_only: bool = False
+        pool_rebalance: object = None
 
     KVCacheManagerConfig.__dataclass_fields__ = _KVCacheManagerConfigFieldSpec.__dataclass_fields__
     del _KVCacheManagerConfigFieldSpec, _dataclasses
@@ -262,6 +264,7 @@ else:
     ScratchDesc = getattr(_cpp, "ScratchDesc", None)
     SsmSnapshotIterationStatsDelta = _cpp.SsmSnapshotIterationStatsDelta
     ReusedBlocksByLevel = _cpp.ReusedBlocksByLevel
+    PoolRebalanceConfig = getattr(_cpp, "PoolRebalanceConfig", None)
     SwaScratchReuseConfig = getattr(_cpp, "SwaScratchReuseConfig", None)
     UniqueToken = _cpp.UniqueToken
 
@@ -383,6 +386,7 @@ __all__ = [
     "SlidingWindowSize",
     "SlotDesc",
     "SlotDescVariant",
+    "PoolRebalanceConfig",
     "SsmLayerConfig",
     "SwaScratchReuseConfig",
     "TokenId",
