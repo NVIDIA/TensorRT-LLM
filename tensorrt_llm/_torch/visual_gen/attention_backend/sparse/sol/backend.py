@@ -12,49 +12,55 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""VisualGen SOL attention backends.
+
+SOL (Sol-Attn, https://arxiv.org/abs/2607.24027) routes attention blocks
+dynamically and corrects the approximation of the blocks it skips. Two backends
+serve one ``SolParams``:
+
+* ``SOLTrtllmAttention`` runs SOL in two stages through the generic TRTLLM
+  sparse lifecycle: one graph-visible predictor operator derives the exact
+  block bitmask and K/V proxy summaries, then the shared PrimTS block-sparse
+  FMHA executes that route.
+* ``SOLCuTeDSLAttention`` runs the fused kernel vendored from the reference
+  implementation (https://github.com/NVlabs/Sana, branch ``sol-engine``, pinned
+  in ``cute_dsl_kernels/blackwell/sol_attn/THIRD_PARTY_NOTICES.md``), which
+  folds routing, sparse computation and correction into one online-softmax
+  pass. Only the sm100 kernels are carried; see
+  ``cute_dsl_kernels/blackwell/sol_attn_backend.py`` for the shape and dtype
+  guard around them.
+
+``disabled_until_timestep`` is the dense-prefix control shared with skip
+softmax: the layer runs dense while the normalized timestep is at or above the
+cutoff and switches to SOL below it. The TRTLLM wrapper prepares that timestep
+as a host value before CUDA Graph capture; the CuTeDSL backend reads the phase
+the CUDA Graph runner resolved for the graph key.
 """
-Sol-Attn backend for visual generation models.
 
-Sol-Attn (https://arxiv.org/abs/2607.24027) is dynamic block routing +
-sparse computation + approximation correction folded into one online-softmax
-pass. The kernel is vendored from its reference implementation
-(https://github.com/NVlabs/Sana, branch
-https://github.com/NVlabs/Sana/tree/sol-engine, pinned at commit
-https://github.com/NVlabs/Sana/commit/5fe5feb -- see
-``cute_dsl_kernels/blackwell/sol_attn/THIRD_PARTY_NOTICES.md`` for the pin
-and its currency-check note) under ``..cute_dsl_kernels.blackwell.sol_attn``
-/ ``sol_attn_backend.py``. Only the sm100 (B200/GB200)
-Blackwell) kernels are carried; the upstream sm89/sm90 kernels and the Triton
-reference path are not, and the FlashAttention CuTe helpers they needed come
-from the ``flash-attn-4`` dependency rather than a vendored copy.
-
-This file is only the TRT-LLM AttentionBackend adapter around that kernel's
-public BTHD entry point, plus the dense_layers layer-skip guard.
-
-``disabled_until_timestep`` is the dense-prefix control, and mirrors
-skip_softmax's field of the same name: sparse attention stays disabled (that
-is, the layer runs the backend's dense kernel) while the normalized timestep is at
-or above the cutoff, and switches to the sparse kernel once it drops below.
-
-The timestep arrives as a forward kwarg -- ``modules/attention.py`` already
-threads it to every backend, and all VisualGen pipelines normalize it to
-``[0, 1]`` by ``num_train_timesteps`` per the ``BaseDiffusionModel.forward``
-contract. Nothing has to be wired per pipeline, and there is no process-wide
-state to keep in sync.
-
-"""
+from __future__ import annotations
 
 from typing import Any, Optional
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import SkipSoftmaxScheduler
+from tensorrt_llm._torch.attention.backends.fmha.prims_ts_block_sparse import PrimsTSBlockSparseFmha
+from tensorrt_llm._torch.attention.backends.fmha.utils import get_bmm1_scale
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionForwardArgs,
+    PredefinedAttentionMask,
+)
+from tensorrt_llm._torch.attention.backends.sparse.params import BlockSparseForwardInputs
+from tensorrt_llm._torch.attention.backends.sparse.timestep_phase import graph_phase_for_timestep
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_key
 from tensorrt_llm.logger import logger
 
-from ....attention.backends.interface import PredefinedAttentionMask
-from ..interface import AttentionBackend, AttentionTensorLayout
-from ..vanilla import VanillaAttention
+from ...interface import AttentionBackend, AttentionTensorLayout
+from ...trtllm import TrtllmAttention
+from ...vanilla import VanillaAttention
+from . import predictor as sol_predictor
+from .params import SolParams
+from .predictor import BLOCK_SIZE
 
 _sol_attn_import_error = None
 try:
@@ -69,13 +75,13 @@ except (ImportError, OSError) as e:
 def _cute_dense_available() -> bool:
     """Whether `cute_dsl_fmha_fwd` can run on the current device.
 
-    Checked once at construction. Sol-Attn and the dense CuTe DSL kernel now
+    Checked once at construction. SOL and the dense CuTe DSL kernel now
     cover the same set (sm_100a/sm_103a), so in practice this is always true
-    wherever Sol-Attn runs; the negative branch exists so an unsupported device
+    wherever SOL runs; the negative branch exists so an unsupported device
     degrades to SDPA instead of raising.
     """
     try:
-        from .fmha import _check_cute_runtime_available, _get_gpu_arch
+        from ...cute_dsl.fmha import _check_cute_runtime_available, _get_gpu_arch
 
         _check_cute_runtime_available()
         _get_gpu_arch()
@@ -84,8 +90,8 @@ def _cute_dense_available() -> bool:
     return True
 
 
-class SolAttention(AttentionBackend):
-    """Sol-Attn dynamic block-routing sparse attention (CuTeDSL, sm100/sm103).
+class SOLCuTeDSLAttention(AttentionBackend):
+    """Fused SOL sparse attention (CuTeDSL, sm100/sm103).
 
     Inputs the kernel cannot serve (shape, dtype, architecture) are delegated to
     dense attention up front by ``_run_sol_attn_bthd``; a kernel error is not
@@ -101,14 +107,18 @@ class SolAttention(AttentionBackend):
         head_dim: int = 128,
         num_kv_heads: Optional[int] = None,
         dtype: Optional[torch.dtype] = None,
-        sparse_attention_config=None,
+        sparse_params: SolParams | None = None,
         **kwargs,
     ):
         if _sol_attn_run is None:
             raise ImportError(
-                "SolAttention requires the vendored sol_attn kernel "
+                "SOLCuTeDSLAttention requires the vendored sol_attn kernel "
                 f"package; import failed: {_sol_attn_import_error}"
             )
+        if sparse_params is None:
+            sparse_params = SolParams()
+        if not isinstance(sparse_params, SolParams):
+            raise TypeError("SOLCuTeDSLAttention requires SolParams")
         self.layer_idx = layer_idx
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -118,23 +128,22 @@ class SolAttention(AttentionBackend):
             # would then see unequal Q/K shapes and quietly take its dense
             # fallback instead of rejecting an unsupported configuration.
             raise ValueError(
-                f"Sol-Attn is MHA-only (num_kv_heads == num_heads), got "
+                f"SOL is MHA-only (num_kv_heads == num_heads), got "
                 f"num_kv_heads={self.num_kv_heads}, num_heads={self.num_heads}. "
                 f"GQA/MQA is not supported."
             )
         self.dtype = dtype
-        cfg = sparse_attention_config
-        self.tau = getattr(cfg, "tau", 1.0)
-        self.thresh_type = getattr(cfg, "thresh_type", "diag")
-        self.disabled_until_timestep = getattr(cfg, "disabled_until_timestep", None)
-        self.dense_layers = frozenset(getattr(cfg, "dense_layers", None) or ())
+        self.tau = sparse_params.tau
+        self.thresh_type = sparse_params.thresh_type
+        self.disabled_until_timestep = sparse_params.disabled_until_timestep
+        self.dense_layers = sparse_params.dense_layers
 
-        # Sol-Attn's dense steps must run the backend the user selected. Without
+        # SOL's dense steps must run the backend the user selected. Without
         # this they ran torch SDPA while a `backend: CUTEDSL` baseline ran
         # cute_dsl_fmha_fwd, so candidate and reference differed on the dense
         # steps too -- measured at LPIPS 0.214 on Wan2.2-T2V-A14B with sparsity
         # switched off entirely, against a 0.25 gate.
-        from .fmha import CuTeDSLAttention
+        from ...cute_dsl.fmha import CuTeDSLAttention
 
         # The only backend that consumes `key_padding_mask` (CuTeDSL's `_fwd`
         # swallows it via **kwargs, silently). Masked self-attention is routed
@@ -173,9 +182,9 @@ class SolAttention(AttentionBackend):
         # Under CUDA-graph capture the runner has already resolved the phase
         # host-side (it is part of the graph key); reading the tensor here
         # would `.item()` inside capture, which CUDA forbids.
-        phase = resolved_extra_key("sol_attn_phase")
+        phase = resolved_extra_key("sparse_attn_phase")
         if phase is None:
-            phase = SkipSoftmaxScheduler.get_graph_phase_for_timestep(
+            phase = graph_phase_for_timestep(
                 timestep,
                 disabled_until_timestep=self.disabled_until_timestep,
             )
@@ -187,7 +196,7 @@ class SolAttention(AttentionBackend):
             logger.warning_once(
                 "SolAttentionConfig.disabled_until_timestep="
                 f"{self.disabled_until_timestep} is set, but no `timestep` reached "
-                "the Sol-Attn forward call. The dense prefix it requests will not "
+                "the SOL forward call. The dense prefix it requests will not "
                 "be applied. Ensure the pipeline passes a normalized timestep, or "
                 "unset disabled_until_timestep.",
                 key="sol_attn_missing_timestep",
@@ -248,14 +257,14 @@ class SolAttention(AttentionBackend):
 
         Everything false here is delegated (see ``_delegate``). Deciding it from the
         tensors, per call, is deliberate, and it is why ``modules/attention.py``
-        has no ``SEPARATE_QKV`` rule for Sol-Attn: ``qkv_mode`` describes how
+        has no ``SEPARATE_QKV`` rule for SOL: ``qkv_mode`` describes how
         Q/K/V are *projected*, not whether K/V come from another sequence, so a
         construction-time rule keyed on it mistakes self-attention for
         cross-attention wherever that mode is chosen for other reasons --
         Qwen-Image always, and WAN's ``attn1`` under async Ulysses -- silently
         costing those modules their configured backend.
         """
-        # Cross-attention: K/V come from another sequence, and Sol-Attn's
+        # Cross-attention: K/V come from another sequence, and SOL's
         # routing assumes one self-attending sequence. Unequal Q/K lengths are
         # a heuristic for that, not a definition: a cross-attention call whose
         # context happens to match the query length is not caught here. The
@@ -313,3 +322,97 @@ class SolAttention(AttentionBackend):
     @classmethod
     def support_fused_qkv(cls) -> bool:
         return False
+
+
+class SOLTrtllmAttention(TrtllmAttention):
+    """Predict SOL routes inside the core prediction hook, then execute them
+    through the generic block-sparse FMHA."""
+
+    def __init__(self, *, sparse_params: SolParams | None = None, **kwargs) -> None:
+        if not isinstance(sparse_params, SolParams):
+            raise TypeError("SOLTrtllmAttention requires SolParams")
+        self.sol_params = sparse_params
+        super().__init__(sparse_params=None, **kwargs)
+
+    @property
+    def timestep_cutoff(self) -> Optional[float]:
+        """SOL keeps its parameters outside the core ``sparse_params`` slot."""
+
+        return self.sol_params.disabled_until_timestep
+
+    @property
+    def dense_layers(self) -> frozenset[int]:
+        return self.sol_params.dense_layers
+
+    def block_sparse_attn_predict(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> BlockSparseForwardInputs | None:
+        """Return SOL routes for sparse calls and ``None`` for dense calls.
+
+        ``q``, ``k``, and ``v`` arrive in the flattened ``[B*S, H*D]`` core
+        layout; the batch layout comes from ``metadata`` and the timestep,
+        already prepared by the wrapper forward, from ``forward_args``.
+        """
+
+        if not self.should_use_sparse(forward_args.timestep):
+            return None
+
+        if self.quant_attention_config is not None:
+            raise ValueError("SOL sparse execution does not support quant_attention_config")
+        if not any(
+            isinstance(fmha, PrimsTSBlockSparseFmha) for fmha in self._fmha_manager.fmha_libs
+        ):
+            raise RuntimeError("SOL sparse execution requires PrimTS block-sparse FMHA")
+        if forward_args.attention_mask != PredefinedAttentionMask.FULL:
+            raise ValueError("SOL sparse execution requires a full attention mask")
+        if k is None or v is None:
+            raise ValueError("SOL sparse execution requires separate q, k, and v tensors")
+
+        batch_size = metadata.num_seqs
+        seq_len = metadata.max_seq_len
+        num_tokens = batch_size * seq_len
+        if q.shape[0] != num_tokens or k.shape[0] != num_tokens or v.shape[0] != num_tokens:
+            raise ValueError(
+                "SOL sparse execution supports only uniform-length self-attention; "
+                f"got {q.shape[0]} query and {k.shape[0]} key tokens for "
+                f"{batch_size} sequences of length {seq_len}"
+            )
+
+        # The VisualGen wrapper compacts the flattened tensors once; these views
+        # are shared between prediction and the generic block-sparse FMHA.
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        unsupported_reason = sol_predictor.support_reason(q, k, v)
+        if unsupported_reason is not None:
+            raise ValueError(unsupported_reason)
+
+        outputs = sol_predictor.predict(
+            q,
+            k,
+            v,
+            tau=self.sol_params.tau,
+            sm_scale=get_bmm1_scale(self),
+            thresh_type=self.sol_params.thresh_type,
+        )
+        return BlockSparseForwardInputs(
+            q_block_size=BLOCK_SIZE,
+            kv_block_size=BLOCK_SIZE,
+            exact_block_bits=outputs.exact_block_bits,
+            k_summary=outputs.k_summary,
+            v_summary=outputs.v_summary,
+        )
+
+    @classmethod
+    def support_fused_qkv(cls) -> bool:
+        """SOL prediction requires separate Q, K, and V tensors."""
+
+        return False
+
+
+__all__ = ["SOLCuTeDSLAttention", "SOLTrtllmAttention"]

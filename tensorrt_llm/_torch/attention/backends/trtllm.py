@@ -1592,6 +1592,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         sparse_params: Optional[SparseParams] = None,
         kv_cache_dtype: str = "auto",
         skip_correction_threshold: float = 0.0,
+        fmha_state: Optional[dict] = None,
         **kwargs,
     ) -> None:
         """
@@ -1616,6 +1617,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 used by DeepSeek-V4 and DSA on SM120/SM121.
             skip_correction_threshold (float): Runtime MLA threshold. Zero disables
                 skip-correction.
+            fmha_state (dict): Optional state shared with the FMHA libraries of this
+                backend, for example plan caches. Libraries read the entries they own
+                from it, so handing one dict to several layers shares those entries
+                across them; the default is a private dict per instance.
         """
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
@@ -1687,6 +1692,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.kv_scale_orig_quant = 1.0 / self.kv_cache_scaling_factor
 
         self.local_layer_idx: Optional[int] = None
+        self.fmha_state: dict = {} if fmha_state is None else fmha_state
         self._fmha_manager: FmhaManager
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)

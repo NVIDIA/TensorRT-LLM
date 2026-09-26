@@ -190,29 +190,24 @@ def _uniform_seq_len_q(
 class PrimsTSBlockSparseFmha(PrimsTSFmha):
     """Contiguous context and fixed-Q paged generation block-sparse FMHA."""
 
+    PLAN_CACHE_KEY = "prims_ts_block_sparse"
+
     supports_block_sparse_inputs = True
 
     def __init__(self, attn: "TrtllmAttention") -> None:
         super().__init__(attn)
-        self._contiguous_wrappers: dict[_BlockSparsePlanKey, "BlockSparseTSWrapper"] = {}
-        self._paged_wrappers: dict[_BlockSparsePlanKey, "BlockSparsePagedTSWrapper"] = {}
-
-    def bind_plan_cache(self, cache_state: dict[str, object]) -> None:
-        """Share planned wrappers with every adapter bound to ``cache_state``.
-
-        Attention layers that execute serially, such as the blocks of one
-        diffusion transformer, see identical static profiles. Binding them to
-        one model-scoped container plans each profile once and allocates its
-        route workspace once. Call before the first forward.
-        """
-
+        # Planned wrappers live in the attention's FMHA state. Layers constructed
+        # with one shared state, such as the blocks of one diffusion transformer,
+        # plan each static profile once and allocate its route workspace once;
+        # the default per-instance state keeps the caches private to this layer.
+        caches = attn.fmha_state.setdefault(self.PLAN_CACHE_KEY, {})
         self._contiguous_wrappers = cast(
             dict[_BlockSparsePlanKey, "BlockSparseTSWrapper"],
-            cache_state.setdefault("contiguous_wrappers", {}),
+            caches.setdefault("contiguous_wrappers", {}),
         )
         self._paged_wrappers = cast(
             dict[_BlockSparsePlanKey, "BlockSparsePagedTSWrapper"],
-            cache_state.setdefault("paged_wrappers", {}),
+            caches.setdefault("paged_wrappers", {}),
         )
 
     def _is_supported(

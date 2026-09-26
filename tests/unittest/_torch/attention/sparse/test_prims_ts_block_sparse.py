@@ -120,7 +120,8 @@ def _proxy_reference(
 
 
 class _Attention:
-    def __init__(self) -> None:
+    def __init__(self, fmha_state: dict | None = None) -> None:
+        self.fmha_state = {} if fmha_state is None else fmha_state
         self.sparse_params = None
         self.num_heads = 2
         self.num_kv_heads = 1
@@ -385,22 +386,24 @@ def test_block_sparse_plan_key_includes_attention_head_topology() -> None:
     assert _key(first) != _key(second)
 
 
-def test_block_sparse_plan_cache_is_shared_only_when_explicitly_bound() -> None:
+def test_block_sparse_plan_cache_follows_the_attention_fmha_state() -> None:
     first = block_sparse_fmha.PrimsTSBlockSparseFmha(_Attention())
     second = block_sparse_fmha.PrimsTSBlockSparseFmha(_Attention())
 
     assert first._contiguous_wrappers is not second._contiguous_wrappers
     assert first._paged_wrappers is not second._paged_wrappers
 
-    cache_state = {}
-    first.bind_plan_cache(cache_state)
-    second.bind_plan_cache(cache_state)
+    fmha_state = {}
+    shared_first = block_sparse_fmha.PrimsTSBlockSparseFmha(_Attention(fmha_state))
+    shared_second = block_sparse_fmha.PrimsTSBlockSparseFmha(_Attention(fmha_state))
 
-    assert first._contiguous_wrappers is second._contiguous_wrappers
-    assert first._paged_wrappers is second._paged_wrappers
-    assert cache_state == {
-        "contiguous_wrappers": {},
-        "paged_wrappers": {},
+    assert shared_first._contiguous_wrappers is shared_second._contiguous_wrappers
+    assert shared_first._paged_wrappers is shared_second._paged_wrappers
+    assert fmha_state == {
+        "prims_ts_block_sparse": {
+            "contiguous_wrappers": {},
+            "paged_wrappers": {},
+        }
     }
 
 

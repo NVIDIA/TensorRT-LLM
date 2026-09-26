@@ -224,11 +224,13 @@ routes, and optional token-validity bits mask ragged KV tails. Plans contain
 only static format, proxy, geometry, and capacity choices; every run receives
 the live routes, summaries, validity bits, page tables, and sequence lengths.
 
-`PrimsTSBlockSparseFmha` owns its wrapper-plan cache by default. Integrations
-whose attention layers execute serially may explicitly bind a model-scoped
-cache to reuse graph-stable route workspaces across compatible layers. The
-cache must not be shared by concurrent forwards; each independent model
-component must own separate state.
+`PrimsTSBlockSparseFmha` keeps its wrapper-plan cache in the attention's
+`fmha_state` dict (`TrtllmAttention(fmha_state=...)`), which defaults to a
+private dict per layer. Integrations whose attention layers execute serially
+hand one dict to every layer of a component to plan each static profile once
+and reuse its graph-stable route workspace across compatible layers; the
+sharing granularity is the lifetime of that dict. A shared dict must not serve
+concurrent forwards, so each independent model component owns separate state.
 
 `TrtllmAttention.block_sparse_attn_predict(q, k, v, metadata, forward_args)`
 is the backend hook that produces this payload; `prepare_sparse_runtime_params`
