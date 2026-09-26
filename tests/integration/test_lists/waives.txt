@@ -293,8 +293,6 @@ unittest/_torch/thop/parallel/test_fp4_linear.py::test_fp4_gemm_bias_per_backend
 unittest/_torch/thop/parallel/test_fp4_linear.py::test_fp4_gemm_bias_per_backend[mnk2-cutlass] SKIP (https://nvbugs/6581067)
 unittest/_torch/thop/parallel/test_fp4_linear.py::test_fp4_gemm_bias_per_backend[mnk3-cublaslt] SKIP (https://nvbugs/6581067)
 unittest/_torch/thop/parallel/test_fp4_linear.py::test_fp4_gemm_bias_per_backend[mnk3-cutlass] SKIP (https://nvbugs/6581067)
-unittest/_torch/thop/parallel/test_kimi_k3_fp8_weight_read_linear.py::test_unfilled_placeholder_raises SKIP (https://nvbugs/6810943)
-unittest/_torch/thop/parallel/test_kimi_k3_fp8_weight_read_linear.py::test_weight_preparation_returns_only_cute_pair SKIP (https://nvbugs/6810945)
 unittest/_torch/visual_gen/test_cosmos3_t2v_offload.py::TestCosmos3Offload::test_cosmos3_offload_matches_baseline SKIP (https://nvbugs/6702264)
 unittest/bindings/test_transfer_agent_bindings.py::TestMooncakeFunctionalTransfer::test_mooncake_wait_in_progress_on_zero_timeout SKIP (https://nvbugs/6517836)
 unittest/bindings/test_transfer_agent_bindings.py::TestMooncakeFunctionalTransfer::test_mooncake_write_transfer_gpu_tensor SKIP (https://nvbugs/6517836)
