@@ -1405,6 +1405,8 @@ def serve(
         exclude=("extra_llm_api_options", "config"))
 
     def _serve_llm():
+        from tensorrt_llm.usage.usage_lib import _capture_startup_context
+        _capture_startup_context(requested={})
         nonlocal server_role, allow_request_chat_template
         llm_args, _ = get_llm_args(
             model=model,
@@ -1463,6 +1465,7 @@ def serve(
             llm_args, llm_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
 
         _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
+        _capture_startup_context(requested=llm_args)
 
         metadata_server_cfg = parse_metadata_server_config_file(
             metadata_server_config_file)

@@ -20,6 +20,7 @@ import os
 import threading
 import time
 from types import SimpleNamespace
+from typing import Literal
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -51,6 +52,120 @@ def _reset_process_telemetry_state():
 
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize("attempts,created", [(0, 0), (1, 0), (2, 0), (1, 1)])
+def test_startup_context_is_correlated_and_conservative(
+    monkeypatch, enable_telemetry, attempts, created
+):
+    sent = []
+    monkeypatch.setattr(usage_lib, "_send_to_gxt", sent.append)
+    monkeypatch.setattr(
+        usage_lib, "bounded_gpu_fields", lambda deadline: {"gpuCount": 1, "gpuName": "GPU"}
+    )
+    usage_lib.apply_usage_session_config(
+        default_usage_context="cli_serve", lifecycle_phase="config_validation"
+    )
+    token = object()
+    for _ in range(attempts):
+        usage_lib.record_llm_initialization_attempt()
+    usage_lib._capture_startup_context(
+        token,
+        requested={
+            "backend": "pytorch",
+            "tensor_parallel_size": 2,
+            "pipeline_parallel_size": True,
+            "dtype": "/home/private",
+            "model": "/home/private/model",
+        },
+    )
+    if created:
+        usage_lib.record_llm_initialized()
+    usage_lib.report_exit(usage_lib.TerminalOutcome("exception", exit_code_known=True, exit_code=1))
+    assert len(sent) == 1
+    events = sent[0]["events"]
+    assert events[-1]["name"] == "trtllm_exit_report"
+    assert len(events) == (1 if created else 2)
+    if not created:
+        params = events[0]["parameters"]
+        meta = json.loads(params["llmApiConfigMetaJson"])
+        assert meta["report_context"] == "pre_initialization_exit"
+        assert params["tensorParallelSize"] == (2 if attempts <= 1 else 0)
+        assert params["pipelineParallelSize"] == 0
+        assert params["featuresJson"] == params["llmApiConfigJson"] == "{}"
+        assert params["gpuCount"] == 1
+        assert events[0]["ts"] == events[1]["ts"]
+        assert "private" not in json.dumps(sent)
+        assert not usage_lib._REPORTER_STARTED
+
+
+def test_startup_context_preserves_exit_on_collection_failure(monkeypatch, enable_telemetry):
+    sent = []
+    monkeypatch.setattr(usage_lib, "_send_to_gxt", sent.append)
+
+    def fail(deadline):
+        raise RuntimeError("optional discovery failed")
+
+    monkeypatch.setattr(usage_lib, "bounded_gpu_fields", fail)
+    usage_lib.record_llm_initialization_attempt()
+    usage_lib.report_exit(usage_lib.TerminalOutcome("unknown"))
+    assert [event["name"] for event in sent[0]["events"]] == ["trtllm_exit_report"]
+
+
+@pytest.mark.parametrize("case", ["help", "supervisor", "late_opt_out", "duplicate"])
+def test_startup_context_delivery_guards(monkeypatch, enable_telemetry, case):
+    sent = []
+    monkeypatch.setattr(usage_lib, "_send_to_gxt", sent.append)
+
+    def gpu_fields(deadline):
+        if case == "late_opt_out":
+            monkeypatch.setenv("TRTLLM_NO_USAGE_STATS", "1")
+        return {}
+
+    monkeypatch.setattr(usage_lib, "bounded_gpu_fields", gpu_fields)
+    usage_lib.apply_usage_session_config(
+        default_usage_context="cli_serve", lifecycle_phase="config_validation"
+    )
+    usage_lib._capture_startup_context(requested={})
+    outcome = usage_lib.TerminalOutcome(
+        "clean" if case == "help" else "exception",
+        reporting_source="supervisor" if case == "supervisor" else "self",
+    )
+    assert usage_lib.report_exit(outcome)
+    assert not usage_lib.report_exit(outcome)
+    if case in ("help", "late_opt_out"):
+        assert not sent
+    else:
+        assert len(sent) == 1
+        assert len(sent[0]["events"]) == (1 if case == "supervisor" else 2)
+
+
+def test_startup_context_validated_snapshot_and_stale_token(monkeypatch, enable_telemetry):
+    usage_lib.record_llm_initialization_attempt()
+    token = object()
+    usage_lib._capture_startup_context(token, requested={"backend": "pytorch"})
+
+    class Args(BaseModel):
+        backend: Literal["pytorch"] = "pytorch"
+        dtype: Literal["float16"] = "float16"
+        model: str = "/home/private/model"
+
+    args = Args()
+    usage_lib._capture_startup_context(token, llm_args=args)
+    usage_lib._capture_startup_context(
+        object(), pretrained_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
+    )
+    fields = usage_lib._SESSION.startup_context
+    assert fields["dtype"] == "float16"
+    assert json.loads(fields["llmApiConfigJson"]) == {"backend": "pytorch", "dtype": "float16"}
+    assert "private" not in json.dumps(fields)
+    assert json.loads(fields["llmApiConfigMetaJson"])["capture_succeeded"]
+    assert json.loads(fields["llmApiConfigMetaJson"])["source"] == "validated_pre_initialization"
+    assert "architectureClassName" not in fields
+    usage_lib._capture_startup_context(
+        token, pretrained_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
+    )
+    assert fields["architectureClassName"] == "LlamaForCausalLM"
 
 
 @pytest.fixture
@@ -1086,7 +1201,7 @@ class TestProcessTelemetrySession:
                 telemetry_config=telemetry_config,
             )
 
-        _, payload, _ = thread_cls.call_args.kwargs["args"]
+        payload = thread_cls.call_args.kwargs["args"][0].payload
         event = payload["events"][0]
         assert payload["sessionId"] == session_id
         assert event["name"] == "trtllm_exit_report"

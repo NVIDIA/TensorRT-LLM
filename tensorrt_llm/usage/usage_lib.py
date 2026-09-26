@@ -48,7 +48,9 @@ import json
 import logging
 import os
 import platform
+import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -58,6 +60,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, TypeVar
 
 from tensorrt_llm.usage import schema
+from tensorrt_llm.usage._startup import REPORT_CONTEXT, bounded_gpu_fields, requested_fields
 from tensorrt_llm.usage.architecture_allowlist import PUBLIC_HF_ARCHITECTURES
 from tensorrt_llm.usage.config import UsageContext
 from tensorrt_llm.usage.llmapi_config import _failure_llm_api_config_payloads
@@ -819,6 +822,8 @@ class _TelemetrySession:
         self.disabled = False
         self.initial_reported = False
         self.terminal_reported = False
+        self.startup_context: Optional[dict] = None
+        self.startup_token: object = None
         self.lock = threading.Lock()
         self.refresh_metadata()
 
@@ -873,6 +878,9 @@ class _TelemetrySession:
             if self.disabled or self.terminal_reported:
                 return False
             self.llm_initialization_attempts = self._increment(self.llm_initialization_attempts)
+            # Multiple attempts cannot be attributed from a process-exit snapshot.
+            self.startup_context = {}
+            self.startup_token = None
             self.lifecycle_phase = "model_initialization"
             if self.component == "unknown":
                 self.component = "llm"
@@ -967,7 +975,7 @@ class _TelemetrySession:
             return self.observed_signal
 
     def claim_terminal(
-        self, outcome: TerminalOutcome
+        self, outcome: TerminalOutcome, lifecycle_phase: Optional[schema.LifecyclePhase] = None
     ) -> Optional[tuple[dict[str, Any], TerminalOutcome]]:
         """Atomically merge causal context and claim the terminal slot."""
         with self.lock:
@@ -975,7 +983,39 @@ class _TelemetrySession:
                 return None
             outcome = outcome.with_observation(self.observed_outcome)
             self.terminal_reported = True
-            return self._snapshot_unlocked(), outcome
+            snapshot = self._snapshot_unlocked()
+            if lifecycle_phase is not None:
+                snapshot["lifecyclePhase"] = lifecycle_phase
+            if (
+                self.startup_context is not None
+                and not self.initial_reported
+                and self.llm_instances_created == 0
+                and outcome.reporting_source == "self"
+                and outcome.component in (None, self.component)
+                and snapshot["lifecyclePhase"]
+                in ("cli_parsing", "config_validation", "model_initialization")
+                and not (
+                    outcome.termination_kind == "clean" and self.llm_initialization_attempts == 0
+                )
+            ):
+                self.initial_reported = True
+                snapshot["startup_context"] = (
+                    self.startup_context.copy() if self.llm_initialization_attempts <= 1 else {}
+                )
+            return snapshot, outcome
+
+    def capture_startup(self, token: object, fields: dict, *, begin: bool) -> None:
+        """Keep sanitized context only for the sole attributable construction attempt."""
+        with self.lock:
+            if self.disabled or self.terminal_reported or self.llm_instances_created:
+                return
+            if self.llm_initialization_attempts > 1:
+                return
+            if begin:
+                self.startup_token = token
+                self.startup_context = {}
+            if self.startup_context is not None and token is self.startup_token:
+                self.startup_context.update(fields)
 
     def claim_initial(self) -> bool:
         """Claim the success-only initial report before network delivery."""
@@ -1003,6 +1043,8 @@ class _PendingTerminal:
     session: _TelemetrySession
     payload: dict
     completion: threading.Event
+    startup_context: Optional[dict] = None
+    deadline: float = 0.0
 
 
 _SESSION: Optional[_TelemetrySession] = None
@@ -1286,6 +1328,40 @@ def record_llm_initialization_failure() -> None:
     _session_call(lambda session: session.record_llm_initialization_failure(), None)
 
 
+def _capture_startup_context(
+    token: object = None,
+    *,
+    requested: Optional[dict] = None,
+    llm_args: Any = None,
+    pretrained_config: Any = None,
+) -> None:
+    """Snapshot LLM-only startup context at normal parsing/loading hooks; retain no raw objects."""
+    try:
+        session = _get_session()
+        if session is None or not is_usage_stats_enabled() or not session.try_start_delivery():
+            return
+        fields = {}
+        if requested is not None:
+            fields = requested_fields(requested)
+        if llm_args is not None:
+            if not apply_usage_session_config(getattr(llm_args, "telemetry_config", None)):
+                return
+            fields = requested_fields(_extract_trtllm_config(llm_args))
+            config_json, meta_json = _collect_llm_api_config_payloads(llm_args)
+            meta = json.loads(meta_json)
+            meta["source"] = "validated_pre_initialization"
+            fields.update(llmApiConfigJson=config_json, llmApiConfigMetaJson=json.dumps(meta))
+        if pretrained_config is not None:
+            name, hashed = _architecture_telemetry_fields(pretrained_config)
+            if name:
+                fields["architectureClassName"] = name
+            if hashed:
+                fields["architectureClassHash"] = hashed
+        session.capture_startup(token, fields, begin=requested is not None)
+    except Exception:
+        pass
+
+
 def record_llm_initialized() -> bool:
     """Record one successfully constructed LLM object."""
     return _session_call(lambda session: session.record_llm_initialized(), False)
@@ -1358,14 +1434,76 @@ def _finish_background_reporter() -> None:
             pending = _PENDING_TERMINAL
             _PENDING_TERMINAL = None
         if pending is not None:
-            _send_if_session_active(
-                pending.session,
-                pending.payload,
-                pending.completion,
-            )
+            _send_terminal(pending)
     except Exception:
         if pending is not None:
             pending.completion.set()
+
+
+def _send_terminal(pending: _PendingTerminal) -> None:
+    """Attach optional partial context without delaying exit beyond the shared deadline."""
+    payload = pending.payload
+    try:
+        if pending.startup_context is not None and pending.session.try_start_delivery():
+            fields = dict(pending.startup_context)
+            meta = json.loads(fields.pop("llmApiConfigMetaJson", "{}"))
+            source = meta.get("source", "requested_pre_initialization" if fields else "unavailable")
+            fields.update(
+                pythonVersion=platform.python_version(),
+            )
+            for key, value in (
+                ("trtllmVersion", pending.session.trtllm_version),
+                ("cpuArchitecture", platform.machine()),
+            ):
+                if value and value != "unknown":
+                    fields[key] = _clamp_str(value, schema._SHORT_STR)
+            cpu_count = os.cpu_count()
+            if cpu_count is not None:
+                fields["cpuCount"] = cpu_count
+            # Build version is not the driver's supported CUDA version.
+            torch = sys.modules.get("torch")
+            cuda_version = getattr(getattr(torch, "version", None), "cuda", None)
+            if isinstance(cuda_version, str):
+                fields["cudaVersion"] = _clamp_str(cuda_version, schema._SHORT_STR)
+            gpu_fields = bounded_gpu_fields(pending.deadline)
+            gpu_source = gpu_fields.pop(
+                "_source", "nvml_visible_hardware" if gpu_fields else "unavailable"
+            )
+            fields.update(gpu_fields)
+            terminal = payload["events"][0]
+            meta.update(
+                report_context=REPORT_CONTEXT,
+                capture_phase=terminal["parameters"]["lifecyclePhase"],
+                source=source,
+                known_fields=sorted(
+                    key
+                    for key in fields
+                    if key != "llmApiConfigJson" or meta.get("capture_succeeded")
+                ),
+                gpu_source=gpu_source,
+                attempt_attribution="sole_attempt"
+                if terminal["parameters"]["llmInitializationAttempts"] == 1
+                else "unavailable",
+            )
+            event_fields = _session_event_fields(terminal["parameters"])
+            defaults = dict(tensorParallelSize=0, pipelineParallelSize=0, contextParallelSize=0)
+            initial = schema.TrtllmInitialReport(
+                **(defaults | fields),
+                llmApiConfigMetaJson=json.dumps(meta, sort_keys=True),
+                **event_fields,
+            )
+            context_event = schema.GxtEvent(
+                ts=terminal["ts"],
+                name="trtllm_initial_report",
+                parameters=initial.model_dump(by_alias=True),
+            ).model_dump(by_alias=True)
+            payload = dict(payload, events=[context_event, terminal])
+    except Exception:
+        # Optional context must never displace the authoritative exit event.
+        pass
+    if not is_usage_stats_enabled():
+        pending.session.disable()
+    _send_if_session_active(pending.session, payload, pending.completion)
 
 
 def report_exit(
@@ -1382,6 +1520,7 @@ def report_exit(
     this call claimed the slot, not whether network delivery succeeded.
     """
     claimed = False
+    deadline = time.monotonic() + _TERMINAL_FLUSH_TIMEOUT
     try:
         disabled, _ = _telemetry_settings(
             telemetry_config,
@@ -1400,7 +1539,7 @@ def report_exit(
         if not _is_reporting_rank():
             return False
 
-        terminal = session.claim_terminal(outcome)
+        terminal = session.claim_terminal(outcome, lifecycle_phase)
         if terminal is None:
             return False
         snapshot, outcome = terminal
@@ -1446,6 +1585,9 @@ def report_exit(
         )
 
         completion = threading.Event()
+        pending = _PendingTerminal(
+            session, payload, completion, snapshot.get("startup_context"), deadline
+        )
         queued_to_reporter = False
         global _PENDING_TERMINAL
         with _REPORTER_LOCK:
@@ -1453,26 +1595,22 @@ def report_exit(
                 completion.set()
                 return True
             if _REPORTER_ACTIVE:
-                _PENDING_TERMINAL = _PendingTerminal(
-                    session=session,
-                    payload=payload,
-                    completion=completion,
-                )
+                _PENDING_TERMINAL = pending
                 queued_to_reporter = True
 
         _REPORTER_STOP.set()
         if queued_to_reporter:
-            completion.wait(timeout=_TERMINAL_FLUSH_TIMEOUT)
+            completion.wait(timeout=max(0, deadline - time.monotonic()))
             return True
 
         thread = threading.Thread(
-            target=_send_if_session_active,
-            args=(session, payload, completion),
+            target=_send_terminal,
+            args=(pending,),
             daemon=True,
             name="trtllm-usage-terminal",
         )
         thread.start()
-        completion.wait(timeout=_TERMINAL_FLUSH_TIMEOUT)
+        completion.wait(timeout=max(0, deadline - time.monotonic()))
         return True
     except Exception:
         return claimed
