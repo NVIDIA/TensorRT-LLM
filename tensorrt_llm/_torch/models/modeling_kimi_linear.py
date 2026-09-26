@@ -18,7 +18,7 @@ TRT-LLM PyTorch-backend flow (``LLM(model=<ckpt>) -> generate``):
 
 Caching
 -------
-KDA states live on the mamba side of a ``MixedMambaHybridCacheManager``
+KDA states live on the mamba side of a ``MambaHybridCacheManagerV2``
 (wired in ``pyexecutor/_util.py``): per layer, a short-conv slot of
 ``[3 * num_heads * head_dim, W]`` bf16 (the full FLA ``ShortConvolution``
 cache window, sections ``[q | k | v]``) and a delta-rule recurrent slot of
@@ -68,13 +68,12 @@ conv/recurrent state back into the FLA kernels (``use_initial_states``)
 and the MLA prefill path natively attends over the cached latent prefix
 (``kv_len = cached + q_len``). KV-cache block reuse is supported as an
 opt-in via ``kv_cache_config.enable_block_reuse=true``, which routes to
-the unified-pool ``CppMambaHybridCacheManager`` (per-block KDA state
-snapshots every ``mamba_state_cache_interval`` tokens, FORCE_CHUNK
-context chunking).
+``MambaHybridCacheManagerV2`` (per-block KDA state snapshots every
+``mamba_state_cache_interval`` tokens, FORCE_CHUNK context chunking).
 
 Not supported: pipeline parallelism, draft-head spec-dec modes
 (MTP/Eagle — no draft-head checkpoint exists). SA speculative decoding
-is validated only without block reuse (Mixed cache manager).
+is validated only without block reuse.
 """
 
 from __future__ import annotations
@@ -2290,9 +2289,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
     @classmethod
     def get_model_defaults(cls, llm_args) -> dict:
         # - enable_block_reuse defaults off: reuse is supported as an
-        #   explicit opt-in (routes to CppMambaHybridCacheManager with
-        #   per-block KDA state snapshots); the default stays on the
-        #   Mixed manager, which SA speculative decoding requires.
+        #   explicit opt-in with per-block KDA state snapshots.
         # - tokens_per_block=64: with 32, the flashinfer trtllm-gen FMHA lib
         #   rejects the MLA (576, 512) generation kernel (marked slower) and
         #   the fallback C++ path requires num_heads % 64 == 0, which K3's
@@ -2303,6 +2300,14 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 "tokens_per_block": 64,
             }
         }
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for KimiLinear."""
+        return "V2"
 
     @classmethod
     def get_preferred_transceiver_runtime(
