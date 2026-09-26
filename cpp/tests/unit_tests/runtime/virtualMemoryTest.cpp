@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,11 +21,14 @@
 #include "tensorrt_llm/common/nvmlWrapper.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/memoryCounters.h"
 #include "tensorrt_llm/runtime/tllmBuffers.h"
 #include "tensorrt_llm/runtime/virtualMemory.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <random>
+#include <tuple>
 #include <unistd.h>
 #include <vector>
 
@@ -1557,6 +1560,83 @@ TEST_F(VirtualMemoryManagerTest, TestCudaVirtualMemoryAllocator)
         ASSERT_EQ(memoryBegin, memoryAfterCleanup) << "Buffer destruction should free memory";
     }
 }
+
+class VirtualMemoryAllocatorOffloadTest
+    : public VirtualMemoryTest,
+      public ::testing::WithParamInterface<std::tuple<CudaVirtualMemoryAllocator::RestoreMode, bool>>
+{
+};
+
+TEST_P(VirtualMemoryAllocatorOffloadTest, BackupLifetimeAndIsolation)
+{
+    using Mode = CudaVirtualMemoryAllocator::RestoreMode;
+    auto const [mode, releaseBackup] = GetParam();
+    bool const pinned = mode == Mode::PINNED;
+    auto const hostBytes = [pinned]()
+    {
+        auto const& counters = MemoryCounters::getInstance();
+        return pinned ? counters.getPinned() : counters.getCpu();
+    };
+    auto const baseline = hostBytes();
+    std::size_t constexpr kSize = 4 * 1024 * 1024;
+    std::string const tag = "offload_policy";
+    std::string const otherTag = "retained_backup";
+    CudaVirtualMemoryManager manager;
+    auto stream = std::make_shared<CudaStream>();
+    auto config = std::make_shared<CudaVirtualMemoryAllocator::Configuration>(manager, tag, mode, stream);
+    auto otherConfig = std::make_shared<CudaVirtualMemoryAllocator::Configuration>(
+        manager, otherTag, pinned ? Mode::PINNED : Mode::CPU, stream);
+    auto buffer = std::make_unique<VirtualAddressDeviceBuffer>(
+        kSize, tensorrt_llm::DataType::kINT8, CudaVirtualMemoryAllocator{config});
+    auto other = std::make_unique<VirtualAddressDeviceBuffer>(
+        kSize, tensorrt_llm::DataType::kINT8, CudaVirtualMemoryAllocator{otherConfig});
+    auto const pointer = buffer->data();
+    std::uint8_t constexpr kOtherValue = 17;
+    TLLM_CUDA_CHECK(cudaMemset(other->data(), kOtherValue, kSize));
+    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+    ASSERT_EQ(hostBytes(), baseline);
+    ASSERT_EQ(manager.releaseWithTag(otherTag), 1);
+    ASSERT_EQ(hostBytes(), baseline + kSize);
+
+    std::vector<std::uint8_t> restored(kSize);
+    for (std::uint8_t const value : {42, 19, 63})
+    {
+        TLLM_CUDA_CHECK(cudaMemset(pointer, value, kSize));
+        TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+        ASSERT_EQ(manager.releaseWithTag(tag), 1);
+        ASSERT_EQ(hostBytes(), baseline + 2 * kSize);
+        EXPECT_THROW(manager.releaseHostBackupsWithTag(tag), std::runtime_error);
+        ASSERT_EQ(hostBytes(), baseline + 2 * kSize);
+        ASSERT_EQ(manager.materializeWithTag(tag), 1);
+        stream->synchronize();
+        ASSERT_EQ(hostBytes(), baseline + 2 * kSize);
+        if (releaseBackup)
+        {
+            EXPECT_EQ(manager.releaseHostBackupsWithTag(tag), 1);
+            EXPECT_EQ(manager.releaseHostBackupsWithTag(tag), 0);
+        }
+        EXPECT_EQ(hostBytes(), baseline + (releaseBackup ? kSize : 2 * kSize));
+        ASSERT_EQ(buffer->data(), pointer);
+        TLLM_CUDA_CHECK(cudaMemcpy(restored.data(), pointer, kSize, cudaMemcpyDeviceToHost));
+        ASSERT_TRUE(std::all_of(restored.begin(), restored.end(), [value](auto byte) { return byte == value; }));
+    }
+
+    // Waking one tag must not discard the only copy of another sleeping allocation.
+    ASSERT_EQ(manager.materializeWithTag(otherTag), 1);
+    stream->synchronize();
+    TLLM_CUDA_CHECK(cudaMemcpy(restored.data(), other->data(), kSize, cudaMemcpyDeviceToHost));
+    ASSERT_TRUE(std::all_of(restored.begin(), restored.end(), [](auto byte) { return byte == kOtherValue; }));
+    EXPECT_EQ(hostBytes(), baseline + (releaseBackup ? kSize : 2 * kSize));
+    buffer.reset();
+    other.reset();
+    EXPECT_EQ(hostBytes(), baseline);
+}
+
+INSTANTIATE_TEST_SUITE_P(BackingModes, VirtualMemoryAllocatorOffloadTest,
+    ::testing::Values(std::make_tuple(CudaVirtualMemoryAllocator::RestoreMode::CPU, false),
+        std::make_tuple(CudaVirtualMemoryAllocator::RestoreMode::PINNED, false),
+        std::make_tuple(CudaVirtualMemoryAllocator::RestoreMode::CPU, true),
+        std::make_tuple(CudaVirtualMemoryAllocator::RestoreMode::PINNED, true)));
 
 TEST_F(VirtualMemoryManagerTest, TestCudaVirtualMemoryAllocatorUnalignedSize)
 {
