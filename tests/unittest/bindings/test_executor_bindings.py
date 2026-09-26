@@ -95,50 +95,6 @@ def test_prompt_tuning_config():
     assert (config.embedding_table == embedding_table).all()
 
 
-def test_multimodal_embedding():
-
-    def get_base_kwargs():
-        return {
-            "input_token_ids": [1, 2, 3],
-            "max_tokens": 1,
-            "streaming": False,
-            "sampling_config": trtllm.SamplingConfig(),
-            "output_config": trtllm.OutputConfig(),
-            "end_id": -1,
-            "bad_words": [[4, 5, 6]],
-            "stop_words": [[7, 8, 9]],
-            "embedding_bias": torch.ones(1),
-            "prompt_tuning_config":
-            trtllm.PromptTuningConfig(torch.ones(100, 64)),
-            "lora_config": trtllm.LoraConfig(1),
-            "client_id": 1234,
-        }
-
-    # Test with ones
-    embedding = torch.ones(576, 1024)
-    kwargs = get_base_kwargs()
-    kwargs["multimodal_embedding"] = embedding
-    request = trtllm.Request(**kwargs)
-    assert torch.equal(request.multimodal_embedding,
-                       embedding), "Multimodal embedding with ones failed"
-
-    # Test with random values
-    random_embedding = torch.randn(576, 1024)
-    kwargs["multimodal_embedding"] = random_embedding
-    request = trtllm.Request(**kwargs)
-    assert torch.equal(
-        request.multimodal_embedding,
-        random_embedding), "Multimodal embedding with random values failed"
-
-    # Test with different shapes
-    small_embedding = torch.ones(10, 20)
-    kwargs["multimodal_embedding"] = small_embedding
-    request = trtllm.Request(**kwargs)
-    assert torch.equal(
-        request.multimodal_embedding,
-        small_embedding), "Multimodal embedding with different shape failed"
-
-
 @pytest.mark.cpu_only
 def test_multimodal_input():
     multimodal_hashes = [[1, 2, 3], [4, 5, 6]]
@@ -330,7 +286,6 @@ def test_request():
         "stop_words": [[7, 8, 9]],
         "embedding_bias": torch.ones(1),
         "prompt_tuning_config": trtllm.PromptTuningConfig(torch.ones(100, 64)),
-        "multimodal_embedding": torch.ones(100, 64),
         "lora_config": trtllm.LoraConfig(1),
         "client_id": 1234,
     }

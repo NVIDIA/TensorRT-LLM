@@ -58,12 +58,31 @@ protected:
         tensorrt_llm::executor::SamplingConfig samplingConfig(1);
 
         return std::make_shared<tb::LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, false,
-            std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-            std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-            std::nullopt, false, false, false, std::nullopt, false, std::nullopt, false, std::nullopt,
-            tensorrt_llm::executor::Request::kDefaultPriority, std::nullopt, std::nullopt,
-            tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, false, std::nullopt, std::nullopt,
-            std::nullopt, std::nullopt, agentHierarchy);
+            /*promptEmbeddingTable=*/std::nullopt,
+            /*promptVocabSize=*/std::nullopt,
+            /*multimodalHashes=*/std::nullopt,
+            /*multimodalPositions=*/std::nullopt,
+            /*multimodalLengths=*/std::nullopt,
+            /*multimodalUuids=*/std::nullopt,
+            /*loraTaskId=*/std::nullopt,
+            /*loraWeights=*/std::nullopt,
+            /*loraConfig=*/std::nullopt,
+            /*kvCacheRetentionConfig=*/std::nullopt,
+            /*returnLogProbs=*/false,
+            /*returnContextLogits=*/false,
+            /*returnGenerationLogits=*/false,
+            /*draftTokens=*/std::nullopt,
+            /*excludeInputFromOutput=*/false,
+            /*encoderInputTokens=*/std::nullopt,
+            /*returnEncoderOutput=*/false,
+            /*clientId=*/std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+            /*encoderInputFeatures=*/std::nullopt,
+            /*encoderOutputLength=*/std::nullopt, tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
+            /*inputTokenExtraIds=*/std::nullopt,
+            /*returnPerfMetrics=*/false,
+            /*allottedTimeMs=*/std::nullopt,
+            /*contextPhaseParams=*/std::nullopt,
+            /*arrivalTime=*/std::nullopt, agentHierarchy);
     }
 
     LlmRequestPtr createAgentDeepResearchRequest(SizeType32 nodeId, SizeType32 requestId)

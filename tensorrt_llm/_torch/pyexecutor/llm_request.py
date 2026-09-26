@@ -917,6 +917,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # consumer, so the C++ request no longer carries a copy.
         self.py_embedding_bias: Optional[torch.Tensor] = kwargs.pop(
             "embedding_bias", None)
+        self.py_position_ids: list[int] | None = kwargs.pop(
+            "position_ids", None)
+        self.py_guided_decoding_params = kwargs.pop("guided_decoding_params",
+                                                    None)
+        self.py_end_id: Optional[int] = kwargs.pop("end_id", None)
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
@@ -969,7 +974,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_client_id = client_id
         self.py_request_id = self.request_id
         self.py_llm_request_type = self.llm_request_type
-        self.py_end_id = self.end_id
         self.py_min_length = self.sampling_config.min_tokens
         self.py_helix_is_inactive_rank = False
         # Manager-owned helix decode-step counter; see
@@ -1536,12 +1540,22 @@ def executor_request_to_llm_request(
         multimodal_run_lengths = (
             executor_request.multimodal_input.multimodal_run_lengths)
 
-    # Extract mrope fields
-    mrope_rotary_cos_sin = None
-    mrope_position_deltas = None
+    # Python multimodal data is the canonical source for mRoPE model inputs.
+    # Preserve input-processor values and fill only missing entries when a
+    # directly constructed executor request carries the public MropeConfig.
+    py_multimodal_data = getattr(executor_request, "py_multimodal_data", None)
     if executor_request.mrope_config is not None:
-        mrope_rotary_cos_sin = executor_request.mrope_config.mrope_rotary_cos_sin
+        if py_multimodal_data is None:
+            py_multimodal_data = {}
+        mrope_config = py_multimodal_data.setdefault("mrope_config", {})
+        mrope_config.setdefault(
+            "mrope_rotary_cos_sin",
+            executor_request.mrope_config.mrope_rotary_cos_sin)
         mrope_position_deltas = executor_request.mrope_config.mrope_position_deltas
+        if not isinstance(mrope_position_deltas, torch.Tensor):
+            mrope_position_deltas = torch.tensor([mrope_position_deltas],
+                                                 dtype=torch.int32)
+        mrope_config.setdefault("mrope_position_deltas", mrope_position_deltas)
 
     agent_hierarchy = None
     if getattr(executor_request, "py_scheduling_params", None) is not None:
@@ -1554,7 +1568,7 @@ def executor_request_to_llm_request(
     # length rather than a token count.
     encoder_input_features = None
     encoder_output_len = None
-    py_mm_data = getattr(executor_request, "py_multimodal_data", None) or {}
+    py_mm_data = py_multimodal_data or {}
     audio_mm_data = py_mm_data.get("audio") or {}
     if isinstance(audio_mm_data, dict):
         # Only enc-dec input processors emit encoder_input_features (decoder-only
@@ -1591,7 +1605,6 @@ def executor_request_to_llm_request(
         multimodal_item_run_cu_offsets=multimodal_item_run_cu_offsets,
         multimodal_run_positions=multimodal_run_positions,
         multimodal_run_lengths=multimodal_run_lengths,
-        multimodal_embedding=executor_request.multimodal_embedding,
         lora_task_id=executor_request.lora_config.task_id
         if executor_request.lora_config is not None else None,
         lora_weights=executor_request.lora_config.weights
@@ -1599,8 +1612,6 @@ def executor_request_to_llm_request(
         lora_config=executor_request.lora_config.config
         if executor_request.lora_config is not None else None,
         py_lora_path=getattr(executor_request, "py_lora_path", None),
-        mrope_rotary_cos_sin=mrope_rotary_cos_sin,
-        mrope_position_deltas=mrope_position_deltas,
         return_log_probs=executor_request.output_config.return_log_probs,
         num_logprobs=getattr(executor_request, "py_num_logprobs", 0),
         return_context_logits=executor_request.output_config.
@@ -1632,8 +1643,7 @@ def executor_request_to_llm_request(
         context_phase_params=executor_request.context_phase_params,
         cache_salt=executor_request.cache_salt,
         arrival_time=getattr(executor_request, "py_arrival_time", None),
-        py_multimodal_data=getattr(executor_request, "py_multimodal_data",
-                                   None),
+        py_multimodal_data=py_multimodal_data,
         py_mm_item_order=getattr(executor_request, "py_mm_item_order", None),
         kv_cache_retention_config=executor_request.kv_cache_retention_config,
         agent_hierarchy=agent_hierarchy,

@@ -5546,7 +5546,17 @@ class PyExecutor:
         )
 
     def _validate_token_id_range(self, request: LlmRequest) -> None:
-        if isinstance(self.model_engine.model, DecoderModelForCausalLM):
+        model = self.model_engine.model
+        if not hasattr(model, "lm_head"):
+            return
+
+        num_embeddings = model.lm_head.num_embeddings
+        end_id = request.py_end_id
+        if end_id is not None and (end_id < -1 or end_id >= num_embeddings):
+            raise ValueError(f"EndId ({end_id}) is not within acceptable range "
+                             f"[-1, {num_embeddings}).")
+
+        if isinstance(model, DecoderModelForCausalLM):
             # Only skip token-range checks for Llama4 when the request has
             # multimodal data. Probed via sys.modules so this module does not
             # import a model-zoo module at startup (which would defeat the
@@ -5560,8 +5570,7 @@ class PyExecutor:
                 "tensorrt_llm._torch.models." +
                 MODEL_ARCH_TO_MODULE["Llama4ForConditionalGeneration"])
             if modeling_llama is not None and isinstance(
-                    self.model_engine.model,
-                    modeling_llama.Llama4ForConditionalGeneration):
+                    model, modeling_llama.Llama4ForConditionalGeneration):
                 has_mm = bool(request.py_multimodal_data)
                 if has_mm:
                     logger.debug(
@@ -5569,15 +5578,7 @@ class PyExecutor:
                         "(multimodal request)")
                     return
 
-            # FIXME: This check is necessary because of how Qwen2ForProcessRewardModel
-            #        subclasses DecoderModelForCausalLM. Perhaps the functionality
-            #        of DecoderModelForCausalLM reused by Qwen2ForProcessRewardModel
-            #        should be factored out into a separate class instead.
-            if not hasattr(self.model_engine.model, "lm_head"):
-                return
-
-            if not request.check_token_id_range(
-                    self.model_engine.model.lm_head.num_embeddings):
+            if not request.check_token_id_range(num_embeddings):
                 raise ValueError("Token ID out of range")
 
     def _warn_if_kv_block_budget_unchecked(self) -> None:

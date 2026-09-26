@@ -162,10 +162,10 @@ class NoKVCacheRunner(ABC):
             context_start_idx = len(input_ids)
             input_ids.extend(prompt_tokens)
             request_ids.append(request.py_request_id)
-            if request.position_ids is None:
+            if request.py_position_ids is None:
                 position_ids.extend(range(len(prompt_tokens)))
             else:
-                position_ids.extend(request.position_ids)
+                position_ids.extend(request.py_position_ids)
             gather_ids.append(len(input_ids) - 1)
             sequence_lengths.append(len(prompt_tokens))
             draft_lens.append(0)
