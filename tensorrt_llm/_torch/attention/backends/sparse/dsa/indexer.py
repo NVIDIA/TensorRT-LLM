@@ -1179,6 +1179,7 @@ class Indexer(nn.Module):
         """
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
+        metadata.mtp_sched_metadata_stale = False
         gen_seq_lens = metadata.get_indexer_kv_lens(
             metadata.kv_lens_cuda_runtime[num_contexts : num_contexts + num_generations]
         )
@@ -1683,6 +1684,18 @@ class Indexer(nn.Module):
                 metadata.shared_topk_indices[:num_generations, :]
             )
         elif has_decode and not metadata.skip_indexer_for_gen_reqs:
+            # getattr: test doubles for the metadata may predate this flag.
+            if getattr(metadata, "mtp_sched_metadata_stale", False):
+                # The MTP tail trim skipped the schedule rebuild (see
+                # DSAtrtllmAttentionMetadata._skip_indexer_sched_metadata) but
+                # this pass would read it: fail loudly.
+                raise RuntimeError(
+                    "DSA indexer: MQA-logits scheduler metadata is stale "
+                    "(skipped by the MTP tail trim) but this pass computes TopK "
+                    f"(in_mtp_draft_loop={metadata.in_mtp_draft_loop}, "
+                    f"indexer_skip_topk={metadata.indexer_skip_topk}, "
+                    f"mtp_index_share={self.mtp_index_share})"
+                )
             # Get decode lengths per request (from seq_lens) for validation
             gen_seq_lens = metadata.seq_lens[num_contexts : num_contexts + num_generations]
             max_decode_len = gen_seq_lens.max().item()

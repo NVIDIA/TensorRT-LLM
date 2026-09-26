@@ -7,7 +7,7 @@ from __future__ import annotations
 import functools
 import os
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, ClassVar, List, Optional
 
 import torch
 
@@ -72,6 +72,10 @@ def build_req_idx_per_token(seq_lens: torch.Tensor, num_tokens: int) -> torch.Te
 class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     """Attention metadata for DSA (Dense Sparse Attention) with indexer state."""
 
+    # on_update_kv_lens() rebuilds everything from the current seq/kv lengths and block offsets:
+    # idempotent, fully overwritten by the second call.
+    kv_lens_hook_idempotent: ClassVar[bool] = True
+
     sparse_metadata_params: Optional[DSAMetadataParams] = None
     use_fp8_ds_mla: bool = field(default=False, init=False)
     # Store reference to indexer for preparation stage
@@ -100,6 +104,16 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     indexer_skip_topk: bool = False
     in_mtp_draft_loop: bool = False
     mtp_num_accepted: Optional[torch.Tensor] = None
+    # MTP tail trim (TRTLLM_MTP_TAIL_TRIM). While set, on_update_kv_lens() leaves the DeepGEMM
+    # MQA-logits schedule, the 2D/expanded indexer KV lengths and the GVR row order untouched.
+    # Only the indexer's MQA-logits + TopK pass reads them, and the draft loop sets this exactly
+    # when that pass does not run before the next full rebuild: before an index-shared draft
+    # step (indexer_skip_topk, reuse-TopK path) and after the last draft step (the next target
+    # forward rebuilds in _preprocess_inputs). Slot mappings / indptrs are still refreshed.
+    _skip_indexer_sched_metadata: bool = False
+    # Records the skip until the next full rebuild so the indexer can assert it never reads the
+    # stale buffers.
+    mtp_sched_metadata_stale: bool = False
     # Whether skip the indexer for context requests
     skip_indexer_for_ctx_reqs: bool = False
     # Whether skip the indexer for generation requests
@@ -500,6 +514,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # transform_local_topk_and_prepare_pool_view() call.
         self._invalidate_pool_view_cache()
 
+        # MTP tail trim: leave the indexer's MQA-logits schedule as is (see the field).
+        skip_sched = self._skip_indexer_sched_metadata
+
         # Default fused path: collapse the eager DSA decode-metadata chain
         # (req_idx_per_token + slot mappings + the two gen indptr cumsums) into
         # one fused Triton launch. Only for the pure-decode/generation step
@@ -577,6 +594,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     dtype=torch.int64,
                     out=self.gen_cached_token_indptr[1 : self.num_generations + 1],
                 )
+            self.mtp_sched_metadata_stale = skip_sched
+        if self.num_generations > 0 and not skip_sched:
             gen_kv_lens = self.kv_lens_cuda[self.num_contexts : self.num_seqs]
             gen_indexer_kv_lens = self.get_indexer_kv_lens(gen_kv_lens)
             self.gen_indexer_kv_lens_cuda_runtime = gen_indexer_kv_lens
@@ -636,7 +655,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self._fused_dsa_meta_armed = True
             self._run_fused_dsa_decode_metadata()
 
-        self._compute_kv_lens_row_reorder()
+        if not skip_sched:
+            self._compute_kv_lens_row_reorder()
         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
 
     def _run_fused_dsa_decode_metadata(self):
@@ -835,6 +855,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.indexer_skip_topk = False
         self.in_mtp_draft_loop = False
         self.mtp_num_accepted = None
+        self._skip_indexer_sched_metadata = False
+        self.mtp_sched_metadata_stale = False
 
         # Indexer metadata
         # Separate slot mappings for non-interleaved layout (flat byte indices)
@@ -1170,6 +1192,19 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def set_skip_topk(self, skip: bool) -> None:
         self.indexer_skip_topk = skip
+
+    def set_skip_indexer_sched_metadata(self, skip: bool) -> None:
+        self._skip_indexer_sched_metadata = skip
+
+    def mtp_next_step_reuses_topk(self) -> bool:
+        """True when a following MTP draft step (which runs with
+        indexer_skip_topk) takes the indexer's reuse-TopK path instead of the
+        MQA-logits + TopK path."""
+        return (
+            self.in_mtp_draft_loop
+            and self.sparse_metadata_params.mtp_index_share
+            and self.shared_topk_indices is not None
+        )
 
     def set_in_mtp_draft_loop(self, active: bool) -> None:
         self.in_mtp_draft_loop = active

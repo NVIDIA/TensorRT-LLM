@@ -33,6 +33,7 @@ from ..attention.backends.trtllm import (AttentionBackend, TrtllmAttention,
                                          TrtllmAttentionMetadata)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..pyexecutor.resource_manager import ResourceManagerType
+from .mtp_tail_trim import gather_draft_argmax_pairs, mtp_tail_trim_enabled
 
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
@@ -2691,6 +2692,12 @@ class SpecWorkerBase(nn.Module, ABC):
         if (sharded and mapping is not None
                 and getattr(mapping, "tp_size", 1) > 1
                 and not mapping.enable_attention_dp):
+            if mtp_tail_trim_enabled() and logits.stride(-1) == 1:
+                # One Triton launch for the local (idx, max) pair + the
+                # dedicated MNNVL mailbox exchange (NCCL fallback); the
+                # gathered tensor is bit-identical to the path below.
+                gathered = gather_draft_argmax_pairs(logits, mapping)
+                return self._get_draft_tokens_from_gathered(gathered)
             from ..distributed.ops import allgather
             combined = self._get_local_max_and_combined(logits)
             gathered = allgather(combined, mapping, dim=-1)

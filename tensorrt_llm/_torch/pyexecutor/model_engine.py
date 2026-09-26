@@ -70,6 +70,7 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            restore_attn_metadata_after_draft_replay,
                            update_spec_config_from_loaded_model)
 from ..speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
+from ..speculative.mtp_tail_trim import mtp_tail_trim_enabled
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_static_draft_len, update_draft_len
 from ..utils import (get_model_extra_attrs,
@@ -3807,8 +3808,20 @@ class PyTorchModelEngine(ModelEngine):
         Make some changes to the device inputs and avoid blocking the async data transfer
         """
         attn_meta = inputs.get('attn_metadata')
+        # Overlap scheduling corrects kv_lens_cuda below from the runtime
+        # accepted-token counts and calls on_update_kv_lens() again after it.
+        spec_kv_correction = (self.enable_spec_decode
+                              and not self._disable_overlap_scheduler
+                              and attn_meta is not None
+                              and attn_meta.kv_cache_manager is not None
+                              and hasattr(attn_meta, 'kv_lens_cuda'))
         # Invalidate per-forward-pass caches so they are recomputed (and captured) on every _forward_step.
-        if attn_meta is not None:
+        # MTP tail trim: when the hook is idempotent and the correction below
+        # repeats it with nothing reading its results in between, the first
+        # call is fully overwritten by the second call and skipped.
+        if attn_meta is not None and not (spec_kv_correction
+                                          and mtp_tail_trim_enabled() and
+                                          attn_meta.kv_lens_hook_idempotent):
             attn_meta.on_update_kv_lens()
 
         if self.enable_spec_decode and not self._disable_overlap_scheduler:
@@ -3836,7 +3849,7 @@ class PyTorchModelEngine(ModelEngine):
                         self.
                         previous_pos_id_offsets_cuda[:previous_batch_tokens])
 
-                if hasattr(inputs['attn_metadata'], 'kv_lens_cuda'):
+                if spec_kv_correction:
                     if num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:
                         # The generation requests with draft_tokens are treated as chunked context requests when extend_ctx returns True.
                         inputs['attn_metadata'].kv_lens_cuda[

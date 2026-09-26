@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple
+from typing import TYPE_CHECKING, ClassVar, Dict, Optional, Set, Tuple
 
 import torch
 
@@ -28,6 +28,8 @@ if TYPE_CHECKING:
 
 
 class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
+    # on_update_kv_lens() is overridden below and has not been audited for idempotence.
+    kv_lens_hook_idempotent: ClassVar[bool] = False
     # The set of compress ratios for the layers
     compress_ratio_set: Set[int]
     # The set of (compress ratio, attention type) for the layers

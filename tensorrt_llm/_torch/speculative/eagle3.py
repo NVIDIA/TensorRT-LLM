@@ -15,7 +15,8 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends import AttentionMetadata
 from ..attention.backends.flashinfer import FlashInferAttentionMetadata
-from ..attention.backends.sparse.params import MTPIndexShareMetadata
+from ..attention.backends.sparse.params import (MTPIndexerScheduleTrimMetadata,
+                                                MTPIndexShareMetadata)
 from ..model_config import ModelConfig
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
@@ -24,6 +25,7 @@ from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import (INVALID_PROMPT_LOOKAHEAD_TOKEN, SpecMetadata,
                         SpecWorkerBase)
 from .mtp import _select_mtp_position_ids
+from .mtp_tail_trim import mtp_tail_trim_enabled
 from .sa_enhancer import SADraftEnhancer
 from .spec_tree_manager import SpecTreeManager
 
@@ -36,6 +38,24 @@ def _reset_mtp_index_share(attn_metadata: MTPIndexShareMetadata) -> None:
     attn_metadata.set_skip_topk(False)
     attn_metadata.set_in_mtp_draft_loop(False)
     attn_metadata.set_mtp_num_accepted(None)
+
+
+def _update_for_next_draft_step(attn_metadata,
+                                skip_indexer_sched: bool) -> None:
+    """``update_for_spec_dec`` before the next draft step.
+
+    ``skip_indexer_sched`` (MTP tail trim) leaves the indexer's scheduler
+    metadata untouched for a step nothing reads it in; the invariant is
+    documented on ``DSAtrtllmAttentionMetadata._skip_indexer_sched_metadata``.
+    """
+    if not skip_indexer_sched:
+        attn_metadata.update_for_spec_dec()
+        return
+    attn_metadata.set_skip_indexer_sched_metadata(True)
+    try:
+        attn_metadata.update_for_spec_dec()
+    finally:
+        attn_metadata.set_skip_indexer_sched_metadata(False)
 
 
 class Eagle3ResourceManager(BaseResourceManager):
@@ -781,6 +801,19 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # config turns the reuse on.
         uses_mtp_index_share = self.is_mtp_eagle and isinstance(
             attn_metadata, MTPIndexShareMetadata)
+        # TRTLLM_MTP_TAIL_TRIM (see mtp_tail_trim.py): numerics-preserving
+        # draft-loop glue trims. From draft step 1 on every sequence has one
+        # token and ``gather_ids`` is ``batch_indices_cuda[:batch_size]`` =
+        # arange(batch_size), so its row gathers are prefix slices.
+        tail_trim = self.is_mtp_eagle and mtp_tail_trim_enabled()
+        # Index-sharing metadata that can also skip its indexer schedule
+        # rebuild for a draft step nothing reads it in (see the Protocol).
+        trims_indexer_sched = (tail_trim and uses_mtp_index_share
+                               and isinstance(attn_metadata,
+                                              MTPIndexerScheduleTrimMetadata))
+        # Whether draft steps >= 1 take the indexer's reuse-TopK path; fixed
+        # once step 0 has run.
+        reuses_topk = False
         with contextlib.ExitStack() as draft_scope:
             if uses_mtp_index_share:
                 attn_metadata.set_in_mtp_draft_loop(True)
@@ -815,6 +848,12 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # uses try/finally); attn_metadata is left untouched here.
                 hidden_states, hidden_states_to_save = self._run_draft_forward(
                     draft_model, inputs, spec_metadata, i)
+                if i == 0:
+                    # Constant for the rest of the loop: steps >= 1 run with
+                    # indexer_skip_topk, so whether they reuse this step's
+                    # TopK (and never read the MQA-logits schedule) is known.
+                    reuses_topk = (trims_indexer_sched and
+                                   attn_metadata.mtp_next_step_reuses_topk())
 
                 # Compute gather_ids: on the first draft step each generation
                 # request may have accepted multiple tokens, so we index into
@@ -832,6 +871,15 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         [last_tokens_idx[:num_contexts], gather_ids_gen], dim=0)
                 else:
                     gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
+                # MTP tail trim: from step 1 on gather_ids == arange(batch_size),
+                # so the row selections are prefix slices, and the hidden-state
+                # rows are selected once for the LM head and the next step.
+                # With the trim off every site keeps its own
+                # hidden_states[gather_ids] gather, exactly as upstream.
+                row_sel = slice(0, batch_size) if (tail_trim
+                                                   and i > 0) else gather_ids
+                if tail_trim:
+                    hidden_states_sel = hidden_states[row_sel]
 
                 if self.guided_decoder is not None:
                     new_tokens = inputs["input_ids"][gather_ids]
@@ -871,8 +919,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 use_lm_head_tp_in_adp = (lm_head_tp_in_adp_configured
                                          and not advanced_draft_sampling)
                 if self.is_mtp_eagle:
+                    head_rows = (hidden_states_sel
+                                 if tail_trim else hidden_states[gather_ids])
                     if use_lm_head_tp_in_adp:
-                        hidden_states_gathered = hidden_states[gather_ids]
+                        hidden_states_gathered = head_rows
                         token_count = hidden_states_gathered.view(
                             -1, hidden_states_gathered.shape[-1]).shape[0]
                         max_num_requests = spec_metadata.max_num_requests
@@ -906,19 +956,17 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         local_full_vocab_forward = getattr(
                             shared_head, "forward_local_full_vocab", None)
                         if local_full_vocab_forward is None:
-                            logits = draft_model.lm_head(
-                                hidden_states[gather_ids])
+                            logits = draft_model.lm_head(head_rows)
                         else:
                             logits = local_full_vocab_forward(
-                                hidden_states[gather_ids],
+                                head_rows,
                                 draft_model.lm_head,
                                 attn_metadata,
                                 True,
                             )
                     else:
                         logits = draft_model.mtp_layers[0].shared_head(
-                            hidden_states[gather_ids], draft_model.lm_head,
-                            attn_metadata, True)
+                            head_rows, draft_model.lm_head, attn_metadata, True)
                 else:
                     logits = draft_model.logits_processor(
                         hidden_states[gather_ids], draft_model.lm_head,
@@ -964,14 +1012,24 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 #   gather_ids to get one hidden state per request.
                 # Eagle3: the EAGLE draft model returns a secondary
                 #   ``hidden_states_to_save`` specifically for this purpose.
-                if self.is_mtp_eagle:
-                    hidden_states = hidden_states[gather_ids]
+                is_last_step = i == runtime_draft_len - 1
+                if tail_trim and is_last_step:
+                    # No next draft step consumes these.
+                    hidden_states = position_ids = None
                 else:
-                    hidden_states = hidden_states_to_save[gather_ids]
-                position_ids = (_select_mtp_position_ids(
-                    inputs["position_ids"], gather_ids) + 1)
+                    if self.is_mtp_eagle:
+                        hidden_states = (hidden_states_sel if tail_trim else
+                                         hidden_states[gather_ids])
+                    else:
+                        hidden_states = hidden_states_to_save[gather_ids]
+                    position_ids = (_select_mtp_position_ids(
+                        inputs["position_ids"], row_sel) + 1)
 
-                # Update attn_metadata for the next iteration.
+                # Update attn_metadata for the next iteration. MTP tail trim:
+                # skip the indexer schedule rebuild when its next consumer is
+                # a full rebuild (index-shared draft step / next target step).
+                skip_indexer_sched = trims_indexer_sched and (is_last_step
+                                                              or reuses_topk)
                 if i == 0:
                     attn_metadata._seq_lens[:batch_size].fill_(1)
                     attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
@@ -994,7 +1052,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         self._prepare_flash_mla_generation_layout(
                             attn_metadata, num_contexts, batch_size)
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
-                        attn_metadata.update_for_spec_dec()
+                        _update_for_next_draft_step(attn_metadata,
+                                                    skip_indexer_sched)
 
                     # Both Eagle3 and MTP Eagle drafters take ``draft_len + 1``
                     # tokens in the first draft step (attention runs in spec-dec
@@ -1005,7 +1064,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 else:
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
                         attn_metadata.kv_lens_cuda[:batch_size] += 1
-                        attn_metadata.update_for_spec_dec()
+                        _update_for_next_draft_step(attn_metadata,
+                                                    skip_indexer_sched)
 
                 inputs = {
                     "input_ids": new_draft_token,

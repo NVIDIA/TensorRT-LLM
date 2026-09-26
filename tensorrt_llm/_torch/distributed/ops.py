@@ -47,6 +47,9 @@ _NCCL_SYMMETRIC_ZERO_COPY: bool = (os.environ.get(
 
 _MNNVL_ONE_SHOT_THRESHOLD_BYTES = 64 * 1024 * 8 * 2
 
+# Lamport buffers per MNNVL all-reduce workspace.
+NUM_LAMPORT_BUFFERS = 3
+
 _thread_local = threading.local()
 
 # Mirrored by the autotune context so Dynamo can guard this branch without
@@ -264,12 +267,65 @@ def get_or_scale_allreduce_mnnvl_workspace(
                                                        buffer_size_bytes)
 
 
+def _build_mnnvl_workspace(comm, mapping: Mapping,
+                           buffer_size_bytes: int) -> _MnnvlWorkspace:
+    """Allocate and initialise one MNNVL all-reduce workspace over ``comm``.
+
+    The workspace holds NUM_LAMPORT_BUFFERS Lamport buffers of ``buffer_size_bytes`` each. The
+    outcome is converged across ``comm``: every rank either returns a ready workspace or raises,
+    so no rank is left waiting on the handle exchange. ``comm`` stays owned by the caller.
+    """
+    force_mn = os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1"
+    use_fabric_handle = force_mn or mapping.is_multi_node()
+    candidate_workspace: Optional[_MnnvlWorkspace] = None
+    candidate_error: Optional[Exception] = None
+    try:
+        # Each workspace contains NUM_LAMPORT_BUFFERS buffers.
+        workspace_size_bytes = NUM_LAMPORT_BUFFERS * buffer_size_bytes
+        mcast_buf_handle = _make_mnnvl_mcast_buffer(comm, workspace_size_bytes,
+                                                    mapping, use_fabric_handle)
+        # We use per FP32 element in the buffer for lamport sync
+        buffer = mcast_buf_handle.get_uc_buffer(
+            mapping.tp_rank,
+            (workspace_size_bytes // torch.float32.itemsize, ),
+            torch.float32,
+            0,
+        )
+        # Layout: [cur idx, dirty idx, bytes per buffer, dirty num stages,
+        # numBytesToClear[4], access count ptr]. Filled in by
+        # _initialize_allreduce_mnnvl_protocol once every rank has its buffers.
+        buffer_flags = torch.tensor(
+            [0] * 9,
+            dtype=torch.uint32,
+            device=torch.device("cuda", _mnnvl_device_index(mapping)),
+        )
+        candidate_workspace = {
+            "handle": mcast_buf_handle,
+            "uc_buffer": buffer,
+            "buffer_flags": buffer_flags,
+            "buffer_size_bytes": buffer_size_bytes,
+            "comm": comm,
+        }
+    except Exception as error:
+        candidate_error = error
+
+    if not _mnnvl_workspace_all_succeeded(comm, candidate_error is None):
+        raise RuntimeError(
+            "MNNVL workspace construction failed on at least one rank"
+        ) from candidate_error
+    if candidate_error is not None:
+        raise candidate_error
+    assert candidate_workspace is not None
+    # Also fences the handle exchange: every rank leaves this call knowing its peers have
+    # their buffers, so nobody signals through memory another rank has not initialised.
+    _initialize_allreduce_mnnvl_protocol(candidate_workspace)
+    return candidate_workspace
+
+
 def _get_or_scale_allreduce_mnnvl_workspace(
         mapping: Mapping,
         dtype: torch.dtype,
         buffer_size_bytes: Optional[int] = None) -> _MnnvlWorkspace:
-
-    NUM_LAMPORT_BUFFERS = 3
 
     # Use MNNVLAllReduce class to share across threads
     allreduce_mnnvl_workspaces = MNNVLAllReduce.allreduce_mnnvl_workspaces
@@ -282,8 +338,6 @@ def _get_or_scale_allreduce_mnnvl_workspace(
 
     # A safe method to get the element size of the dtype
     elem_size = torch.tensor([], dtype=dtype).element_size()
-    force_mn = os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1"
-    use_fabric_handle = force_mn or mapping.is_multi_node()
 
     if mapping not in allreduce_mnnvl_workspaces or allreduce_mnnvl_workspaces[
             mapping]["buffer_size_bytes"] < (buffer_size_bytes or 0):
@@ -317,54 +371,39 @@ def _get_or_scale_allreduce_mnnvl_workspace(
             logger.debug(
                 f"[MNNVL] Requested {req_buffer_size_bytes} bytes, is larger than the current workspace size. Scaling workspace for pp_rank {mapping.pp_rank}, tp_size {mapping.tp_size} from {allreduce_mnnvl_workspaces[mapping]['buffer_size_bytes']} to {buffer_size_bytes} bytes"
             )
-        candidate_workspace: Optional[_MnnvlWorkspace] = None
-        candidate_error: Optional[Exception] = None
-        try:
-            # Each workspace contains NUM_LAMPORT_BUFFERS buffers.
-            workspace_size_bytes = NUM_LAMPORT_BUFFERS * buffer_size_bytes
-            mcast_buf_handle = _make_mnnvl_mcast_buffer(comm,
-                                                        workspace_size_bytes,
-                                                        mapping,
-                                                        use_fabric_handle)
-            # We use per FP32 element in the buffer for lamport sync
-            buffer = mcast_buf_handle.get_uc_buffer(
-                mapping.tp_rank,
-                (workspace_size_bytes // torch.float32.itemsize, ),
-                torch.float32,
-                0,
-            )
-            # Layout: [cur idx, dirty idx, bytes per buffer, dirty num stages,
-            # numBytesToClear[4], access count ptr]. Filled in by
-            # _initialize_allreduce_mnnvl_protocol once every rank has its buffers.
-            buffer_flags = torch.tensor(
-                [0] * 9,
-                dtype=torch.uint32,
-                device=torch.device("cuda", _mnnvl_device_index(mapping)),
-            )
-            candidate_workspace = {
-                "handle": mcast_buf_handle,
-                "uc_buffer": buffer,
-                "buffer_flags": buffer_flags,
-                "buffer_size_bytes": buffer_size_bytes,
-                "comm": comm,
-            }
-        except Exception as error:
-            candidate_error = error
-
-        if not _mnnvl_workspace_all_succeeded(comm, candidate_error is None):
-            raise RuntimeError(
-                "MNNVL workspace construction failed on at least one rank"
-            ) from candidate_error
-        if candidate_error is not None:
-            raise candidate_error
-        assert candidate_workspace is not None
-        # Also fences the handle exchange: every rank leaves this call knowing its peers have
-        # their buffers, so nobody signals through memory another rank has not initialised.
-        _initialize_allreduce_mnnvl_protocol(candidate_workspace)
+        candidate_workspace = _build_mnnvl_workspace(comm, mapping,
+                                                     buffer_size_bytes)
         # Hand ownership of the communicator to the workspace.
         pending_comms.pop(mapping, None)
         allreduce_mnnvl_workspaces[mapping] = candidate_workspace
     return allreduce_mnnvl_workspaces[mapping]
+
+
+def _launch_mnnvl_allreduce(input: torch.Tensor, workspace: _MnnvlWorkspace,
+                            dtype: torch.dtype,
+                            params: AllReduceParams) -> List[torch.Tensor]:
+    """Launch the MNNVL (fusion) all-reduce kernel on ``input`` over ``workspace``.
+
+    ``params.fusion_op`` NONE is a plain SUM; the fused variants apply the RMSNorm epilogue.
+    Returns the kernel's output list (one tensor for a plain SUM).
+    """
+    # We don't expect the buffer to be directly used in this level. The tensor is only used for passing the pointer to the kernel
+    buffer_base = workspace["uc_buffer"].view(dtype).view(
+        NUM_LAMPORT_BUFFERS, -1)
+    # The buffer flags is tied to the buffer and used to save the state of the buffer
+    buffer_flags = workspace["buffer_flags"]
+    fusion_op = params.fusion_op
+    return torch.ops.trtllm.mnnvl_fusion_allreduce(
+        input,
+        params.norm_weight,  # gamma
+        params.residual,  # residual
+        params.eps,  # epsilon
+        buffer_base,  # comm_buffer
+        buffer_flags,  # buffer_flags
+        fusion_op != AllReduceFusionOp.NONE,  # rmsnorm_fusion
+        params.scale,  # scale
+        int(fusion_op),
+    )
 
 
 def userbuffers_allreduce_finalize(
@@ -947,26 +986,12 @@ class MNNVLAllReduce(nn.Module):
             buffer_size_bytes=workspace_size_bytes,
         )
 
-        # We don't expect the buffer to be directly used in this level. The tensor is only used for passing the pointer to the kernel
-        buffer_base = workspace["uc_buffer"].view(self.dtype).view(3, -1)
-        # The buffer flags is tied to the buffer and used to save the state of the buffer
-        buffer_flags = workspace["buffer_flags"]
-
         is_fusion = fusion_op != AllReduceFusionOp.NONE
         if is_fusion and fusion_op not in MNNVLAllReduce.SUPPORTED_FUSION_OPS:
             return None
 
-        outputs = torch.ops.trtllm.mnnvl_fusion_allreduce(
-            input,
-            all_reduce_params.norm_weight,  # gamma
-            all_reduce_params.residual,  # residual
-            all_reduce_params.eps,  # epsilon
-            buffer_base,  # comm_buffer
-            buffer_flags,  # buffer_flags
-            is_fusion,  # rmsnorm_fusion
-            all_reduce_params.scale,  # scale
-            int(fusion_op),
-        )
+        outputs = _launch_mnnvl_allreduce(input, workspace, self.dtype,
+                                          all_reduce_params)
         return tuple(outputs) if is_fusion else outputs[0]
 
 

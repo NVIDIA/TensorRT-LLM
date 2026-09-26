@@ -61,6 +61,22 @@ class MTPIndexShareMetadata(Protocol):
         """Ask the indexer to reuse its captured selection instead of scoring."""
 
 
+@runtime_checkable
+class MTPIndexerScheduleTrimMetadata(Protocol):
+    """Index-sharing sparse metadata that can leave its indexer schedule untouched.
+
+    Used with ``MTPIndexShareMetadata`` by the MTP draft loop (``TRTLLM_MTP_TAIL_TRIM``):
+    before a draft step whose indexer pass reuses the captured selection, and after
+    the last one, the schedule the scoring pass would need is not rebuilt.
+    """
+
+    def set_skip_indexer_sched_metadata(self, skip: bool) -> None:
+        """Make the next kv-lens update leave the indexer's scheduler metadata as is."""
+
+    def mtp_next_step_reuses_topk(self) -> bool:
+        """Whether the following draft step reuses the captured selection instead of scoring."""
+
+
 def use_self_sampling_gvr(
     *,
     enable_heuristic_topk: bool,

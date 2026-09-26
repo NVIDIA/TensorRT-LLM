@@ -3920,14 +3920,20 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_l
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
+@pytest.mark.parametrize("stale_sched", [False, True])
 @pytest.mark.parametrize("step0_mode", ["gen", "context"])
 @pytest.mark.parametrize("batch_size", [1, 2])
-def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size):
+def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size, stale_sched):
     """Verify mtp_index_share: draft step 0 stashes each request's last-token
     Top-K and draft steps > 0 reuse it verbatim (bit-exact), across > 1 draft
     step. Covers both step-0 shapes: "gen" (steady state, next_n > 1) and
     "context" (the first gen round after prefill, which runs the context path).
     Step-0 Top-K correctness is covered by test_indexer_decode_custom_vs_fallback.
+
+    stale_sched: the reuse steps run with the MQA-logits schedule marked stale
+    and poisoned, as TRTLLM_MTP_TAIL_TRIM leaves it (the draft loop skips its
+    rebuild before index-shared steps); reuse must not read it, and a step that
+    computes Top-K on a stale schedule must raise instead.
     """
     torch.manual_seed(7)
     heads, head_dim, block_size = 32, 128, 64
@@ -4068,12 +4074,21 @@ def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size):
         meta.in_mtp_draft_loop = True
         meta.shared_topk_indices = stash
         meta.indexer_skip_topk = True
+        if stale_sched:
+            meta.mtp_sched_metadata_stale = True
+            meta.scheduler_metadata_buffer.fill_(-1)
+            meta.scheduler_metadata_buffer_full_next_n.fill_(-1)
+            meta.kv_lens_cuda_2d.fill_(-1)
         hs, qs, ks_fp8, ks_scale, ws = make_inputs(batch_size)
         indexer._update_k_cache(ks_fp8, ks_scale, meta)
         topk = indexer.sparse_attn_indexer(meta, hs, qs, ks_fp8, ks_scale, ws)
         assert torch.equal(topk, stash[:batch_size, :]), (
             f"{step0_mode} draft reuse step {step} should copy the stash 1:1 (next_n=1)"
         )
+        if stale_sched:
+            meta.indexer_skip_topk = False
+            with pytest.raises(RuntimeError, match="stale"):
+                indexer.sparse_attn_indexer(meta, hs, qs, ks_fp8, ks_scale, ws)
 
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")

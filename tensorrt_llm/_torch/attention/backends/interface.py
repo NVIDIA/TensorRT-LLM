@@ -6,8 +6,8 @@ import weakref
 from collections import namedtuple
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import (TYPE_CHECKING, Any, Dict, Generic, List, Literal, Optional,
-                    Protocol, Tuple, Type, TypeVar, Union)
+from typing import (TYPE_CHECKING, Any, ClassVar, Dict, Generic, List, Literal,
+                    Optional, Protocol, Tuple, Type, TypeVar, Union)
 
 import torch
 from typing_extensions import Self
@@ -91,6 +91,11 @@ class AttentionMetadata:
     enable_context_mla_with_cached_kv: bool = False
     # Whether CUDA graph is enabled.
     is_cuda_graph: bool = field(default=False, repr=False)
+
+    # Whether on_update_kv_lens() is a pure function of the current seq/kv lengths and block
+    # offsets, so a second call fully overwrites the first. Backends opt in per class after
+    # auditing their hook; the model engine then skips a call that is repeated right after.
+    kv_lens_hook_idempotent: ClassVar[bool] = False
 
     # The length of each sequence in the batch for query.
     # The shape is (batch_size), and located on CPU memory.
