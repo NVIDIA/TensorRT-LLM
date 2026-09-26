@@ -18,6 +18,6 @@
   "diffusers_version": "0.39.0",
   "torch_version": "2.12.0a0+5aff3928d8.nv26.05",
   "tensorrt_llm_version": "1.3.0rc24",
-  "tensorrt_llm_commit": "ad2cece816939ef0b9e8bab5dfba013d9ddf9288",
+  "tensorrt_llm_commit": "aacb3bd13af3c31d36084b762e0f9443795d9c4c",
   "container_image": "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-26.05-py3-x86_64-ubuntu24.04-skip-tritondevel-202607271403-16694"
 }
