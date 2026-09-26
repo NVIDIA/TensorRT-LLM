@@ -3155,6 +3155,8 @@ def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 @Field
 def RUN_MODE = "run_mode"
+@Field
+def JOB_TYPE = "job_type"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -3162,6 +3164,7 @@ def globalVars = [
     (IMAGE_KEY_TO_TAG): [:],
     (TRTLLM_VERSION_OVERRIDE): null,
     (RUN_MODE): null,
+    (JOB_TYPE): null,
 ]
 
 class GlobalState {
@@ -4111,7 +4114,7 @@ def runLLMAgentFlowTest(pipeline, stageName)
     sh "cd ${WORKSPACE}/${stageName} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' results.xml || true"
 }
 
-def launchTestListCheck(pipeline)
+def launchTestListCheck(pipeline, globalVars)
 {
     stageName = "Test List Check"
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10"), "trt-llm", {
@@ -4132,7 +4135,13 @@ def launchTestListCheck(pipeline)
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
-            throw e
+            if (globalVars[JOB_TYPE] == "L0_PostMerge") {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    throw e
+                }
+            } else {
+                throw e
+            }
         }
     })
 }
@@ -7373,7 +7382,7 @@ pipeline {
             steps
             {
                 script {
-                    launchTestListCheck(this)
+                    launchTestListCheck(this, globalVars)
                 }
             }
         }
