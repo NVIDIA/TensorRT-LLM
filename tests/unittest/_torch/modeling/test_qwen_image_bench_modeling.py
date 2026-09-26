@@ -239,16 +239,18 @@ def test_qwen_image_bench_forwards_speculative_interface():
     assert model.load_draft_weights("weights") is sentinel
 
 
-def test_qwen_image_bench_mapper_uses_normalized_inner_model_config():
+@pytest.mark.parametrize("is_mm_disagg", [False, True])
+def test_qwen_image_bench_mapper_uses_normalized_inner_model_config(is_mm_disagg):
     inner_model_config = object()
     llm = SimpleNamespace(model_config=inner_model_config, load_weights=Mock())
     model = QwenImageBenchModel.__new__(QwenImageBenchModel)
     object.__setattr__(model, "llm", llm)
+    object.__setattr__(model, "mm_encoder", None)
 
     with (
         patch(
             "tensorrt_llm._torch.models.modeling_qwen_image_bench._is_mm_disagg",
-            return_value=True,
+            return_value=is_mm_disagg,
         ),
         patch.object(Qwen3_5MoeHfWeightMapper, "init_model_and_config") as init_mapper,
     ):
@@ -256,3 +258,32 @@ def test_qwen_image_bench_mapper_uses_normalized_inner_model_config():
 
     init_mapper.assert_called_once_with(llm, inner_model_config)
     llm.load_weights.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "is_mm_disagg, expect_encoder_load",
+    [(False, True), (True, False)],
+)
+def test_qwen_image_bench_load_weights_respects_mm_disagg_encoder_guard(
+    is_mm_disagg, expect_encoder_load
+):
+    weights = {}
+    encoder = Mock()
+    llm = SimpleNamespace(model_config=object(), load_weights=Mock())
+    model = QwenImageBenchModel.__new__(QwenImageBenchModel)
+    object.__setattr__(model, "llm", llm)
+    object.__setattr__(model, "mm_encoder", encoder)
+
+    with (
+        patch(
+            "tensorrt_llm._torch.models.modeling_qwen_image_bench._is_mm_disagg",
+            return_value=is_mm_disagg,
+        ),
+        patch.object(Qwen3_5MoeHfWeightMapper, "init_model_and_config"),
+    ):
+        model.load_weights(weights)
+
+    if expect_encoder_load:
+        encoder.load_weights.assert_called_once_with(weights)
+    else:
+        encoder.load_weights.assert_not_called()
