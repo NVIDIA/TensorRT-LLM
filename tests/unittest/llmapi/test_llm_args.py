@@ -4182,6 +4182,35 @@ class _NoModelDefaults:
         return {}
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("cache_dtype", ["auto", "nvfp4"])
+def test_nvfp4_cache_auto_resolution_accepts_frozen_config(
+        monkeypatch: pytest.MonkeyPatch, cache_dtype: str) -> None:
+    from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
+
+    config = ModelConfig(
+        pretrained_config=SimpleNamespace(
+            architectures=["UnregisteredForCausalLM"]),
+        quant_config=QuantConfig(kv_cache_quant_algo="NVFP4"),
+        attn_backend="FLASHINFER",
+    )
+    config._frozen = True
+    loader = SimpleNamespace(load_config=lambda *args, **kwargs: config)
+    monkeypatch.setattr(model_loader_mod.AutoModelForCausalLM, "_resolve_class",
+                        staticmethod(lambda config: _NoModelDefaults))
+    args = TorchLlmArgs(model="/tmp/dummy_model",
+                        attn_backend="TRTLLM",
+                        kv_cache_config=KvCacheConfig(dtype=cache_dtype))
+
+    result = model_loader_mod.ModelLoader.load_config_and_apply_defaults(
+        "/tmp/dummy_model", args, loader)
+
+    assert result.kv_cache_config.use_kv_cache_manager_v2 is False
+    assert config._frozen
+    assert config.attn_backend == "FLASHINFER"
+    assert config.sparse_attention_config is None
+
+
 class TestMambaSnapshotConfigResolution:
 
     @staticmethod

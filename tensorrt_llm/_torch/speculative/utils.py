@@ -16,7 +16,8 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
-from ..pyexecutor.config_utils import match_nemotron_h_layer_types
+from ..pyexecutor.config_utils import (is_nemotron_hybrid,
+                                       match_nemotron_h_layer_types)
 from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.sampler import TorchSampler
 from ..speculative.interface import SpecMetadata
@@ -835,6 +836,10 @@ def update_spec_config_from_model_config(spec_config,
             checkpoint_type = _MTPDraftCheckpointType.HEAD_REPLACEMENT
     spec_config._mtp_draft_checkpoint_type = checkpoint_type
 
+    language_config = getattr(model_config, "llm_config", None)
+    if language_config is not None and is_nemotron_hybrid(language_config):
+        model_config = language_config
+
     # When MTP heads live in a separate checkpoint, prefer that checkpoint's
     # layer count / pattern over the target model's (which may have no MTP or
     # an older embedded MTP head that will be overridden at weight load).
@@ -860,6 +865,13 @@ def update_spec_config_from_model_config(spec_config,
                                                "mtp_num_hidden_layers", None)
         if num_nextn_predict_layers is None:
             num_nextn_predict_layers = 1
+    if (draft_nextn is None and num_nextn_predict_layers == 0
+            and spec_config.uses_replacement_heads
+            and is_nemotron_hybrid(model_config)):
+        # A target without embedded MTP does not declare the replacement's count.
+        # Resolve the shared head before selecting the mode and draft length.
+        num_nextn_predict_layers = 1
+        _set_pretrained_config_attr(model_config, "num_nextn_predict_layers", 1)
     spec_config.num_nextn_predict_layers = num_nextn_predict_layers
     spec_config._validate_moe_backend_compatibility(model_config_resolved=True)
     is_vanilla = spec_config.spec_dec_mode.is_mtp_vanilla()

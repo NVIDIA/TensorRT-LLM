@@ -26,6 +26,7 @@ from einops import rearrange as einops_rearrange
 from PIL import Image
 
 from tensorrt_llm._torch.models.checkpoints import NemotronHHfWeightMapper
+from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm.inputs.multimodal import (
     DisaggPrefillMultimodalInputs,
     MultimodalParams,
@@ -2921,6 +2922,19 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         # `infer_max_seq_len` and `set_guided_decoder` through this property,
         # and its base implementation raises.
         return self.llm
+
+    @property
+    def draft_config(self) -> Optional[ModelConfig]:
+        return self.llm.draft_config
+
+    @property
+    def draft_model(self) -> Optional[torch.nn.Module]:
+        return self.llm.draft_model
+
+    def load_draft_weights(
+        self, weights: Dict, weight_mapper: Optional[BaseWeightMapper] = None
+    ) -> None:
+        self.llm.load_draft_weights(weights, weight_mapper=weight_mapper)
 
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:

@@ -22,6 +22,7 @@ from tensorrt_llm._torch.speculative.utils import (
     uses_mtp_head_checkpoint,
 )
 from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig, MTPDecodingConfig
+from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
 class _ExternalDraftModelTarget:
@@ -231,6 +232,52 @@ def test_update_spec_config_uses_mtp_layers_block_type_when_present(tmp_path):
     spec_config = MTPDecodingConfig(max_draft_len=3, speculative_model=str(mtp_dir))
     update_spec_config_from_model_config(spec_config, model_config)
     assert model_config.mtp_layers_block_type == ["attention", "moe"]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_nemotron_replacement_without_head_count_uses_shared_head(tmp_path, multimodal):
+    (tmp_path / "config.json").write_text(json.dumps({"mtp_hybrid_override_pattern": "*E"}))
+    language_config = SimpleNamespace(
+        architectures=["NemotronHForCausalLM"],
+        hybrid_override_pattern="*E",
+        num_nextn_predict_layers=0,
+        mtp_layers_block_type=None,
+    )
+    model_config = (
+        SimpleNamespace(architectures=["NemotronH_Nano_VL_V2"], llm_config=language_config)
+        if multimodal
+        else language_config
+    )
+    spec_config = MTPDecodingConfig(max_draft_len=3, speculative_model=str(tmp_path))
+
+    update_spec_config_from_model_config(spec_config, model_config)
+
+    assert language_config.num_nextn_predict_layers == 1
+    assert spec_config.num_nextn_predict_layers == 1
+    assert spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+    assert spec_config.max_draft_len == 3
+    assert language_config.mtp_layers_block_type == ["attention", "moe"]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("head_count", [1, 2])
+def test_nemotron_embedded_multimodal_mtp_uses_language_config(head_count: int) -> None:
+    language_config = SimpleNamespace(
+        architectures=["NemotronHForCausalLM"],
+        num_nextn_predict_layers=head_count,
+        hybrid_override_pattern="*E",
+        mtp_layers_block_type=["attention", "moe"],
+    )
+    config = SimpleNamespace(llm_config=language_config)
+    spec_config = MTPDecodingConfig(max_draft_len=3)
+
+    update_spec_config_from_model_config(spec_config, config)
+
+    assert spec_config.num_nextn_predict_layers == head_count
+    assert spec_config.spec_dec_mode.is_mtp_eagle_one_model() == (head_count == 1)
+    assert spec_config.max_draft_len == (3 if head_count == 1 else head_count)
+    assert not spec_config.uses_replacement_heads
 
 
 def test_remap_preprocessed_mtp_weights_for_draft_model():
@@ -488,3 +535,45 @@ def test_separate_mtp_draft_load_skip_shared_head_scales(monkeypatch):
     )
     assert captured["skip_modules"] == []
     assert "mtp_layers.0.shared_head.norm.weight" in captured["weight_keys"]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("head_algo", [QuantAlgo.FP8, QuantAlgo.W4A16_NVFP4])
+def test_replacement_mtp_loads_owned_head_and_requires_scales(monkeypatch, head_algo):
+    from tensorrt_llm._torch.models import modeling_utils
+
+    loaded = {}
+    monkeypatch.setattr(
+        modeling_utils,
+        "_load_weights_impl_v2",
+        lambda model, weights, mapper, **kwargs: loaded.update(weights=weights, **kwargs),
+    )
+    model = _make_one_engine_stub(
+        MTPDecodingConfig(max_draft_len=1, speculative_model="/path/to/mtp"), num_hidden_layers=52
+    )
+    model.draft_model.owns_lm_head = True
+    model.draft_model.lm_head = SimpleNamespace(quant_config=QuantConfig(quant_algo=head_algo))
+    mapper = _PassthroughMtpMapper(52)
+    head_weights = {"lm_head.weight": torch.ones(4, 4), "lm_head.weight_scale": torch.ones(1)}
+    if head_algo == QuantAlgo.W4A16_NVFP4:
+        head_weights["lm_head.weight_scale_2"] = torch.ones(1)
+    weights = {
+        **_nemotron_style_mtp_weights(include_shared_head=False),
+        **head_weights,
+        "model.embed_tokens.weight": torch.zeros(4, 4),
+    }
+
+    model.load_draft_weights(weights, mapper)
+
+    assert loaded["allow_partial_loading"] is False
+    assert loaded["skip_modules"] == ["shared_head"]
+    assert "mtp_layers.0.layers.0.enorm.weight" in loaded["weights"]
+    assert "model.embed_tokens.weight" not in loaded["weights"]
+    for name, value in head_weights.items():
+        assert loaded["weights"][name] is value
+        with pytest.raises(ValueError, match="missing " + name):
+            model.load_draft_weights({k: v for k, v in weights.items() if k != name}, mapper)
+
+    model.draft_model.owns_lm_head = False
+    model.load_draft_weights(weights, mapper)
+    assert not any(name.startswith("lm_head.") for name in loaded["weights"])
