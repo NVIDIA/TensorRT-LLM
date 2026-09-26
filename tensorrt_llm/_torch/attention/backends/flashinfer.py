@@ -2277,6 +2277,22 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             # its indptr.cpu()/get_seq_lens calls stay free of D2H syncs.
             paged_kv_indptr = self._host_paged_kv_indptr_decode
             assert paged_kv_indptr is not None
+            paged_kv_indptr = paged_kv_indptr[:self.num_generations + 1]
+            last_page_len = self.paged_kv_last_page_len[self.num_contexts:]
+            if (self.is_cuda_graph and self.num_contexts == 0
+                    and decode_wrapper._backend in ('fa2', 'auto')):
+                padding = self._paged_kv_last_page_len.numel(
+                ) - self.num_generations
+                if padding > 0:
+                    # FA2 graph plans retain the wrapper's constructor batch.
+                    # Empty trailing rows need both zero page counts and lengths.
+                    # This pads only plan metadata; the graph runner still owns
+                    # the legal dummy requests and Q/K/V padding used for replay.
+                    paged_kv_indptr = maybe_pin_memory(
+                        torch.nn.functional.pad(paged_kv_indptr, (0, padding),
+                                                value=int(paged_kv_indptr[-1])))
+                    self._paged_kv_last_page_len[self.num_generations:].zero_()
+                    last_page_len = self._paged_kv_last_page_len
             # Persistent, host-built block table: skips flashinfer's
             # per-request rebuild loop, whose GPU-scalar slice bounds cost
             # one sync + one scalar D2H per generation request per plan.
@@ -2285,9 +2301,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 block_tables = self._build_decode_block_tables(
                     plan_params, wrappers)
             decode_wrapper.plan(
-                paged_kv_indptr[:self.num_generations + 1],
+                paged_kv_indptr,
                 self.paged_kv_indices[self.num_context_blocks:],
-                self.paged_kv_last_page_len[self.num_contexts:],
+                last_page_len,
                 plan_params.num_heads,
                 plan_params.num_kv_heads,
                 plan_params.head_dim,
