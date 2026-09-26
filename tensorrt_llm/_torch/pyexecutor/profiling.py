@@ -749,11 +749,16 @@ class PyExecutorProfileManager:
                 active_enable_torch_trace = False
 
             should_capture_timing = executor.print_log or executor.enable_iter_perf_stats
+            should_capture_gpu_timing = (
+                executor.print_log or executor._should_capture_iter_gpu_timing()
+            )
             if should_capture_timing and start_time is not None:
                 end_time = time.time()
-                # Iteration logs require every duration. Statistics omit a
-                # GPU duration when obtaining it would delay inference.
-                prev_device_step_time = loop_timing.finish(it, synchronize=executor.print_log)
+                prev_device_step_time = None
+                if should_capture_gpu_timing:
+                    # Iteration logs require every duration. Statistics omit a
+                    # GPU duration when obtaining it would delay inference.
+                    prev_device_step_time = loop_timing.finish(it, synchronize=executor.print_log)
 
                 host_step_time = (end_time - start_time) * 1000  # ms
                 executor._latest_host_step_time_ms = host_step_time
@@ -871,7 +876,7 @@ class PyExecutorProfileManager:
 
             calibrator.pre_step(it)
             start_time = time.time()
-            if should_capture_timing:
+            if should_capture_gpu_timing:
                 loop_timing.start(it)
 
         try:

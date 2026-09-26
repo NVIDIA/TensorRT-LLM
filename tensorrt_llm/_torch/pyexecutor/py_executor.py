@@ -1903,6 +1903,14 @@ class PyExecutor:
     def set_gather_responses(self, gather_all_responses):
         self.gather_all_responses = gather_all_responses
 
+    def _should_capture_iter_gpu_timing(self) -> bool:
+        # Joined ADP reports use rank-zero timings; other ranks only need
+        # these events for explicit logging or request performance metrics.
+        return self.enable_iter_perf_stats and (self.print_log
+                                                or self.perf_manager.enabled
+                                                or not self.enable_attention_dp
+                                                or self.dist.rank == 0)
+
     @property
     def should_stop_processing(self):
         return self.is_shutdown and len(self.active_requests) == 0 and \
@@ -2864,7 +2872,7 @@ class PyExecutor:
                     gpu_forward_start = None
                     gpu_forward_end = None
                     gpu_forward_events_from_perf_pool = False
-                    if self.enable_iter_perf_stats:
+                    if self._should_capture_iter_gpu_timing():
                         gpu_forward_start, gpu_forward_end = self.perf_manager.borrow_forward_timing_events(
                         )
                         gpu_forward_events_from_perf_pool = True
@@ -4432,7 +4440,8 @@ class PyExecutor:
                     # GPU and CPU timing for perf metrics
                     gpu_forward_start, gpu_forward_end, gpu_sample_end = self.perf_manager.create_timing_events(
                     )
-                    if self.enable_iter_perf_stats and gpu_forward_start is None:
+                    if self._should_capture_iter_gpu_timing(
+                    ) and gpu_forward_start is None:
                         gpu_forward_start, gpu_forward_end = self.perf_manager.borrow_forward_timing_events(
                         )
                         gpu_forward_events_from_perf_pool = True
@@ -5310,7 +5319,8 @@ class PyExecutor:
                     # GPU timing for perf metrics
                     gpu_forward_start, gpu_forward_end, gpu_sample_end = self.perf_manager.create_timing_events(
                     )
-                    if self.enable_iter_perf_stats and gpu_forward_start is None:
+                    if self._should_capture_iter_gpu_timing(
+                    ) and gpu_forward_start is None:
                         gpu_forward_start, gpu_forward_end = self.perf_manager.borrow_forward_timing_events(
                         )
                         gpu_forward_events_from_perf_pool = True
