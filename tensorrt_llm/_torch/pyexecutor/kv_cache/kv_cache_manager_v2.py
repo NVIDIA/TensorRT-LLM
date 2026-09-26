@@ -4390,6 +4390,12 @@ class KVCacheManagerV2(BaseResourceManager):
         return [_CACHE_TIER_NAMES.get(tier, str(tier)) for tier in self.impl.cache_tier_list]
 
     def _stats_life_cycle_metadata(self) -> dict[int, tuple[int, Optional[int], str]]:
+        if self._stats_metadata_cache is not None:
+            return {
+                life_cycle_id: (pool_id, window_size, kind)
+                for life_cycle_id, pool_id, window_size, kind in self._stats_metadata_cache.life_cycles
+            }
+
         # life cycle (== layer group) -> pool group is static structure exposed by
         # the public pool_group_descs API; no introspection needed.
         pool_groups_by_life_cycle = {
