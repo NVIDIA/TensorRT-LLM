@@ -49,10 +49,12 @@ QkvLayout AttentionInputLayoutToQkvLayout(AttentionInputLayout layout)
 
 FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
     : mFixedParams(fixedParams)
-    // TRTLLM-GEN only supports power of 2 head sizes (and 80 with padding).
-    // The exception will fall back to fmha v2.
+    // TRTLLM-GEN has no head-size 72 kernel or packed-QKV head-size 104 vision kernel.
+    // Keep mixed Q/KV precisions on TRTLLM-GEN: fmha v2 requires matching types.
     // Please update fmha_v2/setup.py if you want to add more supported head sizes.
-    , mUseTllmGen(tensorrt_llm::common::isSM100Family() && fixedParams.headSize != 72)
+    , mUseTllmGen(tensorrt_llm::common::isSM100Family() && fixedParams.headSize != 72
+          && !(fixedParams.headSize == 104 && fixedParams.attentionInputLayout == AttentionInputLayout::PACKED_QKV
+              && fixedParams.dataType == fixedParams.dataTypeKv))
     , mMultiProcessorCount(tensorrt_llm::common::getMultiProcessorCount())
 {
     if (mUseTllmGen)
