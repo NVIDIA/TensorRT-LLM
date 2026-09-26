@@ -105,6 +105,8 @@ struct BufferConfig
     // If set, overrides tokens_per_block for this buffer.
     // Must be a divisor of KVCacheManagerConfig::tokensPerBlock.
     std::optional<int> tokensPerBlockOverride;
+
+    bool isSparse = false; //!< Whether history uses the sparse attention lifecycle.
 };
 
 // ---------------------------------------------------------------------------
@@ -156,6 +158,13 @@ struct AttentionLayerConfig
     void validate() const
     {
         detail::validateNoDuplicateBufferRoles(buffers);
+        for (auto const& buf : buffers)
+        {
+            if (buf.isSparse != buffers.front().isSparse)
+            {
+                throw std::invalid_argument("Sparse and non-sparse buffers cannot share an attention layer lifecycle");
+            }
+        }
     }
 };
 
@@ -176,7 +185,13 @@ struct SsmLayerConfig
         for (auto const& buf : buffers)
         {
             if (buf.tokensPerBlockOverride.has_value())
+            {
                 throw std::invalid_argument("tokensPerBlockOverride not supported for SSM layers");
+            }
+            if (buf.isSparse)
+            {
+                throw std::invalid_argument("Sparse buffers are only supported for attention layers");
+            }
         }
     }
 };

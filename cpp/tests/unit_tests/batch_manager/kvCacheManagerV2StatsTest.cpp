@@ -356,15 +356,13 @@ TEST(KvCacheManagerV2StatsTest, MigrationAndLastTierDropRecordersReceiveExactPag
     }
 
     auto cache = manager->createKvCache();
-    std::vector<BatchedLockTarget> targets;
     for (BlockOrdinal ordinal{0}; ordinal < BlockOrdinal{2}; ++ordinal)
     {
         auto const& page = firstPages[toSizeT(ordinal)];
         ASSERT_TRUE(page->scheduledForEviction());
         storage.excludeFromEviction(*page);
-        targets.push_back({page, kDefaultBeamIndex, ordinal, lifeCycle});
     }
-    storage.batchedMigrateToGpu(targets, migrationRecorder);
+    storage.batchedMigrate(kHotLevel, firstPages, migrationRecorder);
     EXPECT_EQ(onboarded, 2);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     for (size_t index = 0; index < firstPages.size(); ++index)
@@ -388,7 +386,6 @@ TEST(KvCacheManagerV2StatsTest, MigrationAndLastTierDropRecordersReceiveExactPag
     auto secondPages = makeCommittedPages(std::move(temporarySlots[lifeCycle]));
     (void) secondPages;
     firstPages.clear();
-    targets.clear();
 
     auto finalSlots = storage.newGpuSlots(twoSlots, migrationRecorder, dropRecorder);
     EXPECT_EQ(offloaded, 6);

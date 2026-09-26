@@ -46,7 +46,7 @@ extern bool const gDebug; // true == debug mode (expensive assertions enabled)
 
 enum class PageStatus : int
 {
-    LOCKED = 0,    // Required in GPU. Eviction/dropping not allowed.
+    LOCKED = 0,    // Pinned at the current storage level. Eviction/dropping not allowed.
     HELD = 1,      // Allow eviction but not dropping.
     DROPPABLE = 2, // Allow eviction and dropping.
 };
@@ -78,6 +78,7 @@ enum class PageIndexMode : int
 using CacheLevel = StrongIndex<int, struct CacheLevelTag, 0>;
 // The kernel-facing hot level; colder levels may also use GPU memory.
 inline constexpr CacheLevel kHotLevel{0};
+inline constexpr CacheLevel kHostLevel{1}; // Sparse history requires HOST_MEM at this level.
 
 // Opaque request identifier shared with the rest of the batch manager.
 using RequestIdType = tensorrt_llm::batch_manager::RequestIdType;

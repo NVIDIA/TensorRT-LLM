@@ -26,6 +26,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
+#include <set>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -205,6 +206,13 @@ SharedPtr<Page> KvCache::_page(BlockOrdinal ordinal, BeamIndex beamIdx, LifeCycl
     return blockPageGetPage(blockPage);
 }
 
+CacheLevel KvCache::_lockLevel(Page const& page, BlockOrdinal ordinal) const
+{
+    bool const readOnly = page.isCommitted()
+        || (ordinal != kBadBlockOrdinal && ordinal < BlockOrdinal{mHistoryLength / mTokensPerBlock});
+    return readOnly && page.cacheLevel > kHotLevel && page.canLockAt(kHostLevel) ? kHostLevel : kHotLevel;
+}
+
 void KvCache::activate()
 {
     TLLM_CHECK_DEBUG(mStatus == Status::SUSPENDED);
@@ -212,7 +220,7 @@ void KvCache::activate()
 
     mFinishEvent.reset();
 
-    // Lock only active (non-stale) pages to GPU — mirrors Python's _active_pages().
+    // Cold sparse history stays on host; writable pages require GPU storage.
     auto activePages = _activePages();
     std::vector<BatchedLockTarget> targets;
     targets.reserve(activePages.size());
@@ -230,11 +238,11 @@ void KvCache::activate()
         }
         auto& holder = std::get<SharedPtr<PageHolder>>(*bp);
         TLLM_CHECK_DEBUG(holder);
-        targets.push_back({holder->page, ap.beamIdx, ap.ordinal, ap.lcId});
+        targets.push_back({holder->page, ap.beamIdx, ap.ordinal, ap.lcId, _lockLevel(*holder->page, ap.ordinal)});
     }
 
     {
-        auto locks = batchedLockToGpu(*this, targets);
+        auto locks = batchedLockPages(*this, targets);
         size_t idx = 0;
         for (auto& t : targets)
         {
@@ -396,7 +404,8 @@ bool KvCache::resume(std::optional<CUstream> stream)
             streamWaitEvents(reinterpret_cast<CudaStream>(cudaStr), std::move(slotEvents));
         }
 
-        // Phase 1: Copy GPU→GPU from locked source pages to pre-allocated slots.
+        // Phase 1: Copy locked sources into private GPU slots. A shared sparse
+        // prefix may be locked on host by another request and must stay there.
         std::vector<SharedPageLock*> srcLocks;
         for (LifeCycleId lcIdx{0}; lcIdx < numLc; ++lcIdx)
         {
@@ -420,7 +429,8 @@ bool KvCache::resume(std::optional<CUstream> stream)
             bool const hasPartialReuseSource = _hasReuseSource(*sourcePage);
             srcLocks.push_back(lock);
 
-            storageMgr.copySlotData(lcIdx, kHotLevel, kHotLevel, newSlot.slotId(), lock->page()->slotId(), cudaStr);
+            CacheLevel const sourceLevel = lock->page()->cacheLevel;
+            storageMgr.copySlotData(lcIdx, kHotLevel, sourceLevel, newSlot.slotId(), lock->page()->slotId(), cudaStr);
             if ((!ssmLcId.has_value() || lcIdx != *ssmLcId) && (recordManagerStats || recordRequestStats))
             {
                 bool const changed = mPendingStats.recordAllocationRange(lcIdx, lastOrdinal, lastOrdinal + 1,
@@ -432,8 +442,16 @@ bool KvCache::resume(std::optional<CUstream> stream)
                 }
             }
             KVCacheIterationStatsDelta iterationStats;
-            iterationStats.iterIntraDeviceCopyBlocks = 1;
-            iterationStats.iterIntraDeviceCopyBytes = sumSlotBytes(storageMgr, kHotLevel, lcIdx);
+            if (sourceLevel == kHotLevel)
+            {
+                iterationStats.iterIntraDeviceCopyBlocks = 1;
+                iterationStats.iterIntraDeviceCopyBytes = sumSlotBytes(storageMgr, sourceLevel, lcIdx);
+            }
+            else
+            {
+                iterationStats.iterOnboardBlocks = 1;
+                iterationStats.iterOnboardBytes = sumSlotBytes(storageMgr, sourceLevel, lcIdx);
+            }
             _recordDirectIterationStats(lcIdx, iterationStats);
         }
 
@@ -501,9 +519,8 @@ bool KvCache::prefetch(CacheLevel target)
     TLLM_CHECK_DEBUG(kHotLevel <= target && target < numTiers);
 
     LifeCycleId const numLifeCycles = storageMgr.numLifeCycles();
-    TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> allPages(
-        numLifeCycles, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>(numTiers));
-
+    TypedVec<CacheLevel, std::vector<SharedPtr<Page>>> pagesByDestination(numTiers);
+    std::set<Page*> seen;
     for (auto const& activePage : _activePages())
     {
         auto page = _page(activePage.ordinal, activePage.beamIdx, activePage.lcId);
@@ -511,23 +528,30 @@ bool KvCache::prefetch(CacheLevel target)
         {
             continue;
         }
-        CacheLevel const level = page->cacheLevel;
-        if (level < target)
+        CacheLevel const destination = std::max(target, _lockLevel(*page, activePage.ordinal));
+        if (page->cacheLevel < destination || !seen.insert(page.get()).second)
         {
             continue;
         }
-        allPages.at(activePage.lcId).at(level).push_back(std::move(page));
+        pagesByDestination.at(destination).push_back(std::move(page));
     }
 
     try
     {
-        // StorageManager reports what it actually migrated. Blocks, the unit iterOffloadBlocks and
-        // iterOnboardBlocks use: one page per block per life cycle. Unrelated to
-        // mCachedTokensByLevel, which answers where reuse-matched tokens lived.
-        int64_t const diskBlocksMigrated = storageMgr.prefetch(target, allPages);
-        if (diskBlocksMigrated > 0 && _shouldRecordManagerStats())
+        for (CacheLevel destination = target; destination < numTiers; ++destination)
         {
-            mManager->recordDiskPrefetchBlocks(diskBlocksMigrated);
+            if (pagesByDestination[destination].empty())
+                continue;
+            // Earlier allocations may have evicted held pages in another group.
+            // Read their source levels immediately before this migration.
+            TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> allPages(
+                numLifeCycles, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>(numTiers));
+            for (auto const& page : pagesByDestination[destination])
+                allPages.at(page->lifeCycle).at(page->cacheLevel).push_back(page);
+
+            int64_t const diskBlocksMigrated = storageMgr.prefetch(destination, allPages);
+            if (diskBlocksMigrated > 0 && _shouldRecordManagerStats())
+                mManager->recordDiskPrefetchBlocks(diskBlocksMigrated);
         }
     }
     catch (OutOfPagesError const&)
@@ -1464,7 +1488,7 @@ std::vector<KvCache::StaleBackup> KvCache::_unlockStaleBlocks(int newHistoryLeng
                 }
                 TLLM_CHECK_DEBUG(std::holds_alternative<SharedPageLock>(bp));
                 auto holder = blockPageGetPage(bp)->hold();
-                ret.push_back({ord, bi, lcIdx, holder});
+                ret.push_back({ord, bi, lcIdx, holder, holder->page->cacheLevel});
                 bp = holdForCommit ? BlockPage{std::move(holder)} : BlockPage{std::monostate{}};
             }
         }
@@ -1477,9 +1501,9 @@ void KvCache::_lockHeldBlocks(std::vector<StaleBackup> const& backup)
     std::vector<BatchedLockTarget> targets;
     targets.reserve(backup.size());
     for (auto const& b : backup)
-        targets.push_back({b.holder->page, b.beamIdx, b.ordinal, b.lcId});
+        targets.push_back({b.holder->page, b.beamIdx, b.ordinal, b.lcId, b.cacheLevel});
 
-    auto locks = batchedLockToGpu(*this, targets);
+    auto locks = batchedLockPages(*this, targets);
     for (size_t i = 0; i < locks.size(); ++i)
     {
         auto const& t = backup[i];
@@ -1667,13 +1691,13 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
                     auto holder = blockPageGetPage(bp)->hold();
                     bp = std::move(holder);
                 }
-                reuseTasks.push_back(
-                    {existingPage->sharedFromThis(), kDefaultBeamIndex, static_cast<BlockOrdinal>(ord), lc});
+                reuseTasks.push_back({existingPage->sharedFromThis(), kDefaultBeamIndex, static_cast<BlockOrdinal>(ord),
+                    lc, _lockLevel(*existingPage, static_cast<BlockOrdinal>(ord))});
             }
         }
         if (!reuseTasks.empty())
         {
-            auto locks = batchedLockToGpu(*this, reuseTasks);
+            auto locks = batchedLockPages(*this, reuseTasks);
             for (size_t ri = 0; ri < reuseTasks.size(); ++ri)
             {
                 LifeCycleId lc = reuseTasks[ri].lifeCycle;

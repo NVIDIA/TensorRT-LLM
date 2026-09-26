@@ -1124,6 +1124,11 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
         return updateSrc ? std::nullopt : std::optional<std::vector<Slot>>{std::in_place};
     }
 
+    if (updateSrc && !defrag
+        && std::any_of(
+            srcPages.begin(), srcPages.end(), [](auto const& page) { return page->status() == PageStatus::LOCKED; }))
+        throw LogicError("Cannot migrate a locked page between storage levels");
+
     SlotCount const numSlots = slotCountValueFromSize(srcPages.size());
     LifeCycleId const firstLifeCycle = srcPages.front()->lifeCycle;
     LayerGroupId const batchingLayerGroupId = getMigrationBatchingLayerGroupId(dstLevel, srcLevel, firstLifeCycle);
@@ -1235,25 +1240,26 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
 }
 
 // ---------------------------------------------------------------------------
-// batchedMigrateToGpu
+// batchedMigrate
 // ---------------------------------------------------------------------------
 
-void StorageManager::batchedMigrateToGpu(
-    std::vector<BatchedLockTarget> const& targets, MigrationRecorder const& migrationRecorder)
+void StorageManager::batchedMigrate(
+    CacheLevel dstLevel, std::vector<SharedPtr<Page>> const& pages, MigrationRecorder const& migrationRecorder)
 {
     std::map<MigrationBatchKey, std::vector<SharedPtr<Page>>> groups;
-    for (auto const& t : targets)
+    std::set<Page*> seen;
+    for (auto const& page : pages)
     {
-        if (t.page->cacheLevel == kHotLevel)
+        if (page->cacheLevel == dstLevel || !seen.insert(page.get()).second)
         {
             continue;
         }
-        CacheLevel const srcLevel = t.page->cacheLevel;
-        groups[{srcLevel, getMigrationBatchingLayerGroupId(kHotLevel, srcLevel, t.lifeCycle)}].push_back(t.page);
+        CacheLevel const srcLevel = page->cacheLevel;
+        groups[{srcLevel, getMigrationBatchingLayerGroupId(dstLevel, srcLevel, page->lifeCycle)}].push_back(page);
     }
-    for (auto& [key, pages] : groups)
+    for (auto& [key, group] : groups)
     {
-        _batchedMigrate(kHotLevel, key.first, pages, /*updateSrc=*/true, migrationRecorder);
+        _batchedMigrate(dstLevel, key.first, group, /*updateSrc=*/true, migrationRecorder);
     }
 }
 
