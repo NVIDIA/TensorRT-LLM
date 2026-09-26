@@ -48,10 +48,7 @@ inline __device__ float reduce(float x, Params const& params, int* barrier, int 
 {
 
     // The M dimension of the CTA tile.
-    enum
-    {
-        M = Kernel_traits::Cta_tile_p::M
-    };
+    static constexpr int M = Kernel_traits::Cta_tile_p::M;
 
     // Make sure it does not exceed the CTA size.
     static_assert(M <= Kernel_traits::Cta_tile_p::THREADS_PER_CTA, "");
@@ -180,26 +177,14 @@ inline __device__ void device_1xN_multi_cta(Params const& params)
     using Smem_tile_o = typename Kernel_traits::Smem_tile_o;
 
     // Do we use LDGSTS for Q, K or V?
-    enum
-    {
-        USE_LDGSTS_Q = Kernel_traits::USE_LDGSTS_Q
-    };
+    static constexpr int USE_LDGSTS_Q = Kernel_traits::USE_LDGSTS_Q;
 
-    enum
-    {
-        USE_LDGSTS_K = Kernel_traits::USE_LDGSTS_K
-    };
+    static constexpr int USE_LDGSTS_K = Kernel_traits::USE_LDGSTS_K;
 
-    enum
-    {
-        USE_LDGSTS_V = Kernel_traits::USE_LDGSTS_V
-    };
+    static constexpr int USE_LDGSTS_V = Kernel_traits::USE_LDGSTS_V;
 
     // Do we use LDGSTS for any of the 3 input matrices.
-    enum
-    {
-        USE_LDGSTS = USE_LDGSTS_Q || USE_LDGSTS_K || USE_LDGSTS_V
-    };
+    static constexpr int USE_LDGSTS = USE_LDGSTS_Q || USE_LDGSTS_K || USE_LDGSTS_V;
 
     // If either K or V uses LDGSTS, they cannot share a buffer.
     static_assert(!(USE_LDGSTS_K || USE_LDGSTS_V) || !Kernel_traits::SHARE_SMEM_FOR_K_AND_V, "");

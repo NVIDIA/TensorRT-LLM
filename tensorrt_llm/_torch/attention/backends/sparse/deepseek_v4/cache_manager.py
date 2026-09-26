@@ -57,7 +57,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
-from .compressor import NVFP4_COMPRESS_RESIDUAL_DIM, KVCacheDtype
+from .compressor import KVCacheDtype, get_nvfp4_compress_residual_dim
 from .kernels import (
     check_sparse_read_table,
     merge_sparse_read_table,
@@ -112,6 +112,7 @@ def get_token_bytes(
     indexer_k_dtype: str = "fp8",
     use_fp8_ds_mla: bool = False,
     has_nvfp4_compress: bool = False,
+    nvfp4_residual_dim: int | None = None,
 ) -> int:
     if not compress_ratio_has_attention(compress_ratio, attn_type):
         raise ValueError(
@@ -156,7 +157,9 @@ def get_token_bytes(
         )
 
     if attn_type == DeepseekV4AttentionType.COMPRESS and has_nvfp4_compress:
-        storage_dim = attn_dim + NVFP4_COMPRESS_RESIDUAL_DIM
+        if nvfp4_residual_dim is None:
+            nvfp4_residual_dim = get_nvfp4_compress_residual_dim()
+        storage_dim = attn_dim + nvfp4_residual_dim
         return storage_dim // 2 + storage_dim // NVFP4_VECTOR_SIZE
 
     return attn_dim * dtype_bytes
@@ -170,6 +173,7 @@ def _estimate_non_sliding_attn_size_per_token(
     indexer_k_dtype: str = "fp8",
     use_fp8_ds_mla: bool = False,
     has_nvfp4_compress: bool = False,
+    nvfp4_residual_dim: int | None = None,
 ) -> int:
     total_bytes = 0
     for compress_ratio in compress_ratios:
@@ -184,6 +188,7 @@ def _estimate_non_sliding_attn_size_per_token(
                     indexer_k_dtype=indexer_k_dtype,
                     use_fp8_ds_mla=use_fp8_ds_mla,
                     has_nvfp4_compress=has_nvfp4_compress,
+                    nvfp4_residual_dim=nvfp4_residual_dim,
                 )
     return total_bytes
 
@@ -253,6 +258,7 @@ def _get_attn_bytes_per_token(
     indexer_k_dtype: str = "fp8",
     use_fp8_ds_mla: bool = False,
     has_nvfp4_compress: bool = False,
+    nvfp4_residual_dim: int | None = None,
 ) -> int:
     token_bytes = get_token_bytes(
         head_dim,
@@ -263,6 +269,7 @@ def _get_attn_bytes_per_token(
         indexer_k_dtype=indexer_k_dtype,
         use_fp8_ds_mla=use_fp8_ds_mla,
         has_nvfp4_compress=has_nvfp4_compress,
+        nvfp4_residual_dim=nvfp4_residual_dim,
     )
     if attn_type in [DeepseekV4AttentionType.COMPRESS, DeepseekV4AttentionType.INDEXER_COMPRESS]:
         token_bytes //= compress_ratio
@@ -380,6 +387,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         self._swa_window_size = sparse_attn_config.window_size
         self._compressor_dtype = compressor_dtype
         self._use_nvfp4_compress = dtype == DataType.NVFP4
+        self._nvfp4_residual_dim = get_nvfp4_compress_residual_dim()
         cache_dtype = DataType.FP8 if self._use_nvfp4_compress else dtype
         # If MTP is enabled, append compress ratios for MTP virtual layers.
         # MTP adds (max_draft_len - 1) extra layers that mirror the last real
@@ -465,6 +473,11 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     COMPRESS_BLOCK_SCALE_ROLE,
                     PageIndexMode.SHARED,
                 )
+
+    @property
+    def nvfp4_residual_dim(self) -> int:
+        """Residual dimensions fixed when the NVFP4 cache is constructed."""
+        return self._nvfp4_residual_dim if self._use_nvfp4_compress else 0
 
     def _assert_nvfp4_compress_pool_layout(self) -> None:
         if not self._use_nvfp4_compress:
@@ -557,7 +570,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
 
             dim_per_token = footer_scale_kv.TOKEN_BYTES
         elif attn_type == DeepseekV4AttentionType.COMPRESS and self._use_nvfp4_compress:
-            dim_per_token = (attn_dim + NVFP4_COMPRESS_RESIDUAL_DIM) // 2
+            dim_per_token = (attn_dim + self.nvfp4_residual_dim) // 2
         else:
             dim_per_token = attn_dim
 
@@ -601,7 +614,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         shape = (
             page_index_upper_bound,
             self.compressed_block_sizes[layer_idx],
-            (self.head_dim + NVFP4_COMPRESS_RESIDUAL_DIM) // NVFP4_VECTOR_SIZE,
+            (self.head_dim + self.nvfp4_residual_dim) // NVFP4_VECTOR_SIZE,
         )
         return convert_to_torch_tensor(TensorWrapper(addr, DataType.FP8, shape))
 
@@ -622,11 +635,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             TensorWrapper(
                 self.compress_pool_ptrs[compress_ratio],
                 DataType.UINT8,
-                [
-                    data_pages
-                    * tokens_per_page
-                    * ((self.head_dim + NVFP4_COMPRESS_RESIDUAL_DIM) // 2)
-                ],
+                [data_pages * tokens_per_page * ((self.head_dim + self.nvfp4_residual_dim) // 2)],
             )
         )
         scales = convert_to_torch_tensor(
@@ -636,7 +645,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 [
                     scale_pages
                     * tokens_per_page
-                    * ((self.head_dim + NVFP4_COMPRESS_RESIDUAL_DIM) // NVFP4_VECTOR_SIZE)
+                    * ((self.head_dim + self.nvfp4_residual_dim) // NVFP4_VECTOR_SIZE)
                 ],
             )
         )
@@ -948,6 +957,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
             has_nvfp4_compress=self._use_nvfp4_compress,
+            nvfp4_residual_dim=self.nvfp4_residual_dim,
         )
         (
             context_swa_size_per_token,
@@ -1004,6 +1014,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
             has_nvfp4_compress=self._use_nvfp4_compress,
+            nvfp4_residual_dim=self.nvfp4_residual_dim,
         )
         context_swa_size_per_token, _ = _estimate_swa_cache_size(
             self.head_dim,
@@ -1062,9 +1073,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         nvfp4_padding_pages: Dict[int, int] = {}
         if self._use_nvfp4_compress:
             compress_layers_by_scale_page_size: Dict[int, List[int]] = defaultdict(list)
-            scale_bytes_per_token = (
-                self.head_dim + NVFP4_COMPRESS_RESIDUAL_DIM
-            ) // NVFP4_VECTOR_SIZE
+            scale_bytes_per_token = (self.head_dim + self.nvfp4_residual_dim) // NVFP4_VECTOR_SIZE
             for layer_idx in self.pp_layers:
                 compress_ratio = self._compress_ratios[layer_idx]
                 if compress_ratio_has_attention(compress_ratio, DeepseekV4AttentionType.COMPRESS):
@@ -1105,7 +1114,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             if self._use_nvfp4_compress and DeepseekV4AttentionType.COMPRESS in attention_types:
                 scale_page_size = (
                     self.compressed_block_sizes[layer_idx]
-                    * (self.head_dim + NVFP4_COMPRESS_RESIDUAL_DIM)
+                    * (self.head_dim + self.nvfp4_residual_dim)
                     // NVFP4_VECTOR_SIZE
                 )
                 buffers.append(
@@ -1330,10 +1339,11 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
             has_nvfp4_compress=self._use_nvfp4_compress,
+            nvfp4_residual_dim=self.nvfp4_residual_dim,
         )
 
         if attn_type == DeepseekV4AttentionType.COMPRESS and self._use_nvfp4_compress:
-            token_bytes = (self.head_dim + NVFP4_COMPRESS_RESIDUAL_DIM) // 2
+            token_bytes = (self.head_dim + self.nvfp4_residual_dim) // 2
 
         block_size = self.tokens_per_block
         if attn_type in [
@@ -1356,6 +1366,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
             has_nvfp4_compress=self._use_nvfp4_compress,
+            nvfp4_residual_dim=self.nvfp4_residual_dim,
         )
 
     def get_max_resource_count(self) -> int:
@@ -1401,6 +1412,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
             has_nvfp4_compress=self._use_nvfp4_compress,
+            nvfp4_residual_dim=self.nvfp4_residual_dim,
         )
         swa_size_per_token, swa_size_per_request = _estimate_swa_cache_size(
             self.head_dim,

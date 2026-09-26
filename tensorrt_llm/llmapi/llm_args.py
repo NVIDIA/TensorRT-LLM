@@ -79,7 +79,6 @@ from .utils import (StrictBaseModel, generate_api_docs_as_docstring,
                     get_type_repr)
 
 TypeBaseModel = TypeVar("T", bound=BaseModel)
-_TRTLLM_JSON_SCHEMA_EXTRA_ATTR = "_trtllm_json_schema_extra"
 
 if TYPE_CHECKING:
     # Runtime methods import QSA params locally to avoid loading the sparse
@@ -113,7 +112,8 @@ def Field(default: Any = ...,
             telemetry=TelemetryField.categorical(...) to opt an otherwise unsafe
             categorical branch in with exact allowed values, or telemetry=False
             to opt a type-safe field out.
-        **kwargs: All other arguments passed to the original Pydantic Field
+        **kwargs: All other arguments passed to the original Pydantic Field.
+            json_schema_extra must be a dict when status or telemetry is set.
 
     Returns:
         A Pydantic FieldInfo object with extra metadata added to
@@ -124,7 +124,9 @@ def Field(default: Any = ...,
 
     if status is not None or telemetry_requested or telemetry_explicit_exclude:
         trtllm_schema_extra: dict[str, Any] = {}
-        json_schema_extra = kwargs.get('json_schema_extra', {})
+        json_schema_extra = kwargs.get('json_schema_extra')
+        if json_schema_extra is None:
+            json_schema_extra = {}
         if status is not None:
             trtllm_schema_extra['status'] = status
         if telemetry_explicit_exclude:
@@ -142,35 +144,21 @@ def Field(default: Any = ...,
                 raise TypeError(
                     "telemetry must be bool, dict, or TelemetryField")
             trtllm_schema_extra['telemetry'] = telemetry_metadata
-        if isinstance(json_schema_extra, dict):
-            json_schema_extra = {**json_schema_extra, **trtllm_schema_extra}
-        elif callable(json_schema_extra):
-            original_json_schema_extra = json_schema_extra
-
-            def merged_json_schema_extra(schema: dict[str, Any]) -> None:
-                original_extra = original_json_schema_extra(schema)
-                if isinstance(original_extra, dict):
-                    schema.update(original_extra)
-                schema.update(trtllm_schema_extra)
-
-            setattr(merged_json_schema_extra, _TRTLLM_JSON_SCHEMA_EXTRA_ATTR,
-                    trtllm_schema_extra)
-            json_schema_extra = merged_json_schema_extra
-        else:
-            json_schema_extra = trtllm_schema_extra
-        kwargs['json_schema_extra'] = json_schema_extra
+        if not isinstance(json_schema_extra, dict):
+            raise TypeError(
+                "json_schema_extra must be a dict when status or telemetry metadata is set"
+            )
+        kwargs['json_schema_extra'] = {
+            **json_schema_extra,
+            **trtllm_schema_extra
+        }
 
     return PydanticField(default, **kwargs)
 
 
 def _get_trtllm_json_schema_extra(field_info: Any) -> dict[str, Any]:
     json_schema_extra = getattr(field_info, "json_schema_extra", None)
-    if callable(json_schema_extra):
-        json_schema_extra = getattr(json_schema_extra,
-                                    _TRTLLM_JSON_SCHEMA_EXTRA_ATTR, None)
-    if isinstance(json_schema_extra, dict):
-        return json_schema_extra
-    return {}
+    return json_schema_extra if isinstance(json_schema_extra, dict) else {}
 
 
 class BaseCudaGraphConfig(StrictBaseModel):
@@ -761,6 +749,27 @@ class QSASparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             "geometry is loaded; an explicit value below token_topk is raised "
             "to token_topk because it cannot reduce attention work."),
     )
+    enable_heuristic_topk: bool = Field(
+        default=False,
+        description=
+        "Whether to enable the Guess-Verify-Refine (GVR) Top-K for the QSA "
+        "indexer instead of the exact radix Top-K. QSA dispatches only the "
+        "hint-free self-sampling engine, which requires Blackwell (SM100/103), "
+        "the CUTLASS DSL, a compressed-group budget "
+        "(indexer_budget / indexer_compress_ratio) in {512, 1024, 2048}, and "
+        "an indexer_compress_ratio of 4. Falls back to the exact radix "
+        "Top-K with a one-time warning when the prerequisites are not met.")
+    index_share_for_mtp_iteration: Optional[bool] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Whether the MTP draft loop reuses the indexer selection captured by "
+        "its draft-extend pass instead of re-running the indexer on every "
+        "draft decode step. The query advances by at most max_draft_len "
+        "positions, so the captured ranking is the one the indexer would "
+        "recompute; compressed groups that complete during the loop are "
+        "appended at lookup. When omitted, the checkpoint config supplies the "
+        "value, defaulting to off.")
     # Index projection dimensions, compression, and selection budget are part
     # of the checkpoint contract rather than serving-time tuning knobs.
     _resolved_params: Optional["QSASparseParams"] = PrivateAttr(default=None)
@@ -822,7 +831,16 @@ class QSASparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             compress_ratio=self._checkpoint_value(pretrained_config,
                                                   "indexer_compress_ratio"),
             seq_len_threshold=seq_len_threshold,
+            enable_heuristic_topk=self.enable_heuristic_topk,
+            mtp_index_share=self._mtp_index_share(pretrained_config),
         )
+
+    def _mtp_index_share(self, pretrained_config: object) -> bool:
+        """Resolve the draft-loop index-share opt-in from config or checkpoint."""
+        if self.index_share_for_mtp_iteration is not None:
+            return bool(self.index_share_for_mtp_iteration)
+        return bool(
+            getattr(pretrained_config, "index_share_for_mtp_iteration", False))
 
     def to_sparse_metadata_params(
             self, **kwargs: object) -> "QSASparseMetadataParams":
@@ -833,6 +851,7 @@ class QSASparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         return QSASparseMetadataParams(
             token_topk=params.token_topk,
             compress_ratio=params.compress_ratio,
+            mtp_index_share=params.mtp_index_share,
         )
 
 
@@ -1093,7 +1112,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
     use_cute_dsl_paged_mqa_logits: bool = Field(
         default=False,
         description=
-        "Whether to use CuTE DSL paged MQA logits kernel on SM100 instead of C++ DeepGEMM."
+        "Whether to use CuTE DSL paged MQA logits kernel on SM100-family GPUs instead of C++ DeepGEMM."
     )
     q_split_threshold: int = Field(
         default=8192,
@@ -1467,6 +1486,9 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         description="Target sparsity for prefill and/or decode phases. "
         "Requires formula coefficients in the model's config.json. "
         "Ignored if threshold_scale_factor is also set.")
+    uses_spcompress: bool = Field(
+        default=False,
+        description="Whether to enable spcompress (context phase, SM107 only).")
 
     @field_validator("target_sparsity")
     @classmethod
@@ -1547,7 +1569,8 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
             is not None else SkipSoftmaxScheduler.from_target_sparsity(
                 target_sparsity,
                 ckpt_sparse_attention_config=ckpt_sparse_attention_config))
-        return SkipSoftmaxParams(scheduler=scheduler)
+        return SkipSoftmaxParams(scheduler=scheduler,
+                                 uses_spcompress=self.uses_spcompress)
 
 
 class MoeLoadBalancerConfig(StrictBaseModel):
@@ -1649,8 +1672,8 @@ class MoeLoadBalancerConfig(StrictBaseModel):
         return assignments
 
 
-_MoeBackend = Literal["AUTO", "CUTLASS", "CUTEDSL", "TRTLLM", "DEEPGEMM",
-                      "DENSEGEMM", "VANILLA", "TRITON", "MARLIN",
+_MoeBackend = Literal["AUTO", "CUTLASS", "CUTEDSL", "CUTEDSL_FC12", "TRTLLM",
+                      "DEEPGEMM", "DENSEGEMM", "VANILLA", "TRITON", "MARLIN",
                       "MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"]
 
 
@@ -1959,7 +1982,8 @@ class CalibConfig(StrictBaseModel):
 class AdvancedSamplingMode(StrEnum):
     """Deploy-time specialization of the one-model advanced sampler.
 
-    FULL    - per-row tensor top_k/top_p (default; mixed per-request sampling).
+    FULL    - per-row tensor top_k/top_p/min_p in one fused kernel (default; mixed
+              per-request sampling). The only mode that accepts min_p.
     NO_TOPK - top_k disabled, top_p honored. Skips the top_k mask kernel.
     NO_TOPP - top_p disabled, top_k honored. Skips the top_p renorm kernel.
     NO_TOPK_NO_TOPP - both disabled (pure temperature sampling). Skips both kernels.
@@ -1980,6 +2004,11 @@ class AdvancedSamplingMode(StrEnum):
         """Single source of truth: does this mode disable the top_p filter?"""
         return self in (AdvancedSamplingMode.NO_TOPP,
                         AdvancedSamplingMode.NO_TOPK_NO_TOPP)
+
+    @property
+    def is_fused(self) -> bool:
+        """Whether this mode runs the fused kernel, and so accepts min_p."""
+        return self is AdvancedSamplingMode.FULL
 
 
 class _MTPDraftCheckpointType(StrEnum):
@@ -2093,8 +2122,9 @@ class DecodingBaseConfig(StrictBaseModel):
         default=AdvancedSamplingMode.FULL,
         description=
         "Deploy-time specialization of the one-model advanced sampler that skips disabled "
-        "filter kernels. FULL (default): per-row top_k/top_p. NO_TOPK: skip top_k. "
-        "NO_TOPP: skip top_p. NO_TOPK_NO_TOPP: skip both.")
+        "filter kernels. FULL (default): per-row top_k/top_p/min_p in one fused kernel, the "
+        "only mode accepting min_p. NO_TOPK: skip top_k. NO_TOPP: skip top_p. "
+        "NO_TOPK_NO_TOPP: skip both.")
 
     enable_penalty: bool = Field(
         default=False,
@@ -2725,7 +2755,7 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
         return self
 
     def supports_backend(self, backend: str) -> bool:
-        return backend == "pytorch" or backend == "_autodeploy"
+        return backend == "pytorch"
 
     @functools.cached_property
     def spec_dec_mode(self):
@@ -2857,7 +2887,7 @@ class MTPDecodingConfig(DecodingBaseConfig):
         return self
 
     def supports_backend(self, backend: str) -> bool:
-        return backend in ("pytorch", "_autodeploy")
+        return backend == "pytorch"
 
     @property
     def num_capture_layers(self) -> int:
@@ -2976,6 +3006,14 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         "TRTLLM-Gen FMHA (via FlashInfer) over a private paged context K/V cache "
         "and supports SM100/SM103 only. FA4 uses the flash-attn CuTe DSL kernels "
         "on the same paged cache and supports SM90 only.")
+
+    skip_ctx_buffer_budget_check: bool = Field(
+        default=False,
+        description=
+        "Skip the config-time check that the pooled-context K/V buffers fit in "
+        "the memory left free after the KV-cache pool commits. The estimate is "
+        "deliberately conservative; set this to proceed when you know the "
+        "device has the headroom. The token-budget check is not affected.")
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
@@ -3105,18 +3143,18 @@ class DSparkDecodingConfig(DecodingBaseConfig):
 
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
 
-    attention_backend: Literal["VANILLA", "TRTLLM"] = Field(
-        default="VANILLA",
+    attention_backend: Literal["AUTO", "VANILLA", "TRTLLM", "CUTEDSL"] = Field(
+        default="AUTO",
         description=
-        "Attention backend for the pooled-context cross-attention of a "
-        "standalone DSpark drafter (one shipped as its own checkpoint rather "
-        "than inside the target's mtp.* namespace). Ignored by the embedded "
-        "DeepSeek-V4-Pro draft, which uses its own captured-context attention. "
-        "This is independent of the backend used to construct the drafter's "
-        "standard attention modules. TRTLLM requires FlashInfer and an NVIDIA "
-        "Blackwell GPU with SM100 or SM103, and uses generated FMHA kernels "
-        "with a private paged context cache; VANILLA uses FlashAttention with "
-        "a contiguous cache.")
+        "Block-decode attention backend for a standalone DSpark drafter (one "
+        "shipped as its own checkpoint, not inside the target's mtp.* "
+        "namespace). Ignored by the embedded DeepSeek-V4-Pro draft. Independent "
+        "of the backend that builds the drafter's own attention modules.\n\n"
+        "AUTO resolves per drafter family and is right unless you are pinning a "
+        "kernel: a GQA backbone degrades when its kernel is missing, an MLA one "
+        "raises. TRTLLM needs FlashInfer and SM100/SM103. CUTEDSL is MLA-only "
+        "and needs a cute-dsl MLA decode taking per-token kv_bounds that is not "
+        "upstream yet. Which kernel each name selects: MLADSparkForCausalLM.")
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
@@ -4619,9 +4657,8 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "each server and is only logged, not surfaced, so keep context and "
         "generation server configurations consistent. 'CPP' selects the C++ "
         "transceiver, 'PYTHON' the Python transceiver. None is equivalent "
-        "to 'CPP'. 'auto' is only resolved on the PyTorch backend's "
-        "standard model-loading path; other paths (e.g. AutoDeploy) fall "
-        "back to the C++ transceiver.")
+        "to 'CPP'. 'auto' is resolved on the PyTorch backend's standard "
+        "model-loading path.")
 
     max_tokens_in_buffer: Optional[int] = Field(
         default=None,
@@ -5124,7 +5161,7 @@ class BaseLlmArgs(StrictBaseModel):
         exclude_json_schema=True,  # hide from API references
         validate_default=True,
         status="deprecated",
-        telemetry=TelemetryField.categorical('pytorch', '_autodeploy'))
+        telemetry=TelemetryField.categorical('pytorch'))
 
     return_perf_metrics: bool = Field(
         default=False,
@@ -5323,9 +5360,8 @@ class BaseLlmArgs(StrictBaseModel):
                     "lora_dir is empty, so custom embedding or lm head will not be applied."
                 )
 
-        if self.enable_lora and self.lora_config is not None and self.backend in [
-                'pytorch', '_autodeploy'
-        ]:
+        if (self.enable_lora and self.lora_config is not None
+                and self.backend == 'pytorch'):
             logger.warning(
                 f"enable_lora is ignored when lora_config is provided for {self.backend} backend."
             )
@@ -5657,6 +5693,16 @@ class TorchLlmArgs(BaseLlmArgs):
         description="Disable the overlap scheduler.",
         status="beta")
 
+    enable_return_routed_experts: bool = Field(
+        default=False,
+        description=
+        "Router Replay (R3): capture per-token pre-EPLB logical top-k MoE expert "
+        "ids so they can be returned on outputs (per request via "
+        "SamplingParams.return_routed_experts), for train/inference routing "
+        "alignment in MoE reinforcement learning. Zero overhead when disabled. "
+        "Separated-routing MoE backends only.",
+        status="beta")
+
     moe_config: MoeConfig = Field(default_factory=MoeConfig,
                                   description="MoE config.",
                                   status="beta")
@@ -5823,6 +5869,12 @@ class TorchLlmArgs(BaseLlmArgs):
     enable_iter_perf_stats: bool = Field(
         default=False,
         description="Enable iteration performance statistics.",
+        status="prototype")
+
+    enable_tokenization_cache: bool = Field(
+        default=False,
+        description=
+        "Cache the tokenization of recent prompts so that a prompt extending a cached one only tokenizes its tail, which speeds up multi-turn serving with long prompts. Requires a fast tokenizer and applies only to prompts tokenized with add_special_tokens=False and no truncation. The output is identical to tokenizing the whole prompt.",
         status="prototype")
 
     enable_iter_req_stats: bool = Field(
@@ -6264,6 +6316,128 @@ class TorchLlmArgs(BaseLlmArgs):
 
         return self
 
+    def _kv_cache_estimation_runs(self) -> bool:
+        """Whether the executor will profile a forward to size the KV pool.
+
+        Mirrors the config-time-knowable conditions of
+        ``KvCacheCreator.try_prepare_estimation``: the
+        ``TRTLLM_SKIP_KV_CACHE_ESTIMATION`` env var, a VANILLA target
+        attention backend, and context parallelism all skip estimation.
+        Encoder-decoder targets also skip it but are only known from the
+        model config at load time; they are treated as estimating here,
+        which errs toward the looser arena budget.
+        """
+        if os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "0") == "1":
+            return False
+        if self.attn_backend == "VANILLA":
+            return False
+        if self.cp_config is not None:
+            return False
+        return True
+
+    def _validate_dflash_ctx_budget(self,
+                                    memory_budget_bytes: Optional[int] = None
+                                    ) -> None:
+        """Fail at config time on DFlash setups that would die late.
+
+        Delegates to ``validate_dflash_ctx_buffer_budget``: the token-budget
+        rule (``max_batch_size * (1 + max_draft_len) <= max_num_tokens``) and
+        the pooled-context K/V buffer fit, both of which otherwise fail only
+        once the model is loaded and the first forward runs.
+
+        The buffer budget depends on when the arena is allocated relative to
+        the KV-cache pool (``_kv_cache_estimation_runs``). With estimation
+        (the default) the arena is allocated inside the estimation forward,
+        before the pool is sized, so it must fit the device total less the
+        runtime overhead, the estimated per-rank weight footprint (checkpoint
+        shard bytes on disk divided across TP x PP ranks) and a reserve for
+        activations and CUDA graphs; ``free_gpu_memory_fraction`` bounds the
+        pool that is sized afterwards, not the arena. With estimation skipped
+        the pool commits first as ``free_gpu_memory_fraction`` of the
+        post-load memory, and the arena gets ``(1 - fraction)`` of that. See
+        ``derive_dflash_ctx_memory_budget_bytes`` for both forms. The check
+        is only enforced when the KV pool is sized by fraction (an explicit
+        ``kv_cache_config.max_tokens`` cap can leave more headroom than the
+        fraction implies) and when a CUDA device is visible.
+        ``memory_budget_bytes`` overrides the derivation (tests).
+        """
+        from tensorrt_llm._torch.speculative.dflash import (
+            derive_dflash_ctx_memory_budget_bytes,
+            estimate_checkpoint_weight_bytes, validate_dflash_ctx_buffer_budget)
+
+        spec_cfg = self.speculative_config
+
+        # Token budget: max_batch_size * (1 + max_draft_len) must fit
+        # max_num_tokens or the config corrupts memory at engine init. Under
+        # the stock defaults (max_batch_size=2048, max_num_tokens=8192) this is
+        # violated for any max_draft_len >= 4, so a plain
+        # DFlashDecodingConfig(max_draft_len=7) would fail at construction.
+        # When max_batch_size was not set explicitly, clamp it to what fits and
+        # warn; an explicitly-set max_batch_size is left to hard-fail in the
+        # validator below rather than silently overridden.
+        K = spec_cfg.max_draft_len
+        if (self.max_num_tokens is not None and self.max_batch_size is not None
+                and "max_batch_size" not in self.model_fields_set):
+            tokens_per_req = 1 + K
+            if self.max_batch_size * tokens_per_req > self.max_num_tokens:
+                clamped = self.max_num_tokens // tokens_per_req
+                if clamped >= 1:
+                    logger.warning(
+                        f"DFlash: max_batch_size ({self.max_batch_size}) x (1 "
+                        f"+ max_draft_len ({K})) exceeds max_num_tokens "
+                        f"({self.max_num_tokens}); clamping max_batch_size to "
+                        f"{clamped}. Set max_num_tokens explicitly to raise "
+                        "it.")
+                    self.max_batch_size = clamped
+                # clamped < 1 means not even one request fits; leave
+                # max_batch_size so the validator below raises with the
+                # actionable token-budget message.
+
+        draft_config = None
+        if spec_cfg.speculative_model is not None:
+            draft_config_path = os.path.join(str(spec_cfg.speculative_model),
+                                             "config.json")
+            if os.path.exists(draft_config_path):
+                with open(draft_config_path) as f:
+                    draft_config = json.load(f)
+
+        arena_before_pool = self._kv_cache_estimation_runs()
+        if spec_cfg.skip_ctx_buffer_budget_check:
+            # Opt out of the pooled-context buffer-fit check (the estimate is
+            # conservative); the token-budget check above still applies.
+            memory_budget_bytes = None
+        elif memory_budget_bytes is None:
+            kv_fraction = self.kv_cache_config.free_gpu_memory_fraction
+            if (kv_fraction is not None
+                    and self.kv_cache_config.max_tokens is None
+                    and torch.cuda.is_available()):
+                total = torch.cuda.get_device_properties(0).total_memory
+                per_rank_weight_bytes = None
+                checkpoint_bytes = estimate_checkpoint_weight_bytes(
+                    str(self.model))
+                if checkpoint_bytes is not None:
+                    weight_shards = max(
+                        1,
+                        self.tensor_parallel_size * self.pipeline_parallel_size)
+                    per_rank_weight_bytes = checkpoint_bytes // weight_shards
+                memory_budget_bytes = derive_dflash_ctx_memory_budget_bytes(
+                    total,
+                    kv_fraction,
+                    per_rank_weight_bytes,
+                    arena_before_pool=arena_before_pool)
+
+        validate_dflash_ctx_buffer_budget(
+            max_batch_size=self.max_batch_size,
+            max_num_tokens=self.max_num_tokens,
+            max_seq_len=self.max_seq_len,
+            max_draft_len=spec_cfg.max_draft_len,
+            attention_backend=spec_cfg.attention_backend,
+            draft_config=draft_config,
+            tp_size=self.tensor_parallel_size,
+            memory_budget_bytes=memory_budget_bytes,
+            arena_before_pool=arena_before_pool,
+        )
+
     @model_validator(mode="after")
     def validate_speculative_config(self):
         if self.speculative_config:
@@ -6417,10 +6591,29 @@ class TorchLlmArgs(BaseLlmArgs):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
 
             if isinstance(self.speculative_config, DFlashDecodingConfig):
+                if (self.cache_transceiver_config is not None
+                        and self.cache_transceiver_config.backend is not None):
+                    # The transceiver moves the target KV cache, but the
+                    # drafter's context is built from target hidden states
+                    # during prefill and is not transferred with it, so a
+                    # generation server drafts without the prompt. Drafts are
+                    # verified against the target, so this costs acceptance
+                    # rather than correctness: warn, do not reject.
+                    logger.warning(
+                        "DFlash acceptance is degraded under disaggregated "
+                        "serving: the cache transceiver moves the target KV "
+                        "cache, but the drafter's context is built during "
+                        "prefill and is not transferred, so a generation "
+                        "server drafts without the prompt context. Output is "
+                        "unaffected; expect a lower acceptance rate than the "
+                        "same configuration run aggregated.")
                 assert self.speculative_config.max_draft_len > 0, "DFlash max_draft_len must be > 0"
-                # A Hugging Face repo id is not readable yet; CachedModelLoader
-                # calls this again after the drafter is downloaded.
+                # A Hugging Face repo id is not readable yet: both calls below
+                # then run without the drafter's config.json (the budget check
+                # covers only the token budget), and CachedModelLoader repeats
+                # both after the drafter is downloaded.
                 self.speculative_config.resolve_from_checkpoint()
+                self._validate_dflash_ctx_budget()
 
             if isinstance(self.speculative_config, DSparkDecodingConfig):
                 spec_cfg = self.speculative_config
@@ -6606,20 +6799,6 @@ class TorchLlmArgs(BaseLlmArgs):
                 "checkpoint_format will be set to HF.")
             self.checkpoint_format = "HF"
 
-        return self
-
-    @model_validator(mode="after")
-    def warn_non_pytorch_checkpoint_io_policy_fallback(self) -> 'TorchLlmArgs':
-        # AutoDeploy does not construct a checkpoint loader. Preserve the
-        # requested policy for telemetry while reporting its native selection.
-        # PyTorch requests are resolved at loader construction, where the actual
-        # format and registered loader implementations are known.
-        if (self.checkpoint_io_policy == "rank_striped_read_ahead"
-                and self.backend != "pytorch"):
-            logger.warning(
-                "Checkpoint I/O policy resolved before loading: "
-                "requested=rank_striped_read_ahead, selected=native, "
-                "reason=rank-striped read-ahead requires the PyTorch backend.")
         return self
 
     @model_validator(mode="after")

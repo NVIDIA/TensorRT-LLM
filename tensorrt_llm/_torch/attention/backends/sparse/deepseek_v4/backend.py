@@ -34,7 +34,7 @@ from tensorrt_llm.quantization import QuantMode
 
 from ..dsa.backend import _get_nvfp4_mla_kv_cache_amax
 from .cache_manager import get_token_bytes
-from .compressor import NVFP4_COMPRESS_RESIDUAL_DIM, Compressor
+from .compressor import Compressor
 from .indexer import DeepseekV4Indexer
 from .kernels import deepseek_v4_local_to_global_indices
 from .metadata import DeepseekV4TrtllmAttentionMetadata
@@ -367,7 +367,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             tokens_per_block=kv_cache_manager.tokens_per_block,
             token_stride=token_stride,
             compressed_token_stride=(
-                (self.head_dim + NVFP4_COMPRESS_RESIDUAL_DIM) // 2
+                (self.head_dim + kv_cache_manager.nvfp4_residual_dim) // 2
                 if self._uses_nvfp4_compress
                 else token_stride
             ),
@@ -392,7 +392,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             compressed_indices = global_indices[:, -num_compressed_indices:].contiguous()
             data_pool, scale_pool = kv_cache_manager.get_compress_pool_buffers(self.compress_ratio)
             num_pool_tokens = data_pool.numel() // (
-                (self.head_dim + NVFP4_COMPRESS_RESIDUAL_DIM) // 2
+                (self.head_dim + kv_cache_manager.nvfp4_residual_dim) // 2
             )
             # The previous layer has already enqueued its attention on this stream.
             # Release its Python reference before allocating the next scratch so
@@ -410,7 +410,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                     compressed_indices,
                     scratch,
                     self._nvfp4_compress_scale_quant_orig,
-                    NVFP4_COMPRESS_RESIDUAL_DIM,
+                    kv_cache_manager.nvfp4_residual_dim,
                     num_pool_tokens,
                 )
             else:
@@ -452,7 +452,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                         compressed_indices,
                         scratch,
                         self._nvfp4_compress_scale_quant_orig,
-                        NVFP4_COMPRESS_RESIDUAL_DIM,
+                        kv_cache_manager.nvfp4_residual_dim,
                         max_compressed_kv_tokens,
                         num_pool_tokens,
                     )

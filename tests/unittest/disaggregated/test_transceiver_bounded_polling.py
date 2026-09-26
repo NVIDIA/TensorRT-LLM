@@ -36,6 +36,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     TransferWorker,
     TransferWorkerConfig,
     TxSession,
+    _LogicalOutcomes,
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm.bindings import LlmRequestState
@@ -171,6 +172,7 @@ def _make_tx_session(
     deadline_monotonic_s: Optional[float] = None,
 ) -> TxSession:
     session = object.__new__(TxSession)
+    session._logical_outcomes = _LogicalOutcomes()
     session._timeout_s = timeout_s
     session._overall_timeout_s = None
     session._deadline_monotonic_s = deadline_monotonic_s

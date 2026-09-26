@@ -134,7 +134,7 @@ class BaseWorker(GenerationExecutor):
         self._client_id_to_request_id: Dict[int, int] = {}
         self._await_response_helper = AwaitResponseHelper(weakref.proxy(self))
         self._backend = None if llm_args is None else llm_args.backend
-        self._is_pytorch_backend = self._backend in ["pytorch", "_autodeploy"]
+        self._is_pytorch_backend = self._backend == "pytorch"
         self._lora_config = llm_args.lora_config if self._is_pytorch_backend else None
         self._resource_governor_queue = None
 
@@ -178,15 +178,6 @@ class BaseWorker(GenerationExecutor):
                 args["llm_args"] = self.llm_args
                 args["checkpoint_dir"] = self._hf_model_dir
                 args["tokenizer"] = self._tokenizer
-            elif self._backend == "_autodeploy":
-                from tensorrt_llm._torch.auto_deploy.llm_args import \
-                    LlmArgs as ADLlmArgs
-                from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
-                    create_autodeploy_executor
-                create_executor = create_autodeploy_executor
-                assert isinstance(self.llm_args, ADLlmArgs)
-                args["ad_config"] = self.llm_args
-                args["tokenizer"] = self._tokenizer
             else:
                 raise ValueError(f"Unsupported backend config: {self._backend}")
 
@@ -201,7 +192,6 @@ class BaseWorker(GenerationExecutor):
                     _construct_checkpoint_loader
                 partial_model_loading = self.llm_args.is_partial_model_loading
                 self.checkpoint_loader = _construct_checkpoint_loader(
-                    self.llm_args.backend,
                     self.llm_args.checkpoint_loader,
                     self.llm_args.checkpoint_format,
                     mx_config=self.llm_args.mx_config,
@@ -491,7 +481,6 @@ class BaseWorker(GenerationExecutor):
                 sampling_config=request.sampling_params._get_sampling_config(),
                 end_id=-1 if request.sampling_params.ignore_eos else
                 request.sampling_params.end_id,
-                pad_id=request.sampling_params.pad_id,
                 output_config=request.sampling_params._get_output_config(
                     is_pytorch_backend=self._is_pytorch_backend),
                 # Beam search enforces return_all_generated_tokens=True regardless of the passed value
@@ -508,12 +497,6 @@ class BaseWorker(GenerationExecutor):
                 # NOTE: `multimodal_embedding` and `mrope_config` will be in MultimodalParams.multimodal_data. And this will be handled below by `py_multimodal_data`.
                 multimodal_embedding=None,
                 mrope_config=None,
-                logits_post_processor_name=(
-                    tllm.Request.BATCHED_POST_PROCESSOR_NAME
-                    if request.sampling_params.apply_batched_logits_processor
-                    else None),
-                logits_post_processor=None if self._is_pytorch_backend else
-                request.sampling_params.logits_processor,
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
                 encoder_input_token_ids=request.encoder_input_token_ids,
@@ -527,6 +510,8 @@ class BaseWorker(GenerationExecutor):
             executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode
             executor_request.py_logprobs_simple_format = (
                 request.sampling_params.logprobs_simple_format)
+            executor_request.py_return_routed_experts = (
+                request.sampling_params.return_routed_experts)
 
             # here we add executor_request.py_disaggregated_params= request.disaggregated_params for python cache transceiver
             if self._is_pytorch_backend and request.disaggregated_params is not None:
@@ -612,10 +597,6 @@ class BaseWorker(GenerationExecutor):
             ValueError: If the backend is not ``"pytorch"`` or
                 ``sleep_config`` is not set.
         """
-        # _autodeploy is intentionally excluded: its allocations are not tagged
-        # under sleep_config VMM scopes, so release_with_tag would silently
-        # no-op instead of actually freeing GPU memory.  Use _backend directly
-        # rather than _is_pytorch_backend, which also covers _autodeploy.
         if self._backend != "pytorch":
             raise ValueError(
                 f"{method}() is only available for the PyTorch (TorchLLM) "

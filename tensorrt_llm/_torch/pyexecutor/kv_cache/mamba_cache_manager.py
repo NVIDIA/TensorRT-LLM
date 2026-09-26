@@ -59,6 +59,10 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, PageIndexMode,
                                                       SsmLayerConfig,
                                                       TokenIdExt, _KVCache)
 
+# Shared with the KV budget estimator so allocator and budgeting can never
+# diverge on the sharding rule (config_utils is import-cycle-free).
+from ..config_utils import mamba_effective_tp_size
+
 GB = 1 << 30
 
 
@@ -84,6 +88,29 @@ class _PrefixReuseDiagnostics(Protocol):
 # combining larger histories with new kernel designs that stay efficient when
 # the window is only partly full.
 MIN_REPLAY_HISTORY_SIZE = 16
+
+_KDA_BETA_CACHE_ALIGNMENT_BYTES = 16
+
+
+def _allocate_kda_beta_cache(
+    shape: Tuple[int, ...],
+    device: Optional[torch.device],
+) -> torch.Tensor:
+    """Allocate a logically shaped beta cache with aligned physical rows."""
+    logical_num_heads = shape[-1]
+    heads_per_alignment = (_KDA_BETA_CACHE_ALIGNMENT_BYTES //
+                           torch.float32.itemsize)
+    padded_num_heads = ((logical_num_heads + heads_per_alignment - 1) //
+                        heads_per_alignment) * heads_per_alignment
+    # CuTe requires every nested cache view to be 16-byte aligned. Keep the
+    # logical head count while padding the physical stride (six fp32 heads are
+    # 24 bytes, so an unpadded row makes alternating views only 8-byte aligned).
+    return torch.zeros(
+        *shape[:-1],
+        padded_num_heads,
+        dtype=torch.float32,
+        device=device,
+    )[..., :logical_num_heads]
 
 
 def _get_num_cuda_graph_padding_dummy_slots(
@@ -143,19 +170,6 @@ class MambaRole:
     CONV_STATE = DataRole("conv_state")
     PLE_NGRAM_CONTEXT = DataRole("ple_ngram_context")
     PLE_CONV_STATE = DataRole("ple_conv_state")
-
-
-def _mamba_effective_tp_size(mapping: Mapping) -> int:
-    """TP degree for sizing per-rank mamba/KDA state pools.
-
-    Attention-DP replicates the state and takes precedence; helix
-    repurposes CP ranks as plain TP for recurrent-state layers.
-    """
-    if mapping.enable_attention_dp:
-        return 1
-    if mapping.has_cp_helix():
-        return mapping.tp_size * mapping.cp_size
-    return mapping.tp_size
 
 
 def get_tensor_size_bytes(tensor):
@@ -513,7 +527,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         self._seed_request_counter = 0
 
         # get tp size
-        tp_size = _mamba_effective_tp_size(mapping)
+        tp_size = mamba_effective_tp_size(mapping)
 
         # derive mamba parameters for conv and ssm states
         d_inner = head_dim * num_heads
@@ -648,12 +662,8 @@ class PythonMambaCacheManager(BaseResourceManager):
                                                          section_dim,
                                                          dtype=torch.float32,
                                                          device=device)
-                spec_kwargs['kda_beta_cache'] = torch.zeros(num_local_layers,
-                                                            max_batch_size,
-                                                            M,
-                                                            nheads,
-                                                            dtype=torch.float32,
-                                                            device=device)
+                spec_kwargs['kda_beta_cache'] = _allocate_kda_beta_cache(
+                    (num_local_layers, max_batch_size, M, nheads), device)
                 ssm_spec_cache = [
                     spec_kwargs['kda_conv_q'], spec_kwargs['kda_conv_k'],
                     spec_kwargs['kda_conv_v'], spec_kwargs['kda_qkg_cache'],
@@ -2333,7 +2343,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             return
 
         # Derive ssm_state_shape and conv_state_shape from mamba params (same as MambaCacheManager)
-        tp_size = _mamba_effective_tp_size(mapping)
+        tp_size = mamba_effective_tp_size(mapping)
         d_inner = mamba_head_dim * mamba_num_heads
         conv_dim = d_inner + 2 * mamba_n_groups * mamba_d_state
         nheads = mamba_num_heads
@@ -3123,7 +3133,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             and self.local_num_mamba_layers > 0)
 
         if self.local_num_mamba_layers > 0:
-            tp_size = _mamba_effective_tp_size(mapping)
+            tp_size = mamba_effective_tp_size(mapping)
             d_inner = mamba_head_dim * mamba_num_heads
             grouped_state_dim = mamba_n_groups * mamba_d_state
             conv_dim = d_inner + 2 * grouped_state_dim
@@ -3489,13 +3499,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             dtype=torch.float32,
             device=device,
         )
-        self.kda_beta_cache = torch.zeros(
-            self.local_num_mamba_layers,
-            cache_size,
-            num_spec,
-            self.ssm_state_shape[0],
-            dtype=torch.float32,
-            device=device,
+        self.kda_beta_cache = _allocate_kda_beta_cache(
+            (self.local_num_mamba_layers, cache_size, num_spec,
+             self.ssm_state_shape[0]),
+            device,
         )
         logger.info("Mamba Cache (kda-replay) is allocated for "
                     f"{cache_size} state slots")

@@ -33,7 +33,7 @@ not one shared concept: they are two registers in the activation functor that
 unrelated kinds borrow for unrelated jobs. ``SwigluBias`` reads ``alpha`` as a
 scale inside the sigmoid and ``beta`` as an additive offset (neutral ``0.0``);
 ``SiTu`` reads both as tanh soft-cap magnitudes that must be positive (neutral
-``1.0``). See ``cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/
+``1.0``). See ``cpp/tensorrt_llm/kernels/moe/cutlass/
 moe_kernels.cuh`` (``SwigluBiasAdaptor`` / ``SiTuAdaptor``) and
 ``GemmGatedActOptions.h``. A single nullable ``beta`` slot therefore has no
 coherent default and no readable meaning until you know the kind.

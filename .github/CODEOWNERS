@@ -19,7 +19,7 @@
 #   Top-K                     			  @NVIDIA/trt-llm-topk-devs
 #   VisualGen (AIGV)         			  @NVIDIA/trt-llm-torch-visual-gen-devs
 #   Scaffolding              			  @WeiHaocheng @dc3671
-#   Self-managed: AutoDeploy, Triton backend, Dynamo.  Governance/legal: unchanged.
+#   Self-managed: Triton backend, Dynamo.  Governance/legal: unchanged.
 #
 # New handles (trt-llm-devs / doc / agent / runtime / models / perf / moe / kernels / multi-gpu-ci-review)
 # must be created & populated before activation (unknown owner blocks merge).
@@ -329,19 +329,13 @@
 
 # ===== MoE =====
 /cpp/tensorrt_llm/deep_ep @NVIDIA/trt-llm-moe-devs
-/cpp/tensorrt_llm/kernels/*Moe* @NVIDIA/trt-llm-moe-devs
-/cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm @NVIDIA/trt-llm-moe-devs
-/cpp/tensorrt_llm/kernels/moe* @NVIDIA/trt-llm-moe-devs
-/cpp/tensorrt_llm/kernels/moeLoadBalance @NVIDIA/trt-llm-moe-devs
-/cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe @NVIDIA/trt-llm-moe-devs
-/cpp/tensorrt_llm/thop/*Moe* @NVIDIA/trt-llm-moe-devs
-/cpp/tensorrt_llm/thop/moe* @NVIDIA/trt-llm-moe-devs
+/cpp/tensorrt_llm/kernels/moe @NVIDIA/trt-llm-moe-devs
+/cpp/tensorrt_llm/thop/moe @NVIDIA/trt-llm-moe-devs
+/cpp/tests/unit_tests/kernels/moe @NVIDIA/trt-llm-moe-devs
+/cpp/tensorrt_llm/kernels/moeCommKernelsCommon.h @NVIDIA/trt-llm-moe-devs
+/cpp/tensorrt_llm/kernels/moeTopKFuncs.cuh @NVIDIA/trt-llm-moe-devs
+/cpp/tensorrt_llm/kernels/moe_utils.cuh @NVIDIA/trt-llm-moe-devs
 /cpp/tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/kernel/*moe* @NVIDIA/trt-llm-moe-devs
-/cpp/tensorrt_llm/kernels/communicationKernels/moe* @NVIDIA/trt-llm-moe-devs
-/cpp/tensorrt_llm/kernels/cuteDslKernels/moe* @NVIDIA/trt-llm-moe-devs
-/cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h @NVIDIA/trt-llm-moe-devs
-/cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h @NVIDIA/trt-llm-moe-devs
-/cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_util_kernels.h @NVIDIA/trt-llm-moe-devs
 /cpp/tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_gemm_kernels.h @NVIDIA/trt-llm-moe-devs
 /cpp/tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_kernels.h @NVIDIA/trt-llm-moe-devs
 /cpp/tensorrt_llm/kernels/llama4MinLatencyKernels/*Moe* @NVIDIA/trt-llm-moe-devs
@@ -390,16 +384,6 @@
 # ===== SCAFFOLDING =====
 /tensorrt_llm/scaffolding @WeiHaocheng @dc3671
 /tests/unittest/scaffolding @WeiHaocheng @dc3671
-
-# ===== SELF-MANAGED =====
-/docs/source/features/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs @NVIDIA/trt-llm-doc-owners
-/examples/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
-/scripts/check_auto_deploy_imports.py @NVIDIA/trt-llm-torch-autodeploy-devs
-/scripts/check_model_registry.py @NVIDIA/trt-llm-torch-autodeploy-devs
-/tensorrt_llm/_torch/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
-/tests/unittest/_torch/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
-/tests/unittest/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
-/tests/integration/defs/accuracy/test_llm_api_autodeploy.py @NVIDIA/trt-llm-torch-autodeploy-devs
 
 ## TensorRT-LLM LLM Disaggregated
 /examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners
@@ -493,7 +477,7 @@
 ### Usage telemetry / privacy review
 /tensorrt_llm/usage/ @NVIDIA/trt-llm-usage-telemetry-devs
 /tests/unittest/usage/ @NVIDIA/trt-llm-usage-telemetry-devs
-/tensorrt_llm/usage/llm_args_golden_manifest.json @NVIDIA/trt-llm-usage-telemetry-devs @NVIDIA/trt-llm-oss-compliance @NVIDIA/trt-llm-noncommitted-api-review-committee
+/tensorrt_llm/usage/llm_args_golden_manifest.json @NVIDIA/trt-llm-usage-telemetry-devs
 
 # Uncomment only on release branches (e.g. release/0.19):
 # * @NVIDIA/trt-llm-release-branch-approval

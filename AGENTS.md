@@ -1,7 +1,7 @@
 # AGENTS.md
 
 TensorRT-LLM: open-source library for optimized LLM inference on NVIDIA GPUs.
-Python and C++ codebase with PyTorch and AutoDeploy execution paths.
+Python and C++ codebase with a PyTorch execution path.
 
 > If a `CLAUDE.local.md` file exists alongside this file, read and respect it — it contains developer-specific overrides that supplement this shared guidance.
 
@@ -19,6 +19,9 @@ Python and C++ codebase with PyTorch and AutoDeploy execution paths.
   `tensorrt_llm/usage/architecture_allowlist.py` with its exact Hugging Face architecture name;
   never add private or customer-specific names
 - PR title format: `[JIRA/NVBUG/None][type] description` (e.g., `[TRTLLM-5516][perf] optimize cuda graph padding`)
+- Put a change's rationale and history (why it was made, what it replaces, ticket/PR references) in the PR
+  description, not in code comments. Code comments should explain the code as it stands for a future reader,
+  not narrate how it got there.
 - Set `LLM_MODELS_ROOT` env var when running tests that need model weights
 
 ## Common Commands
@@ -57,7 +60,6 @@ See [architecture diagram](.github/tava_architecture_diagram.md) for the full Me
 | Backend | Status | Entry Point | Key Path |
 |---------|--------|-------------|----------|
 | **PyTorch** | Default | `TorchLlmArgs` | `_torch/pyexecutor/` → `PyExecutor` → PyTorch Engine |
-| **AutoDeploy** | Beta | `_torch/auto_deploy/` shim | `_torch/auto_deploy/shim/ad_executor.py` → adapts `PyExecutor` → graph transforms + torch.export |
 
 ### Shared C++ Core (via Nanobind)
 
@@ -67,7 +69,7 @@ Both backends share these C++ components:
 
 ### Request Flow
 ```text
-HuggingFace Model → LLM API → Executor (PyTorch/AutoDeploy)
+HuggingFace Model → LLM API → PyTorch Executor
     → Scheduler → Model Forward → Decoder → Sampling → Generated Tokens
 ```
 
@@ -185,7 +187,6 @@ For a full list of up-to-date bot commands, post `/bot help` as a PR comment and
 | Architecture overview | `docs/source/developer-guide/overview.md` |
 | PyTorch backend | `docs/source/torch/arch_overview.md` |
 | Adding a new model | `docs/source/torch/adding_new_model.md` |
-| AutoDeploy | `docs/source/features/auto_deploy/auto-deploy.md` |
 | Disaggregated serving | `docs/source/features/disagg-serving.md` |
 | Speculative decoding | `docs/source/features/speculative-decoding.md` |
 | Quantization | `docs/source/features/quantization.md` |

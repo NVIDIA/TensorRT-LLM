@@ -105,14 +105,12 @@ def test_multimodal_embedding():
             "sampling_config": trtllm.SamplingConfig(),
             "output_config": trtllm.OutputConfig(),
             "end_id": -1,
-            "pad_id": -2,
             "bad_words": [[4, 5, 6]],
             "stop_words": [[7, 8, 9]],
             "embedding_bias": torch.ones(1),
             "prompt_tuning_config":
             trtllm.PromptTuningConfig(torch.ones(100, 64)),
             "lora_config": trtllm.LoraConfig(1),
-            "logits_post_processor_name": "my_logits_pp",
             "client_id": 1234,
         }
 
@@ -328,14 +326,12 @@ def test_request():
         "sampling_config": trtllm.SamplingConfig(),
         "output_config": trtllm.OutputConfig(),
         "end_id": -1,
-        "pad_id": -2,
         "bad_words": [[4, 5, 6]],
         "stop_words": [[7, 8, 9]],
         "embedding_bias": torch.ones(1),
         "prompt_tuning_config": trtllm.PromptTuningConfig(torch.ones(100, 64)),
         "multimodal_embedding": torch.ones(100, 64),
         "lora_config": trtllm.LoraConfig(1),
-        "logits_post_processor_name": "my_logits_pp",
         "client_id": 1234,
     }
     request = trtllm.Request(**kwargs)
