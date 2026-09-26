@@ -48,7 +48,8 @@ from tensorrt_llm._utils import mpi_rank, set_prometheus_multiproc_dir
 from tensorrt_llm.commands import _telemetry as _command_telemetry
 from tensorrt_llm.commands._serve_stability import stability_option
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
-                                         get_is_diffusion_only_model)
+                                         get_is_diffusion_only_model,
+                                         resolve_parser_detection_dir)
 from tensorrt_llm.executor.utils import MAX_NUM_FRONTENDS, LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi import KvCacheConfig
@@ -61,8 +62,9 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig, TorchLlmArgs
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr, split_mpi_env
-from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
-                                                  resolve_auto_reasoning_parser)
+from tensorrt_llm.llmapi.reasoning_parser import (
+    MODEL_TYPE_TO_REASONING_PARSER, ReasoningParserFactory,
+    is_auto_reasoning_parser_supported, resolve_auto_reasoning_parser)
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
@@ -1362,8 +1364,12 @@ def serve(
             "no longer supported. This option will be removed in a future release."
         )
 
+    if "auto" in (tool_parser, reasoning_parser):
+        # `model` may be a Hugging Face id; detection reads a directory.
+        detection_dir = resolve_parser_detection_dir(model)
+
     if tool_parser == "auto":
-        resolved = resolve_auto_tool_parser(model)
+        resolved = resolve_auto_tool_parser(detection_dir)
         if resolved is None:
             supported_model_types = ", ".join(
                 sorted(MODEL_TYPE_TO_TOOL_PARSER.keys()))
@@ -1377,18 +1383,23 @@ def serve(
         tool_parser = resolved
 
     if reasoning_parser == "auto":
-        resolved = resolve_auto_reasoning_parser(model)
-        if resolved is None:
+        resolved = resolve_auto_reasoning_parser(detection_dir)
+        if resolved is not None:
+            logger.info(f"Auto-detected reasoning parser: {resolved}")
+        elif is_auto_reasoning_parser_supported(detection_dir):
+            # An Instruct checkpoint emits no reasoning block, so "no parser"
+            # is the detected answer rather than a detection failure.
+            logger.info(f"Model '{model}' emits no reasoning content; serving "
+                        f"without a reasoning parser.")
+        else:
+            supported_model_types = ", ".join(
+                sorted(MODEL_TYPE_TO_REASONING_PARSER.keys()))
             raise click.BadParameter(
                 f"Cannot auto-detect reasoning parser for model '{model}'. "
-                f"Supported model types for auto-detection: qwen3, qwen3_moe, "
-                f"qwen3_5, qwen3_5_moe, qwen3_next, deepseek_v3 (R1 only), "
-                f"deepseek_v32 (R1 only), deepseek_v4, nemotron_h, gemma4, "
-                f"kimi_k2, kimi_k25. "
+                f"Supported model types for auto-detection: {supported_model_types}. "
                 f"Please specify a parser explicitly: "
                 f"{list(ReasoningParserFactory.keys())}",
                 param_hint="--reasoning_parser")
-        logger.info(f"Auto-detected reasoning parser: {resolved}")
         reasoning_parser = resolved
     if "--revision" in sys.argv:
         logger.warning("--revision is deprecated, use --hf_revision instead.")

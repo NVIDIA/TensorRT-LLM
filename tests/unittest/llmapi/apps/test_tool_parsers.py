@@ -3152,6 +3152,75 @@ class TestNemotron35SuperVLToolParserFactory:
         assert resolve_auto_tool_parser(str(model_dir)) == "qwen3_coder"
 
 
+@pytest.mark.parametrize("model_type", [
+    "qwen3_5",
+    "qwen3_5_text",
+    "qwen3_5_moe",
+    "qwen3_5_moe_text",
+    "qwen4_exp",
+    "qwen4_exp_text",
+])
+def test_auto_detect_qwen3_5_and_qwen3_8_tool_parser(tmp_path, model_type):
+    """Qwen3.5 through Qwen3.8 use the Qwen3-Coder XML format."""
+    from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+        resolve_auto_tool_parser
+    model_dir = tmp_path / model_type
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps({"model_type": model_type}))
+
+    assert resolve_auto_tool_parser(str(model_dir)) == "qwen3_coder"
+
+
+def test_auto_detect_qwen3_8_tool_parser_matches_output(tmp_path, sample_tools):
+    """The auto-selected parser consumes the official Qwen3.8 XML format."""
+    from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
+        ToolParserFactory, resolve_auto_tool_parser)
+    model_dir = tmp_path / "qwen3_8"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(json.dumps({"model_type":
+                                                       "qwen3_5"}))
+
+    parser_name = resolve_auto_tool_parser(str(model_dir))
+    assert parser_name == "qwen3_coder"
+
+    output = (
+        "<tool_call>\n<function=get_weather>\n<parameter=location>\nParis\n"
+        "</parameter>\n</function>\n</tool_call>")
+    result = ToolParserFactory.create_tool_parser(parser_name).detect_and_parse(
+        output, sample_tools)
+    assert result.normal_text == ""
+    assert len(result.calls) == 1
+    assert result.calls[0].name == "get_weather"
+    assert json.loads(result.calls[0].parameters) == {"location": "Paris"}
+
+
+@pytest.mark.parametrize(("chat_template", "expected"), [
+    ("If you choose to call a function ONLY reply in the following format:\n"
+     "<tool_call>\n<function=example_function_name>\n"
+     "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+     "</function>\n</tool_call>", "qwen3_coder"),
+    ("<tool_call>\n{\"name\": <function-name>, "
+     "\"arguments\": <args-json-object>}\n</tool_call>", "qwen3"),
+])
+def test_auto_detect_qwen3_tool_format_from_chat_template(
+        tmp_path, chat_template, expected):
+    """Qwen3-Coder is a `qwen3_moe` checkpoint like plain Qwen3.
+
+    The two were trained on incompatible tool-call formats, so the chat
+    template is the only thing that tells them apart.
+    """
+    from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+        resolve_auto_tool_parser
+    model_dir = tmp_path / "qwen3_moe"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_moe"}))
+    (model_dir / "chat_template.jinja").write_text(chat_template)
+
+    assert resolve_auto_tool_parser(str(model_dir)) == expected
+
+
 # ============================================================================
 # Integration Tests
 # ============================================================================

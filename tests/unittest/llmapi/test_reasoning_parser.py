@@ -531,8 +531,8 @@ def test_resolved_mode_overrides_whatever_the_caller_sent(
 
 
 @pytest.mark.parametrize("parser", [
-    "deepseek-r1", "deepseek_v4", "qwen3", "qwen3_5", "minimax_m2",
-    "minimax_m3", "nemotron-v3", "nano-v3", "gemma4", "kimi_k2", "kimi_k25"
+    "deepseek-r1", "deepseek_v4", "qwen3", "minimax_m2", "minimax_m3",
+    "nemotron-v3", "nano-v3", "gemma4", "kimi_k2", "kimi_k25"
 ])
 def test_resolve_prefilled_thinking_requires_opt_in(parser: str) -> None:
     """Parsers that have not opted in must never be resolved from the prompt.
@@ -550,26 +550,43 @@ def test_resolve_prefilled_thinking_requires_opt_in(parser: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("prompt_tail", "model_output", "content", "reasoning_content"), [
-        (R1_START, f"hidden{R1_END}visible", "visible", "hidden"),
-        (R1_END, "visible", "visible", ""),
-    ])
-def test_poolside_v1_mode_resolved_from_prompt(prompt_tail: str,
-                                               model_output: str, content: str,
-                                               reasoning_content: str) -> None:
+    ("parser", "prompt_tail", "expected_thinking", "model_output", "content",
+     "reasoning_content"), [
+         ("poolside_v1", R1_START, True, f"hidden{R1_END}visible", "visible",
+          "hidden"),
+         ("poolside_v1", R1_END, False, "visible", "visible", ""),
+         ("qwen3_5", R1_START, True, f"hidden{R1_END}visible", "visible",
+          "hidden"),
+         ("qwen3_5", R1_END, False, "visible", "visible", ""),
+     ])
+def test_reasoning_mode_resolved_from_prompt(parser: str, prompt_tail: str,
+                                             expected_thinking: bool,
+                                             model_output: str, content: str,
+                                             reasoning_content: str) -> None:
     """Mirror the server path: resolve from the prompt, then parse.
 
     A request that sends no chat template kwargs must still land in the mode
-    the template actually rendered.
+    the template actually rendered. The resolved mode is asserted separately
+    because both parsers default to thinking, so the parse result alone would
+    still pass if resolution stopped recognizing the marker.
     """
     prompt = f"<user>hi</user>\n<assistant>{prompt_tail}"
-    thinking = ReasoningParserFactory.resolve_prefilled_thinking(
-        "poolside_v1", prompt)
+    thinking = ReasoningParserFactory.resolve_prefilled_thinking(parser, prompt)
+    assert thinking is expected_thinking
     reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
-        "poolside_v1", {"enable_thinking": thinking})
+        parser, {"enable_thinking": thinking})
     result = reasoning_parser.parse(model_output)
     assert result.content == content
     assert result.reasoning_content == reasoning_content
+
+
+def test_qwen3_5_without_resolved_mode_preserves_reasoning_default() -> None:
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser("qwen3_5")
+
+    result = reasoning_parser.parse(f"hidden{R1_END}visible")
+
+    assert result.content == "visible"
+    assert result.reasoning_content == "hidden"
 
 
 TOOL_CALL = "<tool_call>"
@@ -877,6 +894,67 @@ def test_auto_detect_qwen3_forced_non_thinking(tmp_path):
     assert result is None
 
 
+# Instruct Qwen checkpoints mention <think> to re-render reasoning kept in the
+# conversation history, but leave the generation prompt empty.
+_HISTORY_ONLY_THINKING_TEMPLATE = (
+    "{%- for message in messages %}"
+    "{{- '<|im_start|>assistant\\n<think>\\n' + message.reasoning_content"
+    "  + '\\n</think>\\n\\n' + message.content }}"
+    "{%- endfor %}"
+    "{%- if add_generation_prompt %}"
+    "{{- '<|im_start|>assistant\\n' }}"
+    "{%- endif %}")
+
+
+def test_auto_detect_qwen3_template_from_jinja_file(tmp_path):
+    """The template may live in chat_template.jinja instead of the tokenizer.
+
+    Quantized Qwen3 checkpoints are re-saved by a `transformers` version that
+    writes the template to its own file and leaves `chat_template` null, and
+    reading only the tokenizer config would take that for a model with no
+    reasoning at all.
+    """
+    model_dir = str(tmp_path / "Qwen3-32B-FP8")
+    os.makedirs(model_dir)
+    _write_config(model_dir, "qwen3")
+    with open(os.path.join(model_dir, "tokenizer_config.json"), "w") as f:
+        json.dump({"chat_template": None}, f)
+    with open(os.path.join(model_dir, "chat_template.jinja"), "w") as f:
+        f.write(_HYBRID_TEMPLATE)
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result == "qwen3"
+
+
+def test_auto_detect_qwen3_unreadable_template_falls_through(tmp_path):
+    """An undecodable template file must not abort detection.
+
+    The three candidate files are tried in order, so a corrupt one has to be
+    treated like a missing one; otherwise a single bad byte takes the server
+    down at startup.
+    """
+    model_dir = str(tmp_path / "Qwen3-32B")
+    os.makedirs(model_dir)
+    _write_config(model_dir, "qwen3")
+    with open(os.path.join(model_dir, "chat_template.jinja"), "wb") as f:
+        f.write(b"\xff\xfe not utf-8")
+    _write_tokenizer_config(model_dir, _HYBRID_TEMPLATE)
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result == "qwen3"
+
+
+def test_auto_detect_qwen3_ignores_think_outside_generation_prompt(tmp_path):
+    """Only a <think> in the generation prompt means the model always reasons."""
+    model_dir = str(tmp_path / "Qwen3-Next-80B-A3B-Instruct")
+    os.makedirs(model_dir)
+    _write_config(model_dir, "qwen3_next")
+    _write_tokenizer_config(model_dir, _HISTORY_ONLY_THINKING_TEMPLATE)
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result is None
+
+
 def test_auto_detect_qwen3_no_tokenizer_config(tmp_path):
     """Qwen3 model without tokenizer_config.json → falls back to 'qwen3'."""
     model_dir = str(tmp_path / "Qwen3-SomeModel")
@@ -885,6 +963,24 @@ def test_auto_detect_qwen3_no_tokenizer_config(tmp_path):
 
     result = resolve_auto_reasoning_parser(model_dir)
     assert result == "qwen3"
+
+
+@pytest.mark.parametrize("model_type", [
+    "qwen3_5",
+    "qwen3_5_text",
+    "qwen3_5_moe",
+    "qwen3_5_moe_text",
+    "qwen4_exp",
+    "qwen4_exp_text",
+])
+def test_auto_detect_qwen3_5_and_qwen3_8(tmp_path, model_type):
+    """Qwen3.5 and Qwen3.8 configs use the prefilled-thinking parser."""
+    model_dir = str(tmp_path / model_type)
+    os.makedirs(model_dir)
+    _write_config(model_dir, model_type)
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result == "qwen3_5"
 
 
 def test_auto_detect_deepseek_r1(tmp_path):
