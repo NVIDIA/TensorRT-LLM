@@ -203,8 +203,38 @@ Cold-page NVFP4 is different from an active NVFP4 KV cache. The former stores
 NVFP4 only in a cold cache tier and restores the runtime type before Attention;
 the latter sets `KvCacheConfig(dtype="nvfp4")` and keeps active GPU KV in
 NVFP4. See [Quantization](quantization.md) for active KV-cache quantization.
+
 For complete single-GPU and disaggregated-serving configurations, see the
 [NVFP4 cold-page compression example](source:examples/kv_cache_compression/nvfp4_cold_page.md).
+
+#### Skipping RoPE Quantization
+
+For every token and KV head, the KV cache stores one K vector and one V vector.
+In some models only part of the K vector carries the token's position (the RoPE
+part): the last 64 numbers of an MLA vector (GLM-5), the first 64 of a Qwen3.5
+head, the last 64 of a DeepSeek-V4 compressed entry. `skip_rope_quantization`
+lets you leave that part out of the NVFP4 conversion:
+
+- `false` (default): the whole K vector and the whole V vector become NVFP4.
+  Highest compression ratio.
+- `true`: the RoPE part of the K vector is copied unchanged and keeps the hot cache's
+  precision; the rest of K and the whole V vector become NVFP4. The compression
+  ratio drops; an FP8 MLA vector goes from 1.78x to 1.64x.
+
+This is an option to explore, not a tuned default. Whether keeping the RoPE part
+changes accuracy depends on the model and the workload, so measure it on yours.
+The option is available for DeepSeek-V4, GLM-5 (`glm_moe_dsa`), and the Qwen3.5
+series, whose RoPE layout the codec knows; any other model ignores it with a
+warning. To add a model, add its `model_type` to
+`_SKIP_ROPE_QUANTIZATION_MODEL_TYPES` in `nvfp4_quantization.py`. The KV cache of
+a draft model (speculative decoding) always quantizes whole vectors.
+
+```yaml
+kv_cache_compression_config:
+  algorithm: quantization_for_cold_page
+  quant: nvfp4
+  skip_rope_quantization: true
+```
 
 ### TriAttention
 
@@ -251,7 +281,7 @@ structures. Both share the same general platform requirements.[^general-requirem
 | MLA Attention KV | Supported | Not supported |
 | GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly | Not supported |
 | DSA and other Attention side buffers | Preserved losslessly | Not supported |
-| DeepSeek-V4 CSA cache | Supported[^deepseek-v4]; the NoPE part of the compressed KV is encoded as NVFP4, the RoPE part and the indexer cache are preserved losslessly | Not supported |
+| DeepSeek-V4 CSA cache | Supported[^deepseek-v4]; the compressed KV rows are encoded as NVFP4 (their RoPE part is preserved losslessly when `skip_rope_quantization` is `true`) and the indexer cache is preserved losslessly | Not supported |
 | DeepSeek-V4 SWA, HCA, and compressor state | Preserved losslessly | Not supported |
 
 [^general-requirements]: Both methods currently require the PyTorch backend,

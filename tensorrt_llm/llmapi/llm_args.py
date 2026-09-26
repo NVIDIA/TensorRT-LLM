@@ -3895,6 +3895,14 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
     quant: Literal["nvfp4"] = Field(
         default="nvfp4",
         description="Quantization format stored in the compressed cache tier.")
+    skip_rope_quantization: bool = Field(
+        default=False,
+        description=
+        "False (default): whole K and V vectors become NVFP4 in the compressed "
+        "cache tier. True: the position-encoded (RoPE) part of each K vector is "
+        "copied unchanged and the rest becomes NVFP4, at a lower compression "
+        "ratio. An option to explore; measure its accuracy effect on your model."
+    )
     scale_checkpoint_path: Optional[str] = Field(
         default=None,
         min_length=1,

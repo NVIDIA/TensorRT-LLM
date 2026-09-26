@@ -550,6 +550,11 @@
       "path": "kv_cache_compression_config.quant"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_compression_config.skip_rope_quantization"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "kv_cache_config.attention_dp_events_gather_period_ms"
