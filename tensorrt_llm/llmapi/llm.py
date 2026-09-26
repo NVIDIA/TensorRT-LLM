@@ -1569,6 +1569,12 @@ class BaseLLM:
     def _check_arguments(self, prompt_len: int, sampling_params: SamplingParams,
                          is_gen_only: bool) -> None:
 
+        if (sampling_params._get_guided_decoding_params() is not None
+                and self.args.guided_decoding_backend is None):
+            raise ValueError(
+                "Guided decoding requires `guided_decoding_backend` to be configured on the LLM."
+            )
+
         # Check prompt length against max_num_tokens to filter illegal requests.
         # Skip check for gen-only requests.
         if not self.args.enable_chunked_prefill and not is_gen_only:
