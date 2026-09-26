@@ -213,7 +213,7 @@ num_heads_groups = [
 num_tokens_list = [1, 3, 8, 32, 256]
 is_neox_list = [False, True]
 partial_rotary_factor_list = [1.0, 0.5]
-dtypes = [torch.bfloat16]  # TODO: support float16
+dtypes = [torch.bfloat16, torch.float16]
 
 
 @pytest.mark.parametrize("head_dim", head_dims)
@@ -315,6 +315,8 @@ def test_fused_qk_norm_rope(
         rtol=5e-2,
         atol=1e-1,
     )
+    v_offset = (num_heads_q + num_heads_k) * head_dim
+    torch.testing.assert_close(output[:, v_offset:], qkv_copy[:, v_offset:], rtol=0, atol=0)
 
 
 @torch.inference_mode()
