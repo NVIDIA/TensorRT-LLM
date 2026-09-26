@@ -53,7 +53,9 @@ from tensorrt_llm.llmapi.llm_args import (
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BatchDesc,
+    GpuCacheTierConfig,
     KVCacheDesc,
+    KVCacheManagerConfig,
     PageIndexMode,
     _introspection,
 )
@@ -73,6 +75,53 @@ def test_typical_seq_len_preserves_deepseek_v4_fallback(
     manager.max_seq_len = 1024
 
     assert manager._get_typical_seq_len(KvCacheConfig(avg_seq_len=avg_seq_len)) == expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("pool_ratio", [None, [1.0]])
+def test_build_cache_config_long_decode_constraint(pool_ratio: list[float] | None) -> None:
+    manager = object.__new__(DeepseekV4CacheManager)
+    manager.pp_layers = [0]
+    manager._compress_ratios = [1]
+    manager.dtype = DataType.BF16
+    manager._use_nvfp4_compress = False
+    manager.head_dim = 512 + 64
+    manager.index_head_dim = 128
+    manager._indexer_k_dtype = "fp8"
+    manager.use_fp8_ds_mla = False
+    manager._swa_window_size = 128
+    manager.tokens_per_block = 128
+    manager.max_seq_len = 1024
+    manager.max_batch_size = 3
+    manager.max_draft_len = manager._max_draft_len = 4
+    manager.num_extra_kv_tokens = 3
+
+    context_constraint = BatchDesc([KVCacheDesc(capacity=259, history_length=0)])
+    base_config = KVCacheManagerConfig(
+        tokens_per_block=128,
+        cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
+        layers=[],
+        constraints=[context_constraint] if pool_ratio is None else [],
+        initial_pool_ratio=pool_ratio,
+    )
+
+    config = manager._build_cache_config(base_config)
+
+    if pool_ratio is None:
+        assert config.constraints == [
+            context_constraint,
+            BatchDesc(
+                [
+                    KVCacheDesc(capacity=1024, history_length=1023),
+                    KVCacheDesc(capacity=8, history_length=0),
+                    KVCacheDesc(capacity=8, history_length=0),
+                ]
+            ),
+        ]
+        assert base_config.constraints == [context_constraint]
+    else:
+        assert config.initial_pool_ratio == pool_ratio
+        assert config.constraints == []
 
 
 def test_cache_size_estimation_uses_model_attention_layer_count():

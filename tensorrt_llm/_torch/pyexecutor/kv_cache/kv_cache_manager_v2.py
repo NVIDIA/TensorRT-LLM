@@ -2764,38 +2764,6 @@ class KVCacheManagerV2(BaseResourceManager):
                     * (generation_request_capacity - 1)
                 )
 
-                # CUDA graph generation warmup uses one request at max_seq_len and
-                # enough minimal decode requests to fill the resident capacity.
-                if (
-                    self.max_cuda_graph_batch_size is not None
-                    and self.max_cuda_graph_batch_size > 0
-                    and self.is_estimating_kv_cache
-                    and all(window is None for window in self.max_attention_window_vec)
-                ):
-                    # Estimation graph warmup needs the smaller of the resident
-                    # capacity and the largest captured CUDA graph batch.
-                    constraint_batch_size = min(
-                        generation_request_capacity, self.max_cuda_graph_batch_size
-                    )
-                else:
-                    constraint_batch_size = generation_request_capacity
-                constraint_batch_size = max(1, constraint_batch_size)
-                min_decode_capacity = 1 + self.max_draft_len + self.num_extra_kv_tokens
-                # Model one request at max_seq_len plus minimal decode requests
-                # to fill constraint_batch_size.
-                constraints.append(
-                    BatchDesc(
-                        [
-                            KVCacheDesc(
-                                capacity=self.max_seq_len,
-                                history_length=self.max_seq_len - 1,
-                            )
-                        ]
-                        + [KVCacheDesc(capacity=min_decode_capacity, history_length=0)]
-                        * (constraint_batch_size - 1)
-                    )
-                )
-
                 # General and chunked-prefill warmup uses one fresh context request
                 # at the per-iteration token budget.
                 if self.max_num_tokens is not None:
@@ -5033,7 +5001,8 @@ class KVCacheManagerV2(BaseResourceManager):
                     req.total_input_len_cp = token_num * self._helix_cp_size - 1
                     req.py_decoding_iter = 1
                 if prepare_resource:
-                    new_capacity = kv_cache.capacity + _kv_draft + 1
+                    # token_num already includes the current generation input.
+                    new_capacity = kv_cache.capacity + _kv_draft
                     success = kv_cache.resize(new_capacity, history_length=history_hint)
                     if not success:
                         release_resources(req, free_draft_resources=draft_kv_cache is not None)

@@ -828,7 +828,7 @@ def test_default_uses_allocator_fallback() -> None:
     assert config.constraints == []
 
 
-def test_avg_seq_len_builds_warmup_constraints() -> None:
+def test_avg_seq_len_builds_context_warmup_constraint() -> None:
     config = _make_cache_config_for_test(
         KvCacheConfig(host_cache_size=0, avg_seq_len=1024),
         max_batch_size=3,
@@ -841,16 +841,7 @@ def test_avg_seq_len_builds_warmup_constraints() -> None:
         [KVCacheDesc(capacity=2048, history_length=0)]
         + [KVCacheDesc(capacity=1024, history_length=1021)] * 2
     )
-    assert config.constraints == [
-        BatchDesc(
-            [
-                KVCacheDesc(capacity=1024, history_length=1023),
-                KVCacheDesc(capacity=3, history_length=0),
-                KVCacheDesc(capacity=3, history_length=0),
-            ]
-        ),
-        BatchDesc([KVCacheDesc(capacity=2048, history_length=0)]),
-    ]
+    assert config.constraints == [BatchDesc([KVCacheDesc(capacity=2048, history_length=0)])]
 
 
 def test_avg_seq_len_updates_typical_step() -> None:
@@ -1104,7 +1095,7 @@ def test_extra_tokens_are_in_context_capacity() -> None:
     )
 
     assert config.typical_step == BatchDesc([KVCacheDesc(capacity=258, history_length=0)])
-    assert config.constraints[1] == BatchDesc([KVCacheDesc(capacity=258, history_length=0)])
+    assert config.constraints == [BatchDesc([KVCacheDesc(capacity=258, history_length=0)])]
 
 
 def test_try_commit_blocks_commits_partial_block_at_context_end() -> None:
@@ -1507,6 +1498,44 @@ def test_external_draft_estimated_quota_supports_allocation_and_resume(
     finally:
         for cache in caches:
             cache.close()
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("draft_len", [0, 4])
+def test_generation_dummy_uses_available_capacity(draft_len: int) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    init_cuda_once()
+    manager = KVCacheManagerV2(
+        KvCacheConfig(enable_block_reuse=False, max_gpu_total_bytes=4 << 20),
+        CacheType.SELF,
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=128,
+        tokens_per_block=32,
+        max_seq_len=131072,
+        max_batch_size=1,
+        max_num_tokens=128,
+        mapping=Mapping(),
+        dtype=DataType.HALF,
+        spec_config=MTPDecodingConfig(max_draft_len=draft_len) if draft_len else None,
+    )
+    try:
+        token_num = manager.get_num_available_tokens(
+            token_num_upper_bound=manager.max_seq_len, max_num_draft_tokens=draft_len
+        )
+        capacity = token_num + manager.num_extra_kv_tokens + draft_len
+        assert capacity % manager.tokens_per_block == 0
+        # The current generation input is already included in token_num.
+        requests = manager.add_dummy_requests(
+            [0], token_nums=[token_num], is_gen=True, max_num_draft_tokens=draft_len
+        )
+        assert requests is not None
+        cache = manager.kv_cache_map[requests[0].py_request_id]
+        assert cache.history_length == token_num - 1
+        assert cache.capacity == capacity
+        manager.free_resources(requests[0])
+    finally:
         manager.shutdown()
 
 

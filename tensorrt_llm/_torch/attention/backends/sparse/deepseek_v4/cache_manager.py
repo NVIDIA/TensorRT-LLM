@@ -44,8 +44,10 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime import ModelConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
+    BatchDesc,
     BufferConfig,
     DataRole,
+    KVCacheDesc,
     LayerId,
     PageIndexMode,
     ScratchDesc,
@@ -1039,7 +1041,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """
-        Add DeepSeek-V4 layers to the cache config.
+        Add DeepSeek-V4 layers and warmup constraints to the cache config.
         """
         layers: List[AttentionLayerConfig] = []
         layer_attn_to_layer_id: Dict[Tuple[int, DeepseekV4AttentionType], LayerId] = {}
@@ -1182,9 +1184,28 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         # number of layers in the KVCacheManagerPy
         self._num_manager_layers = len(layers)
 
+        constraints = list(config.constraints)
+        # _build_base_config copies kv_cache_config.pool_ratio to initial_pool_ratio.
+        if config.initial_pool_ratio is None:
+            # DeepSeek-V4's windowed and compressed pools must also support
+            # the longest decode request alongside the short decode requests.
+            min_decode_capacity = 1 + self.max_draft_len + self.num_extra_kv_tokens
+            constraints.append(
+                BatchDesc(
+                    [
+                        KVCacheDesc(
+                            capacity=self.max_seq_len,
+                            history_length=self.max_seq_len - 1,
+                        )
+                    ]
+                    + [KVCacheDesc(capacity=min_decode_capacity, history_length=0)]
+                    * (self.max_batch_size - 1)
+                )
+            )
         return replace(
             config,
             layers=layers,
+            constraints=constraints,
         )
 
     def _init_indexer_dtype(self, sparse_attn_config: DeepSeekV4SparseAttentionConfig) -> None:
