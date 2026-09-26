@@ -43,7 +43,7 @@ from tensorrt_llm.llmapi import KvCacheConfig  # noqa: E402
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs  # noqa: E402
 from tensorrt_llm.sampling_params import MAX_TOP_LOGPROBS  # noqa: E402
 
-MODEL_NAME = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+MODEL_NAME = "Qwen3/Qwen3-0.6B"
 GUIDED_BACKEND = "xgrammar"
 
 # The engine is module-scoped, so the executor proxy's `proxy_dispatch_result_thread`

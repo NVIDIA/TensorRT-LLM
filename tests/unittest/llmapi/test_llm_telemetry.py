@@ -35,7 +35,7 @@ from tensorrt_llm.usage import usage_lib
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
-MODEL_NAME = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+MODEL_NAME = "Qwen3/Qwen3-0.6B"
 _kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
 
 
@@ -241,7 +241,7 @@ class TestTelemetryPyTorchBackend:
         )
         assert isinstance(pretrained_config.architectures, list)
         assert len(pretrained_config.architectures) > 0
-        assert pretrained_config.architectures[0] == "LlamaForCausalLM"
+        assert pretrained_config.architectures[0] == "Qwen3ForCausalLM"
 
         assert captured.get("llm_args") is not None, "report_usage was not called with llm_args"
 
@@ -264,7 +264,7 @@ class TestTelemetryArchitectureExtraction:
         assert pretrained_config is not None
 
         arch = usage_lib._extract_architecture_class_name(pretrained_config)
-        assert arch == "LlamaForCausalLM", f"Expected 'LlamaForCausalLM', got '{arch}'"
+        assert arch == "Qwen3ForCausalLM", f"Expected 'Qwen3ForCausalLM', got '{arch}'"
 
 
 class TestTelemetryDisabledFlag:
@@ -412,7 +412,7 @@ class TestFeatureTrackingIntegration:
         assert set(features.keys()) == set(usage_lib._FEATURES_DEFAULTS.keys())
 
     def test_features_json_default_values_pytorch(self):
-        """Default TinyLlama config has expected feature defaults."""
+        """Default Qwen3-0.6B config has expected feature defaults."""
         import json
 
         captured, spy = _make_spy()
@@ -424,7 +424,7 @@ class TestFeatureTrackingIntegration:
         llm_args = captured.get("llm_args")
         features = json.loads(usage_lib._collect_features(llm_args))
 
-        # TinyLlama loaded with defaults: no LoRA, no spec dec, no chunked prefill
+        # Qwen3-0.6B loaded with defaults: no LoRA, no spec dec, no chunked prefill
         assert features["lora"] is False
         assert features["speculative_decoding"] is False
         assert features["chunked_context"] is False

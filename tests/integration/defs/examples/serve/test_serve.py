@@ -77,8 +77,7 @@ def wait_for_log(log_queue, expected_log, timeout=10):
     return False
 
 
-def check_openai_chat_completion(http_port,
-                                 model_name="TinyLlama-1.1B-Chat-v1.0"):
+def check_openai_chat_completion(http_port, model_name="Qwen3-0.6B"):
     """
     Test the launched trtllm-serve server using OpenAI client.
 
@@ -261,7 +260,7 @@ def test_env_overrides_pdl(tmp_path):
     environment variables to the server workers. Specifically, it sets `TRTLLM_ENABLE_PDL=1`
     (Programmatic Dependent Launch) via config and verifies it overrides the env var initially set to 0.
 
-    1. This model (TinyLlama-1.1B-Chat-v1.0) architecture uses RMSNorm, which triggers 'flashinfer' kernels that use PDL when `TRTLLM_ENABLE_PDL=1`.
+    1. This model (Qwen3-0.6B) architecture uses RMSNorm, which triggers 'flashinfer' kernels that use PDL when `TRTLLM_ENABLE_PDL=1`.
     2. When `TRTLLM_ENABLE_PDL=1` is actually propagated into worker env, flashinfer custom ops log "PDL enabled" to stdout/stderr.
     """
     pdl_enabled = "1"
@@ -284,8 +283,7 @@ def test_env_overrides_pdl(tmp_path):
     })
 
     cmd = [
-        "trtllm-serve", "serve",
-        f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
+        "trtllm-serve", "serve", f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
         "--host", "0.0.0.0", "--port",
         str(port), "--backend", "pytorch", "--config",
         str(config_file)
@@ -305,7 +303,7 @@ def test_env_overrides_pdl(tmp_path):
         check_server_ready(http_port=port, timeout_timer=300)
         response = OpenAI(base_url=f"http://localhost:{port}/v1",
                           api_key="tensorrt_llm").chat.completions.create(
-                              model="TinyLlama-1.1B-Chat-v1.0",
+                              model="Qwen3-0.6B",
                               messages=[{
                                   "role": "user",
                                   "content": "Test"

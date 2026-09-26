@@ -31,7 +31,7 @@ def ray_example_root(llm_root):
 
 def test_llm_inference_async_ray(ray_example_root, llm_venv):
     script_path = os.path.join(ray_example_root, "llm_inference_async_ray.py")
-    model_path = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    model_path = f"{llm_models_root()}/Qwen3/Qwen3-0.6B"
     venv_check_call(llm_venv, [script_path, "--model", model_path])
 
 
@@ -64,7 +64,7 @@ def test_llm_inference_distributed_ray(ray_example_root, llm_venv, tp_size,
         model_dir = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
         cmd.extend(["--model_dir", model_dir])
     else:
-        model_dir = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+        model_dir = f"{llm_models_root()}/Qwen3/Qwen3-0.6B"
         cmd.extend(["--model_dir", model_dir])
 
     venv_check_call(llm_venv, cmd)
@@ -171,7 +171,7 @@ def _run_ray_disaggregated_serving(ray_example_root, tp_size,
 
     disagg_dir = os.path.join(ray_example_root, "disaggregated")
     script_path = os.path.join(disagg_dir, "disagg_serving_local.sh")
-    model_dir = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    model_dir = f"{llm_models_root()}/Qwen3/Qwen3-0.6B"
 
     try:
         runtime_env = {
@@ -229,7 +229,7 @@ def _run_completion_requests():
 
     async def send_request(session, prompt):
         payload = {
-            "model": "TinyLlama-1.1B-Chat-v1.0",
+            "model": "Qwen3-0.6B",
             "prompt": prompt,
             "max_tokens": max_tokens,
             "temperature": 0,

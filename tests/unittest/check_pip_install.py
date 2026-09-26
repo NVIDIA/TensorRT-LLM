@@ -238,9 +238,8 @@ def create_link_for_models():
         print(f"ERROR: Models root {models_root} does not exist")
         exit(1)
     src_dst_dict = {
-        # TinyLlama-1.1B-Chat-v1.0
-        f"{models_root}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0":
-        f"{os.getcwd()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        # Qwen3-0.6B
+        f"{models_root}/Qwen3/Qwen3-0.6B": f"{os.getcwd()}/Qwen3/Qwen3-0.6B",
     }
 
     for src, dst in src_dst_dict.items():

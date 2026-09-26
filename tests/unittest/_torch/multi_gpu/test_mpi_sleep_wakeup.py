@@ -33,7 +33,7 @@ from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
 
-_LLAMA_MODEL_PATH = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+_LLAMA_MODEL_PATH = str(llm_models_root() / "Qwen3/Qwen3-0.6B")
 
 _PROMPTS = [
     "Hello, my name is",
