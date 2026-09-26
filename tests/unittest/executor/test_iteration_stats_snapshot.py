@@ -172,31 +172,97 @@ def test_legacy_kv_capture_does_not_keep_native_rows():
     assert received[16] is not row
 
 
-def test_buffer_eviction_is_bounded_and_visible_after_drain():
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
-    executor = SimpleNamespace(
+def _stats_executor(max_stats_len):
+    return SimpleNamespace(
         stats_lock=Lock(),
         stats=deque(),
-        max_stats_len=2,
+        max_stats_len=max_stats_len,
         _stats_sequence=0,
         _stats_dropped_frames=0,
         enable_iter_perf_stats=True,
     )
-    for iteration in range(5):
-        PyExecutor._append_stats_frame(
-            executor, IterationStatsFrame(IterationStatsSnapshot(iter=iteration))
-        )
-    assert len(executor.stats) == 2
+
+
+def _stats_frame(iteration, rank_count=None):
+    return IterationStatsFrame(
+        IterationStatsSnapshot(iter=iteration),
+        rank_payloads=tuple(
+            RankStatsSnapshot.capture(rank, InflightBatchingSnapshot(num_gen_requests=rank + 1))
+            for rank in range(rank_count or 0)
+        ),
+    )
+
+
+def _report_identity(reports):
+    return [
+        (row["iter"], row["attentionDpRank"], row["statsSequence"], row["statsDroppedFrames"])
+        for row in reports
+    ]
+
+
+@pytest.mark.parametrize("max_stats_len", [1, 2, 1000])
+@pytest.mark.parametrize("rank_count", [None, 4, 8], ids=["single", "adp4", "adp8"])
+def test_buffer_eviction_is_bounded_and_visible_after_drain(max_stats_len, rank_count):
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    executor = _stats_executor(max_stats_len)
+    for iteration in range(max_stats_len + 2):
+        PyExecutor._append_stats_frame(executor, _stats_frame(iteration, rank_count))
+    assert len(executor.stats) == max_stats_len
     received = PyExecutor.get_latest_iteration_stats(executor)
     assert not executor.stats
     reports = materialize_stats_batch(received)
-    assert [report["iter"] for report in reports] == [3, 4]
-    assert [report["statsSequence"] for report in reports] == [4, 5]
-    assert reports[-1]["statsDroppedFrames"] == 3
-    PyExecutor._append_stats_frame(executor, IterationStatsFrame(IterationStatsSnapshot(iter=9)))
-    assert executor.stats[0].sequence == 6
-    assert executor.stats[0].dropped_frames == 3
+    assert _report_identity(reports) == [
+        (iteration, rank, iteration + 1, max(0, iteration + 1 - max_stats_len))
+        for iteration in range(2, max_stats_len + 2)
+        for rank in range(rank_count or 1)
+    ]
+    assert PyExecutor.get_latest_iteration_stats(executor) == []
+
+    for iteration in range(max_stats_len):
+        PyExecutor._append_stats_frame(executor, _stats_frame(iteration + 10000, rank_count))
+    assert len(executor.stats) == max_stats_len
+    reports = materialize_stats_batch(PyExecutor.get_latest_iteration_stats(executor))
+    assert _report_identity(reports) == [
+        (iteration + 10000, rank, max_stats_len + 3 + iteration, 2)
+        for iteration in range(max_stats_len)
+        for rank in range(rank_count or 1)
+    ]
+
+
+@pytest.mark.parametrize("max_stats_len", [1, 2, 1000])
+@pytest.mark.parametrize("rank_count", [4, 8])
+def test_mixed_startup_and_joined_frames_share_the_frame_budget(max_stats_len, rank_count):
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    executor = _stats_executor(max_stats_len)
+    for iteration in range(max_stats_len + 2):
+        PyExecutor._append_stats_frame(
+            executor, _stats_frame(iteration, rank_count if iteration % 2 else None)
+        )
+    assert len(executor.stats) == max_stats_len
+    reports = materialize_stats_batch(PyExecutor.get_latest_iteration_stats(executor))
+    assert _report_identity(reports) == [
+        (iteration, rank, iteration + 1, max(0, iteration + 1 - max_stats_len))
+        for iteration in range(2, max_stats_len + 2)
+        for rank in range(rank_count if iteration % 2 else 1)
+    ]
+
+
+@pytest.mark.parametrize("rank_count", [None, 4, 8], ids=["single", "adp4", "adp8"])
+def test_unbounded_buffer_keeps_all_frames_and_rank_rows(rank_count):
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    executor = _stats_executor(-1)
+    for iteration in range(1002):
+        PyExecutor._append_stats_frame(executor, _stats_frame(iteration, rank_count))
+    assert len(executor.stats) == 1002
+    reports = materialize_stats_batch(PyExecutor.get_latest_iteration_stats(executor))
+    assert _report_identity(reports) == [
+        (iteration, rank, iteration + 1, 0)
+        for iteration in range(1002)
+        for rank in range(rank_count or 1)
+    ]
 
 
 @pytest.mark.parametrize(

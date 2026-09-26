@@ -1826,9 +1826,11 @@ class PyExecutor:
         return self.executor_request_queue.can_enqueue_control_request()
 
     def get_latest_iteration_stats(self):
-        """
-        Returns the per-iterations statistics computed since last call to this method.
-        Contains at most iter_stats_max_iterations iterations.
+        """Drain the pending captured iteration-statistics frames.
+
+        At most max_stats_len frames are retained unless the limit is -1.
+        Overflow evicts whole frames; a joined attention-DP frame expands into
+        one report row per rank when materialized by the client.
         """
         if self.enable_iter_perf_stats == False:
             return []

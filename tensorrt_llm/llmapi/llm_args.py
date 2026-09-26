@@ -6126,8 +6126,11 @@ class TorchLlmArgs(BaseLlmArgs):
         default=1000,
         ge=-1,
         description=
-        "The max number of performance statistic entries. Set to -1 to keep all entries. "
-        "Set to 0 to use a minimum buffer size of 1.",
+        "Maximum number of pending captured iteration-statistics frames in the executor. "
+        "Each joined attention-DP frame expands into one report row per rank. "
+        "Overflow evicts whole frames. Set to -1 for an unbounded buffer or 0 for a "
+        "minimum buffer size of 1. The server's iter_stats_max_iterations setting "
+        "separately limits retained report history.",
         status="prototype",
     )
 
