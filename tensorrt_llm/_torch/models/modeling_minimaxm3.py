@@ -1459,8 +1459,8 @@ class MiniMaxM3Attention(Attention):
         if any(weight.dtype != torch.bfloat16 or not weight.is_cuda for weight in norm_weights):
             return None
 
+        kv_cache_manager = attn_metadata.kv_cache_manager
         if cache_tensors is None:
-            kv_cache_manager = attn_metadata.kv_cache_manager
             if kv_cache_manager is None:
                 return None
             buffers = kv_cache_manager.get_buffers(self.layer_idx, kv_layout="HND")

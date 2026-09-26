@@ -44,6 +44,9 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
     MiniMaxM3MsaSparseAttention,
     MiniMaxM3SparseRuntimeBackend,
 )
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
+    MiniMaxM3KVCacheManagerV2,
+)
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
     MiniMaxM3SparseConfig,
     MiniMaxM3SparseMetadataParams,
@@ -1865,6 +1868,97 @@ def _make_fused_qk_norm_rope_test_config():
         skip_create_weights_in_init=True,
     )
     return text_cfg, model_cfg
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 horizontal producer needs CUDA")
+@pytest.mark.parametrize("kv_dtype", ["fp8", "nvfp4"])
+@torch.inference_mode()
+def test_horizontal_producer_explicit_caches_match_manager(
+    monkeypatch: pytest.MonkeyPatch, kv_dtype: str
+) -> None:
+    """Exercise real producer dispatch and replay the FP8 PCG custom op."""
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("MiniMax-M3 MSA requires SM100 or SM103")
+    _, model_cfg = _make_fused_qk_norm_rope_test_config()
+    layer = MiniMaxM3Attention(
+        model_config=model_cfg,
+        layer_idx=3,
+        is_sparse_attention_layer=True,
+        disable_index_value=True,
+    )
+    backend = object.__new__(MiniMaxM3MsaSparseAttention)
+    backend.indexer_kv_dtype = "fp8"
+    layer.attn = backend
+    layer.enable_fused_qkv_index_projection = True
+    layer.main_kv_is_fp8 = kv_dtype == "fp8"
+    layer.main_kv_is_nvfp4 = kv_dtype == "nvfp4"
+    layer.qkv_proj = nn.Identity()
+    layer.qkv_proj.register_buffer("inv_kv_scales", torch.tensor([1.0, 0.75, 1.25], device="cuda"))
+    torch.manual_seed(7)
+    for norm in (layer.q_norm, layer.k_norm, layer.index_q_norm, layer.index_k_norm):
+        norm.weight = nn.Parameter(torch.randn(128, dtype=torch.bfloat16, device="cuda") * 0.1)
+    packed = torch.randn((4, 11 * 128), dtype=torch.bfloat16, device="cuda")
+    positions = torch.arange(4, dtype=torch.int32, device="cuda")
+    slots = torch.tensor([0, 129, -1, -1], dtype=torch.int32, device="cuda")
+    nvfp4 = kv_dtype == "nvfp4"
+    main = torch.zeros(
+        (2, 2, 2, 128, 64 if nvfp4 else 128),
+        dtype=torch.uint8 if nvfp4 else torch.float8_e4m3fn,
+        device="cuda",
+    )
+    index = torch.zeros((2, 1, 128, 128), dtype=torch.float8_e4m3fn, device="cuda")
+    scales = torch.zeros((2, 2, 2, 128, 8), dtype=torch.uint8, device="cuda")
+    manager = create_autospec(MiniMaxM3KVCacheManagerV2, instance=True, spec_set=True)
+    manager.is_nvfp4_layer.return_value = nvfp4
+    manager.get_buffers.return_value = main
+    manager.get_block_scale_buffers.return_value = scales
+    metadata = Mock(
+        spec_set=MiniMaxM3MsaSparseAttentionMetadata,
+        kv_cache_manager=manager,
+        msa_out_cache_loc=slots,
+    )
+    metadata.msa_idx_k_cache.return_value = index
+
+    def snapshot(outputs: tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, ...]:
+        return tuple(t.view(torch.uint8).clone() for t in (*outputs, main, index, scales))
+
+    expected_outputs = layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(packed, positions, metadata)
+    assert expected_outputs is not None
+    expected = snapshot(expected_outputs)
+    for cache in (main, index, scales):
+        cache.zero_()
+    outputs = layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(
+        packed, positions, metadata, cache_tensors=(main, index, slots)
+    )
+    assert outputs is not None
+    for actual, reference in zip(snapshot(outputs), expected):
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    manager.get_buffers.assert_called_once_with(3, kv_layout="HND")
+    metadata.msa_idx_k_cache.assert_called_once_with(3)
+
+    if not nvfp4:
+        monkeypatch.setattr(
+            modeling_minimaxm3,
+            "_extract_minimax_m3_attention_extra_attrs",
+            lambda _: (metadata, layer),
+        )
+        op = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer
+        args = (packed, positions, main, index, slots, "3")
+        op(*args)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            replay_outputs = op(*args)
+        packed.mul_(-0.5)
+        for cache in (main, index):
+            cache.zero_()
+        graph.replay()
+        replay = snapshot(replay_outputs)
+        for cache in (main, index):
+            cache.zero_()
+        eager = snapshot(op(*args))
+        for actual, reference in zip(replay, eager):
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 
 @pytest.mark.gpu
