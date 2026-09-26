@@ -158,23 +158,31 @@ def get_request_num_tokens(request: Optional[OpenAIRequest]) -> int:
 
 
 def block_key_hasher(
-    token_ids: list[int], parent_hash: Optional[int] = None, cache_salt_id: Optional[int] = None
+    token_ids: list[int],
+    parent_hash: Optional[int] = None,
+    cache_salt_id: Optional[int] = None,
+    lora_task_id: Optional[int] = None,
 ) -> int:
     parent = 0 if parent_hash is None else parent_hash
     # Fast path: the native C++ BlockKeyHasher is bit-exact with
     # hash_v1_block_key and avoids the per-token Python loop. Its hash() binding
-    # takes no cache_salt_id, so fall back to Python only when a salt is set
-    # (rare opt-in; never in the unsalted agent/chat completion path).
-    if cache_salt_id is None:
+    # takes no cache_salt_id or lora_task_id, so fall back to Python whenever
+    # either is set (rare opt-in; never in the plain agent/chat completion path).
+    if cache_salt_id is None and lora_task_id is None:
         return _NativeBlockKeyHasher.hash(_NativeBlockKey(token_ids), parent)
-    return hash_v1_block_key(token_ids, parent_hash=parent, cache_salt_id=cache_salt_id)
+    return hash_v1_block_key(
+        token_ids, parent_hash=parent, lora_task_id=lora_task_id, cache_salt_id=cache_salt_id
+    )
 
 
 def v2_sha256_block_hasher(
-    token_ids: list[int], parent_hash: Optional[str] = None, cache_salt_id: Optional[int] = None
+    token_ids: list[int],
+    parent_hash: Optional[str] = None,
+    cache_salt_id: Optional[int] = None,
+    lora_task_id: Optional[int] = None,
 ) -> str:
     parent_key = (
-        V2RootBlock.make_key(ReuseScope(salt=cache_salt_id))
+        V2RootBlock.make_key(ReuseScope(lora_id=lora_task_id, salt=cache_salt_id))
         if parent_hash is None
         else bytes.fromhex(parent_hash)
     )
@@ -324,13 +332,14 @@ class BlockHashMixin:
         token_lists: list[list[int]],
         hash_algo: str = KV_CACHE_HASH_ALGO_DEFAULT,
         cache_salt_id: Optional[int] = None,
+        lora_task_id: Optional[int] = None,
     ) -> list[list[BlockHash]]:
         if hash_algo == KV_CACHE_HASH_ALGO_V1:
             block_hasher = block_key_hasher
         elif hash_algo == KV_CACHE_HASH_ALGO_V2:
             block_hasher = v2_sha256_block_hasher
         elif hash_algo == KV_CACHE_HASH_ALGO_V2_SHA256_64:
-            reuse_scope = ReuseScope(salt=cache_salt_id)
+            reuse_scope = ReuseScope(lora_id=lora_task_id, salt=cache_salt_id)
             block_hashes: list[list[BlockHash]] = []
             for token_list in token_lists:
                 hash_list = []
@@ -352,7 +361,10 @@ class BlockHashMixin:
                 t_end = min(t + self._tokens_per_block, len(token_list) - 1)
                 hash_list.append(
                     block_hasher(
-                        token_list[t:t_end], None if t == 0 else hash_list[-1], cache_salt_id
+                        token_list[t:t_end],
+                        None if t == 0 else hash_list[-1],
+                        cache_salt_id,
+                        lora_task_id,
                     )
                 )
             block_hashes.append(hash_list)
@@ -376,9 +388,12 @@ class BlockHashMixin:
         self,
         request: OpenAIRequest,
         cache_salt_id: Optional[int] = None,
+        lora_task_id: Optional[int] = None,
     ) -> tuple[list[list[int]], list[list[int]]]:
         token_lists = self._tokenize(request)
-        block_hashes = self._compute_block_hashes(token_lists, cache_salt_id=cache_salt_id)
+        block_hashes = self._compute_block_hashes(
+            token_lists, cache_salt_id=cache_salt_id, lora_task_id=lora_task_id
+        )
         return token_lists, block_hashes
 
     def _tokenize_and_compute_block_hashes_by_algo(
@@ -386,12 +401,13 @@ class BlockHashMixin:
         request: OpenAIRequest,
         hash_algos: Iterable[str],
         cache_salt_id: Optional[int] = None,
+        lora_task_id: Optional[int] = None,
     ) -> tuple[list[list[int]], dict[str, list[list[BlockHash]]]]:
         """Synchronous tokenize + per-algorithm block hashes for thread offload."""
         token_lists = self._tokenize(request)
         return token_lists, {
             hash_algo: self._compute_block_hashes(
-                token_lists, hash_algo, cache_salt_id=cache_salt_id
+                token_lists, hash_algo, cache_salt_id=cache_salt_id, lora_task_id=lora_task_id
             )
             for hash_algo in set(hash_algos)
         }
@@ -408,3 +424,17 @@ class BlockHashMixin:
     def _get_request_cache_salt_id(request: OpenAIRequest) -> Optional[int]:
         cache_salt = getattr(request, "cache_salt", None)
         return None if cache_salt is None else get_cache_salt_id(cache_salt)
+
+    @staticmethod
+    def _get_request_lora_id(request: OpenAIRequest) -> Optional[int]:
+        """LoRA adapter id keying the worker's KV reuse namespace, or None.
+
+        The worker partitions KV cache reuse by ``LoRARequest.adapter_id``
+        (== ``lora_int_id``): it becomes ``LlmRequest.lora_task_id`` and then
+        ``ReuseScope.lora_id`` (V2) / ``BlockKey.loraTaskId`` (V1 C++), so the
+        router must fold the same id into its recomputed block hashes or a
+        LoRA request can never match a worker's published blocks.
+        """
+        lora_request = getattr(request, "lora_request", None)
+        adapter_id = getattr(lora_request, "adapter_id", None)
+        return None if adapter_id is None else int(adapter_id)
