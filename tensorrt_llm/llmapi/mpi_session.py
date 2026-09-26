@@ -107,13 +107,9 @@ except Exception as error:  # noqa: BLE001
 
 os.environ["TRTLLM_FLASHINFER_WORKSPACE_MANAGED"] = "1"
 
-# Preserve FlashInfer's default cubin cache without importing
-# flashinfer.jit.env. The environment must be fully configured before that
-# module initializes its workspace constants.
-if "FLASHINFER_CUBIN_DIR" not in os.environ and os.environ.get("HOME"):
-    os.environ["FLASHINFER_CUBIN_DIR"] = str(
-        Path(os.environ["HOME"]) / ".cache" / "flashinfer" / "cubins"
-    )
+# FLASHINFER_CUBIN_DIR is left unset so FlashInfer keeps downloaded artifacts,
+# which include compiler inputs, inside the per-rank workspace. A caller-set
+# value is preserved. See docs/source/llm-api/index.md.
 
 from mpi4py.futures.server import main
 
@@ -554,7 +550,8 @@ class MpiPoolSession(MpiSession):
             key: value
             for key, value in os.environ.items()
             if key.startswith("TRTLLM") or key.startswith("TLLM") or key in (
-                "FLASHINFER_WORKSPACE_BASE", "FLASHINFER_CUBIN_DIR")
+                "FLASHINFER_WORKSPACE_BASE", "FLASHINFER_CUBIN_DIR",
+                "MASTER_ADDR", "MASTER_PORT")
         }
         workspace_managed = env.get(_FLASHINFER_WORKSPACE_MANAGED_ENV) == "1"
         env.update(self._env_overrides)

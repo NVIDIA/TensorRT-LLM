@@ -22,6 +22,7 @@ import pytest
 import torch
 from defs import conftest
 from defs.common import venv_check_call
+from defs.conftest import skip_pre_blackwell
 from defs.examples.visual_gen.visual_gen_test_utils import (
     FASTWAN_LPIPS_FRAME_RATE,
     FASTWAN_LPIPS_GUIDANCE_SCALE,
@@ -70,16 +71,17 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     _run_reusable_video_lpips_eval,
     _run_single_device_feature_generator,
     _save_lpips_video_mp4,
-    _skip_if_missing,
     _validate_single_feature_config,
     _visual_gen_output_path,
 )
+from test_common.llm_data import get_checkpoint
 
 WAN_T2V_MODEL_SUBPATH = "Wan2.1-T2V-1.3B-Diffusers"
 WAN22_T2V_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers"
 WAN22_A14B_NVFP4_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers-NVFP4"
 FASTWAN_MODEL_SUBPATH = "FastWan2.2-TI2V-5B-FullAttn-Diffusers"
 WAN22_I2V_A14B_NVFP4_MODEL_SUBPATH = "Wan2.2-I2V-A14B-Diffusers-NVFP4"
+WAN22_LPIPS_THRESHOLD = 0.25
 WAN_FEATURE_LPIPS_THRESHOLD = 0.05
 WAN_STANDARD_SUPPORTED_FEATURES = frozenset({"fp8-blockwise", "nvfp4", "cuda-graph"})
 
@@ -298,11 +300,11 @@ def test_wan22_t2v_lpips_against_golden(request, tmp_path, wan22_bf16_video_path
     _preserve_lpips_candidate_on_failure(
         request,
         score,
-        WAN_LPIPS_THRESHOLD,
+        WAN22_LPIPS_THRESHOLD,
         wan22_bf16_video_path,
         "wan22_t2v_lpips_golden_video.mp4",
     )
-    _assert_lpips_below_threshold(score, WAN_LPIPS_THRESHOLD)
+    _assert_lpips_below_threshold(score, WAN22_LPIPS_THRESHOLD)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -331,8 +333,7 @@ def test_fastwan_lpips_against_golden(request, tmp_path, fastwan_video_path):
 def _generate_wan_feature_video(case, output_path):
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
-    model_path = _lpips_model_path(case.checkpoint_subdir)
-    _skip_if_missing(model_path, f"{case.checkpoint_subdir} checkpoint", is_dir=True)
+    model_path = get_checkpoint(case.checkpoint_subdir)
     _disable_inductor_compile_worker_quiesce()
     pipeline = None
     with (
@@ -463,19 +464,22 @@ def test_visual_gen_api_walkthrough(_visual_gen_deps, llm_root, llm_venv):
 # =============================================================================
 
 
+@skip_pre_blackwell
 def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
     """Run examples/visual_gen/models/wan_t2v.py with NVFP4 config end-to-end.
 
-    This is a core example test: it validates that the per-model example script
-    and the shared YAML config work together as documented in the README.
-    Uses the pre-quantized Wan 2.2 T2V A14B NVFP4 checkpoint and the shared
-    ``configs/wan2.2-t2v-fp4-1gpu.yaml`` (NVFP4 dynamic quant).
+    Reuse the shared ``configs/wan2.2-t2v-fp4-1gpu.yaml`` configuration. Prefer
+    the pre-quantized checkpoint, falling back to dynamic quantization of the
+    original checkpoint when it is unavailable.
     """
     scratch_space = conftest.llm_models_root()
-    model_path = os.path.join(scratch_space, WAN22_A14B_NVFP4_MODEL_SUBPATH)
+    model_subpath = WAN22_A14B_NVFP4_MODEL_SUBPATH
+    if not os.path.isdir(os.path.join(scratch_space, model_subpath)):
+        model_subpath = WAN22_T2V_MODEL_SUBPATH
+    model_path = os.path.join(scratch_space, model_subpath)
     assert os.path.isdir(model_path), (
         f"Model not found: {model_path} "
-        f"(set LLM_MODELS_ROOT or place {WAN22_A14B_NVFP4_MODEL_SUBPATH} under models root)"
+        f"(set LLM_MODELS_ROOT or place {model_subpath} under models root)"
     )
 
     out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", "wan_t2v_example")
@@ -504,6 +508,7 @@ def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
 
 
+@skip_pre_blackwell
 def test_wan_i2v_example(_visual_gen_deps, llm_root, llm_venv):
     """Run examples/visual_gen/models/wan_i2v.py with NVFP4 config end-to-end.
 

@@ -15,6 +15,13 @@ run, based on what the PR changed. New rules are added in Python only.
 The touch DB is produced by the post-merge collection under `coverage_utils/`;
 see `coverage_utils/COLLECTION.md` for what it does and does not record.
 
+Tier 2 is evaluated for every eligible CBTS run (`/bot run` and
+`/bot run --post-merge`). Coverage decisions for authors outside
+`CBTS_COVERAGE_PILOT_USERS` are shadow-only: their candidate scope, stages,
+case counts, and skip rate are reported, but the narrowed test DB is not
+uploaded and the baseline filter chain remains active. Tier 1 decisions
+continue to apply to all users.
+
 ## Consumption layers
 
 CBTS narrows test cases only; Build always runs.
@@ -37,7 +44,6 @@ Nine rules, registered in `main.py::RULE_CLASSES`:
 | `WaivesRule` | `waiveonly` | `tests/integration/test_lists/waives.txt` |
 | `TestsDefRule` | `testdefonly` | `tests/**/*` (.py via AST; data files via dir walk-up) |
 | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
-| `AutoDeployRule` | `autodeployonly` | `examples/auto_deploy/**`, `tensorrt_llm/_torch/auto_deploy/**` (excl. `.md`; other suffixes incl. images kept as potential test fixtures) |
 | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (excl. `.md`; reference images such as `cat_piano.png` ARE test fixtures and stay claimed; outward-facing files force fallback) |
 | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (excl. `.md`; other suffixes incl. images kept as potential test fixtures) |
 | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. `.md`) |
@@ -53,12 +59,11 @@ See `rules/README.md` for per-rule logic.
 | `waiveonly` | `WaivesRule` fired solo: PR only edits `waives.txt`. |
 | `testdefonly` | `TestsDefRule` fired solo: PR only edits files under `tests/**/*`. |
 | `testlistonly` | `TestListRule` fired solo: PR only adds entries under `tests/integration/test_lists/test-db/*.yml`. |
-| `autodeployonly` | `AutoDeployRule` fired solo: PR only touches AutoDeploy source paths (`examples/auto_deploy/**`, `tensorrt_llm/_torch/auto_deploy/**`; excl. `.md`). Narrows to AD-only blocks (`backend: autodeploy` plus blocks containing `test_llm_api_autodeploy.py` / `_autodeploy-` entries). |
 | `visualgenonly` | `VisualGenRule` fired solo: PR only touches VisualGen internal source paths (`examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`; excl. `.md`; image fixtures like `cat_piano.png` are claimed). Narrows to blocks containing VG test entries. Outward-facing files under `tensorrt_llm/visual_gen/**` and `tensorrt_llm/media/**` (eagerly imported by `trtllm-serve`) force `null` fallback. |
 | `specdeconly` | `SpecDecRule` fired solo: PR only touches speculative-decoding source paths (`tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py`; excl. `.md`). Narrows to blocks containing spec-dec test entries (eagle / medusa / redrafter / ngram / draft-target-model / MTP). |
 | `agentflowonly` | `AgentFlowRule` fired solo: PR only touches `agent-flow/**` source or test files (excl. `.md`). Runs `CPU-AgentFlow-UnitTest`. |
-| `openengineonly` | `OpenEngineRule` fired solo: PR only touches `tensorrt_llm/grpc/openengine/**` source files (excl. `.md`). Narrows to the registered OpenEngine unit test, which lives on the always-run `CPU-Generic-*` stages. |
-| `testsonly` | Multiple rules from the testsonly family fired (`waiveonly`, `testdefonly`, `testlistonly`, `autodeployonly`, `visualgenonly`, `specdeconly`, `agentflowonly`, `openengineonly`); their narrows union. |
+| `openengineonly` | `OpenEngineRule` fired solo: PR only touches `tensorrt_llm/grpc/openengine/**` source files (excl. `.md`). Narrows to the registered OpenEngine unit tests: the stub-based ones on the always-run `CPU-Generic-*` stages, plus `test_capability_conformance.py` on `A10-PyTorch-*`, which needs a GPU. |
+| `testsonly` | Multiple rules from the testsonly family fired (`waiveonly`, `testdefonly`, `testlistonly`, `visualgenonly`, `specdeconly`, `agentflowonly`, `openengineonly`); their narrows union. |
 | `noop` | Rule(s) fired but determined no test stages need to run (QA-only path, removals-only test list, all-miss waives, in-namespace .py with no covering YAML entry, docs-only edits). Layer 2 still applies. |
 | `null` (fallback) | A rule cannot decide, scopes don't combine, or there are unhandled files. Groovy defers to baseline filter chain. |
 
@@ -85,17 +90,17 @@ jenkins/scripts/cbts/
 │   ├── waives_rule.py
 │   ├── tests_def_rule.py
 │   ├── test_list_rule.py
-│   ├── auto_deploy_rule.py
 │   ├── visual_gen_rule.py
 │   ├── spec_dec_rule.py
 │   ├── agent_flow_rule.py
 │   ├── openengine_rule.py
 │   └── out_of_scope_rule.py
 ├── coverage_tier.py       Tier 2 entry: applies the selector to the test-db YAMLs, classifies every candidate entry
+├── python_change_analysis.py  shared AST scopes, bindings, and local dependencies
+├── repository_reference.py   shared repository import and binding-reference index
 ├── coverage_selection/
 │   ├── SELECTION.md       how a decision is made: qualname concepts, decline gates, narrowing
 │   ├── selector.py        CoverageSelector.decide(): changed lines → qualnames → impacted / skippable per stage family
-│   ├── qualname_map.py    changed lines → co_qualname, plus the import-time and closure classifications
 │   ├── touch_db.py        read-only accessor over cbts_touchmap.sqlite + the untrusted-capture signals
 │   └── artifact.py        resolve and merge the x86/SBSA post-merge touch DBs
 ├── coverage_utils/        post-merge collection that produces the touch DB (see its README / COLLECTION.md)
@@ -230,7 +235,7 @@ Decision JSON:
 `cbts_test_db/` is written on the L0_MergeRequest agent and is not
 available to downstream `L0_Test-*` pods. To deliver it per stage:
 
-1. `getCbtsResult` tars `cbts_test_db/` and uploads it to Artifactory,
+1. For an applied decision, `getCbtsResult` tars `cbts_test_db/` and uploads it to Artifactory,
    recording the path in `result.cbts_test_db_artifact_path` (rides along
    inside `testFilter`).
 2. `renderTestDB` on the stage agent downloads and extracts that tarball
@@ -241,6 +246,12 @@ If the upload or the download/extraction fails, the override directory is
 absent and `renderTestDB` falls back to the source test-db. Layer 2 still
 applies. The tarball carries only the narrowed YAMLs, so no PR diff text
 travels between jobs.
+
+Shadow coverage decisions return to the baseline before this upload step, so
+neither Layer 2 stage filtering nor Layer 3 test-db narrowing can affect the
+run. OpenSearch records `b_cbts_applied` and
+`b_coverage_pilot_eligible`; `s_scope=coverage` with
+`b_cbts_applied=false` identifies a successful shadow candidate.
 
 ## Split-resize heuristic (Layer 2.5)
 

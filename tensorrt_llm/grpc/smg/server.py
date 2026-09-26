@@ -64,11 +64,6 @@ def launch_smg_server(
         if backend == "pytorch":
             llm_args.pop("build_config", None)
             llm = PyTorchLLM(**llm_args)
-        elif backend == "_autodeploy":
-            from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-
-            llm_args.pop("build_config", None)
-            llm = AutoDeployLLM(**llm_args)
         else:
             raise click.BadParameter(
                 f"{backend} is not a known backend, check help for available options.",

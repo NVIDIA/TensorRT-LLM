@@ -27,7 +27,10 @@
 #include "kv_cache_manager_v2/movingAverage.h"
 #include "kv_cache_manager_v2/stats.h"
 #include "kv_cache_manager_v2/storageManager.h"
+#include "kv_cache_manager_v2/utils/poison.h"
+#include "kv_cache_manager_v2/utils/reentrantSharedMutex.h"
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -115,6 +118,10 @@ public:
 
     void shutdown();
 
+    // Number of not-yet-destroyed managers in this process. A manager counts from the start of its
+    // construction, so one whose constructor throws is counted for the duration of that attempt.
+    [[nodiscard]] static uint32_t numLiveManagers() noexcept;
+
     // Clear all reusable (committed) blocks from the radix tree.
     void clearReusableBlocks();
 
@@ -143,6 +150,11 @@ public:
     BlockRadixTree::ReuseMatch matchReuse(
         ReuseScope const& reuseScope, TokenSpan inputTokens, bool knownNoDigest = false) const;
     int probeReuse(ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false) const;
+
+    // Read-only, advisory key of the first full block past the reusable prefix.
+    // Uses the same fresh, window-aware match as probeReuse without acquiring pages.
+    std::optional<BlockKey> probeFirstNewBlockKey(
+        ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false) const;
 
     // ---- Memory pool queries -----------------------------------------------
 
@@ -225,13 +237,27 @@ public:
 
     // ---- Statistics -------------------------------------------------------
 
+    // Independent per-pool values sampled together under the shared API lock.
+    TypedVec<PoolGroupIndex, StorageStatistics> getStorageStatistics(CacheLevel cacheLevel = kHotLevel) const;
+    // Pool-group numbering is level-specific; cold grouping can differ from the hot layout.
+    TypedVec<LifeCycleId, PoolGroupIndex> getLifeCyclePoolGroupIndices(CacheLevel cacheLevel = kHotLevel) const;
+
+    // Internal commit* and recordDiskPrefetchBlocks helpers require the caller's exclusive API lock.
     void commitStats(KVCacheStatsDelta const& stats, IterationStatsByLifeCycle const& iterationStatsByLifeCycle = {});
     KVCacheStatsDelta getCommittedStats() const;
     IterationStatsByLifeCycle getAndResetIterationStats();
     PeakBlockStatsByPoolGroup getAndResetIterationPeakBlockStats(CacheLevel cacheLevel);
+    // Drain every level at once. The peaks are already tracked as one per-level record, so a
+    // caller that wants all of them should not take that record apart one level at a time.
+    PeakBlockStatsByCacheLevel getAndResetIterationPeakBlockStatsByLevel();
 
     void commitSsmSnapshotIterationStats(SsmSnapshotIterationStatsByLifeCycle const& statsByLifeCycle);
     SsmSnapshotIterationStatsByLifeCycle getAndResetSsmSnapshotIterationStats();
+
+    // Per-cache-level split of the reuse block counts, committed alongside the scalar
+    // iteration stats so both views cover exactly the same requests.
+    void commitReusedBlocksByLevel(ReusedBlocksByLevelByLifeCycle const& byLifeCycle);
+    ReusedBlocksByLevelByLifeCycle getAndResetIterationReusedBlocksByLevel();
 
     // Count one ACTIVE->SUSPENDED transition for the current iteration window.
     void recordRequestSuspended();
@@ -240,6 +266,19 @@ public:
     // counts; a freshly-created cache is activated by its first resume(), but
     // that is an admission, not a recovery, and is not counted.
     void recordRequestResumed();
+    // Add the blocks a prefetch call actually migrated off disk in the current iteration window.
+    // Independent of reuse-hit attribution, which asks where matched tokens lived rather than
+    // what a prefetch moved.
+    void recordDiskPrefetchBlocks(int64_t numBlocks);
+    // Return the number of disk-prefetched blocks since the last drain and reset it.
+    int64_t getAndResetIterationDiskPrefetchBlocks();
+    // Accumulate a request's initial current-residency cached-token attribution, indexed by cache
+    // level, into the current iteration window. Committed alongside the scalar iteration stats so
+    // both views cover exactly the same requests.
+    void commitCachedTokensByLevel(CountsByLevel const& counts);
+    // Return the per-cache-level cached-token counts accumulated since the last drain and reset
+    // them.
+    CountsByLevel getAndResetIterationCachedTokensByLevel();
     // Return {suspended, resumed} counts since the last drain and reset them.
     // Both counters track the same population, so the running
     // (suspended - resumed) total is the number of requests still parked in
@@ -313,11 +352,43 @@ public:
     // Try to rebalance memory pool ratios based on usage statistics.
     void tryUpdateTargetRatios();
 
+    // ---- Thread safety ----------------------------------------------------
+    //
+    // One ReentrantSharedMutex guards all mutable state reachable from this manager: the radix
+    // tree, the storage manager and the living-KvCache set. Mutating APIs take it exclusively,
+    // read-only queries take it shared.
+    //
+    // SCOPE: it protects state shared *between* KvCaches, not the fields of one KvCache. Each
+    // KvCache is driven by its owning thread; calling into the same KvCache from two threads is
+    // unsupported. So a KvCache method locks only if it reaches the manager, storage or the tree.
+    //
+    // See AGENTS.md ("Concurrency model") for the rationale, the granularity trade-off and the
+    // rules for adding new APIs, and utils/reentrantSharedMutex.h for the lock's semantics.
+
+    //! Exclusive lock for mutating APIs. Held by KvCache too, via its owning manager.
+    [[nodiscard]] ReentrantSharedMutex::Guard lockExclusive() const
+    {
+        return mApiMutex.lockExclusive();
+    }
+
+    //! Shared lock for read-only queries.
+    [[nodiscard]] ReentrantSharedMutex::Guard lockShared() const
+    {
+        return mApiMutex.lockShared();
+    }
+
     // White-box introspection (incl. test-only auto-tuner state mutation) reaches
     // private members directly rather than widening the public API.
     friend class KvCacheIntrospection;
 
 private:
+    // First member, so the registration covers the whole lifetime: it is taken before any state
+    // this manager could leave behind exists, and dropped after ~KvCacheManager has run.
+    PoisonHold mPoisonHold;
+
+    //! Guards all mutable state reachable from this manager. See the scope note above.
+    mutable ReentrantSharedMutex mApiMutex;
+
     // Throw unless every KvCache has been closed. `api` names the caller so the message
     // points at the mistake rather than at whatever breaks later.
     void _checkNoLivingKvCaches(char const* api) const;
@@ -360,11 +431,14 @@ private:
     KVCacheStatsDelta mCommittedStats;
     IterationStatsByLifeCycle mIterationStatsByLifeCycle;
     SsmSnapshotIterationStatsByLifeCycle mSsmSnapshotIterationStatsByLifeCycle;
+    ReusedBlocksByLevelByLifeCycle mIterReusedBlocksByLevel;
     PeakBlockStatsByCacheLevel mIterationPeakNumBlocksByCacheLevel;
     std::unordered_set<RequestIdType> mDirtyStatsKvCacheIds;
     std::unordered_set<RequestIdType> mStatsExcludedKvCacheIds;
     int64_t mIterSuspendedRequests{0};
     int64_t mIterResumedRequests{0};
+    int64_t mIterDiskPrefetchBlocks{0};
+    CountsByLevel mIterCachedTokensByLevel;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

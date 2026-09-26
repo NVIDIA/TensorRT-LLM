@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 1993-2022 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -46,6 +46,7 @@ add_compile_definitions(TRTLLM_ABI_NAMESPACE=${TRTLLM_ABI_NAMESPACE})
 option(BUILD_PYT "Build in PyTorch TorchScript class mode" ON)
 option(BUILD_TESTS "Build Google tests" ON)
 option(BUILD_DEEP_EP "Build the Deep EP module" ON)
+option(BUILD_NCCL_EXTENSIONS "Build the nccl-extensions Python wheel" ON)
 option(BUILD_DEEP_GEMM "Build the DeepGEMM module" ON)
 option(BUILD_FLASH_MLA "Build the FlashMLA module" ON)
 option(BUILD_MICRO_BENCHMARKS "Build C++ micro benchmarks" OFF)
@@ -236,7 +237,9 @@ else()
   list(APPEND CUDA_TOOLKIT_COMPONENTS nvrtc_static nvrtc_builtins_static)
 endif()
 
-find_package(CUDAToolkit 11.2 REQUIRED COMPONENTS ${CUDA_TOOLKIT_COMPONENTS})
+# TRT-LLM currently validates CUDA 13.x toolkits. Require CUDA major version 13
+# or newer to align with that coverage.
+find_package(CUDAToolkit 13.0 REQUIRED COMPONENTS ${CUDA_TOOLKIT_COMPONENTS})
 
 set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 
@@ -280,8 +283,15 @@ include_directories(${CMAKE_BINARY_DIR}/_deps/nanobind-src/include)
 
 FetchContent_MakeAvailable(cutlass cxxopts flashmla json msa xgrammar)
 
+# cppzmq (header-only) is the bounce v2 control-plane dependency AND the UCX
+# bootstrap dependency. Make it available whenever NIXL (-> bounce) or UCX is
+# enabled, so bounce does NOT require UCX (its real deps are NIXL + zmq,
+# orthogonal to UCX). ucxx stays UCX-only.
+if(NIXL_ROOT OR ENABLE_UCX)
+  FetchContent_MakeAvailable(cppzmq)
+endif()
 if(ENABLE_UCX)
-  FetchContent_MakeAvailable(cppzmq ucxx)
+  FetchContent_MakeAvailable(ucxx)
 endif()
 
 if(NOT NVTX_DISABLE)
@@ -339,11 +349,15 @@ if(ENABLE_MULTI_DEVICE)
   add_definitions("-DOMPI_SKIP_MPICXX")
 endif()
 
-# C++17
-set(CMAKE_CXX_STANDARD 17)
+# C++20 is required by the PyTorch headers starting with torch 2.14.
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CUDA_STANDARD ${CMAKE_CXX_STANDARD})
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+# C++20 makes CMake scan the sources for module imports, which needs a scanner
+# the build images do not ship. Nothing here uses modules, so skip the scan.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 
 if(UNIX)
   set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -fno-inline")
@@ -475,10 +489,10 @@ endif()
 
 if((WIN32))
   if((MSVC_VERSION GREATER_EQUAL 1914))
-    # MSVC does not apply the correct __cplusplus version per the C++ standard
-    # by default. This is required for compiling CUTLASS 3.0 kernels on windows
-    # with C++-17 constexpr enabled. The 2017 15.7 MSVC adds /Zc:__cplusplus to
-    # set __cplusplus to 201703 with std=c++17. See
+    # MSVC does not report the correct __cplusplus version per the C++ standard
+    # by default, which the CUTLASS kernels rely on to enable their constexpr
+    # paths. /Zc:__cplusplus makes it follow the standard it is compiling
+    # against. See
     # https://learn.microsoft.com/en-us/cpp/build/reference/zc-cplusplus for
     # more info.
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Zc:__cplusplus")

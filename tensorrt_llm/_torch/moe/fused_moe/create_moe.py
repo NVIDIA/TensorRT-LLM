@@ -12,6 +12,7 @@ from .activation import DEFAULT_MOE_ACTIVATION, MoEActivation
 from .configurable_moe import ConfigurableMoE
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+from .fused_moe_cute_dsl_fc12 import CuteDslFc12FusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
 from .fused_moe_densegemm import DenseGEMMFusedMoE
@@ -128,7 +129,7 @@ def create_moe_backend(
             f"apply_router_weight_on_input not supported in {moe_cls.__name__}."
         )
 
-    if moe_cls == TRTLLMGenFusedMoE:
+    if issubclass(moe_cls, TRTLLMGenFusedMoE):
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -145,7 +146,7 @@ def create_moe_backend(
             activation=activation,
         )
 
-    if moe_cls in (CutlassFusedMoE, MarlinFusedMoE):
+    if moe_cls is CutlassFusedMoE or issubclass(moe_cls, MarlinFusedMoE):
         # The two whose constructor takes an expert-bias flag. Marlin declines
         # the flag itself, so the check above already rejected a True.
         return moe_cls(
@@ -178,8 +179,11 @@ def create_moe_backend(
             layer_idx=layer_idx,
             activation=activation,
         )
-    elif moe_cls in (CuteDslFusedMoE, CuteDslB12xFusedMoE):
-        # The narrower CuteDsl argument set: these kernels take no expert bias.
+    elif moe_cls in (CuteDslFusedMoE, CuteDslB12xFusedMoE, CuteDslFc12FusedMoE):
+        # Both are constructed through the narrower CuteDsl argument set (no
+        # bias / swiglu_alpha-beta-limit). CuteDslB12xFusedMoE now delegates to
+        # CutlassFusedMoE.__init__, which does accept those four, so widening
+        # this branch would need the allow-lists above to admit b12x first.
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -195,10 +199,6 @@ def create_moe_backend(
             init_load_balancer=init_load_balancer,
             activation=activation,
         )
-    # ``DeepGemmFusedMoE`` is an alias onto the registered implementation, so
-    # this matches that one class today. ``issubclass`` rather than ``==`` so
-    # that splitting an abstract parent back out, once a second quantization
-    # format needs one, does not require a new branch here.
     elif issubclass(moe_cls, DeepGemmFusedMoE):
         return moe_cls(
             routing_method=routing_method,
@@ -229,7 +229,7 @@ def create_moe_backend(
             layer_idx=layer_idx,
             activation=activation,
         )
-    elif moe_cls == DenseGEMMFusedMoE:
+    elif issubclass(moe_cls, DenseGEMMFusedMoE):
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -245,8 +245,6 @@ def create_moe_backend(
             init_load_balancer=init_load_balancer,
             activation=activation,
         )
-    # ``issubclass`` for the same reason as the DeepGEMM branch above;
-    # ``MegaMoEDeepGemm`` is likewise an alias onto the registered class.
     elif issubclass(moe_cls, (MegaMoEDeepGemm, MegaMoECuteDsl)):
         return moe_cls(
             routing_method=routing_method,

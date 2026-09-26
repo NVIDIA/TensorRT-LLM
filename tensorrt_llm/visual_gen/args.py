@@ -31,7 +31,11 @@ from tensorrt_llm.llmapi.llm_args import Field
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .sparse_attention import SkipSoftmaxAttentionConfig, VideoSparseAttentionConfig
+from .sparse_attention import (
+    SkipSoftmaxAttentionConfig,
+    SolAttentionConfig,
+    VideoSparseAttentionConfig,
+)
 
 # =============================================================================
 # Type aliases
@@ -45,7 +49,7 @@ CacheBackendName = Literal["teacache", "cache_dit"]
 
 
 class QuantAttentionConfig(StrictBaseModel):
-    """Attention quantization recipe (TRTLLM / FLASHINFER / CUTEDSL backends).
+    """Attention quantization recipe (TRTLLM / CUDNN / FLASHINFER / CUTEDSL backends).
 
     Specifies Q/K and V quantization formats and their optional block sizes.
 
@@ -63,12 +67,12 @@ class QuantAttentionConfig(StrictBaseModel):
             "integer and floating-point element formats; mxfp8 and nvfp4 are block-scaled formats."
         ),
     )
-    v_dtype: Literal["fp8", "nvfp4"] = Field(
+    v_dtype: Literal["fp8", "mxfp8", "nvfp4"] = Field(
         "fp8",
         status="prototype",
         description=(
-            "V quantization dtype. The current kernels always load V in FP8 (e4m3) "
-            "or block-scaled NVFP4."
+            "V quantization format. fp8 is the 8-bit floating-point element format; mxfp8 and "
+            "nvfp4 are block-scaled formats."
         ),
     )
     q_block_size: int = Field(
@@ -95,7 +99,7 @@ class QuantAttentionConfig(StrictBaseModel):
 
 # Discriminated union of sparse attention configs.
 SparseAttentionConfig = Annotated[
-    Union[SkipSoftmaxAttentionConfig, VideoSparseAttentionConfig],
+    Union[SkipSoftmaxAttentionConfig, VideoSparseAttentionConfig, SolAttentionConfig],
     Field(discriminator="algorithm"),
 ]
 
@@ -103,16 +107,16 @@ SparseAttentionConfig = Annotated[
 class AttentionConfig(StrictBaseModel):
     """Configuration for Attention layers."""
 
-    backend: Literal["VANILLA", "TRTLLM", "FLASHINFER", "FA4", "CUTEDSL"] = Field(
+    backend: Literal["VANILLA", "TRTLLM", "CUDNN", "FLASHINFER", "CUTEDSL", "FA4"] = Field(
         "VANILLA",
         status="prototype",
-        description=("Attention backend: VANILLA (PyTorch SDPA), TRTLLM, FLASHINFER, FA4, CUTEDSL"),
+        description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, CUDNN, FLASHINFER, CUTEDSL, FA4",
     )
     quant_attention_config: Optional[QuantAttentionConfig] = Field(
         None,
         status="prototype",
         description=(
-            "Quantized-attention recipe (TRTLLM / FLASHINFER / CUTEDSL backends). "
+            "Quantized-attention recipe (TRTLLM / CUDNN / FLASHINFER / CUTEDSL backends). "
             "Set to a QuantAttentionConfig instance to enable quantized "
             "attention; leave as None to disable."
         ),
@@ -122,7 +126,8 @@ class AttentionConfig(StrictBaseModel):
         status="prototype",
         description=(
             "Sparse attention recipe. Discriminated by algorithm: "
-            "skip_softmax (TRTLLM / CUTEDSL backends) or VSA (CUTEDSL backend)."
+            "skip_softmax (TRTLLM / CUTEDSL backends), vsa (CUTEDSL backend), "
+            "or sol_attn (CUTEDSL backend)."
         ),
     )
 
@@ -135,6 +140,11 @@ class AttentionConfig(StrictBaseModel):
             ("int8", "fp8", (1, 16, 1)),
             ("fp8", "fp8", (1, 1, 1)),
             ("fp8", "fp8", (1, 4, 1)),
+        }
+        # cuDNN fused SDPA quantizes both GEMMs with the same element format.
+        CUDNN_RECIPES = {
+            ("fp8", "fp8", (0, 0, 0)),
+            ("mxfp8", "mxfp8", (0, 0, 0)),
         }
         CUTEDSL_RECIPES = {
             ("bf16", "fp8", (0, 0, 0)),
@@ -181,6 +191,15 @@ class AttentionConfig(StrictBaseModel):
                     f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
                     f"{sorted(CUTEDSL_RECIPES)}."
                 )
+        elif self.backend == "CUDNN":
+            if recipe not in CUDNN_RECIPES:
+                raise ValueError(
+                    f"Unsupported quant_attention_config={self.quant_attention_config!r} "
+                    f"for backend='CUDNN'. Supported recipes "
+                    f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
+                    f"{sorted(CUDNN_RECIPES)}. Omit quant_attention_config to run "
+                    f"unquantized attention."
+                )
         elif self.backend == "FLASHINFER":
             if recipe not in FLASHINFER_RECIPES:
                 raise ValueError(
@@ -191,7 +210,7 @@ class AttentionConfig(StrictBaseModel):
                 )
         else:
             raise ValueError(
-                f"quant_attention_config requires backend in ('TRTLLM', 'FLASHINFER', 'CUTEDSL'), "
+                f"quant_attention_config requires backend in ('TRTLLM', 'CUDNN', 'FLASHINFER', 'CUTEDSL'), "
                 f"got backend='{self.backend}'. Either change backend or "
                 f"remove quant_attention_config."
             )
@@ -206,6 +225,7 @@ class AttentionConfig(StrictBaseModel):
         supported_backends = {
             "skip_softmax": ("TRTLLM", "CUTEDSL"),
             "vsa": ("CUTEDSL",),
+            "sol_attn": ("CUTEDSL",),
         }.get(algo)
         if supported_backends is None:
             return self
@@ -221,19 +241,23 @@ class AttentionConfig(StrictBaseModel):
 
     @model_validator(mode="after")
     def _validate_cutedsl_quant_sparse_mutex(self) -> "AttentionConfig":
-        # VSA replaces the dense CuTeDSL path and cannot compose with quantized
-        # attention. SkipSoftmax is part of that dense path and can compose.
+        # VSA and Sol-Attn each replace the dense CuTeDSL path and cannot
+        # compose with quantized attention: create_attention swaps in their own
+        # backend class, which never consumes quant_attention_config, so the
+        # request would be silently ignored. SkipSoftmax is part of the dense
+        # path itself and can compose.
+        _replaces_dense_path = ("vsa", "sol_attn")
         if (
             self.backend == "CUTEDSL"
             and self.quant_attention_config is not None
             and self.sparse_attention_config is not None
-            and self.sparse_attention_config.algorithm == "vsa"
+            and self.sparse_attention_config.algorithm in _replaces_dense_path
         ):
             raise ValueError(
-                "CUTEDSL backend: quant_attention_config and VSA "
-                "sparse_attention_config are mutually exclusive (the "
-                "CuTeDSLAttention dispatcher selects either the dense path "
-                "or the sparse VSA path, not both)."
+                f"CUTEDSL backend: quant_attention_config and "
+                f"'{self.sparse_attention_config.algorithm}' sparse_attention_config "
+                "are mutually exclusive (the CuTeDSLAttention dispatcher selects "
+                "either the dense path or that sparse path, not both)."
             )
         return self
 
@@ -825,6 +849,7 @@ __all__ = [
     "SparseAttentionConfig",
     "SkipSoftmaxAttentionConfig",
     "VideoSparseAttentionConfig",
+    "SolAttentionConfig",
     "AttentionConfig",
     "VAEConfig",
     "ParallelConfig",

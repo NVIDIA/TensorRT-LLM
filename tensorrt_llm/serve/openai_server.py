@@ -12,6 +12,7 @@ import re
 import signal
 import socket
 import sys
+import tempfile
 import time
 import traceback
 import uuid
@@ -35,6 +36,7 @@ from pydantic import ValidationError
 from starlette.routing import Mount
 from transformers import AutoProcessor
 
+from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.async_llm import AsyncLLM
 from tensorrt_llm._utils import EnergyMonitor
 # yapf: disable
@@ -84,7 +86,8 @@ from tensorrt_llm.serve.chat_utils import (load_chat_template,
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
 from tensorrt_llm.serve.disagg_auth import (
-    request_requires_internal_disagg_auth, validate_internal_disagg_request)
+    request_requires_internal_disagg_auth, validate_internal_disagg_request,
+    validate_subagent_affinity)
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
                                                QueueFullError)
@@ -97,9 +100,9 @@ from tensorrt_llm.serve.openai_protocol import (
     EmbeddingResponse, EmbeddingResponseData, EmbeddingUsageInfo, ErrorResponse,
     ImageEditRequest, ImageGenerationRequest, ImageGenerationResponse,
     ImageObject, MemoryUpdateRequest, ModelCard, ModelList, PromptTokensDetails,
-    ResponseFormat, ResponsesRequest, ResponsesResponse, StreamOptions,
-    TokenizeRequest, TokenizeResponse, UpdateWeightsRequest, UsageInfo,
-    ensure_request_chat_template_allowed, to_llm_conversation_params,
+    ResponseFormat, ResponsesRequest, ResponsesResponse, StartProfileRequest,
+    StreamOptions, TokenizeRequest, TokenizeResponse, UpdateWeightsRequest,
+    UsageInfo, ensure_request_chat_template_allowed, to_llm_conversation_params,
     to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.perf_metrics import (PerfMetricsJsonlWriter,
@@ -610,6 +613,48 @@ def _build_forced_tool_call_decoding(tools, tool_parser_name, forced_tool_name):
     return begin_prefix, guided
 
 
+def _new_media_dir(root: Path) -> Path:
+    """Create a directory under ``root`` stamped with the current time.
+
+    ``mkdir`` without ``exist_ok`` is what makes this safe: the kernel either
+    creates the directory or raises, so two servers starting in the same
+    second take separate names instead of sharing one.
+    """
+    stamp = datetime.now().strftime("%y%m%d-%H%M%S")
+    root.mkdir(parents=True, exist_ok=True)
+    n = 1
+    while True:
+        candidate = root / (stamp if n == 1 else f"{stamp}-{n}")
+        try:
+            candidate.mkdir()
+            return candidate
+        except FileExistsError:
+            n += 1
+
+
+def _resolve_media_dir() -> Path:
+    """Create and return the directory to store generated media in.
+
+    ``TRTLLM_MEDIA_STORAGE_PATH`` names the directory outright, empty meaning
+    unset. Otherwise it goes beside the working directory, and where that
+    cannot be written it goes to a private temporary one: a shared ``/tmp``
+    holds directories owned by other users, so the fallback takes a name
+    nobody else can hold rather than a fixed one.
+    """
+    explicit = os.getenv("TRTLLM_MEDIA_STORAGE_PATH")
+    if explicit:
+        path = Path(explicit)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    try:
+        return _new_media_dir(Path.cwd() / "trtllm_generated")
+    except OSError:
+        # OSError rather than PermissionError: a read-only mount raises
+        # EROFS, which is not one.
+        stamp = datetime.now().strftime("%y%m%d-%H%M%S")
+        return Path(tempfile.mkdtemp(prefix=f"trtllm_generated-{stamp}-"))
+
+
 def _normalize_image_output(image) -> list:
     """Normalize image output to a list of individual images.
 
@@ -815,8 +860,7 @@ class OpenAIServer(_VideoRoutesMixin):
                         self.energy_monitor = None
 
                 # Start background iteration stats collector if metrics are enabled
-                # The args for pytorch and autodeploy backend has attribute `enable_iter_perf_stats` while
-                # tensorrt backend does not have this attribute but it always has iter stats enabled.
+                # The PyTorch backend args include `enable_iter_perf_stats`.
                 if self.metrics_collector and getattr(
                         self.generator.args, "enable_iter_perf_stats", True):
                     # The background loop becomes the sole consumer of the
@@ -923,10 +967,8 @@ class OpenAIServer(_VideoRoutesMixin):
     def _init_visual_gen(self):
         self.processor = None
         self.model_config = None
-        self.media_storage_path = Path(
-            os.getenv("TRTLLM_MEDIA_STORAGE_PATH",
-                      "/tmp/trtllm_generated"))  # nosec B108
-        self.media_storage_path.mkdir(exist_ok=True, parents=True)
+        self.media_storage_path = _resolve_media_dir()
+        logger.info(f"VisualGen media storage path: {self.media_storage_path}")
         self.video_gen_tasks = {}
 
     def _supports_image_edit(self) -> bool:
@@ -1078,6 +1120,16 @@ class OpenAIServer(_VideoRoutesMixin):
         headers = None if raw_request is None else raw_request.headers
         validate_internal_disagg_request(
             getattr(self, "_internal_disagg_auth_key", None), request, headers)
+
+    def _get_scheduling_params(
+            self, request: ChatCompletionRequest,
+            raw_request: Optional[Request]) -> SchedulingParams:
+        return SchedulingParams(
+            agent_hierarchy=request.agent_hierarchy,
+            subagent_affinity_id=validate_subagent_affinity(
+                getattr(self, "_internal_disagg_auth_key", None), request,
+                getattr(self, "server_role", None),
+                None if raw_request is None else raw_request.headers))
 
     def _has_cache_transceiver_config(self) -> bool:
         cache_transceiver_config = getattr(
@@ -1392,6 +1444,14 @@ class OpenAIServer(_VideoRoutesMixin):
                                methods=["DELETE"])
         self.app.add_api_route("/_internal/tokenize",
                                self.tokenize,
+                               methods=["POST"])
+
+        # Profiling endpoints (PyTorch backend only)
+        self.app.add_api_route("/start_profile",
+                               self.start_profile,
+                               methods=["POST"])
+        self.app.add_api_route("/stop_profile",
+                               self.stop_profile,
                                methods=["POST"])
 
         self._register_rl_control_routes()
@@ -2175,12 +2235,31 @@ class OpenAIServer(_VideoRoutesMixin):
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
 
+            # A generation-only worker already has prompt_token_ids with the
+            # placeholders expanded and the KV behind them over the
+            # transceiver, so the media still on the relayed messages is not
+            # its to resolve.
+            #
+            # Decided before the fetch rather than after it: resolving
+            # downloads and decodes every item a second time, and fails
+            # outright on a reference only the context worker could read --
+            # a node-local path, or a single-use or expired URL.
+            #
+            # prompt_token_ids_b64 counts too; it is decoded into
+            # prompt_token_ids further below.
+            resolve_media = not (disaggregated_params is not None
+                                 and disaggregated_params.request_type
+                                 == "generation_only" and
+                                 (request.prompt_token_ids is not None
+                                  or request.prompt_token_ids_b64))
+
             try:
                 conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
                     request.messages,
                     self.model_config,
                     self.multimodal_server_config,
                     request_media_io_kwargs=request.media_io_kwargs,
+                    resolve_media=resolve_media,
                 )
             except ValidationError:
                 # ValidatorIterator rejects extra fields; fall back to raw JSON.
@@ -2191,6 +2270,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     self.model_config,
                     self.multimodal_server_config,
                     request_media_io_kwargs=request.media_io_kwargs,
+                    resolve_media=resolve_media,
                 )
 
             # Decode base64 int32 prompt_token_ids relayed by the orchestrator.
@@ -2289,8 +2369,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 request, None if raw_request is None else raw_request.headers)
             conversation_params = to_llm_conversation_params(
                 request.conversation_params)
-            scheduling_params = SchedulingParams(
-                agent_hierarchy=request.agent_hierarchy)
+            scheduling_params = self._get_scheduling_params(
+                request, raw_request)
 
             generate_inputs = prompt
             preprocess_fn = getattr(self.generator, "preprocess", None)
@@ -2873,6 +2953,8 @@ class OpenAIServer(_VideoRoutesMixin):
             yield "data: [DONE]\n\n"
 
         try:
+            if isinstance(request.prompt, list) and not request.prompt:
+                return self.create_error_response("'prompt' must not be empty.")
             if isinstance(request.prompt, str) or \
                 (isinstance(request.prompt, list) and isinstance(request.prompt[0], int)):
                 prompts = [request.prompt]
@@ -3093,8 +3175,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 request, None if raw_request is None else raw_request.headers)
             conversation_params = to_llm_conversation_params(
                 request.conversation_params)
-            scheduling_params = SchedulingParams(
-                agent_hierarchy=request.agent_hierarchy)
+            scheduling_params = self._get_scheduling_params(
+                request, raw_request)
 
             # Generate
             promise = self.generator.generate_async(
@@ -3353,6 +3435,101 @@ class OpenAIServer(_VideoRoutesMixin):
                 message=str(e),
                 err_type="InvalidRequestError",
                 status_code=HTTPStatus.BAD_REQUEST)
+
+    async def start_profile(
+            self,
+            request: Optional[StartProfileRequest] = None) -> JSONResponse:
+        """Start runtime profiling in the backend engine.
+
+        Request body (all optional): ``output_dir``, ``num_steps``,
+        ``start_step``, ``activities``. See ``StartProfileRequest`` for
+        descriptions.
+
+        The backend ``PyExecutor.start_profile`` schedules the profile
+        window and the broadcasted ``PROFILE_START_REQUEST_ID`` queue
+        item wakes the executor loop, so no tickle-via-generation is
+        needed on this side — the captured chrome trace stays free of
+        synthetic single-token forward passes.
+
+        The underlying ``GenerationExecutor.start_profile`` call may
+        block (it waits for the worker subprocess to ack on the
+        IPC-proxy path, up to ~60s). We run it on a worker thread via
+        ``asyncio.to_thread`` so the FastAPI event loop stays
+        responsive to other endpoints during that wait.
+        """
+        if request is None:
+            request = StartProfileRequest()
+        try:
+            await asyncio.to_thread(
+                self.generator.start_profile,
+                output_dir=request.output_dir,
+                num_steps=request.num_steps,
+                start_step=request.start_step,
+                activities=request.activities,
+            )
+        except RuntimeError as e:
+            # ``PyExecutor.start_profile`` raises RuntimeError when a
+            # profile window is already active or pending. Surface this
+            # to the caller as 409 so they can distinguish it from a
+            # generic backend failure (which keeps 500).
+            msg = str(e)
+            if "already in progress" in msg or "pending" in msg:
+                logger.info(f"/start_profile rejected: {msg}")
+                return JSONResponse(content={
+                    "success": False,
+                    "message": msg
+                },
+                                    status_code=409)
+            logger.error(f"/start_profile failed: {e}")
+            return JSONResponse(content={
+                "success": False,
+                "message": msg
+            },
+                                status_code=500)
+        except (OSError, ValueError, TimeoutError) as e:
+            # OSError: filesystem/IPC failures while preparing the
+            # profile window. ValueError: schema-level rejections that
+            # slipped past Pydantic. TimeoutError: ack-queue wait gave
+            # up. Anything truly unexpected is allowed to propagate to
+            # FastAPI's middleware so we get a real stack trace in the
+            # server log instead of swallowing it as a generic 500.
+            logger.error(f"/start_profile failed: {e}")
+            return JSONResponse(content={
+                "success": False,
+                "message": str(e)
+            },
+                                status_code=500)
+
+        return JSONResponse(content={"message": "Profiling started"})
+
+    async def stop_profile(self) -> JSONResponse:
+        """Stop any in-progress runtime profiling and flush traces.
+
+        The backend ``PyExecutor.stop_profile`` schedules the stop and
+        the broadcasted ``PROFILE_STOP_REQUEST_ID`` queue item wakes the
+        executor loop. The call blocks until ``profile_step()`` has
+        actually fired the stop, so by the time this handler returns 200
+        the chrome trace is on disk. No synthetic ``generate_async([0])``
+        tickle is submitted, so the captured trace is free of HTTP-layer
+        events.
+
+        The wait can take up to ~35s on the IPC-proxy path. We run the
+        blocking call on a worker thread via ``asyncio.to_thread`` so
+        the FastAPI event loop stays responsive to other endpoints
+        (notably ``/health`` for liveness checks) during the flush.
+        """
+        try:
+            await asyncio.to_thread(self.generator.stop_profile)
+        except (RuntimeError, OSError, TimeoutError) as e:
+            # RuntimeError: backend rejected the stop or broadcast
+            # enqueue failed. OSError: filesystem error flushing the
+            # trace. TimeoutError: ack-queue wait gave up. Truly
+            # unexpected exceptions propagate to FastAPI so they show
+            # up as a real stack trace rather than a swallowed 500.
+            logger.error(f"/stop_profile failed: {e}")
+            return JSONResponse(content={"error": str(e)}, status_code=500)
+
+        return JSONResponse(content={"message": "Profiling stopped"})
 
     async def release_memory(self,
                              request: MemoryUpdateRequest) -> JSONResponse:
@@ -3775,11 +3952,15 @@ class OpenAIServer(_VideoRoutesMixin):
         server = create_uvicorn_server(config)
 
         async def _register_after_serving():
-            while not server.started:
-                await asyncio.sleep(0.1)
+            with _StartupTimer("http_server_start"):
+                while not server.started:
+                    await asyncio.sleep(0.1)
             if self.disagg_cluster_worker:
                 try:
-                    await self.disagg_cluster_worker.register_worker()
+                    with _StartupTimer(
+                            f"service_registration/{self.disagg_cluster_worker.worker_info.worker_id}"
+                    ):
+                        await self.disagg_cluster_worker.register_worker()
                 except Exception as e:
                     logger.error(f"Worker registration failed: {e}")
                     server.should_exit = True

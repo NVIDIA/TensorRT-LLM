@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import atexit
 import contextlib
@@ -162,7 +176,7 @@ def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
                              "Must be a class or an async function.")
 
 
-def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
+def is_non_default_or_required(param_name, value, explicit_cli_keys):
     """
     Check if a parameter should be explicitly included in llm_args.
 
@@ -198,12 +212,7 @@ def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
            for s in cli_derived_fields.get(param_name, ())):
         return True
 
-    if backend == "_autodeploy":
-        from tensorrt_llm._torch.auto_deploy.llm_args import \
-            LlmArgs as AutoDeployLlmArgs
-        llm_args_class = AutoDeployLlmArgs
-    else:
-        llm_args_class = TorchLlmArgs
+    llm_args_class = TorchLlmArgs
 
     field_info = llm_args_class.model_fields.get(param_name)
     if not field_info:
@@ -247,7 +256,6 @@ def get_llm_args(
         trust_remote_code: bool = False,
         revision: Optional[str] = None,
         reasoning_parser: Optional[str] = None,
-        fail_fast_on_attention_window_too_large: bool = True,
         otlp_traces_endpoint: Optional[str] = None,
         enable_chunked_prefill: bool = False,
         enable_attention_dp: bool = False,
@@ -331,8 +339,6 @@ def get_llm_args(
         reasoning_parser,
         "otlp_traces_endpoint":
         otlp_traces_endpoint,
-        "fail_fast_on_attention_window_too_large":
-        fail_fast_on_attention_window_too_large,
         "multimodal_config":
         MultimodalConfig(video_pruning_rate=video_pruning_rate)
         if video_pruning_rate is not None else None,
@@ -349,7 +355,7 @@ def get_llm_args(
     llm_args = {
         param: value
         for param, value in cli_maybe_overrides.items()
-        if is_non_default_or_required(param, value, backend, explicit_cli_keys)
+        if is_non_default_or_required(param, value, explicit_cli_keys)
     }
 
     return llm_args, llm_args_extra_dict
@@ -698,12 +704,6 @@ def launch_server(
         if backend == 'pytorch':
             llm_args.pop("build_config", None)
             llm = PyTorchLLM(**llm_args)
-        elif backend == '_autodeploy':
-            from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-
-            # AutoDeploy does not support build_config
-            llm_args.pop("build_config", None)
-            llm = AutoDeployLLM(**llm_args)
         else:
             raise click.BadParameter(
                 f"{backend} is not a known backend, check help for available options.",
@@ -993,11 +993,9 @@ def launch_visual_gen_server(
                   status="beta")
 @stability_option(
     "--backend",
-    type=click.Choice(["pytorch", "_autodeploy"]),
+    type=click.Choice(["pytorch"]),
     default="pytorch",
-    help="The backend to use to serve the model. Default is pytorch backend. "
-    "Note: the '_autodeploy' backend is deprecated and will be discontinued "
-    "in a future release; please use the 'pytorch' backend instead.",
+    help="The backend to use to serve the model. Default is pytorch backend.",
     status="deprecated")
 @stability_option(
     "--generation-config",
@@ -1177,15 +1175,6 @@ def launch_visual_gen_server(
     "MM_ENCODER=multimodal encoder, VISUAL_GEN=visual generation. "
     "Required when using service registry.",
     status="prototype")
-@stability_option(
-    "--fail_fast_on_attention_window_too_large",
-    is_flag=True,
-    default=True,
-    help=
-    "[Deprecated] Exit with runtime error when attention window is too large "
-    "to fit even a single sequence in the KV cache. Now defaults to True. "
-    "This flag only affects the TRT backend and will be removed in a future release.",
-    status="deprecated")
 @stability_option("--otlp_traces_endpoint",
                   type=str,
                   default=None,
@@ -1305,44 +1294,64 @@ def launch_visual_gen_server(
     "launcher read the kernel-assigned port back instead of reserving one up "
     "front.",
     status="prototype")
-def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
-          post_processor_hook: Optional[str], host: str, port: int,
-          log_level: str, backend: str, generation_config: str,
-          max_beam_width: int, max_batch_size: int, max_num_tokens: int,
-          max_seq_len: int, tensor_parallel_size: int,
-          pipeline_parallel_size: int, context_parallel_size: int,
-          moe_expert_parallel_size: Optional[int],
-          moe_cluster_parallel_size: Optional[int],
-          gpus_per_node: Optional[int], free_gpu_memory_fraction: float,
-          kv_cache_dtype: str, num_postprocess_workers: int,
-          num_serve_frontends: int, num_input_processor_workers: int,
-          num_media_load_workers: int, trust_remote_code: bool,
-          revision: Optional[str], extra_llm_api_options: Optional[str],
-          reasoning_parser: Optional[str], tool_parser: Optional[str],
-          metadata_server_config_file: Optional[str],
-          server_role: Optional[str],
-          fail_fast_on_attention_window_too_large: bool,
-          otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
-          enable_attention_dp: bool, disagg_cluster_uri: Optional[str],
-          media_io_kwargs: Optional[str], agent_percentage: float,
-          agent_types: Optional[str], video_pruning_rate: Optional[float],
-          telemetry: bool, custom_module_dirs: list[Path],
-          chat_template: Optional[str], allow_request_chat_template: bool,
-          middleware: tuple[str, ...], grpc: bool, grpc_protocol: str,
-          enable_visual_gen: bool, served_model_name: Optional[str],
-          visual_gen_args: Optional[str], report_addr: Optional[str]) -> None:
+def serve(
+    model: str,
+    tokenizer: Optional[str],
+    custom_tokenizer: Optional[str],
+    post_processor_hook: Optional[str],
+    host: str,
+    port: int,
+    log_level: str,
+    backend: str,
+    generation_config: str,
+    max_beam_width: int,
+    max_batch_size: int,
+    max_num_tokens: int,
+    max_seq_len: int,
+    tensor_parallel_size: int,
+    pipeline_parallel_size: int,
+    context_parallel_size: int,
+    moe_expert_parallel_size: Optional[int],
+    moe_cluster_parallel_size: Optional[int],
+    gpus_per_node: Optional[int],
+    free_gpu_memory_fraction: float,
+    kv_cache_dtype: str,
+    num_postprocess_workers: int,
+    num_serve_frontends: int,
+    num_input_processor_workers: int,
+    num_media_load_workers: int,
+    trust_remote_code: bool,
+    revision: Optional[str],
+    extra_llm_api_options: Optional[str],
+    reasoning_parser: Optional[str],
+    tool_parser: Optional[str],
+    metadata_server_config_file: Optional[str],
+    server_role: Optional[str],
+    otlp_traces_endpoint: Optional[str],
+    enable_chunked_prefill: bool,
+    enable_attention_dp: bool,
+    disagg_cluster_uri: Optional[str],
+    media_io_kwargs: Optional[str],
+    agent_percentage: float,
+    agent_types: Optional[str],
+    video_pruning_rate: Optional[float],
+    telemetry: bool,
+    custom_module_dirs: list[Path],
+    chat_template: Optional[str],
+    allow_request_chat_template: bool,
+    middleware: tuple[str, ...],
+    grpc: bool,
+    grpc_protocol: str,
+    enable_visual_gen: bool,
+    served_model_name: Optional[str],
+    visual_gen_args: Optional[str],
+    report_addr: Optional[str],
+) -> None:
     """Running an OpenAI API compatible server
 
-    MODEL: model name | HF checkpoint path | TensorRT engine path
+    MODEL: model name or Hugging Face checkpoint path
     """
     logger.set_level(log_level)
-
-    if backend == "_autodeploy":
-        logger.warning(
-            "The '_autodeploy' backend is deprecated and will be discontinued in a "
-            "future release. No new features or models will be added. Please migrate "
-            "to the 'pytorch' backend. See "
-            "https://github.com/NVIDIA/TensorRT-LLM/issues/15638 for details.")
 
     if not grpc and grpc_protocol != "smg":
         raise click.UsageError("--grpc-protocol requires --grpc")
@@ -1352,12 +1361,6 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
             "--moe_cluster_parallel_size / --cluster_size is deprecated and "
             "no longer supported. This option will be removed in a future release."
         )
-
-    if "--fail_fast_on_attention_window_too_large" in sys.argv:
-        logger.warning(
-            "--fail_fast_on_attention_window_too_large is deprecated. "
-            "It now defaults to True and will be removed in a future release. "
-            "This flag only affects the TRT backend.")
 
     if tool_parser == "auto":
         resolved = resolve_auto_tool_parser(model)
@@ -1427,8 +1430,6 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
             trust_remote_code=trust_remote_code,
             revision=revision,
             reasoning_parser=reasoning_parser,
-            fail_fast_on_attention_window_too_large=
-            fail_fast_on_attention_window_too_large,
             otlp_traces_endpoint=otlp_traces_endpoint,
             enable_chunked_prefill=enable_chunked_prefill,
             enable_attention_dp=enable_attention_dp,
@@ -1482,7 +1483,7 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
             ), "server_role is required when metadata_server_cfg or disagg_cluster_config is provided"
             try:
                 server_role = ServerRole[server_role.upper()]
-            except ValueError:
+            except KeyError:
                 raise ValueError(f"Invalid server role: {server_role}. " \
                                 f"Must be one of: {', '.join([role.name for role in ServerRole])}")
         # Parse media_io_kwargs from JSON string to dict if provided
@@ -1553,7 +1554,10 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                         "https://buf.build/gen/python "
                         "\"tensorrt_llm[openengine]\"`.") from error
 
-                launch_grpc_server(host, port)
+                launch_grpc_server(host,
+                                   port,
+                                   llm_args,
+                                   served_model_name=served_model_name)
         else:
             # Default: launch OpenAI HTTP server
             launch_server(
@@ -1691,16 +1695,26 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
     default=True,
     help="Enable or disable anonymous usage telemetry collection.",
     status="beta")
-def serve_encoder(model: str, host: str, port: int, log_level: str,
-                  max_batch_size: int, max_num_tokens: int,
-                  gpus_per_node: Optional[int], trust_remote_code: bool,
-                  extra_encoder_options: Optional[str], revision: Optional[str],
-                  free_gpu_memory_fraction: float, tensor_parallel_size: int,
-                  metadata_server_config_file: Optional[str],
-                  allow_request_chat_template: bool, telemetry: bool):
+def serve_encoder(
+    model: str,
+    host: str,
+    port: int,
+    log_level: str,
+    max_batch_size: int,
+    max_num_tokens: int,
+    gpus_per_node: Optional[int],
+    trust_remote_code: bool,
+    extra_encoder_options: Optional[str],
+    revision: Optional[str],
+    free_gpu_memory_fraction: float,
+    tensor_parallel_size: int,
+    metadata_server_config_file: Optional[str],
+    allow_request_chat_template: bool,
+    telemetry: bool,
+):
     """Running an OpenAI API compatible server
 
-    MODEL: model name | HF checkpoint path | TensorRT engine path
+    MODEL: model name or Hugging Face checkpoint path
     """
     logger.set_level(log_level)
 
@@ -1817,11 +1831,20 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
               default=True,
               help="Enable or disable anonymous usage telemetry collection.")
 def serve_embedding(
-        model: str, host: str, port: int, log_level: str, max_batch_size: int,
-        max_num_tokens: int, max_queue_delay: float, max_queue_size: int,
-        trust_remote_code: bool, extra_llm_api_options: Optional[str],
-        revision: Optional[str], metadata_server_config_file: Optional[str],
-        telemetry: bool):
+    model: str,
+    host: str,
+    port: int,
+    log_level: str,
+    max_batch_size: int,
+    max_num_tokens: int,
+    max_queue_delay: float,
+    max_queue_size: int,
+    trust_remote_code: bool,
+    extra_llm_api_options: Optional[str],
+    revision: Optional[str],
+    metadata_server_config_file: Optional[str],
+    telemetry: bool,
+):
     """Run an OpenAI-compatible /v1/embeddings server for encoder-only models.
 
     Coalesces concurrent requests with a dynamic batcher and serves them through
@@ -2223,6 +2246,27 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     coord_url = f"unix:{coord_uds}" if coord_uds else \
         f"http://{public_host}:{coord_port}"
 
+    # Bind the coordinator's TCP socket here rather than letting uvicorn bind the
+    # hostname, so this listener starts the same way as the standalone server and
+    # the fleet workers. uvicorn would resolve the name itself, and a hostname
+    # whose AAAA record is link-local resolves to fe80:: with scope id 0 -- which
+    # the kernel always rejects with "invalid argument", because the scope id can
+    # only be derived from an interface name. Binding AF_INET here also surfaces a
+    # port conflict with the same diagnostics as the other two listeners.
+    coord_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    coord_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        coord_socket.bind((public_host, coord_port))
+    except OSError as e:
+        coord_socket.close()
+        holder = _diagnose_port_in_use(coord_port)
+        logger.error(f"Failed to bind coordinator socket to "
+                     f"{public_host}:{coord_port} (pid={os.getpid()}): {e}. "
+                     f"Current port holder(s): {holder}")
+        raise RuntimeError(
+            f"Failed to bind socket to {public_host}:{coord_port}: {e}. "
+            f"Port holder(s): {holder}")
+
     # 1. Launch the delegating fleet pointed at the implicit coordinator we start
     #    below (port-1 for TCP; UDS for the hot path). Workers hold
     #    CoordinatorClients (no core), so they can't race the ZMQ ingest bind.
@@ -2246,7 +2290,8 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
         disagg_cfg,
         _client_factory,
         metadata_config=metadata_server_cfg,
-        server_start_timeout_secs=server_start_timeout)
+        server_start_timeout_secs=server_start_timeout,
+        request_timeout_secs=request_timeout)
     logger.info(f"Coordinator serving on {public_host}:{coord_port} "
                 f"(uds={coord_uds}) (fleet on public port {public_port})")
     set_lifecycle_phase("serving")
@@ -2257,7 +2302,8 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
                 public_host,
                 coord_port,
                 uds=coord_uds,
-                keep_alive_timeout=disagg_cfg.server_keep_alive_timeout))
+                keep_alive_timeout=disagg_cfg.server_keep_alive_timeout,
+                sockets=[coord_socket]))
 
         async def _monitor_fleet():
             while True:
@@ -2285,6 +2331,7 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     try:
         asyncio.run(_serve_and_monitor())
     finally:
+        coord_socket.close()
         for process in fleet:
             if process.poll() is None:
                 process.terminate()

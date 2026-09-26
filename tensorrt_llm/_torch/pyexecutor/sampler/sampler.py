@@ -30,7 +30,6 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import (
-    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -56,7 +55,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 from ...utils import torch_multi_arange
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
-from ..resource_manager import ResourceManager, ResourceManagerType
+from ..resource_manager import ResourceManager
 from ..scheduler import ScheduledRequests
 from .beam_search import BeamHistoryBuilder, BeamSearchHandler, finalize_beam, prepare_beam_search
 from .finish_reasons import FinishReasonsHandler
@@ -84,6 +83,7 @@ from .sampler_features import (
     apply_embedding_bias,
     check_stop_words_length,
     fast_greedy_sample_kernel,
+    meet_stop_token_criteria,
     scatter_new_tokens,
 )
 from .sampler_strategy import (
@@ -116,15 +116,6 @@ if sys.version_info[:2] >= (3, 12):
     from typing import override
 else:
     from typing_extensions import override
-
-if TYPE_CHECKING:
-    # Type-only: importing the speculative package at module level would
-    # re-create the import cycle sampler.sampler -> speculative ->
-    # (draft_target/mtp) -> pyexecutor.sampler that this package's lazy
-    # __init__ exists to avoid. The cycle only resolves when speculative is
-    # imported first; a process whose first touch is sampler.sampler (e.g. a
-    # test module, with the top-level package now lazy) would break.
-    from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 
 T = TypeVar("T")
 
@@ -644,9 +635,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # Number of leading rows of the fast-tier buffers the staged batch fills.
         self._fast_num_rows: int = 0
 
-        # AutoDeploy build creates the sampler in inference mode,
-        # which would disallow in-place mutating of new_tokens.
-        # So, we temporarily exit inference mode.
+        # The sampler can be created in inference mode, which disallows
+        # in-place mutation of new_tokens. Temporarily exit inference mode.
         with torch.inference_mode(False):
             self.store = self._create_store()
             self._request_grouper: _CachingRequestGrouper[Any] = _CachingRequestGrouper(
@@ -692,7 +682,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         # Force number of accepted tokens for speculative decoding testing.
         # Imported here (not at module level) to keep sampler.sampler off the
-        # speculative import cycle; see the TYPE_CHECKING note above.
+        # import cycle sampler.sampler -> speculative -> (draft_target/mtp) ->
+        # pyexecutor.sampler that this package's lazy __init__ exists to avoid.
         from ...speculative.interface import get_force_num_accepted_tokens
 
         self._force_num_accepted_tokens = get_force_num_accepted_tokens()
@@ -736,7 +727,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     def _is_draft_batch(requests: list[LlmRequest]) -> bool:
         """Whether this batch belongs to the draft model.
 
-        Batches are homogeneous by construction: ModelDrafter builds all-draft
+        Batches are homogeneous by construction: a drafter builds all-draft
         batches for its sample_async/update_requests calls on this shared
         sampler, and PyExecutor's batches are all-target. The pending-steps
         accounting relies on this to skip draft batches wholesale; assert it so
@@ -763,18 +754,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             self._generator.manual_seed(self._global_seed)
         assert self._generator.device == device
         return self._generator
-
-    def get_spec_tree_manager(
-        self, resource_manager: Optional[ResourceManager]
-    ) -> Optional["SpecTreeManager"]:
-        if resource_manager is None:
-            return None
-        spec_resource_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.SPEC_RESOURCE_MANAGER
-        )
-        if spec_resource_manager is None or not hasattr(spec_resource_manager, "spec_tree_manager"):
-            return None
-        return spec_resource_manager.spec_tree_manager  # type: ignore
 
     @property
     def _use_beam_search(self) -> bool:
@@ -1533,15 +1512,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         finalized_token_updates: list[tuple[int, list[int]]] = []
         # Fast-path (batched pybind): when the batch is greedy with no beam
-        # search, no logprobs, no draft tokens, no stop-words, and no
-        # speculative tree, collapse per-request pybind chatter into one
-        # batched add_new_tokens_to_requests call. Single-pass eligibility
-        # check with early-break; falls through when any invariant breaks.
-        if (
-            self._batch_fastpath_eligible
-            and logprobs_state_list is None
-            and self.get_spec_tree_manager(resource_manager) is None
-        ):
+        # search, no logprobs, no draft tokens and no stop-words, collapse
+        # per-request pybind chatter into one batched
+        # add_new_tokens_to_requests call. Single-pass eligibility check with
+        # early-break; falls through when any invariant breaks.
+        if self._batch_fastpath_eligible and logprobs_state_list is None:
             alive_reqs: list[LlmRequest] = []
             tokens_flat: list[int] = []
             fastpath_ok = True
@@ -1654,7 +1629,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     new_tokens_tensor=new_tokens,
                     new_tokens_list=new_tokens_list,
                     finish_reasons=finish_reasons,
-                    resource_manager=resource_manager,
                 )
                 if (actual_draft_len := get_draft_token_length(req)) > 0:
                     req.py_num_accepted_draft_tokens = num_accepted
@@ -1739,7 +1713,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 or request.max_beam_num_tokens >= self.max_seq_len
             ):
                 request.finish_by(FinishReason.LENGTH, DEFAULT_BEAM_IDX)
-            elif request.py_stop_words_list and new_token in request.py_stop_words_list[0]:
+            elif meet_stop_token_criteria(request, new_token, DEFAULT_BEAM_IDX):
                 request.finish_by(FinishReason.STOP_WORDS, DEFAULT_BEAM_IDX)
             request.py_num_accepted_draft_tokens = 0
             request.py_rewind_len = 0
@@ -1756,7 +1730,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         resource_manager: Optional[ResourceManager] = None,
     ) -> SampleStateTorch:
         # NB: The sampler is either called directly by PyExecutor, for the target model,
-        #     or by ModelDrafter.prepare_draft_tokens(), for the draft model. In the former
+        #     or by a drafter's prepare_draft_tokens(), for the draft model. In the former
         #     case there are 1 + get_draft_token_length(request) tokens per request. In the
         #     latter case, there is always only 1 token per request because draft
         #     tokens are sampled one-by-one.

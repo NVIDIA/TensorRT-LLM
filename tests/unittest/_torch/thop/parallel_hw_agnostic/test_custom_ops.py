@@ -53,7 +53,6 @@ def discover_custom_ops(namespaces):
 @pytest.fixture(scope="module", autouse=True)
 def custom_ops():
     """Discover custom ops in the codebase."""
-    # "auto_deploy" custom ops are not checked here.
     custom_op_namespaces = ("trtllm",)
 
     return discover_custom_ops(custom_op_namespaces)
@@ -81,7 +80,6 @@ def test_register_fake(custom_ops):
         "trtllm::mtp_relaxed_acceptance_op",
         "trtllm::mtp_update_hidden_states_op",
         "trtllm::mtp_prepare_drafter_inputs_op",
-        "trtllm::extract_real_draft_tokens_op",
         "trtllm::selective_scan",
         "trtllm::reducescatter_list",
         "trtllm::reducescatter_list_pg",

@@ -27,7 +27,8 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import torch
-from transformers import AutoConfig, Gemma4Config, Gemma4TextConfig
+from torch.utils._python_dispatch import TorchDispatchMode
+from transformers import AutoConfig, Gemma4Config, Gemma4TextConfig, Gemma4VisionConfig
 
 from tensorrt_llm._torch.attention.backends import FlashInferAttention, FlashInferAttentionMetadata
 from tensorrt_llm._torch.configs.gemma4 import Gemma4AssistantConfig
@@ -645,6 +646,7 @@ class TestGemma4Assistant(unittest.TestCase):
         model_config = _make_assistant_model_config()
         model_config.extra_attrs["_speculative_position_headroom"] = 2 * 4
         assistant = Gemma4AssistantForCausalLM(model_config)
+        self.assertIs(assistant.model.model_config.extra_attrs, model_config.extra_attrs)
         self.assertEqual(len(assistant.model.layers), 4)
         self.assertTrue(all(layer.is_kv_shared_layer for layer in assistant.model.layers))
         self.assertEqual(
@@ -4265,6 +4267,40 @@ class TestGemma4MMTowerRMSNormConvention(unittest.TestCase):
             "``Gemma4VisionRMSNorm`` adapter for q/k/v norms and "
             "encoder layer norms.",
         )
+
+
+class _RejectMatrixMultiply(TorchDispatchMode):
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if func in (torch.ops.aten.mm.default, torch.ops.aten.bmm.default):
+            raise AssertionError(f"Gemma4 vision RoPE must not dispatch {func}")
+        return func(*args, **(kwargs or {}))
+
+
+class TestGemma4VisionRotaryEmbedding(unittest.TestCase):
+    def test_rotary_table_avoids_matrix_multiply(self):
+        from tensorrt_llm._torch.models.modeling_gemma4_vision import Gemma4VisionRotaryEmbedding
+
+        config = Gemma4VisionConfig(
+            hidden_size=1152,
+            num_attention_heads=16,
+            head_dim=72,
+            rope_parameters={"rope_type": "default", "rope_theta": 10_000.0},
+        )
+        rotary = Gemma4VisionRotaryEmbedding(config)
+        axis = torch.arange(64, dtype=torch.float32)
+        grid_y, grid_x = torch.meshgrid(axis, axis, indexing="ij")
+        position_ids = torch.stack((grid_x.flatten(), grid_y.flatten()), dim=-1).unsqueeze(0)
+
+        with _RejectMatrixMultiply():
+            cos, sin = rotary(torch.empty(0), position_ids)
+
+        inv_freq = rotary.inv_freq.double()[None, None, :]
+        reference_parts = [
+            inv_freq * position_ids[:, :, dim].double().unsqueeze(-1) for dim in range(2)
+        ]
+        reference = torch.cat([torch.cat((part, part), dim=-1) for part in reference_parts], dim=-1)
+        torch.testing.assert_close(cos.double(), reference.cos(), atol=2e-6, rtol=0)
+        torch.testing.assert_close(sin.double(), reference.sin(), atol=2e-6, rtol=0)
 
 
 class TestGemma4AudioTowerStructure(unittest.TestCase):

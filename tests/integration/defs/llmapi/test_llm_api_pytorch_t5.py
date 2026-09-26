@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 from transformers import AutoTokenizer
 
+from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm.llmapi import (
     LLM,
     CudaGraphConfig,
@@ -583,7 +584,8 @@ def _assert_decoder_cuda_graphs_captured(llm: LLM) -> None:
     output checks. The enc-dec encoder step stays eager.
     """
     model_engine = llm._executor.engine.model_engine
-    assert not model_engine.encoder_cuda_graph_runner.enabled
+    assert isinstance(model_engine._runner, EncoderDecoderRunner)
+    assert not model_engine._runner._encoder_cuda_graph_runner.enabled
     assert model_engine.cuda_graph_runner.enabled
     assert model_engine.cuda_graph_runner.graphs
 
@@ -902,7 +904,8 @@ def test_t5_pytorch_continuous_admission_replays_encoder_and_mixed_cuda_graphs(
         batch_wait_timeout_iters=2,
     ) as llm:
         model_engine = llm._executor.engine.model_engine
-        encoder_runner = model_engine.encoder_cuda_graph_runner
+        assert isinstance(model_engine._runner, EncoderDecoderRunner)
+        encoder_runner = model_engine._runner._encoder_cuda_graph_runner
         decoder_runner = model_engine.cuda_graph_runner
 
         assert encoder_runner.enabled
@@ -981,3 +984,51 @@ def test_t5_pytorch_continuous_admission_replays_encoder_and_mixed_cuda_graphs(
         }
         assert replayed_mixed_keys
         assert replayed_mixed_keys <= captured_mixed_keys
+
+
+def test_t5_pytorch_block_reuse_is_refused_for_relative_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """KV block reuse with T5 must fail with a message about relative position.
+
+    Block reuse turns on paged-context attention, which needs the fused context
+    FMHA kernel to attend to cached KV. T5 self attention uses relative position
+    embedding, for which no fused kernel exists on any build, so the attention
+    op refuses the combination up front instead of silently running the unfused
+    path and dropping the cached prefix. The refusal must name the real cause
+    (relative position embedding), not a missing kernel or the build's
+    architecture list, which cannot help here.
+    """
+    monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
+    # Keep the worker in-process so the C++ error message reaches pytest intact.
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+
+    model_path = _get_t5_model_path("t5-small")
+    sampling_params = _sampling_params(num_beams=1, num_return_sequences=1)
+
+    # Warmup during construction may already run a forward, so the refusal can
+    # come from either the constructor or the first generate call.
+    with pytest.raises(Exception, match="relative position embedding"):
+        with LLM(
+            model_path,
+            backend="pytorch",
+            attn_backend="TRTLLM",
+            cuda_graph_config=None,
+            disable_overlap_scheduler=True,
+            dtype="bfloat16",
+            enable_chunked_prefill=False,
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=True,
+                max_tokens=_MAX_KV_TOKENS,
+                free_gpu_memory_fraction=_FREE_GPU_MEMORY_FRACTION,
+                cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
+            ),
+            max_batch_size=1,
+            max_beam_width=1,
+            max_input_len=_MAX_SEQUENCE_LENGTH,
+            max_num_tokens=_MAX_SEQUENCE_LENGTH,
+            max_seq_len=_MAX_SEQUENCE_LENGTH,
+            model_kwargs={"torch_dtype": "bfloat16"},
+            scheduler_config=SchedulerConfig(use_python_scheduler=True),
+        ) as llm:
+            llm.generate(_SOURCE_TEXT, sampling_params=sampling_params, use_tqdm=False)

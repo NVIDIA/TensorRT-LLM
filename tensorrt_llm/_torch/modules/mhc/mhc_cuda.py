@@ -36,7 +36,7 @@ from tensorrt_llm._utils import get_sm_version
 
 @lru_cache(maxsize=1)
 def _fused_hc_mma_supported() -> bool:
-    """tcgen05 TF32 MMA paths (Path B / Path D, "fused_*_mma") require SM100.
+    """tcgen05 TF32 MMA paths (Path B / Path D, "fused_*_mma") require the SM100 family.
 
     They also require BUILD_DEEP_GEMM=ON so the C++ extension compiles the
     DeepGEMM-backed TF32 kernels. On unsupported builds or GPU generations, only
@@ -875,7 +875,7 @@ class MhcFusedHcRunner(TunableRunner):
                 if m_tiles * ks <= max_grid_ctas:
                     for bs in _fused_hc_mma_bigfuse_bs_options(M):
                         add(("fused_half_mma", 0, ks, bs, 1))
-                    if M >= 64:
+                    if M >= 64 and ks in _FUSED_HC_ALL_MMA_KS:
                         add(("fused_all_mma", 0, ks, 0, 1))
 
         if not mma_ok and M > 32:

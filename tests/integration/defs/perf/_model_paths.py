@@ -52,6 +52,8 @@ MODEL_PATH_DICT = {
     # Nemotron-3-Nano-Omni-30B (text + image multimodal)
     "nemotron_3_nano_omni_nvfp4": "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4",
     "nemotron_3_nano_omni_nvfp4_image": "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4",
+    "nemotron_3.5_lightning_30b_nvfp4_mtp": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
+    "nemotron_3.5_lightning_30b_bf16_mtp": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
     # MiniMax M3 (block-sparse MoE, MXFP8 weights, BF16 activations + KV cache)
     "minimax_m3_mxfp8": "MiniMax-M3-MXFP8",
     # Qwen3.5 dense + MoE
@@ -65,8 +67,13 @@ MODEL_PATH_DICT = {
     # benchmarked with one-model MTP drafting, so the two can be compared.
     "qwen3.6_35b_a3b_fp4": "Qwen3.6-35B-A3B-NVFP4",
     "qwen3.6_35b_a3b_fp4_mtp": "Qwen3.6-35B-A3B-NVFP4",
+    # Qwen3.8 checkpoint paths from accuracy PRs #18071 and #18585.
+    "qwen3.8_max_fp4_mtp": "Inferact-Qwen3.8-2.4T-A95B-NVFP4",
+    "qwen3.8_flash_next_fp8_mtp": "Qwen3.8-Flash-Next-FP8",
+    "qwen3.8_flash_next_fp4_mtp": "Inferact-Qwen3.8-Flash-Next-NVFP4",
     # DeepSeek V4
     "deepseek_v4_pro_fp4": "DeepSeek-V4-Pro",
+    "deepseek_v4_pro_base_fp8": "DeepSeek-V4-Pro-Base",
     "deepseek_v4_flash": "DeepSeek-V4-Flash",
     "deepseek_v4_flash_base_fp8": "DeepSeek-V4-Flash-Base",
     "deepseek_v4_pro_dspark": "DeepSeek-V4-Pro-DSpark",

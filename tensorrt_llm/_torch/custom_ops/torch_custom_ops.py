@@ -16,6 +16,7 @@
 import enum
 import os
 import threading
+from contextlib import nullcontext
 from dataclasses import replace
 from functools import lru_cache
 from typing import ClassVar, List, Mapping, Optional, Tuple, Union
@@ -34,13 +35,16 @@ from tensorrt_llm.quantization.utils import fp8_quantize
 
 from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
-                         TuningConfig)
+                         TuningConfig, autotune)
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
 from .fast_custom_op import fast_custom_op
 
 if IS_FLASHINFER_AVAILABLE:
+    from flashinfer import autotune as _flashinfer_autotune
+    from flashinfer import mm_mxfp8 as _flashinfer_mm_mxfp8
+    from flashinfer import mxfp8_quantize as _flashinfer_mxfp8_quantize
     from flashinfer.fp4_quantization import nvfp4_quantize as _flashinfer_nvfp4_quantize
 
 from ..modules.multi_stream_utils import do_multi_stream
@@ -48,7 +52,9 @@ from ..modules.swiglu import silu_and_mul_kernel
 from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
                      fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
-                     is_nvfp4_marlin_supported_sm, last_positive_power_of_2)
+                     get_power_of_2_num_tokens_buckets,
+                     is_nvfp4_marlin_supported_sm, last_positive_power_of_2,
+                     next_positive_power_of_2)
 
 if IS_CUTLASS_DSL_AVAILABLE:
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
@@ -56,6 +62,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
 # BufferKind is bound from C++; see cpp/tensorrt_llm/thop/outputTensor.h (torch_ext::BufferKind).
 from tensorrt_llm.bindings.internal.thop import BufferKind
+
+IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE = (IS_FLASHINFER_AVAILABLE
+                                          and IS_CUTLASS_DSL_AVAILABLE)
 
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
@@ -567,6 +576,9 @@ def _(
 
 
 _MXFP8_AUTOTUNED_OP = "trtllm::mxfp8_mxfp8_gemm_autotuned::gemm"
+_MXFP8_QUANTIZE_AUTOTUNED_OP = "trtllm::mxfp8_quantize_autotuned::quantize"
+_FLASHINFER_MXFP8_GEMM_AUTOTUNED_OP = (
+    "trtllm::flashinfer_mxfp8_gemm_autotuned::gemm")
 
 
 def _map_to_mxfp8_large_m_bucket(num_tokens: int) -> int:
@@ -716,6 +728,122 @@ def _(
     output_dtype: torch.dtype,
 ) -> torch.Tensor:
     return act.new_empty((act.size(0), weight.size(0)), dtype=output_dtype)
+
+
+class MXFP8QuantizeRunner(TunableRunner):
+    """Profile the native and FlashInfer CuTeDSL MXFP8 activation quantizers."""
+
+    TRTLLM = -1  # -1 is the AutoTuner fallback tactic.
+    CUTE_DSL = 0
+
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, get_power_of_2_num_tokens_buckets, next_positive_power_of_2), ))
+
+    def __init__(self, input_dtype: torch.dtype) -> None:
+        self.input_dtype = input_dtype
+
+    def unique_id(self) -> Tuple[torch.dtype]:
+        return (self.input_dtype, )
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
+        return [self.TRTLLM, self.CUTE_DSL]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = TRTLLM,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        activation = inputs[0]
+        if tactic == self.CUTE_DSL:
+            return _flashinfer_mxfp8_quantize(
+                activation,
+                is_sf_swizzled_layout=True,
+                alignment=32,
+                enable_pdl=None,
+                backend="cute-dsl",
+            )
+        return torch.ops.trtllm.mxfp8_quantize(activation, True)
+
+
+class FlashInferMXFP8GemmRunner(TunableRunner):
+    """Profile the FlashInfer CUTLASS and CuTeDSL MXFP8 GEMMs."""
+
+    CUTLASS = -1  # -1 is the AutoTuner fallback tactic.
+    CUTE_DSL = 0
+
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, get_power_of_2_num_tokens_buckets,
+            next_positive_power_of_2), ),
+        constraint_specs=(ConstraintSpec(1, 0, _mxfp8_scale_infer_shape), ),
+    )
+
+    def __init__(self, output_dtype: torch.dtype) -> None:
+        self.output_dtype = output_dtype
+
+    def unique_id(self) -> Tuple[torch.dtype]:
+        return (self.output_dtype, )
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
+        return [self.CUTLASS, self.CUTE_DSL]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = CUTLASS,
+    ) -> torch.Tensor:
+        act, act_scale, weight, weight_scale = inputs
+        if tactic == self.CUTLASS:
+            backend = "cutlass"
+            context = nullcontext()
+        else:
+            # Skip FlashInfer's CuTeDSL config sweep; use its heuristic config.
+            backend = "cute-dsl"
+            context = _flashinfer_autotune(tune_mode=False,
+                                           skip_ops="mxfp8_gemm")
+        with context:
+            return _flashinfer_mm_mxfp8(
+                act,
+                weight.t(),
+                act_scale,
+                weight_scale,
+                out_dtype=self.output_dtype,
+                use_8x4_sf_layout=False,
+                backend=backend,
+            )
+
+
+def _choose_mxfp8_tactic(custom_op: str, runner: TunableRunner,
+                         inputs: List[torch.Tensor], tune: bool) -> int:
+    """Pick this token bucket's tactic; ``tune`` profiles on a cache miss."""
+    with autotune(tune_mode=tune, skip_dynamic_tuning_buckets=True):
+        _, tactic = AutoTuner.get().choose_one(custom_op, [runner],
+                                               runner.tuning_config, inputs)
+    return tactic
+
+
+def mxfp8_quantize_gemm_autotuned(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    tune: bool = False,
+) -> torch.Tensor:
+    """MXFP8 quantize + GEMM with each stage's tuned backend for this bucket."""
+    quantize_runner = MXFP8QuantizeRunner(input.dtype)
+    quantize_inputs = [input]
+    act, act_scale = quantize_runner(
+        quantize_inputs,
+        tactic=_choose_mxfp8_tactic(_MXFP8_QUANTIZE_AUTOTUNED_OP,
+                                    quantize_runner, quantize_inputs, tune))
+    gemm_runner = FlashInferMXFP8GemmRunner(output_dtype)
+    gemm_inputs = [act, act_scale, weight, weight_scale]
+    return gemm_runner(gemm_inputs,
+                       tactic=_choose_mxfp8_tactic(
+                           _FLASHINFER_MXFP8_GEMM_AUTOTUNED_OP, gemm_runner,
+                           gemm_inputs, tune))
 
 
 class FP4GemmRunner(TunableRunner):
@@ -1955,7 +2083,7 @@ _USE_FUSED_FP8_QUANT_PACK = os.environ.get("TRTLLM_FUSED_FP8_QUANT_PACK",
 def _fp8_quantize_1x128_ue8m0(input: torch.Tensor, tactic: int):
     """Dispatch FP8 1x128 quantization to CUDA or Triton kernel.
 
-    On SM100 with ``TRTLLM_FUSED_FP8_QUANT_PACK=1``, the fused
+    On SM100/SM103/SM107 with ``TRTLLM_FUSED_FP8_QUANT_PACK=1``, the fused
     ``fp8_quantize_1x128_packed_ue8m0`` op already emits the legacy packed-UE8M0
     (int32) layout deep_gemm expects, so the follow-on
     ``get_mn_major_tma_aligned_packed_ue8m0_tensor`` call is skipped.
@@ -2062,6 +2190,104 @@ class fp8SwapABGemmRunner(TunableRunner):
             disable_ue8m0_cast=self.disable_ue8m0_cast,
         )
         return output
+
+
+class Fp8PrequantizedSwapABGemmRunner(TunableRunner):
+    """Runs DeepGemm with pre-quantized FP8 activations and packed scales."""
+
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, deep_gemm_gen_tuning_buckets), ),
+        constraint_specs=(ConstraintSpec(
+            1, 0, lambda input_shapes: input_shapes[0][0]), ),
+        exclude_from_cache=True,
+    )
+
+    def __init__(self, output_dtype: torch.dtype,
+                 disable_ue8m0_cast: bool) -> None:
+        self.output_dtype = output_dtype
+        self.disable_ue8m0_cast = disable_ue8m0_cast
+
+    def unique_id(self):
+        return (
+            self.output_dtype,
+            self.disable_ue8m0_cast,
+        )
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> List[int]:
+        return [0]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+    ) -> torch.Tensor:
+        del tactic
+        activation, activation_scale, weight, weight_scale = inputs
+        scale_m_aligned = fp4_utils.pad_up(activation_scale.size(0), 4)
+        if activation_scale.stride() != (1, scale_m_aligned):
+            # Dynamic autotuning recreates constrained integer tensors with a
+            # contiguous layout. Restore the MN-major packed-scale stride that
+            # the real quantizers return and DeepGemm requires.
+            normalized_scale = torch.empty_strided(
+                activation_scale.shape, (1, scale_m_aligned),
+                dtype=activation_scale.dtype,
+                device=activation_scale.device)
+            normalized_scale.copy_(activation_scale)
+            activation_scale = normalized_scale
+        output = torch.empty(
+            (activation.size(0), weight.size(0)),
+            device=activation.device,
+            dtype=self.output_dtype,
+        )
+        deep_gemm.fp8_gemm_nt(
+            (activation, activation_scale),
+            (weight, weight_scale),
+            output,
+            disable_ue8m0_cast=self.disable_ue8m0_cast,
+        )
+        return output
+
+
+@torch.library.custom_op("trtllm::fp8_prequantized_swap_ab_gemm",
+                         mutates_args=())
+def fp8_prequantized_swap_ab_gemm(
+    activation: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype = torch.bfloat16,
+    disable_ue8m0_cast: bool = False,
+) -> torch.Tensor:
+    runner = Fp8PrequantizedSwapABGemmRunner(output_dtype, disable_ue8m0_cast)
+    _, best_tactic = AutoTuner.get().choose_one(
+        "trtllm::fp8_prequantized_swap_ab_gemm",
+        [runner],
+        Fp8PrequantizedSwapABGemmRunner.tuning_config,
+        [activation, activation_scale, weight, weight_scale],
+    )
+    return runner(
+        inputs=[activation, activation_scale, weight, weight_scale],
+        tactic=best_tactic,
+    )
+
+
+@fp8_prequantized_swap_ab_gemm.register_fake
+def _(
+    activation: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype = torch.bfloat16,
+    disable_ue8m0_cast: bool = False,
+) -> torch.Tensor:
+    del activation_scale, weight_scale, disable_ue8m0_cast
+    return activation.new_empty((activation.size(0), weight.size(0)),
+                                dtype=output_dtype)
 
 
 @torch.library.custom_op("trtllm::fp8_swap_ab_gemm", mutates_args=())

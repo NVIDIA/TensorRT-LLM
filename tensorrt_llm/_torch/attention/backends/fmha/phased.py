@@ -38,15 +38,20 @@ if TYPE_CHECKING:
 
 @dataclass(slots=True)
 class FmhaParams:
+    """Phase inputs with exactly one of packed QKV or a separate query tensor.
+
+    MLA uses ``query_input`` with ``is_fused_qkv=False``.
+    """
+
     attn: "TrtllmAttention"
     meta: "TrtllmAttentionMetadata"
     fwd: AttentionForwardArgs
     workspace: torch.Tensor
-    attention_input: Optional[torch.Tensor] = None
     qkv_input: Optional[torch.Tensor] = None
+    query_input: Optional[torch.Tensor] = None
     key_input: Optional[torch.Tensor] = None
     value_input: Optional[torch.Tensor] = None
-    context_buf: Optional[torch.Tensor] = None
+    output: Optional[torch.Tensor] = None
     sequence_lengths: Optional[torch.Tensor] = None
     context_lengths: Optional[torch.Tensor] = None
     input_seq_length: int = 0
@@ -55,6 +60,12 @@ class FmhaParams:
     cyclic_attention_window_size: int = 0
     num_tokens: int = 0
     seq_offset: int = 0
+    # First query token of this phase on the axis of the q handed to the
+    # library, which covers the whole batch only where both phases share one
+    # tensor. The phase tensors above are already sliced by it; a library that
+    # indexes a separate per-token input, such as a sparse block table, needs
+    # it to take the matching slice.
+    token_offset: int = 0
     tokens_per_block: int = 64
     kv_factor: int = 0
     total_num_blocks: int = 0
@@ -205,6 +216,7 @@ class PhasedFmha(Fmha):
             metadata.tokens_per_block if metadata.tokens_per_block is not None else 64
         )
 
+        is_fused_qkv = forward_args.is_fused_qkv
         params = FmhaParams(
             attn=attn,
             meta=metadata,
@@ -233,20 +245,22 @@ class PhasedFmha(Fmha):
                 host_past_key_value_lengths[seq_offset : seq_offset + num_seqs].max()
             )
 
-            params.attention_input = q[token_offset : token_offset + num_ctx_tokens]
-            params.qkv_input = params.attention_input
+            phase_input = q[token_offset : token_offset + num_ctx_tokens]
+            params.qkv_input = phase_input if is_fused_qkv else None
+            params.query_input = None if is_fused_qkv else phase_input
             params.key_input = (
                 k[token_offset : token_offset + num_ctx_tokens] if k is not None else None
             )
             params.value_input = (
                 v[token_offset : token_offset + num_ctx_tokens] if v is not None else None
             )
-            params.context_buf = out_tensor[token_offset : token_offset + num_ctx_tokens]
+            params.output = out_tensor[token_offset : token_offset + num_ctx_tokens]
             params.sequence_lengths = sequence_length[seq_offset:]
             params.context_lengths = context_lengths[seq_offset:]
             params.max_past_kv_length = max_past_kv_len
             params.num_tokens = num_ctx_tokens
             params.seq_offset = seq_offset
+            params.token_offset = token_offset
             params.input_seq_length = max_context_q_len
             params.batch_size = num_seqs
             params.num_requests = num_seqs
@@ -277,19 +291,21 @@ class PhasedFmha(Fmha):
                     )
                 spec_pos_offsets = position_offsets_for_cpp
 
-            params.attention_input = q[token_offset : token_offset + num_gen_tokens]
-            params.qkv_input = params.attention_input
+            phase_input = q[token_offset : token_offset + num_gen_tokens]
+            params.qkv_input = phase_input if is_fused_qkv else None
+            params.query_input = None if is_fused_qkv else phase_input
             params.key_input = (
                 k[token_offset : token_offset + num_gen_tokens] if k is not None else None
             )
             params.value_input = (
                 v[token_offset : token_offset + num_gen_tokens] if v is not None else None
             )
-            params.context_buf = out_tensor[token_offset : token_offset + num_gen_tokens]
+            params.output = out_tensor[token_offset : token_offset + num_gen_tokens]
             params.sequence_lengths = sequence_length[seq_offset:]
             params.max_past_kv_length = max_past_kv_len
             params.num_tokens = num_gen_tokens
             params.seq_offset = seq_offset
+            params.token_offset = token_offset
             params.input_seq_length = input_seq_length
             params.batch_size = num_seqs
             params.num_requests = num_seqs // metadata.beam_width

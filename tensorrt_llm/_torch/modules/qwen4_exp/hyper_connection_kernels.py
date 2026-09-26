@@ -446,4 +446,191 @@ def _(
     return torch.empty_like(residual), torch.empty_like(residual)
 
 
-__all__ = ["hc_combine", "hc_combine_norm", "hc_gate_mix", "hc_silu"]
+@triton.jit
+def _hc_moe_finalize_combine_norm_kernel(
+    residual_ptr,
+    routed_ptr,
+    shared_ptr,
+    shared_gate_ptr,
+    injection_ptr,
+    weight_ptr,
+    output_ptr,
+    normed_ptr,
+    stride_residual,
+    stride_routed,
+    stride_shared,
+    stride_shared_gate,
+    stride_injection,
+    stride_output,
+    stride_normed,
+    hidden_size: tl.constexpr,
+    hc_count: tl.constexpr,
+    shared_weight: tl.constexpr,
+    eps: tl.constexpr,
+    block_size: tl.constexpr,
+    padded_tiles: tl.constexpr,
+    launch_with_pdl: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    stream = tl.program_id(1)
+    tile_ids = tl.arange(0, padded_tiles)
+    offsets_inner = tile_ids[:, None] * block_size + tl.arange(0, block_size)[None, :]
+    mask = offsets_inner < hidden_size
+    offsets = stream * hidden_size + offsets_inner
+    weight_offsets = offsets_inner if shared_weight else offsets
+
+    if launch_with_pdl:
+        tl.extra.cuda.gdc_wait()
+    routed = tl.load(
+        routed_ptr + row * stride_routed + offsets_inner,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    shared = tl.load(
+        shared_ptr + row * stride_shared + offsets_inner,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    shared_gate = tl.load(shared_gate_ptr + row * stride_shared_gate).to(tl.float32)
+    # Match the standalone shared-expert finalize's materialized BF16 boundary.
+    block = (routed + tl.sigmoid(shared_gate) * shared).to(output_ptr.dtype.element_ty)
+    residual = tl.load(
+        residual_ptr + row * stride_residual + offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    weight = tl.load(weight_ptr + weight_offsets, mask=mask, other=0.0).to(tl.float32)
+    injection = tl.load(injection_ptr + row * stride_injection + stream).to(tl.float32)
+    injection = 2.0 * tl.sigmoid(injection / hc_count)
+
+    output = (residual + injection * block.to(tl.float32)).to(output_ptr.dtype.element_ty)
+    tl.store(output_ptr + row * stride_output + offsets, output, mask=mask)
+    output_fp32 = output.to(tl.float32)
+    sum_squares = tl.sum(tl.sum(output_fp32 * output_fp32, axis=1), axis=0)
+    reciprocal_rms = tl.rsqrt(sum_squares / hidden_size + eps)
+    normed = output_fp32 * reciprocal_rms
+    normed += normed * weight
+    if launch_with_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
+    tl.store(normed_ptr + row * stride_normed + offsets, normed, mask=mask)
+
+
+@torch.library.custom_op("trtllm::qwen4_exp_hc_moe_finalize_combine_norm", mutates_args=())
+def hc_moe_finalize_combine_norm(
+    residual: torch.Tensor,
+    routed_output: torch.Tensor,
+    shared_output: torch.Tensor,
+    shared_gate_logits: torch.Tensor,
+    injection_logits: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    hc_count: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse a TP1 shared-MoE finalize with HC combine and grouped RMSNorm."""
+    if residual.ndim != 2 or hc_count <= 0 or residual.shape[1] % hc_count:
+        raise ValueError("HC residual geometry is incompatible with its stream count")
+    rows, hyper_hidden_size = residual.shape
+    hidden_size = hyper_hidden_size // hc_count
+    if (
+        routed_output.shape != (rows, hidden_size)
+        or shared_output.shape != (rows, hidden_size)
+        or shared_gate_logits.shape != (rows, 1)
+        or injection_logits.shape != (rows, hc_count)
+    ):
+        raise ValueError("deferred MoE/HC operands have incompatible shapes")
+    if norm_weight.ndim != 1 or norm_weight.shape[0] not in (hidden_size, hyper_hidden_size):
+        raise ValueError("HC norm weight has an incompatible shape")
+    row_tensors = (
+        residual,
+        routed_output,
+        shared_output,
+        shared_gate_logits,
+        injection_logits,
+    )
+    if (
+        residual.dtype != torch.bfloat16
+        or not residual.is_cuda
+        or any(
+            tensor.device != residual.device
+            or tensor.dtype != residual.dtype
+            or not tensor.is_cuda
+            or tensor.stride(1) != 1
+            or (tensor.shape[0] > 1 and tensor.stride(0) < tensor.shape[1])
+            for tensor in row_tensors
+        )
+        or norm_weight.device != residual.device
+        or norm_weight.dtype != residual.dtype
+        or not norm_weight.is_cuda
+        or not norm_weight.is_contiguous()
+    ):
+        raise ValueError(
+            "deferred MoE/HC operands must be non-overlapping row-major BF16 CUDA tensors"
+        )
+
+    output = torch.empty_like(residual)
+    normed = torch.empty_like(residual)
+    if rows == 0:
+        return output, normed
+    block_size = min(triton.next_power_of_2(hidden_size), _COMBINE_NORM_MAX_BLOCK)
+    padded_tiles = triton.next_power_of_2(triton.cdiv(hidden_size, block_size))
+    with torch.cuda.device(residual.device.index):
+        launch_with_pdl = _pdl_enabled(rows)
+        _hc_moe_finalize_combine_norm_kernel[(rows, hc_count)](
+            residual,
+            routed_output,
+            shared_output,
+            shared_gate_logits,
+            injection_logits,
+            norm_weight,
+            output,
+            normed,
+            residual.stride(0),
+            routed_output.stride(0),
+            shared_output.stride(0),
+            shared_gate_logits.stride(0),
+            injection_logits.stride(0),
+            output.stride(0),
+            normed.stride(0),
+            hidden_size=hidden_size,
+            hc_count=hc_count,
+            shared_weight=norm_weight.numel() == hidden_size,
+            eps=eps,
+            block_size=block_size,
+            padded_tiles=padded_tiles,
+            launch_with_pdl=launch_with_pdl,
+            num_warps=4,
+            launch_pdl=launch_with_pdl,
+        )
+    return output, normed
+
+
+@hc_moe_finalize_combine_norm.register_fake
+def _(
+    residual: torch.Tensor,
+    routed_output: torch.Tensor,
+    shared_output: torch.Tensor,
+    shared_gate_logits: torch.Tensor,
+    injection_logits: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    hc_count: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del (
+        routed_output,
+        shared_output,
+        shared_gate_logits,
+        injection_logits,
+        norm_weight,
+        eps,
+        hc_count,
+    )
+    return torch.empty_like(residual), torch.empty_like(residual)
+
+
+__all__ = [
+    "hc_combine",
+    "hc_combine_norm",
+    "hc_gate_mix",
+    "hc_moe_finalize_combine_norm",
+    "hc_silu",
+]

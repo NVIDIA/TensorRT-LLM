@@ -27,16 +27,15 @@ def parse_arguments():
 async def main():
     args = parse_arguments()
     prompts = [
-        # "What's the weather like today in LA?"
+        "What's the weather like today in LA?"
         # 'Solve the problem with running python code: What is the number of'
         # ' Fibonacci array 20th element? The array goes like 0,1,1,2,3...'
         # 'Which game won TGA Best Action Game and Players Voice awards in 2024?'
-        "What was the score of the NBA playoffs game 7 between the Thunder and the Nuggets in 2025?"
     ]
     API_KEY = args.API_KEY
     urls = [
-        # "http://0.0.0.0:8080/sse", "http://0.0.0.0:8081/sse",
-        "http://0.0.0.0:8082/sse"
+        "http://127.0.0.1:8080/mcp",
+        # "http://127.0.0.1:8081/mcp",
     ]
     print(f"API_KEY {API_KEY}")
     client = AsyncOpenAI(api_key=API_KEY, base_url=args.base_url)

@@ -163,6 +163,10 @@ methods:
         annotation: bool
         default: False
         status: beta
+      enable_return_routed_experts:
+        annotation: bool
+        default: False
+        status: beta
       moe_config:
         annotation: tensorrt_llm.llmapi.llm_args.MoeConfig
         status: beta
@@ -204,6 +208,10 @@ methods:
         default: False
         status: prototype
       enable_iter_perf_stats:
+        annotation: bool
+        default: False
+        status: prototype
+      enable_tokenization_cache:
         annotation: bool
         default: False
         status: prototype
@@ -489,6 +497,26 @@ methods:
     parameters: {}
     return_annotation: None
     status: beta
+  start_profile:
+    parameters:
+      output_dir:
+        annotation: Optional[str]
+        default: null
+      num_steps:
+        annotation: Optional[int]
+        default: null
+      start_step:
+        annotation: int
+        default: 0
+      activities:
+        annotation: Optional[List[str]]
+        default: null
+    return_annotation: None
+    status: prototype
+  stop_profile:
+    parameters: {}
+    return_annotation: None
+    status: prototype
 properties:
   llm_id:
     annotation: str

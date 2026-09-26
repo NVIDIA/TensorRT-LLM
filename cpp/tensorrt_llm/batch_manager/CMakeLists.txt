@@ -37,10 +37,8 @@ set(SRCS
     llmRequest.cpp
     microBatchScheduler.cpp
     peftCacheManager.cpp
-    rnnStateManager.cpp
     rnnCacheFormatter.cpp
     rnnCacheTransBuffer.cpp
-    utils/staticThreadPool.cpp
     evictionPolicy.cpp
     cacheTransBuffer.cpp
     agentTree.cpp)
@@ -85,7 +83,7 @@ target_include_directories(
 
 set_target_properties(
   ${BATCH_MANAGER_STATIC_TARGET}
-  PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
+  PROPERTIES CXX_STANDARD "20" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
              POSITION_INDEPENDENT_CODE ON)
 
 set_property(TARGET ${BATCH_MANAGER_STATIC_TARGET}

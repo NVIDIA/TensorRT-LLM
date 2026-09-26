@@ -758,7 +758,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         enabledStages += [stageNames.internalReleaseX86, stageNames.internalReleaseSBSA]
     }
     if (buildCiImage) {
-        enabledStages += [stageNames.ciImageX86, stageNames.ciImageSBSA, stageNames.ciImageRockyPy310, stageNames.ciImageRockyPy312, stageNames.ciImageSBSAUbuntu]
+        enabledStages += [stageNames.ciImageX86, stageNames.ciImageSBSA, stageNames.ciImageSBSAUbuntu, stageNames.ciImageRockyPy310, stageNames.ciImageRockyPy312]
     }
     if (buildNgcRelease) {
         enabledStages += [stageNames.ngcReleaseX86, stageNames.ngcReleaseSBSA]

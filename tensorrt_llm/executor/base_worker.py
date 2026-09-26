@@ -105,6 +105,11 @@ class BaseWorker(GenerationExecutor):
             postprocess_tokenizer_dir=postproc_config.postprocess_tokenizer_dir,
             is_llm_executor=is_llm_executor,
         )
+        # GenerationExecutor.__init__ rebuilds postproc_config from the two
+        # fields above, dropping the rest (e.g. post_processor_hook). Workers
+        # that spawn their own postproc pool (RpcWorkerMixin) need the full
+        # configuration, so keep the caller-provided one.
+        self.postproc_config = postproc_config
 
         # inputs
         self._engine = engine
@@ -129,7 +134,7 @@ class BaseWorker(GenerationExecutor):
         self._client_id_to_request_id: Dict[int, int] = {}
         self._await_response_helper = AwaitResponseHelper(weakref.proxy(self))
         self._backend = None if llm_args is None else llm_args.backend
-        self._is_pytorch_backend = self._backend in ["pytorch", "_autodeploy"]
+        self._is_pytorch_backend = self._backend == "pytorch"
         self._lora_config = llm_args.lora_config if self._is_pytorch_backend else None
         self._resource_governor_queue = None
 
@@ -173,15 +178,6 @@ class BaseWorker(GenerationExecutor):
                 args["llm_args"] = self.llm_args
                 args["checkpoint_dir"] = self._hf_model_dir
                 args["tokenizer"] = self._tokenizer
-            elif self._backend == "_autodeploy":
-                from tensorrt_llm._torch.auto_deploy.llm_args import \
-                    LlmArgs as ADLlmArgs
-                from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
-                    create_autodeploy_executor
-                create_executor = create_autodeploy_executor
-                assert isinstance(self.llm_args, ADLlmArgs)
-                args["ad_config"] = self.llm_args
-                args["tokenizer"] = self._tokenizer
             else:
                 raise ValueError(f"Unsupported backend config: {self._backend}")
 
@@ -196,7 +192,6 @@ class BaseWorker(GenerationExecutor):
                     _construct_checkpoint_loader
                 partial_model_loading = self.llm_args.is_partial_model_loading
                 self.checkpoint_loader = _construct_checkpoint_loader(
-                    self.llm_args.backend,
                     self.llm_args.checkpoint_loader,
                     self.llm_args.checkpoint_format,
                     mx_config=self.llm_args.mx_config,
@@ -256,9 +251,20 @@ class BaseWorker(GenerationExecutor):
         assert self.frontend_result_queues is None
         self.result_queue = queue
 
-    def set_postproc_queues(self, queues: List["IpcQueue"]):
-        """ Set the IPC queues for feeding post-processing processes. """
-        assert self.result_queue is None
+    def set_postproc_queues(self,
+                            queues: list["IpcQueue"],
+                            *,
+                            coexist_with_result_queue: bool = False) -> None:
+        """ Set the IPC queues for feeding post-processing processes.
+
+        coexist_with_result_queue: the classic proxy gives each PostprocWorker
+        its own push lane to the frontend, so a result_queue must not exist
+        there. Under RPC/Ray orchestration the finished PostprocWorker.Output
+        records are collected back INTO the result queue (the single RPC
+        response stream), so both queues legitimately coexist.
+        """
+        if not coexist_with_result_queue:
+            assert self.result_queue is None
         assert self.frontend_result_queues is None
         self.postproc_queues = queues
 
@@ -475,7 +481,6 @@ class BaseWorker(GenerationExecutor):
                 sampling_config=request.sampling_params._get_sampling_config(),
                 end_id=-1 if request.sampling_params.ignore_eos else
                 request.sampling_params.end_id,
-                pad_id=request.sampling_params.pad_id,
                 output_config=request.sampling_params._get_output_config(
                     is_pytorch_backend=self._is_pytorch_backend),
                 # Beam search enforces return_all_generated_tokens=True regardless of the passed value
@@ -492,12 +497,6 @@ class BaseWorker(GenerationExecutor):
                 # NOTE: `multimodal_embedding` and `mrope_config` will be in MultimodalParams.multimodal_data. And this will be handled below by `py_multimodal_data`.
                 multimodal_embedding=None,
                 mrope_config=None,
-                logits_post_processor_name=(
-                    tllm.Request.BATCHED_POST_PROCESSOR_NAME
-                    if request.sampling_params.apply_batched_logits_processor
-                    else None),
-                logits_post_processor=None if self._is_pytorch_backend else
-                request.sampling_params.logits_processor,
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
                 encoder_input_token_ids=request.encoder_input_token_ids,
@@ -511,6 +510,8 @@ class BaseWorker(GenerationExecutor):
             executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode
             executor_request.py_logprobs_simple_format = (
                 request.sampling_params.logprobs_simple_format)
+            executor_request.py_return_routed_experts = (
+                request.sampling_params.return_routed_experts)
 
             # here we add executor_request.py_disaggregated_params= request.disaggregated_params for python cache transceiver
             if self._is_pytorch_backend and request.disaggregated_params is not None:
@@ -596,10 +597,6 @@ class BaseWorker(GenerationExecutor):
             ValueError: If the backend is not ``"pytorch"`` or
                 ``sleep_config`` is not set.
         """
-        # _autodeploy is intentionally excluded: its allocations are not tagged
-        # under sleep_config VMM scopes, so release_with_tag would silently
-        # no-op instead of actually freeing GPU memory.  Use _backend directly
-        # rather than _is_pytorch_backend, which also covers _autodeploy.
         if self._backend != "pytorch":
             raise ValueError(
                 f"{method}() is only available for the PyTorch (TorchLLM) "
@@ -1053,16 +1050,58 @@ class BaseWorker(GenerationExecutor):
         model_engine = getattr(self.engine, "model_engine", None)
         model_loader = getattr(model_engine, "model_loader", None)
         if model_loader is not None:
-            startup_metrics["model_loader"] = dict(model_loader.metrics)
+            startup_metrics["model_loader"] = {
+                **model_loader.metrics,
+                **getattr(model_loader, "startup_metadata", {}),
+            }
 
         draft_model_engine = getattr(self.engine, "draft_model_engine", None)
         draft_model_loader = getattr(draft_model_engine, "model_loader", None)
         if draft_model_loader is not None:
-            startup_metrics["draft_model_loader"] = dict(
-                draft_model_loader.metrics)
+            startup_metrics["draft_model_loader"] = {
+                **draft_model_loader.metrics,
+                **getattr(draft_model_loader, "startup_metadata", {}),
+            }
 
         return startup_metrics
 
+    def start_profile(self,
+                      output_dir: Optional[str] = None,
+                      num_steps: Optional[int] = None,
+                      start_step: int = 0,
+                      activities: Optional[List[str]] = None) -> None:
+        """Forward profiling request to the underlying PyExecutor engine.
+
+        No-op (with a warning) for legacy TensorRT-backend engines which
+        do not expose this API.
+        """
+        if self.engine is None:
+            logger.warning(
+                "start_profile called but engine is not initialized.")
+            return
+        start_fn = getattr(self.engine, "start_profile", None)
+        if start_fn is None:
+            logger.warning("Current engine does not support start_profile; "
+                           "this API requires the PyTorch PyExecutor backend.")
+            return
+        start_fn(output_dir=output_dir,
+                 num_steps=num_steps,
+                 start_step=start_step,
+                 activities=activities)
+
+    def stop_profile(self) -> None:
+        """Forward stop_profile request to the underlying PyExecutor engine."""
+        if self.engine is None:
+            logger.warning("stop_profile called but engine is not initialized.")
+            return
+        stop_fn = getattr(self.engine, "stop_profile", None)
+        if stop_fn is None:
+            logger.warning("Current engine does not support stop_profile; "
+                           "this API requires the PyTorch PyExecutor backend.")
+            return
+        stop_fn()
+
+    # Define a Callable to join iteration and request stats
     @staticmethod
     def _stats_serializer(stats) -> str:
         # Per-rank path: stats is ("per_rank_dict", {..., "rank": N}).
@@ -1400,7 +1439,11 @@ class AwaitResponseHelper:
             []
             for _ in range(self.worker.postproc_config.num_postprocess_workers)
         ] if self.enable_postprocprocess_parallel else None
-        rsp_batch = [] if not self.enable_postprocprocess_parallel else None
+        # Always allocate: even with postproc parallelism on, ErrorResponse
+        # records bypass the postproc lane (see _send_rsp) and must be batched
+        # here — consumers of result_queue under RPC/Ray expect lists, and a
+        # bare ErrorResponse (a NamedTuple) would be splatted by extend().
+        rsp_batch = []
 
         for response in responses:
 
@@ -1541,6 +1584,35 @@ def _get_logprobs(worker,
     return logprobs_result
 
 
+def _send_rsp_to_postproc(
+        worker, response: Union[tllm.Response, ResponseWrapper, ErrorResponse],
+        postproc_batches: Optional[List[List["PostprocWorker.Input"]]]):
+    """Shard a raw response to the postproc workers (batched or direct put)."""
+    sampling_params, postproc_params, disaggregated_params = (
+        _get_params_for_first_rsp(worker, response.client_id))
+    inp = PostprocWorker.Input(
+        response,
+        # sampling_params is necessary for creating fake GenerationResult
+        # instances in the postproc processes. They are for incremental
+        # detokenize. They should be transmitted only once for each
+        # Request.
+        sampling_params=sampling_params,
+        postproc_params=postproc_params,
+        disaggregated_params=disaggregated_params,
+        streaming=worker._results.get(response.client_id, None)._streaming)
+
+    # Group the responses into buckets for the postprocessing steps.
+    # Bucketing is used instead of random dispatching because the
+    # incremental detokenization during postprocessing relies on the
+    # prior CompletionOutput of a given request.
+    pid = response.client_id % worker.postproc_config.num_postprocess_workers
+
+    if postproc_batches is None:
+        worker.postproc_queues[pid].put(inp)
+    else:
+        postproc_batches[pid].append(inp)
+
+
 def _send_rsp(
         worker,
         response: Union[tllm.Response, ResponseWrapper, ErrorResponse],
@@ -1548,7 +1620,24 @@ def _send_rsp(
         rsp_batch: Optional[List[tllm.Response]] = None):
     # if postproc_batches is set, append to batch instead of putting to IpcQueue
 
-    if worker.frontend_result_queues is not None:
+    # Postprocess parallelism takes priority over the direct result routes:
+    # under RPC/Ray orchestration the worker holds a result_queue (the RPC
+    # response stream feed) AND postproc input queues at the same time, and
+    # raw responses must go to the postproc workers first — their finished
+    # Output records re-enter the result_queue via the collector thread
+    # (see RpcWorkerMixin.init_postproc_workers). ErrorResponse records are
+    # exempt when a direct route exists: PostprocWorker reads input.rsp.result,
+    # which they lack, so they ride the result queue instead (the proxy demux
+    # already terminates on them). Note the direct route can overtake earlier
+    # responses of the same client still queued for postproc; the proxy pops
+    # the record on the error, so a trailing Output may log a benign
+    # "unknown client_id" warning.
+    _error_with_direct_route = (isinstance(response, ErrorResponse)
+                                and (worker.frontend_result_queues is not None
+                                     or worker.result_queue is not None))
+    if postproc_batches is not None and not _error_with_direct_route:
+        _send_rsp_to_postproc(worker, response, postproc_batches)
+    elif worker.frontend_result_queues is not None:
         # Route to the origin frontend's result lane; None/out-of-range ids
         # fall back to lane 0 (see frontend_lane_index).
         if rsp_batch is not None:
@@ -1563,29 +1652,7 @@ def _send_rsp(
         else:
             worker.result_queue.put(response)
     else:
-        sampling_params, postproc_params, disaggregated_params = (
-            _get_params_for_first_rsp(worker, response.client_id))
-        inp = PostprocWorker.Input(
-            response,
-            # sampling_params is necessary for creating fake GenerationResult
-            # instances in the postproc processes. They are for incremental
-            # detokenize. They should be transmitted only once for each
-            # Request.
-            sampling_params=sampling_params,
-            postproc_params=postproc_params,
-            disaggregated_params=disaggregated_params,
-            streaming=worker._results.get(response.client_id, None)._streaming)
-
-        pid = response.client_id % worker.postproc_config.num_postprocess_workers
-
-        if not postproc_batches:
-            # Group the responses into buckets for the postprocessing steps.
-            # Bucketing is used instead of random dispatching because the
-            # incremental detokenization during postprocessing relies on the
-            # prior CompletionOutput of a given request.
-            worker.postproc_queues[pid].put(inp)
-        else:
-            postproc_batches[pid].append(inp)
+        _send_rsp_to_postproc(worker, response, None)
 
     # Eliminate the finished GenerationRequest instances timely, which may
     # take considerable memory.

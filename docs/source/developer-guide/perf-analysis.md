@@ -9,6 +9,22 @@ Given the potential long runtimes of Large Languages Models (LLMs) and the diver
 
 ## Feature Descriptions
 
+### Workspace Reclamation
+
+`TRTLLM_RECLAIM_WORKSPACE=1` (the default) reduces retained eager attention
+workspace memory on supported PyTorch fallback paths. After three consecutive
+underfilled model forwards, excess capacity is released to the PyTorch allocator,
+without shrinking below the warmup baseline. CUDA graph workspace is unchanged.
+
+This can reduce memory retained after workload spikes, but demand tracking and
+repeated reclamation/reallocation can affect performance. It does not reduce the
+initial spike's allocation requirement or necessarily reduce allocator-reserved
+memory. Set `TRTLLM_RECLAIM_WORKSPACE=0` before starting the process to disable
+this behavior if it causes performance regression. Currently this setting only
+controls eager attention workspace reclamation, not all GPU memory management.
+
+### Profiling Features
+
 The main functionality:
   * Relies on toggling the CUDA profiler runtime API on and off.
   * (PyTorch workflow only) Toggling the PyTorch profiler on and off.
@@ -88,7 +104,7 @@ For the per-mode specifics, see `parse_profile_range` in
 
 ### Visualize the PyTorch profiler results
 
-Use [chrome://tracing/](chrome://tracing/) to inspect the saved profile.
+Use `chrome://tracing/` to inspect the saved profile.
 
 
 ## Examples
@@ -128,7 +144,7 @@ TLLM_PROFILE_START_STOP=100-150 nsys profile \
 
 The Nsight Systems reports will be saved to `trace.nsys-rep`. Use NVIDIA Nsight Systems application to open it.
 
-The PyTorch profiler results will be saved to `trace.json`. Use [chrome://tracing/](chrome://tracing/) to inspect the saved profile.
+The PyTorch profiler results will be saved to `trace.json`. Use `chrome://tracing/` to inspect the saved profile.
 
 ## MoE Expert Load Balance Analysis (Perfect Router)
 

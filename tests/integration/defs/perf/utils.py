@@ -322,17 +322,6 @@ class PerfBenchScriptTestCmds(NamedTuple):
             print(f'Augmented LD_LIBRARY_PATH={envs["LD_LIBRARY_PATH"]}')
             benchmark_cmd = mpi_cmd + command
             output += _run_command_with_captured_output(benchmark_cmd, env=envs)
-            match = re.search(r'--engine_dir=([^\s]+)', current_cmd_str)
-            if match:
-                engine_dir = match.group(1)
-                print_info(f'writing config.json in {engine_dir} to output log')
-                with open(os.path.join(engine_dir, "config.json"), "r") as f:
-                    config_content = f.read()
-                    output += "\n" + "=" * 50 + "\n"
-                    output += "ENGINE CONFIG:\n"
-                    output += "=" * 50 + "\n"
-                    output += config_content
-                    output += "\n" + "=" * 50 + "\n"
         return output
 
     def get_cmd_str(self, cmd_idx) -> List[str]:
@@ -728,7 +717,7 @@ class AbstractPerfScriptTestClass(abc.ABC):
             gpu_idx = gpu_prop.get("index", self._gpu_clock_lock.get_gpu_id())
         # Remove the prefix, which includes the platform info, for network_hash.
         short_test_name = full_test_name.split("::")[-1]
-        # Get device subtype for autodeploy tests
+        # Get the device subtype when available.
         device_subtype = None
         if self._gpu_clock_lock:
             device_subtype = self._gpu_clock_lock.get_device_subtype()

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -16,17 +16,16 @@ include(FetchContent)
 
 set(SRCS
     utils/mpiUtils.cpp
+    mcastGroupComm.cpp
     utils/numpyUtils.cpp
     utils/runtimeUtils.cpp
     utils/debugUtils.cu
     locality_domain/locality_domain_utils.cpp
     bufferManager.cpp
     cudaMemPool.cpp
-    loraManager.cpp
     loraUtils.cpp
     loraModule.cpp
     loraCache.cpp
-    gptJsonConfig.cpp
     iBuffer.cpp
     iTensor.cpp
     ipcUtils.cpp

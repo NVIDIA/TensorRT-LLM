@@ -11,7 +11,6 @@ for the overall CBTS architecture.
 | `waives_rule.py` | `WaivesRule` | `waiveonly` | `tests/integration/test_lists/waives.txt` |
 | `tests_def_rule.py` | `TestsDefRule` | `testdefonly` | `tests/**/*` (any file under tests/) |
 | `test_list_rule.py` | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
-| `auto_deploy_rule.py` | `AutoDeployRule` | `autodeployonly` | `examples/auto_deploy/**`, `tensorrt_llm/_torch/auto_deploy/**` (each excl. `.md`) |
 | `visual_gen_rule.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (each excl. `.md`) |
 | `spec_dec_rule.py` | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (each excl. `.md`) |
 | `agent_flow_rule.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. `.md`) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
@@ -56,6 +55,10 @@ For each file under `tests/` in the diff:
    `@pytest.mark.parametrize` stays at method level and a class-level
    `@skip_pre_blackwell` stays at class level instead of dropping to
    module scope.
+   Python helper modules instead query the shared `RepositoryReferenceIndex`.
+   A complete set of direct `test_*.py` importers becomes the anchors; an
+   ambiguous, dynamic, transitive, or non-test importer retains the directory
+   fallback.
 3. `lookup_paths_into_block_filters` calls `find_match_for_path`
    (bidirectional pytest-tree lineage) for each anchor; matches feed
    `block_filters`. For non-`test_*.py` paths, the lookup walks up
@@ -152,48 +155,6 @@ Outcomes:
 - Some added entries resolved → `scope=testlistonly`; unresolved entries
   are noted in the reason and ignored for narrowing.
 
-## AutoDeployRule
-
-Path-only rule. Claims source files under `examples/auto_deploy/` and
-`tensorrt_llm/_torch/auto_deploy/` (excluding `.md`, which
-`OutOfScopeRule` claims as noop). Other suffixes — including images —
-are NOT excluded: a binary asset under an AD path could be a test
-fixture, so the rule keeps claiming them and forces AD stages to
-re-run.
-
-Block selection — entry-based, two cases:
-- **Primary**: blocks where `condition.terms.backend == 'autodeploy'`.
-  Covers the 9 AD-conditioned blocks across all yamls.
-- **Supplementary**: blocks containing entries with
-  `test_llm_api_autodeploy.py` in the path or `_autodeploy-` in the
-  parametrize id. Covers 3 entries that live in `backend: pytorch`
-  blocks (l0_l40s, l0_perf) because Jenkins has no `L40S-AutoDeploy-*`
-  / `H100-Perf-AutoDeploy-*` stage to consume a proper AD-conditioned
-  block. The two patterns are stable conventions
-  (`test_llm_api_autodeploy.py` is the AD accuracy filename;
-  `_autodeploy-` is the cross-codebase backend parametrize value).
-
-For each matched block, `block_filters` keeps only the AD entries
-(every entry for AD-conditioned blocks; only entries matching the
-supplementary patterns for leaker blocks). Non-AD siblings in leaker
-blocks stay governed by other rules.
-
-Outcomes:
-- No AD source files in the diff → rule returns `None`.
-- AD source touched → `scope=autodeployonly`; sanity off
-  (AD changes don't affect wheel sanity); perfsanity on iff a
-  matched block lives in `l0_perf` or `*perf_sanity*`.
-- AD source touched but no AD block found anywhere (defensive) →
-  `scope=None` (fallback).
-
-Why narrowing is safe: AD is a beta backend isolated from the main
-PyTorch backend. The 7 reverse imports of AD from non-AD code in
-`bench/`, `executor/`, `commands/serve.py` are all lazy, guarded by
-`if backend == "_autodeploy"`, so AD-only changes don't affect tests
-that use the default PyTorch backend.
-`scripts/check_auto_deploy_imports.py` enforces AD's outbound import
-discipline statically.
-
 ## VisualGenRule
 
 Path-only rule. Claims source files under `examples/visual_gen/`,
@@ -218,7 +179,7 @@ live in `backend: pytorch` and `backend: tensorrt` blocks. A block
 For each matched block, `block_filters` keeps only the VG entries.
 Non-VG siblings in the same block stay governed by other rules.
 
-Outward-facing fallback: unlike AutoDeploy, VG public symbols and
+Outward-facing fallback: VisualGen public symbols and
 `tensorrt_llm.media.*` are imported eagerly by non-VG startup paths such
 as `commands/serve.py`, `commands/utils.py`, and
 `serve/openai_server.py`. Both package prefixes
@@ -296,13 +257,14 @@ Outcomes:
 ## OpenEngineRule
 
 Claims non-documentation source changes under `tensorrt_llm/grpc/openengine/` and keeps only test-db
-entries under `unittest/grpc/openengine/`. The focused test is registered in `l0_cpu.yml`, so it
-resolves to `CPU-Generic-x86-1` / `CPU-Generic-arm-1` — one split each, and stages CBTS runs
-unconditionally (`ALWAYS_RUN_STAGE_PREFIX`), so an OpenEngine change never needs a GPU shard and the
-test still runs on every baseline and fallback pipeline. Those are also the only stages that install
-`requirements-openengine.txt`; that install is guarded on the stage name in `jenkins/L0_Test.groovy`
-and deliberately not on CBTS scope, because `scopes` is a union across fired rules and a mixed
-selection would otherwise carry the OpenEngine pins into every shard it runs. If no OpenEngine test
+entries under `unittest/grpc/openengine/`. The stub-based tests are registered in `l0_cpu.yml`, so
+they resolve to `CPU-Generic-x86-1` / `CPU-Generic-arm-1` — one split each, and stages CBTS runs
+unconditionally (`ALWAYS_RUN_STAGE_PREFIX`), so they still run on every baseline and fallback
+pipeline. `test_capability_conformance.py` builds a real `LLM` and so is registered in `l0_a10.yml`,
+adding `A10-PyTorch-*`: an OpenEngine change does pull one GPU shard. Any GPU serves — the model is
+TinyLlama-1.1B — so it sits with the other gateway tests rather than claiming a scarcer type.
+`requirements-openengine.txt` is installed on every stage in `jenkins/L0_Test.groovy` alongside the
+SMG file, so no stage-name guard decides which gateway a shard can import. If no OpenEngine test
 entry is registered, the rule returns `scope=None` and falls back to the baseline rather than
 silently skipping coverage.
 

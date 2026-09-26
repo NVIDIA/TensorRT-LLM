@@ -25,6 +25,7 @@ l0_cpu:
   - disaggregated/test_aiperf_gate.py::test_non_request_records_excluded_from_denominator
   # Kimi K3 disagg parity harness self-test (comparison logic only, no GPUs).
   - test_kimi_k3_specdec.py::test_kimi_k3_disagg_parity_selftest
+  - examples/visual_gen/test_media_deps_install.py::test_install_ffmpeg_via_apt_installs_ffmpeg
   # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
   # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
   # is what picks them up:
@@ -38,21 +39,49 @@ l0_cpu:
   # runs -m cpu_only, so this entry contributes only the 3 marked files under attention/.
   - unittest/_torch/attention
   - unittest/_torch/cute_dsl/test_kimi_k3_kda_ptx_patch.py
+  - unittest/_torch/compilation/test_auto_multi_stream.py
+  - unittest/_torch/compilation/test_remove_copy_pass.py::test_remove_copy_preserves_minimax_producer_outputs
   - unittest/_torch/distributed
   - unittest/_torch/executor
+  - unittest/test_startup.py
   - unittest/_torch/disaggregation
   - unittest/_torch/peft
   - unittest/_torch/memory
   - unittest/_torch/modeling
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_decoder_layer_sets_post_fusion_from_moe_scheduler
+  - unittest/_torch/models/test_minimax_m3.py::test_validate_fused_projection_requires_fp8_main_kv_cache
+  - unittest/_torch/models/test_minimax_m3.py::test_fused_qkv_index_projection_preserves_index_head_groups
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_projection_shards_index_rows
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_index_tp_matches_unsharded_reference
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_index_head_range_rejects_invalid_geometry
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_uses_one_engine_speculative_base
+  - unittest/_torch/models/test_minimax_m3.py::test_setup_aliases_preserves_one_engine_draft_weight_loading
+  - unittest/_torch/models/test_minimax_m3.py::test_eagle_capture_precedes_next_layer_norm
+  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_attention_boundary_runs_horizontal_producer
+  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_projection_fake_preserves_padded_hidden_rows
+  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_fused_projection_preserves_input_token_dimension
+  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_captured_producer_preserves_symbolic_shapes
+  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_captures_horizontal_producer_before_attention
+  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_captured_producer_rejects_unavailable_fusion
+  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_captured_producer_declares_cache_mutations
+  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_unfused_indexer_keeps_cache_write_eager
+  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_attention_boundary_preserves_indexer_cache_contract
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_projection_shard_geometry
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_loader_returns_exact_generic_skip
   - unittest/_torch/models/checkpoints
   - unittest/_torch/modules
   - unittest/_torch/moe
   - unittest/_torch/multimodal
   - unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py
   - unittest/_torch/speculative/hw_agnostic
+  # l0_h100 selects with -m "not cpu_only", so this entry is what runs it.
+  - unittest/_torch/speculative/test_spec_slot_pool_sizing.py
+  - unittest/_torch/test_hf_quant_config.py
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_model_config.py
+  - unittest/_torch/test_route_capture.py
   - unittest/_torch/test_utils.py
   - unittest/_torch/thop/parallel_hw_agnostic
   - unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py
@@ -66,11 +95,14 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_flux_infer.py
   - unittest/evaluate/visual_gen/test_generation_evaluation_pipeline.py
   - unittest/_torch/visual_gen/test_ltx2_pipeline.py
+  - unittest/_torch/visual_gen/test_minimax_h3_pipeline.py
+  - unittest/_torch/visual_gen/test_minimax_h3_scheduler_packing.py
   - unittest/_torch/visual_gen/test_ltx2_transformer.py
   - unittest/_torch/visual_gen/test_quant_static_guard.py
   - unittest/_torch/visual_gen/test_teacache.py
   - unittest/_torch/visual_gen/test_tensor_payload.py
   - unittest/_torch/visual_gen/test_trtllm_serve_endpoints.py
+  - unittest/_torch/visual_gen/test_utils.py
   - unittest/_torch/visual_gen/test_visual_gen_args.py
   - unittest/_torch/visual_gen/test_visual_gen_params.py
   - unittest/_torch/visual_gen/test_visual_gen_utils.py
@@ -93,7 +125,9 @@ l0_cpu:
   - unittest/executor/test_spec_dec_perf_metrics.py
   - unittest/executor/test_stop_word_side_output_trim.py
   - unittest/executor/test_ray_stub.py
+  - unittest/grpc/openengine/test_control.py
   - unittest/grpc/openengine/test_openengine.py
+  - unittest/grpc/openengine/test_servicer.py
   - unittest/inputs
   - unittest/kv_cache_manager_v2_tests
   - unittest/llmapi/apps/test_anthropic_adapter.py
@@ -104,7 +138,14 @@ l0_cpu:
   - unittest/llmapi/apps/test_harmony_channel_validation.py
   - unittest/llmapi/apps/test_harmony_parsing.py::TestStripIncompleteMessagesReporting
   - unittest/llmapi/apps/test_kimi_serve_extensions.py
+  - unittest/llmapi/apps/test_openai_chat_disagg_multimodal.py
   - unittest/llmapi/apps/test_reasoning_prompt_resolution.py
+  # test_request_metrics.py as a whole is not registered on any list, so only the
+  # two cases added with the KV-transfer fix are selected here. Registering the
+  # file would also enable a dozen pre-existing cases that have never run in CI,
+  # which belongs in its own change.
+  - unittest/llmapi/apps/test_request_metrics.py::test_header_derived_record_keeps_kv_transfer_without_kv_cache_size
+  - unittest/llmapi/apps/test_request_metrics.py::test_unpopulated_kv_transfer_timestamps_stay_absent
   - unittest/llmapi/apps/test_responses_custom_tools.py
   - unittest/llmapi/apps/test_responses_input_preprocess.py
   - unittest/llmapi/apps/test_responses_streaming_events.py
@@ -120,6 +161,7 @@ l0_cpu:
   - unittest/llmapi/test_kv_cache_dtype_override.py
   - unittest/llmapi/test_llm_args.py
   - unittest/llmapi/test_mx_args.py
+  - unittest/llmapi/test_custom_tokenizer_aliases.py
   - unittest/llmapi/test_llm_quant.py
   - unittest/llmapi/test_llm_telemetry.py
   - unittest/llmapi/test_llm_utils.py
@@ -144,4 +186,5 @@ l0_cpu:
   - unittest/usage
   - unittest/utils/test_logger.py
   - unittest/utils/test_confidential_compute.py
+  - unittest/utils/test_llm_data.py
   - unittest/visual_gen/test_output.py

@@ -94,6 +94,25 @@ The test file uses `find_spec("kv_cache_manager_v2")` to detect whether the pack
 
 Pages inside radix tree blocks are `BlockPage` wrappers that delegate to the underlying `CommittedPage`/`UncommittedPage`.
 
+## Concurrency
+
+**This pure-Python backend is not thread-safe.** There is no lock around the
+manager API; the only `threading.Lock` in the package guards copy-engine state
+in `_copy_engine.py`. The GIL makes individual bytecode operations atomic but
+gives no atomicity across a multi-step operation like `resize()`, which walks
+the radix tree, evicts, and migrates pages.
+
+The **C++ backend is** thread-safe, via a manager-wide reader-writer lock. The
+two backends are selected by `TLLM_KV_CACHE_MANAGER_V2_BACKEND` and are
+otherwise interchangeable, so this is an easy asymmetry to trip over: code that
+drives `resize()` from a background thread works against the C++ backend and
+races against this one.
+
+See `cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/AGENTS.md`
+("Concurrency model") for the guarantee, its scope, and the supported
+helper-thread handoff pattern. If this backend ever needs the same property, it
+needs its own design -- the C++ lock is not reachable from here.
+
 ## Gotchas
 
 - **`rawref` must be built first** — the package imports `rawref` at the top level. Run `make rawref` before anything else.
@@ -101,4 +120,4 @@ Pages inside radix tree blocks are `BlockPage` wrappers that delegate to the und
 - **`_exceptions.py` excluded from mypyc** — mypyc can't compile classes inheriting from builtin `Exception`.
 - **`NDEBUG` controls assertions** — many hot-path assertions are gated behind `if not NDEBUG:`. Don't remove these guards.
 - **`stopCommitting()` must NOT call `commit()`** — it would double-append tokens to the block.
-- **Cross-stream sync on `cuda_stream` setter** — changing the CUDA stream records an event on the old stream and waits on the new one. This is intentional.
+- **Cross-stream sync on `cuda_stream` setter** — changing the CUDA stream records an event on the old stream and waits on the new one. This is intentional, and it is how a cache built on one thread is adopted by another without a blocking host-side sync (C++ backend; see its AGENTS.md).
