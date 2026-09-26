@@ -154,7 +154,6 @@ full:GB300/disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_l
 full:GB300/perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_deepseek-v4-pro-fp4_8k1k_con8_ctx1_dep4_gen4_tep8_eplb0_mtp3_ccb-NIXL] SKIP (https://nvbugs/6670230)
 full:GB300/test_e2e.py::test_openai_disagg_multi_nodes_completion[ctx_tp1pp2-gen_tp1pp2] SKIP (https://nvbugs/6812588)
 full:GB300/test_e2e.py::test_openai_disagg_multi_nodes_completion[ctx_tp2pp1-gen_tp2pp1] SKIP (https://nvbugs/6812588)
-full:GB300/test_e2e.py::test_openai_disagg_multi_nodes_completion_service_discovery[etcd] SKIP (https://nvbugs/6812591)
 full:GB300/unittest/_torch/modeling/test_modeling_gpt_oss.py::test_gpt_oss_trtllmgen[CUTLASS] SKIP (https://nvbugs/6633932)
 full:GB300/unittest/_torch/modules/tests_lora_modules/test_qwen3_sanity.py::TestQwen3LoRA::test_qwen3_fp8_lora SKIP (https://nvbugs/6668777)
 full:H100/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=2-overlap_scheduler=False] SKIP (https://nvbugs/6313072)
