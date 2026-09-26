@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import socket
+import time
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -56,7 +57,7 @@ from ..interface import MoESchedulerKind, MoEWeightLoadingMode, _reject
 from ..quantization import W4A8MXFP4MXFP8MegaMoEDeepGemmMethod, _import_deep_gemm
 from ..routing import BaseMoeRoutingMethod
 
-__all__ = ["DeepgemmCudaW4a8Mxfp4Mxfp8Impl", "MegaMoEDeepGemm"]
+__all__ = ["DeepgemmCudaW4a8Mxfp4Mxfp8Impl", "MegaMoEDeepGemm", "set_warmup_launch_fence"]
 
 # Process-global DG SymmBuffer cache. The cached object is mutable
 # forward-time activation workspace (input ``x`` / routing slots /
@@ -79,6 +80,34 @@ __all__ = ["DeepgemmCudaW4a8Mxfp4Mxfp8Impl", "MegaMoEDeepGemm"]
 # into a false stale -- freeing a buffer another layer already holds.
 # ``release_symm_buffer_cache`` bounds the lifetime.
 _MEGA_MOE_SYMM_BUFFER_CACHE: Dict[tuple, Tuple[object, object]] = {}
+
+# Switched by the model engine at every warmup transition, see
+# ``set_warmup_launch_fence``.
+_warmup_launch_fence = False
+
+# A fence wait at least this long is logged: it is skew the kernel's own
+# barrier would otherwise have had to absorb.
+_FENCE_WAIT_LOG_SECONDS = 10.0
+
+
+def set_warmup_launch_fence(enabled: bool) -> None:
+    """Fence each ``fp8_fp4_mega_moe`` launch with a host-side EP barrier.
+
+    The kernel's cross-rank barriers trap once a peer is late by
+    ``DG_BARRIER_TIMEOUT_SECONDS`` (60 s unless ``DG_JIT_BARRIER_TIMEOUT_SECONDS``
+    overrides it), and the trap is a sticky CUDA error that takes down every
+    rank that was waiting. During warmup a rank can fall that far behind for
+    reasons that are not failures: its first forwards pay for one-time work
+    such as kernel JIT and cache loads. A host barrier waits for such a rank
+    instead, bounded by the process group timeout rather than the kernel's.
+    Warmup does not care about the barrier's cost; serving launches are not
+    fenced.
+
+    Args:
+        enabled: Whether the launches that follow are fenced.
+    """
+    global _warmup_launch_fence
+    _warmup_launch_fence = enabled
 
 
 def _free_symm_buffer(buffered: object) -> int:
@@ -821,6 +850,26 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
         """Whether ``run_moe`` can prepare DG SymmBuffer directly from BF16 input."""
         return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "megamoe_prepare")
 
+    def _fence_ep_ranks(self) -> None:
+        """Block the host until every EP rank reaches this launch.
+
+        ``dist.barrier`` on the NCCL EP group is a dummy all-reduce ordered
+        after the work already queued on the current stream, and the host then
+        waits for it, so each rank launches the kernel only after its peers
+        have finished everything before it. Skipped under CUDA graph capture,
+        where launches are recorded rather than run and the host must not wait.
+        """
+        if self.ep_size <= 1 or torch.cuda.is_current_stream_capturing():
+            return
+        start = time.monotonic()
+        dist.barrier(group=self._ep_pg)
+        waited = time.monotonic() - start
+        if waited >= _FENCE_WAIT_LOG_SECONDS:
+            logger.warning(
+                f"[MegaMoE] layer={self.layer_idx} EP rank {self.mapping.moe_ep_rank} "
+                f"waited {waited:.1f} s for its EP peers before a warmup launch"
+            )
+
     def run_moe(
         self,
         ctx: MoERunContext,
@@ -874,6 +923,8 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
                 buf.topk_weights[:num_tokens].copy_(token_final_scales.to(torch.float32))
 
         y = torch.empty((num_tokens, self.hidden_size), dtype=torch.bfloat16, device=buf.x.device)
+        if _warmup_launch_fence:
+            self._fence_ep_ranks()
         dg.fp8_fp4_mega_moe(
             y,
             self._t_l1,
