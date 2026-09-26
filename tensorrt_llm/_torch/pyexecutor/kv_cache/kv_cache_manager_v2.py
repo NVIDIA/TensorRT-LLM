@@ -3152,7 +3152,12 @@ class KVCacheManagerV2(BaseResourceManager):
         return full_view[:, 0]
 
     def get_num_available_tokens(
-        self, *, token_num_upper_bound: int, batch_size: int = 1, max_num_draft_tokens: int = 0
+        self,
+        *,
+        token_num_upper_bound: int,
+        batch_size: int = 1,
+        max_num_draft_tokens: int = 0,
+        max_beam_width: int = 1,
     ) -> int:
         """Clamp ``token_num_upper_bound`` to the allocatable token capacity.
 
@@ -3164,6 +3169,9 @@ class KVCacheManagerV2(BaseResourceManager):
         ``max_num_tokens``) stay consistent because a helix context forward
         replicates all tokens on every rank, so both bounds constrain the
         same request-length variable.
+
+        ``max_beam_width`` is accepted for interface parity with the V1
+        manager; V2 only supports a beam width of 1.
         """
         extra_tokens = self.num_extra_kv_tokens + max_num_draft_tokens
         # Token num upper bound is the maximum number of tokens that can be allocated in the kv cache manager.
