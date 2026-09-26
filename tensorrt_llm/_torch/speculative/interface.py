@@ -2975,6 +2975,12 @@ class SpecWorkerBase(nn.Module, ABC):
         if self.use_separate_draft_kv_cache and resource_manager is not None:
             return resource_manager.get_resource_manager(
                 ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+        if resource_manager is not None:
+            target = resource_manager.get_resource_manager(
+                ResourceManagerType.KV_CACHE_MANAGER)
+            get_view = getattr(target, "get_draft_subpage_view", None)
+            if get_view is not None:
+                return get_view()
         return None
 
     @contextmanager

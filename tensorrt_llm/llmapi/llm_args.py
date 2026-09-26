@@ -927,7 +927,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         "also use a horizontal norm/RoPE/cache-insertion producer for prefill, "
         "mixed, and CUDA-graph decode execution. The MiniMax-M3-specific path "
         "requires the MSA implementation, indexer_kv_dtype='fp8', and an FP8 "
-        "main KV cache.",
+        "or NVFP4 main KV cache.",
         status="prototype",
     )
     num_attention_heads: Optional[int] = Field(
@@ -945,9 +945,10 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
     implementation: Literal["triton", "msa"] = Field(
         default="triton",
         description=
-        "Sparse attention implementation: 'triton' reference (default) or 'msa' "
-        "(fmha_sm100 kernels). The 'msa' implementation requires an SM100 GPU, "
-        "the fmha_sm100 package, and sparse_block_size == 128.",
+        "Sparse attention implementation: 'triton' legacy reference (default) "
+        "or the recommended 'msa' backend. MSA requires an SM100 or SM103 GPU, "
+        "the fmha_sm100 package, and sparse_block_size == 128. NVFP4 KV cache "
+        "requires 'msa'; it uses MSA prefill and Triton sparse decode kernels.",
         status="prototype",
     )
 

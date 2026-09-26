@@ -31,12 +31,86 @@ from tensorrt_llm._torch.models.modeling_speculative import (
     SpecDecOneEngineForCausalLM,
     _build_mtp_one_model_draft,
     _copy_model_config_with_moe_backend,
+    _set_draft_kv_cache_quant_algo,
     external_drafter_config_kwargs,
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
+
+
+@pytest.mark.cpu_only
+def test_draft_kv_cache_quant_algo_override_updates_all_layers() -> None:
+    target = SimpleNamespace(
+        quant_config=SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4),
+        extra_attrs={"draft_kv_cache_quant_algo_override": QuantAlgo.FP8},
+    )
+    layer_quant_0 = SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4)
+    layer_quant_1 = SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4)
+    draft = SimpleNamespace(
+        quant_config=SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4),
+        quant_config_dict={
+            "model.layers.0": layer_quant_0,
+            "model.layers.1": layer_quant_1,
+        },
+    )
+
+    _set_draft_kv_cache_quant_algo(draft, target)
+
+    assert draft.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+    assert layer_quant_0.kv_cache_quant_algo == QuantAlgo.FP8
+    assert layer_quant_1.kv_cache_quant_algo == QuantAlgo.FP8
+    assert target.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("target_algo", [None, QuantAlgo.FP8, QuantAlgo.NVFP4])
+def test_draft_kv_cache_quant_algo_inheritance_preserves_layer_settings(
+    target_algo: QuantAlgo | None,
+) -> None:
+    """Without an override, inherit only the global setting as before."""
+    target = SimpleNamespace(
+        quant_config=SimpleNamespace(kv_cache_quant_algo=target_algo),
+        extra_attrs={},
+    )
+    layer_algos = (None, QuantAlgo.FP8, QuantAlgo.NVFP4)
+    layer_configs = {
+        f"model.layers.{i}": SimpleNamespace(kv_cache_quant_algo=algo)
+        for i, algo in enumerate(layer_algos)
+    }
+    draft = SimpleNamespace(
+        quant_config=SimpleNamespace(kv_cache_quant_algo=QuantAlgo.FP8),
+        quant_config_dict=layer_configs,
+    )
+
+    _set_draft_kv_cache_quant_algo(draft, target)
+
+    assert draft.quant_config.kv_cache_quant_algo == target_algo
+    assert draft.quant_config_dict is layer_configs
+    assert tuple(config.kv_cache_quant_algo for config in layer_configs.values()) == layer_algos
+    assert target.quant_config.kv_cache_quant_algo == target_algo
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("override", [None, QuantAlgo.FP8])
+def test_draft_kv_cache_quant_algo_without_layer_settings(override: QuantAlgo | None) -> None:
+    """Global inheritance and overrides also support uniform checkpoints."""
+    target = SimpleNamespace(
+        quant_config=SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4),
+        extra_attrs={"draft_kv_cache_quant_algo_override": override},
+    )
+    draft = SimpleNamespace(
+        quant_config=SimpleNamespace(kv_cache_quant_algo=None),
+        quant_config_dict=None,
+    )
+
+    _set_draft_kv_cache_quant_algo(draft, target)
+
+    expected_algo = QuantAlgo.NVFP4 if override is None else override
+    assert draft.quant_config.kv_cache_quant_algo == expected_algo
+    assert draft.quant_config_dict is None
+    assert target.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
 
 
 class _FakeDraftModel(nn.Module):

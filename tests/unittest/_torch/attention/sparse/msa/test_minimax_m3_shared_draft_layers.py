@@ -12,29 +12,143 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pure-logic tests for MiniMax-M3's shared Eagle3 draft layers: each gets its own
-virtual attention-op pool rooted at its K page inside the mega-slot.
+"""MiniMax-M3 shared Eagle3 draft layouts and real heterogeneous page tables.
+
+Draft views use an attention-op pool rooted at the draft K page inside the slot.
 """
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
+    FlashInferTrtllmGenFmha,
+)
+from tensorrt_llm._torch.attention.backends.fmha.utils import get_kv_page_offset
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
     cache_manager as m3_cache_manager,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
+    MiniMaxM3DraftSubpageView,
     MiniMaxM3KVCacheManagerV2,
     derive_shared_draft_layout,
     extend_attention_op_pools_for_shared_draft_layers,
     shared_draft_layer_count,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
+from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm.bindings import DataType
+from tensorrt_llm.bindings.internal.batch_manager import CacheType
+from tensorrt_llm.llmapi.llm_args import (
+    Eagle3DecodingConfig,
+    KvCacheConfig,
+    MiniMaxM3SparseAttentionConfig,
+)
+from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
+from tensorrt_llm.runtime.kv_cache_manager_v2._utils import init_cuda_once
 
 DRAFT_LOCAL_LAYER = 60
 SCALE = 179  # sub-pages per M3 mega-slot: 3 dense x 2 + 57 sparse x 3 + draft x 2
 DRAFT_K_ADDR = 0x7000_0000
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
+def test_nvfp4_shared_draft_constructs_and_converts_heterogeneous_page_tables() -> None:
+    """Exercise real pool allocation and both target/draft page-table consumers."""
+    init_cuda_once()
+    manager = MiniMaxM3KVCacheManagerV2(
+        KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            host_cache_size=0,
+            enable_block_reuse=False,
+            enable_swa_scratch_reuse=False,
+        ),
+        CacheType.SELF,
+        num_layers=4,
+        num_kv_heads=[2, 2, 2, 2, 1],
+        head_dim=128,
+        tokens_per_block=128,
+        max_seq_len=256,
+        max_batch_size=2,
+        max_num_tokens=256,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.NVFP4,
+        vocab_size=16,
+        spec_config=Eagle3DecodingConfig(max_draft_len=3, speculative_model="unused"),
+        sparse_attention_config=MiniMaxM3SparseAttentionConfig(
+            implementation="msa", indexer_kv_dtype="fp8"
+        ),
+    )
+    try:
+        assert manager._use_per_layer_page_tables
+        assert manager._shared_draft_layer_ids == [4]
+        assert manager.impl.get_page_index_converter(4, Role.KEY).expansion == 4
+        # Fill two logical request rows; no context scratch is active.
+        for row, slot in enumerate((2, 5)):
+            manager.host_kv_cache_block_offsets[:, row].fill_(slot)
+        output = torch.empty(
+            (manager.num_attention_op_pools, 2, 2, manager.max_blocks_per_seq),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        manager._copy_batch_block_offsets_per_layer(
+            output, [101, 102], torch.tensor([0, 1], dtype=torch.long), 0, 2
+        )
+        actual = output.cpu()
+        for layer_id in range(manager.num_local_layers):
+            for role_idx, role in enumerate((Role.KEY, Role.VALUE)):
+                converter = manager.impl.get_page_index_converter(layer_id, role)
+                for row, slot in enumerate((2, 5)):
+                    expected = converter(
+                        [slot] * manager.max_blocks_per_seq, PageIndexMode.PER_LAYER
+                    )[:: converter.expansion]
+                    assert actual[layer_id, row, role_idx].tolist() == expected
+
+        # The draft attention consumer gets every P32 page, not just the first.
+        draft = manager.get_draft_subpage_view()
+        assert draft is not None
+        table = draft._host_block_table([[2, 5]], 1, 2, torch.int32)
+        converter = manager.impl.get_page_index_converter(4, Role.KEY)
+        expected_k = converter([2, 5], PageIndexMode.SHARED)
+        assert table[0, 0].tolist() == expected_k
+        assert table[0, 1].tolist() == [page + 4 for page in expected_k]
+
+        # FMHA must use the view's P32 extent and K/V displacement rather than
+        # rejecting the view or delegating to its differently rooted owner.
+        attn = TrtllmAttention.__new__(TrtllmAttention)
+        attn.local_layer_idx = 4
+        fmha = FlashInferTrtllmGenFmha.__new__(FlashInferTrtllmGenFmha)
+        fmha._attn_ref = lambda: attn
+        metadata = TrtllmAttentionMetadata(
+            max_num_requests=2, max_num_tokens=256, kv_cache_manager=draft, mapping=manager.mapping
+        )
+        assert fmha._get_total_num_blocks(metadata) == draft.blocks_in_primary_pool
+        assert get_kv_page_offset(attn, metadata, 0) == 4
+        with pytest.raises(ValueError, match="only addresses its shared draft layer"):
+            draft.get_attention_op_num_blocks(0)
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("dtype", [DataType.FP8, DataType.NVFP4])
+def test_block_scale_role_uses_global_layer_ids(dtype: DataType) -> None:
+    manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
+    manager.dtype = dtype
+    manager.pp_layers = [60, 7, 2]
+    manager.sparse_layer_ids = {7}
+    for local_layer, expected_nvfp4 in enumerate((None, Role.KEY_BLOCK_SCALE, None)):
+        expected = expected_nvfp4 if dtype == DataType.NVFP4 else None
+        assert manager._get_block_scale_role(Role.KEY, local_layer) == expected
+        assert manager._get_block_scale_role(Role.VALUE, local_layer) is None
+    generic = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    generic.dtype = dtype
+    expected = Role.KEY_BLOCK_SCALE if dtype == DataType.NVFP4 else None
+    assert generic._get_block_scale_role(Role.KEY, 0) == expected
 
 
 def test_virtual_pool_is_rooted_at_the_draft_k_page():
@@ -77,6 +191,7 @@ def test_block_offset_copy_fills_the_virtual_pool_from_the_source_pool(monkeypat
     monkeypatch.setattr(m3_cache_manager, "copy_batch_block_offsets_to_device", fake_device_copy)
 
     manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
+    manager.dtype = DataType.FP8
     manager._draft_op_pools = ((1, 0),)
     manager._draft_index_scales = torch.tensor([SCALE], dtype=torch.int32)
     manager._draft_kv_offsets = torch.tensor([1], dtype=torch.int32)
@@ -106,7 +221,9 @@ def test_block_offset_copy_fills_the_virtual_pool_from_the_source_pool(monkeypat
     assert calls == [("base", [7], 1, None)]
 
 
-def test_per_layer_page_tables_get_no_virtual_pools(monkeypatch):
+@pytest.mark.parametrize("dtype", [DataType.FP8, DataType.NVFP4])
+@pytest.mark.parametrize("swa_scratch_reuse", [False, True])
+def test_per_layer_page_tables_get_no_virtual_pools(monkeypatch, dtype, swa_scratch_reuse):
     """With per-layer page tables every layer already has its own pool."""
     pointers = torch.tensor([[0x6000_0000 + i, 0] for i in range(61)])
     mapping = torch.tensor([[i, 0] for i in range(61)], dtype=torch.int32)
@@ -119,11 +236,17 @@ def test_per_layer_page_tables_get_no_virtual_pools(monkeypatch):
 
     monkeypatch.setattr(KVCacheManagerV2, "_prepare_page_table_tensor", fake_base_prepare)
     manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
+    manager.dtype = dtype
     manager._shared_draft_layer_ids = [DRAFT_LOCAL_LAYER]
     manager.layer_offsets = {i: i for i in range(61)}
     manager.is_draft = False
-    manager.enable_swa_scratch_reuse = False
+    manager.enable_swa_scratch_reuse = swa_scratch_reuse
     manager.tokens_per_block = 128
+
+    if swa_scratch_reuse:
+        with pytest.raises(NotImplementedError, match="SWA scratch reuse"):
+            manager._prepare_page_table_tensor(8)
+        return
 
     manager._prepare_page_table_tensor(8)
 
@@ -131,7 +254,8 @@ def test_per_layer_page_tables_get_no_virtual_pools(monkeypatch):
     assert torch.equal(manager.kv_cache_pool_mapping, mapping)
     assert manager.num_attention_op_pools == 61
     assert manager._draft_op_pools == ()
-    assert manager.trtllm_gen_extra_tokens_per_block == frozenset({128})
+    expected_extra_pages = {128} if dtype == DataType.FP8 else set()
+    assert manager.trtllm_gen_extra_tokens_per_block == frozenset(expected_extra_pages)
 
 
 def test_update_resources_refuses_tree_relocation(monkeypatch):
@@ -139,6 +263,7 @@ def test_update_resources_refuses_tree_relocation(monkeypatch):
     calls = []
     monkeypatch.setattr(KVCacheManagerV2, "update_resources", lambda self, *a: calls.append(a))
     manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
+    manager.dtype = DataType.FP8
     linear = SimpleNamespace(
         py_num_accepted_draft_tokens=2, py_num_accepted_draft_tokens_indices=[]
     )
@@ -173,3 +298,201 @@ def test_shared_draft_layer_count_follows_the_base_manager():
     assert shared_draft_layer_count(eagle3, None) == 1
     assert shared_draft_layer_count(eagle3, [True] * 60) == 0
     assert shared_draft_layer_count(None, None) == 0
+
+
+NVFP4_DRAFT_LAYER = 60
+NVFP4_SCALE = 178
+NVFP4_ADDR = 0x7000_0000
+
+
+class _Nvfp4BaseManager:
+    tokens_per_block = 128
+    max_blocks_per_seq = 16
+    num_pools = 1
+    # V2's flattened bound uses the target pool's 128-token page units and
+    # base pointer. The draft view must not delegate this value.
+    blocks_in_primary_pool = 1024 * NVFP4_SCALE
+
+    def __init__(self):
+        self.layer_offsets = {NVFP4_DRAFT_LAYER: NVFP4_DRAFT_LAYER}
+        self.kv_cache_pool_mapping = torch.zeros((NVFP4_DRAFT_LAYER + 1, 2), dtype=torch.int32)
+        self.kv_cache_pool_mapping[NVFP4_DRAFT_LAYER] = torch.tensor([0, 7], dtype=torch.int32)
+        self.slot_rows = [[5, 7]]
+        self.impl = SimpleNamespace(
+            get_layer_group_id=lambda local: int(self.kv_cache_pool_mapping[local, 0])
+        )
+
+    def _kv_slot_geometry(self, layer_idx, kv_layout):
+        assert layer_idx == NVFP4_DRAFT_LAYER
+        page_shape = [self.tokens_per_block, 16, 128]
+        return NVFP4_ADDR, torch.int8, 1024, NVFP4_SCALE, page_shape
+
+    def _get_batch_cache_indices_by_pool_id(self, request_ids, *, pool_id):
+        assert pool_id == 0
+        return self.slot_rows[: len(request_ids)]
+
+
+class _Nvfp4HybridManager(_Nvfp4BaseManager):
+    dtype = DataType.NVFP4
+    DRAFT_PHYSICAL_TOKENS_PER_BLOCK = 32
+    num_pools = 2
+
+    def __init__(self):
+        super().__init__()
+        self.kv_cache_pool_mapping[NVFP4_DRAFT_LAYER] = torch.tensor([1, 7], dtype=torch.int32)
+
+    def is_fp8_subpaged_layer(self, layer_idx):
+        assert layer_idx == NVFP4_DRAFT_LAYER
+        return True
+
+    def _fp8_dense_data_buffers(self, layer_idx):
+        assert layer_idx == NVFP4_DRAFT_LAYER
+
+        class _Pointer:
+            shape = (1024, NVFP4_SCALE * 4, 16, 32, 128)
+
+            @staticmethod
+            def data_ptr():
+                return NVFP4_ADDR
+
+        return _Pointer(), None, NVFP4_SCALE * 4, 4
+
+    def _get_batch_cache_indices_by_pool_id(self, request_ids, *, pool_id):
+        assert pool_id == 1
+        return self.slot_rows[: len(request_ids)]
+
+
+def test_hybrid_view_publishes_an_fp8_pool_pointer_from_the_draft_pool():
+    view = MiniMaxM3DraftSubpageView(_Nvfp4HybridManager(), [NVFP4_DRAFT_LAYER], 32)
+    expected = [[NVFP4_ADDR, 0]]
+    assert view.kv_cache_pool_pointers.tolist() == expected
+    assert view.host_kv_cache_pool_pointers.tolist() == expected
+    assert view.dtype == DataType.FP8
+    assert view._source_pool_id == 1
+    assert view.blocks_in_primary_pool == (1024 - 1) * NVFP4_SCALE * 4 + 8
+
+    dst = torch.full((1, 1, 2, view.max_blocks_per_seq), -7, dtype=torch.int32)
+    view.copy_batch_block_offsets(dst, request_ids=[123], beam_width=1, num_contexts=1, num_seqs=1)
+    unit = NVFP4_SCALE * 4
+    expected_k = [5 * unit + j for j in range(4)] + [7 * unit + j for j in range(4)]
+    assert dst[0, 0, 0, :8].tolist() == expected_k
+    assert dst[0, 0, 1, :8].tolist() == [page + 4 for page in expected_k]
+
+
+def test_hybrid_view_rejects_non_p32_draft_pages():
+    try:
+        MiniMaxM3DraftSubpageView(_Nvfp4HybridManager(), [NVFP4_DRAFT_LAYER], 128)
+    except AssertionError as error:
+        assert "physical draft-cache page size P32" in str(error)
+    else:
+        raise AssertionError("expected NVFP4 Eagle draft view to require P32 pages")
+
+
+@pytest.mark.parametrize("local_draft_layers", [[], [60], [61]])
+@pytest.mark.parametrize("swa_scratch_reuse", [False, True])
+def test_draft_subpage_accessor_respects_local_layers(
+    monkeypatch: pytest.MonkeyPatch, local_draft_layers: list[int], swa_scratch_reuse: bool
+) -> None:
+    """Only local draft layers may create a view; scratch reuse is unsupported on every rank."""
+    manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
+    manager.dtype = DataType.NVFP4
+    manager.is_draft = False
+    manager._shared_draft_layer_ids = [60, 61]
+    manager.layer_offsets = {layer: local for local, layer in enumerate([30, *local_draft_layers])}
+    manager.enable_swa_scratch_reuse = swa_scratch_reuse
+    manager._draft_subpage_view_obj = None
+    view = SimpleNamespace(tokens_per_block=32, blocks_in_primary_pool=1024)
+    create_view = Mock(return_value=view)
+    monkeypatch.setattr(m3_cache_manager, "MiniMaxM3DraftSubpageView", create_view)
+
+    if swa_scratch_reuse:
+        with pytest.raises(NotImplementedError, match="SWA scratch reuse"):
+            manager.get_draft_subpage_view()
+        create_view.assert_not_called()
+        assert manager._draft_subpage_view_obj is None
+    elif not local_draft_layers:
+        assert manager.get_draft_subpage_view() is None
+        create_view.assert_not_called()
+        assert manager._draft_subpage_view_obj is None
+    else:
+        assert manager.get_draft_subpage_view() is view
+        assert manager.get_draft_subpage_view() is view
+        create_view.assert_called_once_with(manager, local_draft_layers, 32)
+    assert manager._shared_draft_layer_ids == [60, 61]
+
+
+@pytest.mark.parametrize("via_accessor", [False, True])
+def test_draft_subpage_view_rejects_multiple_local_layers(via_accessor: bool) -> None:
+    """The real single-pool view must reject a second layer before publishing wrong pointers."""
+    manager = _Nvfp4HybridManager()
+    manager.layer_offsets[61] = 61
+    manager.kv_cache_pool_mapping = torch.cat(
+        [manager.kv_cache_pool_mapping, torch.tensor([[1, 9]], dtype=torch.int32)]
+    )
+    manager.is_draft = False
+    manager._shared_draft_layer_ids = [60, 61]
+    manager.enable_swa_scratch_reuse = False
+    manager._draft_subpage_view_obj = None
+
+    with pytest.raises(NotImplementedError, match="exactly one local shared draft layer"):
+        if via_accessor:
+            MiniMaxM3KVCacheManagerV2.get_draft_subpage_view(manager)
+        else:
+            MiniMaxM3DraftSubpageView(manager, [60, 61], 32)
+    assert manager._draft_subpage_view_obj is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("manager_cls", [KVCacheManagerV2, MiniMaxM3KVCacheManagerV2])
+@pytest.mark.parametrize("dtype", [None, DataType.HALF, DataType.FP8, DataType.NVFP4])
+@pytest.mark.parametrize("spec_mode", ["none", "linear", "dynamic"])
+def test_speculative_validation_precedes_cache_setup(
+    monkeypatch: pytest.MonkeyPatch,
+    manager_cls: type[KVCacheManagerV2],
+    dtype: DataType | None,
+    spec_mode: str,
+) -> None:
+    class CacheSetupReached(Exception):
+        pass
+
+    setup = Mock(spec_set=kv_cache_manager_v2.get_pp_layers, side_effect=CacheSetupReached)
+    monkeypatch.setattr(kv_cache_manager_v2, "get_pp_layers", setup)
+    spec_config = (
+        None
+        if spec_mode == "none"
+        else Eagle3DecodingConfig(
+            max_draft_len=3,
+            speculative_model="unused",
+            use_dynamic_tree=spec_mode == "dynamic",
+            dynamic_tree_max_topK=2 if spec_mode == "dynamic" else None,
+        )
+    )
+    manager = manager_cls.__new__(manager_cls)
+    dtype_kwargs = {} if dtype is None else {"dtype": dtype}
+    reject = (
+        manager_cls is MiniMaxM3KVCacheManagerV2
+        and dtype == DataType.NVFP4
+        and spec_mode == "dynamic"
+    )
+    with pytest.raises(
+        NotImplementedError if reject else CacheSetupReached,
+        match="does not yet move NVFP4 K/V block scales" if reject else None,
+    ):
+        manager.__init__(
+            KvCacheConfig(max_tokens=256, enable_block_reuse=False),
+            CacheType.SELF,
+            num_layers=4,
+            num_kv_heads=2,
+            head_dim=128,
+            tokens_per_block=128,
+            max_seq_len=256,
+            max_batch_size=2,
+            mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+            spec_config=spec_config,
+            **dtype_kwargs,
+        )
+    assert manager.dtype == (DataType.HALF if dtype is None else dtype)
+    if reject:
+        setup.assert_not_called()
+    else:
+        setup.assert_called_once()

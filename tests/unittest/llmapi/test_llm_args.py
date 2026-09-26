@@ -10,15 +10,17 @@ from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Annotated, Any, ClassVar, Literal, get_args, get_origin
-from unittest.mock import patch
+from unittest.mock import create_autospec, patch
 
 import pydantic_core
 import pytest
 import torch
 import yaml
 from pydantic import BaseModel, TypeAdapter, ValidationError
+from transformers import PretrainedConfig
 from utils.llm_data import llm_models_root
 
+import tensorrt_llm._torch.pyexecutor.model_loader as model_loader_mod
 import tensorrt_llm.bindings.executor as tle
 import tensorrt_llm.llmapi as public_llmapi
 import tensorrt_llm.llmapi.llm_args as llm_args_mod
@@ -783,6 +785,73 @@ class TestKvCacheManagerV2AutoResolution:
         @classmethod
         def get_preferred_kv_cache_manager_version(cls, pretrained_config=None):
             return "V1"
+
+    @pytest.mark.parametrize(
+        "kind,dtype,checkpoint_dtype,backend,setting,expected",
+        [
+            ("m3", "nvfp4", "FP8", "TRTLLM", "auto", True),
+            ("mla", "nvfp4", "FP8", "TRTLLM", "auto", True),
+            ("mla", "auto", "NVFP4", "TRTLLM", "auto", True),
+            ("mla", "nvfp4", "FP8", "TRTLLM", False, False),
+            ("mla", "nvfp4", "FP8", "FLASHINFER", "auto", False),
+            ("dense", "nvfp4", "FP8", "TRTLLM", "auto", False),
+        ],
+    )
+    def test_nvfp4_resolution_preserves_frozen_checkpoint_config(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        kind: str,
+        dtype: str,
+        checkpoint_dtype: str,
+        backend: str,
+        setting: bool | str,
+        expected: bool,
+    ) -> None:
+        """Resolve KV policy without mutating a loader's frozen config or scales."""
+        pretrained_config = PretrainedConfig(
+            architectures=["TestFrozenConfigForCausalLM"],
+            kv_lora_rank=512 if kind == "mla" else None,
+            qk_rope_head_dim=64 if kind == "mla" else None,
+        )
+        config = ModelConfig(
+            pretrained_config=pretrained_config,
+            quant_config=QuantConfig(kv_cache_quant_algo=checkpoint_dtype),
+            quant_config_dict={
+                "model.layers.0.self_attn.qkv_proj":
+                QuantConfig(kv_cache_quant_algo=checkpoint_dtype)
+            },
+            attn_backend="FLASHINFER",
+        )
+        config._frozen = True
+        loader = create_autospec(HfCheckpointLoader,
+                                 instance=True,
+                                 spec_set=True)
+        loader.load_config.return_value = config
+        model_cls = self._PreferV2 if kind == "m3" else self._PreferV1
+        monkeypatch.setattr(model_loader_mod.AutoModelForCausalLM,
+                            "_resolve_class", lambda _: model_cls)
+        args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            attn_backend=backend,
+            kv_cache_config=KvCacheConfig(dtype=dtype,
+                                          use_kv_cache_manager_v2=setting),
+            sparse_attention_config=(
+                llm_args_mod.MiniMaxM3SparseAttentionConfig(
+                    implementation="msa") if kind == "m3" else None),
+        )
+
+        model_loader_mod.ModelLoader.load_config_and_apply_defaults(
+            "/tmp/dummy_model", args, loader)
+
+        assert args.kv_cache_config.use_kv_cache_manager_v2 is expected
+        assert config._frozen
+        assert config.attn_backend == "FLASHINFER"
+        assert config.sparse_attention_config is None
+        assert config.quant_config.kv_cache_quant_algo == checkpoint_dtype
+        assert all(layer.kv_cache_quant_algo == checkpoint_dtype
+                   for layer in config.quant_config_dict.values())
+        with pytest.raises(AttributeError, match="instance is frozen"):
+            config.attn_backend = "TRTLLM"
 
     @pytest.mark.parametrize("explicit_auto", [False, True])
     def test_auto_uses_model_preference(self, explicit_auto):

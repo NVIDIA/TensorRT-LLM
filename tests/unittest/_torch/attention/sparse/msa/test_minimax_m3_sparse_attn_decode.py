@@ -10,18 +10,31 @@ The PyTorch oracle follows the vLLM reference linked in the file header
 truncated at the query token's own causal extent.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import run_msa_nvfp4_sparse_gqa
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
     build_kv_page_indices,
     msa_package_available,
+    require_msa_module,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.triton_sparse_decode import (
+    NVFP4_SF_VEC_SIZE,
     SPARSE_BLOCK_SIZE,
+    _sm100f_nvfp4_launch_options,
+    _sm100f_nvfp4_merge_launch_options,
+    _sm100f_nvfp4_num_topk_chunks,
+    _sm100f_nvfp4_query_group_size,
+    _sm100f_nvfp4_use_linear_softmax,
     minimax_m3_sparse_attn_decode,
     resolve_num_topk_chunks,
+)
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import (
+    MiniMaxM3MsaSparseAttentionMetadata,
 )
 from tensorrt_llm._utils import get_sm_version
 
@@ -32,7 +45,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 skip_not_sm100 = pytest.mark.skipif(
     get_sm_version() not in (100, 103),
-    reason="fmha_sm100 A/B comparison requires SM100/SM103.",
+    reason="MiniMax-M3 NVFP4 and fmha_sm100 require SM100/SM103.",
 )
 
 
@@ -166,6 +179,150 @@ def _make_inputs(
         generator=generator,
     )
     return q, k_paged, v_paged, topk_idx, block_table, seq_lens_dev
+
+
+def _dequant_nvfp4_flat(data: torch.Tensor, scale: torch.Tensor, dequant: float) -> torch.Tensor:
+    """Dequantize fp4_quantize output in its own flat [rows, D] layout.
+
+    Deliberately independent of any paged placement: this is the value oracle
+    the paged readers are checked against.
+    """
+    rows = data.reshape(-1, data.shape[-1]).to(torch.int32)
+    nibbles = torch.stack([rows & 0x0F, (rows >> 4) & 0x0F], dim=-1).reshape(rows.shape[0], -1)
+    exponent = (nibbles & 7) >> 1
+    mantissa = (nibbles & 1).float()
+    magnitude = torch.where(
+        exponent == 0, mantissa * 0.5, torch.exp2((exponent - 1).float()) * (1.0 + mantissa * 0.5)
+    )
+    values = torch.where((nibbles >> 3) & 1 == 1, -magnitude, magnitude)
+    factors = scale.reshape(rows.shape[0], -1).view(torch.float8_e4m3fn).float()
+    return values * factors.repeat_interleave(NVFP4_SF_VEC_SIZE, dim=-1) * dequant
+
+
+def _make_nvfp4_inputs(seq_lens, *, num_kv_heads=1, group=8, decode_query_len=1, seed=0):
+    """Build a paged NVFP4 cache with the production scatter kernel.
+
+    Returns the kernel arguments alongside `k_ref`/`v_ref`: the same values
+    dequantized in fp4_quantize's flat layout and then placed by slot id. A
+    reference run on those measures the kernel's error, not the quantizer's.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_scatter import (
+        fused_write_layer_caches_nvfp4,
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    batch = len(seq_lens)
+    total_q = batch * decode_query_len
+    num_heads = num_kv_heads * group
+    max_blocks = max(1, (max(seq_lens) + PAGE_SIZE - 1) // PAGE_SIZE)
+    num_pages = batch * max_blocks
+    num_slots = num_pages * PAGE_SIZE
+    scale_cols = HEAD_DIM // NVFP4_SF_VEC_SIZE
+
+    block_table = torch.randperm(num_pages, device="cuda", generator=generator)
+    block_table = block_table.to(torch.int32).reshape(batch, max_blocks)
+    seq_lens_dev = torch.tensor(seq_lens, device="cuda", dtype=torch.int32)
+    q = torch.randn(
+        total_q, num_heads, HEAD_DIM, device="cuda", generator=generator, dtype=torch.float32
+    ).to(torch.bfloat16)
+
+    # One [pages, 2, ...] pool per role, matching get_block_scale_buffers and
+    # msa_paged_kv: K is role 0, V role 1.
+    data_pool = torch.zeros(
+        num_pages, 2, num_kv_heads, PAGE_SIZE, HEAD_DIM // 2, device="cuda", dtype=torch.uint8
+    )
+    scale_pool = torch.zeros(
+        num_pages, 2, num_kv_heads, PAGE_SIZE, scale_cols, device="cuda", dtype=torch.uint8
+    )
+    source = {}
+    quant = torch.empty(3, device="cuda", dtype=torch.float32)
+    quant[0] = 1.0
+    for role in (0, 1):
+        values = torch.randn(
+            num_slots, num_heads, HEAD_DIM, device="cuda", generator=generator, dtype=torch.float32
+        ).to(torch.bfloat16)
+        # One head group per KV head, so the cache holds num_kv_heads of them.
+        values = values[:, :num_kv_heads].reshape(num_slots, num_kv_heads * HEAD_DIM)
+        quant[role + 1] = (448.0 * 6.0) / values.abs().max().float().item()
+        source[role] = values
+    assert fused_write_layer_caches_nvfp4(
+        data_pool[:, 0],
+        data_pool[:, 1],
+        scale_pool[:, 0],
+        scale_pool[:, 1],
+        None,
+        torch.arange(num_slots, device="cuda", dtype=torch.int32),
+        source[0],
+        source[1],
+        None,
+        quant,
+    )
+
+    # Slot s lives at page s // PAGE_SIZE, token s % PAGE_SIZE.
+    reference = []
+    for role in (0, 1):
+        flat = torch.ops.trtllm.fp4_quantize(
+            source[role].reshape(num_slots, num_kv_heads, HEAD_DIM).contiguous(),
+            quant[role + 1 : role + 2],
+            NVFP4_SF_VEC_SIZE,
+            False,
+            False,
+        )
+        dequantized = _dequant_nvfp4_flat(
+            flat[0].view(torch.uint8), flat[1].view(torch.uint8), 1.0 / quant[role + 1].item()
+        )
+        reference.append(
+            dequantized.reshape(num_pages, PAGE_SIZE, num_kv_heads, HEAD_DIM)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+        )
+
+    topk_idx = _random_topk(
+        seq_lens,
+        num_kv_heads=num_kv_heads,
+        decode_query_len=decode_query_len,
+        topk=MSA_REQUIRED_TOPK,
+        generator=generator,
+    )
+    scales = {
+        "k_block_scale": scale_pool[:, 0],
+        "v_block_scale": scale_pool[:, 1],
+        "k_global_scale": (1.0 / quant[1:2]).contiguous(),
+        "v_global_scale": (1.0 / quant[2:3]).contiguous(),
+    }
+    return SimpleNamespace(
+        q=q,
+        k_paged=data_pool[:, 0],
+        v_paged=data_pool[:, 1],
+        topk_idx=topk_idx,
+        block_table=block_table,
+        seq_lens=seq_lens_dev,
+        scales=scales,
+        scale_pool=scale_pool,
+        k_ref=reference[0],
+        v_ref=reference[1],
+        decode_query_len=decode_query_len,
+    )
+
+
+def _run_nvfp4(case, **kwargs):
+    # An E4M3 q is widened in-register, so the output stays at compute dtype.
+    out_dtype = torch.bfloat16 if case.q.dtype == torch.float8_e4m3fn else case.q.dtype
+    out = torch.empty(case.q.shape, device=case.q.device, dtype=out_dtype)
+    minimax_m3_sparse_attn_decode(
+        case.q,
+        case.k_paged,
+        case.v_paged,
+        case.topk_idx,
+        case.block_table,
+        case.seq_lens,
+        sm_scale=HEAD_DIM**-0.5,
+        output=out,
+        decode_query_len=case.decode_query_len,
+        **case.scales,
+        **kwargs,
+    )
+    return out
 
 
 def _run(q, k_paged, v_paged, topk_idx, block_table, seq_lens, decode_query_len, **kwargs):
@@ -326,7 +483,8 @@ def test_sparse_decode_accepts_token_major_topk_table():
     assert torch.equal(out_hm, out_tm)
 
 
-def test_sparse_decode_cuda_graph_replay_tracks_inputs():
+@pytest.mark.parametrize("num_topk_chunks", [1, 4], ids=["direct-output", "split-merge"])
+def test_sparse_decode_cuda_graph_replay_tracks_inputs(num_topk_chunks):
     """Replay must recompute from the live buffers, not reuse captured values."""
     seq_lens = [2048, 4097, 900]
     q, k_paged, v_paged, topk_idx, block_table, seq_lens_dev = _make_inputs(
@@ -345,7 +503,7 @@ def test_sparse_decode_cuda_graph_replay_tracks_inputs():
             sm_scale=HEAD_DIM**-0.5,
             output=out,
             decode_query_len=1,
-            num_topk_chunks=4,
+            num_topk_chunks=num_topk_chunks,
         )
 
     # Warm up on a side stream so the Triton JIT and the scratch arena are
@@ -411,6 +569,312 @@ def test_sparse_decode_matches_msa_kernel():
     torch.testing.assert_close(triton_out.float(), msa_out.float(), rtol=6e-2, atol=6e-2)
 
 
+@skip_not_sm100
+@pytest.mark.parametrize(
+    ("num_kv_heads", "group", "decode_query_len"),
+    [(1, 8, 1), (1, 8, 2), (2, 16, 1), (4, 4, 3)],
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [[128], [1, 128, 129], [1025, 4097], [300, 1500, 2049, 4096]],
+    ids=["one-block", "short-mixed", "two-req", "batch4"],
+)
+def test_nvfp4_sparse_decode_matches_reference(num_kv_heads, group, decode_query_len, seq_lens):
+    """The packed cache read must agree with the same values dequantized."""
+    seq_lens = [max(s, decode_query_len) for s in seq_lens]
+    case = _make_nvfp4_inputs(
+        seq_lens, num_kv_heads=num_kv_heads, group=group, decode_query_len=decode_query_len
+    )
+    out = _run_nvfp4(case)
+    expected = _reference_sparse_decode(
+        case.q,
+        case.k_ref,
+        case.v_ref,
+        case.topk_idx,
+        case.block_table,
+        case.seq_lens,
+        sm_scale=HEAD_DIM**-0.5,
+        decode_query_len=decode_query_len,
+    )
+    torch.testing.assert_close(out.float(), expected, rtol=3e-2, atol=3e-2)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("local_batch", [11, 12, 14])
+def test_nvfp4_sparse_decode_eagle_pair_matches_divergent_reference(local_batch):
+    """The paired producer must remain exact when adjacent selections differ."""
+    seq_lens = [131 + 137 * row for row in range(local_batch)]
+    case = _make_nvfp4_inputs(
+        seq_lens,
+        num_kv_heads=4,
+        group=16,
+        decode_query_len=4,
+        seed=113 + local_batch,
+    )
+    case.q = case.q.to(torch.float8_e4m3fn)
+    assert not torch.equal(case.topk_idx[:, 0::4], case.topk_idx[:, 1::4])
+
+    out = _run_nvfp4(case)
+    expected = _reference_sparse_decode(
+        case.q.to(torch.bfloat16),
+        case.k_ref,
+        case.v_ref,
+        case.topk_idx,
+        case.block_table,
+        case.seq_lens,
+        sm_scale=HEAD_DIM**-0.5,
+        decode_query_len=case.decode_query_len,
+    )
+    torch.testing.assert_close(out.float(), expected, rtol=3e-2, atol=3e-2)
+
+
+@skip_not_sm100
+def test_nvfp4_sparse_decode_fp8_q_matches_reference():
+    """Production FP8 q may use FP16 dot operands without changing the cache math."""
+    case = _make_nvfp4_inputs([300, 1500, 4097], num_kv_heads=2, group=8, seed=67)
+    case.q = case.q.to(torch.float8_e4m3fn)
+    out = _run_nvfp4(case)
+    expected = _reference_sparse_decode(
+        case.q.to(torch.bfloat16),
+        case.k_ref,
+        case.v_ref,
+        case.topk_idx,
+        case.block_table,
+        case.seq_lens,
+        sm_scale=HEAD_DIM**-0.5,
+        decode_query_len=case.decode_query_len,
+    )
+    torch.testing.assert_close(out.float(), expected, rtol=3e-2, atol=3e-2)
+
+
+@skip_not_sm100
+def test_nvfp4_paged_scale_layouts_are_the_ones_the_kernel_reads():
+    """Lock the two block-scale layouts and the nibble order.
+
+    The scatter kernel writes K's scale bytes token-major linear and V's in
+    vLLM's 4x4 token-quad order; the decode kernel inverts both from the same
+    formulas. Reproducing them here means a change to either side has to change
+    this test too, rather than silently reading a neighbor's scale.
+    """
+    case = _make_nvfp4_inputs([4096], num_kv_heads=2, group=8, seed=71)
+    num_pages, num_kv_heads = case.k_paged.shape[0], case.k_paged.shape[1]
+    scale_cols = HEAD_DIM // NVFP4_SF_VEC_SIZE
+    token = torch.arange(PAGE_SIZE, device="cuda")[:, None]
+    col = torch.arange(scale_cols, device="cuda")[None, :]
+    linear = token * scale_cols + col
+    swizzled = (token // 4) * (4 * scale_cols) + 4 * col + (token % 4)
+
+    for role, expected, offsets in (
+        (0, case.k_ref, linear),
+        (1, case.v_ref, swizzled),
+    ):
+        data = case.k_paged if role == 0 else case.v_paged
+        flat = case.scale_pool[:, role].reshape(num_pages, num_kv_heads, PAGE_SIZE * scale_cols)
+        gathered = flat[..., offsets.reshape(-1)].reshape(
+            num_pages, num_kv_heads, PAGE_SIZE, scale_cols
+        )
+        dequant = case.scales["k_global_scale" if role == 0 else "v_global_scale"].item()
+        decoded = _dequant_nvfp4_flat(data, gathered, dequant).reshape(
+            num_pages, num_kv_heads, PAGE_SIZE, HEAD_DIM
+        )
+        torch.testing.assert_close(decoded, expected, rtol=0, atol=0)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("num_topk_chunks", [1, 2, 4, 8, 16])
+def test_nvfp4_sparse_decode_split_k_invariant(num_topk_chunks):
+    """Flash-decoding over an NVFP4 cache must merge to one answer.
+
+    V's per-tensor scale is applied per partial, so this also covers the claim
+    that doing so survives the merge.
+    """
+    case = _make_nvfp4_inputs([4097, 300, 8192], num_kv_heads=2, group=8, seed=83)
+    reference = _run_nvfp4(case, num_topk_chunks=1)
+    out = _run_nvfp4(case, num_topk_chunks=num_topk_chunks)
+    torch.testing.assert_close(out.float(), reference.float(), rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize(("num_kv_heads", "group"), [(1, 8), (2, 16)], ids=["h1-g8", "h2-g16"])
+@skip_not_sm100
+@pytest.mark.skipif(not msa_package_available(), reason="fmha_sm100 (MSA submodule) required")
+def test_nvfp4_sparse_decode_matches_msa_csr_kernel(num_kv_heads, group):
+    """A/B against MSA's NVFP4 CSR kernel over the same cache bytes.
+
+    Three independent readings of one layout contract have to agree here: the
+    Triton scatter that wrote the bytes, MSA's CuTe reader, and this kernel's
+    reader. A torch oracle alone could share a misreading of the layout.
+
+    FP8 staging introduces ordinary rounding after full NVFP4 reconstruction;
+    it must not clip the unscaled FP4/block-scale product.
+    """
+    require_msa_module()
+    seq_lens = [1025, 4097, 300, 8192]
+    case = _make_nvfp4_inputs(seq_lens, num_kv_heads=num_kv_heads, group=group, seed=97)
+    # E4M3 is what the fused M3 producer emits and what the CSR kernel needs.
+    # Sharing it removes q quantization from the comparison; the Triton kernel
+    # widens it back exactly.
+    case.q = case.q.to(torch.float8_e4m3fn)
+    batch = len(seq_lens)
+    kv_lens = torch.tensor(seq_lens, device="cuda", dtype=torch.int32)
+    cu_kv = torch.zeros(batch + 1, device="cuda", dtype=torch.int32)
+    torch.cumsum(kv_lens, 0, out=cu_kv[1:])
+    metadata = object.__new__(MiniMaxM3MsaSparseAttentionMetadata)
+    metadata.__dict__.update(
+        _msa_live_batch=batch,
+        msa_cu_q_lens=torch.arange(batch + 1, device="cuda", dtype=torch.int32),
+        msa_cu_kv_lens=cu_kv,
+        _msa_max_q_len=1,
+        _msa_max_kv_len_all=max(seq_lens),
+        _msa_total_k=sum(seq_lens),
+        _msa_total_k_rows=sum((s + PAGE_SIZE - 1) // PAGE_SIZE for s in seq_lens),
+        msa_block_table=case.block_table,
+        msa_seq_lens_cuda=case.seq_lens,
+        _num_contexts=2,
+        _msa_context_prefix_bounds=(
+            1,
+            max(seq_lens[:2]),
+            sum(seq_lens[:2]),
+            sum((s + PAGE_SIZE - 1) // PAGE_SIZE for s in seq_lens[:2]),
+        ),
+        _num_generations=batch - 2,
+    )
+
+    triton_out = _run_nvfp4(case)
+    msa_out = torch.empty(case.q.shape, device="cuda", dtype=torch.bfloat16)
+    run_msa_nvfp4_sparse_gqa(
+        case.q,
+        case.k_paged,
+        case.v_paged,
+        case.scale_pool,
+        case.topk_idx.permute(1, 0, 2).contiguous(),
+        metadata,
+        sm_scale=HEAD_DIM**-0.5,
+        k_global_scale=case.scales["k_global_scale"],
+        v_global_scale=case.scales["v_global_scale"],
+        out=msa_out,
+    )
+
+    # A mixed step sends only its context prefix to CSR prefill. The longer
+    # generation suffix must not affect the prefix worklist or output.
+    prefix_rows = metadata.num_contexts
+    prefix_out = torch.empty_like(msa_out[:prefix_rows])
+    run_msa_nvfp4_sparse_gqa(
+        case.q[:prefix_rows],
+        case.k_paged,
+        case.v_paged,
+        case.scale_pool,
+        case.topk_idx[:, :prefix_rows].permute(1, 0, 2).contiguous(),
+        metadata,
+        sm_scale=HEAD_DIM**-0.5,
+        k_global_scale=case.scales["k_global_scale"],
+        v_global_scale=case.scales["v_global_scale"],
+        num_rows=prefix_rows,
+        out=prefix_out,
+    )
+    torch.testing.assert_close(prefix_out, msa_out[:prefix_rows], rtol=1e-2, atol=1e-2)
+
+    reference = _reference_sparse_decode(
+        case.q.to(torch.bfloat16),
+        case.k_ref,
+        case.v_ref,
+        case.topk_idx,
+        case.block_table,
+        case.seq_lens,
+        sm_scale=HEAD_DIM**-0.5,
+        decode_query_len=1,
+    )
+    torch.testing.assert_close(triton_out.float(), reference, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(msa_out.float(), reference, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.parametrize("q_dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"])
+@pytest.mark.parametrize("pair_dequant", [False, True], ids=["scalar", "pair"])
+@pytest.mark.parametrize("kv_len", [1, 2], ids=["one-token", "k-sensitive"])
+@skip_not_sm100
+@pytest.mark.skipif(not msa_package_available(), reason="fmha_sm100 (MSA submodule) required")
+def test_msa_nvfp4_calibrated_staging_and_scale_replay(
+    q_dtype: torch.dtype, pair_dequant: bool, kv_len: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Global scales must precede FP8 conversion and remain live during replay."""
+    monkeypatch.setenv("MINIMAX_KVFP4_FP8_PAIR_DEQUANT", str(int(pair_dequant)))
+    require_msa_module()
+    q = torch.zeros((1, 8, HEAD_DIM), device="cuda", dtype=torch.bfloat16)
+    q[:, :, 0] = 1.0
+    q = q.to(q_dtype)
+    data = torch.zeros((1, 2, 1, PAGE_SIZE, HEAD_DIM // 2), device="cuda", dtype=torch.uint8)
+    # E2M1 nibble 7 is +6, nibble 15 is -6. With block scale 448,
+    # the unscaled magnitude is 2688, outside E4M3's finite range.
+    data[:, 0, :, 0] = 0xFF
+    data[:, 0, :, 1] = 0x77
+    data[:, 1, :, 0] = 0x77
+    data[:, 1, :, 1] = 0xFF
+    # Constant scales work for both K-linear and V-swizzle4x4 layouts.
+    scales = (
+        torch.full(
+            (1, 2, 1, PAGE_SIZE, HEAD_DIM // NVFP4_SF_VEC_SIZE),
+            448.0,
+            device="cuda",
+            dtype=torch.float32,
+        )
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8)
+    )
+    k_global = torch.tensor([2.0 / 2688.0], device="cuda", dtype=torch.float32)
+    v_global = torch.tensor([1.0 / 2688.0], device="cuda", dtype=torch.float32)
+    metadata = object.__new__(MiniMaxM3MsaSparseAttentionMetadata)
+    metadata._msa_live_batch = 1
+    metadata.msa_cu_q_lens = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    metadata.msa_cu_kv_lens = torch.tensor([0, kv_len], device="cuda", dtype=torch.int32)
+    metadata._msa_max_q_len = 1
+    metadata._msa_max_kv_len_all = kv_len
+    metadata._msa_total_k = kv_len
+    metadata._msa_total_k_rows = 1
+    metadata.msa_block_table = torch.zeros((1, 1), device="cuda", dtype=torch.int32)
+    metadata.msa_seq_lens_cuda = torch.tensor([kv_len], device="cuda", dtype=torch.int32)
+    topk = torch.full((1, 1, MSA_REQUIRED_TOPK), -1, device="cuda", dtype=torch.int32)
+    topk[..., 0] = 0
+    out = torch.empty(q.shape, device="cuda", dtype=torch.bfloat16)
+
+    def run() -> None:
+        run_msa_nvfp4_sparse_gqa(
+            q,
+            data[:, 0],
+            data[:, 1],
+            scales,
+            topk,
+            metadata,
+            sm_scale=1.0,
+            k_global_scale=k_global,
+            v_global_scale=v_global,
+            out=out,
+        )
+
+    # One token must reconstruct V=1, not the premature-saturation result 1/6.
+    # Two tokens also expose K saturation through softmax([-2, 2]).
+    logits = torch.tensor([-2.0, 2.0], device="cuda")[:kv_len]
+    values = torch.tensor([1.0, -1.0], device="cuda")[:kv_len]
+    expected = (logits.softmax(0) * values).sum().expand_as(out)
+    run()
+    torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        run()
+    k_ptr, v_ptr = k_global.data_ptr(), v_global.data_ptr()
+    k_global.mul_(0.5)
+    v_global.mul_(2.0)
+    expected_updated = ((logits * 0.5).softmax(0) * values * 2.0).sum().expand_as(out)
+    graph.replay()
+    torch.testing.assert_close(out.float(), expected_updated, rtol=2e-2, atol=2e-2)
+    run()
+    torch.testing.assert_close(out.float(), expected_updated, rtol=2e-2, atol=2e-2)
+    assert (k_global.data_ptr(), v_global.data_ptr()) == (k_ptr, v_ptr)
+
+
 @pytest.mark.parametrize(
     ("total_q", "num_kv_heads", "max_topk"),
     [(1, 1, 16), (8, 1, 16), (64, 2, 16), (512, 4, 16), (4096, 8, 16)],
@@ -426,3 +890,168 @@ def test_resolve_num_topk_chunks_is_shape_only_power_of_two(total_q, num_kv_head
     assert 1 <= chunks <= max_topk
     assert chunks & (chunks - 1) == 0
     assert chunks == resolve_num_topk_chunks(total_q, num_kv_heads, max_topk)
+
+
+@pytest.mark.parametrize(
+    ("local_batch", "expected"),
+    [
+        (1, {"num_warps": 4, "num_stages": 1}),
+        (2, {"num_warps": 4, "num_stages": 1}),
+        (4, {"num_warps": 2, "num_stages": 1}),
+        (8, {"num_warps": 4, "num_stages": 2}),
+        (28, {"num_warps": 4, "num_stages": 2}),
+        (29, {"num_warps": 2, "num_stages": 1}),
+        (32, {"num_warps": 2, "num_stages": 1}),
+        (33, {}),
+    ],
+)
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+def test_sm100f_nvfp4_launch_options(local_batch, expected, capability):
+    if capability != (10, 3):
+        expected = {}
+    assert (
+        _sm100f_nvfp4_launch_options(
+            total_q=local_batch * 4,
+            num_kv_heads=4,
+            gqa_group_size=16,
+            max_topk=16,
+            decode_query_len=4,
+            capability=capability,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("local_batch", "expected"),
+    [
+        (1, None),
+        (2, 8),
+        (4, 8),
+        (5, 16),
+        (6, 4),
+        (8, 2),
+        (10, 8),
+        (11, 4),
+        (12, 2),
+        (13, 2),
+        (14, 2),
+        (15, None),
+    ],
+)
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+def test_sm100f_nvfp4_num_topk_chunks(local_batch, expected, capability):
+    if capability != (10, 3):
+        expected = None
+    assert (
+        _sm100f_nvfp4_num_topk_chunks(
+            total_q=local_batch * 4,
+            num_kv_heads=4,
+            gqa_group_size=16,
+            max_topk=16,
+            decode_query_len=4,
+            capability=capability,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("local_batch", "expected"),
+    [(10, 1), (11, 2), (12, 2), (14, 2), (15, 1)],
+)
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+def test_sm100f_nvfp4_query_group_size_is_narrowly_scoped(local_batch, expected, capability):
+    if capability != (10, 3):
+        expected = 1
+    common = dict(
+        total_q=local_batch * 4,
+        num_kv_heads=4,
+        gqa_group_size=16,
+        max_topk=16,
+        decode_query_len=4,
+    )
+    assert _sm100f_nvfp4_query_group_size(**common, capability=capability) == expected
+    assert _sm100f_nvfp4_query_group_size(**common, capability=(12, 0)) == 1
+    assert (
+        _sm100f_nvfp4_query_group_size(**(common | {"num_kv_heads": 2}), capability=capability) == 1
+    )
+
+
+def test_sm100f_nvfp4_launch_options_rejects_unmeasured_shapes():
+    common = dict(
+        total_q=32,
+        num_kv_heads=4,
+        gqa_group_size=16,
+        max_topk=16,
+        decode_query_len=4,
+    )
+    assert _sm100f_nvfp4_launch_options(**common, capability=(12, 0)) == {}
+    assert _sm100f_nvfp4_launch_options(**(common | {"num_kv_heads": 2}), capability=(10, 3)) == {}
+    assert (
+        _sm100f_nvfp4_launch_options(**(common | {"decode_query_len": 1}), capability=(10, 3)) == {}
+    )
+
+
+@pytest.mark.parametrize(
+    ("num_kv_heads", "local_batch", "expected"),
+    [
+        (1, 1, False),
+        (1, 2, True),
+        (1, 16, True),
+        (2, 1, True),
+        (2, 16, True),
+        (4, 1, True),
+        (4, 14, True),
+        (8, 14, False),
+    ],
+)
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+def test_sm100f_nvfp4_linear_softmax_policy(num_kv_heads, local_batch, expected, capability):
+    if capability != (10, 3):
+        expected = False
+    common = dict(
+        total_q=local_batch * 4,
+        num_kv_heads=num_kv_heads,
+        gqa_group_size=16,
+        max_topk=16,
+        decode_query_len=4,
+    )
+    assert _sm100f_nvfp4_use_linear_softmax(**common, capability=capability) is expected
+    assert not _sm100f_nvfp4_use_linear_softmax(**common, capability=(12, 0))
+
+
+@pytest.mark.parametrize(
+    ("local_batch", "expected"),
+    [
+        (1, {}),
+        (2, {"num_warps": 1}),
+        (3, {}),
+        (4, {"num_warps": 1}),
+        (5, {"num_warps": 1}),
+        (6, {"num_warps": 1}),
+        (7, {"num_warps": 1}),
+        (8, {}),
+        (10, {"num_warps": 1}),
+        (11, {"num_warps": 1}),
+        (12, {}),
+    ],
+)
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+def test_sm100f_nvfp4_merge_launch_options_is_narrowly_scoped(local_batch, expected, capability):
+    if capability != (10, 3):
+        expected = {}
+    common = dict(
+        num_kv_heads=4,
+        gqa_group_size=16,
+        max_topk=16,
+        decode_query_len=4,
+    )
+    assert (
+        _sm100f_nvfp4_merge_launch_options(total_q=local_batch * 4, **common, capability=capability)
+        == expected
+    )
+    assert (
+        _sm100f_nvfp4_merge_launch_options(total_q=local_batch * 4, **common, capability=(12, 0))
+        == {}
+    )
