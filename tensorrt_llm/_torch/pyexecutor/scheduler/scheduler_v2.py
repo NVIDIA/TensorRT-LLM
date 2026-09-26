@@ -20,6 +20,7 @@ from typing import Optional
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 from tensorrt_llm.logger import logger
 
+from ...disaggregation.native.perf_logger import perf_log_manager
 from ..llm_request import (
     LlmRequest,
     LlmRequestState,
@@ -726,7 +727,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Cache-transceiver mode disables the separate one-model draft manager,
         # so disagg generation init has no paired-reuse path. Supporting one
         # would also require draft KV transfer and history_length=prompt_len.
-        if not self.kv_cache_manager.prepare_disagg_gen_init(req):
+        admitted = self.kv_cache_manager.prepare_disagg_gen_init(req)
+        perf_log_manager.event("gen_kv_admission", req, admitted=admitted)
+        if not admitted:
             logger.debug("prepare_disagg_gen_init failed for request %s", req.py_request_id)
             return ScheduleAction.SKIP, 0
         return ScheduleAction.SCHEDULED, 0

@@ -14,13 +14,51 @@
 # limitations under the License.
 """Performance logging utilities for KV cache transfer."""
 
+import json
 import logging
 import os
+import socket
 import sys
 import threading
 import time
+from typing import Any, Optional
 
 from tensorrt_llm import logger
+
+# Lifecycle event names. Every event is one JSONL line in
+# ``{TRTLLM_KVCACHE_TIME_OUTPUT_PATH}/lifecycle_rank{rank}_pid{pid}.jsonl``.
+# Together with the per-task CSV rows written by ``PerfTimer`` and the
+# ``kv_cache_transfer_start/end`` request metrics, they cover a disaggregated
+# request from GEN ingress to decode readiness. See
+# ``scripts/disagg_lifecycle_timeline.py`` for the reader.
+LIFECYCLE_EVENTS = (
+    "gen_ingress",  # gen executor accepted a disagg gen-init request
+    "gen_kv_admission",  # scheduler V2 KV/index capacity check (admitted=bool)
+    "gen_transfer_window",  # transfer-window budget decision (admitted=bool, policy)
+    "gen_kv_rollback",  # KV allocated for a gen-init request was reverted
+    "gen_decode_ready",  # first token installed, request enters decode
+    "ctx_send_ready",  # ctx finished prefill and handed KV to the transceiver
+    "ctx_kv_released",  # ctx-only request freed its execution resources
+    "timeout_started",  # kv_transfer_timeout_ms clock started (side)
+    "timeout_observed",  # kv_transfer_timeout_ms elapsed (side, elapsed_ms)
+    "cancel_requested",  # executor asked the transceiver to cancel (side)
+    "settled",  # transfer session retired (side, outcome)
+)
+
+
+def _steady_clock_now() -> float:
+    """Seconds on the rank-aligned steady clock used by kv_cache_transfer_start/end.
+
+    Falls back to ``time.monotonic`` when the C++ bindings are unavailable so the
+    reader can still order events within one process.
+    """
+    try:
+        from tensorrt_llm._utils import get_global_steady_clock_now_in_seconds
+
+        return get_global_steady_clock_now_in_seconds()
+    except Exception:
+        return time.monotonic()
+
 
 # CSV header for performance log files
 _PERF_CSV_HEADER = (
@@ -169,9 +207,100 @@ class PerfLogManager:
             self._log_file_base = os.getenv("TLLM_KV_TRANSFER_PERF_LOG_FILE")
             self._use_cpp_naming = False
 
+        # Lifecycle JSONL is tied to the directory-style output only.
+        self._lifecycle_dir: Optional[str] = cpp_output_path or None
+        self._lifecycle_stream = None
+        self._lifecycle_pid: Optional[int] = None
+        self._identity: dict[str, Any] = {"rank": None, "instance": None}
+
     @property
     def enabled(self) -> bool:
         return self._perf_enabled
+
+    # -- request lifecycle events ------------------------------------------
+
+    @property
+    def lifecycle_enabled(self) -> bool:
+        return self._lifecycle_dir is not None
+
+    def configure_identity(self, *, rank: Optional[int] = None, instance: Optional[str] = None):
+        """Record who is emitting; called once by the executor/transceiver at startup."""
+        if rank is not None:
+            self._identity["rank"] = rank
+        if instance is not None:
+            self._identity["instance"] = instance
+
+    def event(self, name: str, request: Any, **fields: Any) -> None:
+        """Append one lifecycle event; a no-op unless ``lifecycle_enabled``.
+
+        ``request`` is an ``LlmRequest`` or a bare disaggregated request id. The
+        record carries both the disaggregated id (``rid``, shared by ctx and gen)
+        and this worker's local id, plus a rank-aligned steady clock and wall
+        time. Nothing here may raise into the caller.
+        """
+        if self._lifecycle_dir is None:
+            return
+        try:
+            if isinstance(request, int) or request is None:
+                rid, local_id = request, None
+            else:
+                params = getattr(request, "py_disaggregated_params", None)
+                rid = getattr(params, "disagg_request_id", None)
+                local_id = getattr(request, "py_request_id", None)
+                if rid is None:
+                    rid = local_id
+            record = {
+                "event": name,
+                "rid": rid,
+                "local_id": local_id,
+                "t_steady": _steady_clock_now(),
+                "t_wall": time.time(),
+                **self._identity,
+                "pid": os.getpid(),
+                **fields,
+            }
+            line = json.dumps(record, default=str) + "\n"
+            stream = self._lifecycle_writer()
+            if stream is not None:
+                stream.write(line)
+                stream.flush()
+        except Exception as e:  # diagnostics must never affect request progress
+            logger.debug(f"[KV Transfer] lifecycle event {name} dropped: {e}")
+
+    def _lifecycle_writer(self):
+        pid = os.getpid()
+        if self._lifecycle_stream is not None and self._lifecycle_pid == pid:
+            return self._lifecycle_stream
+        with self._file_lock:
+            if self._lifecycle_stream is not None and self._lifecycle_pid == pid:
+                return self._lifecycle_stream
+            os.makedirs(self._lifecycle_dir, exist_ok=True)
+            rank = self._identity.get("rank")
+            path = os.path.join(
+                self._lifecycle_dir,
+                f"lifecycle_rank{'na' if rank is None else rank}_pid{pid}.jsonl",
+            )
+            try:
+                self._lifecycle_stream = open(path, "a", encoding="utf-8")
+                self._lifecycle_pid = pid
+            except OSError as e:
+                sys.stderr.write(f"[KV Transfer] Warning: cannot open {path}: {e}\n")
+                self._lifecycle_dir = None
+                return None
+            self._lifecycle_stream.write(
+                json.dumps(
+                    {
+                        "event": "lifecycle_start",
+                        "host": socket.gethostname(),
+                        "pid": pid,
+                        "t_steady": _steady_clock_now(),
+                        "t_wall": time.time(),
+                        **self._identity,
+                    }
+                )
+                + "\n"
+            )
+        return self._lifecycle_stream
 
     @property
     def use_file(self) -> bool:
