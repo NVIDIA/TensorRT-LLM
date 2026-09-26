@@ -1155,8 +1155,11 @@ class BaseLLM:
             batch_indexed_model_output (bool): If specified, assume batched model output indexed by request index, as opposed to token index. Defaults to True.
             copy_logits_to_host (bool): If set, copy logits from device to host. Otherwise, return a view into the on-device logits tensor. Defaults to True.
             return_raw_logits (bool): Whether to return the raw CPU logits tensor for the whole input batch. Defaults to False.
-            model_kwargs (Any): Model-specific inputs passed through to the model's forward(). Examples: token_type_ids (BERT),
-                inputs_embeds (reward models).
+            model_kwargs (Any): Model-specific inputs passed through to the model's forward(). Examples:
+                token_type_ids (BERT), inputs_embeds (reward models). Tensors may be on host or device.
+                With encoder CUDA graphs enabled, every tensor kwarg must be declared in
+                `cuda_graph_config.extra_model_inputs`: an undeclared tensor raises, and a non-tensor
+                value runs that call eagerly.
 
         Returns:
             Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput], torch.Tensor]:

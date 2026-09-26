@@ -1,6 +1,6 @@
 import bisect
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (Any, Callable, Dict, Iterator, List, NamedTuple, Optional,
                     Tuple, TypeAlias)
 
@@ -9,6 +9,7 @@ import torch
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
                                           DecodingBaseConfig,
+                                          EncodeExtraInputSpec,
                                           SeqLenAwareSparseAttentionConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -1252,6 +1253,11 @@ class EncoderCUDAGraphRunnerConfig:
     feature_dtype: Optional[torch.dtype] = None
     fixed_seq_len: Optional[int] = None
 
+    # Extra tensor inputs declared via EncodeCudaGraphConfig.extra_model_inputs.
+    # Each gets a static buffer (+ pinned host shadow) sized at its bucket maximum.
+    cuda_graph_extra_inputs: List[EncodeExtraInputSpec] = field(
+        default_factory=list)
+
 
 class EncoderCUDAGraphRunner:
     """CUDA graph runner for no-cache encoder forward passes.
@@ -1279,7 +1285,23 @@ class EncoderCUDAGraphRunner:
         self.supported_batch_sizes = sorted(config.cuda_graph_batch_sizes)
         self.max_supported_batch_size = config.max_cuda_graph_batch_size
         self.feature_mode = config.feature_shape is not None
+        self.extra_input_specs: List[EncodeExtraInputSpec] = list(
+            config.cuda_graph_extra_inputs or [])
         self.is_encoder_decoder = config.is_encoder_decoder
+        if self.extra_input_specs and (self.feature_mode
+                                       or self.is_encoder_decoder):
+            # Neither mode prepares inputs through the encode-only path that
+            # validates them and synthesizes capture stand-ins: feature mode
+            # stages via its own mirrors, and the encoder-decoder runner
+            # overrides prepare_inputs/_prepare_capture_inputs. The graph would
+            # capture the caller's tensor and then read it stale (or freed).
+            unsupported = ("feature-mode"
+                           if self.feature_mode else "encoder-decoder")
+            raise ValueError(
+                "EncodeCudaGraphConfig.extra_model_inputs is not supported "
+                f"together with {unsupported} encoder CUDA graphs. "
+                f"Declared extra inputs: "
+                f"{[spec.name for spec in self.extra_input_specs]}")
         self.use_fixed_sequence_slots = config.use_fixed_sequence_slots
 
         if self.feature_mode:
@@ -1443,8 +1465,52 @@ class EncoderCUDAGraphRunner:
                        pin_memory=prefer_pinned()),
         }
 
+        self._create_extra_input_buffers(max_total_tokens, max_batch_size)
+
         # Cached arange used by replay() to build packed position_ids in-place via slice copies.
         self._arange_max = torch.arange(max_total_tokens, dtype=torch.int32)
+
+    def _create_extra_input_buffers(self, max_total_tokens: int,
+                                    max_batch_size: int) -> None:
+        """Allocate one static buffer per user-declared extra model input.
+
+        The symbolic axis is sized at its bucket maximum. The pinned host
+        shadow gives captured H2D copies a stable source to re-issue from at
+        replay, mirroring the input_ids / position_ids handling.
+        """
+        for spec in self.extra_input_specs:
+            max_shape = spec.resolve_shape(num_tokens=max_total_tokens,
+                                           batch_size=max_batch_size)
+            torch_dtype = spec.torch_dtype()
+            self.shared_static_tensors[spec.name] = torch.zeros(
+                max_shape, device="cuda", dtype=torch_dtype)
+            self.shared_static_tensors_cpu[spec.name] = torch.zeros(
+                max_shape,
+                device="cpu",
+                dtype=torch_dtype,
+                pin_memory=prefer_pinned())
+
+    @staticmethod
+    def _extra_input_symbolic(spec: EncodeExtraInputSpec) -> Tuple[str, int]:
+        """``(symbolic_dim_name, axis)`` for a spec's single symbolic dim."""
+        return spec.symbolic_dim()
+
+    @staticmethod
+    def _extra_input_padded_size(spec: EncodeExtraInputSpec,
+                                 key: EncoderKeyType) -> int:
+        """Padded bucket size for a spec's symbolic axis.
+
+        - "num_tokens" -> padded_num_tokens (key[1])
+        - "batch_size" -> padded_batch_size (key[0])
+        """
+        sym, _ = spec.symbolic_dim()
+        if sym == "num_tokens":
+            return key[1]
+        if sym == "batch_size":
+            return key[0]
+        # Unreachable: the spec validator pins the symbolic dim to the known set.
+        raise ValueError(
+            f"EncodeExtraInputSpec.shape uses unknown symbolic dim {sym!r}")
 
     @staticmethod
     def _round_up(value: int, supported: List[int]) -> int:
@@ -1993,6 +2059,34 @@ class EncoderCUDAGraphRunner:
 
         staged_position_ids[offset:padded_num_tokens].fill_(0)
 
+        # Stage extra inputs for encode_only path
+        self._stage_extra_inputs(key, inputs, static_tensors)
+
+    def _stage_extra_inputs(self, key: EncoderKeyType, inputs: Dict[str, Any],
+                            static_tensors: Dict[str, torch.Tensor]) -> None:
+        """Stage user-declared extra model inputs into their static buffers.
+
+        The zero-filled tail covers both the dummy requests ``pad_batch``
+        appends (batch_size specs) and token padding within the bucket
+        (num_tokens specs). ``encode()`` has already validated dtype/rank/shape,
+        so a failure here means an internal contract break.
+        """
+        for spec in self.extra_input_specs:
+            user_tensor = inputs[spec.name]
+            sym, axis = self._extra_input_symbolic(spec)
+            actual_len = int(user_tensor.shape[axis])
+            padded_size = self._extra_input_padded_size(spec, key)
+            if actual_len > padded_size:
+                raise ValueError(
+                    f"extra_model_inputs[{spec.name!r}]: tensor length "
+                    f"{actual_len} along symbolic {sym!r} axis exceeds "
+                    f"padded bucket size {padded_size}")
+            static_buf = static_tensors[spec.name]
+            torch.narrow(static_buf, axis, 0, actual_len).copy_(user_tensor)
+            pad_len = padded_size - actual_len
+            if pad_len > 0:
+                torch.narrow(static_buf, axis, actual_len, pad_len).fill_(0)
+
     def _stage_encoder_decoder_inputs(
         self,
         key: EncoderKeyType,
@@ -2152,6 +2246,15 @@ class EncoderCUDAGraphRunner:
             self.shared_static_tensors_cpu["position_ids"]
             [:, :padded_num_tokens],
         }
+        # Narrow each extra input along its symbolic axis to this bucket's
+        # padded size so the captured graph sees the shape it will see at replay.
+        for spec in self.extra_input_specs:
+            _, axis = self._extra_input_symbolic(spec)
+            padded_size = self._extra_input_padded_size(spec, key)
+            sliced_static_tensors[spec.name] = torch.narrow(
+                self.shared_static_tensors[spec.name], axis, 0, padded_size)
+            sliced_static_tensors_cpu[spec.name] = torch.narrow(
+                self.shared_static_tensors_cpu[spec.name], axis, 0, padded_size)
 
         capture_inputs = dict(inputs)
         capture_inputs.update(sliced_static_tensors)
@@ -2163,6 +2266,9 @@ class EncoderCUDAGraphRunner:
                 sliced_static_tensors_cpu["input_ids"], non_blocking=True)
             capture_inputs["position_ids"].copy_(
                 sliced_static_tensors_cpu["position_ids"], non_blocking=True)
+            for spec in self.extra_input_specs:
+                capture_inputs[spec.name].copy_(
+                    sliced_static_tensors_cpu[spec.name], non_blocking=True)
 
         # Warmup must see the same runtime data as capture. In particular,
         # graph metadata initializes _seq_lens_cuda to ones, while
