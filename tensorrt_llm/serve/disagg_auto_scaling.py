@@ -18,6 +18,7 @@ import os
 import random
 import socket
 import time
+import traceback
 from dataclasses import asdict, dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -161,8 +162,17 @@ class DisaggClusterManager:
                 try:
                     worker_events = await self._watch_handle.drain()
                     for event in worker_events:
-                        worker_info = self._parse_worker_info(event)
-                        await on_event(worker_info, event.event_type)
+                        try:
+                            worker_info = self._parse_worker_info(event)
+                            await on_event(worker_info, event.event_type)
+                        except Exception as e:
+                            # drain() is destructive: a failing event must not
+                            # discard the remaining events in this batch.
+                            logger.error(
+                                f"Error updating routers by worker event "
+                                f"{event.event_type} for "
+                                f"{event.storage_item.key}: {e}\n"
+                                f"{traceback.format_exc()}")
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
@@ -226,7 +236,12 @@ class DisaggClusterManager:
         # if it's a set event, parse the worker info from the value and add it to the current workers
         # return the worker info and whether to notify the event
         if event.event_type == WatchEventType.DELETE:
-            workers = self._get_workers_by_id(event.storage_item.key)
+            # A DELETE for an unknown worker (stale, duplicate, or reordered
+            # delivery) is an idempotent no-op, not an error.
+            try:
+                workers = self._get_workers_by_id(event.storage_item.key)
+            except ValueError:
+                workers = None
             if workers is None:
                 logger.warning(
                     f"Failed to parse delete event: Worker {event.storage_item.key} is unknown, "

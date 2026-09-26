@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import json
 import subprocess
 import tempfile
 import time
+from dataclasses import asdict
 from unittest.mock import ANY, AsyncMock
 
 import pytest
@@ -13,12 +15,14 @@ from test_cluster_storage import http_server_storage
 
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MinimalInstances, ServerRole)
+from tensorrt_llm.serve import cluster_storage
 from tensorrt_llm.serve.cluster_storage import (WatchEventType,
                                                 create_cluster_storage,
                                                 create_cluster_storage_client,
                                                 key_time)
 from tensorrt_llm.serve.disagg_auto_scaling import (DisaggClusterManager,
-                                                    DisaggClusterWorker)
+                                                    DisaggClusterWorker,
+                                                    WorkerInfo)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -35,6 +39,23 @@ def worker_config(cluster_uri="http://localhost:18000"):
                                    context_servers=1, generation_servers=1),
                                inactive_timeout_sec=INACTIVE_TIMEOUT,
                                heartbeat_interval_sec=HEARTBEAT_INTERVAL)
+
+
+def _worker_set_event(worker_id, role=ServerRole.CONTEXT):
+    info = WorkerInfo(worker_id=worker_id,
+                      host="127.0.0.1",
+                      port=8001,
+                      role=role)
+    return cluster_storage.WatchEvent(storage_item=cluster_storage.StorageItem(
+        key=f"/trtllm-disagg/test/workers/{worker_id}",
+        value=json.dumps(asdict(info))),
+                                      event_type=WatchEventType.SET)
+
+
+async def _wait_for_calls(calls, count, timeout=10):
+    deadline = time.monotonic() + timeout
+    while len(calls) < count and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
 
 
 @pytest.mark.asyncio
@@ -364,3 +385,70 @@ async def test_cluster_worker_heartbeat(cluster_manager, storage_client,
     finally:
         await ctx_worker.deregister_worker()
         await gen_worker.deregister_worker()
+
+
+@pytest.mark.asyncio
+async def test_worker_event_loop_keeps_batch_after_unknown_delete():
+    """A stale/duplicate DELETE must not discard later events in its batch.
+
+    Regression test for https://github.com/NVIDIA/TensorRT-LLM/issues/19551:
+    drain() is destructive, so the loop must isolate failures per event and
+    treat an unknown-worker DELETE as an idempotent no-op.
+    """
+    config = worker_config()
+    storage = cluster_storage.HttpClusterStorageServer(config.cluster_uri,
+                                                       config.cluster_name)
+    manager = DisaggClusterManager(config, storage)
+    await manager.start()
+    try:
+        calls = []
+
+        async def on_event(worker_info, event_type):
+            calls.append((worker_info.worker_id, event_type))
+
+        await manager.watch_workers(get_existing_first=False, on_event=on_event)
+        ghost_delete = cluster_storage.WatchEvent(
+            storage_item=cluster_storage.StorageItem(key="ghost-worker"),
+            event_type=WatchEventType.DELETE)
+        await manager._watch_handle.add_events(
+            [ghost_delete, _worker_set_event("w1")])
+        await _wait_for_calls(calls, 2)
+        assert calls == [("ghost-worker", WatchEventType.DELETE),
+                         ("w1", WatchEventType.SET)]
+        assert list(
+            manager._current_ctx_workers) == ["/trtllm-disagg/test/workers/w1"]
+        assert manager._watch_handle.events.empty()
+    finally:
+        await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_worker_event_loop_isolates_on_event_failures():
+    """One failing on_event call must not drop the rest of the batch."""
+    config = worker_config()
+    storage = cluster_storage.HttpClusterStorageServer(config.cluster_uri,
+                                                       config.cluster_name)
+    manager = DisaggClusterManager(config, storage)
+    await manager.start()
+    try:
+        calls = []
+
+        async def on_event(worker_info, event_type):
+            calls.append((worker_info.worker_id, event_type))
+            if worker_info.worker_id == "w1":
+                raise RuntimeError("boom")
+
+        await manager.watch_workers(get_existing_first=False, on_event=on_event)
+        await manager._watch_handle.add_events([
+            _worker_set_event("w1"),
+            _worker_set_event("w2", ServerRole.GENERATION)
+        ])
+        await _wait_for_calls(calls, 2)
+        assert [worker_id for worker_id, _ in calls] == ["w1", "w2"]
+        assert sorted(
+            manager._current_ctx_workers) == ["/trtllm-disagg/test/workers/w1"]
+        assert sorted(
+            manager._current_gen_workers) == ["/trtllm-disagg/test/workers/w2"]
+        assert manager._watch_handle.events.empty()
+    finally:
+        await manager.stop()
