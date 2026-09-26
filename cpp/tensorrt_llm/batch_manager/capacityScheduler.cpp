@@ -59,7 +59,14 @@ prefillWithChunkedContextsAlreadyExecuting(RequestList const& activeRequests,
                     newlyContributedContextBlocks.insert(summary.firstNewBlock.value());
                 }
             }
-            if (crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse())
+            // A features-based encoder (audio enc-dec models such as Whisper) carries no
+            // encoder tokens, so mEncoderUniqueTokens stays unset: it is derived from
+            // mEncoderTokens alone. Prefix reuse matches on token prefixes, so there is
+            // nothing for analyzePrefixReuse to walk there. Leave the summary unset, the
+            // state both consumers already handle, rather than dereferencing an empty
+            // optional.
+            if (crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse()
+                && req->getEncoderUniqueTokens().has_value())
             {
                 auto uniqueTokens = *(req->getEncoderUniqueTokens().value());
                 auto summary = crossKvCacheManager->analyzePrefixReuse(uniqueTokens, *req);
@@ -341,15 +348,18 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                             auto uniqueTokens = req->getUniqueTokens(0);
                             summary = kvCacheManager.analyzePrefixReuse(uniqueTokens, *req);
                         }
+                        // See the note on the same dereference above.
                         if (crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse()
-                            && !crossKvCacheManager->getBlockManager().isVariableWindow())
+                            && !crossKvCacheManager->getBlockManager().isVariableWindow()
+                            && req->getEncoderUniqueTokens().has_value())
                         {
                             auto uniqueTokens = *(req->getEncoderUniqueTokens().value());
                             crossSummary = crossKvCacheManager->analyzePrefixReuse(uniqueTokens, *req);
                         }
                     }
                     else if (isEncoderInit && crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse()
-                        && !crossKvCacheManager->getBlockManager().isVariableWindow())
+                        && !crossKvCacheManager->getBlockManager().isVariableWindow()
+                        && req->getEncoderUniqueTokens().has_value())
                     {
                         // Encoder admission only needs the cross summary for reuse ordering.
                         auto uniqueTokens = *(req->getEncoderUniqueTokens().value());
