@@ -267,10 +267,6 @@ def latency_command(
     exec_settings["settings_config"][
         "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
 
-    # Performance options
-    exec_settings["performance_options"]["cuda_graphs"] = True
-    exec_settings["performance_options"]["multi_block_mode"] = True
-
     exec_settings["extra_llm_api_options"] = params.get("extra_llm_api_options")
     exec_settings["explicit_cli_keys"] = collect_explicit_cli_keys()
 

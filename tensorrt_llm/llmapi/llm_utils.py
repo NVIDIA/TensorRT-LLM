@@ -3,7 +3,6 @@
 
 import json
 import os
-import tempfile
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -44,11 +43,8 @@ class ModelLoader:
     It accepts model name or a local model dir, and will download the model if necessary.
     """
 
-    def __init__(self,
-                 llm_args: LlmArgs,
-                 workspace: Optional[str | tempfile.TemporaryDirectory] = None):
+    def __init__(self, llm_args: LlmArgs):
         self.llm_args = llm_args
-        self._workspace = workspace or tempfile.TemporaryDirectory()
 
         self.model_obj = _ModelWrapper(self.llm_args.model)
         self.speculative_model_obj = _ModelWrapper(

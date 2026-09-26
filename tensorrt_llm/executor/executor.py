@@ -244,10 +244,10 @@ class GenerationExecutor(ABC):
                 prompt_logprobs=request.sampling_params.prompt_logprobs,
                 # drop logits if users didn't explicitly ask for it, or if it's using PostProcess flow
                 drop_context_logits=(
-                    not request.sampling_params._need_return_context_logits)
+                    not request.sampling_params.return_context_logits)
                 or self.postproc_config.num_postprocess_workers > 0,
                 drop_generation_logits=(
-                    not request.sampling_params._need_return_generation_logits)
+                    not request.sampling_params.return_generation_logits)
                 or self.postproc_config.num_postprocess_workers > 0,
                 logprobs_simple_format=request.sampling_params.
                 logprobs_simple_format,
