@@ -533,12 +533,14 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if r.is_generation_in_progress_state
                 and not r.is_generation_to_complete_state
                 and r.request_id not in inflight_request_ids
+                and not self._has_pending_connector_load(r)
             )
             if (
                 num_gen_candidates > 0
                 and not evicted
                 and not recompute_paused
                 and not inflight_request_ids
+                and not any(self._has_pending_connector_load(r) for r in active_requests)
             ):
                 # A connector rejects every tier below GPU at bring-up
                 # (`PyExecutor._reject_non_gpu_cache_tiers`), so offering those
@@ -739,17 +741,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         Returns ``(action, tokens, chunking_flag)``.  *tokens* and
         *chunking_flag* are meaningful only when *action* is ``SCHEDULED``.
 
-        Deliberately connector-blind: the connector is asked later, in
-        the cache manager's ``prepare_resources``, so the budget here assumes it
-        serves nothing. That is safe because honouring an offer only ever
-        removes tokens from the forward pass, and it costs only that a served
-        prefix frees no budget for another request in the same iteration.
-
-        ``should_add_sequence`` must not gate scheduling either: it stays false
-        from the moment an asynchronous load completes until
-        ``request_finished``, so a request gated on it would be skipped forever
-        and never run the prefill the load was for. A loading request is kept
-        out of the batch by its ``DISAGG_GENERATION_TRANS_IN_PROGRESS`` state.
+        Source reservations advance the prefix before budget checks. Destination
+        pages are allocated here; loads are accepted after the final batch trims.
+        A loading request remains outside the schedulable state range.
         """
         first_chunk = req.is_first_context_chunk
         if self.chunking_enabled:
@@ -1322,7 +1316,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         # GPU pages so other requests can resume().
         # Skip if already suspended — suspending again is a no-op
         # that frees no pages.
-        if self.kv_cache_manager.is_request_active(req.py_request_id):
+        if self.kv_cache_manager.is_request_active(
+            req.py_request_id
+        ) and not self._has_pending_connector_load(req):
             logger.debug(
                 f"[V2Scheduler] Self-evicting request {req.py_request_id} "
                 f"(state={req.state.name}) to free GPU pages"
@@ -1384,6 +1380,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         if self.draft_kv_cache_manager is not None:
             self.draft_kv_cache_manager.free_resources(req)
 
+    def _has_pending_connector_load(self, req: LlmRequest) -> bool:
+        connector = self.kv_cache_manager.kv_connector_manager
+        return connector is not None and connector.has_pending_load(req)
+
     def _is_evictable(self, req: LlmRequest, inflight_request_ids: set[int]) -> bool:
         """A started request whose KV cache is still active on GPU.
 
@@ -1394,12 +1394,16 @@ class KVCacheV2Scheduler(RequestScheduler):
             return False
         if not self._is_started_request(req):
             return False
+        if self._has_pending_connector_load(req):
+            return False
         return self.kv_cache_manager.is_request_active(req.py_request_id)
 
     def _is_recompute_pause_candidate(
         self, req: LlmRequest, inflight_request_ids: set[int]
     ) -> bool:
         if req.request_id in inflight_request_ids:
+            return False
+        if self._has_pending_connector_load(req):
             return False
         # is_generation_in_progress_state also includes GENERATION_TO_COMPLETE,
         # which is outside the schedulable range and may still be finalizing.

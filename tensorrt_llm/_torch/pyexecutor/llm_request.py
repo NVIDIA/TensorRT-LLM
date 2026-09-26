@@ -1053,16 +1053,12 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         self.py_num_connector_matched_tokens = 0
 
-        # Whether the KV connector has been asked about, and told about, this
-        # request's current KV allocation. The promise is at most once per
-        # allocation, not once per request, so this is cleared in
-        # `free_resources` -- the one place an allocation dies.
+        # Destination pages are reported once per allocation. Destroying the
+        # allocation clears this flag so replay can report its new pages.
         self.py_connector_allocation_reported = False
 
-        # End of the prefix a KV connector populated for the current allocation,
-        # or 0. The cache holds those tokens but never commits them, so a context
-        # request that re-enters cannot recover the end from the cache's own
-        # reuse depth.
+        # End of the connector prefix retained by this allocation, or 0. This
+        # depth survives async parking; local reuse cannot reconstruct it.
         self.py_connector_served_position = 0
 
         self.py_result = PyResult(
