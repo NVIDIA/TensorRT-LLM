@@ -293,45 +293,28 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                 topk_indices = sparse_backend_args.topk_indices
                 assert topk_indices is not None, "topk_indices is required when compress_ratio=4"
                 compressed_local_indices = topk_indices
-                if self.sparse_attention_config.enable_kv_cache_offload:
+                # Metadata setup and prepare() validate the dtype and batch layout.
+                # Fresh prefill already uses the resident write table.
+                if (
+                    self.sparse_attention_config.enable_kv_cache_offload
+                    and attention_input_type == AttentionInputType.generation_only
+                ):
                     state = metadata.sparse_offload_state
-                    if state is None or not state.prepared or layer_idx not in state.layers:
-                        raise RuntimeError(
-                            "Sparse offload requires prepared metadata for this layer"
-                        )
-                    if self.use_fp8_ds_mla or self._uses_nvfp4_compress:
-                        raise NotImplementedError(
-                            "Sparse offload supports BF16/per-tensor FP8 KV only"
-                        )
-                    if (
-                        attention_input_type == AttentionInputType.context_only
-                        and state.is_prefill
-                        and metadata.num_generations == 0
-                    ):
-                        # Fresh prefill has no history. The compressor's write
-                        # table already addresses every compressed token.
-                        pass
-                    elif (
-                        attention_input_type == AttentionInputType.generation_only
-                        and not state.is_prefill
-                        and metadata.num_contexts == 0
-                        and metadata.num_tokens == metadata.num_generations
-                        and topk_indices.shape[0] == metadata.num_tokens
-                    ):
-                        # module.forward_sparse_attn has joined both producer
-                        # streams. Keep fetch before the conversion kernel's
-                        # FMHA scheduler prologue on this consuming stream.
-                        block_table_compressed = kv_cache_manager.fetch_sparse_read_table(
-                            state,
-                            layer_idx,
-                            topk_indices,
-                            req_id,
-                            metadata.compressed_kv_lens_cuda[self.compress_ratio],
-                            block_table_compressed,
-                        )
-                        active_request_count = state.active_request_count
-                    else:
-                        raise NotImplementedError("Unsupported sparse offload attention phase")
+                    assert state is not None, "Sparse offload metadata must be initialized"
+                    # module.forward_sparse_attn has joined both producer
+                    # streams. Keep fetch before the conversion kernel's
+                    # FMHA scheduler prologue on this consuming stream.
+                    block_table_compressed = kv_cache_manager.fetch_sparse_read_table(
+                        state,
+                        layer_idx,
+                        topk_indices,
+                        req_id,
+                        metadata.compressed_kv_lens_cuda[self.compress_ratio],
+                        block_table_compressed,
+                    )
+                    # Metadata counts include CUDA graph dummy rows. The active
+                    # count is refreshed in place before replay to mask them.
+                    active_request_count = state.active_request_count
             else:
                 compressed_local_indices = metadata.compressed_local_indices_cuda[start_idx:end_idx]
         else:
@@ -397,6 +380,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             **sched_kwargs,
             split_extra=self.use_fp8_ds_mla,
             active_request_count=active_request_count,
+            mask_invalid_pages=active_request_count is not None,
         )
 
         if self.use_fp8_ds_mla:

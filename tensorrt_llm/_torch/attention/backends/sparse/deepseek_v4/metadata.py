@@ -292,16 +292,34 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         self._init_draft_sparse_buffers()
 
     def _init_sparse_offload_state(self) -> None:
-        """Allocate fixed-capacity offload metadata before capture or execution."""
+        """Validate fixed offload configuration and allocate persistent metadata."""
         self.sparse_offload_state: SparseOffloadState | None = None
         if not self.sparse_metadata_params.enable_kv_cache_offload:
             return
-        layers = self.kv_cache_manager.get_sparse_offload_descriptors()
+        manager = self.kv_cache_manager
+        # Per-batch beam/draft values start at defaults. Also check the manager's
+        # configured limits before allocating any offload buffers.
+        if (
+            self.beam_width != 1
+            or manager.max_beam_width != 1
+            or self.max_draft_tokens
+            or manager.max_draft_len
+            or manager.max_total_draft_tokens
+            or self.draft_kv_cache_manager is not None
+        ):
+            raise NotImplementedError(
+                "Sparse offload requires single-beam, non-speculative execution"
+            )
+        # Compression policies are bound after manager construction, before
+        # metadata initialization. Validate them once here, not on each batch.
+        manager._validate_sparse_history_policy()
+        # Descriptor setup also validates the fixed KV dtype and pool layout.
+        layers = manager.get_sparse_offload_descriptors()
         if not layers:
             # This PP stage has no ratio-4 main KV to stage.
             return
-        if self.beam_width != 1 or self.sparse_mla_topk <= 0:
-            raise ValueError("Sparse offload metadata requires beam width 1 and positive top-k")
+        if self.sparse_mla_topk <= 0:
+            raise ValueError("Sparse offload metadata requires positive top-k")
         batch = self.max_num_sequences
         max_blocks = self.kv_cache_manager.max_blocks_per_seq
 
@@ -580,6 +598,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         Only a fresh, unchunked context batch or one query per decode request
         is supported. This runs during prepare(), outside capture/replay;
         the per-layer path consumes the resulting phase and device metadata.
+        Fixed configuration is validated during offload metadata initialization.
         """
         if not self.sparse_metadata_params.enable_kv_cache_offload:
             return
@@ -587,10 +606,6 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         if state is not None:
             state.prepared = False
             state.is_prefill = False
-        if self.beam_width != 1 or self.max_draft_tokens or self.draft_kv_cache_manager is not None:
-            raise NotImplementedError(
-                "Sparse offload requires single-beam, non-speculative execution"
-            )
         if self.num_contexts and self.num_generations:
             raise NotImplementedError(
                 "Sparse offload does not support mixed context/decode batches"

@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -60,6 +61,13 @@ class SparseOffloadState:
     ``prepared`` means preparation was enqueued successfully; stream ordering
     establishes device readiness. ``is_prefill`` is set by host batch validation
     before execution, never inferred from a device count inside a layer.
+
+    ``read_table_valid`` is a private int32 [1] diagnostic flag, refreshed by
+    GPU validation after each decode fetch. Only the device assertion requires
+    ``TLLM_DSV4_OFFLOAD_DEBUG_ASSERT=1``, read at initialization before graph
+    capture. A failed assertion makes the CUDA context unusable. By default,
+    the flag does not trigger an error or request recovery; production trusts
+    KVCM to provide valid mappings for every required page.
     """
 
     layers: dict[int, SparseOffloadLayerDescriptor]
@@ -71,6 +79,9 @@ class SparseOffloadState:
     fetched_page_table: torch.Tensor
     compress_read_table: torch.Tensor
     read_table_valid: torch.Tensor
+    debug_assert: bool = field(
+        default_factory=lambda: os.environ.get("TLLM_DSV4_OFFLOAD_DEBUG_ASSERT", "0") == "1"
+    )
     history_upload_done: torch.cuda.Event = field(default_factory=torch.cuda.Event)
     history_upload_pending: bool = False
     prepared: bool = False

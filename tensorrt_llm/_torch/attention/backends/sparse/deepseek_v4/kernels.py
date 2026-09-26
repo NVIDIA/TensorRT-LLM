@@ -57,6 +57,7 @@ def _deepseek_v4_local_to_global_kernel(
     LAUNCH_WITH_PDL: tl.constexpr,
     active_request_count_ptr,
     MASK_DECODE_PADDING: tl.constexpr,
+    MASK_INVALID_PAGES: tl.constexpr,
 ):
     """
     Triton kernel for converting local indices to global KV cache pool indices.
@@ -113,7 +114,8 @@ def _deepseek_v4_local_to_global_kernel(
 
     swa_bt_ptr = block_table_swa_ptr + req * bt_swa_stride0 + swa_block_ordinal * bt_swa_stride1
     swa_page_index = tl.load(swa_bt_ptr, mask=swa_full_mask, other=0)
-    swa_full_mask = swa_full_mask & (swa_page_index >= 0)
+    if MASK_INVALID_PAGES:
+        swa_full_mask = swa_full_mask & (swa_page_index >= 0)
 
     swa_global_index = (
         swa_buffer_offset_in_tokens + swa_page_index * tokens_per_block_swa + swa_token_in_block
@@ -147,7 +149,8 @@ def _deepseek_v4_local_to_global_kernel(
             + compressed_block_ordinal * bt_compressed_stride1
         )
         compressed_page_index = tl.load(compressed_bt_ptr, mask=compressed_full_mask, other=0)
-        compressed_full_mask = compressed_full_mask & (compressed_page_index >= 0)
+        if MASK_INVALID_PAGES:
+            compressed_full_mask = compressed_full_mask & (compressed_page_index >= 0)
 
         compressed_global_index = (
             compressed_buffer_offset_in_tokens
@@ -198,6 +201,7 @@ def deepseek_v4_local_to_global_indices(
     host_bmm1_scale: float = 1.0,
     split_extra: bool = False,
     active_request_count: torch.Tensor | None = None,
+    mask_invalid_pages: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
     """
     Convert local token indices to global KV cache pool indices.
@@ -230,9 +234,13 @@ def deepseek_v4_local_to_global_indices(
         num_compressed_indices: Max number of compressed indices for CUDA graph compatibility
             Output width = num_swa_indices + num_compressed_indices.
         split_extra: Return separate SWA and compressed index tensors.
-        active_request_count: Optional CUDA int32 [1] live prefix for single-token
-            decode. Mask both pools for padded queries without reading their
+        active_request_count: Optional CUDA int32 [1] count excluding trailing CUDA
+            graph dummy requests, refreshed in place before replay. Single-token
+            decode only: mask both pools for padded queries without reading their
             page-table rows. Do not pass this for multi-query context inputs.
+        mask_invalid_pages: Mask negative physical page mappings in both pools
+            when consuming an offload read table. Compiled out by default to
+            preserve the original non-offload indexing behavior.
 
     Returns:
         A combined index tensor, or separate SWA and compressed tensors when
@@ -397,6 +405,7 @@ def deepseek_v4_local_to_global_indices(
         LAUNCH_WITH_PDL=launch_with_pdl,
         active_request_count_ptr=active_request_count,
         MASK_DECODE_PADDING=active_request_count is not None,
+        MASK_INVALID_PAGES=mask_invalid_pages,
         launch_pdl=launch_with_pdl,
     )
 

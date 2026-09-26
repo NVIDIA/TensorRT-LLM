@@ -1611,8 +1611,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests) -> None:
-        if self._enable_kv_cache_offload:
-            self._validate_sparse_history_policy()
         if self._enable_kv_cache_offload and any(
             not (request.is_first_context_chunk and request.is_last_context_chunk)
             for request in scheduled_batch.context_requests
@@ -1624,6 +1622,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         super().prepare_resources(scheduled_batch)
 
     def _validate_sparse_history_policy(self) -> None:
+        """Check fixed history policies during attention metadata initialization."""
         if (
             self.enable_block_reuse
             or self.kv_compression_manages_history
@@ -1645,7 +1644,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         """
         if not self._enable_kv_cache_offload:
             return
-        self._validate_sparse_history_policy()
         active = False
         for request in requests:
             cache = self.kv_cache_map.get(request.py_request_id)
@@ -1809,8 +1807,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             if state.history_upload_pending:
                 state.history_upload_done.synchronize()
             state.history_blocks_host.zero_()
-            for row, history in enumerate(histories):
-                state.history_blocks_host[row] = history
+            state.history_blocks_host[:active_count].copy_(
+                torch.tensor(histories, dtype=torch.int32, device="cpu")
+            )
             state.history_blocks.copy_(state.history_blocks_host, non_blocking=True)
             state.history_upload_done.record(stream)
             state.history_upload_pending = True
@@ -1910,12 +1909,13 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 descriptor.page_index_upper_bound,
                 state.read_table_valid,
             )
-            # A sentinel is address-safe but would silently drop required KV.
-            # Fail on device before conversion/FMHA, including during replay.
-            torch._assert_async(
-                state.read_table_valid,
-                "Sparse offload: invalid top-k request/token or missing/out-of-bounds KV page",
-            )
+            if state.debug_assert:
+                # KVCM must return every required page. Keep the assertion opt-in
+                # because a failed device assertion poisons the CUDA context.
+                torch._assert_async(
+                    state.read_table_valid,
+                    "Sparse offload: invalid top-k request/token or missing/out-of-bounds KV page",
+                )
         return state.compress_read_table
 
     @nvtx_range_debug("dsv4_copy_batch_compress_block_tables")

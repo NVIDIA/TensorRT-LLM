@@ -16,7 +16,7 @@
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -42,6 +42,10 @@ from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.nvfp4_q
     Nvfp4ColdPageQuantizationCompression,
 )
 from tensorrt_llm._torch.pyexecutor._util import CacheCost
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    BlockReusePolicy,
+    KVCacheManagerV2,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import binding_to_torch_dtype
@@ -68,6 +72,275 @@ _RequestCache = Dict[
     Tuple[int, DeepseekV4AttentionType],  # (layer index, attention type)
     Tuple[torch.Tensor, torch.Tensor | None],  # (values tensor, scales tensor)
 ]
+
+
+# Sparse offload cache descriptors and history lifecycle.
+
+
+class _SparseRuntime:
+    """Test double for the declared APIs; no sparse transfer implementation."""
+
+    def __init__(self):
+        self.groups = {41: 13, 19: 13, 42: 9, 20: 9, 43: 5, 21: 5, 7: 14}
+        self.sparse = {41, 19}
+        self.converters = {
+            41: SimpleNamespace(scale=5, expansion=1, layer_offset=17),
+            19: SimpleNamespace(scale=5, expansion=1, layer_offset=23),
+        }
+        self.pool_bases = {41: 100000, 19: 100000}
+        self.calls = []
+        self.uploads = []
+
+    def is_sparse(self, layer_id, role):
+        return layer_id in self.sparse
+
+    def get_layer_group_id(self, layer_id):
+        return self.groups[layer_id]
+
+    def get_page_index_converter(self, layer_id, role):
+        return self.converters[layer_id]
+
+    def get_mem_pool_base_address(self, layer_id, role, index_mode):
+        if index_mode == PageIndexMode.SHARED:
+            return self.pool_bases[layer_id] + self.converters[layer_id].layer_offset * 4096
+        assert index_mode == PageIndexMode.PER_LAYER
+        return self.pool_bases[layer_id]
+
+    def get_page_index_upper_bound(self, layer_id, role):
+        return 320 - self.converters[layer_id].layer_offset
+
+    def copy_base_page_indices_to_device(self, kv_caches, layer_group_id, out, stream):
+        assert stream == torch.cuda.current_stream().cuda_stream
+        assert out.shape[0] == len(kv_caches)
+        self.calls.append(
+            ([cache.id for cache in kv_caches], layer_group_id, out.data_ptr(), stream)
+        )
+        table = torch.full(out.shape, -1, dtype=torch.int32, pin_memory=True)
+        for row, cache in enumerate(kv_caches):
+            table[row, : cache.num_blocks] = torch.tensor(cache.pages, dtype=torch.int32)
+        self.uploads.append(table)  # Keep each immutable pinned source alive through its upload.
+        out.copy_(table, non_blocking=True)
+
+
+def _manager(tokens_per_block=128):
+    manager = object.__new__(DeepseekV4CacheManager)
+    manager._enable_kv_cache_offload = True
+    manager.max_beam_width = 1
+    manager.max_draft_len = 0
+    manager.max_total_draft_tokens = 0
+    manager.enable_block_reuse = False
+    manager.kv_compression_manages_history = False
+    manager._has_cp_helix = False
+    manager.is_draft = False
+    manager._use_nvfp4_compress = False
+    manager.use_fp8_ds_mla = False
+    manager.pp_layers = [2, 3, 4]
+    manager._compress_ratios = [1, 4, 4, 128, 4]
+    manager.tokens_per_block = tokens_per_block
+    manager.max_blocks_per_seq = 6
+    manager._layer_attn_to_layer_id = {
+        (2, DeepseekV4AttentionType.COMPRESS): 41,
+        (4, DeepseekV4AttentionType.COMPRESS): 19,
+        (2, DeepseekV4AttentionType.INDEXER_COMPRESS): 42,
+        (4, DeepseekV4AttentionType.INDEXER_COMPRESS): 20,
+        (2, DeepseekV4AttentionType.SWA): 43,
+        (4, DeepseekV4AttentionType.SWA): 21,
+        (3, DeepseekV4AttentionType.COMPRESS): 7,
+    }
+    manager.impl = _SparseRuntime()
+    manager.kv_cache_map = {
+        10: SimpleNamespace(id=10, history_length=tokens_per_block - 1, pages=[0, 9, -1]),
+        20: SimpleNamespace(id=20, history_length=tokens_per_block, pages=[0, 0, 12]),
+        30: SimpleNamespace(id=30, history_length=tokens_per_block + 1, pages=[8, 7, 0]),
+    }
+    for cache in manager.kv_cache_map.values():
+        cache.num_blocks = len(cache.pages)
+        cache.capacity = cache.num_blocks * tokens_per_block
+        cache.beam_width = 1
+    return manager
+
+
+@pytest.mark.cpu_only
+def test_sparse_offload_descriptors_use_runtime_ids():
+    manager = _manager()
+    descriptors = manager.get_sparse_offload_descriptors()
+    assert list(descriptors) == [2, 4]
+    assert [d.buffer_id.layer_id for d in descriptors.values()] == [41, 19]
+    for descriptor in descriptors.values():
+        assert descriptor.buffer_id.role == DeepseekV4AttentionType.COMPRESS.role
+        assert descriptor.group_id == 13
+        assert descriptor.page_scale == 5
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "invalid",
+    ["group", "scale", "pool", "expansion", "ordinary", "not_sparse", "nvfp4", "footer", "api"],
+)
+def test_sparse_offload_rejects_incompatible_layout(invalid):
+    manager = _manager()
+    if invalid == "group":
+        manager.impl.groups[19] = 100
+    elif invalid == "scale":
+        manager.impl.converters[19].scale = 3
+    elif invalid == "pool":
+        manager.impl.pool_bases[19] += 128
+    elif invalid == "expansion":
+        manager.impl.converters[41].expansion = 2
+    elif invalid == "ordinary":
+        manager.impl.groups[42] = 13
+    elif invalid == "not_sparse":
+        manager.impl.sparse.remove(41)
+    elif invalid == "nvfp4":
+        manager._use_nvfp4_compress = True
+    elif invalid == "footer":
+        manager.use_fp8_ds_mla = True
+    else:
+        manager.impl = SimpleNamespace()
+    with pytest.raises((ValueError, NotImplementedError)):
+        manager.get_sparse_offload_descriptors()
+
+
+class _HistoryCache:
+    def __init__(self, tokens_per_block: int, cuda_stream: int) -> None:
+        self.id, self.beam_width, self.num_blocks = 20, 1, 3
+        self.capacity, self.history_length = 3 * tokens_per_block, 0
+        self.cuda_stream, self.is_active = cuda_stream, True
+        self.pages = [0, 7, 8]
+        self.calls: list[tuple[int | None, int | None]] = []
+        self.fail_resize = False
+
+    def resize(self, capacity: int | None, history_length: int | None) -> bool:
+        self.calls.append((capacity, history_length))
+        if self.fail_resize:
+            return False
+        if capacity is not None:
+            self.capacity = capacity
+        if history_length is not None:
+            self.history_length = history_length
+        return True
+
+
+def _history_case(
+    tokens_per_block: int = 128, *, stream: torch.cuda.Stream | None = None
+) -> tuple[DeepseekV4CacheManager, _HistoryCache, SimpleNamespace, SimpleNamespace]:
+    manager = _manager(tokens_per_block)
+    manager._stream = stream or Mock(cuda_stream=19, device=None)
+    manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
+    manager.conversation_manager = None
+    manager._allocated_draft_lens = {}
+    cache = _HistoryCache(tokens_per_block, manager._stream.cuda_stream)
+    manager.kv_cache_map = {20: cache}
+    request = SimpleNamespace(
+        py_request_id=20,
+        context_current_position=tokens_per_block - 1,
+        context_remaining_length=0,
+        is_dummy_request=False,
+        py_num_accepted_draft_tokens=0,
+        py_rewind_len=0,
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
+        max_beam_num_tokens=tokens_per_block,
+    )
+    batch = SimpleNamespace(context_requests=[request], generation_requests=[])
+    return manager, cache, request, batch
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tokens_per_block", [128, 256])
+def test_completed_history_advances_without_reuse_or_capacity_growth(tokens_per_block: int) -> None:
+    manager, cache, request, batch = _history_case(tokens_per_block)
+    caller_stream = object()
+    with (
+        patch("torch.cuda.current_stream", return_value=caller_stream),
+        patch("torch.cuda.is_current_stream_capturing", return_value=False),
+    ):
+        manager.update_context_resources(batch)
+        assert cache.history_length == tokens_per_block - 1
+        assert cache.calls == [(None, tokens_per_block - 1)]
+        batch.context_requests, batch.generation_requests = [], [request]
+        for completed in (
+            tokens_per_block,
+            tokens_per_block + 1,
+            2 * tokens_per_block,
+            2 * tokens_per_block + 1,
+        ):
+            # Sampling has appended one output token; that token has no KV yet.
+            request.max_beam_num_tokens = completed + 1
+            manager.update_resources(batch)
+            assert cache.history_length == completed
+            assert cache.calls[-1] == (3 * tokens_per_block, completed)
+        assert manager._stream.wait_stream.call_count == 5
+        manager._stream.wait_stream.assert_called_with(caller_stream)
+        assert len(cache.calls) == 5
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("context", [False, True])
+@pytest.mark.parametrize(
+    "problem", ["resize_failure", "wrong_stream", "capture", "suspended", "removed"]
+)
+def test_history_update_rejects_failures_and_skips_inactive(context: bool, problem: str) -> None:
+    manager, cache, request, batch = _history_case()
+    update = manager.update_context_resources if context else manager.update_resources
+    if not context:
+        batch.context_requests, batch.generation_requests = [], [request]
+    if problem == "resize_failure":
+        cache.fail_resize = True
+    elif problem == "wrong_stream":
+        cache.cuda_stream += 1
+    elif problem == "suspended":
+        cache.is_active = False
+    elif problem == "removed":
+        manager.kv_cache_map.clear()
+    with (
+        patch("torch.cuda.current_stream"),
+        patch("torch.cuda.is_current_stream_capturing", return_value=problem == "capture"),
+    ):
+        if problem in ("suspended", "removed"):
+            update(batch)
+            manager._stream.wait_stream.assert_not_called()
+        else:
+            with pytest.raises((ValueError, RuntimeError)):
+                update(batch)
+    assert cache.history_length == 0
+    assert len(cache.calls) == (1 if problem == "resize_failure" else 0)
+
+
+@pytest.mark.cpu_only
+def test_descriptor_uses_common_pool_origin_and_layer_relative_bound() -> None:
+    manager = _manager()
+    descriptors = manager.get_sparse_offload_descriptors()
+    first, second = descriptors[2], descriptors[4]
+    assert first.page_index_upper_bound == 303
+    assert second.page_index_upper_bound == 297
+    role = first.buffer_id.role
+    assert manager.impl.get_mem_pool_base_address(
+        41, role, PageIndexMode.SHARED
+    ) != manager.impl.get_mem_pool_base_address(19, role, PageIndexMode.SHARED)
+    manager.impl.get_page_index_upper_bound = Mock(return_value=0)
+    with pytest.raises(ValueError, match="physical-page bound"):
+        manager.get_sparse_offload_descriptors()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("first", "last"), [(True, False), (False, False), (False, True), (True, True)]
+)
+@pytest.mark.parametrize("enabled", [False, True])
+def test_chunked_prefill_checked_from_scheduled_request(first, last, enabled):
+    manager = _manager()
+    manager._enable_kv_cache_offload = enabled
+    batch = SimpleNamespace(
+        context_requests=[SimpleNamespace(is_first_context_chunk=first, is_last_context_chunk=last)]
+    )
+    with patch.object(KVCacheManagerV2, "prepare_resources") as prepare:
+        if enabled and not (first and last):
+            with pytest.raises(NotImplementedError, match="chunked prefill"):
+                manager.prepare_resources(batch)
+            prepare.assert_not_called()
+        else:
+            manager.prepare_resources(batch)
+            prepare.assert_called_once_with(batch)
 
 
 @dataclass(slots=True)

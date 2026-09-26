@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Attention integration with a device-driven fetch double, without native H2D/FMHA."""
+"""Sparse offload metadata, attention integration, and CUDA graph replay tests."""
 
 import math
 from dataclasses import replace
@@ -32,42 +32,323 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.backend import (
     DeepseekV4TrtllmAttention,
 )
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.kernels import (
+    check_sparse_read_table,
+    merge_sparse_read_table,
+    select_sparse_history_pages,
+)
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
     DeepseekV4TrtllmAttentionMetadata,
 )
 from tensorrt_llm._torch.attention.backends.sparse.hooks import prepare_sparse_runtime_params
 from tensorrt_llm._torch.attention.backends.sparse.params import SparseBackendForwardArgs
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
-    CUDA_GRAPH_DUMMY_REQUEST_ID,
-    KVCacheManagerV2,
-)
+from tensorrt_llm._torch.memory_buffer_utils import Buffers
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig
 
-from .test_deepseek_v4_offload_metadata import _manager, _metadata
+from .test_deepseek_v4_cache_manager import _history_case, _manager
 
 _requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
 
+# Offload metadata allocation and per-batch preparation.
+
+
+def _metadata(manager, *, enabled=True, graph=False, buffers=None, initialize=True):
+    # Exercise the production offload initialization without constructing the
+    # unrelated indexer/compressor/native attention workspaces.
+    metadata = object.__new__(DeepseekV4TrtllmAttentionMetadata)
+    metadata.kv_cache_manager = manager
+    metadata.sparse_metadata_params = DeepSeekV4SparseAttentionConfig(
+        enable_kv_cache_offload=enabled, index_topk=8
+    ).to_sparse_metadata_params()
+    metadata.max_num_sequences = 4
+    metadata.sparse_mla_topk = 8
+    metadata.beam_width = 1
+    metadata.max_draft_tokens = 0
+    metadata.draft_kv_cache_manager = None
+    metadata.is_cuda_graph = graph
+    metadata.cuda_graph_buffers = buffers
+    if initialize:
+        metadata._init_sparse_offload_state()
+    return metadata
+
+
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("local_csa", [False, True])
 @pytest.mark.parametrize(
-    ("first", "last"), [(True, False), (False, False), (False, True), (True, True)]
+    "unsupported",
+    ["beam", "configured_beam", "draft", "configured_draft", "draft_tree", "draft_cache"],
 )
+def test_sparse_offload_rejects_configuration_before_allocation(
+    unsupported: str, local_csa: bool
+) -> None:
+    manager = _manager()
+    if not local_csa:
+        manager.pp_layers = [3]
+    metadata = _metadata(manager, initialize=False)
+    if unsupported == "beam":
+        metadata.beam_width = 2
+    elif unsupported == "configured_beam":
+        manager.max_beam_width = 2
+    elif unsupported == "draft":
+        metadata.max_draft_tokens = 1
+    elif unsupported == "configured_draft":
+        manager.max_draft_len = 1
+    elif unsupported == "draft_tree":
+        manager.max_total_draft_tokens = 1
+    else:
+        metadata.draft_kv_cache_manager = object()
+    with patch.object(metadata, "get_empty") as allocate:
+        with pytest.raises(NotImplementedError, match="single-beam, non-speculative"):
+            metadata._init_sparse_offload_state()
+        allocate.assert_not_called()
+    assert metadata.sparse_offload_state is None
+
+
+@pytest.mark.cpu_only
+def test_sparse_offload_disabled_allocates_nothing():
+    manager = _manager()
+    with patch.object(manager, "get_sparse_offload_descriptors") as describe:
+        metadata = _metadata(manager, enabled=False)
+    assert metadata.sparse_offload_state is None
+    describe.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_sparse_offload_stage_without_local_csa_allocates_nothing():
+    manager = _manager()
+    manager.pp_layers = [3]
+    manager.impl = SimpleNamespace()  # No sparse API lookup is needed on this stage.
+    assert _metadata(manager).sparse_offload_state is None
+
+
+@_requires_cuda
+@pytest.mark.parametrize("graph", [False, True])
+def test_sparse_offload_buffers_are_persistent_and_separate(graph):
+    manager = _manager()
+    buffers = Buffers() if graph else None
+    metadata = _metadata(manager, graph=graph, buffers=buffers)
+    state = metadata.sparse_offload_state
+    assert state.history_blocks_host.is_pinned()
+    assert state.selected_history_pages.shape == (4, 6)
+    tables = [*state.base_page_tables.values(), state.fetched_page_table, state.compress_read_table]
+    assert all(table.shape == (4, 6) for table in tables)
+    device_tensors = tables + [
+        state.selected_history_pages,
+        state.history_blocks,
+        state.active_request_count,
+    ]
+    assert all(tensor.is_cuda and tensor.dtype == torch.int32 for tensor in device_tensors)
+    assert len({tensor.data_ptr() for tensor in device_tensors}) == len(device_tensors)
+    assert all((table == -1).all() for table in tables)
+    assert (state.history_blocks == 0).all() and state.active_request_count.item() == 0
+    if graph:
+        # Same-name graph buffers can be reused for serial graph buckets.
+        reused = _metadata(manager, graph=True, buffers=buffers).sparse_offload_state
+        assert reused.base_page_tables[13].data_ptr() == state.base_page_tables[13].data_ptr()
+        assert reused.compress_read_table.data_ptr() == state.compress_read_table.data_ptr()
+        assert reused.history_blocks_host.data_ptr() != state.history_blocks_host.data_ptr()
+
+
+@_requires_cuda
+@pytest.mark.parametrize("tokens_per_block", [128, 256])
+def test_prepare_sparse_offload_request_order_and_boundaries(tokens_per_block):
+    manager = _manager(tokens_per_block)
+    manager._stream = torch.cuda.current_stream()
+    metadata = _metadata(manager)
+    state = metadata.sparse_offload_state
+    write = torch.empty((4, 6), device="cuda", dtype=torch.int32)
+    pointers = [t.data_ptr() for t in (state.history_blocks, state.base_page_tables[13], write)]
+    prepare_stream = torch.cuda.Stream()
+    for ids in (
+        [30, 10, 20],
+        [20, CUDA_GRAPH_DUMMY_REQUEST_ID, CUDA_GRAPH_DUMMY_REQUEST_ID],
+        [],
+        [10],
+    ):
+        state.fetched_page_table.fill_(999)
+        state.compress_read_table.fill_(999)
+        state.selected_history_pages.fill_(999)
+        prepare_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(prepare_stream):
+            manager.prepare_sparse_offload(state, ids, write, beam_width=1)
+        torch.cuda.current_stream().wait_stream(prepare_stream)
+        live_ids = [req for req in ids if req != CUDA_GRAPH_DUMMY_REQUEST_ID]
+        expected_raw = torch.full((4, 6), -1, dtype=torch.int32)
+        expected_write = torch.full_like(expected_raw, -1)
+        expected_history = torch.zeros(4, dtype=torch.int32)
+        for row, req in enumerate(live_ids):
+            cache = manager.kv_cache_map[req]
+            count = cache.history_length // tokens_per_block
+            expected_history[row] = count
+            expected_raw[row, : cache.num_blocks] = torch.tensor(cache.pages)
+            for ordinal, page in enumerate(cache.pages):
+                if ordinal >= count and page >= 0:
+                    expected_write[row, ordinal] = page * 5
+        torch.testing.assert_close(state.base_page_tables[13].cpu(), expected_raw)
+        torch.testing.assert_close(write.cpu(), expected_write)
+        torch.testing.assert_close(state.history_blocks.cpu(), expected_history)
+        assert state.active_request_count.item() == len(live_ids)
+        assert all(
+            (t == -1).all()
+            for t in (
+                state.selected_history_pages,
+                state.fetched_page_table,
+                state.compress_read_table,
+            )
+        )
+        if live_ids:
+            assert manager.impl.calls[-1][:2] == (live_ids, 13)
+            assert manager.impl.calls[-1][3] == prepare_stream.cuda_stream
+        assert pointers == [
+            t.data_ptr() for t in (state.history_blocks, state.base_page_tables[13], write)
+        ]
+        # Change the frontier and physical assignment without replacing tensors.
+        manager.kv_cache_map[10].history_length = 2 * tokens_per_block
+        manager.kv_cache_map[10].pages = [17, 19, 0]
+    assert len(manager.impl.calls) == 3  # The empty batch does not call KVCM.
+
+
+@_requires_cuda
+@pytest.mark.parametrize(
+    "invalid",
+    ["batch", "duplicates", "dummy_order", "unknown", "width", "frontier", "beam", "capture"],
+)
+def test_sparse_offload_rejects_invalid_preparation(invalid):
+    manager = _manager()
+    manager._stream = torch.cuda.current_stream()
+    state = _metadata(manager).sparse_offload_state
+    write = torch.empty((4, 6), device="cuda", dtype=torch.int32)
+    ids = [10]
+    beam = 1
+    if invalid == "batch":
+        ids = [10] * 5
+    elif invalid == "duplicates":
+        ids = [10, 10]
+    elif invalid == "dummy_order":
+        ids = [CUDA_GRAPH_DUMMY_REQUEST_ID, 10]
+    elif invalid == "unknown":
+        ids = [12345]
+    elif invalid == "width":
+        manager.kv_cache_map[10].num_blocks = 7
+    elif invalid == "frontier":
+        manager.kv_cache_map[10].history_length = 99999
+    elif invalid == "beam":
+        beam = 2
+    with patch("torch.cuda.is_current_stream_capturing", return_value=invalid == "capture"):
+        with pytest.raises((ValueError, KeyError, RuntimeError)):
+            manager.prepare_sparse_offload(state, ids, write, beam_width=beam)
+    assert not manager.impl.calls
+    assert state.active_request_count.item() == 0
+
+
+@_requires_cuda
 @pytest.mark.parametrize("enabled", [False, True])
-def test_chunked_prefill_checked_from_scheduled_request(first, last, enabled):
+def test_metadata_routes_only_sparse_main_table(enabled):
     manager = _manager()
     manager._enable_kv_cache_offload = enabled
-    batch = SimpleNamespace(
-        context_requests=[SimpleNamespace(is_first_context_chunk=first, is_last_context_chunk=last)]
+    manager._stream = torch.cuda.current_stream()
+    metadata = _metadata(manager, enabled=enabled)
+    metadata.request_ids = [20, 10]
+    metadata._seq_lens = torch.ones(2, dtype=torch.int32)
+    metadata._num_contexts = 1
+    metadata.sliding_block_tables = torch.empty((1, 1, 4, 6), dtype=torch.int32, device="cuda")
+    metadata.compress_block_tables = {
+        ratio: torch.empty((4, 6), dtype=torch.int32, device="cuda") for ratio in (4, 128)
+    }
+    manager.copy_batch_sliding_block_tables = Mock(side_effect=lambda out, *args: out.fill_(71))
+    manager.copy_batch_compress_block_tables = Mock(
+        side_effect=lambda out, *args, **kwargs: out.fill_(29)
     )
-    with patch.object(KVCacheManagerV2, "prepare_resources") as prepare:
-        if enabled and not (first and last):
-            with pytest.raises(NotImplementedError, match="chunked prefill"):
-                manager.prepare_resources(batch)
-            prepare.assert_not_called()
-        else:
-            manager.prepare_resources(batch)
-            prepare.assert_called_once_with(batch)
+    metadata.prepare_for_block_tables()
+    assert (metadata.sliding_block_tables == 71).all()
+    assert (metadata.compress_block_tables[128] == 29).all()
+    ratios = [
+        call.kwargs["compress_ratio"]
+        for call in manager.copy_batch_compress_block_tables.call_args_list
+    ]
+    assert ratios == ([128] if enabled else [4, 128])
+    if enabled:
+        assert manager.impl.calls[-1][0] == [20, 10]
+        assert metadata.compress_block_tables[4][0, 0].item() == -1
+        assert metadata.compress_block_tables[4][0, 1].item() == 0
+    else:
+        assert metadata.sparse_offload_state is None
+        assert not manager.impl.calls
+
+
+@_requires_cuda
+def test_sparse_metadata_refresh_before_graph_replay():
+    manager = _manager()
+    manager._stream = torch.cuda.current_stream()
+    state = _metadata(manager, graph=True, buffers=Buffers()).sparse_offload_state
+    write = torch.empty((4, 6), dtype=torch.int32, device="cuda")
+    topk = torch.tensor([[0, 31, 32, 63, 64, -1, 32, 0]] * 4, dtype=torch.int32, device="cuda")
+    requests = torch.arange(4, dtype=torch.int32, device="cuda")
+    lengths = torch.full((4,), 96, dtype=torch.int32, device="cuda")
+
+    def consume():
+        select_sparse_history_pages(
+            topk,
+            requests,
+            state.active_request_count,
+            lengths,
+            state.base_page_tables[13],
+            state.history_blocks,
+            32,
+            state.selected_history_pages,
+        )
+        # No fetch is simulated here. History remains absent, and only the
+        # prepared resident table can supply valid addresses to the merger.
+        merge_sparse_read_table(
+            state.fetched_page_table,
+            write,
+            state.history_blocks,
+            state.active_request_count,
+            state.compress_read_table,
+            fetched_page_scale=1,
+        )
+
+    manager.prepare_sparse_offload(state, [20, 10], write, beam_width=1)
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        consume()
+    capture_stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        consume()
+    pointers = state.selected_history_pages.data_ptr(), state.compress_read_table.data_ptr()
+    for ids in ([20, 10], [30, CUDA_GRAPH_DUMMY_REQUEST_ID], [], [10, 30]):
+        manager.prepare_sparse_offload(state, ids, write, beam_width=1)
+        graph.replay()
+        expected = torch.full((4, 6), -1, dtype=torch.int32)
+        live = [req for req in ids if req != CUDA_GRAPH_DUMMY_REQUEST_ID]
+        for row, req in enumerate(live):
+            cache = manager.kv_cache_map[req]
+            pages = sorted(
+                {
+                    token // 32
+                    for token in topk[row].cpu().tolist()
+                    if 0 <= token < 96
+                    and token // 32 < cache.history_length // 128
+                    and cache.pages[token // 32] >= 0
+                }
+            )
+            expected[row, : len(pages)] = torch.tensor(pages, dtype=torch.int32)
+        torch.testing.assert_close(state.selected_history_pages.cpu(), expected)
+        torch.testing.assert_close(state.compress_read_table, write)
+        assert pointers == (
+            state.selected_history_pages.data_ptr(),
+            state.compress_read_table.data_ptr(),
+        )
+        manager.kv_cache_map[30].history_length = 2 * 128
+        manager.kv_cache_map[30].pages = [0, 16, 3]
+
+
+# Sparse attention fetch and consumption.
 
 
 def _host_batch(*, prefill=False):
@@ -107,9 +388,6 @@ def test_offload_admits_decode_or_fresh_prefill(prefill):
     [
         "mixed",
         "multiquery",
-        "beam",
-        "draft",
-        "draft_cache",
         "cached",
         "chunk",
         "history",
@@ -122,12 +400,6 @@ def test_offload_rejects_batch_before_table_preparation(unsupported):
         metadata.num_contexts = metadata.num_generations = 1
     elif unsupported == "multiquery":
         metadata.seq_lens[:] = metadata.seq_lens_kv[:] = 2
-    elif unsupported == "beam":
-        metadata.beam_width = 2
-    elif unsupported == "draft":
-        metadata.max_draft_tokens = 1
-    elif unsupported == "draft_cache":
-        metadata.draft_kv_cache_manager = object()
     elif unsupported == "cached":
         metadata.kv_cache_params.num_cached_tokens_per_seq[0] = 1
     elif unsupported == "chunk":
@@ -391,7 +663,7 @@ def test_fetch_preserves_fp8_scheduler_prologue():
 
 
 @_requires_cuda
-@pytest.mark.parametrize("failure", ["units", "scale", "api", "prepared", "phase", "transfer"])
+@pytest.mark.parametrize("failure", ["units", "scale", "api", "prepared", "prefill", "transfer"])
 def test_sparse_fetch_fails_without_resident_fallback(failure):
     case = _attention_case()
     if failure in ("units", "scale"):
@@ -402,8 +674,8 @@ def test_sparse_fetch_fails_without_resident_fallback(failure):
         case.manager.impl.fetch_sparse_pages = None
     elif failure == "prepared":
         case.state.prepared = False
-    elif failure == "phase":
-        case.args.attention_input_type = AttentionInputType.mixed
+    elif failure == "prefill":
+        case.state.is_prefill = True
     else:
         case.manager.impl.fetch_sparse_pages = Mock(side_effect=RuntimeError("fetch failed"))
     with pytest.raises((NotImplementedError, RuntimeError, ValueError)):
@@ -480,7 +752,9 @@ def test_offload_disabled_and_other_ratios_do_not_fetch():
 
 
 @_requires_cuda
-def test_fetch_graph_replay_refreshes_requests_topk_and_padding():
+@pytest.mark.parametrize("debug_assert", [False, True])
+def test_fetch_graph_replay_refreshes_requests_topk_and_padding(monkeypatch, debug_assert):
+    monkeypatch.setenv("TLLM_DSV4_OFFLOAD_DEBUG_ASSERT", "1" if debug_assert else "0")
     case = _attention_case(fetched_page_scale=5)
     backend = case.backends[0]
     consumer = torch.cuda.Stream()
@@ -543,3 +817,120 @@ def test_fetch_graph_replay_refreshes_requests_topk_and_padding():
         )
     ]
     assert (case.state.fetched_page_table == -1).all()
+
+
+# History policy validation and stream ordering.
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "policy", ["enable_block_reuse", "kv_compression_manages_history", "_has_cp_helix", "is_draft"]
+)
+def test_offload_rejects_other_history_policies_during_initialization(policy: str) -> None:
+    manager = _manager()
+    setattr(manager, policy, True)
+    with pytest.raises(NotImplementedError, match="Sparse offload requires"):
+        _metadata(manager)
+
+
+@_requires_cuda
+@pytest.mark.parametrize("debug_assert", [False, True])
+def test_missing_fetch_result_assertion_is_debug_only(monkeypatch, debug_assert) -> None:
+    monkeypatch.delenv("TLLM_DSV4_OFFLOAD_DEBUG_ASSERT", raising=False)
+    if debug_assert:
+        monkeypatch.setenv("TLLM_DSV4_OFFLOAD_DEBUG_ASSERT", "1")
+    case = _attention_case()
+    assert case.state.debug_assert == debug_assert
+    case.manager.impl.fetch_sparse_pages = lambda **kwargs: kwargs["out"].fill_(-1)
+
+    # Avoid poisoning the suite's CUDA context with a deliberate device assert.
+    def check(valid: torch.Tensor, message: str) -> None:
+        if not valid.item():
+            raise RuntimeError(message)
+
+    with (
+        patch("torch._assert_async", side_effect=check) as device_assert,
+        patch(
+            "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager.check_sparse_read_table",
+            wraps=check_sparse_read_table,
+        ) as validate,
+        patch(
+            "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.backend.deepseek_v4_local_to_global_indices"
+        ) as convert,
+    ):
+        if debug_assert:
+            with pytest.raises(RuntimeError, match="missing/out-of-bounds KV page"):
+                _consume(case, case.backends[0])
+            device_assert.assert_called_once()
+            convert.assert_not_called()
+        else:
+            _consume(case, case.backends[0])
+            device_assert.assert_not_called()
+            convert.assert_called_once()
+        validate.assert_called_once()
+        assert case.state.read_table_valid.item() == 0
+
+
+@_requires_cuda
+@pytest.mark.parametrize("tokens_per_block", [128, 256])
+def test_history_demotion_waits_for_all_layer_writers_and_readers(tokens_per_block: int) -> None:
+    cache_stream, model_stream = torch.cuda.Stream(), torch.cuda.Stream()
+    manager, cache, request, batch = _history_case(tokens_per_block, stream=cache_stream)
+    state = _metadata(manager).sparse_offload_state
+    write = torch.empty((4, 6), dtype=torch.int32, device="cuda")
+    p = tokens_per_block // 4
+    # Two CSA layers write different data to the same logical history page.
+    source = torch.zeros((2, p, 16), dtype=torch.bfloat16, device="cuda")
+    host = torch.empty(source.shape, dtype=source.dtype, pin_memory=True)
+    read_before_recycle = torch.empty_like(source)
+    fetched = torch.empty_like(source)
+    model_stream.wait_stream(torch.cuda.current_stream())
+    resize = cache.resize
+
+    def demote(capacity: int | None, history: int | None) -> bool:
+        previous = cache.history_length
+        result = resize(capacity, history)
+        if previous < tokens_per_block <= cache.history_length:
+            with torch.cuda.stream(cache_stream):
+                host.copy_(source, non_blocking=True)
+                source.fill_(-99)  # Simulate reusing the released resident slots.
+        return result
+
+    cache.resize = demote
+    with torch.cuda.stream(model_stream):
+        source[0, :-1].fill_(1)
+        source[1, :-1].fill_(2)
+        manager.update_context_resources(batch)
+        manager.prepare_sparse_offload(state, [20], write, beam_width=1)
+    model_stream.synchronize()
+    assert cache.history_length == tokens_per_block - 1
+    assert state.history_blocks[0].item() == 0
+    assert write[0, 0].item() == 0
+
+    events = []
+    producers = [torch.cuda.Stream(), torch.cuda.Stream()]
+    for layer, producer in enumerate(producers):
+        producer.wait_stream(model_stream)
+        with torch.cuda.stream(producer):
+            torch.cuda._sleep(2_000_000 * (layer + 1))
+            source[layer, -1].fill_(layer + 3)
+            events.append(producer.record_event())
+    batch.context_requests, batch.generation_requests = [], [request]
+    request.max_beam_num_tokens = tokens_per_block + 1
+    with torch.cuda.stream(model_stream):
+        for event in events:
+            model_stream.wait_event(event)
+        read_before_recycle.copy_(source)
+        manager.update_resources(batch)
+        manager.prepare_sparse_offload(state, [20], write, beam_width=1)
+        fetched.copy_(host, non_blocking=True)
+    model_stream.synchronize()
+    assert cache.history_length == tokens_per_block
+    assert state.history_blocks[0].item() == 1
+    assert write[0, 0].item() == -1
+    assert (source == -99).all()
+    expected = torch.empty_like(source)
+    expected[0, :-1], expected[1, :-1] = 1, 2
+    expected[0, -1], expected[1, -1] = 3, 4
+    torch.testing.assert_close(read_before_recycle, expected, rtol=0, atol=0)
+    torch.testing.assert_close(fetched, expected, rtol=0, atol=0)

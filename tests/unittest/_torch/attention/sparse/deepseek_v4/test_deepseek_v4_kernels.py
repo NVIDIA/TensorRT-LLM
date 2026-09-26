@@ -13,16 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Tests for DeepSeek-V4 sparse offload kernels."""
+
 import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.kernels import (
+    check_sparse_read_table,
     deepseek_v4_local_to_global_indices,
     merge_sparse_read_table,
+    prepare_sparse_write_table,
     select_sparse_history_pages,
 )
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+_requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+
+
+# Sparse history selection and read-table kernels.
 
 
 def _cuda_tensor(value: torch.Tensor | list, strided: bool = False) -> torch.Tensor:
@@ -81,6 +88,7 @@ def _merge_reference(
     return result
 
 
+@_requires_cuda
 @pytest.mark.parametrize("tokens_per_block", [128, 256])
 @pytest.mark.parametrize("strided", [False, True])
 def test_select_history_pages_boundaries(tokens_per_block: int, strided: bool) -> None:
@@ -147,6 +155,7 @@ def test_select_history_pages_boundaries(tokens_per_block: int, strided: bool) -
     assert (out == -1).all()
 
 
+@_requires_cuda
 @pytest.mark.parametrize("tokens_per_page", [32, 64])
 @pytest.mark.parametrize(("topk_size", "max_blocks"), [(1, 1), (7, 3), (513, 1100), (1024, 257)])
 def test_select_history_pages_scattered(
@@ -183,6 +192,7 @@ def test_select_history_pages_scattered(
         select_sparse_history_pages(*args, out[:, : width - 1])
 
 
+@_requires_cuda
 def test_select_history_pages_masks_invalid_request_ids() -> None:
     out = torch.full((4, 1), 999, dtype=torch.int32, device="cuda")
     select_sparse_history_pages(
@@ -198,6 +208,7 @@ def test_select_history_pages_masks_invalid_request_ids() -> None:
     torch.testing.assert_close(out.cpu(), torch.tensor([[0], [0], [-1], [-1]], dtype=torch.int32))
 
 
+@_requires_cuda
 @pytest.mark.parametrize(("batch", "max_blocks", "topk"), [(0, 3, 7), (2, 0, 7), (2, 3, 0)])
 def test_sparse_offload_empty_shapes(batch: int, max_blocks: int, topk: int) -> None:
     raw = torch.empty((batch, max_blocks), dtype=torch.int32, device="cuda")
@@ -220,6 +231,7 @@ def test_sparse_offload_empty_shapes(batch: int, max_blocks: int, topk: int) -> 
     assert (read == -1).all()
 
 
+@_requires_cuda
 @pytest.mark.parametrize("scale", [1, 4])
 @pytest.mark.parametrize("strided", [False, True])
 def test_merge_sparse_read_table(scale: int, strided: bool) -> None:
@@ -251,6 +263,7 @@ def test_merge_sparse_read_table(scale: int, strided: bool) -> None:
     torch.testing.assert_close(write_gpu.cpu(), write, rtol=0, atol=0)
 
 
+@_requires_cuda
 def test_sparse_offload_cuda_graph_replay() -> None:
     batch, max_blocks, topk_size, p = 3, 6, 8, 32
     topk = torch.zeros((batch, topk_size), dtype=torch.int32, device="cuda")
@@ -325,10 +338,15 @@ def test_sparse_offload_cuda_graph_replay() -> None:
         assert (selected.data_ptr(), read.data_ptr()) == pointers
 
 
+@_requires_cuda
 @pytest.mark.parametrize("compress_ratio", [1, 4, 128])
 @pytest.mark.parametrize("split_extra", [False, True])
-def test_local_to_global_preserves_invalid_pages(
-    compress_ratio: int, split_extra: bool, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("mask_invalid_pages", [False, True])
+def test_local_to_global_invalid_page_mask_is_opt_in(
+    compress_ratio: int,
+    split_extra: bool,
+    mask_invalid_pages: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("TRTLLM_ENABLE_PDL", "0")
     p = 128 // compress_ratio
@@ -337,6 +355,8 @@ def test_local_to_global_preserves_invalid_pages(
     compressed_table = [[160, -1, 36], [-1, 0, 164]]
     swa_tokens = [[0, 127, 128, 255, 256, -1, -7, 999]] * 2
     compressed_tokens = [[0, p - 1, p, 2 * p, 2 * p + p - 1, -1, -7, 999]] * 2
+    # Omit the option for the default path to verify masking remains opt-in.
+    mask_kwargs = {"mask_invalid_pages": True} if mask_invalid_pages else {}
     result = deepseek_v4_local_to_global_indices(
         req_id=_cuda_tensor(requests),
         block_table_swa=_cuda_tensor(swa_table),
@@ -353,6 +373,7 @@ def test_local_to_global_preserves_invalid_pages(
         compress_ratio=compress_ratio,
         num_compressed_indices=8 if compress_ratio > 1 else 0,
         split_extra=split_extra,
+        **mask_kwargs,
     )
 
     def reference(
@@ -363,7 +384,7 @@ def test_local_to_global_preserves_invalid_pages(
             for k, token in enumerate(tokens[query]):
                 if 0 <= token < len(table[request]) * page_size:
                     page = table[request][token // page_size]
-                    if page >= 0:
+                    if page >= 0 or not mask_invalid_pages:
                         expected[query, k] = offset + page * page_size + token % page_size
         return expected
 
@@ -383,3 +404,81 @@ def test_local_to_global_preserves_invalid_pages(
             else expected_swa
         )
         torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+
+@_requires_cuda
+@pytest.mark.parametrize("scale", [1, 5])
+def test_prepare_write_table_preserves_invalids_and_strides(scale):
+    raw = torch.tensor(
+        [[0, 2, -1, 1 << 30], [3, 0, 2, -9], [7, 8, 9, 10]], dtype=torch.int32, device="cuda"
+    )
+    storage = torch.full((6, 8), 999, dtype=torch.int32, device="cuda")
+    out = storage[::2, ::2]
+    history = torch.tensor([1, 2, 0], dtype=torch.int32, device="cuda")
+    active = torch.tensor([2], dtype=torch.int32, device="cuda")
+    prepare_sparse_write_table(raw, history, active, out, page_scale=scale)
+    expected = [
+        [-1, 2 * scale, -1, (1 << 30) if scale == 1 else -1],
+        [-1, -1, 2 * scale, -1],
+        [-1] * 4,
+    ]
+    torch.testing.assert_close(out.cpu(), torch.tensor(expected, dtype=torch.int32))
+    assert (storage[1::2] == 999).all() and (storage[:, 1::2] == 999).all()
+
+
+def _cuda(value: list[int] | list[list[int]]) -> torch.Tensor:
+    return torch.tensor(value, dtype=torch.int32, device="cuda")
+
+
+@_requires_cuda
+@pytest.mark.parametrize(
+    "problem", ["none", "missing", "bound", "length", "ordinal", "request", "active", "padding"]
+)
+def test_read_coverage_detects_required_pages_without_host_reads(problem: str) -> None:
+    topk = _cuda([[0, 31, -1, -1], [0, 31, 32, 63], [0] * 4, [0] * 4])
+    requests, active, lengths = _cuda([1, 0, 2, 999]), _cuda([2]), _cuda([64] * 4)
+    read = _cuda([[6, 8, 10], [2, -1, 4], [-1] * 3, [-1] * 3])
+    if problem == "missing":
+        read[0, 1] = -1
+    elif problem == "bound":
+        read[0, 1] = 16
+    elif problem == "length":
+        topk[1, 0] = 64
+    elif problem == "ordinal":
+        topk[1, 0], lengths[0] = 128, 160
+    elif problem == "request":
+        requests[0] = 999
+    elif problem == "active":
+        active.fill_(5)
+    elif problem == "padding":
+        active.zero_()  # Stale, invalid queries cannot invalidate an empty replay.
+    valid = _cuda([77])
+    check_sparse_read_table(topk, requests, active, lengths, read, 32, 16, valid)
+    assert valid.item() == int(problem in ("none", "padding"))
+    # Status is rewritten, rather than sticky from the previous failed step.
+    active.zero_()
+    check_sparse_read_table(topk, requests, active, lengths, read, 32, 16, valid)
+    torch._assert_async(valid)
+    assert valid.item() == 1
+
+
+@_requires_cuda
+def test_decode_padding_masks_both_pools_before_table_access() -> None:
+    active = _cuda([1])
+    args = dict(
+        req_id=_cuda([0, 0, 999, -1]),
+        block_table_swa=_cuda([[2], [3], [4], [5]]),
+        swa_local_indices=_cuda([[0, 1]] * 4),
+        swa_pool_base_ptr=0,
+        swa_buffer_ptr=0,
+        tokens_per_block=128,
+        token_stride=32,
+        block_table_compressed=_cuda([[6], [7], [8], [9]]),
+        compressed_local_indices=_cuda([[0, 1]] * 4),
+        compress_ratio=4,
+        num_compressed_indices=2,
+        active_request_count=active,
+    )
+    indices = deepseek_v4_local_to_global_indices(**args)
+    torch.testing.assert_close(indices[0], _cuda([256, 257, 192, 193]))
+    assert (indices[1:] == -1).all()
