@@ -107,7 +107,11 @@ def _forward_compat_reason():
         pynvml.nvmlShutdown()
     if isinstance(kernel, bytes):
         kernel = kernel.decode()
-    if user_mode is not None and user_mode != kernel:
+
+    def version(text):
+        return tuple(int(part) for part in text.split("."))
+
+    if user_mode is not None and version(user_mode) > version(kernel):
         return (
             f"CFT logical endpoints need kernel-driver support; CUDA forward compatibility "
             f"runs user-mode driver {user_mode} on kernel driver {kernel}"
