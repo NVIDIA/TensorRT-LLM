@@ -279,7 +279,6 @@ unittest/_torch/executor/test_pytorch_model_engine.py::PyTorchModelEngineTestCas
 unittest/_torch/executor/test_pytorch_model_engine_warmup.py::test_compiled_mxfp8_warmup_backend_selection SKIP (https://nvbugs/6835139)
 unittest/_torch/executor/test_pytorch_model_engine_warmup.py::test_pcg_fx_fallback_policy_is_model_specific SKIP (https://nvbugs/6831653)
 unittest/_torch/modeling/test_modeling_nemotron_h_multimodal.py::test_nemotron_nano_v2_vl_image_batch_equivalence SKIP (https://nvbugs/6758946)
-unittest/_torch/modeling/test_modeling_nemotron_h_multimodal.py::test_nemotron_nano_v2_vl_video_batch_equivalence SKIP (https://nvbugs/6625695)
 unittest/_torch/modules/tests_lora_modules/test_nemotron_h_lora_sanity.py::TestNemotronHLoRA::test_lora_pp2_sanity SKIP (https://nvbugs/6428124)
 unittest/_torch/moe/test_moe_backend.py::test_moe_backend[act=Relu2-e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-backend=TRTLLM-quant=NVFP4-routing=Renormalize] SKIP (https://nvbugs/5989912)
 unittest/_torch/multi_gpu/test_linear.py::test_row_linear_norm_fusion[2-hidden:16-seqlen:2] SKIP (https://nvbugs/6501404)
