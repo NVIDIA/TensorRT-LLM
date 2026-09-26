@@ -49,7 +49,7 @@ from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
 from pydantic import (AliasChoices, BaseModel, ConfigDict, Field,
                       NonNegativeInt, PositiveInt, field_validator,
-                      model_validator)
+                      model_serializer, model_validator)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
@@ -149,6 +149,73 @@ def _logit_bias_to_embedding_bias(
 class OpenAIBaseModel(BaseModel):
     # OpenAI API does not allow extra fields & allow to initialize by both alias and field name
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+
+class SpeculativeDecodingStats(OpenAIBaseModel):
+    """Per-request speculative-decoding acceptance for one generated sequence.
+
+    Opt-in: emitted only when the server sets per_request_spec_decode_stats.
+    Absent entirely when the request drafted nothing. PyTorch backend only.
+
+    ``mean acceptance length`` is deliberately not a field here: it is already
+    reported per choice as ``avg_decoded_tokens_per_iter``, and duplicating it
+    would let the two drift. Consumers derive it as
+    ``1 + total_accepted_draft_tokens / num_spec_steps``.
+
+    Three identities hold on every emitted record, and a consumer may rely on
+    them:
+
+    * ``sum(acceptance_histogram) == num_spec_steps``
+    * ``sum(j * acceptance_histogram[j]) == total_accepted_draft_tokens``
+    * ``total_accepted_draft_tokens <= total_draft_tokens``
+    """
+
+    acceptance_rate: float = Field(
+        description="Accepted draft tokens divided by proposed draft tokens.")
+    total_accepted_draft_tokens: int = Field(
+        description="Draft tokens accepted across the request, excluding the "
+        "always-accepted bonus token.")
+    total_draft_tokens: int = Field(
+        description="Draft tokens proposed across the request. For tree "
+        "drafting this counts paths, not tree nodes, mirroring the "
+        "getMaxDraftPathLen clamp in updateNumTokensPerIteration.")
+    num_spec_steps: int = Field(
+        description="Verify steps performed for the request. Equals the sum of "
+        "acceptance_histogram.")
+    acceptance_histogram: List[int] = Field(
+        description="Dense histogram indexed by accepted-draft count: entry j "
+        "is the number of verify steps that accepted exactly j draft tokens. "
+        "Tree-agnostic -- it records output lengths per step and encodes no "
+        "parent/child structure.")
+    num_spec_tokens: Optional[int] = Field(
+        default=None,
+        description="Maximum draft length per step, when the run has a fixed "
+        "bound. None under draft_len_schedule, where the bound varies by batch "
+        "size.")
+
+
+class _OmitsAbsentSpecDecodeStats(OpenAIBaseModel):
+    """Drops ``speculative_decoding`` from serialized output when it is absent.
+
+    Per-request spec-decode stats are off by default, so without this every
+    response on the paths that serialize with a plain ``model_dump()`` -- the
+    non-streaming chat and completions responses, and the completions stream
+    (``exclude_unset=False``) -- would gain ``"speculative_decoding": null`` for
+    every user, whether or not they enabled ``per_request_spec_decode_stats``.
+
+    Scoped to this one field on purpose. Blanket ``exclude_none`` would also
+    strip unrelated optional fields that clients may rely on being present, and
+    the dump calls are spread across the serving layer rather than funnelled
+    through one place where an ``exclude=`` argument could be applied.
+    """
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_spec_decode_stats(self, handler: Any) -> Any:
+        data = handler(self)
+        if isinstance(data, dict) and data.get("speculative_decoding",
+                                               ...) is None:
+            data.pop("speculative_decoding", None)
+        return data
 
 
 class StreamOptions(OpenAIBaseModel):
@@ -295,7 +362,7 @@ class CompletionLogProbs(OpenAIBaseModel):
     top_logprobs: List[Optional[Dict[str, float]]] = Field(default_factory=list)
 
 
-class CompletionResponseChoice(OpenAIBaseModel):
+class CompletionResponseChoice(_OmitsAbsentSpecDecodeStats):
     index: int
     text: str
     token_ids: Optional[List[int]] = None
@@ -312,6 +379,8 @@ class CompletionResponseChoice(OpenAIBaseModel):
     )
     disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
     avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
+    speculative_decoding: Optional[SpeculativeDecodingStats] = Field(
+        default=None)
 
 
 class CompletionResponse(OpenAIBaseModel):
@@ -326,7 +395,7 @@ class CompletionResponse(OpenAIBaseModel):
     prompt_token_ids: Optional[Union[List[List[int]], List[int]]] = None
 
 
-class CompletionResponseStreamChoice(OpenAIBaseModel):
+class CompletionResponseStreamChoice(_OmitsAbsentSpecDecodeStats):
     index: int
     text: str
     token_ids: Optional[List[int]] = None
@@ -340,6 +409,8 @@ class CompletionResponseStreamChoice(OpenAIBaseModel):
             "including encountering the EOS token"),
     )
     avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
+    speculative_decoding: Optional[SpeculativeDecodingStats] = Field(
+        default=None)
 
 
 class CompletionStreamResponse(OpenAIBaseModel):
@@ -856,7 +927,7 @@ class ChatCompletionLogProbs(OpenAIBaseModel):
     content: Optional[List[ChatCompletionLogProbsContent]] = None
 
 
-class ChatCompletionResponseChoice(OpenAIBaseModel):
+class ChatCompletionResponseChoice(_OmitsAbsentSpecDecodeStats):
     index: int
     message: ChatMessage
     logprobs: Optional[ChatCompletionLogProbs] = None
@@ -868,6 +939,8 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
 
     disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
     avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
+    speculative_decoding: Optional[SpeculativeDecodingStats] = Field(
+        default=None)
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
@@ -894,13 +967,15 @@ class DeltaMessage(OpenAIBaseModel):
     tool_calls: Optional[List[DeltaToolCall]] = None
 
 
-class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
+class ChatCompletionResponseStreamChoice(_OmitsAbsentSpecDecodeStats):
     index: int
     delta: DeltaMessage
     logprobs: Optional[ChatCompletionLogProbs] = None
     finish_reason: Optional[str] = None
     stop_reason: Optional[Union[int, str]] = None
     avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
+    speculative_decoding: Optional[SpeculativeDecodingStats] = Field(
+        default=None)
 
 
 class ChatCompletionStreamResponse(OpenAIBaseModel):
