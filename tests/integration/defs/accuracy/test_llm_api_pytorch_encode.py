@@ -25,6 +25,9 @@ Note: encode() is single-GPU only (no TP/PP). Every listed model is
 architecturally required to fit on one GPU for these tests.
 """
 
+import json
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -92,6 +95,25 @@ TEXT_EMBEDDING_MODELS = [
         marks=pytest.mark.skip_less_device_memory(32000),
         id="qwen3-embedding-8b",
     ),
+]
+
+RERANKER_MODELS = [
+    pytest.param(
+        "Qwen/Qwen3-Reranker-0.6B",
+        f"{llm_models_root()}/Qwen3/Qwen3-Reranker-0.6B",
+        id="qwen3-reranker-0.6b",
+    ),
+    pytest.param(
+        "Qwen/Qwen3-Reranker-8B",
+        f"{llm_models_root()}/Qwen3/Qwen3-Reranker-8B",
+        marks=pytest.mark.skip_less_device_memory(32000),
+        id="qwen3-reranker-8b",
+    ),
+]
+
+RERANK_PAIRS = [
+    ("What is the capital of China?", "The capital of China is Beijing."),
+    ("What is gravity?", "Bananas grow in tropical climates."),
 ]
 
 # Encoder CUDA graph configs for parametrization. PROMPTS tokenize to short
@@ -228,6 +250,52 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
             torch.testing.assert_close(tllm_emb, hf_emb, rtol=1.5e-2, atol=1.5e-2)
             # Embeddings must be unit-norm.
             assert abs(tllm_emb.norm().item() - 1.0) < 1e-2
+
+    @pytest.mark.parametrize("model_name,model_path", RERANKER_MODELS)
+    def test_qwen3_reranker_matches_huggingface(self, model_name, model_path):
+        """Derived scalar head matches HF's last-token yes-minus-no logit."""
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        from tensorrt_llm.serve.reranker import format_qwen3_rerank_prompt
+
+        torch_dtype, llm_dtype = _resolve_checkpoint_dtype(model_path)
+        with (Path(model_path) / "1_LogitScore" / "config.json").open(
+            encoding="utf-8"
+        ) as config_file:
+            logit_score_config = json.load(config_file)
+        yes_token_id = logit_score_config["true_token_id"]
+        no_token_id = logit_score_config["false_token_id"]
+        prompts = [format_qwen3_rerank_prompt(query, document) for query, document in RERANK_PAIRS]
+
+        with LLM(
+            model_path,
+            encode_only=True,
+            dtype=llm_dtype,
+            model_kwargs={"architectures": ["Qwen3ForTextReranking"]},
+        ) as llm:
+            outputs = llm.encode(prompts)
+
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        hf_model = (
+            AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch_dtype).cuda().eval()
+        )
+
+        for index, prompt in enumerate(prompts):
+            with torch.inference_mode():
+                inputs = tokenizer(prompt, return_tensors="pt").to(hf_model.device)
+                hf_last = hf_model(**inputs, logits_to_keep=1).logits[0, -1].float().cpu()
+            hf_score = hf_last[yes_token_id] - hf_last[no_token_id]
+            trtllm_score = outputs[index].logits.flatten()[0].float().cpu()
+
+            torch.testing.assert_close(
+                trtllm_score,
+                hf_score,
+                rtol=1.5e-2,
+                atol=2.5e-1,
+                msg=lambda message: (
+                    f"[{model_name}] pair#{index} scalar logit mismatch\n{message}"
+                ),
+            )
 
 
 # --------------------------------------------------------------------------- #

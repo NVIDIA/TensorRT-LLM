@@ -43,6 +43,7 @@ The following is a table of supported models for the PyTorch backend:
 | `Qwen2ForRewardModel`                | Qwen2-based                        | `Qwen/Qwen2.5-Math-RM-72B`                   |
 | `Qwen3ForCausalLM`                   | Qwen3                              | `Qwen/Qwen3-8B`                              |
 | `Qwen3ForTextEmbedding`              | Qwen3-Embedding                    | `Qwen/Qwen3-Embedding-8B`                    |
+| `Qwen3ForTextReranking`              | Qwen3-Reranker                     | `Qwen/Qwen3-Reranker-8B`                     |
 | `Qwen3MoeForCausalLM`                | Qwen3MoE                           | `Qwen/Qwen3-30B-A3B`                         |
 | `Qwen3NextForCausalLM`               | Qwen3Next                          | `Qwen/Qwen3-Next-80B-A3B-Thinking`           |
 | `Qwen3_5MoeForCausalLM`              | Qwen3.8-MoE, Qwen3.5-MoE           | `Qwen/Qwen3.8-2.4T-A95B`, `Qwen/Qwen3.5-397B-A17B` |

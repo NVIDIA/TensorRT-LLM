@@ -102,6 +102,7 @@ MODEL_ARCH_TO_MODULE = {
     "Qwen2_5_VLForConditionalGeneration": "modeling_qwen2vl",
     "Qwen3ForCausalLM": "modeling_qwen3",
     "Qwen3ForTextEmbedding": "modeling_qwen3",
+    "Qwen3ForTextReranking": "modeling_qwen3",
     "Qwen3MoeForCausalLM": "modeling_qwen3_moe",
     "Qwen3NextForCausalLM": "modeling_qwen3_next",
     "Qwen3VLForConditionalGeneration": "modeling_qwen3vl",

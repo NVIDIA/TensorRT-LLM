@@ -32,8 +32,8 @@ import uuid
 from importlib.util import find_spec
 from pathlib import Path
 from types import FrameType
-from typing import (TYPE_CHECKING, Any, Dict, NamedTuple, NoReturn, Optional,
-                    Sequence, Set)
+from typing import (TYPE_CHECKING, Any, Dict, Literal, NamedTuple, NoReturn,
+                    Optional, Sequence, Set)
 
 import click
 import torch
@@ -776,6 +776,13 @@ _EMBEDDING_ARCH_MAP = {
     "Qwen3ForCausalLM": "Qwen3ForTextEmbedding",
 }
 
+# Qwen3-Reranker checkpoints declare their causal-LM architecture because they
+# are trained to answer yes or no. The rerank command supplies the serving
+# intent needed to select the scalar text-reranking wrapper.
+_RERANK_ARCH_MAP = {
+    "Qwen3ForCausalLM": "Qwen3ForTextReranking",
+}
+
 
 def _resolve_embedding_architecture_override(
         model: str,
@@ -820,6 +827,40 @@ def _resolve_embedding_architecture_override(
     return {"architectures": [target]}
 
 
+def _resolve_rerank_architecture_override(
+        model: str,
+        trust_remote_code: bool,
+        revision: Optional[str] = None) -> Optional[dict]:
+    """Route a published Qwen3-Reranker checkpoint to its scoring model."""
+    try:
+        from transformers import AutoConfig
+        hf_config = AutoConfig.from_pretrained(
+            model, trust_remote_code=trust_remote_code, revision=revision)
+        architectures = getattr(hf_config, "architectures", None) or []
+    except Exception as e:  # noqa: BLE001 - config read is best-effort
+        logger.warning(
+            f"Could not read model config for rerank routing ({model}): {e}")
+        return None
+
+    if not architectures:
+        return None
+    target = _RERANK_ARCH_MAP.get(architectures[0])
+    if target is None:
+        return None
+
+    if os.path.isdir(model):
+        score_config = os.path.join(model, "1_LogitScore", "config.json")
+        if not os.path.isfile(score_config):
+            logger.warning(
+                f"{model} maps to {target} but has no "
+                "1_LogitScore/config.json; proceeding with the standard "
+                "Qwen3-Reranker yes/no token IDs.")
+
+    logger.info(f"Rerank routing: overriding architecture "
+                f"{architectures[0]} -> {target}")
+    return {"architectures": [target]}
+
+
 def launch_embedding_server(
     host: str,
     port: int,
@@ -860,6 +901,43 @@ def launch_embedding_server(
     server = OpenAIServer(generator=llm,
                           model=model,
                           server_role=ServerRole.EMBEDDING,
+                          metadata_server_cfg=metadata_server_cfg,
+                          tool_parser=None,
+                          embedding_max_queue_delay=max_queue_delay,
+                          embedding_max_queue_size=max_queue_size)
+    asyncio.run(server(host, port))
+
+
+def launch_rerank_server(
+    host: str,
+    port: int,
+    llm_args: dict,
+    max_queue_delay: float,
+    max_queue_size: int,
+    metadata_server_cfg: Optional[MetadataServerConfig] = None,
+) -> None:
+    model = llm_args["model"]
+    llm_args.pop("build_config", None)
+    llm_args.pop("encode_only", None)
+
+    override = _resolve_rerank_architecture_override(
+        model, llm_args.get("trust_remote_code", False),
+        llm_args.get("revision"))
+    if override is not None:
+        model_kwargs = dict(llm_args.get("model_kwargs") or {})
+        if "architectures" in model_kwargs:
+            logger.info(
+                "Rerank routing: keeping user-supplied model_kwargs "
+                f"architectures={model_kwargs['architectures']} (auto-remap "
+                f"to {override['architectures']} suppressed).")
+        else:
+            model_kwargs["architectures"] = override["architectures"]
+        llm_args["model_kwargs"] = model_kwargs
+
+    llm = PyTorchLLM(encode_only=True, **llm_args)
+    server = OpenAIServer(generator=llm,
+                          model=model,
+                          server_role=ServerRole.RERANK,
                           metadata_server_cfg=metadata_server_cfg,
                           tool_parser=None,
                           embedding_max_queue_delay=max_queue_delay,
@@ -1771,6 +1849,64 @@ def serve_encoder(
         allow_request_chat_template=allow_request_chat_template)
 
 
+def _prepare_encode_only_llm_args(
+    *,
+    model: str,
+    max_batch_size: int,
+    max_num_tokens: int,
+    trust_remote_code: bool,
+    revision: Optional[str],
+    extra_llm_api_options: Optional[str],
+    telemetry: bool,
+    server_name: Literal["embeddings", "rerank"],
+) -> dict:
+    """Resolve shared LLM arguments for single-GPU encode-only servers."""
+    explicit_cli_keys = collect_explicit_cli_keys(exclude=("config", ))
+    llm_args, _ = get_llm_args(
+        model=model,
+        max_batch_size=max_batch_size,
+        max_num_tokens=max_num_tokens,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        tensor_parallel_size=1,
+        telemetry=telemetry,
+        explicit_cli_keys=explicit_cli_keys,
+    )
+
+    extra_dict = {}
+    if extra_llm_api_options is not None:
+        with open(extra_llm_api_options, "r", encoding="utf-8") as config_file:
+            extra_dict = yaml.safe_load(config_file)
+        if extra_dict is None:
+            extra_dict = {}
+        elif not isinstance(extra_dict, dict):
+            raise ValueError("Configuration file root must be a mapping.")
+
+    _command_telemetry.apply_raw_config_telemetry_opt_out(
+        extra_dict,
+        usage_context=_telemetry_config.UsageContext.CLI_SERVE,
+        component="server",
+        explicit_cli_telemetry="telemetry" in explicit_cli_keys,
+    )
+    llm_args = update_llm_args_with_extra_dict(
+        llm_args, extra_dict, explicit_cli_keys=explicit_cli_keys)
+    _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
+
+    effective_tp = llm_args.get("tensor_parallel_size") or 1
+    effective_pp = llm_args.get("pipeline_parallel_size") or 1
+    effective_cp = llm_args.get("context_parallel_size") or 1
+    if effective_tp > 1 or effective_pp > 1 or effective_cp > 1:
+        raise click.BadParameter(
+            f"The {server_name} server is single-GPU only; multi-GPU "
+            "(TP/PP/CP) is not supported yet. Got "
+            f"tensor_parallel_size={effective_tp}, "
+            f"pipeline_parallel_size={effective_pp}, "
+            f"context_parallel_size={effective_cp} from --config.",
+            param_hint="config")
+
+    return llm_args
+
+
 @click.command("embeddings")
 @click.argument("model", type=str)
 @click.option("--host",
@@ -1855,58 +1991,117 @@ def serve_embedding(
     """
     logger.set_level(log_level)
 
-    explicit_cli_keys = collect_explicit_cli_keys(exclude=("config", ))
-
-    # Single-GPU, encode-only: tensor_parallel_size is fixed to 1 and not exposed as a
-    # flag (the in-process encode path has no multi-GPU worker proxy). gpus_per_node is
-    # auto-detected by get_llm_args; free_gpu_memory_fraction is omitted because the
-    # encode path allocates no KV cache. All remain settable via --config if needed.
-    llm_args, _ = get_llm_args(model=model,
-                               max_batch_size=max_batch_size,
-                               max_num_tokens=max_num_tokens,
-                               trust_remote_code=trust_remote_code,
-                               revision=revision,
-                               tensor_parallel_size=1,
-                               telemetry=telemetry,
-                               explicit_cli_keys=explicit_cli_keys)
-
-    extra_dict = {}
-    if extra_llm_api_options is not None:
-        with open(extra_llm_api_options, 'r') as f:
-            extra_dict = yaml.safe_load(f)
-        if extra_dict is None:
-            extra_dict = {}
-        elif not isinstance(extra_dict, dict):
-            raise ValueError("Configuration file root must be a mapping.")
-    _command_telemetry.apply_raw_config_telemetry_opt_out(
-        extra_dict,
-        usage_context=_telemetry_config.UsageContext.CLI_SERVE,
-        component="server",
-        explicit_cli_telemetry="telemetry" in explicit_cli_keys,
+    llm_args = _prepare_encode_only_llm_args(
+        model=model,
+        max_batch_size=max_batch_size,
+        max_num_tokens=max_num_tokens,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        extra_llm_api_options=extra_llm_api_options,
+        telemetry=telemetry,
+        server_name="embeddings",
     )
-    llm_args = update_llm_args_with_extra_dict(
-        llm_args, extra_dict, explicit_cli_keys=explicit_cli_keys)
-
-    _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
-
-    # The CLI does not expose TP/PP/CP, but a --config YAML could still set them. Reject
-    # that explicitly rather than hang: the in-process encode-only path cannot shard.
-    effective_tp = llm_args.get("tensor_parallel_size") or 1
-    effective_pp = llm_args.get("pipeline_parallel_size") or 1
-    effective_cp = llm_args.get("context_parallel_size") or 1
-    if effective_tp > 1 or effective_pp > 1 or effective_cp > 1:
-        raise click.BadParameter(
-            "The embeddings server is single-GPU only; multi-GPU (TP/PP/CP) is not "
-            f"supported yet. Got tensor_parallel_size={effective_tp}, "
-            f"pipeline_parallel_size={effective_pp}, "
-            f"context_parallel_size={effective_cp} from --config.",
-            param_hint="config")
 
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
 
     launch_embedding_server(host, port, llm_args, max_queue_delay,
                             max_queue_size, metadata_server_cfg)
+
+
+@click.command("rerank")
+@click.argument("model", type=str)
+@click.option("--host",
+              type=str,
+              default="localhost",
+              help="Hostname of the server.")
+@click.option("--port", type=int, default=8000, help="Port of the server.")
+@click.option('--log_level',
+              type=click.Choice(severity_map.keys()),
+              default='info',
+              help="The logging level.")
+@click.option("--max_batch_size",
+              type=int,
+              default=_LLM_ARGS_FIELDS["max_batch_size"].default,
+              help="Maximum batch size coalesced into a single encode() call.")
+@click.option(
+    "--max_num_tokens",
+    type=int,
+    default=8192,
+    help="Maximum number of batched input tokens in each encode() call.")
+@click.option(
+    "--max_queue_delay",
+    type=click.FloatRange(min=0.0),
+    default=0.005,
+    help="Dynamic-batching hold window in seconds: how long an incoming request "
+    "waits for others to join its batch before being dispatched.")
+@click.option(
+    "--max_queue_size",
+    type=click.IntRange(min=1),
+    default=2048,
+    help="Maximum number of in-flight queued requests; further requests are "
+    "rejected with HTTP 429.")
+@click.option("--trust_remote_code",
+              is_flag=True,
+              default=False,
+              help="Flag for HF transformers.")
+@click.option(
+    "--config",
+    "--extra_llm_api_options",
+    "extra_llm_api_options",
+    type=str,
+    default=None,
+    help="Path to a YAML configuration file. Explicit CLI flags take precedence "
+    "over values in this file.")
+@click.option("--hf_revision",
+              "--revision",
+              "revision",
+              type=str,
+              default=None,
+              help="The revision to use for the HuggingFace model "
+              "(branch name, tag name, or commit id).")
+@click.option("--metadata_server_config_file",
+              type=str,
+              default=None,
+              help="Path to metadata server config file")
+@click.option("--telemetry/--no-telemetry",
+              default=True,
+              help="Enable or disable anonymous usage telemetry collection.")
+def serve_rerank(
+    model: str,
+    host: str,
+    port: int,
+    log_level: str,
+    max_batch_size: int,
+    max_num_tokens: int,
+    max_queue_delay: float,
+    max_queue_size: int,
+    trust_remote_code: bool,
+    extra_llm_api_options: Optional[str],
+    revision: Optional[str],
+    metadata_server_config_file: Optional[str],
+    telemetry: bool,
+) -> None:
+    """Run a /rerank, /v1/rerank, and /v2/rerank server.
+
+    MODEL: model name | HF checkpoint path
+    """
+    logger.set_level(log_level)
+    llm_args = _prepare_encode_only_llm_args(
+        model=model,
+        max_batch_size=max_batch_size,
+        max_num_tokens=max_num_tokens,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        extra_llm_api_options=extra_llm_api_options,
+        telemetry=telemetry,
+        server_name="rerank",
+    )
+
+    metadata_server_cfg = parse_metadata_server_config_file(
+        metadata_server_config_file)
+    launch_rerank_server(host, port, llm_args, max_queue_delay, max_queue_size,
+                         metadata_server_cfg)
 
 
 @click.command("disaggregated")
@@ -2745,7 +2940,8 @@ main = DefaultGroup(
         "disaggregated": disaggregated,
         "disaggregated_mpi_worker": disaggregated_mpi_worker,
         "mm_embedding_serve": serve_encoder,
-        "embeddings": serve_embedding
+        "embeddings": serve_embedding,
+        "rerank": serve_rerank,
     })
 
 if __name__ == "__main__":

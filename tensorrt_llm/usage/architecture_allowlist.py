@@ -98,6 +98,7 @@ PUBLIC_HF_ARCHITECTURES = frozenset(
         "Qwen2_5_VLForConditionalGeneration",
         "Qwen3ForCausalLM",
         "Qwen3ForTextEmbedding",
+        "Qwen3ForTextReranking",
         "Qwen3MoeForCausalLM",
         "Qwen3NextForCausalLM",
         "Qwen3VLForConditionalGeneration",

@@ -100,6 +100,8 @@ from tensorrt_llm.serve.openai_protocol import (
     EmbeddingResponse, EmbeddingResponseData, EmbeddingUsageInfo, ErrorResponse,
     ImageEditRequest, ImageGenerationRequest, ImageGenerationResponse,
     ImageObject, MemoryUpdateRequest, ModelCard, ModelList, PromptTokensDetails,
+    RerankDocument, RerankRequest, RerankResponse, RerankResult,
+    RerankUsageInfo, RerankV2Request, RerankV2Response, RerankV2Result,
     ResponseFormat, ResponsesRequest, ResponsesResponse, StartProfileRequest,
     StreamOptions, TokenizeRequest, TokenizeResponse, UpdateWeightsRequest,
     UsageInfo, ensure_request_chat_template_allowed, to_llm_conversation_params,
@@ -115,6 +117,8 @@ from tensorrt_llm.serve.postprocess_handlers import (
     chat_stream_post_processor, completion_response_post_processor,
     completion_stream_post_processor, responses_api_post_processor,
     responses_api_streaming_post_processor)
+from tensorrt_llm.serve.reranker import (build_qwen3_rerank_input,
+                                         rerank_probability)
 from tensorrt_llm.serve.responses_utils import (ConversationHistoryStore,
                                                 ResponsesStreamingProcessor,
                                                 ServerArrivalTimeMiddleware)
@@ -729,9 +733,11 @@ class OpenAIServer(_VideoRoutesMixin):
 
         self.generator = generator
         self._is_visual_gen = _is_visual_gen_instance(generator)
-        self._embedding_max_queue_delay = embedding_max_queue_delay
-        self._embedding_max_queue_size = embedding_max_queue_size
-        self.embedding_batcher: Optional[EncodeBatcher] = None
+        # Keep the established embedding_* constructor keywords for API
+        # compatibility; the underlying batcher is shared by encode-only roles.
+        self._encode_max_queue_delay = embedding_max_queue_delay
+        self._encode_max_queue_size = embedding_max_queue_size
+        self.encode_batcher: Optional[EncodeBatcher] = None
         self.tool_parser = tool_parser
         self.metadata_server = create_metadata_server(metadata_server_cfg)
         self.disagg_cluster_config = disagg_cluster_config
@@ -759,10 +765,8 @@ class OpenAIServer(_VideoRoutesMixin):
         self.host = None
         self.port = None
 
-        # Dedicated thread pools for the chat / completion path. Keeping
-        # multimodal preprocessing and decode work off the asyncio default
-        # executor avoids contention with unrelated `to_thread` callers and
-        # lets the two stages be sized independently.
+        # Dedicated thread pools keep input and multimodal preprocessing off
+        # the asyncio default executor and let the stages be sized independently.
         self._input_proc_executor = ThreadPoolExecutor(
             max_workers=input_processor_workers,
             thread_name_prefix="trtllm_inputproc",
@@ -885,17 +889,17 @@ class OpenAIServer(_VideoRoutesMixin):
                     logger.info(
                         "Started background iteration stats collector task")
 
-            # Start the encode dynamic batcher (embedding server only). It must be
-            # started inside the running event loop, hence here rather than __init__.
-            if self.embedding_batcher is not None:
-                await self.embedding_batcher.start()
+            # The encode batcher must start inside the running event loop,
+            # hence here rather than __init__.
+            if self.encode_batcher is not None:
+                await self.encode_batcher.start()
                 logger.info("Started encode dynamic batcher")
 
             yield
 
             await self._perf_metrics_writer.close()
-            if self.embedding_batcher is not None:
-                await self.embedding_batcher.shutdown()
+            if self.encode_batcher is not None:
+                await self.encode_batcher.shutdown()
                 logger.info("Stopped encode dynamic batcher")
 
             # Stop background iteration stats collector
@@ -947,12 +951,15 @@ class OpenAIServer(_VideoRoutesMixin):
                 self.generator, MultimodalEncoder
             ), "generator must be a MultimodalEncoder for multimodal encoder"
             self.register_mm_encoder_routes()
-        elif self.server_role is ServerRole.EMBEDDING:
+        elif self.server_role in (ServerRole.EMBEDDING, ServerRole.RERANK):
             assert getattr(self.generator.args, "encode_only", False), (
-                "generator must be an encode_only=True LLM for the embedding "
-                "server")
-            self._init_embedding_batcher()
-            self.register_embedding_routes()
+                "generator must be an encode_only=True LLM for an embedding "
+                "or rerank server")
+            self._init_encode_batcher()
+            if self.server_role is ServerRole.EMBEDDING:
+                self.register_embedding_routes()
+            else:
+                self.register_rerank_routes()
         else:
             self.register_routes()
 
@@ -1329,10 +1336,10 @@ class OpenAIServer(_VideoRoutesMixin):
         )
 
     def _check_health(self) -> bool:
-        # An embedding server's requests flow through the batcher worker; if it
-        # has exited the engine is up but every /v1/embeddings request hangs, so
+        # Encode-only requests flow through the batcher worker; if it has
+        # exited the engine is up but every embedding/rerank request hangs, so
         # report unhealthy rather than a misleading 200.
-        batcher = self.embedding_batcher
+        batcher = self.encode_batcher
         if batcher is not None and not batcher.is_alive():
             return False
         if hasattr(self.generator, '_check_health'):
@@ -1523,11 +1530,11 @@ class OpenAIServer(_VideoRoutesMixin):
                                methods=["POST"],
                                dependencies=dependencies)
 
-    def _init_embedding_batcher(self):
-        """Create the encode dynamic batcher for the embedding server.
+    def _init_encode_batcher(self):
+        """Create the dynamic batcher shared by encode-only servers.
 
-        The batcher coalesces concurrent /v1/embeddings requests into a single
-        `llm.encode()` call. `encode()` is synchronous; the batcher runs it in
+        The batcher coalesces concurrent requests into a single `llm.encode()`
+        call. `encode()` is synchronous; the batcher runs it in
         the default executor so the event loop stays responsive.
         """
 
@@ -1543,11 +1550,11 @@ class OpenAIServer(_VideoRoutesMixin):
         # would leave the batcher's seq-len/token-budget guards inert (typed 400s
         # would never fire) and could let it form a batch encode() then rejects.
         engine = self.generator._encoder_executor.model_engine
-        self.embedding_batcher = EncodeBatcher(
+        self.encode_batcher = EncodeBatcher(
             encode_fn,
             max_batch_size=engine.batch_size,
-            max_queue_delay=self._embedding_max_queue_delay,
-            max_queue_size=self._embedding_max_queue_size,
+            max_queue_delay=self._encode_max_queue_delay,
+            max_queue_size=self._encode_max_queue_size,
             max_num_tokens=engine.max_num_tokens,
             max_seq_len=engine.max_seq_len,
         )
@@ -1620,9 +1627,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 # cancels the awaiters but their already-queued inputs still run
                 # encode() (wasted GPU work).
                 for token_ids in token_ids_list:
-                    self.embedding_batcher.validate_input(token_ids)
+                    self.encode_batcher.validate_input(token_ids)
                 results = await asyncio.gather(*[
-                    self.embedding_batcher.submit(token_ids)
+                    self.encode_batcher.submit(token_ids)
                     for token_ids in token_ids_list
                 ])
             except InputTooLongError as e:
@@ -1657,6 +1664,114 @@ class OpenAIServer(_VideoRoutesMixin):
                 str(e),
                 err_type="InternalServerError",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def register_rerank_routes(self) -> None:
+        self.app.add_api_route("/health", self.health, methods=["GET"])
+        self.app.add_api_route("/version", self.version, methods=["GET"])
+        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
+        self.app.add_api_route("/rerank", self.rerank, methods=["POST"])
+        self.app.add_api_route("/v1/rerank", self.rerank, methods=["POST"])
+        self.app.add_api_route("/v2/rerank", self.rerank_v2, methods=["POST"])
+
+    async def _rerank(self,
+                      request: RerankRequest | RerankV2Request) -> Response:
+        try:
+            if (isinstance(request, RerankV2Request) and request.priority != 0):
+                return self.create_error_response(
+                    "Only priority=0 is currently supported by the rerank "
+                    "server.",
+                    status_code=HTTPStatus.BAD_REQUEST)
+
+            documents = [
+                doc if isinstance(doc, str) else doc.text
+                for doc in request.documents
+            ]
+            engine = self.generator._encoder_executor.model_engine
+            max_prompt_length = min(engine.max_seq_len, engine.max_num_tokens)
+            loop = asyncio.get_running_loop()
+            try:
+                token_ids_list = await asyncio.gather(*[
+                    loop.run_in_executor(
+                        self._input_proc_executor,
+                        functools.partial(
+                            build_qwen3_rerank_input,
+                            tokenizer=self.tokenizer,
+                            query=request.query,
+                            document=document,
+                            max_seq_len=max_prompt_length,
+                            instruction=request.instruction,
+                            max_tokens_per_doc=request.max_tokens_per_doc))
+                    for document in documents
+                ])
+            except ValueError as e:
+                return self.create_error_response(
+                    str(e), status_code=HTTPStatus.BAD_REQUEST)
+
+            try:
+                for token_ids in token_ids_list:
+                    self.encode_batcher.validate_input(token_ids)
+                outputs = await asyncio.gather(*[
+                    self.encode_batcher.submit(token_ids)
+                    for token_ids in token_ids_list
+                ])
+            except InputTooLongError as e:
+                return self.create_error_response(
+                    str(e), status_code=HTTPStatus.BAD_REQUEST)
+            except QueueFullError as e:
+                return self.create_error_response(
+                    str(e), status_code=HTTPStatus.TOO_MANY_REQUESTS)
+
+            scored = []
+            for index, output in enumerate(outputs):
+                logits = output.logits.flatten()
+                if logits.numel() != 1:
+                    raise RuntimeError(
+                        "Reranker model must return exactly one logit per "
+                        f"document; got shape {tuple(output.logits.shape)}.")
+                score = rerank_probability(float(logits.item()))
+                scored.append((index, score))
+            scored.sort(key=lambda item: item[1], reverse=True)
+            if request.top_n is not None and request.top_n > 0:
+                scored = scored[:request.top_n]
+
+            if isinstance(request, RerankV2Request):
+                response = RerankV2Response(results=[
+                    RerankV2Result(index=index, relevance_score=score)
+                    for index, score in scored
+                ])
+                return JSONResponse(content=response.model_dump())
+
+            results = []
+            for index, score in scored:
+                document = (RerankDocument(text=documents[index])
+                            if request.return_documents else None)
+                results.append(
+                    RerankResult(index=index,
+                                 relevance_score=score,
+                                 document=document))
+            prompt_tokens = sum(len(token_ids) for token_ids in token_ids_list)
+            response = RerankResponse(model=request.model or self.model,
+                                      results=results,
+                                      usage=RerankUsageInfo(
+                                          prompt_tokens=prompt_tokens,
+                                          total_tokens=prompt_tokens))
+            return JSONResponse(content=response.model_dump(exclude_none=True))
+        except Exception as e:
+            logger.error(traceback.format_exc())
+            return self.create_error_response(
+                str(e),
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    async def rerank(self, request: RerankRequest,
+                     raw_request: Request) -> Response:
+        del raw_request
+        return await self._rerank(request)
+
+    async def rerank_v2(self, request: RerankV2Request,
+                        raw_request: Request) -> Response:
+        del raw_request
+        return await self._rerank(request)
 
     def register_visual_gen_routes(self):
         """Register routes for diffusion model serving."""
