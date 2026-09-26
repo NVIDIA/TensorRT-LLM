@@ -94,6 +94,38 @@ TEXT_EMBEDDING_MODELS = [
     ),
 ]
 
+# Qwen3-Reranker family. All variants are Qwen3ForCausalLM + a cross-encoder
+# yes/no-logit-diff scoring pipeline; one wrapper class (Qwen3ForTextReranking)
+# serves all sizes. We cover both 0.6B (small/fast) and 8B (the large variant
+# downstream users actually serve); 8B is memory-gated so it skips on small GPUs.
+# The CI L0 list selects each variant by its `id=` below
+# (tests/integration/test_lists/test-db/l0_l40s.yml) — the ids must stay in sync
+# with that list or CI silently drops the test.
+TEXT_RERANKING_MODELS = [
+    pytest.param(
+        "Qwen/Qwen3-Reranker-0.6B",
+        f"{llm_models_root()}/Qwen3/Qwen3-Reranker-0.6B",
+        id="qwen3-reranker-0.6b",
+    ),
+    pytest.param(
+        "Qwen/Qwen3-Reranker-8B",
+        f"{llm_models_root()}/Qwen3/Qwen3-Reranker-8B",
+        marks=pytest.mark.skip_less_device_memory(32000),
+        id="qwen3-reranker-8b",
+    ),
+]
+
+# (query, document) pairs covering a clear match, a clear mismatch, and a
+# different topic, so the yes/no logit diff is exercised in both directions.
+RERANK_PAIRS = [
+    ("What is the capital of France?",
+     "Paris is the capital and most populous city of France."),
+    ("What is the capital of France?", "Berlin is the capital of Germany."),
+    ("How do plants make energy?",
+     "Photosynthesis is the process by which plants convert light energy "
+     "into chemical energy."),
+]
+
 # Encoder CUDA graph configs for parametrization. PROMPTS tokenize to short
 # (~6-12 token) sequences, so we only need buckets that cover that range plus
 # one small/larger pair to exercise dispatch + padding. Larger grids inflate
@@ -228,6 +260,65 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
             torch.testing.assert_close(tllm_emb, hf_emb, rtol=1.5e-2, atol=1.5e-2)
             # Embeddings must be unit-norm.
             assert abs(tllm_emb.norm().item() - 1.0) < 1e-2
+
+    @pytest.mark.parametrize("model_name,model_path", TEXT_RERANKING_MODELS)
+    def test_qwen3_reranking_matches_huggingface(self, model_name, model_path):
+        """Cross-encoder reranking score (yes_logit - no_logit) vs HF.
+
+        Builds the Qwen3-Reranker prompt with the same
+        `build_rerank_prompt_token_ids` helper the `/rerank` server uses, so
+        both TRT-LLM and the HF reference score the exact same token ids —
+        isolating the check to the scoring math (Qwen3ForTextReranking's
+        last-token lm_head projection + yes/no logit diff), not prompt
+        construction.
+        """
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        from tensorrt_llm.serve.rerank_utils import \
+            build_rerank_prompt_token_ids
+
+        torch_dtype, llm_dtype = _resolve_checkpoint_dtype(model_path)
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        token_true_id = tokenizer.convert_tokens_to_ids("yes")
+        token_false_id = tokenizer.convert_tokens_to_ids("no")
+
+        token_ids_list = [
+            build_rerank_prompt_token_ids(tokenizer,
+                                          query,
+                                          document,
+                                          max_seq_len=4096)
+            for query, document in RERANK_PAIRS
+        ]
+
+        # Force the reranking wrapper class (the model's config declares
+        # Qwen3ForCausalLM) and inject the tokenizer-resolved yes/no ids,
+        # mirroring what the `rerank` serve command does at startup.
+        with LLM(
+                model_path,
+                encode_only=True,
+                dtype=llm_dtype,
+                model_kwargs={
+                    "architectures": ["Qwen3ForTextReranking"],
+                    "reranking_token_true_id": token_true_id,
+                    "reranking_token_false_id": token_false_id,
+                },
+        ) as llm:
+            outs = llm.encode(token_ids_list)
+
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            model_path, torch_dtype=torch_dtype).cuda().eval()
+
+        for i, (query, document) in enumerate(RERANK_PAIRS):
+            with torch.inference_mode():
+                ids = torch.tensor([token_ids_list[i]]).to(hf_model.device)
+                hf_logits = hf_model(ids).logits[0, -1].float().cpu()
+            hf_score = (hf_logits[token_true_id] -
+                       hf_logits[token_false_id]).item()
+
+            tllm_score = outs[i].logits.cpu().float().item()
+            assert tllm_score == pytest.approx(hf_score, rel=1e-2, abs=1e-2), (
+                f"[{model_name}] pair#{i} ({query!r}, {document!r}) "
+                f"TLLM score={tllm_score} != HF score={hf_score}")
 
 
 # --------------------------------------------------------------------------- #
