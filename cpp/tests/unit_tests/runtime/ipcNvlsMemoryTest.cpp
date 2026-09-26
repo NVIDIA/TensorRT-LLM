@@ -28,8 +28,8 @@ namespace
 #if ENABLE_MULTI_DEVICE
 // Recompute the static NVLS multicast capability exactly as ipcNvlsSupported()
 // must: CUDA driver >= 12010 and CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED on the
-// device. Deliberately does NO fabric/IMEX probe -- that is what
-// ipcNvlsFabricUsable() adds on top.
+// device. Deliberately does NO fabric-state check -- that is what
+// ipcNvlsUsable() adds on top.
 bool computeStaticNvlsCapability()
 {
     int driverVersion = -1;
@@ -79,7 +79,7 @@ protected:
 // PR #15302 folded a fabric probe into ipcNvlsSupported(), which on a
 // multicast-capable but fabric-unprovisioned node made it return false. That
 // wrongly disabled the single-node NVLS allocator (ipcNvlsAllocate) and fused
-// GEMM-allreduce. The fabric probe now lives in ipcNvlsFabricUsable(); if it
+// GEMM-allreduce. The fabric-state check now lives in ipcNvlsUsable(); if it
 // leaks back into ipcNvlsSupported() this assertion fails on such nodes.
 TEST_F(IpcNvlsMemoryTest, SupportedReflectsStaticCapabilityOnly)
 {
@@ -88,12 +88,13 @@ TEST_F(IpcNvlsMemoryTest, SupportedReflectsStaticCapabilityOnly)
 #endif // ENABLE_MULTI_DEVICE
 }
 
-// Fabric usability is a strict refinement of static capability, so it must
-// never be reported as usable when NVLS is not even statically supported.
-TEST_F(IpcNvlsMemoryTest, FabricUsableImpliesSupported)
+// Usability (static capability + configured NVLink fabric) is a strict
+// refinement of static capability, so it must never be reported as usable
+// when NVLS is not even statically supported.
+TEST_F(IpcNvlsMemoryTest, UsableImpliesSupported)
 {
 #if ENABLE_MULTI_DEVICE
-    if (tr::ipcNvlsFabricUsable())
+    if (tr::ipcNvlsUsable())
     {
         EXPECT_TRUE(tr::ipcNvlsSupported());
     }
