@@ -22,8 +22,9 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
-                                 is_sm_100f, prefer_pinned,
-                                 str_dtype_to_binding, torch_dtype_to_str)
+                                 is_device_integrated, is_sm_100f,
+                                 prefer_pinned, str_dtype_to_binding,
+                                 torch_dtype_to_str)
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 # isort: off
@@ -1369,6 +1370,11 @@ class KvCacheCreator:
         free_mem, _ = torch.cuda.mem_get_info()
         max_memory = self._kv_cache_config.free_gpu_memory_fraction * free_mem
         kv_size_per_token = self._get_kv_size_per_token()
+        if kv_size_per_token.intercept > 0 and is_device_integrated():
+            # Unified-memory free-memory counters can include mmap-backed weights.
+            # Relax only the provisional dry-run cap; final affine sizing remains
+            # unchanged.
+            kv_size_per_token = CacheCost(slope=kv_size_per_token.slope)
         max_num_tokens_in_memory = (
             kv_size_per_token.tokens_for_budget(max_memory) //
             self._tokens_per_block * self._tokens_per_block)
