@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import io
 import json
 import shutil
 import sqlite3
@@ -86,46 +87,84 @@ artifact = _load_artifact()
 cbts_main = _load_main()
 
 
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+        timeout=120,
+    ).stdout.strip()
+
+
 class CoverageArtifactTest(unittest.TestCase):
-    def test_selects_closest_complete_ancestor_pair(self) -> None:
-        commits = {104: "newer", 102: "older-three", 101: "older-one"}
+    def test_patch_apply_status_detects_clean_and_conflicting_diffs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir)
+            _git(repo, "init")
+            _git(repo, "config", "user.email", "cbts@example.com")
+            _git(repo, "config", "user.name", "CBTS Test")
+            source = repo / "source.py"
+            waives = repo / "waives.txt"
+            source.write_text("first\nbase\nlast\n")
+            waives.write_text("base\n")
+            _git(repo, "add", "source.py", "waives.txt")
+            _git(repo, "commit", "-m", "base")
+            base = _git(repo, "rev-parse", "HEAD")
 
-        def exists(url: str) -> bool:
-            if "/103/" in url:
-                return url.endswith("cbts_pystart_report_x86_64.tar.gz")
-            return "/100/" not in url
+            _git(repo, "checkout", "-b", "pr")
+            source.write_text("first\npr\nlast\n")
+            waives.write_text("pr\n")
+            _git(repo, "commit", "-am", "pr")
+            head = _git(repo, "rev-parse", "HEAD")
 
-        relations = {
-            "newer": (1, "behind"),
-            "older-three": (3, "ahead"),
-            "older-one": (1, "ahead"),
-        }
-        with (
-            mock.patch.object(artifact, "latest_build_number", return_value=104),
-            mock.patch.object(artifact, "_exists", side_effect=exists),
-            mock.patch.object(
-                artifact, "build_commit", side_effect=lambda build, _base: commits[build]
-            ),
-            mock.patch.object(
-                artifact, "drift", side_effect=lambda commit, _base: relations[commit]
-            ),
-            mock.patch.object(artifact, "compare_distance", return_value=7) as lag,
-        ):
-            selected = artifact.select_tarball(
-                "pr-base", artifact_base="coverage", jenkins_base="jenkins", max_probe=5
+            _git(repo, "checkout", "-b", "db-clean", base)
+            (repo / "other.py").write_text("coverage revision\n")
+            _git(repo, "add", "other.py")
+            _git(repo, "commit", "-m", "non-conflicting db")
+            clean_db = _git(repo, "rev-parse", "HEAD")
+
+            _git(repo, "checkout", "-b", "db-conflict", base)
+            source.write_text("first\ndb\nlast\n")
+            _git(repo, "commit", "-am", "conflicting db")
+            conflicting_db = _git(repo, "rev-parse", "HEAD")
+
+            _git(repo, "checkout", "-b", "db-irrelevant-conflict", base)
+            waives.write_text("db\n")
+            _git(repo, "commit", "-am", "conflicting non-residual file")
+            irrelevant_conflict_db = _git(repo, "rev-parse", "HEAD")
+            _git(repo, "checkout", "pr")
+
+            self.assertEqual(
+                artifact._patch_apply_status(base, head, clean_db, repo, str(repo)), "clean"
             )
-
-        self.assertIsNotNone(selected)
-        assert selected is not None
-        self.assertEqual(selected["build"], 101)
-        self.assertEqual(selected["commit"], "older-one")
-        self.assertEqual(selected["drift"], 1)
-        self.assertEqual(selected["drift_status"], "ahead")
-        self.assertEqual(
-            [url.rsplit("/", 1)[-1] for url in selected["urls"]],
-            list(artifact.ARCH_TARBALL_NAMES),
-        )
-        lag.assert_called_once_with("older-one")
+            self.assertEqual(
+                artifact._patch_apply_status(base, head, conflicting_db, repo, str(repo)),
+                "conflict",
+            )
+            self.assertEqual(
+                artifact._patch_apply_status(
+                    base,
+                    head,
+                    irrelevant_conflict_db,
+                    repo,
+                    str(repo),
+                    ["source.py"],
+                ),
+                "clean",
+            )
+            self.assertEqual(
+                artifact._patch_apply_status(
+                    base,
+                    head,
+                    irrelevant_conflict_db,
+                    repo,
+                    str(repo),
+                    ["waives.txt"],
+                ),
+                "conflict",
+            )
 
     def test_accepts_artifact_collected_at_pr_base(self) -> None:
         with (
@@ -141,6 +180,191 @@ class CoverageArtifactTest(unittest.TestCase):
         assert selected is not None
         self.assertEqual(selected["drift"], 0)
         self.assertEqual(selected["drift_status"], "identical")
+
+    def test_select_build_resolves_explicit_pinned_build(self) -> None:
+        with (
+            mock.patch.object(artifact, "_exists", return_value=True),
+            mock.patch.object(artifact, "build_commit", return_value="coverage-commit"),
+            mock.patch.object(artifact, "drift", return_value=(3, "behind")),
+            mock.patch.object(artifact, "compare_distance", return_value=7),
+        ):
+            selected = artifact.select_build(42, "pr-base")
+
+        self.assertIsNotNone(selected)
+        assert selected is not None
+        self.assertEqual(selected["build"], 42)
+        self.assertEqual(selected["commit"], "coverage-commit")
+        self.assertEqual(selected["base_commit"], "pr-base")
+        self.assertEqual(selected["drift"], 3)
+
+    def test_select_build_rejects_changed_pinned_commit(self) -> None:
+        with (
+            mock.patch.object(artifact, "_exists", return_value=True),
+            mock.patch.object(artifact, "build_commit", return_value="replacement-commit"),
+            mock.patch.object(artifact, "drift") as drift,
+        ):
+            selected = artifact.select_build(
+                42,
+                "pr-base",
+                expected_commit="pinned-commit",
+            )
+
+        self.assertIsNone(selected)
+        drift.assert_not_called()
+
+    def test_resolve_pin_reuses_matching_artifactory_pin(self) -> None:
+        commit = "a" * 40
+        pin = {
+            "version": artifact.PIN_VERSION,
+            "pr_number": "18802",
+            "pr_head": "b" * 40,
+            "coverage_db_build": 42,
+            "coverage_db_commit": commit,
+        }
+        with (
+            mock.patch.object(artifact, "_get", return_value=(200, json.dumps(pin).encode())),
+            mock.patch.object(artifact, "select_tarball") as select_latest,
+        ):
+            plan = artifact.resolve_pin(
+                "unused.json",
+                "18802",
+                "b" * 40,
+                "pr-base",
+            )
+
+        self.assertEqual(
+            plan,
+            {
+                "status": "ready",
+                "build": 42,
+                "commit": commit,
+                "pin_upload_required": False,
+            },
+        )
+        select_latest.assert_not_called()
+
+    def test_resolve_pin_creates_file_for_jenkins_upload(self) -> None:
+        commit = "a" * 40
+        selection = {"build": 42, "commit": commit}
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            mock.patch.object(artifact, "_get", return_value=(404, None)),
+            mock.patch.object(artifact, "select_tarball", return_value=selection),
+        ):
+            pin_path = Path(temp_dir) / artifact.PIN_NAME
+            plan = artifact.resolve_pin(
+                str(pin_path),
+                "18802",
+                "b" * 40,
+                "pr-base",
+            )
+            pin = json.loads(pin_path.read_text())
+
+        self.assertEqual(pin["coverage_db_build"], 42)
+        self.assertEqual(pin["coverage_db_commit"], commit)
+        self.assertTrue(plan["pin_upload_required"])
+        self.assertEqual(plan["pin_path"], str(pin_path))
+        self.assertEqual(
+            plan["pin_target"],
+            f"{artifact.PIN_BASE}/18802/{'b' * 40}/",
+        )
+
+    def test_resolve_pin_declines_invalid_or_unavailable_pin(self) -> None:
+        with mock.patch.object(artifact, "_get", return_value=(200, b"{}")):
+            invalid = artifact.resolve_pin("unused.json", "18802", "b" * 40, "pr-base")
+        with mock.patch.object(artifact, "_get", return_value=(None, None)):
+            unavailable = artifact.resolve_pin("unused.json", "18802", "b" * 40, "pr-base")
+
+        self.assertEqual(invalid["status"], "declined")
+        self.assertIn("invalid coverage DB pin", invalid["decline_reason"])
+        self.assertEqual(unavailable["status"], "declined")
+        self.assertIn("pin query failed", unavailable["decline_reason"])
+
+    def test_resolve_pin_cli_prints_upload_plan(self) -> None:
+        plan = {
+            "status": "ready",
+            "build": 42,
+            "commit": "a" * 40,
+            "pin_upload_required": True,
+        }
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(artifact, "merge_base", return_value="c" * 40),
+            mock.patch.object(artifact, "resolve_pin", return_value=plan) as resolve_pin,
+            mock.patch("sys.stdout", stdout),
+        ):
+            status = artifact.main(
+                [
+                    "--resolve-pin",
+                    "cbts_db_pin.json",
+                    "--pr-number",
+                    "18802",
+                    "--pr-head",
+                    "b" * 40,
+                ]
+            )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), plan)
+        resolve_pin.assert_called_once_with(
+            "cbts_db_pin.json",
+            "18802",
+            "b" * 40,
+            "c" * 40,
+        )
+
+    def test_resolve_build_prints_metadata_without_residual_paths(self) -> None:
+        selection = {
+            "build": 42,
+            "commit": "coverage-commit",
+            "base_commit": "pr-base",
+        }
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(artifact, "merge_base", return_value="pr-base"),
+            mock.patch.object(artifact, "select_tarball", return_value=selection),
+            mock.patch("sys.stdout", stdout),
+        ):
+            status = artifact.main(["--resolve-build", "--pr-head", "pr-head"])
+
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), selection)
+
+    def test_prepare_uses_explicit_pinned_build(self) -> None:
+        selection = {
+            "url": "x86-url",
+            "urls": ["x86-url", "sbsa-url"],
+            "build": 42,
+            "commit": "coverage-commit",
+            "base_commit": "pr-base",
+            "drift": 2,
+            "drift_status": "behind",
+            "lag": 5,
+        }
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            mock.patch.object(artifact, "merge_base", return_value="pr-base"),
+            mock.patch.object(artifact, "select_build", return_value=selection) as select_build,
+            mock.patch.object(artifact, "select_tarball") as select_latest,
+            mock.patch.object(artifact, "_patch_apply_status", return_value="conflict"),
+        ):
+            ready = artifact.prepare(
+                temp_dir,
+                "pr-head",
+                ["tensorrt_llm/source.py"],
+                build=42,
+                expected_commit="coverage-commit",
+            )
+
+        self.assertIsNotNone(ready)
+        assert ready is not None
+        self.assertIsNone(ready["path"])
+        select_build.assert_called_once_with(
+            42,
+            "pr-base",
+            expected_commit="coverage-commit",
+        )
+        select_latest.assert_not_called()
 
     def test_prepare_merges_x86_and_sbsa_databases(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -195,14 +419,21 @@ class CoverageArtifactTest(unittest.TestCase):
             with (
                 mock.patch.object(artifact, "merge_base", return_value="pr-base"),
                 mock.patch.object(artifact, "select_tarball", return_value=selection) as select,
+                mock.patch.object(artifact, "_patch_apply_status", return_value="clean") as apply,
                 mock.patch.object(artifact, "download", side_effect=download),
                 mock.patch.object(artifact, "extract", side_effect=extract),
             ):
-                ready = artifact.prepare(str(output_dir), "pr-head")
+                ready = artifact.prepare(str(output_dir), "pr-head", ["tensorrt_llm/source.py"])
 
             self.assertIsNotNone(ready)
             assert ready is not None
             select.assert_called_once_with("pr-base")
+            apply.assert_called_once_with(
+                "pr-base",
+                "pr-head",
+                "coverage-commit",
+                relevant_paths=["tensorrt_llm/source.py"],
+            )
             connection = sqlite3.connect(ready["path"])
             try:
                 tests = {
@@ -218,12 +449,6 @@ class CoverageArtifactTest(unittest.TestCase):
                 },
             )
             self.assertEqual(json.loads(Path(ready["meta"]).read_text()), selection)
-
-    def test_freshness_gate_honors_configured_threshold(self) -> None:
-        self.assertEqual(cbts_main._coverage_freshness(7, 7), ("ok", ""))
-        freshness, reason = cbts_main._coverage_freshness(8, 7)
-        self.assertEqual(freshness, "stale")
-        self.assertTrue(reason)
 
 
 # Coverage pilot
@@ -894,6 +1119,10 @@ def test_build_document_filters_unscheduled_stages_and_persists_valid_rate(
         "H100-PyTorch-1": 1,
         "H100-4_GPUs-PyTorch-1": 1,
     }
+    decision["coverage_compatibility"] = "conflict"
+    decision["coverage_decline_reason"] = "residual conflict"
+    decision["coverage_decline_category"] = "compatibility_conflict"
+    decision["coverage_residual_files"] = ["tensorrt_llm/source.py"]
 
     document = report_module.build_document(
         decision,
@@ -914,6 +1143,10 @@ def test_build_document_filters_unscheduled_stages_and_persists_valid_rate(
     assert document["b_multi_gpu_label_gate_open"] is False
     assert document["b_cbts_applied"] is cbts_applied
     assert document["b_coverage_pilot_eligible"] is coverage_pilot_eligible
+    assert document["s_coverage_compatibility"] == "conflict"
+    assert document["s_coverage_decline_reason"] == "residual conflict"
+    assert document["s_coverage_decline_category"] == "compatibility_conflict"
+    assert document["l_coverage_residual_files"] == 1
     assert document["flat_detail"]["hit_stages"] == [
         "H100-PyTorch-1",
         "H100-PyTorch-2",

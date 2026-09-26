@@ -171,6 +171,23 @@ def _build_narrowing(
     return removed, dropped, must_run
 
 
+def coverage_preflight(
+    pr: PRInputs,
+    pairs: list[tuple[object, RuleResult]],
+    handled: set[str],
+) -> tuple[list[str], str]:
+    """Return the Tier-2 residual and any reason it cannot be audited."""
+    residual = sorted(set(pr.changed_files) - handled)
+    if any(result.scope is None for _, result in pairs):
+        return residual, "coverage tier skipped: a rule forced fallback (scope=null)"
+    if not residual:
+        return residual, "coverage tier skipped: no residual (all files handled by rules)"
+    for path in residual:
+        if not (path.endswith(".py") and path.startswith("tensorrt_llm/")):
+            return residual, f"coverage tier declined: non-core-Python residual file: {path}"
+    return residual, ""
+
+
 def apply_coverage_tier(
     pr: PRInputs,
     pairs: list[tuple[object, RuleResult]],
@@ -182,11 +199,9 @@ def apply_coverage_tier(
     no_data_policy: str = DEFAULT_NO_DATA_POLICY,
 ) -> tuple[CoverageTierResult | None, str]:
     """Return (narrowing, note); narrowing is None when the tier keeps the Tier-1 result."""
-    if any(r.scope is None for _, r in pairs):
-        return None, "coverage tier skipped: a rule forced fallback (scope=null)"
-    residual = sorted(set(pr.changed_files) - handled)
-    if not residual:
-        return None, "coverage tier skipped: no residual (all files handled by rules)"
+    residual, note = coverage_preflight(pr, pairs, handled)
+    if note:
+        return None, note
 
     selector = CoverageSelector(db, repo_root, no_data_policy=no_data_policy)
     cov = selector.decide(residual, pr.diffs)

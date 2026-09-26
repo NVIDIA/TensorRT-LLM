@@ -95,6 +95,28 @@ class InfraDryRunPipelineTest(unittest.TestCase):
             L0_TEST,
         )
 
+    def test_cbts_parser_preserves_coverage_preflight_fields(self) -> None:
+        parser = _function_body(
+            L0_PARENT, "_cbtsParseSelectionResult", "getOssComplianceFileChanged"
+        )
+
+        self.assertIn(
+            "coverage_residual_files: data.coverage_residual_files ?: []",
+            parser,
+        )
+        self.assertIn(
+            'coverage_decline_reason: data.coverage_decline_reason ?: ""',
+            parser,
+        )
+
+    def test_cbts_pin_policy_is_owned_by_python(self) -> None:
+        audit = _function_body(L0_PARENT, "_cbtsCoverageAudit", "_cbtsPrNumber")
+
+        self.assertIn("--resolve-pin cbts_db_pin.json", audit)
+        self.assertIn("pinPlan.pin_upload_required", audit)
+        self.assertIn("trtllm_utils.uploadArtifacts", audit)
+        self.assertNotIn("curl --noproxy", audit)
+
 
 if __name__ == "__main__":
     unittest.main()

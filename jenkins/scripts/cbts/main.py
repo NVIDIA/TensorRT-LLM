@@ -55,6 +55,7 @@ from coverage_tier import (  # noqa: E402
     NO_DATA_POLICIES,
     apply_coverage_tier,
     compute_coverage_stage_counts,
+    coverage_preflight,
     open_db,
     write_coverage_test_db,
 )
@@ -134,15 +135,22 @@ class SelectionResult:
     coverage_dropped_stages: list[str] = field(default_factory=list)
     # Post-merge build the consulted touch DB came from; makes a decision replayable.
     coverage_db_build: Optional[int] = None
-    # Revision the DB was collected at and main's distance from it; ranking, not the gate.
+    # Revision the DB was collected at and main's distance from it.
     coverage_db_commit: Optional[str] = None
     coverage_db_lag: Optional[int] = None
-    # The PR's base and the DB's distance from it — what the freshness gate decides on.
+    # The PR's base and the DB's distance from it, retained for telemetry.
     coverage_db_base_commit: Optional[str] = None
     coverage_db_drift: Optional[int] = None
     coverage_db_drift_status: str = ""
-    # Freshness verdict on that drift: ok / stale / unknown; empty when no DB was consulted.
+    # Whether drift was measurable: ok / unknown; empty when no DB was consulted.
     coverage_freshness: str = ""
+    # Files left after Tier 1; the patch compatibility check is scoped to these paths.
+    coverage_residual_files: list[str] = field(default_factory=list)
+    # clean / conflict / unknown / not_attempted.
+    coverage_compatibility: str = "not_attempted"
+    # Stable classification for coverage-tier fallback telemetry.
+    coverage_decline_reason: str = ""
+    coverage_decline_category: str = ""
     # Residual files the forge API returned no patch for; they fall back to file level.
     coverage_no_diff_files: int = 0
 
@@ -166,17 +174,17 @@ class SelectionResult:
             "coverage_db_drift": self.coverage_db_drift,
             "coverage_db_drift_status": self.coverage_db_drift_status,
             "coverage_freshness": self.coverage_freshness,
+            "coverage_residual_files": list(self.coverage_residual_files),
+            "coverage_compatibility": self.coverage_compatibility,
+            "coverage_decline_reason": self.coverage_decline_reason,
+            "coverage_decline_category": self.coverage_decline_category,
             "coverage_no_diff_files": self.coverage_no_diff_files,
         }
         return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 
 
-# Tier 2 stands down past this many commits between the DB's revision and the PR's base.
-DEFAULT_COVERAGE_MAX_DRIFT = 30
-
-
 def _load_coverage_db_meta(path: Optional[str]) -> dict:
-    """artifact.py's selection JSON; empty when absent or unreadable, which declines."""
+    """artifact.py's selection JSON; empty when absent or unreadable."""
     if not path:
         return {}
     try:
@@ -187,16 +195,24 @@ def _load_coverage_db_meta(path: Optional[str]) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _coverage_freshness(drift: Optional[int], max_drift: int) -> tuple[str, str]:
-    """Verdict on the consulted DB's drift, plus the decline note (empty when usable)."""
-    if drift is None:
-        return "unknown", "coverage DB freshness unknown: its drift could not be measured"
-    if drift > max_drift:
-        return (
-            "stale",
-            f"coverage DB is {drift} commit(s) from the PR's base, over the {max_drift} limit",
-        )
-    return "ok", ""
+def _coverage_decline_category(reason: str) -> str:
+    """Map a human-readable Tier-2 decline reason to a stable telemetry category."""
+    categories = (
+        ("a rule forced fallback", "rule_forced_fallback"),
+        ("no residual", "no_residual"),
+        ("non-core-Python residual file", "non_core_python"),
+        ("zero-touch residual file", "zero_touch"),
+        ("no usable diff", "no_usable_diff"),
+        ("import-executed change", "import_executed"),
+        ("unparsable source", "unparsable_source"),
+        ("closure change", "closure_change"),
+        ("coverage tier errored", "tier_error"),
+    )
+    return (
+        next((category for text, category in categories if text in reason), "other")
+        if reason
+        else ""
+    )
 
 
 def _rule_reason(rule, r) -> dict:
@@ -388,15 +404,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--coverage-db-meta",
         default=None,
         help="Path to artifact.py's --print-selection JSON, describing which DB "
-        "--coverage-db is. Its `drift` is what the freshness gate decides on; the "
-        "rest is recorded. Absent or unreadable declines the tier.",
-    )
-    parser.add_argument(
-        "--coverage-max-drift",
-        type=int,
-        default=DEFAULT_COVERAGE_MAX_DRIFT,
-        help="Decline the coverage tier when the DB is more than this many commits "
-        "from the PR's base.",
+        "--coverage-db is. Its topology and compatibility metadata are recorded.",
     )
     parser.add_argument(
         "--no-data-policy",
@@ -452,6 +460,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     rules = build_rules(yaml_index, stages, repo_root)
     selector = Selector(stages)
     result = selector.run(pr, rules)
+    if result.scope is None:
+        result.coverage_residual_files, result.coverage_decline_reason = coverage_preflight(
+            pr, selector.pairs, selector.handled
+        )
+        result.coverage_decline_category = _coverage_decline_category(
+            result.coverage_decline_reason
+        )
 
     meta = _load_coverage_db_meta(args.coverage_db_meta)
     result.coverage_db_build = meta.get("build")
@@ -460,28 +475,32 @@ def main(argv: Optional[list[str]] = None) -> int:
     result.coverage_db_drift = meta.get("drift")
     result.coverage_db_base_commit = meta.get("base_commit")
     result.coverage_db_drift_status = meta.get("drift_status") or ""
+    result.coverage_compatibility = meta.get("patch_apply_status") or "not_attempted"
+    result.coverage_decline_reason = (
+        meta.get("coverage_decline_reason") or result.coverage_decline_reason
+    )
+    result.coverage_decline_category = (
+        meta.get("coverage_decline_category") or result.coverage_decline_category
+    )
 
     if args.coverage_db and result.scope is None:
         tier = None
-        result.coverage_freshness, note = _coverage_freshness(
-            result.coverage_db_drift, args.coverage_max_drift
-        )
-        if not note:  # the gate passed; a note here means it did not
-            try:
-                db = open_db(args.coverage_db)
-                tier, note = apply_coverage_tier(
-                    pr,
-                    selector.pairs,
-                    selector.handled,
-                    stages,
-                    yaml_index,
-                    repo_root,
-                    db,
-                    no_data_policy=args.no_data_policy,
-                )
-            except Exception as e:  # noqa: BLE001 — CBTS must never break CI
-                note = f"coverage tier errored: {e}"
-                tier = None
+        result.coverage_freshness = "ok" if result.coverage_db_drift is not None else "unknown"
+        try:
+            db = open_db(args.coverage_db)
+            tier, note = apply_coverage_tier(
+                pr,
+                selector.pairs,
+                selector.handled,
+                stages,
+                yaml_index,
+                repo_root,
+                db,
+                no_data_policy=args.no_data_policy,
+            )
+        except Exception as e:  # noqa: BLE001 — CBTS must never break CI
+            note = f"coverage tier errored: {e}"
+            tier = None
         if tier is not None:
             result.scope = "coverage"
             result.scopes = sorted(
@@ -515,6 +534,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 cov_reason
             ]
         elif note:
+            result.coverage_decline_reason = note
+            result.coverage_decline_category = _coverage_decline_category(note)
             for x in result.reasons:
                 if isinstance(x, dict) and x.get("source") == "fallback":
                     x["coverage_declined"] = note

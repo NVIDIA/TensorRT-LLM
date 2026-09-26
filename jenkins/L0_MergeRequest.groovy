@@ -1042,7 +1042,8 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
 // Calls jenkins/scripts/cbts/main.py with PR changed_files + diffs and returns
 // a result map (or null = defer to existing filter chain). Result keys:
 // scope, affected_stages, reasons, test_db_dir_override,
-// affected_stage_test_counts, affected_stage_split_counts.
+// affected_stage_test_counts, affected_stage_split_counts,
+// coverage_residual_files, coverage_decline_reason.
 // CBTS narrows test cases only — Build always runs. See cbts/README.md.
 // ============================================================================
 
@@ -1081,12 +1082,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         // pyyaml is needed by main.py's blocks.py to parse test-db YAMLs.
         sh "apt-get update -qq && apt-get install -y -qq python3-yaml"
 
-        // Evaluate Tier 2 for every eligible PR. The pilot gate below controls
-        // application only; non-pilot coverage hits remain shadow decisions.
-        def coverageContext = _cbtsCoverageAudit(pipeline)
-        def coverageDb = coverageContext?.db
-        def coveragePilotEligible = coverageContext?.pilotEligible ?: false
-
+        def coveragePilotEligible = false
         // Ask Python which file patterns need diffs, fetch them.
         def patternsOut = sh(
             script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py --list-needed-diffs",
@@ -1100,7 +1096,8 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         if (filesNeedingDiff) {
             def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
             def fileChanges = githubPrApiUrl != null
-                ? getGithubMRChangedFileWithFallback(pipeline, globalVars, "getFileChanges", "", filesNeedingDiff)
+                ? getGithubMRChangedFileWithFallback(
+                    pipeline, globalVars, "getFileChanges", "", filesNeedingDiff)
                 : getGitlabMRChangedFile(pipeline, "getFileChanges")
             diffs = filesNeedingDiff.collectEntries { filePath ->
                 // Null (patch omitted for binary / rename / too-large diffs) coerces to empty.
@@ -1118,12 +1115,34 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         writeFile file: inputPath, text: inputJson
 
         def mainCmd = "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py cbts_input.json"
-        if (coverageDb) {
-            mainCmd += " --coverage-db ${coverageDb.path} --coverage-db-meta ${coverageDb.meta}"
-        }
         def output = sh(script: mainCmd, returnStdout: true)
-
         def result = _cbtsParseSelectionResult(output)
+
+        // Tier 1 owns the definition of handled files. Only prepare a coverage DB when
+        // its residual is eligible for Tier 2, and scope the compatibility check to it.
+        if (result.scope == null && result.coverage_residual_files &&
+                !result.coverage_decline_reason) {
+            def residualPath = "${LLM_ROOT}/cbts_coverage_residual.json"
+            writeFile file: residualPath,
+                      text: groovy.json.JsonOutput.toJson(result.coverage_residual_files)
+            def coverageContext = _cbtsCoverageAudit(pipeline, globalVars, residualPath)
+            def coverageDb = coverageContext?.db
+            coveragePilotEligible = coverageContext?.pilotEligible ?: false
+            if (coverageDb?.meta) {
+                def coverageCmd = mainCmd + " --coverage-db-meta ${coverageDb.meta}"
+                if (coverageDb.path) {
+                    coverageCmd += " --coverage-db ${coverageDb.path}"
+                }
+                output = sh(script: coverageCmd, returnStdout: true)
+                result = _cbtsParseSelectionResult(output)
+            } else if (coverageDb?.compatibility) {
+                result.coverage_compatibility = coverageDb.compatibility
+                result.coverage_decline_reason = coverageDb.decline_reason ?: ""
+                result.coverage_decline_category = "coverage_unavailable"
+                output = groovy.json.JsonOutput.toJson(result)
+            }
+        }
+
         if (result.scope == null) {
             pipeline.echo("CBTS: deferring — Python returned scope=null. " +
                           "Reasons: ${result.reasons.join('; ')}")
@@ -1195,9 +1214,21 @@ def _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
     }
 }
 
+def _cbtsCoverageDecline(boolean pilotEligible, String reason)
+{
+    return [
+        db: [
+            compatibility: "unknown",
+            decline_reason: "coverage tier declined: ${reason}",
+        ],
+        pilotEligible: pilotEligible,
+    ]
+}
+
 // Resolve pilot application eligibility, then fetch and audit the touch DB for
-// every PR. Returns {db, pilotEligible}; db is null on a non-fatal preparation failure.
-def _cbtsCoverageAudit(pipeline)
+// every Tier-2 residual. Returns {db, pilotEligible}; a compatibility decline
+// remains in db without a path so it is observable in shadow and pilot modes.
+def _cbtsCoverageAudit(pipeline, globalVars, String residualPath)
 {
     def pilotEligible = false
     try {
@@ -1205,26 +1236,85 @@ def _cbtsCoverageAudit(pipeline)
         // ${LLM_ROOT}-relative, matching the main.py caller's `cd ${LLM_ROOT}`.
         // The checked-out revision is the PR head; its merge base is what drift is measured against.
         def prHead = env.gitlabMergeRequestLastCommit ?: ""
+        def prNumber = _cbtsPrNumber(globalVars)
+        if (!(prHead ==~ /[0-9a-fA-F]{40}/) || !(prNumber ==~ /[1-9]\d*/)) {
+            pipeline.echo("CBTS audit: PR number/head unavailable; cannot make coverage DB selection repeatable")
+            return _cbtsCoverageDecline(
+                pilotEligible, "PR identity unavailable for coverage DB pin")
+        }
+
         def readyJson = ""
         def prAuthor = ""
-        withCredentials([usernamePassword(credentialsId: 'github-cred-trtllm-ci', usernameVariable: 'NOT_USED_YET', passwordVariable: 'GITHUB_API_TOKEN')]) {
+        def pinPlanJson = ""
+        withCredentials([usernamePassword(
+            credentialsId: 'github-cred-trtllm-ci',
+            usernameVariable: 'NOT_USED_YET',
+            passwordVariable: 'GITHUB_API_TOKEN'),
+        ]) {
             prAuthor = sh(
                 script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_pilot.py",
                 returnStdout: true,
             ).trim()
             pilotEligible = prAuthor && CBTS_COVERAGE_PILOT_USERS.any { it.equalsIgnoreCase(prAuthor) }
             pipeline.echo("CBTS coverage pilot: pr_author=${prAuthor ?: 'unknown'}, eligible=${pilotEligible}")
+            pinPlanJson = sh(
+                script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
+                        "--resolve-pin cbts_db_pin.json --pr-number ${prNumber} " +
+                        "--pr-head ${prHead} || true",
+                returnStdout: true,
+            ).trim()
+        }
+        if (!pinPlanJson) {
+            pipeline.echo("CBTS audit: coverage DB pin could not be resolved")
+            return _cbtsCoverageDecline(pilotEligible, "coverage DB pin could not be resolved")
+        }
+        def pinPlan = new groovy.json.JsonSlurper().parseText(pinPlanJson)
+        if (pinPlan.status != "ready") {
+            pipeline.echo("CBTS audit: ${pinPlan.decline_reason ?: 'coverage DB pin declined'}")
+            return [db: pinPlan, pilotEligible: pilotEligible]
+        }
+
+        if (pinPlan.pin_upload_required) {
+            try {
+                trtllm_utils.uploadArtifacts(
+                    "${LLM_ROOT}/${pinPlan.pin_path}", pinPlan.pin_target)
+                pipeline.echo("CBTS audit: pinned coverage DB build ${pinPlan.build} " +
+                              "for PR head ${prHead}")
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                pipeline.echo("CBTS audit: coverage DB pin upload failed (${e.message})")
+                return _cbtsCoverageDecline(pilotEligible, "coverage DB pin upload failed")
+            }
+        } else {
+            pipeline.echo("CBTS audit: reusing pinned coverage DB build ${pinPlan.build}")
+        }
+
+        withCredentials([
+            usernamePassword(
+                credentialsId: 'github-cred-trtllm-ci',
+                usernameVariable: 'NOT_USED_YET',
+                passwordVariable: 'GITHUB_API_TOKEN'),
+        ]) {
             readyJson = sh(
                 script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
-                        "--prepare cbts_cov${prHead ? " --pr-head ${prHead}" : ""} || true",
+                        "--prepare cbts_cov --paths-json cbts_coverage_residual.json" +
+                        " --pr-head ${prHead}" +
+                        " --build ${pinPlan.build}" +
+                        " --expected-commit ${pinPlan.commit} || true",
                 returnStdout: true,
             ).trim()
         }
         if (!readyJson) {
             pipeline.echo("CBTS audit: no coverage DB could be prepared — Tier 2 decision unavailable")
-            return [db: null, pilotEligible: pilotEligible]
+            return _cbtsCoverageDecline(pilotEligible, "coverage DB could not be prepared")
         }
         def ready = new groovy.json.JsonSlurper().parseText(readyJson)
+        if (!ready.path) {
+            pipeline.echo("CBTS audit: Tier-2 residual compatibility check did not pass")
+            return [db: ready, pilotEligible: pilotEligible]
+        }
+        pipeline.echo("CBTS audit: Tier-2 residual applies cleanly to the selected coverage DB")
         sh "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/tools/coverage_audit.py --db ${ready.path}"
         return [db: ready, pilotEligible: pilotEligible]
     } catch (InterruptedException e) {
@@ -1233,6 +1323,19 @@ def _cbtsCoverageAudit(pipeline)
         pipeline.echo("CBTS audit: skipped (non-fatal): ${e.message}")
         return [db: null, pilotEligible: pilotEligible]
     }
+}
+
+def _cbtsPrNumber(globalVars)
+{
+    def prUrl = globalVars[GITHUB_PR_API_URL]
+    if (prUrl) {
+        def match = (prUrl =~ /\/pulls?\/(\d+)/)
+        if (match.find()) {
+            return match.group(1)
+        }
+        return ""
+    }
+    return env.gitlabMergeRequestIid ?: ""
 }
 
 // Post one CBTS decision record to OpenSearch (best-effort; never blocks CI).
@@ -1266,16 +1369,7 @@ def _cbtsReportDecision(pipeline, globalVars, String status, String reason, Stri
         // PR number for s_pr_number, mirroring perf_regression_utils: GitHub PR
         // builds carry it in github_pr_api_url (.../pulls/<n>); GitLab MR builds
         // expose env.gitlabMergeRequestIid. Empty for post-merge/branch builds.
-        def prNumber = ""
-        def prUrl = globalVars[GITHUB_PR_API_URL]
-        if (prUrl) {
-            def m = (prUrl =~ /\/pulls?\/(\d+)/)
-            if (m.find()) {
-                prNumber = m.group(1)
-            }
-        } else {
-            prNumber = env.gitlabMergeRequestIid ?: ""
-        }
+        def prNumber = _cbtsPrNumber(globalVars)
         if (prNumber) {
             args += " --pr-number ${prNumber}"
         }
@@ -1337,6 +1431,9 @@ def _cbtsParseSelectionResult(String text)
         test_db_dir_override: data.test_db_dir_override,
         affected_stage_test_counts: data.affected_stage_test_counts ?: [:],
         affected_stage_split_counts: data.affected_stage_split_counts ?: [:],
+        // The first pass uses these to decide whether Tier 2 should prepare a DB.
+        coverage_residual_files: data.coverage_residual_files ?: [],
+        coverage_decline_reason: data.coverage_decline_reason ?: "",
         // Explicit null check preserves `false`; default True is safe.
         sanity_required: data.sanity_required != null ? data.sanity_required : true,
         perfsanity_required: data.perfsanity_required != null ? data.perfsanity_required : true,
