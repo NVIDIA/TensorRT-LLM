@@ -1,0 +1,88 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Semantic conflict review
+on:
+  schedule:
+    - cron: '23 */2 * * *'
+  issue_comment:
+    types: [created, edited, deleted]
+  workflow_dispatch:
+    inputs:
+      pull_number:
+        description: 'Eligible PR number to retry, including an already requested revision'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  request:
+    name: Request semantic analysis
+    concurrency:
+      group: semantic-review-state
+      cancel-in-progress: false
+      queue: max
+    if: >-
+      github.repository == 'NVIDIA/TensorRT-LLM' &&
+      contains(fromJSON('["schedule", "workflow_dispatch"]'), github.event_name)
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      checks: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: |
+            .github/scripts
+            .github/semantic-review-prompt.md
+          sparse-checkout-cone-mode: false
+      - uses: actions/github-script@v8
+        env:
+          INPUT_PULL_NUMBER: ${{ inputs.pull_number }}
+          SEMANTIC_COMMAND_TOKEN: ${{ secrets.TRTLLM_AGENT_SHARED_TOKEN }}
+        with:
+          script: |
+            const {run} = require('./.github/scripts/semantic_review_request.js');
+            if (!process.env.SEMANTIC_COMMAND_TOKEN) throw new Error('Missing semantic command token.');
+            const commandGithub = new github.constructor({
+              auth: process.env.SEMANTIC_COMMAND_TOKEN, retry: {enabled: false},
+            });
+            await run({github, commandGithub, context, core});
+
+  publish:
+    name: Publish semantic verdict
+    concurrency:
+      group: semantic-review-state
+      cancel-in-progress: false
+      queue: max
+    if: >-
+      github.repository == 'NVIDIA/TensorRT-LLM' &&
+      github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+      github.event.comment.user.login == 'coderabbitai[bot]' &&
+      github.event.comment.user.id == 136622811 &&
+      github.event.comment.user.type == 'Bot'
+    permissions:
+      contents: read
+      issues: read
+      checks: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts/semantic_review.js
+          sparse-checkout-cone-mode: false
+      - uses: actions/github-script@v8
+        with:
+          script: |
+            const {publish} = require('./.github/scripts/semantic_review.js');
+            await publish({github, context, core});
