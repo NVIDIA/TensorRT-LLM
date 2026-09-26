@@ -7081,6 +7081,9 @@ def update_llm_args_with_extra_dict(
             if not isinstance(base_mm, dict):
                 base_mm = {}
             merged = dict(base_mm) | dict(yaml_mm)
+            if ("video_pruning_rate" in explicit_cli_keys
+                    and "video_pruning_rate" in base_mm):
+                merged["video_pruning_rate"] = base_mm["video_pruning_rate"]
             llm_args_dict['multimodal_config'] = merged
 
     # Drop YAML keys claimed by explicit CLI flags so the outer merge below
@@ -7119,7 +7122,8 @@ def update_llm_args_with_extra_dict(
             llm_args_dict[field_name] = field_type(**llm_args_dict[field_name])
             if field_name in llm_args:
                 extra_llm_str = f" because it's specified in {extra_llm_api_options}" if extra_llm_api_options else ""
-                logger.info(f"YAML overrides {field_name}{extra_llm_str}")
+                logger.info(
+                    f"Configuration overrides {field_name}{extra_llm_str}")
 
     llm_args = llm_args | llm_args_dict
 

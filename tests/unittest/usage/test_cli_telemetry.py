@@ -401,6 +401,50 @@ class TestSerializedTerminationKinds:
         assert captured_exit_payloads == []
 
     @pytest.mark.parametrize(
+        "assignment",
+        [
+            "telemetry_config.disabled=false",
+            "unknown_config.enabled=true",
+            "max_batch_size=[",
+        ],
+    )
+    @pytest.mark.parametrize("opt_out_source", [None, "cli", "yaml"])
+    def test_serve_opt_out_precedes_invalid_set(
+        self,
+        tmp_path,
+        captured_exit_payloads,
+        assignment,
+        opt_out_source,
+    ):
+        """Invalid overrides emit an error report unless CLI or YAML opts out."""
+        from tensorrt_llm.commands.serve import main as serve_main
+
+        opt_out_args = ["--no-telemetry"] if opt_out_source == "cli" else []
+        if opt_out_source == "yaml":
+            config_path = tmp_path / "config.yaml"
+            config_path.write_text("telemetry_config:\n  disabled: true\n", encoding="utf-8")
+            opt_out_args = ["--config", str(config_path)]
+        with (
+            patch(
+                "tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+                return_value=False,
+            ),
+            pytest.raises(SystemExit) as raised,
+        ):
+            serve_main(
+                args=["dummy/model", *opt_out_args, "--set", assignment],
+                prog_name="trtllm-serve",
+            )
+
+        assert raised.value.code == 2
+        if opt_out_source is None:
+            params = _captured_terminal_parameters(captured_exit_payloads)
+            assert params["terminationKind"] == "exception"
+            assert params["exitCode"] == 2
+        else:
+            assert captured_exit_payloads == []
+
+    @pytest.mark.parametrize(
         ("args", "expected"),
         [
             pytest.param(

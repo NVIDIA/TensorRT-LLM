@@ -389,27 +389,81 @@ For a full benchmarking + profiling workflow (including multi-cycle capture unde
 
 .. _configuring-with-yaml-files:
 
-Configuring with YAML Files
-----------------------------
+Configuring with YAML Files and ``--set``
+------------------------------------------
 
-You can configure various options of ``trtllm-serve`` using YAML files by setting the ``--config`` option to the path of a YAML file. Explicit CLI flags take precedence over values in the YAML; un-set CLI flags fall back to the YAML.
+Pass a YAML file with ``--config``. Explicit CLI flags override conflicting
+YAML values; otherwise, YAML values override the defaults.
 
 .. include:: ../../_includes/note_sections.rst
    :start-after: .. start-note-config-flag-alias
    :end-before: .. end-note-config-flag-alias
 
-The yaml file is configuration of `tensorrt_llm.llmapi.LlmArgs <https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs>`_, the class has multiple levels of hierarchy, to configure the top level arguments like ``max_batch_size``, the yaml file should be like:
+The file configures
+`tensorrt_llm.llmapi.LlmArgs <https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs>`_.
+For example, set a top-level field as follows:
 
 .. code-block:: yaml
 
    max_batch_size: 8
 
-To configure the nested level arguments like ``moe_config.backend``, the yaml file should be like:
+Use YAML mappings for nested fields:
 
 .. code-block:: yaml
 
    moe_config:
        backend: CUTLASS
+
+Use repeatable ``--set PATH=YAML_VALUE`` options to override individual fields.
+Paths use canonical snake-case ``LlmArgs`` field names and dots for nesting:
+
+.. code-block:: bash
+
+   trtllm-serve MODEL \
+       --config base.yaml \
+       --video_pruning_rate 0.4 \
+       --set multimodal_config.video_pruning_rate=0.6 \
+       --set 'cuda_graph_config.batch_sizes=[1, 2, 4]'
+
+Precedence is fixed, regardless of command-line order:
+
+.. code-block:: text
+
+   LlmArgs defaults < --config < dedicated CLI flags < --set
+
+Values use YAML syntax and support ``null``, booleans, finite numbers, strings,
+lists, and string-keyed mappings. Quote arguments containing spaces or shell
+characters. An assignment replaces exactly the addressed value; assigning a
+mapping or list replaces it entirely. The last duplicate path wins, while
+conflicting parent and child paths are rejected.
+
+``--set`` supports public, YAML-serializable fields in ``TorchLlmArgs``, with
+the following exceptions:
+
+* ``model`` and ``backend``: use ``MODEL`` and ``--backend``.
+* ``telemetry_config``: use ``--telemetry`` or ``--no-telemetry``.
+* ``env_overrides`` and ``internal_request_auth_key``: use the YAML file.
+* ``allow_request_chat_template``: use ``--allow_request_chat_template``.
+* ``disagg_cluster``: use ``--disagg_cluster_uri`` or the YAML file.
+* ``batched_logits_processor``, ``checkpoint_loader``, ``mpi_session``,
+  ``ray_placement_config.placement_groups``,
+  ``speculative_config.drafter``, and
+  ``speculative_config.resource_manager``: use the Python LLM API.
+
+Assigning a whole parent mapping does not bypass these exclusions; a mapping
+that contains one of the excluded descendant paths is rejected.
+
+``--set`` is available only for normal LLM serving. It is unavailable for
+VisualGen and the ``embeddings``, ``mm_embedding_serve``, ``disaggregated``,
+and ``disaggregated_mpi_worker`` subcommands. Server-only YAML keys, list
+indexes, escaped dots, and Hydra/OmegaConf interpolation are also unsupported.
+Replace an enclosing mapping to set free-form keys that cannot be expressed as
+a path.
+
+Do not pass secrets through ``--set`` because arguments may appear in shell
+history, process listings, or logs. Eligible configuration fields may also be
+included in usage telemetry; use ``--no-telemetry`` to opt out. See
+:doc:`../../developer-guide/telemetry`.
 
 .. _syntax:
 
