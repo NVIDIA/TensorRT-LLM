@@ -1395,6 +1395,7 @@ class _ContextRequest:
     return_perf_metrics: bool = False
     context_current_position: int = 0
     py_connector_served_position: int = 0
+    py_num_connector_matched_tokens: int = 0
     prepopulated_prompt: tuple[int, int] | None = None
     multimodal_hashes: None = None
     multimodal_positions: None = None
@@ -1591,6 +1592,73 @@ def _run_context(
     request.context_current_position = request.prompt_len
     request.context_remaining_length = 0
     _update_context_resources(manager, batch)
+
+
+def _try_run_context(manager: KVCacheManagerV2, request: _ContextRequest) -> bool:
+    """Run a context request all the way through, reporting whether it fit."""
+    batch = _prepare_context_resources(manager, request)
+    if not manager.prepare_context(request):
+        return False
+    request.context_remaining_length = request.prompt_len - request.context_current_position
+    if not manager.resize_context(request, num_tokens=request.context_remaining_length):
+        return False
+    request.context_current_position = request.prompt_len
+    request.context_remaining_length = 0
+    _update_context_resources(manager, batch)
+    return True
+
+
+def test_preempt_request_gives_a_full_pool_back_its_pages(
+    manager: KVCacheManagerV2,
+) -> None:
+    """Preemption is the only way out of a full GPU-only pool.
+
+    With GPU as the last cache level a suspended page stays HELD, which the
+    eviction controller refuses to move, so suspension frees nothing. This
+    covers the release itself: the pages returning, and the connector's
+    matched-token count dropping.
+    """
+    victim = _ContextRequest(1, list(range(MAX_SEQ_LEN)), MAX_SEQ_LEN, "conv-1")
+    victim.py_num_connector_matched_tokens = TOKENS_PER_BLOCK
+    started: list[_ContextRequest] = [victim]
+
+    try:
+        assert _try_run_context(manager, victim)
+        assert manager.is_request_active(victim.py_request_id)
+
+        # The pool's capacity in requests follows from the fixture's layout and
+        # windows, so find it rather than hard-code it. Distinct tokens per
+        # request keep block reuse from hiding the pressure.
+        blocked = None
+        for request_id in range(2, 12):
+            candidate = _ContextRequest(
+                request_id,
+                [request_id * 1000 + i for i in range(MAX_SEQ_LEN)],
+                MAX_SEQ_LEN,
+                f"conv-{request_id}",
+            )
+            started.append(candidate)
+            if not _try_run_context(manager, candidate):
+                blocked = candidate
+                break
+        assert blocked is not None, "the pool never filled, so there is nothing to preempt for"
+
+        # Its own partial allocation goes back first, as the scheduler's retry
+        # does. What is missing is the victim's pages.
+        manager.free_resources(blocked)
+
+        assert manager.preempt_request(victim) is True
+        assert not manager.is_request_active(victim.py_request_id)
+        assert victim.py_request_id not in manager.kv_cache_map
+        # A replay recomputes from its own reuse match, so a stale count would
+        # skip a prefix the pool no longer holds for it.
+        assert victim.py_num_connector_matched_tokens == 0
+
+        blocked.context_current_position = 0
+        assert _try_run_context(manager, blocked)
+    finally:
+        for request in started:
+            _free_if_active(manager, request)
 
 
 def test_per_conversation_policy_delays_commit_until_last_context_chunk(

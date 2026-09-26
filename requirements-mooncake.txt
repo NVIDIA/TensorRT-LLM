@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Pins the Mooncake Python client (MooncakeDistributedStore, imported as
+# `mooncake.store`) used by the mooncake-store KV cache connector and the
+# `trtllm-serve mooncake_master` / `mooncake_donor` commands.
+#
+# This is the single source of truth for the client version: the standalone
+# wheel exposes it through the `tensorrt-llm[mooncake]` extra (see setup.py) and
+# the container installs this same file from docker/common/install_mooncake.sh,
+# so both agree on one pin. The C++ transfer engine that the cache transceiver
+# links against is a separate component built from source in that script.
+#
+# The plain `mooncake-transfer-engine` wheel is built against CUDA 12, while
+# TensorRT-LLM ships CUDA 13 (see cuda-python>=13 in requirements.txt), so its
+# extensions cannot resolve libcudart.so.12. `mooncake-transfer-engine-cuda13`
+# is the same project built for CUDA 13; it is versioned independently, with
+# releases starting at 0.3.9, so its version does not track the source build.
+mooncake-transfer-engine-cuda13==0.3.13

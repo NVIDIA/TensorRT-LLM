@@ -726,6 +726,11 @@ class PyExecutor:
             self.resource_manager,
             should_store_blocks=self.enable_disagg_partial_reuse_store)
 
+        # Wire the transfer manager into the V2 scheduler's deadlock detector.
+        if hasattr(self.scheduler, "set_async_transfer_manager"):
+            self.scheduler.set_async_transfer_manager(
+                self.async_transfer_manager)
+
         # Router is built after async_transfer_manager so KVCacheAwareADPRouter
         # can receive the transfer-manager reference at construction time.
         self.adp_router: ADPRouter = ADPRouter.create(

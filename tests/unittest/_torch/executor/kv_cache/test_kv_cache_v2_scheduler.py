@@ -38,6 +38,8 @@ DISAGG_GEN_TRANS_IN_PROGRESS = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRE
 CONTEXT_INIT = LlmRequestState.CONTEXT_INIT.value  # 10
 GEN_IN_PROGRESS = LlmRequestState.GENERATION_IN_PROGRESS.value  # 13
 GEN_TO_COMPLETE = LlmRequestState.GENERATION_TO_COMPLETE.value  # 14
+DISAGG_CTX_TRANS_IN_PROGRESS = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS.value  # 21
+DISAGG_CTX_COMPLETE = LlmRequestState.DISAGG_CONTEXT_COMPLETE.value  # 22
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +59,7 @@ def make_gen_request(
     req.lora_task_id = lora_task_id
     req.is_context_init_state = False
     req.is_generation_in_progress_state = True
+    req.is_generation_to_complete_state = False
     req.is_first_context_chunk = is_first_context_chunk
     req.py_encoder_output_ready_event = None
     req.py_multimodal_data = None
@@ -172,6 +175,7 @@ def make_kv_cache_manager(
     block_reuse_policy=BlockReusePolicy.PER_REQUEST,
     first_new_block_fn=None,
     is_vswa=False,
+    has_cache_tier_below_gpu=True,
 ):
     mgr = Mock()
     mgr.tokens_per_block = tokens_per_block
@@ -215,6 +219,9 @@ def make_kv_cache_manager(
 
     mgr.suspend_request.side_effect = suspend_request
     mgr.is_request_active.side_effect = lambda req_id: mgr.kv_cache_map[req_id].is_active
+    # The default here has a cache tier below GPU, which leaves preemption off.
+    mgr.has_cache_tier_below_gpu = has_cache_tier_below_gpu
+    mgr.preempt_request.side_effect = lambda req: True
     return mgr
 
 
@@ -1282,6 +1289,473 @@ class TestEviction:
         # gen0 self-evicts; break stops loop before ctx1, ctx2
         assert ids(out.paused_requests) == [0]
         assert len(out.context_requests) == 0
+
+
+# ===========================================================================
+# Preemption (context side, no cache tier below GPU)
+# ===========================================================================
+
+
+def _out_of_pages_for(request_id):
+    """resize_context that only fails for *request_id*."""
+    return lambda req, n: req.py_request_id != request_id
+
+
+#: What the executor passes to reset_for_recompute. Its choice, not the
+#: scheduler's, so the exact value does not matter here.
+UNBOUNDED_MAX_INPUT_LEN = 0x7FFFFFFF
+
+
+class TestContextPreemption:
+    """Releasing a started request's pages when suspension cannot help.
+
+    With GPU as the last cache level a suspended page stays HELD and
+    unevictable, so suspension frees nothing. These tests cover the fallback
+    that gives the pages up instead.
+    """
+
+    def test_out_of_pages_preempts_started_request(self):
+        mgr = make_kv_cache_manager(
+            resize_context_fn=_out_of_pages_for(0),
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+        reqs = [make_ctx_request(0, 100), victim]
+
+        out = sched.schedule_request(reqs, set())
+
+        mgr.preempt_request.assert_called_once_with(victim)
+        assert ids(out.recompute_paused_requests) == [99]
+        # Deferred to the next iteration: a failed resize leaves the first
+        # chunk suspended, so the retry has to go back through
+        # prepare_context.
+        assert len(out.context_requests) == 0
+
+    def test_released_victim_is_left_for_the_executor_to_reset(self):
+        """The rest of the teardown belongs to the recompute-pause path."""
+        mgr = make_kv_cache_manager(
+            resize_context_fn=_out_of_pages_for(0),
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+        victim.py_batch_idx = 7
+
+        out = sched.schedule_request([make_ctx_request(0, 100), victim], set())
+
+        victim.pause.assert_not_called()
+        victim.reset_for_recompute.assert_not_called()
+        assert ids(out.recompute_paused_requests) == [99]
+        assert victim.py_batch_idx is None
+
+    def test_preemption_releases_the_draft_pool_too(self):
+        """The draft pool mirrors the target, so a half-released victim leaks."""
+        mgr = make_kv_cache_manager(
+            resize_context_fn=_out_of_pages_for(0),
+            has_cache_tier_below_gpu=False,
+        )
+        draft_mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=1000, draft_kv_cache_manager=draft_mgr)
+        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+
+        out = sched.schedule_request([make_ctx_request(0, 100), victim], set())
+
+        mgr.preempt_request.assert_called_once_with(victim)
+        draft_mgr.free_resources.assert_called_once_with(victim)
+        assert ids(out.recompute_paused_requests) == [99]
+
+    def test_blocked_request_is_admitted_after_the_executor_recomputes(self):
+        """The whole handoff, not just the scheduler's half of it.
+
+        A preemption is only worth anything if the blocked request gets in on a
+        later pass, and that depends on the executor freeing the victim and
+        resetting it for recompute in between.
+        """
+        out_of_pages = {0}
+
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: req.py_request_id not in out_of_pages,
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        blocked = make_ctx_request(0, 100)
+        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+
+        first = sched.schedule_request([blocked, victim], set())
+        assert ids(first.context_requests) == []
+        assert ids(first.recompute_paused_requests) == [99]
+
+        # Stand in for the executor: free the victim's resources, reset it for
+        # recompute, and let the pages it gave up satisfy the blocked request.
+        for req in first.recompute_paused_requests:
+            mgr.free_resources(req)
+            req.reset_for_recompute(UNBOUNDED_MAX_INPUT_LEN)
+            req.is_first_context_chunk = True
+        out_of_pages.clear()
+
+        second = sched.schedule_request([blocked, victim], set())
+
+        assert 0 in ids(second.context_requests)
+        victim.reset_for_recompute.assert_called_once()
+
+    def test_disagg_generation_worker_never_preempts(self):
+        """It received its context KV, so it cannot replay a prefill."""
+        mgr = make_kv_cache_manager(
+            resize_context_fn=_out_of_pages_for(0),
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000, enable_recompute_pause=False)
+        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+
+        sched.schedule_request([make_ctx_request(0, 100), victim], set())
+
+        mgr.preempt_request.assert_not_called()
+
+    def test_preempted_victim_not_scheduled_in_the_same_pass(self):
+        """Re-admitting the victim would spend the pages it just released."""
+        mgr = make_kv_cache_manager(
+            resize_context_fn=_out_of_pages_for(0),
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+
+        out = sched.schedule_request([make_ctx_request(0, 100), victim], set())
+
+        assert ids(out.context_requests) == []
+
+    def test_freed_pages_are_reserved_for_the_request_that_preempted(self):
+        """No later context request may spend them first."""
+        mgr = make_kv_cache_manager(
+            resize_context_fn=_out_of_pages_for(0),
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        blocked = make_ctx_request(0, 100)
+        # Fits in what the preemption releases, and is only behind `blocked`
+        # in arrival order.
+        later = make_ctx_request(1, 10)
+        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+
+        out = sched.schedule_request([blocked, later, victim], set())
+
+        assert ids(out.recompute_paused_requests) == [99]
+        assert ids(out.context_requests) == []
+
+    def test_a_failed_preemption_still_lets_the_pass_continue(self):
+        """With nothing to give up there is no capacity to reserve."""
+        mgr = make_kv_cache_manager(
+            resize_context_fn=_out_of_pages_for(0),
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        # Only first chunks, so there is no preemption victim among them.
+        reqs = [make_ctx_request(0, 100), make_ctx_request(1, 10)]
+
+        out = sched.schedule_request(reqs, set())
+
+        mgr.preempt_request.assert_not_called()
+        assert ids(out.context_requests) == [1]
+
+    def test_generation_scheduled_before_a_preemption_is_unaffected(self):
+        """Phase 1 has already committed, so ending phase 2 costs it nothing."""
+        mgr = make_kv_cache_manager(
+            resize_context_fn=_out_of_pages_for(1),
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        blocked = make_ctx_request(1, 100)
+        later = make_ctx_request(2, 10)
+        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+
+        out = sched.schedule_request([make_gen_request(0), blocked, later, victim], set())
+
+        assert ids(out.generation_requests) == [0]
+        assert ids(out.recompute_paused_requests) == [99]
+        assert ids(out.context_requests) == []
+
+    def test_skipped_when_a_cache_tier_exists_below_gpu(self):
+        mgr = make_kv_cache_manager(
+            resize_context_fn=_out_of_pages_for(0),
+            has_cache_tier_below_gpu=True,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+
+        out = sched.schedule_request([make_ctx_request(0, 100), victim], set())
+
+        mgr.preempt_request.assert_not_called()
+        # Suspension is cheaper and keeps the pages, so the request is
+        # simply skipped.
+        assert ids(out.context_requests) == [99]
+
+    def test_never_preempts_a_scheduled_request(self):
+        mgr = make_kv_cache_manager(
+            resize_context_fn=_out_of_pages_for(1),
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        # gen0 is scheduled in phase 1; ctx1 then runs out of pages and must
+        # not take the pages out from under it.
+        reqs = [make_gen_request(0), make_ctx_request(1, 100)]
+
+        out = sched.schedule_request(reqs, set())
+
+        assert ids(out.generation_requests) == [0]
+        mgr.preempt_request.assert_not_called()
+
+    def test_never_preempts_itself(self):
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: False,
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        req = make_ctx_request(0, 100, is_first_context_chunk=False)
+
+        sched.schedule_request([req], set())
+
+        mgr.preempt_request.assert_not_called()
+
+    def test_never_preempts_an_inflight_request(self):
+        mgr = make_kv_cache_manager(
+            resize_context_fn=_out_of_pages_for(0),
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+
+        sched.schedule_request([make_ctx_request(0, 100), victim], {99})
+
+        mgr.preempt_request.assert_not_called()
+
+    def test_never_preempts_a_first_chunk_or_suspended_request(self):
+        mgr = make_kv_cache_manager(
+            resize_context_fn=_out_of_pages_for(0),
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        # First chunk: holds no pages worth taking.
+        first_chunk = make_ctx_request(98, 100, is_first_context_chunk=True)
+        # Already suspended: preempting it frees nothing extra.
+        suspended = make_ctx_request(99, 100, is_first_context_chunk=False)
+        mgr.kv_cache_map[suspended.py_request_id].is_active = False
+
+        sched.schedule_request([make_ctx_request(0, 100), first_chunk, suspended], set())
+
+        mgr.preempt_request.assert_not_called()
+
+    def test_chunked_context_out_of_pages_preempts(self):
+        mgr = make_kv_cache_manager(
+            resize_context_fn=_out_of_pages_for(0),
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1000,
+            ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 64),
+        )
+        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+
+        out = sched.schedule_request([make_ctx_request(0, 500), victim], set())
+
+        mgr.preempt_request.assert_called_once_with(victim)
+        assert ids(out.recompute_paused_requests) == [99]
+
+
+# ===========================================================================
+# Deadlock detection
+# ===========================================================================
+
+
+class TestDeadlockDetection:
+    """The scheduler must fail loudly rather than spin scheduling nothing.
+
+    A stalled pass costs a couple of milliseconds, so an undetected stall
+    burns a job's whole wall clock.
+    """
+
+    def test_raises_after_repeated_stalls_with_context_candidates(self):
+        """A prefill-only worker has no generation requests to count."""
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: False,
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        sched._DEADLOCK_STALL_ITERS = 3
+        reqs = [make_ctx_request(0, 100, is_first_context_chunk=False)]
+
+        for _ in range(2):
+            sched.schedule_request(reqs, set())
+        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+            sched.schedule_request(reqs, set())
+
+    def test_raises_after_repeated_stalls_with_generation_candidates(self):
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False, can_evict=True)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        sched._DEADLOCK_STALL_ITERS = 3
+        # Self-eviction suspends it on the first pass, which counts as
+        # progress. Afterwards it is inactive and nothing can be reclaimed.
+        reqs = [make_gen_request(0)]
+
+        for _ in range(3):
+            sched.schedule_request(reqs, set())
+        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+            sched.schedule_request(reqs, set())
+
+    def test_transient_stall_does_not_raise(self):
+        """One bad iteration is normal; the counter has to reset."""
+        fail = [True]
+
+        def resize_fn(req, n):
+            return not fail[0]
+
+        mgr = make_kv_cache_manager(resize_context_fn=resize_fn, has_cache_tier_below_gpu=False)
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        sched._DEADLOCK_STALL_ITERS = 3
+        reqs = [make_ctx_request(0, 100, is_first_context_chunk=False)]
+
+        for _ in range(10):
+            sched.schedule_request(reqs, set())
+            fail[0] = not fail[0]
+
+    def test_idle_scheduler_never_raises(self):
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        sched._DEADLOCK_STALL_ITERS = 2
+
+        for _ in range(5):
+            out = sched.schedule_request([], set())
+            assert len(out.context_requests) == 0
+
+    def test_all_candidates_inflight_never_raises(self):
+        """Requests in the PP pipeline are progressing, just not here."""
+        mgr = make_kv_cache_manager(resize_context_fn=lambda req, n: False)
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        sched._DEADLOCK_STALL_ITERS = 2
+        reqs = [make_ctx_request(0, 100)]
+
+        for _ in range(5):
+            sched.schedule_request(reqs, {0})
+
+    @pytest.mark.parametrize(
+        "holder_state",
+        [DISAGG_CTX_TRANS_IN_PROGRESS, DISAGG_CTX_COMPLETE, DISAGG_GEN_TRANS_IN_PROGRESS],
+    )
+    def test_a_pending_transfer_holding_pages_is_not_a_deadlock(self, holder_state):
+        """A context server's pool can be full of sends that have not landed.
+
+        Those requests are past the schedulable states, so they never reach
+        the scheduled lists, and the context requests they block cannot
+        allocate. The transfer's own timeout covers a send that never lands.
+        """
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: False,
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        sched._DEADLOCK_STALL_ITERS = 3
+        reqs = [
+            make_ctx_request(0, 100, is_first_context_chunk=False),
+            make_filtered_request(1, state_value=holder_state),
+        ]
+
+        for _ in range(sched._DEADLOCK_STALL_ITERS + 2):
+            sched.schedule_request(reqs, set())
+
+        assert sched._stalled_schedules == 0
+
+    def test_a_deadlock_behind_a_finished_transfer_is_still_reported(self):
+        """The reprieve lasts only as long as the transfer does."""
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: False,
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        sched._DEADLOCK_STALL_ITERS = 3
+        blocked = make_ctx_request(0, 100, is_first_context_chunk=False)
+        sending = make_filtered_request(1, state_value=DISAGG_CTX_TRANS_IN_PROGRESS)
+
+        for _ in range(5):
+            sched.schedule_request([blocked, sending], set())
+
+        # The send landed and the executor reaped it, but the pool is still
+        # full, so the stall is now the scheduler's to report.
+        for _ in range(sched._DEADLOCK_STALL_ITERS - 1):
+            sched.schedule_request([blocked], set())
+        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+            sched.schedule_request([blocked], set())
+
+    def test_inflight_send_that_left_active_list_is_not_a_deadlock(self):
+        """A sender off the active list but still in flight is not a deadlock.
+
+        The sender never appears in active_requests, so only the transfer
+        manager can tell the detector its pinned pages are coming back.
+        """
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: False,
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        sched._DEADLOCK_STALL_ITERS = 3
+        transfer_mgr = Mock()
+        transfer_mgr.has_any_inflight_requests.return_value = True
+        sched.set_async_transfer_manager(transfer_mgr)
+        # Only the blocked request is on the active list; the sender has left.
+        blocked = make_ctx_request(0, 100, is_first_context_chunk=False)
+
+        for _ in range(sched._DEADLOCK_STALL_ITERS + 2):
+            sched.schedule_request([blocked], set())
+
+        assert sched._stalled_schedules == 0
+
+    def test_blocked_request_schedules_after_send_completes(self):
+        """Once the off-list send lands, its pages free the blocked request."""
+        pages_held = [True]
+
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: not pages_held[0],
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        sched._DEADLOCK_STALL_ITERS = 3
+        transfer_mgr = Mock()
+        transfer_mgr.has_any_inflight_requests.return_value = True
+        sched.set_async_transfer_manager(transfer_mgr)
+        blocked = make_ctx_request(0, 100, is_first_context_chunk=False)
+
+        for _ in range(sched._DEADLOCK_STALL_ITERS + 2):
+            out = sched.schedule_request([blocked], set())
+            assert len(out.context_requests) == 0
+        assert sched._stalled_schedules == 0
+
+        # The send lands: the transfer manager drops it and its pages return.
+        transfer_mgr.has_any_inflight_requests.return_value = False
+        pages_held[0] = False
+        out = sched.schedule_request([blocked], set())
+        assert ids(out.context_requests) == [0]
+
+    def test_finished_send_still_deadlocks_with_transfer_manager_wired(self):
+        """The transfer-manager reprieve ends the moment no send is in flight.
+
+        With the manager wired but reporting nothing in flight, a still-full
+        pool must deadlock exactly as it does without a manager attached.
+        """
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: False,
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        sched._DEADLOCK_STALL_ITERS = 3
+        transfer_mgr = Mock()
+        transfer_mgr.has_any_inflight_requests.return_value = False
+        sched.set_async_transfer_manager(transfer_mgr)
+        blocked = make_ctx_request(0, 100, is_first_context_chunk=False)
+
+        for _ in range(sched._DEADLOCK_STALL_ITERS - 1):
+            sched.schedule_request([blocked], set())
+        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+            sched.schedule_request([blocked], set())
 
 
 # ===========================================================================
@@ -3397,6 +3871,24 @@ class TestPrefixAwareSkip:
         # Both attempted, neither deferred on behalf of a failed contributor.
         assert ids(out.context_requests) == []
         assert mgr.resize_context.call_count == 2
+
+    def test_deferral_behind_an_inflight_contributor_is_not_a_stall(self):
+        """Deferring is progress when the contributor is the one in flight.
+
+        Nothing reaches a scheduled list on such a pass, but the duplicate
+        stays in pending_ctx and still counts as a candidate, so without an
+        explicit signal the detector reads a working engine as hung.
+        """
+        mgr = self._keyed_manager({5: b"blockA", 1: b"blockA"})
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        sched._DEADLOCK_STALL_ITERS = 3
+        contributor = make_ctx_request(5, 100, is_first_context_chunk=False)
+        duplicate = make_ctx_request(1, 500)
+        reqs = [duplicate, contributor]
+
+        for _ in range(sched._DEADLOCK_STALL_ITERS + 1):
+            out = sched.schedule_request(reqs, {5})
+            assert ids(out.context_requests) == []
 
     def test_registered_contributor_cannot_be_evicted(self):
         """Eviction and deferral cannot collide.

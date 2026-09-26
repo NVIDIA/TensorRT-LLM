@@ -53,3 +53,31 @@ cd ../..
 rm -rf Mooncake
 
 echo "export LD_LIBRARY_PATH=${MOONCAKE_INSTALL_PATH}/lib:\$LD_LIBRARY_PATH" >> "${ENV}"
+
+# The source build above provides only the C++ transfer engine, which is what
+# the cache transceiver links against. MooncakeDistributedStore, the shared CPU
+# pool behind the mooncake-store KV cache connector, comes from the Python
+# wheel below.
+#
+# `make install` also emits a `mooncake` package that omits
+# libmooncake_store.so, so importing mooncake.store from it fails. It has to go
+# before the wheel is installed: CMake writes
+# store.cpython-312-x86_64-linux-gnu.so where the wheel writes store.so, and
+# importlib prefers the interpreter-tagged suffix, so the broken extension
+# would win even after pip reports success. The directory is the one
+# mooncake-integration/CMakeLists.txt chose, which this repeats.
+MOONCAKE_CMAKE_PACKAGE="$(python3 -c "import sys; print([s for s in sys.path if 'packages' in s][0])")/mooncake"
+echo "removing CMake-generated mooncake package: ${MOONCAKE_CMAKE_PACKAGE}"
+rm -rf "${MOONCAKE_CMAKE_PACKAGE}"
+
+# The Mooncake Python client (MooncakeDistributedStore) is installed from
+# requirements-mooncake.txt, the pin shared with the standalone wheel's
+# `tensorrt-llm[mooncake]` extra. That file explains why the pin is independent
+# of MOONCAKE_VERSION above and why the CUDA 13 wheel is required.
+# The Docker build bind-mounts the file at /opt; a run from a checkout finds it
+# relative to this script instead.
+MOONCAKE_REQUIREMENTS="${MOONCAKE_REQUIREMENTS:-/opt/requirements-mooncake.txt}"
+if [ ! -f "${MOONCAKE_REQUIREMENTS}" ]; then
+    MOONCAKE_REQUIREMENTS="$(dirname "${BASH_SOURCE[0]}")/../../requirements-mooncake.txt"
+fi
+pip3 install --no-cache-dir -r "${MOONCAKE_REQUIREMENTS}"

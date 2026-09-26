@@ -47,6 +47,7 @@ from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._utils import mpi_rank, set_prometheus_multiproc_dir
 from tensorrt_llm.commands import _telemetry as _command_telemetry
 from tensorrt_llm.commands._serve_stability import stability_option
+from tensorrt_llm.commands.mooncake import mooncake_donor, mooncake_master
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
                                          get_is_diffusion_only_model)
 from tensorrt_llm.executor.utils import MAX_NUM_FRONTENDS, LlmLauncherEnvs
@@ -2745,7 +2746,11 @@ main = DefaultGroup(
         "disaggregated": disaggregated,
         "disaggregated_mpi_worker": disaggregated_mpi_worker,
         "mm_embedding_serve": serve_encoder,
-        "embeddings": serve_embedding
+        "embeddings": serve_embedding,
+        # The parts of a Mooncake pool that cannot belong to a server, for
+        # deployments where a pool outlives or spans them.
+        "mooncake_master": mooncake_master,
+        "mooncake_donor": mooncake_donor,
     })
 
 if __name__ == "__main__":
