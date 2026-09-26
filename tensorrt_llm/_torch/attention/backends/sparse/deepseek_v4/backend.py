@@ -280,6 +280,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             local_layer_idx, DeepseekV4AttentionType.SWA.value
         ]
 
+        active_request_count = None
         if self.compress_ratio > 1:
             compressed_buffer_ptr = metadata.compressed_buffer_ptrs[layer_idx]
             compress_pool_base_ptr = metadata.sparse_mla_base_ptrs[self.compress_ratio]
@@ -292,6 +293,28 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                 topk_indices = sparse_backend_args.topk_indices
                 assert topk_indices is not None, "topk_indices is required when compress_ratio=4"
                 compressed_local_indices = topk_indices
+                # Metadata setup and prepare() validate the dtype and batch layout.
+                # Fresh prefill already uses the resident write table.
+                if (
+                    self.sparse_attention_config.enable_kv_cache_offload
+                    and attention_input_type == AttentionInputType.generation_only
+                ):
+                    state = metadata.sparse_offload_state
+                    assert state is not None, "Sparse offload metadata must be initialized"
+                    # module.forward_sparse_attn has joined both producer
+                    # streams. Keep fetch before the conversion kernel's
+                    # FMHA scheduler prologue on this consuming stream.
+                    block_table_compressed = kv_cache_manager.fetch_sparse_read_table(
+                        state,
+                        layer_idx,
+                        topk_indices,
+                        req_id,
+                        metadata.compressed_kv_lens_cuda[self.compress_ratio],
+                        block_table_compressed,
+                    )
+                    # Metadata counts include CUDA graph dummy rows. The active
+                    # count is refreshed in place before replay to mask them.
+                    active_request_count = state.active_request_count
             else:
                 compressed_local_indices = metadata.compressed_local_indices_cuda[start_idx:end_idx]
         else:
@@ -356,6 +379,8 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             num_compressed_indices=metadata.max_compressed_indices[self.compress_ratio],
             **sched_kwargs,
             split_extra=self.use_fp8_ds_mla,
+            active_request_count=active_request_count,
+            mask_invalid_pages=active_request_count is not None,
         )
 
         if self.use_fp8_ds_mla:

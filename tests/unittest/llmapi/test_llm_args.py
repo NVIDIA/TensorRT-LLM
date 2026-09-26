@@ -4171,8 +4171,11 @@ class TestDeepSeekV4SparseAttentionConfig:
         with pytest.raises(ValidationError, match="requires SM>=100"):
             DeepSeekV4SparseAttentionConfig(indexer_k_dtype="fp4")
 
-    def test_lowers_to_deepseek_v4_sparse_params(self):
-        config = DeepSeekV4SparseAttentionConfig(compress_ratios=[0, 4, 128])
+    @pytest.mark.parametrize("enable_kv_cache_offload", [False, True])
+    def test_lowers_to_deepseek_v4_sparse_params(self, enable_kv_cache_offload):
+        config = DeepSeekV4SparseAttentionConfig(
+            compress_ratios=[0, 4, 128],
+            enable_kv_cache_offload=enable_kv_cache_offload)
 
         sparse_params = config.to_sparse_params()
         sparse_metadata_params = config.to_sparse_metadata_params()
@@ -4181,6 +4184,29 @@ class TestDeepSeekV4SparseAttentionConfig:
         assert sparse_params.compress_ratios == [1, 4, 128]
         assert sparse_metadata_params.compress_ratios == [1, 4, 128]
         assert sparse_metadata_params.window_size == 128
+        assert sparse_params.enable_kv_cache_offload is enable_kv_cache_offload
+        assert sparse_metadata_params.enable_kv_cache_offload is enable_kv_cache_offload
+
+    def test_kv_cache_offload_opt_in_round_trip(self):
+        default_config = DeepSeekV4SparseAttentionConfig()
+        assert default_config.enable_kv_cache_offload is False
+        config = DeepSeekV4SparseAttentionConfig(enable_kv_cache_offload=True)
+
+        restored = DeepSeekV4SparseAttentionConfig.model_validate_json(
+            config.model_dump_json())
+
+        assert restored.enable_kv_cache_offload is True
+
+    def test_kv_cache_offload_requires_sparse_layer(self):
+        with pytest.raises(ValidationError, match="ratio-4 attention layer"):
+            DeepSeekV4SparseAttentionConfig(compress_ratios=[0, 128],
+                                            enable_kv_cache_offload=True)
+
+    @pytest.mark.parametrize("index_topk", [None, 0, -1])
+    def test_kv_cache_offload_requires_positive_topk(self, index_topk):
+        with pytest.raises(ValidationError, match="positive index_topk"):
+            DeepSeekV4SparseAttentionConfig(index_topk=index_topk,
+                                            enable_kv_cache_offload=True)
 
     @pytest.mark.parametrize("compress_ratios", [[], [-1, 4, 128]])
     def test_invalid_compress_ratios_raise(self, compress_ratios):

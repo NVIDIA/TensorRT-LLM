@@ -1291,6 +1291,11 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "sparse_attention_config.enable_kv_cache_offload"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "sparse_attention_config.fuse_qkv_index_projection"
     },
     {
