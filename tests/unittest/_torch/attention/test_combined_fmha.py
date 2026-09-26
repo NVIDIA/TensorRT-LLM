@@ -15,6 +15,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from fmha_test_utils import FakeAttention, FakePhasedFmha
 
@@ -27,7 +28,12 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 
 
-def test_combined_fmha_delegates_phases_and_prepares_max_workspace() -> None:
+@pytest.mark.parametrize(
+    "input_type", [AttentionInputType.mixed, AttentionInputType.generation_only]
+)
+def test_combined_fmha_delegates_phases_and_prepares_max_workspace(
+    monkeypatch: pytest.MonkeyPatch, input_type: AttentionInputType
+) -> None:
     events: list[tuple] = []
     attn = FakeAttention()
     context_fmha = FakePhasedFmha(
@@ -64,8 +70,8 @@ def test_combined_fmha_delegates_phases_and_prepares_max_workspace() -> None:
         num_generations=4,
         kv_lens_cuda_runtime=torch.tensor([2, 1, 5, 5, 5, 5], dtype=torch.int32),
         kv_lens_runtime=torch.tensor([2, 1, 5, 5, 5, 5], dtype=torch.int32),
-        prompt_lens_cuda_runtime=torch.tensor([2, 1, 1, 1, 1, 1], dtype=torch.int32),
-        prompt_lens_cpu_runtime=torch.tensor([2, 1, 1, 1, 1, 1], dtype=torch.int32),
+        prompt_lens_cuda_runtime=torch.tensor([2, 1, 3, 3, 4, 4], dtype=torch.int32),
+        prompt_lens_cpu_runtime=torch.tensor([2, 1, 3, 3, 4, 4], dtype=torch.int32),
         beam_width=2,
         cache_indirection=None,
         tokens_per_block=32,
@@ -73,20 +79,31 @@ def test_combined_fmha_delegates_phases_and_prepares_max_workspace() -> None:
         is_cross=False,
         is_spec_decoding_enabled=False,
     )
+    run_generation = generation_fmha.run_generation
+
+    def check_generation_lengths(params) -> None:
+        assert params.context_lengths.tolist() == [3, 3, 4, 4]
+        assert params.context_lengths.data_ptr() == metadata.prompt_lens_cuda_runtime[2:].data_ptr()
+        run_generation(params)
+
+    monkeypatch.setattr(generation_fmha, "run_generation", check_generation_lengths)
+    num_tokens = 4 if input_type == AttentionInputType.generation_only else 7
     forward_args = AttentionForwardArgs(
-        output=torch.empty((7, 4)),
-        attention_input_type=AttentionInputType.mixed,
+        output=torch.empty((num_tokens, 4)),
+        attention_input_type=input_type,
         attention_window_size=8,
     )
 
-    combined_fmha.forward(torch.empty((7, 4)), None, None, metadata, forward_args)
+    combined_fmha.forward(torch.empty((num_tokens, 4)), None, None, metadata, forward_args)
 
-    assert events == [
+    expected_events = [
         ("prepare", "context"),
         ("prepare", "generation"),
-        ("run", "context", FmhaPhase.CONTEXT, 3, 2, 2),
-        ("run", "generation", FmhaPhase.GENERATION, 4, 4, 2),
     ]
+    if input_type == AttentionInputType.mixed:
+        expected_events.append(("run", "context", FmhaPhase.CONTEXT, 3, 2, 2))
+    expected_events.append(("run", "generation", FmhaPhase.GENERATION, 4, 4, 2))
+    assert events == expected_events
     assert metadata.effective_workspace.numel() == 8
 
 
