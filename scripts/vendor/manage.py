@@ -36,7 +36,7 @@ from pathlib import Path, PurePosixPath
 
 import yaml
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_LOCK = _REPO_ROOT / "3rdparty" / "vendor_sources.lock.yaml"
 _SCHEMA_VERSION = 1
 _COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}\Z")

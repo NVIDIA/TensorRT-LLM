@@ -14,7 +14,7 @@ the selected files, any persistent compatibility patch and its content digest,
 and a digest of the materialized destination. A short branch or tag may explain
 where the commit came from, but the full commit is authoritative.
 
-Use `scripts/vendor_sources.py` for every lock or vendor-state change. Do not
+Use `scripts/vendor/manage.py` for every lock or vendor-state change. Do not
 edit the YAML, generated patches, or digests by hand. All examples below use the
 default lock. For an isolated test or another consumer repository, place
 `--lock PATH` before the subcommand.
@@ -91,10 +91,10 @@ existing compatibility patch, then use `pin`.
 List entries, or run the offline integrity status for all or one vendor:
 
 ```bash
-python scripts/vendor_sources.py list
-python scripts/vendor_sources.py status
-python scripts/vendor_sources.py status VENDOR
-python scripts/vendor_sources.py check VENDOR
+python scripts/vendor/manage.py list
+python scripts/vendor/manage.py status
+python scripts/vendor/manage.py status VENDOR
+python scripts/vendor/manage.py check VENDOR
 ```
 
 `status` and the default `check` exit unsuccessfully if the destination has a
@@ -107,7 +107,7 @@ When neither the lock entry nor destination exists, create both from an
 immutable commit and a local upstream checkout:
 
 ```bash
-python scripts/vendor_sources.py create VENDOR \
+python scripts/vendor/manage.py create VENDOR \
   --url https://example.com/organization/repository.git \
   --branch main \
   --commit FULL_COMMIT \
@@ -124,7 +124,7 @@ If the destination already exists but has no lock entry, adopt it. Use `exact`
 to require an exact upstream match:
 
 ```bash
-python scripts/vendor_sources.py create VENDOR \
+python scripts/vendor/manage.py create VENDOR \
   --url https://example.com/organization/repository.git \
   --commit FULL_COMMIT \
   --source path/in/upstream \
@@ -143,7 +143,7 @@ Discard destination edits and reproduce the currently locked upstream commit
 plus its persistent patch:
 
 ```bash
-python scripts/vendor_sources.py sync VENDOR --repo /path/to/upstream
+python scripts/vendor/manage.py sync VENDOR --repo /path/to/upstream
 ```
 
 This overwrites the selected destination files. It does not update the lock,
@@ -155,21 +155,21 @@ After editing an exact destination for a change that must remain downstream,
 create its persistent patch:
 
 ```bash
-python scripts/vendor_sources.py patch VENDOR create --repo /path/to/upstream
+python scripts/vendor/manage.py patch VENDOR create --repo /path/to/upstream
 ```
 
 After intentionally changing an already patched destination, regenerate the
 patch:
 
 ```bash
-python scripts/vendor_sources.py patch VENDOR refresh --repo /path/to/upstream
+python scripts/vendor/manage.py patch VENDOR refresh --repo /path/to/upstream
 ```
 
 Drop a no-longer-needed patch only after the destination exactly matches the
 currently locked upstream selection:
 
 ```bash
-python scripts/vendor_sources.py patch VENDOR drop --repo /path/to/upstream
+python scripts/vendor/manage.py patch VENDOR drop --repo /path/to/upstream
 ```
 
 Generated patches live under `3rdparty/vendor_patches/`. Review them, but update
@@ -184,7 +184,7 @@ branch at the currently locked commit **before** exporting:
 
 ```bash
 git -C /path/to/upstream switch -c trtllm-vendor-fix LOCKED_FULL_COMMIT
-python scripts/vendor_sources.py export VENDOR --repo /path/to/upstream
+python scripts/vendor/manage.py export VENDOR --repo /path/to/upstream
 ```
 
 The upstream checkout's selected source must be clean before export and its
@@ -205,7 +205,7 @@ git -C /path/to/upstream push -u origin trtllm-vendor-fix
 Finally, pin the committed revision from that checkout:
 
 ```bash
-python scripts/vendor_sources.py pin VENDOR \
+python scripts/vendor/manage.py pin VENDOR \
   --url https://example.com/my-fork/repository.git \
   --branch trtllm-vendor-fix \
   --commit NEW_FULL_COMMIT \
@@ -236,7 +236,7 @@ Remove a lock entry and its generated compatibility patch while preserving the
 destination:
 
 ```bash
-python scripts/vendor_sources.py remove VENDOR
+python scripts/vendor/manage.py remove VENDOR
 ```
 
 The preserved destination is no longer protected by the lock. Delete or move
@@ -247,8 +247,8 @@ it separately as part of the reviewed migration that removes the vendor.
 The default check is deliberately offline:
 
 ```bash
-python scripts/vendor_sources.py check
-python scripts/vendor_sources.py check --offline
+python scripts/vendor/manage.py check
+python scripts/vendor/manage.py check --offline
 ```
 
 It validates the lock schema and path safety, patch metadata, and the checked-in
@@ -260,7 +260,7 @@ When network access is available, attempt verification against every recorded
 upstream:
 
 ```bash
-python scripts/vendor_sources.py check --upstream
+python scripts/vendor/manage.py check --upstream
 ```
 
 An inaccessible repository is reported as unavailable rather than failing. If
@@ -268,14 +268,14 @@ a commit can be obtained, a source, patch, or destination mismatch is an error.
 Trusted maintainer CI can require access to every source:
 
 ```bash
-python scripts/vendor_sources.py check --upstream --require-access
+python scripts/vendor/manage.py check --upstream --require-access
 ```
 
 To verify one vendor against an existing checkout without contacting the
 recorded URL, provide it explicitly:
 
 ```bash
-python scripts/vendor_sources.py check VENDOR --repo /path/to/upstream
+python scripts/vendor/manage.py check VENDOR --repo /path/to/upstream
 ```
 
 The checkout's configured remote may differ from the lock URL; it only needs to
@@ -288,6 +288,23 @@ that destination. Creating and pinning vendors therefore require a fetched or
 local repository, and URL or commit changes require vendor CODEOWNER review.
 Never put credentials in a lock URL. Run checks that use internal credentials
 only in a trusted environment, not with pull-request-controlled scripts.
+
+## Promotion and local monitoring
+
+The generic toolkit under `scripts/vendor/` supports every vendor key in this
+lock. `promote.py` prepares a verified lock-only follow-up after a source-update
+PR merges; `bot.py` can monitor PRs locally, request missing contributor metadata,
+match upstream commits, and publish promotions with squash auto-merge.
+
+See the [toolkit guide](../scripts/vendor/README.md) for the workflow diagram,
+contributor description format, author resolution of ambiguous matches,
+authentication, configurable private workdirs, daemon launch/stop, and recovery.
+No GitHub App or systemd setup is required. All remote writes are opt-in with
+`--publish`; operator settings and credentials are not committed to this repo.
+
+Use the entry points under `scripts/vendor/` directly. The old top-level scripts
+and PrimTS-specific CLI aliases are not retained; callers must migrate to the
+generic commands and supply their vendor and repository configuration explicitly.
 
 ## License and attribution
 
@@ -310,6 +327,6 @@ files remain exact upstream copies.
 Use the normal commands with `flashinfer-prims-ts`, for example:
 
 ```bash
-python scripts/vendor_sources.py status flashinfer-prims-ts
-python scripts/vendor_sources.py check flashinfer-prims-ts
+python scripts/vendor/manage.py status flashinfer-prims-ts
+python scripts/vendor/manage.py check flashinfer-prims-ts
 ```

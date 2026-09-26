@@ -167,6 +167,25 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 | Test waives | `tests/integration/test_lists/waives.txt` | Skip known-failing tests with NVBug links |
 | Performance | See [benchmarking guide](docs/source/developer-guide/perf-benchmarking.md) | `trtllm-bench` and `trtllm-serve` benchmarks |
 
+### Vendor source tools and promotion
+
+Use `scripts/vendor/manage.py` for lock/vendor-state changes and
+`scripts/vendor/promote.py promote` for lock-only promotion after a source-update
+PR merges. Select the vendor, upstream, and canonical fork/branch explicitly.
+Manual publication uses `--publish --auto-merge`; dry-run is the default.
+`scripts/vendor/bot.py run` provides an optional local monitor with `--workdir`,
+`--daemon`, and opt-in `--publish`. Do not launch a publishing daemon unless the
+user requested ongoing automation. Never commit operator credentials or runtime
+state. The bot asks the PR author to correct metadata or ambiguous attribution;
+it never approves code merely because metadata passes. Use the entry points
+under `scripts/vendor/`; no legacy script wrappers are provided. See
+`scripts/vendor/README.md` and `3rdparty/vendor-sources.md`. Preserve structured
+promotion provenance and DCO sign-off in the final squash message. CI skip applies
+only to verified lock-only promotions, not changes to these tools.
+Git/GitHub promotion commits are authoritative; SQLite is a disposable cache.
+After cache loss, stop the old process and relaunch with the same operator/config.
+Cold discovery backfills merged PRs; `--since` explicitly limits that history.
+
 ### Triggering CI
 
 CI is triggered by posting comments on the PR. Basic commands:

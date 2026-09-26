@@ -1607,7 +1607,7 @@ repos:
         pass_filenames: false
     -   id: vendor-sources-check
         name: verify vendored sources are in sync
-        entry: python scripts/vendor_sources.py check
+        entry: python scripts/vendor/manage.py check
         language: python
         additional_dependencies: [PyYAML]
         always_run: true
