@@ -70,6 +70,10 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
     CuteDslFusedMoENvfp4Runner,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import (
+    CuteDslFc12FusedMoENvfp4Runner,
+    TrtllmCutedslFusedFc12Nvfp4Impl,
+)
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import MarlinFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import (
@@ -1281,19 +1285,93 @@ def test_megamoe_cutedsl_cache_derived_state_survives_the_read_only_reader_walk(
     wrapper.cache_derived_state.assert_not_called()
 
 
-def test_megamoe_bakes_situ_softcaps_as_uniform_scalars():
-    # MegaMoE declares UNIFORM_SCALAR for alpha/beta because the kernels bake
-    # them at codegen time, so a per-expert tensor is reduced here.
+@pytest.mark.parametrize("impl", [MegaMoEDeepGemm, TrtllmCutedslFusedFc12Nvfp4Impl])
+def test_codegen_baked_situ_softcaps_are_uniform_scalars(impl):
+    # These kernels bake alpha/beta at codegen time, so the activation adapter
+    # accepts only one value shared by every local expert.
     params = materialize_activation_params(
         SiTuActivation(gate_softcap=torch.full((8,), 4.0), linear_softcap=25.0),
-        MegaMoEDeepGemm.activation_support,
+        impl.activation_support,
         num_local_experts=8,
-        owner="MegaMoEDeepGemm",
+        owner=impl.__name__,
     )
 
     assert params.activation_type is ActivationType.SiTu
     assert params.alpha == 4.0
     assert params.beta == 25.0
+
+
+def test_fc12_rejects_nonuniform_situ_softcaps() -> None:
+    with pytest.raises(ValueError, match="uniform"):
+        materialize_activation_params(
+            SiTuActivation(gate_softcap=torch.tensor([4.0, 5.0]), linear_softcap=25.0),
+            TrtllmCutedslFusedFc12Nvfp4Impl.activation_support,
+            num_local_experts=2,
+            owner="FC12",
+        )
+
+
+@pytest.mark.parametrize("clamp", [None, 7.0])
+def test_fc12_swiglu_keeps_clamp_without_situ_constants(clamp: Optional[float]) -> None:
+    params = materialize_activation_params(
+        SwigluActivation(clamp=clamp),
+        TrtllmCutedslFusedFc12Nvfp4Impl.activation_support,
+        num_local_experts=2,
+        owner="FC12",
+    )
+    assert params.activation_type is ActivationType.Swiglu
+    assert (params.alpha, params.beta) == (None, None)
+    assert params.clamp == (float("inf") if clamp is None else clamp)
+
+
+def test_fc12_outer_tuning_separates_activation_and_softcaps() -> None:
+    identities = [
+        (int(ActivationType.Swiglu), None, None),
+        (int(ActivationType.SiTu), 4.0, 25.0),
+        (int(ActivationType.SiTu), 5.0, 25.0),
+        (int(ActivationType.SiTu), 4.0, 30.0),
+    ]
+    keys = [
+        CuteDslFc12FusedMoENvfp4Runner(
+            forward_impl=MagicMock(),
+            num_experts=8,
+            top_k=2,
+            num_local_experts=8,
+            local_expert_offset=0,
+            workload_identity=identity,
+        ).unique_id()
+        for identity in identities
+    ]
+    assert len(set(keys)) == len(identities)
+
+
+def test_fc12_preparation_primes_fused_tiles_without_two_op_memset_knob() -> None:
+    def fused_forward(
+        *inputs,
+        enable_alltoall,
+        tile_size,
+        recv_expert_count,
+        deep_ep_expert_capacity,
+        use_count_native_expert_metadata,
+    ):
+        assert not enable_alltoall
+        assert recv_expert_count is None and deep_ep_expert_capacity is None
+        assert not use_count_native_expert_metadata
+        tiles.append(tile_size)
+        return inputs[4]
+
+    tiles = []
+    runner = CuteDslFc12FusedMoENvfp4Runner(
+        forward_impl=fused_forward,
+        num_experts=8,
+        top_k=2,
+        num_local_experts=8,
+        local_expert_offset=0,
+        workload_identity=(int(ActivationType.SiTu), 4.0, 25.0),
+    )
+    inputs = [object() for _ in range(6)]
+    assert runner.forward(inputs, tactic=None, do_preparation=True) is inputs[4]
+    assert tiles == [128, 256]
 
 
 def test_megamoe_plain_swiglu_carries_no_constants():

@@ -17465,7 +17465,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # builds that do not ship cutlass.utils.rubin_helpers (SM107 only).
     if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
         # ----------------------------------------------------------------
-        # Rubin NVFP4 Fused FC12 (FC1 gather+SwiGLU + FC2 finalize in ONE kernel)
+        # Rubin NVFP4 Fused FC12 (FC1 gather+gated-act + FC2 finalize in ONE kernel)
         # ----------------------------------------------------------------
         # Compat shim: the delivered fused kernel accesses ``cutlass.memory.*``
         # (SmemAllocator / TmemAllocator / get_smem_capacity_in_bytes) and
@@ -17558,16 +17558,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
             kernel_cache = dict()
             tuning_config_cache = dict()
 
-            def __init__(self,
-                         num_experts: int,
-                         top_k: int,
-                         num_local_experts: int,
-                         local_expert_offset: int,
-                         tile_size: int,
-                         scaling_vector_size: int = 16,
-                         swiglu_limit: float = float("inf"),
-                         ep_size: int = 1,
-                         enable_alltoall: bool = False):
+            def __init__(
+                    self,
+                    num_experts: int,
+                    top_k: int,
+                    num_local_experts: int,
+                    local_expert_offset: int,
+                    tile_size: int,
+                    scaling_vector_size: int = 16,
+                    swiglu_limit: float = float("inf"),
+                    ep_size: int = 1,
+                    enable_alltoall: bool = False,
+                    activation_type: ActivationType = ActivationType.Swiglu,
+                    situ_beta: Optional[float] = None,
+                    situ_linear_beta: Optional[float] = None):
                 super().__init__()
                 self.num_experts = num_experts
                 self.top_k = top_k
@@ -17576,6 +17580,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.tile_size = tile_size
                 self.scaling_vector_size = scaling_vector_size
                 self.swiglu_limit = swiglu_limit
+                self.activation_type = ActivationType(activation_type)
+                self.situ_beta = situ_beta
+                self.situ_linear_beta = situ_linear_beta
                 # Used only by the in-op output memset (moved here so the memset
                 # is the fused kernel's immediate stream predecessor).
                 self.ep_size = ep_size
@@ -17600,6 +17607,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self.tile_size,
                     self.scaling_vector_size,
                     self.swiglu_limit,
+                    int(self.activation_type),
+                    self.situ_beta,
+                    self.situ_linear_beta,
                 )
 
             def get_valid_tactics(
@@ -17897,7 +17907,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cache_key = (self.scaling_vector_size, self.tile_size,
                              self.top_k, mma_tiler, mma_inst_shape,
                              cluster_shape_mn, max_active_clusters,
-                             self.swiglu_limit)
+                             self.swiglu_limit, int(self.activation_type),
+                             self.situ_beta, self.situ_linear_beta)
                 if cache_key not in self.__class__.kernel_cache:
                     gemm = self.__class__.kernel_class(
                         self.scaling_vector_size,
@@ -17909,6 +17920,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         use_pdl=True,
                         swiglu_limit=self.swiglu_limit,
                         scheduler="l2_atomic",
+                        activation_type=self.activation_type,
+                        situ_beta=self.situ_beta,
+                        situ_linear_beta=self.situ_linear_beta,
                     )
 
                     @cute.jit
@@ -18144,6 +18158,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             ep_size: int,
             enable_alltoall: bool,
             tuner_key: str,
+            activation_type: ActivationType = ActivationType.Swiglu,
+            situ_beta: Optional[float] = None,
+            situ_linear_beta: Optional[float] = None,
         ) -> torch.Tensor:
             tuner = AutoTuner.get()
             runner = Sm107BlockScaledContiguousGroupedGemmFusedFc12Runner(
@@ -18156,6 +18173,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 swiglu_limit=swiglu_limit,
                 ep_size=ep_size,
                 enable_alltoall=enable_alltoall,
+                activation_type=activation_type,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
             )
             # Input order matches Fc12FusedInputsHelper (FC1 prefix 0..9 mirrors
             # GatherGroupedGemmInputsHelper; FC2 tensors 10..14; expanded_idx 15
@@ -18192,7 +18212,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             "SymInt local_expert_offset, SymInt tile_size, float swiglu_limit, "
             "SymInt ep_size, bool enable_alltoall, "
             "SymInt scaling_vector_size=16, "
-            "str? precomputed_tactic=None) -> ()",
+            "str? precomputed_tactic=None, "
+            f"SymInt activation_type={int(ActivationType.Swiglu)}, "
+            "float? situ_beta=None, float? situ_linear_beta=None) -> ()",
             device_types="cuda")
         def cute_dsl_nvfp4_fc12_fused_rubin(
             input: torch.Tensor,
@@ -18221,6 +18243,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             enable_alltoall: bool,
             scaling_vector_size: int = 16,
             precomputed_tactic: Optional[str] = None,
+            activation_type: int = int(ActivationType.Swiglu),
+            situ_beta: Optional[float] = None,
+            situ_linear_beta: Optional[float] = None,
         ) -> None:
             # In-place: finalize scatter-adds into ``output`` (mutates_args);
             # the op returns nothing so it does not alias its own input.
@@ -18233,7 +18258,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 local_expert_offset, tile_size, scaling_vector_size,
                 swiglu_limit, precomputed_tactic, expanded_idx_to_permuted_idx,
                 ep_size, enable_alltoall,
-                "trtllm::cute_dsl_nvfp4_fc12_fused_rubin")
+                "trtllm::cute_dsl_nvfp4_fc12_fused_rubin",
+                ActivationType(activation_type), situ_beta, situ_linear_beta)
 
         @torch.library.register_fake("trtllm::cute_dsl_nvfp4_fc12_fused_rubin")
         def _(
@@ -18263,5 +18289,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             enable_alltoall: bool,
             scaling_vector_size: int = 16,
             precomputed_tactic: Optional[str] = None,
+            activation_type: int = int(ActivationType.Swiglu),
+            situ_beta: Optional[float] = None,
+            situ_linear_beta: Optional[float] = None,
         ) -> None:
             return None

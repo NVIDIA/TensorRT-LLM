@@ -555,7 +555,17 @@ def test_kimi_k3_moe_split_selection() -> None:
     assert KimiK3MoERuntime._select_moe_tp_ep(tep) == (4, 2)
 
 
-@pytest.mark.parametrize("backend", ["CUTLASS", "TRTLLM", "MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"])
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "CUTLASS",
+        "TRTLLM",
+        "CUTEDSL",
+        "CUTEDSL_FC12",
+        "MEGAMOE_DEEPGEMM",
+        "MEGAMOE_CUTEDSL",
+    ],
+)
 def test_kimi_k3_routed_config_preserves_explicit_backend(backend):
     model_config = ModelConfig(
         mapping=Mapping(world_size=1, rank=0, tp_size=1),
@@ -673,7 +683,8 @@ def test_kimi_k3_allow_list_matches_what_the_backends_declare():
     assert "CUTEDSL" in declares_situ
 
 
-def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch):
+@pytest.mark.parametrize("backend", ["CUTEDSL", "CUTEDSL_FC12"])
+def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch, backend):
     """K3 must propagate strict backend selection through create_moe."""
     from transformers.configuration_utils import PretrainedConfig
 
@@ -688,7 +699,7 @@ def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch):
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
     # Keep the real resolver and K3 caller; only make eligibility deterministic.
-    for backend_cls in BACKEND_FAMILY["CUTEDSL"]:
+    for backend_cls in BACKEND_FAMILY[backend]:
         monkeypatch.setattr(
             backend_cls,
             "can_implement",
@@ -707,7 +718,7 @@ def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch):
     model_config = ModelConfig(
         pretrained_config=pretrained_config,
         mapping=Mapping(world_size=1, rank=0, tp_size=1),
-        moe_backend="CUTEDSL",
+        moe_backend=backend,
         quant_config_dict={"layers.0.mlp.experts": quant_config},
     )
     cfg = _K3Config(routed_expert_hidden_size=512, latent_moe_use_norm=True)
@@ -726,8 +737,8 @@ def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch):
     assert report.degraded
     assert impl_class_for(report) is CutlassFusedMoE
 
-    # Removing CUTEDSL from K3's no-degradation list must fail this assertion.
-    with pytest.raises(ValueError, match="CUTEDSL.*degradation disallowed") as excinfo:
+    # Removing either backend from K3's no-degradation list must fail this assertion.
+    with pytest.raises(ValueError, match=rf"{backend}.*degradation disallowed") as excinfo:
         KimiK3MoERuntime(model_config, cfg, layer_idx=0, aux_stream_dict={})
     assert "dep_missing" in str(excinfo.value)
 
@@ -1370,12 +1381,12 @@ def test_tp16_nvfp4_padded_loaders_preserve_rank_ownership():
     assert torch.count_nonzero(w2_sf_dst[:, 12:].float()) == 0
 
 
-#: The FP4 backends that serve SiTU. CUTEDSL additionally needs the CuTe DSL
-#: wheel, which is checked inside the test rather than in a ``skipif``:
+#: The FP4 backends that serve SiTU. The CuteDSL backends additionally need
+#: the matching CuTe DSL wheel, checked inside the test rather than a ``skipif``:
 #: importing ``cute_dsl_utils`` pulls in the DSL package, which appends its own
 #: directory to ``sys.path``, and this repository fails the whole pytest
 #: session when a test file does that at collection time.
-_NVFP4_SITU_BACKENDS = ["CUTLASS", "TRTLLM", "CUTEDSL"]
+_NVFP4_SITU_BACKENDS = ["CUTLASS", "TRTLLM", "CUTEDSL", "CUTEDSL_FC12"]
 
 
 def _skip_if_backend_unavailable(moe_backend):
@@ -1386,19 +1397,29 @@ def _skip_if_backend_unavailable(moe_backend):
     early puts the wheel's package directory on ``sys.path`` for every other
     test file in the session.
     """
-    if moe_backend != "CUTEDSL":
+    if moe_backend not in ("CUTEDSL", "CUTEDSL_FC12"):
         return
-    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+    from tensorrt_llm._torch.cute_dsl_utils import (
+        IS_CUTLASS_DSL_AVAILABLE,
+        IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    )
 
     if not IS_CUTLASS_DSL_AVAILABLE:
         pytest.skip("CuteDSL MoE requires the CuTe DSL wheel")
+    sm_version = get_sm_version()
+    if moe_backend == "CUTEDSL_FC12":
+        if sm_version != 107:
+            pytest.skip(f"FC12 SiTU MoE requires Rubin (SM107), got SM{sm_version}")
+        if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+            pytest.skip("FC12 SiTU MoE requires CuTe DSL Rubin support")
+        return
     # nvfp4_moe_supported admits every SM >= 100, but this integration enables
     # SiTU only on Blackwell. Match can_implement() rather than exercising an
     # end-to-end path that has not been enabled on SM107.
-    if get_sm_version() not in (100, 103):
+    if sm_version not in (100, 103):
         pytest.skip(
             f"CuteDSL SiTU MoE needs the Blackwell act-fusion kernel "
-            f"(SM100/SM103), got SM{get_sm_version()}"
+            f"(SM100/SM103), got SM{sm_version}"
         )
 
 
@@ -1440,13 +1461,13 @@ def _make_nvfp4_expert_bank(num_experts, intermediate, hidden, seed=907):
 def _make_nvfp4_moe(
     gate, num_experts=_TP_EXPERTS, moe_backend="CUTLASS", gate_softcap=4.0, linear_softcap=25.0
 ):
-    """NVFP4 + SiTU routed MoE on either FP4 backend.
+    """NVFP4 + SiTU routed MoE on a supported FP4 backend.
 
-    Both take the same ``SiTuActivation`` carrier; CUTLASS serves it as an
-    ``ActivationType`` its kernels branch on, TRTLLM-Gen with the fused
-    ``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*`` FC1 cubins (group-16 block scales).
-    ``_make_routed_moe`` already mirrors both of KimiK3MoERuntime's branches,
-    so the backend is the only variable.
+    All take the same ``SiTuActivation`` carrier. CUTLASS branches on the
+    ``ActivationType`` in its kernels, TRTLLM-Gen selects the fused
+    ``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*`` FC1 cubins, Blackwell CuteDSL folds
+    the soft-caps into a JIT epilogue, and FC12 specializes its Rubin fused
+    epilogue.
     """
     from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -1992,12 +2013,11 @@ def test_nvfp4_kernel_actually_applies_situ(moe_backend):
     Run for every FP4 backend, because each reaches SiTU by a different
     mechanism and so fails differently: CUTLASS resolves it through the
     activation enum, TRTLLM-Gen through a distinct fused-cubin family
-    (``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*``), and CuteDSL through soft-caps
-    folded into a JIT-compiled epilogue at trace time. The CuteDSL case is
-    the one this test exists for: its betas travel as trace-time scalars
-    keyed into the kernel cache, so dropping them does not raise -- it
-    compiles a SwiGLU kernel and returns plausible numbers. An internal
-    branch shipped exactly that defect on a sibling backend for weeks.
+    (``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*``), Blackwell CuteDSL through
+    soft-caps folded into a JIT-compiled epilogue at trace time, and FC12
+    through its Rubin fused epilogue. The CuteDSL cases are why this test
+    exists: dropping their trace-time activation parameters does not raise --
+    it compiles a SwiGLU kernel and returns plausible numbers.
 
     The degenerate all-zero FC1 output is caught as well: it scores 0 against
     both references.
@@ -2045,10 +2065,33 @@ def test_nvfp4_kernel_actually_applies_situ(moe_backend):
     bank = [_quantize_expert_to_nvfp4(w1[e], w2[e], w3[e], act_scale) for e in range(num_experts)]
 
     moe = _make_nvfp4_moe(gate, num_experts=num_experts, moe_backend=moe_backend)
+    if moe_backend == "CUTEDSL_FC12":
+        from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import (
+            TrtllmCutedslFusedFc12Nvfp4Impl,
+        )
+
+        assert type(moe.backend) is TrtllmCutedslFusedFc12Nvfp4Impl
     _load_nvfp4_bank_for(moe, bank, moe_backend)
 
     router_logits = gate.compute_logits(x)
     actual = moe.forward(x, router_logits, all_rank_num_tokens=None).float()
+    assert torch.isfinite(actual).all()
+
+    if moe_backend == "CUTEDSL_FC12":
+        # Warm up on a side stream before capture; compilation and tuning
+        # must finish before CUDA Graph records the fused op.
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                moe.forward(x, router_logits, all_rank_num_tokens=None)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = moe.forward(x, router_logits, all_rank_num_tokens=None)
+        for _ in range(2):
+            graph.replay()
+            torch.testing.assert_close(captured.float(), actual, rtol=0.02, atol=0.02)
 
     # Both references read the weights BACK OUT of the checkpoint tensors, so
     # they see the same 4-bit values the kernel was loaded with. Against the

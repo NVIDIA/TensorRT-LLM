@@ -23,6 +23,7 @@ Tests that merely *use* an implementation, such as weight loading, staged hooks,
 or numerical parity across backends, belong in ``test_moe_backend.py``.
 """
 
+from dataclasses import replace
 from unittest.mock import MagicMock
 
 import pytest
@@ -946,6 +947,23 @@ def test_fc12_identity_round_trips_through_registry():
     assert impl.scheduler_kind is impl.descriptor.scheduler_kind
     assert impl.capabilities is impl.descriptor.capabilities
     assert impl.input_requirement is impl.descriptor.input_requirement
+
+
+@pytest.mark.parametrize("activation,accepted", [("SiTu", True), ("Relu2", False)])
+def test_fc12_pinned_activation_support(activation: str, accepted: bool) -> None:
+    problem = replace(
+        _fc12_problem(),
+        activation=activation,
+        activation_constants=frozenset({"alpha", "beta"}) if activation == "SiTu" else frozenset(),
+    )
+    report = resolve_moe_impl(
+        ModelConfig(), problem=problem, deployment=_fc12_deployment(), impl_id=_FC12_IMPL_ID
+    )
+    if accepted:
+        assert impl_class_for(report) is TrtllmCutedslFusedFc12Nvfp4Impl
+    else:
+        assert report.winner is None
+        assert report.rejected[0].reason is MoERejectReason.ACTIVATION_UNSUPPORTED
 
 
 def test_pinned_fc12_identity_fails_hard_where_the_backend_literal_degrades():
