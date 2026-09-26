@@ -21,8 +21,9 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-pytest.importorskip("diffusers")
+from diffusers.models.transformers.transformer_minimax_h3 import (
+    MiniMaxH3Transformer3DModel as HFMiniMaxH3Transformer3DModel,
+)
 
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
@@ -33,13 +34,6 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.visual_gen.args import AttentionConfig
-
-try:
-    from diffusers.models.transformers.transformer_minimax_h3 import (
-        MiniMaxH3Transformer3DModel as HFMiniMaxH3Transformer3DModel,
-    )
-except ImportError:
-    HFMiniMaxH3Transformer3DModel = None
 
 try:
     from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd
@@ -859,8 +853,10 @@ def test_attention_backends_match_vanilla(backend: str) -> None:
     same comparison on sm_89 shows TRTLLM diverging by >100%, so this is only
     meaningful on hardware the build actually targets.
     """
-    if backend == "FA4" and not FA4_AVAILABLE:
-        pytest.skip("FA4 kernel not available")
+    if backend == "FA4":
+        if not _sm_at_least(10):
+            pytest.skip("FA4 parity requires SM100 or newer")
+        assert FA4_AVAILABLE, "FA4 kernel not available; expected on the Blackwell CI runner"
     if backend in ("CUTEDSL", "TRTLLM") and not _sm_at_least(10):
         pytest.skip(f"{backend} parity requires SM100 or newer")
 
@@ -1124,10 +1120,7 @@ def test_tiny_transformer_matches_pinned_diffusers_golden(
     )
 
 
-@pytest.mark.skipif(
-    HFMiniMaxH3Transformer3DModel is None or not torch.cuda.is_available(),
-    reason="MiniMax-H3 Diffusers reference and CUDA are required",
-)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_pinned_diffusers_golden_matches_live_hf_reference() -> None:
     parity_config = _TINY_CONFIG | {"num_layers": 1, "num_refiner_layers": 1}
     reference = HFMiniMaxH3Transformer3DModel(**parity_config).to(
