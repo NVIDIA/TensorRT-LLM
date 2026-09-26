@@ -2381,6 +2381,61 @@ class OpenAIServer(_VideoRoutesMixin):
                     functools.partial(preprocess_fn, prompt, sampling_params,
                                       disaggregated_params))
 
+            if mm_data:
+                try:
+                    mm_metadata = None
+                    processed_mm_data = None
+                    item_order = None
+                    if isinstance(generate_inputs, dict):
+                        processed_mm_data = generate_inputs.get("multi_modal_data")
+                        item_order = generate_inputs.get("mm_item_order")
+                    elif hasattr(generate_inputs, "multimodal_params") and generate_inputs.multimodal_params is not None:
+                        processed_mm_data = getattr(generate_inputs.multimodal_params, "multimodal_data", None)
+                        item_order = getattr(generate_inputs.multimodal_params, "mm_item_order", None)
+
+                    if item_order is None and isinstance(processed_mm_data, dict):
+                        item_order = processed_mm_data.get("mm_item_order")
+                    if item_order is None:
+                        item_order = prompt.get("mm_item_order")
+
+                    if processed_mm_data is not None:
+                        from tensorrt_llm.inputs.registry import \
+                            get_multimodal_encoder_item_metadata
+                        mm_metadata = get_multimodal_encoder_item_metadata(processed_mm_data)
+
+                    item_refs = None
+                    embedding_lengths = None
+                    if mm_metadata is not None:
+                        item_refs = mm_metadata.item_refs
+                        embedding_lengths = mm_metadata.output_embedding_lengths
+                    elif (isinstance(processed_mm_data, dict)
+                          and "multimodal_embedding_lengths" in processed_mm_data):
+                        lengths = processed_mm_data["multimodal_embedding_lengths"]
+                        if (isinstance(item_order, list)
+                                and isinstance(lengths, list)
+                                and len(item_order) == len(lengths)):
+                            item_refs = [
+                                (e["modality"] if isinstance(e, dict) else e[0],
+                                 e.get("index", 0) if isinstance(e, dict) else e[1])
+                                for e in item_order
+                            ]
+                            embedding_lengths = lengths
+
+                    if item_refs is not None and embedding_lengths is not None:
+                        modality_totals = {}
+                        for (modality, _), length in zip(item_refs, embedding_lengths):
+                            modality_totals[modality] = modality_totals.get(modality, 0) + length
+                        if "image" in modality_totals:
+                            postproc_args.image_tokens = modality_totals["image"]
+                        if "video" in modality_totals:
+                            postproc_args.video_tokens = modality_totals["video"]
+                        if "audio" in modality_totals:
+                            postproc_args.audio_tokens = modality_totals["audio"]
+                except (AttributeError, TypeError, ValueError, KeyError) as e:
+                    logger.warning_once(
+                        f"Failed to calculate multimodal token counts: {e}",
+                        key="openai_server_multimodal_token_calc_failed")
+
             promise = self.generator.generate_async(
                 inputs=generate_inputs,
                 sampling_params=sampling_params,
@@ -2844,6 +2899,39 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
 
+    @staticmethod
+    def merge_completion_responses(responses: List[CompletionResponse],
+                                   model: str = "") -> CompletionResponse:
+        all_choices: List[CompletionResponseChoice] = []
+        all_prompt_token_ids: List[List[int]] = []
+        num_prompt_tokens = num_gen_tokens = num_cached_tokens = 0
+        for rsp in responses:
+            choices, usage = rsp.choices, rsp.usage
+            all_choices.extend(choices)
+            num_prompt_tokens += usage.prompt_tokens
+            num_gen_tokens += usage.completion_tokens
+            if usage.prompt_tokens_details is not None:
+                num_cached_tokens += usage.prompt_tokens_details.cached_tokens or 0
+            # Aggregate prompt token ids for context-only requests
+            if rsp.prompt_token_ids is not None:
+                all_prompt_token_ids.append(rsp.prompt_token_ids)
+
+        usage_info = UsageInfo(
+            prompt_tokens=num_prompt_tokens,
+            completion_tokens=num_gen_tokens,
+            total_tokens=num_gen_tokens + num_prompt_tokens,
+            prompt_tokens_details=PromptTokensDetails(
+                cached_tokens=num_cached_tokens,
+            ),
+        )
+        merged_rsp = CompletionResponse(
+            model=model,
+            choices=all_choices,
+            usage=usage_info,
+            prompt_token_ids=all_prompt_token_ids,
+        )
+        return merged_rsp
+
     async def openai_completion(self, request: CompletionRequest,
                                 raw_request: Request) -> Response:
 
@@ -2864,36 +2952,6 @@ class OpenAIServer(_VideoRoutesMixin):
                 pp_result.prompt_token_ids = response.prompt_token_ids
             await self._extract_metrics(response, raw_request)
             return pp_result
-
-        def merge_completion_responses(
-                responses: List[CompletionResponse]) -> CompletionResponse:
-            all_choices: List[CompletionResponseChoice] = []
-            all_prompt_token_ids: List[List[int]] = []
-            num_prompt_tokens = num_gen_tokens = num_cached_tokens = 0
-            for rsp in responses:
-                choices, usage = rsp.choices, rsp.usage
-                all_choices.extend(choices)
-                num_prompt_tokens += usage.prompt_tokens
-                num_gen_tokens += usage.completion_tokens
-                num_cached_tokens += usage.prompt_tokens_details.cached_tokens
-                # Aggregate prompt token ids for context-only requests
-                if rsp.prompt_token_ids is not None:
-                    all_prompt_token_ids.append(rsp.prompt_token_ids)
-
-            usage_info = UsageInfo(
-                prompt_tokens=num_prompt_tokens,
-                completion_tokens=num_gen_tokens,
-                total_tokens=num_gen_tokens + num_prompt_tokens,
-                prompt_tokens_details=PromptTokensDetails(
-                    cached_tokens=num_cached_tokens, ),
-            )
-            merged_rsp = CompletionResponse(
-                model=self.model,
-                choices=all_choices,
-                usage=usage_info,
-                prompt_token_ids=all_prompt_token_ids,
-            )
-            return merged_rsp
 
         async def completion_generator(promise: RequestOutput,
                                        params: Optional[PostprocParams]):
@@ -3055,8 +3113,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     completion_response(promise, params) for promise, params in
                     zip(promises, postproc_params_collection)
                 ])
-                response = merge_completion_responses(rsps) if len(
-                    rsps) > 1 else rsps[0]
+                response = self.merge_completion_responses(
+                    rsps, self.model) if len(rsps) > 1 else rsps[0]
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
             logger.error(traceback.format_exc())
