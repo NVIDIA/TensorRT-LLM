@@ -31,6 +31,9 @@ from tensorrt_llm._torch.distributed.allreduce_helper import \
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
+from tensorrt_llm.quantization.mode import (QuantAlgo,
+                                            get_fp4_support_error_message,
+                                            is_fp4_supported)
 from tensorrt_llm.quantization.utils import fp8_quantize
 
 from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
@@ -65,6 +68,20 @@ from tensorrt_llm.bindings.internal.thop import BufferKind
 
 IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE = (IS_FLASHINFER_AVAILABLE
                                           and IS_CUTLASS_DSL_AVAILABLE)
+
+
+def _validate_fp4_arch_support(quant_algo: str,
+                               marlin_available: bool = False) -> None:
+    """Reject an FP4 algorithm this GPU has no kernel for, before autotuning.
+
+    ``marlin_available`` carries whether the caller allowed the Marlin
+    backend, which is what puts Ada and Hopper in range for an NVFP4
+    checkpoint -- so it can only be answered once the backend list is parsed.
+    """
+    sm = get_sm_version()
+    if not is_fp4_supported(sm, quant_algo, marlin_available):
+        raise RuntimeError(
+            get_fp4_support_error_message(sm, quant_algo, marlin_available))
 
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
@@ -1555,6 +1572,11 @@ def nvfp4_gemm(
             f"allowed_backends cannot be empty. "
             f"Valid backends are: {sorted(valid_individual_backends)}.")
 
+    # Only now is it knowable whether Marlin is on the table, and with it
+    # whether Ada/Hopper can serve this checkpoint at all.
+    _validate_fp4_arch_support(QuantAlgo.NVFP4,
+                               marlin_available="marlin" in backends_list)
+
     # Build runner with allowed backends
     runner = NVFP4GemmUnifiedRunner(output_buffer_kind,
                                     output_dtype,
@@ -1825,6 +1847,7 @@ def w4a8_mxfp4_fp8_gemm(
         output_dtype: torch.dtype,
         output_buffer_kind: int = int(BufferKind.DEFAULT),
 ) -> torch.Tensor:
+    _validate_fp4_arch_support(QuantAlgo.W4A8_MXFP4_FP8)
 
     tuner = AutoTuner.get()
 
