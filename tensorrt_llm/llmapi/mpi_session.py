@@ -700,6 +700,8 @@ class RemoteTask(NamedTuple):
     args: Tuple[Any, ...]
     kwargs: Dict[str, Any]
     sync: bool = False  # if True, the result will be sent back to the client
+    # Submitting client's sys.path, applied on every rank by task_wrapper.
+    sys_path: Tuple[str, ...] = ()
 
 
 class RemoteWorkerDeath(NamedTuple):
@@ -781,7 +783,8 @@ class RemoteMpiCommSessionClient(MpiSession):
         logger_debug(
             f"RemoteMpiCommSessionClient [rank{global_mpi_rank()}] sending task {task} to {self.addr}\n",
             "yellow")
-        self.queue.put(RemoteTask(task, args, kwargs, sync=sync))
+        self.queue.put(
+            RemoteTask(task, args, kwargs, sync=sync, sys_path=tuple(sys.path)))
         return []
 
     SYNC_IDLE_INTERVAL = 8
@@ -883,7 +886,17 @@ class RemoteMpiCommSessionServer():
                     n_workers=n_workers)
 
     @staticmethod
-    def task_wrapper(task: Callable[..., T], *args, **kwargs) -> T:
+    def task_wrapper(client_sys_path: Tuple[str, ...], task: Callable[..., T],
+                     *args, **kwargs) -> T:
+        # Adopt the client's sys.path before the task runs, so objects it later
+        # unpickles -- per-request payloads such as a caller-defined logits
+        # processor -- can resolve their classes on this rank. Appending keeps
+        # this process's own environment ahead of the client's; relative entries
+        # are dropped because they would resolve against this process's working
+        # directory rather than the client's.
+        for path in client_sys_path:
+            if os.path.isabs(path) and path not in sys.path:
+                sys.path.append(path)
         logger_debug(
             f"MpiCommSession rank{mpi_rank()} with world_size {mpi_world_size()}\n",
             "green")
@@ -958,8 +971,8 @@ class RemoteMpiCommSessionServer():
                     f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received task [{message.task}] from {self.addr}\n",
                     "green")
                 futures = self.session.submit(
-                    RemoteMpiCommSessionServer.task_wrapper, message.task,
-                    *message.args, **message.kwargs)
+                    RemoteMpiCommSessionServer.task_wrapper, message.sys_path,
+                    message.task, *message.args, **message.kwargs)
                 self.num_results = self.session.n_workers
                 assert len(futures) == self.num_results == mpi_world_size()
                 # Store futures to wait for them before the next task
