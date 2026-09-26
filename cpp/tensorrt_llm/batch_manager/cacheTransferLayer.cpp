@@ -46,21 +46,29 @@ CacheTransferLayer& CacheTransferLayer::operator=(CacheTransferLayer&&) noexcept
 
 void CacheTransferLayer::validateSupport(executor::DataTransceiverState const& peerState) const
 {
-    TLLM_CHECK_WITH_INFO(mKvFormatter->inquireSupport(mCacheState, peerState.getCacheState().value()),
+    // Sides are labelled self/peer rather than context/generation: validateSupport() runs on both
+    // ends of the handshake (context in recvRequestInfo(), generation in sendRequestInfo()), so a
+    // fixed role label would be wrong on one of them.
+    auto const& peerCacheState = peerState.getCacheState().value();
+    TLLM_CHECK_WITH_INFO(mKvFormatter->inquireSupport(mCacheState, peerCacheState),
         "Disagg server does not currently support these cacheState, please check the cacheState of the context and "
-        "gen executors");
+        "gen executors. The mismatching field is named in the preceding inquireSupport warning."
+        "\nself cacheState:\n%s\npeer cacheState:\n%s",
+        mCacheState.toString().c_str(), peerCacheState.toString().c_str());
 
     bool const selfHasRnn = mCacheState.hasRnnConfig();
-    bool const peerHasRnn = peerState.getCacheState().value().hasRnnConfig();
+    bool const peerHasRnn = peerCacheState.hasRnnConfig();
 
     if (mRnnFormatter && selfHasRnn)
     {
         // Unified pool path (CppMambaHybridCacheManager) uses RnnCacheFormatter.
         if (peerHasRnn)
         {
-            TLLM_CHECK_WITH_INFO(mRnnFormatter->inquireSupport(mCacheState, peerState.getCacheState().value()),
+            TLLM_CHECK_WITH_INFO(mRnnFormatter->inquireSupport(mCacheState, peerCacheState),
                 "Disagg server does not currently support these RNN state configurations, please check the RNN "
-                "state of the context and gen executors");
+                "state of the context and gen executors. The mismatching field is named in the preceding "
+                "inquireSupport warning.\nself cacheState:\n%s\npeer cacheState:\n%s",
+                mCacheState.toString().c_str(), peerCacheState.toString().c_str());
         }
         else
         {
