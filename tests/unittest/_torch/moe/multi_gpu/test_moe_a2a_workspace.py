@@ -5,12 +5,10 @@
 import ctypes
 import faulthandler
 import pickle
-import re
 import sys
 import traceback
 
 import cloudpickle
-import pynvml
 import pytest
 import torch
 from mpi4py import MPI
@@ -18,7 +16,12 @@ from mpi4py.futures import MPIPoolExecutor
 
 import tensorrt_llm as tllm
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
-from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
+from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
+    _CFT_MIN_DRIVER_BRANCH,
+    NVLinkOneSided,
+    _get_nvidia_driver_version,
+    cft_driver_is_supported,
+)
 from tensorrt_llm.mapping import Mapping
 
 # Match the neighboring MPI tests: workers must receive this module by value.
@@ -83,39 +86,11 @@ def _cft_skip_reason():
         )
         if result != 0 or status.value != 0 or not pointer.value:
             return f"CUDA driver lacks cuLogicalEndpoint{suffix}"
-    return _forward_compat_reason()
-
-
-def _forward_compat_reason():
-    """Skip when the loaded libcuda is newer than the kernel driver.
-
-    Under CUDA forward compatibility the user-mode driver exports the
-    cuLogicalEndpoint entry points, but creating an endpoint needs
-    kernel-driver support and fails with CUDA_ERROR_INVALID_VALUE.
-    """
-    user_mode = None
-    with open("/proc/self/maps") as maps:
-        for line in maps:
-            match = re.search(r"libcuda\.so\.(\d+\.\d+(?:\.\d+)?)", line)
-            if match:
-                user_mode = match.group(1)
-                break
-    pynvml.nvmlInit()
-    try:
-        kernel = pynvml.nvmlSystemGetDriverVersion()
-    finally:
-        pynvml.nvmlShutdown()
-    if isinstance(kernel, bytes):
-        kernel = kernel.decode()
-
-    def version(text):
-        return tuple(int(part) for part in text.split("."))
-
-    if user_mode is not None and version(user_mode) > version(kernel):
-        return (
-            f"CFT logical endpoints need kernel-driver support; CUDA forward compatibility "
-            f"runs user-mode driver {user_mode} on kernel driver {kernel}"
-        )
+    # Logical endpoints also need kernel-driver support; under CUDA forward
+    # compatibility the newer user-mode driver exports them but creation fails.
+    driver_version = _get_nvidia_driver_version()
+    if not cft_driver_is_supported(driver_version):
+        return f"CFT requires NVIDIA driver {_CFT_MIN_DRIVER_BRANCH}+ (found {driver_version})"
     return None
 
 
