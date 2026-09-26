@@ -107,7 +107,6 @@ def _prepare(
             prefill_cuda_graph_num_tokens=[],
             mm_encoder_cache_enabled=True,
             spec_config=object() if enable_spec_decode else None,
-            is_draft_model=False,
             num_seq_slots=None,
             original_max_draft_len=0,
             original_max_total_draft_tokens=0,

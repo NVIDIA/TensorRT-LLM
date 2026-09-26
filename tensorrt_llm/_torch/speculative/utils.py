@@ -338,7 +338,6 @@ def get_spec_metadata(spec_config,
                       max_num_requests,
                       max_num_tokens,
                       spec_resource_manager=None,
-                      is_draft_model=False,
                       max_seq_len=262144,
                       num_seq_slots=None):
     metadata = _build_spec_metadata(spec_config,
@@ -346,7 +345,6 @@ def get_spec_metadata(spec_config,
                                     max_num_requests,
                                     max_num_tokens,
                                     spec_resource_manager=spec_resource_manager,
-                                    is_draft_model=is_draft_model,
                                     max_seq_len=max_seq_len)
     # Set here rather than in each branch below: every one-model mode needs it and
     # the per-mode constructors are easy to miss one of.
@@ -370,7 +368,6 @@ def _build_spec_metadata(spec_config,
                          max_num_requests,
                          max_num_tokens,
                          spec_resource_manager=None,
-                         is_draft_model=False,
                          max_seq_len=262144):
     use_rejection_sampling = getattr(spec_config, "use_rejection_sampling",
                                      False)
