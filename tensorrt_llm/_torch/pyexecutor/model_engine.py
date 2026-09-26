@@ -9,6 +9,7 @@ import math
 import os
 import weakref
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from contextlib import contextmanager
 from typing import (Any, Callable, Dict, Iterator, List, Optional, Sequence,
                     Tuple, Type, Union, cast)
@@ -49,6 +50,7 @@ from ..attention.backends.trtllm import TrtllmAttentionMetadata
 from ..attention.backends.utils import get_attention_backend
 from ..autotuner import AutoTuner, autotune
 from ..compilation.backend import Backend
+from ..compilation.piecewise_optimizer import PiecewiseRunner
 from ..compilation.utils import capture_piecewise_cuda_graph
 from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
@@ -57,7 +59,7 @@ from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_mixin import (MultimodalModelMixin,
                                                 _build_request_multimodal_input)
-from ..models.modeling_utils import DecoderModelForCausalLM
+from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
 from ..modules.mamba.mamba2_metadata import Mamba2Metadata
 from ..moe.expert_statistic import ExpertStatistic
 from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
@@ -384,6 +386,7 @@ class PyTorchModelEngine(ModelEngine):
     ):
         _configure_deep_gemm_pdl()
 
+        self._metrics: dict[str, float] = defaultdict(float)
         self.forward_pass_callable = None
         self._cleanup_done = False
         self._runner: Optional[Union[ModelRunner, PackedModelRunner]] = None
@@ -1218,6 +1221,11 @@ class PyTorchModelEngine(ModelEngine):
         """Which of the two runner contracts `_runner` implements."""
         return isinstance(self._runner, EncoderRunner)
 
+    @property
+    def metrics(self) -> dict[str, float]:
+        """Return model-engine warmup time metrics."""
+        return self._metrics
+
     def _get_draft_kv_cache_manager(
         self, resource_manager: ResourceManager
     ) -> Optional[Union[KVCacheManager, KVCacheManagerV2]]:
@@ -1333,17 +1341,19 @@ class PyTorchModelEngine(ModelEngine):
                     resource_manager: Optional[ResourceManager] = None,
                     *args,
                     **kwargs):
-            result = method(self, resource_manager, *args, **kwargs)
-            kv_cache_manager = (resource_manager.get_resource_manager(
-                self.kv_cache_manager_key)
-                                if resource_manager is not None else None)
-            if kv_cache_manager is not None:
-                has_invalid_values = kv_cache_manager.check_invalid_values_in_kv_cache(
-                    fill_with_zero=True)
-                if has_invalid_values:
-                    logger.warning(
-                        "NaNs/Infs have been introduced to KVCache during warmup, KVCache was filled with zeros to avoid potential issues"
-                    )
+            with timing_metric("total_warmup_seconds", self._metrics):
+                result = method(self, resource_manager, *args, **kwargs)
+                with timing_metric("kv_cache_cleanup_seconds", self._metrics):
+                    kv_cache_manager = (resource_manager.get_resource_manager(
+                        self.kv_cache_manager_key) if resource_manager
+                                        is not None else None)
+                    if kv_cache_manager is not None:
+                        has_invalid_values = kv_cache_manager.check_invalid_values_in_kv_cache(
+                            fill_with_zero=True)
+                        if has_invalid_values:
+                            logger.warning(
+                                "NaNs/Infs have been introduced to KVCache during warmup, KVCache was filled with zeros to avoid potential issues"
+                            )
             return result
 
         return wrapper
@@ -1465,6 +1475,12 @@ class PyTorchModelEngine(ModelEngine):
     @warmup_with_kv_cache_cleanup
     def warmup(self,
                resource_manager: Optional[ResourceManager] = None) -> None:
+        """Run model warmup and record its total wall-clock duration."""
+        self._warmup_impl(resource_manager)
+
+    def _warmup_impl(self,
+                     resource_manager: Optional[ResourceManager] = None
+                     ) -> None:
         """
         Orchestrates the warmup process by calling specialized warmup methods for
         torch.compile, the autotuner, and CUDA graphs.
@@ -1499,7 +1515,8 @@ class PyTorchModelEngine(ModelEngine):
         # cuda_graph_config=None flashinfer's sampling kernels would be
         # JIT-built mid-serving.
         self._eager_workspace_reclaimer = None
-        with self._warmup_timer.phase("sampling_module_prewarm"):
+        with self._warmup_timer.phase("sampling_module_prewarm"), timing_metric(
+                "sampling_warmup_seconds", self._metrics):
             warmup_sampling_module()
             if self.enable_in_graph_sampling:
                 # The fast tier samples inside the captured graph via a
@@ -1546,7 +1563,8 @@ class PyTorchModelEngine(ModelEngine):
             self._prewarm_cute_dsl_indexer_q()
         log_mem_snapshot("warmup/after_cute_dsl_indexer_q")
         if not is_enc_dec:
-            with self._warmup_timer.phase("attention_jit"):
+            with self._warmup_timer.phase("attention_jit"), timing_metric(
+                    "attention_warmup_seconds", self._metrics):
                 self._run_attention_warmup(resource_manager,
                                            can_run_general_warmup)
 
@@ -1556,7 +1574,8 @@ class PyTorchModelEngine(ModelEngine):
                 warmup_requests_configs = self._agree_warmup_shapes(
                     self._get_full_general_warmup_requests(resource_manager))
                 # Currently graph has not been captured, disable cuda graph for this warmup.
-                with self.no_cuda_graph():
+                with timing_metric("general_warmup_seconds",
+                                   self._metrics), self.no_cuda_graph():
                     self._general_warmup(resource_manager,
                                          warmup_requests_configs)
                     # Release C++ MoE workspace buffers so the autotuner can
@@ -1571,7 +1590,8 @@ class PyTorchModelEngine(ModelEngine):
         # Helix CP is decode-only and runs into issues with the
         # autotuner warmup's context requests.
         if not is_enc_dec and not self.mapping.has_cp_helix():
-            with self._warmup_timer.phase("autotuner"):
+            with self._warmup_timer.phase("autotuner"), timing_metric(
+                    "autotuner_warmup_seconds", self._metrics):
                 self._run_autotuner_warmup(resource_manager)
             log_mem_snapshot("warmup/after_autotuner")
             # Pre-JIT Mamba SSD multi-seq + HAS_INITSTATES=True Triton kernels
@@ -1579,7 +1599,8 @@ class PyTorchModelEngine(ModelEngine):
             # since MambaHybridCacheManager skips _general_warmup and the
             # default autotuner shape is single-seq / no-initstates. Safe
             # no-op for non-Mamba models.
-            with self._warmup_timer.phase("mamba_hybrid"):
+            with self._warmup_timer.phase("mamba_hybrid"), timing_metric(
+                    "mamba_hybrid_warmup_seconds", self._metrics):
                 self._run_mamba_hybrid_warmup(resource_manager)
             log_mem_snapshot("warmup/after_mamba_hybrid")
             # Release the autotuner's exploration-mode intermediates. The
@@ -1600,8 +1621,7 @@ class PyTorchModelEngine(ModelEngine):
             with self.cuda_graph_runner.allow_capture():
                 self.cuda_graph_runner.is_warmup_only = True
                 try:
-                    with self.maybe_autotune_lora():
-                        self._run_cuda_graph_warmup(resource_manager)
+                    self._run_cuda_graph_warmup(resource_manager)
                 finally:
                     self.cuda_graph_runner.is_warmup_only = False
                 self.cuda_graph_runner.padding_dummy_requests = {}
@@ -1620,9 +1640,12 @@ class PyTorchModelEngine(ModelEngine):
         # creates; build it when every forward above was skipped.
         with self._warmup_timer.phase("dsa_prewarm"):
             self._ensure_dsa_attn_metadata_for_warmup(resource_manager)
-            self._warmup_dg_paged_mqa_logits_metadata()
+            with timing_metric("dg_paged_mqa_warmup_seconds", self._metrics):
+                self._warmup_dg_paged_mqa_logits_metadata()
             log_mem_snapshot("warmup/after_dg_paged_mqa_logits_metadata")
-            self._warmup_cute_dsl_radix_topk()
+            with timing_metric("cute_dsl_radix_topk_warmup_seconds",
+                               self._metrics):
+                self._warmup_cute_dsl_radix_topk()
         log_mem_snapshot("warmup/after_cute_dsl_radix_topk")
         if can_run_general_warmup:
             # Pre-populate the memory pool with max-shape allocations to reduce
@@ -1630,7 +1653,10 @@ class PyTorchModelEngine(ModelEngine):
             with self._warmup_timer.phase("memory_pool_prepop"):
                 warmup_requests_configs = self._get_max_shape_warmup_requests(
                     resource_manager)
-                self._general_warmup(resource_manager, warmup_requests_configs)
+                with timing_metric("memory_pool_prepopulation_seconds",
+                                   self._metrics):
+                    self._general_warmup(resource_manager,
+                                         warmup_requests_configs)
             log_mem_snapshot("warmup/after_memory_pool_prepop")
 
         # Allocate the CUDA graph padding dummies now, while the KV cache is
@@ -2668,34 +2694,44 @@ class PyTorchModelEngine(ModelEngine):
 
     def _run_cuda_graph_warmup(self, resource_manager: ResourceManager):
         """Warm up or capture CUDA graphs for the configured graph shapes."""
-        if not (self.cuda_graph_runner.enabled
-                or self.prefill_cuda_graph_backend
-                != PrefillCudaGraphBackend.DISABLED):
-            return
+        is_warmup_only = self.cuda_graph_runner.is_warmup_only
+        metric_name = ("gen_cuda_graph_warmup_seconds"
+                       if is_warmup_only else "gen_cuda_graph_capture_seconds")
+        with timing_metric(metric_name, self._metrics):
+            # Include LoRA autotuning and its PP cache hand-off/cleanup in
+            # warmup timing, including when this rank has no graph shapes.
+            lora_context = (self.maybe_autotune_lora()
+                            if is_warmup_only else contextlib.nullcontext())
+            with lora_context:
+                if not (self.cuda_graph_runner.enabled
+                        or self.prefill_cuda_graph_backend
+                        != PrefillCudaGraphBackend.DISABLED):
+                    return
 
-        from ..modules.linear import (MXFP8LinearMethod,
-                                      flashinfer_mxfp8_autotune,
-                                      flashinfer_mxfp8_decode_graph_capture)
+                from ..modules.linear import (
+                    MXFP8LinearMethod, flashinfer_mxfp8_autotune,
+                    flashinfer_mxfp8_decode_graph_capture)
 
-        # The automatic MiniMax-M3 MXFP8 selection is decode-graph-only.
-        # Tune every generation graph shape during the warmup-only pass. Keep
-        # piecewise context/prefill graph capture on the native backend.
-        flashinfer_methods = [
-            quant_method for module in self.model.modules()
-            if isinstance((quant_method := getattr(module, "quant_method", None)
-                           ), MXFP8LinearMethod)
-            and quant_method.needs_flashinfer_autotune
-        ]
-        flashinfer_autotune_context = (
-            flashinfer_mxfp8_autotune() if self.cuda_graph_runner.is_warmup_only
-            and flashinfer_methods else contextlib.nullcontext())
-        with flashinfer_autotune_context, flashinfer_mxfp8_decode_graph_capture(
-        ):
-            self._capture_generation_cuda_graphs(resource_manager)
-        self._capture_mixed_encoder_decoder_cuda_graphs(resource_manager)
+                # The automatic MiniMax-M3 MXFP8 selection is decode-graph-only.
+                # Tune every generation graph shape during the warmup-only pass.
+                # Keep piecewise context/prefill capture on the native backend.
+                flashinfer_methods = [
+                    quant_method for module in self.model.modules()
+                    if isinstance((quant_method := getattr(
+                        module, "quant_method", None)), MXFP8LinearMethod)
+                    and quant_method.needs_flashinfer_autotune
+                ]
+                flashinfer_autotune_context = (
+                    flashinfer_mxfp8_autotune() if is_warmup_only
+                    and flashinfer_methods else contextlib.nullcontext())
+                with flashinfer_autotune_context, flashinfer_mxfp8_decode_graph_capture(
+                ):
+                    self._capture_generation_cuda_graphs(resource_manager)
+                self._capture_mixed_encoder_decoder_cuda_graphs(
+                    resource_manager)
         # Piecewise graphs have separate capture machinery and do not use the
         # whole-model attention workspace. Capture them only on the second pass.
-        if not self.cuda_graph_runner.is_warmup_only:
+        if not is_warmup_only:
             self._capture_prefill_cuda_graphs(resource_manager)
 
     def _capture_generation_cuda_graphs(self,
@@ -3078,7 +3114,12 @@ class PyTorchModelEngine(ModelEngine):
                         self.runtime_draft_len = saved_runtime_draft_len
 
     def _capture_prefill_cuda_graphs(self, resource_manager: ResourceManager):
-        """Capture configured CUDA graphs for context/prefill steps."""
+        """Warm up and capture prefill CUDA graphs, timing each phase separately.
+
+        After capture, run prefill batches with many requests to warm up
+        logits buffers outside the captured model body. This post-capture
+        warmup runs for both piecewise and breakable prefill CUDA graphs.
+        """
         if (self.prefill_cuda_graph_backend == PrefillCudaGraphBackend.DISABLED
                 or (self.prefill_cuda_graph_backend
                     == PrefillCudaGraphBackend.PIECEWISE
@@ -3107,47 +3148,67 @@ class PyTorchModelEngine(ModelEngine):
                         f"Run prefill CUDA graph capture for num tokens={num_tokens}"
                     )
                     if self.breakable_cuda_graph_runner is not None:
-                        self.breakable_cuda_graph_runner.capture(
-                            num_tokens, lambda: self.forward(
-                                batch,
-                                new_tensors_device=None,
-                                resource_manager=resource_manager))
+                        runner = self.breakable_cuda_graph_runner
+                        try:
+                            runner.capture(
+                                num_tokens, lambda: self.forward(
+                                    batch,
+                                    new_tensors_device=None,
+                                    resource_manager=resource_manager))
+                        finally:
+                            self._metrics[
+                                "ctx_cuda_graph_warmup_seconds"] += runner.metrics.get(
+                                    BreakableCUDAGraphRunner.
+                                    CUDA_GRAPH_WARMUP_METRIC, 0.0)
+                            self._metrics[
+                                "ctx_cuda_graph_capture_seconds"] += runner.metrics.get(
+                                    BreakableCUDAGraphRunner.
+                                    CUDA_GRAPH_CAPTURE_METRIC, 0.0)
                     else:
-                        # Run a few times to ensure torch.compile capture.
-                        for _ in range(4):
+                        with timing_metric("ctx_cuda_graph_warmup_seconds",
+                                           self._metrics):
+                            for _ in range(PiecewiseRunner.WARMUP_STEPS):
+                                self.forward(batch,
+                                             new_tensors_device=None,
+                                             resource_manager=resource_manager)
+                            torch.cuda.synchronize()
+                        with timing_metric("ctx_cuda_graph_capture_seconds",
+                                           self._metrics):
                             self.forward(batch,
                                          new_tensors_device=None,
                                          resource_manager=resource_manager)
+                            torch.cuda.synchronize()
 
         # The logits allocations grow with the number of requests and are not
         # part of the captured model body. Warm up the largest request count so
         # those allocations can be reused during stable inference.
-        for num_tokens in prefill_cuda_graph_num_tokens:
-            warmup_request = self._create_warmup_request(resource_manager,
-                                                         num_tokens,
-                                                         0,
-                                                         least_requests=False)
-            with self._release_batch_context(warmup_request,
-                                             resource_manager) as batch:
-                self._assert_all_tp_ranks_have_warmup_batch(batch, num_tokens)
-                if batch is None:
-                    continue
-                logger.info(
-                    f"Run prefill CUDA graph warmup for num tokens={num_tokens} with most requests"
-                )
-                if self.breakable_cuda_graph_runner is not None:
-                    with self.no_cuda_graph():
-                        self.breakable_cuda_graph_runner.warmup(
-                            lambda: self.forward(batch,
-                                                 new_tensors_device=None,
-                                                 resource_manager=
-                                                 resource_manager),
-                            steps=1)
-                else:
-                    self.forward(batch,
-                                 new_tensors_device=None,
-                                 resource_manager=resource_manager)
-                torch.cuda.synchronize()
+        with timing_metric("post_ctx_cuda_graph_capture_warmup_seconds",
+                           self._metrics):
+            for num_tokens in prefill_cuda_graph_num_tokens:
+                warmup_request = self._create_warmup_request(
+                    resource_manager, num_tokens, 0, least_requests=False)
+                with self._release_batch_context(warmup_request,
+                                                 resource_manager) as batch:
+                    self._assert_all_tp_ranks_have_warmup_batch(
+                        batch, num_tokens)
+                    if batch is None:
+                        continue
+                    logger.info(
+                        f"Run prefill CUDA graph warmup for num tokens={num_tokens} with most requests"
+                    )
+                    if self.breakable_cuda_graph_runner is not None:
+                        with self.no_cuda_graph():
+                            self.breakable_cuda_graph_runner.warmup(
+                                lambda: self.forward(batch,
+                                                     new_tensors_device=None,
+                                                     resource_manager=
+                                                     resource_manager),
+                                steps=1)
+                    else:
+                        self.forward(batch,
+                                     new_tensors_device=None,
+                                     resource_manager=resource_manager)
+                    torch.cuda.synchronize()
 
     ### Helper methods promoted from the original warmup method ###
 
