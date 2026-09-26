@@ -1016,18 +1016,13 @@ superseded — this task pays for breadth:
   named in `full_name` and their summed share in `share_pct`. Grouping
   is for honest shared verdicts — never to bury a kernel whose answer
   would differ.
-- **Capture ncu in bounded passes, not one blind sweep.** One pass's
-  `--launch-count` is consumed in launch order, so per-layer hot kernels
-  exhaust it before once-per-step kernels (final norm, logits GEMM,
-  sampler) ever match. Run Run B's canonical command up to **3 passes**:
-  pass 1 filters on the hottest stems exactly as Run B describes; then
-  check which enumerated stems the report actually captured (`ncu
-  --import ... --page raw --csv`), and each further pass filters on
-  **only the still-missing stems** (so its budget is spent on them),
-  with `--launch-count` ≈ 8 × that pass's stem count (cap ~300). Name
-  the artifacts `server_ncu_pass<k>.ncu-rep` (+ per-pass
-  `ncu_details_pass<k>.txt` / `ncu_raw_pass<k>.csv`); each pass is its
-  own server relaunch, gated to the same iteration window.
+- **Capture ncu with faithful standalone microbenchmarks, not a server
+  sweep.** Build or reuse the smallest Run B microbenchmark that reproduces
+  each row's production invocation. A genuinely shared benchmark may cover a
+  grouped row; otherwise keep one target family per benchmark. Preserve every
+  `microbench_<hotspot>.py`, `ncu_<hotspot>.ncu-rep[z]`, details export, and raw
+  CSV beside the ledger, and verify the expected stems actually appear in the
+  imported report.
 - **Degrade honestly, never fabricate**: a kernel no pass captured (or
   ncu itself unavailable) keeps its ledger row with
   `ncu: "unavailable: <reason>"` — all four questions are still owed,

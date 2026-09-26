@@ -845,74 +845,54 @@ never profile every kernel blindly.
    alone bound the capture, noting the untargeted sample in *Caveats*;
    if nsys ran but the skill's pipeline did not, rank on `kern_sum` and
    say so there too.
-3. Relaunch `trtllm-serve` (same flags) wrapped in ncu, gated to the
-   same steady-state window. **Start from this canonical invocation —
-   do not improvise the ncu flags** (fill the `<...>` placeholders;
-   keep the rest as shown):
+3. **Profile faithful hotspot microbenchmarks, never the full server.** For
+   each target selected above, build or reuse a minimal standalone benchmark
+   that faithfully reproduces its production invocation — kernel variant,
+   representative shape, dtype, layout, launch configuration, and required
+   runtime state. Warm up JIT compilation and autotuning, then bracket only
+   steady-state launches with `cudaProfilerStart()` / `cudaProfilerStop()`.
+   **Start from this canonical invocation — do not improvise the ncu flags**
+   (fill the `<...>` placeholders; keep the rest as shown):
    ```bash
    cd <trtllm_repo_path>
-   setsid env TLLM_PROFILE_START_STOP="<profile.nsys_iter_range>" \\
+   env -u BASH_ENV \\
    ncu --target-processes all \\
        --profile-from-start off \\
-       -o <workspace>/server_ncu -f \\
+       -o <workspace>/ncu_<hotspot> -f \\
        --section SpeedOfLight --section LaunchStats --section Occupancy \\
        --section WarpStateStats --section MemoryWorkloadAnalysis \\
        --section ComputeWorkloadAnalysis \\
-       --kernel-name "regex:<top-kernel stems from Run A>" \\
-       --launch-count 40 \\
-       trtllm-serve <checkpoint_path> ...same trtllm-serve flags... \\
-       > <workspace>/serve.log 2>&1 < /dev/null &
-   echo $! > <workspace>/serve.pid
+       --kernel-name "regex:<target-kernel stems>" \\
+       --launch-count <bounded count, at most 40> \\
+       python <workspace>/microbench_<hotspot>.py
    ```
    - `--profile-from-start off` arms ncu on the `cudaProfilerStart()` /
-     `cudaProfilerStop()` calls that `TLLM_PROFILE_START_STOP` already
-     drives, so the capture lands in the same iteration window as Runs
-     A and B.
-   - `--launch-count 40` caps the total profiled launches — ncu replays
-     each profiled kernel, running it 10–100× slower than native, so an
-     uncapped capture would hang the load. Once the cap is hit the rest
-     of the run proceeds at near-native speed.
-   - **Multi-rank serves: expect the hang watchdog to end the capture
-     early — that is a partial capture, not a failed run.** Replaying a
-     CUDA-graph kernel under MPI costs on the order of a minute per
-     launch (graph-node replay serialized + cross-rank sync), and
-     TensorRT-LLM's executor hang watchdog
-     (`tensorrt_llm/_torch/pyexecutor/hang_detector.py`, fixed 300 s —
-     `hang_detection_timeout` has no config or env knob) kills the
-     server after only a handful of profiled launches. ncu writes the
-     report incrementally, so the launches already captured survive:
-     import what is there, and only if dominant stems are still missing
-     run another *small targeted pass* (one kernel family per pass) as
-     walltime allows. State the achieved share of GPU time your
-     captures cover under *Caveats* — never burn server relaunches
-     chasing full coverage. Keep cross-rank collective stems (allreduce
-     / allgather) **out** of the `--kernel-name` filter: replaying a
-     collective under ncu deadlocks the ranks; take their share from
-     nsys instead.
+     `cudaProfilerStop()` calls in the microbenchmark, so warmup and JIT
+     compilation stay outside the capture.
+   - Keep `--launch-count` no larger than 40 and lower it when a few
+     steady-state launches represent the hotspot. ncu replays each captured
+     kernel 10–100× slower than native.
+   - Keep cross-rank collective stems (allreduce / allgather) **out** of the
+     target set: analyze their share with nsys instead.
    - The `--section` list is the one-shot adaptation of the skill's
      escalation ladder (SpeedOfLight to classify; the rest are the
-     sections its table escalates to per class). One combined capture
-     is deliberate: each server relaunch costs a full checkpoint load,
-     so the escalation sections are collected up front instead of over
-     multiple runs.
-   - `--target-processes all` follows trtllm-serve's forked workers.
+     sections its table escalates to per class).
      If your installed `ncu` rejects a flag, drop **only** that flag,
      note it, and keep going.
-4. Poll readiness, then replay the **same** benchmark load (canonical
-   command, `--no-test-input`). Expect the profiled window to take much
-   longer wall-clock than Runs A/B — poll patiently rather than
-   declaring a hang; the client-side numbers from this replay are
-   **not measurements** (kernel replay serializes the GPU) and must
-   never be reported as performance results.
-5. Tear the server down so the report finalizes at
-   `<workspace>/server_ncu.ncu-rep`, then summarize without the GUI:
+   Do not wrap `trtllm-serve` in ncu: `--kernel-name` limits captured
+   launches, not replay-context size, so full-server capture can fail with
+   `ContextSaveFailed` before the first kernel is captured.
+4. Run each microbenchmark in the foreground so its report finalizes. Preserve
+   the microbenchmark source and the evidence for its production invocation
+   beside the report. Accept either `.ncu-rep` or `.ncu-repz`, then summarize
+   without the GUI:
    ```bash
-   ncu --import <workspace>/server_ncu.ncu-rep --page details \\
-       > <workspace>/ncu_details.txt
-   ncu --import <workspace>/server_ncu.ncu-rep --page raw --csv \\
-       > <workspace>/ncu_raw.csv
+   ncu --import <workspace>/ncu_<hotspot>.ncu-rep[z] --page details \\
+       > <workspace>/ncu_<hotspot>_details.txt
+   ncu --import <workspace>/ncu_<hotspot>.ncu-rep[z] --page raw --csv \\
+       > <workspace>/ncu_<hotspot>_raw.csv
    ```
-6. **Analyze per the skill** you loaded in step 1: for every profiled
+5. **Analyze per the skill** you loaded in step 1: for every profiled
    kernel extract duration, `Compute (SM) Throughput`, `Memory
    Throughput`, and achieved occupancy; classify each with the skill's
    thresholds (compute-bound / memory-bound / latency-bound /

@@ -3267,7 +3267,8 @@ def test_analyzer_prompt_instructs_the_ncu_deep_dive(tmp_path):
     for prompt in (without, with_sol):
         assert "perf-nsight-compute-analysis" in prompt
         assert "trtllm-agent-toolkit:perf-nsight-compute-analysis" in prompt
-        assert "server_ncu.ncu-rep" in prompt
+        assert "ncu_<hotspot>.ncu-rep[z]" in prompt
+        assert "standalone microbenchmarks" in prompt
         assert "ncu kernel analysis" in prompt
         # Roadmap items are grounded across the analyses, not the
         # timeline alone.
@@ -3624,7 +3625,7 @@ def test_default_driving_prompts_omit_the_coverage_contract(tmp_path):
     captured = _capture_driving_prompts(tmp_path)
     assert "kernel_ledger.yaml" not in captured["analyzer"]
     assert "Kernel Coverage / " not in captured["reporter"]
-    assert "server_ncu.ncu-rep" in captured["analyzer"]
+    assert "ncu_<hotspot>.ncu-rep[z]" in captured["analyzer"]
 
 
 def test_reporter_prompt_names_the_highest_round_ledger(tmp_path, fake_git):
