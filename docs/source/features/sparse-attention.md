@@ -353,8 +353,10 @@ sparse_attention_config:
 
 Two implementations are available:
 
-- `triton` is the default reference implementation.
-- `msa` uses `fmha_sm100` kernels and requires an SM100-family GPU (SM100 or
+- `triton` is the legacy reference implementation and remains the configuration
+  default. Selecting it logs a recommendation to use `msa`. It does not support
+  NVFP4 KV cache.
+- `msa` is the recommended implementation and requires an SM100-family GPU (SM100 or
   SM103), the `fmha_sm100` package, and `sparse_block_size=128`.
 
 ```yaml
@@ -363,8 +365,29 @@ sparse_attention_config:
   implementation: msa
 ```
 
-The sparse path currently has no dense fallback and does not support KV-cache
-reuse or MTP. See the
+For NVFP4 KV cache, select MSA explicitly:
+
+```yaml
+kv_cache_config:
+  dtype: nvfp4
+  enable_block_reuse: false
+sparse_attention_config:
+  algorithm: minimax_m3
+  implementation: msa
+  indexer_kv_dtype: fp8
+```
+
+With NVFP4 KV cache, sparse target layers use packed E2M1 data and FP8 block
+scales. Dense target layers and the shared Eagle3 draft layer keep FP8 caches.
+Prefill uses MSA kernels; decode uses TensorRT LLM's Triton sparse kernels
+within the MSA backend. This does not select `implementation: triton`.
+The optional `fuse_qkv_index_projection: true` supports FP8 and NVFP4 main
+caches with an FP8 indexer.
+
+The sparse path has no dense fallback and does not support KV-cache reuse.
+Eagle3 supports one shared draft layer and linear drafting; other MTP/tree
+configurations are unsupported. NVFP4 KV with piecewise CUDA graphs is not
+qualified by the existing FP8-KV PCG tests. See the
 [MiniMax-M3 deployment guide](../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.md)
 for supported checkpoints and parallel deployment settings.
 

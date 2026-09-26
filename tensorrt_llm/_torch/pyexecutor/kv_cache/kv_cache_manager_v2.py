@@ -122,6 +122,7 @@ from ..scheduler import ScheduledRequests
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 KV_CACHE_ITERATION_STATS_DELTA_FIELDS = _KV_CACHE_ITERATION_STATS_DELTA_FIELDS
 KV_CACHE_ITERATION_STATS_REUSE_FIELDS = (
@@ -1149,6 +1150,7 @@ class KVCacheManagerV2(BaseResourceManager):
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
+        self._validate_speculative_config(spec_config)
         self.is_disagg = is_disagg
         self.kv_connector_manager = kv_connector_manager
         # Filled on first use; the layer grouping does not change after init.
@@ -1760,6 +1762,13 @@ class KVCacheManagerV2(BaseResourceManager):
             self.event_manager.start()
             logger.info("Streaming KV event fast path reuses V2 radix block hashes")
 
+    def _validate_speculative_config(self, spec_config: Optional["DecodingBaseConfig"]) -> None:
+        """Validate speculative decoding after dtype resolution, before cache setup.
+
+        Overrides may use ``self.dtype`` and ``spec_config``; other cache state
+        has not been initialized yet. The base manager adds no restrictions.
+        """
+
     def _iter_guard_candidate_buffers(self) -> Iterable[Tuple[int, torch.Tensor]]:
         """Yield ``(layer_idx, buffer)`` pairs a guard page can be parked on.
 
@@ -2028,7 +2037,8 @@ class KVCacheManagerV2(BaseResourceManager):
         role_b = None if self.kv_cache_type == CacheTypeCpp.SELFKONLY else Role.VALUE
         return Role.KEY, role_b
 
-    def _get_block_scale_role(self, role_a: DataRole) -> Optional[DataRole]:
+    def _get_block_scale_role(self, role_a: DataRole, layer_id: int) -> Optional[DataRole]:
+        """Select block scales for a role and local layer in the pool mapping."""
         if self.dtype != DataType.NVFP4 or role_a != Role.KEY:
             return None
         return Role.KEY_BLOCK_SCALE
@@ -2055,7 +2065,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     ]
                 )
                 if self.dtype == DataType.NVFP4:
-                    block_scale_role = self._get_block_scale_role(role_a)
+                    block_scale_role = self._get_block_scale_role(role_a, layer_id)
                     block_scale_pool_pointers_list.append(
                         [
                             self.impl.get_mem_pool_base_address(
@@ -2087,7 +2097,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     # shift lands the origin on the pool's slot-0 scale address.
                     # This keeps block_scale_offset == offset without depending on
                     # the non-contractual layer_grouping order.
-                    block_scale_role = self._get_block_scale_role(role_a)
+                    block_scale_role = self._get_block_scale_role(role_a, layer_id)
                     if block_scale_role is not None:
                         rep_offset = self._kv_pool_mapping_offset(layer_id, pool_id, key_base_addr)
                         scale_stride = (
@@ -2127,7 +2137,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 if self.dtype != DataType.NVFP4 or role_a != Role.KEY:
                     block_scale_offset = None
                 else:
-                    block_scale_role = self._get_block_scale_role(role_a)
+                    block_scale_role = self._get_block_scale_role(role_a, layer_id)
                     if block_scale_role is None:
                         block_scale_offset = None
                     else:
@@ -2471,6 +2481,23 @@ class KVCacheManagerV2(BaseResourceManager):
         for entry in entries:
             logger.info(entry)
 
+    def _get_attention_op_page_index_params(
+        self, layer_id: LayerId, role: DataRole
+    ) -> Tuple[int, int, int]:
+        """Scale, layer offset and scratch span for one entry per logical block."""
+        converter = self.impl.get_page_index_converter(layer_id, role)
+        if converter.expansion != 1:
+            raise NotImplementedError(
+                "SWA scratch block-table conversion does not support "
+                f"expanded page indices yet: layer={layer_id}, role={role}, "
+                f"expansion={converter.expansion}"
+            )
+        return (
+            int(converter.scale),
+            int(converter.layer_offset),
+            int(converter.scratch_pages_per_block),
+        )
+
     def _prepare_swa_scratch_copy_tensors(self, index_mapper_capacity: int) -> None:
         pool_ids = torch.empty(
             self.num_attention_op_pools,
@@ -2495,17 +2522,13 @@ class KVCacheManagerV2(BaseResourceManager):
                 role_a if role_b is None else role_b,
             ]
             for role_idx, role in enumerate(roles):
-                converter = self.impl.get_page_index_converter(layer_id, role)
-                if converter.expansion != 1:
-                    raise NotImplementedError(
-                        "SWA scratch block-table conversion does not support "
-                        f"expanded page indices yet: layer={layer_id}, role={role}, "
-                        f"expansion={converter.expansion}"
-                    )
+                scale, layer_offset, scratch_span = self._get_attention_op_page_index_params(
+                    layer_id, role
+                )
                 pool_ids[local_layer_idx, role_idx] = pool_id
-                scales[local_layer_idx, role_idx] = int(converter.scale)
-                layer_offsets[local_layer_idx, role_idx] = int(converter.layer_offset)
-                scratch_pages[local_layer_idx, role_idx] = int(converter.scratch_pages_per_block)
+                scales[local_layer_idx, role_idx] = scale
+                layer_offsets[local_layer_idx, role_idx] = layer_offset
+                scratch_pages[local_layer_idx, role_idx] = scratch_span
 
         staging_capacity = index_mapper_capacity * self.max_beam_width
         device = torch.device("cuda", torch.cuda.current_device())
