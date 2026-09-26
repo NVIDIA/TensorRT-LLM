@@ -513,9 +513,20 @@ class BaseLLM:
                     == _usage.UsageContext.UNKNOWN):
                 telemetry_config = telemetry_config.model_copy(
                     update={"usage_context": _usage.UsageContext.LLM_CLASS})
+            pretrained_config = self._hf_model_config
+            if getattr(self, "_encoder_executor", None) is not None:
+                try:
+                    runtime_pretrained_config = (
+                        self._encoder_executor.model_engine.model.model_config.
+                        pretrained_config)
+                    if runtime_pretrained_config is not None:
+                        pretrained_config = runtime_pretrained_config
+                except AttributeError:
+                    # Missing runtime metadata must not suppress usage reporting.
+                    pass
             _usage.report_usage(
                 llm_args=self.args,
-                pretrained_config=self._hf_model_config,
+                pretrained_config=pretrained_config,
                 telemetry_config=telemetry_config,
             )
         except Exception as exc:

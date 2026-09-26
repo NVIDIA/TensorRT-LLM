@@ -58,7 +58,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, TypeVar
 
 from tensorrt_llm.usage import schema
-from tensorrt_llm.usage.architecture_allowlist import PUBLIC_HF_ARCHITECTURES
+from tensorrt_llm.usage.architecture_allowlist import PUBLIC_MODEL_ARCHITECTURES
 from tensorrt_llm.usage.config import UsageContext
 from tensorrt_llm.usage.llmapi_config import _failure_llm_api_config_payloads
 from tensorrt_llm.usage.llmapi_config import (
@@ -404,7 +404,7 @@ def _architecture_telemetry_fields(pretrained_config: Any) -> tuple[str, str]:
     architecture = _extract_architecture_class_name(pretrained_config)
     if architecture is None:
         return "", ""
-    if architecture in PUBLIC_HF_ARCHITECTURES:
+    if architecture in PUBLIC_MODEL_ARCHITECTURES:
         return architecture, ""
     try:
         digest = hashlib.sha256(

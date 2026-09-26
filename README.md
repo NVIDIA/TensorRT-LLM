@@ -318,9 +318,11 @@ deployment, and not linked to users. The data we collect includes:
 - Ingress point (e.g., LLM API, CLI, serve command)
 - Deployment duration (via periodic heartbeats)
 - GPU SKUs, count, memory, and CUDA version
-- Public model architecture class name (e.g., `LlamaForCausalLM`); architectures
-  outside the checked-in public allowlist are sent only as a deterministic
-  SHA-256 hash, never as the original free-form name
+- Public model architecture identifier (e.g., `LlamaForCausalLM` or
+  `Qwen3ForTextEmbedding`). This may be an upstream checkpoint architecture or
+  a publicly documented TensorRT-LLM runtime architecture. Identifiers outside
+  the checked-in public allowlist are sent only as a deterministic SHA-256
+  hash, never as the original free-form name
 - Parallelism configuration (TP/PP/CP/MoE-EP/MoE-TP sizes), quantization algorithm, dtype, KV cache dtype
 - System information (OS platform, Python version, CPU architecture, CPU count)
 - TRT-LLM version and backend
