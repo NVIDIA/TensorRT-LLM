@@ -662,10 +662,12 @@ class SpecMetadata:
     # the slot keys are bounded by the slot pool, which SeqSlotManager frees
     # and reuses on request completion.
     #
-    # A per-slot counter is not reset when a slot is reused, so a new seeded
-    # request on a recycled slot starts partway into its stream. That is still
-    # a disjoint region of it, so sampling stays correct; the cost is that a
-    # seeded request reproduces bit-exactly only for a given slot history.
+    # A slot's counter is reset when a different request takes the slot over
+    # (see ``_rng_slot_owner``), so a seeded request always starts at the
+    # beginning of its stream: with a fixed seed it reproduces bit-exactly
+    # regardless of which slot it lands on or that slot's history. (Batch
+    # composition can still perturb it, because the kernel's per-row
+    # subsequence follows the batch row.)
     #
     # Unseeded requests all share DEFAULT_SAMPLING_SEED, so a per-slot counter
     # would give two requests on never-used slots the same (seed, offset) and
@@ -674,6 +676,8 @@ class SpecMetadata:
     # low-concurrency case. The shared counter guarantees every unseeded
     # request an offset window no earlier request has used.
     _rng_window_counter: dict = field(default_factory=dict)
+    # seq_slot -> py_request_id mapping to track offset slot ownership.
+    _rng_slot_owner: dict = field(default_factory=dict)
     # The same state expanded to one entry per logits row, mirroring the
     # temperatures / top_ks / top_ps / min_ps layout, for the sampling calls that
     # consume rows rather than requests.
@@ -766,7 +770,16 @@ class SpecMetadata:
             # Dummy/padding requests (no slot) never have their output kept;
             # they are unseeded, so they draw from the shared counter like any
             # other unseeded request and never perturb a real slot's stream.
-            key = request.py_seq_slot if is_seeded else _UNSEEDED_RNG_WINDOW_KEY
+            if is_seeded:
+                key = request.py_seq_slot
+                # A recycled slot still carries the finished request's counter.
+                # Start the newcomer at 0 so a seeded request's stream never
+                # depends on its slot's history.
+                if self._rng_slot_owner.get(key) != request.py_request_id:
+                    self._rng_slot_owner[key] = request.py_request_id
+                    self._rng_window_counter[key] = 0
+            else:
+                key = _UNSEEDED_RNG_WINDOW_KEY
             step = self._rng_window_counter.get(key, 0)
             self._rng_window_counter[key] = step + 1
             offsets.append(step * window)
