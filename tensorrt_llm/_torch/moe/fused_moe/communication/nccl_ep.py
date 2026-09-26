@@ -151,7 +151,6 @@ class NcclEP(Communication):
                     "NcclEP context must be initialized before CUDA graph capture. "
                     "Run an eager warmup forward before enabling or capturing CUDA graphs."
                 )
-            from nccl.ep import Layout
 
             from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import get_nccl_ep_context
 
@@ -162,7 +161,8 @@ class NcclEP(Communication):
                 self.hidden_size,
                 self.max_top_k,
                 self.uses_internal_fp8_dispatch,
-                Layout.RANK_MAJOR,
+                # None => honor the TRTLLM_NCCL_EP_ALGO-gated layout default.
+                None,
                 external_fp8=self.use_external_fp8,
                 external_nvfp4=self.use_external_nvfp4,
             )
@@ -358,8 +358,8 @@ class NcclEP(Communication):
         # numbering downstream consumers expect.
         # The dispatch buffer is 3D [ep_size, max_tokens_per_rank, max_top_k]
         # per the LL rank-major contract; flatten to 2D for downstream.
-        recv_topk_idx_flat = ctx.recv_topk_idx_buf.view(self.max_recv_tokens, self.max_top_k)
-        if ctx.kernel_writes_global_ids:
+        recv_topk_idx_flat = ctx.recv_topk_idx_buf.reshape(self.max_recv_tokens, self.max_top_k)
+        if ctx.dispatch_writes_global_ids:
             recv_slots_global = recv_topk_idx_flat
         else:
             recv_slots_global = torch.where(
@@ -377,12 +377,15 @@ class NcclEP(Communication):
         elif self.use_external_nvfp4:
             output_tokens = output_tokens.view(torch.uint8)
         return (
-            output_tokens.view(
+            # reshape, not view: the HT recv buffer is already 2D, and view()
+            # rejects a no-op re-spec on some strides. reshape is a superset
+            # and is a no-op when the shape already matches.
+            output_tokens.reshape(
                 self.max_recv_tokens,
                 self.hidden_size // 2 if self.use_external_nvfp4 else self.hidden_size,
             ),
             (
-                ctx.scales_buf.view(
+                ctx.scales_buf.reshape(
                     self.max_recv_tokens,
                     self.hidden_size // 128
                     if self.uses_internal_fp8_dispatch
@@ -391,8 +394,12 @@ class NcclEP(Communication):
                 if (self.uses_internal_fp8_dispatch or self.use_external_nvfp4)
                 else None
             ),
-            recv_slots_global,
-            ctx.recv_topk_weights_buf.view(self.max_recv_tokens, self.max_top_k),
+            # torch.ops.trtllm.fused_moe requires int32 routing ids, while the
+            # v0.1 HT kernel ABI requires an int64 recv buffer. Narrow here so
+            # both contracts hold; -1 sentinels survive the cast. Under LL the
+            # buffer is already int32 and this is a no-op.
+            recv_slots_global.to(torch.int32),
+            ctx.recv_topk_weights_buf.reshape(self.max_recv_tokens, self.max_top_k),
         )
 
     # ------------------------------------------------------------------
@@ -436,10 +443,28 @@ class NcclEP(Communication):
                     f"combine input rows={final_hidden_states.shape[0]} "
                     f"expected={self.max_recv_tokens}"
                 )
-            final_hidden_states = final_hidden_states.view(
-                self.ep_size,
-                self.max_tokens_per_rank,
-                self.hidden_size,
+            # HT+FLAT combine takes the 2D [max_recv, hidden] stream as-is; LL
+            # rank-major requires the 3D per-rank view. The algorithm comes
+            # from the context, never a fresh env read, so this agrees with
+            # the buffers the context allocated.
+            if not ctx.is_high_throughput:
+                final_hidden_states = final_hidden_states.view(
+                    self.ep_size,
+                    self.max_tokens_per_rank,
+                    self.hidden_size,
+                )
+        elif final_hidden_states.dim() == 3:
+            expected_shape = (self.ep_size, self.max_tokens_per_rank, self.hidden_size)
+            if tuple(final_hidden_states.shape) != expected_shape:
+                raise ValueError(
+                    f"combine input shape={tuple(final_hidden_states.shape)} "
+                    f"expected={expected_shape}"
+                )
+        else:
+            raise ValueError(
+                "NcclEP combine input must be 2D [max_recv_tokens, hidden] or "
+                "3D [ep_size, max_tokens_per_rank, hidden], got "
+                f"shape={tuple(final_hidden_states.shape)}"
             )
 
         combine_input_c = final_hidden_states.contiguous()
