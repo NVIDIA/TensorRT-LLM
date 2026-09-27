@@ -436,22 +436,21 @@ class SpeculativeDecodingMode(IntEnum):
 
     def attention_need_spec_dec_mode(
         self,
-        is_draft_model: bool,
         attention_backend: Type[AttentionBackend],
     ):
         """
         If true, the attention backend kernel needs to run in spec-dec mode (multi-token query mode).
         Args:
-            is_draft_model: whether the model is a draft model.
             attention_backend: the attention backend.
         """
         is_trtllm_attention = issubclass(attention_backend, TrtllmAttention)
 
         # Always use the multi-token query mode for 1-model if the kernels are available.
         use_case_1 = self.use_one_engine()
-        # For 2-model, only the target model (verification) processes multiple tokens at once.
-        use_case_2 = (not self.use_one_engine() and not is_draft_model
-                      and is_trtllm_attention)
+        # For modes that do not run in one engine (NGram, user-provided drafts),
+        # the target model verifies multiple draft tokens per step and needs the
+        # multi-token query kernel.
+        use_case_2 = not self.use_one_engine() and is_trtllm_attention
 
         return use_case_1 or use_case_2
 

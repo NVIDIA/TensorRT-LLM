@@ -1768,8 +1768,7 @@ class KvCacheCreator:
             layer_mask=spec_dec_layer_mask,
             is_disagg=self._is_disagg,
             disable_overlap_scheduler=self._disable_overlap_scheduler,
-            kv_events_config=None
-            if estimating_kv_cache or model_engine.is_draft_model else
+            kv_events_config=None if estimating_kv_cache else
             self._llm_args.kv_cache_config.kv_events_config,
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
@@ -2754,7 +2753,7 @@ def _create_kv_cache_manager(
         # Optional overrides for one-model draft case (when model_engine is None)
         model_config: Optional[ModelConfig] = None,
         dtype: Optional[torch.dtype] = None,
-        is_draft: Optional[bool] = None,
+        is_draft: bool = False,
         layer_mask: Optional[List[bool]] = None,
         num_layers: Optional[int] = None,
         num_kv_heads: Optional[Union[int, List[int]]] = None,
@@ -2801,9 +2800,6 @@ def _create_kv_cache_manager(
 
     if dtype is None:
         dtype = model_engine.dtype
-
-    if is_draft is None:
-        is_draft = model_engine.is_draft_model
 
     if kv_cache_type is None:
         kv_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
