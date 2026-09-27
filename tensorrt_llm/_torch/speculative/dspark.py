@@ -48,6 +48,7 @@ def _store_managed_window_kernel(
     slots,
     lengths,
     positions,
+    write_starts,
     block_tables,
     real_rows,
     capacities,
@@ -72,10 +73,11 @@ def _store_managed_window_kernel(
     slot = tl.load(slots + row)
     length = tl.load(lengths + slot)
     position = tl.load(positions + slot) - length + token
+    write_start = tl.load(write_starts + row)
     real = tl.load(real_rows + row)
     capacity = tl.load(capacities + row)
     valid = real & (token < length) & (token < window_size)
-    valid = valid & (position >= 0) & (position < capacity)
+    valid = valid & (position >= write_start) & (position >= 0) & (position < capacity)
     page = tl.load(
         block_tables + row * table_stride + position // page_size,
         mask=valid,
@@ -682,19 +684,23 @@ class DSv4DSparkWorker(SpecWorkerBase):
         )
         self._prepared_managed_request_ids = tuple(real_ids)
 
-    def _write_managed_history(self, batch_size: int) -> None:
-        """Store accepted rolling frames in their pages with replay-time device indices."""
+    def _write_managed_history(
+        self, batch_size: int, write_starts: torch.Tensor, *, batch_offset: int = 0
+    ) -> None:
+        """Store newly appended frames without rewriting shared committed prefix pages."""
         head_dim = self._kv_windows.shape[-1]
+        rows = slice(batch_offset, batch_offset + batch_size)
         for stage, pool in enumerate(self._draft_kv_buffers):
             _store_managed_window_kernel[(batch_size, triton.cdiv(self._win * head_dim, 128))](
                 self._kv_windows,
                 pool,
-                self._batch_to_slot,
+                self._batch_to_slot[rows],
                 self._valid_len,
                 self._ctx_len,
-                self._draft_block_tables,
-                self._draft_real_rows,
-                self._draft_capacities,
+                write_starts,
+                self._draft_block_tables[rows],
+                self._draft_real_rows[rows],
+                self._draft_capacities[rows],
                 *self._kv_windows.stride(),
                 pool.stride(0),
                 pool.stride(3),
@@ -736,19 +742,35 @@ class DSv4DSparkWorker(SpecWorkerBase):
             slot = self._assign_slot(
                 req_id, reset=first_position == 0 and self._draft_kv_manager is None
             )
-            self._ctx_len[slot] = chunk_positions[-1] + 1
             self._position_initialized[slot] = True
 
             if captured is not None:
-                self._valid_len[slot] = torch.clamp(
-                    self._valid_len[slot] + chunk_len, max=self._win
-                )
                 keep = min(self._win, chunk_len)
+                if self._draft_kv_manager is not None and self._draft_kv_manager.enable_block_reuse:
+                    # Reusable prefixes can end before this chunk's final window.
+                    # Persist earlier frames before the ring overwrites them.
+                    prefix_end = chunk_len - keep
+                    for begin in range(0, prefix_end, self._win):
+                        end = min(begin + self._win, prefix_end)
+                        self._ctx_len[slot] = chunk_positions[end - 1] + 1
+                        self._valid_len[slot] = torch.clamp(
+                            self._valid_len[slot] + end - begin, max=self._win
+                        )
+                        draft_model.write_context_windows(
+                            captured[context_offset + begin : context_offset + end],
+                            chunk_positions[begin:end] + 1,
+                            self._kv_windows[slot],
+                        )
+                        self._write_managed_history(
+                            1, chunk_positions[begin : begin + 1], batch_offset=i
+                        )
+                self._valid_len[slot] = torch.clamp(self._valid_len[slot] + keep, max=self._win)
                 hidden = captured[context_offset + chunk_len - keep : context_offset + chunk_len]
                 # A prompt token at absolute position p is stored in frame p+1,
                 # matching the generation path's start_pos convention.
                 window_positions = chunk_positions[-keep:] + 1
                 draft_model.write_context_windows(hidden, window_positions, self._kv_windows[slot])
+            self._ctx_len[slot] = chunk_positions[-1] + 1
             context_offset += chunk_len
 
     def _advance_generation_state(
@@ -971,6 +993,11 @@ class DSv4DSparkWorker(SpecWorkerBase):
             saved_position_initialized = self._position_initialized.clone()
             saved_windows = self._kv_windows.clone()
 
+        if self._draft_kv_manager is not None:
+            # Gather before either append path advances the positions. This runs
+            # inside graph replay so overlapping iterations use device progress.
+            write_starts = self._ctx_len[self._batch_to_slot[:batch_size]]
+
         # Assign / reset window slots for context (prefill) requests and seed each
         # request's rolling KV window from its prompt's captured context, so the
         # first generation step drafts against real context instead of an all-zero
@@ -1080,7 +1107,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         )
 
         if self._draft_kv_manager is not None:
-            self._write_managed_history(batch_size)
+            self._write_managed_history(batch_size, write_starts)
 
         if is_warmup:
             self._ctx_len.copy_(saved_ctx_len)

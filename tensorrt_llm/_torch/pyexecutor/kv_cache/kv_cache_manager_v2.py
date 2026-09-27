@@ -1112,8 +1112,6 @@ def _settle_context_cursor(req: LlmRequest, reuse: int, tokens_per_block: int) -
 
 def get_draft_cache_unsupported_reason(kv_cache_config: KvCacheConfig) -> Optional[str]:
     """Restrictions shared by creator admission and direct manager construction."""
-    if kv_cache_config.enable_block_reuse:
-        return "Unified DSpark draft KV does not yet support prefix reuse"
     if kv_cache_config.enable_swa_scratch_reuse:
         return (
             "Unified DSpark draft KV cannot use SWA scratch reuse; "
@@ -3807,6 +3805,15 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache.enable_swa_scratch_reuse = False
             if not self._resume_and_restore(req.py_request_id, kv_cache):
                 return None
+            if self.draft_layout is not None and req.py_request_id not in self.draft_history:
+                # The reuse match covers every cache domain. Initialize once,
+                # after resume succeeds, so overlap/chunk retries cannot rewind
+                # draft history that has already advanced on the device.
+                reused = kv_cache.num_committed_tokens
+                valid_length = reused
+                if self.draft_layout.window_size is not None:
+                    valid_length = min(valid_length, self.draft_layout.window_size)
+                self.set_draft_history(req.py_request_id, valid_length, reused)
             return kv_cache.num_committed_tokens
 
         # Subsequent chunk: cache must exist from first chunk. It may be

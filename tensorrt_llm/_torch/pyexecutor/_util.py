@@ -1875,11 +1875,6 @@ class KvCacheCreator:
                 "would lose accepted-token history before speculation resumes.")
         if self._mapping.pp_size != 1 or self._mapping.cp_size != 1:
             return "Unified DSpark KV cache requires PP=1 and CP=1."
-        if (self._mapping.enable_attention_dp
-                and not self._is_embedded_dspark()):
-            return (
-                "Unified DSpark KV cache does not yet support "
-                "attention data parallelism; set enable_attention_dp=False.")
         if self._kv_connector_manager is not None:
             return ("Unified DSpark KV cache does not yet support "
                     "KV cache connectors.")
