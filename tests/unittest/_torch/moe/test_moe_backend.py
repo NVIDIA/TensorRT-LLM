@@ -1301,10 +1301,13 @@ def test_codegen_baked_situ_softcaps_are_uniform_scalars(impl):
     assert params.beta == 25.0
 
 
-def test_fc12_rejects_nonuniform_situ_softcaps() -> None:
+@pytest.mark.parametrize("nonuniform_softcap", ["gate", "linear"])
+def test_fc12_rejects_nonuniform_situ_softcaps(nonuniform_softcap: str) -> None:
+    gate_softcap = torch.tensor([4.0, 5.0]) if nonuniform_softcap == "gate" else 4.0
+    linear_softcap = torch.tensor([25.0, 26.0]) if nonuniform_softcap == "linear" else 25.0
     with pytest.raises(ValueError, match="uniform"):
         materialize_activation_params(
-            SiTuActivation(gate_softcap=torch.tensor([4.0, 5.0]), linear_softcap=25.0),
+            SiTuActivation(gate_softcap=gate_softcap, linear_softcap=linear_softcap),
             TrtllmCutedslFusedFc12Nvfp4Impl.activation_support,
             num_local_experts=2,
             owner="FC12",

@@ -260,9 +260,9 @@ def _resolve_kimi_situ_betas(cfg: Any) -> tuple[float, float]:
             "Kimi K3 routed SiTu experts require activation_situ_linear_beta; "
             "None means an identity linear branch that the fused kernels cannot represent."
         )
-    if situ_beta <= 0 or situ_linear_beta <= 0:
+    if not (0 < situ_beta < float("inf") and 0 < situ_linear_beta < float("inf")):
         raise ValueError(
-            f"Kimi K3 SiTu betas must be positive; got {situ_beta} and {situ_linear_beta}."
+            f"Kimi K3 SiTu betas must be finite and positive; got {situ_beta} and {situ_linear_beta}."
         )
     return float(situ_beta), float(situ_linear_beta)
 

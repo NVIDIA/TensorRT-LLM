@@ -84,10 +84,14 @@ class CuteDslFc12FusedMoENvfp4Runner(CuteDslFusedMoENvfp4Runner):
         tactic: Optional[int],
         do_preparation: bool = False,
     ) -> torch.Tensor:
+        """Prime both fused tiles before outer CUDA-graph profiling.
+
+        The inner fused op may need to compile or tune, which cannot happen
+        inside the outer profiler's CUDA graph. The parent's preparation also
+        passes a two-op memset argument that FC12 does not accept. This path
+        runs for SwiGLU as well as SiTU when the outer tuner prepares a shape.
+        """
         if do_preparation:
-            # Prime the fused inner op before outer CUDA-graph profiling.
-            # The parent's preparation passes a two-op memset knob that
-            # FC12 does not accept: its memset is owned by the fused op.
             for tile_size in self._tile_sizes():
                 super().forward(inputs, tactic=tile_size)
             return inputs[4]

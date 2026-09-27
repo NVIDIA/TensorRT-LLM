@@ -110,7 +110,16 @@ def test_kimi_situ_betas_require_linear_beta():
 
 @pytest.mark.parametrize(
     "situ_beta,situ_linear_beta",
-    [(0.0, 25.0), (4.0, 0.0), (-1.0, 25.0), (4.0, -1.0)],
+    [
+        (0.0, 25.0),
+        (4.0, 0.0),
+        (-1.0, 25.0),
+        (4.0, -1.0),
+        (float("nan"), 25.0),
+        (4.0, float("nan")),
+        (float("inf"), 25.0),
+        (4.0, float("inf")),
+    ],
 )
 def test_kimi_situ_betas_must_be_positive(situ_beta, situ_linear_beta):
     cfg = SimpleNamespace(
@@ -118,8 +127,40 @@ def test_kimi_situ_betas_must_be_positive(situ_beta, situ_linear_beta):
         activation_situ_linear_beta=situ_linear_beta,
     )
 
-    with pytest.raises(ValueError, match="must be positive"):
+    with pytest.raises(ValueError, match="must be finite and positive"):
         modeling_kimi_linear._resolve_kimi_situ_betas(cfg)
+
+
+@pytest.mark.parametrize(
+    "situ_beta,situ_linear_beta",
+    [
+        (float("nan"), 25.0),
+        (4.0, float("nan")),
+        (float("inf"), 25.0),
+        (4.0, float("inf")),
+    ],
+    ids=["nan_gate", "nan_linear", "inf_gate", "inf_linear"],
+)
+def test_fc12_kernel_rejects_nonfinite_situ_betas(situ_beta, situ_linear_beta):
+    pytest.importorskip("cutlass")
+    pytest.importorskip("cutlass.utils.rubin_helpers")
+    from tensorrt_llm._torch.cute_dsl_kernels.rubin.moe.rubin_contiguous_grouped_blockscaled_gemm_fused_fc12 import (  # noqa: E501
+        Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel,
+    )
+    from tensorrt_llm._torch.utils import ActivationType
+
+    with pytest.raises(ValueError, match="finite and positive"):
+        Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel(
+            sf_vec_size=16,
+            mma_inst_shape=(128, 128, 256),
+            mma_tiler=(128, 128, 256),
+            cluster_shape_mn=(1, 1),
+            vectorized_f32=True,
+            topk=8,
+            activation_type=ActivationType.SiTu,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+        )
 
 
 @pytest.mark.parametrize(

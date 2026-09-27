@@ -971,9 +971,9 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                     "ActivationType.SiTu requires both situ_beta and "
                     f"situ_linear_beta, got {situ_beta} and {situ_linear_beta}."
                 )
-            if situ_beta <= 0 or situ_linear_beta <= 0:
+            if not (0 < situ_beta < float("inf") and 0 < situ_linear_beta < float("inf")):
                 raise ValueError(
-                    f"SiTU betas must be positive, got {situ_beta} and {situ_linear_beta}."
+                    f"SiTU betas must be finite and positive, got {situ_beta} and {situ_linear_beta}."
                 )
             if self.has_swiglu_limit:
                 raise ValueError(
@@ -2343,6 +2343,9 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
 
         Packed path uses ``tanh(z) = 2 * sigmoid(2z) - 1``. Betas fold at
         trace time; a different pair compiles a different kernel.
+
+        Keep the packed SiTU algebra in sync with the Blackwell two-op
+        ``blockscaled_contiguous_gather_grouped_gemm_act_fusion.py`` epilogue.
         """
         beta = self.situ_beta
         linear_beta = self.situ_linear_beta
