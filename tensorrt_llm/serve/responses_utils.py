@@ -167,9 +167,8 @@ def _parse_response_input(
             # would have to be inferred from 'id' or recovered from
             # 'encrypted_content', which is not implemented). Follow the
             # standard fallback behavior and ignore such items.
-            logger.debug(
-                "Responses API: ignoring reasoning input item without "
-                "'content'")
+            logger.debug("Responses API: ignoring reasoning input item without "
+                         "'content'")
             msg = None
         elif len(content) > 1:
             raise ValueError(
