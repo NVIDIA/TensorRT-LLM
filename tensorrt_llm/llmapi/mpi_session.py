@@ -11,7 +11,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import wait as futures_wait
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
 
@@ -172,6 +172,21 @@ class MPINodeState:
     # This is necessary because MPICommExecutor can only be created once per MPI process
     _global_comm_executor = None
     _global_mpi_pool = None
+
+    @classmethod
+    def close_global_comm_executor(cls):
+        """Stop the follower ranks and release the shared COMM_WORLD executor.
+
+        The follower ranks sit in ``MPICommExecutor``'s receive loop until rank
+        0 sends this sentinel; nothing else ends them. mpi4py only sends it
+        after every submitted task has returned, so this call blocks for as
+        long as any worker task is still running. Callers bound it.
+        """
+        executor = cls._global_comm_executor
+        cls._global_comm_executor = None
+        cls._global_mpi_pool = None
+        if executor is not None:
+            executor.__exit__(None, None, None)
 
     @staticmethod
     def is_initialized() -> bool:
@@ -340,6 +355,30 @@ def _process_start_time(pid: int) -> Optional[bytes]:
 
 
 _DEFAULT_IDENTITY_TIMEOUT = 300.0
+_DEFAULT_MGMN_SHUTDOWN_GRACE = 60.0
+
+
+def _mgmn_shutdown_grace_seconds() -> float:
+    """Seconds the worker world gets to drain before MPI_Abort is called.
+
+    The default matches the grace ``MpiSession.shutdown_abort`` already uses.
+    ``TLLM_MGMN_SHUTDOWN_GRACE_SECONDS`` overrides it; unparsable, non-finite
+    or non-positive values fall back to the default rather than turning every
+    shutdown into an immediate abort.
+    """
+    raw = os.environ.get("TLLM_MGMN_SHUTDOWN_GRACE_SECONDS")
+    if not raw:
+        return _DEFAULT_MGMN_SHUTDOWN_GRACE
+    try:
+        value = float(raw)
+        if math.isfinite(value) and value > 0:
+            return value
+    except ValueError:
+        pass
+    logger.warning(
+        f"Ignoring invalid TLLM_MGMN_SHUTDOWN_GRACE_SECONDS={raw!r}; "
+        f"using {_DEFAULT_MGMN_SHUTDOWN_GRACE}s")
+    return _DEFAULT_MGMN_SHUTDOWN_GRACE
 
 
 def _identity_barrier_timeout() -> float:
@@ -873,6 +912,9 @@ class RemoteMpiCommSessionServer():
                                  use_hmac_encryption=True)
         self.comm = comm
         self.results = []  # the results may arrive in any order
+        # Task messages read from the control socket while worker futures were
+        # still outstanding; served in order once they are done.
+        self._deferred_messages: list = []
 
         if self.comm is not None:
             self.session = MpiCommSession(n_workers=self.comm.Get_size(),
@@ -908,6 +950,106 @@ class RemoteMpiCommSessionServer():
                 "green")
             mpi_barrier()
 
+    # How often the pending-futures wait re-checks the control socket.
+    PENDING_POLL_SECONDS = 1.0
+
+    def _wait_for_pending_futures(self, pending_futures) -> bool:
+        """Wait for outstanding worker futures while reading the control socket.
+
+        Returns True if the client asked for shutdown in the meantime. Before
+        this the wait was a plain ``as_completed`` loop: a worker world with
+        even one wedged rank kept the server from ever reading the shutdown
+        request that ``trtllm-llmapi-launch`` sends after the engine exits,
+        so the server never returned and no rank of the step ever exited.
+        Task messages that arrive while waiting are deferred, not dropped.
+        """
+        logger_debug(
+            f"RemoteMpiCommSessionServer waiting for {len(pending_futures)} pending futures to complete\n",
+            "grey")
+        n_failed = 0
+        first_exc = None
+        not_done = set(pending_futures)
+        while not_done:
+            done, not_done = futures_wait(not_done,
+                                          timeout=self.PENDING_POLL_SECONDS)
+            for future in done:
+                try:
+                    future.result()
+                except Exception as e:
+                    n_failed += 1
+                    if first_exc is None:
+                        first_exc = e
+                    print_colored(
+                        f"RemoteMpiCommSessionServer: MPI worker future "
+                        f"failed: {type(e).__name__}: {e}\n", "red")
+            if n_failed == len(pending_futures):
+                # All workers failed, no point waiting further.
+                break
+            if not_done and self.queue.poll(0):
+                message = self.queue.get()
+                if message is None:
+                    logger_debug(
+                        f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received shutdown signal while {len(not_done)} worker future(s) are still running\n",
+                        "green")
+                    return True
+                self._deferred_messages.append(message)
+        if n_failed:
+            logger.error(f"RemoteMpiCommSessionServer: {n_failed}/"
+                         f"{len(pending_futures)} MPI worker(s) failed. "
+                         f"First error: {first_exc}")
+        logger_debug(
+            "RemoteMpiCommSessionServer all pending futures completed\n",
+            "grey")
+        return False
+
+    def _shutdown_worker_world(self, pending_futures):
+        """Tear the worker world down within a bounded time.
+
+        The shutdown request from the client is the only signal the follower
+        ranks ever get: they block in ``MPICommExecutor``'s receive loop until
+        rank 0 sends the stop sentinel, and mpi4py only sends it once every
+        submitted task has returned. If a rank is wedged (a collective that
+        never completes, a crashed engine's teardown), the plain shutdown never
+        returns, this process never exits, no follower exits, and the job step
+        stays alive with a dead engine behind it. Give the world ``grace``
+        seconds to drain, then call MPI_Abort on the communicator so every
+        rank exits together.
+        """
+        grace = _mgmn_shutdown_grace_seconds()
+        still_running = [f for f in pending_futures if not f.done()]
+        if still_running:
+            logger.warning(
+                f"RemoteMpiCommSessionServer: shutdown requested while "
+                f"{len(still_running)}/{len(pending_futures)} MPI worker "
+                f"task(s) are still running; waiting up to {grace}s before "
+                f"calling MPI_Abort")
+
+        finished = threading.Event()
+
+        def teardown():
+            try:
+                # Plain shutdown, not shutdown_abort: the bounded wait below
+                # is the single place that decides to call MPI_Abort.
+                self.session.shutdown()
+                MPINodeState.close_global_comm_executor()
+            finally:
+                finished.set()
+
+        # Daemon: if the teardown is wedged it dies with the process.
+        threading.Thread(target=teardown,
+                         name="RemoteMpiCommSessionServerTeardown",
+                         daemon=True).start()
+        if finished.wait(grace):
+            logger_debug(
+                "RemoteMpiCommSessionServer worker world shut down cleanly\n",
+                "green")
+            return
+        logger.critical(
+            f"RemoteMpiCommSessionServer: worker world did not shut down "
+            f"within {grace}s; calling MPI_Abort so no rank outlives the "
+            f"leader")
+        self.session.abort()
+
     def serve(self):
         logger_debug(f"RemoteMpiCommSessionServer listening on {self.addr}\n",
                      "yellow")
@@ -916,42 +1058,20 @@ class RemoteMpiCommSessionServer():
             # Wait for any pending futures from previous tasks to complete
             # This ensures all ranks are ready before accepting the next task
             if pending_futures:
-                logger_debug(
-                    f"RemoteMpiCommSessionServer waiting for {len(pending_futures)} pending futures to complete\n",
-                    "grey")
-                n_failed = 0
-                first_exc = None
-                # Use as_completed so that failures are logged as soon as
-                # they occur rather than blocking behind a stuck future.
-                for future in as_completed(pending_futures):
-                    try:
-                        future.result()  # Wait for completion
-                    except Exception as e:
-                        n_failed += 1
-                        if first_exc is None:
-                            first_exc = e
-                        print_colored(
-                            f"RemoteMpiCommSessionServer: MPI worker future "
-                            f"failed: {type(e).__name__}: {e}\n", "red")
-                        if n_failed == len(pending_futures):
-                            # All workers failed — no point waiting further.
-                            break
-                if n_failed:
-                    logger.error(
-                        f"RemoteMpiCommSessionServer: {n_failed}/"
-                        f"{len(pending_futures)} MPI worker(s) failed. "
-                        f"First error: {first_exc}")
+                if self._wait_for_pending_futures(pending_futures):
+                    self._shutdown_worker_world(pending_futures)
+                    break
                 pending_futures.clear()
-                logger_debug(
-                    "RemoteMpiCommSessionServer all pending futures completed\n",
-                    "grey")
 
-            message: Optional[RemoteTask] = self.queue.get()
+            if self._deferred_messages:
+                message: Optional[RemoteTask] = self._deferred_messages.pop(0)
+            else:
+                message = self.queue.get()
             if message is None:
                 logger_debug(
                     f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received shutdown signal\n",
                     "green")
-                self.session.shutdown_abort()
+                self._shutdown_worker_world([])
                 break
             else:
                 logger_debug(

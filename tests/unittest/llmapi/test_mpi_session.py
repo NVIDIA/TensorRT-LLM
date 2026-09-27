@@ -1,10 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import importlib.util
 import os
+import shutil
 import subprocess  # nosec B404
 import sys
 import threading
+import time
 from pathlib import Path
 from subprocess import PIPE, Popen
 from typing import Literal
@@ -195,6 +198,132 @@ def test_remote_mpi_session(
 
     if task_type == "flashinfer_temporary_cleanup":
         assert not list(tmp_path.glob("trtllm-flashinfer-rank-*"))
+
+
+# ---- fail fast when the rank-0 task exits and the worker world is wedged ----
+
+_MPI_RUNTIME_MISSING = (shutil.which("mpirun") is None
+                        or importlib.util.find_spec("mpi4py") is None)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(_MPI_RUNTIME_MISSING,
+                    reason="mpirun and mpi4py are required")
+def test_remote_mpi_session_fails_fast_when_worker_world_hangs() -> None:
+    """The rank-0 task exits while every worker rank is stuck in a task.
+
+    Before ``RemoteMpiCommSessionServer`` polled the control socket while
+    worker futures were outstanding, the launcher's stop request was never
+    read, rank 0 never exited, and only the ``timeout`` in the driver script
+    ended the run (exit code 124). Now the server sees the stop request while
+    the futures are outstanding, gives the worker world
+    ``TLLM_MGMN_SHUTDOWN_GRACE_SECONDS`` to drain, then calls MPI_Abort so the
+    whole run ends non-zero well inside the driver's timeout.
+    """
+    cur_dir = os.path.dirname(os.path.abspath(__file__))
+    test_file = os.path.join(cur_dir, "_test_remote_mpi_session.sh")
+    assert os.path.exists(test_file), f"Test file {test_file} does not exist"
+    command = ["bash", test_file, "hang"]
+    print(' '.join(command))
+    env = os.environ.copy()
+    env["TLLM_MGMN_SHUTDOWN_GRACE_SECONDS"] = "5"
+    env["TLLM_LLMAPI_LAUNCH_STOP_TIMEOUT"] = "20"
+    # The abort decision is logged at warning and critical level; make sure
+    # both lines are emitted so the assertions below can see them.
+    env["TLLM_LOG_LEVEL"] = "info"
+
+    start = time.monotonic()
+    result = subprocess.run(  # nosec B603
+        command,
+        env=env,
+        cwd=cur_dir,
+        stdout=PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    elapsed = time.monotonic() - start
+    print(result.stdout)
+    print(f"hang run ended in {elapsed:.1f}s with exit code "
+          f"{result.returncode}")
+
+    # 124 is `timeout` killing a run that never ended on its own.
+    assert result.returncode != 124, "the rank-0 launcher never exited"
+    assert result.returncode != 0, "a rank-0 task that exits 1 must not end 0"
+    assert ("shutdown requested while 2/2 MPI worker task(s) are still "
+            "running") in result.stdout
+    assert "calling MPI_Abort so no rank outlives the leader" in result.stdout
+
+
+def _pending_futures_stand_in(messages):
+    """A server stand-in whose control socket replays ``messages`` (no MPI)."""
+    import types
+
+    class _Queue:
+
+        def poll(self, timeout):
+            return bool(messages)
+
+        def get(self):
+            return messages.pop(0)
+
+    return types.SimpleNamespace(queue=_Queue(),
+                                 _deferred_messages=[],
+                                 PENDING_POLL_SECONDS=0.01)
+
+
+def test_wait_for_pending_futures_sees_shutdown_while_workers_run():
+    from concurrent.futures import Future
+
+    from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionServer
+
+    wait_for_pending = RemoteMpiCommSessionServer._wait_for_pending_futures
+    wedged = [Future(), Future()]  # never resolve: the worker world is stuck
+    server = _pending_futures_stand_in(["task", None])
+    t0 = time.monotonic()
+    assert wait_for_pending(server, wedged) is True
+    assert time.monotonic() - t0 < 5.0  # did not block on the futures
+    # The task that arrived before the stop request is kept, not dropped.
+    assert server._deferred_messages == ["task"]
+
+
+def test_wait_for_pending_futures_completes_without_shutdown():
+    from concurrent.futures import Future
+
+    from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionServer
+
+    wait_for_pending = RemoteMpiCommSessionServer._wait_for_pending_futures
+    done = []
+    for _ in range(2):
+        f = Future()
+        f.set_result(None)
+        done.append(f)
+    server = _pending_futures_stand_in([])
+    assert wait_for_pending(server, done) is False
+    assert server._deferred_messages == []
+
+
+def test_mgmn_shutdown_grace_default(monkeypatch):
+    from tensorrt_llm.llmapi.mpi_session import (_DEFAULT_MGMN_SHUTDOWN_GRACE,
+                                                 _mgmn_shutdown_grace_seconds)
+
+    monkeypatch.delenv("TLLM_MGMN_SHUTDOWN_GRACE_SECONDS", raising=False)
+    assert _mgmn_shutdown_grace_seconds() == _DEFAULT_MGMN_SHUTDOWN_GRACE
+
+
+# Invalid values (unparsable, non-finite, non-positive) fall back to the
+# default rather than turning every shutdown into an immediate MPI_Abort.
+@pytest.mark.parametrize("raw, use_default", [("5", False), ("0.5", False),
+                                              ("", True), ("0", True),
+                                              ("-1", True), ("abc", True),
+                                              ("nan", True), ("inf", True)])
+def test_mgmn_shutdown_grace_env_override(monkeypatch, raw, use_default):
+    from tensorrt_llm.llmapi.mpi_session import (_DEFAULT_MGMN_SHUTDOWN_GRACE,
+                                                 _mgmn_shutdown_grace_seconds)
+
+    monkeypatch.setenv("TLLM_MGMN_SHUTDOWN_GRACE_SECONDS", raw)
+    expected = _DEFAULT_MGMN_SHUTDOWN_GRACE if use_default else float(raw)
+    assert _mgmn_shutdown_grace_seconds() == expected
 
 
 def task1():
