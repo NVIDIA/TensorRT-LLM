@@ -119,6 +119,7 @@ from ..resource_manager import (
     request_context,
 )
 from ..scheduler import ScheduledRequests
+from ..step_prologue_trim import GLOBAL_COPY_FILTER, MAX_COMPARE_BYTES, step_prologue_trim_enabled
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
@@ -2229,6 +2230,20 @@ class KVCacheManagerV2(BaseResourceManager):
         # Plain-int mirror of index_scales so the per-step block-table build
         # does not index a tensor per request (see get_batch_cache_indices*).
         self._index_scale_ints: List[int] = self.index_scales.tolist()
+        # Step-prologue trim (TRTLLM_STEP_PROLOGUE_TRIM): the filter key that
+        # ties a block-offset record to these lifetime-constant pool scales and
+        # offsets, and the staging buffer for the gathered host rows it
+        # compares, sized to the filter's compare cap (wider batches take the
+        # plain copy; see copy_batch_block_offsets).
+        self._page_index_key = (tuple(self._index_scale_ints), tuple(self.kv_offset.tolist()))
+        row_bytes = self.num_pools * self.max_blocks_per_seq * torch.int32.itemsize
+        self._page_index_payload = torch.empty(
+            self.num_pools,
+            min(MAX_COMPARE_BYTES // row_bytes, index_mapper_capacity * self.max_beam_width),
+            self.max_blocks_per_seq,
+            dtype=torch.int32,
+            device="cpu",
+        )
 
         # Keep unused block offsets as safe block index 0.
         self.host_kv_cache_block_offsets = torch.zeros(
@@ -5706,10 +5721,42 @@ class KVCacheManagerV2(BaseResourceManager):
         assert copy_idx.shape[0] == num_seqs
 
         if self._use_per_layer_page_tables:
+            GLOBAL_COPY_FILTER.invalidate(dst_tensor)
             self._copy_batch_block_offsets_per_layer(
                 dst_tensor, request_ids, copy_idx, num_contexts, num_seqs
             )
             return
+
+        # Step-prologue trim (TRTLLM_STEP_PROLOGUE_TRIM). The v2 copy kernel
+        # (cpp/tensorrt_llm/batch_manager/kvCacheManagerV2Utils.cu,
+        # numBlocksPerSeq = srcShape.d[3]) streams the FULL max_blocks_per_seq
+        # row of every (pool, seq) out of pinned host memory and ignores
+        # max_blocks; bounding the copy width like the v1 path is the follow-up
+        # that would shrink every step. In steady decode those rows change only
+        # when a block is appended, so skip the launch when the rows it would
+        # read, the copy index and the pool scales/offsets are identical to the
+        # last launch into this destination region: dst[:, :num_seqs] then
+        # already holds exactly what the kernel would write. This method is the
+        # only writer of the attention metadata's block-offset buffers. The
+        # host rows cannot change between here and the kernel's zero-copy read
+        # (the executor waits on the previous input copy before touching the
+        # page table), so the launch-time snapshot is what the kernel sees.
+        payload = None
+        host = self.host_kv_cache_block_offsets
+        if (
+            num_seqs > 0
+            and step_prologue_trim_enabled()
+            and GLOBAL_COPY_FILTER.fits(
+                num_seqs * host.shape[0] * host.shape[3] * host.element_size()
+            )
+        ):
+            # Gather the K rows of the batch into the persistent staging
+            # buffer (copy_idx is int32 host memory; index_select takes it).
+            payload = torch.index_select(
+                host[:, :, 0, :], 1, copy_idx, out=self._page_index_payload[:, :num_seqs]
+            )
+            if GLOBAL_COPY_FILTER.unchanged(dst_tensor, payload, self._page_index_key):
+                return
 
         copy_batch_block_offsets_to_device(
             self.host_kv_cache_block_offsets,
@@ -5719,6 +5766,10 @@ class KVCacheManagerV2(BaseResourceManager):
             self.kv_offset,
             self._stream.cuda_stream,
         )
+        if payload is not None:
+            GLOBAL_COPY_FILTER.record(dst_tensor, payload, self._page_index_key)
+        else:
+            GLOBAL_COPY_FILTER.invalidate(dst_tensor)
 
     @staticmethod
     def _derive_reuse_salt(cache_salt: str | None) -> int | None:

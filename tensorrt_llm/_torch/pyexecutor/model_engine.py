@@ -10,8 +10,8 @@ import os
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import (Any, Callable, Dict, Iterator, List, Optional, Sequence,
-                    Tuple, Type, Union, cast)
+from typing import (Any, Callable, Dict, Iterator, List, NamedTuple, Optional,
+                    Sequence, Tuple, Type, Union, cast)
 
 import torch
 import torch._dynamo.config
@@ -116,6 +116,9 @@ from .sampler.ops.flashinfer import (warmup_sample_from_logits_op,
                                      warmup_sampling_module)
 from .sampler.sampler_common import SampleType
 from .scheduler import ScheduledRequests
+from .step_prologue_trim import (step_prologue_trim_enabled,
+                                 step_prologue_trim_verify,
+                                 verify_device_equals)
 from .trace_log_utils import log_mem_snapshot
 from .workspace import EagerWorkspaceReclaimer
 
@@ -361,6 +364,31 @@ def _set_moe_a2a_warmup(in_warmup: bool) -> None:
         logger.warning(
             f"moe_a2a_set_warmup unavailable, the all-to-all timeout "
             f"budget was not switched: {type(e).__name__}: {e}")
+
+
+class _ZeroedOutside(NamedTuple):
+    """Step-prologue trim: previous_pos_id_offsets_cuda is zero outside
+    [pos_lo:pos_hi] and previous_kv_lens_offsets_cuda outside [kv_lo:kv_hi]."""
+    pos_lo: int
+    pos_hi: int
+    kv_lo: int
+    kv_hi: int
+
+
+_dsa_metadata_cls: Optional[type] = None
+
+
+def _decode_metadata_rebuilt_by_class(cls: type) -> bool:
+    """Step-prologue trim: whether attention metadata of ``cls`` has every
+    decode-metadata device write of its prepare() rebuilt by the audited,
+    unoverridden DSA ``on_update_kv_lens()`` hook. The DSA import is deferred
+    like every other DSA import in this package."""
+    global _dsa_metadata_cls
+    if _dsa_metadata_cls is None:
+        from ..attention.backends.sparse.dsa import DSAtrtllmAttentionMetadata
+        _dsa_metadata_cls = DSAtrtllmAttentionMetadata
+    return (issubclass(cls, _dsa_metadata_cls)
+            and cls.on_update_kv_lens is _dsa_metadata_cls.on_update_kv_lens)
 
 
 class PyTorchModelEngine(ModelEngine):
@@ -806,6 +834,14 @@ class PyTorchModelEngine(ModelEngine):
                                                        dtype=torch.int,
                                                        device='cuda')
         self._encoder_decoder_staged_request_ids: Optional[List[int]] = None
+        # Step-prologue trim (TRTLLM_STEP_PROLOGUE_TRIM) records of what the
+        # engine-owned device input buffers hold; None = unknown.
+        self._prologue_prev_slots: Optional[List[int]] = None
+        self._prologue_prev_pos_indices: Optional[List[int]] = None
+        self._prologue_gather_ids: Optional[List[int]] = None
+        self._prologue_num_accepted: Optional[List[int]] = None
+        self._prologue_offsets_state: Optional[_ZeroedOutside] = None
+        self._rebuilds_decode_metadata_by_class: Dict[type, bool] = {}
         self.input_ids_cuda = torch.empty((self.max_num_tokens, ),
                                           dtype=torch.int,
                                           device='cuda')
@@ -3802,6 +3838,262 @@ class PyTorchModelEngine(ModelEngine):
                 and getattr(spec_config, '_use_shared_kv_cache', False)
                 and hasattr(attn_metadata, 'apply_spec_decode_kv_lens_offsets'))
 
+    def _forward_rebuilds_decode_metadata(self, attn_meta) -> bool:
+        """Step-prologue trim: True when the forward consuming this step's
+        ``attn_meta.prepare()`` re-runs the DSA ``on_update_kv_lens()`` hook
+        before any layer reads the metadata. ``_preprocess_inputs`` (top of
+        every ``_forward_step``; captured into the decode graph, so it re-runs
+        on every replay) calls it unconditionally. Restricted to the audited
+        DSA hook, whose rebuild covers the decode metadata prepare() writes."""
+        if (not step_prologue_trim_enabled() or attn_meta is None
+                or attn_meta.kv_cache_manager is None):
+            return False
+        cls = type(attn_meta)
+        rebuilds = self._rebuilds_decode_metadata_by_class.get(cls)
+        if rebuilds is None:
+            rebuilds = _decode_metadata_rebuilt_by_class(cls)
+            self._rebuilds_decode_metadata_by_class[cls] = rebuilds
+        return rebuilds
+
+    def _stage_int_list(self, record_attr: str, values: List[int],
+                        dst: torch.Tensor, what: str) -> bool:
+        """H2D ``values`` into ``dst[:len(values)]`` and return True, unless
+        (step-prologue trim) the engine's record ``record_attr`` says the
+        buffer already holds this list, in which case nothing is issued and
+        False is returned. Each caller is its buffer's only writer; a record of
+        None means unknown. Verify mode compares the device slice instead of
+        skipping."""
+        trim = step_prologue_trim_enabled()
+        n = len(values)
+        if trim and getattr(self, record_attr) == values:
+            if step_prologue_trim_verify():
+                verify_device_equals(dst[:n],
+                                     torch.tensor(values, dtype=torch.int),
+                                     what)
+            return False
+        host = torch.tensor(values, dtype=torch.int, pin_memory=prefer_pinned())
+        dst[:n].copy_(host, non_blocking=True)
+        setattr(self, record_attr, list(values) if trim else None)
+        return True
+
+    def _stage_previous_seq_slots(
+            self, previous_batch_indices: List[int]) -> torch.Tensor:
+        """H2D the previous-batch seq slots into previous_batch_indices_cuda
+        and return that slice. Step-prologue trim: seq slots are stable for a
+        request's lifetime, so in steady decode the device buffer already holds
+        this list and the copy is skipped (this method and the encoder-decoder
+        fast path are the buffer's only writers; each invalidates the other's
+        record)."""
+        if self._stage_int_list('_prologue_prev_slots', previous_batch_indices,
+                                self.previous_batch_indices_cuda,
+                                "previous_batch_indices_cuda"):
+            self._encoder_decoder_staged_request_ids = None
+        return self.previous_batch_indices_cuda[:len(previous_batch_indices)]
+
+    def _prologue_trim_spec_overlap_fixup(
+            self, *, previous_batch_indices: List[int],
+            previous_pos_indices: List[int], num_tokens: int,
+            num_draft_tokens: int, new_tokens_device: torch.Tensor,
+            next_draft_tokens_device: torch.Tensor,
+            new_tokens_lens_device: torch.Tensor,
+            num_extend_requests_wo_dummy: int) -> bool:
+        """Step-prologue trim of the overlap-scheduler + speculative-decoding
+        input fix-up in ``_prepare_tp_inputs`` (the ``next_draft_tokens_device
+        is not None`` branch). Returns False (nothing issued) when the trim is
+        off or the tensors do not have the layout it relies on; the caller then
+        runs ``_spec_overlap_fixup_reference``.
+
+        Same values as the original, fewer launches on the prologue's critical
+        path:
+
+        * ``index_select`` with the int32 slot / position indices writes the
+          gathered rows straight into ``input_ids_cuda``, ``draft_tokens_cuda``
+          and the two offset buffers, replacing, for each of the four, an
+          index int32->int64 cast + advanced-indexing gather + D2D copy; the
+          kv-length offset is the gathered ``new_tokens_lens`` minus the step
+          width, done in place on the destination slice (the original
+          subtracts on the whole [max_batch] vector first).
+        * The two whole-buffer ``*= 0`` resets run only when the regions
+          written this step differ from the ones written since the last
+          reset (outside them the buffers are still zero; this method and the
+          other reset site are their only writers).
+        * The slot and position-index H2D copies are skipped when the device
+          buffers already hold the same lists.
+        """
+        if not step_prologue_trim_enabled():
+            return False
+        rt = self.get_runtime_tokens_per_gen_step(self.runtime_draft_len)
+        width = rt - 1
+        n = len(previous_batch_indices)
+        tokens_src = new_tokens_device.transpose(0, 1)
+        offsets_dtype = self.previous_pos_id_offsets_cuda.dtype
+        if n > 0:
+            if (tokens_src.dim() < 2 or tokens_src.shape[1] != rt
+                    or math.prod(tokens_src.shape[2:]) != 1
+                    or tokens_src.dtype != self.input_ids_cuda.dtype
+                    or new_tokens_lens_device.dim() != 1
+                    or new_tokens_lens_device.dtype != offsets_dtype or
+                    self.previous_kv_lens_offsets_cuda.dtype != offsets_dtype):
+                return False
+            if width > 0 and (next_draft_tokens_device.dim() != 2
+                              or next_draft_tokens_device.shape[1] != width
+                              or next_draft_tokens_device.dtype
+                              != self.draft_tokens_cuda.dtype):
+                return False
+
+        num_prev_tokens = n * rt
+        pos_hi = num_extend_requests_wo_dummy * rt
+        pos_lo = pos_hi - num_prev_tokens
+        kv_hi = num_extend_requests_wo_dummy
+        kv_lo = kv_hi - n
+        regions = (_ZeroedOutside(pos_lo, pos_hi, kv_lo, kv_hi)
+                   if n > 0 else _ZeroedOutside(0, 0, 0, 0))
+        verify = step_prologue_trim_verify()
+        if self._prologue_offsets_state != regions:
+            self.previous_pos_id_offsets_cuda *= 0
+            self.previous_kv_lens_offsets_cuda *= 0
+            self._prologue_offsets_state = regions
+        elif verify:
+            for buf, lo, hi, what in (
+                (self.previous_pos_id_offsets_cuda, pos_lo, pos_hi,
+                 "previous_pos_id_offsets_cuda zero reset"),
+                (self.previous_kv_lens_offsets_cuda, kv_lo, kv_hi,
+                 "previous_kv_lens_offsets_cuda zero reset")):
+                outside = torch.cat([buf[:lo], buf[hi:]])
+                verify_device_equals(outside, torch.zeros_like(outside), what)
+        if n == 0:
+            return True
+
+        previous_slots = self._stage_previous_seq_slots(previous_batch_indices)
+        # previous input ids: [n, rt] rows of the (transposed) sample buffer.
+        torch.index_select(
+            tokens_src,
+            0,
+            previous_slots,
+            out=self.input_ids_cuda[num_tokens:num_tokens +
+                                    num_prev_tokens].view(
+                                        (n, ) + tuple(tokens_src.shape[1:])))
+        # previous draft tokens
+        if width > 0:
+            torch.index_select(
+                next_draft_tokens_device,
+                0,
+                previous_slots,
+                out=self.draft_tokens_cuda[num_draft_tokens:num_draft_tokens +
+                                           n * width].view(n, width))
+        # per-token position offsets (see _preprocess_inputs)
+        self._stage_int_list('_prologue_prev_pos_indices', previous_pos_indices,
+                             self.previous_pos_indices_cuda,
+                             "previous_pos_indices_cuda")
+        torch.index_select(new_tokens_lens_device,
+                           0,
+                           self.previous_pos_indices_cuda[0:num_prev_tokens],
+                           out=self.previous_pos_id_offsets_cuda[pos_lo:pos_hi])
+        # per-request kv-length offsets: new_tokens_lens[slot] - rt
+        kv_offsets = self.previous_kv_lens_offsets_cuda[kv_lo:kv_hi]
+        torch.index_select(new_tokens_lens_device,
+                           0,
+                           previous_slots,
+                           out=kv_offsets)
+        kv_offsets.sub_(rt)
+        if verify:
+            # The original expressions, evaluated into temporaries.
+            slots_long = previous_slots.long()
+            verify_device_equals(
+                self.input_ids_cuda[num_tokens:num_tokens + num_prev_tokens],
+                tokens_src[slots_long, :rt].flatten(), "input_ids fix-up")
+            if width > 0:
+                verify_device_equals(
+                    self.draft_tokens_cuda[num_draft_tokens:num_draft_tokens +
+                                           n * width],
+                    next_draft_tokens_device[slots_long, :width].flatten(),
+                    "draft_tokens fix-up")
+            verify_device_equals(
+                self.previous_pos_id_offsets_cuda[pos_lo:pos_hi],
+                new_tokens_lens_device[
+                    self.previous_pos_indices_cuda[0:num_prev_tokens].long()],
+                "previous_pos_id_offsets fix-up")
+            verify_device_equals(kv_offsets,
+                                 (new_tokens_lens_device - rt)[slots_long],
+                                 "previous_kv_lens_offsets fix-up")
+        return True
+
+    def _spec_overlap_fixup_reference(
+            self, previous_batch_indices: List[int],
+            previous_pos_indices: List[int], num_tokens: int,
+            num_draft_tokens: int, new_tokens_device: torch.Tensor,
+            next_draft_tokens_device: torch.Tensor,
+            new_tokens_lens_device: torch.Tensor,
+            num_extend_requests_wo_dummy: int) -> None:
+        """The overlap-scheduler + speculative-decoding input fix-up of
+        ``_prepare_tp_inputs`` (the ``next_draft_tokens_device is not None``
+        branch); ``_prologue_trim_spec_overlap_fixup`` issues the same values
+        with fewer launches and falls back to this."""
+        previous_batch_len = len(previous_batch_indices)
+        # Initialize these two values to zeros
+        self.previous_pos_id_offsets_cuda *= 0
+        self.previous_kv_lens_offsets_cuda *= 0
+        runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(
+            self.runtime_draft_len)
+        runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
+
+        if previous_batch_len > 0:
+            previous_slots = self._stage_previous_seq_slots(
+                previous_batch_indices)
+            # previous input ids
+            previous_batch_tokens = (previous_batch_len *
+                                     runtime_tokens_per_gen_step)
+            new_tokens = new_tokens_device.transpose(
+                0, 1)[previous_slots, :runtime_tokens_per_gen_step].flatten()
+            self.input_ids_cuda[num_tokens:num_tokens +
+                                previous_batch_tokens].copy_(new_tokens,
+                                                             non_blocking=True)
+
+            # previous draft tokens
+            previous_batch_draft_tokens = (previous_batch_len *
+                                           runtime_draft_token_buffer_width)
+            if runtime_draft_token_buffer_width > 0:
+                self.draft_tokens_cuda[
+                    num_draft_tokens:num_draft_tokens +
+                    previous_batch_draft_tokens].copy_(next_draft_tokens_device[
+                        previous_slots, :runtime_draft_token_buffer_width].
+                                                       flatten(),
+                                                       non_blocking=True)
+            # prepare data for the preprocess inputs
+            kv_len_offsets_device = (new_tokens_lens_device -
+                                     runtime_tokens_per_gen_step)
+            previous_pos_indices_host = torch.tensor(previous_pos_indices,
+                                                     dtype=torch.int,
+                                                     pin_memory=prefer_pinned())
+            self.previous_pos_indices_cuda[0:previous_batch_tokens].copy_(
+                previous_pos_indices_host, non_blocking=True)
+
+            # The order of requests in a batch: [context requests, generation requests]
+            # generation requests: ['requests that do not have previous batch', 'requests that already have previous batch', 'dummy requests']
+            #   1) 'requests that do not have previous batch': disable overlap scheduler or the first step in the generation server of disaggregated serving.
+            #   2) 'requests that already have previous batch': previous iteration's requests.
+            #   3) 'dummy requests': pad dummy requests for CUDA graph or attention dp.
+            # Therefore, both of self.previous_pos_id_offsets_cuda and self.previous_kv_lens_offsets_cuda are also 3 segments.
+            #   For 1) 'requests that do not have previous batch': disable overlap scheduler or the first step in the generation server of disaggregated serving.
+            #       Set these requests' previous_pos_id_offsets and previous_kv_lens_offsets to '0' to skip the value changes in _preprocess_inputs.
+            #       Already set to '0' during initialization.
+            #   For 2) 'requests that already have previous batch': enable overlap scheduler.
+            #       Set their previous_pos_id_offsets and previous_kv_lens_offsets according to new_tokens_lens_device and kv_len_offsets_device.
+            #   For 3) 'dummy requests': pad dummy requests for CUDA graph or attention dp.
+            #       Already set to '0' during initialization.
+
+            self.previous_pos_id_offsets_cuda[
+                (num_extend_requests_wo_dummy - previous_batch_len) *
+                runtime_tokens_per_gen_step:num_extend_requests_wo_dummy *
+                runtime_tokens_per_gen_step].copy_(new_tokens_lens_device[
+                    self.previous_pos_indices_cuda[0:previous_batch_tokens]],
+                                                   non_blocking=True)
+
+            self.previous_kv_lens_offsets_cuda[
+                num_extend_requests_wo_dummy -
+                previous_batch_len:num_extend_requests_wo_dummy].copy_(
+                    kv_len_offsets_device[previous_slots], non_blocking=True)
+
     def _preprocess_inputs(self, inputs: Dict[str, Any]):
         """
         Make some changes to the device inputs and avoid blocking the async data transfer
@@ -4357,6 +4649,7 @@ class PyTorchModelEngine(ModelEngine):
                                      [:num_previous_batch_requests],
                                      non_blocking=True)
                 self._encoder_decoder_staged_request_ids = staged_request_ids
+                self._prologue_prev_slots = None
             generation_begin = num_context_tokens
             generation_end = generation_begin + num_previous_batch_requests
             torch.index_select(
@@ -5395,16 +5688,6 @@ class PyTorchModelEngine(ModelEngine):
 
         previous_batch_len = len(previous_batch_indices)
 
-        def previous_seq_slots_device():
-            previous_batch_indices_host = torch.tensor(
-                previous_batch_indices,
-                dtype=torch.int,
-                pin_memory=prefer_pinned())
-            previous_slots = self.previous_batch_indices_cuda[:
-                                                              previous_batch_len]
-            previous_slots.copy_(previous_batch_indices_host, non_blocking=True)
-            return previous_slots
-
         num_tokens = len(input_ids)
         num_draft_tokens = len(draft_tokens)
         total_num_tokens = len(position_ids)
@@ -5425,85 +5708,32 @@ class PyTorchModelEngine(ModelEngine):
             self.draft_tokens_cuda[:len(draft_tokens)].copy_(draft_tokens,
                                                              non_blocking=True)
         if self.is_spec_decode and len(num_accepted_draft_tokens) > 0:
-            num_accepted_draft_tokens = torch.tensor(num_accepted_draft_tokens,
-                                                     dtype=torch.int,
-                                                     pin_memory=prefer_pinned())
-            self.num_accepted_draft_tokens_cuda[:len(
-                num_accepted_draft_tokens)].copy_(num_accepted_draft_tokens,
-                                                  non_blocking=True)
+            self._stage_int_list('_prologue_num_accepted',
+                                 num_accepted_draft_tokens,
+                                 self.num_accepted_draft_tokens_cuda,
+                                 "num_accepted_draft_tokens_cuda")
         if next_draft_tokens_device is not None:
-            # Initialize these two values to zeros
-            self.previous_pos_id_offsets_cuda *= 0
-            self.previous_kv_lens_offsets_cuda *= 0
-            runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(
-                self.runtime_draft_len)
-            runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
-
-            if previous_batch_len > 0:
-                previous_slots = previous_seq_slots_device()
-                # previous input ids
-                previous_batch_tokens = (previous_batch_len *
-                                         runtime_tokens_per_gen_step)
-                new_tokens = new_tokens_device.transpose(
-                    0,
-                    1)[previous_slots, :runtime_tokens_per_gen_step].flatten()
-                self.input_ids_cuda[num_tokens:num_tokens +
-                                    previous_batch_tokens].copy_(
-                                        new_tokens, non_blocking=True)
-
-                # previous draft tokens
-                previous_batch_draft_tokens = (previous_batch_len *
-                                               runtime_draft_token_buffer_width)
-                if runtime_draft_token_buffer_width > 0:
-                    self.draft_tokens_cuda[
-                        num_draft_tokens:num_draft_tokens +
-                        previous_batch_draft_tokens].copy_(
-                            next_draft_tokens_device[
-                                previous_slots, :
-                                runtime_draft_token_buffer_width].flatten(),
-                            non_blocking=True)
-                # prepare data for the preprocess inputs
-                kv_len_offsets_device = (new_tokens_lens_device -
-                                         runtime_tokens_per_gen_step)
-                previous_pos_indices_host = torch.tensor(
-                    previous_pos_indices,
-                    dtype=torch.int,
-                    pin_memory=prefer_pinned())
-                self.previous_pos_indices_cuda[0:previous_batch_tokens].copy_(
-                    previous_pos_indices_host, non_blocking=True)
-
-                # The order of requests in a batch: [context requests, generation requests]
-                # generation requests: ['requests that do not have previous batch', 'requests that already have previous batch', 'dummy requests']
-                #   1) 'requests that do not have previous batch': disable overlap scheduler or the first step in the generation server of disaggregated serving.
-                #   2) 'requests that already have previous batch': previous iteration's requests.
-                #   3) 'dummy requests': pad dummy requests for CUDA graph or attention dp.
-                # Therefore, both of self.previous_pos_id_offsets_cuda and self.previous_kv_lens_offsets_cuda are also 3 segments.
-                #   For 1) 'requests that do not have previous batch': disable overlap scheduler or the first step in the generation server of disaggregated serving.
-                #       Set these requests' previous_pos_id_offsets and previous_kv_lens_offsets to '0' to skip the value changes in _preprocess_inputs.
-                #       Already set to '0' during initialization.
-                #   For 2) 'requests that already have previous batch': enable overlap scheduler.
-                #       Set their previous_pos_id_offsets and previous_kv_lens_offsets according to new_tokens_lens_device and kv_len_offsets_device.
-                #   For 3) 'dummy requests': pad dummy requests for CUDA graph or attention dp.
-                #       Already set to '0' during initialization.
-
-                num_extend_reqeust_wo_dummy = len(extend_requests) - len(
-                    extend_dummy_requests)
-                self.previous_pos_id_offsets_cuda[
-                    (num_extend_reqeust_wo_dummy - previous_batch_len) *
-                    runtime_tokens_per_gen_step:num_extend_reqeust_wo_dummy *
-                    runtime_tokens_per_gen_step].copy_(
-                        new_tokens_lens_device[self.previous_pos_indices_cuda[
-                            0:previous_batch_tokens]],
-                        non_blocking=True)
-
-                self.previous_kv_lens_offsets_cuda[
-                    num_extend_reqeust_wo_dummy -
-                    previous_batch_len:num_extend_reqeust_wo_dummy].copy_(
-                        kv_len_offsets_device[previous_slots],
-                        non_blocking=True)
+            fixup_args = dict(
+                previous_batch_indices=previous_batch_indices,
+                previous_pos_indices=previous_pos_indices,
+                num_tokens=num_tokens,
+                num_draft_tokens=num_draft_tokens,
+                new_tokens_device=new_tokens_device,
+                next_draft_tokens_device=next_draft_tokens_device,
+                new_tokens_lens_device=new_tokens_lens_device,
+                num_extend_requests_wo_dummy=len(extend_requests) -
+                len(extend_dummy_requests))
+            if not self._prologue_trim_spec_overlap_fixup(**fixup_args):
+                # The reference path rewrites the offset buffers and the
+                # position indices wholesale: the trim's records no longer
+                # describe them.
+                self._prologue_offsets_state = None
+                self._prologue_prev_pos_indices = None
+                self._spec_overlap_fixup_reference(**fixup_args)
 
         elif new_tokens_device is not None:
-            seq_slots_device = previous_seq_slots_device()
+            seq_slots_device = self._stage_previous_seq_slots(
+                previous_batch_indices)
             max_draft_len = max(draft_lens)
             new_tokens = new_tokens_device[:max_draft_len + 1,
                                            seq_slots_device, :self.
@@ -5521,6 +5751,9 @@ class PyTorchModelEngine(ModelEngine):
             # when writing key/values to the KV cache.
             self.previous_pos_id_offsets_cuda *= 0
             self.previous_kv_lens_offsets_cuda *= 0
+            # Both buffers are now all-zero (see _prologue_trim_spec_overlap_fixup).
+            self._prologue_offsets_state = (_ZeroedOutside(
+                0, 0, 0, 0) if step_prologue_trim_enabled() else None)
 
         position_ids = apply_position_id_offset(position_ids, model=self.model)
         host_position_ids = torch.tensor(position_ids,
@@ -5572,9 +5805,10 @@ class PyTorchModelEngine(ModelEngine):
                                                             0)
 
         if self.enable_spec_decode:
-            self.gather_ids_cuda[:len(gather_ids)].copy_(torch.tensor(
-                gather_ids, dtype=torch.int, pin_memory=prefer_pinned()),
-                                                         non_blocking=True)
+            # Step-prologue trim: gather ids are step-invariant in steady
+            # decode; the H2D is skipped when the device already holds them.
+            self._stage_int_list('_prologue_gather_ids', gather_ids,
+                                 self.gather_ids_cuda, "gather_ids_cuda")
 
         if self.mapping.has_cp_helix():
             # A non-None owned-count list is what arms
@@ -5650,7 +5884,14 @@ class PyTorchModelEngine(ModelEngine):
         # pre-prepare counts so the steady-gen recording below stores values
         # that the per-step prepare() can re-clamp from scratch.
         num_cached_tokens_snapshot = list(num_cached_tokens_per_seq)
-        attn_metadata.prepare()
+        rebuilds = self._forward_rebuilds_decode_metadata(attn_metadata)
+        if rebuilds:
+            attn_metadata.forward_rebuilds_decode_metadata = True
+        try:
+            attn_metadata.prepare()
+        finally:
+            if rebuilds:
+                attn_metadata.forward_rebuilds_decode_metadata = False
         cross_attention_inputs = (self._prepare_enc_dec_cross_attn_inputs(
             cross_encoder_hidden_states,
             cross_encoder_seq_lens,

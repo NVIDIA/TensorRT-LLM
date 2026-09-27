@@ -15,6 +15,7 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from tensorrt_llm._torch.pyexecutor.step_prologue_trim import GLOBAL_COPY_FILTER
 from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
@@ -59,6 +60,24 @@ def _fused_dsa_meta_enabled() -> bool:
     voiding the "pre-compiled at warmup" capture-safety guarantee.
     """
     return os.environ.get("TRTLLM_DISABLE_FUSED_DSA_METADATA", "0") == "0"
+
+
+def _copy_unless_unchanged(
+    dev: torch.Tensor, host: torch.Tensor, clamp_buffer: Optional[torch.Tensor] = None
+) -> None:
+    """H2D ``host`` into ``dev`` unless the step-prologue trim's filter knows
+    ``dev`` already holds it (same region, bit-identical payload). When
+    ``clamp_buffer`` is given it is clamped at 0 between the copy and the
+    record: with the rows unchanged the previous clamp left nothing negative,
+    so both launches are skipped together."""
+    if GLOBAL_COPY_FILTER.unchanged(dev, host):
+        return
+    dev.copy_(host, non_blocking=True)
+    if clamp_buffer is not None:
+        # Sanitize graph-padding entries that may be stale after cache
+        # eviction or host-cache onboarding.
+        clamp_buffer.clamp_(min=0)
+    GLOBAL_COPY_FILTER.record(dev, host)
 
 
 def build_req_idx_per_token(seq_lens: torch.Tensor, num_tokens: int) -> torch.Tensor:
@@ -238,6 +257,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def prepare(self):
         super().prepare()
         self._invalidate_pool_view_cache()
+        # Step-prologue trim: decided once per prepare() for the dead-store
+        # sites below (the engine sets forward_rebuilds_decode_metadata only
+        # around this call).
+        self._decode_metadata_rebuilt = self._decode_metadata_rebuilt_by_forward()
 
         # Get kv lengths
         assert self.kv_cache_params.use_cache is True, "DSA requires use_cache to be True"
@@ -272,7 +295,14 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.prepare_for_spec_decode(kv_lens)
 
         # Prepare metadata for indexer
-        Indexer.prepare(metadata=self)
+        if self._decode_metadata_rebuilt:
+            # Step-prologue trim: Indexer.prepare()'s device writes are all
+            # rebuilt by on_update_kv_lens(); keep only its host-side
+            # num_ctx_kv_tokens.
+            if Indexer.build_indexer_params(self) is not None:
+                self.num_ctx_kv_tokens = 0
+        else:
+            Indexer.prepare(metadata=self)
 
     def prepare_for_draft_forward(self) -> dict | None:
         """Select native DSA indexer metadata for a draft forward."""
@@ -1160,16 +1190,46 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         page_indices = pool_indices * cache_manager.indexer_k_cache_page_scale
         num_blocks = page_indices.shape[1]
         self.host_indexer_k_cache_block_offsets[: self.num_seqs, :num_blocks].copy_(page_indices)
-        self.indexer_k_cache_block_offsets[: self.num_seqs].copy_(
-            self.host_indexer_k_cache_block_offsets[: self.num_seqs], non_blocking=True
+        # Step-prologue trim: the full-width rows (max_blocks_per_seq columns)
+        # change only when a block is appended.
+        _copy_unless_unchanged(
+            self.indexer_k_cache_block_offsets[: self.num_seqs],
+            self.host_indexer_k_cache_block_offsets[: self.num_seqs],
+            clamp_buffer=self.indexer_k_cache_block_offsets,
         )
-        # Sanitize graph-padding entries that may be stale after cache
-        # eviction or host-cache onboarding.
-        self.indexer_k_cache_block_offsets.clamp_(min=0)
         return pool_indices
 
     def set_skip_topk(self, skip: bool) -> None:
         self.indexer_skip_topk = skip
+
+    # Step-prologue trim (TRTLLM_STEP_PROLOGUE_TRIM): set by PyTorchModelEngine
+    # around its prepare() call when the forward that consumes it starts with
+    # on_update_kv_lens(). Class-level defaults, not dataclass fields.
+    forward_rebuilds_decode_metadata = False
+    _decode_metadata_rebuilt = False
+
+    def _decode_metadata_rebuilt_by_forward(self) -> bool:
+        """True when this prepare()'s device writes of the decode metadata
+        that on_update_kv_lens() rebuilds (slot mappings, req_idx_per_token,
+        gen indptrs [1:], DSL-expanded KV lengths, MQA-logits schedule) are dead:
+        a pure-decode step whose forward re-runs the full hook first."""
+        return (
+            self.forward_rebuilds_decode_metadata
+            and self.num_contexts == 0
+            and self.num_generations > 0
+        )
+
+    def _copy_gen_indptr(self, dev: torch.Tensor, host: torch.Tensor) -> None:
+        """H2D of a gen indptr [0 : num_generations + 1]. on_update_kv_lens()
+        rewrites [1:] on the device but never element 0; host[0] is always 0
+        (zeros_like init, only [1:] is ever written), so on a rebuilt step the
+        whole copy is dead once an earlier copy through here (the only writer
+        of element 0) is on record for dev[:1]."""
+        n = self.num_generations + 1
+        if self._decode_metadata_rebuilt and GLOBAL_COPY_FILTER.unchanged(dev[:1]):
+            return
+        dev[:n].copy_(host[:n], non_blocking=True)
+        GLOBAL_COPY_FILTER.record(dev[:1])
 
     def set_in_mtp_draft_loop(self, active: bool) -> None:
         self.in_mtp_draft_loop = active
@@ -1428,9 +1488,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 num_tokens = self.num_generations * expand_factor
                 gen_kv_lens_expanded = gen_kv_lens.repeat_interleave(expand_factor)
                 self.kv_lens_expanded_host[:num_tokens].copy_(gen_kv_lens_expanded)
-                self.kv_lens_expanded_cuda[:num_tokens].copy_(
-                    self.kv_lens_expanded_host[:num_tokens], non_blocking=True
-                )
+                # Dead on a pure-decode step: on_update_kv_lens() rewrites
+                # kv_lens_expanded_cuda[:num_tokens] from the corrected
+                # kv_lens_cuda before the indexer reads it.
+                if not self._decode_metadata_rebuilt:
+                    self.kv_lens_expanded_cuda[:num_tokens].copy_(
+                        self.kv_lens_expanded_host[:num_tokens], non_blocking=True
+                    )
                 self._refresh_expanded_block_table(expand_factor)
         else:
             self.dsl_expand_factor = 1
@@ -1457,10 +1521,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.host_block_table_expanded[:num_tokens, :max_len].copy_(
             expanded_blocks, non_blocking=True
         )
-        self.block_table_expanded[:num_tokens].copy_(
-            self.host_block_table_expanded[:num_tokens], non_blocking=True
+        # Step-prologue trim: rows change only when a block is appended.
+        _copy_unless_unchanged(
+            self.block_table_expanded[:num_tokens],
+            self.host_block_table_expanded[:num_tokens],
+            clamp_buffer=self.block_table_expanded,
         )
-        self.block_table_expanded.clamp_(min=0)
 
     def prepare_for_indexer_k_cache(self):
         if self.kv_cache_manager is None:
@@ -1496,9 +1562,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         host_block_table.masked_fill_(
             pad_cols.unsqueeze(0) >= num_blocks_per_seq[: self.num_seqs].unsqueeze(1), -1
         )
-        # Copy to GPU
-        self.block_table[: self.num_seqs, :max_blocks_used].copy_(
-            host_block_table, non_blocking=True
+        # Copy to GPU (step-prologue trim: skipped when identical to the last
+        # copy into this region).
+        _copy_unless_unchanged(
+            self.block_table[: self.num_seqs, :max_blocks_used], host_block_table
         )
 
     def prepare_for_skip_indexer(self, kv_lens: torch.Tensor):
@@ -1565,9 +1632,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 dtype=torch.int64,
                 out=self.host_gen_cached_token_indptr[1 : self.num_generations + 1],
             )
-            self.gen_cached_token_indptr[: self.num_generations + 1].copy_(
-                self.host_gen_cached_token_indptr[: self.num_generations + 1], non_blocking=True
-            )
+            self._copy_gen_indptr(self.gen_cached_token_indptr, self.host_gen_cached_token_indptr)
             # generation kv indptr
             torch.cumsum(
                 kv_lens[self.num_contexts : self.num_seqs],
@@ -1575,9 +1640,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 dtype=torch.int64,
                 out=self.host_gen_kv_indptr[1 : self.num_generations + 1],
             )
-            self.gen_kv_indptr[: self.num_generations + 1].copy_(
-                self.host_gen_kv_indptr[: self.num_generations + 1], non_blocking=True
-            )
+            self._copy_gen_indptr(self.gen_kv_indptr, self.host_gen_kv_indptr)
         else:
             self.max_gen_seq_len = 0
 
@@ -1589,7 +1652,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.seq_lens,
             dim=0,
         )
-        self.req_idx_per_token[: self.num_tokens].copy_(
-            self.host_req_idx_per_token[: self.num_tokens],
-            non_blocking=True,
-        )
+        # Dead on a pure-decode step: on_update_kv_lens() rebuilds
+        # req_idx_per_token[:num_tokens] (fused decode-metadata kernel).
+        if not self._decode_metadata_rebuilt:
+            self.req_idx_per_token[: self.num_tokens].copy_(
+                self.host_req_idx_per_token[: self.num_tokens],
+                non_blocking=True,
+            )
