@@ -39,6 +39,7 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm._torch.visual_gen.triton_kernels.minimax_h3_rope import apply_minimax_h3_rope_bf16
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -79,6 +80,23 @@ def apply_minimax_h3_rotary_emb(
         raise ValueError(
             f"Invalid rotary dimension {rotary_dim} for head dimension {hidden_states.shape[-1]}."
         )
+
+    if (
+        hidden_states.is_cuda
+        and hidden_states.dtype == torch.bfloat16
+        and hidden_states.ndim == 4
+        and cos.shape == (hidden_states.shape[1], rotary_dim)
+        and sin.shape == cos.shape
+        and cos.device == hidden_states.device
+        and sin.device == hidden_states.device
+        and cos.dtype in (torch.float32, torch.bfloat16)
+        and sin.dtype in (torch.float32, torch.bfloat16)
+        and not (
+            torch.is_grad_enabled()
+            and (hidden_states.requires_grad or cos.requires_grad or sin.requires_grad)
+        )
+    ):
+        return apply_minimax_h3_rope_bf16(hidden_states, cos, sin)
 
     hidden_states_rotary = hidden_states[..., :rotary_dim]
     hidden_states_pass = hidden_states[..., rotary_dim:]
