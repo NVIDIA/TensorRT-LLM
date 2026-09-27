@@ -716,8 +716,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         """Try to schedule a disagg generation init request.
 
         Disagg gen init requests bypass normal state gating but still need
-        KV cache allocation inline (V2 prepare_resources is a no-op for
-        the primary manager).  Aligned with C++ CapacityScheduler which
+        KV cache allocation inline. Aligned with C++ CapacityScheduler which
         treats disagg_gen_init identically to context_init for block/PEFT/
         maxNumRequests accounting.
 

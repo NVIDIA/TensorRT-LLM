@@ -59,15 +59,9 @@ struct Smem_tile_qkv_interleaved : public fmha::Smem_tile_without_skews<Cta_tile
     // The fragment.
 
     // The size of a single LDS in bytes.
-    enum
-    {
-        BYTES_PER_LDS = 16
-    };
+    static constexpr int BYTES_PER_LDS = 16;
 
-    enum
-    {
-        ROWS_PER_WARP = Cta_tile::THREADS_PER_WARP / Base::THREADS_PER_ROW
-    };
+    static constexpr int ROWS_PER_WARP = Cta_tile::THREADS_PER_WARP / Base::THREADS_PER_ROW;
 
     using Fragment_a = fmha::Fragment_a<Traits_, fmha::Row>;
     using Fragment_b = fmha::Fragment_b<Traits_, fmha::Col>;
@@ -96,10 +90,7 @@ struct Smem_tile_qk_interleaved_a_base : public Smem_tile_qkv_interleaved<Cta_ti
 
     static_assert(Base::THREADS_PER_ROW == 128 / 16, "");
 
-    enum
-    {
-        SMEM_ROWS_PER_WARP = Base::ROWS_PER_WARP
-    };
+    static constexpr int SMEM_ROWS_PER_WARP = Base::ROWS_PER_WARP;
 
     static_assert(SMEM_ROWS_PER_WARP == 4, "");
 

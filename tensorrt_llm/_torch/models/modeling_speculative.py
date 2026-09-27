@@ -13,6 +13,7 @@ from transformers import LlamaConfig, PretrainedConfig
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ...functional import PositionEmbeddingType
 from ..attention.attention import Attention
@@ -52,6 +53,20 @@ def _ensure_draft_vocab_size(config: PretrainedConfig) -> None:
         "Set 'draft_vocab_size' explicitly if the draft head uses a different vocabulary."
     )
     config.draft_vocab_size = config.vocab_size
+
+
+def _set_draft_kv_cache_quant_algo(draft_config: ModelConfig,
+                                   target_config: ModelConfig) -> None:
+    """Inherit the target KV dtype unless the model requests a draft override."""
+    algo = target_config.quant_config.kv_cache_quant_algo
+    override = target_config.extra_attrs.get(
+        "draft_kv_cache_quant_algo_override")
+    if override is not None:
+        algo = QuantAlgo(override)
+    draft_config.quant_config.kv_cache_quant_algo = algo
+    if override is not None and draft_config.quant_config_dict is not None:
+        for layer_quant_config in draft_config.quant_config_dict.values():
+            layer_quant_config.kv_cache_quant_algo = algo
 
 
 def _slice_spec_position_ids(position_ids: Optional[torch.Tensor],
@@ -1615,8 +1630,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         raise ValueError(
                             f"Unsupported eagle3 model architecture for draft model: {spec_config.eagle3_model_arch}"
                         )
-                    self.draft_config.quant_config.kv_cache_quant_algo = \
-                    model_config.quant_config.kv_cache_quant_algo
+                    _set_draft_kv_cache_quant_algo(self.draft_config,
+                                                   model_config)
                     self.draft_config.extra_attrs = model_config.extra_attrs
 
                 elif spec_config.uses_external_draft_model:
@@ -1629,8 +1644,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         spec_config=None,
                         max_num_tokens=model_config.max_num_tokens,
                         moe_max_num_tokens=model_config.moe_max_num_tokens)
-                    self.draft_config.quant_config.kv_cache_quant_algo = \
-                        model_config.quant_config.kv_cache_quant_algo
+                    _set_draft_kv_cache_quant_algo(self.draft_config,
+                                                   model_config)
                     self.draft_config.extra_attrs = model_config.extra_attrs
                     self.draft_config.extra_attrs[
                         _SPECULATIVE_POSITION_HEADROOM] = (
@@ -1641,8 +1656,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         model_config.spec_config.speculative_model,
                         **external_drafter_config_kwargs(
                             model_config, spec_config))
-                    self.draft_config.quant_config.kv_cache_quant_algo = \
-                        model_config.quant_config.kv_cache_quant_algo
+                    _set_draft_kv_cache_quant_algo(self.draft_config,
+                                                   model_config)
                     self.draft_config.extra_attrs = model_config.extra_attrs
 
                 self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(

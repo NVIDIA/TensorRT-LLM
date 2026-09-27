@@ -287,6 +287,10 @@ def _cute_dsl_mla_helix_support(
         is_spec_dec_tree=False,
         is_spec_dec_dynamic_tree=False,
         helix_position_offsets=torch.zeros(batch_size, dtype=torch.int32),
+        # Multi-token decode under helix is admitted only when the speculative
+        # verify-group buffers are armed; unarmed is what this contract test
+        # exercises.
+        _helix_spec_tokens_valid=False,
         kv_cache_manager=SimpleNamespace(
             get_buffers=lambda _layer_idx: torch.empty(0, dtype=torch.bfloat16)
         ),

@@ -616,6 +616,12 @@ models:
         default: none
         status: stable
         required: false
+      parallel_tool_calls:
+        kind: openai
+        type: Optional[bool]
+        default: null
+        status: stable
+        required: false
       user:
         kind: openai
         type: Optional[str]

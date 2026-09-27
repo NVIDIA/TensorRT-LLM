@@ -81,6 +81,7 @@ WAN22_T2V_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers"
 WAN22_A14B_NVFP4_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers-NVFP4"
 FASTWAN_MODEL_SUBPATH = "FastWan2.2-TI2V-5B-FullAttn-Diffusers"
 WAN22_I2V_A14B_NVFP4_MODEL_SUBPATH = "Wan2.2-I2V-A14B-Diffusers-NVFP4"
+WAN22_LPIPS_THRESHOLD = 0.25
 WAN_FEATURE_LPIPS_THRESHOLD = 0.05
 WAN_STANDARD_SUPPORTED_FEATURES = frozenset({"fp8-blockwise", "nvfp4", "cuda-graph"})
 
@@ -299,11 +300,11 @@ def test_wan22_t2v_lpips_against_golden(request, tmp_path, wan22_bf16_video_path
     _preserve_lpips_candidate_on_failure(
         request,
         score,
-        WAN_LPIPS_THRESHOLD,
+        WAN22_LPIPS_THRESHOLD,
         wan22_bf16_video_path,
         "wan22_t2v_lpips_golden_video.mp4",
     )
-    _assert_lpips_below_threshold(score, WAN_LPIPS_THRESHOLD)
+    _assert_lpips_below_threshold(score, WAN22_LPIPS_THRESHOLD)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

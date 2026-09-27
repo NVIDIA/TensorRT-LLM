@@ -8922,13 +8922,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # ``forward`` (shares ``_pick_tuning`` with the single-CTA path).
 
     # ------------------------------------------------------------------ #
-    #  CuTE DSL FP8 Paged MQA Logits (Blackwell SM100)                   #
+    #  CuTE DSL FP8 Paged MQA Logits (SM100 family)                      #
     # ------------------------------------------------------------------ #
     from ..cute_dsl_kernels.blackwell.paged_mqa_logits import (
         FP4MQALogitsKernel, FP8MQALogitsKernel)
 
     class CuteDSLPagedMQALogitsRunner:
-        """Runner for CuTe DSL FP8 Paged MQA Logits kernel (Blackwell SM100).
+        """Runner for CuTe DSL FP8 Paged MQA Logits kernel (SM100 family).
 
         Caches compiled kernels keyed by static params
         (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n, num_sms).
@@ -9182,7 +9182,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                            device=q.device)
 
     # ------------------------------------------------------------------ #
-    #  CuTe DSL MiniMax-M3 index decode scoring (Blackwell SM100)         #
+    #  CuTe DSL MiniMax-M3 index decode scoring (SM100 family)            #
     # ------------------------------------------------------------------ #
     from ..cute_dsl_kernels.blackwell.cute_ptx_utils import \
         TORCH_TO_CUTE_DTYPE as _M3_TORCH_TO_CUTE_DTYPE
@@ -9447,6 +9447,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
     class CuteDSLBf16BlackwellBmmRunner(TunableRunner):
         kernel_class = PersistentDenseGemmKernel
         kernel_cache = dict()
+        # Output element type; subclasses override (see the FP8-out runner).
+        c_dtype = cutlass.BFloat16
 
         tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
             0, 1, get_last_power_of_2_num_tokens_buckets,
@@ -9502,7 +9504,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 if self.__class__.kernel_class.can_implement(
                     cutlass.BFloat16,  # ab_dtype
                     cutlass.Float32,  # acc_dtype
-                    cutlass.BFloat16,  # c_dtype
+                    self.__class__.c_dtype,  # c_dtype
                     use_2cta_instrs,
                     mma_tiler_mn,
                     cluster_shape_mn,
@@ -9713,6 +9715,143 @@ if IS_CUTLASS_DSL_AVAILABLE:
         assert output.dtype == torch.bfloat16, "CuTe DSL bf16 bmm output dtype must be bf16"
         assert output.shape == (
             batch_size, m, n), "CuTe DSL bf16 bmm output shape is incorrect"
+
+    # ======================================================================
+    # BF16 x BF16 -> FP8 Dense Persistent BMM (CuTe DSL) for Blackwell
+    # ======================================================================
+
+    class CuteDSLBf16BlackwellBmmFp8OutRunner(CuteDSLBf16BlackwellBmmRunner):
+        """BF16 batched GEMM whose epilogue stores FP8 E4M3 at unit scale.
+
+        Same tactic space and A/B handling as the bf16 runner; only C differs:
+        it is built from a raw pointer with explicit (M, batch) strides (DLPack
+        does not carry FP8), so the output may be a column slice of a wider
+        buffer. Used by the MLA absorbed-Q context path to write the nope
+        columns of the FP8 Q buffer directly.
+        """
+        kernel_cache = dict()
+        c_dtype = cutlass.Float8E4M3FN
+
+        def __init__(self, use_tvm_ffi: bool = False):
+            # Always the direct launch path: with every operand a raw pointer
+            # there is no DLPack tensor for the TVM-FFI env stream to bind to
+            # ("EnvStream cannot be detected in wrapper_strided_c").
+            super().__init__(use_tvm_ffi=False)
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic,
+        ) -> None:
+            if isinstance(tactic, tuple):
+                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = tactic
+            else:
+                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = [
+                    False,
+                    (128, 128),
+                    (1, 1),
+                ]
+            a_tensor, b_tensor, c_tensor = inputs
+            batch_size, m, k = a_tensor.shape[0], a_tensor.shape[
+                1], a_tensor.shape[2]
+            n = b_tensor.shape[1]
+            # CuTe tensors are (M, K, B) / (N, K, B) / (M, N, B); K and N
+            # innermost with unit stride, the other strides taken from torch.
+            strides = (a_tensor.stride(1), a_tensor.stride(0),
+                       b_tensor.stride(1), b_tensor.stride(0),
+                       c_tensor.stride(1), c_tensor.stride(0))
+            a_ptr = make_ptr(cutlass.BFloat16,
+                             a_tensor.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=16)
+            b_ptr = make_ptr(cutlass.BFloat16,
+                             b_tensor.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=16)
+            c_ptr = make_ptr(self.__class__.c_dtype,
+                             c_tensor.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=16)
+            stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+            cache_key = (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
+            if cache_key not in self.__class__.kernel_cache:
+                gemm = self.__class__.kernel_class(
+                    cutlass.Float32,  # acc_dtype
+                    use_2cta_instrs=use_2cta_instrs,
+                    mma_tiler_mn=mma_tiler_mn,
+                    cluster_shape_mn=cluster_shape_mn,
+                )
+                hardware_info = cutlass.utils.HardwareInfo()
+                max_active_clusters = hardware_info.get_max_active_clusters(
+                    cluster_shape_mn[0] * cluster_shape_mn[1])
+                compiled_gemm = cute.compile(
+                    gemm.wrapper_strided_c,
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    a_ptr,
+                    b_ptr,
+                    c_ptr,
+                    *strides,
+                    max_active_clusters=max_active_clusters,
+                    stream=stream,
+                    options="--opt-level 2",
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            compiled_gemm(m,
+                          n,
+                          k,
+                          batch_size,
+                          a_ptr,
+                          b_ptr,
+                          c_ptr,
+                          *strides,
+                          stream=stream)
+
+    def _check_bf16_bmm_fp8out_args(output: torch.Tensor) -> None:
+        assert output.dtype == torch.float8_e4m3fn, "output dtype must be float8_e4m3fn"
+        assert output.stride(2) == 1, "output N dim must be contiguous"
+
+    # a/b: bf16, output: fp8 e4m3 (scale 1.0), possibly a strided column slice
+    @torch.library.custom_op("trtllm::cute_dsl_bf16_bmm_fp8out_blackwell",
+                             mutates_args=("output", ),
+                             device_types="cuda")
+    def cute_dsl_bf16_bmm_fp8out_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        if not is_sm_100f():
+            raise ValueError(
+                f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                f"CuteDSL BF16->FP8 BMM only supports SM 100 family.")
+        _check_bf16_bmm_fp8out_args(output)
+        tuner = AutoTuner.get()
+        runner = CuteDSLBf16BlackwellBmmFp8OutRunner()
+        inputs = [input, weight, output]
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_bf16_bmm_fp8out_blackwell::gemm",
+            [runner],
+            runner.__class__.tuning_config,
+            inputs,
+        )
+        runner(inputs, tactic=best_tactic)
+
+    @torch.library.register_fake("trtllm::cute_dsl_bf16_bmm_fp8out_blackwell")
+    def _(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        batch_size, m, k = mat_a.shape[0], mat_a.shape[1], mat_a.shape[2]
+        n = mat_b.shape[1]
+        _check_bf16_bmm_fp8out_args(output)
+        assert output.shape == (batch_size, m, n)
 
     # ======================================================================
     # BF16 Dense Persistent GEMM (CuTe DSL) for Blackwell - Linear layers
@@ -10767,11 +10906,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m, n), "CuTe DSL bf16 gemm output shape is incorrect"
 
     # ------------------------------------------------------------------ #
-    #  CuTE DSL FP4 Paged MQA Logits (Blackwell SM100)                   #
+    #  CuTE DSL FP4 Paged MQA Logits (SM100 family)                      #
     # ------------------------------------------------------------------ #
 
     class CuteDSLFP4PagedMQALogitsRunner:
-        """Runner for CuTe DSL FP4 Paged MQA Logits kernel (Blackwell SM100).
+        """Runner for CuTe DSL FP4 Paged MQA Logits kernel (SM100 family).
 
         Caches compiled kernels keyed by static params
         (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n,
@@ -11865,7 +12004,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     tensor of shape (H, S_q, B) remains in the workspace.
             """
             (q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o,
-             workspace, softmax_stats) = inputs
+             workspace, softmax_stats) = inputs[:9]
+            # inputs[9] (optional): helix per-token attention bounds of shape
+            # (B * S_q,), int32 — speculative verify groups only.
+            kv_bounds = inputs[9] if len(inputs) > 9 else None
             softmax_scale = float(kwargs.get("softmax_scale", 1.0))
             output_scale = float(kwargs.get("output_scale", 1.0))
 
@@ -11938,12 +12080,33 @@ if IS_CUTLASS_DSL_AVAILABLE:
             split_workspace = workspace_bytes[split_kv_offset:split_kv_offset +
                                               split_kv_size]
 
+            if kv_bounds is not None and AutoTuner.get().is_tuning_mode:
+                # Profiling rebuilds cache_seqs at bucketed sizes but input 9
+                # has no dynamic-dim spec, so kv_bounds arrives at the old
+                # size. Bound values only affect masking depth, not the
+                # tactic space, so any size-consistent dummy will do.
+                if kv_bounds.numel() != batch_size * seq_len_q:
+                    kv_bounds = cache_seqs.repeat_interleave(
+                        seq_len_q).contiguous()
+            if kv_bounds is not None:
+                expected_bounds_shape = (batch_size * seq_len_q, )
+                if (kv_bounds.shape != expected_bounds_shape
+                        or kv_bounds.dtype != torch.int32
+                        or kv_bounds.device != o.device
+                        or not kv_bounds.is_contiguous()):
+                    raise RuntimeError(
+                        "CuteDSLNVMlaDecodeBlackwellRunner requires contiguous "
+                        "int32 kv_bounds on the output device with shape "
+                        f"{expected_bounds_shape}, got shape="
+                        f"{tuple(kv_bounds.shape)}, dtype={kv_bounds.dtype}.")
+
             cache_key = self.unique_id() + (
                 out_dtype,
                 mma_qk_tiler_mn,
                 mma_pv_tiler_mn,
                 split_kv,
                 is_persistent,
+                kv_bounds is not None,
             )
             if cache_key not in CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache:
                 # A compile outside the tuning window stalls the serving loop
@@ -12011,6 +12174,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                 if use_workspace else None)
                 cache_seqs_ct = cute.runtime.from_dlpack(
                     cache_seqs, assumed_align=16).mark_layout_dynamic()
+                kv_bounds_ct = (cute.runtime.from_dlpack(
+                    kv_bounds, assumed_align=4).mark_layout_dynamic()
+                                if kv_bounds is not None else None)
                 # Variable split-KV (block_split_kvs) is not used on this path:
                 block_split_kvs_ct = None
 
@@ -12031,6 +12197,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     workspace_ct,
                     split_kv,
                     cache_seqs_ct,
+                    kv_bounds_ct,
                     block_split_kvs_ct,
                     cutlass.Float32(softmax_scale),
                     cutlass.Float32(output_scale),
@@ -12069,6 +12236,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 (split_kv > 1 and split_workspace.numel() > 0) else None,
                 split_kv,
                 cache_seqs,
+                kv_bounds,
                 None,  # block_split_kvs: var-split path unused (is_var_split_kv False)
                 softmax_scale,
                 output_scale,
@@ -12096,13 +12264,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
         page_size: int,
         softmax_scale: float,
         output_scale: float,
-        # Keep the last two arguments required in the custom-op schema. PyTorch
+        # Keep the trailing arguments required in the custom-op schema. PyTorch
         # elides trailing default-valued arguments before its mutation fallback,
         # while mutates_args retains their positional indices.
         max_batch_size: int,
         softmax_stats: Optional[torch.Tensor],
+        kv_bounds: Optional[torch.Tensor],
     ) -> None:
         """CuTe DSL FP8 MLA decode (Blackwell SM100/SM103).
+
+        kv_bounds: helix speculative verify groups -- per-token rank-local
+        attention bounds of shape (B * seq_len_q,), int32.
         """
         if (sm_version := get_sm_version()) not in (100, 103):
             raise ValueError(
@@ -12121,7 +12293,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         )
         inputs = [
             q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o,
-            workspace, softmax_stats
+            workspace, softmax_stats, kv_bounds
         ]
         tuner = AutoTuner.get()
         _, best_tactic = tuner.choose_one(
@@ -12159,6 +12331,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output_scale: float,
         max_batch_size: int,
         softmax_stats: Optional[torch.Tensor],
+        kv_bounds: Optional[torch.Tensor],
     ) -> None:
         return None
 
@@ -12184,8 +12357,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # See the FP8 op above: these must remain required schema arguments.
         max_batch_size: int,
         softmax_stats: Optional[torch.Tensor],
+        kv_bounds: Optional[torch.Tensor],
     ) -> None:
         """CuTe DSL FP16/BF16 MLA decode (Blackwell SM100/SM103).
+
+        kv_bounds: helix speculative verify groups — per-token rank-local
+        attention bounds of shape (B * seq_len_q,), int32.
         """
         if (sm_version := get_sm_version()) not in (100, 103):
             raise ValueError(
@@ -12221,7 +12398,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         )
         inputs = [
             q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o,
-            workspace, softmax_stats
+            workspace, softmax_stats, kv_bounds
         ]
         tuner = AutoTuner.get()
         _, best_tactic = tuner.choose_one(
@@ -12259,6 +12436,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output_scale: float,
         max_batch_size: int,
         softmax_stats: Optional[torch.Tensor],
+        kv_bounds: Optional[torch.Tensor],
     ) -> None:
         return None
 

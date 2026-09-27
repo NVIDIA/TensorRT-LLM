@@ -84,7 +84,6 @@ Key flags used above:
 | `--build_type RelWithDebInfo` | Build with debug info (default: `Release`) |
 | `-j <N>` | Number of parallel compile jobs (default: number of available CPUs) |
 | `--fast_build` | Skip compiling some kernels to speed up compilation -- for development only |
-| `--cpp_only` | Build only the C++ runtime library, without Python bindings |
 
 ### Building from a checkout on a network filesystem
 
