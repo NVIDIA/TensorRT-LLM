@@ -10,21 +10,21 @@ from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Annotated, Any, ClassVar, Literal, get_args, get_origin
-from unittest.mock import patch
+from unittest.mock import create_autospec, patch
 
 import pydantic_core
 import pytest
 import torch
 import yaml
 from pydantic import BaseModel, TypeAdapter, ValidationError
+from transformers import PretrainedConfig
 from utils.llm_data import llm_models_root
 
+import tensorrt_llm._torch.pyexecutor.model_loader as model_loader_mod
 import tensorrt_llm.bindings.executor as tle
 import tensorrt_llm.llmapi as public_llmapi
 import tensorrt_llm.llmapi.llm_args as llm_args_mod
 from tensorrt_llm import LLM as TorchLLM
-from tensorrt_llm._torch.auto_deploy.llm_args import \
-    LlmArgs as AutoDeployLlmArgs
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import \
     HfCheckpointLoader
@@ -83,13 +83,6 @@ def test_generation_config_mode_defaults_and_validation() -> None:
 
     with pytest.raises(ValidationError, match="generation_config"):
         TorchLlmArgs(model=llama_model_path, generation_config="invalid")
-
-
-@pytest.mark.cpu_only
-def test_generation_config_auto_rejects_autodeploy() -> None:
-    with pytest.raises(ValidationError,
-                       match="AutoDeploy does not support generation_config"):
-        AutoDeployLlmArgs(model=llama_model_path, generation_config="auto")
 
 
 @pytest.mark.cpu_only
@@ -157,21 +150,6 @@ def test_rank_striped_checkpoint_io_accepts_best_effort_config(
 
 
 @pytest.mark.cpu_only
-def test_rank_striped_checkpoint_io_warns_and_preserves_request_for_autodeploy(
-) -> None:
-    with patch.object(llm_args_mod.logger, "warning") as warning:
-        args = AutoDeployLlmArgs(
-            model=llama_model_path,
-            checkpoint_io_policy="rank_striped_read_ahead",
-        )
-    assert args.checkpoint_io_policy == "rank_striped_read_ahead"
-    serialized_args = args.model_dump()
-    assert serialized_args["checkpoint_io_policy"] == "rank_striped_read_ahead"
-    assert any("selected=native" in call.args[0]
-               for call in warning.call_args_list)
-
-
-@pytest.mark.cpu_only
 def test_MTPDecodingConfig_default_draft_len_is_not_user_set():
     config = MTPDecodingConfig()
 
@@ -225,13 +203,6 @@ moe_backend: TRTLLM
         assert isinstance(restored, MTPDecodingConfig)
         assert restored.moe_backend == "TRTLLM"
         assert restored.model_dump()["moe_backend"] == "TRTLLM"
-
-    def test_autodeploy_rejects_override(self) -> None:
-        spec_config = MTPDecodingConfig(max_draft_len=1, moe_backend="CUTLASS")
-
-        with pytest.raises(ValidationError,
-                           match="available only with the PyTorch backend"):
-            AutoDeployLlmArgs(model="/target", speculative_config=spec_config)
 
     def test_accepts_explicit_vanilla_mtp_override(self) -> None:
         spec_config = MTPDecodingConfig(max_draft_len=1,
@@ -814,6 +785,73 @@ class TestKvCacheManagerV2AutoResolution:
         @classmethod
         def get_preferred_kv_cache_manager_version(cls, pretrained_config=None):
             return "V1"
+
+    @pytest.mark.parametrize(
+        "kind,dtype,checkpoint_dtype,backend,setting,expected",
+        [
+            ("m3", "nvfp4", "FP8", "TRTLLM", "auto", True),
+            ("mla", "nvfp4", "FP8", "TRTLLM", "auto", True),
+            ("mla", "auto", "NVFP4", "TRTLLM", "auto", True),
+            ("mla", "nvfp4", "FP8", "TRTLLM", False, False),
+            ("mla", "nvfp4", "FP8", "FLASHINFER", "auto", False),
+            ("dense", "nvfp4", "FP8", "TRTLLM", "auto", False),
+        ],
+    )
+    def test_nvfp4_resolution_preserves_frozen_checkpoint_config(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        kind: str,
+        dtype: str,
+        checkpoint_dtype: str,
+        backend: str,
+        setting: bool | str,
+        expected: bool,
+    ) -> None:
+        """Resolve KV policy without mutating a loader's frozen config or scales."""
+        pretrained_config = PretrainedConfig(
+            architectures=["TestFrozenConfigForCausalLM"],
+            kv_lora_rank=512 if kind == "mla" else None,
+            qk_rope_head_dim=64 if kind == "mla" else None,
+        )
+        config = ModelConfig(
+            pretrained_config=pretrained_config,
+            quant_config=QuantConfig(kv_cache_quant_algo=checkpoint_dtype),
+            quant_config_dict={
+                "model.layers.0.self_attn.qkv_proj":
+                QuantConfig(kv_cache_quant_algo=checkpoint_dtype)
+            },
+            attn_backend="FLASHINFER",
+        )
+        config._frozen = True
+        loader = create_autospec(HfCheckpointLoader,
+                                 instance=True,
+                                 spec_set=True)
+        loader.load_config.return_value = config
+        model_cls = self._PreferV2 if kind == "m3" else self._PreferV1
+        monkeypatch.setattr(model_loader_mod.AutoModelForCausalLM,
+                            "_resolve_class", lambda _: model_cls)
+        args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            attn_backend=backend,
+            kv_cache_config=KvCacheConfig(dtype=dtype,
+                                          use_kv_cache_manager_v2=setting),
+            sparse_attention_config=(
+                llm_args_mod.MiniMaxM3SparseAttentionConfig(
+                    implementation="msa") if kind == "m3" else None),
+        )
+
+        model_loader_mod.ModelLoader.load_config_and_apply_defaults(
+            "/tmp/dummy_model", args, loader)
+
+        assert args.kv_cache_config.use_kv_cache_manager_v2 is expected
+        assert config._frozen
+        assert config.attn_backend == "FLASHINFER"
+        assert config.sparse_attention_config is None
+        assert config.quant_config.kv_cache_quant_algo == checkpoint_dtype
+        assert all(layer.kv_cache_quant_algo == checkpoint_dtype
+                   for layer in config.quant_config_dict.values())
+        with pytest.raises(AttributeError, match="instance is frozen"):
+            config.attn_backend = "TRTLLM"
 
     @pytest.mark.parametrize("explicit_auto", [False, True])
     def test_auto_uses_model_preference(self, explicit_auto):
@@ -3238,35 +3276,27 @@ class TestServeDefaults:
 
     def test_serve_is_non_default_or_required_helper(self):
         # Test always_include parameters
-        assert is_non_default_or_required("model", "test-model", "pytorch",
-                                          set())
-        assert is_non_default_or_required("backend", "pytorch", "pytorch",
-                                          set())
-        assert is_non_default_or_required("tokenizer", "test-tokenizer",
-                                          "pytorch", set())
+        assert is_non_default_or_required("model", "test-model", set())
+        assert is_non_default_or_required("backend", "pytorch", set())
+        assert is_non_default_or_required("tokenizer", "test-tokenizer", set())
 
         # Test None values
-        assert not is_non_default_or_required("max_batch_size", None, "pytorch",
-                                              set())
+        assert not is_non_default_or_required("max_batch_size", None, set())
 
         # Test default values (should return False)
-        assert not is_non_default_or_required("tensor_parallel_size", 1,
-                                              "pytorch", set())
+        assert not is_non_default_or_required("tensor_parallel_size", 1, set())
         assert not is_non_default_or_required("pipeline_parallel_size", 1,
-                                              "pytorch", set())
+                                              set())
 
         # Test non-default values (should return True)
-        assert is_non_default_or_required("tensor_parallel_size", 4, "pytorch",
-                                          set())
-        assert is_non_default_or_required("max_batch_size", 128, "pytorch",
-                                          set())
+        assert is_non_default_or_required("tensor_parallel_size", 4, set())
+        assert is_non_default_or_required("max_batch_size", 128, set())
 
         # Test explicit CLI source overrides the default-equals-value check
-        assert is_non_default_or_required("tensor_parallel_size", 1, "pytorch",
+        assert is_non_default_or_required("tensor_parallel_size", 1,
                                           {"tensor_parallel_size"})
         # Test CLI-derived field (--free_gpu_memory_fraction -> kv_cache_config)
         assert is_non_default_or_required("kv_cache_config", KvCacheConfig(),
-                                          "pytorch",
                                           {"free_gpu_memory_fraction"})
 
 
@@ -3481,12 +3511,6 @@ class TestPydanticBestPractices:
         ],
         TorchLlmArgs: [
             "checkpoint_loader",  # abstract base class type
-        ],
-        AutoDeployLlmArgs: [
-            "transforms",  # typed as Dict[str, Dict[str, Any]] for flexibility
-            "model_kwargs",  # typed as Dict[str, Any] for flexibility
-            "speculative_model_kwargs",  # typed as Dict[str, Any] for flexibility (overrides draft model HF config)
-            "tokenizer_kwargs",  # typed as Dict[str, Any] for flexibility
         ],
         UserProvidedDecodingConfig: [
             "drafter",  # abstract base class type
