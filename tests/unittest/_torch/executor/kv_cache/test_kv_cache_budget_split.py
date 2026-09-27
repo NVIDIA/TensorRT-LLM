@@ -64,6 +64,7 @@ def _make_creator(
     c._max_seq_len = 1024
     c._max_num_tokens = 0
     c._max_batch_size = 1
+    c._max_beam_width = 1
     c._is_disagg = False
     c._cache_transceiver_config = None
     c._speculative_config = None
