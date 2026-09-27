@@ -92,7 +92,7 @@ If you want to use the latest main branch, you can build from source: [https://n
 
 ### Recommended Performance Settings
 
-Use these configurations as starting points for 4x B200 with FP8 weights and a BF16 KV cache. Tune the batch size and token budget for your workload; the [Performance](#performance) section lists the settings used for the measured curve.
+Use these configurations as starting points for 4x B200 with FP8 weights and a BF16 KV cache. Tune the batch size and token budget for your workload.
 
 #### B200 FP8 Config
 
@@ -133,6 +133,8 @@ EOF
 
 Attention data parallelism distributes requests across ranks while keeping the routed experts expert-parallel. Set `enable_attention_dp: true` and reduce `--max_num_tokens` to `4096` in the launch command below. To enable MTP as well, add the `speculative_config` section from the MTP example above.
 
+With attention data parallelism, the batch size limits apply per rank and each slot reserves KDA state, so size them to the per-rank concurrency (for example, 64 for 256 concurrent requests on four ranks).
+
 ```bash
 cat > /tmp/config.yml <<EOF
 cuda_graph_config:
@@ -146,7 +148,7 @@ kv_cache_config:
 EOF
 ```
 
-To use FP8 KV cache with any of these aggregated-serving configurations, add `dtype: fp8` under `kv_cache_config`. This halves latent KV storage; indexer and KDA state precision are unchanged. Selected KV rows are dequantized in bounded query chunks before attention. For large prefills, repeated staging and attention calls can increase time to first token and reduce prefill throughput, in addition to decode overhead. Use BF16 KV when prioritizing latency or prefill throughput. `dtype: auto` inherits the checkpoint's KV-cache quantization metadata, so BF16 also requires that metadata not to enable FP8 KV quantization. The performance curves below use BF16 KV cache.
+To use FP8 KV cache with any of these aggregated-serving configurations, add `dtype: fp8` under `kv_cache_config`. This halves latent KV storage; indexer and KDA state precision are unchanged. Selected KV rows are dequantized in bounded query chunks before attention. For large prefills, repeated staging and attention calls can increase time to first token and reduce prefill throughput, in addition to decode overhead. Use BF16 KV when prioritizing latency or prefill throughput. `dtype: auto` inherits the checkpoint's KV-cache quantization metadata, so BF16 also requires that metadata not to enable FP8 KV quantization. The performance results below use BF16 KV cache.
 
 ### Launch the TensorRT LLM Server
 
@@ -319,7 +321,7 @@ To benchmark the performance of your TensorRT LLM server, you can use the built-
 
 ```bash
 cat << 'EOF' > bench.sh
-concurrency_list="1 4 8 16 32 64 128"
+concurrency_list="1 2 4 8 16 32 64 128 256"
 multi_round=5
 isl=1024
 osl=1024
@@ -443,12 +445,6 @@ $$
 
 ## Performance
 
-The chart compares TP4 / EP4 and attention DP4 / EP4, each with and without MTP3, on 4x B200 with FP8 weights and a BF16 KV cache. Measurements use the `benchmark_serving` client above, ISL 1024 / OSL 1024, random token IDs, seed 0, and greedy decoding. Each run sends `5 * concurrency` requests. Points combine all matching runs; faint dots show individual runs and bars show their minimum and maximum, not confidence intervals.
+The chart below shows the Pareto frontier of output-token throughput per GPU versus per-user output speed on 4x B200 with GLM-5.3-Flash FP8, a BF16 KV cache, and MTP enabled, at ISL 1024 / OSL 1024. The frontier is the efficient boundary of the measured TP4 / EP4 and attention DP4 / EP4 configurations with MTP: no other measured point is better on both axes. Other settings or workloads can give different results. Benchmarks were run using the `benchmark_serving` client above against TensorRT LLM 1.3.0rc29.
 
-To reproduce the curve, use the serving configurations above with `--max_batch_size 128`, `--max_seq_len 8192`, and `cuda_graph_config.max_batch_size: 128`. Keep CUDA graph padding, chunked prefill, and the overlap scheduler enabled; use a cache memory fraction of 0.5 and disable block reuse. Set `--max_num_tokens 16384` for TP4 / EP4 or `4096` for attention DP4 / EP4, with or without MTP3.
-
-The horizontal axis is `1000 / mean_tpot_ms`, excluding TTFT. The vertical axis is aggregate output-token throughput divided by four GPUs, excluding input-token throughput. For repeated runs, throughput is total output tokens divided by total measured duration, and mean TPOT is weighted by request count.
-
-![GLM-5.3-Flash FP8 performance on 4x B200](../media/glm_5_3_flash_fp8_perf.png)
-
-With TP4 / EP4, MTP3 improves single-user decode speed from approximately 153 to 372 tok/s/user. At concurrency 128, the four configurations deliver approximately 5.9K–6.3K output tok/s in aggregate. MTP acceptance and speedup depend on the workload; these measurements use random-token prompts.
+![GLM-5.3-Flash FP8 Performance on 4x B200 with MTP](../media/glm_5_3_flash_fp8_perf.png)
