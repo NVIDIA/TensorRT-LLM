@@ -1163,7 +1163,8 @@ void launchDynBlockKernel(Data const& data, uint32_t numThreadsHist, void* strea
 //       Phase A  one warp per token: the classic kernel's preprocess -> packed-key TopK -> postprocess
 //                (same ops, same tie-break -> bit-identical weights and selection); the DeepSeek-style
 //                policy reads the bias from shared memory instead of a dependent global reload after
-//                the TopK. Lane k writes k into byte t of expert row (top-k expert of token t).
+//                the TopK. Lane k writes k into byte t of expert row (top-k expert of token t) and the
+//                expert into slot (t, k) of the forward map.
 //       ---- barrier 1 ----
 //       Phase B  one thread per expert: one 64-bit shared load gives the expert's count and its position
 //                in every token (token order = the classic kernel's offset-within-expert order). numCta and
@@ -1171,9 +1172,15 @@ void launchDynBlockKernel(Data const& data, uint32_t numThreadsHist, void* strea
 //                through shared memory.
 //       ---- barrier 2 ----
 //                Every warp scans the <= 32 warp totals itself (no extra barrier), giving the exclusive
-//                CTA offset and permuted-row offset of every expert.
-//       Phase C  CTA tile maps for the grouped GEMM, permutedIdxSize / numNonExitingCtas, and the
-//                expandedIdx <-> permutedIdx / permutedIdx -> tokenIdx writes straight from the registers.
+//                CTA offset and permuted-row offset of every expert; the latter is published in shared
+//                memory for the permutation.
+//       Phase C  CTA tile maps for the grouped GEMM and permutedIdxSize / numNonExitingCtas straight from
+//                the registers.
+//       ---- barrier 3 ----
+//                Permutation, one (token, k) pair per thread: the expert comes from the forward map, its
+//                permuted-row offset from shared memory, and offset-within-expert is the number of earlier
+//                tokens in the expert's byte-map row (the classic kernel's order); the thread then writes
+//                expandedIdx <-> permutedIdx and permutedIdx -> tokenIdx.
 //
 //     Output format is exactly the classic kernel's (see the A/B tests): the same -1 sentinel for
 //     non-local experts in mPtrExpandedIdxToPermutedIdx, only local rows of the permuted arrays written,
@@ -1224,8 +1231,13 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
         static constexpr int PackShift = 12;
 
         __shared__ __align__(8) uint8_t smemKIdx[MaxNumExperts * KIdxRowBytes];
+        // Forward map (token, k) -> expert and the per-expert permuted-row offset: the permutation phase runs
+        // one (token, k) pair per thread instead of a per-expert loop over the tokens.
+        __shared__ int16_t smemTopKExpert[MaxNumTokens * MaxTopK];
+        __shared__ int32_t smemExpertScan[MaxNumExperts];
         __shared__ uint32_t smemWarpTotals[NumWarpsBlock];
         __shared__ float smemBias[BiasCached ? MaxNumExperts : 1];
+        static_assert(MaxNumTokens * MaxTopK <= NumThreadsBlock, "one (token, k) pair per thread in phase C");
 
         int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
         int32_t const laneIdx = cutlass::arch::LaneId();
@@ -1300,6 +1312,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
             if (laneIdx < params.mTopK)
             {
                 smemKIdx[warpTopKExpertIdx[laneIdx] * KIdxRowBytes + warpIdx] = static_cast<uint8_t>(laneIdx);
+                smemTopKExpert[warpIdx * MaxTopK + laneIdx] = static_cast<int16_t>(warpTopKExpertIdx[laneIdx]);
                 if (params.mPtrTopKWeights != nullptr)
                 {
                     params.mPtrTopKWeights[warpIdx * params.mTopK + laneIdx] = OutputT{warpTopKScore[laneIdx]};
@@ -1353,6 +1366,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
         int32_t const numNonExitingCtas = static_cast<int32_t>(blockTotal & ((1u << PackShift) - 1));
         int32_t const ctaOffset = static_cast<int32_t>(exclusive & ((1u << PackShift) - 1));
         int32_t const expertScanCount = static_cast<int32_t>(exclusive >> PackShift);
+        smemExpertScan[expert] = expertScanCount;
 
         // ----- Phase C: CTA tile maps, sizes, permutation -----
         if (isLocal)
@@ -1391,29 +1405,39 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
             params.mPtrPermutedIdxSize[0] = permutedIdxSize;
             params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
         }
+        __syncthreads();
 
-        int32_t offsetWithinExpert = 0;
-#pragma unroll
-        for (int t = 0; t < MaxNumTokens; ++t)
+        // Permutation: one (token, k) pair per thread. offset-within-expert = number of earlier tokens that
+        // also selected the expert (the byte map row below byte t), which is the classic kernel's order.
+        // Invariant: only the first MaxNumTokens tokens have forward-map slots (run() never dispatches more).
+        int32_t const numRoutedTokens = params.mNumTokens < MaxNumTokens ? params.mNumTokens : MaxNumTokens;
+        int32_t const numPairs = numRoutedTokens * params.mTopK;
+        if (static_cast<int32_t>(threadIdx.x) < numPairs)
         {
-            int32_t const kIdx = static_cast<int32_t>(((t < 4 ? kRow.x : kRow.y) >> (8 * (t & 3))) & 0xFFu);
-            if (kIdx != 0xFF)
+            int32_t const expandedIdx = threadIdx.x;
+            int32_t const tokenIdx = expandedIdx / params.mTopK;
+            int32_t const k = expandedIdx - tokenIdx * params.mTopK;
+            int32_t const pairExpert = smemTopKExpert[tokenIdx * MaxTopK + k];
+            auto const pairLocalIdx = pairExpert - params.mLocalExpertsStartIdx;
+            bool const pairIsLocal = pairLocalIdx >= 0 && pairLocalIdx < params.mNumLocalExperts
+                && (pairLocalIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
+            uint2 const row = *reinterpret_cast<uint2 const*>(&smemKIdx[pairExpert * KIdxRowBytes]);
+            uint64_t const present = (static_cast<uint64_t>(__vsetne4(row.y, 0xFFFFFFFFu)) << 32)
+                | static_cast<uint64_t>(__vsetne4(row.x, 0xFFFFFFFFu));
+            uint64_t const earlier = tokenIdx == 0 ? 0ull : (present & ((1ull << (8 * tokenIdx)) - 1));
+            int32_t const offsetWithinExpert = __popcll(earlier);
+            int32_t const permutedIdx = pairIsLocal ? smemExpertScan[pairExpert] + offsetWithinExpert : int32_t{-1};
+            if (params.mPtrExpandedIdxToPermutedIdx != nullptr)
             {
-                int32_t const expandedIdx = t * params.mTopK + kIdx;
-                int32_t const permutedIdx = isLocal ? expertScanCount + offsetWithinExpert : int32_t{-1};
-                if (params.mPtrExpandedIdxToPermutedIdx != nullptr)
-                {
-                    params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = permutedIdx;
-                }
-                if (params.mPtrPermutedIdxToExpandedIdx != nullptr && isLocal)
-                {
-                    params.mPtrPermutedIdxToExpandedIdx[permutedIdx] = expandedIdx;
-                }
-                if (params.mPtrPermutedIdxToTokenIdx != nullptr && isLocal)
-                {
-                    params.mPtrPermutedIdxToTokenIdx[permutedIdx] = t;
-                }
-                ++offsetWithinExpert;
+                params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = permutedIdx;
+            }
+            if (params.mPtrPermutedIdxToExpandedIdx != nullptr && pairIsLocal)
+            {
+                params.mPtrPermutedIdxToExpandedIdx[permutedIdx] = expandedIdx;
+            }
+            if (params.mPtrPermutedIdxToTokenIdx != nullptr && pairIsLocal)
+            {
+                params.mPtrPermutedIdxToTokenIdx[permutedIdx] = tokenIdx;
             }
         }
 
