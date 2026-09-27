@@ -15,7 +15,7 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { run, requestOne } = require('./semantic_review_request');
+const { discover, run, requestOne } = require('./semantic_review_request');
 const { NAME, requests } = require('./semantic_review');
 
 const HEAD = '1'.repeat(40);
@@ -35,14 +35,16 @@ function fixture(prs = [pull()], options = {}) {
     prs, checks: [], comments: new Map(), posts: [], updates: [], warnings: [],
     failures: [], remaining: options.remaining ?? 5000, target: TARGET,
     mergeBase: BASE, service: SERVICE, readCounts: new Map(), refReads: 0,
-    before: [], after: [], postErrors: new Map(),
+    before: [], after: [], commandBefore: [], commandAfter: [],
+    commandRemaining: options.commandRemaining ?? 5000, postErrors: new Map(), comparisons: 0,
   };
-  const api = (method) => async (args) => {
-    for (const hook of state.before) await hook();
-    state.remaining -= 1;
+  const api = (method, commandToken = false) => async (args) => {
+    const key = commandToken ? 'commandRemaining' : 'remaining';
+    for (const hook of commandToken ? state.commandBefore : state.before) await hook();
+    state[key] -= 1;
     const response = { data: await method(args),
-      headers: { 'x-ratelimit-remaining': String(state.remaining) } };
-    for (const hook of state.after) await hook(response);
+      headers: { 'x-ratelimit-remaining': String(state[key]) } };
+    for (const hook of commandToken ? state.commandAfter : state.after) await hook(response);
     return response;
   };
   const github = {
@@ -59,7 +61,7 @@ function fixture(prs = [pull()], options = {}) {
       return data.check_runs || data;
     },
     rest: {
-      rateLimit: { get: api(() => ({ resources: { core: { remaining: state.remaining } } })) },
+      rateLimit: { get: async () => ({ data: { resources: { core: { remaining: state.remaining } } } }) },
       pulls: {
         list: api(() => structuredClone(state.prs)),
         get: api(({ pull_number: number }) => {
@@ -74,7 +76,10 @@ function fixture(prs = [pull()], options = {}) {
         return { object: { sha: options.readTarget ?
           options.readTarget(state.refReads) : state.target } };
       }) },
-      repos: { compareCommits: api(() => ({ merge_base_commit: { sha: state.mergeBase } })) },
+      repos: { compareCommits: api(() => {
+        state.comparisons += 1;
+        return { merge_base_commit: { sha: state.mergeBase } };
+      }) },
       issues: { listComments: api(({ issue_number: number }) => state.comments.get(number) || []) },
       checks: {
         listForRef: api(({ ref, check_name: name }) => ({ check_runs: state.checks.filter(
@@ -94,9 +99,17 @@ function fixture(prs = [pull()], options = {}) {
       },
     },
   };
-  const commandGithub = { rest: {
-    users: { getAuthenticated: async () => ({ data: state.service }) },
-    issues: { createComment: async (args) => {
+  const commandGithub = { hook: {
+    before: (_, callback) => state.commandBefore.push(callback),
+    after: (_, callback) => state.commandAfter.push(callback),
+    remove: (_, callback) => {
+      state.commandBefore = state.commandBefore.filter((hook) => hook !== callback);
+      state.commandAfter = state.commandAfter.filter((hook) => hook !== callback);
+    },
+  }, rest: {
+    rateLimit: { get: async () => ({ data: { resources: { core: { remaining: state.commandRemaining } } } }) },
+    users: { getAuthenticated: api(() => state.service, true) },
+    issues: { createComment: api((args) => {
       assert.equal(args.request.retries, 0);
       const errorMode = state.postErrors.get(args.issue_number);
       state.postErrors.delete(args.issue_number);
@@ -108,8 +121,8 @@ function fixture(prs = [pull()], options = {}) {
         created_at: new Date().toISOString() };
       state.comments.set(args.issue_number, comments.concat(comment));
       if (errorMode === 'after') throw failure();
-      return { data: comment };
-    } },
+      return comment;
+    }, true) },
   } };
   const context = { repo: { owner: 'NVIDIA', repo: 'TensorRT-LLM' }, eventName: 'schedule' };
   const core = {
@@ -118,7 +131,8 @@ function fixture(prs = [pull()], options = {}) {
   };
   const args = { github, commandGithub, context, core };
   return { ...args, state, one: (changes = {}) => requestOne({ ...args, number: 1, ...changes }),
-    scan: (changes = {}) => run({ ...args, now: 0, ...changes }) };
+    scan: (changes = {}) => discover({ ...args, ...changes }),
+    worker: (changes = {}) => run({ ...args, number: 1, ...changes }) };
 }
 
 test('eligibility accepts either approval or auto-merge and requires an open supported non-draft PR', async () => {
@@ -154,7 +168,7 @@ test('an already requested pair is skipped even without a reply; force issues a 
   const first = await f.one();
   assert.equal((await f.one()).status, 'unchanged');
   assert.equal(f.state.posts.length, 1);
-  const forced = await f.one({ force: true });
+  const forced = await f.one({ manual: true });
   assert.equal(forced.status, 'requested');
   assert.notEqual(first.request.id, forced.request.id);
   assert.equal(first.request.checkId, forced.request.checkId);
@@ -202,12 +216,13 @@ test('a check from a different app or PR cannot be reused', async () => {
   assert.notEqual(result.request.checkId, 78);
 });
 
-test('a target already contained in the PR needs no analysis, including forced runs', async () => {
+test('a target already contained in the PR is analyzed with its real merge base', async () => {
   const f = fixture();
   f.state.mergeBase = TARGET;
-  assert.equal((await f.one()).status, 'up-to-date');
-  assert.equal((await f.one({ force: true })).status, 'up-to-date');
-  assert.equal(f.state.posts.length, 0);
+  assert.equal((await f.one()).status, 'requested');
+  assert.equal((await f.one({ manual: true })).status, 'requested');
+  assert.equal(f.state.posts.length, 2);
+  assert.equal(requests(f.state.comments.get(1))[0].mergeBase, TARGET);
 });
 
 test('live head changes, branch changes and approval removal stop stale requests before mutation', async () => {
@@ -258,55 +273,154 @@ test('ambiguous POST acceptance is recovered from the trusted comment without a 
   assert.equal(f.state.checks[0].conclusion, 'neutral');
 });
 
-test('each scan sends at most 20 requests and rotates the next starting candidate', async () => {
+test('discovery selects at most 30 new requests, newest PR first on every scan', async () => {
   const candidates = Array.from({ length: 45 }, (_, index) => pull(index + 1));
-  const first = fixture(candidates);
-  const counts = await first.scan();
-  assert.equal(counts.requested, 20);
-  assert.deepEqual(first.state.posts.map((post) => post.issue_number),
-    Array.from({ length: 20 }, (_, index) => index + 1));
-  const next = fixture(candidates);
-  await next.scan({ now: 2 * 60 * 60 * 1000 });
-  assert.equal(next.state.posts[0].issue_number, 21);
-  assert.equal(next.state.posts.length, 20);
+  const f = fixture(candidates);
+  const expected = Array.from({ length: 30 }, (_, index) => 45 - index);
+  assert.deepEqual((await f.scan()).numbers, expected);
+  assert.deepEqual((await f.scan()).numbers, expected);
+  assert.equal(f.state.comparisons, 0);
+  assert.equal(f.state.posts.length, 0);
+  assert.equal(f.state.checks.length, 0);
 });
 
-test('ambiguous failures consume request slots, continue other PRs and report operational failure', async () => {
-  const f = fixture(Array.from({ length: 25 }, (_, index) => pull(index + 1)));
-  for (let number = 1; number <= 3; number += 1) f.state.postErrors.set(number, 'after');
-  const counts = await f.scan();
-  assert.equal(counts.requested, 17);
-  assert.equal(counts.failed, 3);
-  assert.equal(f.state.posts.length, 20);
+test('already requested and newly ineligible candidates do not consume discovery slots', async () => {
+  const f = fixture(Array.from({ length: 45 }, (_, index) => pull(index + 1)), {
+    readPR: (pr, count) => {
+      if (pr.number === 45 && count > 2) pr.labels = [];
+      return pr;
+    },
+  });
+  for (let number = 36; number <= 45; number += 1) await f.one({ number });
+  const result = await f.scan();
+  assert.deepEqual(result.numbers, Array.from({ length: 30 }, (_, index) => 35 - index));
+  assert.equal(result.skipped, 10);
+  assert.equal(f.state.posts.length, 10);
+});
+
+test('discovery read errors consume slots and report failure while preserving other selected PRs', async () => {
+  const f = fixture(Array.from({ length: 40 }, (_, index) => pull(index + 1)), {
+    readPR: (pr) => {
+      if (pr.number > 34) throw Object.assign(new Error('Unavailable'), { status: 502 });
+      return pr;
+    },
+  });
+  const result = await f.scan();
+  assert.equal(result.failed, 6);
+  assert.deepEqual(result.numbers, Array.from({ length: 24 }, (_, index) => 34 - index));
+  assert.equal(f.state.warnings.length, 5);
   assert.equal(f.state.failures.length, 1);
-  assert.equal(f.state.checks.every((check) => check.conclusion === 'neutral'), true);
+  assert.equal(f.state.checks.length, 0);
 });
 
-test('REST reserve stops a scan without spending the last 100 requests or failing AI analysis', async () => {
-  const f = fixture([pull(1), pull(2)], { remaining: 110 });
-  const counts = await f.scan();
-  assert.equal(counts.limited, true);
-  assert.equal(f.state.remaining, 100);
+test('at most 30 workers run per discovery even when a POST is accepted ambiguously', async () => {
+  const f = fixture(Array.from({ length: 40 }, (_, index) => pull(index + 1)));
+  const { numbers } = await f.scan();
+  for (const number of numbers.slice(0, 3)) f.state.postErrors.set(number, 'after');
+  const results = [];
+  for (const number of numbers) results.push(await f.worker({ number }));
+  assert.equal(results.filter((result) => result.status === 'requested').length, 27);
+  assert.equal(results.filter((result) => result.status === 'failed').length, 3);
+  assert.equal(f.state.posts.length, 30);
+  assert.equal(f.state.failures.length, 3);
+  assert.equal(f.state.checks.every((check) => check.conclusion === 'neutral'), true);
+  assert.equal((await f.worker({ number: numbers[0] })).status, 'unchanged');
+  assert.equal(f.state.posts.length, 30);
+});
+
+test('worker rechecks approval, refs and request comments after discovery', async () => {
+  const f = fixture([pull(1), pull(2), pull(3)]);
+  assert.deepEqual((await f.scan()).numbers, [3, 2, 1]);
+  f.state.prs[0].labels = [];
+  assert.equal((await f.worker({ number: 1 })).status, 'ineligible');
+  await f.one({ number: 2 });
+  assert.equal((await f.worker({ number: 2 })).status, 'unchanged');
+  f.state.prs[2].head.sha = OTHER;
+  f.state.target = '5'.repeat(40);
+  const result = await f.worker({ number: 3 });
+  assert.equal(result.status, 'requested');
+  assert.equal(result.request.head, OTHER);
+  assert.equal(result.request.target, f.state.target);
+  assert.equal(f.state.posts.length, 2);
+});
+
+test('discovery preserves 1000 REST requests and returns candidates already found', async () => {
+  const f = fixture([pull(1), pull(2)], { remaining: 1005 });
+  const result = await f.scan();
+  assert.equal(result.limited, true);
+  assert.deepEqual(result.numbers, [2]);
+  assert.equal(f.state.remaining, 1000);
   assert.equal(f.state.failures.length, 0);
   assert.equal(f.state.before.length, 0);
   assert.equal(f.state.after.length, 0);
 });
 
-test('manual dispatch validates its PR input and bypasses only exact-pair dedup', async () => {
+test('worker preserves the 1000-request reserve independently for both tokens', async () => {
+  for (const options of [{ remaining: 1000 }, { remaining: 1004 },
+    { commandRemaining: 1000 }, { commandRemaining: 1001 }]) {
+    const f = fixture([pull()], options);
+    assert.equal((await f.worker()).status, 'limited');
+    assert.equal(f.state.posts.length, 0);
+    assert.ok(f.state.remaining >= 1000);
+    assert.ok(f.state.commandRemaining >= 1000);
+    assert.equal(f.state.checks.every((check) => check.conclusion === 'neutral'), true);
+    assert.equal(f.state.failures.length, 0);
+    assert.equal(f.state.before.length + f.state.after.length +
+      f.state.commandBefore.length + f.state.commandAfter.length, 0);
+  }
+  const f = fixture([pull()], { commandRemaining: 1002 });
+  assert.equal((await f.worker()).status, 'requested');
+  assert.equal(f.state.commandRemaining, 1000);
+});
+
+test('rate-limit responses stop discovery without marking an AI failure', async () => {
+  for (const error of [Object.assign(new Error('Retry later'), { status: 429 }),
+    Object.assign(new Error('Secondary rate limit'), { status: 403 })]) {
+    const f = fixture([pull()], { readPR: () => { throw error; } });
+    const result = await f.scan();
+    assert.equal(result.limited, true);
+    assert.equal(result.failed, 0);
+    assert.equal(f.state.failures.length, 0);
+    assert.equal(f.state.checks.length, 0);
+  }
+});
+
+test('worker operational errors fail its job, release quota hooks and never pass the AI check', async () => {
+  const f = fixture();
+  f.state.service = { ...SERVICE, id: 999 };
+  assert.equal((await f.worker()).status, 'failed');
+  assert.equal(f.state.failures.length, 1);
+  assert.equal(f.state.posts.length, 0);
+  assert.equal(f.state.checks.length, 0);
+  assert.equal(f.state.before.length + f.state.after.length +
+    f.state.commandBefore.length + f.state.commandAfter.length, 0);
+});
+
+test('manual dispatch validates input and forces any open supported PR, including drafts', async () => {
   const previous = process.env.INPUT_PULL_NUMBER;
   try {
-    const f = fixture();
+    const f = fixture([pull(1, { labels: [], draft: true })]);
     f.context.eventName = 'workflow_dispatch';
     for (const input of ['', '0', '-1', '1.5', '1oops', '9007199254740992']) {
       process.env.INPUT_PULL_NUMBER = input;
       await assert.rejects(f.scan(), /positive pull request number/);
     }
     process.env.INPUT_PULL_NUMBER = '1';
-    assert.equal((await f.scan()).requested, 1);
-    assert.equal((await f.scan()).requested, 1);
-    f.state.prs[0].labels = [];
-    assert.equal((await f.scan()).requested, 0);
+    f.state.mergeBase = TARGET;
+    assert.deepEqual((await f.scan()).numbers, [1]);
+    assert.equal((await f.worker()).status, 'requested');
+    assert.deepEqual((await f.scan()).numbers, [1]);
+    assert.equal((await f.worker()).status, 'requested');
     assert.equal(f.state.posts.length, 2);
+    for (const change of [{ state: 'closed' }, { base: { ref: 'feature/experimental' } }]) {
+      f.state.prs[0] = pull(1, change);
+      assert.deepEqual((await f.scan()).numbers, []);
+      assert.equal((await f.worker()).status, 'ineligible');
+    }
+    const limited = fixture([pull(1, { labels: [], draft: true })], { commandRemaining: 1000 });
+    limited.context.eventName = 'workflow_dispatch';
+    assert.equal((await limited.worker()).status, 'limited');
+    assert.equal(limited.state.posts.length, 0);
   } finally {
     if (previous === undefined) delete process.env.INPUT_PULL_NUMBER;
     else process.env.INPUT_PULL_NUMBER = previous;

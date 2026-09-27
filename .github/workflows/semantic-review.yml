@@ -10,20 +10,21 @@ on:
   workflow_dispatch:
     inputs:
       pull_number:
-        description: 'Eligible PR number to retry, including an already requested revision'
+        description: 'Open main/release PR to check, including drafts and already requested revisions'
         required: true
         type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.event_name == 'schedule' && 'semantic-review-scan' || format('semantic-review-run-{0}', github.run_id) }}
+  cancel-in-progress: false
+  queue: max
+
 jobs:
-  request:
-    name: Request semantic analysis
-    concurrency:
-      group: semantic-review-state
-      cancel-in-progress: false
-      queue: max
+  discover:
+    name: Select PRs for semantic analysis
     if: >-
       github.repository == 'NVIDIA/TensorRT-LLM' &&
       contains(fromJSON('["schedule", "workflow_dispatch"]'), github.event_name)
@@ -31,9 +32,50 @@ jobs:
       contents: read
       pull-requests: read
       issues: read
-      checks: write
+    outputs:
+      numbers: ${{ steps.select.outputs.numbers }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: |
+            .github/scripts
+          sparse-checkout-cone-mode: false
+      - id: select
+        uses: actions/github-script@v8
+        env:
+          INPUT_PULL_NUMBER: ${{ inputs.pull_number }}
+        with:
+          script: |
+            const {discover} = require('./.github/scripts/semantic_review_request.js');
+            const result = await discover({github, context, core});
+            core.setOutput('numbers', JSON.stringify(result.numbers));
+
+  request:
+    name: 'Request analysis for PR #${{ matrix.number }}'
+    needs: discover
+    if: >-
+      !cancelled() && needs.discover.outputs.numbers != '' &&
+      needs.discover.outputs.numbers != '[]'
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        number: ${{ fromJSON(needs.discover.outputs.numbers) }}
+    concurrency:
+      group: semantic-review-pr-${{ matrix.number }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      checks: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
         with:
@@ -45,7 +87,7 @@ jobs:
           sparse-checkout-cone-mode: false
       - uses: actions/github-script@v8
         env:
-          INPUT_PULL_NUMBER: ${{ inputs.pull_number }}
+          PULL_NUMBER: ${{ matrix.number }}
           SEMANTIC_COMMAND_TOKEN: ${{ secrets.TRTLLM_AGENT_SHARED_TOKEN }}
         with:
           script: |
@@ -54,12 +96,12 @@ jobs:
             const commandGithub = new github.constructor({
               auth: process.env.SEMANTIC_COMMAND_TOKEN, retry: {enabled: false},
             });
-            await run({github, commandGithub, context, core});
+            await run({github, commandGithub, context, core, number: Number(process.env.PULL_NUMBER)});
 
   publish:
     name: Publish semantic verdict
     concurrency:
-      group: semantic-review-state
+      group: semantic-review-pr-${{ github.event.issue.number }}
       cancel-in-progress: false
       queue: max
     if: >-

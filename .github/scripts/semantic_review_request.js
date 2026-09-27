@@ -15,12 +15,11 @@
 
 const { randomUUID } = require('node:crypto');
 const {
-  NAME, eligible, isCommandUser, requests, identity, command, awaiting,
+  NAME, supported, eligible, isCommandUser, requests, identity, command, awaiting,
 } = require('./semantic_review');
 
-const REQUEST_LIMIT = 20;
-const REST_RESERVE = 100;
-const SCAN_INTERVAL = 2 * 60 * 60 * 1000;
+const REQUEST_LIMIT = 30;
+const REST_RESERVE = 1000;
 
 function isRateLimitError(error) {
   const headers = error.response?.headers || {};
@@ -35,11 +34,36 @@ function quotaError() {
   return error;
 }
 
-async function requestOne({ github, commandGithub, context, number, force = false }) {
+async function withReserve(github, operation) {
+  const { data: rate } = await github.rest.rateLimit.get();
+  let remaining = rate.resources.core.remaining;
+  const before = () => {
+    if (remaining <= REST_RESERVE) throw quotaError();
+  };
+  const after = (response) => {
+    if (response.headers?.['x-ratelimit-remaining'] !== undefined) {
+      remaining = Number(response.headers['x-ratelimit-remaining']);
+    }
+  };
+  github.hook.before('request', before);
+  github.hook.after('request', after);
+  try {
+    before();
+    return await operation();
+  } finally {
+    github.hook.remove('request', before);
+    github.hook.remove('request', after);
+  }
+}
+
+function candidate(pr, manual) {
+  return manual ? pr.state === 'open' && supported(pr.base.ref) : eligible(pr);
+}
+
+async function pending({ github, context, number, manual }) {
   const repo = context.repo;
   const { data: pr } = await github.rest.pulls.get({ ...repo, pull_number: number });
-  if (!eligible(pr)) return { status: 'ineligible' };
-
+  if (!candidate(pr, manual)) return { status: 'ineligible' };
   const branch = pr.base.ref;
   const { data: ref } = await github.rest.git.getRef({ ...repo, ref: `heads/${branch}` });
   const head = pr.head.sha;
@@ -47,11 +71,18 @@ async function requestOne({ github, commandGithub, context, number, force = fals
   const comments = await github.paginate(github.rest.issues.listComments, {
     ...repo, issue_number: number, per_page: 100,
   });
-  if (!force && requests(comments).some((r) =>
+  if (!manual && requests(comments).some((r) =>
     r.head === head && r.target === target && r.branch === branch)) {
     return { status: 'unchanged' };
   }
+  return { status: 'ready', head, target, branch };
+}
 
+async function requestOne({ github, commandGithub, context, number, manual = false }) {
+  const snapshot = await pending({ github, context, number, manual });
+  if (snapshot.status !== 'ready') return snapshot;
+  const { head, target, branch } = snapshot;
+  const repo = context.repo;
   const { data: comparison } = await github.rest.repos.compareCommits({
     ...repo, base: target, head, per_page: 1,
   });
@@ -59,16 +90,12 @@ async function requestOne({ github, commandGithub, context, number, force = fals
   if (!/^[a-f0-9]{40}$/.test(mergeBase || '')) {
     throw new Error('The comparison did not return a full merge-base SHA.');
   }
-  if (mergeBase === target) return { status: 'up-to-date' };
 
-  const { data: user, headers } = await commandGithub.rest.users.getAuthenticated();
+  const { data: user } = await commandGithub.rest.users.getAuthenticated();
   if (!isCommandUser(user)) {
     const error = new Error('The command token must belong to the configured service account.');
     error.code = 'SEMANTIC_REVIEW_COMMAND_USER';
     throw error;
-  }
-  if (Number(headers?.['x-ratelimit-remaining'] ?? Infinity) <= REST_RESERVE) {
-    throw quotaError();
   }
 
   const checks = await github.paginate(github.rest.checks.listForRef, {
@@ -79,7 +106,7 @@ async function requestOne({ github, commandGithub, context, number, force = fals
     .sort((a, b) => b.id - a.id)[0];
 
   const { data: current } = await github.rest.pulls.get({ ...repo, pull_number: number });
-  if (!eligible(current) || current.head.sha !== head || current.base.ref !== branch) {
+  if (!candidate(current, manual) || current.head.sha !== head || current.base.ref !== branch) {
     return { status: 'moved' };
   }
   const { data: currentRef } = await github.rest.git.getRef({
@@ -127,77 +154,66 @@ async function requestOne({ github, commandGithub, context, number, force = fals
   return { status: 'requested', request };
 }
 
-async function run({ github, commandGithub, context, core, now = Date.now() }) {
+async function discover({ github, context, core }) {
   const input = process.env.INPUT_PULL_NUMBER || '';
   const manual = context.eventName === 'workflow_dispatch';
   if ((manual && !/^[1-9]\d*$/.test(input)) || (!manual && input) ||
     (input && !Number.isSafeInteger(Number(input)))) {
     throw new Error('Manual review requires a positive pull request number.');
   }
-
-  const { data: rate } = await github.rest.rateLimit.get();
-  let remaining = rate.resources.core.remaining;
-  const before = () => {
-    if (remaining <= REST_RESERVE) throw quotaError();
-  };
-  const after = (response) => {
-    if (response.headers?.['x-ratelimit-remaining'] !== undefined) {
-      remaining = Number(response.headers['x-ratelimit-remaining']);
-    }
-  };
-  github.hook.before('request', before);
-  github.hook.after('request', after);
-
-  const counts = { requested: 0, skipped: 0, failed: 0 };
-  let limited = false;
+  const result = { numbers: [], skipped: 0, failed: 0, limited: false };
   try {
-    let candidates;
-    if (manual) {
-      candidates = [{ number: Number(input) }];
-    } else {
-      const open = await github.paginate(github.rest.pulls.list, {
-        ...context.repo, state: 'open', sort: 'created', direction: 'asc', per_page: 100,
-      });
-      candidates = open.filter(eligible).sort((a, b) => a.number - b.number);
-      const start = candidates.length ?
-        (Math.floor(now / SCAN_INTERVAL) * REQUEST_LIMIT) % candidates.length : 0;
-      candidates = candidates.slice(start).concat(candidates.slice(0, start));
-    }
-
-    for (const { number } of candidates) {
-      // A failed POST can still have reached CodeRabbit, so it consumes a slot.
-      if (counts.requested + counts.failed >= REQUEST_LIMIT) break;
-      try {
-        const result = await requestOne({
-          github, commandGithub, context, number, force: manual,
-        });
-        counts[result.status === 'requested' ? 'requested' : 'skipped'] += 1;
-      } catch (error) {
-        if (isRateLimitError(error)) {
-          limited = true;
-          break;
-        }
-        if (error.code === 'SEMANTIC_REVIEW_COMMAND_USER') throw error;
-        counts.failed += 1;
-        if (counts.failed <= 5) {
-          core.warning(`PR #${number}: request failed (HTTP ${error.status || 'unknown'}).`);
+    await withReserve(github, async () => {
+      const candidates = manual ? [{ number: Number(input) }] :
+        (await github.paginate(github.rest.pulls.list, {
+          ...context.repo, state: 'open', sort: 'created', direction: 'desc', per_page: 100,
+        })).filter(eligible).sort((a, b) => b.number - a.number);
+      for (const { number } of candidates) {
+        if (result.numbers.length + result.failed >= REQUEST_LIMIT) break;
+        try {
+          const snapshot = await pending({ github, context, number, manual });
+          if (snapshot.status === 'ready') result.numbers.push(number);
+          else result.skipped += 1;
+        } catch (error) {
+          if (isRateLimitError(error)) throw error;
+          result.failed += 1;
+          if (result.failed <= 5) {
+            core.warning(`PR #${number}: discovery failed (HTTP ${error.status || 'unknown'}).`);
+          }
         }
       }
-    }
+    });
   } catch (error) {
     if (!isRateLimitError(error)) throw error;
-    limited = true;
-  } finally {
-    github.hook.remove('request', before);
-    github.hook.remove('request', after);
+    result.limited = true;
   }
-
-  const summary = `Semantic review: ${counts.requested} requested, ${counts.skipped} skipped, ` +
-    `${counts.failed} failed${limited ? '; stopped for API quota' : ''}.`;
-  core.info(summary);
-  if (core.summary) await core.summary.addRaw(summary).write();
-  if (counts.failed) core.setFailed('Some semantic review requests could not be sent.');
-  return { ...counts, limited };
+  core.info(`Semantic review: ${result.numbers.length} selected, ${result.skipped} skipped, ` +
+    `${result.failed} failed${result.limited ? '; stopped for API quota' : ''}.`);
+  if (result.failed) core.setFailed('Some semantic review candidates could not be read.');
+  return result;
 }
 
-module.exports = { run, requestOne, isRateLimitError };
+async function run({ github, commandGithub, context, core, number }) {
+  if (!Number.isSafeInteger(number) || number <= 0) {
+    throw new Error('A positive pull request number is required.');
+  }
+  let result;
+  try {
+    result = await withReserve(github, () => withReserve(commandGithub, () => requestOne({
+      github, commandGithub, context, number, manual: context.eventName === 'workflow_dispatch',
+    })));
+  } catch (error) {
+    if (isRateLimitError(error)) {
+      result = { status: 'limited' };
+    } else {
+      core.setFailed(`PR #${number}: semantic review request failed (HTTP ${error.status || 'unknown'}).`);
+      result = { status: 'failed' };
+    }
+  }
+  const summary = `PR #${number}: semantic review ${result.status}.`;
+  core.info(summary);
+  if (core.summary) await core.summary.addRaw(summary).write();
+  return result;
+}
+
+module.exports = { discover, run, requestOne, isRateLimitError };

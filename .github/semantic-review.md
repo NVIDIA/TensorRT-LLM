@@ -14,17 +14,26 @@ Every two hours, scan open, non-draft PRs targeting `main` or `release/**` that
 have `ci: full pre-merge approved` or auto-merge enabled. PR activity does not
 immediately request analysis. GitHub scheduled runs can be delayed.
 
-- Read the current head, target and merge-base. Skip if head already contains
-  the target or the same head/target/branch combination was requested before.
-- Issue at most 20 new requests per scan, rotating the starting PR. Failed
-  attempts count against the budget because their delivery can be uncertain.
-- Stop when approaching the GitHub REST quota reserve or receiving rate limits.
+- Read the current head, target and merge-base. Skip only previously requested
+  head/target/branch combinations. A head that already contains target still
+  needs compatibility analysis: rebase or merge can incorporate semantic bugs.
+- Select candidates by descending PR number, starting with the newest each scan.
+  Select at most 30 requests after deduplication. Failed selection or delivery
+  attempts consume slots; a failed POST can still have reached CodeRabbit.
+  Workers recheck eligibility, revisions and deduplication under the PR's lock.
+- Stop requesting when either token's observed REST quota remaining is 1,000 or
+  less, or when rate limited. `GITHUB_TOKEN` and the service PAT have separate
+  quota checks. Concurrent API users can spend quota between observations.
 - Do not automatically retry an unchanged version, including a missing reply.
-  Maintainers may explicitly retry an eligible PR with **Run workflow** and its
-  `pull_number`. An ordinary workflow rerun still follows its original inputs.
+  Maintainers may use **Run workflow** with an open main/release `pull_number`,
+  including drafts, without an approval label or auto-merge. Manual requests
+  bypass version deduplication but retain revision and quota checks. An ordinary
+  workflow rerun still follows its original inputs.
 
-The budget permits up to 240 scheduled requests per day; manual retries are
-additional. Monitor actual throughput and backlog before changing this limit.
+The budget permits up to 360 scheduled requests per day; manual retries are
+additional. Newest-first selection can defer older PRs indefinitely when target
+keeps advancing and there are more than 30 actionable candidates. Monitor actual
+throughput and backlog before changing this policy.
 
 ## Results
 
@@ -38,11 +47,13 @@ revisions, and presence of source citations before publishing:
 | FAIL | Failure: possible conflict; inspect linked evidence |
 | Missing or inconclusive | Neutral: no verified verdict |
 
-Replies publish without waiting for the next scheduled scan. The request and
-publication jobs share a concurrency queue, so switching the current request
-cannot race an older reply. They do not wait for AI analysis while holding the
-queue. A scan's success only means its requests were processed, not that AI
-approved those PRs.
+Replies publish without waiting for the next scheduled scan. Request and
+publication jobs for the same PR share a concurrency queue, so switching the
+current request cannot race an older reply. Different PRs can run independently;
+each scan has up to four concurrent request workers. Scheduled batches run one
+at a time; manual requests and publication do not share that batch lock. Jobs do
+not wait for AI analysis while holding a queue. A scan's success only means its
+requests were processed, not that AI approved those PRs.
 
 When main advances, a reply still describes its requested snapshot. The next
 scan requests the newer combination. Switching requests clears the earlier
@@ -73,19 +84,24 @@ Run the deterministic policy and result tests:
 node --test .github/scripts/semantic_review*.test.js
 ```
 
-`semantic_review_cases.js` freezes three real divergent histories for analysis
-replay. Build each request with the same `command()` used by the workflow:
+`semantic_review_cases.js` freezes three real incidents in divergent,
+already-integrated and repaired states for analysis replay. Integrated inputs
+use the actual defective merge commits to exercise `merge_base == target`;
+they are not newly synthesized rebases. Repair controls compare each historical
+fix with its immediate parent to exclude unrelated intervening changes. Build
+each request with the same `command()` used by the workflow:
 
 ```sh
 node -e "const {randomUUID}=require('node:crypto'); const {command}=require('./.github/scripts/semantic_review'); const cases=require('./.github/scripts/semantic_review_cases'); console.log(command({...cases[0],id:randomUUID()}));"
 ```
 
-Replay all three with the final prompt, retaining request IDs, input SHAs, raw
+Replay all nine inputs with the final prompt, retaining request IDs, input SHAs, raw
 replies, concrete findings and timings, including missed/inconclusive results.
 Use an independent context without giving the incident explanation or a repair.
 If the hosting discussion reveals the answer, label the run as a replay rather
 than a blind evaluation. Fixed repeats characterize variability; production
-still issues one request. Validate compatible repair controls separately.
+still issues one request. Assess known defect detection and repair false positives
+separately; a narrow repair control does not establish general accuracy.
 
 The deterministic tests simulate GitHub. A real AI reply and a real Check write
 are separate validation layers and must be reported as such. Historical cases

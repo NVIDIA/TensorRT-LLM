@@ -213,14 +213,13 @@ test('a bot-looking user cannot publish or revoke results', async () => {
   assert.equal(state.updates.length, 0);
 });
 
-test('all three real histories produce the same protocol without ground-truth hints', () => {
-  assert.equal(cases.length, 3);
+test('real divergent, integrated and repaired histories use the same result protocol', () => {
+  assert.equal(cases.length, 9);
   for (const fixture of cases) {
     const r = request(1, fixture);
     const body = command(r);
     for (const value of [r.id, r.head, r.target, r.mergeBase]) assert.ok(body.includes(value));
     assert.ok(body.startsWith('@coderabbitai\n'));
-    assert.notEqual(r.mergeBase, r.target);
     assert.doesNotMatch(body, /llm_build_stats|routed_output_is_global|get_steady_clock_now_in_seconds/);
     assert.equal(parseResult(reply(20, r, 'FAIL'), r, repo).verdict, 'FAIL');
   }
@@ -230,8 +229,10 @@ test('privileged jobs run trusted code and serialize request switches with publi
   const workflow = readFileSync(join(__dirname, '../workflows/semantic-review.yml'), 'utf8');
   assert.doesNotMatch(workflow, /pull_request_target:|pull_request:/);
   assert.match(workflow, /cron: '23 \*\/2 \* \* \*'/);
-  assert.equal(workflow.match(/concurrency:\n      group: semantic-review-state\n      cancel-in-progress: false\n      queue: max/g).length, 2);
-  assert.equal(workflow.match(/ref: \$\{\{ github.event.repository.default_branch \}\}/g).length, 2);
+  assert.match(workflow, /group: semantic-review-pr-\$\{\{ matrix.number \}\}/);
+  assert.match(workflow, /group: semantic-review-pr-\$\{\{ github.event.issue.number \}\}/);
+  assert.equal(workflow.match(/      cancel-in-progress: false\n      queue: max/g).length, 2);
+  assert.equal(workflow.match(/ref: \$\{\{ github.event.repository.default_branch \}\}/g).length, 3);
   assert.match(workflow, /types: \[created, edited, deleted\]/);
   assert.equal(workflow.match(/secrets\./g).length, 1);
   assert.doesNotMatch(workflow.split('  publish:')[1], /SEMANTIC_COMMAND_TOKEN|issues: write/);
