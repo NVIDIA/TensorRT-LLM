@@ -250,35 +250,55 @@ _BEAM_SEARCH_CASES = [
 ]
 
 
-def test_whisper_pytorch_block_reuse_requested(monkeypatch):
+def test_whisper_pytorch_block_reuse_requested(monkeypatch: pytest.MonkeyPatch) -> None:
     """Greedy transcription when KV block reuse is requested.
 
     Whisper requests carry encoder features, not encoder token ids, so the
     executor disables reuse for both KV pools and must still admit and run
     them (https://nvbugs/6713231). Batch 2 co-schedules two
     encoder-init requests, the shape that reached the unguarded cross-reuse
-    lookup in the C++ capacity scheduler.
+    lookup in the C++ capacity scheduler. Distinct audio clips sharing the
+    decoder prompt must match their reuse-disabled results.
     """
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
 
     model_path = _get_whisper_model_path()
     wave, sample_rate = soundfile.read(_get_audio_path())
     sampling_params = SamplingParams(temperature=0.0, max_tokens=_MAX_NEW_TOKENS)
+    # Derive a distinct speech clip from the existing CI fixture, keeping the
+    # sample rate and decoder prompt identical. No extra model-share asset is needed.
+    cropped_wave = wave[: len(wave) // 2].copy()
+    batches = ([wave], [cropped_wave], [wave, cropped_wave])
+    results = {}
 
-    with _make_llm(
-        model_path,
-        enable_block_reuse=True,
-        use_python_scheduler=False,
-    ) as llm:
-        for batch_size in (1, 2):
-            outputs = llm.generate(
-                [_audio_prompt(wave, sample_rate) for _ in range(batch_size)],
-                sampling_params,
-            )
-            for output in outputs:
-                completion = output.outputs[0]
-                assert list(completion.token_ids) == _EXPECTED_GREEDY_OUTPUT_TOKEN_IDS
-                assert _EXPECTED_TRANSCRIPT_FRAGMENT in completion.text.lower()
+    for enable_block_reuse in (False, True):
+        batch_results = []
+        with _make_llm(
+            model_path,
+            enable_block_reuse=enable_block_reuse,
+            use_python_scheduler=False,
+        ) as llm:
+            for batch in batches:
+                outputs = llm.generate(
+                    [_audio_prompt(clip, sample_rate) for clip in batch],
+                    sampling_params,
+                )
+                assert len(outputs) == len(batch)
+                batch_results.append(
+                    [
+                        (list(output.outputs[0].token_ids), output.outputs[0].text)
+                        for output in outputs
+                    ]
+                )
+        results[enable_block_reuse] = batch_results
+
+    baseline = results[False]
+    assert baseline[0][0][0] == _EXPECTED_GREEDY_OUTPUT_TOKEN_IDS
+    assert _EXPECTED_TRANSCRIPT_FRAGMENT in baseline[0][0][1].lower()
+    assert baseline[1][0][1].strip()
+    # Ensure the second input actually distinguishes feature-conditioned caches.
+    assert baseline[0][0][0] != baseline[1][0][0]
+    assert results[True] == baseline
 
 
 @pytest.mark.parametrize("torch_dtype,cuda_graph_batch_sizes,graphs_captured", _BEAM_SEARCH_CASES)
