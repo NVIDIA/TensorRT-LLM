@@ -192,6 +192,16 @@ def test_stop_drains_preceding_async_batches():
     assert queue.closed
 
 
+def test_stop_passes_remaining_deadline_to_final_shutdown(monkeypatch):
+    monkeypatch.setattr(mpi, "_mgmn_shutdown_grace_seconds", lambda: 10)
+    clock = iter([100, 103])
+    monkeypatch.setattr(mpi.time, "monotonic", lambda: next(clock))
+    queue = _Queue([mpi.RemoteTask(_task, (), {}), None])
+    server = _server(queue, [[_future(1), _future(2)]])
+    server.serve()
+    server._shutdown_session.assert_called_once_with(7)
+
+
 @pytest.mark.parametrize("failure", ["session", "executor", None])
 def test_final_owner_shutdown_closes_shared_executor(monkeypatch, failure):
     class TestSession(mpi.MpiCommSession):
