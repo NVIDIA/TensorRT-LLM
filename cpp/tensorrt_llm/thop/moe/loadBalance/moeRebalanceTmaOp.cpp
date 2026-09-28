@@ -55,12 +55,11 @@ uint64_t checkedUnsigned(int64_t value, char const* name)
     return static_cast<uint64_t>(value);
 }
 
-std::vector<uint64_t> checkedU64Vector(
-    std::vector<int64_t> const& values, uint64_t expectedSize, char const* name)
+std::vector<uint64_t> checkedU64Vector(std::vector<int64_t> const& values, uint64_t expectedSize, char const* name)
 {
     TORCH_CHECK(expectedSize <= std::numeric_limits<size_t>::max(), name, " size overflows size_t");
-    TORCH_CHECK(values.size() == static_cast<size_t>(expectedSize), name, " has ", values.size(),
-        " entries; expected ", expectedSize);
+    TORCH_CHECK(values.size() == static_cast<size_t>(expectedSize), name, " has ", values.size(), " entries; expected ",
+        expectedSize);
     std::vector<uint64_t> result;
     result.reserve(values.size());
     for (int64_t value : values)
@@ -89,8 +88,8 @@ public:
     {
         TORCH_CHECK(maxSegments > 0, "max_segments must be positive");
         auto const maxSegmentsUnsigned = checkedUnsigned(maxSegments, "max_segments");
-        int const error = megamoe_tma_copy_create(
-            maxSegmentsUnsigned, checkedInt(sms, "sms"), checkedInt(warps, "warps"), &mState);
+        int const error
+            = megamoe_tma_copy_create(maxSegmentsUnsigned, checkedInt(sms, "sms"), checkedInt(warps, "warps"), &mState);
         checkTmaResult(error, "moe rebalance TMA create");
 
         MegamoeTmaCopyConfig config{};
@@ -117,12 +116,12 @@ public:
         }
     }
 
-    void configureGpuPlan(int64_t world, int64_t rank, int64_t helperCount, int64_t planes,
-        int64_t globalExperts, int64_t homeCount, int64_t ownerStride, int64_t levelCount,
-        int64_t targetCount, int64_t planAbiVersion, int64_t planWords, int64_t routeFeatures,
-        int64_t tmaRoute, int64_t tmaSourceLoadPercent, std::vector<int64_t> const& groupSizes,
-        std::vector<int64_t> const& sourceTable, std::vector<int64_t> const& destinationTable,
-        std::vector<int64_t> const& foreignDestinationTable, std::vector<int64_t> const& planeBytes)
+    void configureGpuPlan(int64_t world, int64_t rank, int64_t helperCount, int64_t planes, int64_t globalExperts,
+        int64_t homeCount, int64_t ownerStride, int64_t levelCount, int64_t targetCount, int64_t planAbiVersion,
+        int64_t planWords, int64_t routeFeatures, int64_t tmaRoute, int64_t tmaSourceLoadPercent,
+        std::vector<int64_t> const& groupSizes, std::vector<int64_t> const& sourceTable,
+        std::vector<int64_t> const& destinationTable, std::vector<int64_t> const& foreignDestinationTable,
+        std::vector<int64_t> const& planeBytes)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         requireLive();
@@ -139,16 +138,15 @@ public:
             "world, helper_count, planes, and global_experts must be positive");
         TORCH_CHECK(worldValue <= MEGAMOE_TMA_GPU_PLAN_MAX_WORLD && planesValue <= 32 && globalExpertsValue <= 384,
             "world, planes, or global_experts exceeds the GPU plan ABI");
-        TORCH_CHECK(helperCountValue <= (std::numeric_limits<int>::max() - 25) / 7,
-            "helper_count exceeds the GPU plan ABI");
+        TORCH_CHECK(
+            helperCountValue <= (std::numeric_limits<int>::max() - 25) / 7, "helper_count exceeds the GPU plan ABI");
         TORCH_CHECK(levelCountValue > 0 && targetCountValue >= 0,
             "level_count must be positive and target_count must be nonnegative");
         TORCH_CHECK(targetCountValue <= 32 && (routeFeaturesValue == 0 || routeFeaturesValue == 1),
             "target_count or route_features exceeds the GPU plan ABI");
-        TORCH_CHECK(levelCountValue <= MEGAMOE_TMA_GPU_PLAN_MAX_LEVELS,
-            "level_count exceeds the GPU plan ABI");
-        TORCH_CHECK(groupSizes.size() == static_cast<size_t>(levelCountValue),
-            "group_sizes must contain level_count entries");
+        TORCH_CHECK(levelCountValue <= MEGAMOE_TMA_GPU_PLAN_MAX_LEVELS, "level_count exceeds the GPU plan ABI");
+        TORCH_CHECK(
+            groupSizes.size() == static_cast<size_t>(levelCountValue), "group_sizes must contain level_count entries");
 
         std::array<int, MEGAMOE_TMA_GPU_PLAN_MAX_LEVELS> groups{};
         for (int index = 0; index < levelCountValue; ++index)
@@ -157,11 +155,9 @@ public:
         }
 
         uint64_t const sourceCount = static_cast<uint64_t>(globalExpertsValue) * planesValue;
-        uint64_t const destinationCount
-            = static_cast<uint64_t>(levelCountValue) * helperCountValue * planesValue;
-        uint64_t const foreignCount = routeFeaturesValue
-            ? static_cast<uint64_t>(targetCountValue) * helperCountValue * planesValue
-            : 0;
+        uint64_t const destinationCount = static_cast<uint64_t>(levelCountValue) * helperCountValue * planesValue;
+        uint64_t const foreignCount
+            = routeFeaturesValue ? static_cast<uint64_t>(targetCountValue) * helperCountValue * planesValue : 0;
         auto sources = checkedU64Vector(sourceTable, sourceCount, "source_table");
         auto destinations = checkedU64Vector(destinationTable, destinationCount, "destination_table");
         auto foreign = checkedU64Vector(foreignDestinationTable, foreignCount, "foreign_destination_table");
@@ -192,14 +188,13 @@ public:
         config.plane_bytes = bytes.data();
 
         c10::cuda::CUDAGuard const deviceGuard(c10::Device(c10::DeviceType::CUDA, mDevice));
-        checkTmaResult(
-            megamoe_tma_copy_configure_gpu_plan(mState, &config), "moe rebalance TMA GPU plan configure");
+        checkTmaResult(megamoe_tma_copy_configure_gpu_plan(mState, &config), "moe rebalance TMA GPU plan configure");
         mConfigured = true;
         mHelperCount = helperCountValue;
     }
 
-    void bindGpuDirect(torch::Tensor ids, torch::Tensor levels, torch::Tensor owners, torch::Tensor workspace,
-        int64_t capacity)
+    void bindGpuDirect(
+        torch::Tensor ids, torch::Tensor levels, torch::Tensor owners, torch::Tensor workspace, int64_t capacity)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         requireLive();
@@ -214,8 +209,7 @@ public:
 
         c10::cuda::CUDAGuard const deviceGuard(ids.device());
         checkTmaResult(megamoe_tma_copy_bind_gpu_direct(mState, reinterpret_cast<uint64_t>(ids.data_ptr()),
-                           reinterpret_cast<uint64_t>(levels.data_ptr()),
-                           reinterpret_cast<uint64_t>(owners.data_ptr()),
+                           reinterpret_cast<uint64_t>(levels.data_ptr()), reinterpret_cast<uint64_t>(owners.data_ptr()),
                            reinterpret_cast<uint64_t>(workspace.data_ptr()), capacityValue),
             "moe rebalance TMA GPU-direct bind");
 
@@ -275,8 +269,7 @@ public:
             value.slots_per_warp, value.bank0_slots_per_warp, value.bank1_slots_per_warp, value.slice_bytes,
             value.dynamic_shared_bytes, value.device_optin_shared_bytes, value.device_shared_bytes_per_sm,
             value.max_active_ctas_per_sm, value.compute_major, value.compute_minor, value.total_slots,
-            value.max_slots_per_warp, value.extra_slot_warps, value.max_warps,
-            checkedDiagnostic(value.max_segments)};
+            value.max_slots_per_warp, value.extra_slot_warps, value.max_warps, checkedDiagnostic(value.max_segments)};
     }
 
     void destroy()
@@ -406,27 +399,35 @@ TRTLLM_NAMESPACE_END
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.class_<tensorrt_llm::torch_ext::MoeRebalanceTmaState>("MoeRebalanceTmaState");
-    m.def("moe_rebalance_tma_create(int max_segments, int sms=0, int warps=0) -> "
-          "__torch__.torch.classes.trtllm.MoeRebalanceTmaState");
-    m.def("moe_rebalance_tma_configure_gpu_plan("
-          "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state, int world, int rank, int helper_count, "
-          "int planes, int global_experts, int home_count, int owner_stride, int level_count, int target_count, "
-          "int plan_abi_version, int plan_words, int route_features, int tma_route, int tma_source_load_percent, "
-          "int[] group_sizes, int[] source_table, int[] destination_table, int[] foreign_destination_table, "
-          "int[] plane_bytes) -> ()");
-    m.def("moe_rebalance_tma_bind_gpu_direct("
-          "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state, Tensor ids, Tensor levels, Tensor owners, "
-          "Tensor workspace, int capacity) -> ()");
-    m.def("moe_rebalance_tma_submit_gpu_direct("
-          "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state, int flag_mc) -> int");
-    m.def("moe_rebalance_tma_current_gen("
-          "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state) -> int");
-    m.def("moe_rebalance_tma_result("
-          "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state) -> int[]");
-    m.def("moe_rebalance_tma_config("
-          "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state) -> int[]");
-    m.def("moe_rebalance_tma_destroy("
-          "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state) -> ()");
+    m.def(
+        "moe_rebalance_tma_create(int max_segments, int sms=0, int warps=0) -> "
+        "__torch__.torch.classes.trtllm.MoeRebalanceTmaState");
+    m.def(
+        "moe_rebalance_tma_configure_gpu_plan("
+        "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state, int world, int rank, int helper_count, "
+        "int planes, int global_experts, int home_count, int owner_stride, int level_count, int target_count, "
+        "int plan_abi_version, int plan_words, int route_features, int tma_route, int tma_source_load_percent, "
+        "int[] group_sizes, int[] source_table, int[] destination_table, int[] foreign_destination_table, "
+        "int[] plane_bytes) -> ()");
+    m.def(
+        "moe_rebalance_tma_bind_gpu_direct("
+        "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state, Tensor ids, Tensor levels, Tensor owners, "
+        "Tensor workspace, int capacity) -> ()");
+    m.def(
+        "moe_rebalance_tma_submit_gpu_direct("
+        "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state, int flag_mc) -> int");
+    m.def(
+        "moe_rebalance_tma_current_gen("
+        "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state) -> int");
+    m.def(
+        "moe_rebalance_tma_result("
+        "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state) -> int[]");
+    m.def(
+        "moe_rebalance_tma_config("
+        "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state) -> int[]");
+    m.def(
+        "moe_rebalance_tma_destroy("
+        "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)

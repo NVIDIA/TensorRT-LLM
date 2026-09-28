@@ -27,14 +27,15 @@ if(DYNAMIC_EPLB_ARCHS)
   list(APPEND DYNAMIC_EPLB_SOURCES moeRebalanceHaloQ.cu)
 else()
   list(APPEND DYNAMIC_EPLB_SOURCES moeRebalancePlaceholder.cpp)
-  list(APPEND DYNAMIC_EPLB_DEFINITIONS
-       TRTLLM_DYNAMIC_EPLB_PLACEHOLDER_HALO_Q)
+  list(APPEND DYNAMIC_EPLB_DEFINITIONS TRTLLM_DYNAMIC_EPLB_PLACEHOLDER_HALO_Q)
   message(
     STATUS
-      "Dynamic EPLB HALO-Q disabled: none of SM100, SM103, or SM107 was requested")
+      "Dynamic EPLB HALO-Q disabled: none of SM100, SM103, or SM107 was requested"
+  )
 endif()
 
-if(DYNAMIC_EPLB_ARCHS AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.1)
+if(DYNAMIC_EPLB_ARCHS AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL
+                          13.1)
   list(APPEND DYNAMIC_EPLB_SOURCES moeRebalanceTma.cu)
 else()
   list(APPEND DYNAMIC_EPLB_SOURCES moeRebalancePlaceholder.cpp)
@@ -42,11 +43,13 @@ else()
   if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.1)
     message(
       STATUS
-        "Dynamic EPLB TMA disabled: CUDA 13.1 or newer is required (found ${CMAKE_CUDA_COMPILER_VERSION})")
+        "Dynamic EPLB TMA disabled: CUDA 13.1 or newer is required (found ${CMAKE_CUDA_COMPILER_VERSION})"
+    )
   else()
     message(
       STATUS
-        "Dynamic EPLB TMA disabled: none of SM100, SM103, or SM107 was requested")
+        "Dynamic EPLB TMA disabled: none of SM100, SM103, or SM107 was requested"
+    )
   endif()
 endif()
 
@@ -54,8 +57,8 @@ list(REMOVE_DUPLICATES DYNAMIC_EPLB_SOURCES)
 add_library(moe_dynamic_eplb_src OBJECT ${DYNAMIC_EPLB_SOURCES})
 
 if(DYNAMIC_EPLB_ARCHS)
-  # These kernels use SM100-family PTX. The family target avoids
-  # inheriting the generic kernels_src SM80/SM90 compilation passes.
+  # These kernels use SM100-family PTX. The family target avoids inheriting the
+  # generic kernels_src SM80/SM90 compilation passes.
   set_cuda_architectures(moe_dynamic_eplb_src 100f)
 endif()
 
@@ -66,4 +69,4 @@ endif()
 
 set_property(TARGET moe_dynamic_eplb_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET moe_dynamic_eplb_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS
-                                                   ON)
+                                                  ON)

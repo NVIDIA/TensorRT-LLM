@@ -2205,7 +2205,7 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         publish: cutlass.Constexpr = self.token_back_enabled
         flag_address = Int64(0)
         if cutlass.const_expr(publish):
-            if cutlass.const_expr(self.token_back_ready_granularity == "token_tile"):
+            if cutlass.const_expr(self.token_back_ready_granularity == "token_tile"):  # nosec B105 -- scheduler mode name, not a credential
                 # The scheduler maps every fallback CTA into the preferred
                 # logical cluster. N=1 keeps this slot common to all hidden
                 # shards; padded hidden CTAs must also publish their completion.

@@ -192,7 +192,7 @@ _MEGAMOE_GRAPH_CAPTURE_SEEN: bool = False
 _TACTIC_LEN = 11
 _TACTIC_LEN_V4 = 10
 _LEGACY_TACTIC_LEN = 8
-_DEFAULT_TOKEN_BACK_READY_GRANULARITY = "expert"
+_DEFAULT_TOKEN_BACK_READY_GRANULARITY = "expert"  # nosec B105 -- scheduler mode name, not a credential
 _TOKEN_BACK_READY_GRANULARITIES = ("expert", "token_tile")
 
 # Kernel-side ceiling: ``flag_batch`` is hard-checked ``[1, 32]`` and
@@ -1218,7 +1218,7 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
             f"token_back_ready_granularity must be one of "
             f"{_TOKEN_BACK_READY_GRANULARITIES}, got {token_back_ready_granularity!r}."
         )
-    if token_back_ready_granularity == "token_tile":
+    if token_back_ready_granularity == "token_tile":  # nosec B105 -- scheduler mode name, not a credential
         # Mirrors the kernel's own guard (kernel_src/*/inference/mega/
         # block_scaled_swap_ab_mega_moe_kernel.py, _validate_geometry). Checking
         # it HERE is the point of putting the granularity in the tuple: the

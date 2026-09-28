@@ -246,9 +246,7 @@ class RebalanceSlotSchedulerGroupV2:
         self.lease = _V2LiveBankLeaseProvider(self)
         self.broadcaster.bind_generation_reuse_authority(self.lease)
 
-        logger.debug(
-            "[MegaMoECuteDsl] layer=%s rebalance producer initialized", layer_idx
-        )
+        logger.debug("[MegaMoECuteDsl] layer=%s rebalance producer initialized", layer_idx)
 
     def _check_owner(self) -> None:
         thread_id = threading.get_ident()
@@ -488,9 +486,7 @@ def apply_rebalance_scheduler(
             )
         gap_hook, gap_hook_owner = backend_gap_hook, backend
     if gap_hook is None:
-        physical_slot_ids, generation = group.plan(
-            token_selected_slots, defer_wait=True
-        )
+        physical_slot_ids, generation = group.plan(token_selected_slots, defer_wait=True)
     else:
         part = group.plan_schedule(token_selected_slots)
         setattr(gap_hook_owner, _PLAN_GAP_HOOK_ATTR, None)
@@ -516,8 +512,9 @@ def bind_live_weight_planes(quant_method: Any, module: Any) -> None:
     arena = getattr(module, "_rebalance_arena", None)
     if arena is None:
         return
-    from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler_v2.integrations.megamoe.direct_live_weight_bridge import \
-        CANONICAL_WEIGHT_PLANE_NAMES
+    from ....cute_dsl_kernels.megamoe_scheduler_v2.integrations.megamoe.direct_live_weight_bridge import (
+        CANONICAL_WEIGHT_PLANE_NAMES,
+    )
 
     if tuple(arena.plane_names) != CANONICAL_WEIGHT_PLANE_NAMES:
         raise RuntimeError("MoE rebalance arena plane order is not canonical")
@@ -527,21 +524,15 @@ def bind_live_weight_planes(quant_method: Any, module: Any) -> None:
     ):
         old = getattr(module, name, None)
         if old is None:
-            raise RuntimeError(
-                f"MoE rebalance live weight plane {name!r} was not registered"
-            )
+            raise RuntimeError(f"MoE rebalance live weight plane {name!r} was not registered")
         if (
             tuple(alias.shape) != tuple(old.shape)
             or tuple(alias.stride()) != tuple(old.stride())
             or alias.dtype != old.dtype
         ):
-            raise RuntimeError(
-                f"MoE rebalance arena alias for {name!r} has an incompatible layout"
-            )
+            raise RuntimeError(f"MoE rebalance arena alias for {name!r} has an incompatible layout")
         if not alias.is_cuda or int(alias.data_ptr()) != int(arena_view.data_ptr()):
-            raise RuntimeError(
-                f"MoE rebalance arena alias for {name!r} is not its allocator view"
-            )
+            raise RuntimeError(f"MoE rebalance arena alias for {name!r} is not its allocator view")
         if old.is_meta:
             setattr(
                 module,

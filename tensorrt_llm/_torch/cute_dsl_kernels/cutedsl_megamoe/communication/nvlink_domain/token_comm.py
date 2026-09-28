@@ -1454,9 +1454,9 @@ class TokenCommNonDeterministic(KernelComponent):
             raise ValueError(
                 f"Unsupported token_back_ready_granularity {self.token_back_ready_granularity!r}."
             )
-        if self.token_back_ready_granularity == "token_tile" and (
+        if self.token_back_ready_granularity == "token_tile" and (  # nosec B105 -- scheduler mode name, not a credential
             self.token_back_mode not in ("standalone_warps", "reuse_dispatch_warps")
-            or self.token_back_schedule_mode != "atomic_counter"
+            or self.token_back_schedule_mode != "atomic_counter"  # nosec B105 -- scheduler mode name, not a credential
         ):
             raise ValueError(
                 "token_tile return-ready requires standalone_warps or reuse_dispatch_warps with atomic_counter."
@@ -1718,7 +1718,7 @@ class TokenCommNonDeterministic(KernelComponent):
         if self.token_back_enabled:
             fc2_done_slots = (
                 self.max_fc1_ready_slot_count
-                if self.token_back_ready_granularity == "token_tile"
+                if self.token_back_ready_granularity == "token_tile"  # nosec B105 -- scheduler mode name, not a credential
                 else self.experts_per_rank
             )
             workspace.register(
@@ -2295,7 +2295,7 @@ class TokenCommNonDeterministic(KernelComponent):
         next_dense_token = self.next_token(next_dense_token)
         expert_valid_begin = Int32(0)
         transfer_phase = Int32(0)
-        if cutlass.const_expr(self.token_back_ready_granularity == "token_tile"):
+        if cutlass.const_expr(self.token_back_ready_granularity == "token_tile"):  # nosec B105 -- scheduler mode name, not a credential
             expert_ready_slot_begin = Int32(0)
             last_ready_slot = Int32(-1)
 
@@ -2304,7 +2304,7 @@ class TokenCommNonDeterministic(KernelComponent):
         while local_expert < Int32(self.experts_per_rank):
             expert_token_count = owned_sizes[local_expert]
             expert_valid_end = expert_valid_begin + expert_token_count
-            if cutlass.const_expr(self.token_back_ready_granularity == "expert"):
+            if cutlass.const_expr(self.token_back_ready_granularity == "expert"):  # nosec B105 -- scheduler mode name, not a credential
                 if next_dense_token < expert_valid_end:
                     token_tile_count = (
                         expert_token_count + Int32(self.tokens_per_fc1_ready_slot - 1)
@@ -2322,7 +2322,7 @@ class TokenCommNonDeterministic(KernelComponent):
 
             while next_dense_token < expert_valid_end:
                 token_in_expert = next_dense_token - expert_valid_begin
-                if cutlass.const_expr(self.token_back_ready_granularity == "token_tile"):
+                if cutlass.const_expr(self.token_back_ready_granularity == "token_tile"):  # nosec B105 -- scheduler mode name, not a credential
                     # Same rank-local expert/tile prefix as FC1 ready; separate counter storage.
                     ready_slot = expert_ready_slot_begin + token_in_expert // Int32(
                         self.tokens_per_fc1_ready_slot
@@ -2518,7 +2518,7 @@ class TokenCommNonDeterministic(KernelComponent):
                 cute.arch.sync_warp()
                 next_dense_token = self.next_token(next_dense_token)
 
-            if cutlass.const_expr(self.token_back_ready_granularity == "token_tile"):
+            if cutlass.const_expr(self.token_back_ready_granularity == "token_tile"):  # nosec B105 -- scheduler mode name, not a credential
                 # Advance even when this worker skipped the expert (empty experts contribute zero).
                 expert_ready_slot_begin = expert_ready_slot_begin + (
                     expert_token_count + Int32(self.tokens_per_fc1_ready_slot - 1)

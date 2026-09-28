@@ -18,7 +18,7 @@ import hashlib
 import importlib.util
 import os
 from pathlib import Path
-import subprocess
+import subprocess  # nosec B404 -- compiler argv is validated and shell=False
 import sys
 import sysconfig
 import tempfile
@@ -45,6 +45,7 @@ _DEFAULT_ARCH = "sm_100"
 _SUPPORTED_ARCHES = ("sm_100", "sm_100a", "sm_103", "sm_107", "sm_107a")
 
 _NATIVE: dict[str, object] = {}
+_DEFAULT_BUILD_ROOT = Path(tempfile.gettempdir())
 
 
 def _target_arch() -> str:
@@ -226,7 +227,7 @@ def load_hierarchical_native(force: bool = False):
         argv=_sami_argv,
         sources=(_SAMI_SOURCE, _SAMI_HEADER),
         build_dir_env="MEGAMOE_SAMI_HIERARCHICAL_BUILD_DIR",
-        default_build_dir="/tmp/megamoe_sami_hierarchical",
+        default_build_dir=str(_DEFAULT_BUILD_ROOT / "megamoe_sami_hierarchical"),
         failure="hierarchical SAMI native build failed",
         validate=_validate_sami,
         force=force,
@@ -241,7 +242,7 @@ def load_tma_native(force: bool = False):
                  _COPY_POLICY_HEADER, _SAMI_SOURCE.with_name("gpu_plan.h"),
                  _SAMI_SOURCE.with_name("gpu_plan_builder.cuh")),
         build_dir_env="MEGAMOE_SAMI_TMA_BUILD_DIR",
-        default_build_dir="/tmp/megamoe_sami_tma",
+        default_build_dir=str(_DEFAULT_BUILD_ROOT / "megamoe_sami_tma"),
         failure="SM TMA copy build failed (CUDA 13.1+ required)",
         validate=_validate_sami, force=force, commands=_tma_commands,
     )
@@ -255,7 +256,7 @@ def load_scheduler_native(force: bool = False):
         argv=_halo_q_argv,
         sources=(_HALO_Q_SOURCE, _COPY_POLICY_HEADER),
         build_dir_env="MEGAMOE_HALO_Q_BUILD_DIR",
-        default_build_dir="/tmp/megamoe_halo_q_cuda",
+        default_build_dir=str(_DEFAULT_BUILD_ROOT / "megamoe_halo_q_cuda"),
         failure="pure-CUDA scheduler build failed",
         validate=_validate_halo_q,
         force=force,

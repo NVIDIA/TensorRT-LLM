@@ -270,13 +270,16 @@ class QueueStartupContractTests(unittest.TestCase):
             return object()
 
         constant_names = {
-            "_FLASHINFER_WORKSPACE_ROOT", "_FLASHINFER_WORKSPACE_ENV",
-            "_FLASHINFER_WORKSPACE_MANAGED_ENV", "_FLASHINFER_WORKER_BOOTSTRAP",
+            "_FLASHINFER_WORKSPACE_ROOT",
+            "_FLASHINFER_WORKSPACE_ENV",
+            "_FLASHINFER_WORKSPACE_MANAGED_ENV",
+            "_FLASHINFER_WORKER_BOOTSTRAP",
         }
         source = ast.parse((REPO / "tensorrt_llm/llmapi/mpi_session.py").read_text())
         constants = {
             target.id: ast.literal_eval(statement.value)
-            for statement in source.body if isinstance(statement, ast.Assign)
+            for statement in source.body
+            if isinstance(statement, ast.Assign)
             for target in statement.targets
             if isinstance(target, ast.Name) and target.id in constant_names
         }
@@ -297,7 +300,11 @@ class QueueStartupContractTests(unittest.TestCase):
         self.assertEqual(captured["max_workers"], 2)
         self.assertEqual(
             captured["python_args"],
-            ["-c", constants["_FLASHINFER_WORKER_BOOTSTRAP"], constants["_FLASHINFER_WORKSPACE_ROOT"]],
+            [
+                "-c",
+                constants["_FLASHINFER_WORKER_BOOTSTRAP"],
+                constants["_FLASHINFER_WORKSPACE_ROOT"],
+            ],
         )
         self.assertIsNotNone(session.mpi_pool)
 
