@@ -764,6 +764,7 @@ def dspark_propose(
     temperature: float = 0.0,
     return_confidence: bool = False,
     return_logits: bool = False,
+    confidence_hidden: Optional[torch.Tensor] = None,
 ) -> tuple:
     """Produce DSpark draft tokens for one block (functional-first, static length).
 
@@ -774,8 +775,9 @@ def dspark_propose(
     Args:
         base_logits: ``[batch, block_size, vocab]`` from the backbone + lm_head.
         bonus_token_ids: ``[batch]`` the token preceding the first draft position.
-        block_hidden: ``[batch, block_size, hidden]`` backbone hidden (feeds the
-            confidence head, and the RNN-head variant).
+        block_hidden: ``[batch, block_size, hidden]`` proposal-head hidden.
+        confidence_hidden: Optional separate pre-normalization confidence input.
+            Defaults to ``block_hidden`` for callers without a separate input.
         markov_head / confidence_head: the validated DSpark heads (may be None).
         return_confidence: Compute fixed-shape per-position confidence logits.
             This is a run-constant flag so CUDA-graph execution cannot diverge.
@@ -807,6 +809,7 @@ def dspark_propose(
     # CUDA-graph capturable.
     confidence = None
     if return_confidence and confidence_head is not None:
+        scoring_hidden = block_hidden if confidence_hidden is None else confidence_hidden
         # prev token at position k is [bonus, draft_0, ..., draft_{k-1}]
         prev_ids = torch.cat([bonus_token_ids.unsqueeze(1), draft_tokens[:, :-1]], dim=1)
         prev_emb = (
@@ -815,9 +818,9 @@ def dspark_propose(
             else None
         )
         confidence = (
-            confidence_head(block_hidden, prev_embeddings=prev_emb)
+            confidence_head(scoring_hidden, prev_embeddings=prev_emb)
             if prev_emb is not None
-            else confidence_head(block_hidden)
+            else confidence_head(scoring_hidden)
         )
     if return_logits:
         return draft_tokens, confidence, draft_logits
@@ -1942,6 +1945,7 @@ class DSv4DSparkDraftModel(nn.Module):
         """
         last = self.mtp_layers[-1]
         h = last.hc_head(block_hidden)
+        confidence_hidden = h if return_confidence and last.confidence_head is not None else None
         h = last.norm(h)
         base_logits = self.lm_head(h)
         return dspark_propose(
@@ -1954,6 +1958,7 @@ class DSv4DSparkDraftModel(nn.Module):
             temperature=temperature,
             return_confidence=return_confidence,
             return_logits=return_logits,
+            confidence_hidden=confidence_hidden,
         )
 
 
