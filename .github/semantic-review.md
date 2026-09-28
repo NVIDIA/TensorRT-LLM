@@ -6,8 +6,29 @@
 The workflow asks CodeRabbit to inspect the combined behavior of a PR and its
 target branch. It publishes a commit status named
 **Semantic conflict with target branch / PR #N** on the requested head commit.
-Keep this status **non-required** in branch protection/rulesets. AI can miss
-defects and report false positives; reviewers should read the linked evidence.
+Keep this status and its workflow **non-required** in branch protection/rulesets.
+PASS, FAIL and INCONCLUSIVE are all best-effort AI judgments that can be incomplete
+or incorrect. Authors and reviewers should independently verify the evidence and
+relevant behavior. Their advisory results do not, by themselves, block GitHub
+merging; required CI, approvals and other merge rules still apply. A confirmed
+defect should not be ignored because the status is non-required.
+
+## Analysis scope
+
+The prompt checks behavioral compatibility involving the PR changes, including
+when head already contains target. It asks CodeRabbit to distinguish cross-branch
+interactions from PR-local compatibility defects and to verify how both sides'
+edits combine. An alleged caller/definition mismatch must remain after three-way
+merge analysis before it can support FAIL. Unresolved relevant
+textual conflicts must not be replaced with an assumed resolution.
+
+FAIL needs a supported trigger, a reachable failure path and evidence that paired
+edits, feature gates or recovery logic do not prevent the problem. Unrelated
+pre-existing defects, missing tests alone and wording-only improvements do not
+support FAIL. Missing material evidence supports INCONCLUSIVE. Each reply must
+include the advisory notice and put its fixed-revision citations inside the
+`SEMANTIC_REVIEW` section. These are instructions to the AI, not guarantees of
+its compliance or semantic accuracy.
 
 ## Triggers
 
@@ -177,6 +198,28 @@ audit of the final merge tree. Scheduled recovery covers open PRs; a missed
 publication on a closed PR requires a subsequent trusted reply event or a
 publisher job rerun.
 
+## Correcting a disputed result
+
+Keep the original request and reply as evidence. Record the disputed finding and
+fixed-revision counter-evidence in the PR discussion; a human comment does not
+change the machine result. Do not edit the bot's verdict to impersonate a new AI
+judgment, or delete the reply to clear a failure. Deleting the latest valid reply
+returns its request to waiting and can make it eligible for the bounded timeout
+retry. Hiding a comment is only a display change, not a result override.
+
+After a prompt or code fix is available, use **Run workflow** with `pull_number`
+to request another analysis. It creates a new request ID for the PR's current
+head and current target, even if they match the preceding request. Verify the
+new reply's revisions and status; a result for a newer target does not prove that
+an earlier fixed-input finding was wrong. An older request's reply cannot replace
+the latest request's result. Re-running only the publication job reprocesses the
+existing reply; it does not ask AI to reconsider the evidence.
+
+Completed legacy Check Runs remain historical records even after a new commit
+status is published. Correcting the current status does not automatically clear
+those older checks. A prompt update alone neither reruns completed requests nor
+retracts their findings.
+
 ## Deployment and permissions
 
 Install the workflows and scripts on the repository's default branch. Privileged
@@ -200,8 +243,9 @@ node --test .github/scripts/semantic_review*.test.js
 ```
 
 `semantic_review_cases.js` freezes three real incidents in divergent,
-already-integrated and repaired states for analysis replay. Integrated inputs
-use the actual defective merge commits to exercise `merge_base == target`;
+already-integrated and repaired states, plus three paired-edit controls, for
+analysis replay. Integrated inputs use the actual defective merge commits to
+exercise `merge_base == target`;
 they are not newly synthesized rebases. Repair controls compare each historical
 fix with its immediate parent to exclude unrelated intervening changes. Build
 each request with the same `command()` used by the workflow:
@@ -210,8 +254,16 @@ each request with the same `command()` used by the workflow:
 node -e "const {randomUUID}=require('node:crypto'); const {command}=require('./.github/scripts/semantic_review'); const cases=require('./.github/scripts/semantic_review_cases'); console.log(command({...cases[0],id:randomUUID()}));"
 ```
 
-Replay all nine inputs with the final prompt, retaining request IDs, input SHAs, raw
-replies, concrete findings and timings, including missed/inconclusive results.
+The paired-edit controls use the fixed inputs of PRs #19465, #19397 and #18813.
+They exercise coordinated executor changes, a retained mock default, and
+coordinated warmup changes. The alleged caller/definition, missing-stub and
+missing-metadata mismatches must not be reported when three-way integration
+preserves the paired edits. #19397 also has textual conflicts, so rejecting that
+specific false finding does not require an overall PASS. Fixtures carry no
+expected answer into `command()`.
+
+Replay all twelve inputs with the final prompt, retaining request IDs, input SHAs,
+raw replies, concrete findings and timings, including missed/inconclusive results.
 Use an independent context without giving the incident explanation or a repair.
 If the hosting discussion reveals the answer, label the run as a replay rather
 than a blind evaluation. Fixed repeats characterize variability; production
@@ -219,7 +271,14 @@ uses one initial request and at most one automatic timeout retry per version.
 Assess known defect detection and repair false positives separately; a narrow
 repair control does not establish general accuracy.
 
+A defective input is successfully flagged when FAIL identifies at least one
+source-supported, in-scope incompatibility for developers to investigate.
+Finding every known defect or providing a complete fix is not required. Record
+additional omissions as observations, not failed alerts. Uncertainty about one
+path must not override a confirmed incompatibility on another. Repair inputs
+and paired-edit controls also check for unsupported FAIL findings.
+
 The deterministic tests simulate GitHub. A real AI reply and a real commit
 status write are separate validation layers and must be reported as such.
-Historical cases are already merged; replay them explicitly without broadening
-the production candidate filter.
+Fixtures preserve historical revisions; replay them explicitly without
+broadening the production candidate filter.
