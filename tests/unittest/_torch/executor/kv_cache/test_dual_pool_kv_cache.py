@@ -147,7 +147,6 @@ def _make_mock_model_engine(model_config):
     engine = Mock()
     engine.model.model_config = model_config
     engine.dtype = torch.bfloat16
-    engine.is_draft_model = False
     engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
     engine.input_processor = SimpleNamespace(requires_encoder_features=False)
     return engine
