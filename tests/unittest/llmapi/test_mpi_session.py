@@ -45,6 +45,29 @@ def test_mpi_session_basic():
     assert results == [2, 2, 2, 2], results
 
 
+def rendezvous_environment_probe():
+    from mpi4py import MPI
+
+    MPI.COMM_WORLD.barrier()
+    return os.environ.get("MASTER_ADDR"), os.environ.get("MASTER_PORT")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
+def test_mpi_pool_session_forwards_current_rendezvous(monkeypatch):
+    # The MPI launcher may outlive a pool and retain its original environment.
+    for address, port in [("127.0.0.1", "33271"), ("localhost", "51003")]:
+        monkeypatch.setenv("MASTER_ADDR", address)
+        monkeypatch.setenv("MASTER_PORT", port)
+        session = MpiPoolSession(n_workers=2, wait_shutdown=True)
+        try:
+            assert session.submit_sync(rendezvous_environment_probe) == [
+                (address, port), (address, port)
+            ]
+        finally:
+            session.shutdown()
+
+
 def flashinfer_environment_probe():
     """Return this worker's FlashInfer isolation paths."""
     # Keep importing this from initializing MPI in the submitting process.
