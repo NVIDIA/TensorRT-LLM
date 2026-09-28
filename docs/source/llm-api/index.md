@@ -69,6 +69,9 @@ A typical result has the following structure (values are illustrative):
     "general_warmup_seconds": 0.387,
     "autotuner_warmup_seconds": 0.041,
     "mamba_hybrid_warmup_seconds": 0.000,
+    "ctx_cuda_graph_warmup_seconds": 0.480,
+    "ctx_cuda_graph_capture_seconds": 0.320,
+    "post_ctx_cuda_graph_capture_warmup_seconds": 0.110,
     "gen_cuda_graph_warmup_seconds": 0.566,
     "gen_cuda_graph_capture_seconds": 0.950,
     "dg_paged_mqa_warmup_seconds": 0.000,
@@ -115,6 +118,9 @@ A typical result has the following structure (values are illustrative):
 }
 ```
 
+Some of the timing metrics may not appear or may show as a very small value if the corresponding codepath is not executed, e.g.
+if the prefill CUDA graphs are not enabled, its related metrics "...ctx_cuda_graph..." will not appear.
+
 The `py_executor` property contains the timed scopes in `create_py_executor()`, which creates the [PyExecutor](../developer-guide/overview.md).
 
 | PyExecutor metric | Scope |
@@ -150,7 +156,7 @@ stages.
 |---------------------|-------|
 | `sampling_warmup_seconds` | Warm up sampling kernels and run `torch.compile()` on sampling operators. |
 | `attention_warmup_seconds` | Warm up the attention backend and kernels. |
-| `general_warmup_seconds` | Warm up general input shapes and release temporary workspaces. |
+| `general_warmup_seconds` | Prepare and warm up general input shapes and release temporary workspaces. |
 | `autotuner_warmup_seconds` | Run kernel autotuning warmup. |
 | `mamba_hybrid_warmup_seconds` | Warm up Mamba hybrid kernels, when applicable. |
 | `gen_cuda_graph_warmup_seconds` | Run the warmup-only pass for generation and mixed encoder-decoder CUDA graphs, including LoRA autotuning and pipeline-parallel cache synchronization and cleanup. |
@@ -160,7 +166,7 @@ stages.
 | `post_ctx_cuda_graph_capture_warmup_seconds` | Warm up prefill logits buffers with many requests after CUDA graph capture. |
 | `dg_paged_mqa_warmup_seconds` | Warm up DeepGEMM paged-MQA metadata, when applicable. |
 | `cute_dsl_radix_topk_warmup_seconds` | Warm up the CuTe DSL radix top-k kernel, when applicable. |
-| `memory_pool_prepopulation_seconds` | Pre-populate the memory pool with maximum-shape allocations. |
+| `memory_pool_prepopulation_seconds` | Prepare maximum-shape requests and pre-populate the memory pool. |
 | `kv_cache_cleanup_seconds` | Check and clear invalid KV cache values produced during warmup. |
 | `total_warmup_seconds` | Complete model-engine warmup, including KV cache cleanup. |
 
