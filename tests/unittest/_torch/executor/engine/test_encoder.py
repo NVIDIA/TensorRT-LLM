@@ -443,6 +443,7 @@ def _warmup_runner(*, world_size: int) -> EncoderRunner:
     runner._encoder_cuda_graph_runner = SimpleNamespace(
         enabled=True,
         build_capture_sequence_lengths=Mock(return_value=[1]),
+        extra_input_specs=[],
     )
     runner._prepare_encoder_batch = Mock(
         return_value=EncoderPreparedInputs({}, sequence_lengths=[1])
