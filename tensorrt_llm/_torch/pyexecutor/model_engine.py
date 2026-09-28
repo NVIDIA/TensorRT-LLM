@@ -2056,8 +2056,8 @@ class PyTorchModelEngine(ModelEngine):
                             f"num_gen_tokens={num_gen_tokens}",
                             record=False,
                             log_start=False):
-                        _run_discarded_warmup_forward(
-                            self, batch, resource_manager)
+                        _run_discarded_warmup_forward(self, batch,
+                                                      resource_manager)
                         torch.cuda.synchronize()
             except torch.OutOfMemoryError:
                 if self._is_distributed_forward():
@@ -2172,8 +2172,8 @@ class PyTorchModelEngine(ModelEngine):
                         record=False,
                         log_start=True):
                     with trtllm_gen_fmha_jit_warmup():
-                        _run_discarded_warmup_forward(
-                            self, batch, resource_manager)
+                        _run_discarded_warmup_forward(self, batch,
+                                                      resource_manager)
                     torch.cuda.synchronize()
 
     @staticmethod
