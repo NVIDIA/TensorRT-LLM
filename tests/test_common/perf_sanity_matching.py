@@ -33,6 +33,7 @@ def get_test_case_match_keys() -> list[str]:
 def benchmark_data_matches(
     history_data: Mapping[str, object],
     new_data: Mapping[str, object],
+    *,
     match_keys: Iterable[str],
 ) -> bool:
     """Return whether historical and new benchmark data match on all requested fields."""
