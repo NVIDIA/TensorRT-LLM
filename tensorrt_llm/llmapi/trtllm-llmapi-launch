@@ -86,14 +86,12 @@ PY
 function configure_flashinfer_workspace {
     local workspace_root="${HOME:+$HOME/.cache/tensorrt_llm/flashinfer}"
     if [ -n "$TRTLLM_CACHE_DIR" ]; then
-        local cache_root="$TRTLLM_CACHE_DIR"
-        if [[ "$cache_root" == "~" || "$cache_root" == "~/"* ]]; then
-            if [ -z "$HOME" ]; then
-                log_stderr "HOME is unset; cannot expand TRTLLM_CACHE_DIR=$TRTLLM_CACHE_DIR"
-                use_unique_flashinfer_workspace
-                return
-            fi
-            cache_root="${cache_root/#\~/$HOME}"
+        local cache_root
+        if ! cache_root=$(python3 -S -c \
+            'import os, sys; print(os.path.expanduser(sys.argv[1]))' "$TRTLLM_CACHE_DIR"); then
+            log_stderr "Failed to expand TRTLLM_CACHE_DIR=$TRTLLM_CACHE_DIR"
+            use_unique_flashinfer_workspace
+            return
         fi
         workspace_root="${cache_root%/}/flashinfer"
     fi

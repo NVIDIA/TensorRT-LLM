@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import shlex
 import subprocess  # nosec B404
 import sys
 import threading
@@ -283,14 +284,16 @@ def _launcher_env(tmp_path: Path, home: str) -> dict:
     """Environment for a rank-0 launcher-managed run of ``trtllm-llmapi-launch``.
 
     ``python3`` and ``openssl`` are stubbed so the launcher can hand out an IPC
-    address and an HMAC key without importing tensorrt_llm; the stubbed
-    ``python3 -S`` used for the workspace lock exits 0, so the persistent slot
-    is treated as acquired.
+    address and an HMAC key without importing tensorrt_llm. Stdlib-only
+    ``python3 -S`` calls use the test interpreter.
     """
     stub_bin = tmp_path / "bin"
     stub_bin.mkdir(exist_ok=True)
     python_stub = stub_bin / "python3"
     python_stub.write_text("#!/bin/sh\n"
+                           "if [ \"$1\" = \"-S\" ]; then\n"
+                           f"    exec {shlex.quote(sys.executable)} \"$@\"\n"
+                           "fi\n"
                            "if [ \"$1\" = \"-c\" ]; then\n"
                            "    echo ipc:///tmp/trtllm-pmi-workspace-test\n"
                            "fi\n")
@@ -384,6 +387,9 @@ def test_llmapi_launch_respects_unified_cache_root(tmp_path: Path) -> None:
     stub_bin.mkdir()
     python_stub = stub_bin / "python3"
     python_stub.write_text("#!/bin/sh\n"
+                           "if [ \"$1\" = \"-S\" ]; then\n"
+                           f"    exec {shlex.quote(sys.executable)} \"$@\"\n"
+                           "fi\n"
                            "if [ \"$1\" = \"-c\" ]; then\n"
                            "    echo ipc:///tmp/trtllm-unified-cache-test\n"
                            "fi\n")
@@ -427,6 +433,23 @@ def test_llmapi_launch_respects_unified_cache_root(tmp_path: Path) -> None:
     assert f"FLASHINFER_WORKSPACE_BASE={workspace}" in result.stdout
     assert "TRTLLM_FLASHINFER_WORKSPACE_MANAGED=1" in result.stdout
     assert "better cache reuse" in result.stderr
+
+
+@pytest.mark.cpu_only
+def test_llmapi_launch_matches_bootstrap_expansion_with_trailing_home(
+        tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    cache_root = home / "unified"
+    env = _launcher_env(tmp_path, f"{home}{os.sep}")
+    env["TRTLLM_CACHE_DIR"] = "~/unified"
+    env["FLASHINFER_WORKSPACE_BASE"] = str(cache_root / "flashinfer")
+
+    result = _run_launcher_env(env)
+
+    workspace = cache_root / "flashinfer" / "rank-0"
+    assert f"FLASHINFER_WORKSPACE_BASE={workspace}" in result.stdout
+    assert "TRTLLM_FLASHINFER_WORKSPACE_MANAGED=1" in result.stdout
 
 
 @pytest.mark.cpu_only
