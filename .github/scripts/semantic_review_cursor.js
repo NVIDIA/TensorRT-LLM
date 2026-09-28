@@ -19,17 +19,20 @@ const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const { withReserve } = require('./semantic_review_request');
 
-const ARTIFACT = 'semantic-review-cursor';
+const ARTIFACTS = ['semantic-review-cursor', 'semantic-review-cursor-next'];
 
 async function findCursorArtifact({ github, context }) {
   if (context.eventName !== 'schedule') return;
   return withReserve(github, async () => {
-    const artifacts = await github.paginate(github.rest.actions.listArtifactsForRepo,
-      { ...context.repo, name: ARTIFACT, per_page: 100 });
+    const artifacts = [];
+    for (const name of ARTIFACTS) {
+      artifacts.push(...await github.paginate(github.rest.actions.listArtifactsForRepo,
+        { ...context.repo, name, per_page: 100 }));
+    }
     artifacts.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || b.id - a.id);
     const repository = `${context.repo.owner}/${context.repo.repo}`.toLowerCase();
     for (const artifact of artifacts) {
-      if (artifact.name !== ARTIFACT) continue;
+      if (!ARTIFACTS.includes(artifact.name)) continue;
       const { data: run } = await github.rest.actions.getWorkflowRun({
         ...context.repo, run_id: artifact.workflow_run.id,
       });
@@ -52,8 +55,10 @@ function parseCursor(text) {
 }
 
 async function restoreCursor({ github, context }) {
+  if (context.eventName !== 'schedule') return;
   const artifact = await findCursorArtifact({ github, context });
-  if (!artifact) return;
+  const nextArtifact = ARTIFACTS.find(name => name !== artifact?.name);
+  if (!artifact) return { nextArtifact };
   const { data } = await withReserve(github, () => github.rest.actions.downloadArtifact({
     ...context.repo, artifact_id: artifact.id, archive_format: 'zip',
   }));
@@ -61,8 +66,9 @@ async function restoreCursor({ github, context }) {
   try {
     const archive = join(directory, 'cursor.zip');
     writeFileSync(archive, Buffer.from(data));
-    return parseCursor(execFileSync('unzip', ['-p', archive, 'cursor.json'],
+    const cursor = parseCursor(execFileSync('unzip', ['-p', archive, 'cursor.json'],
       { encoding: 'utf8', maxBuffer: 4096 }));
+    return { cursor, nextArtifact };
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

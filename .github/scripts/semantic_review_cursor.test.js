@@ -20,6 +20,7 @@ const test = require('node:test');
 const { findCursorArtifact, parseCursor, restoreCursor } = require('./semantic_review_cursor');
 
 const ARTIFACT = 'semantic-review-cursor';
+const NEXT_ARTIFACT = 'semantic-review-cursor-next';
 const archives = {
   valid: 'UEsDBBQAAAAAAOlbPF0CF26zEQAAABEAAAALAAAAY3Vyc29yLmpzb257Imxhc3RfcHIiOjE5NjIxfVBLAQIUAxQAAAAAAOlbPF0CF26zEQAAABEAAAALAAAAAAAAAAAAAACAAQAAAABjdXJzb3IuanNvblBLBQYAAAAAAQABADkAAAA6AAAAAAA=',
   missing: 'UEsDBBQAAAAAAOlbPF0CF26zEQAAABEAAAAKAAAAb3RoZXIuanNvbnsibGFzdF9wciI6MTk2MjF9UEsBAhQDFAAAAAAA6Vs8XQIXbrMRAAAAEQAAAAoAAAAAAAAAAAAAAIABAAAAAG90aGVyLmpzb25QSwUGAAAAAAEAAQA4AAAAOQAAAAAA',
@@ -45,7 +46,9 @@ function fixture(pages = [[]], options = {}) {
     for (const hook of state.before) await hook();
     state.calls.push({ kind, ...args });
     state.remaining -= 1;
-    if (options.errors?.[kind]) throw options.errors[kind];
+    if (options.errors?.[kind] && (!options.errorName || options.errorName === args.name)) {
+      throw options.errors[kind];
+    }
     const response = { data: operation(args),
       headers: { 'x-ratelimit-remaining': String(state.remaining) } };
     for (const hook of state.after) await hook(response);
@@ -75,7 +78,8 @@ function fixture(pages = [[]], options = {}) {
         return { data: { resources: { core: { remaining: state.remaining } } } };
       } },
       actions: {
-        listArtifactsForRepo: api('list', ({ page }) => ({ artifacts: pages[page - 1] })),
+        listArtifactsForRepo: api('list', ({ page, name }) =>
+          ({ artifacts: pages[page - 1].filter(item => item.name === name) })),
         getWorkflowRun: api('run', ({ run_id: id }) => options.runs?.[id] || trustedRun()),
         downloadArtifact: api('download', () => options.archive ?? zip('valid')),
       },
@@ -94,18 +98,18 @@ test('manual and publisher invocations return without touching API or cursor fil
   }
 });
 
-test('lookup paginates the exact artifact name and selects newest creation time then ID', async () => {
+test('lookup paginates both exact artifact names sequentially and sorts their combined results', async () => {
   const older = artifact(900, { created_at: '2026-09-01T00:00:00Z' });
   const firstTie = artifact(1, { created_at: '2026-09-03T00:00:00Z' });
-  const lastTie = artifact(2, { created_at: firstTie.created_at });
+  const lastTie = artifact(2, { name: NEXT_ARTIFACT, created_at: firstTie.created_at });
   const unrelated = artifact(9999, { name: 'semantic-review-cursor-other',
     created_at: '2026-09-04T00:00:00Z' });
   const f = fixture([[older, firstTie], [lastTie, unrelated]]);
   assert.equal((await f.find()).id, lastTie.id);
   const lists = f.state.calls.filter(call => call.kind === 'list');
-  assert.equal(lists.length, 2);
+  assert.equal(lists.length, 4);
+  assert.deepEqual(lists.map(call => call.name), [ARTIFACT, ARTIFACT, NEXT_ARTIFACT, NEXT_ARTIFACT]);
   for (const call of lists) {
-    assert.equal(call.name, ARTIFACT);
     assert.equal(call.per_page, 100);
     assert.equal(call.owner, repo.owner);
     assert.equal(call.repo, repo.repo);
@@ -145,7 +149,7 @@ test('manual, publisher, fork and wrong-workflow artifacts cannot supply the cur
 
 test('the latest trusted artifact being expired fails instead of falling back', async () => {
   const older = artifact(1);
-  const expired = artifact(2, { expired: true });
+  const expired = artifact(2, { name: NEXT_ARTIFACT, expired: true });
   const f = fixture([[older, expired]]);
   await assert.rejects(f.find(), /artifact has expired/);
   assert.deepEqual(f.state.calls.filter(call => call.kind === 'run').map(call => call.run_id),
@@ -186,7 +190,10 @@ test('quota reserve stops lookup before spending the last 1000 requests', async 
   await assert.rejects(during.find(), { code: 'SEMANTIC_REVIEW_QUOTA' });
   assert.equal(during.state.remaining, 1000);
   assert.deepEqual(during.state.calls.map(call => call.kind), ['list']);
-  const enough = fixture([[artifact(1)]], { remaining: 1002 });
+  const beforeRun = fixture([[artifact(1)]], { remaining: 1002 });
+  await assert.rejects(beforeRun.find(), { code: 'SEMANTIC_REVIEW_QUOTA' });
+  assert.deepEqual(beforeRun.state.calls.map(call => call.kind), ['list', 'list']);
+  const enough = fixture([[artifact(1)]], { remaining: 1003 });
   assert.equal((await enough.find()).id, 1);
   assert.equal(enough.state.remaining, 1000);
 });
@@ -206,12 +213,12 @@ test('cursor JSON accepts only a positive safe integer last_pr', () => {
 test('restore downloads the trusted artifact as ZIP and reads its exact cursor.json entry', async () => {
   const before = temporaryCursors();
   const f = fixture([[artifact(1)]]);
-  assert.equal(await f.restore(), 19621);
+  assert.deepEqual(await f.restore(), { cursor: 19621, nextArtifact: NEXT_ARTIFACT });
   assert.deepEqual(f.state.calls.filter(call => call.kind === 'download'),
     [{ kind: 'download', ...repo, artifact_id: 1, archive_format: 'zip' }]);
   assert.deepEqual(temporaryCursors(), before);
   const absent = fixture();
-  assert.equal(await absent.restore(), undefined);
+  assert.deepEqual(await absent.restore(), { nextArtifact: ARTIFACT });
   assert.equal(absent.state.calls.some(call => call.kind === 'download'), false);
 });
 
@@ -237,13 +244,50 @@ test('restore propagates download API errors and releases its quota hooks', asyn
 });
 
 test('restore rechecks quota after lookup and does not download at the 1000-request reserve', async () => {
-  const f = fixture([[artifact(1)]], { remaining: 1002 });
+  const f = fixture([[artifact(1)]], { remaining: 1003 });
   await assert.rejects(f.restore(), { code: 'SEMANTIC_REVIEW_QUOTA' });
   assert.equal(f.state.remaining, 1000);
   assert.equal(f.state.rateReads, 2);
-  assert.deepEqual(f.state.calls.map(call => call.kind), ['list', 'run']);
+  assert.deepEqual(f.state.calls.map(call => call.kind), ['list', 'list', 'run']);
   assert.equal(f.state.before.length + f.state.after.length, 0);
-  const enough = fixture([[artifact(1)]], { remaining: 1003 });
-  assert.equal(await enough.restore(), 19621);
+  const enough = fixture([[artifact(1)]], { remaining: 1004 });
+  assert.deepEqual(await enough.restore(), { cursor: 19621, nextArtifact: NEXT_ARTIFACT });
   assert.equal(enough.state.remaining, 1000);
+});
+
+test('a failure listing the second slot propagates even when the first has a valid cursor', async () => {
+  const failure = Object.assign(new Error('Second slot unavailable'), { status: 503 });
+  const f = fixture([[artifact(1)]], { errors: { list: failure }, errorName: NEXT_ARTIFACT });
+  await assert.rejects(f.restore(), error => error === failure);
+  assert.deepEqual(f.state.calls.map(call => call.name), [ARTIFACT, NEXT_ARTIFACT]);
+});
+
+test('either slot can be newest and successful subsequent saves alternate the target name', async () => {
+  for (const latestName of [ARTIFACT, NEXT_ARTIFACT]) {
+    const otherName = latestName === ARTIFACT ? NEXT_ARTIFACT : ARTIFACT;
+    const pages = [[artifact(1, { name: otherName }), artifact(2, { name: latestName })]];
+    const f = fixture(pages);
+    const restored = await f.restore();
+    assert.deepEqual(restored, { cursor: 19621, nextArtifact: otherName });
+    assert.equal((await f.find()).id, 2);
+    pages[0] = pages[0].filter(item => item.name !== restored.nextArtifact);
+    pages[0].push(artifact(3, { name: restored.nextArtifact }));
+    assert.deepEqual(await f.restore(), { cursor: 19621, nextArtifact: latestName });
+    assert.equal((await f.find()).id, 3);
+  }
+});
+
+test('a same-run save failure after deleting the older target slot preserves the restored latest cursor', async () => {
+  const run = { id: 9001 };
+  const older = artifact(1, { name: ARTIFACT, workflow_run: run });
+  const latest = artifact(2, { name: NEXT_ARTIFACT, workflow_run: run });
+  const pages = [[older, latest]];
+  const f = fixture(pages);
+  const restored = await f.restore();
+  assert.deepEqual(restored, { cursor: 19621, nextArtifact: ARTIFACT });
+  pages[0] = pages[0].filter(item => item.name !== restored.nextArtifact);
+  assert.deepEqual(await f.restore(), restored);
+  assert.equal((await f.find()).id, latest.id);
+  assert.deepEqual(f.state.calls.filter(call => call.kind === 'download').map(call => call.artifact_id),
+    [latest.id, latest.id]);
 });

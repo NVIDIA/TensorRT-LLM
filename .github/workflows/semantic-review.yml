@@ -59,7 +59,8 @@ jobs:
             const {dirname} = require('node:path');
             const {restoreCursor} = require('./.github/scripts/semantic_review_cursor.js');
             const {discover} = require('./.github/scripts/semantic_review_request.js');
-            const cursor = await restoreCursor({github, context});
+            const state = await restoreCursor({github, context});
+            const cursor = state?.cursor;
             if (context.eventName === 'schedule' && cursor === undefined) {
               core.info('No retained semantic review cursor; start with the newest PR.');
             }
@@ -68,6 +69,7 @@ jobs:
               mkdirSync(dirname(process.env.CURSOR_PATH), {recursive: true});
               writeFileSync(process.env.CURSOR_PATH, JSON.stringify({last_pr: result.cursor}));
               core.setOutput('cursor', result.cursor);
+              core.setOutput('cursor_artifact', state.nextArtifact);
               core.info(`Next scheduled scan continues below PR #${result.cursor}.`);
             }
             core.setOutput('jobs', JSON.stringify(result.jobs));
@@ -76,7 +78,7 @@ jobs:
         if: ${{ !cancelled() && github.event_name == 'schedule' && steps.select.outputs.cursor != '' }}
         uses: actions/upload-artifact@v7
         with:
-          name: semantic-review-cursor
+          name: ${{ steps.select.outputs.cursor_artifact }}
           path: ${{ runner.temp }}/semantic-review-cursor/cursor.json
           if-no-files-found: error
           retention-days: 90

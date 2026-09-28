@@ -89,8 +89,9 @@ Only scheduled scans restore and save the PR-number cursor. Manual PR requests
 and result publication do neither. The scheduled workflow concurrency queue
 serializes the complete restore/select/save cycle.
 
-The cursor is stored as `{"last_pr":100}` in `cursor.json`, in an Actions artifact
-named `semantic-review-cursor`. Discovery adds only `actions: read` to its
+The cursor is stored as `{"last_pr":100}` in `cursor.json`, alternating between
+Actions artifact names `semantic-review-cursor` and `semantic-review-cursor-next`.
+Discovery adds only `actions: read` to its
 `GITHUB_TOKEN` permissions; native artifact upload uses the workflow runtime
 credential. Cursor storage does not use the service PAT or repository write
 permissions.
@@ -98,8 +99,9 @@ permissions.
 Select the newest retained artifact from this repository's scheduled
 `semantic-review.yml` runs, ordered by creation time and artifact ID. Ignore
 artifacts from PR, manual or other workflows. A run need not have succeeded:
-selection progress remains valid when later PR jobs fail. Same-run reruns
-restore the saved position before replacing that run's artifact.
+selection progress remains valid when later PR jobs fail. Save to the other
+artifact name so the latest saved cursor survives even if a same-run rerun
+fails while replacing the older artifact.
 
 API, download, expired-artifact and invalid-file errors fail the scan instead of
 falling back to an older cursor or treating the error as initialization. Save
