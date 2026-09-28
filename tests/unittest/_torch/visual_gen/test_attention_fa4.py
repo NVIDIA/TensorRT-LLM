@@ -39,6 +39,43 @@ pytestmark = [
 ]
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("strided", [False, True])
+@torch.inference_mode()
+def test_autotuned_tactics_output_lse_and_graph_replay(dtype, strided):
+    """Every demo tactic must preserve both attention output and float32 LSE."""
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("FA4 tuning demo targets SM100/SM103")
+    if getattr(_flash_attn_fwd, "visual_gen_tuning_api", None) != 1:
+        pytest.skip("Requires the FA4 b19 per-call tuning patch")
+    from tensorrt_llm._torch.autotuner import OptimizationProfile
+    from tensorrt_llm._torch.visual_gen.attention_backend.fa4_autotuner import Fa4Runner
+
+    torch.manual_seed(42)
+    inputs = [
+        torch.randn(1, 512, 4 if strided else 2, 128, device="cuda", dtype=dtype) for _ in range(3)
+    ]
+    if strided:
+        inputs = [t[:, :, ::2] for t in inputs]
+    q, k, v = (t.float().transpose(1, 2) for t in inputs)
+    scale = 128**-0.5
+    scores = q @ k.transpose(-2, -1) * scale
+    expected_lse = torch.logsumexp(scores, dim=-1)
+    expected = (scores.softmax(dim=-1) @ v).transpose(1, 2).to(dtype)
+    runner = Fa4Runner(inputs, scale)
+    for tactic in runner.get_valid_tactics(inputs, OptimizationProfile()):
+        output, lse = runner(inputs, tactic=tactic)
+        torch.testing.assert_close(output, expected, atol=5e-3, rtol=5e-3)
+        torch.testing.assert_close(lse, expected_lse, atol=2e-3, rtol=2e-3)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output, graph_lse = runner(inputs, tactic=tactic)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(graph_output, output, atol=0, rtol=0)
+        torch.testing.assert_close(graph_lse, lse, atol=0, rtol=0)
+
+
 def _run_self_attn(B, S_real, S_pad, H, d_h, dtype=torch.bfloat16):
     """Helper: self-attention case (Q=K=V, padded only on the seq dim)."""
     device = "cuda"

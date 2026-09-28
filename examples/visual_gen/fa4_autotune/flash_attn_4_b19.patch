@@ -1,0 +1,71 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+--- a/flash_attn/cute/interface.py
++++ b/flash_attn/cute/interface.py
+@@ -332,6 +332,8 @@
+     k_descale: Optional[torch.Tensor] = None,
+     v_descale: Optional[torch.Tensor] = None,
+     gather_kv_indices: Optional[torch.Tensor] = None,
++    use_2cta: Optional[bool] = None,
++    ex2_emu_freq: Optional[int] = None,
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+     """Forward pass for FlashAttention.
+ 
+@@ -598,6 +600,29 @@
+         and (tile_m % qhead_per_kvhead == 0 or not pack_gqa)
+     )
+ 
++    # Experimental per-call controls for dense VisualGen attention. Keep the
++    # existing environment/CUDA guards and reject unsupported forced tactics.
++    if use_2cta is not None or ex2_emu_freq is not None:
++        if not (
++            arch in (100, 103) and head_dim == head_dim_v == 128
++            and q.dtype in (torch.float16, torch.bfloat16)
++            and not causal and not local and not is_split_kv
++            and cu_seqlens_q is None and cu_seqlens_k is None
++            and seqused_q is None and seqused_k is None
++            and page_table is None and not use_block_sparsity
++            and score_mod is None and mask_mod is None
++            and softcap in (None, 0.0) and learnable_sink is None
++            and qhead_per_kvhead == 1 and qv is None
++            and gather_kv_indices is None
++        ):
++            raise ValueError("FA4 tuning controls require dense SM100/SM103 FP16/BF16 h128 MHA")
++        if ex2_emu_freq is not None and ex2_emu_freq not in (0, 4, 8, 10, 16, 32):
++            raise ValueError("Unsupported ex2_emu_freq")
++        if use_2cta is True and not use_2cta_instrs:
++            raise ValueError("2CTA is disabled or ineligible for these inputs")
++        if use_2cta is False:
++            use_2cta_instrs = False
++
+     # hd=256 2CTA forward uses dedicated kernel (Blackwell family)
+     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
+     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
+@@ -750,6 +775,7 @@
+         arch,
+         page_size not in [None, tile_n],  # paged KV non-TMA
+         use_2cta_instrs,
++        ex2_emu_freq,
+         q_subtile_factor,
+         mma_pv_is_rs,
+         intra_wg_overlap,
+@@ -976,6 +1002,11 @@
+             raise ValueError(
+                 f"Unsupported compute capability: {arch}. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
+             )
++        if ex2_emu_freq is not None:
++            # The instance and compilation key belong to this call. Never mutate
++            # the module-level tuning table shared by other callers/threads.
++            fa_fwd._tune = dict(fa_fwd._tune, ex2_emu_freq=ex2_emu_freq)
++            fa_fwd.enable_ex2_emu = ex2_emu_freq > 0
+         # TODO: check @can_implement
+         if qv is not None:
+             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+@@ -1113,6 +1144,7 @@
+ 
+ 
+ _flash_attn_fwd.compile_cache = get_jit_cache("fwd")
++_flash_attn_fwd.visual_gen_tuning_api = 1
+ 
+ 
+ def make_fake_bwd_tensors(dtype, has_gqa, varlen_q, varlen_k, nheads_major=False):

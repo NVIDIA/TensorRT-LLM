@@ -20,6 +20,7 @@ Expects NHD layout ([B, S, H, D]) and supports float16/bfloat16.
 """
 
 import math
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -129,6 +130,7 @@ class FlashAttn4Attention(AttentionBackend):
         self.num_kv_heads = num_kv_heads or num_heads
         self.dtype = dtype
         self.scale = 1.0 / math.sqrt(head_dim)
+        self._enable_fa4_autotune = os.environ.get("TLLM_VISUAL_GEN_FA4_AUTOTUNE", "0") == "1"
 
         # FA4 expects [B, S, H, D] format
         self._preferred_layout = AttentionTensorLayout.NHD
@@ -143,6 +145,12 @@ class FlashAttn4Attention(AttentionBackend):
         seqused_k: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Calls _flash_attn_fwd with torch.compile disabled. Returns (output, lse)."""
+        if self._enable_fa4_autotune and seqused_k is None:
+            from .fa4_autotuner import can_tune, tuned_forward
+
+            if can_tune(q, k, v, causal):
+                return tuned_forward(q, k, v, self.scale)
+
         # FA4's private forward API may append diagnostics that this backend does not consume.
         output, lse, *_ = _flash_attn_fwd(
             q,
