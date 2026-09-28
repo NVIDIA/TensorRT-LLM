@@ -124,7 +124,8 @@ inline HalfOpenRange<BlockOrdinal> computeScratchRange(
     LifeCycle const& lc, int historyLength, int capacity, int tokensPerBlock, int maxRewindLen)
 {
     auto const* attn = std::get_if<AttnLifeCycle>(&lc);
-    if (!attn || !attn->windowSize.has_value())
+    // Draft history must retain private pages for later drafting or transfer.
+    if (!attn || !attn->windowSize.has_value() || attn->cacheDomain == "standalone_draft")
     {
         return {BlockOrdinal{0}, BlockOrdinal{0}};
     }

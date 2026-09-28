@@ -469,13 +469,14 @@ def _estimate_swa_cache_size(
     *,
     context: bool,
     scratch: bool,
+    num_scratch_layers: int | None = None,
     generation_capacity_headroom: int = BASE_GENERATION_TOKEN_COUNT,
 ) -> tuple[int, int]:
     tokens_per_block = int(tokens_per_block)
     size_per_token = 0
     size_per_request = 0
     scratch_keys = set()
-    for layer_size, window_size in zip(layer_sizes, attention_windows):
+    for layer_idx, (layer_size, window_size) in enumerate(zip(layer_sizes, attention_windows)):
         if window_size is not None and window_size > 0:
             # Match AttnLifeCycle.get_stale_range(): the live interval contains
             # window_size + generation_capacity_headroom - 1 tokens. Across all
@@ -486,7 +487,9 @@ def _estimate_swa_cache_size(
             window_tokens = window_blocks * tokens_per_block
             if not context:
                 size_per_request += window_tokens * layer_size
-            elif not scratch:
+            elif not scratch or (
+                num_scratch_layers is not None and layer_idx >= num_scratch_layers
+            ):
                 size_per_token += layer_size
             else:
                 scratch_key = (int(window_size), layer_size)
@@ -527,6 +530,7 @@ def _estimate_cache_size_components(
     scratch: bool,
     generation_capacity_headroom: int,
     standalone_draft_reserve: int = 0,
+    num_scratch_layers: int | None = None,
 ) -> tuple[int, int, int]:
     """Return context/generation bytes per token and generation bytes per request.
 
@@ -534,11 +538,17 @@ def _estimate_cache_size_components(
     retention pages and context scratch space. The standalone draft reserve
     is a shared allocation envelope, including windowed attention groups;
     it does not represent committed history. Resume-watermark normalization
-    is separate from these usable-capacity costs.
+    is separate from these usable-capacity costs. Scratch reuse applies only
+    to the leading num_scratch_layers; appended draft layers use ordinary pages.
     """
     full_attn_size = _estimate_full_attn_size_per_token(layer_sizes, attention_windows)
     context_swa_size, _ = _estimate_swa_cache_size(
-        layer_sizes, attention_windows, tokens_per_block, context=True, scratch=scratch
+        layer_sizes,
+        attention_windows,
+        tokens_per_block,
+        context=True,
+        scratch=scratch,
+        num_scratch_layers=num_scratch_layers,
     )
     generation_swa_size, generation_swa_per_request = _estimate_swa_cache_size(
         layer_sizes,
@@ -1111,17 +1121,6 @@ def _settle_context_cursor(req: LlmRequest, reuse: int, tokens_per_block: int) -
     req.context_chunk_size = req.context_remaining_length
 
 
-def get_draft_cache_unsupported_reason(kv_cache_config: KvCacheConfig) -> Optional[str]:
-    """Restrictions shared by creator admission and direct manager construction."""
-    if kv_cache_config.enable_swa_scratch_reuse:
-        return (
-            "Unified DSpark draft KV cannot use SWA scratch reuse; "
-            "draft prefill requires ordinary pages. "
-            "set kv_cache_config.enable_swa_scratch_reuse=False"
-        )
-    return None
-
-
 class KVCacheManagerV2(BaseResourceManager):
     draft_layout: Optional[StandaloneDraftLayout] = None
     draft_layer_ids: tuple[int, ...] = ()
@@ -1176,10 +1175,6 @@ class KVCacheManagerV2(BaseResourceManager):
         self._standalone_draft_reserve = (
             standalone_draft_layout.extra_tokens if standalone_draft_layout is not None else 0
         )
-        if standalone_draft_layout is not None:
-            reason = get_draft_cache_unsupported_reason(kv_cache_config)
-            if reason is not None:
-                raise ValueError(reason)
         self.mapping = mapping
         self.dtype = dtype
         self._validate_speculative_config(spec_config)
@@ -2334,6 +2329,19 @@ class KVCacheManagerV2(BaseResourceManager):
         """Return the resident generation requests used for SWA sizing."""
         return self.max_batch_size
 
+    def _get_runtime_cache_size_components(self) -> tuple[int, int, int]:
+        layer_sizes, attention_windows = self._get_runtime_cache_size_layer_components()
+        return _estimate_cache_size_components(
+            layer_sizes,
+            attention_windows,
+            self.tokens_per_block,
+            scratch=self.enable_swa_scratch_reuse,
+            generation_capacity_headroom=self._generation_kv_capacity_headroom,
+            standalone_draft_reserve=self._standalone_draft_reserve,
+            num_scratch_layers=len(layer_sizes)
+            - (self.draft_layout.num_layers if self.draft_layout is not None else 0),
+        )
+
     def _get_max_tokens_from_quota(self, quota: int) -> float:
         """Rank-local byte quota -> token capacity (GLOBAL tokens under helix)."""
         tokens = self._get_max_tokens_from_quota_impl(quota)
@@ -2346,19 +2354,11 @@ class KVCacheManagerV2(BaseResourceManager):
         return tokens
 
     def _get_max_tokens_from_quota_impl(self, quota: int) -> float:
-        layer_sizes, attention_windows = self._get_runtime_cache_size_layer_components()
         (
             context_size_per_token,
             generation_size_per_token,
             generation_size_per_request,
-        ) = _estimate_cache_size_components(
-            layer_sizes,
-            attention_windows,
-            self.tokens_per_block,
-            scratch=self.enable_swa_scratch_reuse,
-            generation_capacity_headroom=self._generation_kv_capacity_headroom,
-            standalone_draft_reserve=self._standalone_draft_reserve,
-        )
+        ) = self._get_runtime_cache_size_components()
         size_per_batch = self._get_generation_request_capacity() * generation_size_per_request
         if quota < size_per_batch:
             return 0
@@ -2383,19 +2383,11 @@ class KVCacheManagerV2(BaseResourceManager):
         return self._get_quota_from_max_tokens_impl(max_tokens)
 
     def _get_quota_from_max_tokens_impl(self, max_tokens: int) -> int:
-        layer_sizes, attention_windows = self._get_runtime_cache_size_layer_components()
         (
             context_size_per_token,
             generation_size_per_token,
             generation_size_per_request,
-        ) = _estimate_cache_size_components(
-            layer_sizes,
-            attention_windows,
-            self.tokens_per_block,
-            scratch=self.enable_swa_scratch_reuse,
-            generation_capacity_headroom=self._generation_kv_capacity_headroom,
-            standalone_draft_reserve=self._standalone_draft_reserve,
-        )
+        ) = self._get_runtime_cache_size_components()
         context_tokens = min(max_tokens, self.max_num_tokens)
         generation_tokens = max_tokens - context_tokens
         return int(
@@ -2807,9 +2799,11 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         scratch_reuse_config = None
         if self.enable_swa_scratch_reuse:
-            # Context requests allocate num_extra_kv_tokens for spec decoding.
-            # They should not count toward the scratch range.
-            scratch_reuse_config = SwaScratchReuseConfig(max_rewind_len=self.num_extra_kv_tokens)
+            # Unwritten speculative and draft reserves must stay outside the
+            # scratch range when a context chunk advances its history.
+            scratch_reuse_config = SwaScratchReuseConfig(
+                max_rewind_len=self.num_extra_kv_tokens + self._standalone_draft_reserve
+            )
 
         typical_step = None
         constraints = []
@@ -5903,6 +5897,7 @@ class KVCacheManagerV2(BaseResourceManager):
         _, generation_capacity_headroom = _get_generation_kv_capacity(
             spec_config, is_draft=is_draft
         )
+        num_scratch_layers = len(layer_sizes)
         draft_reserve = 0
         if draft_layout is not None:
             layer_sizes.extend([draft_layout.bytes_per_layer_token] * draft_layout.num_layers)
@@ -5924,6 +5919,7 @@ class KVCacheManagerV2(BaseResourceManager):
             ),
             generation_capacity_headroom=generation_capacity_headroom,
             standalone_draft_reserve=draft_reserve,
+            num_scratch_layers=num_scratch_layers,
         )
         # The affine slope covers all tokens; context additionally retains SWA
         # pages for the current token batch beyond the generation windows.

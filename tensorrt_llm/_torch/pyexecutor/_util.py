@@ -63,8 +63,7 @@ from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
-from .kv_cache.kv_cache_manager_v2 import (KVCacheManagerV2,
-                                           get_draft_cache_unsupported_reason)
+from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            CppMambaHybridCacheManager,
                                            MambaHybridCacheManagerV2,
@@ -1890,9 +1889,6 @@ class KvCacheCreator:
 
     def _unified_draft_cache_unsupported_reason(self) -> Optional[str]:
         """Shared admission requirements for unified aggregate and disagg KV."""
-        reason = get_draft_cache_unsupported_reason(self._kv_cache_config)
-        if reason is not None:
-            return reason
         if (self._is_standalone_dspark()
                 and is_mla(self._draft_config.pretrained_config)):
             return "Unified DSpark KV cache does not yet support MLA drafters."
