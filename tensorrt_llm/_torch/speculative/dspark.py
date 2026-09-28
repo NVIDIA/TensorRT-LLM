@@ -520,16 +520,16 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._scratch_slot = max_batch
             num_rows = max_batch + 1
 
-            # CUDA-graph padding requests carry ids in
-            # ``[CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len, CUDA_GRAPH_DUMMY_REQUEST_ID]``,
-            # while real request ids start at ``max_batch_size`` and grow, so a simple
-            # floor cleanly separates them. Together with ``ATTENTION_DP_DUMMY_REQUEST_ID``
-            # (0) these dummies must route to the scratch row (see ``prepare()``) and
-            # never consume a real slot. Imported lazily to break the
-            # dspark -> cuda_graph_runner -> speculative.utils -> dspark import cycle.
-            from ..pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+            # Cover both primary and secondary graph-padding ID families.
+            # The secondary variant represents non-divisible zero-real exact
+            # cells; neither variant may consume a real rolling-window slot.
+            # Derive the inclusive floor from the graph runner's authoritative
+            # namespace helper instead of duplicating its arithmetic.
+            from ..pyexecutor.cuda_graph_runner import cuda_graph_dummy_request_id
 
-            self._graph_dummy_id_floor = CUDA_GRAPH_DUMMY_REQUEST_ID - self.max_draft_len
+            self._graph_dummy_id_floor = cuda_graph_dummy_request_id(
+                self.max_draft_len, variant=1, max_draft_len=self.max_draft_len
+            )
 
             self._kv_windows = torch.zeros(
                 (num_rows, num_stages, self._win, head_dim),
