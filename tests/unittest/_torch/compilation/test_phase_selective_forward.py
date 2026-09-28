@@ -9,30 +9,45 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_pre_hopper
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm._torch.compilation.utils import _PhaseSelectiveForward
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine, _PrefillCompiledModel
 from tensorrt_llm.llmapi import CudaGraphConfig, PrefillCudaGraphBackend, TorchCompileConfig
 
 
-def test_phase_selective_forward_uses_compiled_by_default() -> None:
+def _create_prefill_compiled_model() -> tuple[_PrefillCompiledModel, Mock, Mock]:
+    eager_model = torch.nn.Module()
+    compiled_model = torch.nn.Module()
     eager_forward = Mock(return_value="eager")
     compiled_forward = Mock(return_value="compiled")
-    forward = _PhaseSelectiveForward(eager_forward, compiled_forward)
+    eager_model.forward = eager_forward
+    compiled_model.forward = compiled_forward
+    return (_PrefillCompiledModel(eager_model, compiled_model), eager_forward, compiled_forward)
 
-    assert forward("input") == "compiled"
+
+def test_prefill_compiled_model_uses_compiled_when_eligible() -> None:
+    model, eager_forward, compiled_forward = _create_prefill_compiled_model()
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.model_engine.get_per_request_prefill_cuda_graph_flag",
+        return_value=True,
+    ):
+        assert model("input") == "compiled"
     compiled_forward.assert_called_once_with("input")
     eager_forward.assert_not_called()
 
 
-def test_phase_selective_forward_bypass_is_restored() -> None:
-    eager_forward = Mock(return_value="eager")
-    compiled_forward = Mock(return_value="compiled")
-    forward = _PhaseSelectiveForward(eager_forward, compiled_forward)
+def test_prefill_compiled_model_bypass_is_restored() -> None:
+    model, eager_forward, compiled_forward = _create_prefill_compiled_model()
 
-    assert forward() == "compiled"
-    with forward.bypass():
-        assert forward() == "eager"
-    assert forward() == "compiled"
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.model_engine.get_per_request_prefill_cuda_graph_flag",
+        return_value=True,
+    ):
+        assert model() == "compiled"
+        with model.bypass():
+            assert model() == "eager"
+        assert model() == "compiled"
+    assert eager_forward.call_count == 1
+    assert compiled_forward.call_count == 2
 
 
 @pytest.mark.parametrize(
@@ -49,19 +64,17 @@ def test_model_engine_selects_torch_compile_forward(
     prefill_graph_eligible: bool,
     expected: str,
 ) -> None:
-    # A phase-selective proxy is installed by ModelEngine initialization when
-    # compile_only_piecewise_graphs is enabled.
     engine = object.__new__(PyTorchModelEngine)
-    eager_forward = Mock(return_value="eager")
-    compiled_forward = Mock(return_value="compiled")
-    engine._phase_selective_forward = _PhaseSelectiveForward(eager_forward, compiled_forward)
+    model, eager_forward, compiled_forward = _create_prefill_compiled_model()
+    engine._compile_only_piecewise_graphs = True
+    engine._prefill_compiled_model = model
 
     with patch(
         "tensorrt_llm._torch.pyexecutor.model_engine.get_per_request_prefill_cuda_graph_flag",
         return_value=prefill_graph_eligible,
     ) as get_prefill_graph_flag:
         with engine._maybe_bypass_torch_compile(can_run_graph=can_run_graph):
-            actual = engine._phase_selective_forward()
+            actual = model()
 
     assert actual == expected
     selected_forward = compiled_forward if expected == "compiled" else eager_forward
@@ -76,21 +89,39 @@ def test_model_engine_selects_torch_compile_forward(
 
 def test_model_engine_explicit_bypass_skips_graph_eligibility() -> None:
     engine = object.__new__(PyTorchModelEngine)
-    eager_forward = Mock(return_value="eager")
-    compiled_forward = Mock(return_value="compiled")
-    engine._phase_selective_forward = _PhaseSelectiveForward(eager_forward, compiled_forward)
+    model, eager_forward, compiled_forward = _create_prefill_compiled_model()
+    engine._compile_only_piecewise_graphs = True
+    engine._prefill_compiled_model = model
 
     with patch(
         "tensorrt_llm._torch.pyexecutor.model_engine.get_per_request_prefill_cuda_graph_flag",
         return_value=True,
     ) as get_prefill_graph_flag:
         with engine._maybe_bypass_torch_compile(bypass=True, can_run_graph=False):
-            actual = engine._phase_selective_forward()
+            actual = model()
 
     assert actual == "eager"
     eager_forward.assert_called_once_with()
     compiled_forward.assert_not_called()
     get_prefill_graph_flag.assert_not_called()
+
+
+def test_model_engine_bypass_requires_compile_only_option() -> None:
+    engine = object.__new__(PyTorchModelEngine)
+    model, eager_forward, compiled_forward = _create_prefill_compiled_model()
+    engine._compile_only_piecewise_graphs = False
+    engine._prefill_compiled_model = model
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.model_engine.get_per_request_prefill_cuda_graph_flag",
+        return_value=True,
+    ):
+        with engine._maybe_bypass_torch_compile(bypass=True):
+            actual = model()
+
+    assert actual == "compiled"
+    compiled_forward.assert_called_once_with()
+    eager_forward.assert_not_called()
 
 
 @skip_pre_hopper
