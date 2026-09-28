@@ -20,6 +20,7 @@ all the readiness handshake ever observes. A master someone else runs is a
 plain socket.
 """
 
+import contextlib
 import json
 import os
 import shutil
@@ -30,6 +31,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.connectors import mooncake_store
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import master as master_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
     CONFIG_PATH_ENV,
@@ -40,6 +42,11 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
     PoolSpec,
     provision_pool,
     resolve_master_address,
+)
+from tensorrt_llm.llmapi.llm_args import (
+    KvCacheConnectorConfig,
+    MooncakeDonationConfig,
+    MooncakeStoreConfig,
 )
 
 
@@ -464,7 +471,7 @@ def test_an_empty_address_file_is_not_taken_for_an_address(tmp_path):
 
 
 def test_an_unpublished_address_names_the_command_that_publishes_it(tmp_path):
-    with pytest.raises(TimeoutError, match="--address-file"):
+    with pytest.raises(TimeoutError, match="--address_file"):
         resolve_master_address(f"file://{tmp_path / 'absent'}", timeout=1.0)
 
 
@@ -628,3 +635,74 @@ def test_a_named_device_is_what_the_workers_are_told(fake_master, tmp_path):
 
     with provision_pool(pool, run_dir=str(tmp_path / "run")) as config_path:
         assert json.loads(open(config_path).read())["device_name"] == "mlx5_7"
+
+
+# ---- what a server does with the pool settings around its own lifetime ----
+
+
+@contextlib.contextmanager
+def _recording(log, name):
+    log.append(name)
+    yield
+
+
+@pytest.fixture
+def provisioning(monkeypatch):
+    """Record which of the two pool contexts a server enters, in order."""
+    from tensorrt_llm.commands import serve
+
+    entered: list = []
+    monkeypatch.setattr(
+        mooncake_store,
+        "maybe_provision_pool",
+        lambda config: _recording(entered, ("pool", config)),
+    )
+    monkeypatch.setattr(
+        mooncake_store,
+        "maybe_donate_segment",
+        lambda donation: _recording(entered, ("donation", donation)),
+    )
+    return SimpleNamespace(serve=serve, entered=entered)
+
+
+def test_an_attached_frontend_provisions_nothing(provisioning):
+    """It shares the launcher's executor, so a second pool would be its own."""
+    llm_args = {
+        "kv_connector_config": {"connector": "mooncake-store"},
+        "mooncake_donation": {"master_server_address": "10.0.0.1:50051"},
+    }
+
+    with provisioning.serve._provision_kv_cache_pool(llm_args, owns_engine=False):
+        pass
+
+    assert provisioning.entered == []
+
+
+def test_pool_settings_from_yaml_are_typed_before_the_llm_sees_them(provisioning):
+    """A YAML section arrives as a dict, and the pool is described before bringup."""
+    llm_args = {
+        "kv_connector_config": {
+            "connector": "mooncake-store",
+            "mooncake_store": {"launch_master": True},
+        },
+        "mooncake_donation": {"master_server_address": "10.0.0.1:50051"},
+    }
+
+    with provisioning.serve._provision_kv_cache_pool(llm_args):
+        pass
+
+    assert isinstance(llm_args["kv_connector_config"], KvCacheConnectorConfig)
+    assert isinstance(llm_args["mooncake_donation"], MooncakeDonationConfig)
+    assert [name for name, _ in provisioning.entered] == ["pool", "donation"]
+
+
+def test_the_user_facing_pool_settings_name_the_fields_provisioning_takes():
+    """`maybe_provision_pool` matches the two by field name, so they must agree."""
+    config = KvCacheConnectorConfig(
+        connector="mooncake-store",
+        mooncake_store=MooncakeStoreConfig(launch_master=True),
+    )
+    spec = PoolSpec.from_json({}, **config.mooncake_store.model_dump())
+
+    assert spec.launch_master is True
+    assert spec.master_port == MooncakeStoreConfig(launch_master=True).master_port

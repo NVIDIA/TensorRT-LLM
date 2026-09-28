@@ -274,9 +274,9 @@ class MooncakeStoreConnectorConfig:
             return self.model_key
         raise ValueError(
             f"The mooncake-store connector needs a model key to namespace its "
-            f"pool keys by, and there is no safe default: set "
-            f"kv_connector_config.mooncake_store.model_key, the model_key field "
-            f"of the Mooncake JSON config, or ${MODEL_KEY_ENV}. Give it a value "
-            f"that separates this checkpoint from any other an engine sharing "
-            f"the pool might load, rather than one derived from {model!r}."
+            f"pool keys by, and there is no safe default: set the model_key "
+            f"field of the Mooncake JSON config, or ${MODEL_KEY_ENV}. Give it "
+            f"a value that separates this checkpoint from any other an engine "
+            f"sharing the pool might load, rather than one derived from "
+            f"{model!r}."
         )

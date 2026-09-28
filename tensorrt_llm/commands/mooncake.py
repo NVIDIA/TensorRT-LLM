@@ -384,13 +384,18 @@ def mooncake_donor(
     resolved = resolve_master_address(master, master_timeout())
     wait_for_master(resolved)
 
+    # Left empty, Mooncake discovers this node's own devices, which is what a
+    # pool whose nodes do not have the same HCAs needs.
+    transport = protocol or raw.get("protocol") or "rdma"
+    transfer_device = device_name or raw.get("device_name", "") or ""
+
     with (
         _signal_handoff(),
         donate_segment(
             resolved,
             donating,
-            protocol=protocol or raw.get("protocol") or "rdma",
-            device_name=device_name or raw.get("device_name", "") or "",
+            protocol=transport,
+            device_name=transfer_device,
             metadata_server=(
                 metadata_server or raw.get("metadata_server") or DEFAULT_METADATA_SERVER
             ),

@@ -196,7 +196,7 @@ def resolve_master_address(address: str, timeout: float) -> str:
     A master with its own lifetime runs on whichever host its scheduler gave
     it, which is not known when the worker configs are written. Naming the file
     it publishes to keeps the address out of both the config and the launch
-    script: `trtllm-serve mooncake_master --address-file` writes it, every
+    script: `trtllm-serve mooncake_master --address_file` writes it, every
     worker's `master_server_address` names the same path, and the wait here
     doubles as the wait for the master to exist at all.
     """
@@ -230,7 +230,7 @@ def resolve_master_address(address: str, timeout: float) -> str:
             raise TimeoutError(
                 f"No Mooncake master address appeared in {path} within "
                 f"{timeout:g}s. Start one with 'trtllm-serve mooncake_master "
-                f"--address-file {path}', or name a reachable host:port in "
+                f"--address_file {path}', or name a reachable host:port in "
                 f"master_server_address. Raise {MASTER_TIMEOUT_ENV} if the "
                 "master is only slow to start."
             )

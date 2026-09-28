@@ -1661,10 +1661,11 @@ def serve(
                         "Restore the required gRPC runtime with `python -m pip "
                         "install \"grpcio>=1.67.1,<2\"`.") from error
 
-                launch_grpc_server(host,
-                                   port,
-                                   llm_args,
-                                   served_model_name=served_model_name)
+                with _provision_kv_cache_pool(llm_args):
+                    launch_grpc_server(host,
+                                       port,
+                                       llm_args,
+                                       served_model_name=served_model_name)
         else:
             # Default: launch OpenAI HTTP server
             launch_server(

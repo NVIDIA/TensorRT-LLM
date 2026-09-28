@@ -4054,7 +4054,12 @@ class PyExecutor:
             return False
         if not self.kv_cache_manager.try_complete_preemption(request):
             return False
-        request.pause(self.max_input_len)
+        # The same teardown an immediate recompute pause does, since the
+        # request is in the same position by the time the saves retire.
+        # Pausing alone would clear py_seq_slot while SeqSlotManager still
+        # owned the slot, and the next schedule would trip its assertion.
+        self._free_request_resources(request)
+        self._pause_recompute_request(request)
         return True
 
     def _kv_connector_wait_for_save(self):

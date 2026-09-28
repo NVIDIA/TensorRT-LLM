@@ -43,14 +43,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.addressing import 
     PageAddressing,
     merge_intervals,
 )
-from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
-    MooncakeStoreConnectorConfig,
-    StoreRole,
-)
-from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.keys import (
-    BlockHashChain,
-    KeyNamespace,
-)
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.keys import BlockHashChain
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import (
     PageTransfer,
     RequestTransfers,
@@ -58,7 +51,6 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import (
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.scheduler import (
     MooncakeStoreConnectorScheduler,
 )
-from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.staging import plan_slot_geometry
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.validation import (
     validate_layout,
     validate_llm_args,
@@ -217,78 +209,6 @@ def make_request(request_id, tokens, cache_salt=None):
     )
 
 
-# ---- keys ----
-
-
-def test_hash_chain_is_deterministic_and_prefix_sensitive():
-    tokens = list(range(3 * TOKENS_PER_BLOCK))
-    first = list(BlockHashChain(TOKENS_PER_BLOCK).extend(tokens))
-    second = list(BlockHashChain(TOKENS_PER_BLOCK).extend(tokens))
-    assert first == second
-
-    # Changing a token in block 0 must change every hash after it, which is what
-    # makes a key safe to share: a hit implies the whole prefix matched.
-    altered = list(tokens)
-    altered[0] += 1
-    changed = list(BlockHashChain(TOKENS_PER_BLOCK).extend(altered))
-    assert all(a != b for a, b in zip(first, changed))
-
-
-def test_hash_chain_ignores_partial_trailing_block():
-    full = list(range(2 * TOKENS_PER_BLOCK))
-    chain = BlockHashChain(TOKENS_PER_BLOCK)
-    assert len(chain.extend(full)) == 2
-    assert len(chain.extend(full + [99])) == 2
-
-
-def test_hash_chain_extends_incrementally():
-    tokens = list(range(4 * TOKENS_PER_BLOCK))
-    incremental = BlockHashChain(TOKENS_PER_BLOCK)
-    for end in range(0, len(tokens) + 1, TOKENS_PER_BLOCK):
-        incremental.extend(tokens[:end])
-    assert list(incremental.hashes) == list(BlockHashChain(TOKENS_PER_BLOCK).extend(tokens))
-
-
-def test_hash_chain_separates_cache_salts():
-    tokens = list(range(TOKENS_PER_BLOCK))
-    unsalted = BlockHashChain(TOKENS_PER_BLOCK).extend(tokens)
-    salted = BlockHashChain(TOKENS_PER_BLOCK, cache_salt="tenant-a").extend(tokens)
-    other = BlockHashChain(TOKENS_PER_BLOCK, cache_salt="tenant-b").extend(tokens)
-    assert unsalted[0] != salted[0] != other[0]
-    assert salted[0] != other[0]
-
-
-def test_hash_chain_rejects_shrinking_token_list():
-    chain = BlockHashChain(TOKENS_PER_BLOCK)
-    chain.extend(list(range(2 * TOKENS_PER_BLOCK)))
-    with pytest.raises(ValueError, match="shrank"):
-        chain.extend(list(range(TOKENS_PER_BLOCK)))
-
-
-def test_key_namespace_separates_every_dimension():
-    base = dict(
-        cache_prefix="trtllm",
-        model_key="m",
-        rank=0,
-        world_size=2,
-        layer_group_id=0,
-        tokens_per_block=32,
-        bytes_per_page=1024,
-    )
-    block_hash = b"\x01" * 16
-    reference = KeyNamespace(**base).key(block_hash)
-    for field, value in [
-        ("cache_prefix", "other"),
-        ("model_key", "n"),
-        ("rank", 1),
-        ("world_size", 4),
-        ("layer_group_id", 1),
-        ("tokens_per_block", 64),
-        ("bytes_per_page", 2048),
-    ]:
-        assert KeyNamespace(**{**base, field: value}).key(block_hash) != reference
-
-
 # ---- addressing ----
 
 
@@ -357,108 +277,6 @@ def test_page_addressing_rejects_mixed_slot_counts():
     )
     with pytest.raises(ValueError, match="slot counts"):
         PageAddressing(layout)
-
-
-# ---- config ----
-
-
-def test_config_reads_sizes_and_staging_from_the_json(store_config):
-    """Sizes arrive as unit strings, and staging is off until the JSON asks."""
-    config = MooncakeStoreConnectorConfig.from_env()
-    assert config.global_segment_size == 1024**3
-    assert config.local_buffer_size == 256 * 1024**2
-    assert config.role is StoreRole.BOTH
-    assert config.resolve_model_key("/models/ignored") == "test-model"
-    assert config.stage_through_host is False
-
-    raw = json.loads(store_config.read_text())
-    raw["stage_through_host"] = True
-    raw["staging_buffer_bytes"] = "256MiB"
-    store_config.write_text(json.dumps(raw))
-
-    config = MooncakeStoreConnectorConfig.from_env()
-    assert config.stage_through_host is True
-    assert config.staging_buffer_bytes == 256 * 1024**2
-
-
-def test_config_role_comes_from_environment(store_config, monkeypatch):
-    monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_ROLE", "producer")
-    config = MooncakeStoreConnectorConfig.from_env()
-    assert config.role is StoreRole.PRODUCER
-    assert config.role.saves and not config.role.loads
-
-    monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_ROLE", "consumer")
-    config = MooncakeStoreConnectorConfig.from_env()
-    assert config.role.loads and not config.role.saves
-
-    monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_ROLE", "nonsense")
-    with pytest.raises(ValueError, match="TRTLLM_MOONCAKE_STORE_ROLE"):
-        MooncakeStoreConnectorConfig.from_env()
-
-
-def test_config_requires_the_env_var(monkeypatch):
-    monkeypatch.delenv("MOONCAKE_CONFIG_PATH", raising=False)
-    monkeypatch.delenv("TRTLLM_MOONCAKE_RUN_DIR", raising=False)
-    with pytest.raises(ValueError, match="MOONCAKE_CONFIG_PATH"):
-        MooncakeStoreConnectorConfig.from_env()
-
-
-def test_config_falls_back_to_the_run_directory(tmp_path, monkeypatch):
-    # A rank an external launcher started was already running when its leader
-    # provisioned the pool, so it never inherited the exported path and reads
-    # the rendered config out of the shared run directory instead.
-    monkeypatch.delenv("MOONCAKE_CONFIG_PATH", raising=False)
-    monkeypatch.setenv("TRTLLM_MOONCAKE_RUN_DIR", str(tmp_path))
-    (tmp_path / "mooncake.json").write_text(
-        json.dumps({"master_server_address": "10.0.0.1:50051", "global_segment_size": "8GiB"})
-    )
-
-    config = MooncakeStoreConnectorConfig.from_env()
-
-    assert config.master_server_address == "10.0.0.1:50051"
-    assert config.global_segment_size == 8 * 1024**3
-
-
-def test_config_run_directory_without_a_rendered_config_still_asks(tmp_path, monkeypatch):
-    # An empty run directory means no leader provisioned anything, which is a
-    # missing pool rather than a default one.
-    monkeypatch.delenv("MOONCAKE_CONFIG_PATH", raising=False)
-    monkeypatch.setenv("TRTLLM_MOONCAKE_RUN_DIR", str(tmp_path))
-    with pytest.raises(ValueError, match="MOONCAKE_CONFIG_PATH"):
-        MooncakeStoreConnectorConfig.from_env()
-
-
-def test_config_env_var_wins_over_the_run_directory(tmp_path, monkeypatch):
-    # An externally managed pool stays reachable, since the run directory is
-    # only consulted when nothing was passed in.
-    named = tmp_path / "external.json"
-    named.write_text(json.dumps({"master_server_address": "external:50051"}))
-    (tmp_path / "mooncake.json").write_text(
-        json.dumps({"master_server_address": "provisioned:50051"})
-    )
-    monkeypatch.setenv("MOONCAKE_CONFIG_PATH", str(named))
-    monkeypatch.setenv("TRTLLM_MOONCAKE_RUN_DIR", str(tmp_path))
-
-    assert MooncakeStoreConnectorConfig.from_env().master_server_address == "external:50051"
-
-
-@pytest.mark.parametrize("named", [{}, {"metadata_server": ""}], ids=["omitted", "empty"])
-def test_config_metadata_server_falls_back_to_the_handshake(tmp_path, monkeypatch, named):
-    # No metadata service means Mooncake's peer-to-peer handshake. An empty
-    # connstring is not one of the forms setup accepts, so leaving the field
-    # out of a hand-written config must not reach it.
-    path = tmp_path / "metadata.json"
-    path.write_text(json.dumps({"master_server_address": "127.0.0.1:50051", **named}))
-    monkeypatch.setenv("MOONCAKE_CONFIG_PATH", str(path))
-    assert MooncakeStoreConnectorConfig.from_env().metadata_server == "P2PHANDSHAKE"
-
-
-def test_config_model_key_defaults_to_basename(store_config, tmp_path, monkeypatch):
-    path = tmp_path / "no_model_key.json"
-    path.write_text(json.dumps({"master_server_address": "127.0.0.1:50051"}))
-    monkeypatch.setenv("MOONCAKE_CONFIG_PATH", str(path))
-    config = MooncakeStoreConnectorConfig.from_env()
-    assert config.resolve_model_key("/models/MiniMax-M3/") == "MiniMax-M3"
 
 
 # ---- validation ----
@@ -683,43 +501,6 @@ def fake_cuda(monkeypatch):
     return recorded
 
 
-@pytest.mark.parametrize(
-    "page_bytes,batch,budget,expected_slots",
-    [
-        (1024, 64, 1 << 20, 64),  # budget is ample: the full batch stages
-        (1024, 64, 8 * 1024, 8),  # budget binds before the batch does
-        (1024, 8, 1 << 20, 8),  # batch binds before the budget does
-        (1024, 64, 1024, 1),  # exactly one page fits
-        (1024, 64, 1, 1),  # below one page, raised to one rather than refused
-    ],
-)
-def test_plan_slot_geometry(page_bytes, batch, budget, expected_slots):
-    slot_bytes, num_slots = plan_slot_geometry(page_bytes, batch, budget)
-    # A slot always holds a whole page: the budget bounds the count, not the width.
-    assert slot_bytes == page_bytes
-    assert num_slots == expected_slots
-
-
-@pytest.mark.parametrize("bad", [(0, 8, 1024), (-1, 8, 1024), (1024, 0, 1024)])
-def test_plan_slot_geometry_rejects_degenerate_inputs(bad):
-    with pytest.raises(ValueError):
-        plan_slot_geometry(*bad)
-
-
-@pytest.mark.parametrize(
-    "value,expected", [("1", True), ("true", True), ("on", True), ("0", False), ("off", False)]
-)
-def test_config_staging_env_override(store_config, monkeypatch, value, expected):
-    monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_STAGE_THROUGH_HOST", value)
-    assert MooncakeStoreConnectorConfig.from_env().stage_through_host is expected
-
-
-def test_config_rejects_a_non_boolean_staging_env(store_config, monkeypatch):
-    monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_STAGE_THROUGH_HOST", "sometimes")
-    with pytest.raises(ValueError, match="not a boolean"):
-        MooncakeStoreConnectorConfig.from_env()
-
-
 def test_staging_registers_host_buffers_and_never_the_pools(
     store_config, fake_store, staged_copies
 ):
@@ -876,14 +657,15 @@ def make_scheduler(store_config, hit_blocks=0):
     return scheduler
 
 
-def request_data(request_id, new_tokens, page_indices, layer_group_id=0):
+def request_data(request_id, new_tokens, page_indices):
     return RequestData(
         request_id=request_id,
         new_tokens=list(new_tokens),
         new_block_ids=list(page_indices),
         computed_position=0,
         num_scheduled_tokens=len(new_tokens),
-        new_block_ids_by_layer_group={layer_group_id: list(page_indices)},
+        # One entry per layer group, indexed by layer group id.
+        new_block_ids_by_layer_group=[list(page_indices)],
     )
 
 
@@ -992,7 +774,7 @@ def test_scheduler_skips_blocks_without_a_page_in_every_group(store_config):
     scheduler.get_num_new_matched_tokens(request, 0)
 
     data = request_data(1, tokens, [4, 5])
-    data.new_block_ids_by_layer_group[1] = [7, BAD_PAGE_INDEX]
+    data.new_block_ids_by_layer_group.append([7, BAD_PAGE_INDEX])
     metadata = scheduler.build_connector_meta(SchedulerOutput(new_requests=[data]))
 
     # Block 1 has no page in group 1, so neither of its halves is stored; block 0

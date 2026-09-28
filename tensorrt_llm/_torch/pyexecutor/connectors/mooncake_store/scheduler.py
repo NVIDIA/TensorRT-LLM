@@ -247,7 +247,7 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             # indices into the flat `new_block_ids`, but it does not say which
             # group they belong to, so there is nothing safe to record from it.
             return
-        for layer_group_id, indices in by_group.items():
+        for layer_group_id, indices in enumerate(by_group):
             state.pages.setdefault(layer_group_id, []).extend(int(index) for index in indices)
 
     def _addressable_blocks(self, state: _RequestState) -> int:

@@ -2363,14 +2363,20 @@ class MooncakeStoreConfig(StrictBaseModel):
         "names, such as a shared filesystem. Removed when the master stops.")
     master_port: int = Field(
         50051,
+        ge=1,
+        le=65535,
         telemetry=False,
         description="RPC port for a master started by launch_master.")
     master_metrics_port: int = Field(
         9004,
+        ge=1,
+        le=65535,
         telemetry=False,
         description="Prometheus port for a master started by launch_master.")
     master_eviction_ratio: float = Field(
         0.05,
+        gt=0,
+        le=1,
         telemetry=False,
         description="Fraction of the pool a master started by launch_master "
         "frees per eviction pass.")
@@ -2394,9 +2400,8 @@ class MooncakeStoreConfig(StrictBaseModel):
     local_buffer_size: Union[int, str] = Field(
         "1GiB",
         description="Per-process Mooncake transfer buffer, not pool capacity.")
-    transfer_batch_size: int = Field(64,
-                                     telemetry=False,
-                                     description="Page keys per store call.")
+    transfer_batch_size: PositiveInt = Field(
+        64, telemetry=False, description="Page keys per store call.")
     cache_prefix: Optional[str] = Field(
         None,
         description="Key namespace for the pool. Bump it after any change to "
@@ -2415,6 +2420,31 @@ class MooncakeStoreConfig(StrictBaseModel):
         "that cannot hold that many reduces the batch instead of failing, so "
         "undersizing it costs throughput quietly. Defaults to the connector's "
         "own 512MiB.")
+
+    @field_validator("global_segment_size",
+                     "local_buffer_size",
+                     "staging_buffer_bytes",
+                     mode="after")
+    @classmethod
+    def _check_size(cls, value, info):
+        """Reject a size here rather than in every rank after bringup.
+
+        These are parsed by the connector, so a typo or a zero otherwise
+        surfaces as a per-rank failure with the master already launched and
+        the model already loading.
+        """
+        if value is None:
+            return value
+        from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import \
+            parse_size
+        try:
+            parsed = parse_size(value)
+        except ValueError as exc:
+            raise ValueError(f"mooncake_store.{info.field_name}: {exc}")
+        if parsed <= 0:
+            raise ValueError(f"mooncake_store.{info.field_name}: {value!r} is "
+                             f"{parsed} bytes; it has to be positive.")
+        return value
 
     @model_validator(mode="after")
     def _require_exactly_one_master(self) -> "MooncakeStoreConfig":
