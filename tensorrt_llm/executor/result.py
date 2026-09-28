@@ -897,8 +897,7 @@ class GenerationResultBase:
                           sampling_params.n)
             safe_set_attr(span, tracing.SpanAttributes.GEN_AI_REQUEST_ID,
                           self.id)
-            prompt_token_ids = getattr(self, "prompt_token_ids", None)
-            if prompt_token_ids is not None and len(prompt_token_ids) > 0:
+            if prompt_token_ids := getattr(self, "prompt_token_ids", None):
                 safe_set_attr(span,
                               tracing.SpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS,
                               len(prompt_token_ids))
@@ -1095,13 +1094,7 @@ class GenerationResult(GenerationResultBase):
 
     @property
     def prompt_token_ids(self) -> List[int]:
-        request = self._generation_request
-        if request.__dict__.get("_prompt_token_ids") is None:
-            buf = request.__dict__.get("_prompt_token_ids_i32")
-            if buf is not None:
-                # Consumers here only need len(); avoid the O(ISL) .tolist().
-                return buf
-        return request.prompt_token_ids
+        return self._generation_request.prompt_token_ids
 
     def abort(self) -> None:
         """Abort the generation request.
