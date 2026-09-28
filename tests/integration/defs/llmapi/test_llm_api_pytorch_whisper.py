@@ -298,6 +298,7 @@ def test_whisper_pytorch_block_reuse_requested(monkeypatch: pytest.MonkeyPatch) 
     assert baseline[1][0][1].strip()
     # Ensure the second input actually distinguishes feature-conditioned caches.
     assert baseline[0][0][0] != baseline[1][0][0]
+    assert baseline[2] == [baseline[0][0], baseline[1][0]]
     assert results[True] == baseline
 
 
