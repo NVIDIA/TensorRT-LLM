@@ -6,10 +6,9 @@ SPDX-License-Identifier: Apache-2.0
 # FA4 CTA and exp2 autotuning demo
 
 This draft demonstrates selecting FA4's CTA count and exp2 emulation together
-using TRT-LLM's existing warmup `AutoTuner`. It is opt-in and requires the supplied
-patch to **flash-attn-4 4.0.0b19**. Stock installations retain their existing
-behavior. This is not a measured performance improvement or a merge-ready
-dependency change.
+using TRT-LLM's existing warmup `AutoTuner`. It is opt-in. TRT-LLM's build now
+fetches, patches and bundles FA4 b19 in the wheel; users do not patch their
+installation. This draft still needs GPU and end-to-end performance validation.
 
 ## Why tune both?
 
@@ -51,19 +50,16 @@ before changing it. Calls omitting both arguments retain their original behavior
 The explicit capability marker prevents the opt-in path from silently pretending
 to tune an unpatched dependency.
 
-In a disposable TRT-LLM GPU environment with the pinned dependency installed:
+The patch lives at `3rdparty/patches/flash_attn_4_b19.patch`. CMake applies it
+while fetching the pinned source; `scripts/build_wheel.py` stages the validated
+result as `trtllm_flash_attn`, and `setup.py` bundles it into the TRT-LLM wheel.
+Python examples and `trtllm-serve` therefore use the same patched implementation.
+There is no runtime patch step or separate FA4 wheel to install.
 
-```bash
-FA4_SITE=$(python -c 'from importlib.metadata import distribution; print(distribution("flash-attn-4").locate_file(""))')
-patch --dry-run -p1 -d "$FA4_SITE" < examples/visual_gen/fa4_autotune/flash_attn_4_b19.patch
-patch -p1 -d "$FA4_SITE" < examples/visual_gen/fa4_autotune/flash_attn_4_b19.patch
-```
-
-Start a fresh Python process after applying the patch. No dependency pin or
-installer is changed by this TRT-LLM draft. The patch must be upstreamed or
-replaced by a supported FA4 API before production integration. The newer FA4
-register-allocation fix referenced in #19292 may change the winners and needs a
-fresh search and validation when the package combination is upgraded.
+See [FA4 build integration](../../../3rdparty/flash-attn-4.md) for source and
+editable installs, version-bump checks and dependency provenance. A newer FA4
+register-allocation fix may change the winners and needs fresh validation; it
+does not replace the per-call tuning API supplied by this patch.
 
 ## Run the standalone demo
 

@@ -1,5 +1,5 @@
 diff --git a/sol_attn/THIRD_PARTY_NOTICES.md b/sol_attn/THIRD_PARTY_NOTICES.md
-index d3755083d1e7622ff509351594157dd879865e56..b226f77f96bc2316e902ddf91765b35c915a8a6c 100644
+index d3755083d1e7622ff509351594157dd879865e56..4fc606f880ecb748dda62cde05f50097e035eda7 100644
 --- a/sol_attn/THIRD_PARTY_NOTICES.md
 +++ b/sol_attn/THIRD_PARTY_NOTICES.md
 @@ -1,15 +1,49 @@
@@ -50,10 +50,10 @@ index d3755083d1e7622ff509351594157dd879865e56..b226f77f96bc2316e902ddf91765b35c
 +
 +The upstream package vendored a copy of FlashAttention's CuTe DSL helpers
 +under `sol_attn/_vendor/flash_attn/cute/`. That copy is **not** carried here:
-+TensorRT-LLM already depends on
-+[`flash-attn-4`](https://github.com/Dao-AILab/flash-attention) (pinned in
-+`requirements.txt`), which provides the same `flash_attn.cute` modules, and
-+the SM100 kernels import them from that dependency directly. FlashAttention's
++TensorRT-LLM bundles patched
++[FlashAttention 4](https://github.com/Dao-AILab/flash-attention) sources as
++`trtllm_flash_attn` (pinned in `3rdparty/fetch_content.json`), and the SM100
++kernels import their CuTe helpers from that package. FlashAttention's
 +BSD-3-Clause license is retained at `sol_attn/sm100/LICENSE.flash-attention`
 +because portions of the SM100 design scaffold still derive from that project.
 +
@@ -428,27 +428,33 @@ index 43e9267b931c4f87620739182e596f1fe63b2475..2da4ea383947f5cd25bea439d7748d8a
      return _sol_attn_cute(
          q,
 diff --git a/sol_attn/sm100/mainloop.py b/sol_attn/sm100/mainloop.py
-index 36b3ad9d1450c836f7acdc80bbed1382eac4d3a9..24dee1cb0233ebc5ecaabed21eab3c7fe12e86ba 100644
+index 36b3ad9d1450c836f7acdc80bbed1382eac4d3a9..1373a4a41db2eacb4c675c652e1e5bc395145766 100644
 --- a/sol_attn/sm100/mainloop.py
 +++ b/sol_attn/sm100/mainloop.py
-@@ -12,13 +12,13 @@ import cutlass.cute as cute
+@@ -1,3 +1,5 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: BSD-3-Clause
+ """Sol-Attn forward kernel for Blackwell SM100.
+ 
+ The kernel routes two physical N64 halves at a time and accumulates their exact
+@@ -12,13 +14,13 @@ import cutlass.cute as cute
  import cutlass.pipeline as pipeline
  import cutlass.utils as utils
  import cutlass.utils.blackwell_helpers as sm100_utils
 -import sol_attn._vendor.flash_attn.cute.pipeline as fa_pipeline
 -import sol_attn._vendor.flash_attn.cute.utils as fa_utils
-+import flash_attn.cute.pipeline as fa_pipeline
-+import flash_attn.cute.utils as fa_utils
++import trtllm_flash_attn.pipeline as fa_pipeline
++import trtllm_flash_attn.utils as fa_utils
  from cutlass import BFloat16, Float32, Int32
  from cutlass._mlir.dialects import llvm
  from cutlass.cute.nvgpu import cpasync, tcgen05
  from cutlass.cutlass_dsl import T, dsl_user_op
 -from sol_attn._vendor.flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
-+from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
++from trtllm_flash_attn.cute_dsl_utils import assume_tensor_aligned
  
  from .softmax import (
      _load_m64_n128_score as _load_pair_score,
-@@ -27,8 +27,8 @@ from .softmax import (
+@@ -27,8 +29,8 @@ from .softmax import (
  )
  from . import math as mma_utils
  
@@ -460,15 +466,21 @@ index 36b3ad9d1450c836f7acdc80bbed1382eac4d3a9..24dee1cb0233ebc5ecaabed21eab3c7f
      sol_attn_route_is_exact,
  )
 diff --git a/sol_attn/sm100/softmax.py b/sol_attn/sm100/softmax.py
-index 876ef8007e12eb855cdaee1f1ee40c18775ae143..71b11f0e6ece8cabd7d6182bd1759e091c7c57db 100644
+index 876ef8007e12eb855cdaee1f1ee40c18775ae143..90ce14ec8ac614523e76528463b0b3670779c78b 100644
 --- a/sol_attn/sm100/softmax.py
 +++ b/sol_attn/sm100/softmax.py
-@@ -7,7 +7,7 @@ import cutlass.cute as cute
+@@ -1,3 +1,5 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: BSD-3-Clause
+ """Online-softmax helpers for the Blackwell mainloop."""
+ 
+ from __future__ import annotations
+@@ -7,7 +9,7 @@ import cutlass.cute as cute
  from cutlass import Float32, Int32
  from cutlass.cute.nvgpu import tcgen05
  
 -from sol_attn._vendor.flash_attn.cute import utils as fa_utils
-+from flash_attn.cute import utils as fa_utils
++from trtllm_flash_attn import utils as fa_utils
  
  from .tmem import (
      _add_physical_tmem_base,

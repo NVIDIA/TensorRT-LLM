@@ -59,7 +59,7 @@ def _install_flash_attn_tile_scheduler_compatibility() -> None:
     defines these members on its own subclass.
     """
     try:
-        from flash_attn.cute import tile_scheduler
+        from trtllm_flash_attn import tile_scheduler
     except (ImportError, OSError):
         return
     import cutlass.cute as cute
@@ -97,7 +97,7 @@ def _install_flash_attn_tile_scheduler_compatibility() -> None:
 _flash_attn_fwd_import_error = None
 try:
     _install_cutlass_dsl_compatibility()
-    from flash_attn.cute.interface import _flash_attn_fwd
+    from trtllm_flash_attn.interface import _flash_attn_fwd
 
     _install_flash_attn_tile_scheduler_compatibility()
 except (ImportError, OSError) as e:
@@ -109,7 +109,7 @@ class FlashAttn4Attention(AttentionBackend):
     """
     Flash Attention 4 backend for diffusion models.
 
-    Uses flash_attn.cute.interface._flash_attn_fwd which:
+    Uses trtllm_flash_attn.interface._flash_attn_fwd which:
     - Expects [B, S, H, D] (NHD) format
     - Supports float16 and bfloat16 (auto-casts other dtypes)
     - Supports both self-attention and cross-attention (different Q/KV lengths)

@@ -10,6 +10,7 @@ from importlib.metadata import version
 from pathlib import Path
 
 import torch
+from trtllm_flash_attn._build_info import BUILD_ID
 
 from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile, TuningConfig, autotune
 from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import FlashAttn4Attention
@@ -58,7 +59,7 @@ def main() -> None:
         "capability": torch.cuda.get_device_capability(),
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
-        "fa4": version("flash-attn-4"),
+        "fa4": BUILD_ID,
         "cutlass": version("nvidia-cutlass-dsl"),
         "dtype": "bfloat16",
         "heads": args.heads,

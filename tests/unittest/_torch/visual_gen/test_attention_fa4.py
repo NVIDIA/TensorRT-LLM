@@ -23,20 +23,18 @@ Requires CUDA (FA4 is GPU-only).
 import pytest
 import torch
 
-try:
-    from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
-        FlashAttn4Attention,
-        _flash_attn_fwd,
-    )
+from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
+    FlashAttn4Attention,
+    _flash_attn_fwd,
+)
 
-    FA4_AVAILABLE = _flash_attn_fwd is not None
-except ImportError:
-    FA4_AVAILABLE = False
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="FA4 requires CUDA")
 
-pytestmark = [
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="FA4 requires CUDA"),
-    pytest.mark.skipif(not FA4_AVAILABLE, reason="FA4 kernel not available"),
-]
+
+@pytest.fixture(autouse=True)
+def require_bundled_fa4():
+    assert _flash_attn_fwd is not None, "The bundled FA4 backend failed to import"
+    assert getattr(_flash_attn_fwd, "visual_gen_tuning_api", None) == 1
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -46,8 +44,6 @@ def test_autotuned_tactics_output_lse_and_graph_replay(dtype, strided):
     """Every demo tactic must preserve both attention output and float32 LSE."""
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("FA4 tuning demo targets SM100/SM103")
-    if getattr(_flash_attn_fwd, "visual_gen_tuning_api", None) != 1:
-        pytest.skip("Requires the FA4 b19 per-call tuning patch")
     from tensorrt_llm._torch.autotuner import OptimizationProfile
     from tensorrt_llm._torch.visual_gen.attention_backend.fa4_autotuner import Fa4Runner
 

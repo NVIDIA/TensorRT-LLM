@@ -143,7 +143,18 @@ foreach(DEP_IDX RANGE ${DEP_COUNT_MINUS_ONE})
     list(APPEND FETCH_ARGS SOURCE_SUBDIR "${DEP_SOURCE_SUBDIR}")
   endif()
 
-  if(DEP_PATCH_FILE AND NOT DEP_PATCH_FILE STREQUAL "")
+  if(DEP_NAME STREQUAL "flash_attn_4")
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    list(
+      APPEND
+      FETCH_ARGS
+      PATCH_COMMAND
+      "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/prepare_fa4.py"
+      --source
+      <SOURCE_DIR>
+      --apply-patch)
+  elseif(DEP_PATCH_FILE AND NOT DEP_PATCH_FILE STREQUAL "")
     set(_patch_file "${CMAKE_CURRENT_SOURCE_DIR}/${DEP_PATCH_FILE}")
     # Try applying the patch; --forward skips patches already applied and -r -
     # discards rejects. The forward exit status alone cannot distinguish an

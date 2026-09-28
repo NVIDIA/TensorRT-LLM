@@ -51,6 +51,14 @@
       "git_shallow": true
     },
     {
+      "name": "flash_attn_4",
+      "git_repository": "${github_base_url}/Dao-AILab/flash-attention",
+      "git_tag": "940cd9680f3315f2f06b43ab5bea2c2cf2d96806",
+      "use_url": true,
+      "source_subdir": "dont-add-this-project-with-add-subdirectory",
+      "patch_file": "patches/flash_attn_4_b19.patch"
+    },
+    {
       "name": "flashmla",
       "git_repository": "https://github.com/deepseek-ai/FlashMLA.git",
       "git_tag": "15f13e5030374295491c5ce31b02d7e63a7772c6",

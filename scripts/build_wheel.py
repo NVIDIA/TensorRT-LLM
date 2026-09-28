@@ -1589,6 +1589,17 @@ def main(*,
             build_dir / "tensorrt_llm" / "flash_mla" / "python" / "flash_mla",
             pkg_dir / "flash_mla")
 
+    # FA4 is pure Python with runtime CuTe JIT; ship its patched sources.
+    run([
+        str(venv_python),
+        str(project_dir / "3rdparty" / "prepare_fa4.py"),
+        "--source",
+        str(build_dir / "_deps" / "flash_attn_4-src"),
+        "--destination",
+        str(wheel_project_dir / "3rdparty" / "trtllm_flash_attn"),
+    ],
+        check=True)
+
     # Stage the FetchContent-patched MSA package for setup.py packaging.
     msa_src = build_dir / "_deps" / "msa-src" / "python" / "fmha_sm100"
     cutlass_src = build_dir / "_deps" / "cutlass-src"

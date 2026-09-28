@@ -34,10 +34,10 @@ in the module docstrings of `../sol_attn_backend.py` and
 
 The upstream package vendored a copy of FlashAttention's CuTe DSL helpers
 under `sol_attn/_vendor/flash_attn/cute/`. That copy is **not** carried here:
-TensorRT-LLM already depends on
-[`flash-attn-4`](https://github.com/Dao-AILab/flash-attention) (pinned in
-`requirements.txt`), which provides the same `flash_attn.cute` modules, and
-the SM100 kernels import them from that dependency directly. FlashAttention's
+TensorRT-LLM bundles patched
+[FlashAttention 4](https://github.com/Dao-AILab/flash-attention) sources as
+`trtllm_flash_attn` (pinned in `3rdparty/fetch_content.json`), and the SM100
+kernels import their CuTe helpers from that package. FlashAttention's
 BSD-3-Clause license is retained at `sol_attn/sm100/LICENSE.flash-attention`
 because portions of the SM100 design scaffold still derive from that project.
 

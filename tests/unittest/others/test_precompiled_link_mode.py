@@ -54,6 +54,8 @@ def build_tree(tmp_path, monkeypatch):
     (source / "tensorrt_llm" / "libs" / "libtensorrt_llm.so").write_text("so")
     (source / "3rdparty" / "fmha_sm100").mkdir(parents=True)
     (source / "3rdparty" / "fmha_sm100" / "__init__.py").write_text("")
+    (source / "3rdparty" / "trtllm_flash_attn").mkdir()
+    (source / "3rdparty" / "trtllm_flash_attn" / "__init__.py").write_text("# patched FA4")
 
     destination = tmp_path / "checkout"
     destination.mkdir()
@@ -85,6 +87,9 @@ def test_link_mode_symlinks_the_artifacts(extract_from_precompiled, build_tree, 
     fmha = Path("3rdparty/fmha_sm100")
     assert fmha.is_symlink()
     assert Path(os.readlink(fmha)) == build_tree / "3rdparty" / "fmha_sm100"
+    fa4 = Path("3rdparty/trtllm_flash_attn")
+    assert fa4.is_symlink()
+    assert Path(os.readlink(fa4)) == build_tree / "3rdparty/trtllm_flash_attn"
 
 
 def test_link_mode_keeps_an_existing_fmha_symlink(extract_from_precompiled, build_tree, tmp_path):
@@ -138,6 +143,9 @@ def test_copy_mode_is_unchanged(extract_from_precompiled, build_tree, tmp_path):
     fmha = Path("3rdparty/fmha_sm100")
     assert fmha.is_dir() and not fmha.is_symlink()
     assert (fmha / "__init__.py").is_file()
+    fa4 = Path("3rdparty/trtllm_flash_attn")
+    assert not fa4.is_symlink()
+    assert (fa4 / "__init__.py").read_text() == "# patched FA4"
 
 
 def test_link_mode_rejects_a_wheel(extract_from_precompiled, build_tree, tmp_path):
@@ -163,12 +171,14 @@ def test_wheel_extracts_embedded_nccl_ep(extract_from_precompiled, tmp_path, mon
     wheel = tmp_path / "tensorrt_llm-0.0.0.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
         archive.writestr("fmha_sm100/__init__.py", "")
+        archive.writestr("trtllm_flash_attn/__init__.py", "# patched FA4")
         archive.writestr("nccl/ep/__init__.py", "")
         archive.writestr("nccl/ep/lib/libnccl_ep.so", "ep")
         archive.writestr("nccl/_extensions/bindings/binding.so", "binding")
 
     _run(extract_from_precompiled, wheel, tmp_path, link=False)
 
+    assert Path("3rdparty/trtllm_flash_attn/__init__.py").read_text() == "# patched FA4"
     package_root = checkout / "3rdparty" / "nccl_extensions"
     assert not (package_root / "stale").exists()
     assert (package_root / "nccl" / "ep" / "lib" / "libnccl_ep.so").read_text() == "ep"
@@ -252,3 +262,23 @@ def test_skew_check_is_skipped_outside_a_repo(warn_on_build_skew, monkeypatch, c
     warn_on_build_skew("/src")
 
     assert "Cannot check for build skew" in capfd.readouterr().out
+
+
+@pytest.mark.parametrize("source_kind", ["wheel", "directory"])
+def test_precompiled_requires_bundled_fa4(
+    extract_from_precompiled, build_tree, tmp_path, source_kind
+):
+    import shutil
+    import zipfile
+
+    from setuptools.errors import SetupError
+
+    if source_kind == "wheel":
+        source = tmp_path / "old.whl"
+        with zipfile.ZipFile(source, "w") as archive:
+            archive.writestr("fmha_sm100/__init__.py", "")
+    else:
+        source = build_tree
+        shutil.rmtree(source / "3rdparty/trtllm_flash_attn")
+    with pytest.raises(SetupError, match="trtllm_flash_attn"):
+        _run(extract_from_precompiled, source, tmp_path, link=False)

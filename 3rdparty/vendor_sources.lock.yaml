@@ -25,5 +25,5 @@ vendors:
     - sol_attn/preprocess.py
     - sol_attn/sm100/*
     patch: 3rdparty/vendor_patches/sana-sol-attn.patch
-    patch_digest: sha256:0d66669021683773aff34533abaf8f200abd09e3af93d19eed0e2a2e04f2f980
-    digest: sha256-tree-v1:383f6085ca1bc2438e8d7d4796036af3a816dbfd396313704f7f4be2c06ac55b
+    patch_digest: sha256:250a7412bacade1ad2568092000b1687fa33d4d139460b20b15ed98fcb83a205
+    digest: sha256-tree-v1:93d1b185037e1c96dc1d169ef9a1b490605e5f9e18549c5a8ff6537e27dabd37

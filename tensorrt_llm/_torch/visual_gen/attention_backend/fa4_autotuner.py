@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Experimental FA4 dense forward tuning using per-call dependency controls.
 
-Requires the b19 patch in examples/visual_gen/fa4_autotune. Import this module
-after flash_attn4 has installed the existing CUTLASS compatibility shims.
+Uses the source-built FA4 package shipped in the TRT-LLM wheel. Import this
+module after flash_attn4 has installed the CUTLASS compatibility shims.
 """
 
 from functools import lru_cache
@@ -20,15 +20,12 @@ _TUNING_CONFIG = TuningConfig()
 
 @lru_cache(maxsize=1)
 def _require_tuning_api() -> None:
-    from flash_attn.cute.interface import _flash_attn_fwd
+    from trtllm_flash_attn.interface import _flash_attn_fwd
 
-    if (
-        version("flash-attn-4") != "4.0.0b19"
-        or getattr(_flash_attn_fwd, "visual_gen_tuning_api", None) != 1
-    ):
+    if getattr(_flash_attn_fwd, "visual_gen_tuning_api", None) != 1:
         raise RuntimeError(
-            "TLLM_VISUAL_GEN_FA4_AUTOTUNE requires flash-attn-4==4.0.0b19 with "
-            "examples/visual_gen/fa4_autotune/flash_attn_4_b19.patch applied."
+            "The bundled FA4 package is missing its per-call tuning API. "
+            "Rebuild TRT-LLM with scripts/build_wheel.py or install a matching TRT-LLM wheel."
         )
 
 
@@ -61,7 +58,7 @@ class Fa4Runner(TunableRunner):
     """Time CTA count and exp2 emulation jointly without modifying FA4 globals."""
 
     def __init__(self, inputs: list[torch.Tensor], scale: float) -> None:
-        from flash_attn.cute import utils
+        from trtllm_flash_attn import utils
 
         _require_tuning_api()
         self.scale = scale
@@ -71,10 +68,12 @@ class Fa4Runner(TunableRunner):
         self.tensor_metadata = tuple((str(t.dtype), tuple(t.stride())) for t in inputs)
 
     def unique_id(self) -> tuple:
+        from trtllm_flash_attn._build_info import BUILD_ID
+
         # Shapes are keyed by AutoTuner; strides/dtypes and runtime controls are not.
         return (
             1,
-            "4.0.0b19+visual_gen_tuning_api1",
+            BUILD_ID,
             torch.__version__,
             torch.version.cuda,
             _cutlass_version(),
@@ -108,7 +107,7 @@ class Fa4Runner(TunableRunner):
         do_preparation: bool = False,
         **kwargs: object,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        from flash_attn.cute.interface import _flash_attn_fwd
+        from trtllm_flash_attn.interface import _flash_attn_fwd
 
         tuning_kwargs = {}
         if tactic != -1:

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
 """Sol-Attn forward kernel for Blackwell SM100.
 
 The kernel routes two physical N64 halves at a time and accumulates their exact
@@ -12,13 +14,13 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
-import flash_attn.cute.pipeline as fa_pipeline
-import flash_attn.cute.utils as fa_utils
+import trtllm_flash_attn.pipeline as fa_pipeline
+import trtllm_flash_attn.utils as fa_utils
 from cutlass import BFloat16, Float32, Int32
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import T, dsl_user_op
-from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+from trtllm_flash_attn.cute_dsl_utils import assume_tensor_aligned
 
 from .softmax import (
     _load_m64_n128_score as _load_pair_score,

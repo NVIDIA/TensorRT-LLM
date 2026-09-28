@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
 """Online-softmax helpers for the Blackwell mainloop."""
 
 from __future__ import annotations
@@ -7,7 +9,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32
 from cutlass.cute.nvgpu import tcgen05
 
-from flash_attn.cute import utils as fa_utils
+from trtllm_flash_attn import utils as fa_utils
 
 from .tmem import (
     _add_physical_tmem_base,
