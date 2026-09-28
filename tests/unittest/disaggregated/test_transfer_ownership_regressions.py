@@ -1601,12 +1601,14 @@ def test_terminal_sender_settles_known_unsubmitted_aux_peer_once() -> None:
     session._enforce_physical_ownership = True
     session._need_aux = True
     session._reported_aux_peer_ranks = set()
+    session._logical_outcomes = transfer_mod._LogicalOutcomes()
     session.kv_tasks = []
     session.lock = threading.Lock()
     session._exception = None
     session._terminal_status = None
     session._closed = False
     session.aux_task = transfer_mod.AuxSendTask(params, slot=0)
+    session.aux_task.bind_logical_outcomes(session._logical_outcomes)
     assert session.aux_task.begin_physical_operation(active_info.instance_rank)
 
     session.set_exception("request failed before auxiliary submission")

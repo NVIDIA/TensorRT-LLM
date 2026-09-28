@@ -8,6 +8,7 @@ from .hf.config_loader import HfConfigLoader
 from .hf.cosmos3_weight_mapper import Cosmos3HfWeightMapper
 from .hf.gemma3_weight_mapper import Gemma3HfWeightMapper
 from .hf.gemma4_weight_mapper import Gemma4HfWeightMapper
+from .hf.glm5_next_weight_mapper import Glm5NextHfWeightMapper
 from .hf.llama4_weight_mapper import Llama4HfWeightMapper
 from .hf.llava_next_weight_mapper import LlavaNextHfWeightMapper
 from .hf.mixtral_weight_mapper import MixtralHfWeightMapper
@@ -40,5 +41,5 @@ __all__ = [
     "Gemma4HfWeightMapper", "LlavaNextHfWeightMapper",
     "MistralLarge3CheckpointLoader", "MistralLarge3WeightMapper",
     "MXCheckpointLoader", "Qwen3VLHfWeightMapper", "Cosmos3HfWeightMapper",
-    "Qwen4ExpHfWeightMapper"
+    "Qwen4ExpHfWeightMapper", "Glm5NextHfWeightMapper"
 ]

@@ -99,7 +99,6 @@ l0_a10:
   - disaggregated/test_disaggregated.py::test_disaggregated_perf_metrics[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_cache_aware_balance[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_conditional[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_gen_only_insufficient_kv[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_ngram[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_sa[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_chat_completion_tool_calls[TinyLlama-1.1B-Chat-v1.0]
@@ -225,6 +224,11 @@ l0_a10:
   - llmapi/test_llm_api_connector.py::test_connector_max_utilization_is_rejected_on_v1_only[kv_cache_manager_v1]
   - llmapi/test_llm_api_connector.py::test_connector_max_utilization_is_rejected_on_v1_only[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_e2e_persistent_cache[kv_cache_manager_v2]
+  - llmapi/test_llm_api_connector.py::test_connector_reservations_hold_source_without_transmission
+  - llmapi/test_llm_api_connector.py::test_connector_cancel_drains_real_prefix_load[alone-True]
+  - llmapi/test_llm_api_connector.py::test_connector_cancel_drains_real_prefix_load[alone-False]
+  - llmapi/test_llm_api_connector.py::test_connector_cancel_drains_real_prefix_load[traffic-True]
+  - llmapi/test_llm_api_connector.py::test_connector_cancel_drains_real_prefix_load[traffic-False]
   - llmapi/test_llm_api_connector.py::test_connector_prefix_is_asked_once_and_shrinks_the_forward_pass[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_prefix_under_chunked_prefill[kv_cache_manager_v2-offer_inside_chunk]
   - llmapi/test_llm_api_connector.py::test_connector_prefix_under_chunked_prefill[kv_cache_manager_v2-offer_past_chunk]
@@ -263,6 +267,9 @@ l0_a10:
   - test_e2e.py::test_openai_health
   - test_e2e.py::test_trtllm_serve_example
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
+  # Post-merge real-scheduler smoke for the gen-only benchmark insufficient-KV fail-fast;
+  # the CPU tests under unittest/_torch/disaggregation guard the error chain pre-merge.
+  - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_gen_only_insufficient_kv[TinyLlama-1.1B-Chat-v1.0]
 - condition:
     ranges:
       system_gpu_count:

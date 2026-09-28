@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -418,6 +421,24 @@ def test_subagent_affinity_scope_rejects_invalid_value():
                            subagent_affinity_scope="everything")
 
 
+def test_subagent_affinity_requires_key_at_config_load() -> None:
+    with pytest.raises(ValueError, match="requires internal_request_auth_key"):
+        extract_disagg_cfg(
+            **get_yaml_config(),
+            conversation_affinity_header_for_subagents="x-parent-id")
+
+
+@pytest.mark.parametrize("key_location",
+                         ["top_level", "context_servers", "generation_servers"])
+def test_subagent_affinity_accepts_resolved_key(key_location: str) -> None:
+    config = get_yaml_config()
+    config["conversation_affinity_header_for_subagents"] = "x-parent-id"
+    key_config = config if key_location == "top_level" else config[key_location]
+    key_config["internal_request_auth_key"] = "secret"
+
+    assert extract_disagg_cfg(**config).internal_request_auth_key == "secret"
+
+
 def test_subagent_affinity_warns_when_ctx_router_not_conversation(caplog):
     # Default ctx router is round_robin, not conversation -> instance affinity
     # for "context" scope is inactive; expect a startup warning.
@@ -426,6 +447,7 @@ def test_subagent_affinity_warns_when_ctx_router_not_conversation(caplog):
             **get_yaml_config(),
             conversation_affinity_header_for_subagents=
             "X-Dynamo-Parent-Session-ID",
+            internal_request_auth_key="secret",
         )
     assert config.conversation_affinity_header_for_subagents == "X-Dynamo-Parent-Session-ID"
     assert "conversation" in caplog.text
@@ -438,6 +460,7 @@ def test_subagent_affinity_no_warning_when_router_prerequisite_met(caplog):
             **_yaml_config_with_conversation_routers(),
             conversation_affinity_header_for_subagents=
             "X-Dynamo-Parent-Session-ID",
+            internal_request_auth_key="secret",
         )
     assert "router type" not in caplog.text
 
@@ -450,6 +473,7 @@ def test_subagent_affinity_both_scope_warns_with_conditional_disagg(caplog):
             **_yaml_config_with_conversation_routers(),
             conversation_affinity_header_for_subagents=
             "X-Dynamo-Parent-Session-ID",
+            internal_request_auth_key="secret",
             subagent_affinity_scope="both",
             conditional_disagg_config={"max_local_prefill_length": 32},
         )
