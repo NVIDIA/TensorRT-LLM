@@ -170,7 +170,8 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 ### Advisory semantic review
 
 See [.github/semantic-review.md](.github/semantic-review.md) for the two-hour
-candidate scan, fixed-version AI results, and manual retry procedure.
+candidate scan, fixed-version AI results, bounded timeout recovery, and manual
+retry procedure.
 
 ### Triggering CI
 

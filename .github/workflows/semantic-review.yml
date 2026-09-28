@@ -32,8 +32,9 @@ jobs:
       contents: read
       pull-requests: read
       issues: read
+      checks: read
     outputs:
-      numbers: ${{ steps.select.outputs.numbers }}
+      jobs: ${{ steps.select.outputs.jobs }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -52,19 +53,19 @@ jobs:
           script: |
             const {discover} = require('./.github/scripts/semantic_review_request.js');
             const result = await discover({github, context, core});
-            core.setOutput('numbers', JSON.stringify(result.numbers));
+            core.setOutput('jobs', JSON.stringify(result.jobs));
 
   request:
-    name: 'Request analysis for PR #${{ matrix.number }}'
+    name: 'Process semantic review for PR #${{ matrix.number }}'
     needs: discover
     if: >-
-      !cancelled() && needs.discover.outputs.numbers != '' &&
-      needs.discover.outputs.numbers != '[]'
+      !cancelled() && needs.discover.outputs.jobs != '' &&
+      needs.discover.outputs.jobs != '[]'
     strategy:
       fail-fast: false
       max-parallel: 4
       matrix:
-        number: ${{ fromJSON(needs.discover.outputs.numbers) }}
+        include: ${{ fromJSON(needs.discover.outputs.jobs) }}
     concurrency:
       group: semantic-review-pr-${{ matrix.number }}
       cancel-in-progress: false
@@ -88,15 +89,16 @@ jobs:
       - uses: actions/github-script@v8
         env:
           PULL_NUMBER: ${{ matrix.number }}
+          ALLOW_REQUEST: ${{ matrix.allowRequest }}
           SEMANTIC_COMMAND_TOKEN: ${{ secrets.TRTLLM_AGENT_SHARED_TOKEN }}
         with:
           script: |
             const {run} = require('./.github/scripts/semantic_review_request.js');
-            if (!process.env.SEMANTIC_COMMAND_TOKEN) throw new Error('Missing semantic command token.');
-            const commandGithub = new github.constructor({
+            const commandGithub = process.env.SEMANTIC_COMMAND_TOKEN ? new github.constructor({
               auth: process.env.SEMANTIC_COMMAND_TOKEN, retry: {enabled: false},
-            });
-            await run({github, commandGithub, context, core, number: Number(process.env.PULL_NUMBER)});
+            }) : undefined;
+            await run({github, commandGithub, context, core, number: Number(process.env.PULL_NUMBER),
+              allowRequest: process.env.ALLOW_REQUEST === 'true'});
 
   publish:
     name: Publish semantic verdict

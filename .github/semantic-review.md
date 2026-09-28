@@ -28,65 +28,95 @@ directly request analysis. The scheduled scan observes those changes.
 
 ## Request policy
 
-- Read the current head, target and merge-base. Scheduled requests skip
-  previously requested head/target/branch combinations, regardless of whether
-  the earlier analysis replied or passed. A head that already contains target
-  still needs compatibility analysis: rebase or merge can incorporate semantic
-  bugs.
-- Select candidates by descending PR number, starting with the newest each scan.
-  Select at most 30 requests after deduplication. Failed selection or delivery
-  attempts consume slots; a failed POST can still have reached CodeRabbit.
-  Workers recheck eligibility, revisions and scheduled-request deduplication under
-  the PR's lock. If a selected worker skips or fails, its slot is not refilled.
-- Stop the affected discovery or request job when a token's observed REST quota
-  remaining is 1,000 or less, or when rate limited. `GITHUB_TOKEN` and the service
-  PAT have separate quota checks; the service PAT is checked by request workers.
-  Concurrent API users can spend quota between observations. This reserve does
-  not apply to result publication.
-- Skip delivery if eligibility or revisions change during preparation. A later
-  scan can select the PR again. Once a request comment exists, a missing reply
-  does not trigger an automatic retry; use a manual request to retry that version.
+- Select new analyses from eligible PRs by descending PR number, starting with
+  the newest each scan. A head that already contains target still needs analysis.
+- Identify a version by its full head SHA, target SHA and target branch. PASS,
+  FAIL and INCONCLUSIVE all complete a request; none automatically reruns that
+  version. Completion is established by a valid reply, not by a Check's color.
+- If the latest request still matches the current version, has no valid reply
+  and is at least two hours old, it may receive one automatic retry. The retry
+  has a new request ID and records the earlier ID in `automaticRetryOf`. One
+  recorded automatic retry exhausts that version's automatic allowance. Manual
+  requests neither consume nor reset this allowance. After exhaustion, keep
+  waiting for a valid reply or use a manual request.
+- Select at most 30 new-analysis or retry request slots per scan. Failed
+  selection or delivery attempts consume slots; an ambiguous POST failure may
+  already have reached CodeRabbit. Workers recheck eligibility, revisions and
+  replies under the PR's lock before sending. A selected worker that skips or
+  fails is not replaced in the same batch.
+- The scan also repairs result publication for the latest request on open PRs,
+  including drafts or PRs that no longer have approval/auto-merge. Repairs do
+  not consume AI request slots and cannot turn into new requests. The combined
+  request/repair matrix fits GitHub's limit of 256 jobs per matrix.
+- Recover abandoned pending Checks as part of publication repair. A confirmed
+  delivery failure cancels the undelivered Check; an unknown delivery outcome
+  stays pending until comments can be read again. Recovery cancels superseded
+  or unrecorded pending Checks on the current PR head and latest request's head,
+  without treating cancellation as an AI result.
+- Discovery and new-request jobs stop when an applicable token's observed REST
+  quota remaining is 1,000 or less, or when rate limited. `GITHUB_TOKEN` and the
+  service PAT have separate quota checks. Repair-only jobs and comment-triggered
+  publication do not require the service PAT or apply this reserve. Concurrent
+  API users can spend quota between observations.
 
-Twelve scheduled scans have a combined budget of 360 request attempts; this is
-not a calendar-day cap on manual requests, reruns or delayed batches.
-Newest-first selection can defer older PRs indefinitely when target keeps
-advancing and there are more than 30 actionable candidates. Monitor actual
-throughput and backlog before changing this policy.
+A scan first recovers any valid result already received for the latest request,
+then considers a new analysis. A reply received before the worker's final
+recheck prevents a timeout retry. When revisions change, analyze the current
+version instead of retrying the obsolete one. Pure result recovery always uses
+the original request's fixed revisions.
+
+Twelve scheduled scans have a combined budget of 360 request slots; this is not
+a calendar-day cap on manual requests, reruns or delayed batches. Newest-first
+selection can defer older PRs when target keeps advancing and more than 30
+candidates need analysis.
 
 ## Results
 
-Requests have a unique ID and fixed head/target/merge-base SHAs. CodeRabbit
-replies carry those fields. The result job validates the bot identity, request,
-revisions, and presence of source citations before publishing:
+Requests have a unique ID and fixed head/target/merge-base SHAs. The publisher
+validates the bot identity, request identity and all three revisions. The current
+request has the following states:
 
-| Result | PR check |
-| --- | --- |
-| PASS | Success: no conflict found for the recorded revisions |
-| FAIL | Failure: possible conflict; inspect linked evidence |
-| Missing or inconclusive | Neutral: no verified verdict |
+| Situation | Check status | Conclusion |
+| --- | --- | --- |
+| No valid reply yet | `in_progress` | None |
+| PASS | `completed` | `success` |
+| FAIL | `completed` | `failure` |
+| INCONCLUSIVE | `completed` | `neutral` |
 
-Reply events process results without waiting for the next scheduled scan.
-Request and publication jobs for the same PR share a concurrency queue, so
-switching the current request cannot race an older reply. Different PRs can run
-independently; each scan has up to four concurrent request workers. Scheduled
-batches run one at a time; manual requests and publication do not share that batch lock. Jobs do
-not wait for AI analysis while holding a queue. A scan's success only means its
-requests were processed, not that AI approved those PRs.
+Wrong identities, request IDs or revisions are ignored. A reply associated with
+the request but lacking a valid result format does not complete it; it remains
+eligible for the bounded timeout retry. A correctly bound PASS/FAIL without the
+required fixed-revision source citations completes as INCONCLUSIVE. This does
+not establish the semantic correctness of those citations or the AI's findings.
 
-When the target advances, a reply still describes its requested snapshot; target
-updates do not immediately clear the Check. A later scan can request the newer
-combination if the PR is eligible, selected within the budget and quota allows.
-Switching requests clears the earlier verdict; an old reply cannot update the
-new request's check. With a new head, the check is attached to that head.
-Editing or deleting the published source reply revokes a conclusion that is no
-longer valid when that event is processed.
-The scheduled scan does not reconcile missed publication events or failed Check
-writes. A later trusted reply event or a publisher job rerun can reconcile them;
-an open main/release PR can also receive a new manual request.
+Each new request creates a new Check Run. Completed Checks cannot reliably be
+reset to an empty conclusion through the REST update operation. Historical
+Checks remain available; pending Checks on the same head are cancelled when
+superseded. Publication selects the newest Check matching the latest request ID,
+so an old request's late reply cannot replace the current result.
+
+If a published reply is edited or deleted and no longer supplies a valid result,
+the current request returns to waiting through a new Check Run for that same
+request, without asking AI again. Reply-source markers and links are stored in
+the Check output; they prevent falling back to an older PASS. Reconciliation
+uses the same parser and publication code as comment events and skips writes
+when the recorded state already matches the reply.
+
+Reply events publish without waiting for a scan. Request and publication jobs
+for the same PR share a concurrency queue. Each batch runs up to four workers;
+the workers finish after their GitHub operations and do not wait for CodeRabbit.
+This is not a limit on concurrent AI analyses. Scheduled batches run one at a
+time; manual requests and publication do not share that batch lock.
+
+Target updates do not immediately invalidate a recorded snapshot. A later scan
+can request the new combination if eligibility, budget and quota permit. A scan
+workflow's success means orchestration succeeded; it is not an AI PASS.
 
 A PR that merges between scans may never be requested. An already requested
-analysis may finish after merging; its result still covers the recorded input,
-not an audit of the final merge tree.
+analysis may finish after merging and publish its recorded snapshot, not an
+audit of the final merge tree. Scheduled recovery covers open PRs; a missed
+publication on a closed PR requires a subsequent trusted reply event or a
+publisher job rerun.
 
 ## Deployment and permissions
 
@@ -124,8 +154,9 @@ replies, concrete findings and timings, including missed/inconclusive results.
 Use an independent context without giving the incident explanation or a repair.
 If the hosting discussion reveals the answer, label the run as a replay rather
 than a blind evaluation. Fixed repeats characterize variability; production
-still issues one request. Assess known defect detection and repair false positives
-separately; a narrow repair control does not establish general accuracy.
+uses one initial request and at most one automatic timeout retry per version.
+Assess known defect detection and repair false positives separately; a narrow
+repair control does not establish general accuracy.
 
 The deterministic tests simulate GitHub. A real AI reply and a real Check write
 are separate validation layers and must be reported as such. Historical cases
