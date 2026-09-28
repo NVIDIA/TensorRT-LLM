@@ -25,9 +25,11 @@ NVLINK One-Sided supports post-quant dispatch.
 """
 
 import os
+import re
 import sys
 from typing import Callable, Dict, List, Optional, Tuple
 
+import pynvml
 import torch
 
 from tensorrt_llm._mnnvl_utils import CftMnnvlMemory, MnnvlCheckpointCommunicator, MnnvlMemory
@@ -57,6 +59,7 @@ _CFT_DEFAULT_MAX_BATCH_FOR_COMBINE = 128
 _CFT_MAX_BATCH_FOR_COMBINE_ENV = "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_COMBINE"
 FORCE_CFT_ENV = "TRTLLM_MOE_A2A_FORCE_CFT"
 _CFT_ALIGNMENT_BYTES = 16
+_CFT_MIN_DRIVER_BRANCH = 615
 
 
 def get_force_cft() -> bool | None:
@@ -68,17 +71,60 @@ def get_force_cft() -> bool | None:
     return None
 
 
+def _get_nvidia_driver_version() -> str | None:
+    try:
+        try:
+            pynvml.nvmlDeviceGetCount()
+        except pynvml.NVMLError_Uninitialized:
+            pynvml.nvmlInit()
+        value = pynvml.nvmlSystemGetDriverVersion()
+    except pynvml.NVMLError as error:
+        tllm_logger.warning_once(
+            "CFT counted writes disabled: failed to query the NVIDIA driver "
+            f"version via NVML ({error}). Falling back to fence-based dispatch.",
+            key="moe_a2a_cft_driver_query_failed",
+        )
+        return None
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return str(value)
+
+
+def cft_driver_is_supported(driver_version: str | bytes | None) -> bool:
+    if isinstance(driver_version, bytes):
+        driver_version = driver_version.decode(errors="replace")
+    if not driver_version:
+        return False
+    match = re.match(r"^(\d+)(?:\.|$)", driver_version.strip())
+    return bool(match and int(match.group(1)) >= _CFT_MIN_DRIVER_BRANCH)
+
+
 def resolve_can_use_cft(can_use_cft_counted_writes: bool) -> bool:
-    """Apply the TRTLLM_MOE_A2A_FORCE_CFT override to a caller's request.
+    """Apply the TRTLLM_MOE_A2A_FORCE_CFT override, then the driver requirement.
 
     Workspace sizing and workspace layout both depend on this, so they must
     resolve it identically: a caller that sizes without the override and then
     constructs with it would lay out the CFT region in an undersized buffer.
+
+    The driver check applies even when CFT is forced. Logical endpoints need
+    kernel-driver support; under CUDA forward compatibility a newer user-mode
+    driver exports the API but endpoint creation fails on the older kernel driver.
     """
     force_cft = get_force_cft()
-    if force_cft is None:
-        return can_use_cft_counted_writes
-    return force_cft
+    requested = can_use_cft_counted_writes if force_cft is None else force_cft
+    if not requested:
+        return False
+    driver_version = _get_nvidia_driver_version()
+    if not cft_driver_is_supported(driver_version):
+        if driver_version is not None:
+            tllm_logger.warning_once(
+                "CFT counted writes disabled: NVIDIA driver "
+                f"{driver_version} is below required {_CFT_MIN_DRIVER_BRANCH}.00. "
+                "Falling back to fence-based dispatch.",
+                key=f"moe_a2a_cft_driver_unsupported_{driver_version}",
+            )
+        return False
+    return True
 
 
 def should_use_cft(

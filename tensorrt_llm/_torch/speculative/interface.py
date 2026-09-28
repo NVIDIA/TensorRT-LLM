@@ -436,22 +436,21 @@ class SpeculativeDecodingMode(IntEnum):
 
     def attention_need_spec_dec_mode(
         self,
-        is_draft_model: bool,
         attention_backend: Type[AttentionBackend],
     ):
         """
         If true, the attention backend kernel needs to run in spec-dec mode (multi-token query mode).
         Args:
-            is_draft_model: whether the model is a draft model.
             attention_backend: the attention backend.
         """
         is_trtllm_attention = issubclass(attention_backend, TrtllmAttention)
 
         # Always use the multi-token query mode for 1-model if the kernels are available.
         use_case_1 = self.use_one_engine()
-        # For 2-model, only the target model (verification) processes multiple tokens at once.
-        use_case_2 = (not self.use_one_engine() and not is_draft_model
-                      and is_trtllm_attention)
+        # For modes that do not run in one engine (NGram, user-provided drafts),
+        # the target model verifies multiple draft tokens per step and needs the
+        # multi-token query kernel.
+        use_case_2 = not self.use_one_engine() and is_trtllm_attention
 
         return use_case_1 or use_case_2
 
@@ -662,10 +661,12 @@ class SpecMetadata:
     # the slot keys are bounded by the slot pool, which SeqSlotManager frees
     # and reuses on request completion.
     #
-    # A per-slot counter is not reset when a slot is reused, so a new seeded
-    # request on a recycled slot starts partway into its stream. That is still
-    # a disjoint region of it, so sampling stays correct; the cost is that a
-    # seeded request reproduces bit-exactly only for a given slot history.
+    # A slot's counter is reset when a different request takes the slot over
+    # (see ``_rng_slot_owner``), so a seeded request always starts at the
+    # beginning of its stream: with a fixed seed it reproduces bit-exactly
+    # regardless of which slot it lands on or that slot's history. (Batch
+    # composition can still perturb it, because the kernel's per-row
+    # subsequence follows the batch row.)
     #
     # Unseeded requests all share DEFAULT_SAMPLING_SEED, so a per-slot counter
     # would give two requests on never-used slots the same (seed, offset) and
@@ -674,6 +675,8 @@ class SpecMetadata:
     # low-concurrency case. The shared counter guarantees every unseeded
     # request an offset window no earlier request has used.
     _rng_window_counter: dict = field(default_factory=dict)
+    # seq_slot -> py_request_id mapping to track offset slot ownership.
+    _rng_slot_owner: dict = field(default_factory=dict)
     # The same state expanded to one entry per logits row, mirroring the
     # temperatures / top_ks / top_ps / min_ps layout, for the sampling calls that
     # consume rows rather than requests.
@@ -766,7 +769,16 @@ class SpecMetadata:
             # Dummy/padding requests (no slot) never have their output kept;
             # they are unseeded, so they draw from the shared counter like any
             # other unseeded request and never perturb a real slot's stream.
-            key = request.py_seq_slot if is_seeded else _UNSEEDED_RNG_WINDOW_KEY
+            if is_seeded:
+                key = request.py_seq_slot
+                # A recycled slot still carries the finished request's counter.
+                # Start the newcomer at 0 so a seeded request's stream never
+                # depends on its slot's history.
+                if self._rng_slot_owner.get(key) != request.py_request_id:
+                    self._rng_slot_owner[key] = request.py_request_id
+                    self._rng_window_counter[key] = 0
+            else:
+                key = _UNSEEDED_RNG_WINDOW_KEY
             step = self._rng_window_counter.get(key, 0)
             self._rng_window_counter[key] = step + 1
             offsets.append(step * window)
@@ -2975,6 +2987,12 @@ class SpecWorkerBase(nn.Module, ABC):
         if self.use_separate_draft_kv_cache and resource_manager is not None:
             return resource_manager.get_resource_manager(
                 ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+        if resource_manager is not None:
+            target = resource_manager.get_resource_manager(
+                ResourceManagerType.KV_CACHE_MANAGER)
+            get_view = getattr(target, "get_draft_subpage_view", None)
+            if get_view is not None:
+                return get_view()
         return None
 
     @contextmanager
