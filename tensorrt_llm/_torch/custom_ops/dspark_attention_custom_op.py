@@ -5,7 +5,7 @@
 
 The op runs the tcgen05 MMA kernel
 (:class:`DSparkAttention`) on the supported DSV4 DSpark
-geometry: 128 heads, head_dim 512, draft block 5 or 6, and a 128-row rolling
+geometry: 128 heads, head_dim 512, draft block 1 through 8, and a 128-row rolling
 window. Other shapes fall back to the pure-PyTorch reference path in
 ``models/modeling_dspark.py``.
 """
@@ -32,7 +32,8 @@ _DSV4_DSPARK_NUM_HEADS = 128
 _DSV4_DSPARK_HEAD_DIM = 512
 _DSV4_DSPARK_WINDOW_SIZE = 128
 _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE = 8
-_DSV4_DSPARK_BLOCK_SIZES = (5, 6)
+# Physical K is bounded by the eight-row draft-buffer ABI, not the MMA tile.
+_DSV4_DSPARK_BLOCK_SIZES = (1, 2, 3, 4, 5, 6, 7, 8)
 _DSV4_DSPARK_ROPE_DIM = 64
 
 
@@ -92,7 +93,9 @@ def is_fused_dsv4_dspark_attention_supported(
             f"expected q/kv_cache ranks 4/3, got {q.ndim}/{kv_cache.ndim}", "tensor_ranks"
         )
     if q.shape[1] not in _DSV4_DSPARK_BLOCK_SIZES:
-        return _log_unsupported(f"draft block size must be 5 or 6, got {q.shape[1]}", "block_size")
+        return _log_unsupported(
+            f"draft block size must be 1 through 8, got {q.shape[1]}", "block_size"
+        )
     if q.shape[2:] != (_DSV4_DSPARK_NUM_HEADS, _DSV4_DSPARK_HEAD_DIM):
         return _log_unsupported(
             "q must have 128 heads and head_dim 512; "
@@ -346,7 +349,7 @@ def fused_dsv4_dspark_attention(
     ):
         raise ValueError(
             "fused_dsv4_dspark_attention requires contiguous supported DSV4 DSpark tensors "
-            "([B, 5|6, 128, 512] queries, [B, 8, 512] draft blocks, INT32 indices, "
+            "([B, K, 128, 512] queries with 1 <= K <= 8, [B, 8, 512] draft blocks, INT32 indices, "
             "and a 128-row BF16 window) on SM100 or SM103"
         )
 
