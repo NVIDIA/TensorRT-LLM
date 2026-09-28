@@ -129,7 +129,7 @@ torch_compile_config:
 With this option enabled, ineligible context and mixed forwards use the eager decoder. Ordinary CUDA graphs are also captured from the eager decoder and subsequently replayed as CUDA graphs. Auxiliary kernel and memory-pool warmups bypass `torch.compile`. Avoiding unnecessary tracing and compilation can significantly reduce startup time.
 
 The `compile_only_piecewise_graphs` option was validated with a Qwen3 8B FP8 model, where no performance impact was measured in the tested TP1 and TP2 configurations. However, performance and numerical behavior can be model- and configuration-dependent, so these should be evaluated on a case-by-case basis before deployment.
-This option requires `prefill_cuda_graph_backend: piecewise`, does not support attention DP, and currently supports only models derived from `DecoderModelForCausalLM`.
+This option requires `prefill_cuda_graph_backend: piecewise` and currently supports only models derived from `DecoderModelForCausalLM`. With attention DP, the compiled path follows the group-wide prefill graph eligibility decision.
 
 
 ## Known Issue

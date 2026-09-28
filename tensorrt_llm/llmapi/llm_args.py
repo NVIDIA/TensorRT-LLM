@@ -6549,10 +6549,6 @@ class TorchLlmArgs(BaseLlmArgs):
                 raise ValueError(
                     "torch_compile_config.compile_only_piecewise_graphs requires "
                     "prefill_cuda_graph_backend='piecewise'")
-            if self.enable_attention_dp:
-                raise ValueError(
-                    "torch_compile_config.compile_only_piecewise_graphs does not "
-                    "support attention DP")
 
         if self.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED:
             if self.prefill_capture_num_tokens is None:
