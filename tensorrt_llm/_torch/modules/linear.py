@@ -214,6 +214,24 @@ def copy_weight(dst: Parameter, src: torch.Tensor):
     dst.data.copy_(src)
 
 
+def _load_kv_cache_scales(module: Linear, k_scales: List[torch.Tensor],
+                          v_scales: List[torch.Tensor]) -> None:
+    """Merge calibration scales without replacing graph-visible storage."""
+    if not hasattr(module, "kv_scales") or os.environ.get(
+            "TRTLLM_LOAD_KV_SCALES", "1") != "1":
+        return
+    if not k_scales and not v_scales:
+        return
+    assert k_scales and v_scales, "k_scale and v_scale must be loaded together"
+    copy_weight(
+        module.kv_scales,
+        torch.tensor([1.0, max(k_scales).item(),
+                      max(v_scales).item()],
+                     dtype=torch.float32),
+    )
+    copy_weight(module.inv_kv_scales, module.kv_scales.reciprocal())
+
+
 def copy_weight_shard(dst: Parameter, src: torch.Tensor, shard_offset: int,
                       shard_size: int):
     if dst.dtype != src.dtype:
@@ -685,7 +703,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                         [1.0, max(k_scales).item(),
                          max(v_scales).item()],
                         dtype=torch.float32))
-                module.inv_kv_scales.data = 1.0 / module.kv_scales
+                copy_weight(module.inv_kv_scales, module.kv_scales.reciprocal())
 
     def load_weights_fused_gate_up_linear(
             self,
@@ -991,7 +1009,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                         [1.0, max(k_scales).item(),
                          max(v_scales).item()],
                         dtype=torch.float32))
-                module.inv_kv_scales.data = 1.0 / module.kv_scales
+                copy_weight(module.inv_kv_scales, module.kv_scales.reciprocal())
 
         # Clean up temporary attributes
         if hasattr(module, "tmp_k_scales"):
@@ -1975,19 +1993,8 @@ class NVFP4LinearMethod(LinearMethodBase):
         if weight_scale_2 is not None:
             copy_weight(module.weight_scale_2, weight_scale_2)
 
-        # Handle KV scales
-        if os.environ.get("TRTLLM_LOAD_KV_SCALES", "1") == "1":
-            k_scales = getattr(module, "tmp_k_scales", [])
-            v_scales = getattr(module, "tmp_v_scales", [])
-            if k_scales:
-                assert v_scales, "k_scale and v_scale must be loaded together"
-                copy_weight(
-                    module.kv_scales,
-                    torch.tensor(
-                        [1.0, max(k_scales).item(),
-                         max(v_scales).item()],
-                        dtype=torch.float32))
-                module.inv_kv_scales.data = 1.0 / module.kv_scales
+        _load_kv_cache_scales(module, getattr(module, "tmp_k_scales", []),
+                              getattr(module, "tmp_v_scales", []))
 
         self._cleanup_nvfp4_tmp_attrs(
             module, extra_attrs=["tmp_k_scales", "tmp_v_scales"])
@@ -3482,6 +3489,20 @@ class MXFP8LinearMethod(LinearMethodBase):
                 dtype=torch.uint8),
                                             requires_grad=False)
 
+        if (module.quant_config is not None
+                and module.quant_config.layer_quant_mode.has_fp4_kv_cache()
+                and module.weights_loading_config.weight_mode
+                == WeightMode.FUSED_QKV_LINEAR):
+            # MXFP8 quantizes the projection weights only. NVFP4 KV-cache
+            # quantization still needs the same per-tensor K/V scales exposed
+            # by the other fused-QKV methods. Unit defaults support checkpoints
+            # without KV calibration; calibrated checkpoints overwrite them
+            # in load_weights_fused_qkv_linear().
+            module.kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                         requires_grad=False)
+            module.inv_kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                             requires_grad=False)
+
         if bias:
             module.bias = Parameter(torch.empty((out_features), dtype=dtype),
                                     requires_grad=False)
@@ -3610,6 +3631,7 @@ class MXFP8LinearMethod(LinearMethodBase):
             f"MXFP8 vanilla load expects exactly one weight scale, got "
             f"{len(scales)}")
         self._store_scale(module, scales[0])
+        self.load_kv_cache_scales(module, weights)
 
     def load_weights_fused_qkv_linear(self, module: Linear,
                                       weights: List[Dict]) -> None:
@@ -3624,6 +3646,20 @@ class MXFP8LinearMethod(LinearMethodBase):
         # Scales share the out_features dim with weights; concatenate along
         # dim 0 (out_features), same axis the weights are concatenated on.
         self._store_scale(module, torch.cat(scales, dim=0))
+
+        self.load_kv_cache_scales(module, weights)
+
+    def load_kv_cache_scales(self, module: Linear, weights: List[Dict]) -> None:
+        """Load per-tensor KV calibration for ordinary and prepacked QKV."""
+        # Do not materialize checkpoint slices when calibration is disabled.
+        if not hasattr(module, "kv_scales") or os.environ.get(
+                "TRTLLM_LOAD_KV_SCALES", "1") != "1":
+            return
+        _load_kv_cache_scales(
+            module,
+            [w["k_scale"][...].reshape([]) for w in weights if "k_scale" in w],
+            [w["v_scale"][...].reshape([]) for w in weights if "v_scale" in w],
+        )
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
                                           weights: List[Dict]) -> None:

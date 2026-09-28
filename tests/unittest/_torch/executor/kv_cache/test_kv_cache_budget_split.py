@@ -368,6 +368,7 @@ class TestSplitGpuBudgetForDraft:
         # Both target and draft estimates must pass through the recording manager.
         mocker.patch(
             "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",
+            autospec=True,
             return_value=RecordingKVCacheManager,
         )
 
