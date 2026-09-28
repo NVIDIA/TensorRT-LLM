@@ -1053,10 +1053,9 @@ class KvCacheCreator:
         token (the target stores only every cp_size-th page per rank).
         Intercepts are per-request rank-local bytes and stay unscaled.
         """
-        draft_mapping = self._mapping
+        draft_mapping = self._get_draft_mapping()
         helix_cp_scale = 1
         if self._mapping.has_cp_helix():
-            draft_mapping = self._mapping.repurpose_helix_cp_to_tp()
             helix_cp_scale = self._mapping.cp_size
 
         def scaled(cost: CacheCost) -> CacheCost:
@@ -1892,8 +1891,15 @@ class KvCacheCreator:
         if (self._is_standalone_dspark()
                 and is_mla(self._draft_config.pretrained_config)):
             return "Unified DSpark KV cache does not yet support MLA drafters."
-        if self._mapping.pp_size != 1 or self._mapping.cp_size != 1:
-            return "Unified DSpark KV cache requires PP=1 and CP=1."
+        if self._mapping.pp_size != 1:
+            return "Unified DSpark KV cache requires PP=1."
+        if self._mapping.cp_size != 1:
+            if not self._mapping.has_cp_helix():
+                return ("Unified DSpark KV cache supports context parallelism "
+                        "only with Helix.")
+            if not self._is_standalone_dspark():
+                return ("Unified Helix KV cache requires a standalone "
+                        "DSpark drafter.")
         transceiver_config = self._cache_transceiver_config
         if self._is_disagg and (transceiver_config is None
                                 or transceiver_config.transceiver_runtime
@@ -1902,6 +1908,11 @@ class KvCacheCreator:
             return ("DSpark draft-state transfer requires the PYTHON "
                     "NIXL transceiver on both workers.")
         return None
+
+    def _get_draft_mapping(self) -> Mapping:
+        """Use the drafter's dense TP mapping when target attention uses Helix."""
+        return (self._mapping.repurpose_helix_cp_to_tp()
+                if self._mapping.has_cp_helix() else self._mapping)
 
     def _get_standalone_draft_layout(self) -> StandaloneDraftLayout:
         """Describe distinct draft layers without borrowing target shapes."""
@@ -1923,8 +1934,9 @@ class KvCacheCreator:
         head_dim = getattr(config, "head_dim", None)
         if head_dim is None:
             head_dim = config.hidden_size // num_heads
-        attention_tp_size = (1 if self._mapping.enable_attention_dp else
-                             self._mapping.tp_size)
+        draft_mapping = self._get_draft_mapping()
+        attention_tp_size = (1 if draft_mapping.enable_attention_dp else
+                             draft_mapping.tp_size)
         if (num_kv_heads % attention_tp_size != 0
                 and attention_tp_size % num_kv_heads != 0):
             raise ValueError(
@@ -1940,6 +1952,7 @@ class KvCacheCreator:
             dtype=torch.bfloat16,
             extra_tokens=self._speculative_config.max_draft_len + 1,
             attention_backend=attention_backend,
+            total_num_kv_heads=num_kv_heads,
         )
 
     def _should_create_separate_draft_kv_cache(self) -> bool:
@@ -2174,9 +2187,7 @@ class KvCacheCreator:
         # drafter KV, so its paged manager needs the CP-free mapping: the
         # round-robin ledger applies to the TARGET KV alone, and
         # KVCacheManagerV2 rejects is_draft x helix outright.
-        draft_mapping = self._mapping
-        if draft_mapping.has_cp_helix():
-            draft_mapping = draft_mapping.repurpose_helix_cp_to_tp()
+        draft_mapping = self._get_draft_mapping()
         return _create_kv_cache_manager(
             model_engine=None,
             max_cuda_graph_batch_size=self._model_engine.

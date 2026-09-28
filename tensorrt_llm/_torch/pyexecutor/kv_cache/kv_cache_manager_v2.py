@@ -2331,7 +2331,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _get_runtime_cache_size_components(self) -> tuple[int, int, int]:
         layer_sizes, attention_windows = self._get_runtime_cache_size_layer_components()
-        return _estimate_cache_size_components(
+        context_size, generation_size, fixed_size = _estimate_cache_size_components(
             layer_sizes,
             attention_windows,
             self.tokens_per_block,
@@ -2341,6 +2341,15 @@ class KVCacheManagerV2(BaseResourceManager):
             num_scratch_layers=len(layer_sizes)
             - (self.draft_layout.num_layers if self.draft_layout is not None else 0),
         )
+        if self.draft_layout is not None:
+            # Target-token quota units are rank-local under Helix; draft KV
+            # spans the full sequence. Fixed request reserves stay unscaled.
+            extra_draft_bytes_per_token = (
+                self._helix_cp_size - 1
+            ) * self.draft_layout.bytes_per_token
+            context_size += extra_draft_bytes_per_token
+            generation_size += extra_draft_bytes_per_token
+        return context_size, generation_size, fixed_size
 
     def _get_max_tokens_from_quota(self, quota: int) -> float:
         """Rank-local byte quota -> token capacity (GLOBAL tokens under helix)."""
@@ -2400,6 +2409,12 @@ class KVCacheManagerV2(BaseResourceManager):
         """Draft bytes within the unified manager's usable token capacity."""
         layout = self.draft_layout
         assert layout is not None
+        if self._has_cp_helix:
+            # Each target ledger block retains all of its draft subpages.
+            max_tokens = (
+                math.ceil(max_tokens / self._ledger_tokens_per_block)
+                * self._ledger_tokens_per_block
+            )
         context_size, generation_size, fixed_size = _estimate_cache_size_components(
             [layout.bytes_per_layer_token] * layout.num_layers,
             [layout.retention_window_size] * layout.num_layers,
@@ -2556,6 +2571,10 @@ class KVCacheManagerV2(BaseResourceManager):
         """Scale, layer offset and scratch span for one entry per logical block."""
         converter = self.impl.get_page_index_converter(layer_id, role)
         if converter.expansion != 1:
+            if self._is_standalone_draft_layer(layer_id):
+                # Draft kernels consume their own expanded page tables. These
+                # entries in the target operator's tables remain unused.
+                return 1, 0, 0
             raise NotImplementedError(
                 "SWA scratch block-table conversion does not support "
                 f"expanded page indices yet: layer={layer_id}, role={role}, "
@@ -2966,6 +2985,9 @@ class KVCacheManagerV2(BaseResourceManager):
                             size=layout.bytes_per_layer_token
                             // layout.kv_factor
                             * self.tokens_per_block,
+                            tokens_per_block_override=(
+                                self.tokens_per_block if self._helix_cp_size > 1 else None
+                            ),
                         )
                         for role in (Role.KEY, Role.VALUE)[: layout.kv_factor]
                     ],
@@ -2977,7 +2999,9 @@ class KVCacheManagerV2(BaseResourceManager):
             if register_model_layers:
                 self.pp_layers.append(global_id)
                 self.num_kv_heads_per_layer.append(layout.num_kv_heads)
-                self.total_num_kv_heads_per_layer.append(layout.num_kv_heads)
+                self.total_num_kv_heads_per_layer.append(
+                    layout.total_num_kv_heads or layout.num_kv_heads
+                )
                 self.head_dim_per_layer.append(layout.head_dim)
                 self.max_attention_window_vec.append(layout.retention_window_size)
         if register_model_layers:
@@ -3220,6 +3244,7 @@ class KVCacheManagerV2(BaseResourceManager):
         num_kv_heads: int,
         head_dim: int,
         kv_layout: str,
+        page_expansion: int = 1,
     ) -> torch.Tensor:
         """View shared pool pages for a manager-local layer and its KV geometry."""
         if kv_layout not in ("NHD", "HND"):
@@ -3231,7 +3256,10 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             page_size_key = self.impl.get_page_stride(layer_id, Role.KEY)
             page_size_value = self.impl.get_page_stride(layer_id, Role.VALUE)
-            if addr_key + page_size_key != addr_value or page_size_key != page_size_value:
+            if (
+                addr_key + page_size_key * page_expansion != addr_value
+                or page_size_key != page_size_value
+            ):
                 raise ValueError("K/V buffers must have adjacent equal-sized pages")
 
         element_per_container = 1
@@ -3244,16 +3272,33 @@ class KVCacheManagerV2(BaseResourceManager):
             if kv_layout == "NHD"
             else [num_kv_heads, self.tokens_per_block]
         )
+        head_dim //= element_per_container
+        page_upper = self.impl.get_page_index_upper_bound(layer_id, Role.KEY)
+        num_pages = page_upper // kv_factor
+        strides = None
+        if page_expansion > 1:
+            # Each ledger slot contains all of its K subpages, then all V
+            # subpages. Expanded KEY indices skip the V spans between slots.
+            num_pages = page_upper - (kv_factor - 1) * page_expansion
+            page_elements = self.tokens_per_block * num_kv_heads * head_dim
+            strides = [
+                page_elements,
+                page_expansion * page_elements,
+                dimensions[1] * head_dim,
+                head_dim,
+                1,
+            ]
         return convert_to_torch_tensor(
             TensorWrapper(
                 addr_key,
                 dtype,
                 [
-                    self.impl.get_page_index_upper_bound(layer_id, Role.KEY) // kv_factor,
+                    num_pages,
                     kv_factor,
                     *dimensions,
-                    head_dim // element_per_container,
+                    head_dim,
                 ],
+                strides=strides,
             )
         )
 
@@ -3278,7 +3323,17 @@ class KVCacheManagerV2(BaseResourceManager):
             num_kv_heads=layout.num_kv_heads,
             head_dim=layout.head_dim,
             kv_layout=kv_layout,
+            page_expansion=self._helix_cp_size,
         )
+
+    @property
+    def draft_max_blocks_per_seq(self) -> int:
+        """Maximum physical draft pages, including every Helix ledger subpage."""
+        return self.max_blocks_per_seq * self._helix_cp_size
+
+    def get_draft_num_blocks(self, request_id: int) -> int:
+        """Allocated draft pages covering the request's global token positions."""
+        return self.kv_cache_map[request_id].num_blocks * self._helix_cp_size
 
     def get_draft_block_table(
         self,
@@ -3290,11 +3345,19 @@ class KVCacheManagerV2(BaseResourceManager):
             cache = self.kv_cache_map.get(request_id)
             if cache is None or not cache.is_active:
                 raise ValueError(f"Standalone draft request {request_id} has no active cache")
-        batch_indices = self.get_batch_cache_indices(request_ids, self.draft_layer_ids[0])
-        table = torch.zeros((len(request_ids), self.max_blocks_per_seq), dtype=torch.int32)
+        expanded = self._helix_cp_size > 1
+        layer_idx = self.draft_layer_ids[0]
+        batch_indices = self.get_batch_cache_indices(request_ids, layer_idx, raw_indices=expanded)
+        if expanded:
+            converter = self.impl.get_page_index_converter(self.layer_offsets[layer_idx], Role.KEY)
+            batch_indices = [converter(indices, PageIndexMode.SHARED) for indices in batch_indices]
+        table = torch.zeros((len(request_ids), self.draft_max_blocks_per_seq), dtype=torch.int32)
         for row, indices in enumerate(batch_indices):
             cache = self.kv_cache_map[request_ids[row]]
-            if len(indices) != cache.num_blocks or len(indices) > self.max_blocks_per_seq:
+            if (
+                len(indices) != self.get_draft_num_blocks(request_ids[row])
+                or len(indices) > self.draft_max_blocks_per_seq
+            ):
                 raise ValueError("Standalone draft cache has an incomplete or oversized page table")
             first_required_block = 0
             if self.draft_layout.window_size is not None:
@@ -3512,6 +3575,14 @@ class KVCacheManagerV2(BaseResourceManager):
             clamped = min(clamped, self._gpu_max_tokens - extra_tokens)
         return clamped
 
+    def _get_attention_pool_num_blocks(self, local_layer_idx: int) -> int:
+        """Count ledger blocks without counting expanded physical subpages."""
+        layer_id = LayerId(local_layer_idx)
+        expansion = self.impl.get_page_index_converter(layer_id, Role.KEY).expansion
+        return self.impl.get_page_index_upper_bound(layer_id, Role.KEY) // (
+            self.get_layer_kv_factor(self.pp_layers[local_layer_idx]) * expansion
+        )
+
     def get_num_free_blocks(self) -> int:
         # NOTE This method is used to get the number of blocks in the primary pool not the FREE blocks.
         # However, since we only use this function when the kv cache manager is empty, so it is safe to do so.
@@ -3527,9 +3598,8 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         max_num_blocks = max(
             [
-                self.impl.get_page_index_upper_bound(layer_id, Role.KEY)
-                // self.get_layer_kv_factor(self.pp_layers[layer_id])
-                for layer_id in typed_range(LayerId(self.num_local_layers))
+                self._get_attention_pool_num_blocks(local_layer_idx)
+                for local_layer_idx in range(self.num_local_layers)
             ]
         )
         # Subtract the pages the reserved sequences hold, not the count of
@@ -5682,7 +5752,10 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def get_cache_bytes_per_token(self) -> int:
         if self.draft_layout is not None:
-            return sum(self._get_runtime_cache_size_layer_components()[0])
+            return (
+                sum(self._get_runtime_cache_size_layer_components()[0])
+                + (self._helix_cp_size - 1) * self.draft_layout.bytes_per_token
+            )
         data_roles = [Role.KEY]
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
             data_roles.append(Role.VALUE)
@@ -5921,6 +5994,10 @@ class KVCacheManagerV2(BaseResourceManager):
             standalone_draft_reserve=draft_reserve,
             num_scratch_layers=num_scratch_layers,
         )
+        if draft_layout is not None and mapping.has_cp_helix():
+            extra_draft_bytes_per_token = (mapping.cp_size - 1) * draft_layout.bytes_per_token
+            context_size_per_token += extra_draft_bytes_per_token
+            cache_size_per_token += extra_draft_bytes_per_token
         # The affine slope covers all tokens; context additionally retains SWA
         # pages for the current token batch beyond the generation windows.
         fixed_cost = (

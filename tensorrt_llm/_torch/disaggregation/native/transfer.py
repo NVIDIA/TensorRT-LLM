@@ -1408,7 +1408,11 @@ class Sender(SenderBase):
             else:
                 src_block_ids = np.asarray(src_block_ids, dtype=np.int64)
                 dst_block_ids = np.asarray(dst_block_ids, dtype=np.int64)
-                if peer_ri.cp_size > 1 and self_ri.cp_size == 1:
+                if (
+                    peer_ri.cp_size > 1
+                    and self_ri.cp_size == 1
+                    and not getattr(lg_info, "cp_as_tp", False)
+                ):
                     # Helix: the receiver owns global blocks [cp_rank::cp_size]
                     # (same protocol as partition_context_for_helix), so its
                     # table is the strided subset of ours; block reuse is
@@ -2630,6 +2634,19 @@ class Receiver(ReceiverBase):
         # a masked PP stage may advertise no replicated view even though another
         # stage owns one that is visible in the receiver's page table.
         if len(overlap.ranks) > 1:
+            if peer_ri.page_table is not None:
+                for layer_group in peer_ri.page_table.layer_groups:
+                    if not getattr(layer_group, "cp_as_tp", False):
+                        continue
+                    draft_tp, _ = MambaPolicy._mamba_tp(peer_ri)
+                    if (
+                        layer_group.total_kv_head_num is None
+                        or layer_group.kv_head_num_per_rank * draft_tp
+                        > layer_group.total_kv_head_num
+                    ):
+                        # Draft head replicas may elect fewer writers than the
+                        # target's heads, so their payload shares are unequal.
+                        return False
             for page_table in (peer_ri.page_table, receiver_page_table):
                 if page_table is None:
                     continue

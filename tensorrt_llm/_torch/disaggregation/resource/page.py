@@ -310,6 +310,9 @@ class AttentionLayerGroup(LayerGroup):
 
     kv_head_num_per_rank: int = 0
     sliding_window_size: Optional[int] = None
+    # Full-sequence KV whose heads use the flattened TP x CP rank grid.
+    cp_as_tp: bool = False
+    total_kv_head_num: Optional[int] = None
 
     def to_dict(self) -> dict:
         return {
@@ -317,6 +320,8 @@ class AttentionLayerGroup(LayerGroup):
             "pool_group_idx": int(self.pool_group_idx),
             "kv_head_num_per_rank": int(self.kv_head_num_per_rank),
             "sliding_window_size": self.sliding_window_size,
+            "cp_as_tp": self.cp_as_tp,
+            "total_kv_head_num": self.total_kv_head_num,
             "local_layers": [ll.to_dict() for ll in self.local_layers],
             "pool_views": [pv.to_dict() for pv in self.pool_views],
         }
@@ -329,6 +334,8 @@ class AttentionLayerGroup(LayerGroup):
             pool_views=[PoolView.from_dict(pv) for pv in data.get("pool_views", [])],
             kv_head_num_per_rank=int(data["kv_head_num_per_rank"]),
             sliding_window_size=data.get("sliding_window_size"),
+            cp_as_tp=bool(data.get("cp_as_tp", False)),
+            total_kv_head_num=data.get("total_kv_head_num"),
         )
 
 

@@ -24,6 +24,7 @@ class StandaloneDraftLayout:
     attention_backend: str
     kv_factor: int = 2
     window_size: int | None = None
+    total_num_kv_heads: int | None = None
 
     def __post_init__(self) -> None:
         if min(self.num_layers, self.num_kv_heads, self.head_dim) <= 0:
@@ -38,6 +39,8 @@ class StandaloneDraftLayout:
             raise ValueError("Draft KV storage requires one or two planes")
         if self.window_size is not None and self.window_size <= 0:
             raise ValueError("Draft history window must be positive")
+        if self.total_num_kv_heads is not None and self.total_num_kv_heads < self.num_kv_heads:
+            raise ValueError("Total draft KV heads must cover the rank-local heads")
 
     @property
     def bytes_per_layer_token(self) -> int:
@@ -53,9 +56,10 @@ class StandaloneDraftLayout:
         return self.num_layers * self.bytes_per_layer_token
 
     def transfer_identity(self) -> dict:
+        """Model identity shared by workers with different draft head sharding."""
         return {
             "num_layers": self.num_layers,
-            "num_kv_heads": self.num_kv_heads,
+            "num_kv_heads": self.total_num_kv_heads or self.num_kv_heads,
             "head_dim": self.head_dim,
             "dtype": str(self.dtype),
             "attention_backend": self.attention_backend,

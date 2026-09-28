@@ -2220,6 +2220,9 @@ def _estimate_mamba_hybrid_cache_cost(
             standalone_draft_reserve=draft_layout.extra_tokens,
         )
         intercept += max_batch_size * draft_fixed
+        if mapping.has_cp_helix():
+            attention_slope += ((mapping.cp_size - 1) *
+                                draft_layout.bytes_per_token)
     return attention_slope + regular_slope, intercept
 
 
@@ -4230,8 +4233,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     self._ssm_page_index_scale)
             else:
                 attention_pages.append(
-                    self.impl.get_page_index_upper_bound(layer_id, Role.KEY) //
-                    self.get_layer_kv_factor(self.pp_layers[local_layer_idx]))
+                    self._get_attention_pool_num_blocks(local_layer_idx))
         if attention_pages:
             return max(attention_pages)
         return max(ssm_pages) if ssm_pages else 0

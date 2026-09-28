@@ -392,8 +392,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def _describe_local(self, req: LlmRequest) -> Chunk:
         """The blocks this rank holds, one list per layer group.
 
-        Every paged group gets ``ceil(prompt_len / tpb)`` entries indexed by block ordinal: the
-        local pool slot, or -1 where this side has nothing there. Eviction and allocation state
+        Full-sequence groups get ``ceil(prompt_len / tpb)`` entries indexed by block ordinal;
+        Helix target groups retain this rank's strided subset. Each entry is a local pool slot,
+        or -1 where this side has nothing there. Eviction and allocation state
         come straight from the cache manager (``get_block_ordinals``), so ctx and gen never have
         to agree on *when* a block left the window -- the sender simply pairs the ordinals both
         sides still hold. The only request-derived bound is prompt_len, which drops the
@@ -406,7 +407,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         tpb = adapter.tokens_per_block
         assert self._page_table is not None
         layer_groups = self._page_table.layer_groups
-        prompt_blocks = (req.prompt_len + tpb - 1) // tpb
+        prompt_len = self._global_prompt_len(req)
+        prompt_blocks = (prompt_len + tpb - 1) // tpb
+        manager = self._kv_cache_manager
+        cp_size = getattr(manager, "_helix_cp_size", 1)
+        cp_rank = getattr(manager, "_helix_cp_rank", 0)
 
         is_gen_only = req.is_generation_only_request
         cached_per_lg = (
@@ -423,6 +428,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 slot = self._get_mamba_slot_for_request(req)
                 group = np.array([slot], dtype=np.int64) if slot is not None else empty
             else:
+                local_prompt_blocks = (
+                    prompt_blocks
+                    if getattr(lg, "cp_as_tp", False)
+                    else len(range(cp_rank, prompt_blocks, cp_size))
+                )
                 # Block lists carry beam 0 only (beam-search attention reads
                 # prompt positions through beam 0's block table), so the
                 # positional path applies to every beam width.
@@ -432,17 +442,21 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     and self._kv_cache_manager.draft_layout is not None
                     and lg.sliding_window_size is not None
                 ):
-                    stale_end = max(0, (req.prompt_len + 1 - lg.sliding_window_size) // tpb)
-                    prompt_pages = ordinals[stale_end:prompt_blocks]
-                    if prompt_pages.size != prompt_blocks - stale_end or np.any(prompt_pages < 0):
+                    stale_end = max(0, (prompt_len + 1 - lg.sliding_window_size) // tpb)
+                    prompt_pages = ordinals[stale_end:local_prompt_blocks]
+                    if prompt_pages.size != local_prompt_blocks - stale_end or np.any(
+                        prompt_pages < 0
+                    ):
                         raise ValueError("Missing allocated prompt pages for windowed KV transfer")
-                group = self._positional_window(ordinals, prompt_blocks, cached_per_lg[idx] // tpb)
+                group = self._positional_window(
+                    ordinals, local_prompt_blocks, cached_per_lg[idx] // tpb
+                )
             groups.append(group)
 
         return Chunk(
             block_ids_per_layer_groups=groups,
             kind_per_layer_group=kinds,
-            token_range=TokenRange(start=0, end=req.prompt_len),
+            token_range=TokenRange(start=0, end=prompt_len),
             is_last=True,
         )
 
@@ -514,20 +528,25 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if self.pipeline_transfer_enabled:
             raise ValueError("DSpark draft-state transfer does not support pipelined transfer.")
 
-    @staticmethod
-    def _validate_draft_history_range(req: LlmRequest, history: dict) -> None:
+    def _global_prompt_len(self, req: LlmRequest) -> int:
+        if getattr(self._kv_cache_manager, "_has_cp_helix", False):
+            return req.total_input_len_cp
+        return req.prompt_len
+
+    def _validate_draft_history_range(self, req: LlmRequest, history: dict) -> None:
         # Full-attention drafters retain the whole prompt; rolling drafters
         # retain its complete live suffix. Neither includes speculative scratch.
         window_size = history["layout"]["window_size"]
-        expected_length = req.prompt_len
+        prompt_len = self._global_prompt_len(req)
+        expected_length = prompt_len
         if window_size is not None:
             if type(window_size) is not int or window_size <= 0:
                 raise ValueError("Invalid draft history window size")
             expected_length = min(expected_length, window_size)
-        if history["valid_length"] != expected_length or history["position"] != req.prompt_len:
+        if history["valid_length"] != expected_length or history["position"] != prompt_len:
             raise ValueError(
                 "DSpark transfer requires valid draft history and sequence position "
-                f"covering the complete prompt ({req.prompt_len} tokens, "
+                f"covering the complete prompt ({prompt_len} tokens, "
                 f"{expected_length} retained)."
             )
 

@@ -1070,7 +1070,7 @@ class DFlashWorker(SpecWorkerBase):
             self._ctx_block_counts[:num_seqs].copy_(
                 torch.tensor(
                     [
-                        self._ctx_kv_manager.kv_cache_map[rid].num_blocks
+                        self._ctx_kv_manager.get_draft_num_blocks(rid)
                         for rid in request_ids[:num_seqs]
                     ],
                     dtype=torch.long,
@@ -1319,7 +1319,12 @@ class DFlashWorker(SpecWorkerBase):
                 # block table one iteration at a time, so the footprint follows
                 # the sequences served rather than max_batch x max_seq_len.
                 self._ctx_kv_buf = pool
-                self._init_ctx_block_tables(num_slots, draft_kv_cache_manager.max_blocks_per_seq)
+                max_blocks = (
+                    draft_kv_cache_manager.draft_max_blocks_per_seq
+                    if unified
+                    else draft_kv_cache_manager.max_blocks_per_seq
+                )
+                self._init_ctx_block_tables(num_slots, max_blocks)
                 # Only a manager that publishes and matches its own blocks can
                 # hand back a reused prefix's drafter K/V; the private arena and
                 # an unpaired draft pool both start every request at 0.

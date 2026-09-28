@@ -27,7 +27,10 @@ from tensorrt_llm._torch.disaggregation.base.region import (
 )
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable, MapperKind
-from tensorrt_llm._torch.disaggregation.resource.utils import find_replicated_role_mismatch
+from tensorrt_llm._torch.disaggregation.resource.utils import (
+    find_replicated_role_mismatch,
+    get_layer_to_layer_group,
+)
 from tensorrt_llm._utils import nvtx_range
 
 
@@ -573,6 +576,16 @@ class AttentionPolicy:
                 "AttentionPolicy.validate_peer_compatible: replicated roles differ on "
                 f"overlapping layers: {differing}"
             )
+        if self_page_table is not None and peer_page_table is not None:
+            local_layers = get_layer_to_layer_group(self_page_table, CacheKind.PAGED)
+            peer_layers = get_layer_to_layer_group(peer_page_table, CacheKind.PAGED)
+            for layer in local_layers.keys() & peer_layers.keys():
+                local = self_page_table.layer_groups[local_layers[layer]]
+                peer = peer_page_table.layer_groups[peer_layers[layer]]
+                if local.cp_as_tp != peer.cp_as_tp:
+                    raise ValueError("Attention peers disagree on full-sequence CP-to-TP storage")
+                if local.cp_as_tp and local.total_kv_head_num != peer.total_kv_head_num:
+                    raise ValueError("Standalone draft peers have different global KV head counts")
 
     def check_peer_compatible(self, peer_ri: RankInfo) -> bool:
         a = self._ri.attention
