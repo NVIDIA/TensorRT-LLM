@@ -1573,8 +1573,8 @@ class PyTorchModelEngine(ModelEngine):
             with self._warmup_timer.phase(
                     "attention_jit",
                     metrics=self._metrics,
-                    metric_name="attention_warmup_seconds"), self._maybe_bypass_torch_compile(
-                        bypass=True):
+                    metric_name="attention_warmup_seconds"
+            ), self._maybe_bypass_torch_compile(bypass=True):
                 self._run_attention_warmup(resource_manager,
                                            can_run_general_warmup)
 
@@ -1605,8 +1605,8 @@ class PyTorchModelEngine(ModelEngine):
             with self._warmup_timer.phase(
                     "autotuner",
                     metrics=self._metrics,
-                    metric_name="autotuner_warmup_seconds"), self._maybe_bypass_torch_compile(
-                        bypass=True):
+                    metric_name="autotuner_warmup_seconds"
+            ), self._maybe_bypass_torch_compile(bypass=True):
                 self._run_autotuner_warmup(resource_manager)
             log_mem_snapshot("warmup/after_autotuner")
             # Pre-JIT Mamba SSD multi-seq + HAS_INITSTATES=True Triton kernels
@@ -1617,8 +1617,8 @@ class PyTorchModelEngine(ModelEngine):
             with self._warmup_timer.phase(
                     "mamba_hybrid",
                     metrics=self._metrics,
-                    metric_name="mamba_hybrid_warmup_seconds"), self._maybe_bypass_torch_compile(
-                        bypass=True):
+                    metric_name="mamba_hybrid_warmup_seconds"
+            ), self._maybe_bypass_torch_compile(bypass=True):
                 self._run_mamba_hybrid_warmup(resource_manager)
             log_mem_snapshot("warmup/after_mamba_hybrid")
             # Release the autotuner's exploration-mode intermediates. The
@@ -1672,8 +1672,8 @@ class PyTorchModelEngine(ModelEngine):
             with self._warmup_timer.phase(
                     "memory_pool_prepop",
                     metrics=self._metrics,
-                    metric_name="memory_pool_prepopulation_seconds"), self._maybe_bypass_torch_compile(
-                        bypass=True):
+                    metric_name="memory_pool_prepopulation_seconds"
+            ), self._maybe_bypass_torch_compile(bypass=True):
                 warmup_requests_configs = self._get_max_shape_warmup_requests(
                     resource_manager)
                 self._general_warmup(resource_manager, warmup_requests_configs)
