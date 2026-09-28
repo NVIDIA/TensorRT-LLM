@@ -1076,8 +1076,10 @@ class W8A16FP8LinearMethod(FP8QDQLinearMethod):
                 f"W8A16FP8LinearMethod requires a 16-bit activation, got "
                 f"{input.dtype}.")
 
-        weight = module.weight.to(input.dtype) * module.weight_scale.to(
-            input.dtype)
+        # In place: .to() always copies here (the checks above guarantee the
+        # dtypes differ), so only one 16-bit copy of the weight is alive.
+        weight = module.weight.to(input.dtype).mul_(
+            module.weight_scale.to(input.dtype))
         return F.linear(input, weight, bias)
 
 
