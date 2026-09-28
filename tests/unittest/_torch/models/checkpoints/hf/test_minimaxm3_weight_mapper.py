@@ -184,6 +184,9 @@ def test_load_weights_accepts_base_mapper_without_params_map() -> None:
     model = object.__new__(MiniMaxM3ForCausalLM)
     torch.nn.Module.__init__(model)
     model.model_config = model_config
+    # This mapper-only fixture has no decoder layers to refresh after loading.
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleList()
     # Set by SpecDecOneEngineForCausalLM.__init__, which this test bypasses.
     model.spec_config = None
     mapper = HfWeightMapper()

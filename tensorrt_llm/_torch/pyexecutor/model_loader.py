@@ -386,7 +386,6 @@ _SHADOW_WEIGHT_LOAD_PLAN_ENV = "TRTLLM_SHADOW_WEIGHT_LOAD_PLAN"
 
 
 def _resolve_checkpoint_io_policy(
-    backend: str,
     checkpoint_loader: Optional[BaseCheckpointLoader],
     checkpoint_format: Optional[str],
     load_format: LoadFormat | str,
@@ -402,9 +401,7 @@ def _resolve_checkpoint_io_policy(
         return _NATIVE_CHECKPOINT_IO_POLICY, None
 
     reason = None
-    if backend != "pytorch":
-        reason = "rank-striped read-ahead requires the PyTorch backend"
-    elif checkpoint_loader is not None:
+    if checkpoint_loader is not None:
         reason = "an explicit checkpoint loader was provided"
     elif checkpoint_format != "HF":
         reason = ("rank-striped read-ahead requires checkpoint_format='HF' "
@@ -447,7 +444,6 @@ def _resolve_checkpoint_io_policy(
 
 
 def _construct_checkpoint_loader(
-    backend: str,
     checkpoint_loader: Optional[BaseCheckpointLoader],
     checkpoint_format: Optional[str],
     *,
@@ -455,20 +451,16 @@ def _construct_checkpoint_loader(
     checkpoint_io_policy: str = "native",
     load_format: LoadFormat | str = LoadFormat.AUTO,
     partial_model_loading: bool = False,
-) -> Optional[BaseCheckpointLoader]:
+) -> BaseCheckpointLoader:
     requested_checkpoint_io_policy = checkpoint_io_policy
     checkpoint_io_policy, selection_fallback_reason = \
         _resolve_checkpoint_io_policy(
-            backend,
             checkpoint_loader,
             checkpoint_format,
             load_format,
             requested_checkpoint_io_policy,
             partial_model_loading,
         )
-    if backend == "_autodeploy":
-        return None
-
     from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
         BaseCheckpointLoader
     from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import \
@@ -838,9 +830,13 @@ class ModelLoader:
             # Resolve FP4 MLA before the generic model preference turns auto
             # into False. Keep an explicit False distinguishable and reject it
             # during FP4 validation instead of silently overriding the user.
-            fp4_mla_config = copy.copy(config)
-            fp4_mla_config.attn_backend = llm_args.attn_backend
-            fp4_mla_config.sparse_attention_config = llm_args.sparse_attention_config
+            fp4_mla_config = replace(
+                config,
+                attn_backend=llm_args.attn_backend,
+                sparse_attention_config=llm_args.sparse_attention_config,
+                quant_config=copy.deepcopy(config.quant_config),
+                quant_config_dict=copy.deepcopy(config.quant_config_dict),
+            )
             if supports_fp4_mla_attention(fp4_mla_config):
                 validate_and_set_kv_cache_quant(fp4_mla_config,
                                                 llm_args.kv_cache_config.dtype)

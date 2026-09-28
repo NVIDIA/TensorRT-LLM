@@ -2,8 +2,7 @@
 
 ```{note}
 **Breaking change.** The TensorRT engine backend has been removed. PyTorch is now
-the sole execution backend for TensorRT LLM (AutoDeploy, built on the PyTorch
-backend, remains available).
+the sole execution backend for TensorRT LLM.
 ```
 
 ## What changed
