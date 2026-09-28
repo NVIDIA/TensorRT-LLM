@@ -31,28 +31,13 @@ from typing import Any, Optional
 import triton
 import triton.language as tl
 
+from .fp4_mla_kernels import _fp4_mla_swizzled_sf_offset
+
 _LOG2_E = tl.constexpr(1.4426950408889634)
-
-
-@triton.jit
-def _fp4_mla_swizzled_sf_offset(
-    row_idx,
-    col_idx,
-    SF_PER_TOKEN: tl.constexpr,
-):
-    padded_cols = ((SF_PER_TOKEN + 3) // 4) * 4
-    col_in_group = col_idx % 4
-    col_group = col_idx // 4
-    row_in_group0 = row_idx % 32
-    row_in_group1 = (row_idx % 128) // 32
-    row_group = row_idx // 128
-    return (
-        col_in_group
-        + col_group * (4 * 128)
-        + row_in_group0 * 16
-        + row_in_group1 * 4
-        + row_group * (128 * padded_cols)
-    )
+# Triton 3.6.0/sm_100 fails NVWSInsertTmemAref::hasOneUse() for the
+# chained residual-Q dot_scaled path. Enable only after verifying a fixed
+# compiler; gate descriptor construction together with its consumer below.
+_ENABLE_RESIDUAL_Q_FAST_PATH = tl.constexpr(False)
 
 
 @triton.jit
@@ -491,7 +476,12 @@ def _fp4_mla_qk_scores_tile(
             strides=[kv_s0, kv_s2, kv_s4],
             block_shape=[1, BLOCK_T, BLOCK_K // 2],
         )
-    if USE_TMA_DATA_LOAD and Q_RESIDUAL_D == 64 and TAIL_BLOCK_K == 128:
+    if (
+        _ENABLE_RESIDUAL_Q_FAST_PATH
+        and USE_TMA_DATA_LOAD
+        and Q_RESIDUAL_D == 64
+        and TAIL_BLOCK_K == 128
+    ):
         q_tail_desc = tl.make_tensor_descriptor(
             q_fp4_ptr,
             shape=[q_num_rows, Q_STORAGE_HEAD_D // 2],
@@ -585,7 +575,7 @@ def _fp4_mla_qk_scores_tile(
         # calls into the same accumulator (one for even Q lane, one for odd),
         # which lowers to a TMEM alloc with multiple uses and trips
         # NVWSInsertTmemAref::hasOneUse() on Triton 3.6.0 / sm_100.
-        if False and Q_RESIDUAL_D == 64 and TAIL_BLOCK_K == 128:
+        if _ENABLE_RESIDUAL_Q_FAST_PATH and Q_RESIDUAL_D == 64 and TAIL_BLOCK_K == 128:
             residual_packed_offsets = tl.arange(0, 32)
             residual_scale_offsets = tl.arange(0, 4)
             packed_k_cols = non_residual_groups * (FP4_BLOCK // 2) + residual_packed_offsets

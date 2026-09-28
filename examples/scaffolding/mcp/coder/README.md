@@ -1,6 +1,6 @@
 # Coder MCP Server
 
-`coder_mcp.py` is the MCP SSE server backing the Scaffolding Coder agent. Each tool call runs inside an isolated Apiary sandbox session.
+`coder_mcp.py` is the MCP Streamable HTTP server backing the Scaffolding Coder agent. Each tool call runs inside an isolated Apiary sandbox session.
 
 ## Tool Surface
 
@@ -36,7 +36,7 @@ pip install -e examples/scaffolding/mcp/coder
 
 ## Running the Server
 
-Every Apiary session needs a Docker image name. Each SSE request can pick an image via the `image` query parameter; when it doesn't, the server falls back to `--default-image`.
+Every Apiary session needs a Docker image name. Each MCP session can pick an image via the `image` query parameter; when it doesn't, the server falls back to `--default-image`.
 
 ```bash
 python examples/scaffolding/mcp/coder/coder_mcp.py \
@@ -49,15 +49,14 @@ Useful flags:
 
 - `--apiary-url`: Apiary daemon base URL
 - `--apiary-token`: Bearer token for daemon auth
-- `--mcp-token`: Bearer token required on the SSE endpoint
-- `--default-image`: Fallback Docker image for sessions when an SSE client omits the `image` query parameter (must already be registered with the daemon)
+- `--mcp-token`: Bearer token required on the MCP endpoint
+- `--default-image`: Fallback Docker image for sessions when an MCP client omits the `image` query parameter (must already be registered with the daemon)
 - `--working-dir`: Default sandbox working directory
 - `--idle-timeout`: Idle session reap timeout in seconds
 
-## SSE Parameters
+## Streamable HTTP Parameters
 
-The SSE transport lives at `/sse`, with the MCP message endpoint at
-`/messages/`.
+The Streamable HTTP transport lives at `/mcp`.
 
 Supported query parameters:
 
@@ -67,7 +66,7 @@ Supported query parameters:
 Example:
 
 ```text
-http://localhost:8083/sse?client_id=my-session&image=ubuntu:22.04
+http://localhost:8083/mcp?client_id=my-session&image=ubuntu:22.04
 ```
 
 If `image` is omitted, `coder_mcp.py` falls back to `--default-image`.
@@ -77,4 +76,4 @@ If `image` is omitted, `coder_mcp.py` falls back to `--default-image`.
 - `APIARY_URL`: Apiary daemon URL
 - `APIARY_API_TOKEN`: Bearer token for Apiary authentication
 - `APIARY_WORKING_DIR`: Default working directory inside the sandbox
-- `MCP_AUTH_TOKEN`: Optional bearer token required on the MCP SSE endpoint
+- `MCP_AUTH_TOKEN`: Optional bearer token required on the MCP endpoint
