@@ -571,6 +571,10 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
             raise TypeError("defer_consumer_until_full_ready must be a bool.")
         if not isinstance(self.fuse_ready_probe_and_linear1_claim, bool):
             raise TypeError("fuse_ready_probe_and_linear1_claim must be a bool.")
+        if self.defer_consumer_until_full_ready:
+            raise NotImplementedError(
+                "deferred FC2 full-ready admission is not wired into the kernel scheduler loop"
+            )
         if self.defer_consumer_until_full_ready and self.non_clc_mixed_cga_config.is_mixed:
             raise NotImplementedError(
                 "defer_consumer_until_full_ready does not yet support fixed "

@@ -1,7 +1,7 @@
 """Build and load the package's two native extensions.
 
 Both are compiled on first use and cached per (source, argv, interpreter) key,
-so a node compiles once and every later process loads the same .so.  Neither
+so a user compiles once per node and later processes load the same .so.  Neither
 pulls in libtorch, CUTLASS or CuTe: the scheduler extension is ordinary CUDA
 C++ and the SAMI submitter is C11, which is what keeps steady-state launch to
 one short native call.
@@ -18,6 +18,7 @@ import hashlib
 import importlib.util
 import os
 from pathlib import Path
+import stat
 import subprocess  # nosec B404 -- compiler argv is validated and shell=False
 import sys
 import sysconfig
@@ -45,7 +46,62 @@ _DEFAULT_ARCH = "sm_100"
 _SUPPORTED_ARCHES = ("sm_100", "sm_100a", "sm_103", "sm_107", "sm_107a")
 
 _NATIVE: dict[str, object] = {}
-_DEFAULT_BUILD_ROOT = Path(tempfile.gettempdir())
+_DEFAULT_BUILD_ROOT = Path(tempfile.gettempdir()) / f"tensorrt_llm-{os.getuid()}"
+
+
+def _secure_cache_directory(directory: Path) -> None:
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise RuntimeError(f"native cache directory is not owned by this user: {directory}")
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        directory.chmod(0o700)
+        info = directory.lstat()
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o700
+        ):
+            raise RuntimeError(f"cannot secure native cache directory: {directory}")
+
+
+def _is_private_regular_file(path: Path) -> bool:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return (
+        stat.S_ISREG(info.st_mode)
+        and info.st_uid == os.getuid()
+        and stat.S_IMODE(info.st_mode) & 0o077 == 0
+        and info.st_nlink == 1
+    )
+
+
+def _remove_unsafe_cache_file(path: Path) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if not (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)):
+        raise RuntimeError(f"unsafe native cache entry cannot be replaced: {path}")
+    path.unlink()
+
+
+def _open_cache_lock(path: Path):
+    if not _is_private_regular_file(path):
+        _remove_unsafe_cache_file(path)
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            raise RuntimeError(f"native cache lock is not private: {path}")
+        return os.fdopen(descriptor, "a+b")
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def _target_arch() -> str:
@@ -167,14 +223,19 @@ def _build_and_load(
     cached = _NATIVE.get(module_name)
     if cached is not None and not force:
         return cached
-    directory = Path(os.environ.get(build_dir_env, default_build_dir))
-    directory.mkdir(parents=True, exist_ok=True)
+    directory = Path(os.environ.get(build_dir_env, default_build_dir)).expanduser()
+    if build_dir_env not in os.environ:
+        _secure_cache_directory(_DEFAULT_BUILD_ROOT)
+    _secure_cache_directory(directory)
     key = _cache_key(argv, sources)
     output = directory / f"{module_name}_{key}.so"
     lock_path = directory / f"{module_name}_{key}.lock"
-    with lock_path.open("a+b") as lock:
+    with _open_cache_lock(lock_path) as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        if force or not output.exists():
+        reusable_output = _is_private_regular_file(output)
+        if not reusable_output:
+            _remove_unsafe_cache_file(output)
+        if force or not reusable_output:
             with tempfile.NamedTemporaryFile(
                 dir=directory, suffix=".so", delete=False
             ) as temporary:
@@ -188,7 +249,10 @@ def _build_and_load(
                             + "\n--- stdout ---\n" + process.stdout
                             + "\n--- stderr ---\n" + process.stderr
                         )
+                temporary_path.chmod(0o600)
                 os.replace(temporary_path, output)
+                if not _is_private_regular_file(output):
+                    raise RuntimeError(f"native build produced an unsafe cache file: {output}")
             finally:
                 temporary_path.unlink(missing_ok=True)
                 if commands:

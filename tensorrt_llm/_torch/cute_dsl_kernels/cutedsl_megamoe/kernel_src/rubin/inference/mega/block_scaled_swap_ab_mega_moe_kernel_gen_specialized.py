@@ -686,18 +686,18 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             ),
             stream=make_fake_stream(),
         )
+        if self.quant_kind.uses_global_scale:
+            fake_arguments.update(
+                fc1_alpha=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
+                fc2_alpha=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
+                fc1_norm_const=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
+            )
         if self.helper_expert_count > 0:
             fake_arguments.update(
                 hot_expert_weight_ready_flags=make_ptr(
                     cutlass.Uint64, 0, AddressSpace.gmem, assumed_align=8
                 ),
                 hot_expert_weight_ready_generation=cutlass.Uint64(1),
-            )
-        if self.quant_kind.uses_global_scale:
-            fake_arguments.update(
-                fc1_alpha=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
-                fc2_alpha=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
-                fc1_norm_const=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
             )
 
         compiled = cute.compile[cute.EnableTVMFFI(True)](self, **fake_arguments)

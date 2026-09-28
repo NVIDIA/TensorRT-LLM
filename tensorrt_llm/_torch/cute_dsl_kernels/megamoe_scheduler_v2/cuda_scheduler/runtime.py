@@ -509,20 +509,22 @@ class CudaPhysicalSlotScheduler:
         with changing pointers/lengths use eager submit; stage()+launch() remains
         available for a fixed-capacity graph input buffer.
         """
-        if self._gpu_direct_bound:
-            with self._plan_channel_lock:
+        with self._plan_channel_lock:
+            if self._plan_channel_bound:
                 if self._plan_channel_pending:
                     raise RuntimeError("plan publication is still pending")
                 if stream_handle != self._plan_channel_stream_handle:
                     raise RuntimeError("bound plan channel requires its static stream")
-                if self._launch_stream_handle is None:
-                    self._launch_stream_handle = stream_handle
-                elif stream_handle != self._launch_stream_handle:
-                    raise RuntimeError("CUDA scheduler requires its existing static stream")
-                self._submit_routes(routes, stream_handle, valid_tokens=valid_tokens)
-                self._plan_channel_pending = True
-        else:
+            if self._launch_stream_handle is None:
+                self._launch_stream_handle = stream_handle
+            elif stream_handle != self._launch_stream_handle:
+                raise RuntimeError(
+                    "CUDA scheduler uses one static stream because its workspace "
+                    "and reset-free generations are shared"
+                )
             self._submit_routes(routes, stream_handle, valid_tokens=valid_tokens)
+            if self._plan_channel_bound:
+                self._plan_channel_pending = True
         return self.outputs
 
     def _submit_routes(

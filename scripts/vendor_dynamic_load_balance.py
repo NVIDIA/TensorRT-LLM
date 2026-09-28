@@ -8,6 +8,7 @@ import hashlib
 import json
 import re
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
@@ -271,6 +272,33 @@ def _sanitize_vendored_comments(target: Path) -> None:
 
     if target.name != "cutedsl_megamoe":
         return
+
+    scheduler_mode_literals = (
+        'token_back_ready_granularity == "token_tile"',
+        'token_back_ready_granularity == "expert"',
+        'token_back_schedule_mode != "atomic_counter"',
+    )
+    scanner_waiver = "  # nosec B105 -- scheduler mode name, not a credential"
+
+    def annotate_scheduler_modes(text: str) -> str:
+        lines = []
+        for line in text.splitlines(keepends=True):
+            body, ending = (line[:-1], "\n") if line.endswith("\n") else (line, "")
+            if (
+                any(literal in body for literal in scheduler_mode_literals)
+                and "# nosec B105" not in body
+            ):
+                body += scanner_waiver
+            lines.append(body + ending)
+        return "".join(lines)
+
+    for rel in (
+        "communication/nvlink_domain/token_comm.py",
+        "kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_epilogue.py",
+        "kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py",
+    ):
+        _replace_text(target / rel, annotate_scheduler_modes)
+
     for rel in (
         "kernel_src/rubin/inference/local_mega/block_scaled_swap_ab_local_mega_moe_kernel.py",
         "kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py",
@@ -305,6 +333,29 @@ def _sanitize_vendored_comments(target: Path) -> None:
             flags=re.S,
         ),
     )
+
+
+def _format_scheduler_sources(root: Path, target: Path) -> None:
+    sources = sorted(
+        path
+        for path in target.rglob("*")
+        if path.is_file() and path.suffix in {".c", ".cu", ".cuh", ".h"}
+    )
+    if not sources:
+        return
+    command = [
+        sys.executable,
+        "-m",
+        "pre_commit",
+        "run",
+        "clang-format",
+        "--files",
+        *map(str, sources),
+    ]
+    # The first pass returns 1 when clang-format rewrites a file.  A clean
+    # second pass distinguishes that expected result from hook/setup failures.
+    subprocess.run(command, cwd=root, check=False)
+    subprocess.run(command, cwd=root, check=True)
 
 
 def _apply_downstream_patches(root: Path, target: Path, patches: list[dict]) -> None:
@@ -352,8 +403,9 @@ def main() -> None:
         copy_source(source, scheduler_dst / rel, header=False)
         scheduler_files.append(str(rel))
 
-    _apply_downstream_patches(root, scheduler_dst, scheduler_patches)
     _sanitize_vendored_comments(scheduler_dst)
+    _apply_downstream_patches(root, scheduler_dst, scheduler_patches)
+    _format_scheduler_sources(root, scheduler_dst)
 
     pending = [
         path.relative_to(mega_dst) for path in mega_dst.rglob("*.py") if path.name != "__init__.py"
@@ -415,13 +467,16 @@ def main() -> None:
                 ["git", "-C", str(repo), "status", "--porcelain", "--", source_subdir], text=True
             ).strip()
         )
+        previous_manifest = json.loads((target / "VENDOR_MANIFEST.json").read_text())
         record = {
             "commit": revision(repo),
             "source_tree_dirty": source_dirty,
             "kind": kind,
-            "files": {
-                name: hashlib.sha256((target / name).read_bytes()).hexdigest() for name in files
-            },
+        }
+        if "retained_legacy_host" in previous_manifest:
+            record["retained_legacy_host"] = previous_manifest["retained_legacy_host"]
+        record["files"] = {
+            name: hashlib.sha256((target / name).read_bytes()).hexdigest() for name in files
         }
         patches = scheduler_patches if target == scheduler_dst else mega_patches
         if patches:
