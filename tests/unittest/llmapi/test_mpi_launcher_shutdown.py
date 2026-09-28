@@ -5,9 +5,11 @@
 
 import json
 import os
+import pty
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -75,6 +77,10 @@ def hang():
         signal.pause()
 
 if role == "server":
+    if mode == "follower":
+        (root / "worker-ready").touch()
+        while True:
+            signal.pause()
     send("server_ready")
     receive("task_ready")
     if mode == "server_exits":
@@ -88,6 +94,8 @@ elif role == "stop":
     send("stop_requested")
 else:
     receive("server_ready")
+    if mode == "read_stdin":
+        assert sys.stdin.read() == ""
     if mode == "server_exits":
         child = subprocess.Popen([
             sys.executable, "-c",
@@ -147,11 +155,23 @@ def _process_records(tmp_path: Path) -> dict[str, dict]:
     return {path.stem: json.loads(path.read_text()) for path in tmp_path.glob("*.json")}
 
 
-def _run_launcher(tmp_path: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+def _run_launcher(
+    tmp_path: Path, env: dict[str, str], *, terminal_fd: int | None = None
+) -> subprocess.CompletedProcess[str]:
     command = ["bash", str(_LAUNCHER), str(tmp_path / "bin" / "python3"), "task"]
+    if terminal_fd is not None:
+        command = [
+            sys.executable,
+            "-c",
+            "import fcntl, os, sys, termios; "
+            "fcntl.ioctl(0, termios.TIOCSCTTY, 0); "
+            "os.execvp(sys.argv[1], sys.argv[1:])",
+            *command,
+        ]
     with subprocess.Popen(  # nosec B603
         command,
         env=env,
+        stdin=terminal_fd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -226,6 +246,42 @@ def test_launcher_terminates_engine_and_child_when_server_exits(tmp_path: Path) 
     assert "task_child" in _process_records(tmp_path)
     assert "stop" not in _process_records(tmp_path)
     _assert_exited(tmp_path)
+
+
+def test_launcher_task_sees_eof_with_terminal_stdin(tmp_path: Path) -> None:
+    env = _launcher_env(tmp_path, "read_stdin")
+    master_fd, slave_fd = pty.openpty()
+    with os.fdopen(master_fd, "rb"), os.fdopen(slave_fd, "rb") as terminal:
+        result = _run_launcher(tmp_path, env, terminal_fd=terminal.fileno())
+    assert result.returncode == 0, result.stderr
+    _assert_exited(tmp_path)
+
+
+def test_follower_launcher_responds_to_sigterm(tmp_path: Path) -> None:
+    env = _launcher_env(tmp_path, "follower")
+    env["PMI_RANK"] = "1"
+    with subprocess.Popen(  # nosec B603
+        ["bash", str(_LAUNCHER), "/usr/bin/true"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    ) as process:
+        try:
+            deadline = time.monotonic() + 5
+            while not (tmp_path / "worker-ready").exists():
+                assert process.poll() is None, "Follower launcher exited before worker startup"
+                assert time.monotonic() < deadline, "Follower worker did not start"
+                time.sleep(0.01)
+            process.send_signal(signal.SIGTERM)
+            assert process.wait(timeout=2) == -signal.SIGTERM
+        finally:
+            # The foreground worker belongs to this test's isolated session.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5)
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "invalid", "1.5", "9999999"])

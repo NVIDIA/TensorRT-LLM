@@ -79,8 +79,6 @@ function cleanup_launcher {
 }
 
 trap cleanup_launcher EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
 
 function use_unique_flashinfer_workspace {
     local temporary_root=${TMPDIR:-/tmp}
@@ -215,6 +213,9 @@ unset TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
 # The launcher owns the workspace lock. Long-lived child commands close its
 # descriptor so detached descendants cannot keep a stale slot locked.
 if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
     if ! hmac_key=$(openssl rand -hex 32); then
         log_stderr "Failed to generate TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY"
         exit 1
@@ -267,7 +268,7 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
     exec_child_command python3 -m tensorrt_llm.llmapi.mgmn_leader_node &
     server_pid=$!
     owned_child_pids+=("$server_pid")
-    exec_without_mpi_environment "${task_with_command[@]}" &
+    exec_without_mpi_environment "${task_with_command[@]}" < /dev/null &
     task_pid=$!
     owned_child_pids+=("$task_pid")
     log_stderr "Rank${mpi_rank} task PID: $task_pid; MPI Comm server PID: $server_pid"
