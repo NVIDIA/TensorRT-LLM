@@ -224,6 +224,11 @@ l0_a10:
   - llmapi/test_llm_api_connector.py::test_connector_max_utilization_is_rejected_on_v1_only[kv_cache_manager_v1]
   - llmapi/test_llm_api_connector.py::test_connector_max_utilization_is_rejected_on_v1_only[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_e2e_persistent_cache[kv_cache_manager_v2]
+  - llmapi/test_llm_api_connector.py::test_connector_reservations_hold_source_without_transmission
+  - llmapi/test_llm_api_connector.py::test_connector_cancel_drains_real_prefix_load[alone-True]
+  - llmapi/test_llm_api_connector.py::test_connector_cancel_drains_real_prefix_load[alone-False]
+  - llmapi/test_llm_api_connector.py::test_connector_cancel_drains_real_prefix_load[traffic-True]
+  - llmapi/test_llm_api_connector.py::test_connector_cancel_drains_real_prefix_load[traffic-False]
   - llmapi/test_llm_api_connector.py::test_connector_prefix_is_asked_once_and_shrinks_the_forward_pass[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_prefix_under_chunked_prefill[kv_cache_manager_v2-offer_inside_chunk]
   - llmapi/test_llm_api_connector.py::test_connector_prefix_under_chunked_prefill[kv_cache_manager_v2-offer_past_chunk]
