@@ -4,9 +4,10 @@
 # Semantic conflict review
 
 The workflow asks CodeRabbit to inspect the combined behavior of a PR and its
-target branch. Its **Semantic conflict with target branch** check is advisory:
-keep it **non-required** in branch protection/rulesets. AI can miss defects and
-report false positives; reviewers should read the linked evidence.
+target branch. It publishes a commit status named
+**Semantic conflict with target branch / PR #N** on the requested head commit.
+Keep this status **non-required** in branch protection/rulesets. AI can miss
+defects and report false positives; reviewers should read the linked evidence.
 
 ## Triggers
 
@@ -21,7 +22,8 @@ Production jobs run only in `NVIDIA/TensorRT-LLM`:
   An ordinary workflow rerun follows its original trigger and inputs.
 - **Result publication:** a trusted CodeRabbit PR issue comment is created,
   edited or deleted. Validate the latest request and its replies before updating
-  the Check. This event does not request new analysis or wait for the next scan.
+  the commit status. This event does not request new analysis or wait for the next
+  scan.
 
 Label changes, enabling auto-merge, head pushes and target branch updates do not
 directly request analysis. The scheduled scan observes those changes.
@@ -36,7 +38,7 @@ directly request analysis. The scheduled scan observes those changes.
   contains target still needs analysis.
 - Identify a version by its full head SHA, target SHA and target branch. PASS,
   FAIL and INCONCLUSIVE all complete a request; none automatically reruns that
-  version. Completion is established by a valid reply, not by a Check's color.
+  version. Completion is established by a valid reply, not by the commit status.
 - If the latest request still matches the current version, has no valid reply
   and is at least two hours old, it may receive one automatic retry. The retry
   has a new request ID and records the earlier ID in `automaticRetryOf`. One
@@ -59,11 +61,10 @@ directly request analysis. The scheduled scan observes those changes.
   including drafts or PRs that no longer have approval/auto-merge. Repairs do
   not consume AI request slots and cannot turn into new requests. The combined
   request/repair matrix fits GitHub's limit of 256 jobs per matrix.
-- Recover abandoned pending Checks as part of publication repair. A confirmed
-  delivery failure cancels the undelivered Check; an unknown delivery outcome
-  stays pending until comments can be read again. Recovery cancels superseded
-  or unrecorded pending Checks on the current PR head and latest request's head,
-  without treating cancellation as an AI result.
+- Post the request comment before publishing its pending status. If the comment
+  was accepted but status publication fails, recovery publishes the status for
+  that request without asking AI again. Read comments after an ambiguous delivery
+  error before deciding whether the request was accepted.
 - Discovery and new-request jobs stop when an applicable token's observed REST
   quota remaining is 1,000 or less, or when rate limited. `GITHUB_TOKEN` and the
   service PAT have separate quota checks. Repair-only jobs and comment-triggered
@@ -119,15 +120,24 @@ beyond a batch's stopping point, resume in the next rotation.
 ## Results
 
 Requests have a unique ID and fixed head/target/merge-base SHAs. The publisher
-validates the bot identity, request identity and all three revisions. The current
-request has the following states:
+validates the bot identity, request identity and all three revisions. Each PR
+uses the fixed status context `Semantic conflict with target branch / PR #N`,
+where `N` is its PR number. This keeps separate PRs that share a head commit from
+overwriting each other's status and keeps the result name independent of the
+workflow that publishes it.
 
-| Situation | Check status | Conclusion |
-| --- | --- | --- |
-| No valid reply yet | `in_progress` | None |
-| PASS | `completed` | `success` |
-| FAIL | `completed` | `failure` |
-| INCONCLUSIVE | `completed` | `neutral` |
+| Situation | Commit status | Description | Request completed? |
+| --- | --- | --- | --- |
+| No valid reply yet | `pending` | `Waiting for CodeRabbit response` | No |
+| PASS | `success` | `No semantic conflict found (best effort)` | Yes |
+| FAIL | `failure` | `Possible semantic conflict` | Yes |
+| INCONCLUSIVE | `pending` | `Review completed: inconclusive` | Yes |
+
+Commit statuses have no neutral completion state. INCONCLUSIVE therefore remains
+visually pending, while its valid reply completes the request internally and
+prevents an automatic retry. Read the description and linked reply to distinguish
+it from a missing response. Waiting links to the request comment; a result links
+to the CodeRabbit reply. The comments preserve the request ID and fixed revisions.
 
 Wrong identities, request IDs or revisions are ignored. A reply associated with
 the request but lacking a valid result format does not complete it; it remains
@@ -135,18 +145,21 @@ eligible for the bounded timeout retry. A correctly bound PASS/FAIL without the
 required fixed-revision source citations completes as INCONCLUSIVE. This does
 not establish the semantic correctness of those citations or the AI's findings.
 
-Each new request creates a new Check Run. Completed Checks cannot reliably be
-reset to an empty conclusion through the REST update operation. Historical
-Checks remain available; pending Checks on the same head are cancelled when
-superseded. Publication selects the newest Check matching the latest request ID,
-so an old request's late reply cannot replace the current result.
+Publication uses only the latest request and its matching replies. A new request
+updates the same PR context on its requested head commit; an old request's late
+reply cannot replace the current result. Status history remains available.
 
 If a published reply is edited or deleted and no longer supplies a valid result,
-the current request returns to waiting through a new Check Run for that same
-request, without asking AI again. Reply-source markers and links are stored in
-the Check output; they prevent falling back to an older PASS. Reconciliation
-uses the same parser and publication code as comment events and skips writes
-when the recorded state already matches the reply.
+the current request returns to waiting without asking AI again. Publication
+retains the reply source so that it cannot fall back to an older PASS.
+Reconciliation uses the same parser and publication code as comment events and
+skips writes when the recorded state already matches the reply.
+
+Existing request comments remain valid, including records with a Check Run ID.
+Recovery cancels incomplete semantic Check Runs on the current head and latest
+request's head. Completed Check Runs remain as historical records; they cannot
+be deleted or converted into commit statuses through the Checks API. New results
+are published only as commit statuses, and Check cancellation is not an AI result.
 
 Reply events publish without waiting for a scan. Request and publication jobs
 for the same PR share a concurrency queue. Each batch runs up to four workers;
@@ -172,9 +185,11 @@ read-only automation test workflow runs against the proposed changes.
 
 `TRTLLM_AGENT_SHARED_TOKEN` must belong to `trtllm-agent` (user ID `296075020`)
 and permit posting issue comments. It sends CodeRabbit commands and reads its
-own identity and quota; repository reads and Check publication use
-`GITHUB_TOKEN`. The publisher recognizes `coderabbitai[bot]` (user ID `136622811`).
-Keep these checks non-required.
+own identity and quota; repository reads and commit status publication use
+`GITHUB_TOKEN`. Discovery has `statuses: read` and `checks: read`. Request and
+publication jobs have `statuses: write` and retain `checks: write` only to cancel
+incomplete semantic Check Runs. The publisher recognizes `coderabbitai[bot]`
+(user ID `136622811`). Keep semantic statuses non-required.
 
 ## Validation
 
@@ -204,7 +219,7 @@ uses one initial request and at most one automatic timeout retry per version.
 Assess known defect detection and repair false positives separately; a narrow
 repair control does not establish general accuracy.
 
-The deterministic tests simulate GitHub. A real AI reply and a real Check write
-are separate validation layers and must be reported as such. Historical cases
-are already merged; replay them explicitly without broadening the production
-candidate filter.
+The deterministic tests simulate GitHub. A real AI reply and a real commit
+status write are separate validation layers and must be reported as such.
+Historical cases are already merged; replay them explicitly without broadening
+the production candidate filter.
