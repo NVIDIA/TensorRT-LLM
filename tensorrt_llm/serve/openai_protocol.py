@@ -1550,7 +1550,11 @@ class ResponsesRequest(OpenAIBaseModel):
     text: Optional[ResponseTextConfig] = None
     tool_choice: ToolChoice = "auto"
     tools: list[Tool] = Field(default_factory=list)
-    top_logprobs: Optional[int] = 0
+    # None, not 0: to_sampling_params passes this straight through as
+    # SamplingParams.logprobs, where 0 means "return the sampled token's
+    # logprob" and only None means "do not return any". A default of 0 asked
+    # the engine for logprobs on every request.
+    top_logprobs: Optional[int] = None
     top_p: Optional[float] = None
     truncation: Optional[Literal["auto", "disabled"]] = "disabled"
     user: Optional[str] = None

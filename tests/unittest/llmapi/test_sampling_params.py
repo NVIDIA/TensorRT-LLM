@@ -146,6 +146,25 @@ def test_generation_config_overrides_omitted_serve_defaults(request_obj):
     assert prepared.top_p == 0.9
 
 
+def test_responses_request_asks_for_no_logprobs_unless_told_to():
+    """`SamplingParams.logprobs=0` is a request, not an absence.
+
+    `_get_output_config` sets `return_log_probs = self.logprobs is not None`,
+    so 0 turns log probabilities on for every request, and the speculative
+    sampler rejects a request that asks for them. Only None means none.
+    """
+
+    def logprobs_for(**kwargs):
+        request = ResponsesRequest(model="test", input="hi", **kwargs)
+        return request.to_sampling_params().logprobs
+
+    assert logprobs_for() is None
+    # The before-validator drops explicit nulls, so this takes the default too.
+    assert logprobs_for(top_logprobs=None) is None
+    assert logprobs_for(top_logprobs=0) == 0
+    assert logprobs_for(top_logprobs=3) == 3
+
+
 @pytest.mark.parametrize(
     "request_obj",
     [
