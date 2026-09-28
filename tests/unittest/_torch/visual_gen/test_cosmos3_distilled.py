@@ -646,9 +646,7 @@ class TestWarmupAndForwardValidation:
         """Both steps of a two-step warmup sit in a 3/3 policy's edge windows,
         so warmup would never run the FP8 path; one step past both windows does."""
         policy = SimpleNamespace(first_steps=3, last_steps=3)
-        pipeline = _bare_pipeline(
-            transformer=SimpleNamespace(step_precision_controller=policy)
-        )
+        pipeline = _bare_pipeline(transformer=SimpleNamespace(step_precision_controller=policy))
         assert pipeline.default_warmup_steps == 7
 
         # A distilled checkpoint still runs only its fixed schedule length.
