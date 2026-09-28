@@ -24,6 +24,28 @@ from defs.conftest import tests_path
 _MAX_CULPRITS = 20
 
 
+def _parallel_config_key(
+        gpu_name: str, case: str,
+        parallel_config: dict[tuple[str, str], int]) -> tuple[str, str]:
+    """Reuse suite parallelism for exclusions unless an exact override exists."""
+    key = (gpu_name, case)
+    if key in parallel_config:
+        return key
+
+    # Exclusions only narrow the configured suite. Keep all other options and
+    # selectors so unrelated invocations retain their serial fallback.
+    args = iter(shlex.split(case))
+    filtered_args = []
+    for arg in args:
+        if arg == "--ignore":
+            if next(args, None) is None:
+                return key
+        elif not arg.startswith("--ignore="):
+            filtered_args.append(arg)
+    suite_key = (gpu_name, shlex.join(filtered_args))
+    return suite_key if suite_key in parallel_config else key
+
+
 def merge_report(base_file, extra_file, output_file, is_retry=False):
     import xml.etree.ElementTree as ElementTree
 
@@ -209,7 +231,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     print(parallel_dict)
 
-    cur_key = (gpu_name, case)
+    cur_key = _parallel_config_key(gpu_name, case, parallel_dict)
     print(f'Parallel config lookup key: {cur_key!r}')
     if cur_key in parallel_dict:
         num_workers = parallel_dict[cur_key]

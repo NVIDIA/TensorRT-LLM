@@ -12,8 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for culprit attribution in the unittest integration wrapper."""
+"""Tests for culprit attribution and configuration in the unittest wrapper."""
 
+import csv
 import importlib.util
 import sys
 import types
@@ -60,6 +61,60 @@ def _load_test_unittests_module() -> types.ModuleType:
 _TEST_UNITTESTS = _load_test_unittests_module()
 _junit_culprits = _TEST_UNITTESTS._junit_culprits
 _fail_unittests = _TEST_UNITTESTS._fail_unittests
+
+
+@pytest.mark.parametrize(
+    "exclusions",
+    [
+        "--ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py",
+        "--ignore unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py",
+        "--ignore='path with spaces.py' --ignore another.py",
+    ],
+)
+def test_b200_attention_exclusions_reuse_configured_workers(exclusions: str) -> None:
+    config_path = _REPO_ROOT / "tests/integration/defs/agg_unit_mem_df.csv"
+    with config_path.open(encoding="utf-8") as config_file:
+        config = {
+            (row["gpu"], row["unittest_case_name"]): int(row["parallel_factor"])
+            for row in csv.DictReader(config_file)
+        }
+    case = f"unittest/_torch/attention {exclusions}"
+
+    key = _TEST_UNITTESTS._parallel_config_key("NVIDIA B200", case, config)
+
+    assert key == ("NVIDIA B200", "unittest/_torch/attention")
+
+
+def test_parallel_config_prefers_exact_override() -> None:
+    suite = "unittest/_torch/attention"
+    case = f"{suite} --ignore=excluded.py"
+    config = {("NVIDIA B200", suite): 4, ("NVIDIA B200", case): 2}
+
+    key = _TEST_UNITTESTS._parallel_config_key("NVIDIA B200", case, config)
+
+    assert config[key] == 2
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "unittest/_torch/attention -m gpu --ignore=excluded.py",
+        "unittest/_torch/attention unittest/other --ignore=excluded.py",
+        "unittest/other --ignore=excluded.py",
+        "unittest/_torch/attention --ignore",
+    ],
+)
+def test_parallel_config_preserves_unknown_invocations(case: str) -> None:
+    config = {("NVIDIA B200", "unittest/_torch/attention"): 4}
+
+    assert _TEST_UNITTESTS._parallel_config_key("NVIDIA B200", case, config) == (
+        "NVIDIA B200",
+        case,
+    )
+    assert _TEST_UNITTESTS._parallel_config_key("unknown GPU", case, config) == (
+        "unknown GPU",
+        case,
+    )
 
 
 def test_junit_culprits_reports_failures_and_errors(tmp_path: Path) -> None:
