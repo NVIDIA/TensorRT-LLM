@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 1993-2022 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -37,6 +37,11 @@ add_cuda_architectures(common_src 89)
 set_property(TARGET common_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET common_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_link_libraries(common_src PUBLIC trtllm_gen_fmha_interface)
+
+if(BUILD_PYT AND ENABLE_MULTI_DEVICE)
+  # ncclUtils.cpp uses PyTorch's CUDA stream API.
+  target_link_libraries(common_src PRIVATE c10_cuda)
+endif()
 
 if(ENABLE_CUBLASLT_FP4_GEMM)
   target_compile_definitions(common_src PRIVATE ENABLE_CUBLASLT_FP4_GEMM)
