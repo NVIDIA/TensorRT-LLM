@@ -29,6 +29,8 @@ from tensorrt_llm.commands import _telemetry
 from tensorrt_llm.usage import usage_lib
 from tensorrt_llm.usage.config import UsageContext
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _make_cli(callback=None):
     @click.group(
