@@ -63,7 +63,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     MambaHybridCacheManager,
     MambaHybridCacheManagerV2,
 )
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, KVCacheManager
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.bindings import DataType, LlmRequestState
@@ -392,22 +392,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def _describe_local(self, req: LlmRequest) -> Chunk:
         """The blocks this rank holds, one list per layer group.
 
-        A group's list comes back empty when the window left nothing, when local reuse covered it
-        all, or when this rank carries no slot for it. Which of the three it was is known only in
-        the branch that produced it, and nothing on the ask carries it out -- see ``CacheExtent``.
+        Every paged group gets ``ceil(prompt_len / tpb)`` entries indexed by block ordinal: the
+        local pool slot, or -1 where this side has nothing there. Eviction and allocation state
+        come straight from the cache manager (``get_block_ordinals``), so ctx and gen never have
+        to agree on *when* a block left the window -- the sender simply pairs the ordinals both
+        sides still hold. The only request-derived bound is prompt_len, which drops the
+        speculative tail and the ctx first-token block (num_extra_kv_tokens slots are not
+        transferred; both sides use prompt_len, so the ranges stay consistent). On the receiver
+        the already-cached prefix is masked so the sender skips it. A STATE group carries one
+        slot, or nothing when this rank has none.
         """
         adapter = self._reuse_adapter
         tpb = adapter.tokens_per_block
         assert self._page_table is not None
         layer_groups = self._page_table.layer_groups
-        # The transfer covers prompt_len tokens; num_extra_kv_tokens slots
-        # (speculative decoding) are not transferred. In the previously added
-        # support for ctx disabling speculative decoding while gen enables it,
-        # both sides currently use prompt_len as the transfer range, so the
-        # ranges stay consistent.
-        # TODO: the accuracy impact of not transferring num_extra_kv_tokens
-        # on MTP and other speculative decoding paths is currently unclear;
-        # revisit whether these extra KV slots need to be transferred.
         prompt_blocks = (req.prompt_len + tpb - 1) // tpb
 
         is_gen_only = req.is_generation_only_request
@@ -417,71 +415,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else [0] * len(layer_groups)
         )
 
+        empty = np.array([], dtype=np.int64)
         groups = []
         kinds = [lg.kind for lg in layer_groups]
         for idx, lg in enumerate(layer_groups):
             if lg.kind == CacheKind.STATE:
                 slot = self._get_mamba_slot_for_request(req)
-                groups.append(
-                    np.array([slot], dtype=np.int64)
-                    if slot is not None
-                    else np.array([], dtype=np.int64)
-                )
-                continue
-            block_ids = adapter.get_block_ids(req, idx, lg)
-            window_size = lg.sliding_window_size
-
-            if window_size is not None:
-                draft_len = get_draft_token_length(req) if is_gen_only else 0
-                allocated_blocks = (
-                    req.prompt_len
-                    + draft_len
-                    + self._kv_cache_manager.num_extra_kv_tokens
-                    + tpb
-                    - 1
-                ) // tpb
-                if block_ids.size > allocated_blocks:
-                    block_ids = block_ids[:allocated_blocks]
-                # Current PyExecutor cache managers disable KV-cache token sinks,
-                # so SWA block lists contain an evictable prompt prefix followed
-                # by the speculative scratch tail. If token sinks are enabled,
-                # this must use block-ordinal metadata to preserve the sink prefix.
-                # Remove scratch before trimming stale prompt blocks; otherwise a
-                # boundary-crossing allocation can displace initialized prompt KV.
-                scratch_blocks = max(0, allocated_blocks - prompt_blocks)
-                if scratch_blocks > 0:
-                    if req.py_beam_width != 1:
-                        raise ValueError("speculative scratch blocks require beam_width == 1")
-                    block_ids = (
-                        block_ids[:-scratch_blocks]
-                        if scratch_blocks < block_ids.size
-                        else np.array([], dtype=np.int64)
-                    )
-                # Drop stale blocks the manager may still expose (V1 pre-eviction).
-                stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
-                expected_valid = max(0, prompt_blocks - stale_end)
-                if block_ids.size > expected_valid:
-                    block_ids = (
-                        block_ids[-expected_valid:]
-                        if expected_valid > 0
-                        else np.array([], dtype=np.int64)
-                    )
-                # Skip reused blocks that remain after stale-prefix pruning.
-                cache_skip = max(0, cached_per_lg[idx] // tpb - stale_end)
+                group = np.array([slot], dtype=np.int64) if slot is not None else empty
             else:
-                # Drop the speculative scratch tail; only prompt_len is transferred.
-                if block_ids.size > prompt_blocks:
-                    block_ids = block_ids[:prompt_blocks]
-                cache_skip = cached_per_lg[idx] // tpb
-
-            if cache_skip > 0:
-                block_ids = (
-                    block_ids[cache_skip:]
-                    if cache_skip < block_ids.size
-                    else np.array([], dtype=np.int64)
-                )
-
-            groups.append(block_ids)
+                # Block lists carry beam 0 only (beam-search attention reads
+                # prompt positions through beam 0's block table), so the
+                # positional path applies to every beam width.
+                ordinals = adapter.get_block_ordinals(req, idx, lg)
+                group = self._positional_window(ordinals, prompt_blocks, cached_per_lg[idx] // tpb)
+            groups.append(group)
 
         return Chunk(
             block_ids_per_layer_groups=groups,
@@ -489,6 +436,22 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             token_range=TokenRange(start=0, end=req.prompt_len),
             is_last=True,
         )
+
+    @staticmethod
+    def _positional_window(
+        ordinals: np.ndarray, prompt_blocks: int, cached_blocks: int
+    ) -> np.ndarray:
+        """Fit a manager block table into the prompt's ordinal range.
+
+        Pads with -1 when fewer blocks are allocated than the prompt spans
+        (incremental ctx allocation), truncates the speculative / first-token
+        tail, and masks the receiver's cached prefix.
+        """
+        window = np.full(prompt_blocks, -1, dtype=np.int64)
+        n = min(int(ordinals.size), prompt_blocks)
+        window[:n] = ordinals[:n]
+        window[: min(cached_blocks, prompt_blocks)] = -1
+        return window
 
     def _chunk_num_bytes(self, chunk: Chunk) -> int:
         """Local-rank KV bytes covered by a chunk (sum of num_valid_blocks * pool.slot_bytes), enough to populate
@@ -907,18 +870,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if window_size is not None and window_size < req.prompt_len:
                 # SWA pages can leave the active window between chunks. Defer
                 # the group and send its complete final active window at once.
-                chunk_block_ids.append(block_ids if is_last_chunk else block_ids[:0])
+                chunk_block_ids.append(block_ids if is_last_chunk else np.full_like(block_ids, -1))
             else:
-                # _build_kv_write_meta derives the chunk's start token from list length
-                # (total_blocks - len), which only agrees with the slice below
-                # once the group covers the chunk end.
-                assert block_ids.size >= chunk_end, (
-                    f"layer group holds {block_ids.size} blocks, fewer than the "
-                    f"chunk end {chunk_end}; cannot address chunk "
-                    f"[{chunk_start}, {chunk_end}) by position"
-                )
-                chunk_block_ids.append(block_ids[chunk_start:chunk_end])
-        if not is_last_chunk and not any(block_ids.size for block_ids in chunk_block_ids):
+                # Positional: keep the chunk's ordinals, blank everything else.
+                chunk = np.full_like(block_ids, -1)
+                chunk[chunk_start:chunk_end] = block_ids[chunk_start:chunk_end]
+                chunk_block_ids.append(chunk)
+        if not is_last_chunk and not any((ids >= 0).any() for ids in chunk_block_ids):
             return None
         # The block window is rounded up; the span this piece delivers is not. Every reader below
         # rounds back to blocks, and a recurrent-state group reads the end as an exact checkpoint.

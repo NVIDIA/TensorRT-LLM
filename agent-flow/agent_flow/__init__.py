@@ -5,9 +5,14 @@ from .config import (
     BackendConfig,
     SessionConfig,
 )
-from .hooks import called_required_tool_this_turn, require_tool_call_stop_hook
+from .hooks import (
+    RequiredToolCallError,
+    called_required_tool_this_turn,
+    require_tool_call_stop_hook,
+)
 from .layers import AgentLayer
 from .module import Module, Sequential
+from .tools import ToolDefinition, tool
 from .types import (
     AgentRequest,
     AgentResponse,
@@ -33,13 +38,16 @@ __all__ = [
     "CompactBoundaryEvent",
     "Module",
     "RateLimitWarningEvent",
+    "RequiredToolCallError",
     "Sequential",
     "ServerToolCallEvent",
     "SessionConfig",
     "SessionInitEvent",
     "ThinkingEvent",
     "ToolCallEvent",
+    "ToolDefinition",
     "UsageInfo",
     "called_required_tool_this_turn",
     "require_tool_call_stop_hook",
+    "tool",
 ]

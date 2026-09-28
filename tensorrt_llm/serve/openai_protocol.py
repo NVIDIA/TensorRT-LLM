@@ -912,11 +912,67 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     usage: Optional[UsageInfo] = Field(default=None)
 
 
+# Maximum total number of `enum` values across all properties of one tool
+# function's parameters schema. Mirrors the cap reference OpenAI-compatible
+# platforms enforce; unbounded enums also inflate the guided-decoding
+# grammar compiled for strict tool calls.
+TOOL_PARAM_MAX_ENUM_VALUES = 1000
+
+# JSON Schema keywords whose value is instance data rather than a subschema.
+# An `enum` key nested inside these is a value (e.g. a default that happens to
+# be `{"enum": [...]}`), not an enum constraint, so it must not count.
+_SCHEMA_INSTANCE_KEYWORDS = frozenset({"default", "const", "examples"})
+# JSON Schema keywords whose value is a map of {name: subschema}. The names are
+# user-controlled (a property can be literally named `default` or `enum`), so
+# recurse into the values as subschemas without treating the names as keywords.
+_SCHEMA_MAP_KEYWORDS = frozenset({
+    "properties", "patternProperties", "$defs", "definitions",
+    "dependentSchemas"
+})
+
+
+def _count_schema_enum_values(schema: Any) -> int:
+    """Recursively count `enum` *constraint* entries in a JSON-schema fragment.
+
+    Only `enum` keywords in schema positions are counted. `enum` keys that are
+    instance data -- nested under `default`/`const`/`examples`, or the name of a
+    property -- are ignored, so a valid schema is not rejected for values that
+    are not enum constraints.
+    """
+    count = 0
+    if isinstance(schema, dict):
+        for key, value in schema.items():
+            if key == "enum" and isinstance(value, list):
+                count += len(value)
+            elif key in _SCHEMA_INSTANCE_KEYWORDS:
+                continue
+            elif key in _SCHEMA_MAP_KEYWORDS and isinstance(value, dict):
+                for subschema in value.values():
+                    count += _count_schema_enum_values(subschema)
+            else:
+                count += _count_schema_enum_values(value)
+    elif isinstance(schema, list):
+        for item in schema:
+            count += _count_schema_enum_values(item)
+    return count
+
+
 class FunctionDefinition(OpenAIBaseModel):
     name: str
     description: Optional[str] = None
     parameters: Optional[Dict[str, Any]] = None
     strict: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def check_enum_value_cap(self):
+        if self.parameters is not None:
+            num_enum_values = _count_schema_enum_values(self.parameters)
+            if num_enum_values > TOOL_PARAM_MAX_ENUM_VALUES:
+                raise ValueError(
+                    f"tool function {self.name!r} declares {num_enum_values} "
+                    f"enum values across its parameters schema; the maximum "
+                    f"is {TOOL_PARAM_MAX_ENUM_VALUES}.")
+        return self
 
 
 class ChatCompletionToolsParam(OpenAIBaseModel):
@@ -975,6 +1031,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     tools: Optional[List[ChatCompletionToolsParam]] = None
     tool_choice: Optional[Union[Literal["none", "auto", "required"],
                                 ChatCompletionNamedToolChoiceParam]] = "none"
+    # Standard OpenAI field, accepted for compatibility. `false` is not
+    # enforced: the engine does not restrict how many tool calls the model
+    # emits per turn, so parallel emission remains model behavior either way.
+    parallel_tool_calls: Optional[bool] = None
     user: Optional[str] = None
     reasoning_effort: Optional[ReasoningEffort | Literal[
         "low", "medium", "high", "max", "none"]] = Field(
@@ -1327,6 +1387,27 @@ ResponseInputOutputItem: TypeAlias = Union[ResponseInputItemParam,
 _ID_STRIPPED_ROLES = ("user", "system", "developer")
 
 
+def _drop_explicit_nulls(value, _depth=0):
+    """Recursively drop dict keys whose value is an explicit ``null``.
+
+    On the OpenAI wire an unset optional field is omitted, so an explicit
+    ``null`` carries no information — but the vendored Responses item types
+    validate ``null`` differently from omitted and reject it. Dropping
+    null-valued keys restores the omit-unset wire shape for clients that
+    serialize every unset optional as ``null`` (litellm among them).
+    """
+    if _depth > 12:
+        return value
+    if isinstance(value, dict):
+        return {
+            k: _drop_explicit_nulls(v, _depth + 1)
+            for k, v in value.items() if v is not None
+        }
+    if isinstance(value, list):
+        return [_drop_explicit_nulls(v, _depth + 1) for v in value]
+    return value
+
+
 def _materialize_validator_iterators(value, _depth=0):
     """Recursively replace pydantic ValidatorIterator objects with lists.
 
@@ -1386,6 +1467,10 @@ class ResponsesRequest(OpenAIBaseModel):
         """
         if not isinstance(value, list):
             return value
+
+        # Must run before the per-item shaping below: the item types reject
+        # explicit nulls that mean "unset" (see _drop_explicit_nulls).
+        value = [_drop_explicit_nulls(item) for item in value]
 
         def _with_annotations(part):
             """output_text requires annotations; clients often omit it."""
@@ -1518,6 +1603,20 @@ class ResponsesRequest(OpenAIBaseModel):
         )
         _record_sampling_params_request_fields(self, sampling_params)
         return sampling_params
+
+    @model_validator(mode="before")
+    @classmethod
+    def _null_top_level_fields_mean_unset(cls, data):
+        """Drop explicitly-null top-level fields so they take their defaults.
+
+        Shallow on purpose: ``input`` items are scrubbed recursively by their
+        own validator, and the remaining structured fields are Optional
+        throughout. A null required field (``model``, ``input``) still
+        reports as missing.
+        """
+        if not isinstance(data, dict):
+            return data
+        return {k: v for k, v in data.items() if v is not None}
 
     @model_validator(mode="before")
     @classmethod

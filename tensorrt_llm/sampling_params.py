@@ -257,6 +257,7 @@ class SamplingParams:
         exclude_input_from_output (bool): Controls if output tokens in Result should include the input tokens. Defaults to True.
         return_encoder_output (bool): Controls if Result should contain encoder output hidden states (for encoder-only and encoder-decoder models). Defaults to False.
         return_perf_metrics (bool): Controls if Result should contain the performance metrics for this request. Defaults to False.
+        return_routed_experts (bool): Router Replay (R3): return per-token pre-EPLB logical top-k MoE expert ids for train/inference routing alignment in MoE reinforcement learning. Requires the engine-level enable_return_routed_experts. Defaults to False.
         additional_model_outputs (List[str], optional): The additional outputs to gather from the model. Defaults to None.
 
         guided_decoding (tensorrt_llm.sampling_params.GuidedDecodingParams, optional): Guided decoding params. Defaults to None.
@@ -329,6 +330,12 @@ class SamplingParams:
     exclude_input_from_output: bool = True
     return_encoder_output: bool = False
     return_perf_metrics: bool = False
+    # Router Replay (R3): return per-token pre-EPLB logical top-k MoE expert ids
+    # on this request's output (via additional_generation_outputs["routed_experts"]),
+    # for train/inference routing alignment in MoE reinforcement learning. Requires
+    # the engine-level enable_return_routed_experts. Separated-routing MoE backends
+    # only (fused backends fail closed).
+    return_routed_experts: bool = False
     additional_model_outputs: Optional[List[str]] = None
 
     # Decoder tokens moved from generated output into the input prefix. The
@@ -336,11 +343,6 @@ class SamplingParams:
     _decoder_output_token_prefix: Tuple[int, ...] = field(
         default_factory=tuple, init=False, repr=False
     )
-
-    # Used in logprobs calculation in TRT flow to drop logits early if user did not explicitly request them.
-    # Can be deprecated after migration to PyTorch backend.
-    _context_logits_auto_enabled: bool = False
-    _generation_logits_auto_enabled: bool = False
 
     # TODO: deprecate this after trtllm-serve migrate to use TopK logprobs
     _return_log_probs: bool = False
@@ -576,11 +578,11 @@ class SamplingParams:
 
     @property
     def _need_return_context_logits(self) -> bool:
-        return self.return_context_logits and not self._context_logits_auto_enabled
+        return self.return_context_logits
 
     @property
     def _need_return_generation_logits(self) -> bool:
-        return self.return_generation_logits and not self._generation_logits_auto_enabled
+        return self.return_generation_logits
 
     def _setup(
         self, tokenizer, hf_model_config, generation_config, add_special_tokens: bool = False

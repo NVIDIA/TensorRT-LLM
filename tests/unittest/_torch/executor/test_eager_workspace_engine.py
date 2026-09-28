@@ -173,6 +173,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         self.engine.mapping = SimpleNamespace(cp_size=1)
         self.engine.sparse_attention_config = None
         self.engine._torch_compile_backend = None
+        self.engine._torch_compile_prefill_only = False
         self.engine.breakable_cuda_graph_runner = None
         self.engine._is_warmup = False
         self.metadata = object.__new__(TrtllmAttentionMetadata)

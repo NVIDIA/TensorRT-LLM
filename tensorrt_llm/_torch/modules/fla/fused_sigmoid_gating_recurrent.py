@@ -10,7 +10,7 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.modules.fla.utils import custom_device_ctx
-from tensorrt_llm._utils import is_flashinfer_gdn_supported_arch
+from tensorrt_llm._utils import is_flashinfer_gdn_decode_supported_arch
 from tensorrt_llm.logger import logger
 
 try:
@@ -218,7 +218,7 @@ def _can_use_flashinfer_gdn_decode(
     # FlashInfer's GDN decode kernel is built for Hopper (SM90) and datacenter
     # Blackwell (SM100/SM103) only; on consumer Blackwell (SM120) and other archs
     # it aborts at launch -> fall back to the Triton fused-recurrent kernel.
-    if not is_flashinfer_gdn_supported_arch():
+    if not is_flashinfer_gdn_decode_supported_arch():
         return False
     if initial_state_source is None:
         return False
@@ -283,6 +283,16 @@ def _flashinfer_gdn_decode(
     if b.data_ptr() % 32 != 0:
         b = b.clone(memory_format=torch.contiguous_format)
 
+    # The int32 index tensor may likewise be a slice of a larger buffer
+    # (e.g. the decode half ``state_indices[num_prefills:]`` of a mixed
+    # batch) whose 4*offset storage offset breaks the 32-byte alignment;
+    # ``.int()`` is a no-op for int32 and keeps the misaligned pointer, so
+    # realign with an explicit copy when needed, matching
+    # ``_flashinfer_gdn_verify``.
+    initial_state_indices = initial_state_indices.int()
+    if initial_state_indices.data_ptr() % 32 != 0:
+        initial_state_indices = initial_state_indices.clone()
+
     # Reshape from packed varlen [1, N*T, ...] to batched [N, T, ...].
     q_bat = q.view(N, T_per_seq, q.shape[2], q.shape[3])
     k_bat = k.view(N, T_per_seq, k.shape[2], k.shape[3])
@@ -311,7 +321,7 @@ def _flashinfer_gdn_decode(
         v=v_bat,
         b=b_bat,
         initial_state_source=initial_state_source,
-        initial_state_indices=initial_state_indices.int(),
+        initial_state_indices=initial_state_indices,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         scale=scale,
         output=output,
@@ -342,7 +352,7 @@ def _can_use_flashinfer_gdn_verify(
         return False
     if not _FLASHINFER_GDN_BF16_STATE_AVAILABLE:
         return False
-    if not is_flashinfer_gdn_supported_arch():
+    if not is_flashinfer_gdn_decode_supported_arch():
         return False
     if initial_state_source is None or initial_state_source.dtype != torch.bfloat16:
         return False

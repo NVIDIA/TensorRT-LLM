@@ -309,23 +309,14 @@ struct Store_accumulator<fmha::Hopper_hgmma_fp16_traits<GMMA_M, GMMA_N, GMMA_K, 
     using Accumulator = fmha::Fragment_accumulator<Traits>;
 
     // The number of rows accessed by each thread.
-    enum
-    {
-        ROWS_PER_THREAD = GMMA_M / 8 / 4
-    };
+    static constexpr int ROWS_PER_THREAD = GMMA_M / 8 / 4;
 
     // The number of columns access by each thread.
     // Note there are 2 elements per reg.
-    enum
-    {
-        COLUMNS_PER_THREAD = GMMA_N / 4 / 2
-    };
+    static constexpr int COLUMNS_PER_THREAD = GMMA_N / 4 / 2;
 
     // The number of accumulator held by each thread, per HGMMA instruction.
-    enum
-    {
-        ELEMENT_PER_THREAD = ROWS_PER_THREAD * COLUMNS_PER_THREAD
-    };
+    static constexpr int ELEMENT_PER_THREAD = ROWS_PER_THREAD * COLUMNS_PER_THREAD;
 
     // Store.
     inline __device__ void store(char* ptr, int64_t step_m, int64_t step_n, Accumulator const& acc, uint32_t scale)
@@ -363,23 +354,14 @@ struct Store_accumulator<fmha::Hopper_qgmma_fp8_fp32_traits<GMMA_M, GMMA_N, GMMA
     using Accumulator = fmha::Fragment_accumulator<Traits>;
 
     // The number of rows accessed by each thread.
-    enum
-    {
-        ROWS_PER_THREAD = GMMA_M / 8 / 4
-    };
+    static constexpr int ROWS_PER_THREAD = GMMA_M / 8 / 4;
 
     // The number of columns access by each thread.
     // Note there are 2 elements per reg.
-    enum
-    {
-        COLUMNS_PER_THREAD = GMMA_N / 8
-    };
+    static constexpr int COLUMNS_PER_THREAD = GMMA_N / 8;
 
     // The number of accumulator held by each thread, per HGMMA instruction.
-    enum
-    {
-        ELEMENT_PER_THREAD = ROWS_PER_THREAD * COLUMNS_PER_THREAD
-    };
+    static constexpr int ELEMENT_PER_THREAD = ROWS_PER_THREAD * COLUMNS_PER_THREAD;
 
     // Store.
     inline __device__ void store(char* ptr, int64_t step_m, int64_t step_n, Accumulator const& acc, uint32_t scale)
@@ -414,23 +396,14 @@ struct Store_accumulator<fmha::Hopper_igmma_int8_int32_traits<GMMA_M, GMMA_N, GM
     using Accumulator = fmha::Fragment_accumulator<Traits>;
 
     // The number of rows accessed by each thread.
-    enum
-    {
-        ROWS_PER_THREAD = GMMA_M / 8 / 4
-    };
+    static constexpr int ROWS_PER_THREAD = GMMA_M / 8 / 4;
 
     // The number of columns access by each thread.
     // Note there are 2 elements per reg.
-    enum
-    {
-        COLUMNS_PER_THREAD = GMMA_N / 8
-    };
+    static constexpr int COLUMNS_PER_THREAD = GMMA_N / 8;
 
     // The number of accumulator held by each thread, per HGMMA instruction.
-    enum
-    {
-        ELEMENT_PER_THREAD = ROWS_PER_THREAD * COLUMNS_PER_THREAD
-    };
+    static constexpr int ELEMENT_PER_THREAD = ROWS_PER_THREAD * COLUMNS_PER_THREAD;
 
     // Store.
     inline __device__ void store(char* ptr, int64_t step_m, int64_t step_n, Accumulator const& acc, uint32_t scale)
@@ -510,23 +483,14 @@ struct Store_accumulator<fmha::Hopper_qgmma_fp8_fp32_traits<GMMA_M, GMMA_N, GMMA
     using Accumulator = fmha::Fragment_accumulator<Traits>;
 
     // The number of rows accessed by each thread.
-    enum
-    {
-        ROWS_PER_THREAD = GMMA_M / 8 / 4
-    };
+    static constexpr int ROWS_PER_THREAD = GMMA_M / 8 / 4;
 
     // The number of columns access by each thread.
     // Note there are 2 elements per reg.
-    enum
-    {
-        COLUMNS_PER_THREAD = GMMA_N / 8
-    };
+    static constexpr int COLUMNS_PER_THREAD = GMMA_N / 8;
 
     // The number of accumulator held by each thread, per HGMMA instruction.
-    enum
-    {
-        ELEMENT_PER_THREAD = ROWS_PER_THREAD * COLUMNS_PER_THREAD
-    };
+    static constexpr int ELEMENT_PER_THREAD = ROWS_PER_THREAD * COLUMNS_PER_THREAD;
 
     // Store.
     inline __device__ void store(char* ptr, int64_t step_m, int64_t step_n, Accumulator const& acc, uint32_t)
@@ -559,23 +523,14 @@ struct Store_accumulator<fmha::Hopper_igmma_int8_int32_traits<GMMA_M, GMMA_N, GM
     using Accumulator = fmha::Fragment_accumulator<Traits>;
 
     // The number of rows accessed by each thread.
-    enum
-    {
-        ROWS_PER_THREAD = GMMA_M / 8 / 4
-    };
+    static constexpr int ROWS_PER_THREAD = GMMA_M / 8 / 4;
 
     // The number of columns access by each thread.
     // Note there are 2 elements per reg.
-    enum
-    {
-        COLUMNS_PER_THREAD = GMMA_N / 8
-    };
+    static constexpr int COLUMNS_PER_THREAD = GMMA_N / 8;
 
     // The number of accumulator held by each thread, per HGMMA instruction.
-    enum
-    {
-        ELEMENT_PER_THREAD = ROWS_PER_THREAD * COLUMNS_PER_THREAD
-    };
+    static constexpr int ELEMENT_PER_THREAD = ROWS_PER_THREAD * COLUMNS_PER_THREAD;
 
     // Store.
     inline __device__ void store(char* ptr, int64_t step_m, int64_t step_n, Accumulator const& acc, uint32_t)
@@ -606,28 +561,16 @@ struct Gmem_tile_ps
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // The number of elements per STG.
-    enum
-    {
-        ELEMENTS_PER_STG = 2
-    };
+    static constexpr int ELEMENTS_PER_STG = 2;
 
     // The size in bytes of each element.
-    enum
-    {
-        BYTES_PER_ELEMENT = BITS_PER_ELEMENT / 8
-    };
+    static constexpr int BYTES_PER_ELEMENT = BITS_PER_ELEMENT / 8;
 
     // The size of each STG.
-    enum
-    {
-        BYTES_PER_STG = ELEMENTS_PER_STG * BYTES_PER_ELEMENT
-    };
+    static constexpr int BYTES_PER_STG = ELEMENTS_PER_STG * BYTES_PER_ELEMENT;
 
     // The size of a row in bytes.
-    enum
-    {
-        BYTES_PER_ROW = Cta_tile::N * BYTES_PER_ELEMENT
-    };
+    static constexpr int BYTES_PER_ROW = Cta_tile::N * BYTES_PER_ELEMENT;
 
     // // DEBUG.
     // static_assert(BYTES_PER_ROW == 384 || BYTES_PER_ROW == 768 || BYTES_PER_ROW == 1536, "");
@@ -720,28 +663,16 @@ struct Gmem_tile_ps<Volta_hmma_fp16_traits, Cta_tile, 16>
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // The number of elements per STG.
-    enum
-    {
-        ELEMENTS_PER_STG = 4
-    };
+    static constexpr int ELEMENTS_PER_STG = 4;
 
     // The size in bytes of each element.
-    enum
-    {
-        BYTES_PER_ELEMENT = 2
-    };
+    static constexpr int BYTES_PER_ELEMENT = 2;
 
     // The size of each STG.
-    enum
-    {
-        BYTES_PER_STG = ELEMENTS_PER_STG * BYTES_PER_ELEMENT
-    };
+    static constexpr int BYTES_PER_STG = ELEMENTS_PER_STG * BYTES_PER_ELEMENT;
 
     // The size of a row in bytes.
-    enum
-    {
-        BYTES_PER_ROW = Cta_tile::N * BYTES_PER_ELEMENT
-    };
+    static constexpr int BYTES_PER_ROW = Cta_tile::N * BYTES_PER_ELEMENT;
 
     // Ctor.
     inline __device__ Gmem_tile_ps(
@@ -860,28 +791,16 @@ struct Gmem_tile_ps_hopper
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // The number of elements per STG.
-    enum
-    {
-        ELEMENTS_PER_STG = 2
-    };
+    static constexpr int ELEMENTS_PER_STG = 2;
 
     // The size in bytes of each element.
-    enum
-    {
-        BYTES_PER_ELEMENT = BITS_PER_ELEMENT / 8
-    };
+    static constexpr int BYTES_PER_ELEMENT = BITS_PER_ELEMENT / 8;
 
     // The size of each STG.
-    enum
-    {
-        BYTES_PER_STG = ELEMENTS_PER_STG * BYTES_PER_ELEMENT
-    };
+    static constexpr int BYTES_PER_STG = ELEMENTS_PER_STG * BYTES_PER_ELEMENT;
 
     // The size of a row in bytes.
-    enum
-    {
-        BYTES_PER_ROW = Cta_tile::N * BYTES_PER_ELEMENT
-    };
+    static constexpr int BYTES_PER_ROW = Cta_tile::N * BYTES_PER_ELEMENT;
 
     // Ctor.
     inline __device__ Gmem_tile_ps_hopper(void* ptr, int64_t const params_stride_in_bytes, int64_t const bytes_per_row,

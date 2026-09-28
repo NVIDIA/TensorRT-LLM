@@ -163,6 +163,10 @@ methods:
         annotation: bool
         default: False
         status: beta
+      enable_return_routed_experts:
+        annotation: bool
+        default: False
+        status: beta
       moe_config:
         annotation: tensorrt_llm.llmapi.llm_args.MoeConfig
         status: beta
