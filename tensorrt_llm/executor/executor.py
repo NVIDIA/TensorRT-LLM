@@ -145,7 +145,8 @@ class GenerationExecutor(ABC):
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
         """
-        assert isinstance(prompt_token_ids, np.ndarray) or isinstance(prompt_token_ids[0], int)
+        assert isinstance(prompt_token_ids, np.ndarray) or isinstance(
+            prompt_token_ids[0], int)
         assert isinstance(sampling_params, SamplingParams)
 
         self._maybe_initialize_iteration_results()
