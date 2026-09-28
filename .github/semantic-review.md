@@ -8,31 +8,49 @@ target branch. Its **Semantic conflict with target branch** check is advisory:
 keep it **non-required** in branch protection/rulesets. AI can miss defects and
 report false positives; reviewers should read the linked evidence.
 
+## Triggers
+
+Production jobs run only in `NVIDIA/TensorRT-LLM`:
+
+- **Scheduled request:** `23 */2 * * *` (UTC), every two hours at minute 23.
+  Select open, non-draft PRs targeting `main` or `release/**` that have
+  `ci: full pre-merge approved` or auto-merge enabled. GitHub can delay runs.
+- **Manual request:** **Run workflow** with one open main/release `pull_number`.
+  Drafts and PRs without an approval label or auto-merge are accepted. Manual
+  requests bypass version deduplication but retain revision and quota checks.
+  An ordinary workflow rerun follows its original trigger and inputs.
+- **Result publication:** a trusted CodeRabbit PR issue comment is created,
+  edited or deleted. Validate the latest request and its replies before updating
+  the Check. This event does not request new analysis or wait for the next scan.
+
+Label changes, enabling auto-merge, head pushes and target branch updates do not
+directly request analysis. The scheduled scan observes those changes.
+
 ## Request policy
 
-Every two hours, scan open, non-draft PRs targeting `main` or `release/**` that
-have `ci: full pre-merge approved` or auto-merge enabled. PR activity does not
-immediately request analysis. GitHub scheduled runs can be delayed.
-
-- Read the current head, target and merge-base. Skip only previously requested
-  head/target/branch combinations. A head that already contains target still
-  needs compatibility analysis: rebase or merge can incorporate semantic bugs.
+- Read the current head, target and merge-base. Scheduled requests skip
+  previously requested head/target/branch combinations, regardless of whether
+  the earlier analysis replied or passed. A head that already contains target
+  still needs compatibility analysis: rebase or merge can incorporate semantic
+  bugs.
 - Select candidates by descending PR number, starting with the newest each scan.
   Select at most 30 requests after deduplication. Failed selection or delivery
   attempts consume slots; a failed POST can still have reached CodeRabbit.
-  Workers recheck eligibility, revisions and deduplication under the PR's lock.
-- Stop requesting when either token's observed REST quota remaining is 1,000 or
-  less, or when rate limited. `GITHUB_TOKEN` and the service PAT have separate
-  quota checks. Concurrent API users can spend quota between observations.
-- Do not automatically retry an unchanged version, including a missing reply.
-  Maintainers may use **Run workflow** with an open main/release `pull_number`,
-  including drafts, without an approval label or auto-merge. Manual requests
-  bypass version deduplication but retain revision and quota checks. An ordinary
-  workflow rerun still follows its original inputs.
+  Workers recheck eligibility, revisions and scheduled-request deduplication under
+  the PR's lock. If a selected worker skips or fails, its slot is not refilled.
+- Stop the affected discovery or request job when a token's observed REST quota
+  remaining is 1,000 or less, or when rate limited. `GITHUB_TOKEN` and the service
+  PAT have separate quota checks; the service PAT is checked by request workers.
+  Concurrent API users can spend quota between observations. This reserve does
+  not apply to result publication.
+- Skip delivery if eligibility or revisions change during preparation. A later
+  scan can select the PR again. Once a request comment exists, a missing reply
+  does not trigger an automatic retry; use a manual request to retry that version.
 
-The budget permits up to 360 scheduled requests per day; manual retries are
-additional. Newest-first selection can defer older PRs indefinitely when target
-keeps advancing and there are more than 30 actionable candidates. Monitor actual
+Twelve scheduled scans have a combined budget of 360 request attempts; this is
+not a calendar-day cap on manual requests, reruns or delayed batches.
+Newest-first selection can defer older PRs indefinitely when target keeps
+advancing and there are more than 30 actionable candidates. Monitor actual
 throughput and backlog before changing this policy.
 
 ## Results
@@ -47,19 +65,24 @@ revisions, and presence of source citations before publishing:
 | FAIL | Failure: possible conflict; inspect linked evidence |
 | Missing or inconclusive | Neutral: no verified verdict |
 
-Replies publish without waiting for the next scheduled scan. Request and
-publication jobs for the same PR share a concurrency queue, so switching the
-current request cannot race an older reply. Different PRs can run independently;
-each scan has up to four concurrent request workers. Scheduled batches run one
-at a time; manual requests and publication do not share that batch lock. Jobs do
+Reply events process results without waiting for the next scheduled scan.
+Request and publication jobs for the same PR share a concurrency queue, so
+switching the current request cannot race an older reply. Different PRs can run
+independently; each scan has up to four concurrent request workers. Scheduled
+batches run one at a time; manual requests and publication do not share that batch lock. Jobs do
 not wait for AI analysis while holding a queue. A scan's success only means its
 requests were processed, not that AI approved those PRs.
 
-When main advances, a reply still describes its requested snapshot. The next
-scan requests the newer combination. Switching requests clears the earlier
-verdict; an old reply cannot update the new request's check. With a new head,
-the check is attached to that head. Editing or deleting the published source
-reply must revoke a conclusion that is no longer valid.
+When the target advances, a reply still describes its requested snapshot; target
+updates do not immediately clear the Check. A later scan can request the newer
+combination if the PR is eligible, selected within the budget and quota allows.
+Switching requests clears the earlier verdict; an old reply cannot update the
+new request's check. With a new head, the check is attached to that head.
+Editing or deleting the published source reply revokes a conclusion that is no
+longer valid when that event is processed.
+The scheduled scan does not reconcile missed publication events or failed Check
+writes. A later trusted reply event or a publisher job rerun can reconcile them;
+an open main/release PR can also receive a new manual request.
 
 A PR that merges between scans may never be requested. An already requested
 analysis may finish after merging; its result still covers the recorded input,
@@ -72,9 +95,10 @@ jobs always check out that branch and never execute PR-controlled code. The
 read-only automation test workflow runs against the proposed changes.
 
 `TRTLLM_AGENT_SHARED_TOKEN` must belong to `trtllm-agent` (user ID `296075020`)
-and permit posting issue comments. It is used only to send CodeRabbit commands;
-reads and Check publication use `GITHUB_TOKEN`. The publisher recognizes
-`coderabbitai[bot]` (user ID `136622811`). Keep these checks non-required.
+and permit posting issue comments. It sends CodeRabbit commands and reads its
+own identity and quota; repository reads and Check publication use
+`GITHUB_TOKEN`. The publisher recognizes `coderabbitai[bot]` (user ID `136622811`).
+Keep these checks non-required.
 
 ## Validation
 
