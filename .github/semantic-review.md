@@ -271,6 +271,13 @@ uses one initial request and at most one automatic timeout retry per version.
 Assess known defect detection and repair false positives separately; a narrow
 repair control does not establish general accuracy.
 
+A defective input is successfully flagged when FAIL identifies at least one
+source-supported, in-scope incompatibility for developers to investigate.
+Finding every known defect or providing a complete fix is not required. Record
+additional omissions as observations, not failed alerts. Uncertainty about one
+path must not override a confirmed incompatibility on another. Repair inputs
+and paired-edit controls also check for unsupported FAIL findings.
+
 The deterministic tests simulate GitHub. A real AI reply and a real commit
 status write are separate validation layers and must be reported as such.
 Fixtures preserve historical revisions; replay them explicitly without
