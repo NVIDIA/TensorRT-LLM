@@ -40,7 +40,7 @@ function fixture(prs = [pull()], options = {}) {
     mergeBase: BASE, service: SERVICE, readCounts: new Map(), refReads: 0,
     before: [], after: [], commandBefore: [], commandAfter: [],
     commandRemaining: options.commandRemaining ?? 5000, postErrors: new Map(), comparisons: 0,
-    now: NOW, nextCommentId: 1000, commentReads: new Map(), checkUpdateFailures: 0,
+    now: NOW, nextCommentId: 1000, commentReads: new Map(), checkUpdateFailures: 0, readOrder: [],
   };
   const api = (method, commandToken = false) => async (args) => {
     const key = commandToken ? 'commandRemaining' : 'remaining';
@@ -69,6 +69,7 @@ function fixture(prs = [pull()], options = {}) {
       pulls: {
         list: api(() => structuredClone(state.prs)),
         get: api(({ pull_number: number }) => {
+          state.readOrder.push(number);
           const count = (state.readCounts.get(number) || 0) + 1;
           state.readCounts.set(number, count);
           const pr = structuredClone(state.prs.find((item) => item.number === number));
@@ -331,12 +332,25 @@ test('ambiguous POST acceptance is recovered from the trusted comment without a 
   assert.equal(f.state.checks.at(-1).conclusion, null);
 });
 
-test('discovery selects at most 30 new requests, newest PR first on every scan', async () => {
+test('consecutive scans resume below the last visited PR and wrap within a 30-request budget', async () => {
   const candidates = Array.from({ length: 45 }, (_, index) => pull(index + 1));
   const f = fixture(candidates);
-  const expected = Array.from({ length: 30 }, (_, index) => 45 - index);
-  assert.deepEqual((await f.scan()).jobs, expected.map((number) => ({ number, allowRequest: true })));
-  assert.deepEqual((await f.scan()).jobs, expected.map((number) => ({ number, allowRequest: true })));
+  const firstOrder = Array.from({ length: 30 }, (_, index) => 45 - index);
+  const first = await f.scan();
+  assert.deepEqual(first.jobs, firstOrder.map((number) => ({ number, allowRequest: true })));
+  assert.deepEqual(f.state.readOrder, firstOrder);
+  assert.equal(first.cursor, 16);
+  f.state.readOrder = [];
+  const secondOrder = [
+    ...Array.from({ length: 15 }, (_, index) => 15 - index),
+    ...Array.from({ length: 15 }, (_, index) => 45 - index),
+  ];
+  const second = await f.scan({ cursor: first.cursor });
+  assert.deepEqual(second.jobs, secondOrder.map((number) => ({ number, allowRequest: true })));
+  assert.deepEqual(f.state.readOrder, secondOrder);
+  assert.equal(second.cursor, 31);
+  assert.equal(first.requested, 30);
+  assert.equal(second.requested, 30);
   assert.equal(f.state.comparisons, 0);
   assert.equal(f.state.posts.length, 0);
   assert.equal(f.state.checks.length, 0);
@@ -352,7 +366,8 @@ test('already requested and newly ineligible candidates do not consume discovery
   for (let number = 36; number <= 45; number += 1) await f.one({ number });
   const result = await f.scan();
   assert.deepEqual(result.jobs, Array.from({ length: 30 }, (_, index) => ({ number: 35 - index, allowRequest: true })));
-  assert.equal(result.skipped, 15);
+  assert.equal(result.skipped, 10);
+  assert.equal(result.cursor, 6);
   assert.equal(f.state.posts.length, 10);
 });
 
@@ -365,6 +380,8 @@ test('discovery read errors consume slots and report failure while preserving ot
   });
   const result = await f.scan();
   assert.equal(result.failed, 6);
+  assert.equal(result.cursor, 11);
+  assert.equal(f.state.readOrder.length, 30);
   assert.deepEqual(result.jobs, Array.from({ length: 24 }, (_, index) => ({ number: 34 - index, allowRequest: true })));
   assert.equal(f.state.warnings.length, 5);
   assert.equal(f.state.failures.length, 1);
@@ -408,6 +425,8 @@ test('discovery preserves 1000 REST requests and returns candidates already foun
   const result = await f.scan();
   assert.equal(result.limited, true);
   assert.deepEqual(result.jobs, [{ number: 2, allowRequest: true }]);
+  assert.equal(result.cursor, 2);
+  assert.deepEqual(f.state.readOrder, [2]);
   assert.equal(f.state.remaining, 1000);
   assert.equal(f.state.failures.length, 0);
   assert.equal(f.state.before.length, 0);
@@ -440,6 +459,7 @@ test('rate-limit responses stop discovery without marking an AI failure', async 
     const f = fixture([pull()], { readPR: () => { throw error; } });
     const result = await f.scan();
     assert.equal(result.limited, true);
+    assert.equal(result.cursor, 1);
     assert.equal(result.failed, 0);
     assert.equal(f.state.failures.length, 0);
     assert.equal(f.state.checks.length, 0);
@@ -468,7 +488,9 @@ test('manual dispatch validates input and forces any open supported PR, includin
     }
     process.env.INPUT_PULL_NUMBER = '1';
     f.state.mergeBase = TARGET;
-    assert.deepEqual((await f.scan()).jobs, [{ number: 1, allowRequest: true }]);
+    const selected = await f.scan({ cursor: 100 });
+    assert.deepEqual(selected.jobs, [{ number: 1, allowRequest: true }]);
+    assert.equal(Object.hasOwn(selected, 'cursor'), false);
     assert.equal((await f.worker()).status, 'requested');
     assert.deepEqual((await f.scan()).jobs, [{ number: 1, allowRequest: true }]);
     assert.equal((await f.worker()).status, 'requested');
@@ -649,7 +671,7 @@ test('repair recovers the recorded revisions after the current head, target or e
   }
 });
 
-test('repair jobs survive a full 30-request budget and cannot upgrade to new requests', async () => {
+test('repairs after a full request budget resume next rotation and cannot upgrade to new requests', async () => {
   const f = fixture(Array.from({ length: 32 }, (_, index) => pull(index + 1)));
   for (const number of [1, 2]) {
     const first = await f.one({ number });
@@ -657,14 +679,17 @@ test('repair jobs survive a full 30-request budget and cannot upgrade to new req
   }
   const scan = await f.scan();
   assert.equal(scan.requested, 30);
-  assert.equal(scan.jobs.length, 32);
-  assert.deepEqual(scan.jobs.slice(-2), [
+  assert.equal(scan.jobs.length, 30);
+  assert.equal(scan.cursor, 3);
+  for (const job of scan.jobs) assert.equal((await f.worker(job)).status, 'requested');
+  const next = await f.scan({ cursor: scan.cursor });
+  assert.equal(next.requested, 0);
+  assert.deepEqual(next.jobs, [
     { number: 2, allowRequest: false }, { number: 1, allowRequest: false },
   ]);
   f.state.prs[0].head.sha = OTHER;
-  for (const job of scan.jobs) {
-    const result = await f.worker({ ...job, ...(!job.allowRequest ? { commandGithub: undefined } : {}) });
-    assert.equal(result.status, job.allowRequest ? 'requested' : 'reconciled');
+  for (const job of next.jobs) {
+    assert.equal((await f.worker({ ...job, commandGithub: undefined })).status, 'reconciled');
   }
   assert.equal(f.state.posts.length, 32);
   assert.equal(requests(f.state.comments.get(1)).length, 1);
@@ -711,6 +736,7 @@ test('the Actions matrix remains within 256 jobs when many old replies need repa
   assert.equal(scan.jobs.every((job) => job.allowRequest === false), true);
   assert.equal(scan.jobs[0].number, 260);
   assert.equal(scan.jobs.at(-1).number, 5);
+  assert.equal(scan.cursor, 5);
 });
 
 test('a due automatic retry still preserves both token reserves', async () => {
@@ -903,4 +929,106 @@ test('a FAIL received at the final recheck remains completed when a manual new r
   assert.equal(f.state.checks.at(-1).status, 'in_progress');
   assert.equal(f.state.checks.at(-1).conclusion, null);
   assert.equal(f.state.posts.length, 2);
+});
+
+test('new PRs join the descending wrapped segment without skipping older unvisited PRs', async () => {
+  const f = fixture(Array.from({ length: 45 }, (_, index) => pull(index + 1)));
+  const first = await f.scan();
+  assert.equal(first.cursor, 16);
+  f.state.prs.push(pull(46));
+  f.state.readOrder = [];
+  const second = await f.scan({ cursor: first.cursor });
+  const expected = [
+    ...Array.from({ length: 15 }, (_, index) => 15 - index),
+    46, ...Array.from({ length: 14 }, (_, index) => 45 - index),
+  ];
+  assert.deepEqual(second.jobs.map((job) => job.number), expected);
+  assert.deepEqual(f.state.readOrder, expected);
+  assert.equal(second.cursor, 32);
+  assert.equal(second.requested, 30);
+});
+
+test('rotation works when the cursor PR is still open, has closed, or lies outside the open range', async () => {
+  for (const [numbers, cursor, expected] of [
+    [[120, 80, 100, 110, 90], 100, [90, 80, 120, 110, 100]],
+    [[120, 80, 110, 90], 100, [90, 80, 120, 110]],
+    [[120, 80, 110, 90], 1, [120, 110, 90, 80]],
+    [[120, 80, 110, 90], 999, [120, 110, 90, 80]],
+  ]) {
+    const f = fixture(numbers.map((number) => pull(number)));
+    const result = await f.scan({ cursor });
+    assert.deepEqual(result.jobs.map((job) => job.number), expected);
+    assert.deepEqual(f.state.readOrder, expected);
+    assert.equal(new Set(f.state.readOrder).size, numbers.length);
+    assert.equal(result.cursor, expected.at(-1));
+  }
+});
+
+test('deduplicated and ineligible PRs advance the cursor and are each visited once per rotation', async () => {
+  const f = fixture([120, 110, 100, 90].map((number) => pull(number)));
+  for (const number of [120, 110, 100, 90]) await f.one({ number });
+  f.state.prs.push(pull(80, { labels: [] }));
+  f.state.readOrder = [];
+  const result = await f.scan({ cursor: 100 });
+  assert.deepEqual(result.jobs, []);
+  assert.equal(result.requested, 0);
+  assert.equal(result.skipped, 5);
+  assert.deepEqual(f.state.readOrder, [90, 80, 120, 110, 100]);
+  assert.equal(result.cursor, 100);
+  assert.equal(f.state.posts.length, 4);
+});
+
+test('a failed PR read advances the cursor to that attempted PR after the wrap', async () => {
+  const f = fixture([pull(110, { labels: [] }), pull(100), pull(90)], {
+    readPR: (pr) => {
+      if (pr.number === 100) throw Object.assign(new Error('Unavailable'), { status: 502 });
+      return pr;
+    },
+  });
+  const result = await f.scan({ cursor: 100 });
+  assert.deepEqual(result.jobs, [{ number: 90, allowRequest: true }]);
+  assert.deepEqual(f.state.readOrder, [90, 110, 100]);
+  assert.equal(result.cursor, 100);
+  assert.equal(result.failed, 1);
+  assert.equal(result.skipped, 1);
+  assert.equal(f.state.posts.length, 0);
+});
+
+test('an empty scan or quota stop before the first PR read does not emit a cursor update', async () => {
+  const empty = await fixture([]).scan({ cursor: 100 });
+  assert.deepEqual(empty.jobs, []);
+  assert.equal(Object.hasOwn(empty, 'cursor'), false);
+  for (const remaining of [1000, 1001]) {
+    const f = fixture([pull(100), pull(90)], { remaining });
+    const result = await f.scan({ cursor: 100 });
+    assert.equal(result.limited, true);
+    assert.equal(Object.hasOwn(result, 'cursor'), false);
+    assert.deepEqual(f.state.readOrder, []);
+    assert.ok(f.state.remaining >= 1000);
+  }
+  const listing = fixture([pull(100), pull(90)]);
+  listing.github.rest.pulls.list = async () => {
+    throw Object.assign(new Error('Rate limited while listing'), { status: 429 });
+  };
+  const result = await listing.scan({ cursor: 100 });
+  assert.equal(result.limited, true);
+  assert.equal(Object.hasOwn(result, 'cursor'), false);
+  assert.deepEqual(listing.state.readOrder, []);
+});
+
+test('quota exhaustion after a PR read records that PR even if later inspection cannot finish', async () => {
+  for (const [remaining, expectedCursor, expectedJobs, expectedReads] of [
+    [1002, 2, [], [2]],
+    [1006, 1, [{ number: 2, allowRequest: true }], [2, 1]],
+  ]) {
+    const f = fixture([pull(1), pull(2)], { remaining });
+    const result = await f.scan({ cursor: 100 });
+    assert.equal(result.limited, true);
+    assert.equal(result.cursor, expectedCursor);
+    assert.deepEqual(result.jobs, expectedJobs);
+    assert.deepEqual(f.state.readOrder, expectedReads);
+    assert.equal(f.state.remaining, 1000);
+    assert.equal(f.state.failures.length, 0);
+    assert.equal(f.state.before.length + f.state.after.length, 0);
+  }
 });

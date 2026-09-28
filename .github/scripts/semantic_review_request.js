@@ -62,9 +62,16 @@ function candidate(pr, manual) {
   return manual ? pr.state === 'open' && supported(pr.base.ref) : eligible(pr);
 }
 
-async function pending({ github, context, number, manual, now = Date.now() }) {
+async function pending({ github, context, number, manual, now = Date.now(), onVisit }) {
   const repo = context.repo;
-  const { data: pr } = await github.rest.pulls.get({ ...repo, pull_number: number });
+  let pr;
+  try {
+    ({ data: pr } = await github.rest.pulls.get({ ...repo, pull_number: number }));
+  } catch (error) {
+    if (error.code !== 'SEMANTIC_REVIEW_QUOTA') onVisit?.();
+    throw error;
+  }
+  onVisit?.();
   const comments = await github.paginate(github.rest.issues.listComments, {
     ...repo, issue_number: number, per_page: 100,
   });
@@ -174,25 +181,33 @@ async function requestOne({ github, commandGithub, context, core, number, manual
   });
 }
 
-async function discover({ github, context, core, now = Date.now() }) {
+async function discover({ github, context, core, now = Date.now(), cursor }) {
   const input = process.env.INPUT_PULL_NUMBER || '';
   const manual = context.eventName === 'workflow_dispatch';
   if ((manual && !/^[1-9]\d*$/.test(input)) || (!manual && input) ||
     (input && !Number.isSafeInteger(Number(input)))) {
     throw new Error('Manual review requires a positive pull request number.');
   }
+  if (!manual && cursor !== undefined && (!Number.isSafeInteger(cursor) || cursor <= 0)) {
+    throw new Error('The scan cursor must be a positive pull request number.');
+  }
   const result = { jobs: [], requested: 0, skipped: 0, failed: 0, limited: false };
   try {
     await withReserve(github, async () => {
-      const candidates = manual ? [{ number: Number(input) }] :
+      let candidates = manual ? [{ number: Number(input) }] :
         (await github.paginate(github.rest.pulls.list, {
           ...context.repo, state: 'open', sort: 'created', direction: 'desc', per_page: 100,
         })).sort((a, b) => b.number - a.number);
+      if (!manual && cursor !== undefined) {
+        candidates = candidates.filter(pr => pr.number < cursor)
+          .concat(candidates.filter(pr => pr.number >= cursor));
+      }
       for (const { number } of candidates) {
-        if (result.jobs.length >= MATRIX_LIMIT) break;
+        if (result.requested + result.failed >= REQUEST_LIMIT || result.jobs.length >= MATRIX_LIMIT) break;
         try {
-          const snapshot = await pending({ github, context, number, manual, now });
-          if (snapshot.status === 'ready' && result.requested + result.failed < REQUEST_LIMIT) {
+          const snapshot = await pending({ github, context, number, manual, now,
+            onVisit: manual ? undefined : () => { result.cursor = number; } });
+          if (snapshot.status === 'ready') {
             result.jobs.push({ number, allowRequest: true });
             result.requested += 1;
           } else if (!manual && (snapshot.review?.update || snapshot.review?.cleanup.length)) {
@@ -240,4 +255,4 @@ async function run({ github, commandGithub, context, core, number, allowRequest 
   return result;
 }
 
-module.exports = { discover, run, requestOne, isRateLimitError };
+module.exports = { discover, run, requestOne, isRateLimitError, withReserve };
