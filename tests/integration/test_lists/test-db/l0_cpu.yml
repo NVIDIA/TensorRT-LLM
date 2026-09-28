@@ -170,6 +170,9 @@ l0_cpu:
   - unittest/llmapi/test_llm_telemetry.py
   - unittest/llmapi/test_llm_utils.py
   - unittest/llmapi/test_mpi_session.py ISOLATION
+  - unittest/llmapi/test_mpi_server_lifecycle.py
+  - unittest/llmapi/test_mpi_launcher_shutdown.py
+  - unittest/llmapi/test_mpi_lifecycle.py ISOLATION
   - unittest/llmapi/test_reasoning_parser.py
   - unittest/llmapi/test_request_priority.py
   - unittest/llmapi/test_rl_control_auth.py
