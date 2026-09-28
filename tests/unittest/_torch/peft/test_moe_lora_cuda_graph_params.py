@@ -102,7 +102,16 @@ _MODULE_IDS = (
 )
 
 
-def _make_params(max_lora_size=2, max_rank=8, max_batch_size=2, layer_idxs=(0,)):
+def _make_params(
+    max_lora_size: int = 2,
+    max_rank: int = 8,
+    max_batch_size: int = 2,
+    layer_idxs: tuple[int, ...] = (0,),
+) -> tuple[
+    CudaGraphLoraParams,
+    CudaGraphLoraParams.LoraLayerKey,
+    tuple[int, int, int],
+]:
     """Build a CudaGraphLoraParams carrying one MoE layer per entry in
     `layer_idxs`, each with all three routed-expert modules
     (fc1=moe_h_to_4h, gated=moe_gate, fc2=moe_4h_to_h)."""

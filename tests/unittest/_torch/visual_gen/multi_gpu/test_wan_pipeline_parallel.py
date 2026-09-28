@@ -16,15 +16,10 @@
 
 Run with:
     pytest tests/unittest/_torch/visual_gen/multi_gpu/test_wan_pipeline_parallel.py -v -s
-
-Override checkpoint path:
-    DIFFUSION_MODEL_PATH_WAN21_1_3B=/path/to/1.3b \\
-        pytest tests/unittest/_torch/visual_gen/multi_gpu/test_wan_pipeline_parallel.py -v -s
 """
 
 import gc
 import os
-from pathlib import Path
 from typing import Callable
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
@@ -35,23 +30,16 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
+from diffusers import DiffusionPipeline
+from utils.llm_data import get_checkpoint
 
-try:
-    from pathlib import Path
-
-    from diffusers import DiffusionPipeline
-
-    from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-    from tensorrt_llm.visual_gen.args import (
-        AttentionConfig,
-        ParallelConfig,
-        TorchCompileConfig,
-        VisualGenArgs,
-    )
-
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
+from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+from tensorrt_llm.visual_gen.args import (
+    AttentionConfig,
+    ParallelConfig,
+    TorchCompileConfig,
+    VisualGenArgs,
+)
 
 try:
     from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
@@ -61,7 +49,7 @@ try:
         _flash_attn_combine as _fa_combine,
     )
 
-    _ATTN2D_AVAILABLE = MODULES_AVAILABLE and _fa4_fwd is not None and _fa_combine is not None
+    _ATTN2D_AVAILABLE = _fa4_fwd is not None and _fa_combine is not None
 except ImportError:
     _ATTN2D_AVAILABLE = False
 
@@ -72,28 +60,7 @@ def _cleanup_mpi_env():
     os.environ.pop("TLLM_DISABLE_MPI", None)
 
 
-# =============================================================================
-# Path helpers (mirror tests/unittest/_torch/visual_gen/test_wan21_t2v_pipeline.py)
-# =============================================================================
-
-
-def _llm_models_root() -> str:
-    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
-    if "LLM_MODELS_ROOT" in os.environ:
-        root = Path(os.environ["LLM_MODELS_ROOT"])
-    if not root.exists():
-        root = Path("/scratch.trt_llm_data/llm-models/")
-    assert root.exists(), (
-        "Set LLM_MODELS_ROOT or ensure /home/scratch.trt_llm_data_ci/llm-models/ is accessible."
-    )
-    return str(root)
-
-
-def _checkpoint(env_var: str, default_name: str) -> str:
-    return os.environ.get(env_var) or os.path.join(_llm_models_root(), default_name)
-
-
-WAN21_1_3B_PATH = _checkpoint("DIFFUSION_MODEL_PATH_WAN21_1_3B", "Wan2.1-T2V-1.3B-Diffusers")
+WAN21_1_3B_SUBDIR = "Wan2.1-T2V-1.3B-Diffusers"
 
 
 # =============================================================================
@@ -146,8 +113,6 @@ def _distributed_worker(rank, world_size, backend, test_fn, port, kwargs):
 
 
 def run_test_in_distributed(world_size: int, test_fn: Callable, **kwargs):
-    if not MODULES_AVAILABLE:
-        pytest.skip("Required modules not available")
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
     # Spawn distributed workers via a helper that retries with a fresh master
@@ -279,7 +244,7 @@ def _free(*objs) -> None:
 # =============================================================================
 
 
-def _logic_wan_cfg_ulysses_pvae(rank: int, world_size: int, *, checkpoint_path: str) -> None:
+def _logic_wan_cfg_ulysses_pvae(rank: int, world_size: int, *, checkpoint_subdir: str) -> None:
     """End-to-end pipeline run with cfg=2, ulysses=2, parallel_vae=2.
 
     All ranks participate in the TRTLLM forward (CFG parallel, Ulysses, parallel
@@ -288,6 +253,7 @@ def _logic_wan_cfg_ulysses_pvae(rank: int, world_size: int, *, checkpoint_path: 
     """
     assert world_size == 4, f"This test is hardcoded to world_size=4, got {world_size}"
 
+    checkpoint_path = get_checkpoint(checkpoint_subdir)
     trtllm_pipe = PipelineLoader(_build_parallel_args(checkpoint_path)).load(skip_warmup=True)
     trtllm_video = _capture_trtllm_video(
         trtllm_pipe,
@@ -346,11 +312,12 @@ def _logic_wan_cfg_ulysses_pvae(rank: int, world_size: int, *, checkpoint_path: 
 
 
 def _logic_wan_cfg2_attn2d2x1_ulysses2_pvae8(
-    rank: int, world_size: int, *, checkpoint_path: str
+    rank: int, world_size: int, *, checkpoint_subdir: str
 ) -> None:
     """End-to-end pipeline: cfg=2, ulysses=2, attn2d=2×1, async_ulysses, parallel_vae=8 (8 GPUs)."""
     assert world_size == 8, f"This test is hardcoded to world_size=8, got {world_size}"
 
+    checkpoint_path = get_checkpoint(checkpoint_subdir)
     trtllm_pipe = PipelineLoader(_build_cfg2_attn2d2x1_ulysses2_pvae8_args(checkpoint_path)).load(
         skip_warmup=True
     )
@@ -420,32 +387,20 @@ class TestWanPipelineParallel:
 
     def test_cfg2_ulysses2_pvae2(self):
         """world=4, cfg=2, ulysses=2, parallel_vae=2 vs HF reference."""
-        if not MODULES_AVAILABLE:
-            pytest.skip("Required modules not available")
-        if not os.path.exists(WAN21_1_3B_PATH):
-            pytest.skip(
-                f"Checkpoint not found: {WAN21_1_3B_PATH}. Set DIFFUSION_MODEL_PATH_WAN21_1_3B."
-            )
         run_test_in_distributed(
             world_size=4,
             test_fn=_logic_wan_cfg_ulysses_pvae,
-            checkpoint_path=WAN21_1_3B_PATH,
+            checkpoint_subdir=WAN21_1_3B_SUBDIR,
         )
 
     def test_cfg2_attn2d2x1_ulysses2_pvae8(self):
         """world=8, cfg=2, ulysses=2, attn2d=2×1, async_ulysses, parallel_vae=8 vs HF reference."""
-        if not MODULES_AVAILABLE:
-            pytest.skip("Required modules not available")
         if not _ATTN2D_AVAILABLE:
             pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
-        if not os.path.exists(WAN21_1_3B_PATH):
-            pytest.skip(
-                f"Checkpoint not found: {WAN21_1_3B_PATH}. Set DIFFUSION_MODEL_PATH_WAN21_1_3B."
-            )
         run_test_in_distributed(
             world_size=8,
             test_fn=_logic_wan_cfg2_attn2d2x1_ulysses2_pvae8,
-            checkpoint_path=WAN21_1_3B_PATH,
+            checkpoint_subdir=WAN21_1_3B_SUBDIR,
         )
 
 

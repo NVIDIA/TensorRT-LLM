@@ -16,7 +16,7 @@
 """Unit tests for speculative modeling classes."""
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, sentinel
 
 import pytest
 import torch
@@ -29,8 +29,88 @@ from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
 from tensorrt_llm._torch.models.modeling_speculative import (
     Eagle3ForCausalLM,
     SpecDecOneEngineForCausalLM,
+    _build_mtp_one_model_draft,
+    _copy_model_config_with_moe_backend,
+    _set_draft_kv_cache_quant_algo,
+    external_drafter_config_kwargs,
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
+
+
+@pytest.mark.cpu_only
+def test_draft_kv_cache_quant_algo_override_updates_all_layers() -> None:
+    target = SimpleNamespace(
+        quant_config=SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4),
+        extra_attrs={"draft_kv_cache_quant_algo_override": QuantAlgo.FP8},
+    )
+    layer_quant_0 = SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4)
+    layer_quant_1 = SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4)
+    draft = SimpleNamespace(
+        quant_config=SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4),
+        quant_config_dict={
+            "model.layers.0": layer_quant_0,
+            "model.layers.1": layer_quant_1,
+        },
+    )
+
+    _set_draft_kv_cache_quant_algo(draft, target)
+
+    assert draft.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+    assert layer_quant_0.kv_cache_quant_algo == QuantAlgo.FP8
+    assert layer_quant_1.kv_cache_quant_algo == QuantAlgo.FP8
+    assert target.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("target_algo", [None, QuantAlgo.FP8, QuantAlgo.NVFP4])
+def test_draft_kv_cache_quant_algo_inheritance_preserves_layer_settings(
+    target_algo: QuantAlgo | None,
+) -> None:
+    """Without an override, inherit only the global setting as before."""
+    target = SimpleNamespace(
+        quant_config=SimpleNamespace(kv_cache_quant_algo=target_algo),
+        extra_attrs={},
+    )
+    layer_algos = (None, QuantAlgo.FP8, QuantAlgo.NVFP4)
+    layer_configs = {
+        f"model.layers.{i}": SimpleNamespace(kv_cache_quant_algo=algo)
+        for i, algo in enumerate(layer_algos)
+    }
+    draft = SimpleNamespace(
+        quant_config=SimpleNamespace(kv_cache_quant_algo=QuantAlgo.FP8),
+        quant_config_dict=layer_configs,
+    )
+
+    _set_draft_kv_cache_quant_algo(draft, target)
+
+    assert draft.quant_config.kv_cache_quant_algo == target_algo
+    assert draft.quant_config_dict is layer_configs
+    assert tuple(config.kv_cache_quant_algo for config in layer_configs.values()) == layer_algos
+    assert target.quant_config.kv_cache_quant_algo == target_algo
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("override", [None, QuantAlgo.FP8])
+def test_draft_kv_cache_quant_algo_without_layer_settings(override: QuantAlgo | None) -> None:
+    """Global inheritance and overrides also support uniform checkpoints."""
+    target = SimpleNamespace(
+        quant_config=SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4),
+        extra_attrs={"draft_kv_cache_quant_algo_override": override},
+    )
+    draft = SimpleNamespace(
+        quant_config=SimpleNamespace(kv_cache_quant_algo=None),
+        quant_config_dict=None,
+    )
+
+    _set_draft_kv_cache_quant_algo(draft, target)
+
+    expected_algo = QuantAlgo.NVFP4 if override is None else override
+    assert draft.quant_config.kv_cache_quant_algo == expected_algo
+    assert draft.quant_config_dict is None
+    assert target.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
 
 
 class _FakeDraftModel(nn.Module):
@@ -425,3 +505,156 @@ def test_dflash_trtllm_gen_buffers_reject_capture_time_allocation():
         wrapper._dflash_trtllm_gen_counters = torch.empty(16, dtype=torch.uint8, device="meta")
         with pytest.raises(RuntimeError, match="counter buffer.*before CUDA graph capture"):
             _prepare_dflash_buffers(wrapper, 2)
+
+
+# ---------------------------------------------------------------------------
+# One-engine draft MoE backend selection
+# ---------------------------------------------------------------------------
+
+
+def _draft_backend_test_model_config(moe_backend: str = "CUTLASS") -> ModelConfig:
+    return ModelConfig(
+        pretrained_config=PretrainedConfig(
+            architectures=["DraftBackendTestForCausalLM"],
+            hidden_size=64,
+            vocab_size=128,
+            num_hidden_layers=2,
+        ),
+        moe_backend=moe_backend,
+    )
+
+
+def _external_spec_config(moe_backend: str | None) -> SimpleNamespace:
+    return SimpleNamespace(
+        spec_dec_mode=SpeculativeDecodingMode.PARD,
+        moe_backend=moe_backend,
+    )
+
+
+def test_external_draft_moe_backend_none_inherits_target() -> None:
+    """None preserves the existing target-backend inheritance behavior."""
+    model_config = _draft_backend_test_model_config("CUTLASS")
+
+    kwargs = external_drafter_config_kwargs(model_config, _external_spec_config(None))
+
+    assert kwargs["moe_backend"] == "CUTLASS"
+
+
+def test_external_draft_moe_backend_auto_reaches_draft_loader() -> None:
+    """AUTO remains unresolved until the draft checkpoint quant config is read."""
+    model_config = _draft_backend_test_model_config("TRTLLM")
+
+    kwargs = external_drafter_config_kwargs(model_config, _external_spec_config("AUTO"))
+
+    assert kwargs["moe_backend"] == "AUTO"
+
+
+def test_loaded_draft_moe_backend_uses_isolated_model_config() -> None:
+    """Resolving a loaded draft config does not modify another config."""
+    target_config = _draft_backend_test_model_config("CUTLASS")
+    with patch.object(ModelConfig, "resolve_moe_backend", return_value="TRTLLM") as resolve_backend:
+        draft_config = _copy_model_config_with_moe_backend(target_config, "AUTO")
+
+    assert draft_config is not target_config
+    assert draft_config.moe_backend == "TRTLLM"
+    assert target_config.moe_backend == "CUTLASS"
+    resolve_backend.assert_called_once_with(
+        "AUTO", "DraftBackendTestForCausalLM", quant_config=target_config.quant_config
+    )
+
+
+def test_internal_mtp_without_override_reuses_target_model_config() -> None:
+    target_config = _draft_backend_test_model_config("CUTEDSL")
+    target_config.spec_config = SimpleNamespace(moe_backend=None)
+    target_model = SimpleNamespace(aux_stream_dict={}, preload_weight_modules=[])
+
+    with patch(
+        "tensorrt_llm._torch.models.modeling_speculative.MTPForCausalLM",
+        return_value=sentinel.draft_model,
+    ) as mtp_cls:
+        draft_model = _build_mtp_one_model_draft(
+            target_config, None, sentinel.lm_head, target_model
+        )
+
+    assert draft_model is sentinel.draft_model
+    assert mtp_cls.call_args.args[0] is target_config
+    assert target_model.preload_weight_modules == []
+
+
+@pytest.mark.parametrize("requested_backend", ["TRTLLM", "AUTO"])
+@pytest.mark.parametrize(
+    "quant_config_key",
+    ["model.layers.2.mlp.experts", "mtp.layers.0.mlp.experts"],
+)
+def test_internal_mtp_moe_backend_uses_isolated_layer_config(
+    requested_backend: str,
+    quant_config_key: str,
+) -> None:
+    target_config = _draft_backend_test_model_config("CUTEDSL")
+    target_config.spec_config = SimpleNamespace(moe_backend=requested_backend)
+    mtp_quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+    target_config.quant_config_dict = {
+        quant_config_key: mtp_quant_config,
+    }
+    target_config._frozen = True
+    target_model = SimpleNamespace(aux_stream_dict={}, preload_weight_modules=[])
+
+    with (
+        patch.object(ModelConfig, "resolve_moe_backend", return_value="TRTLLM") as resolve_backend,
+        patch(
+            "tensorrt_llm._torch.models.modeling_speculative.MTPForCausalLM",
+            return_value=sentinel.draft_model,
+        ) as mtp_cls,
+    ):
+        draft_model = _build_mtp_one_model_draft(
+            target_config, None, sentinel.lm_head, target_model
+        )
+
+    mtp_model_config = mtp_cls.call_args.args[0]
+    assert draft_model is sentinel.draft_model
+    assert mtp_model_config is not target_config
+    assert mtp_model_config.moe_backend == "TRTLLM"
+    assert mtp_model_config.quant_config_dict is target_config.quant_config_dict
+    assert mtp_model_config.extra_attrs is target_config.extra_attrs
+    assert target_config.moe_backend == "CUTEDSL"
+    assert target_config._frozen
+    assert target_model.preload_weight_modules == ["experts", "routing_method", "all_reduce"]
+    resolve_backend.assert_called_once_with(
+        requested_backend,
+        "DraftBackendTestForCausalLM",
+        quant_config=mtp_quant_config,
+    )
+
+
+def test_internal_mtp_auto_resolves_from_layer_quantization() -> None:
+    target_config = _draft_backend_test_model_config("CUTEDSL")
+    target_config.spec_config = SimpleNamespace(moe_backend="AUTO")
+    target_config.quant_config = QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION)
+    target_config.quant_config_dict = {
+        "model.layers.2.mlp.experts": QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES),
+    }
+    target_config._frozen = True
+    target_model = SimpleNamespace(aux_stream_dict={}, preload_weight_modules=[])
+
+    with (
+        patch("tensorrt_llm._torch.model_config.is_sm_100f", return_value=True),
+        patch(
+            "tensorrt_llm._torch.models.modeling_speculative.MTPForCausalLM",
+            return_value=sentinel.draft_model,
+        ) as mtp_cls,
+    ):
+        _build_mtp_one_model_draft(target_config, None, sentinel.lm_head, target_model)
+
+    mtp_model_config = mtp_cls.call_args.args[0]
+    assert mtp_model_config.moe_backend == "TRTLLM"
+    assert target_config.moe_backend == "CUTEDSL"
+
+
+def test_internal_mtp_rejects_nemotron_backend_mismatch() -> None:
+    target_config = _draft_backend_test_model_config("CUTLASS")
+    target_config.pretrained_config.model_type = "nemotron_h"
+    target_config.spec_config = SimpleNamespace(moe_backend="VANILLA")
+    target_model = SimpleNamespace(aux_stream_dict={}, preload_weight_modules=[])
+
+    with pytest.raises(ValueError, match="Nemotron-H embedded MTP layers"):
+        _build_mtp_one_model_draft(target_config, None, sentinel.lm_head, target_model)

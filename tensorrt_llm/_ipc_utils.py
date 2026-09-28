@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import array
+import ctypes
 import struct
 import sys
 from typing import List, Tuple
@@ -26,6 +27,9 @@ except ImportError:
 from .logger import logger
 from .mapping import Mapping
 
+# Must match CUDA_IPC_HANDLE_SIZE / CU_IPC_HANDLE_SIZE.
+_IPC_MEM_HANDLE_SIZE = 64
+
 
 def _raise_if_error(error: cudart.cudaError_t | cuda.CUresult):
     if isinstance(error, cudart.cudaError_t):
@@ -34,6 +38,33 @@ def _raise_if_error(error: cudart.cudaError_t | cuda.CUresult):
     if isinstance(error, cuda.CUresult):
         if error != cuda.CUresult.CUDA_SUCCESS:
             raise RuntimeError(f"CUDA Driver API error: {repr(error)}")
+
+
+def _ipc_mem_handle_to_bytes(handle) -> bytes:
+    """Serialize a cudaIpcMemHandle across cuda-python / cuda-bindings versions."""
+    reserved = getattr(handle, "reserved", None)
+    if reserved is not None:
+        return bytes(reserved)
+    # Some cuda-bindings builds omit the .reserved attribute on cudaIpcMemHandle_t.
+    return ctypes.string_at(handle.getPtr(), _IPC_MEM_HANDLE_SIZE)
+
+
+def _ipc_mem_handle_from_bytes(data: bytes):
+    """Rebuild a cudaIpcMemHandle from the opaque 64-byte payload."""
+    handle = cudart.cudaIpcMemHandle_t()
+    if hasattr(handle, "reserved"):
+        try:
+            handle.reserved = data
+        except TypeError:
+            # Older bindings expect list[int] rather than bytes.
+            handle.reserved = list(data)
+    else:
+        if len(data) != _IPC_MEM_HANDLE_SIZE:
+            raise ValueError(
+                f"Invalid CUDA IPC mem handle size: {len(data)} (expected {_IPC_MEM_HANDLE_SIZE})"
+            )
+        ctypes.memmove(handle.getPtr(), data, _IPC_MEM_HANDLE_SIZE)
+    return handle
 
 
 def can_access_peer(mapping: Mapping) -> bool:
@@ -117,13 +148,8 @@ class IpcMemory:
             _raise_if_error(cudart.cudaMemset(local_ptr, 0, aligned_size)[0])
         error, local_handle = cudart.cudaIpcGetMemHandle(local_ptr)
         _raise_if_error(error)
-        handles_reserved = dist.tp_allgather(local_handle.reserved)
-
-        handles = []
-        for reserved in handles_reserved:
-            handle = cudart.cudaIpcMemHandle_t()
-            handle.reserved = reserved
-            handles.append(handle)
+        handles_reserved = dist.tp_allgather(_ipc_mem_handle_to_bytes(local_handle))
+        handles = [_ipc_mem_handle_from_bytes(reserved) for reserved in handles_reserved]
 
         peer_ptrs = []
         for node, handle in enumerate(handles):

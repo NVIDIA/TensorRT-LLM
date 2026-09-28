@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import unittest
 from unittest.mock import Mock, patch
 
@@ -45,6 +48,7 @@ def test_dynamic_draft_len(enforce_single_worker):
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
         free_gpu_memory_fraction=0.6,
+        use_kv_cache_manager_v2=True,
     )
     eagle_model_dir = f"{llm_models_root()}/Qwen3/qwen3_8b_eagle3"
     target_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-8B"

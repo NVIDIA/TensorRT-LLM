@@ -20,8 +20,8 @@ from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
 from tensorrt_llm.logger import logger
 
+from ..params import use_self_sampling_gvr
 from .cache_manager import is_dsa_cache_manager
-from .fused_metadata import fused_dsa_decode_metadata
 from .indexer import (
     _DG_SCHEDULE_BLOCK_KV,
     Indexer,
@@ -31,7 +31,8 @@ from .indexer import (
     _pick_dsl_expand,
     _select_indexer_compress_ratio,
 )
-from .params import DSAMetadataParams, use_self_sampling_gvr
+from .kernels import fused_dsa_decode_metadata
+from .params import DSAMetadataParams
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -49,15 +50,15 @@ if TYPE_CHECKING:
 def _fused_dsa_meta_enabled() -> bool:
     """Read the fused-DSA-metadata env gate (once, process-constant).
 
-    ``TRTLLM_FUSED_DSA_METADATA=1`` replaces the eager slot-mapping + gen-indptr
-    chain in on_update_kv_lens with one fused Triton launch (see
-    fused_metadata.py); any other value keeps the eager chain.
+    Enabled by default. Set ``TRTLLM_DISABLE_FUSED_DSA_METADATA`` to any value
+    other than "0" to keep the eager slot-mapping + gen-indptr chain instead of
+    the fused Triton launch in kernels.py.
 
     Cached so the gate is fixed for the whole process: a mid-run flip would
     otherwise let the first fused launch happen inside CUDA-graph capture,
     voiding the "pre-compiled at warmup" capture-safety guarantee.
     """
-    return os.environ.get("TRTLLM_FUSED_DSA_METADATA", "0") == "1"
+    return os.environ.get("TRTLLM_DISABLE_FUSED_DSA_METADATA", "0") == "0"
 
 
 def build_req_idx_per_token(seq_lens: torch.Tensor, num_tokens: int) -> torch.Tensor:
@@ -499,10 +500,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # transform_local_topk_and_prepare_pool_view() call.
         self._invalidate_pool_view_cache()
 
-        # Optional fused path: collapse the eager DSA decode-metadata chain
+        # Default fused path: collapse the eager DSA decode-metadata chain
         # (req_idx_per_token + slot mappings + the two gen indptr cumsums) into
         # one fused Triton launch. Only for the pure-decode/generation step
-        # (num_contexts == 0); see fused_metadata.py and
+        # (num_contexts == 0); see kernels.py and
         # _run_fused_dsa_decode_metadata().
         #
         # The fused kernel produces the five shared decode-metadata outputs but
@@ -628,7 +629,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if fused_eligible:
             if not getattr(self, "_fused_dsa_meta_armed", False):
                 logger.info(
-                    "[TRTLLM_FUSED_DSA_METADATA] fused DSA decode-metadata "
+                    "Fused DSA decode-metadata "
                     f"kernel armed (num_seqs={self.num_seqs}, "
                     f"num_tokens={self.num_tokens})."
                 )
@@ -640,7 +641,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def _run_fused_dsa_decode_metadata(self):
         """Fill req_idx_per_token + slot mappings + gen indptrs via one Triton
-        launch (see fused_metadata.py), replacing the eager chain for the
+        launch (see kernels.py), replacing the eager chain for the
         pure-decode step. Capture-safe: the launch is pre-compiled at warmup and
         replays inside the decode CUDA graph."""
         num_tokens = self.num_tokens

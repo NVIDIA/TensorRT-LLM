@@ -10,7 +10,7 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.modules.fla.utils import custom_device_ctx
-from tensorrt_llm._utils import is_flashinfer_gdn_supported_arch
+from tensorrt_llm._utils import is_flashinfer_gdn_decode_supported_arch
 from tensorrt_llm.logger import logger
 
 try:
@@ -218,7 +218,7 @@ def _can_use_flashinfer_gdn_decode(
     # FlashInfer's GDN decode kernel is built for Hopper (SM90) and datacenter
     # Blackwell (SM100/SM103) only; on consumer Blackwell (SM120) and other archs
     # it aborts at launch -> fall back to the Triton fused-recurrent kernel.
-    if not is_flashinfer_gdn_supported_arch():
+    if not is_flashinfer_gdn_decode_supported_arch():
         return False
     if initial_state_source is None:
         return False
@@ -342,7 +342,7 @@ def _can_use_flashinfer_gdn_verify(
         return False
     if not _FLASHINFER_GDN_BF16_STATE_AVAILABLE:
         return False
-    if not is_flashinfer_gdn_supported_arch():
+    if not is_flashinfer_gdn_decode_supported_arch():
         return False
     if initial_state_source is None or initial_state_source.dtype != torch.bfloat16:
         return False

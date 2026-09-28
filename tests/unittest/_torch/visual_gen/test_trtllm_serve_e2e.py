@@ -39,6 +39,7 @@ from typing import List, Optional
 import pytest
 import requests
 import yaml
+from utils.util import skip_pre_blackwell
 
 # ---------------------------------------------------------------------------
 # Model paths
@@ -364,6 +365,7 @@ class TestWanImageToVideo:
             ),
         ],
     )
+    @skip_pre_blackwell
     def test_ti2v_sync(self, server, format_, expected_content_type):
         """Synchronous image-to-video via multipart POST /v1/videos/sync."""
         with open(_REF_IMAGE_PATH, "rb") as f:
@@ -398,6 +400,7 @@ class TestWanImageToVideo:
             ),
         ],
     )
+    @skip_pre_blackwell
     def test_ti2v_async_lifecycle(self, server, format_, expected_content_type):
         """Async i2v: create job with image → poll → download → delete."""
         base = server.url_for("v1", "videos")

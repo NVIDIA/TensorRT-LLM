@@ -12,6 +12,7 @@ import re
 import signal
 import socket
 import sys
+import tempfile
 import time
 import traceback
 import uuid
@@ -35,6 +36,7 @@ from pydantic import ValidationError
 from starlette.routing import Mount
 from transformers import AutoProcessor
 
+from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.async_llm import AsyncLLM
 from tensorrt_llm._utils import EnergyMonitor
 # yapf: disable
@@ -82,10 +84,10 @@ from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines,
                                            resolve_top_level_model_type)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
-from tensorrt_llm.serve.conversation_id import (
-    extract_subagent_affinity_id_from_headers, resolve_request_conversation_id)
+from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
 from tensorrt_llm.serve.disagg_auth import (
-    request_requires_internal_disagg_auth, validate_internal_disagg_request)
+    request_requires_internal_disagg_auth, validate_internal_disagg_request,
+    validate_subagent_affinity)
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
                                                QueueFullError)
@@ -611,6 +613,48 @@ def _build_forced_tool_call_decoding(tools, tool_parser_name, forced_tool_name):
     return begin_prefix, guided
 
 
+def _new_media_dir(root: Path) -> Path:
+    """Create a directory under ``root`` stamped with the current time.
+
+    ``mkdir`` without ``exist_ok`` is what makes this safe: the kernel either
+    creates the directory or raises, so two servers starting in the same
+    second take separate names instead of sharing one.
+    """
+    stamp = datetime.now().strftime("%y%m%d-%H%M%S")
+    root.mkdir(parents=True, exist_ok=True)
+    n = 1
+    while True:
+        candidate = root / (stamp if n == 1 else f"{stamp}-{n}")
+        try:
+            candidate.mkdir()
+            return candidate
+        except FileExistsError:
+            n += 1
+
+
+def _resolve_media_dir() -> Path:
+    """Create and return the directory to store generated media in.
+
+    ``TRTLLM_MEDIA_STORAGE_PATH`` names the directory outright, empty meaning
+    unset. Otherwise it goes beside the working directory, and where that
+    cannot be written it goes to a private temporary one: a shared ``/tmp``
+    holds directories owned by other users, so the fallback takes a name
+    nobody else can hold rather than a fixed one.
+    """
+    explicit = os.getenv("TRTLLM_MEDIA_STORAGE_PATH")
+    if explicit:
+        path = Path(explicit)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    try:
+        return _new_media_dir(Path.cwd() / "trtllm_generated")
+    except OSError:
+        # OSError rather than PermissionError: a read-only mount raises
+        # EROFS, which is not one.
+        stamp = datetime.now().strftime("%y%m%d-%H%M%S")
+        return Path(tempfile.mkdtemp(prefix=f"trtllm_generated-{stamp}-"))
+
+
 def _normalize_image_output(image) -> list:
     """Normalize image output to a list of individual images.
 
@@ -816,8 +860,7 @@ class OpenAIServer(_VideoRoutesMixin):
                         self.energy_monitor = None
 
                 # Start background iteration stats collector if metrics are enabled
-                # The args for pytorch and autodeploy backend has attribute `enable_iter_perf_stats` while
-                # tensorrt backend does not have this attribute but it always has iter stats enabled.
+                # The PyTorch backend args include `enable_iter_perf_stats`.
                 if self.metrics_collector and getattr(
                         self.generator.args, "enable_iter_perf_stats", True):
                     # The background loop becomes the sole consumer of the
@@ -924,10 +967,8 @@ class OpenAIServer(_VideoRoutesMixin):
     def _init_visual_gen(self):
         self.processor = None
         self.model_config = None
-        self.media_storage_path = Path(
-            os.getenv("TRTLLM_MEDIA_STORAGE_PATH",
-                      "/tmp/trtllm_generated"))  # nosec B108
-        self.media_storage_path.mkdir(exist_ok=True, parents=True)
+        self.media_storage_path = _resolve_media_dir()
+        logger.info(f"VisualGen media storage path: {self.media_storage_path}")
         self.video_gen_tasks = {}
 
     def _supports_image_edit(self) -> bool:
@@ -1079,6 +1120,16 @@ class OpenAIServer(_VideoRoutesMixin):
         headers = None if raw_request is None else raw_request.headers
         validate_internal_disagg_request(
             getattr(self, "_internal_disagg_auth_key", None), request, headers)
+
+    def _get_scheduling_params(
+            self, request: ChatCompletionRequest,
+            raw_request: Optional[Request]) -> SchedulingParams:
+        return SchedulingParams(
+            agent_hierarchy=request.agent_hierarchy,
+            subagent_affinity_id=validate_subagent_affinity(
+                getattr(self, "_internal_disagg_auth_key", None), request,
+                getattr(self, "server_role", None),
+                None if raw_request is None else raw_request.headers))
 
     def _has_cache_transceiver_config(self) -> bool:
         cache_transceiver_config = getattr(
@@ -2318,10 +2369,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 request, None if raw_request is None else raw_request.headers)
             conversation_params = to_llm_conversation_params(
                 request.conversation_params)
-            scheduling_params = SchedulingParams(
-                agent_hierarchy=request.agent_hierarchy,
-                subagent_affinity_id=extract_subagent_affinity_id_from_headers(
-                    None if raw_request is None else raw_request.headers))
+            scheduling_params = self._get_scheduling_params(
+                request, raw_request)
 
             generate_inputs = prompt
             preprocess_fn = getattr(self.generator, "preprocess", None)
@@ -2904,6 +2953,8 @@ class OpenAIServer(_VideoRoutesMixin):
             yield "data: [DONE]\n\n"
 
         try:
+            if isinstance(request.prompt, list) and not request.prompt:
+                return self.create_error_response("'prompt' must not be empty.")
             if isinstance(request.prompt, str) or \
                 (isinstance(request.prompt, list) and isinstance(request.prompt[0], int)):
                 prompts = [request.prompt]
@@ -3124,10 +3175,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 request, None if raw_request is None else raw_request.headers)
             conversation_params = to_llm_conversation_params(
                 request.conversation_params)
-            scheduling_params = SchedulingParams(
-                agent_hierarchy=request.agent_hierarchy,
-                subagent_affinity_id=extract_subagent_affinity_id_from_headers(
-                    None if raw_request is None else raw_request.headers))
+            scheduling_params = self._get_scheduling_params(
+                request, raw_request)
 
             # Generate
             promise = self.generator.generate_async(
@@ -3506,6 +3555,26 @@ class OpenAIServer(_VideoRoutesMixin):
                                             args=(request.weights, ))
         return JSONResponse(content={"status": "success"})
 
+    async def _live_tokens_per_block(self) -> Optional[int]:
+        """Return the runtime's effective KV block size, or None if unknown.
+
+        The executor layer already turns RPC failures into an empty dict, so
+        the only failure left to absorb here is ``encode_only``, which rejects
+        the call outright. Generators without a KV cache (VisualGen) have no
+        such method. Both mean "fall back to the configured value".
+        """
+        get_capacity = getattr(self.generator, "get_kv_cache_capacity", None)
+        if get_capacity is None:
+            return None
+        try:
+            # Off-loop: the RPC blocks, and this worker's own heartbeat task
+            # shares this loop, so stalling it here can lapse its registration.
+            capacity = await asyncio.to_thread(get_capacity)
+        except RuntimeError as e:
+            logger.debug(f"Could not read live tokens_per_block: {e}")
+            return None
+        return capacity.get("tokensPerBlock") or None
+
     async def get_server_info(self) -> JSONResponse:
         # Note: calling self.generator.disaggregated_params and startup_metrics below
         # may trigger an RPC sync call, blocking the server event loop. Since this server_info
@@ -3524,6 +3593,14 @@ class OpenAIServer(_VideoRoutesMixin):
                 if kv_cache_config.tokens_per_block is not None:
                     content[
                         "tokens_per_block"] = kv_cache_config.tokens_per_block
+            # The runtime may override the configured block size (e.g. FlashMLA
+            # forces 64) in the worker process, so args.kv_cache_config still
+            # holds the pre-override value here. A kv-cache-aware router hashes
+            # prompts in whatever block size this endpoint publishes, so a
+            # stale value makes every block hash miss. Prefer the live value.
+            live_tokens_per_block = await self._live_tokens_per_block()
+            if live_tokens_per_block is not None:
+                content["tokens_per_block"] = live_tokens_per_block
         content["startup_metrics"] = getattr(self.generator, "startup_metrics",
                                              {})
         return JSONResponse(content=content)
@@ -3903,11 +3980,15 @@ class OpenAIServer(_VideoRoutesMixin):
         server = create_uvicorn_server(config)
 
         async def _register_after_serving():
-            while not server.started:
-                await asyncio.sleep(0.1)
+            with _StartupTimer("http_server_start"):
+                while not server.started:
+                    await asyncio.sleep(0.1)
             if self.disagg_cluster_worker:
                 try:
-                    await self.disagg_cluster_worker.register_worker()
+                    with _StartupTimer(
+                            f"service_registration/{self.disagg_cluster_worker.worker_info.worker_id}"
+                    ):
+                        await self.disagg_cluster_worker.register_worker()
                 except Exception as e:
                     logger.error(f"Worker registration failed: {e}")
                     server.should_exit = True

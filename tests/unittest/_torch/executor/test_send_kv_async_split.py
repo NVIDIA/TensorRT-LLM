@@ -105,7 +105,7 @@ def test_connector_save_uses_previous_batch_with_overlap_scheduler() -> None:
 
     PyExecutor._save_kv_to_connector_async(executor, [current_req])
 
-    executor.kv_connector_manager.request_finished.assert_called_once_with(prev_req, [7])
+    executor.kv_connector_manager.request_finished.assert_called_once_with(prev_req, [7], None)
     executor.async_transfer_manager.start_transfer.assert_called_once_with(prev_req)
 
 
@@ -117,7 +117,7 @@ def test_connector_save_uses_scheduled_batch_without_overlap_scheduler() -> None
 
     PyExecutor._save_kv_to_connector_async(executor, [finished, running])
 
-    executor.kv_connector_manager.request_finished.assert_called_once_with(finished, [7])
+    executor.kv_connector_manager.request_finished.assert_called_once_with(finished, [7], None)
     executor.async_transfer_manager.start_transfer.assert_called_once_with(finished)
 
 
@@ -155,7 +155,7 @@ def _dual_claim_executor() -> PyExecutor:
     executor.force_terminate_ctx_for_partial_reuse = False
     executor.dist = SimpleNamespace(rank=0, world_size=2)
     executor._terminate_request = Mock()
-    # Make the reap's trailing _check_cache_transfer_errors a no-op.
+    # Make the reap's trailing _check_transfer_errors a no-op (multi-rank ADP).
     executor.enable_attention_dp = True
     return executor
 

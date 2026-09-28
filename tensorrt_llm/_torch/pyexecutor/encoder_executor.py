@@ -18,13 +18,14 @@ import torch
 
 from tensorrt_llm.logger import logger
 
+from .engine.runners.interface import PackedEncoderBatch
+
 
 class EncoderExecutor:
     """Executor for models using the encode-only path.
 
     Primary path: batch_forward(inputs) — synchronous batch execution.
-    Delegates to model_engine.encoder_forward() for all heavy lifting
-    (pre-allocated buffers, attention metadata, torch.compile).
+    Hands the already-packed batch to the encoder runner as-is.
 
     This executor has no background thread, no scheduler, no sampler,
     and no request queue. It runs entirely on the calling thread.
@@ -41,7 +42,7 @@ class EncoderExecutor:
             "are bypassed. Use llm.encode() for inference."
         )
 
-        self.model_engine.warmup_encoder()
+        self.model_engine.warmup()
 
     def batch_forward(self, inputs: Dict[str, Any], **kwargs) -> Dict[str, torch.Tensor]:
         """Execute a pre-formed batch in one forward pass.
@@ -54,7 +55,17 @@ class EncoderExecutor:
         Returns:
             Dict with 'logits' tensor and any other model outputs.
         """
-        return self.model_engine.encoder_forward(inputs, **kwargs)
+        model_inputs = dict(inputs)
+        input_ids = model_inputs.pop("input_ids")
+        if isinstance(input_ids, torch.Tensor):
+            input_ids = input_ids.tolist()
+        batch = PackedEncoderBatch(
+            input_ids=input_ids,
+            sequence_lengths=[int(length) for length in model_inputs.pop("seq_lens")],
+            multi_item_part_lens=model_inputs.pop("multi_item_part_lens", None),
+            model_inputs=model_inputs,
+        )
+        return self.model_engine.forward(batch, **kwargs)
 
     def shutdown(self):
         """No background thread to stop — just release model engine resources."""

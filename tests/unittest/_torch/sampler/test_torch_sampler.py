@@ -51,7 +51,10 @@ from tensorrt_llm._torch.pyexecutor.sampler import (
     _SeedManager,
 )
 from tensorrt_llm._torch.pyexecutor.sampler.finish_reasons import FinishReasonsHandler
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import min_p_renorm_probs
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
+    min_p_renorm_probs,
+    top_k_top_p_sampling_batch,
+)
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import (
     SampleType,
     UtilsSamplingParams,
@@ -981,6 +984,51 @@ class TestFinishReasons:
         assert requests[1].get_tokens(0)[-1] == 7
         assert requests[2].get_tokens(0) == [2, 0]
 
+    # 13 and 17 are the two stop words; 99 is neither, and pins that the check
+    # stays selective rather than finishing on any token.
+    @pytest.mark.parametrize("new_token, expect_finished", [(13, True), (17, True), (99, False)])
+    def test_single_step_greedy_honors_every_single_token_stop_word(
+        self, new_token: int, expect_finished: bool
+    ) -> None:
+        """Each single-token stop word must stop generation, not just the first.
+
+        The harmony / GPT-OSS serving path passes two of them (``<|return|>``
+        and ``<|call|>``); matching only ``py_stop_words_list[0]`` let a tool
+        call run on past ``<|call|>`` into fabricated content (nvbugs/6751484).
+        """
+        sampler = object.__new__(TorchSampler)
+        sampler.max_seq_len = 20
+        sampler._track_pending_steps = False
+        request = LlmRequest(
+            request_id=0,
+            seq_slot=0,
+            input_tokens=[2, 0],
+            # Ample budget, so LENGTH cannot fire and mask a missed stop word.
+            max_new_tokens=10,
+            end_id=2,
+            stop_words_list=[[13], [17]],
+            sampling_config=SamplingConfig(),
+            is_streaming=False,
+        )
+        state = SampleStateTorch(
+            requests=[request],
+            device=None,
+            host=SampleStateTensorsHostTorch(
+                new_tokens=torch.tensor([new_token], dtype=torch.int32),
+                finish_reasons=None,
+                first_finish_reasons=None,
+                single_step_greedy=True,
+            ),
+        )
+
+        sampler.update_requests(state)
+
+        assert request.is_finished == expect_finished
+        if expect_finished:
+            # Pins STOP_WORDS as the reason: the budget above rules out LENGTH,
+            # and none of the parametrized tokens is ``end_id``, ruling out END_ID.
+            assert not request.is_finished_due_to_length
+
     class RequestCase:
         MAX_NEW_TOKENS = 10
         MAX_NUM_SEQUENCES = 128
@@ -1610,6 +1658,54 @@ def test_min_p_sample_top_k_disabled_sentinel():
     probs = torch.softmax(logits, dim=-1)
     kept = probs >= (min_p * probs.max(dim=-1, keepdim=True).values)
     assert kept.gather(1, tokens.unsqueeze(-1)).all()
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_top_p_no_crossing_row_keeps_full_vocab(device: str):
+    """A row whose cumulative probability never reaches top_p keeps its full
+    distribution instead of scattering an out-of-range index.
+
+    fp32 accumulation can leave every cumulative probability of a row below a
+    top_p very close to 1, so the first-True search finds no entry and yields
+    vocab_size. Such a row must retain every token, renormalized.
+    """
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.manual_seed(0)
+    candidates = torch.randn(8, 32000, device=device)
+    sorted_candidates, _ = torch.sort(candidates, descending=True, dim=-1)
+    finals = torch.cumsum(torch.softmax(sorted_candidates, dim=-1), dim=-1)[:, -1]
+    # Put top_p just above the lowest reachable cumulative sum so the no-crossing
+    # branch is hit by construction: fp32 accumulation order differs between CPU
+    # and CUDA and between GPU architectures, so a fixed threshold would only
+    # reach this branch by coincidence.
+    no_crossing_row = int(finals.argmin())
+    top_p = float(
+        torch.nextafter(
+            finals[no_crossing_row],
+            torch.ones((), device=device),
+        )
+    )
+    assert top_p < 1.0
+    no_crossing = candidates[no_crossing_row]
+    peaked = torch.zeros(32000, device=device)
+    peaked[0] = 30.0
+    logits = torch.stack([peaked, no_crossing])
+
+    # Must not raise: without the clamp the search yields vocab_size, giving an
+    # out-of-bounds scatter, which is a device-side assert on CUDA.
+    tokens, probs = top_k_top_p_sampling_batch(logits, temperature=1.0, top_p=top_p)
+
+    assert tokens.shape == (2,)
+    # Crossing row: only the top token survives nucleus filtering.
+    assert int((probs[0] > 0).sum()) == 1
+    assert int(probs[0].argmax()) == 0
+    # No-crossing row: nothing removed, renormalized. Strict positivity proves no
+    # tail was zeroed, since softmax of finite logits is strictly positive while
+    # the failure mode writes exact 0.0.
+    assert bool((probs[1] > 0).all())
+    torch.testing.assert_close(probs[1].sum(), torch.ones((), device=device))
+    torch.testing.assert_close(probs[1], torch.softmax(no_crossing, -1))
 
 
 class TestBatchedSampling:

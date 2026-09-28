@@ -23,13 +23,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-try:
-    from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
-    from tensorrt_llm._utils import get_free_port
-
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
+from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
+from tensorrt_llm._utils import get_free_port
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -175,8 +170,6 @@ def _spawn_entry_combined(rank: int, world_size: int, port: int):
 
 
 def _run_dist(world_size: int, entry: Callable[[int, int, int], None]):
-    if not MODULES_AVAILABLE:
-        pytest.skip("SequenceSharder import failed")
     port = get_free_port()
     mp.spawn(entry, args=(world_size, port), nprocs=world_size, join=True)
 

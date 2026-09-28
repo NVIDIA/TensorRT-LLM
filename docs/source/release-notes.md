@@ -4,6 +4,12 @@
 
 All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our [NVIDIA Developer Forum](https://forums.developer.nvidia.com/).
 
+## TensorRT-LLM Release 1.3
+
+### API Changes
+
+- **[DEPRECATION]** The TRITON MoE backend (`TritonFusedMoE`, `moe_config.backend="TRITON"`) is deprecated as of TensorRT-LLM 1.3 (2026-09) and will be removed after the 3-month migration period. Its only remaining role is a modest performance edge for GPT-OSS on Hopper with `W4A16_MXFP4` — the single configuration `AUTO` resolves to TRITON, and the format an MXFP4 GPT-OSS checkpoint takes on SM90. As the model set and the supported platforms keep growing, a single-scenario MoE path is no longer worth its maintenance cost. `moe_config.backend="CUTLASS"` replaces it functionally on Hopper: it serves `W4A16_MXFP4` on SM90 along with the unquantized BF16 and FP8 per-tensor paths, and MoE backend resolution already degrades to it automatically when TRITON declines a layer. During the migration period TRITON keeps working and logs a one-time warning. See the [deprecation policy](https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy).
+
 ## TensorRT-LLM Release 1.2
 
 ### Key Features and Enhancements
@@ -85,7 +91,7 @@ All published functionality in the Release Notes has been fully tested and verif
     - **Scaffolding:** Added benchmark support for scaffolding examples.
 - **Documentation**
   - **Deployment Guides:** Added comprehensive deployment guides for GPT-OSS, DeepSeek-R1, and VDR 1.0.
-  - **Feature Documentation:** Created new documentation for KV Cache Connector, LoRA feature usage, and AutoDeploy.
+  - **Feature Documentation:** Created new documentation for KV Cache Connector and LoRA feature usage.
   - **Tech Blogs:** Published blogs on "[Combining Guided Decoding and Speculative Decoding](./blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.md)" and "[ADP Balance Strategy](./blogs/tech_blog/blog10_ADP_Balance_Strategy.md)".
   - **Quick Start:** Refined Quick Start guides with new links to ModelOpt checkpoints and updated installation steps (Linux/Windows).
   - **API Reference:** Enhanced LLM API documentation by explicitly labeling stable vs. unstable APIs.
@@ -366,7 +372,6 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
 - The dependent NCCL version is updated to 2.27.5.
 
 ### API Changes
-- Set _AutoDeployLlmArgs as primary config object
 - Removed decoder request from decoder interface
 - Enhanced the torch_compile_config in llm args
 - Removed the redundant use_kv_cache field from PytorchConfig
@@ -449,7 +454,6 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
 ### API Changes
 - [BREAKING CHANGE] Enable scheduling overlap by default
 - Remove deprecated GptSession/V1 from TRT workflow
-- Set _AutoDeployLlmArgs as primary config object
 - Allow overriding CLI arguments with YAML file in trtllm-serve
 - Introduced multimodal embedding field in LlmRequest
 
@@ -500,10 +504,6 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
     - Added support for enabling MTP with CUDA graph padding.
     - Added initial EAGLE-3 implementation.
     - Added support for FP8 MLA on NVIDIA Hopper and Blackwell GPUs.
-  - **AutoDeploy for PyTorch workflow**.
-    - The AutoDeploy for PyTorch workflow is an **experimental** feature in `tensorrt_llm._torch.auto_deploy`.
-    - AutoDeploy provides an automated path from off-the-shelf models to optimized deployment in the TensorRT-LLM runtime.
-    - Check out `examples/auto_deploy/README.md` for more details.
   - LLM API
     - [BREAKING CHANGE] Added dynamic logits processor support, and deprecated static logits processor.
     - Added batched logits processor support.

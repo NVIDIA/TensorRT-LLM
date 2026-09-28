@@ -713,6 +713,7 @@ class DeepseekV3Linear(Linear):
         reduce_output: bool = True,  # ROW parallel only
         skip_create_weights_in_init: bool = False,
         use_custom_cublas_mm: bool = False,
+        use_cute_dsl_bf16_gemm: bool = False,
         use_cute_dsl_blockscaling_mm: bool = False,
         lora: Optional[LoraLayer] = None,
     ):
@@ -720,16 +721,17 @@ class DeepseekV3Linear(Linear):
             in_features,
             out_features,
             bias,
-            dtype,
-            mapping,
-            tensor_parallel_mode,
-            gather_output,
-            quant_config,
-            weights_loading_config,
-            reduce_output,
-            skip_create_weights_in_init,
-            use_custom_cublas_mm,
-            lora,
+            dtype=dtype,
+            mapping=mapping,
+            tensor_parallel_mode=tensor_parallel_mode,
+            gather_output=gather_output,
+            quant_config=quant_config,
+            weights_loading_config=weights_loading_config,
+            reduce_output=reduce_output,
+            skip_create_weights_in_init=skip_create_weights_in_init,
+            use_custom_cublas_mm=use_custom_cublas_mm,
+            use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
+            lora=lora,
             use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
         )
 
@@ -739,7 +741,12 @@ class DeepseekV3Linear(Linear):
                      lora_params: Optional[dict] | None = None,
                      layer_idx: Optional[int] | None = None):
         num_tokens = input.shape[0]
-        if (not self.has_any_quant and 1 <= num_tokens <= 16
+        has_any_quant = self.has_any_quant
+        use_cute_dsl_bf16_gemm = (self.use_cute_dsl_bf16_gemm
+                                  and not has_any_quant and is_sm_100f()
+                                  and self.weight.dtype == torch.bfloat16)
+        if (not use_cute_dsl_bf16_gemm and not has_any_quant
+                and 1 <= num_tokens <= 16
                 and get_sm_version() not in [120, 121]):
             output = torch.ops.trtllm.dsv3_fused_a_gemm_op(
                 input, self.weight.t(), bias, None)
@@ -793,6 +800,7 @@ class DeepseekV3Attention(MLA):
             skip_create_weights_in_init=model_config.
             skip_create_weights_in_init,
             use_custom_cublas_mm=True,
+            use_cute_dsl_bf16_gemm=model_config.use_cute_dsl_bf16_gemm,
             use_cute_dsl_blockscaling_mm=model_config.
             use_cute_dsl_blockscaling_mm,
         )
@@ -843,7 +851,8 @@ class DeepseekV32Attention(MLA):
             quant_config=model_config.get_quant_config(),
             skip_create_weights_in_init=model_config.
             skip_create_weights_in_init,
-            use_custom_cublas_mm=True)
+            use_custom_cublas_mm=True,
+            use_cute_dsl_bf16_gemm=model_config.use_cute_dsl_bf16_gemm)
 
 
 class DeepseekV3Gate(nn.Module):
@@ -982,6 +991,16 @@ class Deepseekv3MoE(nn.Module):
             apply_routing=False,
             moe_backend=model_config.moe_backend,
             use_cute_dsl_bf16_gemm=model_config.use_cute_dsl_bf16_gemm)
+        # For MIXED_PRECISION, resolve the per-expert quant config (e.g. W4A8_AWQ)
+        # instead of using the ambiguous global MIXED_PRECISION config.
+        # For other cases (e.g. nvfp4, unquantized MTP layers), use
+        # override_quant_config as-is — it already encodes exclusions like MTP.
+        if (override_quant_config is not None and
+                override_quant_config.quant_algo == QuantAlgo.MIXED_PRECISION):
+            expert_quant_config = self._get_experts_quant_config(
+                model_config, layer_idx)
+        else:
+            expert_quant_config = override_quant_config
         self.experts = create_moe(
             num_experts=num_experts,
             routing_method=self.gate.routing_method,
@@ -991,17 +1010,13 @@ class Deepseekv3MoE(nn.Module):
             reduce_results=
             False,  # In both low‑latency and attention‑DP modes, FusedMoE skips the in‑op all‑reduce.
             model_config=model_config,
-            override_quant_config=override_quant_config,
+            override_quant_config=expert_quant_config,
             aux_stream_dict=aux_stream_dict,
             layer_idx=layer_idx,
             # DS-R1 W4A8 is only supported through custom quantization script from
             # examples/quantization/quantize_mixed_precision_moe.py
-            weight_loading_mode=(
-                MoEWeightLoadingMode.W4A8_CUSTOM
-                if self._get_experts_quant_config(
-                    model_config,
-                    layer_idx).layer_quant_mode.is_int4_weight_only_per_group()
-                else MoEWeightLoadingMode.VANILLA),
+            weight_loading_mode=self._expert_weight_loading_mode(
+                expert_quant_config),
         )
 
         self.mapping = model_config.mapping
@@ -1095,6 +1110,19 @@ class Deepseekv3MoE(nn.Module):
             return model_config.quant_config
         return model_config.quant_config_dict.get(
             f"model.layers.{layer_idx}.mlp.experts", model_config.quant_config)
+
+    @staticmethod
+    def _expert_weight_loading_mode(
+            expert_quant_config: Optional[QuantConfig]) -> MoEWeightLoadingMode:
+        # W4A8_CUSTOM only for the int4-weight-per-group experts produced by
+        # examples/quantization/quantize_mixed_precision_moe.py; everything else
+        # (including the unquantized case, where there is no expert quant config)
+        # uses VANILLA. Guard None: override_quant_config is Optional, so the
+        # resolved expert config can be None on an unquantized layer.
+        if (expert_quant_config is not None and expert_quant_config.
+                layer_quant_mode.is_int4_weight_only_per_group()):
+            return MoEWeightLoadingMode.W4A8_CUSTOM
+        return MoEWeightLoadingMode.VANILLA
 
     @staticmethod
     def _get_shared_experts_quant_config(model_config,
@@ -1302,13 +1330,14 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             "TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED", "0") == "0"
         self.enable_fusion &= not self.enable_attention_dp
 
-        # FIXME: incompatible with mixed quantization mode
         quant_config = self._get_decoder_layer_quant_config(
             model_config, layer_idx)
-        self.is_nvfp4 = quant_config.layer_quant_mode.has_nvfp4()
-        assert (
-            quant_config.quant_algo
-            is not QuantAlgo.MIXED_PRECISION), "MIXED_PRECISION is ambiguous"
+        # For MIXED_PRECISION, the global quant_algo doesn't map to a single
+        # QuantMode.  Per-module configs (e.g. expert W4A8_AWQ vs attention
+        # FP8_BLOCK_SCALES) are resolved individually where needed, so we
+        # conservatively set layer-level flags here.
+        self.is_nvfp4 = (quant_config.quant_algo != QuantAlgo.MIXED_PRECISION
+                         and quant_config.layer_quant_mode.has_nvfp4())
 
         self.allreduce = None
         self.moe_allreduce = None

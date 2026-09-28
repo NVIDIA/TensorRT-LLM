@@ -39,6 +39,7 @@ from .accuracy_core import (
     JsonModeEval,
     LlmapiAccuracyTestHarness,
     assert_acceptance_length_for_llm,
+    assert_kv_cache_reuse_for_llm,
 )
 
 
@@ -167,7 +168,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(8)
     @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
     def test_tep_nvfp4kv(self, tp_size, ep_size):
-        """Exercise the GLM-5.2 NVFP4 KV cache decode path."""
+        """Exercise GLM-5.2 NVFP4 KV cache prefill and decode paths."""
         model_name = "zai-org/GLM-5.2"
         model_path = f"{llm_models_root()}/GLM-5.2-NVFP4"
         kv_cache_config = KvCacheConfig(
@@ -180,7 +181,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=False,
             cuda_graph_config=CudaGraphConfig(max_batch_size=128, enable_padding=True),
             moe_config=MoeConfig(backend="CUTEDSL"),
-            enable_chunked_prefill=False,
+            enable_chunked_prefill=True,
         )
 
         with LLM(
@@ -190,6 +191,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             moe_expert_parallel_size=ep_size,
             kv_cache_config=kv_cache_config,
             max_seq_len=8192,
+            max_num_tokens=512,
             **pytorch_config,
         ) as llm:
             assert llm.args.kv_cache_config.use_kv_cache_manager_v2 is True
@@ -250,7 +252,11 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             assert llm.args.kv_cache_config.enable_block_reuse is True
             assert llm.args.sparse_attention_config.skip_indexer_for_short_seqs is False
             self._assert_attention_dp(llm, num_ranks)
-            self._assert_kv_cache_reuse(llm)
+            assert_kv_cache_reuse_for_llm(
+                llm,
+                [1] + [42] * 255,
+                scheduling_params=[SchedulingParams(attention_dp_rank=0, attention_dp_relax=False)],
+            )
             self._assert_chunked_prefill(llm)
             self._assert_logits_processor(llm)
             self._assert_guided_decoding(llm)
@@ -321,41 +327,6 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             assert any(stats.get("numGenKvTokens", 0) > 0 for stats in inflight_batching_stats), (
                 f"No real generation KV-cache work executed on ADP rank {rank}"
             )
-
-    @staticmethod
-    def _assert_kv_cache_reuse(llm: LLM) -> None:
-        prompt_token_ids = [1] + [42] * 255
-        output_length = 8
-        sampling_params = SamplingParams(
-            max_tokens=output_length,
-            temperature=0,
-            end_id=-1,
-            return_perf_metrics=True,
-        )
-        scheduling_params = [SchedulingParams(attention_dp_rank=0, attention_dp_relax=False)]
-
-        cold_output = llm.generate(
-            [prompt_token_ids],
-            sampling_params=sampling_params,
-            scheduling_params=scheduling_params,
-            use_tqdm=False,
-        )[0].outputs[0]
-        warm_output = llm.generate(
-            [prompt_token_ids],
-            sampling_params=sampling_params,
-            scheduling_params=scheduling_params,
-            use_tqdm=False,
-        )[0].outputs[0]
-
-        cold_metrics = cold_output.request_perf_metrics
-        warm_metrics = warm_output.request_perf_metrics
-        assert cold_metrics is not None
-        assert warm_metrics is not None
-        assert cold_metrics.kv_cache_metrics.num_reused_blocks == 0
-        assert warm_metrics.kv_cache_metrics.num_reused_blocks > 0
-        assert len(cold_output.token_ids) == output_length
-        assert len(warm_output.token_ids) == output_length
-        assert warm_output.token_ids == cold_output.token_ids
 
     @staticmethod
     def _assert_chunked_prefill(llm: LLM) -> None:
