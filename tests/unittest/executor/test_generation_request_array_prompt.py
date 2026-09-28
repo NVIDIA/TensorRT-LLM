@@ -7,6 +7,8 @@ import torch
 from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.sampling_params import SamplingParams
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _ids(n=1000):
     return np.arange(n, dtype=np.int32) * 7 % 129000
