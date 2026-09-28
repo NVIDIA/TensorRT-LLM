@@ -2,9 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """How the native backend answers the contract's two questions.
 
-The mapping is the whole point of the adapter: which member of ``Outcome`` a native session state
-becomes, and whether a writer is still owed word about this piece. Both are exercised against stub
-sessions, because the interesting states are the ones a real transfer reaches only under a race.
+The adapter observes committed task outcomes and whether a writer still owes word about a piece.
+Stub sessions isolate admission, but task transitions use the native logical outcome arbiter.
 
 The last section covers what the transceiver holds once admission returns, since an adapter that
 starts nothing still decides whether a request stays paired with a session the sweep can retire.
@@ -29,7 +28,12 @@ from tensorrt_llm._torch.disaggregation.base import (
 )
 from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
 from tensorrt_llm._torch.disaggregation.native.fetch import PeerFetch
-from tensorrt_llm._torch.disaggregation.native.transfer import SessionStatus, TaskStatus
+from tensorrt_llm._torch.disaggregation.native.transfer import (
+    KVRecvTask,
+    SessionStatus,
+    TaskStatus,
+    _LogicalOutcomes,
+)
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm.bindings import LlmRequestState
 
@@ -45,25 +49,12 @@ def _owes_a_report(outcome) -> bool:
     return outcome is None or outcome.reports_pending
 
 
-class _StubTask:
-    """A receive task answers for its writers.
-
-    Without that the handle falls back to the send-side probe, and the fan-in assertions would be
-    testing the wrong branch. Transferring means no writer has reported yet; a test about a settled
-    piece says so.
-    """
-
-    def __init__(self, status, reports_outstanding=True):
-        self.status = status
-        self._exception = None
-        self.reports_outstanding = reports_outstanding
-
-
 class _StubSession:
     """Only what the adapter reads, in states a real session reaches only under a race."""
 
     def __init__(self):
         self._kv_tasks = []
+        self._logical_outcomes = _LogicalOutcomes()
         self.status = SessionStatus.INIT
         self.cancelled_by_peer = False
         self.exception = None
@@ -77,18 +68,27 @@ class _StubSession:
     def receive(self, chunk):
         if self.raise_on_receive is not None:
             if self.append_before_raising:
-                self._kv_tasks.append(_StubTask(TaskStatus.TRANSFERRING))
+                self._append_task(chunk)
             raise self.raise_on_receive
         if not self.admits:
             # A closed or already terminal session returns without taking a task.
             return
-        self._kv_tasks.append(_StubTask(TaskStatus.TRANSFERRING))
+        self._append_task(chunk)
+
+    def _append_task(self, chunk):
+        task = KVRecvTask(42, chunk, len(self._kv_tasks), DisaggregatedParams(), aux_slot=None)
+        task.bind_logical_outcomes(self._logical_outcomes)
+        task.status = TaskStatus.TRANSFERRING
+        task.expected_transfers = 1
+        self._kv_tasks.append(task)
 
     def fail_admission(self, error):
+        self._logical_outcomes.fail(error)
         self.status = SessionStatus.ERROR
         self.exception = error
 
     def cancel_local(self, by_peer=False):
+        self._logical_outcomes.cancel(by_peer)
         self.cancel_committed += 1
         return self.cancel_committed == 1
 
@@ -160,7 +160,7 @@ def test_pieces_of_one_request_share_a_session():
 def test_each_attempt_holds_its_own_piece():
     worker, peer, first = _fetch_one()
     second = peer.fetch(_extent())
-    worker.session._kv_tasks[0].status = TaskStatus.TRANSFERRED
+    worker.session._kv_tasks[0].complete()
     assert isinstance(first.poll(), Delivered)
     assert second.poll() is None
 
@@ -187,8 +187,8 @@ def test_no_conclusion_while_the_piece_is_in_flight():
 
 def test_delivery_reports_how_far_the_piece_reaches():
     worker, _, attempt = _fetch_one(end=64)
-    worker.session._kv_tasks[0].status = TaskStatus.TRANSFERRED
-    worker.session._kv_tasks[0].reports_outstanding = False
+    worker.session._kv_tasks[0].complete()
+    worker.session._kv_tasks[0].note_writer_report(0, True)
     outcome = attempt.poll()
     assert isinstance(outcome, Delivered)
     assert outcome.token_end == 64
@@ -198,8 +198,7 @@ def test_delivery_reports_how_far_the_piece_reaches():
 def test_failure_is_reported_before_every_writer_has_gone_quiet():
     """The gate has to stay shut on a failure whose writers have not reported."""
     worker, _, attempt = _fetch_one()
-    worker.session.status = SessionStatus.ERROR
-    worker.session.exception = RuntimeError("peer died")
+    worker.session.fail_admission(RuntimeError("peer died"))
     outcome = attempt.poll()
     assert isinstance(outcome, Failed)
     assert "peer died" in outcome.reason
@@ -209,27 +208,25 @@ def test_failure_is_reported_before_every_writer_has_gone_quiet():
 
 def test_a_settled_failure_opens_the_gate():
     worker, _, attempt = _fetch_one()
-    worker.session.status = SessionStatus.ERROR
-    worker.session._kv_tasks[0].status = TaskStatus.ERROR
-    worker.session._kv_tasks[0].reports_outstanding = False
+    worker.session.fail_admission(RuntimeError("transfer failed"))
+    worker.session._kv_tasks[0].note_writer_report(0, False)
     assert _owes_a_report(attempt.poll()) is False
 
 
 def test_a_cancellation_says_who_asked():
     worker, _, attempt = _fetch_one()
-    worker.session.status = SessionStatus.CANCELLED
-    worker.session.cancelled_by_peer = True
+    worker.session.cancel_local(by_peer=True)
     outcome = attempt.poll()
     assert isinstance(outcome, Cancelled)
     assert outcome.by_peer is True
     assert outcome.reports_pending is True
 
 
-def test_failure_without_a_recorded_cause_still_says_something():
+def test_failure_preserves_its_recorded_cause():
     worker, _, attempt = _fetch_one()
-    worker.session.status = SessionStatus.ERROR
+    worker.session.fail_admission(RuntimeError("transfer failed"))
     assert isinstance(attempt.poll(), Failed)
-    assert attempt.poll().reason
+    assert attempt.poll().reason == "transfer failed"
 
 
 # ---------------------------------------------------------------------------

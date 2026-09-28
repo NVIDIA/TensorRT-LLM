@@ -26,6 +26,7 @@ try:
 except ImportError:
     from cuda import cudart
 
+from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
                                  get_steady_clock_now_in_seconds,
                                  global_mpi_size, is_trace_enabled, mpi_comm,
@@ -840,7 +841,8 @@ class PyExecutor:
         # by heavy initialisation (e.g. guided-decoder / llguidance tokenizer
         # creation) while earlier PP stages already start warmup forward
         # passes that require matching pp_recv on the later stages.
-        self.dist.barrier()
+        with _StartupTimer("pre_warmup_rank_barrier"):
+            self.dist.barrier()
 
         # During warmup, we don't enable the profiler
         # Run warmup on the execution_stream for proper synchronization with
@@ -5275,16 +5277,14 @@ class PyExecutor:
                     # When there's any accepted tokens, we can't directly use the previous batch's outputs in this iteration for the target model,
                     # so we'll set the target model's input to None and skip updating the target requests after target model forward.
                     use_previous_draft_tokens = self.has_previous_draft_tokens
-                    num_accepted_tokens_device = None
 
                     target_inputs = None
-                    num_accepted_tokens_device = None
 
                     if has_draft_batch:
                         self.execution_stream.wait_stream(
                             torch.cuda.current_stream())
                         with torch.cuda.stream(self.execution_stream):
-                            target_inputs, num_accepted_tokens_device = self._handle_speculative_decoding(
+                            target_inputs = self._handle_speculative_decoding(
                                 scheduled_batch, previous_tensors,
                                 previous_tensors_device)
                         torch.cuda.current_stream().wait_stream(
@@ -5319,8 +5319,7 @@ class PyExecutor:
                             gpu_forward_start, gpu_forward_end) as fwd_timing:
                         with self._step_scope(scheduled_batch):
                             batch_outputs = self._forward_step(
-                                scheduled_batch, previous_tensors_device,
-                                num_accepted_tokens_device)
+                                scheduled_batch, previous_tensors_device)
 
                     self._maybe_prefetch_next_iter_mm_encoders(scheduled_batch)
 
@@ -5670,13 +5669,7 @@ class PyExecutor:
                 and self.kv_cache_transceiver.pipeline_transfer_enabled
                 and disagg_params is not None and request.llm_request_type
                 == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY):
-            runtime_features = getattr(self.model_engine,
-                                       "attn_runtime_features", None)
-            enable_chunked_prefill = (getattr(
-                runtime_features,
-                "chunked_prefill") if runtime_features is not None else getattr(
-                    self.model_engine, "_enable_chunked_prefill", False))
-            if not enable_chunked_prefill:
+            if not self.model_engine.attn_runtime_features.chunked_prefill:
                 raise ValueError(
                     "enable_chunked_prefill is required when enable_pipelined_transfer is set."
                 )
@@ -7545,11 +7538,9 @@ class PyExecutor:
                 f"Cross-iter MM encoder prefetch failed; falling back to "
                 f"in-iter encode.\n{traceback.format_exc()}")
 
-    def _forward_step(
-            self,
-            scheduled_requests: ScheduledRequests,
-            new_tensors_device: Optional[SampleStateTensors] = None,
-            num_accepted_tokens_device: Optional[torch.Tensor] = None):
+    def _forward_step(self,
+                      scheduled_requests: ScheduledRequests,
+                      new_tensors_device: Optional[SampleStateTensors] = None):
         self._maybe_record_hang_diagnostic_phase(
             "forward_call",
             scheduled_requests,
@@ -7587,15 +7578,13 @@ class PyExecutor:
             f"[Executor] _forward_step {self.iter_counter}: {scheduled_requests.num_context_requests} ctx reqs, {num_ctx_tokens} ctx tokens, {scheduled_requests.num_generation_requests} gen reqs"
         )
         def forward(scheduled_requests, resource_manager, new_tensors_device,
-                    gather_context_logits, cache_indirection_buffer,
-                    num_accepted_tokens_device):
+                    gather_context_logits, cache_indirection_buffer):
             return self.model_engine.forward(
                 scheduled_requests,
                 resource_manager,
                 new_tensors_device,
                 gather_context_logits=gather_context_logits,
-                cache_indirection_buffer=cache_indirection_buffer,
-                num_accepted_tokens_device=num_accepted_tokens_device)
+                cache_indirection_buffer=cache_indirection_buffer)
 
         try:
             gather_context_logits = any(
@@ -7610,8 +7599,7 @@ class PyExecutor:
             with torch.cuda.stream(self.execution_stream):
                 outputs = forward(scheduled_requests, self.resource_manager,
                                   new_tensors_device, gather_context_logits,
-                                  cache_indirection_buffer,
-                                  num_accepted_tokens_device)
+                                  cache_indirection_buffer)
                 self._maybe_record_hang_diagnostic_phase(
                     "forward_returned",
                     scheduled_requests,
@@ -8555,8 +8543,8 @@ class PyExecutor:
         scheduled_requests.added_inflight_req_ids = []
 
     def _handle_speculative_decoding(
-        self, scheduled_batch, previous_tensors, target_inputs
-    ) -> Tuple[Optional[SampleStateTensorsSpec], Optional[torch.Tensor]]:
+            self, scheduled_batch, previous_tensors,
+            target_inputs) -> Optional[SampleStateTensorsSpec]:
         with request_context(is_draft=self.draft_model_engine is not None,
                              scheduled_requests=scheduled_batch):
             target_outputs = self.previous_batch.sample_state and self.previous_batch.sample_state.device
@@ -8574,7 +8562,7 @@ class PyExecutor:
             # Pad draft tokens to the max draft length for CUDA graph compatibility
             self.has_previous_draft_tokens = new_target_inputs is not None and new_target_inputs.next_draft_tokens is not None
 
-        return new_target_inputs, num_accepted_tokens_device
+        return new_target_inputs
 
     def reset_prefix_cache(self):
         self.kv_cache_manager.reset_reuse_state()

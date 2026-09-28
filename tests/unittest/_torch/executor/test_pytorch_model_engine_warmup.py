@@ -35,6 +35,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine, _PrefillCompiledModel
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._torch.speculative.utils import update_draft_len
 from tensorrt_llm._torch.utils import is_torch_compiling, torch_compiling
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
@@ -94,6 +95,7 @@ def test_pcg_fx_fallback_policy_is_model_specific(
         encoder_max_batch_size=None,
         encoder_max_num_tokens=None,
         enable_in_graph_sampling=False,
+        enable_return_routed_experts=False,
         multimodal_config=SimpleNamespace(video_pruning_rate=None),
         checkpoint_format="HF",
         trust_remote_code=False,
@@ -344,6 +346,7 @@ def test_compiled_mxfp8_warmup_backend_selection(
         _torch_compile_prefill_only=prefill_only,
         _torch_compile_backend=None,
         _eager_workspace_reclaimer=None,
+        _warmup_timer=_WarmupTimer(rank=0),
         is_warmup=True,
         cuda_graph_runner=SimpleNamespace(enabled=True),
         model=SimpleNamespace(
@@ -688,8 +691,10 @@ class TestWarmupCleanup(unittest.TestCase):
 
         self.assertEqual(model_engine._runner.method_calls, [])
 
+    @pytest.mark.cpu_only
     def test_legacy_warmup_skips_without_kv_cache(self):
         model_engine = object.__new__(PyTorchModelEngine)
+        model_engine._warmup_timer = _WarmupTimer(rank=0)
         model_engine.moe_load_balancer = None
         model_engine.is_warmup = False
         model_engine.enable_in_graph_sampling = False
@@ -769,6 +774,7 @@ class TestWarmupCleanup(unittest.TestCase):
             f"Helix CP should skip all warmup cleanup; got {calls}",
         )
 
+    @pytest.mark.cpu_only
     def test_flashinfer_mxfp8_respects_disabled_global_autotuner(self):
         """The global autotuner switch also disables automatic FlashInfer tuning."""
         calls = []
@@ -802,6 +808,7 @@ class TestWarmupCleanup(unittest.TestCase):
             self.assertEqual(method.backend, "trtllm")
 
             engine = SimpleNamespace(
+                _warmup_timer=_WarmupTimer(rank=0),
                 llm_args=SimpleNamespace(enable_autotuner=False),
                 cuda_graph_runner=SimpleNamespace(enabled=True),
                 _torch_compile_enabled=False,
@@ -820,6 +827,7 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertFalse(method._flashinfer_autotuned)
         flashinfer_module.autotune.assert_not_called()
 
+    @pytest.mark.cpu_only
     def test_mxfp8_native_and_flashinfer_use_separate_warmup_passes(self):
         """Native and FlashInfer backends each receive an isolated tuning forward."""
         calls = []
@@ -864,6 +872,7 @@ class TestWarmupCleanup(unittest.TestCase):
             self.assertFalse(method.needs_native_autotune)
 
             engine = SimpleNamespace(
+                _warmup_timer=_WarmupTimer(rank=0),
                 llm_args=SimpleNamespace(enable_autotuner=True),
                 cuda_graph_runner=SimpleNamespace(enabled=True),
                 _torch_compile_enabled=False,
@@ -880,7 +889,6 @@ class TestWarmupCleanup(unittest.TestCase):
                 original_max_draft_len=0,
                 mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
                 dist=object(),
-                is_draft_model=False,
                 guided_decoder=None,
                 max_total_draft_tokens=0,
                 no_cuda_graph=lambda: contextlib.nullcontext(),
@@ -939,6 +947,7 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertEqual(tuner.setup_distributed_state.call_count, 1)
         tuner.setup_distributed_state.assert_called_with(engine.mapping, engine.dist)
 
+    @pytest.mark.cpu_only
     def test_native_mxfp8_falls_back_after_missing_warmup_batch(self):
         """A missing startup batch latches native MXFP8 to the default tactic."""
         calls = []
@@ -978,6 +987,7 @@ class TestWarmupCleanup(unittest.TestCase):
             os.environ.pop("TLLM_AUTOTUNER_CACHE_PATH", None)
             method = MXFP8LinearMethod()
             engine = SimpleNamespace(
+                _warmup_timer=_WarmupTimer(rank=0),
                 llm_args=SimpleNamespace(enable_autotuner=True),
                 cuda_graph_runner=SimpleNamespace(enabled=True),
                 _torch_compile_enabled=False,
@@ -994,7 +1004,6 @@ class TestWarmupCleanup(unittest.TestCase):
                 original_max_draft_len=0,
                 mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
                 dist=object(),
-                is_draft_model=False,
                 guided_decoder=None,
                 max_total_draft_tokens=0,
                 no_cuda_graph=lambda: contextlib.nullcontext(),
@@ -1048,6 +1057,7 @@ class TestWarmupCleanup(unittest.TestCase):
         sync_tactics.assert_not_called()
         engine.forward.assert_not_called()
 
+    @pytest.mark.cpu_only
     def test_flashinfer_mxfp8_rank_mismatch_falls_back_before_warmup(self):
         """TP and PP ranks agree on fallback before the tuning forward."""
         flashinfer_module = ModuleType("flashinfer")
@@ -1077,6 +1087,7 @@ class TestWarmupCleanup(unittest.TestCase):
             os.environ.pop("TRTLLM_MXFP8_GEMM_BACKEND", None)
             method = MXFP8LinearMethod()
             engine = SimpleNamespace(
+                _warmup_timer=_WarmupTimer(rank=0),
                 llm_args=SimpleNamespace(enable_autotuner=True),
                 cuda_graph_runner=SimpleNamespace(enabled=True),
                 _torch_compile_enabled=False,
@@ -1093,7 +1104,6 @@ class TestWarmupCleanup(unittest.TestCase):
                 original_max_draft_len=0,
                 mapping=SimpleNamespace(tp_size=2, has_pp=lambda: True),
                 dist=dist,
-                is_draft_model=False,
                 guided_decoder=None,
                 max_total_draft_tokens=0,
                 no_cuda_graph=lambda: contextlib.nullcontext(),
@@ -1133,6 +1143,7 @@ class TestWarmupCleanup(unittest.TestCase):
         flashinfer_module.autotune.assert_not_called()
         self.assertEqual(engine.forward.call_count, 1)
 
+    @pytest.mark.cpu_only
     def test_native_mxfp8_respects_disabled_global_autotuner(self):
         """Avoid native MXFP8 warmup when the global autotuner is disabled."""
         with (
@@ -1145,6 +1156,7 @@ class TestWarmupCleanup(unittest.TestCase):
             os.environ.pop("TRTLLM_MXFP8_GEMM_BACKEND", None)
             method = MXFP8LinearMethod()
             engine = SimpleNamespace(
+                _warmup_timer=_WarmupTimer(rank=0),
                 llm_args=SimpleNamespace(enable_autotuner=False),
                 cuda_graph_runner=SimpleNamespace(enabled=False),
                 _torch_compile_enabled=False,

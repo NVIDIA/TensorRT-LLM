@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import os
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, create_autospec
 
 import pytest
 import torch
@@ -38,10 +38,14 @@ from transformers import AutoConfig
 from utils.llm_data import llm_models_root
 
 import tensorrt_llm._torch.models.modeling_minimaxm3 as modeling_minimaxm3
+from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
     MiniMaxM3MsaSparseAttention,
     MiniMaxM3SparseRuntimeBackend,
+)
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
+    MiniMaxM3KVCacheManagerV2,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
     MiniMaxM3SparseConfig,
@@ -69,6 +73,7 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     _load_qkv_index_proj_weights,
     _minimax_m3_swiglu_oai,
     _moe_routed_output_is_global,
+    _nvfp4_cache_supports_fused_write,
     _strip_language_model_prefix,
     _validate_sparse_attention_runtime_config,
     _wrap_dict_as_config,
@@ -80,6 +85,7 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
 )
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl_v2
+from tensorrt_llm._torch.modules.linear import _load_kv_cache_scales
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind
 from tensorrt_llm._torch.moe.fused_moe.routing import (
@@ -100,6 +106,115 @@ _NUM_HIDDEN_LAYERS = 7
 _SPARSE_FREQ = [0, 0, 0, 1, 1, 1, 1]
 _DISABLE_INDEX_VALUE = [0, 0, 0, 1, 1, 1, 1]
 _MOE_LAYER_FREQ = [0, 0, 0, 1, 1, 1, 1]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "layout, expected",
+    [
+        ("packed", True),
+        ("padded_planes", True),
+        ("padded_heads", False),
+        ("unaligned_planes", False),
+        ("overlapping_heads", None),
+        ("overlapping_planes", None),
+        ("overlapping_pages", None),
+        ("unpacked_rows", None),
+        ("different_scale_pages", None),
+        ("padded_scale_heads", None),
+    ],
+)
+def test_nvfp4_cache_fused_layout_validation(layout: str, expected: bool | None) -> None:
+    """Only valid layouts may fall back; invalid pools must fail before a write."""
+    shape = (3, 2, 4, 128, 64)
+    strides = [65536, 32768, 8192, 64, 1]
+    if layout == "padded_planes":
+        strides[:2] = [131072, 65536]
+    elif layout == "padded_heads":
+        strides[:3] = [131072, 65536, 16384]
+    elif layout == "unaligned_planes":
+        strides[:2] = [65538, 32769]
+    elif layout == "overlapping_heads":
+        strides[2] = 4096
+    elif layout == "overlapping_planes":
+        strides[1] = 16384
+    elif layout == "overlapping_pages":
+        strides[0] = 32768
+    elif layout == "unpacked_rows":
+        strides[3] = 65
+    data = torch.empty_strided(shape, strides, dtype=torch.uint8)
+    scales = torch.empty(
+        (2 if layout == "different_scale_pages" else 3, 2, 4, 128, 8), dtype=torch.uint8
+    )
+    if layout == "padded_scale_heads":
+        scales = torch.empty_strided(scales.shape, (16384, 8192, 2048, 8, 1), dtype=torch.uint8)
+    if expected is None:
+        with pytest.raises(ValueError, match="MiniMax-M3 NVFP4"):
+            _nvfp4_cache_supports_fused_write(data, scales, 4)
+    else:
+        assert _nvfp4_cache_supports_fused_write(data, scales, 4) is expected
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        pytest.param("cpu", marks=pytest.mark.cpu_only),
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graphs"),
+        ),
+    ],
+)
+def test_nvfp4_reload_preserves_attention_scale_storage(
+    monkeypatch: pytest.MonkeyPatch, device: str
+) -> None:
+    """The model reload hook updates eager and captured readers at stable addresses."""
+    target = MiniMaxM3ForCausalLM.__new__(MiniMaxM3ForCausalLM)
+    nn.Module.__init__(target)
+    target.model_config = ModelConfig(pretrained_config=_make_text_config())
+    target.config.use_gemma_norm = False
+    target.model = nn.Module()
+    decoder = nn.Module()
+    decoder.self_attn = nn.Module()
+    decoder.self_attn.attn = nn.Module()
+    projection = nn.Module()
+    projection.kv_scales = nn.Parameter(torch.ones(3, device=device), requires_grad=False)
+    projection.inv_kv_scales = nn.Parameter(torch.ones(3, device=device), requires_grad=False)
+    decoder.self_attn.qkv_proj = projection
+    target.model.layers = nn.ModuleList([decoder])
+    mapper = create_autospec(MiniMaxM3HfWeightMapper, instance=True, spec_set=True)
+
+    def load_scales(self, *, weights, **kwargs):
+        _load_kv_cache_scales(projection, [weights["k_scale"]], [weights["v_scale"]])
+
+    monkeypatch.setattr(SpecDecOneEngineForCausalLM, "load_weights", load_scales)
+    monkeypatch.setenv("TRTLLM_LOAD_KV_SCALES", "1")
+    k_scale, v_scale = _aligned_nvfp4_dequant_scales(decoder.self_attn.attn, projection.kv_scales)
+    pointers = [
+        x.data_ptr() for x in (projection.kv_scales, projection.inv_kv_scales, k_scale, v_scale)
+    ]
+    assert k_scale.data_ptr() % 16 == v_scale.data_ptr() % 16 == 0
+
+    def read_scales():
+        return torch.cat((k_scale, v_scale, projection.inv_kv_scales[1:]))
+
+    if device == "cuda":
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = read_scales()
+    target.load_weights(
+        {"k_scale": torch.tensor(0.5), "v_scale": torch.tensor(0.25)}, weight_mapper=mapper
+    )
+    new_k, new_v = _aligned_nvfp4_dequant_scales(decoder.self_attn.attn, projection.kv_scales)
+    assert [
+        x.data_ptr() for x in (projection.kv_scales, projection.inv_kv_scales, new_k, new_v)
+    ] == pointers
+    expected = torch.tensor([0.5, 0.25, 2.0, 4.0], device=device)
+    torch.testing.assert_close(read_scales(), expected)
+    if device == "cuda":
+        graph.replay()
+        torch.testing.assert_close(captured, expected)
 
 
 class _M3CompositionGate(nn.Module):
@@ -258,17 +373,43 @@ def test_validate_sparse_attention_runtime_config_rejects_wrong_backend(
         _validate_sparse_attention_runtime_config(model_config)
 
 
-def test_validate_sparse_attention_runtime_config_accepts_minimax_m3() -> None:
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("implementation", [None, "triton", "msa"])
+@pytest.mark.parametrize("kv_algo", [None, QuantAlgo.FP8, QuantAlgo.NVFP4])
+def test_validate_sparse_attention_runtime_config_backend_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    implementation: str | None,
+    kv_algo: QuantAlgo | None,
+) -> None:
+    sparse_config = MiniMaxM3SparseAttentionConfig()
+    if implementation is not None:
+        sparse_config.implementation = implementation
     model_config = ModelConfig(
         pretrained_config=_make_text_config(),
-        sparse_attention_config=MiniMaxM3SparseAttentionConfig(),
+        sparse_attention_config=sparse_config,
     )
+    if kv_algo is not None:
+        model_config.quant_config = QuantConfig(kv_cache_quant_algo=kv_algo)
+    warning = create_autospec(modeling_minimaxm3.logger.warning_once, spec_set=True)
+    monkeypatch.setattr(modeling_minimaxm3.logger, "warning_once", warning)
 
-    _validate_sparse_attention_runtime_config(model_config)
+    if kv_algo == QuantAlgo.NVFP4 and implementation != "msa":
+        with pytest.raises(ValueError, match="NVFP4 KV cache requires.*implementation='msa'"):
+            _validate_sparse_attention_runtime_config(model_config)
+    else:
+        _validate_sparse_attention_runtime_config(model_config)
+
+    if implementation != "msa":
+        warning.assert_called_once()
+        assert "implementation='msa'" in warning.call_args.args[0]
+        assert "recommended" in warning.call_args.args[0]
+    else:
+        warning.assert_not_called()
 
 
 @pytest.mark.cpu_only
-def test_validate_fused_projection_requires_fp8_main_kv_cache() -> None:
+@pytest.mark.parametrize("kv_algo", [QuantAlgo.FP8, QuantAlgo.NVFP4])
+def test_validate_fused_projection_requires_quantized_main_kv_cache(kv_algo: QuantAlgo) -> None:
     sparse_config = MiniMaxM3SparseAttentionConfig(
         implementation="msa",
         indexer_kv_dtype="fp8",
@@ -278,10 +419,10 @@ def test_validate_fused_projection_requires_fp8_main_kv_cache() -> None:
         pretrained_config=_make_text_config(),
         sparse_attention_config=sparse_config,
     )
-    with pytest.raises(ValueError, match="requires an FP8 main KV cache"):
+    with pytest.raises(ValueError, match="requires an FP8 or NVFP4 main KV cache"):
         _validate_sparse_attention_runtime_config(model_config)
 
-    model_config.quant_config = QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8)
+    model_config.quant_config = QuantConfig(kv_cache_quant_algo=kv_algo)
     _validate_sparse_attention_runtime_config(model_config)
 
 
@@ -833,8 +974,11 @@ def test_piecewise_attention_boundary_preserves_indexer_cache_contract(
         live_v: torch.Tensor,
         live_idx_k: torch.Tensor,
         metadata: AttentionMetadata,
+        *,
+        kv_scale_orig_quant: torch.Tensor | None = None,
     ) -> None:
         """Replace only CUDA scatter math, retaining the live cache-write inputs."""
+        assert kv_scale_orig_quant is None
         assert metadata is attn_metadata
         torch.testing.assert_close(live_k.float(), k[:2].float())
         torch.testing.assert_close(live_v.float(), v[:2].float())
@@ -860,6 +1004,7 @@ def test_piecewise_attention_boundary_preserves_indexer_cache_contract(
     layer = MiniMaxM3Attention.__new__(MiniMaxM3Attention)
     layer.attn = backend
     layer.is_sparse_attention_layer = True
+    layer.main_kv_is_nvfp4 = False
     output = torch.empty((4, 128), dtype=torch.bfloat16)
     monkeypatch.setattr(
         modeling_minimaxm3,
@@ -1438,8 +1583,12 @@ def test_minimax_m3_five_way_projection_shards_index_rows(monkeypatch, tp_size: 
             for name, heads in zip(projection._SHARD_NAMES, (64, 4, 4, 4, 1), strict=True)
         }
         loaded = []
+        shards["k"]["k_scale"] = torch.tensor(0.5)
+        shards["v"]["v_scale"] = torch.tensor(0.25)
         projection.load_weights = loaded.extend
         projection.load_five_way_weights(shards)
+        torch.testing.assert_close(loaded[0]["k_scale"], shards["k"]["k_scale"])
+        torch.testing.assert_close(loaded[0]["v_scale"], shards["v"]["v_scale"])
         packed = loaded[0]["weight"].split(projection.local_output_sizes)
         torch.testing.assert_close(packed[4], shards["index_k"]["weight"])
         kv_rank = tp_rank // max(tp_size // 4, 1)
@@ -1719,6 +1868,97 @@ def _make_fused_qk_norm_rope_test_config():
         skip_create_weights_in_init=True,
     )
     return text_cfg, model_cfg
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 horizontal producer needs CUDA")
+@pytest.mark.parametrize("kv_dtype", ["fp8", "nvfp4"])
+@torch.inference_mode()
+def test_horizontal_producer_explicit_caches_match_manager(
+    monkeypatch: pytest.MonkeyPatch, kv_dtype: str
+) -> None:
+    """Exercise real producer dispatch and replay the FP8 PCG custom op."""
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("MiniMax-M3 MSA requires SM100 or SM103")
+    _, model_cfg = _make_fused_qk_norm_rope_test_config()
+    layer = MiniMaxM3Attention(
+        model_config=model_cfg,
+        layer_idx=3,
+        is_sparse_attention_layer=True,
+        disable_index_value=True,
+    )
+    backend = object.__new__(MiniMaxM3MsaSparseAttention)
+    backend.indexer_kv_dtype = "fp8"
+    layer.attn = backend
+    layer.enable_fused_qkv_index_projection = True
+    layer.main_kv_is_fp8 = kv_dtype == "fp8"
+    layer.main_kv_is_nvfp4 = kv_dtype == "nvfp4"
+    layer.qkv_proj = nn.Identity()
+    layer.qkv_proj.register_buffer("inv_kv_scales", torch.tensor([1.0, 0.75, 1.25], device="cuda"))
+    torch.manual_seed(7)
+    for norm in (layer.q_norm, layer.k_norm, layer.index_q_norm, layer.index_k_norm):
+        norm.weight = nn.Parameter(torch.randn(128, dtype=torch.bfloat16, device="cuda") * 0.1)
+    packed = torch.randn((4, 11 * 128), dtype=torch.bfloat16, device="cuda")
+    positions = torch.arange(4, dtype=torch.int32, device="cuda")
+    slots = torch.tensor([0, 129, -1, -1], dtype=torch.int32, device="cuda")
+    nvfp4 = kv_dtype == "nvfp4"
+    main = torch.zeros(
+        (2, 2, 2, 128, 64 if nvfp4 else 128),
+        dtype=torch.uint8 if nvfp4 else torch.float8_e4m3fn,
+        device="cuda",
+    )
+    index = torch.zeros((2, 1, 128, 128), dtype=torch.float8_e4m3fn, device="cuda")
+    scales = torch.zeros((2, 2, 2, 128, 8), dtype=torch.uint8, device="cuda")
+    manager = create_autospec(MiniMaxM3KVCacheManagerV2, instance=True, spec_set=True)
+    manager.is_nvfp4_layer.return_value = nvfp4
+    manager.get_buffers.return_value = main
+    manager.get_block_scale_buffers.return_value = scales
+    metadata = Mock(
+        spec_set=MiniMaxM3MsaSparseAttentionMetadata,
+        kv_cache_manager=manager,
+        msa_out_cache_loc=slots,
+    )
+    metadata.msa_idx_k_cache.return_value = index
+
+    def snapshot(outputs: tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, ...]:
+        return tuple(t.view(torch.uint8).clone() for t in (*outputs, main, index, scales))
+
+    expected_outputs = layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(packed, positions, metadata)
+    assert expected_outputs is not None
+    expected = snapshot(expected_outputs)
+    for cache in (main, index, scales):
+        cache.zero_()
+    outputs = layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(
+        packed, positions, metadata, cache_tensors=(main, index, slots)
+    )
+    assert outputs is not None
+    for actual, reference in zip(snapshot(outputs), expected):
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    manager.get_buffers.assert_called_once_with(3, kv_layout="HND")
+    metadata.msa_idx_k_cache.assert_called_once_with(3)
+
+    if not nvfp4:
+        monkeypatch.setattr(
+            modeling_minimaxm3,
+            "_extract_minimax_m3_attention_extra_attrs",
+            lambda _: (metadata, layer),
+        )
+        op = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer
+        args = (packed, positions, main, index, slots, "3")
+        op(*args)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            replay_outputs = op(*args)
+        packed.mul_(-0.5)
+        for cache in (main, index):
+            cache.zero_()
+        graph.replay()
+        replay = snapshot(replay_outputs)
+        for cache in (main, index):
+            cache.zero_()
+        eager = snapshot(op(*args))
+        for actual, reference in zip(replay, eager):
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 
 @pytest.mark.gpu

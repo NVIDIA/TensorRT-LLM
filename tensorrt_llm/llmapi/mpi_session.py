@@ -551,7 +551,7 @@ class MpiPoolSession(MpiSession):
             for key, value in os.environ.items()
             if key.startswith("TRTLLM") or key.startswith("TLLM") or key in (
                 "FLASHINFER_WORKSPACE_BASE", "FLASHINFER_CUBIN_DIR",
-                "PROMETHEUS_MULTIPROC_DIR")
+                "MASTER_ADDR", "MASTER_PORT", "PROMETHEUS_MULTIPROC_DIR")
         }
         workspace_managed = env.get(_FLASHINFER_WORKSPACE_MANAGED_ENV) == "1"
         env.update(self._env_overrides)
