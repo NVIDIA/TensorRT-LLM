@@ -392,6 +392,7 @@ def _executor_with_real_error_path(monkeypatch) -> tuple:
     # What the cancel and response passes read besides the above.
     executor.waiting_queue = Mock(spec=["remove_by_ids"])
     executor.perf_manager = Mock()
+    executor.model_engine = SimpleNamespace(route_capture=None)
     executor.iter_counter = 0
     executor.disable_overlap_scheduler = True
     executor.stream_interval = 1

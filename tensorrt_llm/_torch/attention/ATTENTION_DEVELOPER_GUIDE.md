@@ -485,6 +485,74 @@ See `attention/backends/sparse/` and the
 [Sparse Attention Development Guide](../../../docs/source/developer-guide/sparse-attention-development-guide.md)
 for details.
 
+#### 3.2.5 Paged-context FMHA requires a fused kernel
+
+`TrtllmAttentionMetadata` enables `use_paged_context_fmha` whenever chunked
+prefill, KV block reuse or speculative draft tokens are configured. Those
+features all require the context phase to attend to KV that is already in the
+cache, and only the fused context FMHA kernel can do that.
+
+`AttentionOp::initialize()` ends with
+`mEnableContextFMHA = mIsGenerationMLA || mFmhaDispatcher->isSupported()`, so a
+configuration with no compiled kernel silently clears the flag and the context
+phase runs the unfused path instead. That path builds K and V from the current
+chunk alone: the cached prefix is dropped from attention and then overwritten
+by the chunk's write-back, which turns a missing kernel into a plausible wrong
+answer rather than an error.
+
+`get_attention_op` in `thop/attentionOp.cpp` therefore refuses a non-MLA,
+non-cross paged-context configuration whose initialization produced no context
+FMHA kernel. The check runs after `initialize()`, because only the initialized
+op reflects the exact Q/KV/output precision, mask type and page size, and
+outside `initialize()` itself, which is `noexcept`.
+
+The refusal has three distinct causes, each with its own message, and the
+distinction matters when triaging:
+
+- Relative position embedding (T5-style self attention). `initialize()` clears
+  `mEnableContextFMHA` for it before the kernel table is consulted, so no
+  build carries a fused kernel for it. This is an unsupported feature
+  combination: disable chunked prefill, KV block reuse and speculative
+  decoding for the model. The message says so and does not point at the
+  build's architecture list, because no architecture list can supply the
+  kernel.
+- The kernel set genuinely has no kernel for that combination (precision,
+  head size, page size, mask).
+- The build's `--cuda_architectures` does not name the SM of the device it is
+  running on. `cuda_configuration.cmake` stamps `-DEXCLUDE_SM_<arch>` for every
+  architecture the list omits, and that macro compiles the matching block of
+  the trtllm-gen cubin table out, so such a build carries no kernels for that
+  SM at all. Check the architecture list first.
+
+The last two share one message ("requires a fused context FMHA kernel, and this
+build has none").
+
+Cross attention is exempt from the op-construction check. Its unfused path
+builds K and V from the encoder output (`params.cross_kv`) rather than from a
+cached prefix, so it is correct whenever the encoder output is supplied, which
+is the case on the first decoder context step and on every generation step.
+The exception is the later chunks of a chunked decoder prefill: the executor
+marks the encoder output consumed after the first chunk, the cross layer then
+passes no K/V, and the op must read the cross KV cache instead. Only the fused
+kernel can do that, so the context-stage enqueue in `thop/attentionOp.cpp`
+checks per call that a cross-attention op called without `cross_kv` has
+`mEnableContextFMHA`.
+
+`thop.fused_context_fmha_kernel_exists(head_size, kv_cache_dtype,
+tokens_per_block, output_dtype)` reports whether this build contains a fused
+context FMHA kernel for an ordinary dense causal paged-context configuration
+with equal Q/KV head counts. Q is probed at the KV precision, except for an
+NVFP4 KV cache, which `AttentionOp` reads with an FP8 Q kernel
+(`hasFp4KvCache()` requires `mFP8ContextFMHA`); only the trtllm-gen kernel
+set carries E2M1-KV context kernels, and the probe reports absent for NVFP4
+KV wherever `FmhaDispatcher` would select FMHA-v2 instead (outside the SM100
+family, or head size 72) rather than trip that runner's Q/KV precision
+assertion. It is a diagnostic aid: the output dtype is an explicit
+argument because the runtime chooses it independently of the KV cache dtype,
+and the probe fixes the mask, layout and head ratio, so its answer does not by
+itself describe the configuration a given model will run. The op-level refusal
+above is the authoritative check.
+
 ## 4. Evaluating New Attention
 
 ### 4.1 First-pass fit
