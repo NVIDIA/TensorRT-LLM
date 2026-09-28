@@ -297,8 +297,6 @@ def _stub_agents(
         (integration_dir / "integration.md").write_text("# integration\n", encoding="utf-8")
         included = [str(entry["current_item_id"]) for entry in candidates]
         best = max(candidates, key=lambda entry: float(entry["measured_gain_pct"]))
-        noise_floor = float(workflow._optimize_block()["noise_floor_pct"])
-        best_gain = max(float(entry["measured_gain_pct"]) for entry in candidates)
         verdict = {
             "agent": "integrator",
             "round": state.round_index + 1,
@@ -309,7 +307,6 @@ def _stub_agents(
             "remediation_attempts": 0,
             "measured_gain_pct": float(best.get("measured_gain_pct") or 0),
             "measured_value": float(best.get("measured_value") or 100),
-            "required_gain_pct": max(noise_floor, best_gain - noise_floor),
             "best_candidate_id": included[0] if included else "",
         }
         if best.get("curve"):
@@ -416,7 +413,6 @@ def test_happy_path_one_accepted_item(tmp_path, fake_git):
     ("verdict_overrides", "error"),
     [
         ({"measured_gain_pct": 0.1}, "below required"),
-        ({"required_gain_pct": 0.0}, "required_gain_pct mismatch"),
         ({"included_item_ids": []}, "included no candidates"),
         ({"included_item_ids": ["opt-failed"]}, "non-candidate item"),
         ({"round": 0}, "without a structured verdict"),
@@ -449,7 +445,6 @@ def test_integrator_rejects_invalid_acceptance_verdict(
             "remediation_attempts": 0,
             "measured_gain_pct": 8.4,
             "measured_value": 108.4,
-            "required_gain_pct": 7.4,
             "best_candidate_id": "opt-001",
         }
         verdict.update(verdict_overrides)
