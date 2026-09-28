@@ -56,9 +56,7 @@ def in_worker(call):
 
 
 def check(repo):
-    group_path = (
-        repo / "tensorrt_llm/_torch/moe/fused_moe/mega_moe/rebalance_slot_scheduler_v2.py"
-    )
+    group_path = repo / "tensorrt_llm/_torch/moe/fused_moe/mega_moe/rebalance_slot_scheduler_v2.py"
     executor_path = repo / "tensorrt_llm/_torch/pyexecutor/py_executor.py"
     events = []
     main = SimpleNamespace(cuda_stream=11, priority=0, device=0)

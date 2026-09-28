@@ -228,7 +228,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             sf_vec_size=self.sf_vec_size,
         )
         tmem_plan = make_tcgen05_tmem_plan(mma_instruction, self.architecture, self.mma_tiler_mnk)
-        if self.token_back_ready_granularity == "token_tile":
+        if self.token_back_ready_granularity == "token_tile":  # nosec B105 -- scheduler mode name, not a credential
             tokens_per_fc1_ready_slot, fc2_done_signals_per_token_tile = derive_fc2_ready_geometry(
                 hidden_size=self.hidden_size,
                 mma_tiler_mnk=self.mma_tiler_mnk,
@@ -296,7 +296,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         )
         self.scheduler = scheduler_type(fc12_problem_desc, resolved_impl_desc)
         self.epilogue = SwapABGatedActEpilogue(fc12_problem_desc, resolved_impl_desc)
-        if self.token_back_ready_granularity == "token_tile":
+        if self.token_back_ready_granularity == "token_tile":  # nosec B105 -- scheduler mode name, not a credential
             self._validate_token_tile_ready_contract()
         if self.epilogue.fc1_output_dtype is not self.b_dtype:
             raise ValueError("Epilogue FC1 output dtype must match the Mainloop B dtype.")
@@ -348,7 +348,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             raise ValueError(
                 f"Unsupported token_back_ready_granularity {self.token_back_ready_granularity!r}."
             )
-        if self.token_back_ready_granularity == "token_tile":
+        if self.token_back_ready_granularity == "token_tile":  # nosec B105 -- scheduler mode name, not a credential
             if not (
                 self.schedule_mode in ("grouped", "phase_interleave")
                 and self.work_id_mode == "atomic_counter"
@@ -618,7 +618,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             f"{'apply_topk_fc1' if self.apply_topk_at_fc1 else 'apply_topk_fc2'}_"
             f"{'inkernel_redg' if self.reduce_topk_in_kernel else 'separate_reduce'}"
             "_dlb_v1"
-            + ("_fc2readytile_v1" if self.token_back_ready_granularity == "token_tile" else "")
+            + ("_fc2readytile_v1" if self.token_back_ready_granularity == "token_tile" else "")  # nosec B105 -- scheduler mode name, not a credential
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):
