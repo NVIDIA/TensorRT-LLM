@@ -1,0 +1,77 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+module.exports = [
+  {
+    name: 'minimax',
+    pr: 18605,
+    head: 'f26e4766f9d4082cb0f747abc465562e17b2fa08',
+    target: '82d667fbfb896df0318d37383fa32c54a031ad48',
+    mergeBase: 'a8ac7e5bccb972b35808dc973f7b4aac96cbbc13',
+    branch: 'main',
+  },
+  {
+    name: 'model-loader',
+    pr: 19428,
+    head: '89d40a92c5cd10bde2f053f4a6f7670c2bb4e90f',
+    target: 'fa2279b35545cc31b8e268073fcafdbea88e882f',
+    mergeBase: 'c5c839308f10004ec6fc1e5a0020d82e6c4d1402',
+    branch: 'main',
+  },
+  {
+    name: 'image-clock',
+    pr: 17491,
+    head: 'f1e49292ff5fd55897ea3e29b43c0209be569cf0',
+    target: '40ac40773e5da7e99021df1566adcbaef8b95345',
+    mergeBase: 'f848ecb24fa8e5e2f8fa6e58bf7a68ef7e826add',
+    branch: 'main',
+  },
+  {
+    name: 'minimax-integrated',
+    pr: 18605,
+    head: '65804bfcede17124661988c674bd183edec1808e',
+    target: '82d667fbfb896df0318d37383fa32c54a031ad48',
+    mergeBase: '82d667fbfb896df0318d37383fa32c54a031ad48',
+    branch: 'main',
+  },
+  {
+    name: 'minimax-repair',
+    pr: 19298,
+    head: 'e19b5e3e700269da66772d13422d039daecea984',
+    target: '66a15a1c60297e39da2e1db799a6e3ac29ec39d6',
+    mergeBase: '66a15a1c60297e39da2e1db799a6e3ac29ec39d6',
+    branch: 'main',
+  },
+  {
+    name: 'model-loader-integrated',
+    pr: 19428,
+    head: '950c9236c58e649ea1fb8ca66829c10e5c9ccb7b',
+    target: 'fa2279b35545cc31b8e268073fcafdbea88e882f',
+    mergeBase: 'fa2279b35545cc31b8e268073fcafdbea88e882f',
+    branch: 'main',
+  },
+  {
+    name: 'model-loader-repair',
+    pr: 19582,
+    head: 'd79ecd55edeb6a45438c0e024df26c9d833b0ba9',
+    target: 'd857367593cf7e032264abb8d010cbbd767096b5',
+    mergeBase: 'd857367593cf7e032264abb8d010cbbd767096b5',
+    branch: 'main',
+  },
+  {
+    name: 'image-clock-integrated',
+    pr: 17491,
+    head: 'e11905f5c6213711b9b19da3ee91e0b81783eb81',
+    target: '40ac40773e5da7e99021df1566adcbaef8b95345',
+    mergeBase: '40ac40773e5da7e99021df1566adcbaef8b95345',
+    branch: 'main',
+  },
+  {
+    name: 'image-clock-repair',
+    pr: 18686,
+    head: 'e8c3fcaccd57f1b8bc147d5d0f4f5d662b3ef367',
+    target: 'ee7525c0cd28225a64913d3f6dbe87a8a373c6aa',
+    mergeBase: 'ee7525c0cd28225a64913d3f6dbe87a8a373c6aa',
+    branch: 'main',
+  },
+];
