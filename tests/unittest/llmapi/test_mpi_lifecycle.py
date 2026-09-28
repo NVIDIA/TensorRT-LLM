@@ -242,3 +242,7 @@ def test_remote_mpi_worker_lifecycle(scenario: str, ranks: int, tmp_path: Path) 
                 for line in (tmp_path / f"events-{rank}.jsonl").read_text().splitlines()
             ]
             assert [event["batch"] for event in events] == list(range(batches)), events
+            if scenario in ("all_return", "reuse", "sync_recovery", "async_drain"):
+                assert (tmp_path / f"finished-{batches - 1}-{rank}.json").exists(), (
+                    f"Rank {rank} started but did not finish the final batch:\n{log}"
+                )
