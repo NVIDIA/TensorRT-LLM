@@ -1896,17 +1896,8 @@ class KvCacheCreator:
         if (self._is_standalone_dspark()
                 and is_mla(self._draft_config.pretrained_config)):
             return "Unified DSpark KV cache does not yet support MLA drafters."
-        if (self._speculative_config.draft_len_schedule is not None
-                or self._speculative_config.max_concurrency is not None):
-            return (
-                "Unified DSpark KV cache does not yet support "
-                "draft_len_schedule or max_concurrency: skipped drafting "
-                "would lose accepted-token history before speculation resumes.")
         if self._mapping.pp_size != 1 or self._mapping.cp_size != 1:
             return "Unified DSpark KV cache requires PP=1 and CP=1."
-        if self._kv_connector_manager is not None:
-            return ("Unified DSpark KV cache does not yet support "
-                    "KV cache connectors.")
         transceiver_config = self._cache_transceiver_config
         if self._is_disagg and (transceiver_config is None
                                 or transceiver_config.transceiver_runtime
