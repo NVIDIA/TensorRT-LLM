@@ -188,12 +188,10 @@ class DSparkSpecMetadata(SpecMetadata):
         )
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices, non_blocking=True)
 
-        # CUDA-graph-safe path: maintain the request->slot mapping on the host
-        # (outside the captured region) and mirror it into ``_batch_to_slot`` so the
-        # captured gen forward can index the rolling windows by tensor. Mirrors
-        # ``DFlashSpecMetadata.prepare`` (dflash.py:96-113).
+        # For private storage, maintain the request->slot mapping outside graph
+        # capture and mirror it into the tensor used by generation forward.
         worker = getattr(self, "_dspark_worker", None)
-        if worker is not None and worker._win_inited:
+        if worker is not None and worker._win_inited and worker._draft_kv_manager is None:
             worker._release_inactive_slots(self.request_ids)
             # Assign a persistent rolling-window slot to every real generation
             # request that never ran a context/seed forward on this worker. In
@@ -616,12 +614,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         for request_id in real_ids:
             cache = self._draft_kv_manager.kv_cache_map[request_id]
             history = self._draft_kv_manager.get_draft_history(request_id)
-            resident = self._managed_residency.get(request_id)
-            if (
-                resident is not None
-                and resident[0] is cache
-                and resident[1] == self._req_to_slot.get(request_id)
-            ):
+            if self._managed_residency.get(request_id) is cache:
                 # Context completion can retire pages before its history
                 # readback is published. Its retained frames are already in
                 # the resident device window on the execution stream.
@@ -648,8 +641,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
             cache = self._draft_kv_manager.kv_cache_map[request_id]
             slot = self._assign_slot(request_id, reset=False)
             batch_slots[row] = slot
-            resident = self._managed_residency.get(request_id)
-            if resident is not None and resident[0] is cache and resident[1] == slot:
+            if self._managed_residency.get(request_id) is cache:
                 continue
             history = self._draft_kv_manager.get_draft_history(request_id)
             if row >= num_contexts and history is None:
@@ -666,7 +658,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 )
                 for stage, pool in enumerate(self._draft_kv_buffers):
                     self._kv_windows[slot, stage, frames] = pool[pages, 0, 0, offsets]
-            self._managed_residency[request_id] = (cache, slot)
+            self._managed_residency[request_id] = cache
         self._batch_to_slot.fill_(self._scratch_slot)
         self._batch_to_slot[: len(request_ids)].copy_(
             torch.tensor(batch_slots, dtype=torch.long, device=self._batch_to_slot.device)
