@@ -3844,14 +3844,14 @@ PyYAML = ">=5.1.0"
 
 [[package]]
 name = "openai"
-version = "3.19.2"
+version = "3.20.0"
 description = "The official Python library for the openai API"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "openai-3.19.2-py3-none-any.whl", hash = "sha256:66247fcd07266e72536e90656dc27f3b0bb1e9d8696d4013fc55402c0b96a5c2"},
-    {file = "openai-3.19.2.tar.gz", hash = "sha256:de185f9834ad064d965ec42bd0766731cf66bceea16a7670294a835d207019e6"},
+    {file = "openai-3.20.0-py3-none-any.whl", hash = "sha256:fb1b109e3423ed51c6ade96bbb0fffddae39c8e64bb9b6e501659bcbaa5ad30c"},
+    {file = "openai-3.20.0.tar.gz", hash = "sha256:5e5dc0a3c0a9362e69cd35a65d04580a73a66eb39d5abeb78881b6190ca5d98c"},
 ]
 
 [package.dependencies]
@@ -4962,14 +4962,14 @@ windows-terminal = ["colorama (>=0.4.6)"]
 
 [[package]]
 name = "pyjwt"
-version = "2.15.0"
+version = "2.15.1"
 description = "JSON Web Token implementation in Python"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "pyjwt-2.15.0-py3-none-any.whl", hash = "sha256:7a3742debf6b879e912dbb9819ceec1594be812452b78c5f2e2dfc56564954f8"},
-    {file = "pyjwt-2.15.0.tar.gz", hash = "sha256:b11c5f9791d7bf51c2b39a81ed669f6b2dbbd669df2942f6c60167e9e3d1abe4"},
+    {file = "pyjwt-2.15.1-py3-none-any.whl", hash = "sha256:42d59d631f7768a1028a64c7ff581a9bf7519804daf91fc5b6c56e30eec5e193"},
+    {file = "pyjwt-2.15.1.tar.gz", hash = "sha256:4f259e80cdfb6b3fc18a7de51fd1ef9ec79652f25019bae68975ca2468a34df8"},
 ]
 
 [package.dependencies]
@@ -5955,14 +5955,14 @@ typing-extensions = "*"
 
 [[package]]
 name = "sse-starlette"
-version = "3.4.11"
+version = "3.5.0"
 description = "SSE plugin for Starlette"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "sse_starlette-3.4.11-py3-none-any.whl", hash = "sha256:c7b2244bdff016fe7f64e10075e89a3e6bbf899649cc89b0fe884b5545042453"},
-    {file = "sse_starlette-3.4.11.tar.gz", hash = "sha256:1bae716c02f3e6f294be41ff333220692dae7c3cbab077c900f159676719dade"},
+    {file = "sse_starlette-3.5.0-py3-none-any.whl", hash = "sha256:3e6e1070df3f0f5d9cea81496de92dbb72f6721871d99748ece67441dd8b7997"},
+    {file = "sse_starlette-3.5.0.tar.gz", hash = "sha256:75de713aa8a9441513cc283220826da079d982770965b951e9437720e8bafdb2"},
 ]
 
 [package.dependencies]
@@ -7136,4 +7136,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "7d3886ac4c9f1b3738cdc9f408fe6a46729d027822769bc170b1dcc56124259c"
+content-hash = "1c7e425140afb52828f313726b9ec5cb091b144e00e3b0f4908c7e0603f36205"
