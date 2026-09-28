@@ -779,8 +779,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
     @property
     def default_warmup_steps(self):
+        steps = super().default_warmup_steps
+        # A step policy's edge windows cover every step of a short warmup; one
+        # more step than both windows reaches the FP8 middle as well.
+        controller = getattr(self.transformer, "step_precision_controller", None)
+        if controller is not None:
+            steps = max(steps, controller.first_steps + controller.last_steps + 1)
         # Distilled checkpoints only run their fixed schedule length.
-        return self.sampling.num_steps(super().default_warmup_steps)
+        return self.sampling.num_steps(steps)
 
     @property
     def default_generation_params(self):
@@ -2237,14 +2243,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         branches of one step always select the same path even though each
         calls this separately. No-op unless the checkpoint declares a step
         policy.
-
-        Warmup leaves the transformer on the checkpoint's native path: its
-        short schedule would land every step inside the policy's edge windows
-        and warm only the 16-bit path, while the quantized GEMMs -- the ones
-        with tactics to tune -- would first run on a user's request.
         """
-        if self._is_warmup:
-            return
         # getattr: the transformer is not always a Cosmos3Transformer.
         # Distilled-pipeline tests substitute a lightweight stand-in, and a
         # transformer with no step policy has no reason to carry these.

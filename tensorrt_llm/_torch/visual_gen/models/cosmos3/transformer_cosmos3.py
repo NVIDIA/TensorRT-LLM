@@ -1491,15 +1491,16 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         return tokens
 
     def register_cuda_graph_extra_key_fns(self, runner) -> None:
-        """Make the position-determining scalars part of the graph key.
+        """Make the scalars that change the computation part of the graph key.
 
-        The base key is tensor shapes only, but the rotary tables are built
-        from Python scalars that leave every shape unchanged: the frame rate,
-        the action clock, and the offset of the first action step. Two requests
-        differing only in these produce different positions at identical
-        shapes, so without them one captured graph would be replayed for both.
+        The base key is tensor shapes only, but some inputs to the computation
+        leave every shape unchanged. The rotary tables are built from Python
+        scalars: the frame rate, the action clock, and the offset of the first
+        action step. The step precision swaps each governed Linear's
+        quantization method between FP8 and 16-bit. Without these in the key,
+        one captured graph would be replayed for all of them.
         Each returns ``None`` when absent, which drops that part of the key --
-        a video-only request keys exactly as it did before.
+        a video-only request without a step policy keys on tensor shapes alone.
         """
         super().register_cuda_graph_extra_key_fns(runner)
 
@@ -1522,6 +1523,13 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         runner.register_extra_key_fn(
             "action_start_frame_offset", _int_key("action_start_frame_offset")
         )
+
+        def _step_precision_key(*args, **kwargs):
+            # Read at call time: the controller is installed after the runner.
+            controller = self.step_precision_controller
+            return None if controller is None else controller.high_precision
+
+        runner.register_extra_key_fn("step_precision_a16", _step_precision_key)
 
     def reset_cache(self):
         self.cached_kv = None
