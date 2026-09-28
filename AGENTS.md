@@ -1,7 +1,7 @@
 # AGENTS.md
 
 TensorRT-LLM: open-source library for optimized LLM inference on NVIDIA GPUs.
-Python and C++ codebase with PyTorch and AutoDeploy execution paths.
+Python and C++ codebase with a PyTorch execution path.
 
 > If a `CLAUDE.local.md` file exists alongside this file, read and respect it — it contains developer-specific overrides that supplement this shared guidance.
 
@@ -60,7 +60,6 @@ See [architecture diagram](.github/tava_architecture_diagram.md) for the full Me
 | Backend | Status | Entry Point | Key Path |
 |---------|--------|-------------|----------|
 | **PyTorch** | Default | `TorchLlmArgs` | `_torch/pyexecutor/` → `PyExecutor` → PyTorch Engine |
-| **AutoDeploy** | Beta | `_torch/auto_deploy/` shim | `_torch/auto_deploy/shim/ad_executor.py` → adapts `PyExecutor` → graph transforms + torch.export |
 
 ### Shared C++ Core (via Nanobind)
 
@@ -70,7 +69,7 @@ Both backends share these C++ components:
 
 ### Request Flow
 ```text
-HuggingFace Model → LLM API → Executor (PyTorch/AutoDeploy)
+HuggingFace Model → LLM API → PyTorch Executor
     → Scheduler → Model Forward → Decoder → Sampling → Generated Tokens
 ```
 
@@ -168,6 +167,12 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 | Test waives | `tests/integration/test_lists/waives.txt` | Skip known-failing tests with NVBug links |
 | Performance | See [benchmarking guide](docs/source/developer-guide/perf-benchmarking.md) | `trtllm-bench` and `trtllm-serve` benchmarks |
 
+### Advisory semantic review
+
+See [.github/semantic-review.md](.github/semantic-review.md) for the two-hour
+rotating candidate scan, fixed-version AI results, bounded timeout recovery, and manual
+retry procedure.
+
 ### Triggering CI
 
 CI is triggered by posting comments on the PR. Basic commands:
@@ -188,7 +193,6 @@ For a full list of up-to-date bot commands, post `/bot help` as a PR comment and
 | Architecture overview | `docs/source/developer-guide/overview.md` |
 | PyTorch backend | `docs/source/torch/arch_overview.md` |
 | Adding a new model | `docs/source/torch/adding_new_model.md` |
-| AutoDeploy | `docs/source/features/auto_deploy/auto-deploy.md` |
 | Disaggregated serving | `docs/source/features/disagg-serving.md` |
 | Speculative decoding | `docs/source/features/speculative-decoding.md` |
 | Quantization | `docs/source/features/quantization.md` |
