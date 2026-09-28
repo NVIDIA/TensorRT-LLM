@@ -89,7 +89,6 @@ def _config() -> NoKVCacheRunnerConfig:
         prefill_cuda_graph_num_tokens=[],
         mm_encoder_cache_enabled=False,
         spec_config=None,
-        is_draft_model=False,
         num_seq_slots=None,
         original_max_draft_len=0,
         original_max_total_draft_tokens=0,
@@ -211,7 +210,6 @@ def test_encoder_runner_graph_config_comes_only_from_cuda_graph_config(
     engine.without_logits = False
     engine.attn_backend = _AttentionBackend
     engine.attn_runtime_features = AttentionRuntimeFeatures()
-    engine.is_draft_model = False
     deps = object()
     engine._create_runner_deps = Mock(return_value=deps)
     runner_config = object()
