@@ -131,6 +131,7 @@ def test_minimax_disagg_role_mapper_kinds(
 def test_minimax_disagg_rejects_unmanaged_index_value(monkeypatch) -> None:
     def fake_base_init(self, *args, **kwargs):
         self.is_disagg = kwargs.get("is_disagg", False)
+        self.dtype = kwargs.get("dtype", DataType.BF16)
         self.layer_offsets = {layer_id: layer_id for layer_id in range(kwargs["num_layers"])}
 
     monkeypatch.setattr(KVCacheManagerV2, "__init__", fake_base_init)
@@ -309,7 +310,7 @@ def _zero_physical_pools(manager: MiniMaxM3KVCacheManagerV2) -> None:
 def _get_nvfp4_scale_view(
     manager: MiniMaxM3KVCacheManagerV2, layer_idx: int
 ) -> torch.Tensor | None:
-    if manager.dtype != DataType.NVFP4:
+    if not manager.is_nvfp4_layer(layer_idx):
         return None
     page_table = KVRegionExtractorV1(manager).page_table
     local_layer_id = manager.layer_offsets[layer_idx]
@@ -374,17 +375,18 @@ def _as_nvfp4_scale_tensor(
     scale_view = _get_nvfp4_scale_view(manager, layer_idx)
     if scale_view is None:
         return None
-    if manager._main_kv_mapper_kind != MapperKind.NHD:
-        raise AssertionError("MSA uses an FP8 KV cache; NVFP4 scale pools are NHD-only")
     local_layer_id = manager.layer_offsets[layer_idx]
     local_heads = manager.num_kv_heads_per_layer[local_layer_id]
     bytes_per_token_head = HEAD_DIM // 16
+    page_shape = (
+        (local_heads, TOKENS_PER_BLOCK, bytes_per_token_head)
+        if manager._main_kv_mapper_kind == MapperKind.HND
+        else (TOKENS_PER_BLOCK, local_heads, bytes_per_token_head)
+    )
     return scale_view.view(
         scale_view.shape[0],
         2,
-        TOKENS_PER_BLOCK,
-        local_heads,
-        bytes_per_token_head,
+        *page_shape,
     )
 
 
@@ -448,6 +450,10 @@ def _initialize_cache(
 
         for layer_idx in manager.pp_layers:
             kv = manager.get_buffers(layer_idx)
+            if manager.dtype == DataType.NVFP4:
+                sparse = layer_idx in manager.sparse_layer_ids
+                assert kv.dtype == (torch.int8 if sparse else torch.float8_e4m3fn)
+                assert kv.shape[-1] == (HEAD_DIM // 2 if sparse else HEAD_DIM)
             first_global_head = _first_global_head(manager)
             _fill_position_dependent(
                 kv,
@@ -655,6 +661,7 @@ def test_minimax_m3_kv_transfer(
 
 @pytest.mark.cuda
 @pytest.mark.timeout(180)
+@pytest.mark.parametrize("cache_dtype", [DataType.FP8, DataType.NVFP4], ids=["fp8", "nvfp4"])
 @pytest.mark.parametrize(
     "update_before_transfer",
     [True, False],
@@ -662,6 +669,7 @@ def test_minimax_m3_kv_transfer(
 )
 def test_minimax_m3_msa_hnd_head_mismatch_transfer(
     update_before_transfer: bool,
+    cache_dtype: DataType,
 ) -> None:
     transfer_harness.run_kv_transfer_test(
         ctx_tp=1,
@@ -675,7 +683,7 @@ def test_minimax_m3_msa_hnd_head_mismatch_transfer(
             tp,
             pp,
             enable_dp,
-            DataType.FP8,
+            cache_dtype,
             implementation="msa",
         ),
         init_fn=_initialize_cache,
