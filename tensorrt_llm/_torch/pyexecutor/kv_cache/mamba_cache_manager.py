@@ -3932,6 +3932,17 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                                  if snapshot_slots > 0 else 0)
         return attention_quota + state_quota + extra_attention_quota
 
+    def _get_draft_quota_from_max_tokens(self, max_tokens: float) -> int:
+        draft_quota = super()._get_draft_quota_from_max_tokens(max_tokens)
+        snapshot_slots = self._num_ssm_snapshots_for_capacity(
+            max_tokens, self.kv_cache_config)
+        if snapshot_slots > 0:
+            # The snapshot plan's partial-page reserve also covers draft KV.
+            draft_quota += (self._max_resident_sequences() *
+                            self.draft_layout.bytes_per_token *
+                            self.tokens_per_block)
+        return draft_quota
+
     def _get_max_tokens_from_quota(self, quota: int) -> float:
         if self._get_quota_from_max_tokens(0) > quota:
             return 0

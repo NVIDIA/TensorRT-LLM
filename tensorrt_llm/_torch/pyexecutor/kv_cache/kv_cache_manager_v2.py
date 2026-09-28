@@ -1119,8 +1119,6 @@ def get_draft_cache_unsupported_reason(kv_cache_config: KvCacheConfig) -> Option
             "draft prefill requires ordinary pages. "
             "set kv_cache_config.enable_swa_scratch_reuse=False"
         )
-    if kv_cache_config.pool_ratio is not None:
-        return "Unified DSpark draft KV does not yet support explicit pool_ratio"
     return None
 
 
@@ -1546,6 +1544,7 @@ class KVCacheManagerV2(BaseResourceManager):
         config = self._build_cache_config(config)
         config = self._append_standalone_draft_layers(config)
         config = self._remove_zero_size_buffers(config)
+        config = self._configure_unified_draft_pool_ratio(config)
         has_host_cache_tier = any(
             isinstance(tier, HostCacheTierConfig) for tier in config.cache_tiers
         )
@@ -2405,6 +2404,27 @@ class KVCacheManagerV2(BaseResourceManager):
             + self._get_generation_request_capacity() * generation_size_per_request
         )
 
+    def _get_draft_quota_from_max_tokens(self, max_tokens: float) -> int:
+        """Draft bytes within the unified manager's usable token capacity."""
+        layout = self.draft_layout
+        assert layout is not None
+        context_size, generation_size, fixed_size = _estimate_cache_size_components(
+            [layout.bytes_per_layer_token] * layout.num_layers,
+            [layout.retention_window_size] * layout.num_layers,
+            self.tokens_per_block,
+            scratch=False,
+            generation_capacity_headroom=self._generation_kv_capacity_headroom,
+            standalone_draft_reserve=layout.extra_tokens,
+        )
+        context_tokens = (
+            max_tokens if self.max_num_tokens is None else min(max_tokens, self.max_num_tokens)
+        )
+        return math.ceil(
+            context_tokens * context_size
+            + (max_tokens - context_tokens) * generation_size
+            + self._get_generation_request_capacity() * fixed_size
+        )
+
     def _get_event_num_blocks_per_cache_level(
         self,
         cache_tiers: List[CacheTierConfig],
@@ -3040,6 +3060,64 @@ class KVCacheManagerV2(BaseResourceManager):
     def _get_typical_seq_len(self, kv_cache_config: KvCacheConfig) -> int | None:
         """Return the configured typical sequence length, if any."""
         return kv_cache_config.avg_seq_len
+
+    def _configure_unified_draft_pool_ratio(
+        self, config: KVCacheManagerConfigPy
+    ) -> KVCacheManagerConfigPy:
+        """Preserve target ratios within their share of the unified byte quota."""
+        target_ratios = config.initial_pool_ratio
+        if self.draft_layout is None or target_ratios is None:
+            return config
+
+        # Native lifecycle equality includes window, rounded sink blocks, and
+        # cache domain. All SSM layers share one lifecycle, represented by None.
+        target_life_cycles: list[AttnLifeCycle | None] = []
+        for layer in config.layers:
+            if isinstance(layer, AttentionLayerConfig):
+                if layer.cache_domain == "standalone_draft":
+                    continue
+                life_cycle = AttnLifeCycle.make(
+                    layer.sliding_window_size,
+                    layer.num_sink_tokens,
+                    config.tokens_per_block,
+                    layer.cache_domain,
+                )
+            else:
+                life_cycle = None
+            if not any(
+                type(existing) is type(life_cycle) and existing == life_cycle
+                for existing in target_life_cycles
+            ):
+                target_life_cycles.append(life_cycle)
+
+        if len(target_ratios) != len(target_life_cycles):
+            raise ValueError(
+                "kv_cache_config.pool_ratio must have one entry per target layer group "
+                f"({len(target_life_cycles)}), got {len(target_ratios)}"
+            )
+        if any(not math.isfinite(ratio) or ratio <= 0 for ratio in target_ratios):
+            raise ValueError("kv_cache_config.pool_ratio values must be finite and positive")
+        if not math.isclose(sum(target_ratios), 1.0, rel_tol=0, abs_tol=1e-6):
+            raise ValueError("kv_cache_config.pool_ratio values must sum to 1.0")
+
+        # Use the same model-specific capacity accounting as quota selection;
+        # specialized targets can include compressed KV or recurrent snapshots.
+        usable_quota = int(config.cache_tiers[GPU_LEVEL].quota * config.max_util_for_resume)
+        max_tokens = self._get_max_tokens_from_quota(usable_quota)
+        if math.isinf(max_tokens):
+            max_tokens = self.max_num_tokens or self.max_seq_len
+        if usable_quota <= 0 or self._get_quota_from_max_tokens(max_tokens) > usable_quota:
+            raise ValueError("Unified KV cache quota cannot hold the target and draft reserves")
+        draft_ratio = self._get_draft_quota_from_max_tokens(max_tokens) / usable_quota
+        if not 0 < draft_ratio < 1:
+            raise ValueError("Unified KV cache quota must leave room for target and draft pools")
+
+        # Appended draft layers share one lifecycle, after all target groups.
+        return replace(
+            config,
+            initial_pool_ratio=[ratio * (1 - draft_ratio) for ratio in target_ratios]
+            + [draft_ratio],
+        )
 
     def _extra_buffers_per_layer(
         self, *, tokens_per_block: int
