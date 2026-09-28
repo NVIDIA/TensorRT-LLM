@@ -424,7 +424,30 @@ class EncodeExtraInputSpec(StrictBaseModel):
 
 
 class EncodeCudaGraphConfig(BaseCudaGraphConfig):
-    """CUDA graph configuration for encode-only requests."""
+    """CUDA graph configuration for encode-only requests (``LLM.encode()``).
+
+    A graph is captured at startup for every feasible combination of
+    ``batch_sizes``, ``num_tokens`` and ``seq_lens``. A batch runs the graph
+    for its (batch size, total tokens, longest request) shape, rounded up when
+    ``enable_padding`` is set, and runs eagerly if no graph matches.
+
+    Example::
+
+        cuda_graph_config = EncodeCudaGraphConfig(
+            batch_sizes=[1, 2, 4, 8],
+            num_tokens=[128, 256, 512],
+            seq_lens=[64, 128],
+            enable_padding=True,
+            extra_model_inputs=[
+                EncodeExtraInputSpec(name="token_type_ids",
+                                     shape=("num_tokens",),
+                                     dtype="int32"),
+            ],
+        )
+        llm = LLM(model, encode_only=True, cuda_graph_config=cuda_graph_config)
+        # token_type_ids: one value per token, prompts packed in order.
+        outputs = llm.encode(prompts, token_type_ids=token_type_ids)
+    """
 
     mode: Literal["encode"] = Field(
         default="encode", description="CUDA graph configuration mode.")
