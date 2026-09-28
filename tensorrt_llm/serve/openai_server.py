@@ -2016,11 +2016,13 @@ class OpenAIServer(_VideoRoutesMixin):
         cost stays opt-in because an operator who does not set the YAML field
         pays nothing, and one who does has asked for exactly this.
         """
-        if not self._per_request_spec_decode_stats:
+        # getattr: servers built without __init__ (object.__new__, as tests
+        # do) must behave as not opted in rather than fail every request.
+        if not getattr(self, "_per_request_spec_decode_stats", False):
             return
         postproc_args.return_spec_decode_stats = True
-        postproc_args.spec_decode_num_spec_tokens = (
-            self._spec_decode_num_spec_tokens)
+        postproc_args.spec_decode_num_spec_tokens = getattr(
+            self, "_spec_decode_num_spec_tokens", None)
 
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:

@@ -155,7 +155,8 @@ def _build_spec_decode_stats(
     ``counters`` is the sequence's own ``CompletionOutput._spec_dec_counters``,
     never the request-level copies on the GenerationResult: with n > 1 every
     candidate reports its own counters and those copies hold whichever
-    candidate responded last.
+    candidate responded last. Callers read it with getattr, since outputs that
+    are not a CompletionOutput (test doubles, for one) lack the field.
 
     Returns None -- meaning the field is omitted entirely -- when the caller has
     not opted in, when the sequence has not finished (streaming carries this
@@ -590,7 +591,8 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
             speculative_decoding=_build_spec_decode_stats(
-                output._spec_dec_counters, args, output.finish_reason),
+                getattr(output, '_spec_dec_counters', None), args,
+                output.finish_reason),
             stop_reason=output.stop_reason,
         )
         if args.return_logprobs:
@@ -757,7 +759,8 @@ def chat_response_post_processor(
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
             speculative_decoding=_build_spec_decode_stats(
-                output._spec_dec_counters, args, output.finish_reason),
+                getattr(output, '_spec_dec_counters', None), args,
+                output.finish_reason),
         )
         if output.finish_reason == "stop" and args.has_tool_call.get(
                 output.index, False):
@@ -887,7 +890,8 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
             speculative_decoding=_build_spec_decode_stats(
-                output._spec_dec_counters, args, output.finish_reason),
+                getattr(output, '_spec_dec_counters', None), args,
+                output.finish_reason),
         )
         if args.return_logprobs:
             logprobs = output.logprobs_diff
@@ -957,7 +961,8 @@ def completion_response_post_processor(
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
             speculative_decoding=_build_spec_decode_stats(
-                output._spec_dec_counters, args, output.finish_reason),
+                getattr(output, '_spec_dec_counters', None), args,
+                output.finish_reason),
         )
         if args.return_logprobs:
             logprobs = output.logprobs
