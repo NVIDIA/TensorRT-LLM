@@ -614,6 +614,26 @@ def test_the_ranks_device_is_captured_and_adopted_by_the_save_thread(
         assert 0 not in fake_cuda
 
 
+def test_a_save_thread_that_cannot_start_fails_registration(
+    store_config, fake_store, fake_cuda, monkeypatch
+):
+    """A worker whose save thread died must not go on to report itself ready.
+
+    The thread's setup binds this rank's device. If that raises and the thread
+    exits, every later `wait_for_save` counts a save that nothing will ever
+    consume, and the requests holding those pages stay pinned for good.
+    """
+
+    def refuse(_index):
+        raise RuntimeError("cudaSetDevice failed")
+
+    monkeypatch.setattr(torch.cuda, "set_device", refuse)
+
+    with pytest.raises(RuntimeError, match="save thread"):
+        with make_worker(fake_store, layout=make_layout()):
+            pytest.fail("registration should not have completed")
+
+
 def test_staging_narrows_the_batch_to_the_budget(store_config, fake_store, staged_copies):
     layout = make_layout(regions_per_group=2, num_slots=8)
     page_bytes = PageAddressing(layout).bytes_per_page(0)

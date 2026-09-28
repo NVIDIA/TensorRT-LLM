@@ -174,6 +174,10 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             Queue()
         )
         self._save_thread: Optional[threading.Thread] = None
+        #: Set once the save thread has finished its device and stream setup,
+        #: whether or not that succeeded. Registration waits on it so a thread
+        #: that cannot start is a bringup failure.
+        self._save_started = threading.Event()
         self._save_lock = threading.Lock()
         # Host staging, when the pool cannot register device memory.
         self._load_staging: Optional[HostStagingPool] = None
@@ -263,6 +267,18 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 daemon=True,
             )
             self._save_thread.start()
+            # Reporting ready before the thread is would turn a thread that
+            # cannot bind this rank's device into requests that stay pinned on
+            # saves nothing will consume. Fail bringup instead.
+            self._save_started.wait()
+            with self._save_lock:
+                startup_error, self._save_error = self._save_error, None
+            if startup_error is not None:
+                raise RuntimeError(
+                    f"mooncake-store: the save thread for rank {self._rank} "
+                    "could not start, so this worker would accept pages it "
+                    "could never write to the pool."
+                ) from startup_error
 
         logger.info(
             f"mooncake-store worker rank {self._rank} registered layout: {addressing.describe()}"
@@ -498,17 +514,33 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         return finished_saving, list(started_loading_req_ids)
 
     def _drain_saves(self) -> None:
-        # A new thread starts on device 0, so adopt the device captured on the
-        # executor thread. Otherwise a stream created below belongs to device 0
-        # while the KV pointers belong to the rank's device, and the copy fails
-        # with cudaErrorInvalidValue on every rank except 0.
-        if self._device_index is not None:
-            torch.cuda.set_device(self._device_index)
-        if self._save_staging is not None and torch.cuda.is_available():
-            # Owned by this thread so the gather never queues behind the
-            # executor's work, and created after set_device so it lands on the
-            # rank's device.
-            self._save_stream = torch.cuda.Stream()
+        try:
+            # A new thread starts on device 0, so adopt the device captured on
+            # the executor thread. Otherwise a stream created below belongs to
+            # device 0 while the KV pointers belong to the rank's device, and
+            # the copy fails with cudaErrorInvalidValue on every rank except 0.
+            if self._device_index is not None:
+                torch.cuda.set_device(self._device_index)
+            if self._save_staging is not None and torch.cuda.is_available():
+                # Owned by this thread so the gather never queues behind the
+                # executor's work, and created after set_device so it lands on
+                # the rank's device.
+                self._save_stream = torch.cuda.Stream()
+        except Exception as exc:
+            # Same thread boundary as the transfer loop below, and the same
+            # handoff. A thread that died here would leave every later save
+            # outstanding against nothing, so the requests holding those pages
+            # would never retire and the worker would look merely slow.
+            logger.error(
+                f"mooncake-store save thread failed to start on rank {self._rank}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            with self._save_lock:
+                if self._save_error is None:
+                    self._save_error = exc
+            return
+        finally:
+            self._save_started.set()
         while True:
             item = self._save_queue.get()
             if item is None:
