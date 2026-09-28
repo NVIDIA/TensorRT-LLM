@@ -956,13 +956,21 @@ class DFlashWorker(SpecWorkerBase):
                 f"scales it down linearly too."
             )
 
-    def _managed_ctx_pool(self, draft_kv_cache_manager, L, nkv, hd, dtype, kv_factor=2):
+    def _managed_ctx_pool(
+        self,
+        draft_kv_cache_manager: BaseResourceManager | None,
+        L: int,
+        nkv: int,
+        hd: int,
+        dtype: torch.dtype,
+        kv_factor: int = 2,
+    ) -> list[torch.Tensor] | None:
         """Per-layer views of the draft KV cache manager's pool, or None.
 
-        The manager already funds a pool sized from the drafter's own config
-        (K3 at TP8: 5 layers x 2 x 2 kv heads x 64 x 2B = 2560 B/token), and
-        ``get_buffers(..., "HND")`` hands back exactly the per-layer shape the
-        private arena uses, so nothing but the ownership of the memory changes.
+        The manager's buffer accessor supplies the same per-layer HND shape
+        as the private arena. Unified storage uses ``get_draft_buffers`` and
+        requires the pool to match the drafter and the manager's page size;
+        legacy storage uses ``get_buffers`` and may fall back to the arena.
 
         A list, not one stacked tensor: only the two consumers that index it by
         layer need it, and the two managers disagree on what a stack would mean.
@@ -972,7 +980,8 @@ class DFlashWorker(SpecWorkerBase):
 
         Note the page count is not the drafter's to interpret: a V2 view spans
         the whole interleaved pool, not this layer's slice, so only shape[1:] is
-        checked here and the index space is settled in _init_ctx_block_offsets.
+        checked here. Legacy offsets are settled in _init_ctx_block_offsets;
+        unified storage supplies draft block indices directly.
         """
         if draft_kv_cache_manager is None:
             # No separate draft KV cache. Attention DP alone does NOT disable
@@ -980,12 +989,23 @@ class DFlashWorker(SpecWorkerBase):
             # what DSpark is, so this drafter does get a manager under DP. The
             # reachable cases are the two-model paths, which never build one.
             return None
-        layers = [draft_kv_cache_manager.get_buffers(i, kv_layout="HND") for i in range(L)]
+        unified = getattr(draft_kv_cache_manager, "draft_layout", None) is not None
+        get_buffers = (
+            draft_kv_cache_manager.get_draft_buffers
+            if unified
+            else draft_kv_cache_manager.get_buffers
+        )
+        layers = [get_buffers(i, kv_layout="HND") for i in range(L)]
         base = layers[0]
+        page_size = draft_kv_cache_manager.tokens_per_block if unified else base.size(-2)
         # kv_factor 1 is the MLA drafter's SELFKONLY pool: one latent, no V.
-        expected = (kv_factor, nkv, base.size(-2), hd)
+        expected = (kv_factor, nkv, page_size, hd)
         for i, layer in enumerate(layers):
             if tuple(layer.shape[1:]) != expected or layer.dtype != dtype:
+                if unified:
+                    raise ValueError(
+                        "Unified DSpark draft pool does not match the drafter KV layout"
+                    )
                 # Fall back rather than fail: the private arena is what every
                 # DFlash model shipped with, so an unrecognized pool costs the
                 # old memory footprint, not the run.
@@ -1236,26 +1256,11 @@ class DFlashWorker(SpecWorkerBase):
         )
         self._ctx_paged = unified or use_paged
         if self._ctx_paged:
-            if unified:
-                pool = [
-                    draft_kv_cache_manager.get_draft_buffers(i, kv_layout="HND") for i in range(L)
-                ]
-                self._ctx_page_size = draft_kv_cache_manager.tokens_per_block
-                expected = (2, nkv, self._ctx_page_size, hd)
-                if any(
-                    tuple(layer.shape[1:]) != expected or layer.dtype != dtype for layer in pool
-                ):
-                    raise ValueError(
-                        "Unified DSpark draft pool does not match the drafter KV layout"
-                    )
-            else:
-                pool = (
-                    None
-                    if self._dflash_attention_backend == "FA4"
-                    else self._managed_ctx_pool(
-                        draft_kv_cache_manager, L, nkv, hd, dtype, kv_factor
-                    )
-                )
+            pool = (
+                None
+                if not unified and self._dflash_attention_backend == "FA4"
+                else self._managed_ctx_pool(draft_kv_cache_manager, L, nkv, hd, dtype, kv_factor)
+            )
             # The manager's page size wins when bound to it: its pool is already
             # carved, so the drafter adopts the geometry rather than imposing one.
             page_size = self._ctx_page_size if pool is None else pool[0].size(-2)

@@ -1866,7 +1866,7 @@ class KvCacheCreator:
                 or self._unified_draft_cache_unsupported_reason() is None)
 
     def _validate_standalone_draft_cache(self) -> None:
-        """Reject unsupported DSpark state ownership before profiling."""
+        """Reject unsupported DSpark configurations before profiling."""
         if not (self._is_standalone_dspark() or self._is_embedded_dspark()):
             return
         if not self._is_kv_cache_manager_v2:
@@ -1881,6 +1881,8 @@ class KvCacheCreator:
                                  "kv_cache_config.use_kv_cache_manager_v2=True "
                                  "on both workers.")
             return
+        if self._mapping.pp_size != 1:
+            raise ValueError("DSpark KVCacheManagerV2 requires PP=1.")
         if self._is_disagg:
             reason = self._unified_draft_cache_unsupported_reason()
             if reason is not None:
@@ -1891,8 +1893,6 @@ class KvCacheCreator:
         if (self._is_standalone_dspark()
                 and is_mla(self._draft_config.pretrained_config)):
             return "Unified DSpark KV cache does not yet support MLA drafters."
-        if self._mapping.pp_size != 1:
-            return "Unified DSpark KV cache requires PP=1."
         if self._mapping.cp_size != 1:
             if not self._mapping.has_cp_helix():
                 return ("Unified DSpark KV cache supports context parallelism "
@@ -1903,10 +1903,9 @@ class KvCacheCreator:
         transceiver_config = self._cache_transceiver_config
         if self._is_disagg and (transceiver_config is None
                                 or transceiver_config.transceiver_runtime
-                                != "PYTHON"
-                                or transceiver_config.backend != "NIXL"):
+                                != "PYTHON"):
             return ("DSpark draft-state transfer requires the PYTHON "
-                    "NIXL transceiver on both workers.")
+                    "transceiver on both workers.")
         return None
 
     def _get_draft_mapping(self) -> Mapping:

@@ -469,14 +469,13 @@ def _estimate_swa_cache_size(
     *,
     context: bool,
     scratch: bool,
-    num_scratch_layers: int | None = None,
     generation_capacity_headroom: int = BASE_GENERATION_TOKEN_COUNT,
 ) -> tuple[int, int]:
     tokens_per_block = int(tokens_per_block)
     size_per_token = 0
     size_per_request = 0
     scratch_keys = set()
-    for layer_idx, (layer_size, window_size) in enumerate(zip(layer_sizes, attention_windows)):
+    for layer_size, window_size in zip(layer_sizes, attention_windows):
         if window_size is not None and window_size > 0:
             # Match AttnLifeCycle.get_stale_range(): the live interval contains
             # window_size + generation_capacity_headroom - 1 tokens. Across all
@@ -487,9 +486,7 @@ def _estimate_swa_cache_size(
             window_tokens = window_blocks * tokens_per_block
             if not context:
                 size_per_request += window_tokens * layer_size
-            elif not scratch or (
-                num_scratch_layers is not None and layer_idx >= num_scratch_layers
-            ):
+            elif not scratch:
                 size_per_token += layer_size
             else:
                 scratch_key = (int(window_size), layer_size)
@@ -530,7 +527,6 @@ def _estimate_cache_size_components(
     scratch: bool,
     generation_capacity_headroom: int,
     standalone_draft_reserve: int = 0,
-    num_scratch_layers: int | None = None,
 ) -> tuple[int, int, int]:
     """Return context/generation bytes per token and generation bytes per request.
 
@@ -538,8 +534,8 @@ def _estimate_cache_size_components(
     retention pages and context scratch space. The standalone draft reserve
     is a shared allocation envelope, including windowed attention groups;
     it does not represent committed history. Resume-watermark normalization
-    is separate from these usable-capacity costs. Scratch reuse applies only
-    to the leading num_scratch_layers; appended draft layers use ordinary pages.
+    is separate from these usable-capacity costs. Callers estimate target and
+    draft layers separately so only target layers can share context scratch.
     """
     full_attn_size = _estimate_full_attn_size_per_token(layer_sizes, attention_windows)
     context_swa_size, _ = _estimate_swa_cache_size(
@@ -548,7 +544,6 @@ def _estimate_cache_size_components(
         tokens_per_block,
         context=True,
         scratch=scratch,
-        num_scratch_layers=num_scratch_layers,
     )
     generation_swa_size, generation_swa_per_request = _estimate_swa_cache_size(
         layer_sizes,
@@ -562,6 +557,35 @@ def _estimate_cache_size_components(
         full_attn_size + context_swa_size,
         full_attn_size + generation_swa_size,
         generation_swa_per_request + standalone_draft_reserve * sum(layer_sizes),
+    )
+
+
+def _estimate_draft_cache_size_components(
+    layout: StandaloneDraftLayout,
+    tokens_per_block: int,
+    *,
+    generation_capacity_headroom: int,
+    helix_cp_size: int = 1,
+) -> tuple[int, int, int]:
+    """Return draft context/generation bytes per token and fixed bytes per request.
+
+    Token units are rank-local target tokens when helix_cp_size exceeds one.
+    Global-token callers leave it at one. Helix adds draft subpage storage to
+    both slopes; per-request retention and extra-token reserves stay unscaled.
+    """
+    context, generation, per_request = _estimate_cache_size_components(
+        [layout.bytes_per_layer_token] * layout.num_layers,
+        [layout.retention_window_size] * layout.num_layers,
+        tokens_per_block,
+        scratch=False,
+        generation_capacity_headroom=generation_capacity_headroom,
+        standalone_draft_reserve=layout.extra_tokens,
+    )
+    extra_draft_bytes_per_token = (helix_cp_size - 1) * layout.bytes_per_token
+    return (
+        context + extra_draft_bytes_per_token,
+        generation + extra_draft_bytes_per_token,
+        per_request,
     )
 
 
@@ -2331,24 +2355,27 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _get_runtime_cache_size_components(self) -> tuple[int, int, int]:
         layer_sizes, attention_windows = self._get_runtime_cache_size_layer_components()
+        num_target_layers = len(layer_sizes) - (
+            self.draft_layout.num_layers if self.draft_layout is not None else 0
+        )
         context_size, generation_size, fixed_size = _estimate_cache_size_components(
-            layer_sizes,
-            attention_windows,
+            layer_sizes[:num_target_layers],
+            attention_windows[:num_target_layers],
             self.tokens_per_block,
             scratch=self.enable_swa_scratch_reuse,
             generation_capacity_headroom=self._generation_kv_capacity_headroom,
             standalone_draft_reserve=self._standalone_draft_reserve,
-            num_scratch_layers=len(layer_sizes)
-            - (self.draft_layout.num_layers if self.draft_layout is not None else 0),
         )
         if self.draft_layout is not None:
-            # Target-token quota units are rank-local under Helix; draft KV
-            # spans the full sequence. Fixed request reserves stay unscaled.
-            extra_draft_bytes_per_token = (
-                self._helix_cp_size - 1
-            ) * self.draft_layout.bytes_per_token
-            context_size += extra_draft_bytes_per_token
-            generation_size += extra_draft_bytes_per_token
+            draft_context, draft_generation, draft_fixed = _estimate_draft_cache_size_components(
+                self.draft_layout,
+                self.tokens_per_block,
+                generation_capacity_headroom=self._generation_kv_capacity_headroom,
+                helix_cp_size=self._helix_cp_size,
+            )
+            context_size += draft_context
+            generation_size += draft_generation
+            fixed_size += draft_fixed
         return context_size, generation_size, fixed_size
 
     def _get_max_tokens_from_quota(self, quota: int) -> float:
@@ -2415,13 +2442,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 math.ceil(max_tokens / self._ledger_tokens_per_block)
                 * self._ledger_tokens_per_block
             )
-        context_size, generation_size, fixed_size = _estimate_cache_size_components(
-            [layout.bytes_per_layer_token] * layout.num_layers,
-            [layout.retention_window_size] * layout.num_layers,
+        context_size, generation_size, fixed_size = _estimate_draft_cache_size_components(
+            layout,
             self.tokens_per_block,
-            scratch=False,
             generation_capacity_headroom=self._generation_kv_capacity_headroom,
-            standalone_draft_reserve=layout.extra_tokens,
         )
         context_tokens = (
             max_tokens if self.max_num_tokens is None else min(max_tokens, self.max_num_tokens)
@@ -5970,7 +5994,7 @@ class KVCacheManagerV2(BaseResourceManager):
         _, generation_capacity_headroom = _get_generation_kv_capacity(
             spec_config, is_draft=is_draft
         )
-        num_scratch_layers = len(layer_sizes)
+        num_target_layers = len(layer_sizes)
         draft_reserve = 0
         if draft_layout is not None:
             layer_sizes.extend([draft_layout.bytes_per_layer_token] * draft_layout.num_layers)
@@ -5982,8 +6006,8 @@ class KVCacheManagerV2(BaseResourceManager):
             cache_size_per_token,
             generation_size_per_request,
         ) = _estimate_cache_size_components(
-            layer_sizes,
-            attention_windows,
+            layer_sizes[:num_target_layers],
+            attention_windows[:num_target_layers],
             tokens_per_block,
             scratch=(
                 kv_cache_config is not None
@@ -5992,12 +6016,17 @@ class KVCacheManagerV2(BaseResourceManager):
             ),
             generation_capacity_headroom=generation_capacity_headroom,
             standalone_draft_reserve=draft_reserve,
-            num_scratch_layers=num_scratch_layers,
         )
-        if draft_layout is not None and mapping.has_cp_helix():
-            extra_draft_bytes_per_token = (mapping.cp_size - 1) * draft_layout.bytes_per_token
-            context_size_per_token += extra_draft_bytes_per_token
-            cache_size_per_token += extra_draft_bytes_per_token
+        if draft_layout is not None:
+            draft_context, draft_generation, draft_fixed = _estimate_draft_cache_size_components(
+                draft_layout,
+                tokens_per_block,
+                generation_capacity_headroom=generation_capacity_headroom,
+                helix_cp_size=mapping.cp_size if mapping.has_cp_helix() else 1,
+            )
+            context_size_per_token += draft_context
+            cache_size_per_token += draft_generation
+            generation_size_per_request += draft_fixed
         # The affine slope covers all tokens; context additionally retains SWA
         # pages for the current token batch beyond the generation windows.
         fixed_cost = (

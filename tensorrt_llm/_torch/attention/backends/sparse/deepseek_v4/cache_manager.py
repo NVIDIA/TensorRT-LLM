@@ -26,11 +26,10 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS,
     GPU_LEVEL,
     KVCacheManagerV2,
-    _estimate_cache_size_components,
+    _estimate_draft_cache_size_components,
     _fill_kv_pages,
     _get_generation_kv_capacity,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.standalone_draft_cache import StandaloneDraftLayout
 from tensorrt_llm._utils import (
     TensorWrapper,
     convert_to_torch_tensor,
@@ -69,24 +68,6 @@ from .params import (
 COMPRESS_BLOCK_SCALE_ROLE = DataRole("deepseek_v4_compress_block_scale")
 KV_CACHE_COPY_ALIGNMENT = 16
 NVFP4_VECTOR_SIZE = 16
-
-
-def _draft_cache_size_components(
-    layout: StandaloneDraftLayout,
-    tokens_per_block: int,
-    generation_capacity_headroom: int,
-    target_context_bytes: int,
-) -> tuple[int, int, int]:
-    """The draft contribution to static profiling and runtime byte quotas."""
-    context, generation, per_request = _estimate_cache_size_components(
-        [layout.bytes_per_layer_token] * layout.num_layers,
-        [layout.retention_window_size] * layout.num_layers,
-        tokens_per_block,
-        scratch=False,
-        generation_capacity_headroom=generation_capacity_headroom,
-        standalone_draft_reserve=layout.extra_tokens,
-    )
-    return context, generation, per_request + layout.extra_tokens * target_context_bytes
 
 
 def get_attn_dim(
@@ -982,12 +963,14 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         context_size_per_token = non_sliding_attn_size_per_token + context_swa_size_per_token
         generation_size_per_token = non_sliding_attn_size_per_token + generation_swa_size_per_token
         if self.draft_layout is not None:
-            draft_context, draft_generation, draft_per_request = _draft_cache_size_components(
-                self.draft_layout,
-                self.tokens_per_block,
-                self._generation_kv_capacity_headroom,
-                context_size_per_token,
+            draft_context, draft_generation, draft_per_request = (
+                _estimate_draft_cache_size_components(
+                    self.draft_layout,
+                    self.tokens_per_block,
+                    generation_capacity_headroom=self._generation_kv_capacity_headroom,
+                )
             )
+            draft_per_request += self.draft_layout.extra_tokens * context_size_per_token
             context_size_per_token += draft_context
             generation_size_per_token += draft_generation
             context_swa_size_per_request += draft_per_request
@@ -1693,11 +1676,13 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 indexer_k_dtype=indexer_k_dtype,
                 use_fp8_ds_mla=use_fp8_ds_mla,
             )
-            _, draft_generation, draft_per_request = _draft_cache_size_components(
+            _, draft_generation, draft_per_request = _estimate_draft_cache_size_components(
                 draft_layout,
                 kwargs["tokens_per_block"],
-                headroom + draft_layout.extra_tokens,
-                non_sliding_attn_size_per_token + target_context_swa_bytes,
+                generation_capacity_headroom=headroom + draft_layout.extra_tokens,
+            )
+            draft_per_request += draft_layout.extra_tokens * (
+                non_sliding_attn_size_per_token + target_context_swa_bytes
             )
             swa_size_per_token += draft_generation
             swa_size_per_request += draft_per_request

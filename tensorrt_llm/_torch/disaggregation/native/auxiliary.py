@@ -242,9 +242,6 @@ class AuxBuffer(AuxBufferBase):
 
         self._free_slots = deque(list(range(self._max_slot_num)))
         self._occupied_slots: set[int] = set()
-        self._slot_token_counts: dict[
-            int, tuple[int, int]
-        ] = {}  # slot -> (first_tokens_len, draft_tokens_len)
 
         data_type = torch.int32
         self._first_tokens_buffer = torch.empty(
@@ -308,7 +305,6 @@ class AuxBuffer(AuxBufferBase):
                 "This indicates a bug in slot management."
             )
         self._occupied_slots.add(slot_id)
-        self._slot_token_counts[slot_id] = (0, 0)
         if self._draft_history_buffer is not None:
             self._draft_history_buffer[slot_id].zero_()
         return AuxSlot(slot_id, self)
@@ -324,7 +320,6 @@ class AuxBuffer(AuxBufferBase):
                 f"Invalid slot id {slot}. Valid slot indices are in the range 0..{self._max_slot_num - 1}."
             )
         self._occupied_slots.remove(slot)
-        self._slot_token_counts.pop(slot, None)
         self._free_slots.append(slot)
 
     @property
@@ -362,7 +357,6 @@ class AuxBuffer(AuxBufferBase):
         self._draft_tokens_buffer[slot][: len(draft_tokens)].copy_(
             torch.tensor(draft_tokens, dtype=torch.int32, device=self._device)
         )
-        self._slot_token_counts[slot] = (len(first_gen_tokens), len(draft_tokens))
         self._token_counts_buffer[slot].copy_(
             torch.tensor(
                 [len(first_gen_tokens), len(draft_tokens)], dtype=torch.int32, device=self._device
