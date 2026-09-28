@@ -3190,11 +3190,6 @@ class KVCacheManagerV2(BaseResourceManager):
             self.layer_offsets[layer_id] == local_layer_idx for layer_id in self.draft_layer_ids
         )
 
-    def get_layer_cache_dtype(self, layer_idx: int) -> DataType:
-        if layer_idx in self.draft_layer_ids:
-            return DataType.BF16 if self.draft_layout.dtype == torch.bfloat16 else DataType.HALF
-        return self.dtype
-
     def get_layer_kv_factor(self, layer_idx: int) -> int:
         return self.draft_layout.kv_factor if layer_idx in self.draft_layer_ids else self.kv_factor
 
@@ -3206,7 +3201,7 @@ class KVCacheManagerV2(BaseResourceManager):
         layer_idx = self.draft_layer_ids[local_layer_idx]
         return self._get_kv_buffer_view(
             self.layer_offsets[layer_idx],
-            dtype=self.get_layer_cache_dtype(layer_idx),
+            dtype=layout.dtype,
             kv_factor=layout.kv_factor,
             num_kv_heads=layout.num_kv_heads,
             head_dim=layout.head_dim,
