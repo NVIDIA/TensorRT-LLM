@@ -326,6 +326,96 @@ def test_mgmn_shutdown_grace_env_override(monkeypatch, raw, use_default):
     assert _mgmn_shutdown_grace_seconds() == expected
 
 
+def _shutdown_worker_world(monkeypatch, shutdown, pending_futures, grace):
+    """Drive ``_shutdown_worker_world`` on an inert stand-in (no MPI launch).
+
+    ``shutdown`` stands in for ``session.shutdown``. The MPI_Abort call, the
+    shared executor teardown and the module logger are replaced by recorders,
+    so the test sees exactly which branch ran. Returns the recorded abort
+    calls, the warning/critical log lines and the wall time spent.
+    """
+    import types
+
+    from tensorrt_llm.llmapi import mpi_session as m
+
+    monkeypatch.setenv("TLLM_MGMN_SHUTDOWN_GRACE_SECONDS", str(grace))
+    aborts = []
+    logged = {"warning": [], "critical": []}
+    monkeypatch.setattr(
+        m, "logger",
+        types.SimpleNamespace(warning=logged["warning"].append,
+                              critical=logged["critical"].append,
+                              error=lambda *args, **kwargs: None,
+                              info=lambda *args, **kwargs: None,
+                              debug=lambda *args, **kwargs: None))
+    monkeypatch.setattr(m.MPINodeState, "close_global_comm_executor",
+                        classmethod(lambda cls: None))
+    stand_in = types.SimpleNamespace(session=types.SimpleNamespace(
+        shutdown=shutdown, abort=lambda: aborts.append("abort")))
+    t0 = time.monotonic()
+    m.RemoteMpiCommSessionServer._shutdown_worker_world(stand_in,
+                                                        pending_futures)
+    return aborts, logged, time.monotonic() - t0
+
+
+@pytest.mark.parametrize("still_running", [False, True])
+def test_shutdown_worker_world_returns_without_abort_when_teardown_finishes(
+        monkeypatch, still_running):
+    # ``session.shutdown`` returns at once, so the teardown thread finishes
+    # inside the grace period: no MPI_Abort, whether or not a worker future
+    # was still outstanding when shutdown was requested.
+    from concurrent.futures import Future
+
+    done = Future()
+    done.set_result(None)
+    pending = [done, Future()] if still_running else [done]
+    shutdowns = []
+    aborts, logged, elapsed = _shutdown_worker_world(
+        monkeypatch,
+        shutdown=lambda: shutdowns.append("shutdown"),
+        pending_futures=pending,
+        grace=0.2)
+
+    assert shutdowns == ["shutdown"]
+    assert aborts == []
+    assert logged["critical"] == []
+    assert elapsed < 2.0
+    if still_running:
+        assert len(logged["warning"]) == 1
+        assert ("shutdown requested while 1/2 MPI worker task(s) are still "
+                "running; waiting up to 0.2s before calling MPI_Abort"
+                ) in logged["warning"][0]
+    else:
+        assert logged["warning"] == []
+
+
+def test_shutdown_worker_world_aborts_when_teardown_exceeds_grace(monkeypatch):
+    # ``session.shutdown`` blocks like a wedged worker world would; the
+    # bounded wait must give up after the grace period and call MPI_Abort
+    # exactly once.
+    from concurrent.futures import Future
+
+    release = threading.Event()
+    try:
+        aborts, logged, elapsed = _shutdown_worker_world(
+            monkeypatch,
+            shutdown=release.wait,
+            pending_futures=[Future(), Future()],
+            grace=0.2)
+    finally:
+        release.set()  # let the daemon teardown thread finish
+
+    assert aborts == ["abort"]
+    assert 0.2 <= elapsed < 5.0
+    assert len(logged["warning"]) == 1
+    assert ("shutdown requested while 2/2 MPI worker task(s) are still "
+            "running; waiting up to 0.2s before calling MPI_Abort"
+            ) in logged["warning"][0]
+    assert len(logged["critical"]) == 1
+    assert ("worker world did not shut down within 0.2s; calling MPI_Abort "
+            "so no rank outlives the leader") in logged["critical"][0]
+
+
 def task1():
     non_mpi_env, mpi_env = split_mpi_env()
     assert non_mpi_env
@@ -530,6 +620,54 @@ def test_llmapi_launch_aborts_when_no_workspace_is_available(
     assert (
         "Failed to create a temporary FlashInfer JIT workspace; aborting launch"
         in result.stderr)
+
+
+@pytest.mark.cpu_only
+def test_llmapi_launch_fails_when_mpi_comm_server_must_be_killed(
+        tmp_path: Path) -> None:
+    """The task and the stop request both return 0, but the server never exits.
+
+    The stubbed MPI Comm server blocks until it is signalled, so the
+    launcher's bounded wait has to kill it. That forced kill must surface as
+    a non-zero launcher exit code even though every command the subshell ran
+    returned 0.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    env = _launcher_env(tmp_path, str(home))
+    # Re-stub python3: ``-m tensorrt_llm.llmapi.mgmn_leader_node`` with no
+    # ``--action`` is the server and blocks until signalled; the stop request
+    # and the workspace lock keep exiting 0, ``-c`` keeps printing the address.
+    python_stub = tmp_path / "bin" / "python3"
+    python_stub.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-c\" ]; then\n"
+        "    echo ipc:///tmp/trtllm-pmi-workspace-test\n"
+        "elif [ $# -eq 2 ] && "
+        "[ \"$2\" = \"tensorrt_llm.llmapi.mgmn_leader_node\" ]; then\n"
+        "    trap 'kill $sleeper 2>/dev/null; exit 143' TERM\n"
+        "    sleep 60 &\n"
+        "    sleeper=$!\n"
+        "    wait $sleeper\n"
+        "fi\n")
+    env["TLLM_LLMAPI_LAUNCH_STOP_TIMEOUT"] = "1"
+
+    # A one-second task keeps the stop request behind the server start-up.
+    result = subprocess.run(  # nosec B603
+        ["bash", str(_LAUNCHER), "sleep", "1"],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+        timeout=60,
+    )
+
+    assert "Task exit code: 0" in result.stderr
+    assert "MPI Comm server exit code: 0" in result.stderr
+    assert ("still running 1s after the stop request (task exit code 0); "
+            "killing it so this rank exits") in result.stderr
+    assert "Subshell exit code: 1" in result.stderr
+    assert result.returncode == 1, result.stderr
 
 
 # ---- wait_shutdown: shutdown blocks until worker processes actually exit ----
