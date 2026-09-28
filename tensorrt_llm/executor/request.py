@@ -116,18 +116,19 @@ class GenerationRequest:
     ):
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
-        elif isinstance(
-                prompt_token_ids,
-            (torch.Tensor, np.ndarray)) and prompt_token_ids.ndim == 1:
-            # Keep a flat token-id array as the int32 wire buffer; the list form is
-            # materialized lazily by the `prompt_token_ids` property only if read.
-            if isinstance(prompt_token_ids, torch.Tensor):
-                prompt_token_ids = prompt_token_ids.cpu().numpy()
-            self._prompt_token_ids = None
-            self._prompt_token_ids_i32 = np.ascontiguousarray(prompt_token_ids,
-                                                              dtype=np.int32)
         elif isinstance(prompt_token_ids, (torch.Tensor, np.ndarray)):
-            self.prompt_token_ids = prompt_token_ids.tolist()
+            if prompt_token_ids.ndim == 1:
+                # A flat array goes straight into the int32 wire buffer that
+                # __setstate__ also produces, so neither this process nor the
+                # pickle path builds one Python int per token; the list is
+                # materialized lazily by the `prompt_token_ids` property.
+                if isinstance(prompt_token_ids, torch.Tensor):
+                    prompt_token_ids = prompt_token_ids.cpu().numpy()
+                self._prompt_token_ids = None
+                self._prompt_token_ids_i32 = np.ascontiguousarray(
+                    prompt_token_ids, dtype=np.int32)
+            else:
+                self.prompt_token_ids = prompt_token_ids.tolist()
         else:
             raise TypeError(
                 f"prompt_token_ids ({prompt_token_ids}) should be an instance of torch.Tensor, np.ndarray or list"
