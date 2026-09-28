@@ -2921,9 +2921,7 @@ class PyExecutor:
                                 # Copy the batch outputs as sampler inputs
                                 # to avoid next forward step overwriting them.
                                 batch_outputs_copy = {
-                                    name:
-                                    tensor.clone() if isinstance(
-                                        tensor, torch.Tensor) else tensor
+                                    name: tensor.clone()
                                     for name, tensor in batch_outputs.items()
                                 }
                                 self.sample_stream.wait_stream(

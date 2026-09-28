@@ -670,7 +670,6 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_len = None
         self._ctx_position_offset = None
         self._managed_cache_bindings = {}
-        self._managed_restore_rows = set()
         self._managed_request_ids = ()
         # Host shadows of _ctx_len and of each request's prompt progress.
         self._ctx_len_host = None
@@ -804,11 +803,11 @@ class DFlashWorker(SpecWorkerBase):
     def _has_unified_draft_cache(self) -> bool:
         return getattr(self._ctx_kv_manager, "draft_layout", None) is not None
 
-    def _prepare_managed_history(self, request_ids: list[int]) -> None:
+    def _prepare_managed_history(self, request_ids: list[int]) -> list[int]:
         """Restore newly resident histories without rewinding overlapping iterations."""
         updates = {self._dummy_slot: 0}
         offsets = {self._dummy_slot: 0}
-        self._managed_restore_rows = set()
+        restore_rows = []
         real_request_ids = {
             request_id
             for request_id in request_ids
@@ -837,7 +836,7 @@ class DFlashWorker(SpecWorkerBase):
                 self._req_ctx_pos[request_id] = history.position if history is not None else 0
                 offsets[slot] = self._req_ctx_pos[request_id] - updates[slot]
                 self._managed_cache_bindings[request_id] = cache
-                self._managed_restore_rows.add(row)
+                restore_rows.append(row)
         self._write_ctx_len(updates)
         for slot, offset in offsets.items():
             self._ctx_position_offset[slot] = offset
@@ -851,16 +850,14 @@ class DFlashWorker(SpecWorkerBase):
         self._managed_request_ids = tuple(
             request_id for request_id in request_ids if request_id in real_request_ids
         )
+        return restore_rows
 
-    def _gather_managed_context(
-        self, request_ids: list[int], *, restored_only: bool = False
-    ) -> None:
+    def _gather_managed_context(self, request_ids: list[int], restore_rows: list[int]) -> None:
         """Refresh VANILLA's dense staging; manager pages remain authoritative."""
         if self._dflash_attention_backend != "VANILLA":
             return
-        for row, request_id in enumerate(request_ids):
-            if restored_only and row not in self._managed_restore_rows:
-                continue
+        for row in restore_rows:
+            request_id = request_ids[row]
             slot = self._req_to_slot.get(request_id)
             if slot is None:
                 continue
@@ -881,11 +878,11 @@ class DFlashWorker(SpecWorkerBase):
             return
         self._lazy_init_ctx_buffers(draft_model, spec_metadata, attn_metadata, manager)
         spec_metadata._dflash_worker = self
-        self._prepare_managed_history(spec_metadata.request_ids)
+        restore_rows = self._prepare_managed_history(spec_metadata.request_ids)
         self._refresh_ctx_block_tables(
             attn_metadata, attn_metadata.num_seqs, spec_metadata.request_ids
         )
-        self._gather_managed_context(spec_metadata.request_ids, restored_only=True)
+        self._gather_managed_context(spec_metadata.request_ids, restore_rows)
 
     def snapshot_managed_draft_history(self) -> DraftHistoryUpdate | None:
         """Queue iteration-owned readback; the executor publishes after completion."""
@@ -975,7 +972,7 @@ class DFlashWorker(SpecWorkerBase):
 
         Note the page count is not the drafter's to interpret: a V2 view spans
         the whole interleaved pool, not this layer's slice, so only shape[1:] is
-        checked here and the index space is settled in _init_ctx_block_tables.
+        checked here and the index space is settled in _init_ctx_block_offsets.
         """
         if draft_kv_cache_manager is None:
             # No separate draft KV cache. Attention DP alone does NOT disable
@@ -1003,10 +1000,8 @@ class DFlashWorker(SpecWorkerBase):
         )
         return layers
 
-    def _init_ctx_block_tables(
-        self, draft_kv_cache_manager, pool, num_slots, L, nkv, hd, page_size
-    ) -> bool:
-        """Size the per-iteration block table and the offset decode constant.
+    def _init_ctx_block_offsets(self, draft_kv_cache_manager, pool, L, nkv, hd, page_size) -> bool:
+        """Validate the legacy pool layout and resolve its offset decode constant.
 
         ``kv_cache_block_offsets`` entries are ``pool_block_index *
         num_pool_layers * kv_factor`` plus the K/V field index. What that has to
@@ -1042,7 +1037,13 @@ class DFlashWorker(SpecWorkerBase):
                 f"rather than guessing block indices."
             )
             return False
-        max_blocks = mgr.max_blocks_per_seq
+        logger.info(
+            f"DFlash: ctx block offsets pool_idx={self._ctx_pool_idx}, "
+            f"divisor={self._ctx_block_divisor}, view_pages={pool[0].size(0)}"
+        )
+        return True
+
+    def _init_ctx_block_tables(self, num_slots: int, max_blocks: int) -> None:
         self._ctx_block_tables = torch.zeros(
             (num_slots, max_blocks), dtype=torch.int32, device="cuda"
         )
@@ -1050,12 +1051,7 @@ class DFlashWorker(SpecWorkerBase):
             0, (num_slots + 1) * max_blocks, max_blocks, dtype=torch.int32, device="cuda"
         )
         self._ctx_block_counts = torch.zeros(num_slots, dtype=torch.long, device="cuda")
-        logger.info(
-            f"DFlash: ctx block tables {tuple(self._ctx_block_tables.shape)}, "
-            f"pool_idx={self._ctx_pool_idx}, divisor={self._ctx_block_divisor}, "
-            f"view_pages={pool[0].size(0)}"
-        )
-        return True
+        logger.info(f"DFlash: ctx block tables {tuple(self._ctx_block_tables.shape)}")
 
     def _refresh_ctx_block_tables(
         self, attn_metadata, num_seqs: int, request_ids: list[int] | None = None
@@ -1196,7 +1192,6 @@ class DFlashWorker(SpecWorkerBase):
         self._req_to_slot = {}
         self._req_ctx_pos = {}
         self._managed_cache_bindings = {}
-        self._managed_restore_rows = set()
         self._managed_request_ids = ()
 
         # checkpoint's trained block width
@@ -1240,46 +1235,27 @@ class DFlashWorker(SpecWorkerBase):
             draft_model, "_paged_ctx_cache", False
         )
         self._ctx_paged = unified or use_paged
-        if unified:
-            self._ctx_kv_buf = [
-                draft_kv_cache_manager.get_draft_buffers(i, kv_layout="HND") for i in range(L)
-            ]
-            self._ctx_page_size = draft_kv_cache_manager.tokens_per_block
-            expected = (2, nkv, self._ctx_page_size, hd)
-            if any(
-                tuple(pool.shape[1:]) != expected or pool.dtype != dtype
-                for pool in self._ctx_kv_buf
-            ):
-                raise ValueError("Unified DSpark draft pool does not match the drafter KV layout")
-            max_blocks = draft_kv_cache_manager.max_blocks_per_seq
-            self._ctx_block_tables = torch.zeros(
-                (num_slots, max_blocks), dtype=torch.int32, device="cuda"
-            )
-            self._ctx_block_indptr = torch.arange(
-                0, (num_slots + 1) * max_blocks, max_blocks, dtype=torch.int32, device="cuda"
-            )
-            self._ctx_block_counts = torch.zeros(num_slots, dtype=torch.long, device="cuda")
-            self._ctx_kv_last_page_len = torch.full(
-                (num_slots,), self._ctx_page_size, dtype=torch.int32, device="cuda"
-            )
-            if self._dflash_attention_backend == "TRTLLM":
-                draft_model.validate_block_attention_windows()
-                validate_dflash_trtllm_gen_runtime(
-                    dtype=dtype,
-                    num_heads=nh,
-                    num_kv_heads=nkv,
-                    head_dim=hd,
-                    tokens_per_block=self._ctx_page_size,
-                    has_context_attention=any(
-                        not draft_model._get_attention_mask_args(i)[0] for i in range(L)
-                    ),
+        if self._ctx_paged:
+            if unified:
+                pool = [
+                    draft_kv_cache_manager.get_draft_buffers(i, kv_layout="HND") for i in range(L)
+                ]
+                self._ctx_page_size = draft_kv_cache_manager.tokens_per_block
+                expected = (2, nkv, self._ctx_page_size, hd)
+                if any(
+                    tuple(layer.shape[1:]) != expected or layer.dtype != dtype for layer in pool
+                ):
+                    raise ValueError(
+                        "Unified DSpark draft pool does not match the drafter KV layout"
+                    )
+            else:
+                pool = (
+                    None
+                    if self._dflash_attention_backend == "FA4"
+                    else self._managed_ctx_pool(
+                        draft_kv_cache_manager, L, nkv, hd, dtype, kv_factor
+                    )
                 )
-        elif use_paged:
-            pool = (
-                None
-                if self._dflash_attention_backend == "FA4"
-                else self._managed_ctx_pool(draft_kv_cache_manager, L, nkv, hd, dtype, kv_factor)
-            )
             # The manager's page size wins when bound to it: its pool is already
             # carved, so the drafter adopts the geometry rather than imposing one.
             page_size = self._ctx_page_size if pool is None else pool[0].size(-2)
@@ -1302,13 +1278,17 @@ class DFlashWorker(SpecWorkerBase):
                     tokens_per_block=page_size,
                     has_context_attention=has_context_attention,
                 )
-            elif self._dflash_attention_backend == "FA4":
+            elif not unified and self._dflash_attention_backend == "FA4":
                 validate_dflash_fa4_runtime(dtype=dtype, head_dim=hd)
             # Settle the block table before committing to the pool: it is the
             # last thing that can rule the pool out, and falling back after
             # taking the pool branch would leave no buffer allocated at all.
-            if pool is not None and not self._init_ctx_block_tables(
-                draft_kv_cache_manager, pool, num_slots, L, nkv, hd, page_size
+            if (
+                not unified
+                and pool is not None
+                and not self._init_ctx_block_offsets(
+                    draft_kv_cache_manager, pool, L, nkv, hd, page_size
+                )
             ):
                 pool = None
             if pool is None:
@@ -1339,12 +1319,14 @@ class DFlashWorker(SpecWorkerBase):
                 # block table one iteration at a time, so the footprint follows
                 # the sequences served rather than max_batch x max_seq_len.
                 self._ctx_kv_buf = pool
+                self._init_ctx_block_tables(num_slots, draft_kv_cache_manager.max_blocks_per_seq)
                 # Only a manager that publishes and matches its own blocks can
                 # hand back a reused prefix's drafter K/V; the private arena and
                 # an unpaired draft pool both start every request at 0.
-                self._ctx_reuse_addressable = bool(
-                    getattr(draft_kv_cache_manager, "enable_joint_kv_cache_reuse", False)
-                )
+                if not unified:
+                    self._ctx_reuse_addressable = bool(
+                        getattr(draft_kv_cache_manager, "enable_joint_kv_cache_reuse", False)
+                    )
             self._ctx_kv_last_page_len = torch.full(
                 (num_slots,), page_size, dtype=torch.int32, device="cuda"
             )

@@ -3130,47 +3130,58 @@ class KVCacheManagerV2(BaseResourceManager):
         layer_offset = self.layer_offsets[layer_idx]
         if self._is_standalone_draft_layer(layer_offset):
             return self.get_draft_buffers(self.draft_layer_ids.index(layer_idx), kv_layout)
-        addr_key = self.impl.get_mem_pool_base_address(layer_offset, Role.KEY, PageIndexMode.SHARED)
-        if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
+        return self._get_kv_buffer_view(
+            layer_offset,
+            dtype=self.dtype,
+            kv_factor=self.kv_factor,
+            num_kv_heads=self.num_kv_heads_per_layer[layer_offset],
+            head_dim=self.head_dim_per_layer[layer_offset],
+            kv_layout=kv_layout,
+        )
+
+    def _get_kv_buffer_view(
+        self,
+        layer_id: int,
+        *,
+        dtype: DataType | torch.dtype,
+        kv_factor: int,
+        num_kv_heads: int,
+        head_dim: int,
+        kv_layout: str,
+    ) -> torch.Tensor:
+        """View shared pool pages for a manager-local layer and its KV geometry."""
+        if kv_layout not in ("NHD", "HND"):
+            raise ValueError(f"Unsupported KV layout: {kv_layout}")
+        addr_key = self.impl.get_mem_pool_base_address(layer_id, Role.KEY, PageIndexMode.SHARED)
+        if kv_factor == 2:
             addr_value = self.impl.get_mem_pool_base_address(
-                layer_offset, Role.VALUE, PageIndexMode.SHARED
+                layer_id, Role.VALUE, PageIndexMode.SHARED
             )
-            page_size_key = self.impl.get_page_stride(layer_offset, Role.KEY)
-            page_size_value = self.impl.get_page_stride(layer_offset, Role.VALUE)
-
-            assert addr_key + page_size_value == addr_value and page_size_key == page_size_value
-
-        assert kv_layout in ["NHD", "HND"], f"Unsupported kv_layout: {kv_layout}"
+            page_size_key = self.impl.get_page_stride(layer_id, Role.KEY)
+            page_size_value = self.impl.get_page_stride(layer_id, Role.VALUE)
+            if addr_key + page_size_key != addr_value or page_size_key != page_size_value:
+                raise ValueError("K/V buffers must have adjacent equal-sized pages")
 
         element_per_container = 1
-        dtype = self.dtype
         if dtype == DataType.NVFP4:
             element_per_container = 2
             dtype = torch.int8
 
-        layer_head_dim = self.head_dim_per_layer[layer_offset]
-        if kv_layout == "NHD":
-            shape = [
-                self.impl.get_page_index_upper_bound(layer_offset, Role.KEY) // self.kv_factor,
-                self.kv_factor,
-                self.tokens_per_block,
-                self.num_kv_heads_per_layer[layer_offset],
-                layer_head_dim // element_per_container,
-            ]
-        else:
-            shape = [
-                self.impl.get_page_index_upper_bound(layer_offset, Role.KEY) // self.kv_factor,
-                self.kv_factor,
-                self.num_kv_heads_per_layer[layer_offset],
-                self.tokens_per_block,
-                layer_head_dim // element_per_container,
-            ]
-
+        dimensions = (
+            [self.tokens_per_block, num_kv_heads]
+            if kv_layout == "NHD"
+            else [num_kv_heads, self.tokens_per_block]
+        )
         return convert_to_torch_tensor(
             TensorWrapper(
                 addr_key,
                 dtype,
-                shape,
+                [
+                    self.impl.get_page_index_upper_bound(layer_id, Role.KEY) // kv_factor,
+                    kv_factor,
+                    *dimensions,
+                    head_dim // element_per_container,
+                ],
             )
         )
 
@@ -3192,34 +3203,14 @@ class KVCacheManagerV2(BaseResourceManager):
         layout = self.draft_layout
         if layout is None or not 0 <= local_layer_idx < layout.num_layers:
             raise ValueError("No standalone draft cache layer at this index")
-        if kv_layout not in ("HND", "NHD"):
-            raise ValueError(f"Unsupported standalone draft KV layout: {kv_layout}")
-        layer_id = self.layer_offsets[self.draft_layer_ids[local_layer_idx]]
-        key_address = self.impl.get_mem_pool_base_address(layer_id, Role.KEY, PageIndexMode.SHARED)
-        if layout.kv_factor == 2:
-            value_address = self.impl.get_mem_pool_base_address(
-                layer_id, Role.VALUE, PageIndexMode.SHARED
-            )
-            stride = self.impl.get_page_stride(layer_id, Role.KEY)
-            if value_address != key_address + stride:
-                raise ValueError(
-                    "Standalone draft K/V buffers must have adjacent equal-sized pages"
-                )
-        dimensions = (
-            [layout.num_kv_heads, self.tokens_per_block, layout.head_dim]
-            if kv_layout == "HND"
-            else [self.tokens_per_block, layout.num_kv_heads, layout.head_dim]
-        )
-        return convert_to_torch_tensor(
-            TensorWrapper(
-                key_address,
-                self.get_layer_cache_dtype(self.draft_layer_ids[local_layer_idx]),
-                [
-                    self.impl.get_page_index_upper_bound(layer_id, Role.KEY) // layout.kv_factor,
-                    layout.kv_factor,
-                    *dimensions,
-                ],
-            )
+        layer_idx = self.draft_layer_ids[local_layer_idx]
+        return self._get_kv_buffer_view(
+            self.layer_offsets[layer_idx],
+            dtype=self.get_layer_cache_dtype(layer_idx),
+            kv_factor=layout.kv_factor,
+            num_kv_heads=layout.num_kv_heads,
+            head_dim=layout.head_dim,
+            kv_layout=kv_layout,
         )
 
     def get_draft_block_table(
