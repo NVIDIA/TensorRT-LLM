@@ -50,7 +50,6 @@ def _store_managed_window_kernel(
     positions,
     write_starts,
     block_tables,
-    real_rows,
     capacities,
     window_slot_stride: tl.constexpr,
     window_stage_stride: tl.constexpr,
@@ -74,9 +73,8 @@ def _store_managed_window_kernel(
     length = tl.load(lengths + slot)
     position = tl.load(positions + slot) - length + token
     write_start = tl.load(write_starts + row)
-    real = tl.load(real_rows + row)
     capacity = tl.load(capacities + row)
-    valid = real & (token < length) & (token < window_size)
+    valid = (token < length) & (token < window_size)
     valid = valid & (position >= write_start) & (position >= 0) & (position < capacity)
     page = tl.load(
         block_tables + row * table_stride + position // page_size,
@@ -335,7 +333,6 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._draft_kv_manager = None
         self._draft_kv_buffers = ()
         self._draft_block_tables = None
-        self._draft_real_rows = None
         self._draft_capacities = None
         self._managed_residency = {}
         self._prepared_managed_request_ids = ()
@@ -569,9 +566,6 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 dtype=torch.int32,
                 device=self._kv_windows.device,
             )
-            self._draft_real_rows = torch.zeros(
-                self._batch_to_slot.shape[0], dtype=torch.bool, device=self._kv_windows.device
-            )
             self._draft_capacities = torch.zeros(
                 self._batch_to_slot.shape[0], dtype=torch.long, device=self._kv_windows.device
             )
@@ -606,8 +600,6 @@ class DSv4DSparkWorker(SpecWorkerBase):
         positions = torch.arange(position - length, position, device=self._kv_windows.device)
         page_size = self._draft_kv_manager.tokens_per_block
         pages = self._draft_block_tables[row, positions // page_size].long()
-        if torch.any(pages < 0).item():
-            raise ValueError("Embedded DSpark committed window contains an unallocated page")
         return pages, positions % page_size, (positions + 1) % self._win
 
     def _prepare_managed_history(self, request_ids: list[int], num_contexts: int) -> None:
@@ -640,9 +632,6 @@ class DSv4DSparkWorker(SpecWorkerBase):
         tables_host = torch.zeros_like(self._draft_block_tables, device="cpu")
         tables_host[real_rows] = table
         self._draft_block_tables.copy_(tables_host, non_blocking=True)
-        real_host = torch.zeros_like(self._draft_real_rows, device="cpu")
-        real_host[real_rows] = True
-        self._draft_real_rows.copy_(real_host, non_blocking=True)
         capacities_host = torch.zeros_like(self._draft_capacities, device="cpu")
         capacities_host[real_rows] = torch.tensor(
             [self._draft_kv_manager.kv_cache_map[rid].capacity for rid in real_ids],
@@ -699,7 +688,6 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 self._ctx_len,
                 write_starts,
                 self._draft_block_tables[rows],
-                self._draft_real_rows[rows],
                 self._draft_capacities[rows],
                 *self._kv_windows.stride(),
                 pool.stride(0),
