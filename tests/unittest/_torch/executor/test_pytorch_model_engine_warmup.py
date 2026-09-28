@@ -285,7 +285,7 @@ def test_prefill_compile_scopes_whole_model_forward(
     bypass: bool,
     raises: bool,
 ) -> None:
-    """Keep compile state active through model epilogues and restore it on exit."""
+    """Scope compile dispatch by phase independently of the model wrapper."""
     observed = []
 
     def forward(**kwargs: object) -> str:
@@ -324,7 +324,7 @@ def test_prefill_compile_scopes_whole_model_forward(
         else:
             assert PyTorchModelEngine.model_forward(engine, attn_metadata=Mock()) == "done"
         assert is_torch_compiling()
-    expected = eligible and not bypass if prefill_only else True
+    expected = eligible if prefill_only else True
     assert observed == [expected] * (1 if raises else 2)
 
 
