@@ -153,12 +153,12 @@ def _make_mock_model_engine(model_config):
 
 
 def _make_creator(
-    kv_cache_config,
-    model_config=None,
-    is_enc_dec=False,
-    manager_cls=None,
-    mapping=None,
-):
+    kv_cache_config: KvCacheConfig,
+    model_config: ModelConfig | None = None,
+    is_enc_dec: bool = False,
+    manager_cls: type[KVCacheManager] | type[KVCacheManagerV2] | None = None,
+    mapping: Mapping | None = None,
+) -> KvCacheCreator:
     """Create a KvCacheCreator from real config objects and a mock engine.
 
     ``manager_cls`` selects the KV cache manager class the creator binds to.
@@ -170,7 +170,7 @@ def _make_creator(
         model_config = _make_model_config(is_encoder_decoder=is_enc_dec)
     model_engine = _make_mock_model_engine(model_config)
     model_engine.attn_runtime_features = SimpleNamespace(
-        cache_reuse=kv_cache_config.enable_block_reuse
+        cache_reuse=kv_cache_config.enable_block_reuse, chunked_prefill=False
     )
 
     if manager_cls is None:
