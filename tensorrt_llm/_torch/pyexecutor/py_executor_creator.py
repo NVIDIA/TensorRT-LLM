@@ -676,9 +676,9 @@ def _create_py_executor(
         }.get(current_stage, current_stage.value)
         stage = current_stage.value
         metric_name = mem_monitor.creation_stage_metric_names[current_stage]
-        with _startup_timer.phase(timing_name), timing_metric(
-                metric_name,
-                creation_metrics), mem_monitor.observe_creation_stage(
+        with _startup_timer.phase(
+                timing_name, metrics=creation_metrics,
+                metric_name=metric_name), mem_monitor.observe_creation_stage(
                     current_stage):
             if not enable_sleep or stage.startswith("_no_capture"):
                 yield
@@ -1202,8 +1202,9 @@ def _create_py_executor(
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
 
-    with _startup_timer.phase("executor_start_worker"), timing_metric(
-            "worker_start_seconds", creation_metrics):
+    with _startup_timer.phase("executor_start_worker",
+                              metrics=creation_metrics,
+                              metric_name="worker_start_seconds"):
         py_executor.start_worker()
 
     py_executor.metrics.update(initial_model_engine_metrics)

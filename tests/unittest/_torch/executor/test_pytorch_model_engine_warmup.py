@@ -29,7 +29,7 @@ import tensorrt_llm._torch.pyexecutor.model_engine as model_engine_module
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8GemmRunner
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
-from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM, timing_metric
+from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
@@ -743,17 +743,21 @@ class TestWarmupCleanup(unittest.TestCase):
         resource_manager = Mock()
         resource_manager.get_resource_manager.return_value = None
         events = []
+        phase = model_engine._warmup_timer.phase
 
         @contextlib.contextmanager
-        def record_metric_scope(name: str, metrics: dict[str, float]) -> Iterator[None]:
-            events.append(("enter", name))
-            with timing_metric(name, metrics):
+        def record_metric_scope(
+            name: str, *, metrics: dict[str, float], metric_name: str
+        ) -> Iterator[None]:
+            events.append(("enter", metric_name))
+            with phase(name, metrics=metrics, metric_name=metric_name):
                 yield
-            events.append(("exit", name))
+            events.append(("exit", metric_name))
 
         with (
-            patch(
-                "tensorrt_llm._torch.pyexecutor.model_engine.timing_metric",
+            patch.object(
+                model_engine._warmup_timer,
+                "phase",
                 side_effect=record_metric_scope,
             ),
             patch(

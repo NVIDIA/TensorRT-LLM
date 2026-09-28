@@ -1466,8 +1466,9 @@ class PyTorchModelEngine(ModelEngine):
         # cuda_graph_config=None flashinfer's sampling kernels would be
         # JIT-built mid-serving.
         self._eager_workspace_reclaimer = None
-        with self._warmup_timer.phase("sampling_module_prewarm"), timing_metric(
-                "sampling_warmup_seconds", self._metrics):
+        with self._warmup_timer.phase("sampling_module_prewarm",
+                                      metrics=self._metrics,
+                                      metric_name="sampling_warmup_seconds"):
             warmup_sampling_module()
             if self.enable_in_graph_sampling:
                 # The fast tier samples inside the captured graph via a
@@ -1514,19 +1515,22 @@ class PyTorchModelEngine(ModelEngine):
             self._prewarm_cute_dsl_indexer_q()
         log_mem_snapshot("warmup/after_cute_dsl_indexer_q")
         if not is_enc_dec:
-            with self._warmup_timer.phase("attention_jit"), timing_metric(
-                    "attention_warmup_seconds", self._metrics):
+            with self._warmup_timer.phase(
+                    "attention_jit",
+                    metrics=self._metrics,
+                    metric_name="attention_warmup_seconds"):
                 self._run_attention_warmup(resource_manager,
                                            can_run_general_warmup)
 
         if can_run_general_warmup:
             # Specialize torch.compile graphs across the key input shapes before CUDA graph capture.
-            with self._warmup_timer.phase("general"):
+            with self._warmup_timer.phase("general",
+                                          metrics=self._metrics,
+                                          metric_name="general_warmup_seconds"):
                 warmup_requests_configs = self._agree_warmup_shapes(
                     self._get_full_general_warmup_requests(resource_manager))
                 # Currently graph has not been captured, disable cuda graph for this warmup.
-                with timing_metric("general_warmup_seconds",
-                                   self._metrics), self.no_cuda_graph():
+                with self.no_cuda_graph():
                     self._general_warmup(resource_manager,
                                          warmup_requests_configs)
                     # Release C++ MoE workspace buffers so the autotuner can
@@ -1541,8 +1545,10 @@ class PyTorchModelEngine(ModelEngine):
         # Helix CP is decode-only and runs into issues with the
         # autotuner warmup's context requests.
         if not is_enc_dec and not self.mapping.has_cp_helix():
-            with self._warmup_timer.phase("autotuner"), timing_metric(
-                    "autotuner_warmup_seconds", self._metrics):
+            with self._warmup_timer.phase(
+                    "autotuner",
+                    metrics=self._metrics,
+                    metric_name="autotuner_warmup_seconds"):
                 self._run_autotuner_warmup(resource_manager)
             log_mem_snapshot("warmup/after_autotuner")
             # Pre-JIT Mamba SSD multi-seq + HAS_INITSTATES=True Triton kernels
@@ -1550,8 +1556,10 @@ class PyTorchModelEngine(ModelEngine):
             # since MambaHybridCacheManager skips _general_warmup and the
             # default autotuner shape is single-seq / no-initstates. Safe
             # no-op for non-Mamba models.
-            with self._warmup_timer.phase("mamba_hybrid"), timing_metric(
-                    "mamba_hybrid_warmup_seconds", self._metrics):
+            with self._warmup_timer.phase(
+                    "mamba_hybrid",
+                    metrics=self._metrics,
+                    metric_name="mamba_hybrid_warmup_seconds"):
                 self._run_mamba_hybrid_warmup(resource_manager)
             log_mem_snapshot("warmup/after_mamba_hybrid")
             # Release the autotuner's exploration-mode intermediates. The
@@ -1601,13 +1609,13 @@ class PyTorchModelEngine(ModelEngine):
         if can_run_general_warmup:
             # Pre-populate the memory pool with max-shape allocations to reduce
             # fragmentation at runtime.
-            with self._warmup_timer.phase("memory_pool_prepop"):
+            with self._warmup_timer.phase(
+                    "memory_pool_prepop",
+                    metrics=self._metrics,
+                    metric_name="memory_pool_prepopulation_seconds"):
                 warmup_requests_configs = self._get_max_shape_warmup_requests(
                     resource_manager)
-                with timing_metric("memory_pool_prepopulation_seconds",
-                                   self._metrics):
-                    self._general_warmup(resource_manager,
-                                         warmup_requests_configs)
+                self._general_warmup(resource_manager, warmup_requests_configs)
             log_mem_snapshot("warmup/after_memory_pool_prepop")
 
         # Allocate the CUDA graph padding dummies now, while the KV cache is
