@@ -1887,6 +1887,15 @@ class EncoderCUDAGraphRunner:
             return None, None
         return graph_attn_metadata, key
 
+    @staticmethod
+    def supports_metadata_type(metadata_cls: type) -> bool:
+        """Whether encoder graphs can replay with this attention metadata type.
+
+        Only TRTLLM attention qualifies: other backends (FlashInfer) keep
+        per-batch planner state that breaks graph replay.
+        """
+        return issubclass(metadata_cls, TrtllmAttentionMetadata)
+
     def maybe_get_cuda_graph(
         self,
         inputs: Dict[str, Any],
@@ -1905,10 +1914,7 @@ class EncoderCUDAGraphRunner:
         if not self.enabled:
             return None, None
 
-        # Only TRTLLM attention backend supports encoder CUDA graphs. Other
-        # backends (FlashInfer) have per-batch planner state that breaks
-        # graph replay.
-        if not isinstance(attn_metadata, TrtllmAttentionMetadata):
+        if not self.supports_metadata_type(type(attn_metadata)):
             logger.warning_once(
                 "Encoder CUDA graph only supports TrtllmAttentionMetadata; "
                 "falling back to eager.",

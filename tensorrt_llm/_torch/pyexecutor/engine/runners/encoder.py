@@ -692,6 +692,25 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
                 f"Model inputs cannot override runner-managed fields: {sorted(reserved_inputs)}"
             )
 
+    def _call_can_use_cuda_graph(self, multi_item_part_lens: list[list[int]] | None) -> bool:
+        """Whether this call could replay an encoder CUDA graph at all.
+
+        Multi-item batches and attention backends that cannot replay encoder
+        graphs always run eagerly, so their model inputs are not checked
+        against the declared specs. Shape only decides which bucket is used,
+        not whether the specs apply.
+        """
+        runner = self._encoder_cuda_graph_runner
+        if not runner.enabled or multi_item_part_lens is not None:
+            return False
+        if not runner.supports_metadata_type(self._config.attention_backend.Metadata):
+            logger.warning_once(
+                "Encoder CUDA graph only supports TrtllmAttentionMetadata; falling back to eager.",
+                key="encoder_cuda_graph_backend_warning",
+            )
+            return False
+        return True
+
     def _check_cuda_graph_model_inputs(
         self,
         model_inputs: dict[str, Any],
@@ -714,9 +733,6 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
             bool: whether the encoder CUDA graph can be used for this call.
         """
         runner = self._encoder_cuda_graph_runner
-        if not runner.enabled:
-            return False
-
         specs_by_name = {spec.name: spec for spec in runner.extra_input_specs}
         declared_names = set(specs_by_name)
         provided_names = set(model_inputs)
@@ -820,9 +836,12 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
                 )
             if any(not part_lens for part_lens in multi_item_part_lens):
                 raise ValueError('"multi_item_part_lens" entries must not be empty.')
-        # Non-tensor model inputs cannot be captured, so such a call must stay
-        # eager; declared tensor inputs are validated against their specs here.
-        allow_cuda_graph = self._check_cuda_graph_model_inputs(
+        # Calls that can never use a graph skip spec validation. For the rest,
+        # declared tensor inputs are validated against their specs, and a
+        # non-tensor input, which cannot be captured, keeps the call eager.
+        allow_cuda_graph = self._call_can_use_cuda_graph(
+            multi_item_part_lens
+        ) and self._check_cuda_graph_model_inputs(
             model_inputs,
             num_packed_tokens=len(input_ids),
             batch_size=len(sequence_lengths),

@@ -8,8 +8,12 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionMetadata,
+    AttentionRuntimeFeatures,
+)
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import EncoderCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners import encoder as encoder_module
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import (
     EncoderConfigMixin,
@@ -279,17 +283,64 @@ def test_encoder_runner_forwards_model_inputs_to_eager_preparation() -> None:
         [2],
         multi_item_part_lens=None,
         model_inputs={"token_type_ids": token_type_ids},
+        allow_cuda_graph=False,
     )
 
 
-def test_encoder_runner_rejects_model_inputs_for_cuda_graph_execution() -> None:
+def _graph_enabled_runner(*, attention_backend=TrtllmAttention) -> EncoderRunner:
+    """An EncoderRunner whose graph runner is enabled but has no declared extra inputs."""
     runner = object.__new__(EncoderRunner)
-    runner._encoder_cuda_graph_runner = SimpleNamespace(enabled=True)
+    runner._encoder_cuda_graph_runner = SimpleNamespace(
+        enabled=True,
+        extra_input_specs=[],
+        supports_metadata_type=EncoderCUDAGraphRunner.supports_metadata_type,
+    )
+    runner._config = SimpleNamespace(attention_backend=attention_backend)
+    runner._prepare_encoder_batch = Mock(
+        return_value=EncoderPreparedInputs({}, sequence_lengths=[2])
+    )
+    return runner
 
-    with pytest.raises(NotImplementedError, match="token_type_ids"):
+
+def test_encoder_runner_rejects_undeclared_tensor_input_when_graph_is_usable() -> None:
+    runner = _graph_enabled_runner()
+
+    with pytest.raises(ValueError, match="not declared"):
         runner.prepare_inputs(
-            PackedInputs([11, 12], [2], model_inputs={"token_type_ids": object()})
+            PackedInputs([11, 12], [2], model_inputs={"token_type_ids": torch.tensor([0, 1])})
         )
+
+
+def test_multi_item_batch_skips_extra_input_validation() -> None:
+    """A multi-item batch always runs eagerly, so undeclared tensor inputs pass through."""
+    runner = _graph_enabled_runner()
+    token_type_ids = torch.tensor([0, 1])
+
+    runner.prepare_inputs(
+        PackedInputs([11, 12], [2], [[1, 1]], model_inputs={"token_type_ids": token_type_ids})
+    )
+
+    assert runner._prepare_encoder_batch.call_args.kwargs["allow_cuda_graph"] is False
+
+
+def test_unsupported_attention_backend_skips_extra_input_validation() -> None:
+    """A backend that cannot replay encoder graphs keeps every call eager."""
+    runner = _graph_enabled_runner(attention_backend=SimpleNamespace(Metadata=AttentionMetadata))
+
+    runner.prepare_inputs(
+        PackedInputs([11, 12], [2], model_inputs={"token_type_ids": torch.tensor([0, 1])})
+    )
+
+    assert runner._prepare_encoder_batch.call_args.kwargs["allow_cuda_graph"] is False
+
+
+def test_encoder_graph_supports_only_trtllm_attention_metadata() -> None:
+    class _TrtllmSubclassMetadata(TrtllmAttentionMetadata):
+        pass
+
+    assert EncoderCUDAGraphRunner.supports_metadata_type(TrtllmAttentionMetadata)
+    assert EncoderCUDAGraphRunner.supports_metadata_type(_TrtllmSubclassMetadata)
+    assert not EncoderCUDAGraphRunner.supports_metadata_type(AttentionMetadata)
 
 
 def test_encoder_runner_forwards_eager_model_inputs_and_gathers_logits() -> None:

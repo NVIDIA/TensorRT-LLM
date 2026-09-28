@@ -467,16 +467,13 @@ class EncodeCudaGraphConfig(BaseCudaGraphConfig):
         default_factory=list,
         description=
         "Tensor kwargs (beyond input_ids / position_ids) that LLM.encode() "
-        "will pass through to the encoder forward(). Each spec is "
-        "pre-allocated as a static buffer sized along its symbolic dim at "
-        "the bucket maximum (`num_tokens` → `max(num_tokens)`, "
-        "`batch_size` → `max(batch_sizes)`; pre-capture synthesizes "
-        "zero-filled stand-ins so every bucket captures with the correct "
-        "forward signature. Required when calling encode() with "
-        "model_kwargs while encoder CUDA graphs are enabled. The tensors "
-        "themselves may be passed on the host or on the device; outside "
-        "confidential computing mode, host tensors avoid a blocking "
-        "device-to-host copy per call.")
+        "passes to the encoder forward() under CUDA graphs. Each is backed "
+        "by a static buffer sized along its symbolic dim at the bucket "
+        "maximum (`num_tokens` → `max(num_tokens)`, `batch_size` → "
+        "`max(batch_sizes)`). With encoder CUDA graphs enabled, every tensor "
+        "kwarg passed to encode() must be declared here, and every declared "
+        "input must be passed on every call. Tensors may be on host or "
+        "device.")
 
     @model_validator(mode='after')
     def validate_encoder_cuda_graph_config(self) -> 'EncodeCudaGraphConfig':
