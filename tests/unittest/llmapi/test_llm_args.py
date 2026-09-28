@@ -4602,35 +4602,54 @@ class TestDSparkConfidenceScheduling:
                 "confidence_sps_table_path": "/tmp/sps.json"
         }, {
                 "confidence_sps_live_fingerprint_path": "/tmp/runtime.json"
+        }, {
+                "confidence_admission_receipt_path": "/tmp/admission.json"
+        }, {
+                "confidence_admission_receipt_sha256": "a" * 64
         }):
             with pytest.raises(ValueError,
                                match="enable_confidence_scheduling"):
                 self._cfg(**kw)
 
-    @pytest.mark.parametrize(
-        ("missing", "message"),
-        [
-            ("confidence_sps_table_path", "confidence_sps_table_path"),
-            (
-                "confidence_sps_live_fingerprint_path",
-                "confidence_sps_live_fingerprint_path",
-            ),
-        ],
-    )
-    def test_exact_table_and_live_fingerprint_are_required(
-            self, missing, message):
-        values = {
-            "confidence_sps_table_path": "/tmp/sps.json",
-            "confidence_sps_live_fingerprint_path": "/tmp/runtime.json",
-        }
-        values[missing] = None
-        with pytest.raises(ValueError, match=message):
-            self._scheduled(**values)
+    def test_admission_artifacts_are_resolved_at_torch_args_boundary(self):
+        c = self._cfg(enable_confidence_scheduling=True)
+        assert c.enable_confidence_scheduling is True
 
     def test_removed_legacy_verify_len_tiers_are_rejected(self):
         with pytest.raises(ValidationError,
                            match="confidence_verify_len_tiers"):
             self._scheduled(confidence_verify_len_tiers=[1, 3, 5])
+
+    def test_physical_k1_resolves_confidence_scheduling_to_static(self):
+        c = self._scheduled(
+            max_draft_len=1,
+            confidence_sts_path="/tmp/sts.json",
+            confidence_admission_receipt_path="/tmp/admission.json",
+            confidence_admission_receipt_sha256="a" * 64,
+            enable_fused_confidence_scheduler=True,
+        )
+
+        assert c.enable_confidence_scheduling is False
+        assert c.enable_fused_confidence_scheduler is False
+        assert c.confidence_sts_path is None
+        assert c.confidence_sps_table_path is None
+        assert c.confidence_sps_live_fingerprint_path is None
+        assert c.confidence_admission_receipt_path is None
+        assert c.confidence_admission_receipt_sha256 is None
+
+    def test_physical_k1_needs_no_confidence_artifacts(self):
+        c = self._cfg(max_draft_len=1, enable_confidence_scheduling=True)
+
+        assert c.enable_confidence_scheduling is False
+        assert c.max_total_draft_tokens == 1
+        assert c.tokens_per_gen_step == 2
+
+    def test_physical_k1_remains_valid_when_scheduling_is_off(self):
+        c = self._cfg(max_draft_len=1)
+        assert c.enable_confidence_scheduling is False
+        assert c.max_draft_len == 1
+        assert c.max_total_draft_tokens == 1
+        assert c.tokens_per_gen_step == 2
 
     def test_fused_scheduler_is_independently_gated(self):
         with pytest.raises(ValueError,

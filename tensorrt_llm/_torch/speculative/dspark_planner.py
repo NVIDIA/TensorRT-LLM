@@ -27,13 +27,44 @@ _MAX_EXACT_COMPACT_CELLS_PER_G = 4
 _MAX_EXACT_COMPACT_CELLS_TOTAL = 32
 
 __all__ = [
+    "ConfidenceWorkloadAdmission",
+    "EXACT_SPS_SELECTOR_IDENTITY_SHA256",
     "ExactSpsDrainGuard",
     "ExactSpsCostRow",
     "ExactSpsCostTable",
+    "evaluate_confidence_workload_admission",
+    "load_confidence_workload_admission",
     "load_runtime_sps_cost_table",
     "select_exact_sps_candidate",
     "validate_sps_cost_table_payload",
 ]
+
+
+# This digest identifies the unchanged hot-path selector semantics. Fixed
+# confidence-path overhead is deliberately absent: it is a workload-level
+# feature-activation cost, evaluated once before engine construction.
+_EXACT_SPS_SELECTOR_IDENTITY = (
+    "dspark-exact-sps-marginal-selector-v1:immediate-goodput+group-drain:no-fixed-overhead"
+)
+EXACT_SPS_SELECTOR_IDENTITY_SHA256 = hashlib.sha256(
+    _EXACT_SPS_SELECTOR_IDENTITY.encode()
+).hexdigest()
+
+
+@dataclass(frozen=True)
+class ConfidenceWorkloadAdmission:
+    """Authenticated workload-level decision made before runtime startup."""
+
+    admitted: bool
+    physical_k: int
+    policy_steps: int
+    compact_choices: int
+    gross_compact_value_ms_lower_bound: float
+    fixed_confidence_path_overhead_ms_upper_bound: float
+    safety_margin_ms: float
+    net_value_ms_lower_bound: float
+    admission_identity_sha256: str
+    receipt_sha256: str
 
 
 @dataclass(frozen=True)
@@ -869,6 +900,210 @@ def _validate_live_fingerprint_values(fingerprint: dict[str, object]) -> None:
             _require_json_int(value, field=f"live engine fingerprint {key}", minimum=1)
         if len(set(values)) != len(values):
             raise ValueError(f"live engine fingerprint {key} must not contain duplicates")
+
+
+def evaluate_confidence_workload_admission(
+    *,
+    policy_steps: int,
+    compact_choices: int,
+    gross_compact_value_ms_lower_bound: float,
+    fixed_confidence_path_overhead_ms_upper_bound: float,
+    safety_margin_ms: float,
+) -> tuple[bool, float]:
+    """Evaluate aggregate confidence economics without an endogenous ratio.
+
+    ``compact_choices`` comes from replaying the exact marginal selector
+    without charging fixed confidence-path overhead to one candidate. The
+    candidate set therefore cannot depend on ``policy_steps / compact_choices``.
+    """
+    policy_steps = _require_exact_int(policy_steps, field="policy_steps", minimum=1)
+    compact_choices = _require_exact_int(compact_choices, field="compact_choices", minimum=0)
+    if compact_choices > policy_steps:
+        raise ValueError(
+            f"compact_choices must not exceed policy_steps; got {compact_choices} > {policy_steps}"
+        )
+    gross_value_ms = _require_nonnegative_finite_number(
+        gross_compact_value_ms_lower_bound, field="gross compact value lower bound"
+    )
+    overhead_ms = _require_nonnegative_finite_number(
+        fixed_confidence_path_overhead_ms_upper_bound,
+        field="fixed confidence-path overhead upper bound",
+    )
+    margin_ms = _require_nonnegative_finite_number(
+        safety_margin_ms, field="confidence admission safety margin"
+    )
+    net_value_ms = gross_value_ms - policy_steps * overhead_ms - margin_ms
+    return compact_choices > 0 and net_value_ms > 0.0, net_value_ms
+
+
+_WORKLOAD_ADMISSION_FIELDS = {
+    "admitted",
+    "calibration_result_sha256",
+    "compact_choices",
+    "fixed_confidence_path_overhead_ms_upper_bound",
+    "gross_compact_value_ms_lower_bound",
+    "live_engine_fingerprint_sha256",
+    "physical_k",
+    "policy_steps",
+    "runtime_snapshot",
+    "safety_margin_ms",
+    "selector_identity_sha256",
+    "selector_replay_sha256",
+    "source_diff_sha256",
+    "source_head",
+    "sps_cost_table_sha256",
+    "workload_identity_sha256",
+}
+_WORKLOAD_ADMISSION_ENVELOPE_FIELDS = {
+    "admission",
+    "admission_sha256",
+    "schema_version",
+}
+
+
+def _sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_strict_json_object(path: str | Path, *, name: str) -> dict[str, object]:
+    def reject_duplicate_fields(pairs):
+        parsed = {}
+        for key, value in pairs:
+            if key in parsed:
+                raise ValueError(f"{name} has duplicate field {key!r}")
+            parsed[key] = value
+        return parsed
+
+    with Path(path).open(encoding="utf-8") as file:
+        payload = json.load(file, object_pairs_hook=reject_duplicate_fields)
+    if not isinstance(payload, dict):
+        raise TypeError(f"{name} must contain a JSON object")
+    return payload
+
+
+def load_confidence_workload_admission(
+    path: str | Path,
+    *,
+    expected_receipt_sha256: str,
+    sps_cost_table_path: str | Path,
+    live_engine_fingerprint_path: str | Path,
+    physical_k: int,
+) -> ConfidenceWorkloadAdmission:
+    """Authenticate and evaluate one deployment-level confidence receipt."""
+    physical_k = _require_exact_int(physical_k, field="physical_k", minimum=1)
+    expected_receipt_sha256 = _require_sha256(
+        expected_receipt_sha256,
+        field="expected confidence workload admission receipt SHA256",
+    )
+    receipt_sha256 = _sha256_file(path)
+    if receipt_sha256 != expected_receipt_sha256:
+        raise ValueError("Confidence workload admission receipt does not match its pinned SHA256")
+    envelope = _validate_exact_fields(
+        _read_strict_json_object(path, name="confidence workload admission receipt"),
+        name="confidence workload admission receipt",
+        fields=_WORKLOAD_ADMISSION_ENVELOPE_FIELDS,
+    )
+    if type(envelope["schema_version"]) is not int or envelope["schema_version"] != 1:
+        raise ValueError("Confidence workload admission receipts require schema_version=1")
+    admission = _validate_exact_fields(
+        envelope["admission"],
+        name="confidence workload admission body",
+        fields=_WORKLOAD_ADMISSION_FIELDS,
+    )
+    admission_sha256 = _require_sha256(
+        envelope["admission_sha256"], field="confidence workload admission SHA256"
+    )
+    if admission_sha256 != _canonical_json_sha256(admission):
+        raise ValueError("Confidence workload admission SHA256 does not match its body")
+    if type(admission["admitted"]) is not bool:
+        raise TypeError("confidence workload admitted must be a JSON boolean")
+    receipt_physical_k = _require_json_int(
+        admission["physical_k"], field="confidence workload physical_k", minimum=1
+    )
+    if receipt_physical_k != physical_k:
+        raise ValueError(
+            "Confidence workload admission physical_k does not match the configured "
+            f"physical K: {receipt_physical_k} != {physical_k}"
+        )
+
+    digest_fields = (
+        "calibration_result_sha256",
+        "live_engine_fingerprint_sha256",
+        "selector_identity_sha256",
+        "selector_replay_sha256",
+        "source_diff_sha256",
+        "sps_cost_table_sha256",
+        "workload_identity_sha256",
+    )
+    for field_name in digest_fields:
+        _require_sha256(admission[field_name], field=f"confidence workload {field_name}")
+    if admission["selector_identity_sha256"] != EXACT_SPS_SELECTOR_IDENTITY_SHA256:
+        raise ValueError("Confidence workload admission selector identity is stale or unknown")
+    if admission["sps_cost_table_sha256"] != _sha256_file(sps_cost_table_path):
+        raise ValueError("Confidence workload admission SPS cost-table SHA256 does not match")
+    if admission["live_engine_fingerprint_sha256"] != _sha256_file(live_engine_fingerprint_path):
+        raise ValueError(
+            "Confidence workload admission live-engine fingerprint SHA256 does not match"
+        )
+
+    live_fingerprint = _validate_exact_fields(
+        _read_strict_json_object(live_engine_fingerprint_path, name="live engine fingerprint"),
+        name="live engine fingerprint",
+        fields=_V2_FINGERPRINT_FIELDS,
+    )
+    _validate_live_fingerprint_values(live_fingerprint)
+    if live_fingerprint["max_draft_len"] != physical_k:
+        raise ValueError(
+            "Live engine fingerprint max_draft_len does not match confidence workload "
+            f"physical K: {live_fingerprint['max_draft_len']} != {physical_k}"
+        )
+    for field_name in ("runtime_snapshot", "source_diff_sha256", "source_head"):
+        if admission[field_name] != live_fingerprint[field_name]:
+            raise ValueError(
+                f"Confidence workload admission {field_name} does not match the live engine"
+            )
+    for field_name in ("runtime_snapshot", "source_head"):
+        if not isinstance(admission[field_name], str) or not admission[field_name]:
+            raise TypeError(f"confidence workload {field_name} must be a non-empty string")
+
+    sps_payload = _read_strict_json_object(sps_cost_table_path, name="SPS cost artifact")
+    validate_sps_cost_table_payload(
+        sps_payload,
+        graph_batch_sizes=live_fingerprint["rank_local_graph_batch_sizes"],
+        max_draft_len=physical_k,
+        live_engine_fingerprint=live_fingerprint,
+    )
+    admitted, net_value_ms = evaluate_confidence_workload_admission(
+        policy_steps=admission["policy_steps"],
+        compact_choices=admission["compact_choices"],
+        gross_compact_value_ms_lower_bound=admission["gross_compact_value_ms_lower_bound"],
+        fixed_confidence_path_overhead_ms_upper_bound=admission[
+            "fixed_confidence_path_overhead_ms_upper_bound"
+        ],
+        safety_margin_ms=admission["safety_margin_ms"],
+    )
+    if admission["admitted"] is not admitted:
+        raise ValueError(
+            "Confidence workload admission decision does not match the aggregate economics"
+        )
+    return ConfidenceWorkloadAdmission(
+        admitted=admitted,
+        physical_k=physical_k,
+        policy_steps=int(admission["policy_steps"]),
+        compact_choices=int(admission["compact_choices"]),
+        gross_compact_value_ms_lower_bound=float(admission["gross_compact_value_ms_lower_bound"]),
+        fixed_confidence_path_overhead_ms_upper_bound=float(
+            admission["fixed_confidence_path_overhead_ms_upper_bound"]
+        ),
+        safety_margin_ms=float(admission["safety_margin_ms"]),
+        net_value_ms_lower_bound=net_value_ms,
+        admission_identity_sha256=admission_sha256,
+        receipt_sha256=receipt_sha256,
+    )
 
 
 def select_exact_sps_candidate(

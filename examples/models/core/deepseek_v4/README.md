@@ -473,6 +473,110 @@ MXFP4 routed MoE expert weights, TensorRT LLM automatically applies the routed-e
 configuration.
 
 
+## DSpark confidence verification (prototype)
+
+Confidence-guided verification is **default-off and experimental**. It proposes the full physical
+draft block `K`, then may select a smaller, measured verifier-token budget. It does not reduce the
+physical drafter length. This draft integration is not a production deployment recipe: receipt
+generation and workload qualification are external, and the composed source still needs native
+build, GPU/full-model, accuracy and performance validation. Mixed context/generation execution is
+not cleared by this work.
+
+### Requested configuration versus actual execution
+
+`DSparkDecodingConfig.enable_confidence_scheduling=True` is a request, not evidence that the
+runtime enabled it. For `K > 1`, `TorchLlmArgs` checks workload admission before constructing
+engines and workers:
+
+| Startup result | Resolved execution |
+| --- | --- |
+| Missing, unreadable, stale or non-positive admission evidence | Both confidence flags become false and all confidence artifact paths/digests are cleared; ordinary feature-off static `K` runs. A warning explains the fallback. |
+| Physical `K=1` | Feature-off static `K1`; there is no smaller verifier tier. Confidence inputs are ignored and cleared. |
+| Matching receipt with positive aggregate value | Confidence remains requested; the existing environment, graph, checkpoint and runtime checks must still pass. |
+
+After successful admission, an **enabled-native** policy decision is different from startup
+feature-off fallback: it retains the enabled control path while verifying the native layout.
+An enabled compact decision uses a positive measured budget. Optional fused-scheduler failure
+falls back to the tensor scheduler for the affected graph size; that is a third, separate fallback.
+
+Before reporting an "enabled" experiment, inspect the resolved
+`TorchLlmArgs.speculative_config.enable_confidence_scheduling` and record both the requested and
+resolved configuration. Require observed native/compact routing and completed outputs, rather
+than inferring execution from an input YAML flag or a successful server start. Do not count
+startup feature-off fallback as an enabled-native run. With confidence disabled, omit all
+confidence-only fields; explicitly supplying them is a configuration error.
+
+### Admission evidence contract
+
+For a deployment requesting confidence, provide all four prototype inputs:
+
+- `confidence_sps_table_path`: schema-v2 measured costs with exact physical `K`, rank-local graph
+  sizes `G`, native `V=0` cells and supported positive verifier budgets.
+- `confidence_sps_live_fingerprint_path`: an independently supplied fingerprint for that runtime
+  and graph ladder, not a copy relabeled from an older cost artifact.
+- `confidence_admission_receipt_path`: the schema-v1 workload receipt.
+- `confidence_admission_receipt_sha256`: the expected lowercase SHA256 of the **receipt file
+  bytes**, obtained from a trusted, separately reviewed deployment package.
+
+There is no supported public receipt-generation command in this prototype. Do not manufacture an
+admitting receipt from the unit-test fixtures. Its producer must preserve the measured cost,
+workload, calibration, selector-replay and runtime evidence and review their applicability to the
+actual deployment. A source, calibration, physical-`K` or workload change requires reassessment;
+historical scores or timing results cannot be relabeled as new-source qualification.
+
+The receipt envelope contains exactly `schema_version: 1`, `admission` and `admission_sha256`.
+The last field hashes the canonical admission-body JSON
+(`json.dumps(body, sort_keys=True, separators=(",", ":")).encode()`).
+The body contains:
+
+- `physical_k`, `source_head`, `source_diff_sha256`, `runtime_snapshot`;
+- `sps_cost_table_sha256`, `live_engine_fingerprint_sha256`, `selector_identity_sha256`;
+- `workload_identity_sha256`, `calibration_result_sha256`, `selector_replay_sha256`;
+- `policy_steps`, `compact_choices`, `gross_compact_value_ms_lower_bound`,
+  `fixed_confidence_path_overhead_ms_upper_bound`, `safety_margin_ms`, `admitted`.
+
+The selector identity must match `EXACT_SPS_SELECTOR_IDENTITY_SHA256` in
+`tensorrt_llm/_torch/speculative/dspark_planner.py`. Replay the existing marginal selector without
+allocating fixed overhead back to candidates through a `policy_steps / compact_choices` ratio.
+Admission recomputes:
+
+```text
+net_value_lower_bound_ms =
+    gross_compact_value_ms_lower_bound
+    - policy_steps * fixed_confidence_path_overhead_ms_upper_bound
+    - safety_margin_ms
+
+admitted = compact_choices > 0 and net_value_lower_bound_ms > 0
+```
+
+Native decisions still pay the enabled confidence-path overhead, so **all** policy steps count.
+Admission does not replace per-decision selection: exact measured tiers and the existing
+iteration/drain guard still determine whether a compact choice is allowed.
+
+Hashes provide integrity and cross-artifact consistency checks, **not signatures or proof of
+origin**. The runtime checks supplied receipt, cost and fingerprint values; it does not independently
+derive the running checkpoint/workload identity, re-execute the calibration or selector replay,
+or verify their referenced result files. The external producer/deployment package remains the
+trust boundary. Hashing an arbitrary receipt and passing that same digest does not establish
+trust or qualify an enabled experiment.
+
+Contract regressions are in `test_dspark_workload_admission.py`,
+`test_dspark_admission_resolution.py` (both under
+`tests/unittest/_torch/speculative/hw_agnostic/`) and
+`tests/unittest/llmapi/test_dspark_workload_admission_config.py`. These fixtures are synthetic
+validator tests, not deployment evidence.
+
+### Drafter fusion scope
+
+The BF16 CuTe attention and RMSNorm–RoPE path is eligible for physical `K=1..8` under the existing
+SM100/SM103, geometry and layout guards; unsupported inputs retain the reference path. This
+dispatch is independent of the confidence flag, so it also affects static DSpark. The eight-row
+storage bound is unchanged; no arbitrary-`K` kernel extension is claimed.
+
+The source-matched extension passed 98 GPU unit cases on B300/SM103. That is not full-model or
+performance qualification of this composed integration. SM100 and exact-integration GPU/model
+validation remain pending; keep this scope experimental until those gates and review complete.
+
 ## Notes and Troubleshooting
 
 - `DeepSeek-V4 on Hopper requires kv_cache_config.dtype='fp8_ds_mla'`: remove an explicit BF16/FP8
