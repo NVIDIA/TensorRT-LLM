@@ -322,7 +322,9 @@ class EncodeExtraInputSpec(StrictBaseModel):
 
     Only tensors can be declared: a non-tensor kwarg cannot be captured and
     instead forces that `encode()` call onto the eager path. Device is not part
-    of the spec -- host or device tensors are both accepted.
+    of the spec: pass tensors where they already live. Each replay copies them
+    into the graph's buffer asynchronously, H2D for host tensors and D2D for
+    device tensors.
     """
 
     name: str = Field(
@@ -472,7 +474,9 @@ class EncodeCudaGraphConfig(BaseCudaGraphConfig):
         "zero-filled stand-ins so every bucket captures with the correct "
         "forward signature. Required when calling encode() with "
         "model_kwargs while encoder CUDA graphs are enabled. The tensors "
-        "themselves may be passed on the host or on the device.")
+        "themselves may be passed on the host or on the device; outside "
+        "confidential computing mode, host tensors avoid a blocking "
+        "device-to-host copy per call.")
 
     @model_validator(mode='after')
     def validate_encoder_cuda_graph_config(self) -> 'EncodeCudaGraphConfig':

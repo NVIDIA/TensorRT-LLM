@@ -458,6 +458,41 @@ def test_encode_declared_kwarg_accepts_either_device(
     torch.testing.assert_close(got, eager, rtol=1e-3, atol=1e-3)
 
 
+def test_encode_declared_kwarg_follows_values_across_devices(
+    bert_encode_llm, bert_encode_llm_cuda_graph_with_token_type_ids
+):
+    """Switching host/device sources between replays of one graph stays correct.
+
+    Host and device sources reach the static buffer through different copies.
+    If any copy of the host shadow were still captured in the graph, a device
+    call would be overwritten by the stale shadow; each call must instead match
+    eager execution with its own values.
+    """
+    llm = bert_encode_llm_cuda_graph_with_token_type_ids
+    ones = _build_token_type_ids(PROMPTS, device="cpu")
+    zeros = torch.zeros_like(ones)
+
+    eager_ones = torch.stack(
+        [o.logits.cpu() for o in bert_encode_llm.encode(PROMPTS, token_type_ids=ones)]
+    )
+    eager_zeros = torch.stack(
+        [o.logits.cpu() for o in bert_encode_llm.encode(PROMPTS, token_type_ids=zeros)]
+    )
+    # Guard against a vacuous test: the two segment patterns must be distinguishable.
+    assert not torch.allclose(eager_ones, eager_zeros, rtol=1e-3, atol=1e-3)
+
+    for token_type_ids, expected in (
+        (ones, eager_ones),
+        (zeros.cuda(), eager_zeros),
+        (ones.cuda(), eager_ones),
+        (zeros, eager_zeros),
+    ):
+        got = torch.stack(
+            [o.logits.cpu() for o in llm.encode(PROMPTS, token_type_ids=token_type_ids)]
+        )
+        torch.testing.assert_close(got, expected, rtol=1e-3, atol=1e-3)
+
+
 def test_encode_host_declared_kwarg_on_eager_fallback(
     bert_encode_llm, bert_encode_llm_cuda_graph_with_token_type_ids
 ):
@@ -540,8 +575,8 @@ def bert_encode_llm_cuda_graph_with_batch_size_extra():
     llm.shutdown()
 
 
-def _build_batch_size_feature(batch: int):
-    return torch.arange(batch * 40, dtype=torch.int32, device="cuda").reshape(batch, 40)
+def _build_batch_size_feature(batch: int, device="cuda"):
+    return torch.arange(batch * 40, dtype=torch.int32, device=device).reshape(batch, 40)
 
 
 def test_encode_accepts_batch_size_extra(bert_encode_llm_cuda_graph_with_batch_size_extra):
@@ -585,8 +620,10 @@ def test_encode_batch_size_extra_wrong_dtype_rejected(
         llm.encode(PROMPTS, per_request_feature=feat)
 
 
+@pytest.mark.parametrize("num_prompts", [3, len(PROMPTS)])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_encode_batch_size_extra_replay_matches_eager(
-    bert_encode_llm, bert_encode_llm_cuda_graph_with_batch_size_extra
+    bert_encode_llm, bert_encode_llm_cuda_graph_with_batch_size_extra, device, num_prompts
 ):
     """Verify batch-size static-buffer replay reproduces eager output.
 
@@ -594,10 +631,11 @@ def test_encode_batch_size_extra_replay_matches_eager(
     effect on compute. The comparison directly checks that the per-spec static
     buffer plumbing doesn't perturb the graph.
     """
-    eager_outs = bert_encode_llm.encode(PROMPTS)
+    prompts = PROMPTS[:num_prompts]
+    eager_outs = bert_encode_llm.encode(prompts)
     graph_llm = bert_encode_llm_cuda_graph_with_batch_size_extra
-    feat = _build_batch_size_feature(len(PROMPTS))
-    graph_outs = graph_llm.encode(PROMPTS, per_request_feature=feat)
+    feat = _build_batch_size_feature(len(prompts), device=device)
+    graph_outs = graph_llm.encode(prompts, per_request_feature=feat)
 
     eager = torch.stack([o.logits.cpu() for o in eager_outs])
     graph = torch.stack([o.logits.cpu() for o in graph_outs])

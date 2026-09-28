@@ -1237,7 +1237,7 @@ class EncoderCUDAGraphRunnerConfig:
     fixed_seq_len: Optional[int] = None
 
     # Extra tensor inputs declared via EncodeCudaGraphConfig.extra_model_inputs.
-    # Each gets a static buffer (+ pinned host shadow) sized at its bucket maximum.
+    # Each gets a device buffer (+ pinned host staging) sized at its bucket maximum.
     cuda_graph_extra_inputs: List[EncodeExtraInputSpec] = field(
         default_factory=list)
 
@@ -1458,8 +1458,7 @@ class EncoderCUDAGraphRunner:
         """Allocate one static buffer per user-declared extra model input.
 
         The symbolic axis is sized at its bucket maximum. The pinned host
-        shadow gives captured H2D copies a stable source to re-issue from at
-        replay, mirroring the input_ids / position_ids handling.
+        shadow stages host-sourced inputs so their upload stays asynchronous.
         """
         for spec in self.extra_input_specs:
             max_shape = spec.resolve_shape(num_tokens=max_total_tokens,
@@ -2043,13 +2042,18 @@ class EncoderCUDAGraphRunner:
         staged_position_ids[offset:padded_num_tokens].fill_(0)
 
         # Stage extra inputs for encode_only path
-        self._stage_extra_inputs(key, inputs, static_tensors)
+        self._stage_extra_inputs(key, inputs)
 
-    def _stage_extra_inputs(self, key: EncoderKeyType, inputs: Dict[str, Any],
-                            static_tensors: Dict[str, torch.Tensor]) -> None:
-        """Stage user-declared extra model inputs into their static buffers.
+    def _stage_extra_inputs(self, key: EncoderKeyType,
+                            inputs: Dict[str, Any]) -> None:
+        """Copy user-declared extra model inputs into their device buffers.
 
-        The zero-filled tail covers both the dummy requests ``pad_batch``
+        These copies are issued eagerly on the current stream, ahead of the
+        replay, instead of being captured: callers may pass host or device
+        tensors, and a captured H2D would push device tensors through a
+        blocking D2H into the host shadow and back. Host sources are staged in
+        the pinned shadow so the upload stays asynchronous; device sources copy
+        D2D. The zero-filled tail covers the dummy requests ``pad_batch``
         appends (batch_size specs) and token padding within the bucket
         (num_tokens specs). ``encode()`` has already validated dtype/rank/shape,
         so a failure here means an internal contract break.
@@ -2064,11 +2068,24 @@ class EncoderCUDAGraphRunner:
                     f"extra_model_inputs[{spec.name!r}]: tensor length "
                     f"{actual_len} along symbolic {sym!r} axis exceeds "
                     f"padded bucket size {padded_size}")
-            static_buf = static_tensors[spec.name]
-            torch.narrow(static_buf, axis, 0, actual_len).copy_(user_tensor)
             pad_len = padded_size - actual_len
-            if pad_len > 0:
-                torch.narrow(static_buf, axis, actual_len, pad_len).fill_(0)
+            device_buf = torch.narrow(self.shared_static_tensors[spec.name],
+                                      axis, 0, padded_size)
+            if user_tensor.is_cuda:
+                torch.narrow(device_buf, axis, 0,
+                             actual_len).copy_(user_tensor, non_blocking=True)
+                if pad_len > 0:
+                    torch.narrow(device_buf, axis, actual_len, pad_len).zero_()
+            else:
+                # retire_staging() has already waited out the previous replay,
+                # so no in-flight upload still reads this shadow.
+                host_buf = torch.narrow(
+                    self.shared_static_tensors_cpu[spec.name], axis, 0,
+                    padded_size)
+                torch.narrow(host_buf, axis, 0, actual_len).copy_(user_tensor)
+                if pad_len > 0:
+                    torch.narrow(host_buf, axis, actual_len, pad_len).zero_()
+                device_buf.copy_(host_buf, non_blocking=True)
 
     def _stage_encoder_decoder_inputs(
         self,
@@ -2236,8 +2253,6 @@ class EncoderCUDAGraphRunner:
             padded_size = self._extra_input_padded_size(spec, key)
             sliced_static_tensors[spec.name] = torch.narrow(
                 self.shared_static_tensors[spec.name], axis, 0, padded_size)
-            sliced_static_tensors_cpu[spec.name] = torch.narrow(
-                self.shared_static_tensors_cpu[spec.name], axis, 0, padded_size)
 
         capture_inputs = dict(inputs)
         capture_inputs.update(sliced_static_tensors)
@@ -2249,9 +2264,6 @@ class EncoderCUDAGraphRunner:
                 sliced_static_tensors_cpu["input_ids"], non_blocking=True)
             capture_inputs["position_ids"].copy_(
                 sliced_static_tensors_cpu["position_ids"], non_blocking=True)
-            for spec in self.extra_input_specs:
-                capture_inputs[spec.name].copy_(
-                    sliced_static_tensors_cpu[spec.name], non_blocking=True)
 
         # Warmup must see the same runtime data as capture. In particular,
         # graph metadata initializes _seq_lens_cuda to ones, while
