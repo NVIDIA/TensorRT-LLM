@@ -40,7 +40,10 @@ def _vae() -> TiledAutoencoderKLMiniMaxH3:
     vae = TiledAutoencoderKLMiniMaxH3.__new__(TiledAutoencoderKLMiniMaxH3)
     torch.nn.Module.__init__(vae)
     vae.spatial_compression_ratio = 2
-    vae.post_quant_conv = torch.nn.Identity()
+    vae.use_tiling = True
+    vae.tile_sample_min_height = vae.tile_sample_min_width = 256
+    vae.tile_sample_min_overlap_height = vae.tile_sample_min_overlap_width = 64
+    vae.post_quant_conv = torch.nn.Conv3d(1, 1, 1)
     vae.decoder = _TileDecoder()
     vae.configure_tiling({**MINIMAX_H3_VAE_DEFAULTS, "vae_tile_size": 8, "vae_tile_overlap": 2})
     return vae
@@ -55,7 +58,7 @@ def test_parallel_tiles_match_reference(shape: tuple[int, int], world_size: int)
     ys, hs, _ = vae._split_tiles(shape[0] * 2, 8, 2)
     xs, ws, _ = vae._split_tiles(shape[1] * 2, 8, 2)
     tiles = [
-        vae.decoder(z[..., y // 2 : (y + h) // 2, x // 2 : (x + w) // 2])
+        vae.decoder(vae.post_quant_conv(z[..., y // 2 : (y + h) // 2, x // 2 : (x + w) // 2]))
         for y, h in zip(ys, hs)
         for x, w in zip(xs, ws)
     ]
@@ -89,14 +92,14 @@ def test_parallel_tiles_match_reference(shape: tuple[int, int], world_size: int)
             assert wave == (len(tiles) + world_size - 1) // world_size
 
 
-def test_disabled_tiling_and_single_rank_do_not_use_collectives() -> None:
+def test_no_tile_group_and_disabled_tiling_do_not_use_collectives() -> None:
     vae = _vae()
     z = torch.randn(1, 1, 2, 7, 10)
     with patch("torch.distributed.all_gather") as gather:
         torch.testing.assert_close(vae._decode_clip(z), AutoencoderKLMiniMaxH3._decode_clip(vae, z))
         vae.disable_tiling()
         vae.tile_parallel_group = object()
-        torch.testing.assert_close(vae._decode_clip(z), vae.decoder(z))
+        torch.testing.assert_close(vae._decode_clip(z), vae.decoder(vae.post_quant_conv(z)))
     gather.assert_not_called()
 
 
@@ -104,14 +107,12 @@ def test_disabled_tiling_and_single_rank_do_not_use_collectives() -> None:
     "overrides",
     [
         {"vae_use_tiling": "false"},
-        {"vae_tile_parallel": 1},
         {"vae_tile_size": 0},
         {"vae_tile_size": True},
         {"vae_tile_overlap": 0},
         {"vae_tile_overlap": -1},
-        {"vae_tile_overlap": 256},
+        {"vae_tile_size": 256, "vae_tile_overlap": 256},
         {"vae_tile_size": 32.5},
-        {"vae_use_tiling": False, "vae_tile_parallel": True},
     ],
 )
 def test_invalid_tiling_options(overrides: dict) -> None:
@@ -119,7 +120,25 @@ def test_invalid_tiling_options(overrides: dict) -> None:
         validate_vae_tiling_config({**MINIMAX_H3_VAE_DEFAULTS, **overrides})
 
 
-@pytest.mark.parametrize("name", ["vae_tile_size", "vae_tile_overlap"])
-def test_tile_geometry_must_align_to_checkpoint(name: str) -> None:
+@pytest.mark.parametrize("name,value", [("vae_tile_size", 65), ("vae_tile_overlap", 3)])
+def test_tile_geometry_must_align_to_checkpoint(name: str, value: int) -> None:
     with pytest.raises(ValueError, match="compression ratio"):
-        _vae().configure_tiling({**MINIMAX_H3_VAE_DEFAULTS, name: 65})
+        _vae().configure_tiling({**MINIMAX_H3_VAE_DEFAULTS, name: value})
+
+
+def test_unset_options_preserve_loaded_vae_defaults() -> None:
+    vae = _vae()
+    vae.use_tiling = False
+    vae.tile_sample_min_height = 16
+    vae.tile_sample_min_width = 20
+    vae.configure_tiling(MINIMAX_H3_VAE_DEFAULTS)
+    assert not vae.use_tiling
+    assert (vae.tile_sample_min_height, vae.tile_sample_min_width) == (16, 20)
+    assert vae.tile_sample_min_overlap_height == 2
+
+
+def test_parallel_decode_requires_tiling() -> None:
+    with pytest.raises(ValueError, match="requires VAE spatial tiling"):
+        _vae().configure_tiling(
+            {**MINIMAX_H3_VAE_DEFAULTS, "vae_use_tiling": False}, group=object()
+        )

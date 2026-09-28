@@ -109,9 +109,8 @@ def main() -> None:
             {
                 **MINIMAX_H3_VAE_DEFAULTS,
                 "vae_use_tiling": mode != "untiled",
-                "vae_tile_parallel": mode == "parallel",
             },
-            group=group,
+            group=group if mode == "parallel" else None,
         )
         seconds = []
         peaks = []

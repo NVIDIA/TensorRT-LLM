@@ -45,8 +45,10 @@ Output: `.png` for image models; `.mp4` for video models when FFmpeg is installe
 
 ### MiniMax-H3 tiled VAE
 
-MiniMax-H3 uses the checkpoint's spatial tiling by default. Its video decoder
-can distribute independent tiles across the existing Ulysses group; the
+MiniMax-H3 inherits spatial tiling settings from the loaded Diffusers VAE
+unless explicitly overridden (Diffusers 0.40 defaults: enabled, 256-pixel
+tiles, 64-pixel overlap). Its video decoder
+can distribute independent tiles across the shared VAE process group; the
 eight-GPU BF16 configuration enables this. Tile geometry, overlap blending,
 and temporal chunking match the sequential tiled decoder. Small canvases
 with fewer tiles than ranks use sequential decoding on each rank.
@@ -56,17 +58,21 @@ They can be set through `VisualGenArgs.pipeline_config` or the YAML
 `pipeline_config` mapping:
 
 ```yaml
+parallel_config:
+  ulysses_size: 8
+  parallel_vae_size: 8
 pipeline_config:
   vae_use_tiling: true
-  vae_tile_parallel: true
   vae_tile_size: 256
   vae_tile_overlap: 64
 ```
 
 Tile size and overlap are positive pixel counts aligned to the checkpoint's
 spatial compression ratio, with overlap smaller than tile size. Setting
-`vae_tile_parallel: false` retains sequential tiling. Setting both booleans
-to `false` disables spatial tiling for encode and decode, which changes the
+`parallel_config.parallel_vae_size: 1` retains sequential tiling. For H3,
+parallel VAE size must be 1 or equal to the full Ulysses world size; partial
+VAE groups are rejected. Setting `vae_use_tiling: false` disables spatial
+tiling for encode and decode, which changes the
 checkpoint's reference output and can increase memory and latency. Audio
 VAE processing is unaffected. Tile parallelism requires all ranks to decode
 the same video latents and uses the supported pure Ulysses configuration.

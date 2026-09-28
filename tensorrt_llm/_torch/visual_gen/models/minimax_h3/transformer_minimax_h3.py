@@ -347,6 +347,7 @@ class MiniMaxH3TokenRefiner(nn.Module):
         model_config: DiffusionModelConfig,
     ) -> None:
         super().__init__()
+        self._supports_key_padding_mask = model_config.attention.backend.upper() == "VANILLA"
         self.sharder = SequenceSharder.from_vgm(
             model_config.visual_gen_mapping,
             num_attention_heads=num_attention_heads,
@@ -378,6 +379,10 @@ class MiniMaxH3TokenRefiner(nn.Module):
         pad = _padding_to_multiple(seq_len, self.sharder.size)
         key_padding_mask = None
         if pad:
+            if not self._supports_key_padding_mask:
+                raise NotImplementedError(
+                    "Padded token-refiner sequences require key_padding_mask support; use VANILLA."
+                )
             valid = hidden_states.new_ones((hidden_states.shape[0], seq_len), dtype=torch.bool)
             key_padding_mask = _pad_tensor_dim(valid, 1, pad, False)
             hidden_states = _pad_tensor_dim(hidden_states, 1, pad)

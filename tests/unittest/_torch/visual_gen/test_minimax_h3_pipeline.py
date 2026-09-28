@@ -345,6 +345,7 @@ def test_pipeline_keeps_torch_compile_enabled(
     def _config(torch_compile: TorchCompileConfig) -> SimpleNamespace:
         return SimpleNamespace(
             mapping=SimpleNamespace(world_size=1),
+            parallel=SimpleNamespace(parallel_vae_size=1),
             attention=SimpleNamespace(backend="VANILLA"),
             cache=None,
             cpu_offload_config=SimpleNamespace(enable=False),
@@ -424,6 +425,7 @@ def test_trtllm_attention_rejects_unvalidated_gpu(
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
     config = SimpleNamespace(
         mapping=SimpleNamespace(world_size=1),
+        parallel=SimpleNamespace(parallel_vae_size=1),
         attention=SimpleNamespace(backend="TRTLLM"),
     )
     with pytest.raises(NotImplementedError, match="SM100"):
@@ -440,6 +442,7 @@ def test_trtllm_attention_accepts_supported_gpu(
     )
     config = SimpleNamespace(
         mapping=SimpleNamespace(world_size=1),
+        parallel=SimpleNamespace(parallel_vae_size=1),
         attention=SimpleNamespace(backend="TRTLLM"),
         cache=None,
         cpu_offload_config=SimpleNamespace(enable=False),
@@ -839,10 +842,10 @@ def test_keyframe_reference_role_must_be_a_keyframe_slot() -> None:
         _SyntheticMiniMaxH3Pipeline()._load_request_keyframes(req)
 
 
-@pytest.mark.parametrize("tiling,parallel", [(True, True), (True, False), (False, False)])
+@pytest.mark.parametrize("tiling", [True, False, None])
 @pytest.mark.parametrize("resolved", [True, False])
 def test_vae_tiling_options_reach_pipeline(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tiling: bool, parallel: bool, resolved: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tiling: bool | None, resolved: bool
 ) -> None:
     (tmp_path / "transformer").mkdir()
     (tmp_path / "transformer" / "config.json").write_text('{"hidden_size": 32}')
@@ -856,7 +859,6 @@ def test_vae_tiling_options_reach_pipeline(
     )
     options = {
         "vae_use_tiling": tiling,
-        "vae_tile_parallel": parallel,
         "vae_tile_size": 128,
         "vae_tile_overlap": 32,
     }
@@ -878,6 +880,7 @@ def test_vae_tiling_options_reach_pipeline(
 def _ulysses_pipeline_config(world_size: int = 8) -> SimpleNamespace:
     return SimpleNamespace(
         mapping=SimpleNamespace(world_size=world_size, tp_size=1),
+        parallel=SimpleNamespace(parallel_vae_size=1),
         visual_gen_mapping=SimpleNamespace(
             cfg_size=1,
             ulysses_size=world_size,
@@ -939,3 +942,46 @@ def test_pipeline_rejects_unvalidated_ulysses_attention(backend: str) -> None:
     config.attention.backend = backend
     with pytest.raises(NotImplementedError, match="VANILLA"):
         MiniMaxH3Pipeline(config)
+
+
+@pytest.mark.parametrize("size", [2, 4])
+def test_h3_rejects_partial_vae_groups(size: int) -> None:
+    config = _ulysses_pipeline_config(8)
+    config.parallel.parallel_vae_size = size
+    with pytest.raises(ValueError, match="parallel_vae_size"):
+        MiniMaxH3Pipeline(config)
+
+
+def test_h3_parallel_vae_requires_spatial_tiling() -> None:
+    config = _ulysses_pipeline_config(2)
+    config.parallel.parallel_vae_size = 2
+    config.extra_attrs = {"vae_use_tiling": False}
+    with pytest.raises(ValueError, match="requires VAE spatial tiling"):
+        MiniMaxH3Pipeline(config)
+
+
+def test_h3_uses_shared_vae_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    group = object()
+    pipeline.pipeline_config = _ulysses_pipeline_config(2)
+    pipeline.pipeline_config.parallel.parallel_vae_size = 2
+    pipeline.pipeline_config.visual_gen_mapping.vae_group = group
+    pipeline._vae_tiling_options = {}
+    calls = []
+    pipeline.vae = SimpleNamespace(configure_tiling=lambda options, group: calls.append(group))
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    pipeline.setup_parallel_vae()
+    assert calls == [group]
+    assert pipeline._parallel_vae_enabled
+
+
+def test_h3_parallel_vae_allows_skipped_vae() -> None:
+    pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.pipeline_config = _ulysses_pipeline_config(2)
+    pipeline.pipeline_config.parallel.parallel_vae_size = 2
+    pipeline.vae = None
+    pipeline._parallel_vae_enabled = False
+    pipeline.setup_parallel_vae()
+    assert not pipeline._parallel_vae_enabled
