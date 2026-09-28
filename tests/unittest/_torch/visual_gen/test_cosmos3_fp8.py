@@ -399,13 +399,13 @@ def test_static_fp8_checkpoint_realizes_expected_module_layout(
         torch.cuda.empty_cache()
 
 
-# Groups TensorRT-LLM used to fuse, mapped checkpoint key -> runtime module.
-# Fusion kept max(shard weight_scale) and requantized the other shards onto it,
-# so these are precisely the projections whose calibration the split topology
-# exists to preserve. Each entry is the worst shard-scale spread in its
-# checkpoint (4.67x for Nano gen QKV, 6.10x for Super gen gate/up), per a full
-# sweep of all fused groups -- the case with the most to lose.
-PREVIOUSLY_FUSED_GROUPS = {
+# Groups the fused topology merges into one Linear, mapped checkpoint key ->
+# runtime module. Fusing keeps max(shard weight_scale) and requantizes the other
+# shards onto it, so these are precisely the projections whose calibration the
+# split topology exists to preserve. Each entry is the worst shard-scale spread
+# in its checkpoint (4.67x for Nano gen QKV, 6.10x for Super gen gate/up), per a
+# full sweep of all fused groups -- the case with the most to lose.
+FUSED_TOPOLOGY_GROUPS = {
     "nano": {
         "layers.32.self_attn.add_q_proj": "gen_layers.32.cross_attention.to_q",
         "layers.32.self_attn.add_k_proj": "gen_layers.32.cross_attention.to_k",
@@ -453,24 +453,23 @@ def _load_checkpoint_tensors(
         (COSMOS3_SUPER_FP8_SUBDIR, "super"),
     ],
 )
-def test_previously_fused_groups_now_load_exactly(checkpoint_subdir, size, _cleanup_gpu):
-    """Every member of a formerly fused group must transcribe bit-for-bit.
+def test_split_groups_load_exactly(checkpoint_subdir, size, _cleanup_gpu):
+    """Every member of a group the fused topology merges must transcribe bit-for-bit.
 
-    Fusion kept one weight scale per group and re-quantized the other members
-    onto it. Splitting the topology is only worth doing if each projection now
+    Fusing keeps one weight scale per group and re-quantizes the other members
+    onto it. Splitting the topology is only worth doing if each projection
     loads its own tensor and its own scale untouched, so this asserts exact
     equality rather than a tolerance -- there is no arithmetic left to drift.
 
     The group's weight scales are asserted to actually differ first. Were they
-    equal, fusion would have been lossless and exactness here would hold
-    trivially, so the check would no longer discriminate between the two
-    topologies.
+    equal, fusing would be lossless and exactness here would hold trivially,
+    so the check could not tell the two topologies apart.
     """
     _requires_cuda()
     checkpoint_path = get_checkpoint(checkpoint_subdir)
     label = checkpoint_subdir
 
-    group = PREVIOUSLY_FUSED_GROUPS[size]
+    group = FUSED_TOPOLOGY_GROUPS[size]
     tensors = _load_checkpoint_tensors(checkpoint_path, list(group))
     first_key = next(iter(group))
     if f"{first_key}.weight" not in tensors:
@@ -486,8 +485,8 @@ def test_previously_fused_groups_now_load_exactly(checkpoint_subdir, size, _clea
     )
 
     # q/k/v (and gate/up) see the same activation, so ModelOpt calibrates one
-    # shared input scale per group. The split path relies on that to quantize
-    # the activation once and hand the same tensor to each projection.
+    # shared input scale per group. With equal scales the split path quantizes
+    # the activation once and hands the same tensor to each projection.
     assert len(set(input_scales.values())) == 1, (
         f"{label}: group {list(group)} has differing input scales {input_scales}"
     )

@@ -431,7 +431,7 @@ class TestTransformerWiring:
         """post_load_weights running twice must not orphan the layers.
 
         The second install must leave every governed layer steered by the
-        controller the transformer now holds; otherwise set_denoising_step
+        controller the transformer holds after it; otherwise set_denoising_step
         stops reaching them, silently, with the edge steps landing on the
         quantized path.
         """

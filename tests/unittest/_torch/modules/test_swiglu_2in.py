@@ -320,7 +320,7 @@ def test_rank_n_inputs(shape, quantized):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_rank3_compile_and_cuda_graph():
-    """Guards the fake/eager rank agreement that previously diverged."""
+    """Guards that the eager op and its fake accept the same ranks."""
     gate, up = _pair(2 * 8, 64, torch.bfloat16)
     gate, up = gate.reshape(2, 8, 64), up.reshape(2, 8, 64)
 

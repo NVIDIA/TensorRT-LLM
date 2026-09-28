@@ -371,8 +371,8 @@ def test_bf16_split_runs_without_quantization():
 def test_rank3_activations(shape):
     """Models carry [batch, seq, hidden]; rank-2 tests alone would miss this.
 
-    The op previously asserted rank 2 while its fake accepted rank 3, so tracing
-    succeeded and execution failed.
+    The eager op and its fake must agree on rank: if only the fake accepted
+    rank 3, tracing would succeed and execution would fail.
     """
     mlp = _make(True)
     for linear in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
