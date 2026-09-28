@@ -290,10 +290,19 @@ def _launcher_env(tmp_path: Path, home: str) -> dict:
     stub_bin = tmp_path / "bin"
     stub_bin.mkdir(exist_ok=True)
     python_stub = stub_bin / "python3"
-    python_stub.write_text("#!/bin/sh\n"
-                           "if [ \"$1\" = \"-c\" ]; then\n"
-                           "    echo ipc:///tmp/trtllm-pmi-workspace-test\n"
-                           "fi\n")
+    stop_fifo = tmp_path / "launcher-stop"
+    os.mkfifo(stop_fifo)
+    python_stub.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-c\" ]; then\n"
+        "    echo ipc:///tmp/trtllm-pmi-workspace-test\n"
+        "elif [ \"$1\" = \"-m\" ]; then\n"
+        "    if [ \"$4\" = \"stop\" ]; then\n"
+        "        echo stop > \"$LAUNCHER_TEST_STOP_FIFO\"\n"
+        "    else\n"
+        "        read message < \"$LAUNCHER_TEST_STOP_FIFO\"\n"
+        "    fi\n"
+        "fi\n")
     python_stub.chmod(0o755)
     openssl_stub = stub_bin / "openssl"
     openssl_stub.write_text("#!/bin/sh\nprintf '%064d\\n' 0\n")
@@ -303,6 +312,7 @@ def _launcher_env(tmp_path: Path, home: str) -> dict:
     for name in _LAUNCHER_ENV_SCRUB:
         env.pop(name, None)
     env["PMI_RANK"] = "0"
+    env["LAUNCHER_TEST_STOP_FIFO"] = str(stop_fifo)
     env["HOME"] = home
     env["PATH"] = f"{stub_bin}{os.pathsep}{env['PATH']}"
     return env
