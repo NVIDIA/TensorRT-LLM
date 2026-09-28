@@ -1109,6 +1109,75 @@ def test_KvCacheConfig_declaration():
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("rewind", [0, 1024, 4096])
+def test_BlockReuseConfig_swa_endpoint_rewind_round_trip(rewind: int) -> None:
+    config = KvCacheConfig.model_validate({
+        "use_kv_cache_manager_v2": True,
+        "block_reuse_config": {
+            "swa_endpoint_rewind_tokens": rewind
+        },
+    })
+    restored = KvCacheConfig.model_validate_json(config.model_dump_json())
+    assert restored.block_reuse_config.swa_endpoint_rewind_tokens == rewind
+    assert BlockReuseConfig().swa_endpoint_rewind_tokens == 0
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("policy", ["per_request", "per_conversation"])
+def test_BlockReuseConfig_swa_endpoint_rewind_rejects_other_policies(
+        policy: str) -> None:
+    with pytest.raises(ValidationError, match="swa_endpoint_rewind_tokens"):
+        BlockReuseConfig(policy=policy, swa_endpoint_rewind_tokens=1024)
+    assert BlockReuseConfig(policy=policy).swa_endpoint_rewind_tokens == 0
+
+
+@pytest.mark.cpu_only
+def test_BlockReuseConfig_swa_endpoint_rewind_rejects_negative() -> None:
+    with pytest.raises(ValidationError, match="swa_endpoint_rewind_tokens"):
+        BlockReuseConfig(swa_endpoint_rewind_tokens=-1)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("disabled",
+                         ["enable_block_reuse", "use_kv_cache_manager_v2"])
+def test_KvCacheConfig_swa_endpoint_rewind_requires_reuse_and_v2(
+        disabled: str) -> None:
+    with pytest.raises(ValidationError, match=disabled):
+        KvCacheConfig.model_validate({
+            disabled: False,
+            "block_reuse_config": {
+                "swa_endpoint_rewind_tokens": 1024
+            },
+        })
+    assert KvCacheConfig.model_validate({
+        disabled: False
+    }).block_reuse_config.swa_endpoint_rewind_tokens == 0
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("preference", [None, "V1", "V2"])
+def test_swa_endpoint_rewind_auto_manager_selection(
+        preference: str | None) -> None:
+
+    class Model:
+
+        @staticmethod
+        def get_preferred_kv_cache_manager_version(
+                config: object) -> str | None:
+            return preference
+
+    args = TorchLlmArgs(
+        model="dummy",
+        kv_cache_config=KvCacheConfig(block_reuse_config=BlockReuseConfig(
+            swa_endpoint_rewind_tokens=1024)))
+    if preference == "V2":
+        assert _resolve_kv_cache_manager_v2_auto(args, Model) is True
+    else:
+        with pytest.raises(ValueError, match="swa_endpoint_rewind_tokens"):
+            _resolve_kv_cache_manager_v2_auto(args, Model)
+
+
+@pytest.mark.cpu_only
 def test_BlockReuseConfig_reports_renamed_policy_field():
     with pytest.raises(ValidationError, match="block_reuse_config\\.policy"):
         KvCacheConfig.model_validate(

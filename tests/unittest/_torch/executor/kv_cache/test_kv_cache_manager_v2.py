@@ -31,6 +31,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     Role,
     _extend_swa_windows_for_reuse,
     _KVCacheManagerInitStatus,
+    _swa_endpoint_priority,
     _sync_kv_cache_manager_init_status,
     _update_kv_cache_draft_token_location,
 )
@@ -53,6 +54,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     DEFAULT_BEAM_INDEX,
     AttentionLayerConfig,
+    AttnLifeCycle,
     BatchDesc,
     BufferConfig,
     CacheLevel,
@@ -71,6 +73,65 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._utils import init_cuda_once
 
 TOKENS_PER_BLOCK = 4
 MAX_SEQ_LEN = 16
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "prompt,rewind,ordinal,window,sinks,expected",
+    [
+        (8192, 1024, 95, 4096, 0, 0),
+        (8192, 1024, 96, 4096, 0, 70),
+        (8192, 1024, 255, 4096, 0, 70),
+        (8192, 1024, 256, 4096, 0, 0),
+        (8192, 1024, 0, 4096, 1, 70),
+        (8192, 4096, 0, 4096, 0, 70),
+        (8193, 1024, 96, 4096, 0, 70),
+        (8193, 1024, 256, 4096, 0, 70),
+        (32, 1024, 0, 4096, 0, 70),
+        (8192, 1024, 0, None, 0, 35),
+    ],
+)
+def test_swa_endpoint_priority(
+    prompt: int, rewind: int, ordinal: int, window: int | None, sinks: int, expected: int
+) -> None:
+    priority = _swa_endpoint_priority(prompt, 32, rewind)
+    assert priority(ordinal, AttnLifeCycle(window, sinks)) == expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "rewind,is_dummy,is_draft,prompt,enabled",
+    [
+        (0, False, False, 8192, False),
+        (1024, False, False, 8192, True),
+        (4096, False, False, 8192, True),
+        (1024, True, False, 8192, False),
+        (1024, False, True, 8192, False),
+        (1024, False, False, None, False),
+    ],
+)
+def test_create_kv_cache_swa_endpoint_priority(
+    rewind: int, is_dummy: bool, is_draft: bool, prompt: int | None, enabled: bool
+) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager._swa_endpoint_rewind = rewind
+    manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
+    manager.enable_block_reuse = True
+    manager.is_draft = is_draft
+    manager.tokens_per_block = 32
+    manager.kv_cache_map = {}
+    manager.index_mapper = Mock()
+    manager.index_mapper.num_free_slots.return_value = 1
+    manager.max_beam_width = 1
+    manager.num_pools = 0
+    manager.impl = Mock()
+
+    manager._create_kv_cache(0, None, None, is_dummy=is_dummy, expected_prompt_length=prompt)
+
+    kwargs = manager.impl.create_kv_cache.call_args.kwargs
+    assert ("custom_priority_callback" in kwargs) is enabled
+    if enabled:
+        assert kwargs["custom_priority_callback"](255, AttnLifeCycle(4096, 0)) == 70
 
 
 class _CacheTierInitError(Exception):
