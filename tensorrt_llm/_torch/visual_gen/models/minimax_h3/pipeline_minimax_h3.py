@@ -212,10 +212,31 @@ class MiniMaxH3Pipeline(BasePipeline):
             for key, value in MINIMAX_H3_VAE_DEFAULTS.items()
         }
         validate_vae_tiling_config(self._vae_tiling_options)
+        vae_size = pipeline_config.parallel.parallel_vae_size
+        if vae_size not in (1, pipeline_config.mapping.world_size):
+            raise ValueError(
+                "MiniMax-H3 parallel_vae_size must be 1 or equal ulysses_size=world_size."
+            )
+        if vae_size > 1 and self._vae_tiling_options["vae_use_tiling"] is False:
+            raise ValueError("parallel_vae_size > 1 requires VAE spatial tiling.")
         self.audio_vae = None
         self.audio_scheduler = None
         self.processor = None
         super().__init__(pipeline_config)
+
+    def setup_parallel_vae(self) -> None:
+        """Use the shared VAE group for independent spatial tile decoding."""
+        size = self.pipeline_config.parallel.parallel_vae_size
+        if size == 1 or self.vae is None:
+            return
+        vgm = self.pipeline_config.visual_gen_mapping
+        if vgm is None or vgm.vae_group is None:
+            raise RuntimeError("MiniMax-H3 parallel VAE requires a VAE group.")
+        if torch.distributed.get_world_size(vgm.vae_group) != size:
+            raise RuntimeError("MiniMax-H3 VAE group size does not match parallel_vae_size.")
+        self.vae.configure_tiling(self._vae_tiling_options, group=vgm.vae_group)
+        self._parallel_vae_enabled = True
+        logger.info(f"MiniMax-H3 spatial VAE tile decode ranks={size}")
 
     @property
     def default_generation_params(self) -> dict:
@@ -346,19 +367,7 @@ class MiniMaxH3Pipeline(BasePipeline):
                 torch_dtype=torch.float32,
             ).to(device)
             self.vae.eval()
-            vgm = self.pipeline_config.visual_gen_mapping
-            self.vae.configure_tiling(
-                self._vae_tiling_options,
-                group=vgm.ulysses_group if vgm is not None else None,
-            )
-            tile_group = self.vae.tile_parallel_group
-            tile_ranks = (
-                torch.distributed.get_world_size(tile_group) if tile_group is not None else 1
-            )
-            logger.info(
-                f"MiniMax-H3 VAE: spatial tiling={self.vae.use_tiling}, "
-                f"tile decode ranks={tile_ranks}"
-            )
+            self.vae.configure_tiling(self._vae_tiling_options)
         if not _component_skipped(skip_components, PipelineComponent.AUDIO_VAE):
             self.audio_vae = AutoencoderKLMiniMaxH3Audio.from_pretrained(
                 checkpoint_dir,

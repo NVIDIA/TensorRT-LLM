@@ -1267,6 +1267,7 @@ def test_ulysses_refiner_masks_padding_and_restores_sequence(
 
         refiner = h3.MiniMaxH3TokenRefiner.__new__(h3.MiniMaxH3TokenRefiner)
         nn.Module.__init__(refiner)
+        refiner._supports_key_padding_mask = True
         refiner.sharder = RankSharder()
         refiner.refiner_blocks = nn.ModuleList([MaskedBlock()])
         refiner.final_norm = nn.Identity()
@@ -1353,3 +1354,12 @@ def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
         handle.remove()
         torch.testing.assert_close(actual.sample, expected.sample, rtol=0, atol=0)
         torch.testing.assert_close(actual.audio_sample, expected.audio_sample, rtol=0, atol=0)
+
+
+def test_refiner_rejects_padding_without_mask_support() -> None:
+    refiner = h3.MiniMaxH3TokenRefiner.__new__(h3.MiniMaxH3TokenRefiner)
+    nn.Module.__init__(refiner)
+    refiner._supports_key_padding_mask = False
+    refiner.sharder = SimpleNamespace(size=2)
+    with pytest.raises(NotImplementedError, match="key_padding_mask"):
+        refiner(torch.zeros(1, 3, 4))

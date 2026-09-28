@@ -424,3 +424,51 @@ def test_wan22_t2v_lpips_against_golden_tp(
     _run_wan22_t2v_lpips_case(
         tmp_path, variant_name, parallel, wan22_within_build_reference, within_build_threshold
     )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two CUDA GPUs")
+def test_minimax_h3_ulysses_parallel_vae_lpips(tmp_path):
+    """Compare real Ulysses + tiled VAE collectives with a fresh one-GPU baseline."""
+    from defs.examples.visual_gen.test_minimax_h3_e2e import (
+        _mean_lpips_distance,
+        _minimax_h3_checkpoint_path,
+    )
+
+    from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
+
+    prompt = "A woman smiles and waves in a sunlit park, with birds chirping."
+    videos = []
+    for size in (1, 2):
+        args = VisualGenArgs(
+            model=_minimax_h3_checkpoint_path(),
+            parallel_config={"ulysses_size": size, "parallel_vae_size": size},
+            attention_config={"backend": "VANILLA"},
+            torch_compile_config={"enable": False},
+            cuda_graph_config={"enable": False},
+            compilation_config={"skip_warmup": True},
+            pipeline_config={"vae_use_tiling": True, "vae_tile_size": 256, "vae_tile_overlap": 64},
+        )
+        engine = VisualGen(model=args.model, args=args)
+        try:
+            output = engine.generate(
+                inputs=prompt,
+                params=VisualGenParams(
+                    height=384, width=384, num_frames=39, num_inference_steps=5, seed=42
+                ),
+            )
+            video = torch.as_tensor(output.video).cpu()
+            if video.ndim == 4:
+                video = video.unsqueeze(0)
+            assert video.shape == (1, 39, 384, 384, 3)
+            assert video.float().std() > 1
+            assert torch.isfinite(torch.as_tensor(output.audio)).all()
+            torch.save({"video": video, "audio": output.audio}, tmp_path / f"h3_{size}gpu.pt")
+            videos.append(video)
+        finally:
+            engine.shutdown()
+    reference = videos[0].permute(0, 1, 4, 2, 3).float().div(255)
+    score = _mean_lpips_distance(videos[1], reference)
+    print(f"H3 Ulysses=2 + parallel_vae_size=2 vs single GPU: mean LPIPS={score:.6f}")
+    # Prior full-resolution 8-GPU measurement was 0.052; this bound allows
+    # BF16 accumulation differences while guarding distributed layout errors.
+    assert score < 0.10, f"H3 parallelism changed output: mean LPIPS={score:.6f} >= 0.10"
