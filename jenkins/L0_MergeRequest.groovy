@@ -2200,27 +2200,23 @@ def getCommonParameters()
 // Looks for a completed /LLM/helpers/PLCScanningSetup pre-merge source-code-scan
 // build that already ran against this exact commit hash, so a retriggered
 // pipeline (e.g. a manual "/bot run" rerun with no new commits pushed) can
-// reuse that result instead of re-running the scan.
-// Must be @NonCPS: it walks live Jenkins domain objects (Job/Run/ParametersAction)
-// and uses a closure over them, which CPS transformation does not handle reliably
-// (the match silently never succeeds instead of throwing).
-@NonCPS
+// reuse that result instead of re-running the scan. Delegates the lookup to
+// jenkins/scripts/find_plc_build.py (plain Jenkins REST API calls), which sidesteps
+// walking live Jenkins domain objects (Job/Run/ParametersAction) from CPS-transformed
+// pipeline code -- that walk previously needed @NonCPS plus an inlined parameter
+// check, because a @NonCPS method calling a CPS-transformed shared-lib method like
+// trtllm_utils.isBuildWithParameter() gets back a continuation/proxy instead of a
+// real value, so the comparison silently never matches.
 def findCachedPLCSourceScanResult(commit) {
-    def plcJob = Jenkins.instance.getItemByFullName("LLM/helpers/PLCScanningSetup")
-    if (!plcJob) {
+    def exitCode = sh(
+        script: "python3 ${LLM_ROOT}/jenkins/scripts/find_plc_build.py --commit ${commit} > find_plc_build.json",
+        returnStatus: true
+    )
+    if (exitCode != 0) {
         return null
     }
-    for (build in plcJob.getBuilds()) {
-        if (build.isBuilding() || build.result == null) {
-            continue
-        }
-        if (trtllm_utils.isBuildWithParameter(build, 'ref', commit) &&
-            trtllm_utils.isBuildWithParameter(build, 'scanMode', 'pre_merge') &&
-            trtllm_utils.isBuildWithParameter(build, 'runSourceCodeScanning', 'true')) {
-            return [result: build.result.toString(), url: build.absoluteUrl]
-        }
-    }
-    return null
+    def buildInfo = new JsonSlurper().parseText(readFile("find_plc_build.json"))
+    return [result: buildInfo.result, url: buildInfo.url]
 }
 
 def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64", additionalParameters = [:]) {
