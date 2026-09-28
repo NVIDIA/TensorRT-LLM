@@ -1,0 +1,175 @@
+{
+  "copyright": "Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. SPDX-License-Identifier: Apache-2.0",
+  "reference": {
+    "repository": "NVIDIA/TensorRT-LLM",
+    "implementation": "GVR V2 self-sampling",
+    "entry": "run_varlen",
+    "mode": "hint-free",
+    "pull_request": "https://github.com/NVIDIA/TensorRT-LLM/pull/19076",
+    "commit": "be1b9885e8df9bf070e8cb68459e24a7119afaa9"
+  },
+  "overall": {
+    "radix_cuda": {
+      "cases": 9746,
+      "geomean": 5.051863720455904,
+      "minimum": 1.3352283494409702,
+      "p5": 1.800987459271426,
+      "p95": 10.216837270210021,
+      "wins": 9746,
+      "win_percent": 100,
+      "baseline_median_us": 46.3535,
+      "gvr_median_us": 9.6435
+    }
+  },
+  "comparison_common_cases": {
+    "flash": {
+      "cases": 2079,
+      "layers": 21,
+      "latency_relative_to_v2": {
+        "gvr_v2": 1.0,
+        "temporal_tiered": 1.5270656764856136,
+        "radix_cuda": 4.875738163985888
+      }
+    },
+    "pro": {
+      "cases": 2970,
+      "layers": 30,
+      "latency_relative_to_v2": {
+        "gvr_v2": 1.0,
+        "temporal_tiered": 1.54320332519381,
+        "radix_cuda": 4.871976103268161
+      }
+    },
+    "v32": {
+      "cases": 4697,
+      "layers": 61,
+      "latency_relative_to_v2": {
+        "gvr_v2": 1.0,
+        "temporal_tiered": 1.3723454906900026,
+        "radix_cuda": 5.250852136354158
+      }
+    }
+  },
+  "by_model": {
+    "flash": {
+      "radix_cuda": {
+        "cases": 2079,
+        "geomean": 4.875738163985888,
+        "minimum": 1.4130089899524063,
+        "p5": 1.6569445902710334,
+        "p95": 10.993023430337592,
+        "wins": 2079,
+        "win_percent": 100,
+        "baseline_median_us": 39.606,
+        "gvr_median_us": 6.608
+      }
+    },
+    "pro": {
+      "radix_cuda": {
+        "cases": 2970,
+        "geomean": 4.871976103268161,
+        "minimum": 1.3352283494409702,
+        "p5": 1.6883335124343106,
+        "p95": 10.58141910734875,
+        "wins": 2970,
+        "win_percent": 100,
+        "baseline_median_us": 42.3375,
+        "gvr_median_us": 6.979
+      }
+    },
+    "v32": {
+      "radix_cuda": {
+        "cases": 4697,
+        "geomean": 5.250852136354158,
+        "minimum": 2.1828381113051605,
+        "p5": 3.648166973469981,
+        "p95": 8.976731655272205,
+        "wins": 4697,
+        "win_percent": 100,
+        "baseline_median_us": 49.974,
+        "gvr_median_us": 10.768
+      }
+    }
+  },
+  "temporal_vs_v2": {
+    "temporal_tiered": {
+      "cases": 9746,
+      "geomean": 1.4550894088383663,
+      "minimum": 0.6885347106288259,
+      "p5": 1.095922446440455,
+      "p95": 2.102507274523004,
+      "wins": 9704,
+      "win_percent": 99.56905397085984,
+      "baseline_median_us": 12.232,
+      "gvr_median_us": 9.6435
+    }
+  },
+  "roofline_reachable_rate": {
+    "batch": 1024,
+    "reference": "Calibrated roof at each plotted intensity",
+    "aggregation": "Arithmetic mean and maximum of plotted-point reachable rates",
+    "by_model": {
+      "flash": {
+        "gvr_v2": {
+          "points": 9,
+          "average_percent": 41.56601571959186,
+          "peak_percent": 77.81571160254971
+        },
+        "temporal_tiered": {
+          "points": 9,
+          "average_percent": 26.123944119758303,
+          "peak_percent": 63.276309173607764
+        },
+        "radix_cuda": {
+          "points": 9,
+          "average_percent": 7.73037106360671,
+          "peak_percent": 16.904373664943286
+        }
+      },
+      "pro": {
+        "gvr_v2": {
+          "points": 9,
+          "average_percent": 39.00405637364329,
+          "peak_percent": 68.39789370398464
+        },
+        "temporal_tiered": {
+          "points": 9,
+          "average_percent": 25.39201270408693,
+          "peak_percent": 58.92620571524122
+        },
+        "radix_cuda": {
+          "points": 9,
+          "average_percent": 7.832445928048165,
+          "peak_percent": 16.38668927402192
+        }
+      },
+      "v32": {
+        "gvr_v2": {
+          "points": 7,
+          "average_percent": 41.47747500688756,
+          "peak_percent": 66.53750601976955
+        },
+        "temporal_tiered": {
+          "points": 7,
+          "average_percent": 27.779057298223755,
+          "peak_percent": 51.13105668384031
+        },
+        "radix_cuda": {
+          "points": 7,
+          "average_percent": 8.28762774707847,
+          "peak_percent": 17.75730356940984
+        }
+      }
+    }
+  },
+  "evolution_vs_radix": {
+    "temporal_tiered": {
+      "geomean": 3.4718579420414657,
+      "wins_percent": 98.38908270059513
+    },
+    "gvr_v2": {
+      "geomean": 5.051863720455904,
+      "wins_percent": 100
+    }
+  }
+}

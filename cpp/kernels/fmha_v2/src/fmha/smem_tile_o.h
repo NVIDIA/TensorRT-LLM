@@ -52,123 +52,63 @@ struct Smem_tile_o<Volta_hmma_fp16_16x16x16_traits, Cta_tile>
     using Data_type = typename Accumulator::Data_type;
 
     // The size of each element.
-    enum
-    {
-        BYTES_PER_ELEMENT = sizeof(Data_type)
-    };
+    static constexpr int BYTES_PER_ELEMENT = sizeof(Data_type);
 
     // The size of each STS.
-    enum
-    {
-        BYTES_PER_STS = 16
-    };
+    static constexpr int BYTES_PER_STS = 16;
 
     // The size of each row in shared memory.
-    enum
-    {
-        BYTES_PER_ROW = Cta_tile::N * Cta_tile::WARPS_K * 2 * BYTES_PER_ELEMENT
-    };
+    static constexpr int BYTES_PER_ROW = Cta_tile::N * Cta_tile::WARPS_K * 2 * BYTES_PER_ELEMENT;
 
     // The size of each LDS.
-    enum
-    {
-        BYTES_PER_LDS = 16
-    };
+    static constexpr int BYTES_PER_LDS = 16;
 
     // The number of threads (to produce 16B per LDS).
-    enum
-    {
-        THREADS_PER_ROW = Cta_tile::N * BYTES_PER_ELEMENT / BYTES_PER_LDS
-    };
+    static constexpr int THREADS_PER_ROW = Cta_tile::N * BYTES_PER_ELEMENT / BYTES_PER_LDS;
 
     // The number of rows loaded per LDS.
-    enum
-    {
-        ROWS_PER_LDS = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW
-    };
+    static constexpr int ROWS_PER_LDS = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW;
 
     // The number of rows.
-    enum
-    {
-        ROWS = Cta_tile::M
-    };
+    static constexpr int ROWS = Cta_tile::M;
 
     // We want at least one output per thread (if possible).
-    enum
-    {
-        ROWS_PER_LOOP_ = ROWS <= 64 ? ROWS : (int) Min<ROWS, ROWS_PER_LDS>::VALUE
-    };
+    static constexpr int ROWS_PER_LOOP_ = ROWS <= 64 ? ROWS : (int) Min<ROWS, ROWS_PER_LDS>::VALUE;
 
     // We also want to have "complete" MMAs.
-    enum
-    {
-        ROWS_PER_LOOP = Max<ROWS_PER_LOOP_, Mma_tile::M_PER_MMA_PER_CTA>::VALUE
-    };
+    static constexpr int ROWS_PER_LOOP = Max<ROWS_PER_LOOP_, Mma_tile::M_PER_MMA_PER_CTA>::VALUE;
 
     // The number of outer loops.
-    enum
-    {
-        LOOPS = fmha::Div_up<ROWS, ROWS_PER_LOOP>::VALUE
-    };
+    static constexpr int LOOPS = fmha::Div_up<ROWS, ROWS_PER_LOOP>::VALUE;
 
     // Make sure it matches our expectations.
     static_assert(ROWS_PER_LOOP >= (int) Mma_tile::M_PER_MMA_PER_CTA, "");
 
     // Do we have to guard against partial writes/reads.
-    enum
-    {
-        HAS_INCOMPLETE_LDS = ROWS_PER_LOOP % ROWS_PER_LDS != 0
-    };
+    static constexpr int HAS_INCOMPLETE_LDS = ROWS_PER_LOOP % ROWS_PER_LDS != 0;
 
     // The total number of LDS per loop.
-    enum
-    {
-        LDS_PER_LOOP = fmha::Div_up<ROWS_PER_LOOP, ROWS_PER_LDS>::VALUE
-    };
+    static constexpr int LDS_PER_LOOP = fmha::Div_up<ROWS_PER_LOOP, ROWS_PER_LDS>::VALUE;
 
     // The amount of shared memory.
-    enum
-    {
-        BYTES_PER_TILE = ROWS_PER_LOOP * BYTES_PER_ROW
-    };
+    static constexpr int BYTES_PER_TILE = ROWS_PER_LOOP * BYTES_PER_ROW;
 
     // Warps.
-    enum
-    {
-        WARPS_M = Cta_tile::WARPS_M
-    };
+    static constexpr int WARPS_M = Cta_tile::WARPS_M;
 
-    enum
-    {
-        WARPS_N = Cta_tile::WARPS_N
-    };
+    static constexpr int WARPS_N = Cta_tile::WARPS_N;
 
-    enum
-    {
-        WARPS_K = Cta_tile::WARPS_K
-    };
+    static constexpr int WARPS_K = Cta_tile::WARPS_K;
 
     // Determine the config.
-    enum
-    {
-        WARPS_2x1x2 = WARPS_M == 2 && WARPS_N == 1 && WARPS_K == 2
-    };
+    static constexpr int WARPS_2x1x2 = WARPS_M == 2 && WARPS_N == 1 && WARPS_K == 2;
 
-    enum
-    {
-        WARPS_1x1x8 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 8
-    };
+    static constexpr int WARPS_1x1x8 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 8;
 
-    enum
-    {
-        WARPS_1x1x4 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 4
-    };
+    static constexpr int WARPS_1x1x4 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 4;
 
     // Flash Attention uses WARPS_4x1x1
-    enum
-    {
-        WARPS_4x1x1 = WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 1
-    };
+    static constexpr int WARPS_4x1x1 = WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 1;
 
     // Ctor.
     inline __device__ Smem_tile_o(void* smem, int tidx)
@@ -365,20 +305,14 @@ struct Smem_tile_o<Volta_hmma_fp16_16x16x16_traits, Cta_tile>
     inline __device__ void store(Accumulator const (&acc)[M][N], int mi)
     {
 
-        enum
-        {
-            M_PER_MMA = Mma_tile::M_PER_MMA_PER_CTA
-        };
+        static constexpr int M_PER_MMA = Mma_tile::M_PER_MMA_PER_CTA;
 
 #pragma unroll
         for (int ni = 0; ni < Mma_tile::VALID_MMAS_N; ++ni)
         {
 
             // The number of MMAs that are stored per loop iteration.
-            enum
-            {
-                MMAS_M_PER_LOOP = Mma_tile::MMAS_M / LOOPS
-            };
+            static constexpr int MMAS_M_PER_LOOP = Mma_tile::MMAS_M / LOOPS;
 
 // Store 1st column of the different MMAs.
 #pragma unroll
@@ -488,155 +422,83 @@ struct Hmma_smem_tile_o
     using Epilogue_type = typename Traits::Epilogue_type;
 
     // The size of each element.
-    enum
-    {
-        BYTES_PER_ELEMENT = sizeof(Epilogue_type)
-    };
+    static constexpr int BYTES_PER_ELEMENT = sizeof(Epilogue_type);
 
     // The amount of bytes per row (without packing or split-k).
-    enum
-    {
-        BYTES_PER_ROW = Cta_tile::N * BYTES_PER_ELEMENT
-    };
+    static constexpr int BYTES_PER_ROW = Cta_tile::N * BYTES_PER_ELEMENT;
 
     // The size of each STS.
-    enum
-    {
-        BYTES_PER_STS = BYTES_PER_STS_
-    };
+    static constexpr int BYTES_PER_STS = BYTES_PER_STS_;
 
     // The size of each LDS.
-    enum
-    {
-        BYTES_PER_LDS = 16
-    };
+    static constexpr int BYTES_PER_LDS = 16;
 
     // The number of threads (to produce 16B per LDS).
-    enum
-    {
-        THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_LDS
-    };
+    static constexpr int THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_LDS;
 
     // The number of rows loaded per LDS.
-    enum
-    {
-        ROWS_PER_LDS = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW
-    };
+    static constexpr int ROWS_PER_LDS = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW;
 
     // The number of rows in shared memory.
-    enum
-    {
-        ROWS = Cta_tile::M
-    };
+    static constexpr int ROWS = Cta_tile::M;
 
     // We want at least one output per thread (if possible).
-    enum
-    {
-        ROWS_PER_LOOP_ = ROWS <= 64 ? ROWS : (int) Min<ROWS, ROWS_PER_LDS>::VALUE
-    };
+    static constexpr int ROWS_PER_LOOP_ = ROWS <= 64 ? ROWS : (int) Min<ROWS, ROWS_PER_LDS>::VALUE;
 
     // We also want to have "complete" MMAs.
-    enum
-    {
-        ROWS_PER_LOOP = Max<ROWS_PER_LOOP_, Mma_tile::M_PER_MMA_PER_CTA>::VALUE
-    };
+    static constexpr int ROWS_PER_LOOP = Max<ROWS_PER_LOOP_, Mma_tile::M_PER_MMA_PER_CTA>::VALUE;
 
     // The number of outer loops.
-    enum
-    {
-        LOOPS = fmha::Div_up<ROWS, ROWS_PER_LOOP>::VALUE
-    };
+    static constexpr int LOOPS = fmha::Div_up<ROWS, ROWS_PER_LOOP>::VALUE;
 
     // Make sure it matches our expectations.
     static_assert(ROWS_PER_LOOP >= (int) Mma_tile::M_PER_MMA_PER_CTA, "");
 
     // Do we have to guard against partial writes/reads.
-    enum
-    {
-        HAS_INCOMPLETE_LDS = ROWS_PER_LOOP % ROWS_PER_LDS != 0
-    };
+    static constexpr int HAS_INCOMPLETE_LDS = ROWS_PER_LOOP % ROWS_PER_LDS != 0;
 
     // The total number of LDS per loop.
-    enum
-    {
-        LDS_PER_LOOP = fmha::Div_up<ROWS_PER_LOOP, ROWS_PER_LDS>::VALUE
-    };
+    static constexpr int LDS_PER_LOOP = fmha::Div_up<ROWS_PER_LOOP, ROWS_PER_LDS>::VALUE;
 
     // The amount of shared memory.
-    enum
-    {
-        BYTES_PER_TILE = ROWS_PER_LOOP * BYTES_PER_ROW * Cta_tile::WARPS_K
-    };
+    static constexpr int BYTES_PER_TILE = ROWS_PER_LOOP * BYTES_PER_ROW * Cta_tile::WARPS_K;
 
     // The amount of row packing to make sure we have at least 128B per smem row (without split-k).
-    enum
-    {
-        ROW_PACKING = Max<1, 128 / BYTES_PER_ROW>::VALUE
-    };
+    static constexpr int ROW_PACKING = Max<1, 128 / BYTES_PER_ROW>::VALUE;
 
     // Make sure our row packing is correct
     static_assert(ROWS_PER_LOOP % ROW_PACKING == 0, "");
 
     // The amount of shared memory per row after packing.
-    enum
-    {
-        BYTES_PER_ROW_WITH_PACKING = BYTES_PER_ROW * ROW_PACKING
-    };
+    static constexpr int BYTES_PER_ROW_WITH_PACKING = BYTES_PER_ROW * ROW_PACKING;
 
     // Make sure we have at least 128B per row after packing.
     static_assert(BYTES_PER_ROW_WITH_PACKING >= 128, "");
 
     // The number of threads per row after packing.
-    enum
-    {
-        THREADS_PER_ROW_WITH_PACKING = THREADS_PER_ROW * ROW_PACKING
-    };
+    static constexpr int THREADS_PER_ROW_WITH_PACKING = THREADS_PER_ROW * ROW_PACKING;
 
     // Make sure we have at least 8 threads per row after packing.
     static_assert(THREADS_PER_ROW_WITH_PACKING >= 8, "");
 
     // Warps.
-    enum
-    {
-        WARPS_M = Cta_tile::WARPS_M
-    };
+    static constexpr int WARPS_M = Cta_tile::WARPS_M;
 
-    enum
-    {
-        WARPS_N = Cta_tile::WARPS_N
-    };
+    static constexpr int WARPS_N = Cta_tile::WARPS_N;
 
-    enum
-    {
-        WARPS_K = Cta_tile::WARPS_K
-    };
+    static constexpr int WARPS_K = Cta_tile::WARPS_K;
 
     // Determine the config.
-    enum
-    {
-        WARPS_2x1x2 = WARPS_M == 2 && WARPS_N == 1 && WARPS_K == 2
-    };
+    static constexpr int WARPS_2x1x2 = WARPS_M == 2 && WARPS_N == 1 && WARPS_K == 2;
 
-    enum
-    {
-        WARPS_1x1x8 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 8
-    };
+    static constexpr int WARPS_1x1x8 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 8;
 
-    enum
-    {
-        WARPS_1x1x4 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 4
-    };
+    static constexpr int WARPS_1x1x4 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 4;
 
     // Flash Attention uses WARPS_4x1x1
-    enum
-    {
-        WARPS_4x1x1 = WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 1
-    };
+    static constexpr int WARPS_4x1x1 = WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 1;
 
-    enum
-    {
-        WARPS_4x1x2 = WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 2
-    };
+    static constexpr int WARPS_4x1x2 = WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 2;
 
     // Ctor.
     inline __device__ Hmma_smem_tile_o(void* smem, int tidx)
@@ -838,10 +700,7 @@ struct Hmma_smem_tile_o
     inline __device__ void store_(Accumulators const (&acc)[M][N], int mi)
     {
 
-        enum
-        {
-            M_PER_MMA = Mma_tile::M_PER_MMA_PER_CTA
-        };
+        static constexpr int M_PER_MMA = Mma_tile::M_PER_MMA_PER_CTA;
 
         Converter converter;
 #pragma unroll
@@ -849,10 +708,7 @@ struct Hmma_smem_tile_o
         {
 
             // The number of MMAs that are stored per loop iteration.
-            enum
-            {
-                MMAS_M_PER_LOOP = Mma_tile::MMAS_M / LOOPS
-            };
+            static constexpr int MMAS_M_PER_LOOP = Mma_tile::MMAS_M / LOOPS;
 
             // Store 1st column of the different MMAs.
             // Skip N paddings
@@ -1079,52 +935,28 @@ struct Smem_tile_o<fmha::Ampere_hmma_fp32_traits, Cta_tile>
     using Accumulator = typename Base::Accumulator;
 
     // The size of each
-    enum
-    {
-        BYTES_PER_ELEMENT = Base::BYTES_PER_ELEMENT
-    };
+    static constexpr int BYTES_PER_ELEMENT = Base::BYTES_PER_ELEMENT;
 
     // The size of each row in shared memory.
-    enum
-    {
-        BYTES_PER_ROW = Base::BYTES_PER_ROW * Cta_tile::WARPS_K
-    };
+    static constexpr int BYTES_PER_ROW = Base::BYTES_PER_ROW * Cta_tile::WARPS_K;
 
     // The size of each row in shared memory.
-    enum
-    {
-        BYTES_PER_LDS = Base::BYTES_PER_LDS
-    };
+    static constexpr int BYTES_PER_LDS = Base::BYTES_PER_LDS;
 
     // The number of threads (to produce 16B per LDS).
-    enum
-    {
-        THREADS_PER_ROW = Base::THREADS_PER_ROW
-    };
+    static constexpr int THREADS_PER_ROW = Base::THREADS_PER_ROW;
 
     // The number of outer loops.
-    enum
-    {
-        LOOPS = Base::LOOPS
-    };
+    static constexpr int LOOPS = Base::LOOPS;
 
     // The number of rows loaded per LDS.
-    enum
-    {
-        ROWS_PER_LDS = Base::ROWS_PER_LDS
-    };
+    static constexpr int ROWS_PER_LDS = Base::ROWS_PER_LDS;
 
     // Do we have to guard against partial writes/reads.
-    enum
-    {
-        HAS_INCOMPLETE_LDS = Base::HAS_INCOMPLETE_LDS
-    };
+    static constexpr int HAS_INCOMPLETE_LDS = Base::HAS_INCOMPLETE_LDS;
 
     // The total number of LDS per loop.
-    enum
-    {
-        LDS_PER_LOOP = Base::LDS_PER_LOOP
-    };
+    static constexpr int LDS_PER_LOOP = Base::LDS_PER_LOOP;
 
     // Ctor.
     inline __device__ Smem_tile_o(void* smem, int tidx)
@@ -1186,20 +1018,14 @@ struct Smem_tile_o<fmha::Ampere_hmma_fp32_traits, Cta_tile>
     inline __device__ void store(Accumulator const (&acc)[M][N], int mi)
     {
 
-        enum
-        {
-            M_PER_MMA = Mma_tile::M_PER_MMA_PER_CTA
-        };
+        static constexpr int M_PER_MMA = Mma_tile::M_PER_MMA_PER_CTA;
 
 #pragma unroll
         for (int ni = 0; ni < Mma_tile::MMAS_N; ++ni)
         {
 
             // The number of MMAs that are stored per loop iteration.
-            enum
-            {
-                MMAS_M_PER_LOOP = Mma_tile::MMAS_M / LOOPS
-            };
+            static constexpr int MMAS_M_PER_LOOP = Mma_tile::MMAS_M / LOOPS;
 
             // Store 1st column of the different MMAs.
             if (ni < Mma_tile::VALID_MMAS_N)
@@ -1292,52 +1118,28 @@ struct Smem_tile_o<fmha::Ampere_hmma_bf16_traits, Cta_tile>
     using Accumulator = typename Base::Accumulator;
 
     // The size of each element.
-    enum
-    {
-        BYTES_PER_ELEMENT = Base::BYTES_PER_ELEMENT
-    };
+    static constexpr int BYTES_PER_ELEMENT = Base::BYTES_PER_ELEMENT;
 
     // The size of each row in shared memory.
-    enum
-    {
-        BYTES_PER_ROW = Base::BYTES_PER_ROW * Cta_tile::WARPS_K
-    };
+    static constexpr int BYTES_PER_ROW = Base::BYTES_PER_ROW * Cta_tile::WARPS_K;
 
     // The size of each row in shared memory.
-    enum
-    {
-        BYTES_PER_LDS = Base::BYTES_PER_LDS
-    };
+    static constexpr int BYTES_PER_LDS = Base::BYTES_PER_LDS;
 
     // The number of threads (to produce 16B per LDS).
-    enum
-    {
-        THREADS_PER_ROW = Base::THREADS_PER_ROW
-    };
+    static constexpr int THREADS_PER_ROW = Base::THREADS_PER_ROW;
 
     // The number of outer loops.
-    enum
-    {
-        LOOPS = Base::LOOPS
-    };
+    static constexpr int LOOPS = Base::LOOPS;
 
     // The number of rows loaded per LDS.
-    enum
-    {
-        ROWS_PER_LDS = Base::ROWS_PER_LDS
-    };
+    static constexpr int ROWS_PER_LDS = Base::ROWS_PER_LDS;
 
     // Do we have to guard against partial writes/reads.
-    enum
-    {
-        HAS_INCOMPLETE_LDS = Base::HAS_INCOMPLETE_LDS
-    };
+    static constexpr int HAS_INCOMPLETE_LDS = Base::HAS_INCOMPLETE_LDS;
 
     // The total number of LDS per loop.
-    enum
-    {
-        LDS_PER_LOOP = Base::LDS_PER_LOOP
-    };
+    static constexpr int LDS_PER_LOOP = Base::LDS_PER_LOOP;
 
     // Ctor.
     inline __device__ Smem_tile_o(void* smem, int tidx)
@@ -1399,20 +1201,14 @@ struct Smem_tile_o<fmha::Ampere_hmma_bf16_traits, Cta_tile>
     inline __device__ void store(Accumulator const (&acc)[M][N], int mi)
     {
 
-        enum
-        {
-            M_PER_MMA = Mma_tile::M_PER_MMA_PER_CTA
-        };
+        static constexpr int M_PER_MMA = Mma_tile::M_PER_MMA_PER_CTA;
 
 #pragma unroll
         for (int ni = 0; ni < Mma_tile::MMAS_N; ++ni)
         {
 
             // The number of MMAs that are stored per loop iteration.
-            enum
-            {
-                MMAS_M_PER_LOOP = Mma_tile::MMAS_M / LOOPS
-            };
+            static constexpr int MMAS_M_PER_LOOP = Mma_tile::MMAS_M / LOOPS;
 
             // Store 1st column of the different MMAs.
             if (ni < Mma_tile::VALID_MMAS_N)
@@ -1625,179 +1421,98 @@ struct Smem_tile_o_base_8bit_mma
     using Accumulator = fmha::Fragment_accumulator<Traits>;
 
     // The size of each element.
-    enum
-    {
-        BYTES_PER_ELEMENT = sizeof(typename Traits::Accumulator_type)
-    };
+    static constexpr int BYTES_PER_ELEMENT = sizeof(typename Traits::Accumulator_type);
 
     // The amount of bytes per row (without packing or split-k).
-    enum
-    {
-        BYTES_PER_ROW = Cta_tile::N * BYTES_PER_ELEMENT
-    };
+    static constexpr int BYTES_PER_ROW = Cta_tile::N * BYTES_PER_ELEMENT;
 
     // The size of each STS.
-    enum
-    {
-        BYTES_PER_STS = BYTES_PER_ELEMENT * 4
-    };
+    static constexpr int BYTES_PER_STS = BYTES_PER_ELEMENT * 4;
 
     // The STS Packed Data Type
     using Sts_packed_type = typename Uint_from_size_in_bytes<BYTES_PER_STS>::Type;
 
     // The size of each LDS.
-    enum
-    {
-        BYTES_PER_LDS = 16
-    };
+    static constexpr int BYTES_PER_LDS = 16;
 
     // The number of threads to store a "row" of the matrix. We force it to 16 for SEQLEN=384.
-    enum
-    {
-        THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_LDS
-    };
+    static constexpr int THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_LDS;
 
     // The number of rows loaded per LDS.
-    enum
-    {
-        ROWS_PER_LDS = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW
-    };
+    static constexpr int ROWS_PER_LDS = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW;
 
     // The STS bytes for one quad of threads
-    enum
-    {
-        BYTES_PER_STS_PER_QUAD = BYTES_PER_STS * 4
-    };
+    static constexpr int BYTES_PER_STS_PER_QUAD = BYTES_PER_STS * 4;
 
     // The xor factor per LDS
     // (4 consecutive threads do 64B swizzle for 16B per sts, 32B swizzle for 8B per sts)
-    enum
-    {
-        XOR_FACTOR = fmha::Div_up<BYTES_PER_STS * 4, BYTES_PER_LDS>::VALUE
-    };
+    static constexpr int XOR_FACTOR = fmha::Div_up<BYTES_PER_STS * 4, BYTES_PER_LDS>::VALUE;
 
     // The smem offset in bytes per MMA_N (2 squad threads)
-    enum
-    {
-        BYTES_OFFSET_PER_MMA_N = BYTES_PER_STS * 8
-    };
+    static constexpr int BYTES_OFFSET_PER_MMA_N = BYTES_PER_STS * 8;
 
     // The number of "rows" to process in total.
-    enum
-    {
-        ROWS = Cta_tile::M
-    };
+    static constexpr int ROWS = Cta_tile::M;
 
     // We want at least one output per thread (if possible).
-    enum
-    {
-        ROWS_PER_LOOP_ = ROWS <= 64 ? ROWS : (int) Min<ROWS, ROWS_PER_LDS>::VALUE
-    };
+    static constexpr int ROWS_PER_LOOP_ = ROWS <= 64 ? ROWS : (int) Min<ROWS, ROWS_PER_LDS>::VALUE;
 
     // We also want to have "complete" MMAs.
-    enum
-    {
-        ROWS_PER_LOOP = Max<ROWS_PER_LOOP_, Mma_tile::M_PER_MMA_PER_CTA>::VALUE
-    };
+    static constexpr int ROWS_PER_LOOP = Max<ROWS_PER_LOOP_, Mma_tile::M_PER_MMA_PER_CTA>::VALUE;
 
     // The number of outer loops.
-    enum
-    {
-        LOOPS = fmha::Div_up<ROWS, ROWS_PER_LOOP>::VALUE
-    };
+    static constexpr int LOOPS = fmha::Div_up<ROWS, ROWS_PER_LOOP>::VALUE;
 
     // Make sure it matches our expectations.
     static_assert(ROWS_PER_LOOP >= (int) Mma_tile::M_PER_MMA_PER_CTA, "");
 
     // Do we have to guard against partial writes/reads.
-    enum
-    {
-        HAS_INCOMPLETE_LDS = ROWS_PER_LOOP % ROWS_PER_LDS != 0
-    };
+    static constexpr int HAS_INCOMPLETE_LDS = ROWS_PER_LOOP % ROWS_PER_LDS != 0;
 
     // The total number of LDS per loop.
-    enum
-    {
-        LDS_PER_LOOP = fmha::Div_up<ROWS_PER_LOOP, ROWS_PER_LDS>::VALUE
-    };
+    static constexpr int LDS_PER_LOOP = fmha::Div_up<ROWS_PER_LOOP, ROWS_PER_LDS>::VALUE;
 
     // The amount of shared memory.
-    enum
-    {
-        BYTES_PER_TILE = ROWS_PER_LOOP * BYTES_PER_ROW * Cta_tile::WARPS_K
-    };
+    static constexpr int BYTES_PER_TILE = ROWS_PER_LOOP * BYTES_PER_ROW * Cta_tile::WARPS_K;
 
     // The amount of row packing to make sure we have at least 128B per smem row (without split-k).
-    enum
-    {
-        ROW_PACKING = Max<1, 128 / BYTES_PER_ROW>::VALUE
-    };
+    static constexpr int ROW_PACKING = Max<1, 128 / BYTES_PER_ROW>::VALUE;
 
     // Make sure our row packing is correct
     static_assert(ROWS_PER_LOOP % ROW_PACKING == 0, "");
 
     // The amount of shared memory per row after packing.
-    enum
-    {
-        BYTES_PER_ROW_WITH_PACKING = BYTES_PER_ROW * ROW_PACKING
-    };
+    static constexpr int BYTES_PER_ROW_WITH_PACKING = BYTES_PER_ROW * ROW_PACKING;
 
     // Make sure we have at least 128B per row after packing.
     static_assert(BYTES_PER_ROW_WITH_PACKING >= 128, "");
 
     // The number of threads per row after packing.
-    enum
-    {
-        THREADS_PER_ROW_WITH_PACKING = THREADS_PER_ROW * ROW_PACKING
-    };
+    static constexpr int THREADS_PER_ROW_WITH_PACKING = THREADS_PER_ROW * ROW_PACKING;
 
     // Make sure we have at least 8 threads per row after packing.
     static_assert(THREADS_PER_ROW_WITH_PACKING >= 8, "");
 
     // Warps.
-    enum
-    {
-        WARPS_M = Cta_tile::WARPS_M
-    };
+    static constexpr int WARPS_M = Cta_tile::WARPS_M;
 
-    enum
-    {
-        WARPS_N = Cta_tile::WARPS_N
-    };
+    static constexpr int WARPS_N = Cta_tile::WARPS_N;
 
-    enum
-    {
-        WARPS_K = Cta_tile::WARPS_K
-    };
+    static constexpr int WARPS_K = Cta_tile::WARPS_K;
 
     static_assert(WARPS_K > 1 || std::is_same<Traits, Ada_qmma_e4m3_fp32_traits>::value,
         "Kernel misconfigured. No split-k needed.");
 
     // Determine the config.
-    enum
-    {
-        WARPS_2x1x2 = WARPS_M == 2 && WARPS_N == 1 && WARPS_K == 2
-    };
+    static constexpr int WARPS_2x1x2 = WARPS_M == 2 && WARPS_N == 1 && WARPS_K == 2;
 
-    enum
-    {
-        WARPS_4x1x2 = WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 2
-    };
+    static constexpr int WARPS_4x1x2 = WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 2;
 
-    enum
-    {
-        WARPS_1x1x8 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 8
-    };
+    static constexpr int WARPS_1x1x8 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 8;
 
-    enum
-    {
-        WARPS_1x1x4 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 4
-    };
+    static constexpr int WARPS_1x1x4 = WARPS_M == 1 && WARPS_N == 1 && WARPS_K == 4;
 
-    enum
-    {
-        WARPS_4x1x1 = WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 1
-    };
+    static constexpr int WARPS_4x1x1 = WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 1;
 
     // Ctor.
     inline __device__ Smem_tile_o_base_8bit_mma(void* smem, int tidx)
@@ -1935,16 +1650,10 @@ struct Smem_tile_o_base_8bit_mma
     inline __device__ void store(Accumulator const (&acc)[M][N], int mi)
     {
 
-        enum
-        {
-            M_PER_MMA = Mma_tile::M_PER_MMA_PER_CTA
-        };
+        static constexpr int M_PER_MMA = Mma_tile::M_PER_MMA_PER_CTA;
 
         // The number of MMAs that are stored per loop iteration.
-        enum
-        {
-            MMAS_M_PER_LOOP = Mma_tile::MMAS_M / LOOPS
-        };
+        static constexpr int MMAS_M_PER_LOOP = Mma_tile::MMAS_M / LOOPS;
 
 #pragma unroll
         for (int ni = 0; ni < Mma_tile::MMAS_N; ++ni)
@@ -2103,76 +1812,37 @@ struct Smem_tile_o_interleaved
     // The accumulators.
     using Accumulator = fmha::Fragment_accumulator<Traits>;
 
-    enum
-    {
-        VEC = 32
-    };
+    static constexpr int VEC = 32;
 
-    enum
-    {
-        NUM_SLICES = Cta_tile::N / VEC
-    };
+    static constexpr int NUM_SLICES = Cta_tile::N / VEC;
 
     static_assert(NUM_SLICES == 1 || NUM_SLICES == 2, "");
 
-    enum
-    {
-        BYTES_PER_ELEMENT = 4
-    };
+    static constexpr int BYTES_PER_ELEMENT = 4;
 
-    enum
-    {
-        BYTES_PER_STS = 16
-    };
+    static constexpr int BYTES_PER_STS = 16;
 
-    enum
-    {
-        BYTES_PER_LDS = 16
-    };
+    static constexpr int BYTES_PER_LDS = 16;
 
-    enum
-    {
-        ELTS_PER_STS = BYTES_PER_STS / BYTES_PER_ELEMENT
-    };
+    static constexpr int ELTS_PER_STS = BYTES_PER_STS / BYTES_PER_ELEMENT;
 
     static_assert(VEC * BYTES_PER_ELEMENT == 128, "");
 
-    enum
-    {
-        BYTES_PER_ROW = Cta_tile::WARPS_K * VEC * BYTES_PER_ELEMENT
-    };
+    static constexpr int BYTES_PER_ROW = Cta_tile::WARPS_K * VEC * BYTES_PER_ELEMENT;
 
     // Each row only stores one slice. The other slice starts this many rows below
-    enum
-    {
-        ROWS_PER_SLICE = Cta_tile::WARPS_M * 16
-    };
+    static constexpr int ROWS_PER_SLICE = Cta_tile::WARPS_M * 16;
 
-    enum
-    {
-        TOTAL_ROWS = NUM_SLICES * ROWS_PER_SLICE
-    };
+    static constexpr int TOTAL_ROWS = NUM_SLICES * ROWS_PER_SLICE;
 
-    enum
-    {
-        BYTES_PER_TILE = BYTES_PER_ROW * TOTAL_ROWS
-    };
+    static constexpr int BYTES_PER_TILE = BYTES_PER_ROW * TOTAL_ROWS;
 
     // LDS
-    enum
-    {
-        THREADS_PER_ROW = 8
-    };
+    static constexpr int THREADS_PER_ROW = 8;
 
-    enum
-    {
-        ROWS_PER_LDS = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW
-    };
+    static constexpr int ROWS_PER_LDS = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW;
 
-    enum
-    {
-        LDS_PER_LOOP = TOTAL_ROWS / ROWS_PER_LDS
-    };
+    static constexpr int LDS_PER_LOOP = TOTAL_ROWS / ROWS_PER_LDS;
 
     // Ctor.
     inline __device__ Smem_tile_o_interleaved(void* smem, int tidx)

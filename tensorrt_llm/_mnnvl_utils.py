@@ -79,7 +79,7 @@ class ProcessGroupComm:
     def barrier(self) -> None:
         # Same MetaInitMode problem: the public ProcessGroup barrier is a c10d
         # operator and gets intercepted before it reaches Gloo. Call the CPU
-        # backend directly, as ops.py::_mnnvl_workspace_barrier does.
+        # backend directly, as ops.py::_mnnvl_workspace_all_succeeded does.
         self._pg._get_backend(torch.device("cpu")).barrier().wait()
 
 

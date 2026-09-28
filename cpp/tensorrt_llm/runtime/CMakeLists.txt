@@ -16,6 +16,7 @@ include(FetchContent)
 
 set(SRCS
     utils/mpiUtils.cpp
+    mcastGroupComm.cpp
     utils/numpyUtils.cpp
     utils/runtimeUtils.cpp
     utils/debugUtils.cu

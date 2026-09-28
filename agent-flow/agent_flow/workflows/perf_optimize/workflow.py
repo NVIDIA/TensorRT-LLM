@@ -19,7 +19,6 @@ from agent_flow import (
     AgentLayerConfig,
     BackendConfig,
     SessionConfig,
-    require_tool_call_stop_hook,
 )
 from agent_flow.console import print_message, print_rule
 from agent_flow.logger import get_logger
@@ -95,22 +94,6 @@ def _progress_has_entries(path: Path) -> bool:
     return bool(data[OPTIMIZATION_STAGE])
 
 
-def _compose_required_tools_hooks(required_tools: list[str]) -> dict | None:
-    """Compose stop hooks that require *every* listed tool to be called.
-
-    ``require_tool_call_stop_hook`` enforces "at least one of the listed
-    names was called". Stacking one such hook per tool — each independent
-    — yields AND semantics: every per-tool hook must allow the stop, so
-    all listed tools must have been called this turn.
-    """
-    if not required_tools:
-        return None
-    merged: dict[str, list] = {"Stop": []}
-    for name in required_tools:
-        merged["Stop"].extend(require_tool_call_stop_hook([name])["Stop"])
-    return merged
-
-
 def _make_agent(
     name: str,
     system_prompt: str,
@@ -121,7 +104,6 @@ def _make_agent(
     session_mode: str = "persistent",
     cwd: Path | None = None,
 ) -> AgentLayer:
-    hooks = _compose_required_tools_hooks(required_tools or [])
     return AgentLayer(
         AgentLayerConfig(
             name=name,
@@ -130,10 +112,10 @@ def _make_agent(
                 kind=backend_kind,
                 model=model,
                 tools=tools,
-                hooks=hooks,
                 cwd=cwd,
             ),
             session=SessionConfig(mode=session_mode),
+            required_tools=tuple(required_tools or ()),
         )
     )
 
@@ -1318,13 +1300,9 @@ class PerfOptimizeWorkflow:
                 f"any conflict-resolution code before finishing.\n\n"
                 f"Launch and benchmark this combined state using "
                 f"`--extra_llm_api_options {integration_config}` and the same "
-                f"Evaluator measurement/Pareto rules. Compute the combined "
-                f"required gain as `max(noise_floor_pct, best standalone "
-                f"measured_gain_pct - noise_floor_pct)` from task.yaml and the "
-                f"manifest. Report that threshold exactly; the Python "
-                f"orchestrator cross-checks it and the measured gain before "
-                f"applying your verdict. You may diagnose/remediate at most "
-                f"twice. If the combined "
+                f"Evaluator measurement/Pareto rules. The Python orchestrator "
+                f"applies the required-gain threshold to your measured result. "
+                f"You may diagnose/remediate at most twice. If the combined "
                 f"state still fails, retain and validate only the highest standalone "
                 f"gain candidate (manifest order breaks ties); if that also fails, "
                 f"restore the base and REJECT.\n\n"
@@ -1362,17 +1340,11 @@ class PerfOptimizeWorkflow:
                 noise_floor,
                 best_standalone_gain - noise_floor,
             )
-            reported_required_gain = float(verdict["required_gain_pct"])
-            if abs(reported_required_gain - expected_required_gain) > 1e-6:
-                raise RuntimeError(
-                    "integrator required_gain_pct mismatch: "
-                    f"reported {reported_required_gain}, expected {expected_required_gain}"
-                )
             measured_gain = float(verdict["measured_gain_pct"])
-            if measured_gain < reported_required_gain:
+            if measured_gain < expected_required_gain:
                 raise RuntimeError(
                     f"integrator {decision} gain {measured_gain} is below required "
-                    f"{reported_required_gain}"
+                    f"{expected_required_gain}"
                 )
             if self._curve_mode():
                 roadmap = roadmap_schema.load_roadmap(self.roadmap_path)
