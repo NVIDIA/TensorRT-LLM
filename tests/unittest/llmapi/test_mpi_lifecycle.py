@@ -77,6 +77,7 @@ def _cleanup_processes(identities: dict[int, float]) -> None:
     "scenario",
     [
         "mixed_failure",
+        "mixed_collective",
         "all_hang",
         "all_return",
         "no_submission",
@@ -213,16 +214,16 @@ def test_remote_mpi_worker_lifecycle(scenario: str, ranks: int, tmp_path: Path) 
     assert (tmp_path / "engine-started.json").exists(), log
     assert "ZMQ thread safety violation" not in log, log
 
-    if scenario in ("mixed_failure", "all_hang"):
+    if scenario in ("mixed_failure", "mixed_collective", "all_hang"):
         assert process.returncode != 0, log
         assert (tmp_path / "workers-started.json").exists(), log
-        expected_marker = "error-observed" if scenario == "mixed_failure" else "engine-exiting"
+        expected_marker = "engine-exiting" if scenario == "all_hang" else "error-observed"
         marker = tmp_path / f"{expected_marker}.json"
         assert marker.exists(), log
         triggered = json.loads(marker.read_text())["monotonic"]
         # The stop helper imports TensorRT-LLM afresh after engine exit. The
         # mixed-failure path needs no new interpreter and has a tighter bound.
-        teardown_budget = 20 if scenario == "mixed_failure" else 120
+        teardown_budget = 120 if scenario == "all_hang" else 20
         assert exited - triggered < teardown_budget, f"Teardown exceeded its bounded budget:\n{log}"
     elif scenario == "no_submission":
         assert process.returncode == 3, log

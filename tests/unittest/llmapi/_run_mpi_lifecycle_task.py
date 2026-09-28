@@ -52,10 +52,15 @@ def worker_task(directory_name: str, scenario: str, batch: int, size: int) -> tu
     if scenario == "async_drain" and batch == 0:
         _wait_for_markers(directory, ["engine-exiting"])
 
-    if scenario in ("mixed_failure", "all_hang"):
+    if scenario in ("mixed_failure", "mixed_collective", "all_hang"):
         _wait_for_markers(directory, [f"started-{batch}-{peer}" for peer in range(size)])
         if scenario == "mixed_failure" and rank % 2 == 0:
             raise RuntimeError("injected MPI lifecycle failure")
+        if scenario == "mixed_collective":
+            if rank == size - 1:
+                raise RuntimeError("injected MPI lifecycle failure")
+            MPI.COMM_WORLD.Barrier()
+            raise AssertionError("The collective completed without the failed rank")
         time.sleep(3600)
         raise AssertionError("The owner did not terminate the stuck worker world")
 
@@ -102,7 +107,7 @@ def main() -> int:
         assert isinstance(response, list), response
         assert sorted(response) == [(rank, batch) for rank in range(args.ranks)], response
 
-    if args.scenario in ("mixed_failure", "all_hang"):
+    if args.scenario in ("mixed_failure", "mixed_collective", "all_hang"):
         client.submit(remote_task, str(directory), args.scenario, 0, args.ranks)
         _wait_for_markers(directory, [f"started-0-{rank}" for rank in range(args.ranks)])
         _mark(directory, "workers-started")
