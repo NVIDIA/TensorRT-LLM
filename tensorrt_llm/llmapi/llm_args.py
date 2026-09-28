@@ -3349,6 +3349,21 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "graph ladder.",
         status="prototype")
 
+    confidence_admission_receipt_path: Optional[str] = Field(
+        default=None,
+        description=
+        "Path to an authenticated workload-level confidence admission receipt. "
+        "The receipt must prove positive aggregate compact value after the "
+        "fixed confidence-path overhead and safety margin are charged.",
+        status="prototype")
+
+    confidence_admission_receipt_sha256: Optional[str] = Field(
+        default=None,
+        description="Externally authenticated lowercase SHA256 of "
+        "confidence_admission_receipt_path. This pin must come from the sealed "
+        "deployment package rather than from the receipt itself.",
+        status="prototype")
+
     enable_fused_confidence_scheduler: bool = Field(
         default=False,
         description=
@@ -3380,23 +3395,40 @@ class DSparkDecodingConfig(DecodingBaseConfig):
             if (self.enable_fused_confidence_scheduler
                     or self.confidence_sts_path
                     or self.confidence_sps_table_path
-                    or self.confidence_sps_live_fingerprint_path):
+                    or self.confidence_sps_live_fingerprint_path
+                    or self.confidence_admission_receipt_path
+                    or self.confidence_admission_receipt_sha256):
                 raise ValueError(
                     "enable_fused_confidence_scheduler / confidence_sts_path / "
                     "confidence_sps_table_path / "
-                    "confidence_sps_live_fingerprint_path require "
+                    "confidence_sps_live_fingerprint_path / "
+                    "confidence_admission_receipt_path / "
+                    "confidence_admission_receipt_sha256 require "
                     "enable_confidence_scheduling=True")
             return self
 
-        if not self.confidence_sps_table_path:
-            raise ValueError(
-                "enable_confidence_scheduling=True requires "
-                "confidence_sps_table_path from a matched static-cost sweep")
-        if not self.confidence_sps_live_fingerprint_path:
-            raise ValueError(
-                "enable_confidence_scheduling=True requires "
-                "confidence_sps_live_fingerprint_path generated from the active runtime"
-            )
+        if self.max_draft_len == 1:
+            # Physical K1 has no smaller verifier window, so confidence
+            # scheduling can only add control-path work. Resolve it to the
+            # ordinary feature-off configuration before any runtime component
+            # observes the config. This preserves the original static K path
+            # rather than running a confidence-enabled native fallback.
+            logger.warning(
+                "DSpark confidence scheduling has no compact tier below the "
+                "native K1 layout; using the feature-off static K1 path and "
+                "ignoring confidence-scheduling inputs.")
+            self.enable_confidence_scheduling = False
+            self.enable_fused_confidence_scheduler = False
+            self.confidence_sts_path = None
+            self.confidence_sps_table_path = None
+            self.confidence_sps_live_fingerprint_path = None
+            self.confidence_admission_receipt_path = None
+            self.confidence_admission_receipt_sha256 = None
+            return self
+        # TorchLlmArgs authenticates all admission artifacts together at the
+        # deployment boundary. Missing or stale evidence resolves to the true
+        # feature-off static path rather than failing after runtime components
+        # have already snapshotted the confidence flag.
         return self
 
     @model_validator(mode="after")
@@ -6652,6 +6684,61 @@ class TorchLlmArgs(BaseLlmArgs):
                     "Those steps use the expanded DeepGEMM path instead, which "
                     "is numerically equivalent.")
 
+    @staticmethod
+    def _resolve_dspark_confidence_workload_admission(
+            spec_cfg: DSparkDecodingConfig) -> None:
+        """Resolve confidence activation before engines or workers observe it."""
+        from tensorrt_llm._torch.speculative.dspark_planner import \
+            load_confidence_workload_admission
+
+        receipt_path = spec_cfg.confidence_admission_receipt_path
+        receipt_sha256 = spec_cfg.confidence_admission_receipt_sha256
+        sps_table_path = spec_cfg.confidence_sps_table_path
+        live_fingerprint_path = spec_cfg.confidence_sps_live_fingerprint_path
+        missing = [
+            name for name, value in (
+                ("confidence_admission_receipt_path", receipt_path),
+                ("confidence_admission_receipt_sha256", receipt_sha256),
+                ("confidence_sps_table_path", sps_table_path),
+                ("confidence_sps_live_fingerprint_path", live_fingerprint_path),
+            ) if not value
+        ]
+        fallback_reason = ("missing " + ", ".join(missing)) if missing else None
+        if fallback_reason is None:
+            assert receipt_path is not None
+            assert receipt_sha256 is not None
+            assert sps_table_path is not None
+            assert live_fingerprint_path is not None
+            try:
+                admission = load_confidence_workload_admission(
+                    receipt_path,
+                    expected_receipt_sha256=receipt_sha256,
+                    sps_cost_table_path=sps_table_path,
+                    live_engine_fingerprint_path=live_fingerprint_path,
+                    physical_k=spec_cfg.max_draft_len,
+                )
+                if not admission.admitted:
+                    fallback_reason = (
+                        "the authenticated workload replay does not have positive "
+                        "net compact value after fixed overhead and safety margin"
+                    )
+            except (OSError, TypeError, ValueError) as error:
+                fallback_reason = str(error)
+
+        if fallback_reason is None:
+            return
+
+        logger.warning(
+            f"DSpark confidence scheduling is not deployment-admitted ({fallback_reason}); "
+            f"using the feature-off static K{spec_cfg.max_draft_len} path.")
+        spec_cfg.enable_confidence_scheduling = False
+        spec_cfg.enable_fused_confidence_scheduler = False
+        spec_cfg.confidence_sts_path = None
+        spec_cfg.confidence_sps_table_path = None
+        spec_cfg.confidence_sps_live_fingerprint_path = None
+        spec_cfg.confidence_admission_receipt_path = None
+        spec_cfg.confidence_admission_receipt_sha256 = None
+
     @model_validator(mode="after")
     def normalize_prefill_cuda_graph_config(self) -> 'TorchLlmArgs':
         """Normalize legacy piecewise CUDA graph options into prefill fields."""
@@ -7116,6 +7203,8 @@ class TorchLlmArgs(BaseLlmArgs):
                         "DSpark block_size must equal max_draft_len; got "
                         f"block_size={spec_cfg.block_size} and "
                         f"max_draft_len={spec_cfg.max_draft_len}")
+                if spec_cfg.enable_confidence_scheduling:
+                    self._resolve_dspark_confidence_workload_admission(spec_cfg)
                 if spec_cfg.enable_confidence_scheduling:
                     self._validate_dspark_confidence_environment()
 
