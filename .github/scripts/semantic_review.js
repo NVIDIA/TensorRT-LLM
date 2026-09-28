@@ -17,8 +17,12 @@ const {readFileSync} = require('node:fs');
 const {join} = require('node:path');
 
 const NAME = 'Semantic conflict with target branch';
-const notice = 'Advisory, non-required AI analysis of the recorded revisions. ' +
-  'CodeRabbit can miss problems or report false positives. Review the evidence.';
+const notice = 'Best-effort AI judgment for the recorded revisions. ' +
+  'PASS, FAIL and INCONCLUSIVE may be incomplete or incorrect. ' +
+  'PR authors and reviewers should independently verify the evidence and relevant behavior. ' +
+  'This semantic review and its status/workflow are advisory, not required merge checks ' +
+  'under current repository rules; other merge requirements still apply. ' +
+  'Advisory status does not make a confirmed defect safe to ignore.';
 const supported = ref => ref === 'main' || /^release\/[^\s]+$/.test(ref);
 const eligible = pr => pr.state === 'open' && !pr.draft && supported(pr.base.ref) &&
   (pr.auto_merge || pr.labels.some(label => label.name === 'ci: full pre-merge approved'));

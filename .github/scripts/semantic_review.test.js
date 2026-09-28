@@ -424,15 +424,18 @@ test('legacy cleanup reads only recorded and explicit heads, deduplicating ident
   assert.equal(state.checks[2].status, 'in_progress');
 });
 
-test('real divergent, integrated and repaired histories use the same result protocol', () => {
-  assert.equal(cases.length, 9);
-  for (const fixture of cases) {
-    const r = request(1, fixture);
+test('fixed historical inputs round-trip request identity and all three result verdicts', () => {
+  assert.equal(cases.length, 12);
+  for (const [index, fixture] of cases.entries()) {
+    const r = request(index + 1, fixture);
     const body = command(r);
     for (const value of [r.id, r.head, r.target, r.mergeBase]) assert.ok(body.includes(value));
     assert.ok(body.startsWith('@coderabbitai\n'));
-    assert.doesNotMatch(body, /llm_build_stats|routed_output_is_global|get_steady_clock_now_in_seconds/);
-    assert.equal(parseResult(reply(20, r, 'FAIL'), r, repo).verdict, 'FAIL');
+    const [recorded] = requests([record(10, r)]);
+    assert.equal(identity(fixture.pr, recorded), `semantic-review:${fixture.pr}:${r.id}`);
+    for (const verdict of ['PASS', 'FAIL', 'INCONCLUSIVE']) {
+      assert.equal(parseResult(reply(20, r, verdict), recorded, repo).verdict, verdict);
+    }
   }
 });
 
