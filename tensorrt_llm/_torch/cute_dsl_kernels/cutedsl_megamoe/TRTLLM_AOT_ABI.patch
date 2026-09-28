@@ -1,0 +1,141 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/megamoe_aot.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/megamoe_aot.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/megamoe_aot.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/megamoe_aot.py
+@@ -1,17 +1,30 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ # SPDX-License-Identifier: Apache-2.0
+ 
+-"""Restore argument names and READY defaults for loaded MegaMoE functions."""
++"""Restore the exact compiled argument names for loaded MegaMoE functions."""
+ 
+ from inspect import signature
++
++_SCALE_ARGUMENTS = frozenset(("fc1_alpha", "fc2_alpha", "fc1_norm_const"))
++_READY_ARGUMENTS = frozenset(
++    ("hot_expert_weight_ready_flags", "hot_expert_weight_ready_generation")
++)
++
++
++def megamoe_aot_argument_names(kernel):
++    """Return the runtime arguments present in this kernel variant AOT ABI."""
++    uses_global_scale = kernel.quant_kind.uses_global_scale
++    helper_enabled = kernel.helper_expert_count > 0
++    return [
++        name
++        for name in signature(kernel.__call__).parameters
++        if (uses_global_scale or name not in _SCALE_ARGUMENTS)
++        and (helper_enabled or name not in _READY_ARGUMENTS)
++    ]
+ 
+ 
+ def make_megamoe_aot_callable(function, kernel):
+     """Use TVM-FFI's native adapter without attaching scheduler metadata."""
+     from tvm_ffi.utils.kwargs_wrapper import make_kwargs_wrapper
+ 
+-    argument_names = list(signature(kernel.__call__).parameters)
+-    # Home-only entries can omit the unused READY pair, as with direct JIT
+-    # calls. Helper-enabled entries require both READY operands explicitly.
+-    defaults = (None, None) if kernel.helper_expert_count == 0 else ()
+-    return make_kwargs_wrapper(function, argument_names, arg_defaults=defaults)
++    return make_kwargs_wrapper(function, megamoe_aot_argument_names(kernel))
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
+@@ -595,6 +595,15 @@
+             ),
+             stream=make_fake_stream(),
+         )
++        if self.quant_kind.uses_global_scale:
++            # nvfp4 carries per-expert dequant scalars. Under an e8m0 scale they do not exist at
++            # all, and declaring them here would put three tensors in the ABI that the caller has
++            # no value for.
++            fake_arguments.update(
++                fc1_alpha=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
++                fc2_alpha=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
++                fc1_norm_const=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
++            )
+         if self.helper_expert_count > 0:
+             fake_arguments.update(
+                 hot_expert_weight_ready_flags=make_ptr(
+@@ -604,15 +613,6 @@
+                     assumed_align=8,
+                 ),
+                 hot_expert_weight_ready_generation=cutlass.Uint64(1),
+-            )
+-        if self.quant_kind.uses_global_scale:
+-            # nvfp4 carries per-expert dequant scalars. Under an e8m0 scale they do not exist at
+-            # all, and declaring them here would put three tensors in the ABI that the caller has
+-            # no value for.
+-            fake_arguments.update(
+-                fc1_alpha=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
+-                fc2_alpha=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
+-                fc1_norm_const=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
+             )
+ 
+         compiled = cute.compile[cute.EnableTVMFFI(True)](self, **fake_arguments)
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
+@@ -705,6 +705,15 @@
+             ),
+             stream=make_fake_stream(),
+         )
++        if self.quant_kind.uses_global_scale:
++            # nvfp4 carries per-expert dequant scalars. Under an e8m0 scale they do not exist at
++            # all, and declaring them here would put three tensors in the ABI that the caller has
++            # no value for.
++            fake_arguments.update(
++                fc1_alpha=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
++                fc2_alpha=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
++                fc1_norm_const=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
++            )
+         if self.helper_expert_count > 0:
+             fake_arguments.update(
+                 hot_expert_weight_ready_flags=make_ptr(
+@@ -714,15 +723,6 @@
+                     assumed_align=8,
+                 ),
+                 hot_expert_weight_ready_generation=cutlass.Uint64(1),
+-            )
+-        if self.quant_kind.uses_global_scale:
+-            # nvfp4 carries per-expert dequant scalars. Under an e8m0 scale they do not exist at
+-            # all, and declaring them here would put three tensors in the ABI that the caller has
+-            # no value for.
+-            fake_arguments.update(
+-                fc1_alpha=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
+-                fc2_alpha=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
+-                fc1_norm_const=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
+             )
+ 
+         compiled = cute.compile[cute.EnableTVMFFI(True)](self, **fake_arguments)
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py
+@@ -686,18 +686,18 @@
+             ),
+             stream=make_fake_stream(),
+         )
++        if self.quant_kind.uses_global_scale:
++            fake_arguments.update(
++                fc1_alpha=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
++                fc2_alpha=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
++                fc1_norm_const=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
++            )
+         if self.helper_expert_count > 0:
+             fake_arguments.update(
+                 hot_expert_weight_ready_flags=make_ptr(
+                     cutlass.Uint64, 0, AddressSpace.gmem, assumed_align=8
+                 ),
+                 hot_expert_weight_ready_generation=cutlass.Uint64(1),
+-            )
+-        if self.quant_kind.uses_global_scale:
+-            fake_arguments.update(
+-                fc1_alpha=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
+-                fc2_alpha=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
+-                fc1_norm_const=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
+             )
+ 
+         compiled = cute.compile[cute.EnableTVMFFI(True)](self, **fake_arguments)

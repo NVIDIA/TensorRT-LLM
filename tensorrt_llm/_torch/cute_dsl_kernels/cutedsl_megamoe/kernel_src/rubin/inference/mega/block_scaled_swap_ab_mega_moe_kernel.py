@@ -705,6 +705,15 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             ),
             stream=make_fake_stream(),
         )
+        if self.quant_kind.uses_global_scale:
+            # nvfp4 carries per-expert dequant scalars. Under an e8m0 scale they do not exist at
+            # all, and declaring them here would put three tensors in the ABI that the caller has
+            # no value for.
+            fake_arguments.update(
+                fc1_alpha=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
+                fc2_alpha=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
+                fc1_norm_const=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
+            )
         if self.helper_expert_count > 0:
             fake_arguments.update(
                 hot_expert_weight_ready_flags=make_ptr(
@@ -714,15 +723,6 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                     assumed_align=8,
                 ),
                 hot_expert_weight_ready_generation=cutlass.Uint64(1),
-            )
-        if self.quant_kind.uses_global_scale:
-            # nvfp4 carries per-expert dequant scalars. Under an e8m0 scale they do not exist at
-            # all, and declaring them here would put three tensors in the ABI that the caller has
-            # no value for.
-            fake_arguments.update(
-                fc1_alpha=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
-                fc2_alpha=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
-                fc1_norm_const=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
             )
 
         compiled = cute.compile[cute.EnableTVMFFI(True)](self, **fake_arguments)

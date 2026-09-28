@@ -5,7 +5,7 @@
   "files": {
     "api.py": "bbfa4b3877ec55780e7cde0b4d2b26566179622fc27fc88bbe08a75825db70c6",
     "communication/nvlink_domain/symmetric_buffer.py": "a30ebfa43163d0fb046ce7fbe21bd3abbc10d57caacb19affb8737a392fc48ca",
-    "communication/nvlink_domain/token_comm.py": "e5ec9664735bf293c69ae24527f78fce7bc7be509cc91944ba71d997a631b9fe",
+    "communication/nvlink_domain/token_comm.py": "b5e49c6f4d035de48209b82d40abdc10d2c7fec0a3e733fc84c43bd4e664858e",
     "communication/token_protocol.py": "d965404d611283c5dcd6f2efb90b4d97dffb1203416d42e46db1be8cac58d4c1",
     "helpers/constants.py": "fa1ca237358291eb89ef45e15424200c27c27a2134bc25e29d2e0a646c29daf2",
     "helpers/cute_py_helpers.py": "dc5e7ff49ecb2009f15888676a9a215091f350f64c707a3711a9f6ed8c0888e0",
@@ -16,7 +16,7 @@
     "helpers/flag_batch.py": "58c3d697467c185abc824773a8a9dfc456ddcb9237b52bf6b2cf5345b093bfa8",
     "helpers/helper_weight_ready_gate.py": "29c1c0af410a2f0ad01c4a77596e635617024281de6b9ae3f2cf3f7b5db956c0",
     "helpers/iket_compat.py": "a1c0cda1100fe411459c09af86a8b4b2ad6b6603250c52d04ba3b1d1a8466989",
-    "helpers/megamoe_aot.py": "96be1b6fc0132e7ed80467495b0875606546911fba60d677b6d1790fce824b53",
+    "helpers/megamoe_aot.py": "c33471b63d3a4813674e7b04f8af301d77a12df1c6d5de83cabed916329ade3f",
     "helpers/ptx_helpers.py": "6d7780ad2ee8f7c595e594f14fd7143a85c92fa87bb7f3f083acec690af0f4cc",
     "helpers/smem_workspace.py": "3de2e14fdb286b604c8390523b4e2a175a88d61da8a745bbf0e38e4b4c1110f6",
     "helpers/software_sync.py": "38d41b893f17e1a29efb0a103dbc0fc55f1e101062ebd69285c40f419d3de9c7",
@@ -26,7 +26,7 @@
     "kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_extension.py": "7d363e9feb4c40d96a03b67dd5b3150e9b317c9915c84de4afc3d6d850772c7a",
     "kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_kernel.py": "3dcd9f4e6abb08ccce8d3736f547eea4ee5cac844abc525249c1f3072c6e0b27",
     "kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_mainloop.py": "1c6f14cbc29f1025c0404ae191b832177d0b06ea67110816edc51adc58bbd084",
-    "kernel_src/blackwell/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py": "f9dec78af4c0518c2c49f784c238e447d111e3f11db80d5d32cd094bb968e1c0",
+    "kernel_src/blackwell/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py": "217399ee0f5660860ff09d084f6397dffa6afebc4b70abe4d9d611ffe1d08a42",
     "kernel_src/blackwell/inference/mega/dynamic_mainloop.py": "6662dd61f1bd51dde33742e0bb0bddff3d5970af720fc25a2a23b298dd2b8e2c",
     "kernel_src/blackwell/inference/mega/topk_reduce.py": "58f1e473369a7454bebc528deb718d46d7075aa6a85f35af4d4eb901273e50e2",
     "kernel_src/function_mapping.py": "473f2e85ed12eadabac22179e0fd874027a93fa1817b0942572db38adfc22ed6",
@@ -38,12 +38,12 @@
     "kernel_src/rubin/inference/local_mega/local_routing.py": "f0f244fe09e94c371804cb65b807d043e29c38dc4b155812e6f830e88442962f",
     "kernel_src/rubin/inference/local_mega/tma_gather.py": "d77218d0172211505445f8f4549fe5fb15cd68abc7110748d06a9b63ed87bd47",
     "kernel_src/rubin/inference/local_mega/topk_reduce.py": "1c4a766bdf76f5b726e321b140e46ea98794b1455cd09b8537a6a434c53b6347",
-    "kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_epilogue.py": "d0f1894b2294f92bce7788209d2d4d30ba28035bed1d89f3d6013771482e926e",
+    "kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_epilogue.py": "c5cddaa289d81fb47ae12178e456a679e433fa36f5afa8007001bd1e777b7c01",
     "kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_extension.py": "cd8f5446b74b38b3e622b587ae8b7a54a43fedd3d5a4017007bb39bc72b0519a",
     "kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py": "ce03d3a4c786bf653fe8fc7e32a76b83adbc1eb354813f0a5d8ad0c4098164ed",
     "kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py": "e99b472281ecd3e4284146b9682524b3a1a2cace3e47a56a528072ccda5b6e98",
-    "kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py": "62861d72d7861b8d5358f2ca74fb4c78719aa15cb7ae6f77ca79959c3ea847ab",
-    "kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py": "e396dcc1a29fa1073b3374253030de009c4df8ba52c225a0d1368011b8c1c205",
+    "kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py": "10834b4409ab830a6c27fd39da5e44295044eb0b2c43d2fd629d4cea21d1c491",
+    "kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py": "533e0954a1ba4ad81d44dbffa521c9b2525978849cbeb7fd620350d1e808eea1",
     "kernel_src/rubin/inference/mega/dynamic_mainloop.py": "3e32cd6c295795a61ab904d0a988cc301abeb2f9b0b54ba5e6ca8e0cd61d2128",
     "kernel_src/rubin/inference/mega/tma_gather.py": "a6a19b35b15ed2909750d7be08067d8ad5268ed05e6584568613810848ff72c5",
     "kernel_src/rubin/inference/mega/token_comm_gen_specialized.py": "a136853957c9c0c11ea23a61dc3a3086f06aae0f918b5b71e5698dd39df18423",
@@ -51,7 +51,7 @@
     "kernel_src/schedulers/__init__.py": "cf2f5cb6e0bd6913baad8327c46af5a25d945c2c8852c1a9616e6f055d3de362",
     "kernel_src/schedulers/base.py": "93d9c46fc3759d76f618be7c89892eeed99724410598da1f9309623277c5e85d",
     "kernel_src/schedulers/fc12_mapping.py": "99b46c87258910523a1daebc89e79a9c6e2aa52e780303a1ccf28dbd30dfeedc",
-    "kernel_src/schedulers/fc12_scheduler.py": "115fab10a3a0bdf926d186e60fe845e8b2b4a40635c74a240250bd9150f8544c",
+    "kernel_src/schedulers/fc12_scheduler.py": "9ebf6039341762ee2289355dae6bbe4bbb9b136a421254707521347cf910706e",
     "kernel_src/schedulers/non_clc_mixed_cga.py": "d2463c76895d63a419490488639864f59267279196364a8b4b0f18aa76b97794",
     "kernel_src/schedulers/work_id_claim.py": "2e5c93d757bc437af45d358ecaf1e38340985f2c1acebe480d5ddf51143259f4",
     "quant_def.py": "fea73fbc3dec939617b2504672156a08f1a4371bedf55e23e9c93e708ae432ac"
@@ -61,13 +61,13 @@
   "downstream_patches": [
     {
       "patch": "FC12_CLAIM_EXHAUSTION.patch",
-      "patch_sha256": "e4a69d8b454e5022cc53a12713deee3cc8310e4633fdbde70adea0c0622c8704",
+      "patch_sha256": "6429282cc7b67bc9f2f54eb885f7653a81dca802265ef793e1b345e6c125fded",
       "file": "kernel_src/schedulers/fc12_scheduler.py",
       "unpatched_vendored_sha256": "6e3ec2efe83a13e04636055aa505d2065da96022f5f50983cf113cd63d78ec74",
-      "patched_sha256": "46ca708d62d9ffa5154abe483fd0972f2ee42235212ae04ec95f00294154563e",
+      "patched_sha256": "925b68c388d246188c0b113fd9743ef482aa3375ee2a3786a5243588dab10b43",
       "source_revision": "06c3af7315b944015c593a1bebeafc3907c6e421",
       "source_diff_base": "1926426ce3bba0ac384fb894602762a68462435a",
-      "description": "Retain FC1 claim watermark wait; determine exhaustion from actual claim/map results instead of the prologue watermark."
+      "description": "Preserve actual FC1 claim exhaustion and reject the unwired deferred FC2 full-ready mode."
     },
     {
       "patch": "TENSORRT_LLM_MAIN_COMPAT.patch",
@@ -252,7 +252,7 @@
         {
           "file": "kernel_src/schedulers/fc12_scheduler.py",
           "unpatched_vendored_sha256": "6e3ec2efe83a13e04636055aa505d2065da96022f5f50983cf113cd63d78ec74",
-          "patched_sha256": "115fab10a3a0bdf926d186e60fe845e8b2b4a40635c74a240250bd9150f8544c"
+          "patched_sha256": "9ebf6039341762ee2289355dae6bbe4bbb9b136a421254707521347cf910706e"
         },
         {
           "file": "kernel_src/schedulers/non_clc_mixed_cga.py",
@@ -280,6 +280,33 @@
       "runtime_contract": "The standalone upstream FC12 top-level does not reset its readiness counters after a launch. The shared-expert runner clears require_zero_workspace_leading_bytes on the same CUDA stream before every invocation with cuMemsetD8Async.",
       "upstream_file_sha256": "327ef47af5d0b113752a0fe43a37dfaa94abd2cef84a3fe81fcb7332de86852b",
       "format_before": "ruff 0.9.4"
+    },
+    {
+      "patch": "TRTLLM_AOT_ABI.patch",
+      "patch_sha256": "d9f20fc602877ec613c96a93328c3bb7faed293bef31b20a4780f48ad192989f",
+      "files": [
+        {
+          "file": "helpers/megamoe_aot.py",
+          "unpatched_vendored_sha256": "96be1b6fc0132e7ed80467495b0875606546911fba60d677b6d1790fce824b53",
+          "patched_sha256": "c33471b63d3a4813674e7b04f8af301d77a12df1c6d5de83cabed916329ade3f"
+        },
+        {
+          "file": "kernel_src/blackwell/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py",
+          "unpatched_vendored_sha256": "50f6172e5bc4386d57494a54b9ad23215bf6141b7e1cb9fb549945dc0a895af6",
+          "patched_sha256": "217399ee0f5660860ff09d084f6397dffa6afebc4b70abe4d9d611ffe1d08a42"
+        },
+        {
+          "file": "kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py",
+          "unpatched_vendored_sha256": "685fb9f0014f8b638454b241b4d8e102915d24a2f9f9b422930a28607ecef915",
+          "patched_sha256": "f97e11a31e4fb483e650759585dc5fe2d06945165d557a37ec129d2f65479f03"
+        },
+        {
+          "file": "kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py",
+          "unpatched_vendored_sha256": "037743ccc9991364d788ff790bbdd505c2ad9bae9f9723d24ce6b8c3f58ad865",
+          "patched_sha256": "d1425bb83eca4cbade97d2b6fff3f87332c7460a8e1d5708055a323cde69d1f9"
+        }
+      ],
+      "description": "Match the TVM-FFI wrapper to each compiled AOT argument list."
     }
   ]
 }
