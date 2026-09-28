@@ -56,7 +56,8 @@ from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
-from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
+from .llm_args import (ENCODER_RUNNER_MANAGED_INPUTS,
+                       TORCH_LLMARGS_EXPLICIT_DOCSTRING,
                        TORCH_LLMARGS_REMOVED_ARGS, TorchLlmArgs,
                        validate_token_encoder_bucket_config)
 from .llm_utils import CachedModelLoader, KvCacheRetentionConfig, ModelLoader
@@ -1267,16 +1268,10 @@ class BaseLLM:
         # Build inputs dict — common + model-specific kwargs.
         # Filter keys that are supplied by EncoderRunner itself to avoid
         # "multiple values for keyword argument" errors.
-        _RESERVED_KEYS = {
-            'input_ids',
-            'seq_lens',
-            'multi_item_part_lens',
-            'attn_metadata',
-            'return_context_logits',
-        }
         filtered_kwargs = {
             k: v
-            for k, v in model_kwargs.items() if k not in _RESERVED_KEYS
+            for k, v in model_kwargs.items()
+            if k not in ENCODER_RUNNER_MANAGED_INPUTS
         }
 
         forward_inputs = {

@@ -37,6 +37,8 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
 from tensorrt_llm._torch.utils import torch_multi_arange, with_model_extra_attrs
 from tensorrt_llm._utils import maybe_pin_memory, nvtx_range, prefer_pinned
 from tensorrt_llm.llmapi.llm_args import (
+    ENCODER_RESERVED_INPUT_NAMES,
+    ENCODER_RUNNER_MANAGED_INPUTS,
     EncodeCudaGraphConfig,
     EncodeExtraInputSpec,
     validate_token_encoder_bucket_config,
@@ -55,13 +57,6 @@ from ..input_buffers import InputBuffers
 from ..metadata import build_attention_metadata
 from ..model_call import ModelCaller
 from .interface import PackedInputs, PackedModelRunner, PreparedInputs, RunnerConfig
-
-# Encode-only inputs the runner places on the device itself. Everything else in
-# that dict is a model-specific input passed through to forward(), and is moved
-# to the device by _model_inputs_to_device().
-_ENCODER_INPUT_KEYS_PREPARED_INTERNALLY = frozenset(
-    ("input_ids", "position_ids", "seq_lens", "multi_item_part_lens")
-)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -613,7 +608,7 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
         moved = {
             name: value.to(device=device, non_blocking=True)
             for name, value in inputs.items()
-            if name not in _ENCODER_INPUT_KEYS_PREPARED_INTERNALLY
+            if name not in ENCODER_RESERVED_INPUT_NAMES
             and isinstance(value, torch.Tensor)
             and value.device != device
         }
@@ -680,13 +675,7 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
         )
 
     def _reject_unsupported_model_inputs(self, model_inputs: dict[str, Any]) -> None:
-        reserved_inputs = model_inputs.keys() & {
-            "input_ids",
-            "seq_lens",
-            "multi_item_part_lens",
-            "attn_metadata",
-            "return_context_logits",
-        }
+        reserved_inputs = model_inputs.keys() & ENCODER_RUNNER_MANAGED_INPUTS
         if reserved_inputs:
             raise ValueError(
                 f"Model inputs cannot override runner-managed fields: {sorted(reserved_inputs)}"

@@ -297,18 +297,19 @@ class DecodeCudaGraphConfig(BaseCudaGraphConfig):
 _ENCODE_EXTRA_INPUT_SYMBOLIC_DIMS: Tuple[str,
                                          ...] = ("num_tokens", "batch_size")
 
-# Names that may not be declared as extra model inputs: input_ids, position_ids,
-# seq_lens and attn_metadata are built or consumed by the encode-only path
-# itself, while multi_item_part_lens and return_context_logits are stripped from
-# model_kwargs by LLM.encode() and so could never satisfy a spec.
-_ENCODE_EXTRA_INPUT_RESERVED_NAMES: Set[str] = {
+# Encode-only inputs the encoder runner builds itself; callers cannot supply them
+# as model_kwargs.
+ENCODER_RUNNER_MANAGED_INPUTS: frozenset[str] = frozenset({
     "input_ids",
-    "position_ids",
     "seq_lens",
     "multi_item_part_lens",
     "attn_metadata",
     "return_context_logits",
-}
+})
+# Names that may not be declared as extra model inputs. position_ids may be
+# passed through (the runner consumes it) but cannot name an extra input.
+ENCODER_RESERVED_INPUT_NAMES: frozenset[str] = (ENCODER_RUNNER_MANAGED_INPUTS
+                                                | {"position_ids"})
 
 
 class EncodeExtraInputSpec(StrictBaseModel):
@@ -353,11 +354,11 @@ class EncodeExtraInputSpec(StrictBaseModel):
             raise ValueError(
                 f"EncodeExtraInputSpec.name must be a non-empty Python "
                 f"identifier, got {value!r}")
-        if value in _ENCODE_EXTRA_INPUT_RESERVED_NAMES:
+        if value in ENCODER_RESERVED_INPUT_NAMES:
             raise ValueError(
                 f"EncodeExtraInputSpec.name {value!r} is reserved by the "
                 f"encode-only path. Reserved names: "
-                f"{sorted(_ENCODE_EXTRA_INPUT_RESERVED_NAMES)}")
+                f"{sorted(ENCODER_RESERVED_INPUT_NAMES)}")
         return value
 
     @field_validator("shape")
