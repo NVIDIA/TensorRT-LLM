@@ -63,10 +63,10 @@ tar -xzf "${OPENMPI_SOURCE_ARCHIVE}" --strip-components=1 -C "${source_dir}"
 cd "${source_dir}"
 if git apply --reverse --check --no-index "${OPENMPI_PATCH}"; then
     echo "OpenMPI source already contains the wait-sync barriers"
-    exit 0
+else
+    git apply --check --no-index "${OPENMPI_PATCH}"
+    git apply --no-index "${OPENMPI_PATCH}"
 fi
-git apply --check --no-index "${OPENMPI_PATCH}"
-git apply --no-index "${OPENMPI_PATCH}"
 
 unset PMIX_VERSION
 # HPC-X 2.50's relocated ucx.pc still points at the absent ucx/mt prefix.
