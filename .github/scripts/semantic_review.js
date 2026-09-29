@@ -209,8 +209,11 @@ async function publish({github, context, core, number, comments, head}) {
     number = context.payload.issue.number;
   }
   const state = await reviewState({github, repo: context.repo, number, comments, head});
+  let statusError;
   if (state?.update) {
-    await github.rest.repos.createCommitStatus(state.update);
+    try { await github.rest.repos.createCommitStatus(state.update); } catch (error) {
+      statusError = error;
+    }
   }
   const event = context.payload?.comment;
   const eventDiagnostic = event && state?.request ?
@@ -228,10 +231,15 @@ async function publish({github, context, core, number, comments, head}) {
       return `- ${message} [Comment](${link})`;
     }).join('\n');
     const {title, summary} = state.output;
-    await core.summary.addRaw(`${title}\n\n${summary}\n` +
-      (observations ? `\nReply diagnostics:\n\n${observations}\n` : '') +
-      (diagnostics.length > 10 ? `\n${diagnostics.length - 10} additional observations omitted.\n` : '')).write();
+    try {
+      await core.summary.addRaw((statusError ? 'Status publication failed; the GitHub status update is unconfirmed.\n\n' : '') +
+        `${title}\n\n${summary}\n` + (observations ? `\nReply diagnostics:\n\n${observations}\n` : '') +
+        (diagnostics.length > 10 ? `\n${diagnostics.length - 10} additional observations omitted.\n` : '')).write();
+    } catch (error) {
+      throw statusError || error;
+    }
   }
+  if (statusError) throw statusError;
   for (const check of state?.cleanup || []) {
     await github.rest.checks.update({...context.repo, check_run_id: check.id,
       status: 'completed', conclusion: 'cancelled', output: {

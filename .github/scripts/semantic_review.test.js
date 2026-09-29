@@ -46,7 +46,7 @@ function harness(r = request()) {
         state.statuses.filter(status => status.sha === ref))}),
       createCommitStatus: async args => {
         if (state.statusFailures-- > 0) {
-          throw Object.assign(new Error('Status failed'), {status: state.statusErrorCode});
+          throw state.statusError || Object.assign(new Error('Status failed'), {status: state.statusErrorCode});
         }
         state.writes.push(args);
         const status = {...args, id: Math.max(0, ...state.statuses.map(item => item.id)) + 1,
@@ -73,7 +73,8 @@ function harness(r = request()) {
     }},
   };
   const core = {info: message => state.logs.push(message),
-    summary: {addRaw(text) {state.summaries.push(text); return this;}, async write() {}},
+    summary: {addRaw(text) {state.summaries.push(text); return this;},
+      async write() {if (state.summaryError) throw state.summaryError;}},
     setFailed() {throw new Error('AI verdict must not fail the orchestration job');}};
   const deliver = async event => publish({github, core, context: {
     repo, eventName: 'issue_comment', payload: {issue: {number: 1, pull_request: {}}, comment: event},
@@ -437,7 +438,42 @@ test('a missing status never prevents result parsing and publication failure is 
   await repair(comments);
   assert.equal((await repair(comments)).update, undefined);
   assert.equal(state.writes.length, 1);
-  assert.equal(state.summaries.length, 2);
+  assert.equal(state.summaries.length, 3);
+});
+
+test('status publication failures retain reply diagnostics and the original error before cleanup', async () => {
+  const r = request();
+  for (const [body, reason] of [
+    [`SEMANTIC_REVIEW\nRequest ${r.id}: analysis without a result record.`, 'Missing SEMANTIC_RESULT record'],
+    ['Oops, something went wrong! Please try again later.', 'CodeRabbit reported a service error'],
+  ]) {
+    const {state, deliver, repair} = harness(r);
+    const message = comment(20, body);
+    state.comments.push(message);
+    state.checks.push(legacy(r));
+    state.statusError = Object.assign(new Error('Status unavailable'), {status: 503});
+    for (const summaryError of [undefined, new Error('Summary unavailable')]) {
+      state.statusFailures = 1;
+      state.summaryError = summaryError;
+      await assert.rejects(deliver(message), error => error === state.statusError);
+      assert.equal(state.writes.length, 0);
+      assert.equal(state.updates.length, 0);
+      assert.ok(state.logs.some(line => line.includes(reason) && line.endsWith('#issuecomment-20')));
+      assert.ok(state.summaries.at(-1).includes(reason));
+      assert.match(state.summaries.at(-1), /Status publication failed; the GitHub status update is unconfirmed/);
+    }
+    state.summaryError = undefined;
+    await repair();
+    assert.equal(state.writes.length, 1);
+    assert.equal(state.updates.length, 1);
+  }
+});
+
+test('a summary-only failure is still surfaced after successful status publication', async () => {
+  const {state, repair} = harness();
+  state.summaryError = new Error('Summary unavailable');
+  await assert.rejects(repair(), error => error === state.summaryError);
+  assert.equal(state.writes.length, 1);
 });
 
 test('status API errors, including the per-SHA context cap, are reported without alternate contexts', async () => {

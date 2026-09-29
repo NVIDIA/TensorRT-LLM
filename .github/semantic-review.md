@@ -181,6 +181,8 @@ These diagnostics do not complete requests, change verdicts or request retries.
 Diagnostic publication does not depend on a status write. Scheduled scans do
 not create repair jobs solely to emit diagnostics for unchanged PRs. Ordinary
 unrelated bot comments do not create an analysis result.
+If a status update fails, publication still attempts the diagnostic summary,
+marks the status update as unconfirmed and rethrows the original status error.
 
 Publication uses only the latest request and its matching replies. A new request
 updates the same PR context on its requested head commit; an old request's late
