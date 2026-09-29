@@ -1892,8 +1892,8 @@ class KvCacheCreator:
 
     def _get_standalone_draft_layout(self) -> StandaloneDraftLayout:
         """Describe distinct draft layers without borrowing target shapes."""
+        draft = self._model_engine.model.draft_model
         if self._is_embedded_dspark():
-            draft = self._model_engine.model.draft_model
             return StandaloneDraftLayout(
                 num_layers=draft.num_stages,
                 num_kv_heads=1,
@@ -1915,13 +1915,14 @@ class KvCacheCreator:
                              draft_mapping.tp_size)
         attention_backend = self._speculative_config.attention_backend
         if attention_backend == "AUTO":
-            attention_backend = self._model_engine.model.draft_model.dflash_attention_backend
+            attention_backend = draft.dflash_attention_backend
         return StandaloneDraftLayout(
             num_layers=config.num_hidden_layers,
             num_kv_heads=(num_kv_heads + attention_tp_size - 1) //
             attention_tp_size,
             head_dim=head_dim,
-            dtype=torch.bfloat16,
+            dtype=(draft.fc.weight.dtype
+                   if hasattr(draft, "fc") else torch.bfloat16),
             extra_tokens=self._speculative_config.max_draft_len + 1,
             attention_backend=attention_backend,
             total_num_kv_heads=num_kv_heads,

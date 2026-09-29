@@ -27,6 +27,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends import AttentionMetadata
+from ..attention.backends.sparse.qsa.kernels import triton_qsa_paged_kv_store
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.kv_cache.standalone_draft_cache import DraftHistoryUpdate
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
@@ -669,6 +670,7 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_buf_inited = False
         self._ctx_len = None
         self._ctx_position_offset = None
+        self._ctx_disabled = None
         self._managed_cache_bindings = {}
         self._managed_request_ids = ()
         # Host shadows of _ctx_len and of each request's prompt progress.
@@ -678,6 +680,7 @@ class DFlashWorker(SpecWorkerBase):
         # fails (or after warmup). See _ensure_spec_dec_state_restored.
         self._saved_ctx_len = None
         self._saved_ctx_position_offset = None
+        self._saved_ctx_disabled = None
         self._saved_ctx_len_host = None
         self._saved_req_ctx_pos = None
         self._ctx_len_restore_pending = False
@@ -820,6 +823,7 @@ class DFlashWorker(SpecWorkerBase):
                 slot = self._req_to_slot.pop(request_id)
                 updates[slot] = 0
                 offsets[slot] = 0
+                self._ctx_disabled[slot] = False
                 self._req_ctx_pos.pop(request_id, None)
                 self._managed_cache_bindings.pop(request_id, None)
                 self._free_slots.append(slot)
@@ -835,6 +839,7 @@ class DFlashWorker(SpecWorkerBase):
                 updates[slot] = history.valid_length if history is not None else 0
                 self._req_ctx_pos[request_id] = history.position if history is not None else 0
                 offsets[slot] = self._req_ctx_pos[request_id] - updates[slot]
+                self._ctx_disabled[slot] = history.is_disabled if history is not None else False
                 self._managed_cache_bindings[request_id] = cache
                 restore_rows.append(row)
         self._write_ctx_len(updates)
@@ -899,6 +904,7 @@ class DFlashWorker(SpecWorkerBase):
             self._ctx_kv_manager,
             self._managed_request_ids,
             torch.stack((lengths, positions), dim=1),
+            is_disabled=self._ctx_disabled[slots],
         )
 
     def _check_ctx_arena_fits(self, capacity, num_slots, L, nkv, hd, dtype, kv_factor=2):
@@ -1186,7 +1192,7 @@ class DFlashWorker(SpecWorkerBase):
             logger.warning(
                 f"DFlash drafter covers {self._max_ctx} positions but the engine serves "
                 f"up to {runtime_max - spec_slack}. max_position_embeddings={max_pos} is "
-                "the binding constraint, so requests past it will draft nothing."
+                "the binding constraint, so requests past it use fallback proposals."
             )
 
         dtype = draft_model.fc.weight.dtype if hasattr(draft_model, "fc") else torch.bfloat16
@@ -1205,6 +1211,7 @@ class DFlashWorker(SpecWorkerBase):
 
         self._ctx_len = torch.zeros(num_slots, dtype=torch.long, device="cuda")
         self._ctx_position_offset = torch.zeros_like(self._ctx_len)
+        self._ctx_disabled = torch.zeros(num_slots, dtype=torch.bool, device="cuda")
         self._ctx_len_host = [0] * num_slots
         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
 
@@ -1419,6 +1426,7 @@ class DFlashWorker(SpecWorkerBase):
             if self._has_unified_draft_cache():
                 self._managed_cache_bindings.pop(req_id, None)
                 self._ctx_position_offset[slot] = 0
+                self._ctx_disabled[slot] = False
             clear(slot)
         return self._req_to_slot[req_id]
 
@@ -1449,6 +1457,19 @@ class DFlashWorker(SpecWorkerBase):
             offsets = positions.long() % page_size
             for layer_idx in range(k.size(1)):
                 self._ctx_kv_buf[layer_idx][pages, 0, 0, offsets] = k[:, layer_idx, 0]
+            return
+        if self._has_unified_draft_cache():
+            for layer_idx, pool in enumerate(self._ctx_kv_buf):
+                triton_qsa_paged_kv_store(
+                    k=k[:, layer_idx].to(pool.dtype),
+                    v=v[:, layer_idx].to(pool.dtype),
+                    k_cache=pool[:, 0],
+                    v_cache=pool[:, 1],
+                    request_indices=rows,
+                    logical_positions=positions,
+                    block_table=self._ctx_block_tables,
+                    tokens_per_block=self._ctx_page_size,
+                )
             return
         append_paged_kv_cache = self._get_ctx_paged_append()
 
@@ -1540,6 +1561,7 @@ class DFlashWorker(SpecWorkerBase):
             self._req_ctx_pos = dict(self._saved_req_ctx_pos)
         if self._has_unified_draft_cache() and self._saved_ctx_position_offset is not None:
             self._ctx_position_offset.copy_(self._saved_ctx_position_offset)
+            self._ctx_disabled.copy_(self._saved_ctx_disabled)
 
     def _store_prefill_context(
         self,
@@ -1623,9 +1645,30 @@ class DFlashWorker(SpecWorkerBase):
                 # reaches the capture buffer. The prefix K/V are still in the
                 # paired pool: precompute_context_kv is per-token in (hidden, p).
                 cur = first_pos
-            if cur + slen > cap:
+            history = (
+                self._ctx_kv_manager.get_draft_history(req_id)
+                if self._has_unified_draft_cache()
+                else None
+            )
+            if cur + slen > cap or (
+                self._has_unified_draft_cache()
+                and (
+                    first_pos + slen > self._max_ctx
+                    or (history is not None and history.is_disabled)
+                )
+            ):
                 if self._has_unified_draft_cache():
-                    raise ValueError("Unified DSpark prompt history exceeds the drafter context")
+                    position = first_pos + slen
+                    ctx_len_updates[slot] = 0
+                    self._req_ctx_pos[req_id] = position
+                    self._ctx_position_offset[slot] = position
+                    self._ctx_disabled[slot] = True
+                    if not spec_metadata.is_cuda_graph:
+                        self._ctx_kv_manager.set_draft_history(
+                            req_id, 0, position, is_disabled=True
+                        )
+                    offset += slen
+                    continue
                 # Request-level, like the no-free-slots path above: truncating
                 # would silently draft from a stale prefix, but killing the
                 # forward would take every other in-flight request with it.
@@ -1763,6 +1806,7 @@ class DFlashWorker(SpecWorkerBase):
             self._saved_ctx_len = self._ctx_len.clone()
             if self._has_unified_draft_cache():
                 self._saved_ctx_position_offset = self._ctx_position_offset.clone()
+                self._saved_ctx_disabled = self._ctx_disabled.clone()
             self._saved_ctx_len_host = list(self._ctx_len_host)
             self._saved_req_ctx_pos = dict(self._req_ctx_pos)
             self._ctx_len_restore_pending = True
@@ -1892,6 +1936,10 @@ class DFlashWorker(SpecWorkerBase):
                         spec_metadata,
                     )
                     vocab_size = gen_logits.shape[-1]
+
+                if self._has_unified_draft_cache():
+                    disabled = self._ctx_disabled[self._batch_to_slot[num_contexts:batch_size]]
+                    gen_logits.masked_fill_(disabled[:, None, None], 0.0)
 
                 gen_draft_tokens = self.sample_draft_tokens(
                     gen_logits,
@@ -2112,6 +2160,9 @@ class DFlashWorker(SpecWorkerBase):
         num_contexts = attn_metadata.num_contexts
         batch_size = attn_metadata.num_seqs
         num_gens = batch_size - num_contexts
+        draft_page_table = (
+            self._ctx_block_tables if self._ctx_block_tables is not None else self._ctx_page_table
+        )
 
         # Resolve mask_token_id and block_size once, cache for subsequent calls
         if self._resolved_mask_token_id is None:
@@ -2173,11 +2224,20 @@ class DFlashWorker(SpecWorkerBase):
                 allocated = dflash_allocated_ctx_limit(
                     self._ctx_block_counts[gen_rows_out], self._ctx_page_size, block_size
                 ).clamp(max=self._max_ctx)
-                torch._assert_async(
-                    torch.all(ctx_len_gen + gen_num_accepted <= allocated),
-                    "Unified DSpark accepted history exceeds the drafter context",
+                absolute_position = ctx_len_gen + self._ctx_position_offset[slots]
+                disabled = (
+                    self._ctx_disabled[slots]
+                    | (ctx_len_gen + gen_num_accepted > allocated)
+                    | (absolute_position + gen_num_accepted + block_size > self._max_ctx)
                 )
-                ctx_position_gen = ctx_len_gen + self._ctx_position_offset[slots]
+                self._ctx_disabled[slots] = disabled
+                self._ctx_len[slots] = torch.where(disabled, 0, ctx_len_gen)
+                self._ctx_position_offset[slots] = torch.where(
+                    disabled,
+                    absolute_position + gen_num_accepted,
+                    self._ctx_position_offset[slots],
+                )
+                ctx_position_gen = torch.where(disabled, 0, absolute_position)
             j_block = torch.arange(query_tokens_per_req, dtype=torch.long, device="cuda")
             offsets_kp1 = torch.arange(K_plus_1, dtype=torch.long, device="cuda")
 
@@ -2187,6 +2247,9 @@ class DFlashWorker(SpecWorkerBase):
                 query_position = query_position.clamp(max=self._max_ctx)
             query_position_ids = query_position.unsqueeze(1) + j_block.unsqueeze(0)
             ctx_position_ids = ctx_position_gen.unsqueeze(1) + offsets_kp1.unsqueeze(0)
+            if self._has_unified_draft_cache():
+                query_position_ids = torch.where(disabled[:, None], 0, query_position_ids)
+                ctx_position_ids = torch.where(disabled[:, None], 0, ctx_position_ids)
 
             # Go through embed_tokens.forward (NOT .weight[...]) so TP-sharded
             # vocabs mask out ranks that don't own the token id and all-reduce.
@@ -2248,13 +2311,22 @@ class DFlashWorker(SpecWorkerBase):
                         rows_long = gen_rows_out.unsqueeze(1).expand(-1, K + 1).reshape(-1)
                     else:
                         rows_long = slot_long
-                    self._store_context_kv_paged(k_new, v_new, rows_long, col_long)
+                    paged_positions = col_long
+                    if self._has_unified_draft_cache():
+                        paged_positions = torch.where(
+                            disabled[:, None].expand(-1, K + 1).reshape(-1), -1, col_long
+                        )
+                    self._store_context_kv_paged(k_new, v_new, rows_long, paged_positions)
                 if self._ctx_k_buf is not None:
                     self._ctx_k_buf[slot_long, :, col_long] = k_new
                     if v_new is not None:
                         self._ctx_v_buf[slot_long, :, col_long] = v_new
 
-                self._ctx_len[slots] += gen_num_accepted_long
+                self._ctx_len[slots] += (
+                    torch.where(disabled, 0, gen_num_accepted_long)
+                    if self._has_unified_draft_cache()
+                    else gen_num_accepted_long
+                )
                 self._ctx_len.clamp_(max=self._max_ctx)
 
             num_ctx_per_req_t = self._ctx_len[slots]
@@ -2267,6 +2339,24 @@ class DFlashWorker(SpecWorkerBase):
                     self._ctx_block_counts, self._ctx_page_size, block_size
                 )
                 num_ctx_per_req_t = torch.minimum(num_ctx_per_req_t, allocated[gen_rows_out])
+            if self._has_unified_draft_cache() and self._ctx_k_buf is None:
+                # Disabled rows still execute a fixed-width draft forward. Its
+                # query writes use the request's reserved tail, never reused history.
+                table = self._ctx_block_tables
+                scratch_start = (
+                    self._ctx_block_counts * self._ctx_page_size - block_size
+                ).clamp_min(0)
+                columns = torch.arange(table.shape[1], device=table.device)
+                scratch_columns = (
+                    scratch_start[:, None] // self._ctx_page_size + columns[None, :]
+                ).clamp(max=table.shape[1] - 1)
+                scratch_tables = table.gather(1, scratch_columns)
+                disabled_rows = torch.zeros(table.shape[0], dtype=torch.bool, device=table.device)
+                disabled_rows[gen_rows_out] = disabled
+                draft_page_table = torch.where(disabled_rows[:, None], scratch_tables, table)
+                num_ctx_per_req_t = torch.where(
+                    disabled, scratch_start[gen_rows_out] % self._ctx_page_size, num_ctx_per_req_t
+                )
             noise_embedding = noise_embed_2d
             query_positions = query_position_ids.long()
 
@@ -2301,9 +2391,5 @@ class DFlashWorker(SpecWorkerBase):
             # token. The dspark Markov chain conditions its first step on it.
             "first_prev_tokens": bonus,
             "ctx_kv_cache": self._ctx_kv_buf,
-            "ctx_page_table": (
-                self._ctx_block_tables
-                if self._ctx_block_tables is not None
-                else self._ctx_page_table
-            ),
+            "ctx_page_table": draft_page_table,
         }

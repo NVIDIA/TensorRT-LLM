@@ -538,9 +538,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def _validate_draft_history_range(self, req: LlmRequest, history: dict) -> None:
         # Full-attention drafters retain the whole prompt; rolling drafters
         # retain its complete live suffix. Neither includes speculative scratch.
+        # Disabled drafters transfer only the prompt position.
         window_size = history["layout"]["window_size"]
         prompt_len = self._global_prompt_len(req)
-        expected_length = prompt_len
+        expected_length = 0 if history.get("is_disabled", False) else prompt_len
         if window_size is not None:
             if type(window_size) is not int or window_size <= 0:
                 raise ValueError("Invalid draft history window size")

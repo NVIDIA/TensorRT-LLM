@@ -3137,11 +3137,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 "kv_cache_config.pool_ratio must have one entry per target layer group "
                 f"({len(target_life_cycles)}), got {len(target_ratios)}"
             )
-        if any(not math.isfinite(ratio) or ratio <= 0 for ratio in target_ratios):
-            raise ValueError("kv_cache_config.pool_ratio values must be finite and positive")
-        if not math.isclose(sum(target_ratios), 1.0, rel_tol=0, abs_tol=1e-6):
-            raise ValueError("kv_cache_config.pool_ratio values must sum to 1.0")
-
         # Use the same model-specific capacity accounting as quota selection;
         # specialized targets can include compressed KV or recurrent snapshots.
         usable_quota = int(config.cache_tiers[GPU_LEVEL].quota * config.max_util_for_resume)
@@ -3406,13 +3401,21 @@ class KVCacheManagerV2(BaseResourceManager):
     def get_draft_history(self, request_id: int) -> Optional[StandaloneDraftHistory]:
         return self.draft_history.get(request_id)
 
-    def set_draft_history(self, request_id: int, valid_length: int, position: int) -> None:
+    def set_draft_history(
+        self, request_id: int, valid_length: int, position: int, is_disabled: bool = False
+    ) -> None:
         cache = self.kv_cache_map.get(request_id)
         if cache is None or not cache.is_active:
             raise ValueError(
                 f"Standalone draft request {request_id} has no active cache allocation"
             )
-        history = StandaloneDraftHistory(valid_length, position)
+        history = StandaloneDraftHistory(valid_length, position, is_disabled)
+        previous = self.get_draft_history(request_id)
+        # Fallback remains terminal when older overlapping updates arrive.
+        if previous is not None and previous.is_disabled:
+            history = StandaloneDraftHistory(0, max(position, previous.position), True)
+        elif is_disabled:
+            history = StandaloneDraftHistory(0, position, True)
         if history.position > cache.capacity:
             raise ValueError("Standalone draft history exceeds allocated capacity")
         if (
@@ -3433,6 +3436,7 @@ class KVCacheManagerV2(BaseResourceManager):
         return {
             "valid_length": history.valid_length,
             "position": history.position,
+            "is_disabled": history.is_disabled,
             "layout": self.draft_layout.transfer_identity(),
         }
 
@@ -3444,10 +3448,11 @@ class KVCacheManagerV2(BaseResourceManager):
             raise ValueError("Standalone draft transfer layout does not match the receiving worker")
         valid_length = metadata.get("valid_length")
         position = metadata.get("position")
-        history = StandaloneDraftHistory(valid_length, position)
+        is_disabled = metadata.get("is_disabled", False)
+        history = StandaloneDraftHistory(valid_length, position, is_disabled)
         # Validate receiver-local allocation before publishing history.
         self.get_draft_block_table([request_id], [history])
-        self.set_draft_history(request_id, valid_length, position)
+        self.set_draft_history(request_id, valid_length, position, is_disabled)
 
     def get_index_k_buffer(
         self,
@@ -5571,6 +5576,14 @@ class KVCacheManagerV2(BaseResourceManager):
 
         kv_cache = self.kv_cache_map.get(request.py_request_id)
         if kv_cache is None:
+            return
+
+        draft_history = (
+            self.get_draft_history(request.py_request_id) if self.draft_layout is not None else None
+        )
+        if draft_history is not None and draft_history.is_disabled:
+            # Unwritten draft rows cannot become reusable snapshots.
+            kv_cache.stop_committing()
             return
 
         commit_end = request.context_current_position

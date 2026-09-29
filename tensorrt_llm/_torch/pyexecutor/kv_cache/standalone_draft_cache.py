@@ -54,13 +54,16 @@ class StandaloneDraftLayout:
         return self.num_layers * self.bytes_per_layer_token
 
     def transfer_identity(self) -> dict:
-        """Model identity shared by workers with different draft head sharding."""
+        """Storage identity shared by compatible attention backends and head sharding."""
         return {
             "num_layers": self.num_layers,
             "num_kv_heads": self.total_num_kv_heads or self.num_kv_heads,
             "head_dim": self.head_dim,
             "dtype": str(self.dtype),
-            "attention_backend": self.attention_backend,
+            # VANILLA and TRTLLM share post-RoPE keys and projected values.
+            "attention_backend": (
+                "VANILLA" if self.attention_backend == "TRTLLM" else self.attention_backend
+            ),
             "kv_factor": self.kv_factor,
             "window_size": self.window_size,
         }
@@ -72,6 +75,7 @@ class StandaloneDraftHistory:
 
     valid_length: int
     position: int
+    is_disabled: bool = False
 
     def __post_init__(self) -> None:
         if type(self.valid_length) is not int or type(self.position) is not int:
@@ -88,6 +92,7 @@ class DraftHistoryUpdate:
     request_ids: tuple[int, ...]
     cache_instances: tuple[object, ...]
     values_host: torch.Tensor
+    is_disabled_host: torch.Tensor | None = None
 
     @classmethod
     def capture(
@@ -95,6 +100,7 @@ class DraftHistoryUpdate:
         manager: "KVCacheManagerV2",
         request_ids: tuple[int, ...],
         values: torch.Tensor,
+        is_disabled: torch.Tensor | None = None,
     ) -> "DraftHistoryUpdate":
         """Queue an independent length/position readback on the execution stream."""
         if values.shape != (len(request_ids), 2):
@@ -103,18 +109,36 @@ class DraftHistoryUpdate:
             values.shape, dtype=values.dtype, device="cpu", pin_memory=values.is_cuda
         )
         values_host.copy_(values, non_blocking=True)
+        is_disabled_host = None
+        if is_disabled is not None:
+            is_disabled_host = torch.empty(
+                is_disabled.shape,
+                dtype=is_disabled.dtype,
+                device="cpu",
+                pin_memory=is_disabled.is_cuda,
+            )
+            is_disabled_host.copy_(is_disabled, non_blocking=True)
         return cls(
             manager,
             tuple(request_ids),
             tuple(manager.kv_cache_map[request_id] for request_id in request_ids),
             values_host,
+            is_disabled_host,
         )
 
     def publish(self) -> None:
         """Publish completed writes without reviving released or replaced requests."""
-        for request_id, cache, (length, position) in zip(
-            self.request_ids, self.cache_instances, self.values_host.tolist()
+        disabled = (
+            self.is_disabled_host.tolist()
+            if self.is_disabled_host is not None
+            else [False] * len(self.request_ids)
+        )
+        for request_id, cache, (length, position), is_disabled in zip(
+            self.request_ids, self.cache_instances, self.values_host.tolist(), disabled
         ):
             current = self.manager.kv_cache_map.get(request_id)
             if current is cache and current.is_active:
-                self.manager.set_draft_history(request_id, length, position)
+                if is_disabled:
+                    self.manager.set_draft_history(request_id, length, position, is_disabled=True)
+                else:
+                    self.manager.set_draft_history(request_id, length, position)
