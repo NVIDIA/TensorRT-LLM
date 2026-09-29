@@ -2710,6 +2710,29 @@ def test_clean_wipes_managed_files_and_dirs(tmp_path):
         workflow.close()
 
 
+def test_clean_removes_the_adopted_sweep_copy(tmp_path):
+    """Or the "fresh" run measures the previous campaign's accepted tuning.
+
+    ``adopt_sweep`` copies the sweep DIRECTORY into ``<workspace>/sweep/``
+    and then leaves an existing copy alone, which is what a resume needs.
+    ``apply_overlay`` writes each attempt's tuning into that copy. So a copy
+    that survives ``--clean`` carries the last accepted optimization into
+    the next campaign's baseline -- measured with a change applied, reported
+    as the sweep's own. Copying into the workspace exists to prevent exactly
+    that, and ``--clean`` is named as the thing that starts over.
+    """
+    adopted = tmp_path / "sweep"
+    adopted.mkdir()
+    (adopted / "sweep.yaml").write_text("gen_extra_llm_api: {carried: over}\n", encoding="utf-8")
+    (tmp_path / "rounds").mkdir()
+
+    workflow = Workflow(workspace=tmp_path, clean=True)
+    try:
+        assert not adopted.exists()
+    finally:
+        workflow.close()
+
+
 # --------------------------------------------------------------- agent wiring
 
 
