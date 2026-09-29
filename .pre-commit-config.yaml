@@ -1617,6 +1617,7 @@ repos:
         name: verify generated OpenEngine bindings are in sync
         entry: python scripts/generate_openengine_protos.py --check
         language: python
+        # Keep these pins in sync with requirements-build-openengine.txt.
         additional_dependencies:
         - grpcio==1.67.1
         - grpcio-tools==1.67.1

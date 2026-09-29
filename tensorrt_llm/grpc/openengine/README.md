@@ -5,11 +5,7 @@
 
 `trtllm-serve` can expose an experimental OpenEngine gRPC server instead of its normal OpenAI HTTP server. SMG remains the default gRPC protocol.
 
-Install TensorRT-LLM with the OpenEngine feature marker:
-
-```bash
-python -m pip install "tensorrt_llm[openengine]"
-```
+OpenEngine support ships in the base TensorRT-LLM package. `pip install "tensorrt_llm[openengine]"` remains available as a compatibility spelling but installs nothing extra.
 
 Then select OpenEngine when starting the gRPC server:
 
