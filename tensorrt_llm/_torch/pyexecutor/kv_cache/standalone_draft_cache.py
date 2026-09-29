@@ -33,8 +33,6 @@ class StandaloneDraftLayout:
             raise ValueError("Standalone draft scratch capacity must be nonnegative")
         if self.dtype not in (torch.float16, torch.bfloat16):
             raise ValueError("Standalone draft KV supports FP16 and BF16 storage")
-        if self.attention_backend not in ("VANILLA", "TRTLLM", "DSv4"):
-            raise ValueError("Unsupported managed draft attention backend")
         if self.kv_factor not in (1, 2):
             raise ValueError("Draft KV storage requires one or two planes")
         if self.window_size is not None and self.window_size <= 0:

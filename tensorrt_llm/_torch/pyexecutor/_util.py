@@ -1883,13 +1883,9 @@ class KvCacheCreator:
         if (self._is_standalone_dspark()
                 and is_mla(self._draft_config.pretrained_config)):
             return "Unified DSpark KV cache does not yet support MLA drafters."
-        if self._mapping.cp_size != 1:
-            if not self._mapping.has_cp_helix():
-                return ("Unified DSpark KV cache supports context parallelism "
-                        "only with Helix.")
-            if not self._is_standalone_dspark():
-                return ("Unified Helix KV cache requires a standalone "
-                        "DSpark drafter.")
+        if (self._mapping.has_cp_helix() and not self._is_standalone_dspark()):
+            return ("Unified Helix KV cache requires a standalone "
+                    "DSpark drafter.")
         transceiver_config = self._cache_transceiver_config
         if self._is_disagg and (transceiver_config is None
                                 or transceiver_config.transceiver_runtime
@@ -1926,17 +1922,13 @@ class KvCacheCreator:
         draft_mapping = self._get_draft_mapping()
         attention_tp_size = (1 if draft_mapping.enable_attention_dp else
                              draft_mapping.tp_size)
-        if (num_kv_heads % attention_tp_size != 0
-                and attention_tp_size % num_kv_heads != 0):
-            raise ValueError(
-                "Standalone DSpark KV heads must divide attention TP or be "
-                "divisible by it.")
         attention_backend = self._speculative_config.attention_backend
         if attention_backend == "AUTO":
             attention_backend = self._model_engine.model.draft_model.dflash_attention_backend
         return StandaloneDraftLayout(
             num_layers=config.num_hidden_layers,
-            num_kv_heads=max(1, num_kv_heads // attention_tp_size),
+            num_kv_heads=(num_kv_heads + attention_tp_size - 1) //
+            attention_tp_size,
             head_dim=head_dim,
             dtype=torch.bfloat16,
             extra_tokens=self._speculative_config.max_draft_len + 1,
