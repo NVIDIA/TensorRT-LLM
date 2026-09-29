@@ -182,7 +182,12 @@ RUN --mount=type=cache,target=/root/.cache/pip --mount=type=bind,from=wheel,sour
     fi && \
     TRTLLM_WHEEL=$(find /tmp/wheel -maxdepth 1 -name 'tensorrt_llm*.whl' -print -quit) && \
     test -n "${TRTLLM_WHEEL}" && \
-    pip install "${TRTLLM_WHEEL}[mx]"
+    # The mooncake extra carries the Python client and the mooncake_master
+    # binary that the mooncake_master and mooncake_donor commands need. It is
+    # installed here rather than inherited, because release starts from
+    # DEVEL_IMAGE and the NGC image names the devel stage, not the tritondevel
+    # one that builds Mooncake. Where it is inherited this is already satisfied.
+    pip install "${TRTLLM_WHEEL}[mx,mooncake]"
 
 RUN --mount=type=bind,source=README.md,target=/mnt/ctx/README.md \
     --mount=type=bind,source=docs,target=/mnt/ctx/docs \
