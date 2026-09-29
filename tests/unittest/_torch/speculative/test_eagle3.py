@@ -630,7 +630,8 @@ def test_block_offsets_staging_width_spec_gate(spec_signal):
 
 @pytest.mark.parametrize("use_mla", [False, True])
 @pytest.mark.parametrize("sliding_window", [None, 64])
-def test_eagle3_sliding_window_wiring(use_mla, sliding_window):
+def test_eagle3_sliding_window_wiring(use_mla, sliding_window,
+                                      monkeypatch: pytest.MonkeyPatch):
     """Verify Eagle3 forwards ``config.sliding_window`` to Attention as
     ``attention_window_size``.
 
@@ -704,13 +705,47 @@ def test_eagle3_sliding_window_wiring(use_mla, sliding_window):
 
     # (2) Eagle3DecoderLayer only injects attention_window_size when the
     # attention forward accepts it; MLA does not, so kwargs stay empty.
-    if use_mla:
-        assert layer._attn_kwargs == {}
+    if use_mla or sliding_window is None:
+        expected_kwargs = {}
     else:
-        expected_kwargs = ({
-            "attention_window_size": sliding_window
-        } if sliding_window is not None else {})
-        assert layer._attn_kwargs == expected_kwargs
+        expected_kwargs = {"attention_window_size": sliding_window}
+    assert layer._attn_kwargs == expected_kwargs
+
+    # (3) Run forward() on CPU and check the keyword actually reaches
+    # attention. The norms and MLP need CUDA kernels and materialized weights,
+    # so replace them with passthroughs and spy on the attention call.
+    class _PassthroughNorm(torch.nn.Module):
+
+        def forward(self, hidden_states, residual=None):
+            if residual is None:
+                return hidden_states
+            return hidden_states, residual
+
+    layer.hidden_norm = _PassthroughNorm()
+    layer.input_layernorm = _PassthroughNorm()
+    layer.post_attention_layernorm = _PassthroughNorm()
+    layer.mlp = torch.nn.Identity()
+
+    attn_calls = []
+
+    def _attn_spy(*, position_ids, hidden_states, attn_metadata, **kwargs):
+        attn_calls.append(kwargs)
+        return hidden_states[..., :config.hidden_size]
+
+    monkeypatch.setattr(layer.self_attn, "forward", _attn_spy)
+
+    num_tokens = 3
+    spec_metadata = MagicMock()
+    layer.forward(
+        position_ids=torch.arange(num_tokens),
+        embeds=torch.randn(num_tokens, config.hidden_size),
+        hidden_states=torch.randn(num_tokens, config.hidden_size),
+        attn_metadata=object(),
+        spec_metadata=spec_metadata,
+    )
+
+    assert attn_calls == [expected_kwargs]
+    spec_metadata.maybe_capture_hidden_states.assert_called_once()
 
 
 @pytest.mark.parametrize("layer_type,expected_window", [
