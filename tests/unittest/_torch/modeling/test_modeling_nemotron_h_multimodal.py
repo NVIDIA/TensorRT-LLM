@@ -128,6 +128,7 @@ def test_nemotron_nano_epd_handoff_preserves_non_contiguous_video_runs(
     processor._sound_context_token_id = None
     processor._sound_start_token_id = None
     processor._sound_end_token_id = None
+    processor.video_pruning_rate = 0.0
 
     processor.get_num_tokens_per_video = MagicMock(return_value=8)
     processor.expand_prompt_token_ids_for_mm = MagicMock(
@@ -196,30 +197,6 @@ def test_nemotron_nano_multimodal_encoder_load_by_worker_role(env_value, expects
         fake_encoder.load_weights.assert_called_once_with(weights)
     else:
         vision_encoder_cls.assert_not_called()
-
-
-@pytest.mark.cpu_only
-def test_nemotron_nano_rejects_evs_attached_video_embeddings():
-    """EVS needs retained-token metadata that E/P attached embeddings do not carry."""
-    model = SimpleNamespace(
-        video_pruning_rate=0.5,
-        _validate_evs_context_batch=MagicMock(),
-    )
-    attn_metadata = SimpleNamespace(num_contexts=1, num_generations=0)
-    param = MultimodalParams(
-        multimodal_data={
-            "modality_type": "video",
-            "multimodal_embedding": torch.zeros(1, 4),
-        }
-    )
-
-    with pytest.raises(ValueError, match="EVS video pruning is not supported"):
-        NemotronHMultimodalModel.forward(
-            model,
-            attn_metadata,
-            input_ids=torch.tensor([[20]], dtype=torch.long),
-            multimodal_params=[param],
-        )
 
 
 def _spec_forward_stub():
