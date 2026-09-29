@@ -14,6 +14,8 @@ l0_l40s:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
+  # Packed-QKV context FMHA: SM89 is the CI arch where the pre-fix null read faults.
+  - unittest/_torch/attention/test_packed_qkv_fmha.py
   # Multimodal modeling tests
   - unittest/_torch/modeling -k "modeling_siglip"
   - unittest/_torch/modeling -k "modeling_nemotron_h_multimodal"
