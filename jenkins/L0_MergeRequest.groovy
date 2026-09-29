@@ -1953,8 +1953,9 @@ def getCommonParameters()
 }
 
 def findCachedPLCSourceScanResult(commit) {
+    def plcJobUrl = "${trtllm_utils.resolveCurrentJenkinsBaseUrl(this)}/job/LLM/job/helpers/job/PLCScanningSetup"
     def exitCode = sh(
-        script: "python3 ${LLM_ROOT}/jenkins/scripts/find_plc_build.py --commit ${commit} > find_plc_build.json",
+        script: "python3 ${LLM_ROOT}/jenkins/scripts/find_plc_build.py --commit ${commit} --jenkins-base ${plcJobUrl} > find_plc_build.json",
         returnStatus: true
     )
     if (exitCode != 0) {
