@@ -338,7 +338,6 @@ def get_spec_metadata(spec_config,
                       max_num_requests,
                       max_num_tokens,
                       spec_resource_manager=None,
-                      is_draft_model=False,
                       max_seq_len=262144,
                       num_seq_slots=None):
     metadata = _build_spec_metadata(spec_config,
@@ -346,7 +345,6 @@ def get_spec_metadata(spec_config,
                                     max_num_requests,
                                     max_num_tokens,
                                     spec_resource_manager=spec_resource_manager,
-                                    is_draft_model=is_draft_model,
                                     max_seq_len=max_seq_len)
     # Set here rather than in each branch below: every one-model mode needs it and
     # the per-mode constructors are easy to miss one of.
@@ -370,7 +368,6 @@ def _build_spec_metadata(spec_config,
                          max_num_requests,
                          max_num_tokens,
                          spec_resource_manager=None,
-                         is_draft_model=False,
                          max_seq_len=262144):
     use_rejection_sampling = getattr(spec_config, "use_rejection_sampling",
                                      False)
@@ -790,8 +787,8 @@ def get_num_extra_kv_tokens(spec_config):
 
 def get_draft_kv_cache_manager(spec_config, resource_manager):
     """
-    Returns the draft KV cache manager only in one-model speculative decoding
-    mode where the target model manages a separate draft KV cache.
+    Return the one-model draft cache manager, including a shared subpage view
+    when the target manager owns the draft cache storage.
     """
     from ..pyexecutor.resource_manager import ResourceManagerType
 
@@ -799,8 +796,14 @@ def get_draft_kv_cache_manager(spec_config, resource_manager):
         return None
     if not spec_config.spec_dec_mode.use_one_engine():
         return None
-    return resource_manager.get_resource_manager(
+    draft = resource_manager.get_resource_manager(
         ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+    if draft is not None:
+        return draft
+    target = resource_manager.get_resource_manager(
+        ResourceManagerType.KV_CACHE_MANAGER)
+    get_view = getattr(target, "get_draft_subpage_view", None)
+    return get_view() if get_view is not None else None
 
 
 def update_spec_config_from_model_config(spec_config,

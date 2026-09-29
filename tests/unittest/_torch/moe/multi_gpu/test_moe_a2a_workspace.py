@@ -16,7 +16,12 @@ from mpi4py.futures import MPIPoolExecutor
 
 import tensorrt_llm as tllm
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
-from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
+from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
+    _CFT_MIN_DRIVER_BRANCH,
+    NVLinkOneSided,
+    _get_nvidia_driver_version,
+    cft_driver_is_supported,
+)
 from tensorrt_llm.mapping import Mapping
 
 # Match the neighboring MPI tests: workers must receive this module by value.
@@ -81,6 +86,11 @@ def _cft_skip_reason():
         )
         if result != 0 or status.value != 0 or not pointer.value:
             return f"CUDA driver lacks cuLogicalEndpoint{suffix}"
+    # Logical endpoints also need kernel-driver support; under CUDA forward
+    # compatibility the newer user-mode driver exports them but creation fails.
+    driver_version = _get_nvidia_driver_version()
+    if not cft_driver_is_supported(driver_version):
+        return f"CFT requires NVIDIA driver {_CFT_MIN_DRIVER_BRANCH}+ (found {driver_version})"
     return None
 
 

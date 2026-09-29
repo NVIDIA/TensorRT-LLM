@@ -342,7 +342,6 @@ def _mamba_engine(*, world_size: int = 1, dwdp_size: int = 0) -> tuple[PyTorchMo
     engine.batch_size = 4
     engine.max_seq_len = 8
     engine.original_max_draft_len = 0
-    engine.is_draft_model = False
     engine.llm_args = SimpleNamespace(enable_autotuner=False)
     engine.no_cuda_graph = contextlib.nullcontext
     batch = object()

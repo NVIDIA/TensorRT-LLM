@@ -15,9 +15,10 @@ Python and C++ codebase with a PyTorch execution path.
 - `pre-commit` hooks run on commit — if files are modified by hooks, re-stage and commit again
 - LLM args or nested-config changes must run `python3 scripts/generate_llm_args_golden_manifest.py` and commit
   `tensorrt_llm/usage/llm_args_golden_manifest.json`; new fields require telemetry/privacy CODEOWNER approval
-- When adding or renaming a public model architecture, update
-  `tensorrt_llm/usage/architecture_allowlist.py` with its exact Hugging Face architecture name;
-  never add private or customer-specific names
+- When adding or renaming a public model architecture identifier, update
+  `tensorrt_llm/usage/architecture_allowlist.py` with its exact identifier. It must be publicly
+  documented by the upstream model provider or in `docs/source/models/supported-models.md`; never add
+  private, customer-specific, or arbitrary user-supplied names
 - PR title format: `[JIRA/NVBUG/None][type] description` (e.g., `[TRTLLM-5516][perf] optimize cuda graph padding`)
 - Put a change's rationale and history (why it was made, what it replaces, ticket/PR references) in the PR
   description, not in code comments. Code comments should explain the code as it stands for a future reader,
@@ -166,6 +167,12 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 | Test lists | `tests/integration/test_lists/test-db/` | Per-GPU YAML files (`l0_a10.yml`, `l0_h100.yml`, etc.) |
 | Test waives | `tests/integration/test_lists/waives.txt` | Skip known-failing tests with NVBug links |
 | Performance | See [benchmarking guide](docs/source/developer-guide/perf-benchmarking.md) | `trtllm-bench` and `trtllm-serve` benchmarks |
+
+### Advisory semantic review
+
+See [.github/semantic-review.md](.github/semantic-review.md) for the two-hour
+rotating candidate scan, fixed-version AI results, bounded timeout recovery, and manual
+retry procedure.
 
 ### Triggering CI
 
