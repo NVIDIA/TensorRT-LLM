@@ -1353,7 +1353,7 @@ def _terminal_sender(session: _TelemetrySession) -> None:
 
 
 def _start_terminal_sender(session: _TelemetrySession) -> None:
-    """Start once while holding _REPORTER_LOCK; retry later if startup fails."""
+    """Start the exit sender if not already started; caller must hold _REPORTER_LOCK."""
     if session.terminal_thread is not None or not session.is_delivery_allowed():
         return
     try:
