@@ -3,9 +3,11 @@
 Pick the subset of a QA test list a machine can run, before Slurm allocates it, and split
 the result across GPU allocation sizes.
 
-The cluster pipeline sends the same flat list (`llm_function_core.txt`) to every architecture. A test that cannot run on
-the allocated machine still occupies it and skips there, because pytest evaluates skip
-conditions at run time. This plugin decides the same questions during collection instead.
+The cluster pipeline sends the same flat list
+([`llm_function_core.txt`](../integration/test_lists/qa/llm_function_core.txt)) to every
+architecture. A test that cannot run on the allocated machine still occupies it and skips there,
+because pytest evaluates skip conditions at run time. This plugin decides the same questions
+during collection instead.
 
 Functional tests only; perf runs are selected by their own configuration.
 
@@ -14,33 +16,42 @@ pytest --collect-only -q -p qa_selection.plugin \
        --machine=B200 --ladder=1,4,8 --selection-out-dir=out/
 ```
 
-`pytest -p qa_selection.plugin --help` documents the four options. `-p` needs `tests/`
+`pytest -p qa_selection.plugin --help` documents the five options. `-p` needs `tests/`
 importable: the integration suite's ini `pythonpath` provides it, elsewhere set
 `PYTHONPATH=tests`.
 
 ## Layout
 
-Imports point downward only, and `plugin.py` is a leaf — nothing imports it.
-
 ```text
 qa_selection/
-  core/          the decision layer -- stdlib only, never pytest
-    machines.py    profiles.json -> MachineProfile
-    rules.py       rules.json    -> SkipRuleTable
-    selector.py    can this machine run this test     -> Decision
-    allocation.py  how much does it want, which rung  -> GpuDemand, Ladder, Assignment
-  collection.py  the options, the markers, ItemView, Selection
-  report.py      the .ids lists, the JSON record, the terminal summary
-  plugin.py      the five pytest hooks; the `-p` entry point
+  plugin.py        the options, the markers, the item adapter, the five hooks;
+                   the `-p` entry point, and the only module importing pytest
+  core/            the decisions -- stdlib only, never pytest
+    ladder.py        what a legal ladder is
+    machines.py      the machines selection can target
+    rules.py         the curated skip rules, and what holds
+    markers.py       the marks whose first argument is a need
+    selector.py      can this machine run this test
+    allocation.py    how much it wants, which rung takes it
+    artifacts.py     what the output files are called
+    request.py       what one run was asked for
+    selection.py     what it decided about every test
+    report.py        the .ids lists, the JSON record, the summary lines
+  tests/           the behaviour suite -- no GPU, no container, no wheel
 ```
 
+`core/` takes plain values and raises `SelectionError`; `plugin.py` reads them off pytest's
+config and raises `pytest.UsageError`. So every decision can be exercised without pytest, and a
+reader who only wants to know what the plugin *does to collection* has one file to read. Imports
+point downward only, and nothing imports `plugin.py`.
 
 ## How the pieces connect
 
 **At config time** `plugin.py` registers the options and resolves them once into a
-`SelectionRequest`: a machine name becomes a `MachineProfile` read from `profiles.json`, a
-ladder becomes a validated `Ladder`. Every usage error surfaces here, before a test module is
-imported. 
+`SelectionRequest`: a machine name becomes a `MachineProfile` read from `profiles.json`, a ladder
+becomes a validated `Ladder`. An output directory is created here too, and refused if it already
+holds files of this machine's that this run would not overwrite — a leftover list from a
+different ladder. Every usage error surfaces here, before a test module is imported.
 
 **At collection time** the hook is declared `trylast` and is not a wrapper, so it runs after
 the integration conftest's own `hookwrapper` has applied `--test-list`, waives and regex
@@ -59,48 +70,43 @@ imported, so it describes the wrong machine and is never evaluated.
 | how much does it want, which allocation? | `allocation.py`, from marks alone | `GpuDemand`, rung |
 
 Feasibility is decided first, assignment second. Because demand never consults the profile, the
-two cannot disagree, and that order cannot double-count. Whatever is not live goes to pytest's
-own deselection hook and is removed from the item list in place.
+two cannot disagree, and that order cannot double-count. `selection.py` holds one answer per
+test in collection order, so `partition` can split the item list by position: whatever is not
+live goes to pytest's own deselection hook and is removed from the list in place.
 
 **After collection** `report.py` turns those decisions into the per-rung `.ids` lists the
 pipeline filters with `awk`, a JSON record, and a terminal summary. Nothing is written unless
 `--selection-out-dir` was given.
 
-## Ideas worth knowing
+## Acceptance tests
 
-**Feasibility and assignment are different questions.** `--gpus=4` alone selects everything
-fitting in 4 GPUs. With `--ladder=1,4,8` it selects the tests *assigned to* the 4-GPU
-allocation — those wanting 2, 3 or 4. The ladder, not the count, decides which.
+Six criteria, one module each. Every expected value was derived from the production decorators
+before the plugin was run, so a test states a command line and the answer expected back — what
+the plugin decides, and how to drive it. The criteria in full, with those derivations, are in
+`openspec/changes/pytest-plugin-test/`.
 
-**`required_gpus` is inferred, not declared.** `skip_less_device(4)` says "not fewer than 4",
-a lower bound on the environment rather than a demand. So the number never travels without
-`required_gpus_from`, the markers it came from; empty means the test said nothing and was
-assumed to need 1.
+```bash
+pytest tests/qa_selection/tests      # 29 tests, no GPU, no container, no wheel
+```
 
-**Rules key on the `skipif` reason string**, the only field a collected mark preserves. Reason
-strings are prose in another file, so rewording one silently disables its rule —
-`scripts/check_qa_selection_rules.py`, wired into pre-commit, is what makes that contract
-enforceable. Add a rule by copying the decorator's reason byte for byte into `core/rules.json`
-and running the check.
+| | guarantee | proved by |
+|---|---|---|
+| **AC-1** | The target machine's **architecture** decides what is selected — `sm`, CPU arch and device memory, read from the profile and never from the collecting host | [`test_arch.py`](tests/test_arch.py) (5) |
+| **AC-2** | The available **GPU count** decides what is selected: the machine's GPUs per node, unless `--gpus` names fewer | [`test_gpu_count.py`](tests/test_gpu_count.py) (5) |
+| **AC-3** | The **ladder** routes each selected test to the smallest allocation that holds it, and publishes one list per rung | [`test_ladder.py`](tests/test_ladder.py) (5) |
+| **AC-4** | Each **option answers one question**, and a rung run selects exactly what that rung published | [`test_options.py`](tests/test_options.py) (9) |
+| **AC-5** | A ladder **shorter than the machine** strands feasible tests audibly — named, counted and warned, never folded into the largest rung | [`test_stranded.py`](tests/test_stranded.py) (3) |
+| **AC-6** | Without `--machine`, loading the plugin **changes nothing**, so it can be loaded unconditionally | [`test_inert.py`](tests/test_inert.py) (2) |
 
-**A rule must turn on a permanent property of the machine.** Skips depending on the allocation
-or the run-time environment get none, and a `pytest.skip()` raised in a body or a fixture
-leaves no mark to read. All of them still skip on the node, as today.
+## Config
 
-**The table is a scope statement, so what it omits is not reported.** A `skipif` with no rule —
-whatever its reason, declared in the conftest or written inline at a test, and including one
-carrying no `reason=` at all — keeps the test for every machine. That is the whole answer, so
-selection gives it no count and no line, and the drift check says nothing about it either. What
-*is* reported is drift in the rules that exist: a reason reworded out from under one is an error
-at commit time.
+Three JSON files under `core/`, each read by the module beside it. `rules.json` and
+`markers.json` are copies of what the integration suite owns — selection must not share a source
+of truth with the code it decides about. [`scripts/check_qa_selection_rules.py`](../../scripts/check_qa_selection_rules.py),
+wired into pre-commit, fails when a copy drifts.
 
-**Marker precedence mirrors the suite's**, inconsistency included: `skipif` and
-`skip_less_device_memory` are read at every level, the other three resource markers only at the
-closest. So a method asking for 2 GPUs replaces its class's 8, while one asking for 80000 MiB
-does not replace its class's 200000.
-
-
-## Hand-maintained inputs
-
-`core/profiles.json` describes the machines selection can target, with the facts the rules ask
-about; `core/rules.json` holds the curated skip rules.
+| file | holds |
+|---|---|
+| `profiles.json` | one entry per machine: `sm`, `device_name`, `device_memory_mib`, `max_gpu_per_node`, `cpu_arch`, and an optional `rungs` ladder — allocation policy, read by no rule |
+| `rules.json` | the curated skip rules, each keyed by the exact `skipif` reason string it decides; a rule must turn on a permanent property of the machine |
+| `markers.json` | the marks whose first argument is a *requirement* rather than a condition, with the description each is declared with |
