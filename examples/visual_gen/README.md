@@ -65,7 +65,6 @@ image:0` to change cross-modality order; include every reference exactly once.
 The Python API uses existing `MediaRef` slots with role `reference`,
 `VisualGenArgs.pipeline_config={"workflow": "ref2va"}`, and optional
 `VisualGenParams.extra_params={"reference_order": ["video:0", "image:0"]}`.
-The BF16 Ref2VA example disables `torch_compile_config.enable` to preserve
-the reference rounding boundaries; compilation can introduce numerical drift.
+The BF16 Ref2VA example uses eager execution and TRTLLM normalization and SwiGLU kernels.
 Ref2VA references condition content rather than anchoring the first/last frame;
 the default output canvas is 768×1344 regardless of reference dimensions.

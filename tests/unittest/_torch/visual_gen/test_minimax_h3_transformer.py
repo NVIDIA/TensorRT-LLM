@@ -1203,30 +1203,22 @@ def test_ref2va_bf16_matches_diffusers_rounding() -> None:
 
 
 @pytest.mark.parametrize("workflow", ["fl2va", "ref2va"])
-def test_ref2va_selects_reference_precision_only_for_its_bf16_model(workflow: str) -> None:
+def test_workflows_reuse_trtllm_norm_and_swiglu(workflow: str) -> None:
+    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+    from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNormTPAware
+
     config = _make_model_config(num_layers=1, num_refiner_layers=1)
     config.extra_attrs["workflow"] = workflow
     model = h3.MiniMaxH3Transformer3DModel(config)
-    assert isinstance(model.norm_out.norm, h3._ReferenceRMSNorm) == (workflow == "ref2va")
-    assert (model.transformer_blocks[0].ff.activation is h3._reference_swiglu) == (
-        workflow == "ref2va"
-    )
-    from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNormTPAware
-
-    assert isinstance(model.transformer_blocks[0].attn.norm_q, RMSNormTPAware)
-    assert model.transformer_blocks[0].attn.reference_precision == (workflow == "ref2va")
-
-
-def test_ref2va_swiglu_preserves_intermediate_bf16_rounding() -> None:
-    # A nontrivial range exercises values whose SiLU result is not exactly
-    # representable in BF16 before it is multiplied by the other branch.
-    gate = torch.linspace(-4, 4, 1024, dtype=torch.bfloat16)
-    up = torch.linspace(0.5, 1.5, 1024, dtype=torch.bfloat16)
-    actual = h3._reference_swiglu(torch.cat((gate, up)))
-    expected = up * nn.SiLU()(gate)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    single_rounding = (F.silu(gate.float()) * up.float()).to(torch.bfloat16)
-    assert not torch.equal(actual, single_rounding)
+    assert type(model.norm_out.norm) is RMSNorm
+    assert type(model.token_refiner.final_norm) is RMSNorm
+    blocks = [*model.transformer_blocks, *model.token_refiner.refiner_blocks]
+    for block in blocks:
+        assert type(block.norm1) is RMSNorm
+        assert type(block.norm2) is RMSNorm
+        assert block.ff.activation is F.silu
+        assert isinstance(block.attn.norm_q, RMSNormTPAware)
+        assert isinstance(block.attn.norm_k, RMSNormTPAware)
 
 
 def test_ref2va_norm_initialization_supports_deferred_weight_loading() -> None:
@@ -1238,6 +1230,6 @@ def test_ref2va_norm_initialization_supports_deferred_weight_loading() -> None:
     with MetaInitMode():
         model = h3.MiniMaxH3Transformer3DModel(config)
     for module in model.modules():
-        if isinstance(module, h3._ReferenceRMSNorm):
+        if isinstance(module, h3.RMSNorm):
             assert module.weight.device.type != "meta"
             torch.testing.assert_close(module.weight, torch.ones_like(module.weight))
