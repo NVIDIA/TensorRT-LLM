@@ -1,0 +1,11 @@
+Eagle3DecodingConfig
+====================
+
+.. autoclass:: tensorrt_llm.llmapi.Eagle3DecodingConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+    :exclude-members: model_copy,model_validate_strings,parse_raw,model_computed_fields,model_rebuild,dict,model_config,parse_file,schema,model_json_schema,validate,update_forward_refs,model_dump_json,from_orm,model_validate_json,Config,model_parametrized_name,model_construct,construct,model_dump,model_validate,model_post_init,schema_json,parse_obj,json,copy,model_extra,model_fields_set,model_fields

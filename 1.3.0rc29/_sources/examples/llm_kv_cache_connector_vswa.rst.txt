@@ -1,0 +1,8 @@
+KV Cache Connector under VSWA
+=============================
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/c76f4a856447820aa1f994b053da7580d69b657d/examples/llm-api/llm_kv_cache_connector_vswa.py.
+
+.. literalinclude:: ../../../examples/llm-api/llm_kv_cache_connector_vswa.py
+    :lines: 1-14,18-359
+    :language: python
+    :linenos:
