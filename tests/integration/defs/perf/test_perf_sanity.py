@@ -657,8 +657,72 @@ def _scan_gen_worker_device_step_time(
     return per_file_rows
 
 
+# The expected steady-state bucket must hold at least this fraction of the
+# modal bucket's rows to be trusted. A config-derived value that the run never
+# settled at (e.g. a scheduler cap the formula does not model) otherwise lands
+# on a handful of transient iterations; below the floor the mode is used.
+_EXPECTED_NGEN_MIN_MODE_FRACTION = 0.5
+
+
+def expected_gen_only_ngen(
+    gen_config: Optional["ServerConfig"],
+    concurrency: int,
+    num_gen_servers: int,
+) -> Optional[int]:
+    """Steady-state num_generation_tokens a gen_only-mode gen worker settles at.
+
+    In the gen_only modes every request is queued on the gen workers before
+    decoding starts, so once the iteration log is stable each rank holds a fixed
+    share of the concurrency, capped by the batch and token budgets, and emits
+    1 + max_draft_len tokens per request:
+
+        per_rank = min(ceil(concurrency / (num_gen_servers * dp)),
+                       max_batch_size,
+                       max_num_tokens // (1 + max_draft_len))
+        ngen     = per_rank * (1 + max_draft_len)
+
+    dp is the attention-DP size (== tp) when enable_attention_dp is on, else 1
+    (every TP rank then sees the whole batch). num_gen_servers is always 1 for
+    gen_only_no_context and hardware.num_gen_servers for gen_only.
+
+    Returns None when the inputs cannot determine a value.
+    """
+    if gen_config is None or concurrency <= 0 or num_gen_servers <= 0:
+        return None
+    tokens_per_request = 1 + max(int(gen_config.max_draft_len or 0), 0)
+    dp = gen_config.tp if gen_config.enable_attention_dp else 1
+    per_rank = min(
+        math.ceil(concurrency / (num_gen_servers * max(dp, 1))),
+        gen_config.max_batch_size,
+        gen_config.max_num_tokens // tokens_per_request,
+    )
+    if per_rank <= 0:
+        return None
+    return per_rank * tokens_per_request
+
+
+def _select_ngen_bucket(
+    by_ngen: Dict[int, List[float]],
+    expected_ngen: Optional[int],
+) -> List[float]:
+    """Pick the steady-state bucket: the expected ngen if trusted, else the mode."""
+    mode_ngen, mode_values = max(by_ngen.items(), key=lambda kv: (len(kv[1]), kv[0]))
+    if expected_ngen is None or expected_ngen == mode_ngen:
+        return mode_values
+    expected_values = by_ngen.get(expected_ngen, [])
+    if len(expected_values) >= _EXPECTED_NGEN_MIN_MODE_FRACTION * len(mode_values):
+        return expected_values
+    print_warning(
+        f"Expected steady-state num_generation_tokens={expected_ngen} has "
+        f"{len(expected_values)} iterations vs {len(mode_values)} at the mode "
+        f"({mode_ngen}); falling back to the modal bucket."
+    )
+    return mode_values
+
+
 def _stats_at_mode_ngen(
     per_file_rows: List[List[_IterRow]],
+    expected_ngen: Optional[int] = None,
 ) -> Optional[_DeviceStepTimeStats]:
     """Aggregate per-file rows into one set of distribution statistics.
 
@@ -673,6 +737,14 @@ def _stats_at_mode_ngen(
     When a file produced usable rows but no parseable num_generation_tokens on
     any of them, fall back to that file's whole sample so a present metric is
     never lost (nvbugs 6487036 / 6487040).
+
+    When expected_ngen is given (the gen_only modes, see
+    expected_gen_only_ngen) that bucket is described instead of the mode,
+    provided it holds at least _EXPECTED_NGEN_MIN_MODE_FRACTION of the modal
+    bucket's rows. The mode alone is not stable: a workload can have two
+    near-tied buckets with very different step times -- the full-batch plateau
+    and a smaller tail -- and the mode then flips between them run to run
+    (nvbug 6843918: 440 vs 441 iterations, 98 ms vs 32 ms).
 
     Then average each statistic across workers, unweighted -- one vote per
     worker, matching how the mean has always been combined. Averaging a median
@@ -689,7 +761,7 @@ def _stats_at_mode_ngen(
             if row.ngen is not None:
                 by_ngen.setdefault(row.ngen, []).append(row.device_step_time)
         if by_ngen:
-            _mode_ngen, values = max(by_ngen.items(), key=lambda kv: (len(kv[1]), kv[0]))
+            values = _select_ngen_bucket(by_ngen, expected_ngen)
         else:
             # No parseable ngen anywhere in this worker; use every row.
             values = [row.device_step_time for row in rows]
@@ -715,13 +787,15 @@ def parse_gen_worker_device_step_time(
     num_gen_servers: int,
     start_offsets: Optional[List[int]] = None,
     end_offsets: Optional[List[int]] = None,
+    expected_ngen: Optional[int] = None,
 ) -> Optional[_DeviceStepTimeStats]:
     """Per-iter prev_device_step_time statistics (ms) across all gen workers.
 
     For each gen_server_{i}.log, take the iter >= 5 rows that are not the
     successor of an empty (num_scheduled_requests == 0) iteration, bucket them
-    by num_generation_tokens, pick the bucket with the most rows (the mode;
-    ties break to the largest ngen), and describe that bucket with mean,
+    by num_generation_tokens, pick the expected steady-state bucket when
+    expected_ngen is given and trusted, else the bucket with the most rows (the
+    mode; ties break to the largest ngen), and describe that bucket with mean,
     median, stdev, P75 and P99. Then average each statistic across the
     num_gen_servers workers. A worker whose num_generation_tokens never parses
     falls back to its whole sample rather than being dropped to None. Returns
@@ -753,7 +827,7 @@ def parse_gen_worker_device_step_time(
     per_file_rows = _scan_gen_worker_device_step_time(
         output_dir, num_gen_servers, start_offsets, end_offsets
     )
-    return _stats_at_mode_ngen(per_file_rows)
+    return _stats_at_mode_ngen(per_file_rows, expected_ngen)
 
 
 def append_gen_worker_device_step_time(
@@ -769,6 +843,7 @@ def append_gen_worker_device_step_time(
             num_gen_servers,
             start_offsets=record["start_offsets"],
             end_offsets=record.get("end_offsets"),
+            expected_ngen=record.get("expected_ngen"),
         )
         if stats is None:
             continue
@@ -3139,6 +3214,19 @@ class DisaggTestCmds(NamedTuple):
                                     "benchmark_file_path": benchmark_file_path,
                                     "start_offsets": gen_log_start_offsets,
                                     "end_offsets": None,
+                                    # Only the gen_only modes reach a steady
+                                    # state the config determines; e2e keeps
+                                    # the modal bucket.
+                                    "expected_ngen": (
+                                        expected_gen_only_ngen(
+                                            configs_for_idx[1],
+                                            client_config.concurrency,
+                                            self.num_gen_servers,
+                                        )
+                                        if benchmark_mode_for_idx in GEN_ONLY_MODES
+                                        and client_config is not None
+                                        else None
+                                    ),
                                 }
                             )
                         if collect_time_breakdown:
@@ -3417,6 +3505,12 @@ class AggrGenOnlyNoContextCmds(NamedTuple):
                                 "benchmark_file_path": benchmark_file_path,
                                 "start_offsets": gen_log_start_offsets,
                                 "end_offsets": None,
+                                # One gen worker, by construction of this mode.
+                                "expected_ngen": (
+                                    expected_gen_only_ngen(gen_cfg, client_config.concurrency, 1)
+                                    if client_config is not None
+                                    else None
+                                ),
                             }
                         )
                         if collect_time_breakdown:
