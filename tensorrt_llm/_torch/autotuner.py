@@ -53,6 +53,10 @@ class _TorchProfilerUnavailableError(RuntimeError):
     """Raised when Kineto/CUPTI cannot provide CUDA timing activities."""
 
 
+class _TorchProfilerEmptyTraceError(RuntimeError):
+    """Raised when one completed profile contains no CUDA activity."""
+
+
 class DistributedTuningStrategy(enum.Enum):
     """
     Strategy for distributed tuning.
@@ -371,15 +375,17 @@ class TunableRunner(ABC):
 
 
 class CuteDSLTunableRunner(TunableRunner):
-    """Marker base for CuTe DSL runners that prefer CUPTI timing."""
+    """Marker base for CuTe DSL runners with optional CUPTI timing."""
 
     def use_torch_profiler(self, tactic: Any) -> bool:
-        """Prefer CUDA activity timing for every CuTe DSL tactic."""
-        return True
+        """Use CUDA activity timing only when explicitly requested."""
+        return os.getenv("TLLM_PROFILING_TIMER",
+                         "").lower() == _TORCH_PROFILER_TIMER_KEY
 
     def profiling_timer_cache_key(self) -> Optional[str]:
-        """Separate CUPTI-ranked tactics from legacy timer cache entries."""
-        return _TORCH_PROFILER_TIMER_KEY
+        """Separate opt-in CUPTI-ranked tactics from legacy cache entries."""
+        return _TORCH_PROFILER_TIMER_KEY if self.use_torch_profiler(
+            None) else None
 
 
 @contextlib.contextmanager
@@ -630,15 +636,16 @@ class AutoTunerProfilingCache:
             runner_id is the index in the current runners list
         """
         for idx, r in enumerate(runners):
-            cache_keys = [
-                self.get_cache_key(
-                    custom_op,
-                    r,
-                    input_shapes,
-                    tuning_config,
-                    apply_map_to_tuning_buckets,
-                )
-            ]
+            cache_key = self.get_cache_key(
+                custom_op,
+                r,
+                input_shapes,
+                tuning_config,
+                apply_map_to_tuning_buckets,
+            )
+            if cache_key in self.cache:
+                cached_runner_id, tactic, min_time = self.cache[cache_key]
+                return True, idx, tactic, min_time
             # A fresh inference process has not probed CUPTI yet. It may reuse
             # an explicitly tagged CUDA-event fallback entry when no preferred
             # CUPTI entry exists. Tuning mode leaves this disabled so a
@@ -647,21 +654,17 @@ class AutoTunerProfilingCache:
             if (allow_timer_fallback
                     and not AutoTuner._torch_profiler_unavailable and
                     r.profiling_timer_cache_key() == _TORCH_PROFILER_TIMER_KEY):
-                cache_keys.append(
-                    self.get_cache_key(
-                        custom_op,
-                        r,
-                        input_shapes,
-                        tuning_config,
-                        apply_map_to_tuning_buckets,
-                        timer_key_override=_CUDA_EVENT_FALLBACK_TIMER_KEY,
-                    ))
-
-            for cache_key in cache_keys:
-                if cache_key in self.cache:
-                    # Return the current index in runners list, not the cached
-                    # runner_id.
-                    cached_runner_id, tactic, min_time = self.cache[cache_key]
+                fallback_key = self.get_cache_key(
+                    custom_op,
+                    r,
+                    input_shapes,
+                    tuning_config,
+                    apply_map_to_tuning_buckets,
+                    timer_key_override=_CUDA_EVENT_FALLBACK_TIMER_KEY,
+                )
+                if fallback_key in self.cache:
+                    cached_runner_id, tactic, min_time = self.cache[
+                        fallback_key]
                     return True, idx, tactic, min_time
 
         return False, *self.fallback_entry()
@@ -1098,15 +1101,16 @@ class AutoTuner:
         self.profiling_cache = AutoTunerProfilingCache()
         self._primed_cached_tactics: set[tuple[str, str, str, str]] = set()
         self._last_profile_timer: Optional[str] = None
+        self._force_cuda_event_for_sweep = False
         self.is_tuning_mode = False
         self.skip_dynamic_tuning_buckets = False
 
         # Default timing backend: globaltimer kernel vs CUDA events. CuTe DSL
-        # runners prefer torch.profiler/CUPTI and fall back to CUDA events when
-        # CUPTI is unavailable in the current process.
+        # runners use torch.profiler/CUPTI only when explicitly requested.
         # TLLM_PROFILING_TIMER env var overrides auto-detection:
         #   "globaltimer" -> force globaltimer
         #   "cuda_event"  -> force cuda events
+        #   "torch_profiler" -> use CUPTI for CuTe DSL runners
         #   unset/default -> auto-detect via confidential_compute_enabled()
         timer_env = os.getenv("TLLM_PROFILING_TIMER", "").lower()
         if timer_env == "globaltimer":
@@ -1584,6 +1588,7 @@ class AutoTuner:
         has_tuning_failure_occurred = False
         best_runner_id, best_tactic = None, None
         torch_profiler_was_available = not AutoTuner._torch_profiler_unavailable
+        local_timer_fallback_started = self._force_cuda_event_for_sweep
         # If the inputs_pre_hook is provided, it will be called before profiling.
         if tuning_config.inputs_pre_hook is not None and not _inputs_prepared:
             input_tensors = tuning_config.inputs_pre_hook(input_tensors)
@@ -1751,14 +1756,35 @@ class AutoTuner:
                 retry_result[3] or has_tuning_failure_occurred,
             )
 
+        if not local_timer_fallback_started and self._force_cuda_event_for_sweep:
+            # An outer profiler (or another profiler entry failure) forced one
+            # measurement onto CUDA events. Re-rank the complete sweep with
+            # events so no candidate is compared across different timers.
+            try:
+                return self._profile_runners(custom_op,
+                                             runners,
+                                             input_tensors,
+                                             profile,
+                                             tuning_config,
+                                             _inputs_prepared=True,
+                                             **kwargs)
+            finally:
+                self._force_cuda_event_for_sweep = False
+
         if best_runner_id is not None:
             # At least one valid (runner, tactic) pair is found
+            timer_key_override = (
+                _CUDA_EVENT_FALLBACK_TIMER_KEY
+                if self._force_cuda_event_for_sweep
+                and runners[best_runner_id].profiling_timer_cache_key()
+                == _TORCH_PROFILER_TIMER_KEY else None)
             cache_key = self.profiling_cache.get_cache_key(
                 custom_op,
                 runners[best_runner_id],
                 profile.get_opt_shapes(),
                 tuning_config,
-                apply_map_to_tuning_buckets=False)
+                apply_map_to_tuning_buckets=False,
+                timer_key_override=timer_key_override)
 
             self._debug_logger(
                 f"[Autotuner] Profiling runner={runners[best_runner_id]}, tactic={best_tactic} for cache_key={cache_key}."
@@ -1802,9 +1828,8 @@ class AutoTuner:
             if event.device_type == torch.autograd.DeviceType.CUDA and (
                 event.device_time_total or 0.0) > 0)
         if not math.isfinite(total_cuda_us) or total_cuda_us <= 0:
-            raise _TorchProfilerUnavailableError(
-                "torch.profiler/CUPTI reported no CUDA activity while "
-                "profiling a CuTe DSL tactic")
+            raise _TorchProfilerEmptyTraceError(
+                "torch.profiler reported no CUDA activity for this tactic")
         return total_cuda_us / max(1, int(repeat)) / 1000.0
 
     @staticmethod
@@ -1894,7 +1919,15 @@ class AutoTuner:
                                 **kwargs,
                             )
 
-                if use_torch_profiler and not AutoTuner._torch_profiler_unavailable:
+                profiler_enabled = getattr(torch.autograd, "_profiler_enabled",
+                                           None)
+                if (use_torch_profiler and profiler_enabled is not None
+                        and profiler_enabled()):
+                    self._force_cuda_event_for_sweep = True
+
+                if (use_torch_profiler
+                        and not AutoTuner._torch_profiler_unavailable
+                        and not self._force_cuda_event_for_sweep):
                     profiled_work_started = False
                     profiled_work_completed = False
                     try:
@@ -1923,13 +1956,19 @@ class AutoTuner:
                         # context.
                         if profiled_work_started and not profiled_work_completed:
                             raise
-                        if not self._is_torch_profiler_unavailable_error(error):
+                        if isinstance(error, _TorchProfilerEmptyTraceError):
                             raise
-                        self._disable_torch_profiler(error)
+                        if self._is_torch_profiler_unavailable_error(error):
+                            self._disable_torch_profiler(error)
+                        else:
+                            # Entering the profiler can fail while an outer
+                            # profiler is active. An exit failure after work
+                            # completes is also a timer failure. Use events
+                            # for this sweep without disabling CUPTI globally.
+                            self._force_cuda_event_for_sweep = True
 
-                # CUPTI was unavailable either earlier in this process or in
-                # the attempt above. Re-run this measurement with the legacy
-                # CUDA-event timer, irrespective of _use_global_timer.
+                # CUPTI was unavailable or profiler entry/exit failed. Re-run
+                # this measurement with CUDA events regardless of globaltimer.
                 force_cuda_event = use_torch_profiler
 
                 if not force_cuda_event and self._use_global_timer:
@@ -1982,7 +2021,14 @@ class AutoTuner:
         for _ in range(self.warmup):
             runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
 
-        fewer_repeat_avg_time = pure_profile(stream, profile_fewer_repeat)
+        def profile_with_empty_retry(repeat: int) -> float:
+            """Retry one empty CUPTI trace without changing the process timer."""
+            try:
+                return pure_profile(stream, repeat)
+            except _TorchProfilerEmptyTraceError:
+                return pure_profile(stream, repeat)
+
+        fewer_repeat_avg_time = profile_with_empty_retry(profile_fewer_repeat)
 
         disable_short_profile = os.environ.get(
             "TLLM_AUTOTUNER_DISABLE_SHORT_PROFILE", "0") == "1"
@@ -1994,11 +2040,12 @@ class AutoTuner:
             avg_time = fewer_repeat_avg_time
         else:
             # profile the kernel with the full repeat to get precise time
-            avg_time = pure_profile(stream, self.repeat)
+            avg_time = profile_with_empty_retry(self.repeat)
 
         shapes = self._get_input_sizes(inputs)
-        timer_name = (_CUDA_EVENT_FALLBACK_TIMER_KEY if use_torch_profiler
-                      and AutoTuner._torch_profiler_unavailable else
+        timer_name = (_CUDA_EVENT_FALLBACK_TIMER_KEY if use_torch_profiler and
+                      (AutoTuner._torch_profiler_unavailable
+                       or self._force_cuda_event_for_sweep) else
                       _TORCH_PROFILER_TIMER_KEY if use_torch_profiler else
                       "globaltimer" if self._use_global_timer else "cuda_event")
         self._last_profile_timer = timer_name
