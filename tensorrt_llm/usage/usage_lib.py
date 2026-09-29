@@ -988,8 +988,8 @@ class _TelemetrySession:
             self.initial_reported = True
             return True
 
-    def try_start_delivery(self) -> bool:
-        """Reject queued delivery when process opt-out already won the race."""
+    def is_delivery_allowed(self) -> bool:
+        """Return whether the session still permits telemetry delivery."""
         with self.lock:
             return not self.disabled
 
@@ -1324,7 +1324,7 @@ def _send_if_session_active(
     payload: dict,
 ) -> bool:
     """Start delivery only if process opt-out has not already won."""
-    if not session.try_start_delivery():
+    if not session.is_delivery_allowed():
         return False
     _send_to_gxt(payload)
     return True
@@ -1354,7 +1354,7 @@ def _terminal_sender(session: _TelemetrySession) -> None:
 
 def _start_terminal_sender(session: _TelemetrySession) -> None:
     """Start once while holding _REPORTER_LOCK; retry later if startup fails."""
-    if session.terminal_thread is not None or not session.try_start_delivery():
+    if session.terminal_thread is not None or not session.is_delivery_allowed():
         return
     try:
         thread = threading.Thread(
@@ -1447,7 +1447,7 @@ def report_exit(
         )
 
         with _REPORTER_LOCK:
-            if not session.try_start_delivery():
+            if not session.is_delivery_allowed():
                 return True
             _start_terminal_sender(session)
             _REPORTER_STOP.set()
