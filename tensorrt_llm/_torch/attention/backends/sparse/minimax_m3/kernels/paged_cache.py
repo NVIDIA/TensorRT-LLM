@@ -13,9 +13,9 @@ def write_kv_slots(
     cache: torch.Tensor,
     out_cache_loc: torch.Tensor,
     values: torch.Tensor,
+    num_live_tokens: int,
     *,
     layout: Literal["NHD", "HND"] = "NHD",
-    num_live_tokens: int,
 ) -> None:
     """Write per-token values into a K, V, or index-K cache at given slots.
 
@@ -31,10 +31,10 @@ def write_kv_slots(
     selects only the allocated live-token positions.
 
     `num_live_tokens` is how many leading rows own a real cache slot; the rest
-    are dropped. It is required rather than defaulted because a caller passing
-    the padded token extent of a piecewise CUDA graph corrupts the cache
-    silently: torch wraps a negative index, so the -1 sentinel past the live
-    count lands in the last page instead of raising.
+    are dropped. It carries no default because a caller passing the padded
+    token extent of a piecewise CUDA graph corrupts the cache silently: torch
+    wraps a negative index, so the -1 sentinel past the live count lands in the
+    last page instead of raising.
     """
     # Trimming by count keeps this sync-free, the sentinel tail being contiguous
     # by construction, where masking on the slot values would not.

@@ -970,8 +970,11 @@ def _dispatch_attention_over_live_tokens(
     read a request out of a token index, so the pad comes off here, once for
     both dispatch paths.
 
-    No kernel writes the pad rows of output, so they are zeroed rather than left
-    holding stale values that nothing can distinguish from a real NaN.
+    Clipping leaves the pad rows of output unwritten, where the full-height
+    dispatch used to cover them. Nothing reads them for its own result, but they
+    are not dropped either: o_proj and every layer after it carry them along, so
+    an uninitialized row puts an arbitrary bit pattern, NaN and Inf included,
+    into the residual stream. Zero them, which costs the pad alone.
     """
     num_tokens = int(attn_metadata.num_tokens)
     if num_tokens < int(output.shape[0]):

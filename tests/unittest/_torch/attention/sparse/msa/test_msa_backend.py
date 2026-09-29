@@ -28,7 +28,6 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_scatte
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
-    check_decode_span_shape,
     msa_paged_kv,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.paged_cache import (
@@ -77,12 +76,18 @@ def test_msa_metadata_clears_padded_cache_slot_tail(
         metadata._msa_qo_lens_cpu = torch.tensor([count], dtype=torch.int32)
         metadata._msa_kv_lens_cpu = metadata._msa_qo_lens_cpu.clone()
         metadata._msa_qo_offset_cpu = torch.zeros(1, dtype=torch.int32)
+        # What the base seq_lens setter would derive; the cache writers read the
+        # live count off it.
+        metadata._num_tokens = count
         metadata._build_msa_fields()
         assert metadata.msa_out_cache_loc.tolist() == list(range(12, 12 + count)) + [-1] * (
             4 - count
         )
         assert metadata.msa_out_cache_loc.data_ptr() == original_ptr
         assert metadata._msa_fields_ready
+        # The rows past the live count hold no slot, so a padded step's cache
+        # writes have to stop here.
+        assert metadata.msa_live_token_count() == count
 
     if empty_state == "empty_batch":
         metadata.request_ids = []
@@ -687,7 +692,7 @@ def test_msa_index_k_uses_hnd_cache_view_and_writer():
     metadata.msa_out_cache_loc = torch.tensor([2, page_size + 5], dtype=torch.int32)
     values = torch.arange(2 * head_dim, dtype=torch.float32).reshape(2, 1, head_dim)
     metadata._msa_fields_ready = True
-    metadata._msa_live_total_q = 2
+    metadata._num_tokens = 2
 
     returned = metadata.msa_idx_k_cache(3)
     metadata.msa_write_idx_k(3, values)
@@ -812,8 +817,8 @@ def test_msa_indexer_enforces_real_fp8_and_bf16_handoff_states() -> None:
                 self.cache,
                 self.msa_out_cache_loc,
                 idx_k,
+                int(idx_k.shape[0]),
                 layout="HND",
-                num_live_tokens=int(idx_k.shape[0]),
             )
 
         def msa_idx_k_cache(self, layer_idx: int) -> torch.Tensor:
@@ -1230,37 +1235,17 @@ def test_the_decode_span_of_a_mixed_step_is_its_generation_suffix():
     assert metadata.msa_max_kv_len == 40
 
 
-def test_decode_span_shape_check_names_the_kernel_that_rejected_the_q():
-    """The guard both decode kernels share."""
-    # Eleven speculative decode requests of 4 query tokens each.
-    check_decode_span_shape("kernel", 44, 11, 4)
-
-    # A piecewise CUDA graph's pad folded into the batch: the kernels would read
-    # 128 page table rows out of a batch that only has 11.
-    with pytest.raises(ValueError, match=r"kernel: total_q \(512\) must be batch \(11\)"):
-        check_decode_span_shape("kernel", 512, 11, 4)
-
-
-def test_both_decode_kernels_reject_a_q_that_outruns_the_batch():
+def test_the_triton_sparse_decode_rejects_a_q_that_outruns_the_batch():
     """The guard has to be reached, not merely available.
 
-    Both kernels read their shapes before touching a device, so the refusal
-    happens at the call and needs no GPU. The dense kernel is handed no cache
-    manager for the same reason: it must decline before consulting one.
+    Eleven speculative decode requests of 4 query tokens each, padded by a
+    piecewise CUDA graph out to 512: the kernel would read 512 page table rows
+    out of a batch that has 11. It reads its shapes before touching a device,
+    so the refusal happens at the call and needs no GPU.
     """
-    batch, query_len, total_q = 11, 4, 512
-    num_heads, head_dim, page_size = 4, 128, 128
+    batch, query_len, total_q, num_heads, head_dim = 11, 4, 512, 4, 128
     q = torch.empty(total_q, num_heads, head_dim)
-    output = torch.empty(total_q, num_heads, head_dim)
-    block_table = torch.zeros(batch, 4, dtype=torch.int32)
-    seq_lens = torch.zeros(batch, dtype=torch.int32)
-
-    pytest.importorskip("triton")
-    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.triton_sparse_decode import (
-        minimax_m3_sparse_attn_decode,
-    )
-
-    paged = torch.empty(1, 1, page_size, head_dim)
+    paged = torch.empty(1, 1, 128, head_dim)
     with pytest.raises(
         ValueError, match=r"Triton sparse decode: total_q \(512\) must be batch \(11\)"
     ):
@@ -1269,18 +1254,27 @@ def test_both_decode_kernels_reject_a_q_that_outruns_the_batch():
             paged,
             paged,
             torch.zeros(1, total_q, 64, dtype=torch.int64),
-            block_table,
-            seq_lens,
+            torch.zeros(batch, 4, dtype=torch.int32),
+            torch.zeros(batch, dtype=torch.int32),
             sm_scale=head_dim**-0.5,
-            output=output,
+            output=torch.empty_like(q),
             decode_query_len=query_len,
         )
 
+
+def test_the_trtllm_gen_dense_decode_rejects_a_q_that_outruns_the_batch():
+    """The same padded q against the dense kernel, which had no such guard.
+
+    It is handed no cache manager: its multi-CTA counters are sized off the
+    batch, so it has to decline before consulting one.
+    """
     pytest.importorskip("flashinfer")
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.trtllm_gen_dense_decode import (
         minimax_m3_trtllm_gen_dense_decode,
     )
 
+    batch, query_len, total_q, num_heads, head_dim = 11, 4, 512, 4, 128
+    q = torch.empty(total_q, num_heads, head_dim)
     with pytest.raises(
         ValueError, match=r"trtllm-gen dense decode: total_q \(512\) must be batch \(11\)"
     ):
@@ -1288,70 +1282,14 @@ def test_both_decode_kernels_reject_a_q_that_outruns_the_batch():
             q,
             None,
             0,
-            block_table,
-            seq_lens,
+            torch.zeros(batch, 4, dtype=torch.int32),
+            torch.zeros(batch, dtype=torch.int32),
             sm_scale=head_dim**-0.5,
-            output=output,
+            output=torch.empty_like(q),
             decode_query_len=query_len,
             max_seq_len=1024,
             max_num_requests=batch,
         )
-
-
-def test_a_shrinking_step_leaves_no_live_slot_in_the_padded_tail():
-    """The slot-guarded consumers recognize a negative slot and nothing else, so
-    every row a step does not own has to hold one."""
-    block_ids = torch.arange(3 * 4, dtype=torch.int32).reshape(3, 4)
-
-    class FakeCacheManager:
-        tokens_per_block = 4
-
-        def get_block_ids_per_seq(self, request_ids):
-            return block_ids[: len(request_ids)]
-
-        def get_buffers(self, layer_idx, kv_layout="NHD"):
-            # Only its device is read, which keeps this test off the GPU.
-            return torch.zeros(1, dtype=torch.bfloat16)
-
-    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
-    metadata = metadata_cls.__new__(metadata_cls)
-    metadata.kv_cache_manager = FakeCacheManager()
-    metadata.mapping = None
-    metadata._msa_buffers_ready = True
-    metadata._msa_params = None
-    metadata._msa_decode_span = None
-    metadata.max_num_sequences = 3
-    metadata.msa_subpage_block_table = None
-    metadata._msa_subpages_per_slot = 0
-    metadata.msa_out_cache_loc = torch.zeros(16, dtype=torch.int32)
-    metadata.msa_kv_indices = torch.zeros(3 * 4, dtype=torch.int32)
-    metadata.msa_block_table = torch.zeros(3, 4, dtype=torch.int32)
-    metadata.msa_seq_lens_cuda = torch.zeros(3, dtype=torch.int32)
-    # Non-speculative, so no on_update_kv_lens staging: the slot tail this test
-    # is about is the same either way, and the staging buffers are not part of
-    # the fixture.
-    metadata._msa_kv_lens_may_change = lambda: False
-
-    def build(request_ids, qo_lens, kv_lens):
-        # The host lengths are read-only properties over these.
-        metadata.request_ids = request_ids
-        metadata._msa_qo_lens_cpu = torch.tensor(qo_lens, dtype=torch.int32)
-        metadata._msa_kv_lens_cpu = torch.tensor(kv_lens, dtype=torch.int32)
-        metadata._msa_qo_offset_cpu = metadata._msa_kv_lens_cpu - metadata._msa_qo_lens_cpu
-        metadata._build_msa_fields()
-
-    # A three-request step of six new tokens, then a smaller one of two.
-    build([0, 1, 2], (4, 1, 1), (9, 3, 5))
-    assert metadata.msa_live_token_count() == 6
-    wide_tail = metadata.msa_out_cache_loc[2:6].tolist()
-    assert all(slot >= 0 for slot in wide_tail)
-
-    build([0, 1], (1, 1), (3, 5))
-
-    assert metadata.msa_live_token_count() == 2
-    # The rows the shrunk step does not own, including those the wider one did.
-    assert metadata.msa_out_cache_loc[2:].tolist() == [-1] * 14
-    assert (metadata.msa_out_cache_loc[:2] >= 0).all()
 
 
 def test_the_eager_writer_drops_the_sentinel_tail_it_is_handed():
@@ -1363,7 +1301,7 @@ def test_the_eager_writer_drops_the_sentinel_tail_it_is_handed():
     out_cache_loc = torch.tensor([2, page_size + 5, -1, -1], dtype=torch.int32)
     values = torch.arange(4 * head_dim, dtype=torch.float32).reshape(4, 1, head_dim)
 
-    write_kv_slots(cache, out_cache_loc, values, layout="HND", num_live_tokens=2)
+    write_kv_slots(cache, out_cache_loc, values, 2, layout="HND")
 
     torch.testing.assert_close(cache[0, 0, 2], values[0, 0].to(torch.bfloat16))
     torch.testing.assert_close(cache[1, 0, 5], values[1, 0].to(torch.bfloat16))
@@ -1378,22 +1316,23 @@ def test_the_eager_writer_refuses_a_live_count_it_has_no_rows_for():
     values = torch.zeros(2, 1, 16)
 
     with pytest.raises(ValueError, match=r"num_live_tokens=3 exceeds the rows supplied"):
-        write_kv_slots(cache, out_cache_loc, values, layout="HND", num_live_tokens=3)
+        write_kv_slots(cache, out_cache_loc, values, 3, layout="HND")
 
     with pytest.raises(ValueError, match="must be non-negative"):
-        write_kv_slots(cache, out_cache_loc, values, layout="HND", num_live_tokens=-1)
+        write_kv_slots(cache, out_cache_loc, values, -1, layout="HND")
 
     # A step that scheduled nothing writes nothing rather than erroring.
-    write_kv_slots(cache, out_cache_loc, values, layout="HND", num_live_tokens=0)
+    write_kv_slots(cache, out_cache_loc, values, 0, layout="HND")
     assert not cache.any()
 
 
 def test_an_unprepared_step_has_no_live_count_to_write_against():
-    """A stale count would let a write land on another step's slots."""
+    """The step's token count would otherwise let a write land on slots
+    prepare() never staged."""
     metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
     metadata = metadata_cls.__new__(metadata_cls)
     metadata._msa_fields_ready = False
-    metadata._msa_live_total_q = 7
+    metadata._num_tokens = 7
 
     with pytest.raises(RuntimeError, match="did not stage a slot mapping"):
         metadata.msa_live_token_count()
@@ -2047,23 +1986,23 @@ def test_fused_scatter_matches_reference(src_dtype, cache_dtype, with_idx):
         ref_pool[1:-1, 0],
         slots[valid],
         k.reshape(num_tokens, num_kv_heads, head_dim)[valid],
+        num_live_slots,
         layout="HND",
-        num_live_tokens=num_live_slots,
     )
     write_kv_slots(
         ref_pool[1:-1, 1],
         slots[valid],
         v.reshape(num_tokens, num_kv_heads, head_dim)[valid],
+        num_live_slots,
         layout="HND",
-        num_live_tokens=num_live_slots,
     )
     if with_idx:
         write_kv_slots(
             ref_idx_pool[1:-1, 0],
             slots[valid],
             idx_k.reshape(num_tokens, 1, head_dim)[valid],
+            num_live_slots,
             layout="HND",
-            num_live_tokens=num_live_slots,
         )
 
     assert fused_write_layer_caches(

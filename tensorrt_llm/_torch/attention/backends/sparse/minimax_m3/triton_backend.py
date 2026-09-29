@@ -162,7 +162,7 @@ def _write_main_kv_slots_to_pool(
     Every row owns a slot, so the row count is the live count: the slot mapping
     emits one real slot per new token and no sentinel.
     """
-    write_kv_slots(pool[:, kv_index], out_cache_loc, values, num_live_tokens=int(values.shape[0]))
+    write_kv_slots(pool[:, kv_index], out_cache_loc, values, int(values.shape[0]))
 
 
 def _write_main_kv_slots(
@@ -176,7 +176,7 @@ def _write_main_kv_slots(
     flat-slot layout used by focused unit tests and the 4-D paged view of
     ``kv_pool[:, 0]`` / ``kv_pool[:, 1]``.
     """
-    write_kv_slots(cache, out_cache_loc, values, num_live_tokens=int(values.shape[0]))
+    write_kv_slots(cache, out_cache_loc, values, int(values.shape[0]))
 
 
 def _scatter_topk_to_block_mask(

@@ -118,7 +118,6 @@ def write_msa_main_kv(
     out_cache_loc: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    *,
     num_live_tokens: int,
 ) -> None:
     """Write new-token K and V into the paged main cache at out_cache_loc.
@@ -136,15 +135,15 @@ def write_msa_main_kv(
         k_view,
         out_cache_loc,
         k.reshape(num_tokens, num_kv_heads, head_dim),
+        num_live_tokens,
         layout="HND",
-        num_live_tokens=num_live_tokens,
     )
     write_kv_slots(
         v_view,
         out_cache_loc,
         v.reshape(num_tokens, num_kv_heads, head_dim),
+        num_live_tokens,
         layout="HND",
-        num_live_tokens=num_live_tokens,
     )
 
 
@@ -189,7 +188,7 @@ def write_msa_phase_kv(
         k,
         v,
         # k and v are this phase's own token slice, so every row owns a slot.
-        num_live_tokens=num_tokens,
+        num_tokens,
     )
 
 
