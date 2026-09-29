@@ -268,3 +268,55 @@ profile:
 #   # ctx_json: /path/to/a/measured/ctx.json   # omit for an anchor-free gen
 #   #                                          # campaign; see above for what
 #   #                                          # that makes ABSENT
+#
+# ── BOTH halves: `disagg_sol` ────────────────────────────────────────────────
+#
+# One file starts two campaigns — a ctx one and a gen one — at an operating
+# point SELECTED from a design that was measured once. Use this instead of
+# writing two `sol_track` specs by hand: those inherit their operating point
+# from whoever wrote them, and this is the layer that exists to remove that.
+#
+# There is deliberately NO `benchmark:` block and no operating point here. The
+# point is not knowable until the design has been measured, so each half's
+# sweep is cut from the design's own sweep afterwards.
+#
+# The two halves are NEVER combined into one number: they are measured on
+# different metrics over different denominators and no measurement joins them.
+# Every selection result carries `e2e_view_absent` saying so.
+#
+# `slurm-environment` above (if present) is inherited by BOTH halves, which is
+# what makes off-cluster execution work: `cluster_ssh` and `remote_run_root`
+# ARE remote execution, and a half that did not receive them would silently run
+# as though the flow were on the cluster.
+#
+#   perf-optimize --task task.yaml --workspace ws            # start both halves
+#   perf-optimize --task task.yaml --workspace ws --dry-run  # select, start nothing
+#
+# disagg_sol:
+#   tracks: [ctx, gen]
+#   design:
+#     design_dir: /path/to/model/sweep_design   # measured once per
+#                                               # (model, cluster, workload)
+#     design_sweep:                             # two, because the halves are
+#       ctx: /path/to/model/sweep_design/ctx_config.yaml      # measured by
+#       gen: /path/to/model/sweep_design/8k1k_sol_mtp0.yaml   # different sweeps
+#     prefer: interactive                       # or `throughput`. No default: a
+#                                               # curve states the trade-off and
+#                                               # cannot state what it is bought for
+#   repos:                                      # ONE CHECKOUT PER HALF, and they
+#     ctx: /path/to/trtllm-ctx                  # may not be shared -- the flow
+#     gen: /path/to/trtllm-gen                  # resets a checkout hard and the
+#                                               # evaluator reviews `git diff` on
+#                                               # it, so two campaigns on one tree
+#                                               # measure fine and read wrong
+#   # config_repo: /path/to/bench-trtllm-disagg # where the create-sweep skill
+#   #                                           # lives. Given, and with no design
+#   #                                           # established, the run measures one
+#   #                                           # first. Omitted, an unestablished
+#   #                                           # design is refused rather than
+#   #                                           # silently fallen back from.
+#   # incumbent: {shape: tep_4_eplb0_mtp3, concurrency: 32}
+#   #                                           # what a previous deployment ran at,
+#   #                                           # so the record says whether the
+#   #                                           # selection confirmed it or moved off
+#   # label: mycampaign                         # names the two child workspaces
