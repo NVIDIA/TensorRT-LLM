@@ -801,6 +801,15 @@ class RemoteMpiCommSessionClient(MpiSession):
         if not res:
             raise RuntimeError(
                 "RemoteMpiCommSessionClient received unexpected response")
+        if isinstance(res, BaseException):
+            # The server forwards a worker exception as the response payload
+            # itself (RemoteMpiCommSessionServer.mpi_future_callback puts
+            # future.exception() on the queue). Re-raise it so this session
+            # matches MpiPoolSession/MpiCommSession, whose submit_sync raises
+            # through future.result(). Returning it instead pushes a bare
+            # exception object into caller code that expects a list, turning
+            # the real failure into a misleading TypeError far from its cause.
+            raise res
         return res
 
     def poll(self) -> bool:
