@@ -62,16 +62,26 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 pytestmark = pytest.mark.cpu_only
 
 
-@pytest.mark.parametrize("return_context_logits", [False, True])
-def test_forward_step_carries_context_logits_request_to_runner(return_context_logits):
+@pytest.mark.parametrize(
+    "request_flags, expected_gather",
+    [
+        ([False], False),
+        ([True], True),
+        ([False, False], False),
+        ([False, True], True),
+        ([True, False], True),
+    ],
+)
+def test_forward_step_carries_context_logits_request_to_runner(request_flags, expected_gather):
     batch = ScheduledRequests()
     batch.context_requests_last_chunk = [
-        types.SimpleNamespace(context_chunk_size=3, py_return_context_logits=return_context_logits)
+        types.SimpleNamespace(context_chunk_size=3, py_return_context_logits=flag)
+        for flag in request_flags
     ]
-    logits = torch.arange(12).reshape(3, 4)
+    logits = torch.arange(len(request_flags) * 12).reshape(-1, 4)
     runner = Mock(spec=ScheduledModelRunner)
     runner.forward.side_effect = lambda inputs, **kwargs: {
-        "logits": logits if inputs.gather_context_logits else logits[-1:]
+        "logits": logits if inputs.gather_context_logits else logits[2::3]
     }
     engine = object.__new__(PyTorchModelEngine)
     engine.model = types.SimpleNamespace(extra_attrs={})
@@ -108,11 +118,11 @@ def test_forward_step_carries_context_logits_request_to_runner(return_context_lo
     runner.forward.assert_called_once()
     inputs = runner.forward.call_args.args[0]
     assert inputs.batch is batch
-    assert inputs.gather_context_logits is return_context_logits
+    assert inputs.gather_context_logits is expected_gather
     assert inputs.new_tensors_device is new_tensors
     assert inputs.cache_indirection_buffer is cache_indirection
     assert runner.forward.call_args.kwargs["resource_manager"] is resources
-    torch.testing.assert_close(outputs["logits"], logits if return_context_logits else logits[-1:])
+    torch.testing.assert_close(outputs["logits"], logits if expected_gather else logits[2::3])
 
 
 class _InflightRequestIds:

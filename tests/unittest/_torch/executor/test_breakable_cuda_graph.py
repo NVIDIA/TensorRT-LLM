@@ -22,6 +22,7 @@ from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import (
     BreakableCUDAGraphRunner,
     BreakableCUDAGraphRunnerState,
 )
+from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ScheduledInputs
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import make_weak_ref
@@ -245,7 +246,7 @@ def test_runner_warmup_capture_execute_and_shared_output(through_model_engine):
     counters = {"outer": 0}
     inputs = {}
 
-    def decoder_forward(*args):
+    def model_forward():
         counters["outer"] += 1
         if runner.is_capturing:
             return runner.capture_model_body(
@@ -254,6 +255,15 @@ def test_runner_warmup_capture_execute_and_shared_output(through_model_engine):
         return {"logits": logits_processor(body(inputs["value"]))}
 
     if through_model_engine:
+        batch = ScheduledRequests()
+        resources = object()
+
+        def decoder_forward(forward_inputs, resource_manager):
+            assert isinstance(forward_inputs, ScheduledInputs)
+            assert forward_inputs.batch is batch
+            assert resource_manager is resources
+            return model_forward()
+
         engine = object.__new__(PyTorchModelEngine)
         engine.model = SimpleNamespace(extra_attrs={})
         engine._runner = None
@@ -262,13 +272,11 @@ def test_runner_warmup_capture_execute_and_shared_output(through_model_engine):
         engine.enable_spec_decode = False
         engine.runtime_draft_len = 0
         engine._forward_decoder = decoder_forward
-        batch = ScheduledRequests()
-        resources = object()
 
     def engine_forward():
         if through_model_engine:
             return engine.forward(batch, resources)
-        return decoder_forward()
+        return model_forward()
 
     inputs["value"] = torch.zeros((8, 4), device="cuda")
     runner.capture(8, engine_forward)
