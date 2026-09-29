@@ -344,7 +344,6 @@ def test_compiled_mxfp8_warmup_backend_selection(
     method = MXFP8LinearMethod()
     engine = SimpleNamespace(
         llm_args=SimpleNamespace(enable_autotuner=True),
-        _warmup_timer=_WarmupTimer(rank=0),
         _torch_compile_enabled=compile_enabled,
         _torch_compile_prefill_only=prefill_only,
         _torch_compile_backend=None,
