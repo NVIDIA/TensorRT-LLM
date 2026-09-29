@@ -14,9 +14,9 @@ import torch
 def _fi_decode_available() -> bool:
     if not torch.cuda.is_available():
         return False
-    from tensorrt_llm._utils import is_flashinfer_gdn_supported_arch
+    from tensorrt_llm._utils import is_flashinfer_gdn_decode_supported_arch
 
-    if not is_flashinfer_gdn_supported_arch():
+    if not is_flashinfer_gdn_decode_supported_arch():
         return False
     try:
         from flashinfer.gdn_kernels import gdn_decode_bf16_state as gdn_decode
