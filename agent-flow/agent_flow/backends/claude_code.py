@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import itertools
+import os
 import shutil
 import subprocess
 from contextlib import asynccontextmanager
@@ -445,6 +447,49 @@ def _sdk_tools(tools: list) -> list[SdkMcpTool]:
     return result
 
 
+# One per client, because parallel roles share a process.
+_CLI_DEBUG_SEQ = itertools.count(1)
+
+# Directory for the CLI's own debug log, or "" for off. Off by default and off
+# unless a deployment asks for it -- 16 KB per short request, so a long campaign
+# is tens of megabytes.
+CLI_DEBUG_DIR_ENV = "AGENT_FLOW_CLI_DEBUG_DIR"
+
+
+def _cli_debug_args(cwd: Path | None) -> dict[str, str | None]:
+    """``--debug-file`` for this client, or nothing.
+
+    The CLI knows things about a failed turn that no caller can reconstruct
+    afterwards, and by default it says none of them. When a stream stops
+    mid-response the transcript records only a synthetic assistant message
+    carrying `API Error: ...` with `error: "unknown"` and every usage counter
+    zero -- which is the same record whether the CLI's own idle watchdog gave
+    up or the server closed the connection. Those two have opposite fixes, and
+    six campaigns were diagnosed by inference because nothing distinguished
+    them. The CLI logs `[Stall] stream_idle_partial ... idleDeadlineMs=<n>` and
+    `[byte-watchdog] aborting: ...` -- the first names the deadline actually in
+    effect, the second says the client was the one that quit.
+
+    Per CLIENT, not per process: parallel optimizer/evaluator pairs run
+    concurrently in one `perf-optimize`, so a single path would interleave
+    several agents' logs into one unreadable file. The name carries the
+    workspace directory so a file can be traced to its campaign without
+    consulting anything else.
+    """
+    root = (os.environ.get(CLI_DEBUG_DIR_ENV) or "").strip()
+    if not root:
+        return {}
+    directory = Path(root)
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # Diagnostics must never be the reason a campaign does not start.
+        return {}
+    where = (cwd or Path.cwd()).name or "cwd"
+    name = f"cli-{where}-{os.getpid()}-{next(_CLI_DEBUG_SEQ):03d}.log"
+    return {"debug-file": str(directory / name)}
+
+
 class ClaudeCodeBackend(Backend):
     def version(self) -> str:
         return _claude_backend_version()
@@ -496,6 +541,7 @@ class ClaudeCodeBackend(Backend):
             permission_mode="bypassPermissions",
             hooks=hooks,
             disallowed_tools=list(disallowed_tools or []),
+            extra_args=_cli_debug_args(cwd),
         )
 
         async with ClaudeSDKClient(options=options) as sdk_client:
