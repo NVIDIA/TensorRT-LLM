@@ -155,6 +155,41 @@ function run_child_command {
     fi
 }
 
+function wait_for_mpi_comm_server_exit {
+    # The stop action only queues a message on the MPI Comm server's control
+    # socket; its exit code says nothing about whether the server exited. If
+    # the server never reads the message, or reads it but cannot finish its
+    # teardown because a worker rank is wedged, the foreground
+    # mgmn_leader_node never returns, this launcher never exits, and the srun
+    # task of rank 0 stays alive with a dead engine behind it. Bound that wait:
+    # give the server TLLM_LLMAPI_LAUNCH_STOP_TIMEOUT seconds (default 120) to
+    # exit, then kill it so rank 0 exits and the scheduler can act
+    # (srun --kill-on-bad-exit, KillOnBadExit=1).
+    local task_exit_code=$1
+    local timeout=${TLLM_LLMAPI_LAUNCH_STOP_TIMEOUT:-120}
+    local deadline=$((SECONDS + timeout))
+    local leader_pid
+
+    # Inside the background subshell "$$" is still the launcher's pid, and the
+    # MPI Comm server is its foreground child.
+    leader_pid=$(pgrep -P "$$" -f 'tensorrt_llm\.llmapi\.mgmn_leader_node' | head -n 1)
+    if [ -z "$leader_pid" ]; then
+        return 0
+    fi
+
+    while kill -0 "$leader_pid" 2>/dev/null; do
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            log_stderr "Rank${mpi_rank} MPI Comm server (pid $leader_pid) still running ${timeout}s after the stop request (task exit code $task_exit_code); killing it so this rank exits"
+            kill -TERM "$leader_pid" 2>/dev/null
+            sleep 5
+            kill -KILL "$leader_pid" 2>/dev/null
+            return 1
+        fi
+        sleep 1
+    done
+    return 0
+}
+
 function maybe_export_free_tcp_addr_for_spawn_proxy_process {
     # use user specified address if provided
     if [ -n "$TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR" ]; then
@@ -227,6 +262,13 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
         run_child_command python3 -m tensorrt_llm.llmapi.mgmn_leader_node --action stop
         mpi_exit_code=$?
         log_stderr "Rank${mpi_rank} MPI Comm server exit code: $mpi_exit_code"
+
+        # Do not let a wedged MPI Comm server keep this rank alive forever.
+        # A forced kill is a failure of this rank even when the task and the
+        # stop request both returned 0; keep any earlier non-zero status.
+        if ! wait_for_mpi_comm_server_exit "$task_exit_code"; then
+            [ "$mpi_exit_code" -eq 0 ] && mpi_exit_code=1
+        fi
 
         # Propagate task exit status
         if [ $task_exit_code -ne 0 ]; then

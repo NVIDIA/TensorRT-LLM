@@ -14,6 +14,8 @@
 # limitations under the License.
 
 import os
+import sys
+import time
 from pathlib import Path
 from typing import Literal
 
@@ -28,12 +30,12 @@ from tensorrt_llm.llmapi.utils import print_colored
 @click.option("--task_type",
               type=click.Choice([
                   "submit", "submit_sync", "flashinfer_workspace",
-                  "flashinfer_temporary_cleanup"
+                  "flashinfer_temporary_cleanup", "hang"
               ]),
               default="submit")
 def main(
     task_type: Literal["submit", "submit_sync", "flashinfer_workspace",
-                       "flashinfer_temporary_cleanup"]
+                       "flashinfer_temporary_cleanup", "hang"]
 ) -> None:
     """Run the requested remote MPI session test task."""
     tasks = [0]
@@ -64,6 +66,16 @@ def main(
             # worker's isolated workspace, keeping downloaded compiler inputs
             # per-rank.
             assert cubin_dirs == {None}
+        elif task_type == "hang":
+            # Every rank blocks inside the task, then this process exits
+            # non-zero: the shape of an engine that dies while its worker
+            # world is wedged. The task must be importable on every rank, so
+            # it is a stdlib function rather than one defined in this script.
+            client.submit(time.sleep, 3600)
+            time.sleep(2)  # let the ranks enter the task before "dying"
+            print_colored("hang task submitted; exiting like a dead engine\n",
+                          "red")
+            sys.exit(1)
 
 
 if __name__ == "__main__":
