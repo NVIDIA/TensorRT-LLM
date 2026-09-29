@@ -97,13 +97,19 @@ SharedPageLock Page::lock(KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal or
     return hold()->lock(kvCache, beamIndex, ordinal, lc, skipWait);
 }
 
-bool Page::canLockAt(CacheLevel level) const
+CacheLevel Page::queryLockLevel() const
 {
-    if (level == kHotLevel)
-        return true;
+    if (cacheLevel == kHotLevel)
+    {
+        return kHotLevel;
+    }
     auto const* attention = std::get_if<AttnLifeCycle>(&manager->getLifeCycle(lifeCycle));
-    return level == kHostLevel && attention != nullptr && attention->isSparse && level < manager->numCacheLevels()
-        && manager->cacheTier(level) == CacheTier::HOST_MEM;
+    if (attention != nullptr && attention->isSparse && kSparseHistoryLevel < manager->numCacheLevels()
+        && manager->cacheTier(kSparseHistoryLevel) == CacheTier::HOST_MEM)
+    {
+        return kSparseHistoryLevel;
+    }
+    return kHotLevel;
 }
 
 // ---------------------------------------------------------------------------
@@ -291,7 +297,7 @@ SharedPageLock PageHolder::lock(
 UniqPageLock::UniqPageLock(SharedPtr<PageHolder> h)
     : holder(std::move(h))
 {
-    if (!holder->page->canLockAt(holder->page->cacheLevel))
+    if (holder->page->cacheLevel != holder->page->queryLockLevel())
     {
         throw LogicError("Pages can only be locked on GPU or, for sparse attention, in level-1 host memory");
     }
@@ -303,7 +309,7 @@ UniqPageLock::~UniqPageLock()
         [this]
         {
             Page& p = *page();
-            TLLM_CHECK_DEBUG(p.canLockAt(p.cacheLevel) && !p.scheduledForEviction());
+            TLLM_CHECK_DEBUG(p.cacheLevel == p.queryLockLevel() && !p.scheduledForEviction());
             // Set readyEvent to the merged finish events of all readers. For committed (read-only)
             // pages, this means the next reader will wait for prior reads to complete, which is
             // unnecessary but correct. See the CommittedPage comment in page.h for rationale.
@@ -453,8 +459,10 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
     {
         auto const& page = target.page;
         CacheLevel const level = target.cacheLevel;
-        if (!page->canLockAt(level) || page->cacheLevel < level)
+        if ((level != kHotLevel && level != page->queryLockLevel()) || page->cacheLevel < level)
+        {
             throw LogicError("Invalid destination for page locking; offload requires a separate handoff");
+        }
         if (page->status() == PageStatus::LOCKED && page->cacheLevel != level)
             throw LogicError("Cannot migrate a page locked by another owner");
         auto const [it, inserted] = destinations.emplace(page.get(), level);

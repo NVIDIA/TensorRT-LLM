@@ -767,14 +767,14 @@ TEST_F(KvCacheManagerV2PageLockTest, SparseHostPrefixStaysPinnedAcrossReuseAndRe
     auto manager = std::make_shared<KvCacheManager>(sparseConfig());
     auto const apiLock = manager->lockExclusive();
     auto& storage = manager->storage();
-    auto page = seedPrefix(*manager, kHostLevel);
+    auto page = seedPrefix(*manager, kSparseHistoryLevel);
     SlotId const hostSlot = page->slotId();
     auto cache = manager->createKvCache({}, tokens());
     auto closeCache = FuncGuard([&]() { cache->close(); });
     ASSERT_TRUE(cache->prefetch(kHotLevel));
     ASSERT_TRUE(cache->resume(stream()));
     EXPECT_EQ(pageAt(*cache), page);
-    EXPECT_EQ(page->cacheLevel, kHostLevel);
+    EXPECT_EQ(page->cacheLevel, kSparseHistoryLevel);
     EXPECT_EQ(page->slotId(), hostSlot);
     EXPECT_EQ(page->status(), PageStatus::LOCKED);
     EXPECT_FALSE(page->scheduledForEviction());
@@ -791,7 +791,7 @@ TEST_F(KvCacheManagerV2PageLockTest, SparseHostPrefixStaysPinnedAcrossReuseAndRe
     second->close();
     EXPECT_EQ(page->status(), PageStatus::HELD);
     ASSERT_TRUE(cache->resume());
-    EXPECT_EQ(page->cacheLevel, kHostLevel);
+    EXPECT_EQ(page->cacheLevel, kSparseHistoryLevel);
     EXPECT_EQ(cache->getBasePageIndices(LifeCycleId{0})[0], slotIdToPageIndexValue(hostSlot));
     cache->close();
     EXPECT_EQ(page->status(), PageStatus::DROPPABLE);
@@ -800,19 +800,44 @@ TEST_F(KvCacheManagerV2PageLockTest, SparseHostPrefixStaysPinnedAcrossReuseAndRe
     // Destruction returns the slot to the host pool, leaving the GPU pool untouched.
     storage.excludeFromEviction(*page);
     page.reset();
-    for (CacheLevel level : {kHotLevel, kHostLevel})
+    for (CacheLevel level : {kHotLevel, kSparseHistoryLevel})
     {
         auto const stats = manager->getStorageStatistics(level).at(PoolGroupIndex{0});
         EXPECT_EQ(stats.free, stats.total);
     }
 }
 
+TEST_F(KvCacheManagerV2PageLockTest, SparseGpuPrefixStaysOnGpuAcrossReuseAndResume)
+{
+    auto manager = std::make_shared<KvCacheManager>(sparseConfig());
+    auto const apiLock = manager->lockExclusive();
+    auto page = seedPrefix(*manager, kHotLevel);
+    SlotId const gpuSlot = page->slotId();
+    EXPECT_EQ(page->queryLockLevel(), kHotLevel);
+    auto cache = manager->createKvCache({}, tokens());
+    auto closeCache = FuncGuard([&]() { cache->close(); });
+    ASSERT_TRUE(cache->prefetch(kHotLevel));
+    ASSERT_TRUE(cache->resume(stream()));
+    EXPECT_EQ(pageAt(*cache), page);
+    EXPECT_EQ(page->cacheLevel, kHotLevel);
+    EXPECT_EQ(page->slotId(), gpuSlot);
+    EXPECT_EQ(page->status(), PageStatus::LOCKED);
+
+    cache->suspend();
+    ASSERT_TRUE(cache->resume());
+    EXPECT_EQ(page->cacheLevel, kHotLevel);
+    EXPECT_EQ(page->slotId(), gpuSlot);
+    EXPECT_EQ(page->status(), PageStatus::LOCKED);
+    auto const hostStats = manager->getStorageStatistics(kSparseHistoryLevel).at(PoolGroupIndex{0});
+    EXPECT_EQ(hostStats.free, hostStats.total);
+}
+
 TEST_F(KvCacheManagerV2PageLockTest, DensePrefixStillRequiresGpuLock)
 {
     auto manager = std::make_shared<KvCacheManager>(makeTieredConfig());
     auto const apiLock = manager->lockExclusive();
-    auto page = seedPrefix(*manager, kHostLevel);
-    EXPECT_FALSE(page->canLockAt(kHostLevel));
+    auto page = seedPrefix(*manager, kSparseHistoryLevel);
+    EXPECT_EQ(page->queryLockLevel(), kHotLevel);
     auto holder = page->hold();
     EXPECT_THROW(makeShared<UniqPageLock>(holder), LogicError);
     auto cache = manager->createKvCache({}, tokens());
@@ -827,11 +852,12 @@ TEST_F(KvCacheManagerV2PageLockTest, PartialReuseCopiesSharedHostPrefixToPrivate
     auto manager = std::make_shared<KvCacheManager>(sparseConfig());
     auto const apiLock = manager->lockExclusive();
     auto& storage = manager->storage();
-    auto page = seedPrefix(*manager, kHostLevel);
+    auto page = seedPrefix(*manager, kSparseHistoryLevel);
     SlotId const hostSlot = page->slotId();
-    PoolGroupIndex const hostPool = storage.getPoolGroupIndex(kHostLevel, page->lifeCycle);
-    auto const hostAddress = std::get<MemAddress>(storage.slotAddress(kHostLevel, hostPool, hostSlot, PoolIndex{0}));
-    size_t const bytes = storage.slotSize(kHostLevel, hostPool).at(PoolIndex{0});
+    PoolGroupIndex const hostPool = storage.getPoolGroupIndex(kSparseHistoryLevel, page->lifeCycle);
+    auto const hostAddress
+        = std::get<MemAddress>(storage.slotAddress(kSparseHistoryLevel, hostPool, hostSlot, PoolIndex{0}));
+    size_t const bytes = storage.slotSize(kSparseHistoryLevel, hostPool).at(PoolIndex{0});
     page->readyEvent.synchronize();
     constexpr uint8_t kPattern = 0xA7;
     std::memset(reinterpret_cast<void*>(hostAddress), kPattern, bytes);
@@ -847,7 +873,7 @@ TEST_F(KvCacheManagerV2PageLockTest, PartialReuseCopiesSharedHostPrefixToPrivate
     EXPECT_NE(privatePage, page);
     EXPECT_FALSE(privatePage->isCommitted());
     EXPECT_EQ(privatePage->cacheLevel, kHotLevel);
-    EXPECT_EQ(page->cacheLevel, kHostLevel);
+    EXPECT_EQ(page->cacheLevel, kSparseHistoryLevel);
     EXPECT_EQ(page->slotId(), hostSlot);
     EXPECT_EQ(page->status(), PageStatus::LOCKED);
     EXPECT_EQ(full->getBasePageIndices(LifeCycleId{0})[0], slotIdToPageIndexValue(hostSlot));
@@ -870,12 +896,12 @@ TEST_F(KvCacheManagerV2PageLockTest, DiskSparsePrefixRestoresToHostBeforeLocking
     auto manager = std::make_shared<KvCacheManager>(std::move(config));
     auto const apiLock = manager->lockExclusive();
     auto page = seedPrefix(*manager, CacheLevel{2});
-    EXPECT_FALSE(page->canLockAt(CacheLevel{2}));
+    EXPECT_EQ(page->queryLockLevel(), kSparseHistoryLevel);
     EXPECT_THROW(makeShared<UniqPageLock>(page->hold()), LogicError);
     auto cache = manager->createKvCache({}, tokens());
     auto closeCache = FuncGuard([&]() { cache->close(); });
     ASSERT_TRUE(cache->resume(stream()));
-    EXPECT_EQ(page->cacheLevel, kHostLevel);
+    EXPECT_EQ(page->cacheLevel, kSparseHistoryLevel);
     EXPECT_EQ(page->status(), PageStatus::LOCKED);
     auto const gpuStats = manager->getStorageStatistics(kHotLevel).at(PoolGroupIndex{0});
     EXPECT_EQ(gpuStats.free, gpuStats.total);
@@ -899,9 +925,9 @@ TEST_F(KvCacheManagerV2PageLockTest, WritableSparsePageRestoresToGpuButFullHisto
         cache->suspend();
         TypedVec<PoolGroupIndex, SlotCount> evictOne(storage.numPoolGroups(kHotLevel), 1);
         storage.forceEvict(kHotLevel, evictOne);
-        ASSERT_EQ(page->cacheLevel, kHostLevel);
+        ASSERT_EQ(page->cacheLevel, kSparseHistoryLevel);
         ASSERT_TRUE(cache->resume());
-        EXPECT_EQ(page->cacheLevel, historyLength == 0 ? kHotLevel : kHostLevel);
+        EXPECT_EQ(page->cacheLevel, historyLength == 0 ? kHotLevel : kSparseHistoryLevel);
         EXPECT_EQ(page->status(), PageStatus::LOCKED);
     }
 }
@@ -912,7 +938,7 @@ TEST_F(KvCacheManagerV2PageLockTest, ResizeOomRestoresOriginalHostLock)
     std::get<AttentionLayerConfig>(config.layers.front()).slidingWindowSize = 4;
     auto manager = std::make_shared<KvCacheManager>(std::move(config));
     auto const apiLock = manager->lockExclusive();
-    auto page = seedPrefix(*manager, kHostLevel);
+    auto page = seedPrefix(*manager, kSparseHistoryLevel);
     auto cache = manager->createKvCache({}, tokens());
     auto closeCache = FuncGuard([&]() { cache->close(); });
     ASSERT_TRUE(cache->resume(stream()));
@@ -926,7 +952,7 @@ TEST_F(KvCacheManagerV2PageLockTest, ResizeOomRestoresOriginalHostLock)
     EXPECT_EQ(cache->capacity(), 8);
     EXPECT_EQ(cache->historyLength(), 4);
     EXPECT_EQ(pageAt(*cache), page);
-    EXPECT_EQ(page->cacheLevel, kHostLevel);
+    EXPECT_EQ(page->cacheLevel, kSparseHistoryLevel);
     EXPECT_EQ(page->slotId(), hostSlot);
     EXPECT_EQ(page->status(), PageStatus::LOCKED);
     EXPECT_FALSE(page->scheduledForEviction());
@@ -942,14 +968,14 @@ TEST_F(KvCacheManagerV2PageLockTest, MixedSparseAndDensePrefixUsesSeparateLockLe
     config.layers.emplace_back(std::move(dense));
     auto manager = std::make_shared<KvCacheManager>(std::move(config));
     auto const apiLock = manager->lockExclusive();
-    auto sparsePage = seedPrefix(*manager, kHostLevel, LifeCycleId{0});
-    auto densePage = seedPrefix(*manager, kHostLevel, LifeCycleId{1});
+    auto sparsePage = seedPrefix(*manager, kSparseHistoryLevel, LifeCycleId{0});
+    auto densePage = seedPrefix(*manager, kSparseHistoryLevel, LifeCycleId{1});
     auto cache = manager->createKvCache({}, tokens());
     auto closeCache = FuncGuard([&]() { cache->close(); });
     ASSERT_TRUE(cache->resume(stream()));
     EXPECT_EQ(pageAt(*cache, 0, LifeCycleId{0}), sparsePage);
     EXPECT_EQ(pageAt(*cache, 0, LifeCycleId{1}), densePage);
-    EXPECT_EQ(sparsePage->cacheLevel, kHostLevel);
+    EXPECT_EQ(sparsePage->cacheLevel, kSparseHistoryLevel);
     EXPECT_EQ(densePage->cacheLevel, kHotLevel);
     EXPECT_EQ(sparsePage->status(), PageStatus::LOCKED);
     EXPECT_EQ(densePage->status(), PageStatus::LOCKED);
@@ -959,7 +985,7 @@ TEST_F(KvCacheManagerV2PageLockTest, CommitRebasesOntoSharedHostPrefix)
 {
     auto manager = std::make_shared<KvCacheManager>(sparseConfig());
     auto const apiLock = manager->lockExclusive();
-    auto page = seedPrefix(*manager, kHostLevel);
+    auto page = seedPrefix(*manager, kSparseHistoryLevel);
     auto first = manager->createKvCache({}, tokens());
     auto closeFirst = FuncGuard([&]() { first->close(); });
     ASSERT_TRUE(first->resume(stream()));
@@ -971,7 +997,7 @@ TEST_F(KvCacheManagerV2PageLockTest, CommitRebasesOntoSharedHostPrefix)
     second->commit(tokens());
     EXPECT_EQ(second->numCommittedBlocks(), 1);
     EXPECT_EQ(pageAt(*second), page);
-    EXPECT_EQ(page->cacheLevel, kHostLevel);
+    EXPECT_EQ(page->cacheLevel, kSparseHistoryLevel);
     EXPECT_EQ(page->status(), PageStatus::LOCKED);
     auto const gpuStats = manager->getStorageStatistics(kHotLevel).at(PoolGroupIndex{0});
     EXPECT_EQ(gpuStats.free, gpuStats.total);
@@ -981,12 +1007,12 @@ TEST_F(KvCacheManagerV2PageLockTest, ScratchSlotReturnsToGpuPool)
 {
     auto manager = std::make_shared<KvCacheManager>(sparseConfig());
     auto const apiLock = manager->lockExclusive();
-    auto page = seedPrefix(*manager, kHostLevel);
+    auto page = seedPrefix(*manager, kSparseHistoryLevel);
     auto cache = manager->createKvCache({}, tokens());
     auto closeCache = FuncGuard([&]() { cache->close(); });
     ASSERT_TRUE(cache->resume(stream()));
     auto const gpuFree = manager->getStorageStatistics(kHotLevel).at(PoolGroupIndex{0}).free;
-    auto const hostFree = manager->getStorageStatistics(kHostLevel).at(PoolGroupIndex{0}).free;
+    auto const hostFree = manager->getStorageStatistics(kSparseHistoryLevel).at(PoolGroupIndex{0}).free;
     auto slots = manager->storage().newGpuSlots(TypedVec<LifeCycleId, SlotCount>(LifeCycleId{1}, 1));
     ScratchSlotLock scratch(std::move(slots[LifeCycleId{0}].front()), *cache, LifeCycleId{0});
     EXPECT_EQ(manager->getStorageStatistics(kHotLevel).at(PoolGroupIndex{0}).free, gpuFree - 1);
@@ -995,7 +1021,7 @@ TEST_F(KvCacheManagerV2PageLockTest, ScratchSlotReturnsToGpuPool)
         scratch.unlock();
     }
     EXPECT_EQ(manager->getStorageStatistics(kHotLevel).at(PoolGroupIndex{0}).free, gpuFree);
-    EXPECT_EQ(manager->getStorageStatistics(kHostLevel).at(PoolGroupIndex{0}).free, hostFree);
+    EXPECT_EQ(manager->getStorageStatistics(kSparseHistoryLevel).at(PoolGroupIndex{0}).free, hostFree);
 }
 
 } // namespace

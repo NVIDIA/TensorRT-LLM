@@ -72,8 +72,9 @@ public:
     // Prevent the page from being dropped (returns/creates a PageHolder).
     SharedPtr<PageHolder> hold();
 
-    // Whether this lifecycle supports locking at the given storage level.
-    [[nodiscard]] bool canLockAt(CacheLevel level) const;
+    //! Return the lock destination for read-only use, preserving pages already at the hot GPU level.
+    //! Cold sparse pages use host memory; callers must force writable pages to GPU.
+    [[nodiscard]] CacheLevel queryLockLevel() const;
 
     // Acquire a shared lock at the current level. The caller handles any migration.
     // skip_wait: caller guarantees the page is ready on kvCache's stream.

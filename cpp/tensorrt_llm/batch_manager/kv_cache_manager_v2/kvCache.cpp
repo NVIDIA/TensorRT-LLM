@@ -210,7 +210,7 @@ CacheLevel KvCache::_lockLevel(Page const& page, BlockOrdinal ordinal) const
 {
     bool const readOnly = page.isCommitted()
         || (ordinal != kBadBlockOrdinal && ordinal < BlockOrdinal{mHistoryLength / mTokensPerBlock});
-    return readOnly && page.cacheLevel > kHotLevel && page.canLockAt(kHostLevel) ? kHostLevel : kHotLevel;
+    return readOnly ? page.queryLockLevel() : kHotLevel;
 }
 
 void KvCache::activate()
