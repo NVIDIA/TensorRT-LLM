@@ -937,7 +937,8 @@ def create_input_processor(
             model-provided Python code.
         enable_tokenization_cache: Whether the ``DefaultInputProcessor`` caches
             the tokenization of recent prompts. Ignored for model-specific
-            (multimodal) input processors.
+            (multimodal) input processors unless they set
+            ``supports_tokenization_cache``.
         **kwargs: Additional arguments passed to input processor constructors
             (e.g., video_pruning_rate for multimodal models).
 
@@ -984,6 +985,9 @@ def create_input_processor(
             logger.info("Unregistered model, using DefaultInputProcessor")
             input_processor_cls = None
         if input_processor_cls is not None:
+            if getattr(input_processor_cls, "supports_tokenization_cache",
+                       False):
+                kwargs["enable_tokenization_cache"] = enable_tokenization_cache
             return input_processor_cls(model_path_or_dir,
                                        config,
                                        tokenizer,
