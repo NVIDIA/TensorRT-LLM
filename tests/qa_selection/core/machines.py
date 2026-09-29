@@ -16,10 +16,14 @@
 
     profiles.json -> MachineCatalog.load() -> profile_for(name, gpu_count) -> MachineProfile
 
-Each field answers a run-time probe without running it: `sm` for
-`get_sm_version()` (major * 10 + minor, so 10.3 is 103), `device_name` for
-`get_gpu_device_list()`, `device_memory_mib` for `get_device_memory()`,
-`gpu_count` for `get_device_count()`, `cpu_arch` for `platform.machine()`.
+Each field answers a run-time probe without running it: `sm` holds what
+`get_sm_version()` returns, and likewise `device_name`, `device_memory_mib`,
+`gpu_count` and `cpu_arch` for `get_gpu_device_list()`, `get_device_memory()`,
+`get_device_count()` and `platform.machine()`.
+
+`max_gpu_per_node` and the optional `rungs` are allocation policy, not
+hardware. No rule reads either; `rungs` is there for a caller to pass back as
+`--ladder`.
 """
 
 import json
@@ -27,7 +31,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Iterator, Optional, Tuple
+
+from .ladder import Ladder
 
 
 class ProfileConfigError(ValueError):
@@ -58,6 +64,9 @@ class MachineProfile:
     cpu_arch: str
     gpu_count: int
 
+    # The ladder this machine is scheduled at; read by callers, never by a rule.
+    rungs: Optional[Tuple[int, ...]] = None
+
     @classmethod
     def from_mapping(cls, source: Path, name: str, values: object) -> "MachineProfile":
         """Validate one raw catalogue entry and build a profile from it."""
@@ -75,13 +84,15 @@ class MachineProfile:
 class CatalogEntry:
     """One unvalidated entry from the catalogue file, with its location.
 
-    Each check reads as a statement about this entry, and each failure names the
-    profile and field that caused it.
+    Every failure names the profile and field that caused it.
     """
 
     DECLARED_FIELDS = ("sm", "device_name", "device_memory_mib", "max_gpu_per_node", "cpu_arch")
     NUMERIC_FIELDS = ("sm", "device_memory_mib", "max_gpu_per_node")
     CPU_ARCHS = ("aarch64", "x86_64")
+
+    # Omitting it means this machine declares no ladder.
+    OPTIONAL_FIELDS = ("rungs",)
 
     def __init__(self, source: Path, name: str, values: object) -> None:
         self.where = f"{source}: profile {name!r}"
@@ -98,20 +109,44 @@ class CatalogEntry:
         self.check_cpu_arch()
         # A fresh profile is sized to a full node until a caller narrows it.
         return MachineProfile(
-            name=self.name, gpu_count=self.values["max_gpu_per_node"], **self.values
+            name=self.name,
+            gpu_count=self.values["max_gpu_per_node"],
+            rungs=self.declared_rungs(),
+            **{field: self.values[field] for field in self.DECLARED_FIELDS},
         )
+
+    def declared_rungs(self) -> Optional[Tuple[int, ...]]:
+        """This entry's allocation ladder, or None when it declares none.
+
+        Checked by `Ladder.of`, the rule `--ladder` is parsed by, then against
+        this entry's `max_gpu_per_node`.
+        """
+        if "rungs" not in self.values:
+            return None
+        try:
+            ladder = Ladder.of(self.values["rungs"])
+        except (TypeError, ValueError) as error:
+            raise ProfileConfigError(f"{self.where}.rungs: {error}") from error
+
+        per_node = self.values["max_gpu_per_node"]
+        ProfileConfigError.check(
+            ladder.largest <= per_node,
+            f"{self.where}.rungs: rung {ladder.largest} exceeds this machine's "
+            f"{per_node} GPUs per node",
+        )
+        return tuple(ladder)
 
     def check_fields_declared(self) -> None:
         """Every declared field present, and nothing else.
 
-        Rejecting unknown fields makes a stale one fail here, not go unnoticed.
+        A stale field fails here rather than going unnoticed.
         """
         declared = set(self.DECLARED_FIELDS)
         missing = declared - self.values.keys()
         ProfileConfigError.check(
             not missing, f"{self.where} is missing: {', '.join(sorted(missing))}"
         )
-        unknown = self.values.keys() - declared
+        unknown = self.values.keys() - declared - set(self.OPTIONAL_FIELDS)
         ProfileConfigError.check(
             not unknown, f"{self.where} has unknown fields: {', '.join(sorted(unknown))}"
         )
@@ -176,8 +211,7 @@ class MachineCatalog(Mapping):
         try:
             return self._profiles[name]
         except KeyError:
-            # Hardware moves faster than the catalogue: a machine we cannot
-            # describe must fail loudly rather than select wrongly.
+            # A machine we cannot describe must fail rather than select wrongly.
             raise KeyError(
                 f"unknown machine {name!r}; known machines are {', '.join(self)}"
             ) from None

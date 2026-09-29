@@ -13,7 +13,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Check tests/qa_selection/core/rules.json against the suite's skip decorators.
+"""Check tests/qa_selection/core/*.json against the integration suite it mirrors.
+
+Two hand-maintained inputs, two ways they can drift:
+
+    rules.json    reason strings, against the `skip_*` decorators
+    markers.json  marker descriptions, against `defs/pytest.ini`
+
+Both are copies on purpose -- selection must not share a source of truth
+with the code it decides about -- so a check is what keeps them honest.
 
 Every rule is resolved through the `skip_*` decorator it names, not through the
 reason string it matches on. Names survive edits to prose, so the check can say
@@ -32,6 +40,7 @@ Decorators are read with `ast`, never imported.
 
 import argparse
 import ast
+import configparser
 import json
 import sys
 from dataclasses import dataclass, field
@@ -52,6 +61,10 @@ class RepoPaths:
 
     # Named in every message, so it stays repo-relative and pasteable.
     RULES_FILE = "tests/qa_selection/core/rules.json"
+    MARKERS_FILE = "tests/qa_selection/core/markers.json"
+
+    # Declares the markers markers.json mirrors, relative to --source-root.
+    PYTEST_INI = "pytest.ini"
 
     @classmethod
     def enable_package_import(cls) -> None:
@@ -63,6 +76,8 @@ class RepoPaths:
 
 RepoPaths.enable_package_import()
 
+from qa_selection.core.allocation import GpuDemand  # noqa: E402
+from qa_selection.core.markers import ResourceMarkers, default_markers  # noqa: E402
 from qa_selection.core.rules import SkipRule, SkipRuleTable, default_rule_table  # noqa: E402
 
 
@@ -268,6 +283,93 @@ class RuleTableDriftCheck:
         return faults
 
 
+class IniMarkers:
+    """The `markers =` block of a pytest.ini, as name -> description."""
+
+    SECTION = "pytest"
+    OPTION = "markers"
+    SEPARATOR = ":"
+
+    def __init__(self, declared: Dict[str, str]) -> None:
+        self.declared = declared
+
+    @classmethod
+    def read(cls, path: Path) -> "IniMarkers":
+        """Parse `path`, or raise OSError/Error naming it."""
+        parser = configparser.ConfigParser()
+        parser.read(path)
+        raw = parser.get(cls.SECTION, cls.OPTION, fallback="")
+        declared = {}
+        for line in raw.splitlines():
+            name, separator, description = line.partition(cls.SEPARATOR)
+            if separator:
+                declared[name.strip()] = description.strip()
+        return cls(declared)
+
+
+class MarkerFaults:
+    """Every way markers.json can disagree with the ini it mirrors."""
+
+    def __init__(self) -> None:
+        self.absent: List[str] = []
+        self.drifted: List[Tuple[str, str, str]] = []
+        self.unreadable: List[str] = []
+
+    def __bool__(self) -> bool:
+        return bool(self.absent or self.drifted or self.unreadable)
+
+    def report_lines(self) -> List[str]:
+        """One block per fault kind, naming the file to edit."""
+        if not self:
+            return []
+        lines = [f"{RepoPaths.MARKERS_FILE} is out of date with the integration pytest.ini."]
+        for name in self.absent:
+            lines.append(f"  {name}: declared here, absent from the ini")
+        for name, mine, theirs in self.drifted:
+            lines.append(f"  {name}: description has drifted")
+            lines.append(f"      here: {mine}")
+            lines.append(f"       ini: {theirs}")
+        lines += self.unreadable
+        return lines
+
+
+class MarkerDriftCheck:
+    """Resolves every marker this package declares through the ini that owns it."""
+
+    def __init__(self, ini_path: Path, markers: ResourceMarkers) -> None:
+        self.ini_path = ini_path
+        self.markers = markers
+
+    def run(self) -> Tuple[int, str]:
+        """Return (exit status, message); any disagreement is an error."""
+        faults = self.faults()
+        if not faults:
+            return 0, f"{len(self.markers)} markers, no drift"
+        return 1, "\n".join(faults.report_lines())
+
+    def faults(self) -> MarkerFaults:
+        """Classify every declared marker against the ini, then the readers."""
+        faults = MarkerFaults()
+        if not self.ini_path.is_file():
+            faults.unreadable.append(f"  cannot read {self.ini_path}")
+            return faults
+
+        declared = IniMarkers.read(self.ini_path).declared
+        for name, description in self.markers.items():
+            if name not in declared:
+                faults.absent.append(name)
+            elif declared[name] != description:
+                faults.drifted.append((name, description, declared[name]))
+
+        # The adapter only carries `args[0]` for a marker this file holds, so a
+        # reader naming one it does not would silently read nothing.
+        for name in self.markers.missing_from(GpuDemand.MARKERS):
+            faults.unreadable.append(
+                f"  {name}: read by GpuDemand.MARKERS but not declared in {RepoPaths.MARKERS_FILE}"
+            )
+        return faults
+
+
 def main(argv: List[str] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -282,8 +384,18 @@ def main(argv: List[str] = None) -> int:
         print(f"qa_selection: no such directory: {args.source_root}", file=sys.stderr)
         return 1
 
-    status, message = RuleTableDriftCheck(args.source_root, default_rule_table()).run()
-    print(message, file=sys.stderr if status else sys.stdout)
+    rules_status, rules_message = RuleTableDriftCheck(args.source_root, default_rule_table()).run()
+    markers_status, markers_message = MarkerDriftCheck(
+        args.source_root / RepoPaths.PYTEST_INI, default_markers()
+    ).run()
+
+    status = rules_status or markers_status
+    if not status:
+        print(f"{rules_message}; {markers_message}")
+        return 0
+    for message in (rules_message, markers_message):
+        if message:
+            print(message, file=sys.stderr)
     return status
 
 
