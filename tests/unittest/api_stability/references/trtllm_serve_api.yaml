@@ -784,6 +784,12 @@ models:
         default: null
         status: stable
         required: false
+      injected_chat_template_kwargs:
+        kind: extension
+        type: Optional[List[str]]
+        default: null
+        status: prototype
+        required: false
       media_io_kwargs:
         kind: extension
         type: Optional[Dict[MediaModality, Dict[str, Any]]]
