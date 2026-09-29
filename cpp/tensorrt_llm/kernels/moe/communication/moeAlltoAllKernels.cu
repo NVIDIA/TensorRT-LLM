@@ -1090,7 +1090,7 @@ __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, 
 #endif // !DISABLE_SYNC_FOR_PROFILING
 }
 #else  // TLLM_MOE_A2A_COMPILE_SM100
-template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK>
+template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK, bool USE_RANK_COMPACT_ROUTING>
 __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, DispatchKernelPointers const ptrs,
     int num_payloads, int max_tokens_per_rank, int local_num_tokens, int rank_id, int ep_size, int num_experts,
     int eplb_stats_num_experts)
