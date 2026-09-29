@@ -34,7 +34,7 @@ per window size) without any of them being special cases.
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -134,6 +134,16 @@ class KvCacheLayout:
 
     tokens_per_block: int
     groups: Tuple[KvCacheLayerGroupLayout, ...]
+    #: Size of one GPU pool mapping, or None if it could not be determined.
+    #:
+    #: V2 builds each GPU pool by reserving a virtual span and mapping one
+    #: `cuMemCreate` handle per `pool_size_granularity` bytes into it. The
+    #: mappings tile from the reservation base, so the boundaries are the
+    #: multiples of this value. A connector passing these addresses to an RDMA
+    #: NIC must keep every registration and every transfer buffer inside a
+    #: single mapping, because a dma-buf memory region cannot span two.
+    #: Connectors that only read the buffers from the device can ignore it.
+    gpu_pool_mapping_bytes: Optional[int] = None
 
     def group(self, layer_group_id: int) -> KvCacheLayerGroupLayout:
         for group in self.groups:
@@ -242,4 +252,27 @@ def build_kv_cache_layout_v2(manager: "KVCacheManagerV2") -> KvCacheLayout:
     return KvCacheLayout(
         tokens_per_block=int(manager.tokens_per_block),
         groups=tuple(groups),
+        gpu_pool_mapping_bytes=_gpu_pool_mapping_bytes(impl),
     )
+
+
+#: GPU is cache level 0; host and disk follow. Spelled out rather than imported
+#: so building a layout does not pull in the manager's internals.
+_GPU_CACHE_LEVEL = 0
+
+
+def _gpu_pool_mapping_bytes(impl: Any) -> Optional[int]:
+    """The GPU level's pool mapping size, or None if it cannot be read.
+
+    Read from the storage rather than recomputed from the quota. The quota is
+    itself rounded to this value, so deriving one from the other risks landing
+    a power of two away and reporting a boundary the pools do not have. A
+    wrong value is worse than none, since None lets a caller treat the pools
+    as unsplit.
+    """
+    try:
+        storage = impl._storage._levels[_GPU_CACHE_LEVEL].storage
+        mapping_bytes = int(storage.pool_size_granularity)
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return None
+    return mapping_bytes if mapping_bytes > 0 else None
