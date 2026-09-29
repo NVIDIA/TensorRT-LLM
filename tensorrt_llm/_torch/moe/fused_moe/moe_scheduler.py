@@ -94,7 +94,8 @@ def _get_supported_graph_padding(moe: "ConfigurableMoE") -> Optional[torch.Tenso
         return padding
     logger.warning_once(
         f"BCG padding trim is unsupported for {type(moe.backend).__name__}/"
-        f"{type(moe.comm).__name__}; padding tokens will still be computed."
+        f"{type(moe.comm).__name__}; padding tokens will still be computed.",
+        key=("moe_graph_padding", type(moe.backend), type(moe.comm)),
     )
     return None
 
