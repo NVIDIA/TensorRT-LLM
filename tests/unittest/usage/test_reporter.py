@@ -1277,7 +1277,8 @@ ready = threading.Event()
 blocked = threading.Event()
 usage_lib._is_reporting_rank = lambda: True
 usage_lib._get_heartbeat_interval = lambda: 0.001
-usage_lib._MAX_HEARTBEATS = 0 if state == "finished" else 1000
+if state == "finished":
+    usage_lib._REPORTER_STOP.set()
 usage_lib._collect_gpu_info = lambda: {}
 
 def send(payload):

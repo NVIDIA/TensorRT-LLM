@@ -177,6 +177,12 @@ Every terminal report also contains the five aggregate LLM lifecycle counters
 above. Delivery is best-effort and waits no more than 0.5 seconds; the local
 terminal lock permits at most one delivery attempt per process session.
 
+An independent sender prevents exit delivery from waiting behind a blocked
+initial report or heartbeat. Ingestion order is not guaranteed: consumers must
+preserve terminal counters over delayed heartbeats and allow initial metadata
+to arrive after the exit report. Once usage reporting starts, the exit sender
+remains available even after heartbeat reporting stops.
+
 When a surviving parent observes a subprocess return code such as `-9`, it is
 normalized to shell-style `exitCode=137` with `signalNumber=9`.
 
