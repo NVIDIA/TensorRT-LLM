@@ -140,7 +140,11 @@ def write_msa_phase_kv(
     phases cover the step between them and neither repeats the other's write.
 
     k and v are the phase's token slice, and token_offset its first token on
-    the step's token axis, which is what msa_out_cache_loc is indexed by.
+    the step's token axis, which is what msa_out_cache_loc is indexed by. A
+    phase handed no K/V (k and v None) has nothing to write: that is how the
+    MiniMax-M3 model layer, which stores the whole step's K/V itself through
+    MiniMaxM3MsaSparseAttention.write_layer_caches ahead of its indexer,
+    tells both libraries the cache is already resident.
     """
     if attention_input_type != AttentionInputType.mixed:
         raise NotImplementedError(

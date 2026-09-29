@@ -42,7 +42,8 @@ class MTPHiddenStatesManager(BaseResourceManager):
                  dtype: torch.dtype,
                  hidden_size: int,
                  max_num_requests: int,
-                 sa_manager=None):
+                 sa_manager=None,
+                 num_seq_slots: Optional[int] = None):
         self.dtype = dtype
         self.num_draft_slots = config.max_draft_len
         self.hidden_size = hidden_size
@@ -50,7 +51,7 @@ class MTPHiddenStatesManager(BaseResourceManager):
         self.use_relaxed_acceptance_for_thinking = config.use_relaxed_acceptance_for_thinking
         # Reserve one extra slot for the CUDA graph padding dummy request,
         # which is kept alive permanently and must not consume a real slot.
-        slot_pool_size = max_num_requests + 1
+        slot_pool_size = (num_seq_slots or max_num_requests) + 1
         self.slot_manager = SlotManager(slot_pool_size)
         # Optional SA manager for MTP+SA mode
         self.sa_manager = sa_manager
@@ -944,6 +945,8 @@ class MTPWorker(SpecWorkerBase):
             attn_metadata.kv_lens_cuda[num_contexts:batch_size].clamp_(
                 min=runtime_draft_len)
             attn_metadata.on_update_kv_lens()
+            if getattr(attn_metadata, "fp4_mla_state", None) is not None:
+                attn_metadata.update_for_spec_dec()
 
         if attn_metadata.kv_cache_params is not None and not attn_metadata.is_cuda_graph:
             for i in range(num_contexts, batch_size):

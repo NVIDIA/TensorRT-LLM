@@ -22,8 +22,8 @@ import tensorrt_llm.profiler as profiler
 from .. import LLM as PyTorchLLM
 from ..evaluate import (AALCR, AIME2025, AIME2026, GSM8K, HLE, MMLU, MMMU,
                         ArenaHard, CnnDailymail, CoVoST2, GPQADiamond,
-                        GPQAExtended, GPQAMain, GPQANemoSkills, IFBench,
-                        ImageGenerationEval, JsonModeEval, LongBenchV1,
+                        GPQAExtended, GPQAMain, GPQANemoSkills, GSM8KInferenceX,
+                        IFBench, ImageGenerationEval, JsonModeEval, LongBenchV1,
                         LongBenchV2, MMMUPro, SciCode)
 from ..llmapi import KvCacheConfig
 from ..llmapi.llm_args import TorchLlmArgs
@@ -262,6 +262,7 @@ def main(ctx, model: str, tokenizer: Optional[str],
 main.add_command(CnnDailymail.command)
 main.add_command(MMLU.command)
 main.add_command(GSM8K.command)
+main.add_command(GSM8KInferenceX.command)
 main.add_command(GPQADiamond.command)
 main.add_command(GPQAMain.command)
 main.add_command(GPQAExtended.command)

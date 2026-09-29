@@ -14,7 +14,7 @@
 # limitations under the License.
 # -*- coding: utf-8 -*-
 """
-Model pytorch/TRT yaml config for trtllm-bench perf tests
+Model PyTorch YAML config for trtllm-bench performance tests.
 """
 
 from ..conftest import llm_models_root
@@ -61,17 +61,12 @@ def get_model_yaml_config(model_label: str,
         Returns:
             dict: yaml config
         """
-    if 'pytorch' in model_label:
-        # Pytorch backend config
-        base_config = {
-            'print_iter_log': True,
-            'cuda_graph_config': {
-                'enable_padding': True,
-            },
-        }
-    else:
-        # TRT backend config
-        base_config = {}
+    base_config = {
+        'print_iter_log': True,
+        'cuda_graph_config': {
+            'enable_padding': True,
+        },
+    }
 
     if 'kv_cache_dtype' in model_label:
         base_config.update({
@@ -330,6 +325,7 @@ def get_model_yaml_config(model_label: str,
         {
             'patterns': [
                 'deepseek_v4_pro_fp4-bench-pytorch-float4-maxbs:32-maxnt:8448',
+                'deepseek_v4_pro_fp4-serve-pytorch-streaming-float4-maxbs:32-maxnt:8448',
             ],
             'config': {
                 'enable_attention_dp': True,
@@ -366,6 +362,7 @@ def get_model_yaml_config(model_label: str,
         {
             'patterns': [
                 'deepseek_v4_pro_fp4-bench-pytorch-float4-maxbs:128-maxnt:8448',
+                'deepseek_v4_pro_fp4-serve-pytorch-float4-maxbs:128-maxnt:8448',
             ],
             'config': {
                 'enable_attention_dp': False,
@@ -428,8 +425,8 @@ def get_model_yaml_config(model_label: str,
         # fallback), it does not support KV-cache block reuse, and max_seq_len
         # must be capped just above ISL+OSL -- left at the checkpoint default
         # (1M) the CUDA-graph warmup decode allocates gigabyte-scale temporaries
-        # and capture fails with cudaErrorStreamCaptureUnsupported. Every NVFP4
-        # case keeps ISL+OSL <= 2048. See
+        # and capture fails with cudaErrorStreamCaptureUnsupported.
+        # Serve sequence-length overrides follow below. See
         # docs/source/deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.md
         {
             'patterns': ['minimax_m3_fp4'],
@@ -453,8 +450,34 @@ def get_model_yaml_config(model_label: str,
                     # The MSA path runs an FP8 KV cache.
                     'dtype': 'fp8',
                 },
+            }
+        },
+        {
+            'patterns': ['minimax_m3_fp4-bench-pytorch'],
+            'config': {
                 'stream_interval': 10,
                 'num_postprocess_workers': 4,
+            }
+        },
+        # Bound the serve warmup/capture batch and sequence length on TP4/EP4.
+        {
+            'patterns': ['minimax_m3_fp4-serve-pytorch'],
+            'config': {
+                'max_seq_len': 4096,
+                'cuda_graph_config': {
+                    'max_batch_size': 128,
+                },
+            }
+        },
+        # The 8K input exceeds the 2048-token budget, so serve needs chunking.
+        # Match the normalized PerfTestConfig label, including maxbs/maxnt.
+        {
+            'patterns': [
+                'minimax_m3_fp4-serve-pytorch-float4-maxbs:128-maxnt:2048-input_output_len:8000,1000',
+            ],
+            'config': {
+                'max_seq_len': 9216,
+                'enable_chunked_prefill': True,
             }
         },
         # Gemma 4 NVFP4: VSWA (1024-token sliding window) plus per-layer
@@ -675,6 +698,54 @@ def get_model_yaml_config(model_label: str,
                     'enable_block_reuse': False,
                     'free_gpu_memory_fraction': 0.80,
                     'mamba_ssm_cache_dtype': 'float32',
+                },
+            }
+        },
+        # Nemotron-3.5-Lightning-30B with MTP=3, NVFP4 and BF16.
+        {
+            'patterns': [
+                'nemotron_3.5_lightning_30b_nvfp4_mtp-serve-pytorch-streaming-',
+                'nemotron_3.5_lightning_30b_bf16_mtp-serve-pytorch-streaming-',
+            ],
+            'config': {
+                'enable_chunked_prefill': True,
+                'stream_interval': 10,
+                'num_postprocess_workers': 4,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 16,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.8,
+                    'mamba_ssm_cache_dtype': 'float16',
+                    'mamba_ssm_stochastic_rounding': True,
+                    'mamba_ssm_philox_rounds': 5,
+                    'mamba_state_config': {
+                        'periodic_snapshot_interval': 8192,
+                    },
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 3,
+                },
+            }
+        },
+        {
+            'patterns':
+            ['nemotron_3.5_lightning_30b_nvfp4_mtp-serve-pytorch-streaming-'],
+            'config': {
+                'moe_config': {
+                    'backend': 'CUTEDSL',
+                },
+            }
+        },
+        {
+            'patterns':
+            ['nemotron_3.5_lightning_30b_bf16_mtp-serve-pytorch-streaming-'],
+            'config': {
+                'moe_config': {
+                    'backend': 'CUTLASS',
                 },
             }
         },

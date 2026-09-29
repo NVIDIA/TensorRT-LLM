@@ -16,11 +16,16 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 from torch import nn
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_nemotron_h import NemotronHMOE, NemotronHMTP
+from tensorrt_llm._torch.models.modeling_nemotron_h import (
+    NemotronHMOE,
+    NemotronHMTP,
+    _remap_hf_quant_module_name,
+)
 from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -101,10 +106,114 @@ def test_nemotron_h_moe_uses_mixer_expert_layer_quant_config():
     assert captured["override_quant_config"] is layer_quant_config
 
 
-def test_nemotron_h_mtp_overrides_quant_and_inherits_moe_backend():
-    quant_config = QuantConfig(
-        quant_algo=QuantAlgo.W4A16_NVFP4, group_size=16, exclude_modules=["lm_head"]
+def test_nemotron_h_moe_exclusion_outranks_the_layer_quant_config():
+    """An excluded experts module has to reach create_moe unquantized.
+
+    The per-layer entry is applied first, so an exclusion that does not
+    override it leaves the layer on the per-layer format and loads quantized
+    weights the checkpoint left in bf16 -- wrong numerics rather than a
+    failure. ``kv_cache_quant_algo`` is not part of what an expert exclusion
+    turns off, so it has to survive.
+    """
+    global_quant_config = QuantConfig(
+        quant_algo=QuantAlgo.W4A16_NVFP4,
+        group_size=16,
+        kv_cache_quant_algo=QuantAlgo.FP8,
+        exclude_modules=["model.layers.1.mixer.experts"],
     )
+    model_config = _make_nemotron_h_moe_config(global_quant_config)
+    model_config.quant_config_dict = {
+        "model.layers.1.mixer.experts.0.up_proj": QuantConfig(
+            quant_algo=QuantAlgo.W4A16_NVFP4, group_size=16
+        ),
+    }
+    captured = {}
+
+    def fake_create_moe(**kwargs):
+        captured.update(kwargs)
+        return nn.Identity()
+
+    with patch(
+        "tensorrt_llm._torch.models.modeling_nemotron_h.create_moe",
+        side_effect=fake_create_moe,
+    ):
+        with patch("torch.cuda.Event", side_effect=lambda: object()):
+            NemotronHMOE(
+                model_config=model_config,
+                layer_idx=1,
+                aux_stream_dict={AuxStreamType.MoeShared: None},
+            )
+
+    override = captured["override_quant_config"]
+    assert override.quant_algo is None
+    assert override.kv_cache_quant_algo == QuantAlgo.FP8
+
+
+def test_nemotron_h_moe_uses_module_prefix_for_mtp_sublayer_quant_config():
+    """MTP sublayers live at model.layers.{N}.layers.{S}; the experts lookup
+    has to follow that path rather than the decoder-layer default."""
+    global_quant_config = QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION)
+    layer_quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+    model_config = _make_nemotron_h_moe_config(global_quant_config)
+    model_config.quant_config_dict = {
+        "model.layers.52.layers.1.mixer.experts.0.up_proj": layer_quant_config,
+    }
+    captured = {}
+
+    def fake_create_moe(**kwargs):
+        captured.update(kwargs)
+        return nn.Identity()
+
+    with patch(
+        "tensorrt_llm._torch.models.modeling_nemotron_h.create_moe",
+        side_effect=fake_create_moe,
+    ):
+        with patch("torch.cuda.Event", side_effect=lambda: object()):
+            NemotronHMOE(
+                model_config=model_config,
+                layer_idx=52,
+                aux_stream_dict={AuxStreamType.MoeShared: None},
+                module_prefix="model.layers.52.layers.1",
+            )
+
+    assert captured["override_quant_config"] is layer_quant_config
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("backbone.layers.3.mixer.in_proj", "model.layers.3.mixer.in_proj"),
+        ("backbone.layers.16*", "model.layers.16*"),
+        ("mtp.layers.0.mixer.q_proj", "model.layers.52.layers.0.mixer.q_proj"),
+        (
+            "mtp.layers.1.mixer.experts.0.up_proj",
+            "model.layers.52.layers.1.mixer.experts.0.up_proj",
+        ),
+        ("mtp.layers.1", "model.layers.52.layers.1"),
+        ("mtp*", "model.layers.52"),
+        ("mtp.*", "model.layers.52"),
+        ("mtp", "model.layers.52"),
+        ("lm_head", "lm_head"),
+        ("mtp_head.weight", "mtp_head.weight"),
+    ],
+)
+def test_remap_hf_quant_module_name(name, expected):
+    assert _remap_hf_quant_module_name(name, num_hidden_layers=52) == expected
+
+
+def test_remap_hf_quant_module_name_whole_head_exclusion_covers_sublayers():
+    quant_config = QuantConfig(
+        quant_algo=QuantAlgo.FP8,
+        exclude_modules=[_remap_hf_quant_module_name("mtp*", num_hidden_layers=52)],
+    )
+    assert quant_config.is_module_excluded_from_quantization("model.layers.52.layers.0")
+    assert quant_config.is_module_excluded_from_quantization(
+        "model.layers.52.layers.1.mixer.experts"
+    )
+    assert not quant_config.is_module_excluded_from_quantization("model.layers.5.mixer")
+
+
+def _build_mtp_capturing_sublayers(quant_config: QuantConfig) -> tuple[ModelConfig, list]:
     model_config = ModelConfig(
         pretrained_config=SimpleNamespace(
             mtp_hybrid_override_pattern="*E",
@@ -136,10 +245,44 @@ def test_nemotron_h_mtp_overrides_quant_and_inherits_moe_backend():
                     layer_idx=52,
                     aux_stream_dict={},
                 )
-
     assert len(captured) == 2
-    for layer_kwargs in captured:
-        sublayer_model_config = layer_kwargs["model_config"]
-        assert sublayer_model_config.quant_config.quant_algo is None
-        assert sublayer_model_config.moe_backend == model_config.moe_backend
+    return model_config, captured
+
+
+def test_nemotron_h_mtp_sublayers_get_module_prefix_and_inherit_moe_backend():
+    quant_config = QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION)
+    model_config, captured = _build_mtp_capturing_sublayers(quant_config)
+
+    for sublayer_idx, layer_kwargs in enumerate(captured):
+        assert layer_kwargs["module_prefix"] == f"model.layers.52.layers.{sublayer_idx}"
+        assert layer_kwargs["model_config"].moe_backend == model_config.moe_backend
     assert model_config.quant_config is quant_config
+
+
+def test_nemotron_h_mtp_excluded_head_stays_unquantized():
+    """modelopt writes ``mtp*`` for a head it left in bf16; after the rewrite
+    that is the head module itself, which excludes every sublayer."""
+    quant_config = QuantConfig(
+        quant_algo=QuantAlgo.NVFP4,
+        group_size=16,
+        kv_cache_quant_algo=QuantAlgo.FP8,
+        exclude_modules=["lm_head", "model.layers.52"],
+    )
+    _, captured = _build_mtp_capturing_sublayers(quant_config)
+
+    for layer_kwargs in captured:
+        sublayer_quant_config = layer_kwargs["model_config"].quant_config
+        assert sublayer_quant_config.quant_algo is None
+        assert sublayer_quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+
+
+def test_nemotron_h_mtp_quantized_head_inherits_checkpoint_quant_config():
+    """A single-algo checkpoint that quantizes the MTP head must build the
+    sublayers quantized, or the packed weights cannot be loaded."""
+    quant_config = QuantConfig(
+        quant_algo=QuantAlgo.NVFP4, group_size=16, exclude_modules=["lm_head"]
+    )
+    _, captured = _build_mtp_capturing_sublayers(quant_config)
+
+    for layer_kwargs in captured:
+        assert layer_kwargs["model_config"].quant_config is quant_config
