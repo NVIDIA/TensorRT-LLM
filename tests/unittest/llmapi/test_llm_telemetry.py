@@ -82,10 +82,10 @@ class TestProcessLifecycleCounters:
         usage_lib._SESSION_LOCK = threading.Lock()
         usage_lib._REPORTER_STARTED = False
         usage_lib._REPORTER_ACTIVE = False
-        usage_lib._REPORTER_STOP = threading.Event()
+        usage_lib._HEARTBEAT_STOP = threading.Event()
         usage_lib._PROCESS_PID = os.getpid()
         yield
-        usage_lib._REPORTER_STOP.set()
+        usage_lib._HEARTBEAT_STOP.set()
         usage_lib._SESSION = None
         usage_lib._SESSION_DISABLED = False
         usage_lib._REPORTER_ACTIVE = False
@@ -304,7 +304,7 @@ class TestRuntimeArchitecturePayloadFlow:
 
         with (
             patch.object(usage_lib, "_send_to_gxt", side_effect=payloads.append),
-            patch.object(usage_lib, "_REPORTER_STOP", stop_event),
+            patch.object(usage_lib, "_HEARTBEAT_STOP", stop_event),
         ):
             usage_lib._background_reporter(
                 report_args["llm_args"],

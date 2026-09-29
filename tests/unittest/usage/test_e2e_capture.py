@@ -186,7 +186,7 @@ def reset_usage_state():
     import tensorrt_llm.usage.usage_lib as usage_lib
 
     def reset():
-        usage_lib._REPORTER_STOP.set()
+        usage_lib._HEARTBEAT_STOP.set()
         deadline = time.monotonic() + 2
         while usage_lib._REPORTER_ACTIVE and time.monotonic() < deadline:
             time.sleep(0.01)
@@ -202,7 +202,7 @@ def reset_usage_state():
         usage_lib._REPORTER_STARTED = False
         usage_lib._REPORTER_ACTIVE = False
         usage_lib._REPORTER_LOCK = threading.Lock()
-        usage_lib._REPORTER_STOP = threading.Event()
+        usage_lib._HEARTBEAT_STOP = threading.Event()
         usage_lib._PROCESS_PID = os.getpid()
 
     reset()

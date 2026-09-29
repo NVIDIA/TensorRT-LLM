@@ -744,7 +744,7 @@ def _background_reporter(
         # --- Heartbeat loop ---
         heartbeat_interval = _get_heartbeat_interval()
         for seq in range(_MAX_HEARTBEATS):
-            if _REPORTER_STOP.wait(timeout=heartbeat_interval):
+            if _HEARTBEAT_STOP.wait(timeout=heartbeat_interval):
                 return  # stop requested
 
             try:
@@ -776,7 +776,7 @@ def _background_reporter(
 _REPORTER_STARTED = False
 _REPORTER_ACTIVE = False
 _REPORTER_LOCK = threading.Lock()
-_REPORTER_STOP = threading.Event()  # signal heartbeat loop to exit
+_HEARTBEAT_STOP = threading.Event()  # signal heartbeat loop to exit
 _PROCESS_PID = os.getpid()
 _PROCESS_EXIT_HOOK_REGISTERED = False
 
@@ -1013,7 +1013,7 @@ def _ensure_process_state() -> None:
     global _REPORTER_ACTIVE
     global _REPORTER_LOCK
     global _REPORTER_STARTED
-    global _REPORTER_STOP
+    global _HEARTBEAT_STOP
     global _SESSION
     global _SESSION_LOCK
 
@@ -1027,7 +1027,7 @@ def _ensure_process_state() -> None:
     _REPORTER_STARTED = False
     _REPORTER_ACTIVE = False
     _REPORTER_LOCK = threading.Lock()
-    _REPORTER_STOP = threading.Event()
+    _HEARTBEAT_STOP = threading.Event()
     _NOTIFICATION_SHOWN = threading.Event()
 
 
@@ -1052,7 +1052,7 @@ def _deactivate_usage_session() -> None:
     with _REPORTER_LOCK:
         if session is not None:
             session.disable()
-    _REPORTER_STOP.set()
+    _HEARTBEAT_STOP.set()
 
 
 def _empty_event_snapshot(usage_context: str = "") -> dict[str, Any]:
@@ -1221,7 +1221,7 @@ def apply_usage_session_config(
                 if not _PROCESS_EXIT_HOOK_REGISTERED:
                     atexit.register(_report_process_exit)
                     _PROCESS_EXIT_HOOK_REGISTERED = True
-                _REPORTER_STOP.clear()
+                _HEARTBEAT_STOP.clear()
                 _SESSION = session
                 return True
             session = _SESSION
@@ -1450,7 +1450,7 @@ def report_exit(
             if not session.is_delivery_allowed():
                 return True
             _start_terminal_sender(session)
-            _REPORTER_STOP.set()
+            _HEARTBEAT_STOP.set()
             if session.terminal_thread is None:
                 return True
             session.terminal_payload = payload

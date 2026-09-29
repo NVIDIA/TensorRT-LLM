@@ -41,10 +41,10 @@ def _reset_process_telemetry_state():
     usage_lib._REPORTER_STARTED = False
     usage_lib._REPORTER_ACTIVE = False
     usage_lib._REPORTER_LOCK = threading.Lock()
-    usage_lib._REPORTER_STOP = threading.Event()
+    usage_lib._HEARTBEAT_STOP = threading.Event()
     usage_lib._PROCESS_PID = os.getpid()
     yield
-    usage_lib._REPORTER_STOP.set()
+    usage_lib._HEARTBEAT_STOP.set()
     session = usage_lib._SESSION
     if session is not None:
         session.disable()
@@ -384,7 +384,7 @@ class TestArchitecturePrivacy:
 
         with (
             patch.object(usage_lib, "_send_to_gxt", side_effect=fake_send),
-            patch.object(usage_lib, "_REPORTER_STOP", stop_event),
+            patch.object(usage_lib, "_HEARTBEAT_STOP", stop_event),
         ):
             usage_lib._background_reporter(None, pretrained_config, "")
 
@@ -426,7 +426,7 @@ class TestClampStrIntegration:
                 },
             ),
             patch.object(usage_lib, "_send_to_gxt", side_effect=fake_send),
-            patch.object(usage_lib, "_REPORTER_STOP", stop_event),
+            patch.object(usage_lib, "_HEARTBEAT_STOP", stop_event),
         ):
             usage_lib._background_reporter(None, None, "")
 
@@ -458,7 +458,7 @@ class TestDisaggMetadata:
 
         with (
             patch.object(usage_lib, "_send_to_gxt", side_effect=fake_send),
-            patch.object(usage_lib, "_REPORTER_STOP", stop_event),
+            patch.object(usage_lib, "_HEARTBEAT_STOP", stop_event),
         ):
             usage_lib._background_reporter(None, None, "")
 
@@ -488,7 +488,7 @@ class TestDisaggMetadata:
 
         with (
             patch.object(usage_lib, "_send_to_gxt", side_effect=fake_send),
-            patch.object(usage_lib, "_REPORTER_STOP", stop_event),
+            patch.object(usage_lib, "_HEARTBEAT_STOP", stop_event),
         ):
             usage_lib._background_reporter(_DisaggTelemetryArgs(), None, "cli_serve")
 
@@ -520,7 +520,7 @@ class TestDisaggMetadataEmpty:
 
         with (
             patch.object(usage_lib, "_send_to_gxt", side_effect=fake_send),
-            patch.object(usage_lib, "_REPORTER_STOP", stop_event),
+            patch.object(usage_lib, "_HEARTBEAT_STOP", stop_event),
         ):
             usage_lib._background_reporter(None, None, "")
 
@@ -627,10 +627,10 @@ class TestRankGuard:
 
 
 class TestReporterShutdown:
-    """Verify _REPORTER_STOP event exits the heartbeat loop."""
+    """Verify _HEARTBEAT_STOP event exits the heartbeat loop."""
 
     def test_reporter_stop_event_exits_heartbeat_loop(self, reporter_session):
-        """Setting _REPORTER_STOP causes the heartbeat loop to exit."""
+        """Setting _HEARTBEAT_STOP causes the heartbeat loop to exit."""
         send_count = {"n": 0}
 
         def counting_send(payload):
@@ -641,7 +641,7 @@ class TestReporterShutdown:
 
         with (
             patch.object(usage_lib, "_send_to_gxt", side_effect=counting_send),
-            patch.object(usage_lib, "_REPORTER_STOP", stop_event),
+            patch.object(usage_lib, "_HEARTBEAT_STOP", stop_event),
             patch.object(usage_lib, "_get_heartbeat_interval", return_value=3600),
         ):
             usage_lib._background_reporter(None, None, "")
@@ -666,7 +666,7 @@ class TestReporterShutdown:
 
         with (
             patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append),
-            patch.object(usage_lib, "_REPORTER_STOP", _OneHeartbeat()),
+            patch.object(usage_lib, "_HEARTBEAT_STOP", _OneHeartbeat()),
         ):
             usage_lib._background_reporter(None, None, "llm_class")
 
@@ -702,7 +702,7 @@ class TestHeartbeatFailSilent:
 
         with (
             patch.object(usage_lib, "_send_to_gxt", side_effect=tracking_send),
-            patch.object(usage_lib, "_REPORTER_STOP", stop),
+            patch.object(usage_lib, "_HEARTBEAT_STOP", stop),
             patch.object(usage_lib, "_get_heartbeat_interval", return_value=0),
         ):
             usage_lib._background_reporter(None, None, "")
@@ -777,7 +777,7 @@ class TestBackgroundReporterOptOut:
         sent = []
         with (
             patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append),
-            patch.object(usage_lib, "_REPORTER_STOP", _OptOutBeforeHeartbeat()),
+            patch.object(usage_lib, "_HEARTBEAT_STOP", _OptOutBeforeHeartbeat()),
         ):
             usage_lib._background_reporter(None, None, "")
 
@@ -841,7 +841,7 @@ class TestProcessTelemetrySession:
     def _reset_session(monkeypatch):
         monkeypatch.setattr(usage_lib, "_SESSION", None)
         monkeypatch.setattr(usage_lib, "_SESSION_DISABLED", False)
-        monkeypatch.setattr(usage_lib, "_REPORTER_STOP", threading.Event())
+        monkeypatch.setattr(usage_lib, "_HEARTBEAT_STOP", threading.Event())
         monkeypatch.setattr(usage_lib, "_REPORTER_STARTED", False)
         monkeypatch.setattr(usage_lib, "_REPORTER_ACTIVE", False)
         usage_lib._NOTIFICATION_SHOWN.set()
@@ -957,7 +957,7 @@ class TestProcessTelemetrySession:
 
         assert not usage_lib.apply_usage_session_config({"disabled": True})
         assert usage_lib._SESSION is None
-        assert usage_lib._REPORTER_STOP.is_set()
+        assert usage_lib._HEARTBEAT_STOP.is_set()
         assert not stale_session.claim_initial()
         assert (
             stale_session.claim_terminal(usage_lib.TerminalOutcome(termination_kind="unknown"))
@@ -986,7 +986,7 @@ class TestProcessTelemetrySession:
             usage_lib.report_usage()
 
         assert usage_lib._SESSION is not None
-        assert not usage_lib._REPORTER_STOP.is_set()
+        assert not usage_lib._HEARTBEAT_STOP.is_set()
         thread_cls.assert_not_called()
 
     def test_nonreporting_rank_does_not_claim_terminal_slot(self, enable_telemetry):
@@ -1291,7 +1291,7 @@ def send(payload):
 usage_lib._send_to_gxt = send
 usage_lib.report_usage()
 if state == "finished":
-    usage_lib._REPORTER_STOP.set()
+    usage_lib._HEARTBEAT_STOP.set()
     for thread in threading.enumerate():
         if thread.name == "trtllm-usage-stats":
             thread.join(5)
