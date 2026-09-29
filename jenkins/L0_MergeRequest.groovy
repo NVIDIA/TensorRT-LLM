@@ -1952,16 +1952,6 @@ def getCommonParameters()
     ]
 }
 
-// Looks for a completed /LLM/helpers/PLCScanningSetup pre-merge source-code-scan
-// build that already ran against this exact commit hash, so a retriggered
-// pipeline (e.g. a manual "/bot run" rerun with no new commits pushed) can
-// reuse that result instead of re-running the scan. Delegates the lookup to
-// jenkins/scripts/find_plc_build.py (plain Jenkins REST API calls), which sidesteps
-// walking live Jenkins domain objects (Job/Run/ParametersAction) from CPS-transformed
-// pipeline code -- that walk previously needed @NonCPS plus an inlined parameter
-// check, because a @NonCPS method calling a CPS-transformed shared-lib method like
-// trtllm_utils.isBuildWithParameter() gets back a continuation/proxy instead of a
-// real value, so the comparison silently never matches.
 def findCachedPLCSourceScanResult(commit) {
     def exitCode = sh(
         script: "python3 ${LLM_ROOT}/jenkins/scripts/find_plc_build.py --commit ${commit} > find_plc_build.json",

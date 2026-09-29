@@ -57,7 +57,7 @@ def build_parameters(build_info):
 
 
 def find_plc_build(
-    jenkins_base, commit, scan_mode="pre_merge", run_source_code_scanning="true", max_builds=1000
+    jenkins_base, commit, scan_mode="pre_merge", run_source_code_scanning=True, max_builds=1000
 ):
     # The job's default "builds" field is truncated to Jenkins' recent-builds
     # list. "allBuilds" is needed to walk the full history like
