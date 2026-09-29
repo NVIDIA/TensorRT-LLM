@@ -1276,6 +1276,7 @@ state = sys.argv[2]
 ready = threading.Event()
 blocked = threading.Event()
 usage_lib._is_reporting_rank = lambda: True
+usage_lib._OPT_OUT_FILE = None
 usage_lib._get_heartbeat_interval = lambda: 0.001
 usage_lib._collect_gpu_info = lambda: {}
 
