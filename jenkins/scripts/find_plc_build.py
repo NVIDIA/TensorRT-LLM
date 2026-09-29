@@ -32,10 +32,6 @@ import sys
 import urllib.error
 import urllib.request
 
-DEFAULT_JENKINS_BASE = (
-    "https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/helpers/job/PLCScanningSetup"
-)
-
 
 def fetch_json(url):
     request = urllib.request.Request(url)
@@ -90,8 +86,8 @@ def main():
     )
     parser.add_argument(
         "--jenkins-base",
-        default=DEFAULT_JENKINS_BASE,
-        help="Jenkins job URL for PLCScanningSetup (default: %(default)s)",
+        required=True,
+        help="Jenkins job URL for PLCScanningSetup",
     )
     parser.add_argument(
         "--max-builds",
