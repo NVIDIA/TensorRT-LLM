@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """The `llmman serve` client: the daemon protocol behind oci:// model paths.
 
 Exercised against a real HTTP server on a loopback port rather than mocks, so
@@ -29,7 +32,6 @@ class _FakeDaemon:
         daemon = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
-
             def log_message(self, *args):
                 pass
 
@@ -83,11 +85,7 @@ def test_reports_nothing_listening_actionably():
 def test_pull_succeeds_and_forwards_progress(daemon):
     daemon.pull_body = _ndjson(
         {"status": "pulling manifest"},
-        {
-            "status": "pulling blobs",
-            "completed": 50,
-            "total": 100
-        },
+        {"status": "pulling blobs", "completed": 50, "total": 100},
         {"status": "success"},
     )
     seen = []

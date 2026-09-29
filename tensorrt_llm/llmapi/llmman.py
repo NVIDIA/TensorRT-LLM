@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Client for a running ``llmman serve`` daemon.
 
 Used to acquire models published as CNCF ModelPack
@@ -24,8 +27,13 @@ import shutil
 import subprocess
 import urllib.error
 import urllib.request
+from pathlib import Path
+from typing import Callable, Optional, Union
 
 logger = logging.getLogger(__name__)
+
+# Receives ``(status, completed, total)`` for each pull progress update.
+ProgressCallback = Callable[[str, int, int], None]
 
 HOST_ENV = "LLMMAN_HOST"
 BIN_ENV = "TRTLLM_LLMMAN_BIN"
@@ -61,8 +69,8 @@ def endpoint() -> str:
     if raw.startswith("["):  # bracketed IPv6, optionally with :port
         close = raw.find("]")
         if close != -1:
-            host = raw[:close + 1]
-            rest = raw[close + 1:]
+            host = raw[: close + 1]
+            rest = raw[close + 1 :]
             if rest.startswith(":") and rest[1:].isdigit():
                 port = int(rest[1:])
     elif raw.count(":") == 1:
@@ -95,7 +103,8 @@ def check_daemon(base: str) -> None:
     except urllib.error.URLError as exc:
         raise RuntimeError(
             f"no llmman daemon reachable at {base} ({exc.reason}). Start one with "
-            f"`llmman serve`, or point {HOST_ENV} at an existing daemon.") from exc
+            f"`llmman serve`, or point {HOST_ENV} at an existing daemon."
+        ) from exc
     except json.JSONDecodeError as exc:
         raise RuntimeError(
             f"the server at {base} is not an llmman daemon (unparseable /api/version)"
@@ -107,7 +116,7 @@ def check_daemon(base: str) -> None:
         )
 
 
-def pull(base: str, reference: str, progress=None) -> None:
+def pull(base: str, reference: str, progress: Optional[ProgressCallback] = None) -> None:
     """Stream POST /api/pull until the daemon reports success.
 
     ``progress`` receives ``(status, completed, total)``. An error can arrive
@@ -126,8 +135,7 @@ def pull(base: str, reference: str, progress=None) -> None:
     try:
         with urllib.request.urlopen(req) as resp:
             if resp.status != 200:
-                raise RuntimeError(
-                    f"llmman pull of {reference!r} failed: HTTP {resp.status}")
+                raise RuntimeError(f"llmman pull of {reference!r} failed: HTTP {resp.status}")
             for raw_line in resp:
                 line = raw_line.decode("utf-8").strip()
                 if not line:
@@ -141,8 +149,7 @@ def pull(base: str, reference: str, progress=None) -> None:
                 if not isinstance(obj, dict):
                     continue
                 if obj.get("error"):
-                    raise RuntimeError(
-                        f"llmman pull of {reference!r} failed: {obj['error']}")
+                    raise RuntimeError(f"llmman pull of {reference!r} failed: {obj['error']}")
                 status = obj.get("status")
                 if status == "success":
                     succeeded = True
@@ -150,15 +157,12 @@ def pull(base: str, reference: str, progress=None) -> None:
                 if progress is not None and status:
                     progress(status, obj.get("completed", 0), obj.get("total", 0))
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(
-            f"llmman pull of {reference!r} failed: HTTP {exc.code}") from exc
+        raise RuntimeError(f"llmman pull of {reference!r} failed: HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(
-            f"llmman pull of {reference!r} failed: {exc.reason}") from exc
+        raise RuntimeError(f"llmman pull of {reference!r} failed: {exc.reason}") from exc
 
     if not succeeded:
-        raise RuntimeError(
-            f"llmman pull of {reference!r} ended without reporting success")
+        raise RuntimeError(f"llmman pull of {reference!r} ended without reporting success")
 
 
 def parse_resolve_output(stdout: str, reference: str) -> str:
@@ -178,14 +182,14 @@ def parse_resolve_output(stdout: str, reference: str) -> str:
         # A protocol violation rather than a caller type error, so RuntimeError
         # keeps every llmman failure one exception type for callers.
         raise RuntimeError(  # noqa: TRY004
-            f"llmman resolve {reference!r}: expected a JSON object, got {lines[-1]}")
+            f"llmman resolve {reference!r}: expected a JSON object, got {lines[-1]}"
+        )
 
     path = payload.get("path")
     if not isinstance(path, str) or not path.strip():
         raise RuntimeError(f"llmman resolve {reference!r}: returned an empty path")
     if not os.path.exists(path):
-        raise RuntimeError(
-            f"llmman resolve {reference!r}: reported path {path!r} does not exist")
+        raise RuntimeError(f"llmman resolve {reference!r}: reported path {path!r} does not exist")
     return path
 
 
@@ -200,7 +204,8 @@ def resolve(reference: str) -> str:
         raise RuntimeError(
             f"{binary!r} not found. Install llmman "
             "(https://github.com/llmmanorg/llmman) and put it on PATH, or set "
-            f"{BIN_ENV} to its location.")
+            f"{BIN_ENV} to its location."
+        )
 
     completed = subprocess.run(
         [binary, "resolve", "--no-pull", reference],
@@ -212,11 +217,12 @@ def resolve(reference: str) -> str:
     if completed.returncode != 0:
         raise RuntimeError(
             f"`{binary} resolve --no-pull {reference}` failed with exit code "
-            f"{completed.returncode}: {completed.stderr.strip()}")
+            f"{completed.returncode}: {completed.stderr.strip()}"
+        )
     return parse_resolve_output(completed.stdout, reference)
 
 
-def pull_and_resolve(reference: str, progress=None) -> str:
+def pull_and_resolve(reference: str, progress: Optional[ProgressCallback] = None) -> str:
     """Full acquisition: probe the daemon, pull through it, report the path."""
     base = endpoint()
     check_daemon(base)
@@ -228,7 +234,7 @@ def pull_and_resolve(reference: str, progress=None) -> str:
 SCHEME = "oci://"
 
 
-def is_oci_ref(model) -> bool:
+def is_oci_ref(model: Union[str, Path, None]) -> bool:
     """Whether ``model`` carries the ``oci://`` scheme.
 
     An explicit scheme is required rather than sniffing a bare
@@ -240,21 +246,21 @@ def is_oci_ref(model) -> bool:
     return str(model).lower().startswith(SCHEME)
 
 
-def strip_scheme(model) -> str:
+def strip_scheme(model: Union[str, Path]) -> str:
     """Drop the ``oci://`` prefix, leaving the bare registry reference."""
     text = str(model)
     if is_oci_ref(text):
-        return text[len(SCHEME):]
+        return text[len(SCHEME) :]
     return text
 
 
-def resolve_model(model) -> str:
+def resolve_model(model: Union[str, Path]) -> str:
     """Pull an ``oci://`` reference through llmman and return the local path."""
     reference = strip_scheme(model).strip()
     if not reference:
         raise ValueError(f"empty OCI model reference: {model!r}")
 
-    def _progress(status, completed, total):
+    def _progress(status: str, completed: int, total: int) -> None:
         if total:
             logger.info("llmman: %s (%s/%s bytes)", status, completed, total)
         else:
