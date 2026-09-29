@@ -50,10 +50,7 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     create_cache_reuse_adapter,
 )
-from tensorrt_llm._torch.disaggregation.resource.utils import (
-    get_physical_pool,
-    get_pool_view_num_layers,
-)
+from tensorrt_llm._torch.disaggregation.resource.utils import get_pool_view_slot_bytes
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
@@ -454,8 +451,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return window
 
     def _chunk_num_bytes(self, chunk: Chunk) -> int:
-        """Local-rank KV bytes covered by a chunk (sum of num_valid_blocks * pool.slot_bytes), enough to populate
-        kv_cache_size and unblock the perf-metric timestamps that gate on it.
+        """Local-rank KV bytes covered by a chunk: per view, the valid block count times the view's
+        transferable slot region. Populates kv_cache_size (and the perf-metric timestamps that gate
+        on it) and is the exact expected-write total the verified-reuse admission checks attested
+        sender bytes against, so it must count what the mappers move, never physical slot bytes: a
+        coalesced pool carries one view per role class (summing slot_bytes per view would double
+        count the slot) and ignored-role buffers occupy slot offsets no view transfers.
 
         Counterpart accounting: the bounce reserve sizing (bounce/impl.py block_bytes_per_group)
         computes per-block bytes for the same layer groups but reads pool 0 only, while this sums
@@ -474,16 +475,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 continue
             lg = pt.layer_groups[lg_id]
             for pv in lg.pool_views:
-                pool = get_physical_pool(pt, lg_id, pv.pool_idx)
+                # The view's byte regions within one slot (all of its layers).
+                view_bytes = get_pool_view_slot_bytes(pv)
                 if lg.kind == CacheKind.STATE:
-                    # STATE: n=1 (one slot), but transfer covers all layers of
-                    # the view. The physical slot may hold several roles, so
-                    # size by the view's per-layer bytes, not the pool's slot.
-                    num_layers = get_pool_view_num_layers(pv)
-                    total += num_layers * pv.bytes_per_layer
+                    # STATE: one slot per request; the transfer covers each
+                    # view region once regardless of the block count.
+                    total += view_bytes
                 else:
-                    # Attention: n blocks, each slot covers all layers.
-                    total += n * pool.slot_bytes
+                    # Attention: n blocks, each covering the view's regions.
+                    total += n * view_bytes
         return total
 
     @staticmethod
