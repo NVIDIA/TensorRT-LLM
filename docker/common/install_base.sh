@@ -116,6 +116,7 @@ init_ubuntu() {
   if ! command -v mpirun &> /dev/null; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openmpi-bin libopenmpi-dev
   fi
+  bash "$(dirname "${BASH_SOURCE[0]}")/install_openmpi_wait_sync.sh"
 
   # PEP 668: Allow break system packages for ubuntu24.04,
   # and ubuntu22.04 (currently not used) shouldn't be affected.
@@ -223,9 +224,6 @@ case "$ID" in
     exit 1
     ;;
 esac
-
-# Apply the ARM64 HPC-X OpenMPI wait-sync barriers before building mpi4py.
-bash "$(dirname "${BASH_SOURCE[0]}")/install_openmpi_wait_sync.sh"
 
 # Final cleanup
 cleanup

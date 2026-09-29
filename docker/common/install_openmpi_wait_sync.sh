@@ -23,10 +23,13 @@ OPENMPI_PREFIX=/opt/hpcx/ompi5
 # against HPC-X 2.50's OpenMPI v5.0.10rc2-gb99be7132e source archive.
 OPENMPI_PATCH="${SCRIPT_DIR}/patches/openmpi/d054029e-request-add-wait-sync-memory-barriers.diff"
 
-if [[ "$(uname -m)" != "aarch64" ]]; then
-    echo "Skipping the OpenMPI wait-sync backport outside ARM64 images"
-    exit 0
-fi
+case "$(uname -m)" in
+    aarch64|x86_64) ;;
+    *)
+        echo "Skipping the OpenMPI wait-sync backport on an unsupported architecture"
+        exit 0
+        ;;
+esac
 
 active_openmpi_prefix="$(readlink -f /usr/local/mpi 2>/dev/null || true)"
 if [[ "${active_openmpi_prefix}" != "${OPENMPI_PREFIX}" ]]; then
