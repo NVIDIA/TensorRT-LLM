@@ -28,8 +28,8 @@ import yaml
 from defs.common import get_free_port_in_ci as get_free_port
 from defs.conftest import get_sm_version, skip_no_hopper
 from disagg_test_utils import (HEARTBEAT_INTERVAL, INACTIVE_TIMEOUT,
-                               run_ctx_worker, run_disagg_server,
-                               run_gen_worker, terminate,
+                               get_registered_worker_urls, run_ctx_worker,
+                               run_disagg_server, run_gen_worker, terminate,
                                wait_for_disagg_server_ready)
 from transformers import AutoTokenizer
 
@@ -614,35 +614,35 @@ def background_workers(llm_venv, config_file: str):
 
     ctx_workers = []
     gen_workers = []
-    ctx_urls = []
-    gen_urls = []
     next_device = 0
 
     import torch
     num_gpus = torch.cuda.device_count()
 
+    # port=0 lets each worker bind an OS-assigned port in its own process and
+    # register it with the cluster, instead of pre-picking a port here and
+    # racing whoever takes it before the worker rebinds it. The real URLs are
+    # read back from the cluster registry once the server reports ready.
     for i in range(num_ctx):
-        port = get_free_port()
-        ctx_urls.append(f"http://localhost:{port}")
         ctx_workers.append(
             run_ctx_worker(model,
                            ctx_worker_config,
                            work_dir,
-                           port=port,
+                           port=0,
                            device=next_device % num_gpus,
-                           env=env))
+                           env=env,
+                           worker_index=i))
         next_device += gpus_per_ctx
 
     for i in range(num_gen):
-        port = get_free_port()
-        gen_urls.append(f"http://localhost:{port}")
         gen_workers.append(
             run_gen_worker(model,
                            gen_worker_config,
                            work_dir,
-                           port=port,
+                           port=0,
                            device=next_device % num_gpus,
-                           env=env))
+                           env=env,
+                           worker_index=i))
         next_device += gpus_per_gen
 
     server_config = {
@@ -664,6 +664,10 @@ def background_workers(llm_venv, config_file: str):
 
     try:
         asyncio.run(wait_for_disagg_server_ready(disagg_port))
+        ctx_urls, gen_urls = get_registered_worker_urls(disagg_port)
+        assert len(ctx_urls) == num_ctx and len(gen_urls) == num_gen, (
+            f"Expected {num_ctx} ctx and {num_gen} gen workers registered, "
+            f"got {ctx_urls} and {gen_urls}")
         yield ctx_urls, gen_urls, disagg_port, internal_request_auth_key
     except Exception:
         logger.error("-------- Service discovery workers error --------")

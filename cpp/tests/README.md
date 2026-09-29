@@ -6,30 +6,24 @@ This document explains how to build and run the C++ tests, and the included [res
 
 The unit tests can be launched via the Pytest script in [test_unit_tests.py](../../tests/integration/defs/cpp/test_unit_tests.py). These do not require engines to be built. The Pytest script will also build TRT-LLM.
 
-The Pytest scripts in [test_e2e.py](../../tests/integration/defs/cpp/test_e2e.py) and [test_multi_gpu.py](../../tests/integration/defs/cpp/test_multi_gpu.py) build TRT-LLM, build engines, and generate expected outputs and execute the end-to-end C++ tests all in one go.
-`test_e2e.py` and `test_multi_gpu.py` contain single and multi-device tests, respectively.
+The Pytest script in [test_multi_gpu.py](../../tests/integration/defs/cpp/test_multi_gpu.py) builds TRT-LLM, builds engines, and generates expected outputs and executes the end-to-end multi-device C++ tests all in one go.
 
 To get an overview of the tests and their parameterization, call:
 
 ```bash
 pytest tests/integration/defs/cpp/test_unit_tests.py --collect-only
-pytest tests/integration/defs/cpp/test_e2e.py --collect-only
 pytest tests/integration/defs/cpp/test_multi_gpu.py --collect-only
 ```
 
 All tests take the number of the CUDA architecture of the GPU you wish to use as a parameter e.g. 90 for Hopper.
 
-It is possible to choose unit tests or a single model for end-to-end tests.
+It is possible to choose individual unit tests or multi-device tests.
 Example calls could look like this:
 
 ```bash
 export LLM_MODELS_ROOT="/path/to/model_cache"
 
 pytest tests/integration/defs/cpp/test_unit_tests.py::test_unit_tests[runtime-90]
-
-pytest tests/integration/defs/cpp/test_e2e.py::test_model[llama-90]
-
-pytest tests/integration/defs/cpp/test_e2e.py::test_benchmarks[gpt-90]
 
 pytest tests/integration/defs/cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[gpt-mpi_kvcache-90]
 ```

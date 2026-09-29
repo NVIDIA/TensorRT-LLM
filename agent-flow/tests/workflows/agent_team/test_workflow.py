@@ -504,8 +504,11 @@ def _stub_agents(
         data[progress_module._STAGE_BY_AGENT[agent]].append(entry)
         progress_module.write_progress(workflow.progress_path, data)
 
-    def plan_drafter(iteration: int, mode: str):
-        trace.append((iteration, f"plan_drafter:{mode}"))
+    def plan_drafter(iteration: int, mode: str, feedback_triggered: bool = False):
+        # Feedback-forced replan turns are tagged ``+feedback`` so tests
+        # can assert the flag threaded through the sub-cycle.
+        suffix = "+feedback" if feedback_triggered else ""
+        trace.append((iteration, f"plan_drafter:{mode}{suffix}"))
         if mode not in drafter_iters:
             raise AssertionError(
                 f"plan_drafter stub was invoked with mode={mode!r} but "
@@ -523,11 +526,12 @@ def _stub_agents(
             },
         )
 
-    def plan_reviewer(iteration: int, phase: str = "initial"):
+    def plan_reviewer(iteration: int, phase: str = "initial", feedback_triggered: bool = False):
         # Tag the trace entry so replan-review calls are distinguishable
         # from initial plan-phase reviews, but keep the initial-mode tag
         # bare so the existing tests' trace assertions still match.
-        label = "plan_reviewer" if phase == "initial" else f"plan_reviewer:{phase}"
+        suffix = "+feedback" if feedback_triggered else ""
+        label = "plan_reviewer" if phase == "initial" else f"plan_reviewer:{phase}{suffix}"
         trace.append((iteration, label))
         decision = next(plan_reviewer_iter, "APPROVE")
         _append(
@@ -1638,10 +1642,15 @@ def test_coder_prompt_documents_ask_human():
     """Coder system prompt must mention ``ask_human`` and its surrounding contract.
 
     It must cover the strict last-resort framing, the build-stage opt-in
-    flag, and the no-reply contract.
+    flag, and the no-reply contract. ``ask_human`` is an MCP tool, so the
+    contract lives in the conditionally-appended MCP-tools block rather
+    than in the transport-neutral base prompt.
     """
     module = _load_module()
-    text = module.DEFAULT_PROMPTS.coder
+    from agent_flow.workflows.agent_team.prompts import MCP_TOOLS_EXTENSIONS
+
+    text = module.DEFAULT_PROMPTS.coder + MCP_TOOLS_EXTENSIONS["coder"]
+    assert "ask_human" not in module.DEFAULT_PROMPTS.coder
     assert "ask_human" in text
     assert "Asking the human as a last resort" in text
     assert "(no response from human)" in text
@@ -1652,49 +1661,69 @@ def test_coder_prompt_documents_ask_human():
     assert "default: do not call it" in text.lower()
 
 
-def test_coder_and_reviewer_required_tools_include_status_update(tmp_path):
-    """The composed Stop hook must enforce both progress and status calls."""
+def test_base_prompts_name_no_mcp_tool():
+    """Every base prompt must be transport-neutral.
+
+    A tool name in the base prompt is the bug this split exists to
+    prevent: under ``--no-mcp-tools`` the tool is not registered, so the
+    prompt would be instructing the role to call something it does not
+    have. Mechanism belongs in ``MCP_TOOLS_EXTENSIONS`` only.
+    """
+    module = _load_module()
+    tools = (
+        "append_",
+        "read_latest_progress",
+        "read_latest_build_progress",
+        "read_human_feedback",
+        "read_status",
+        "update_status",
+        "ask_human",
+    )
+    for role in ("plan_drafter", "plan_reviewer", "coder", "reviewer", "qa"):
+        text = getattr(module.DEFAULT_PROMPTS, role)
+        for tool in tools:
+            assert tool not in text, f"base {role} prompt names the MCP tool {tool!r}"
+
+
+def test_every_registered_tool_is_documented_in_the_role_prompt(tmp_path):
+    """In MCP mode, each role's prompt must document every tool it was handed.
+
+    Guards the other direction of the split: moving a tool's instructions
+    into ``MCP_TOOLS_EXTENSIONS`` must not drop any of them on the floor.
+    """
     module = _load_module()
     workflow = _make_workflow(module, tmp_path)
     try:
-        # Each per-tool hook is a separate matcher; with two required tools
-        # we expect two matchers stacked together (composition = AND).
-        coder_hooks = workflow.coder.config.backend.hooks
-        reviewer_hooks = workflow.reviewer.config.backend.hooks
-        plan_drafter_hooks = workflow.plan_drafter.config.backend.hooks
-        plan_reviewer_hooks = workflow.plan_reviewer.config.backend.hooks
-        qa_hooks = workflow.qa.config.backend.hooks
-
-        assert coder_hooks is not None
-        assert len(coder_hooks["Stop"]) == 2
-        assert reviewer_hooks is not None
-        assert len(reviewer_hooks["Stop"]) == 2
-
-        # PlanDrafter, PlanReviewer, and QA each have a single required
-        # tool — one matcher.
-        assert plan_drafter_hooks is not None
-        assert len(plan_drafter_hooks["Stop"]) == 1
-        assert plan_reviewer_hooks is not None
-        assert len(plan_reviewer_hooks["Stop"]) == 1
-        assert qa_hooks is not None
-        assert len(qa_hooks["Stop"]) == 1
+        for role in ("plan_drafter", "plan_reviewer", "coder", "reviewer", "qa"):
+            agent = getattr(workflow, role)
+            registered = [t.name for t in (agent.config.backend.tools or [])]
+            assert registered, f"{role} has no in-process tools to document"
+            for name in registered:
+                assert name in agent.config.system_prompt, (
+                    f"{role} is handed {name!r} but its prompt never mentions it"
+                )
     finally:
         workflow.close()
 
 
-def test_compose_required_tools_hooks_handles_empty_and_single(tmp_path):
-    """Helper returns ``None`` for empty and one matcher for a single tool."""
+def test_coder_and_reviewer_required_tools_include_status_update(tmp_path):
+    """Every role declares all required calls, including Codex-backed roles."""
     module = _load_module()
-
-    assert module._compose_required_tools_hooks([]) is None
-
-    single = module._compose_required_tools_hooks(["append_plan_drafter_progress"])
-    assert single is not None
-    assert len(single["Stop"]) == 1
-
-    pair = module._compose_required_tools_hooks(["append_coder_progress", "update_status"])
-    assert pair is not None
-    assert len(pair["Stop"]) == 2
+    workflow = _make_workflow(module, tmp_path)
+    try:
+        expected = {
+            "coder": ("append_coder_progress", "update_status"),
+            "reviewer": ("append_reviewer_progress", "update_status"),
+            "plan_drafter": ("append_plan_drafter_progress",),
+            "plan_reviewer": ("append_plan_reviewer_progress",),
+            "qa": ("append_qa_progress",),
+        }
+        for role, names in expected.items():
+            config = getattr(workflow, role).config
+            assert config.required_tools == names
+            assert config.backend.hooks is None
+    finally:
+        workflow.close()
 
 
 def test_qa_uses_stateless_session(tmp_path):
@@ -2252,6 +2281,7 @@ def test_resume_from_qa_skips_coder_and_reviewer(tmp_path):
     assert state.done is True
 
 
+@pytest.mark.live_backend
 def test_claude_agents_baseline_context_under_20_percent(tmp_path):
     """Each Claude-backed team agent's pre-input context must stay < 20%.
 
@@ -3077,10 +3107,13 @@ def test_trigger_replan_with_feedback_enters_replan_subcycle_on_resume(tmp_path)
         workflow.close()
 
     # The first (and only) build-phase agent is the replan PlanDrafter at
-    # the upcoming iteration — the coder was skipped entirely.
-    assert trace == [(2, "plan_drafter:replan")]
+    # the upcoming iteration — the coder was skipped entirely — and the
+    # turn is marked feedback-triggered.
+    assert trace == [(2, "plan_drafter:replan+feedback")]
     state = module.load_state(tmp_path / module.STATE_FILENAME)
     assert state.done is True
+    # The feedback-replan flag is cleared once the sub-cycle terminates.
+    assert state.feedback_replan is False
 
 
 def test_trigger_replan_with_feedback_is_noop_without_feedback(tmp_path):
@@ -3130,4 +3163,374 @@ def test_trigger_replan_with_feedback_replans_after_completed_run(tmp_path):
     finally:
         workflow.close()
 
-    assert trace[0] == (2, "plan_drafter:replan")
+    assert trace[0] == (2, "plan_drafter:replan+feedback")
+
+
+def test_feedback_replan_flag_roundtrips_and_defaults_false(tmp_path):
+    """``feedback_replan`` round-trips through save/load, defaulting to False.
+
+    Checkpoints written before the field existed load with it defaulting to
+    False.
+    """
+    module = _load_module()
+    path = tmp_path / module.STATE_FILENAME
+
+    state = module.WorkflowState(
+        task_path="t", num_iterations=3, stage=module.STAGE_REPLAN, feedback_replan=True
+    )
+    module.save_state(path, state)
+    assert module.load_state(path).feedback_replan is True
+
+    # A pre-existing checkpoint without the key loads as False.
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    del payload["feedback_replan"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert module.load_state(path).feedback_replan is False
+
+
+def test_feedback_replan_flag_survives_replan_reviewer_reject_loop(tmp_path):
+    """The feedback-triggered framing survives a reviewer REJECT loop.
+
+    A feedback-forced replan that goes DRAFT_READY → reviewer REJECT →
+    replan retry keeps the framing on the retried drafter turn, and clears
+    it once the reviewer APPROVEs back to the coder.
+    """
+    module = _load_module()
+    _seed_replan_feedback_resume(module, tmp_path, stage=module.STAGE_CODER)
+
+    workflow = module.AgentTeamWorkflow(
+        workspace=tmp_path,
+        num_iterations=3,
+        replan_on_qa=True,
+        trigger_replan_with_feedback=True,
+        feedback="rebuild the extension in the target container",
+    )
+    trace = _stub_agents(
+        workflow,
+        plan_drafter_decisions={"replan": ["DRAFT_READY", "DRAFT_READY", "DONE"]},
+        plan_reviewer_decisions=["REJECT", "APPROVE"],
+        qa_decisions=["APPROVE"],
+    )
+    workflow._run_plan_phase = lambda *_a, **_kw: None  # defense
+    try:
+        workflow.run(_write_task_yaml(workflow.workspace))
+    finally:
+        workflow.close()
+
+    # Feedback framing persists across the in-sub-cycle REJECT retry …
+    assert trace[:4] == [
+        (2, "plan_drafter:replan+feedback"),
+        (2, "plan_reviewer:replan+feedback"),
+        (2, "plan_drafter:replan+feedback"),
+        (2, "plan_reviewer:replan+feedback"),
+    ]
+    # … and is dropped once the sub-cycle hands back to the coder: the
+    # post-QA replan of the next iteration is an ordinary one.
+    assert (3, "coder") in trace
+    assert (3, "plan_drafter:replan") in trace
+    state = module.load_state(tmp_path / module.STATE_FILENAME)
+    assert state.feedback_replan is False
+
+
+def test_replan_drafter_prompt_flags_feedback_trigger(tmp_path):
+    """The drafter replan prompt surfaces the feedback-triggered framing.
+
+    ``_run_plan_drafter(mode="replan", feedback_triggered=True)`` must
+    surface the framing in the user prompt; an ordinary post-QA replan
+    prompt must not carry it.
+    """
+    module = _load_module()
+
+    for flag, expected in ((True, True), (False, False)):
+        captured: list[str] = []
+        workflow = module.AgentTeamWorkflow(
+            workspace=tmp_path,
+            clean=True,
+            replan_on_qa=True,
+        )
+        real_drafter = workflow.plan_drafter
+        try:
+            workflow.plan_drafter = lambda prompt: captured.append(prompt) or ""
+            workflow._run_plan_drafter(iteration=1, mode="replan", feedback_triggered=flag)
+        finally:
+            workflow.plan_drafter = real_drafter
+            workflow.close()
+
+        assert len(captured) == 1
+        present = "Feedback-triggered replan" in captured[0]
+        assert present is expected, (
+            f"feedback_triggered={flag}: expected marker presence "
+            f"{expected}, prompt head: {captured[0][:200]!r}"
+        )
+
+
+def test_replan_reviewer_prompt_flags_feedback_trigger(tmp_path):
+    """The reviewer replan prompt flags a feedback-forced revision.
+
+    ``_run_plan_reviewer(phase="replan", feedback_triggered=True)`` must
+    tell the reviewer the revision came from a feedback-forced turn; the
+    ordinary replan review must not.
+    """
+    module = _load_module()
+
+    for flag, expected in ((True, True), (False, False)):
+        captured: list[str] = []
+        workflow = module.AgentTeamWorkflow(
+            workspace=tmp_path,
+            clean=True,
+            replan_on_qa=True,
+        )
+        real_reviewer = workflow.plan_reviewer
+        try:
+            workflow.plan_reviewer = lambda prompt: captured.append(prompt) or ""
+            workflow._run_plan_reviewer(iteration=1, phase="replan", feedback_triggered=flag)
+        finally:
+            workflow.plan_reviewer = real_reviewer
+            workflow.close()
+
+        assert len(captured) == 1
+        present = "feedback-triggered" in captured[0]
+        assert present is expected, (
+            f"feedback_triggered={flag}: expected marker presence "
+            f"{expected}, prompt head: {captured[0][:200]!r}"
+        )
+
+
+# --------------------------------------------------------------------------
+# No-in-process-MCP mode (--no-mcp-tools)
+# --------------------------------------------------------------------------
+
+
+def test_no_mcp_mode_builds_agents_without_tools(tmp_path):
+    """Every role — claude-code *and* codex backed — loses its custom tools."""
+    module = _load_module()
+    wf = module.AgentTeamWorkflow(workspace=tmp_path, use_in_process_tools=False)
+    try:
+        assert wf.use_in_process_tools is False
+        for agent in (wf.plan_drafter, wf.plan_reviewer, wf.coder, wf.reviewer, wf.qa):
+            assert agent.config.backend.tools is None
+            assert agent.config.backend.hooks is None
+            assert agent.config.required_tools == ()
+            assert agent.config.human_input_enabled is False
+        # The backend split itself is untouched: only the tools are dropped.
+        assert wf.plan_drafter.config.backend.kind == "codex"
+        assert wf.reviewer.config.backend.kind == "codex"
+        assert wf.coder.config.backend.kind == "claude-code"
+    finally:
+        wf.close()
+
+
+def test_mcp_mode_is_the_default_and_keeps_tools(tmp_path):
+    module = _load_module()
+    wf = module.AgentTeamWorkflow(workspace=tmp_path)
+    try:
+        assert wf.use_in_process_tools is True
+        assert wf.plan_drafter.config.backend.tools is not None
+        assert wf.plan_drafter.config.required_tools == ("append_plan_drafter_progress",)
+        assert wf.plan_drafter.config.human_input_enabled is True
+    finally:
+        wf.close()
+
+
+def test_no_mcp_mode_resets_rebuild_agents_without_tools(tmp_path):
+    """Context recycling must not silently re-arm the MCP tools."""
+    module = _load_module()
+    wf = module.AgentTeamWorkflow(workspace=tmp_path, use_in_process_tools=False)
+    try:
+        wf._reset_coder()
+        wf._reset_reviewer()
+        assert wf.coder.config.backend.tools is None
+        assert wf.coder.config.backend.hooks is None
+        assert wf.coder.config.required_tools == ()
+        assert wf.reviewer.config.backend.tools is None
+        assert wf.reviewer.config.backend.hooks is None
+        assert wf.reviewer.config.required_tools == ()
+    finally:
+        wf.close()
+
+
+class _HandoffStub:
+    """Callable agent stand-in with a no-op ``__exit__`` (safe for ``close()``).
+
+    ``on_call(stub, prompt)`` runs on each invocation; it can inspect
+    ``stub.calls`` (1-based within the call) and write a handoff file.
+    """
+
+    def __init__(self, on_call) -> None:
+        self.calls = 0
+        self.prompts: list[str] = []
+        self._on_call = on_call
+
+    def __call__(self, prompt: str) -> None:
+        self.calls += 1
+        self.prompts.append(prompt)
+        self._on_call(self, prompt)
+
+    def __exit__(self, *_args, **_kwargs) -> None:
+        return None
+
+
+def test_invoke_agent_records_handoff(tmp_path):
+    module = _load_module()
+    from agent_flow.workflows.agent_team import mcpless
+
+    wf = module.AgentTeamWorkflow(workspace=tmp_path, use_in_process_tools=False)
+    wf.coder.__exit__(None, None, None)
+
+    stub = _HandoffStub(
+        lambda s, p: mcpless.handoff_path(wf.turn_dir, "coder").write_text(
+            "summary: did the thing\n", encoding="utf-8"
+        )
+    )
+    wf.coder = stub
+    try:
+        wf._invoke_agent("coder", wf.coder, "PROMPT", 5)
+        entry = progress_module.latest_entry(wf.progress_path, "coder")
+        assert entry["summary"] == "did the thing"
+        assert entry["iteration"] == 5
+        assert entry["agent"] == "coder"
+    finally:
+        wf.close()
+
+
+def test_invoke_agent_missing_handoff_retries_then_raises(tmp_path):
+    module = _load_module()
+    from agent_flow.workflows.agent_team import mcpless
+
+    wf = module.AgentTeamWorkflow(workspace=tmp_path, use_in_process_tools=False)
+    wf.reviewer.__exit__(None, None, None)
+
+    stub = _HandoffStub(lambda s, p: None)  # never writes a handoff
+    wf.reviewer = stub
+    try:
+        with pytest.raises(mcpless.HandoffError):
+            wf._invoke_agent("reviewer", wf.reviewer, "P", 1)
+        assert stub.calls == 2  # initial attempt + one corrective retry
+        assert "=== RETRY ===" in stub.prompts[1]
+    finally:
+        wf.close()
+
+
+def test_invoke_agent_invalid_then_valid_handoff_recovers(tmp_path):
+    module = _load_module()
+    from agent_flow.workflows.agent_team import mcpless
+
+    wf = module.AgentTeamWorkflow(workspace=tmp_path, use_in_process_tools=False)
+    wf.qa.__exit__(None, None, None)
+
+    def _on_call(s, p):
+        hp = mcpless.handoff_path(wf.turn_dir, "qa")
+        if s.calls == 1:
+            hp.write_text("summary: s\ndecision: MAYBE\n", encoding="utf-8")  # bad enum
+        else:
+            hp.write_text("summary: s\ndecision: APPROVE\nweighted_score: 9\n", encoding="utf-8")
+
+    stub = _HandoffStub(_on_call)
+    wf.qa = stub
+    try:
+        wf._invoke_agent("qa", wf.qa, "P", 2)
+        assert stub.calls == 2
+        assert progress_module.latest_entry(wf.progress_path, "qa")["decision"] == "APPROVE"
+    finally:
+        wf.close()
+
+
+def test_invoke_agent_ignores_a_stale_handoff_from_a_prior_turn(tmp_path):
+    """A leftover file must not be mistaken for this turn's handoff."""
+    module = _load_module()
+    from agent_flow.workflows.agent_team import mcpless
+
+    wf = module.AgentTeamWorkflow(workspace=tmp_path, use_in_process_tools=False)
+    wf.coder.__exit__(None, None, None)
+
+    wf.turn_dir.mkdir(parents=True, exist_ok=True)
+    mcpless.handoff_path(wf.turn_dir, "coder").write_text(
+        "summary: stale from last turn\n", encoding="utf-8"
+    )
+
+    stub = _HandoffStub(lambda s, p: None)  # writes nothing this turn
+    wf.coder = stub
+    try:
+        with pytest.raises(mcpless.HandoffError):
+            wf._invoke_agent("coder", wf.coder, "P", 1)
+        assert progress_module.latest_entry(wf.progress_path, "coder") is None
+    finally:
+        wf.close()
+
+
+def test_invoke_agent_prepends_preamble_and_keeps_original_prompt(tmp_path):
+    module = _load_module()
+    from agent_flow.workflows.agent_team import mcpless
+
+    wf = module.AgentTeamWorkflow(workspace=tmp_path, use_in_process_tools=False)
+    wf.qa.__exit__(None, None, None)
+
+    stub = _HandoffStub(
+        lambda s, p: mcpless.handoff_path(wf.turn_dir, "qa").write_text(
+            "summary: s\ndecision: APPROVE\nweighted_score: 9\n", encoding="utf-8"
+        )
+    )
+    wf.qa = stub
+    try:
+        wf._invoke_agent("qa", wf.qa, "ORIGINAL-PROMPT-BODY", 1)
+        assert "ORIGINAL-PROMPT-BODY" in stub.prompts[0]
+        assert "no in-process MCP tools" in stub.prompts[0]
+        assert str(mcpless.handoff_path(wf.turn_dir, "qa")) in stub.prompts[0]
+    finally:
+        wf.close()
+
+
+def test_mcp_mode_invoke_agent_is_passthrough(tmp_path):
+    module = _load_module()
+    wf = module.AgentTeamWorkflow(workspace=tmp_path, use_in_process_tools=True)
+    wf.coder.__exit__(None, None, None)
+    stub = _PromptStub()
+    wf.coder = stub
+    try:
+        wf._invoke_agent("coder", wf.coder, "PLAIN", 1)
+        assert stub.prompts == ["PLAIN"]  # no preamble, no handoff dance
+    finally:
+        wf.close()
+
+
+def test_no_mcp_mode_run_qa_records_the_verdict_end_to_end(tmp_path):
+    """``_run_qa`` (not just ``_invoke_agent``) lands a real progress entry."""
+    module = _load_module()
+    from agent_flow.workflows.agent_team import mcpless
+
+    wf = module.AgentTeamWorkflow(workspace=tmp_path, use_in_process_tools=False)
+    wf.qa.__exit__(None, None, None)
+
+    stub = _HandoffStub(
+        lambda s, p: mcpless.handoff_path(wf.turn_dir, "qa").write_text(
+            "summary: verified\ndecision: APPROVE\nweighted_score: 9.5\n", encoding="utf-8"
+        )
+    )
+    wf.qa = stub
+    try:
+        wf._run_qa(7)
+        assert wf._latest_qa_decision() == "APPROVE"
+        assert wf._latest_qa_score() == 9.5
+        assert progress_module.latest_entry(wf.progress_path, "qa")["iteration"] == 7
+    finally:
+        wf.close()
+
+
+def test_plan_human_review_flag_rejected_in_no_mcp(tmp_path):
+    module = _load_module()
+    with pytest.raises(ValueError, match="human review"):
+        module.AgentTeamWorkflow(
+            workspace=tmp_path,
+            use_in_process_tools=False,
+            plan_human_review_enabled=True,
+        )
+
+
+def test_build_human_review_flag_rejected_in_no_mcp(tmp_path):
+    module = _load_module()
+    with pytest.raises(ValueError, match="human review"):
+        module.AgentTeamWorkflow(
+            workspace=tmp_path,
+            use_in_process_tools=False,
+            build_human_review_enabled=True,
+        )

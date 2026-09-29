@@ -314,7 +314,7 @@ FROM CUPTI_ACTIVITY_KIND_KERNEL;
 | Attention implementations | `tensorrt_llm/_torch/attention/` |
 | Custom ops | `tensorrt_llm/_torch/custom_ops/` |
 | Triton kernels | `tensorrt_llm/_torch/triton_kernels/` |
-| MoE routing | `tensorrt_llm/_torch/modules/fused_moe/` |
+| MoE routing | `tensorrt_llm/_torch/moe/fused_moe/` |
 
 ## Structured Output
 

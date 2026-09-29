@@ -15,6 +15,7 @@
  */
 
 #include "cuda_graph_grouped_gemm.h"
+#include "fp8GroupedGemmConfig.h"
 #include "groupGemm.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -46,7 +47,7 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 #ifdef ENABLE_FP8
-#if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
+#if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 namespace
 {
 
@@ -55,8 +56,8 @@ void checkFp8CudaGraphAlignment(
 {
     static int const smVersion = tensorrt_llm::common::getSMVersion();
     // CUTLASS also exposes this kernel level on SM120/SM121; enable those after validation.
-    TLLM_CHECK_WITH_INFO(
-        smVersion == 90, "%s requires Hopper (SM90), but the current device is SM%d", kernelName, smVersion);
+    TLLM_CHECK_WITH_INFO(smVersion == fp8GroupedGemmConfig::kSm90 || smVersion == fp8GroupedGemmConfig::kSm100,
+        "%s requires Hopper (SM90) or B200 (SM100), but the current device is SM%d", kernelName, smVersion);
 
     TLLM_CHECK_WITH_INFO(minKN >= kFp8TmaAlignment && minKN % kFp8TmaAlignment == 0,
         "%s requires active LoRA ranks to be multiples of %d elements for 128-bit TMA alignment. "
@@ -79,7 +80,7 @@ void checkFp8CudaGraphAlignment(
 }
 
 } // namespace
-#endif // CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED
+#endif // CUTLASS architecture support
 #endif // ENABLE_FP8
 
 /**
@@ -191,7 +192,7 @@ void cudaGraphGroupedGemmType(cutlass::gemm::GemmCoord* problemSizesPtr, int pro
 }
 
 #ifdef ENABLE_FP8
-#if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
+#if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 
 // ====================================================================
 // FP8 CUDA-graph-compatible grouped GEMM using CUTLASS 3.x.
@@ -200,13 +201,20 @@ void cudaGraphGroupedGemmType(cutlass::gemm::GemmCoord* problemSizesPtr, int pro
 // dimensions already on the GPU and reuses their compatible storage directly.
 // ====================================================================
 
-void fp8CudaGraphGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int problemCount, void** ptrAGpu,
+template <typename Config>
+void fp8CudaGraphGroupedGemmImpl(cutlass::gemm::GemmCoord* problemSizesPtr, int problemCount, void** ptrAGpu,
     void** ptrBGpu, void** ptrCGpu, void** ptrDGpu, int64_t* ldaGpu, int64_t* ldbGpu, int64_t* ldcGpu, int64_t* lddGpu,
     cudaStream_t stream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     using namespace cute;
+
+    using ArchTag = typename Config::ArchTag;
+    using TileShape = typename Config::TileShape;
+    using ClusterShape = typename Config::ClusterShape;
+    using KernelSchedule = typename Config::KernelSchedule;
+    using EpilogueSchedule = typename Config::EpilogueSchedule;
 
     using ElementA = cutlass::float_e4m3_t;
     using ElementB = cutlass::float_e4m3_t;
@@ -224,21 +232,14 @@ void fp8CudaGraphGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int prob
     static constexpr int kAlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
     static constexpr int kAlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
 
-    using ArchTag = cutlass::arch::Sm90;
     using OperatorClass = cutlass::arch::OpClassTensorOp;
-
-    using TileShape = Shape<_128, _128, _128>;
-    using ClusterShape = Shape<_1, _2, _1>;
-
-    using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperativeFP8FastAccum;
-    using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
 
     using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
 
-    using CollectiveEpilogue =
-        typename cutlass::epilogue::collective::CollectiveBuilder<ArchTag, OperatorClass, TileShape, ClusterShape,
-            cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementAccumulator, ElementC, LayoutC*,
-            kAlignmentC, ElementD, LayoutD*, kAlignmentD, EpilogueSchedule>::CollectiveOp;
+    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<ArchTag, OperatorClass,
+        TileShape, ClusterShape, cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator,
+        ElementAccumulator, ElementC, LayoutC*, kAlignmentC, ElementD, LayoutD*, kAlignmentD, EpilogueSchedule,
+        cutlass::epilogue::fusion::LinearCombination<ElementD, ElementAccumulator>>::CollectiveOp;
 
     using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<ArchTag, OperatorClass, ElementA,
         LayoutA*, kAlignmentA, ElementB, LayoutB*, kAlignmentB, ElementAccumulator, TileShape, ClusterShape,
@@ -282,10 +283,21 @@ void fp8CudaGraphGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int prob
     hwInfo.device_id = 0;
     cudaGetDevice(&hwInfo.device_id);
     hwInfo.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hwInfo.device_id);
+    if constexpr (Config::kUsesDynamicClusterShape)
+    {
+        hwInfo.cluster_shape = Config::clusterShape();
+        hwInfo.cluster_shape_fallback = Config::clusterShapeFallback();
+        hwInfo.max_active_clusters = cutlass::KernelHardwareInfo::query_device_max_active_clusters(hwInfo.cluster_shape,
+            GemmKernel::MaxThreadsPerBlock, reinterpret_cast<void const*>(&cutlass::device_kernel<GemmKernel>));
+    }
 
-    typename Gemm::Arguments arguments{cutlass::gemm::GemmUniversalMode::kGrouped,
-        {problemCount, problemShapes, nullptr}, {ptrA, strideA, ptrB, strideB},
-        {{1.0f, 0.0f}, ptrC, strideC, ptrD, strideD}, hwInfo};
+    typename Gemm::Arguments arguments;
+    decltype(arguments.epilogue.thread) fusionArgs{};
+    fusionArgs.alpha = 1.0f;
+    fusionArgs.beta = 0.0f;
+    arguments =
+        typename Gemm::Arguments{cutlass::gemm::GemmUniversalMode::kGrouped, {problemCount, problemShapes, nullptr},
+            {ptrA, strideA, ptrB, strideB}, {fusionArgs, ptrC, strideC, ptrD, strideD}, hwInfo};
 
     Gemm gemm;
 
@@ -315,7 +327,31 @@ void fp8CudaGraphGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int prob
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-#endif // CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED
+void fp8CudaGraphGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int problemCount, void** ptrAGpu,
+    void** ptrBGpu, void** ptrCGpu, void** ptrDGpu, int64_t* ldaGpu, int64_t* ldbGpu, int64_t* ldcGpu, int64_t* lddGpu,
+    cudaStream_t stream)
+{
+    int const smVersion = tensorrt_llm::common::getSMVersion();
+    if (smVersion == fp8GroupedGemmConfig::kSm90)
+    {
+#if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED) && !defined(EXCLUDE_SM_90)
+        fp8CudaGraphGroupedGemmImpl<fp8GroupedGemmConfig::Sm90Config>(
+            problemSizesPtr, problemCount, ptrAGpu, ptrBGpu, ptrCGpu, ptrDGpu, ldaGpu, ldbGpu, ldcGpu, lddGpu, stream);
+        return;
+#endif
+    }
+    else if (smVersion == fp8GroupedGemmConfig::kSm100)
+    {
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) && !defined(EXCLUDE_SM_100F)
+        fp8CudaGraphGroupedGemmImpl<fp8GroupedGemmConfig::Sm100Config>(
+            problemSizesPtr, problemCount, ptrAGpu, ptrBGpu, ptrCGpu, ptrDGpu, ldaGpu, ldbGpu, ldcGpu, lddGpu, stream);
+        return;
+#endif
+    }
+    TLLM_CHECK_WITH_INFO(false, "FP8 CUDA graph grouped GEMM was not compiled for SM%d", smVersion);
+}
+
+#endif // CUTLASS architecture support
 #endif // ENABLE_FP8
 
 void cudaGraphGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int problemCount, void** ptrAGpu, void** ptrBGpu,
@@ -323,7 +359,7 @@ void cudaGraphGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int problem
     tensorrt_llm::DataType dataType, int minKN, cutlass::gemm::GemmCoord* hostMaxProblemSizesPtr, cudaStream_t stream)
 {
 #ifdef ENABLE_FP8
-#if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
+#if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
     if (dataType == tensorrt_llm::DataType::kFP8)
     {
         checkFp8CudaGraphAlignment(hostMaxProblemSizesPtr, problemCount, minKN, "FP8 CUDA graph grouped GEMM");
@@ -335,10 +371,10 @@ void cudaGraphGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int problem
     if (dataType == tensorrt_llm::DataType::kFP8)
     {
         TLLM_CHECK_WITH_INFO(false,
-            "FP8 CUDA graph grouped GEMM requires CUTLASS modifiable TMA support (CUDA 12.3+ and Hopper SM90 "
+            "FP8 CUDA graph grouped GEMM requires CUTLASS modifiable TMA support (CUDA 12.3+ and SM90/SM100 "
             "kernels).");
     }
-#endif // CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED
+#endif // CUTLASS architecture support
 #endif // ENABLE_FP8
 
     if (isLoraIn)
@@ -510,7 +546,7 @@ void cudaGraphSplitKGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int p
     cutlass::gemm::GemmCoord* hostMaxProblemSizesPtr, int64_t* splitKOffsetsGpu, cudaStream_t stream)
 {
 #ifdef ENABLE_FP8
-#if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
+#if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
     if (dataType == tensorrt_llm::DataType::kFP8)
     {
         // Reuse the non-split-K fp8 path; CUTLASS 3.x cooperative schedule handles large-K efficiently.
@@ -523,10 +559,10 @@ void cudaGraphSplitKGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int p
     if (dataType == tensorrt_llm::DataType::kFP8)
     {
         TLLM_CHECK_WITH_INFO(false,
-            "FP8 CUDA graph split-K grouped GEMM requires CUTLASS modifiable TMA support (CUDA 12.3+ and Hopper SM90 "
+            "FP8 CUDA graph split-K grouped GEMM requires CUTLASS modifiable TMA support (CUDA 12.3+ and SM90/SM100 "
             "kernels).");
     }
-#endif // CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED
+#endif // CUTLASS architecture support
 #endif // ENABLE_FP8
 
     if (isLoraIn)

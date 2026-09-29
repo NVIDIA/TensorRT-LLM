@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 LongBench v1 evaluation script with TensorRT-LLM and sparse attention.
 
@@ -35,6 +49,7 @@ from transformers import AutoTokenizer
 
 # Add tensorrt_llm imports
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.evaluate.lm_eval import _replace_fuzzywuzzy_with_rapidfuzz
 from tensorrt_llm.llmapi import (CudaGraphConfig, DeepSeekSparseAttentionConfig,
                                  KvCacheConfig, MoeConfig, MTPDecodingConfig,
                                  RocketSparseAttentionConfig)
@@ -107,7 +122,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument('--backend',
                         type=str,
                         default='pytorch',
-                        choices=['pytorch', 'tensorrt'],
+                        choices=['pytorch'],
                         help='LLM backend to use')
     parser.add_argument('--chat_template',
                         type=str,
@@ -376,12 +391,6 @@ def initialize_llm(args: argparse.Namespace) -> Tuple[LLM, AutoTokenizer]:
             enable_padding=args.cuda_graph_padding_enabled,
         ) if args.use_cuda_graph else None
 
-        # Validate backend compatibility
-        if args.backend == 'tensorrt' and (args.dsa_sparse or args.mtp > 0):
-            parser.error(
-                "DSA sparse attention and MTP speculative decoding require "
-                "--backend pytorch (tensorrt backend is not supported)")
-
         # Configure sparse attention
         if args.rocket_sparse:
             sparse_attention_config = RocketSparseAttentionConfig(
@@ -566,10 +575,12 @@ def calculate_metrics(
     # Setup LongBench imports
     setup_longbench_imports(longbench_path)
 
-    # Import LongBench metrics
-    from metrics import (classification_score, code_sim_score, count_score,
-                         qa_f1_score, qa_f1_zh_score, retrieval_score,
-                         retrieval_zh_score, rouge_score, rouge_zh_score)
+    # LongBench still imports FuzzyWuzzy by name. Supply RapidFuzz while its
+    # metrics module loads so the example does not require FuzzyWuzzy.
+    with _replace_fuzzywuzzy_with_rapidfuzz():
+        from metrics import (classification_score, code_sim_score, count_score,
+                             qa_f1_score, qa_f1_zh_score, retrieval_score,
+                             retrieval_zh_score, rouge_score, rouge_zh_score)
 
     # Mapping of datasets to their metric functions (from LongBench)
     dataset2metric = {

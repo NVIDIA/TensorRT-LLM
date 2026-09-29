@@ -1,5 +1,3 @@
-import os
-import sys
 import time
 
 import pytest
@@ -9,7 +7,6 @@ from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
 from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 
 # isort: off
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from utils.llm_data import llm_models_root
 from utils.util import skip_single_gpu
 # isort: on
@@ -59,15 +56,15 @@ def test_lora_request_does_not_probe_filesystem_on_init(tmp_path):
     assert request.path == missing_path
 
 
-def create_fake_executor_config(engine_path, tp_size: int = 1):
-    """Create TorchLlmArgs and executor_config for testing.
+def create_fake_llm_args(engine_path, tp_size: int = 1):
+    """Create TorchLlmArgs for testing.
 
     Args:
         engine_path: Path to the model
         tp_size: Tensor parallel size
 
     Returns:
-        Tuple of (llm_args, executor_config)
+        TorchLlmArgs
     """
     llm_args = TorchLlmArgs(
         model=engine_path,
@@ -78,9 +75,7 @@ def create_fake_executor_config(engine_path, tp_size: int = 1):
         max_batch_size=8,  # Set reasonable batch size for tests
         max_num_tokens=2048,  # Set reasonable max tokens
     )
-    # executor_config is not needed for PyTorch backend
-    executor_config = None
-    return llm_args, executor_config
+    return llm_args
 
 
 class FakeWorker(BaseWorker):

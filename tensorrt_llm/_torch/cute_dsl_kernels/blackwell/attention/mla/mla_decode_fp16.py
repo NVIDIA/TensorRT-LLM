@@ -142,6 +142,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         num_heads: int = 128,
         seq_len_q: int = 1,
         fold_sq: bool = False,
+        emit_softmax_stats: bool = False,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -176,6 +177,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             Required when ``num_heads < mma_qk_tiler_mn[0]`` and ``seq_len_q > 1``
             so the M tile is fully populated.
         :type fold_sq: bool
+        :param emit_softmax_stats: Whether to fuse Helix softmax-statistics
+            stores into the attention epilogue.
+        :type emit_softmax_stats: bool
         """
 
         self.latent_dim = 512
@@ -203,6 +207,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         # When fold_sq=True but the derived ratio is 1, the folding branch
         # is taken with F=1 (a no-op transform).
         self.fold_sq = fold_sq
+        self.emit_softmax_stats = emit_softmax_stats
         self.fold_sq_ratio = (
             BlackwellMultiHeadLatentAttentionForwardFP16.compute_fold_sq_ratio(
                 num_heads, seq_len_q, mma_qk_tiler_mn[0]))
@@ -306,12 +311,100 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         workspace: cute.Tensor,
         split_kv: cutlass.Int32,
         cache_seqs: Optional[cute.Tensor],
+        kv_bounds: Optional[cute.Tensor],
+        block_split_kvs: Optional[cute.Tensor],
+        softmax_scale: cutlass.Float32,
+        output_scale: cutlass.Float32,
+        stream: cuda.CUstream,
+    ):
+        self._run(
+            q_latent,
+            q_rope,
+            c_latent,
+            c_rope,
+            page_table,
+            o,
+            lse,
+            None,
+            workspace,
+            split_kv,
+            cache_seqs,
+            kv_bounds,
+            block_split_kvs,
+            softmax_scale,
+            output_scale,
+            stream,
+        )
+
+    @cute.jit
+    def run_with_softmax_stats(
+        self,
+        q_latent: cute.Tensor,
+        q_rope: cute.Tensor,
+        c_latent: cute.Tensor,
+        c_rope: cute.Tensor,
+        page_table: cute.Tensor,
+        o: cute.Tensor,
+        lse: cute.Tensor,
+        softmax_stats: cute.Tensor,
+        workspace: cute.Tensor,
+        split_kv: cutlass.Int32,
+        cache_seqs: Optional[cute.Tensor],
+        kv_bounds: Optional[cute.Tensor],
+        block_split_kvs: Optional[cute.Tensor],
+        softmax_scale: cutlass.Float32,
+        output_scale: cutlass.Float32,
+        stream: cuda.CUstream,
+    ):
+        self._run(
+            q_latent,
+            q_rope,
+            c_latent,
+            c_rope,
+            page_table,
+            o,
+            lse,
+            softmax_stats,
+            workspace,
+            split_kv,
+            cache_seqs,
+            kv_bounds,
+            block_split_kvs,
+            softmax_scale,
+            output_scale,
+            stream,
+        )
+
+    @cute.jit
+    def _run(
+        self,
+        q_latent: cute.Tensor,
+        q_rope: cute.Tensor,
+        c_latent: cute.Tensor,
+        c_rope: cute.Tensor,
+        page_table: cute.Tensor,
+        o: cute.Tensor,
+        lse: cute.Tensor,
+        softmax_stats: Optional[cute.Tensor],
+        workspace: cute.Tensor,
+        split_kv: cutlass.Int32,
+        cache_seqs: Optional[cute.Tensor],
+        kv_bounds: Optional[cute.Tensor],
         block_split_kvs: Optional[cute.Tensor],
         softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,
         stream: cuda.CUstream,
     ):
         """Execute the Multi-Head Latent Attention operation on the provided tensors.
+
+        kv_bounds (helix speculative verify groups): optional int32 tensor of
+        shape [batch_size * seq_len_q]; entry b*seq_len_q + q gives the number
+        of this rank's local KV entries query token q of sequence b may attend
+        to (committed prefix + owned in-flight group tokens up to and
+        including itself). When present it replaces the implicit causal bound
+        K - (seq_len_q - 1) + q_tok; values are guaranteed to lie in
+        [K - seq_len_q, K], i.e. inside the span the masked phase already
+        covers for the causal case.
 
         The method handles:
         1. Initialization of workspace for temporary split KV buffers
@@ -335,6 +428,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         :type o: cute.Tensor
         :param lse: The LSE tensor with shape [num_head, seq_len_q, batch_size]
         :type lse: cute.Tensor
+        :param softmax_stats: Optional Helix softmax statistics tensor with shape
+            [num_head, seq_len_q, batch_size, 2]
+        :type softmax_stats: cute.Tensor
         :param workspace: The workspace tensor with 1-d shape prepared for acc_o and acc_lse
         :type workspace: cute.Tensor
         :param split_kv: The scalar factor for split KV
@@ -376,6 +472,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             raise ValueError("o must have leading dimension 1")
         if cutlass.const_expr(lse.stride[0] != 1):
             raise ValueError("lse must have leading dimension 0")
+        if cutlass.const_expr(self.emit_softmax_stats
+                              and softmax_stats.stride[3] != 1):
+            raise ValueError("softmax_stats must have leading dimension 3")
 
         # When num_heads < M tile, fold up to F = fold_sq_ratio tokens of
         # seq_len_q into the head dimension so M_eff = num_heads * F (<= M_tile).
@@ -418,6 +517,24 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                     stride=(lse.stride[0], lse.stride[1] * F, lse.stride[2]),
                 ),
             )
+            if cutlass.const_expr(self.emit_softmax_stats):
+                softmax_stats = cute.make_tensor(
+                    softmax_stats.iterator,
+                    cute.make_layout(
+                        (
+                            softmax_stats.shape[0] * F,
+                            softmax_stats.shape[1] // F,
+                            softmax_stats.shape[2],
+                            softmax_stats.shape[3],
+                        ),
+                        stride=(
+                            softmax_stats.stride[0],
+                            softmax_stats.stride[1] * F,
+                            softmax_stats.stride[2],
+                            softmax_stats.stride[3],
+                        ),
+                    ),
+                )
 
         acc_o, acc_lse = self.initialize_workspace(
             q_latent.shape[0],
@@ -668,40 +785,79 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                                                   self.mma_qk_tiler[1] // 2]
 
         softmax_scale_log2 = softmax_scale * LOG2_E
-        self.split_kv_kernel(
-            qk_tiled_mma,
-            pv_tiled_mma,
-            tma_atom_q_latent,
-            tma_tensor_q_latent,
-            tma_atom_q_rope,
-            tma_tensor_q_rope,
-            tma_atom_c_latent,
-            tma_tensor_c_latent,
-            tma_atom_c_rope,
-            tma_tensor_c_rope,
-            tma_atom_c_latent_transpose,
-            tma_tensor_c_latent_transpose,
-            page_table,
-            o,
-            lse,
-            acc_o,
-            acc_lse,
-            split_kv,
-            cache_seqs,
-            block_split_kvs,
-            softmax_scale_log2,
-            output_scale,
-            q_latent_smem_layout_staged,
-            q_rope_smem_layout_staged,
-            kc_smem_layout_staged,
-            p_smem_layout_staged,
-            vc_smem_layout_staged,
-            kc_smem_layout_for_tma,
-            vc_smem_layout_for_tma,
-            cta_layout_vmnk,
-            tile_sched_params,
-            SplitKVKernelSharedStorage,
-        ).launch(
+        if cutlass.const_expr(self.emit_softmax_stats):
+            split_kv_kernel = self.split_kv_kernel(
+                qk_tiled_mma,
+                pv_tiled_mma,
+                tma_atom_q_latent,
+                tma_tensor_q_latent,
+                tma_atom_q_rope,
+                tma_tensor_q_rope,
+                tma_atom_c_latent,
+                tma_tensor_c_latent,
+                tma_atom_c_rope,
+                tma_tensor_c_rope,
+                tma_atom_c_latent_transpose,
+                tma_tensor_c_latent_transpose,
+                page_table,
+                o,
+                (lse, softmax_stats),
+                acc_o,
+                acc_lse,
+                split_kv,
+                cache_seqs,
+                kv_bounds,
+                block_split_kvs,
+                softmax_scale_log2,
+                output_scale,
+                q_latent_smem_layout_staged,
+                q_rope_smem_layout_staged,
+                kc_smem_layout_staged,
+                p_smem_layout_staged,
+                vc_smem_layout_staged,
+                kc_smem_layout_for_tma,
+                vc_smem_layout_for_tma,
+                cta_layout_vmnk,
+                tile_sched_params,
+                SplitKVKernelSharedStorage,
+            )
+        else:
+            split_kv_kernel = self.split_kv_kernel(
+                qk_tiled_mma,
+                pv_tiled_mma,
+                tma_atom_q_latent,
+                tma_tensor_q_latent,
+                tma_atom_q_rope,
+                tma_tensor_q_rope,
+                tma_atom_c_latent,
+                tma_tensor_c_latent,
+                tma_atom_c_rope,
+                tma_tensor_c_rope,
+                tma_atom_c_latent_transpose,
+                tma_tensor_c_latent_transpose,
+                page_table,
+                o,
+                lse,
+                acc_o,
+                acc_lse,
+                split_kv,
+                cache_seqs,
+                kv_bounds,
+                block_split_kvs,
+                softmax_scale_log2,
+                output_scale,
+                q_latent_smem_layout_staged,
+                q_rope_smem_layout_staged,
+                kc_smem_layout_staged,
+                p_smem_layout_staged,
+                vc_smem_layout_staged,
+                kc_smem_layout_for_tma,
+                vc_smem_layout_for_tma,
+                cta_layout_vmnk,
+                tile_sched_params,
+                SplitKVKernelSharedStorage,
+            )
+        split_kv_kernel.launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
             cluster=self.cluster_shape_mnk,
@@ -710,15 +866,28 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             min_blocks_per_mp=1,
         )
         if cutlass.const_expr(acc_o is not None):
-            self.reduction_kernel(
-                o,
-                lse,
-                acc_o,
-                acc_lse,
-                split_kv,
-                cache_seqs,
-                block_split_kvs,
-            ).launch(
+            if cutlass.const_expr(self.emit_softmax_stats):
+                reduction_kernel = self.reduction_kernel(
+                    o,
+                    (lse, softmax_stats),
+                    acc_o,
+                    acc_lse,
+                    split_kv,
+                    cache_seqs,
+                    block_split_kvs,
+                    kv_bounds,
+                )
+            else:
+                reduction_kernel = self.reduction_kernel(
+                    o,
+                    lse,
+                    acc_o,
+                    acc_lse,
+                    split_kv,
+                    cache_seqs,
+                    block_split_kvs,
+                )
+            reduction_kernel.launch(
                 grid=(q_latent.shape[0], q_latent.shape[2], q_latent.shape[3]),
                 block=[self.threads_per_warp * self.num_compute_warps, 1, 1],
                 smem=MAX_SPLITS * self.acc_dtype.width // 8,
@@ -781,11 +950,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         mCLT: cute.Tensor,
         mPT: cute.Tensor,
         mO: Optional[cute.Tensor],
-        mLSE: Optional[cute.Tensor],
+        mLSE,
         mAccO: Optional[cute.Tensor],
         mAccLSE: Optional[cute.Tensor],
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
+        kv_bounds: Optional[cute.Tensor],
         block_split_kvs: cute.Tensor,
         softmax_scale_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
@@ -840,8 +1010,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         :type mPT: cute.Tensor
         :param mO: Output tensor
         :type mO: cute.Tensor
-        :param mLSE: Log-sum-exp tensor
-        :type mLSE: cute.Tensor
+        :param mLSE: Log-sum-exp tensor, or the compile-time tuple
+            ``(lse, softmax_stats)`` for the Helix variant.
         :param mAccO: Intermediate accumulator output tensor
         :type mAccO: cute.Tensor
         :param mAccLSE: Intermediate accumulator log-sum-exp tensor
@@ -877,6 +1047,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         :param SharedStorage: Shared storage for the kernel
         :type SharedStorage: cutlass.Constexpr
         """
+
+        mSoftmaxStats = None
+        if cutlass.const_expr(self.emit_softmax_stats):
+            mLSE, mSoftmaxStats = mLSE
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -1200,6 +1374,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                         mAccO=mAccO,
                         mO=mO,
                         K=cache_seqs[blk_coord[2]],
+                        kv_bounds=kv_bounds,
                         L=mCL.shape[1],
                         tmem_ptr=tmem_ptr,
                         tidx=tidx,
@@ -1265,12 +1440,21 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                         p_cor_pipeline=p_cor_pipeline,
                         mma_o_pipeline=mma_o_pipeline,
                     )
-                    compute_epilogue_params = SimpleNamespace(
-                        output_scale=output_scale,
-                        softmax_scale_log2=softmax_scale_log2,
-                        mAccLSE=mAccLSE,
-                        mLSE=mLSE,
-                    )
+                    if cutlass.const_expr(self.emit_softmax_stats):
+                        compute_epilogue_params = SimpleNamespace(
+                            output_scale=output_scale,
+                            softmax_scale_log2=softmax_scale_log2,
+                            mAccLSE=mAccLSE,
+                            mLSE=mLSE,
+                            mSoftmaxStats=mSoftmaxStats,
+                        )
+                    else:
+                        compute_epilogue_params = SimpleNamespace(
+                            output_scale=output_scale,
+                            softmax_scale_log2=softmax_scale_log2,
+                            mAccLSE=mAccLSE,
+                            mLSE=mLSE,
+                        )
                     p_cor_consumer_state, mma_o_consumer_state = self.correction(
                         compute_common_params,
                         compute_epilogue_params,
@@ -1287,20 +1471,21 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
     def reduction_kernel(
         self,
         mO: cute.Tensor,
-        mLSE: cute.Tensor,
+        mLSE,
         mAccO: cute.Tensor,
         mAccLSE: cute.Tensor,
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
         block_split_kvs: cute.Tensor,
+        kv_bounds: Optional[cute.Tensor] = None,
     ):
         """The reduction kernel for Multi-Head Latent Attention (MLA) that combines intermediate results
         from multiple split_kv blocks into final outputs.
 
         :param mO: Output tensor for storing final results
         :type mO: cute.Tensor
-        :param mLSE: Log-sum-exp tensor for storing final LSE values
-        :type mLSE: cute.Tensor
+        :param mLSE: Log-sum-exp tensor, or the compile-time tuple
+            ``(lse, softmax_stats)`` for the Helix variant.
         :param mAccO: Accumulated output tensor from split_kv blocks
         :type mAccO: cute.Tensor
         :param mAccLSE: Accumulated LSE tensor from split_kv blocks
@@ -1312,6 +1497,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         :param block_split_kvs: Per-block split_kv values tensor (for variable split_kv)
         :type block_split_kvs: cute.Tensor
         """
+        mSoftmaxStats = None
+        if cutlass.const_expr(self.emit_softmax_stats):
+            mLSE, mSoftmaxStats = mLSE
+
         bidx, bidy, bidz = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
         blk_coord = (bidx, bidy, bidz)
@@ -1358,6 +1547,37 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                           or sum_lse != sum_lse else self.lse_dtype.inf)
             if tidx == 0:
                 mLSE[blk_coord[0], blk_coord[1], blk_coord[2]] = global_lse
+                if cutlass.const_expr(self.emit_softmax_stats):
+                    # A rank joins the CP merge only for tokens with at least
+                    # one visible local KV entry. With verify groups that is
+                    # per-token: a straddling group leaves this rank zero
+                    # entries for its leading tokens while later ones have some.
+                    if cutlass.const_expr(kv_bounds is not None):
+                        # blk_coord runs over the folded reduction grid
+                        # (H*F, S_q/F, B) while kv_bounds is indexed by the
+                        # true token. A folded chunk packs its rows as
+                        # tok_in_chunk * H + head, so the true token is
+                        # chunk * F + row // H (self.num_heads and
+                        # self.seq_len_q stay pre-fold).
+                        if cutlass.const_expr(self.fold_sq):
+                            q_tok = (blk_coord[1] * self.fold_sq_ratio +
+                                     blk_coord[0] // self.num_heads)
+                        else:
+                            q_tok = blk_coord[1]
+                        has_local_kv = kv_bounds[blk_coord[2] * self.seq_len_q +
+                                                 q_tok] > 0
+                    else:
+                        has_local_kv = cache_seqs[blk_coord[2]] > 0
+                    if has_local_kv:
+                        mSoftmaxStats[blk_coord[0], blk_coord[1], blk_coord[2],
+                                      0] = global_lse / LOG2_E
+                        mSoftmaxStats[blk_coord[0], blk_coord[1], blk_coord[2],
+                                      1] = 1.0
+                    else:
+                        mSoftmaxStats[blk_coord[0], blk_coord[1], blk_coord[2],
+                                      0] = -self.lse_dtype.inf
+                        mSoftmaxStats[blk_coord[0], blk_coord[1], blk_coord[2],
+                                      1] = 0.0
             # store the scale to shared memory
             for i in cutlass.range_constexpr(lse_per_thread):
                 split_kv_idx = tidx + i * self.threads_per_warp
@@ -2268,8 +2488,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         # positions. Min k_bound = K - (S_q-1), which can span up to
         # ceil((seq_len_q-2)/tile_N)+1 tiles (tile-boundary-crossing case). For
         # S_q=1 this reduces to 1 tile -- identical to a plain K-bound check.
+        # With helix per-token bounds the minimum is K - S_q (a rank owning
+        # none of the group's tokens), one position deeper, so widen the span
+        # by one.
         tile_n = self.mma_qk_tiler[1]
-        mask_tile_count = (self.seq_len_q - 2 + tile_n - 1) // tile_n + 1
+        if cutlass.const_expr(common_params.kv_bounds is not None):
+            mask_tile_count = (self.seq_len_q - 1 + tile_n - 1) // tile_n + 1
+        else:
+            mask_tile_count = (self.seq_len_q - 2 + tile_n - 1) // tile_n + 1
 
         # first_mask_tile_idx is the global index of the first tile that may
         # need masking. Runtime because it depends on K (per-batch in
@@ -2597,7 +2823,19 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                              cta_m_rows) // self.num_heads)
                     else:
                         q_tok = common_params.blk_coord[1]
-                    k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
+                    if cutlass.const_expr(common_params.kv_bounds is not None):
+                        # Per-token rank-local bound; subsumes the causal
+                        # offset and non-owner ranks.
+                        # fold_sq M-tile padding rows derive q_tok >= S_q;
+                        # their results are discarded but the read must stay
+                        # in bounds.
+                        q_tok_c = (q_tok if cute.elem_less(
+                            q_tok, self.seq_len_q) else self.seq_len_q - 1)
+                        k_bound = common_params.kv_bounds[
+                            common_params.blk_coord[2] * self.seq_len_q +
+                            q_tok_c]
+                    else:
+                        k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
                     tTR_rAcc[i] = (tTR_rAcc[i] if cute.elem_less(
                         tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
                         k_bound,
@@ -2606,7 +2844,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX,
                                                  row_max_new, 0)
 
-        elif cutlass.const_expr(arch >= Arch.sm_103 and arch <= Arch.sm_103f):
+        # SM107 (Rubin) shares this reduction path with SM103. The arm was
+        # dropped when this file was taken wholesale from main during the
+        # rebase (c130d75c42); ``rubin-advance`` gates the identical body on
+        # sm_101/sm_103/sm_107/sm_110. Only sm_107 is restored here -- the
+        # others were never in main's copy and are not Rubin.
+        elif cutlass.const_expr(
+            (arch >= Arch.sm_103 and arch <= Arch.sm_103f)
+                or (arch >= Arch.sm_107 and arch <= Arch.sm_107f)):
             tmem_load_red_atom = cute.make_copy_atom(
                 tcgen05.copy.LdRed32x32bOp(tcgen05.copy.Repetition(64),
                                            redOp=tcgen05.TmemLoadRedOp.MAX),
@@ -2637,7 +2882,18 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                              cta_m_rows) // self.num_heads)
                     else:
                         q_tok = common_params.blk_coord[1]
-                    k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
+                    if cutlass.const_expr(common_params.kv_bounds is not None):
+                        # Per-token rank-local bound (see the sm_100 branch).
+                        # fold_sq M-tile padding rows derive q_tok >= S_q;
+                        # their results are discarded but the read must stay
+                        # in bounds.
+                        q_tok_c = (q_tok if cute.elem_less(
+                            q_tok, self.seq_len_q) else self.seq_len_q - 1)
+                        k_bound = common_params.kv_bounds[
+                            common_params.blk_coord[2] * self.seq_len_q +
+                            q_tok_c]
+                    else:
+                        k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
                     tTR_rAcc[i] = (tTR_rAcc[i] if cute.elem_less(
                         tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
                         k_bound,
@@ -3128,6 +3384,16 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             if cutlass.const_expr(self.warps_in_n == 2):
                 if cute.elem_less(cLSE[tidx][0], common_params.H):
                     gLSE[tidx] = lse
+                    if cutlass.const_expr(self.emit_softmax_stats
+                                          and epilogue_params.mAccLSE is None
+                                          and iter_n == 0):
+                        head_idx = cLSE[tidx][0]
+                        epilogue_params.mSoftmaxStats[
+                            head_idx, common_params.blk_coord[1],
+                            common_params.blk_coord[2], 0] = lse / LOG2_E
+                        epilogue_params.mSoftmaxStats[
+                            head_idx, common_params.blk_coord[1],
+                            common_params.blk_coord[2], 1] = 1.0
 
         cute.arch.fence_view_async_tmem_load()
         common_params.mma_o_pipeline.consumer_release(mma_o_consumer_state)
@@ -3995,6 +4261,7 @@ def run(
         workspace,
         split_kv,
         cache_seqs,
+        None,  # kv_bounds: helix-only, not exercised here
         block_split_kvs,
         softmax_scale,
         output_scale,
@@ -4110,6 +4377,7 @@ def run(
             workspace,
             split_kv,
             cache_seqs,
+            None,  # kv_bounds: helix-only, not exercised here
             block_split_kvs,
             softmax_scale,
             output_scale,
@@ -4247,6 +4515,7 @@ def run(
             workspace,
             _split_kv,
             cache_seqs,
+            None,  # kv_bounds: helix-only, not exercised here
             block_split_kvs,
             softmax_scale,
             output_scale,

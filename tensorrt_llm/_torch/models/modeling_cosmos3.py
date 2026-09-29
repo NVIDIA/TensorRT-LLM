@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
-from typing import Dict, Tuple
+from typing import Any, Dict, Tuple
 
 import safetensors.torch
 import torch
@@ -56,15 +56,24 @@ PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
 )
 
 
+class Cosmos3InputProcessor(Qwen3VLInputProcessorBase):
+    def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
+        # Cosmos3 benchmark requests contain already-sampled videos. Preserve their
+        # frames instead of applying the shared ten-frame loader default again.
+        media_io_kwargs = super().get_preferred_media_io_kwargs()
+        media_io_kwargs["video"].update({"num_frames": -1, "fps": -1})
+        return media_io_kwargs
+
+
 @support_multimodal_disaggregated
 @register_vision_encoder(Qwen3VisionModelBase, vlm_base_model=Qwen3VisionModel)
 @register_auto_model("Cosmos3ForConditionalGeneration")
 @register_input_processor(
-    Qwen3VLInputProcessorBase, model_type="cosmos3", placeholder_metadata=PLACEHOLDER_METADATA
+    Cosmos3InputProcessor, model_type="cosmos3", placeholder_metadata=PLACEHOLDER_METADATA
 )
 # cosmos3_omni is the backward-compat alias for cosmos3, remove it when checkpoints migrate to cosmos3
 @register_input_processor(
-    Qwen3VLInputProcessorBase, model_type="cosmos3_omni", placeholder_metadata=PLACEHOLDER_METADATA
+    Cosmos3InputProcessor, model_type="cosmos3_omni", placeholder_metadata=PLACEHOLDER_METADATA
 )
 class Cosmos3Model(Qwen3VLModel):
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):

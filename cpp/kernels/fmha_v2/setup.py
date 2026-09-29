@@ -4002,7 +4002,7 @@ def generate_files(specs_names):
     # Make sure we have a bin directory.
     if not os.path.exists('bin'):
         os.mkdir('bin')
-    cmd = 'nvcc -I src -Xcompiler -Wno-enum-compare --std=c++17 -o bin/print_traits.exe generated/print_kernel_traits.cu'.split(
+    cmd = 'nvcc -I src -Xcompiler -Wno-enum-compare --std=c++20 -o bin/print_traits.exe generated/print_kernel_traits.cu'.split(
     )
     if 'CUDA_PATH' in os.environ:
         cmd[0] = os.environ['CUDA_PATH'] + '/bin/' + cmd[0]
@@ -6813,7 +6813,7 @@ def enumerate_kernels():
         enumerate_qmma_flash_kernels(specs,
                                      sm=120,
                                      dtype='e4m3_fp32',
-                                     head_sizes=[64, 128, 192, 576],
+                                     head_sizes=[64, 128, 192, 256, 576],
                                      output_dtype="bf16")
 
     if 'ENABLE_HMMA_FP32' in os.environ:

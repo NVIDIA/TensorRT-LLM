@@ -1,0 +1,37 @@
+# Kimi K3 NVFP4 on DEP16 with the MegaMoE CuteDSL backend (4 nodes x 4 GPU).
+#
+# Same topology and sequence budget as the CUTLASS DEP16 GSM8K config, so a
+# score difference is attributable to the MoE backend and nothing else. The
+# CUTLASS run on this config scored 96.40 (job 475308) against a 96.47 MXFP4
+# baseline, which is what this is measured against.
+#
+# moe_config.max_num_tokens is deliberately ABSENT. For CUTLASS it is a
+# per-call chunking bound and 131072 is harmless; for MEGAMOE_* the same key is
+# the SymmBuffer capacity, further divided by ep_size under attention-DP.
+# Carrying 131072 over would over-provision the generation SymmBuffer ~32x and
+# eat the KV cache. ModelConfig's default (max_num_tokens x dp_size) lands
+# correctly, so leave it unset -- see the MegaMoE disagg run record.
+#
+# MegaMoE is EP-only, which DEP16 already is (moe_ep=16, moe_tp=1). It also
+# uses MNNVL symmetric memory, so all 4 nodes must sit in one NVL72 domain:
+# pin them with sbatch -w to a single nvl72dNNN rack or the rendezvous fails
+# with "invalid resource handle".
+tensor_parallel_size: 16
+enable_attention_dp: true
+moe_expert_parallel_size: 16
+max_batch_size: 8
+max_num_tokens: 8192
+max_seq_len: 8192
+trust_remote_code: true
+disable_overlap_scheduler: false
+enable_chunked_prefill: true
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 8
+moe_config:
+  backend: MEGAMOE_CUTEDSL
+  use_low_precision_moe_combine: true
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.25
+  tokens_per_block: 64

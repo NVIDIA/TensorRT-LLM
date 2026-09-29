@@ -24,9 +24,6 @@ class MultimodalEncoder(_TorchLLM):
                                 "bfloat16"] = "auto",
                  **kwargs: Any) -> None:
 
-        # Validate that users don't pass LLM-specific or TRT-specific arguments
-        self._validate_mm_args_for_torch_backend(kwargs)
-
         # Set higher default max_num_tokens for multimodal encoder (16384 vs 8192 default)
         # Vision encoders can handle more tokens than text-only models
         # TODO: Make this adaptive based on model-specific max_mm_token_length (see _test_llm_multimodal_general)
@@ -41,8 +38,6 @@ class MultimodalEncoder(_TorchLLM):
 
     def _build_model(self):
         BaseLLM._build_model(self)
-        assert self._engine_dir is None
-
         # Tokenizer loading should be after calling model_loader(), since model_loader() may download the model from HF hub.
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
         self._tokenizer = self._try_load_tokenizer()
@@ -63,8 +58,7 @@ class MultimodalEncoder(_TorchLLM):
         self.args.mm_encoder_only = True
 
         self._executor = self._executor_cls.create(
-            self._engine_dir,
-            executor_config=None,
+            None,
             model_world_size=self.args.parallel_config.world_size,
             mpi_session=self.mpi_session,
             reuse_mpi_comm=external_mpi_comm_available(
@@ -80,6 +74,11 @@ class MultimodalEncoder(_TorchLLM):
             raise ValueError(
                 "MultimodalEncoder does not support encode_only=True. "
                 "It uses mm_encoder_only execution internally.")
+
+    def _validate_args_for_torch_backend(self, kwargs: dict) -> None:
+        """Run multimodal validation inside the tracked constructor boundary."""
+        self._validate_mm_args_for_torch_backend(kwargs)
+        super()._validate_args_for_torch_backend(kwargs)
 
     def generate(
         self,

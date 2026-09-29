@@ -63,13 +63,8 @@ def fixed_params():
     return {"max_tokens": 8, "max_beam_width": 2}
 
 
-@pytest.fixture(scope="module", params=["TRTLLMSampler", "TorchSampler"])
-def sampling_information(request):
-    return request.param
-
-
 @pytest.fixture(scope="module")
-def model_kwargs(fixed_params, sampling_information) -> dict[str, Any]:
+def model_kwargs(fixed_params) -> dict[str, Any]:
 
     assert fixed_params[
         "max_beam_width"] == 2, "This test only works for a beam width of 2"
@@ -79,7 +74,6 @@ def model_kwargs(fixed_params, sampling_information) -> dict[str, Any]:
             weight_loader=DummyWeightLoader(),
             config_loader=DummyConfigLoader(),
         ),
-        sampler_type=sampling_information,
     )
 
 
@@ -130,8 +124,6 @@ def _single_process_context():
 def llm(fixed_params, input_prompts, model_kwargs, single_process: bool,
         with_cuda_graph_and_overlap: bool):
     check_no_sync = single_process  # single_process only used for sync check
-    if check_no_sync and model_kwargs["sampler_type"] != "TorchSampler":
-        pytest.skip("Sync check only supported for TorchSampler")
 
     gc.collect(
         2)  # force destruction of any other LLM instances (cf. comment above)
@@ -405,19 +397,6 @@ def test_beam_search_e2e(
 ) -> None:
     llm_args = cast(TorchLlmArgs, llm.args)  # type: ignore[redundant-cast]
 
-    if return_log_probs and num_prompts > 1 and llm_args.sampler_type == "TRTLLMSampler":
-        pytest.skip(
-            "Beam search currently does not support return_log_probs with multiple prompts"
-        )
-    if return_log_probs and llm_args.sampler_type == "TRTLLMSampler":
-        pytest.skip(
-            "Beam search on TRTLLMSampler does not correctly handle log_probs if called multiple times"
-        )
-    if stop_token_ids is not None and llm_args.sampler_type == "TRTLLMSampler":
-        pytest.skip(
-            "Beam search on TRTLLMSampler does not correctly handle stop_token_ids"
-        )
-
     # create sampling parameters
     # additional_model_outputs is used to gather the cache indirection from the model.
     sampling_params = SamplingParams(
@@ -443,79 +422,8 @@ def test_beam_search_e2e(
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_beam_search_disagg_e2e(
-    fixed_params,
-    input_prompts,
-    model_kwargs: dict[str, Any],
-) -> None:
-    """Beam search is admitted under disaggregated serving.
-
-    The context server's finished-candidate pool is not part of the handoff
-    (TRTLLM-14792), so the CBA op runs with that side's end id masked: an end
-    candidate stays in its beam slot rather than being pooled, travels as
-    first_gen_tokens, and the generation server pools it there instead. Every
-    early_stopping mode goes through the same route, so admission accepts them
-    all rather than rejecting beam search outright.
-    """
-    sampling_params = SamplingParams(
-        max_tokens=fixed_params["max_tokens"],
-        n=fixed_params["max_beam_width"],
-        best_of=fixed_params["max_beam_width"],
-        use_beam_search=True,
-        end_id=-1,
-        include_stop_str_in_output=True,
-    )
-
-    disagg_kwargs = deepcopy(model_kwargs)
-    disagg_kwargs |= dict(
-        disable_overlap_scheduler=True,
-        cuda_graph_config=None,
-        kv_cache_config=KvCacheConfig(max_tokens=10000,
-                                      enable_block_reuse=True,
-                                      enable_partial_reuse=True,
-                                      use_kv_cache_manager_v2=True),
-        cache_transceiver_config=CacheTransceiverConfig(
-            backend="NIXL",
-            transceiver_runtime="PYTHON",
-            kv_transfer_timeout_ms=1000,
-            kv_transfer_sender_future_timeout_ms=1000,
-        ),
-    )
-
-    prompts = [[1, 2, 3]]
-    ctx_llm = _build_llm(fixed_params, prompts, disagg_kwargs)
-    try:
-        with ctx_llm:
-            # Every mode goes through the same route, including the default
-            # (early_stopping unset, i.e. True).
-            for early_stopping in (None, 0, 1, 2):
-                params = deepcopy(sampling_params)
-                if early_stopping is not None:
-                    params.early_stopping = early_stopping
-                outputs = ctx_llm.generate(
-                    deepcopy(prompts),
-                    sampling_params=params,
-                    disaggregated_params=[
-                        DisaggregatedParams(request_type="context_only",
-                                            disagg_request_id=200)
-                    ],
-                    use_tqdm=False,
-                )
-                # The context phase hands off one token per beam; admission no
-                # longer rejects it, which is what this pins.
-                assert len(outputs) == len(prompts)
-                ctx_params = outputs[0].disaggregated_params
-                assert ctx_params is not None
-                assert len(ctx_params.first_gen_tokens
-                           ) == fixed_params["max_beam_width"]
-    finally:
-        ctx_llm.shutdown()
-
-
-@pytest.mark.threadleak(enabled=False)
 def test_beam_search_disagg_first_token_is_end_id(
     fixed_params,
-    input_prompts,
     model_kwargs: dict[str, Any],
 ) -> None:
     """A context phase that finishes on its only token still hands off.
@@ -535,11 +443,6 @@ def test_beam_search_disagg_first_token_is_end_id(
     once to see what the beams sample, then declare beam 0's token the end id
     and rerun, so the context step finishes on its first and only token.
     """
-    if model_kwargs["sampler_type"] != "TorchSampler":
-        pytest.skip(
-            "The context-side end-id mask is a TorchSampler path; the C++ "
-            "decoder behind TRTLLMSampler pools the end candidate instead.")
-
     beam_width = fixed_params["max_beam_width"]
     base_params = SamplingParams(
         max_tokens=fixed_params["max_tokens"],
@@ -640,7 +543,6 @@ def test_beam_search_large_beam_width_regression(
         llm = LLM(
             model=_pl.Path("dummy_path"),
             checkpoint_loader=checkpoint_loader,
-            sampler_type="TRTLLMSampler",
             max_beam_width=beam_width,
             max_batch_size=beam_width * num_prompts,
             max_seq_len=64,
@@ -805,7 +707,6 @@ def test_beam_search_vbws_e2e(beam_width_array: list[int],
         llm = LLM(
             model=_pl.Path("dummy_path"),
             checkpoint_loader=checkpoint_loader,
-            sampler_type="TorchSampler",
             max_beam_width=max_beam_width,
             max_batch_size=max_beam_width,
             max_seq_len=64,
@@ -865,6 +766,171 @@ def test_beam_search_vbws_e2e(beam_width_array: list[int],
         "BEAM_SEARCH_PAD_TOKEN leaked into the request token history; "
         "update_requests() must append only the beams the step produced, not "
         f"the full store width. First offenders: {padded_histories[:3]}")
+
+
+@pytest.mark.parametrize("disable_overlap_scheduler", [False, True],
+                         ids=["overlap", "no_overlap"])
+@pytest.mark.threadleak(enabled=False)
+def test_beam_search_vbws_widening_terminal_step(
+        disable_overlap_scheduler: bool,
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """A run that ends on a widening step returns every beam it produced.
+
+    max_tokens == len(beam_width_array) makes the last step the widening one
+    (3 -> 4 here), which is the case the longer runs in
+    test_beam_search_vbws_e2e do not reach: they decode past the end of the
+    array, so their last step holds the final width.
+
+    Two defects used to drop the beams that step added, either of which leaves
+    the trailing output beams padded and shows up as empty token_ids:
+
+    * the overlap scheduler advances py_decoding_iter in the sampler and only
+      syncs decoding_iter later while handling responses, so a width schedule
+      read from the lagging counter repeats a width and the run goes
+      1 -> 2, 2 -> 2, 2 -> 3 instead of 1 -> 2, 2 -> 3, 3 -> 4;
+    * CBA finalization sliced the last step's snapshot with that step's input
+      width, collecting 3 of the 4 beams it produced
+      (test_cba_finalize_collects_beams_a_widening_step_produced).
+
+    The non-overlap run is the control: there the two counters stay in sync, so
+    it passes with or without the width-tracking correction and separates a
+    scheduling-lag failure from a finalization one.
+    """
+    max_beam_width = 4
+    beam_width_array = [2, 3, 4]
+    # End exactly on the widening step rather than past the array.
+    max_tokens = len(beam_width_array)
+    input_prompts = [[1, 2, 3]]
+
+    checkpoint_loader = HfCheckpointLoader(
+        weight_loader=DummyWeightLoader(),
+        config_loader=DummyConfigLoader(),
+    )
+
+    # Record the width each step produces. Keyed by py_decoding_iter, the
+    # counter the sampler advances, so the schedule is visible per step even
+    # when decoding_iter lags behind it.
+    observed_out_widths: dict[int, int] = {}
+    unwrapped_get_beam_width_by_iter = LlmRequest.get_beam_width_by_iter
+
+    def recording_get_beam_width_by_iter(self: LlmRequest,
+                                         for_next_iteration: bool = False
+                                         ) -> int:
+        width = unwrapped_get_beam_width_by_iter(self, for_next_iteration)
+        # Warmup and CUDA-graph dummies carry no schedule and answer with the
+        # engine's beam width, which is not a step this run took.
+        if (for_next_iteration and not self.is_dummy
+                and self.sampling_config.beam_width_array):
+            observed_out_widths.setdefault(self.py_decoding_iter, width)
+        return width
+
+    monkeypatch.setattr(LlmRequest, "get_beam_width_by_iter",
+                        recording_get_beam_width_by_iter)
+
+    gc.collect(2)  # force destruction of any other LLM instances
+    with _single_process_context():
+        llm = LLM(
+            model=_pl.Path("dummy_path"),
+            checkpoint_loader=checkpoint_loader,
+            max_beam_width=max_beam_width,
+            max_batch_size=max_beam_width,
+            max_seq_len=64,
+            kv_cache_config=KvCacheConfig(max_tokens=10000),
+            disable_overlap_scheduler=disable_overlap_scheduler,
+            cuda_graph_config=None,
+        )
+        with llm:
+            sampling_params = SamplingParams(
+                max_tokens=max_tokens,
+                n=max_beam_width,
+                best_of=max_beam_width,
+                use_beam_search=True,
+                beam_width_array=beam_width_array,
+                end_id=-1,
+            )
+            outputs = llm.generate(deepcopy(input_prompts),
+                                   sampling_params=deepcopy(sampling_params))
+
+    # Every step must widen as scheduled; a lagging counter repeats a width.
+    steps = sorted(observed_out_widths)
+    assert [observed_out_widths[it] for it in steps] == beam_width_array, (
+        f"produced width per decoding iteration {steps} was "
+        f"{[observed_out_widths[it] for it in steps]}, expected "
+        f"{beam_width_array}")
+
+    assert isinstance(outputs, list)
+    assert len(outputs) == len(input_prompts)
+    beams = outputs[0].outputs
+    assert len(beams) == max_beam_width, (
+        f"expected {max_beam_width} beams, but got {len(beams)}")
+    for beam_idx, beam in enumerate(beams):
+        token_ids = beam.token_ids
+        assert token_ids is not None, f"beam {beam_idx} has no token_ids"
+        # The final step produced max_beam_width beams, so all of them are
+        # real: a shorter history means finalize dropped the beams it added,
+        # and an empty one is what the reporter of #19337 observed.
+        assert len(token_ids) == max_tokens, (
+            f"beam {beam_idx} holds {len(token_ids)} tokens, expected "
+            f"{max_tokens}: {token_ids}")
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_beam_search_finish_on_first_step_returns_every_beam() -> None:
+    """A run that ends on its context step still returns every beam.
+
+    Finalization collects the beams the step produced, and a context step
+    produces beam_width of them from a single input row. Reading the width that
+    entered the step instead kept beam 0 and padded the rest, so max_tokens=1
+    at beam_width=4 returned one sequence and three empty ones -- the same
+    defect test_beam_search_vbws_widening_terminal_step covers at the other end
+    of the width range, and one that fixed-width requests hit too.
+    """
+    max_beam_width = 4
+    input_prompts = [[1, 2, 3]]
+
+    checkpoint_loader = HfCheckpointLoader(
+        weight_loader=DummyWeightLoader(),
+        config_loader=DummyConfigLoader(),
+    )
+
+    gc.collect(2)  # force destruction of any other LLM instances
+    with _single_process_context():
+        llm = LLM(
+            model=_pl.Path("dummy_path"),
+            checkpoint_loader=checkpoint_loader,
+            max_beam_width=max_beam_width,
+            max_batch_size=max_beam_width,
+            max_seq_len=64,
+            kv_cache_config=KvCacheConfig(max_tokens=10000),
+            disable_overlap_scheduler=True,
+            cuda_graph_config=None,
+        )
+        with llm:
+            sampling_params = SamplingParams(
+                max_tokens=1,
+                n=max_beam_width,
+                best_of=max_beam_width,
+                use_beam_search=True,
+                end_id=-1,
+            )
+            outputs = llm.generate(deepcopy(input_prompts),
+                                   sampling_params=deepcopy(sampling_params))
+
+    assert isinstance(outputs, list)
+    beams = outputs[0].outputs
+    assert len(beams) == max_beam_width, (
+        f"expected {max_beam_width} beams, but got {len(beams)}")
+    sequences = []
+    for beam_idx, beam in enumerate(beams):
+        token_ids = beam.token_ids
+        assert token_ids is not None, f"beam {beam_idx} has no token_ids"
+        assert len(token_ids) == 1, (
+            f"beam {beam_idx} holds {len(token_ids)} tokens, expected 1: "
+            f"{token_ids}")
+        sequences.append(tuple(token_ids))
+    # The beams are the step's own top-k candidates, so they differ: identical
+    # rows would mean the same path was read beam_width times.
+    assert len(set(sequences)) == max_beam_width
 
 
 ###########################################################################
@@ -1756,6 +1822,21 @@ def _vbws_request(beam_width_array: list[int] | None,
                       is_streaming=False)
 
 
+def _set_vbws_iteration(request: LlmRequest, iteration: int) -> None:
+    """Hold both decoding counters at ``iteration``.
+
+    The Python width schedule is indexed with ``py_decoding_iter`` and the C++
+    binding with ``decoding_iter``; ``_handle_responses`` copies the former into
+    the latter once a step's responses are handled, which is the state every
+    non-overlap step is in. Tests that walk the schedule set both, so they
+    exercise the same iteration on either side -- see
+    test_vbws_width_follows_python_iter_when_response_handling_lags for the
+    overlap case, where the two differ.
+    """
+    request.py_decoding_iter = iteration
+    request.decoding_iter = iteration
+
+
 @pytest.mark.parametrize(
     "beam_width_array, expected",
     [
@@ -1776,15 +1857,40 @@ def test_vbws_beam_width_by_iter_follows_array(beam_width_array: list[int],
     request = _vbws_request(beam_width_array)
     actual = []
     for iteration in range(len(expected)):
-        request.decoding_iter = iteration
+        _set_vbws_iteration(request, iteration)
         actual.append(request.get_beam_width_by_iter())
     assert actual == expected
 
     # for_next_iteration looks one step ahead, i.e. it is the same sequence
     # shifted by one -- this is what feeds beam_width_out during sampling.
-    request.decoding_iter = 0
+    _set_vbws_iteration(request, 0)
     assert request.get_beam_width_by_iter(
         for_next_iteration=True) == expected[1]
+
+
+def test_vbws_width_follows_python_iter_when_response_handling_lags():
+    """The width schedule tracks the counter the sampling loop advances.
+
+    Under the overlap scheduler the sampler advances ``py_decoding_iter`` in
+    ``_update_requests`` and ``_handle_responses`` copies it into
+    ``decoding_iter`` later in the same iteration, so between the two the
+    C++-backed counter trails by one step. Indexing the schedule with it made a
+    widening run repeat a width: beam_width_array=[2, 3, 4] sampled
+    1 -> 2, 2 -> 2, 2 -> 3 instead of 1 -> 2, 2 -> 3, 3 -> 4, ending one width
+    short of what was asked for
+    (test_beam_search_vbws_widening_terminal_step).
+    """
+    request = _vbws_request([2, 3, 4])
+    # Iteration index 0..3 through a three-entry array, clamped past its end.
+    expected_in = [2, 2, 3, 4]
+    expected_out = [2, 3, 4, 4]
+    for py_iteration in range(len(expected_in)):
+        request.py_decoding_iter = py_iteration
+        # Response handling has not caught up with the sampler yet.
+        request.decoding_iter = max(py_iteration - 1, 0)
+        assert request.get_beam_width_by_iter() == expected_in[py_iteration]
+        assert request.get_beam_width_by_iter(
+            for_next_iteration=True) == expected_out[py_iteration]
 
 
 def test_vbws_beam_width_by_iter_clamps_past_array_end():
@@ -1801,7 +1907,7 @@ def test_vbws_beam_width_by_iter_clamps_past_array_end():
     request = _vbws_request(beam_width_array)
     # Run well past the end of the array.
     for iteration in range(len(beam_width_array), len(beam_width_array) + 8):
-        request.decoding_iter = iteration
+        _set_vbws_iteration(request, iteration)
         assert request.get_beam_width_by_iter() == beam_width_array[-1]
         assert request.get_beam_width_by_iter(
             for_next_iteration=True) == beam_width_array[-1]
@@ -1814,15 +1920,15 @@ def test_vbws_cpp_formula_matches_past_array_end():
     kMaxBeamWidthArrayLength rather than the actual array length, so it read
     out of bounds and returned arbitrary widths (observed: 0, 32, 849 for a
     3-entry array). That starved the request in the C++ micro-batch scheduler
-    and hung decoding; it is fixed in llmRequest.cpp. TRTLLMSampler and the
-    scheduler call into C++ directly, so pin the agreement here -- a failure
-    means the two clamps have drifted apart again.
+    and hung decoding; it is fixed in llmRequest.cpp. The scheduler calls into
+    C++ directly, so pin the agreement here -- a failure means the two clamps
+    have drifted apart again.
     """
     beam_width_array = [2, 3, 4]
     request = _vbws_request(beam_width_array)
 
     for iteration in range(len(beam_width_array) + 8):
-        request.decoding_iter = iteration
+        _set_vbws_iteration(request, iteration)
         assert (request.get_beam_width_by_iter() ==
                 CppLlmRequest.get_beam_width_by_iter(request, False))
         assert (request.get_beam_width_by_iter(
@@ -1831,7 +1937,7 @@ def test_vbws_cpp_formula_matches_past_array_end():
 
     # Past the end both must hold the last entry rather than read past it.
     for iteration in range(len(beam_width_array), len(beam_width_array) + 8):
-        request.decoding_iter = iteration
+        _set_vbws_iteration(request, iteration)
         assert CppLlmRequest.get_beam_width_by_iter(
             request, False) == beam_width_array[-1]
 
@@ -1869,12 +1975,15 @@ def test_vbws_rejects_decreasing_beam_width_array(beam_width_array: list[int],
     # executor. A test that mirrored the predicate would keep passing if the
     # production check were deleted.
     # Everything _validate_request touches besides the beam checks runs after
-    # them and needs a live engine/sampler, so stub those two out; the beam
-    # width and beam_width_array branches are reached with the real code.
+    # them and needs a live engine/sampler/KV cache manager, so stub those out;
+    # the beam width and beam_width_array branches are reached with the real
+    # code.
     executor = types.SimpleNamespace(
         max_beam_width=request.py_beam_width,
+        kv_cache_transceiver=None,
         _validate_token_id_range=lambda _request: None,
         sampler=types.SimpleNamespace(validate_request=lambda _request: None),
+        _validate_request_budget=lambda _request: None,
     )
     validate = functools.partial(
         PyExecutor._validate_request,
@@ -1918,8 +2027,8 @@ def test_vbws_uniform_array_matches_fixed_width():
     vbws = _vbws_request([max_beam_width] * 3, max_beam_width=max_beam_width)
     fixed = _vbws_request(None, max_beam_width=max_beam_width)
     for iteration in range(8):
-        vbws.decoding_iter = iteration
-        fixed.decoding_iter = iteration
+        _set_vbws_iteration(vbws, iteration)
+        _set_vbws_iteration(fixed, iteration)
         assert vbws.get_beam_width_by_iter() == fixed.get_beam_width_by_iter()
         assert vbws.get_beam_width_by_iter(
             for_next_iteration=True) == fixed.get_beam_width_by_iter(
@@ -2074,6 +2183,79 @@ def test_cba_finalize_merges_pool_and_orders_by_score():
     assert history.cum_logprobs is not None
     torch.testing.assert_close(history.cum_logprobs,
                                torch.tensor([90.0, 7.0, 6.0]))
+
+
+def test_cba_finalize_collects_beams_a_widening_step_produced():
+    """CBA finalization reads the width the step produced, not its input width.
+
+    A VBWS run whose last step widens (3 -> 4 here) leaves four live beams in
+    the snapshot being finalized. Slicing that snapshot with the step's input
+    width keeps only three of them, so the fourth output beam stays padded and
+    reaches the caller as an empty sequence: with beam_width_array=[16, 32,
+    100] and max_tokens=3 that is 84 of the 100 requested outputs.
+
+    Both iteration counters are set to the same value, the state the
+    non-overlap loop is in, so this pins the finalize width on its own rather
+    than through the width schedule.
+    """
+    beam_width_array = [2, 3, 4]
+    num_beams = max(beam_width_array)  # the requested output beams
+    num_generated = len(beam_width_array)  # the run ends on the widening step
+    pad = BEAM_SEARCH_PAD_TOKEN
+
+    request = _vbws_request(beam_width_array, max_beam_width=num_beams)
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    # The last step is the third one: it starts from 3 beams and produces 4.
+    request.py_decoding_iter = num_generated - 1
+    request.decoding_iter = num_generated - 1
+    request.py_seq_slot = 0
+    prompt_len = request.py_prompt_len
+    # num_generated_tokens is derived from the request's token count, so give it
+    # the generated tokens the beam state below describes. The last token of
+    # the step is not added yet, hence num_generated - 1.
+    request.set_generated_tokens([[0] * (num_generated - 1)] * num_beams)
+    assert request.get_beam_width_by_iter() == num_beams - 1
+    assert request.get_beam_width_by_iter(for_next_iteration=True) == num_beams
+
+    total = prompt_len + num_generated
+    # Identity ancestry: the history must hold exactly the live beams, so what
+    # this test observes is how many of them were collected.
+    cache_indirection = (torch.arange(num_beams,
+                                      dtype=torch.int64).view(-1, 1).expand(
+                                          -1, total).contiguous().unsqueeze(0))
+    active_tokens = [[31, 32, 33], [41, 42, 43], [51, 52, 53], [61, 62, 63]]
+    original_tokens = torch.zeros((1, num_beams, total), dtype=torch.int32)
+    original_tokens[0, :, prompt_len:] = torch.tensor(active_tokens,
+                                                      dtype=torch.int32)
+
+    # An empty pool: every output beam has to come from the live ones.
+    cba_group = CBAGroupHost(
+        pos={0: 0},
+        should_stop=torch.tensor([True]),
+        cache_indirection=cache_indirection,
+        original_tokens=original_tokens,
+        cum=torch.tensor([[4.0, 3.0, 2.0, 1.0]]),
+        cba_tokens=torch.full((1, num_beams, total), pad, dtype=torch.int32),
+        cba_cum=torch.zeros((1, num_beams)),
+        cba_normed=torch.full((1, num_beams), float("-inf")),
+        cba_lengths=torch.zeros((1, num_beams), dtype=torch.int32),
+        original_log_probs=None,
+        cba_log_probs=None,
+    )
+
+    builder = _prepare_beam_history_cba(request, cba_group=cba_group)
+    assert builder is not None
+    history = builder()
+    assert history is not None
+
+    torch.testing.assert_close(history.tokens,
+                               torch.tensor(active_tokens, dtype=torch.int32))
+    assert (history.tokens != pad).all(), (
+        "a finalized beam is still padded, so the beams the widening step "
+        f"added were dropped: {history.tokens.tolist()}")
+    assert history.cum_logprobs is not None
+    torch.testing.assert_close(history.cum_logprobs,
+                               torch.tensor([4.0, 3.0, 2.0, 1.0]))
 
 
 def test_finish_beams():
@@ -2277,11 +2459,6 @@ class TestParameterValidation:
     def batch_size(request) -> int:
         return cast(int, request.param)
 
-    @pytest.fixture(scope="module", params=["TRTLLMSampler", "TorchSampler"])
-    @staticmethod
-    def sampler_type(request) -> str:
-        return cast(str, request.param)
-
     @pytest.fixture(scope="module")
     @staticmethod
     def model_kwargs() -> dict[str, Any]:
@@ -2293,16 +2470,11 @@ class TestParameterValidation:
     # NB: Class-level fixture overrides do not work without this
     @pytest.fixture(scope="module")
     @staticmethod
-    def llm(fixed_params, input_prompts, model_kwargs, batch_size: int,
-            sampler_type: str):
+    def llm(fixed_params, input_prompts, model_kwargs, batch_size: int):
         return _build_llm(
             fixed_params,
             input_prompts,
-            (model_kwargs
-             | dict(
-                 max_batch_size=batch_size,
-                 sampler_type=sampler_type,
-             )),
+            (model_kwargs | dict(max_batch_size=batch_size)),
         )
 
     def _check_engine_responds(self, llm: LLM, input_prompts: list[str],
@@ -2325,15 +2497,12 @@ class TestParameterValidation:
         input_prompts: list[str],
         fixed_params: dict[str, Any],
         batch_size: int,
-        sampler_type: str,
         use_beam_search: bool | None,
     ):
         # best_of > 1 without beam search is greedy multi-return, which the LLM
         # API rejects. Covers use_beam_search both explicitly False and omitted.
         if batch_size == 1:
             pytest.skip("Test does not depend on batch size")
-        if sampler_type == "TorchSampler":
-            pytest.skip("Test does not depend on sampler_type")
         assert fixed_params["max_beam_width"] > 2
         params = dict(
             max_tokens=fixed_params["max_tokens"],
@@ -2361,7 +2530,6 @@ class TestParameterValidation:
         input_prompts: list[str],
         fixed_params: dict[str, Any],
         batch_size: int,
-        sampler_type: str,
         early_stopping: int,
     ):
         # Beam search is rejected wholesale under disaggregated serving (the
@@ -2371,8 +2539,6 @@ class TestParameterValidation:
         # testing a bound method rather than calling it.
         if batch_size == 1:
             pytest.skip("Test does not depend on batch size")
-        if sampler_type == "TRTLLMSampler":
-            pytest.skip("Exhaustive early_stopping check is TorchSampler-side")
         outputs = llm.generate(input_prompts,
                                sampling_params=SamplingParams(
                                    max_tokens=fixed_params["max_tokens"],
@@ -2398,7 +2564,6 @@ class TestParameterValidation:
         input_prompts: list[str],
         fixed_params: dict[str, Any],
         batch_size: int,
-        sampler_type: str,
     ):
         if batch_size == 1:
             pytest.skip("Test does not depend on batch size")
@@ -2437,45 +2602,13 @@ class TestParameterValidation:
 
     @pytest.mark.timeout(120)
     @pytest.mark.threadleak(enabled=False)
-    def test_logprobs_trtllm_sampler(
-        self,
-        llm: LLM,
-        input_prompts: list[str],
-        fixed_params: dict[str, Any],
-        batch_size: int,
-        sampler_type: str,
-    ):
-        if sampler_type != "TRTLLMSampler":
-            pytest.skip("Test is specific to TRTLLMSampler")
-
-        with pytest.raises(
-                RequestError,
-                match=
-                ".*Beam search only supports logprobs when batch size is 1.*"
-        ) if batch_size > 1 else nullcontext():
-            _ = llm.generate(input_prompts,
-                             sampling_params=SamplingParams(
-                                 max_tokens=fixed_params["max_tokens"],
-                                 n=1,
-                                 best_of=fixed_params["max_beam_width"],
-                                 use_beam_search=True,
-                                 end_id=-1,
-                                 logprobs=1,
-                             ))
-        self._check_engine_responds(llm, input_prompts, fixed_params)
-
-    @pytest.mark.timeout(120)
-    @pytest.mark.threadleak(enabled=False)
     def test_logprobs_torch_sampler(
         self,
         llm: LLM,
         input_prompts: list[str],
         fixed_params: dict[str, Any],
         batch_size: int,
-        sampler_type: str,
     ):
-        if sampler_type != "TorchSampler":
-            pytest.skip("Test is specific to TorchSampler")
         if batch_size == 1:
             pytest.skip("Test does not depend on batch size")
 

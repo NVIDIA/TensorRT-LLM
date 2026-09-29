@@ -4,6 +4,12 @@
 
 All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our [NVIDIA Developer Forum](https://forums.developer.nvidia.com/).
 
+## TensorRT-LLM Release 1.3
+
+### API Changes
+
+- **[DEPRECATION]** The TRITON MoE backend (`TritonFusedMoE`, `moe_config.backend="TRITON"`) is deprecated as of TensorRT-LLM 1.3 (2026-09) and will be removed after the 3-month migration period. Its only remaining role is a modest performance edge for GPT-OSS on Hopper with `W4A16_MXFP4` — the single configuration `AUTO` resolves to TRITON, and the format an MXFP4 GPT-OSS checkpoint takes on SM90. As the model set and the supported platforms keep growing, a single-scenario MoE path is no longer worth its maintenance cost. `moe_config.backend="CUTLASS"` replaces it functionally on Hopper: it serves `W4A16_MXFP4` on SM90 along with the unquantized BF16 and FP8 per-tensor paths, and MoE backend resolution already degrades to it automatically when TRITON declines a layer. During the migration period TRITON keeps working and logs a one-time warning. See the [deprecation policy](https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy).
+
 ## TensorRT-LLM Release 1.2
 
 ### Key Features and Enhancements
@@ -28,7 +34,17 @@ All published functionality in the Release Notes has been fully tested and verif
 
 - <span style="color: red">**[BREAKING CHANGE] TensorRT backend removed.**</span> PyTorch is now the sole execution backend. `LLM(backend="tensorrt")` now raises a `ValueError`; `TrtLlmArgs`, `tensorrt_llm._tensorrt_engine.LLM`, the `trtllm-build` / `trtllm-refit` / `trtllm-prune` CLIs, the `--backend tensorrt` CLI choice, and the per-model `convert_checkpoint.py` scripts have all been removed. The `tensorrt` pip dependency is no longer installed. See the [TensorRT Backend Removed migration guide](legacy/tensorrt-backend-removal.md) for details.
 
+- <span style="color: red">**[BREAKING CHANGE] Two-model speculative decoding removed.**</span> The separate draft-engine path behind Eagle3, MTP-Eagle and Draft-Target has been removed; the one-model implementations (draft/drafter as a submodule) are now the only supported paths. The `eagle3_one_model` and `mtp_eagle_one_model` fields are removed from `EagleDecodingConfig` and `MTPDecodingConfig`; both have carried a deprecation warning since #11043/#11761 and have been forced to the one-model path since #17366. Configurations that still set them (including `True`) now fail with a Pydantic `unexpected field` error and should simply drop the field. The `--use_one_model` flag is removed from `examples/llm-api/quickstart_advanced.py`. `EagleDecodingConfig.greedy_sampling` and `EagleDecodingConfig.posterior_threshold`, which had no effect, are also removed.
+
+- <span style="color: red">**[BREAKING CHANGE] C++ executor API: `SpeculativeDecodingFastLogitsInfo::toTensor()` removed.**</span> This is a source and ABI break for downstream code linking against the C++ executor API: the exported symbol `tensorrt_llm::executor::SpeculativeDecodingFastLogitsInfo::toTensor() const` no longer exists, so an unmodified binary fails at link/load time with `undefined symbol`. There is no replacement — it served the fast-logits path of the removed TensorRT-engine flow; call sites should be deleted. The struct's data layout is unchanged (`sizeof` 16, `draftRequestId` at offset 0, `draftParticipantId` at offset 8), so no silent misreads are possible. Speculative-decoding accessors on `runtime::ModelConfig`, `runtime::SpeculativeDecodingMode` and `runtime::SpeculativeDecodingModule` are removed in the same change; these are `inline`/`constexpr` and therefore break at compile time rather than at load time.
+
 - `trtllm-serve`, `trtllm-eval`, `trtllm-bench`: explicit CLI flags now take precedence over values in `--config` / `--extra_llm_api_options` YAML files (was: YAML overrode CLI). Un-set CLI flags continue to fall back to the YAML, then to model-specific and built-in defaults.
+
+- <span style="color: red">**[BREAKING CHANGE] KV Cache Manager V2 `pool_ratio` values are now specified in layer-group ID order, with exactly one normalized hot-tier byte ratio per layer group, instead of hot pool-group order. Cold-tier initialization preserves the implied layer-group slot-count proportions while accounting for cold page sizes.**</span>
+
+- <span style="color: red">**[BREAKING CHANGE] KV Cache Manager V2 reports cold-tier `secondary*` statistics in `kvCacheIterationStatsByColdPoolGroup`. These keys are no longer present in the hot pool-group or window-size views.**</span>
+
+- <span style="color: red">**[BREAKING CHANGE] VisualGen video `response_format`.**</span> Video generation (`POST /v1/videos/sync`, `POST /v1/videos`) narrows `response_format` to `{file, path}` (default `file`): the old `url` value — which returned raw bytes, not a URL — is renamed to `file`, and `b64_json` is removed. Requests still sending `url` or `b64_json` now get an error that names the replacement. The internal `output_path` is no longer emitted by `GET /v1/videos/{id}` or `GET /v1/videos` (status only); a co-located client obtains the on-disk path via `response_format="path"`. Image `response_format` is unchanged and additively gains `path`. The synchronous route is now `POST /v1/videos/sync`, with `POST /v1/videos/generations` kept as a deprecated alias. `response_format="path"` returns absolute server-side file paths and can be disabled server-side with `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` (enabled by default; paths stay under the media-storage directory).
 
 ### Fixed Issues
 
@@ -75,7 +91,7 @@ All published functionality in the Release Notes has been fully tested and verif
     - **Scaffolding:** Added benchmark support for scaffolding examples.
 - **Documentation**
   - **Deployment Guides:** Added comprehensive deployment guides for GPT-OSS, DeepSeek-R1, and VDR 1.0.
-  - **Feature Documentation:** Created new documentation for KV Cache Connector, LoRA feature usage, and AutoDeploy.
+  - **Feature Documentation:** Created new documentation for KV Cache Connector and LoRA feature usage.
   - **Tech Blogs:** Published blogs on "[Combining Guided Decoding and Speculative Decoding](./blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.md)" and "[ADP Balance Strategy](./blogs/tech_blog/blog10_ADP_Balance_Strategy.md)".
   - **Quick Start:** Refined Quick Start guides with new links to ModelOpt checkpoints and updated installation steps (Linux/Windows).
   - **API Reference:** Enhanced LLM API documentation by explicitly labeling stable vs. unstable APIs.
@@ -356,7 +372,6 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
 - The dependent NCCL version is updated to 2.27.5.
 
 ### API Changes
-- Set _AutoDeployLlmArgs as primary config object
 - Removed decoder request from decoder interface
 - Enhanced the torch_compile_config in llm args
 - Removed the redundant use_kv_cache field from PytorchConfig
@@ -439,7 +454,6 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
 ### API Changes
 - [BREAKING CHANGE] Enable scheduling overlap by default
 - Remove deprecated GptSession/V1 from TRT workflow
-- Set _AutoDeployLlmArgs as primary config object
 - Allow overriding CLI arguments with YAML file in trtllm-serve
 - Introduced multimodal embedding field in LlmRequest
 
@@ -490,10 +504,6 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
     - Added support for enabling MTP with CUDA graph padding.
     - Added initial EAGLE-3 implementation.
     - Added support for FP8 MLA on NVIDIA Hopper and Blackwell GPUs.
-  - **AutoDeploy for PyTorch workflow**.
-    - The AutoDeploy for PyTorch workflow is an **experimental** feature in `tensorrt_llm._torch.auto_deploy`.
-    - AutoDeploy provides an automated path from off-the-shelf models to optimized deployment in the TensorRT-LLM runtime.
-    - Check out `examples/auto_deploy/README.md` for more details.
   - LLM API
     - [BREAKING CHANGE] Added dynamic logits processor support, and deprecated static logits processor.
     - Added batched logits processor support.
@@ -1302,7 +1312,7 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
 - Skywork model support
 - Add example for multimodal models (BLIP with OPT or T5, LlaVA)
 
-Refer to the {ref}`support-matrix-software` section for a list of supported models.
+Refer to the {ref}`support-matrix` section for a list of supported models.
 
 * API
   - Add a set of LLM APIs for end-to-end generation tasks (see examples/llm-api/README.md)

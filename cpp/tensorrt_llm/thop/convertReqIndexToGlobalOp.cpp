@@ -67,6 +67,61 @@ th::Tensor convertReqIndexToGlobal(th::Tensor const& reqId, th::Tensor const& bl
     return out;
 }
 
+// Grouped (cross-layer fan-out) variant: one launch produces the remap output for a whole
+// full+shared indexer group. `layer_ids` is an int32 CUDA tensor of length group_size holding each
+// member's layer offset; the returned tensor has shape [group_size, num_tokens, num_topk_tokens].
+// Slice [g] is bit-identical to convertReqIndexToGlobal(...) called with layer_id = layer_ids[g].
+// MLA-only (kv_factor=1, num_kv_heads=1), mirroring convertReqIndexToGlobal.
+th::Tensor convertReqIndexToGlobalGrouped(th::Tensor const& reqId, th::Tensor const& blockTable,
+    th::Tensor const& tokenIndices, int64_t blockSize, int64_t numTopkTokens, int64_t strideFactor,
+    th::Tensor const& layerIds)
+{
+    TORCH_CHECK(reqId.is_cuda() && blockTable.is_cuda() && tokenIndices.is_cuda() && layerIds.is_cuda(),
+        "All tensors must be CUDA tensors");
+    TORCH_CHECK(reqId.scalar_type() == th::kInt32, "req_id must be int32");
+    TORCH_CHECK(blockTable.scalar_type() == th::kInt32, "block_table must be int32");
+    TORCH_CHECK(tokenIndices.scalar_type() == th::kInt32, "token_indices must be int32");
+    TORCH_CHECK(layerIds.scalar_type() == th::kInt32, "layer_ids must be int32");
+
+    TORCH_CHECK(reqId.dim() == 1, "req_id must be 1D");
+    TORCH_CHECK(blockTable.dim() == 2, "block_table must be 2D");
+    TORCH_CHECK(tokenIndices.dim() == 2, "token_indices must be 2D");
+    TORCH_CHECK(layerIds.dim() == 1, "layer_ids must be 1D");
+
+    // Ensure contiguous
+    auto reqIdC = reqId.contiguous();
+    auto blockTableC = blockTable.contiguous();
+    auto tokenIndicesC = tokenIndices.contiguous();
+    auto layerIdsC = layerIds.contiguous();
+
+    int32_t const numTokens = static_cast<int32_t>(reqIdC.size(0));
+    int32_t const maxNumBlocksPerReq = static_cast<int32_t>(blockTableC.size(1));
+    int32_t const groupSize = static_cast<int32_t>(layerIdsC.size(0));
+
+    // Allocate output [group_size, num_tokens, num_topk_tokens] (contiguous)
+    auto out = th::empty(
+        {static_cast<int64_t>(groupSize), static_cast<int64_t>(numTokens), numTopkTokens}, tokenIndicesC.options());
+
+    // Extract strides
+    int64_t const btStride0 = blockTableC.stride(0);
+    int64_t const btStride1 = blockTableC.stride(1);
+    int64_t const tiStride0 = tokenIndicesC.stride(0);
+    int64_t const tiStride1 = tokenIndicesC.stride(1);
+    int64_t const outStrideG = out.stride(0);
+    int64_t const outStride0 = out.stride(1);
+    int64_t const outStride1 = out.stride(2);
+
+    auto stream = at::cuda::getCurrentCUDAStream(reqIdC.get_device()).stream();
+
+    tk::invokeConvertReqIndexToGlobalGrouped(reqIdC.data_ptr<int32_t>(), blockTableC.data_ptr<int32_t>(),
+        tokenIndicesC.data_ptr<int32_t>(), layerIdsC.data_ptr<int32_t>(), out.data_ptr<int32_t>(), numTokens,
+        static_cast<int32_t>(numTopkTokens), groupSize, maxNumBlocksPerReq, static_cast<int32_t>(blockSize),
+        static_cast<int32_t>(strideFactor), btStride0, btStride1, tiStride0, tiStride1, outStrideG, outStride0,
+        outStride1, stream);
+
+    return out;
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -76,9 +131,13 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "convert_req_index_to_global(Tensor req_id, Tensor block_table, Tensor token_indices, int block_size, int "
         "num_topk_tokens, int stride_factor, int layer_id) -> Tensor");
+    m.def(
+        "convert_req_index_to_global_grouped(Tensor req_id, Tensor block_table, Tensor token_indices, int block_size, "
+        "int num_topk_tokens, int stride_factor, Tensor layer_ids) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("convert_req_index_to_global", &tensorrt_llm::torch_ext::convertReqIndexToGlobal);
+    m.impl("convert_req_index_to_global_grouped", &tensorrt_llm::torch_ext::convertReqIndexToGlobalGrouped);
 }

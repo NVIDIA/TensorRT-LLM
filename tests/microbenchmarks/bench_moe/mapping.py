@@ -20,7 +20,8 @@ The benchmark plumbs three TRT-LLM-internal config objects into
 
 * :class:`Mapping`  — TP / EP / attention-DP topology derived from the
   :class:`ConfigSpec` parallel-mode shortcut (``DEP`` / ``TEP`` / ``DTP``
-  / ``TTP`` / ``CUSTOM``).
+  / ``TTP``, a hybrid ``(D|T)TP<k>EP<m>`` name such as ``DTP2EP2``, or
+  ``CUSTOM``).
 * :class:`ModelConfig` — ``Mapping`` + quant config + per-run knobs
   (CUDA graph, max num tokens, low-precision combine).
 * A concrete routing-method instance — picked by the registry value
@@ -33,13 +34,14 @@ the worker and CLI layers.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from transformers.configuration_utils import PretrainedConfig
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.fused_moe.routing import (
+from tensorrt_llm._torch.moe.fused_moe.routing import (
     DeepSeekV3MoeRoutingMethod,
     DefaultMoeRoutingMethod,
     Llama4RenormalizeMoeRoutingMethod,
@@ -62,6 +64,102 @@ _PARALLEL_MODE_LAYOUTS: Dict[str, Dict[str, Any]] = {
     "TTP": {"moe_ep_size": 1, "moe_tp_size": "world", "enable_attention_dp": False},
 }
 
+# Hybrid TP x EP parallel modes, e.g. "DTP2EP2" / "TTP2EP4".
+#
+# The leading letter keeps the meaning it has in the table above -- ``D`` selects
+# attention data parallelism, ``T`` selects attention tensor parallelism -- while
+# ``TP<k>EP<m>`` spells out the MoE grid explicitly: ``moe_tp_size=k`` and
+# ``moe_ep_size=m``. As for every other mode, ``k * m`` must equal ``world_size``.
+#
+# The four legacy names are looked up in the table first, so ``DTP`` (no digits)
+# can never be captured here.
+_HYBRID_MODE_RE = re.compile(r"^(?P<attn>[DT])TP(?P<tp>\d+)EP(?P<ep>\d+)$")
+
+# Grammar shown in user-facing error messages.
+PARALLEL_MODE_SYNTAX_HINT = (
+    "expected one of DEP/TEP/DTP/TTP, a hybrid (D|T)TP<k>EP<m> name "
+    "(e.g. DTP2EP2, TTP2EP4; k=moe_tp_size, m=moe_ep_size, k*m must equal "
+    "world_size), or CUSTOM"
+)
+
+
+def resolve_named_layout(mode: str, world_size: int) -> Optional[Tuple[int, int, bool]]:
+    """Resolve a named parallel mode to ``(moe_ep_size, moe_tp_size, enable_attention_dp)``.
+
+    Handles both the four legacy table entries and the hybrid
+    ``(D|T)TP<k>EP<m>`` grammar. Returns ``None`` for names that carry no
+    layout of their own (``CUSTOM``) and for unknown names -- the caller
+    decides how to report that.
+    """
+    name = str(mode).upper()
+    layout = _PARALLEL_MODE_LAYOUTS.get(name)
+    if layout is not None:
+        moe_ep = world_size if layout["moe_ep_size"] == "world" else int(layout["moe_ep_size"])
+        moe_tp = world_size if layout["moe_tp_size"] == "world" else int(layout["moe_tp_size"])
+        return moe_ep, moe_tp, bool(layout["enable_attention_dp"])
+
+    match = _HYBRID_MODE_RE.match(name)
+    if match is None:
+        return None
+    return (
+        int(match.group("ep")),
+        int(match.group("tp")),
+        match.group("attn") == "D",
+    )
+
+
+def parallel_mode_enable_attention_dp(mode: str) -> Optional[bool]:
+    """Return the attention-DP flag implied by a named mode, without a world size.
+
+    Returns ``None`` when the mode carries no implied flag (``CUSTOM``, or an
+    unknown name), so callers can fall back to their own handling.
+    """
+    name = str(mode).upper()
+    layout = _PARALLEL_MODE_LAYOUTS.get(name)
+    if layout is not None:
+        return bool(layout["enable_attention_dp"])
+    match = _HYBRID_MODE_RE.match(name)
+    if match is None:
+        return None
+    return match.group("attn") == "D"
+
+
+def is_named_parallel_mode(mode: str) -> bool:
+    """Whether ``mode`` is a self-describing layout name (i.e. not ``CUSTOM``)."""
+    return parallel_mode_enable_attention_dp(mode) is not None
+
+
+def default_hybrid_parallel_modes(world_size: int) -> Tuple[str, ...]:
+    """Hybrid mode names that split ``world_size`` as evenly as possible.
+
+    When ``world_size`` is a perfect square there is a single even split
+    (``k == m == sqrt(world_size)``). Otherwise the split is ambiguous, so both
+    neighbours are offered: the grid rounded down on the MoE-TP axis
+    (``k <= sqrt(world_size)``, favouring EP) and the one rounded up
+    (``k >= sqrt(world_size)``, favouring TP). Both attention flavours are
+    emitted for every grid, keeping the axis symmetric with the four presets.
+
+    Grids that degenerate to an existing preset (``k == 1`` is DEP/TEP,
+    ``m == 1`` is DTP/TTP) are dropped, so ``world_size < 4`` adds nothing.
+    """
+    size = int(world_size)
+    if size < 4:
+        return ()
+    divisors = [d for d in range(1, size + 1) if size % d == 0]
+    grids: List[Tuple[int, int]] = []
+    for moe_tp in (
+        max((d for d in divisors if d * d <= size), default=None),
+        min((d for d in divisors if d * d >= size), default=None),
+    ):
+        if moe_tp is None:
+            continue
+        moe_ep = size // moe_tp
+        if moe_tp == 1 or moe_ep == 1 or (moe_tp, moe_ep) in grids:
+            continue
+        grids.append((moe_tp, moe_ep))
+    grids.sort()
+    return tuple(f"{attn}TP{tp}EP{ep}" for tp, ep in grids for attn in ("D", "T"))
+
 
 def _resolve_mapping_layout(config: ConfigSpec, world_size: int) -> Tuple[int, int, bool]:
     """Resolve ``(moe_ep_size, moe_tp_size, enable_attention_dp)`` for a ConfigSpec."""
@@ -74,15 +172,16 @@ def _resolve_mapping_layout(config: ConfigSpec, world_size: int) -> Tuple[int, i
             bool(config.enable_attention_dp) if config.enable_attention_dp is not None else False
         )
     else:
-        layout = _PARALLEL_MODE_LAYOUTS.get(config.parallel_mode)
-        if layout is None:
-            raise ValueError(f"Unknown parallel_mode={config.parallel_mode!r}")
-        moe_ep = world_size if layout["moe_ep_size"] == "world" else int(layout["moe_ep_size"])
-        moe_tp = world_size if layout["moe_tp_size"] == "world" else int(layout["moe_tp_size"])
-        enable_dp = bool(layout["enable_attention_dp"])
+        resolved = resolve_named_layout(config.parallel_mode, world_size)
+        if resolved is None:
+            raise ValueError(
+                f"Unknown parallel_mode={config.parallel_mode!r}; {PARALLEL_MODE_SYNTAX_HINT}"
+            )
+        moe_ep, moe_tp, enable_dp = resolved
     if moe_ep * moe_tp != world_size:
         raise ValueError(
-            f"moe_ep_size * moe_tp_size = {moe_ep * moe_tp} must equal world_size={world_size}"
+            f"parallel_mode={config.parallel_mode}: moe_ep_size * moe_tp_size = "
+            f"{moe_ep} * {moe_tp} = {moe_ep * moe_tp} must equal world_size={world_size}"
         )
     return moe_ep, moe_tp, enable_dp
 

@@ -16,15 +16,15 @@
  */
 #pragma once
 
-#include "trtllm/gen/CommonUtils.h"
+#include <stdexcept>
 #include "trtllm/gen/SfLayoutDecl.h"
 #include "trtllm/gen/SparsityDecl.h"
-#include <stdexcept>
+#include "trtllm/gen/CommonUtils.h"
 #include <tuple>
 
-#include "BatchedGemmEnums.h"
-#include "Enums.h"
 #include "TmaDescriptor.h"
+#include "Enums.h"
+#include "BatchedGemmEnums.h"
 
 // NOTE: keep this code dependency free. It has to be included by the device code and has to be
 // compilable with NVRTC.
@@ -232,7 +232,7 @@ static auto makeTmaShapeStrideAbc(GemmOptions const& options, int sizeM, int siz
 
 // Create the TMA shape/stride for A/B block scaling factors.
 static auto makeTmaShapeStrideSfAb(int mM, int mN, int mK, MatrixType matrixType, int tileM, int tileN, int tileK,
-    tg::SfLayout layout, int sfReshapeFactor, int32_t const numEltsPerSf)
+    tg::SfLayout layout, int sfReshapeFactor, const int32_t numEltsPerSf)
 {
 
     // The outer dimension.

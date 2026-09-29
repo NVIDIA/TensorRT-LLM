@@ -22,6 +22,8 @@ __all__ = [
     "GenerationRequest",
     "TruncateKVCacheRequest",
     "CancellingRequest",
+    "StartProfileRequest",
+    "StopProfileRequest",
 ]
 
 # Mirrors C++ executor.h Request::kDefaultPriority
@@ -96,7 +98,6 @@ class GenerationRequest:
         prompt_token_ids: Union[torch.Tensor, np.ndarray,
                                 Union[List[int], List[List[int]]]],
         sampling_params: SamplingParams,
-        query_token_ids: Optional[Union[torch.Tensor, np.ndarray, list]] = None,
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         streaming: bool = False,
@@ -115,11 +116,8 @@ class GenerationRequest:
     ):
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
-            self.query_token_ids = query_token_ids
         elif isinstance(prompt_token_ids, (torch.Tensor, np.ndarray)):
             self.prompt_token_ids = prompt_token_ids.tolist()
-            if query_token_ids:
-                self.query_token_ids = query_token_ids.tolist()
         else:
             raise TypeError(
                 f"prompt_token_ids ({prompt_token_ids}) should be an instance of torch.Tensor, np.ndarray or list"
@@ -189,7 +187,7 @@ class GenerationRequest:
     # `_prompt_token_ids_i32` (the C++ Request ctor memcpy's it -- see
     # base_worker._enqueue_request) and leave the backing `_prompt_token_ids` None.
     # The list is built lazily (and cached) by the `prompt_token_ids` property below
-    # only if a consumer actually reads it (e.g. prompt-logprobs, star-attention).
+    # only if a consumer actually reads it (e.g. prompt-logprobs).
     # Plain decode never reads it -> the O(ISL) `.tolist()` never runs.
     #
     # NOTE: implemented as a *property* (scoped to this one name), NOT a class-level
@@ -234,9 +232,6 @@ class GenerationRequest:
         elif buf is not None:
             # not yet materialized -> encode the buffer's bytes directly
             state["_prompt_token_ids"] = (GenerationRequest._I32, buf.tobytes())
-        if state.get("query_token_ids") is not None:
-            state["query_token_ids"] = GenerationRequest._enc_tokens(
-                state["query_token_ids"])
         return state
 
     def __setstate__(self, state):
@@ -246,12 +241,6 @@ class GenerationRequest:
                 pt) == 2 and pt[0] == GenerationRequest._I32:
             buf = np.frombuffer(pt[1], dtype=np.int32)
             state["_prompt_token_ids"] = None  # leave None -> lazy via property
-        qt = state.get("query_token_ids")
-        if type(qt) is tuple and len(
-                qt) == 2 and qt[0] == GenerationRequest._I32:
-            # query_token_ids is rare/small -> materialize to list eagerly
-            state["query_token_ids"] = np.frombuffer(qt[1],
-                                                     dtype=np.int32).tolist()
         self.__dict__.update(state)
         self._prompt_token_ids_i32 = buf
 
@@ -264,7 +253,40 @@ class TruncateKVCacheRequest:
 
 
 class CancellingRequest:
-    ''' The request to cancel a generation. '''
+    """The request to cancel a generation."""
 
     def __init__(self, id: int):
         self.id = id
+
+
+class StartProfileRequest:
+    """Request the IPC worker to start runtime profiling.
+
+    Carries the same arguments as ``LLM.start_profile`` / the HTTP
+    ``/start_profile`` endpoint so the worker can forward them to
+    ``PyExecutor.start_profile``.
+    """
+
+    def __init__(self,
+                 output_dir=None,
+                 num_steps=None,
+                 start_step: int = 0,
+                 activities=None,
+                 ack_addr=None):
+        self.output_dir = output_dir
+        self.num_steps = num_steps
+        self.start_step = start_step
+        self.activities = activities
+        # (endpoint, hmac_key) of the proxy's ack channel. The proxy only
+        # binds that socket when profiling is first requested, so the
+        # address travels with the request rather than being handed to the
+        # worker at startup.
+        self.ack_addr = ack_addr
+
+
+class StopProfileRequest:
+    """Request the IPC worker to stop runtime profiling."""
+
+    def __init__(self, ack_addr=None):
+        # See StartProfileRequest.ack_addr.
+        self.ack_addr = ack_addr

@@ -195,12 +195,7 @@ class TestHunyuanVideo15HuggingFaceComparison(unittest.TestCase):
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_hunyuan_video1_5_allclose_to_hf(self):
-        try:
-            from diffusers import (
-                HunyuanVideo15Transformer3DModel as HFHunyuanVideo15Transformer3DModel,
-            )
-        except ImportError:
-            self.skipTest("diffusers not installed")
+        from diffusers import HunyuanVideo15Transformer3DModel as HFHunyuanVideo15Transformer3DModel
 
         from tensorrt_llm._torch.visual_gen.models.hunyuan_video1_5.transformer_hunyuan_video1_5 import (
             HunyuanVideo15Transformer3DModel,

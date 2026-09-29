@@ -18,14 +18,15 @@
 #include "kv_cache_manager_v2/copyEngine.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/exceptions.h"
-#include "kv_cache_manager_v2/utils/math.h"
 
 // Reuse existing copy implementations (no Python round-trip).
 #include "tensorrt_llm/batch_manager/kvCacheManagerV2Utils.h"
 
 #include "tensorrt_llm/common/assert.h"
+
+#include <limits>
 #include <stdexcept>
-#include <variant>
+#include <utility>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -40,7 +41,7 @@ template <CacheTier Tier>
 using TierAddr = std::conditional_t<Tier == CacheTier::DISK, DiskAddress, MemAddress>;
 
 template <CacheTier DstTier, CacheTier SrcTier>
-void dispatchCopy(std::vector<CopyTask> const& tasks, size_t numBytes, CUstream stream)
+static void dispatchCopy(std::vector<CopyTask> const& tasks, size_t numBytes, CUstream stream)
 {
     using DstAddr = TierAddr<DstTier>;
     using SrcAddr = TierAddr<SrcTier>;
@@ -66,101 +67,18 @@ void dispatchCopy(std::vector<CopyTask> const& tasks, size_t numBytes, CUstream 
 }
 
 // ---------------------------------------------------------------------------
-// StagingBuffer
-// ---------------------------------------------------------------------------
-
-StagingBuffer::StagingBuffer(StagingBufferManager& manager, size_t minSize, size_t maxSize, CUstream stream)
-    : mManager(manager)
-    , mStream(stream)
-{
-    if (minSize > manager.totalSize())
-    {
-        throw std::invalid_argument("StagingBuffer: minSize exceeds total staging buffer size");
-    }
-
-    std::unique_lock<std::mutex> lock(mManager.mMutex);
-
-    // Compute how many contiguous grains to use. If the suffix cannot satisfy
-    // the required minimum, skip it and wrap before allocating.
-    size_t const minGrains = divUp(minSize, kGranularity);
-    size_t availableGrains = mManager.suggestNextMaxGrains();
-    if (minGrains > availableGrains)
-    {
-        mManager.mNext = 0;
-        availableGrains = mManager.suggestNextMaxGrains();
-    }
-    TLLM_CHECK_DEBUG(minGrains <= availableGrains);
-
-    size_t const available = availableGrains * kGranularity;
-    size_t actualSize = std::min(maxSize, available);
-    actualSize = std::max(actualSize, minSize);
-    mNumGrains = divUp(actualSize, kGranularity);
-    TLLM_CHECK_DEBUG(mNumGrains <= availableGrains);
-    mSize = actualSize;
-    mStartGrain = mManager.mNext;
-    mManager.mNext += mNumGrains;
-    TLLM_CHECK_DEBUG(mManager.mNext <= mManager.numGrains());
-    if (mManager.mNext == mManager.numGrains())
-    {
-        mManager.mNext = 0;
-    }
-
-    mAddress = mManager.baseAddress() + mStartGrain * kGranularity;
-    lock.unlock();
-
-    // Lock grains and collect their ready events for deduplicated waiting.
-    // Mirrors Python's stream_wait_events(stream, lock_and_consume_events()) which
-    // deduplicates via set() — adjacent grains often share the same event.
-    std::vector<CachedCudaEvent const*> readyEvents;
-    readyEvents.reserve(mNumGrains);
-    for (size_t i = 0; i < mNumGrains; ++i)
-    {
-        GrainMetadata& g = mManager.mGrains[mStartGrain + i];
-        g.mutex.lock();
-        readyEvents.push_back(&g.readyEvent);
-    }
-    streamWaitEvents(reinterpret_cast<CudaStream>(mStream), readyEvents);
-    for (size_t i = 0; i < mNumGrains; ++i)
-        mManager.mGrains[mStartGrain + i].readyEvent.close();
-}
-
-StagingBuffer::~StagingBuffer()
-{
-    // One shared completion event for all grains (all on the same stream → same completion point).
-    CachedCudaEvent finishEvent(reinterpret_cast<CudaStream>(mStream));
-    for (int i = static_cast<int>(mNumGrains) - 1; i >= 0; --i)
-    {
-        GrainMetadata& g = mManager.mGrains[mStartGrain + static_cast<size_t>(i)];
-        g.readyEvent = finishEvent;
-        g.mutex.unlock();
-    }
-}
-
-// ---------------------------------------------------------------------------
-// StagingBufferManager
-// ---------------------------------------------------------------------------
-
-StagingBufferManager::StagingBufferManager(size_t size)
-    : mBuffer(size)
-    , mGrains(size / kGranularity)
-{
-    TLLM_CHECK_DEBUG(size % kGranularity == 0);
-}
-
-StagingBuffer StagingBufferManager::acquire(size_t minSize, size_t maxSize, CUstream stream)
-{
-    return StagingBuffer(*this, minSize, maxSize, stream);
-}
-
-// ---------------------------------------------------------------------------
 // CopyEngine
 // ---------------------------------------------------------------------------
 
-StagingBufferManager& CopyEngine::getStagingManager()
+CopyEngine::CopyEngine(StagingBufferManager* pageStagingManager)
+    : mPageStagingManager(pageStagingManager)
 {
-    if (!mStagingManager)
-        mStagingManager = std::make_unique<StagingBufferManager>(64u << 20u); // 64 MB
-    return *mStagingManager;
+}
+
+StagingBufferManager& CopyEngine::pageStagingManager() const
+{
+    TLLM_CHECK_WITH_INFO(mPageStagingManager != nullptr, "CopyEngine requires page staging for this transfer");
+    return *mPageStagingManager;
 }
 
 // Two-hop transfer via host staging buffer (e.g., GPU→Disk or Disk→GPU).
@@ -174,7 +92,10 @@ static void twoHopTransfer(
 
     while (remaining > 0)
     {
-        StagingBuffer buf = manager.acquire(numBytes, numBytes * remaining, stream);
+        size_t const maxSize = remaining > std::numeric_limits<size_t>::max() / numBytes
+            ? std::numeric_limits<size_t>::max()
+            : numBytes * remaining;
+        StagingBuffer buf = manager.acquire(numBytes, maxSize, numBytes, 1, stream);
         MemAddress addr = buf.address();
         size_t n = buf.size() / numBytes;
         TLLM_CHECK_DEBUG(n > 0 && n <= remaining);
@@ -185,7 +106,7 @@ static void twoHopTransfer(
             hop1.reserve(n);
             for (size_t i = 0; i < n; ++i)
                 hop1.push_back({Address{addr + numBytes * i}, tasks[offset + i].src});
-            dispatchCopy<MidTier, SrcTier>(hop1, numBytes, buf.stream());
+            dispatchCopy<MidTier, SrcTier>(hop1, numBytes, *buf.stream());
         }
 
         // Second hop: staging → dst
@@ -194,7 +115,7 @@ static void twoHopTransfer(
             hop2.reserve(n);
             for (size_t i = 0; i < n; ++i)
                 hop2.push_back({tasks[offset + i].dst, Address{addr + numBytes * i}});
-            dispatchCopy<DstTier, MidTier>(hop2, numBytes, buf.stream());
+            dispatchCopy<DstTier, MidTier>(hop2, numBytes, *buf.stream());
         }
 
         offset += n;
@@ -221,7 +142,7 @@ void CopyEngine::transfer(
     else if (dstTier == G && srcTier == H)
         dispatchCopy<G, H>(tasks, numBytes, stream);
     else if (dstTier == G && srcTier == D)
-        twoHopTransfer<G, H, D>(getStagingManager(), numBytes, tasks, stream);
+        twoHopTransfer<G, H, D>(pageStagingManager(), numBytes, tasks, stream);
     else if (dstTier == H && srcTier == G)
         dispatchCopy<H, G>(tasks, numBytes, stream);
     else if (dstTier == H && srcTier == H)
@@ -229,28 +150,13 @@ void CopyEngine::transfer(
     else if (dstTier == H && srcTier == D)
         dispatchCopy<H, D>(tasks, numBytes, stream);
     else if (dstTier == D && srcTier == G)
-        twoHopTransfer<D, H, G>(getStagingManager(), numBytes, tasks, stream);
+        twoHopTransfer<D, H, G>(pageStagingManager(), numBytes, tasks, stream);
     else if (dstTier == D && srcTier == H)
         dispatchCopy<D, H>(tasks, numBytes, stream);
     else if (dstTier == D && srcTier == D)
         dispatchCopy<D, D>(tasks, numBytes, stream);
     else
         throw std::invalid_argument("CopyEngine::transfer: unsupported tier combination");
-}
-
-// ---------------------------------------------------------------------------
-// Module-level singleton
-// ---------------------------------------------------------------------------
-
-CopyEngine& globalCopyEngine()
-{
-    static CopyEngine engine;
-    return engine;
-}
-
-void batchedCopy(CacheTier dstTier, CacheTier srcTier, size_t numBytes, std::vector<CopyTask> tasks, CUstream stream)
-{
-    globalCopyEngine().transfer(dstTier, srcTier, numBytes, std::move(tasks), stream);
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

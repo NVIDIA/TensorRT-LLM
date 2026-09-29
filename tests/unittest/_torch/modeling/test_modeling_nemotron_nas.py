@@ -1,525 +1,222 @@
-import unittest
-from copy import deepcopy
-from dataclasses import dataclass
-from typing import Any
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
+from collections.abc import Iterator
+from types import SimpleNamespace
+
+import pytest
 import torch
-import transformers
-from parameterized import parameterized
-from transformers import AutoConfig
-from transformers.dynamic_module_utils import get_class_from_dynamic_module
-from utils.llm_data import llm_models_root
+from transformers import PretrainedConfig
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_nemotron_nas import \
     NemotronNASForCausalLM
+from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
-# Setup NEED_SETUP_CACHE_CLASSES_MAPPING to an empty dict for modeling_nemotron_nas.py
-transformers.generation.utils.NEED_SETUP_CACHE_CLASSES_MAPPING = dict()
 
-NEMOTRON_NAS_MINI_CONFIG = {
-    "architectures": ["DeciLMForCausalLM"],
-    "attention_bias":
-    False,
-    "block_configs": [{
-        "attention": {
-            "n_heads_in_group": 8,
-            "no_op": False,
-            "replace_with_linear": False
-        },
-        "ffn": {
-            "ffn_mult": 2.0,
-            "no_op": False,
-            "replace_with_linear": False
-        }
-    }, {
-        "attention": {
-            "n_heads_in_group": 16,
-            "no_op": False,
-            "replace_with_linear": False
-        },
-        "ffn": {
-            "ffn_mult": 2.0,
-            "no_op": False,
-            "replace_with_linear": False
-        }
-    }, {
-        "attention": {
-            "n_heads_in_group": None,
-            "no_op": False,
-            "replace_with_linear": True
-        },
-        "ffn": {
-            "ffn_mult": 2.0,
-            "no_op": False,
-            "replace_with_linear": False
-        }
-    }, {
-        "attention": {
-            "n_heads_in_group": None,
-            "no_op": True,
-            "replace_with_linear": False
-        },
-        "ffn": {
-            "ffn_mult": 2.0,
-            "no_op": False,
-            "replace_with_linear": False
-        }
-    }, {
-        "attention": {
-            "n_heads_in_group": 8,
-            "no_op": False,
-            "replace_with_linear": False
-        },
-        "ffn": {
-            "ffn_mult": None,
-            "no_op": False,
-            "replace_with_linear": True
-        }
-    }, {
-        "attention": {
-            "n_heads_in_group": 4,
-            "no_op": False,
-            "replace_with_linear": False
-        },
-        "ffn": {
-            "ffn_mult": None,
-            "no_op": True,
-            "replace_with_linear": False
-        }
-    }, {
-        "attention": {
-            "n_heads_in_group": 8,
-            "no_op": False,
-            "replace_with_linear": False
-        },
-        "ffn": {
-            "ffn_mult": 2.0,
-            "no_op": False,
-            "replace_with_linear": False
-        }
-    }, {
-        "attention": {
-            "n_heads_in_group": 8,
-            "no_op": False,
-            "replace_with_linear": False
-        },
-        "ffn": {
-            "ffn_mult": 2.0,
-            "no_op": False,
-            "replace_with_linear": False
-        }
-    }, {
-        "attention": {
-            "n_heads_in_group": 16,
-            "no_op": False,
-            "replace_with_linear": False
-        },
-        "ffn": {
-            "ffn_mult": 2.0,
-            "no_op": False,
-            "replace_with_linear": False
-        }
-    }, {
-        "attention": {
-            "n_heads_in_group": None,
-            "no_op": False,
-            "replace_with_linear": True
-        },
-        "ffn": {
-            "ffn_mult": 2.0,
-            "no_op": False,
-            "replace_with_linear": False
-        }
-    }, {
-        "attention": {
-            "n_heads_in_group": None,
-            "no_op": True,
-            "replace_with_linear": False
-        },
-        "ffn": {
-            "ffn_mult": 2.0,
-            "no_op": False,
-            "replace_with_linear": False
-        }
-    }, {
-        "attention": {
-            "n_heads_in_group": 8,
-            "no_op": False,
-            "replace_with_linear": False
-        },
-        "ffn": {
-            "ffn_mult": None,
-            "no_op": False,
-            "replace_with_linear": True
-        }
-    }, {
-        "attention": {
-            "n_heads_in_group": 4,
-            "no_op": False,
-            "replace_with_linear": False
-        },
-        "ffn": {
-            "ffn_mult": None,
-            "no_op": True,
-            "replace_with_linear": False
-        }
-    }, {
-        "attention": {
-            "n_heads_in_group": 8,
-            "no_op": False,
-            "replace_with_linear": False
-        },
-        "ffn": {
-            "ffn_mult": 2.0,
-            "no_op": False,
-            "replace_with_linear": False
-        }
-    }],
-    "bos_token_id":
-    1,
-    "eos_token_id":
-    2,
-    "hidden_act":
-    "silu",
-    "hidden_size":
-    2048,
-    "initializer_range":
-    0.02,
-    "intermediate_size":
-    None,
-    "max_position_embeddings":
-    2048,
-    "model_type":
-    "deci",
-    "num_attention_heads":
-    32,
-    "num_hidden_layers":
-    14,
-    "num_key_value_heads":
-    None,
-    "rms_norm_eps":
-    1e-06,
-    "rope_scaling":
-    None,
-    "rope_theta":
-    10000.0,
-    "tie_word_embeddings":
-    False,
-    "torch_dtype":
-    "bfloat16",
-    "use_cache":
-    True,
-    "vocab_size":
-    32128
-}
+def _block_config(n_heads_in_group: int,
+                  ffn_mult: float,
+                  *,
+                  no_op_ffn: bool = False) -> SimpleNamespace:
+    return SimpleNamespace(
+        attention=SimpleNamespace(
+            no_op=n_heads_in_group == 0,
+            n_heads_in_group=n_heads_in_group,
+            replace_with_linear=False,
+        ),
+        ffn=SimpleNamespace(no_op=no_op_ffn,
+                            ffn_mult=ffn_mult,
+                            replace_with_linear=False),
+    )
 
 
-@dataclass(repr=False)
-class Scenario:
-    backend: str
+def _make_config() -> PretrainedConfig:
+    # Exercise MHA, an FFN-only layer, an attention-only layer, and GQA.
+    return PretrainedConfig(
+        architectures=["DeciLMForCausalLM"],
+        hidden_size=256,
+        num_attention_heads=4,
+        num_hidden_layers=4,
+        vocab_size=128,
+        torch_dtype=torch.float16,
+        rms_norm_eps=1e-6,
+        hidden_act="silu",
+        max_position_embeddings=128,
+        rope_theta=10000.0,
+        rope_scaling=None,
+        tie_word_embeddings=False,
+        block_configs=[
+            _block_config(1, 1.0),
+            _block_config(0, 2.0),
+            _block_config(2, 1.0, no_op_ffn=True),
+            _block_config(4, 1.0),
+        ],
+    )
 
-    def __repr__(self) -> str:
-        return f"backend:{self.backend.lower()}"
+
+@pytest.fixture
+def decilm_model() -> NemotronNASForCausalLM:
+    config = _make_config()
+    # DeciLM is the HF architecture name; NemotronNAS is its native implementation.
+    assert get_registered_model_class(
+        config.architectures[0]) is NemotronNASForCausalLM
+    model_config = ModelConfig(pretrained_config=config, attn_backend="TRTLLM")
+    model = NemotronNASForCausalLM(model_config).cuda().eval()
+
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if parameter.ndim == 1:
+                # RMSNorm scales must preserve activations rather than suppress them.
+                parameter.fill_(1.0)
+            else:
+                parameter.normal_(mean=0.0, std=0.02, generator=generator)
+    model.post_load_weights()
+    return model
 
 
-def reduce_nemotron_nas_config(mem_for_full_model: int, config_dict: dict[str,
-                                                                          Any]):
-    _, total_mem = torch.cuda.mem_get_info()
-    # scale model down if gpu memory is low
-    if total_mem < mem_for_full_model:
-        model_fraction = total_mem / mem_for_full_model
-        num_layers = int(config_dict["num_hidden_layers"] * model_fraction)
-        num_layers = min(num_layers, 32)
-        config_dict["num_hidden_layers"] = num_layers
-        config_dict["block_configs"] = config_dict["block_configs"][:num_layers]
+@pytest.fixture
+def decilm_cache(
+        decilm_model: NemotronNASForCausalLM) -> Iterator[KVCacheManager]:
+    config = decilm_model.config
+    cache = KVCacheManager(
+        KvCacheConfig(max_tokens=512, enable_block_reuse=False),
+        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+        num_layers=config.num_hidden_layers,
+        num_kv_heads=config.num_key_value_heads,
+        head_dim=config.hidden_size // config.num_attention_heads,
+        tokens_per_block=128,
+        max_seq_len=128,
+        max_batch_size=3,
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        dtype=tensorrt_llm.bindings.DataType.HALF,
+    )
+    try:
+        # Each request has room for the complete eight-token sequence.
+        cache.add_dummy_requests([0, 1, 2], [8, 8, 8])
+        yield cache
+    finally:
+        cache.shutdown()
 
 
-class TestNemotronNAS(unittest.TestCase):
+@torch.inference_mode()
+def _forward(
+    model: NemotronNASForCausalLM,
+    cache: KVCacheManager,
+    input_ids: torch.Tensor,
+    *,
+    request_id: int,
+    num_cached_tokens: int = 0,
+    prompt_len: int = 8,
+) -> torch.Tensor:
+    metadata_cls = get_attention_backend(
+        model.model_config.attn_backend).Metadata
+    metadata = metadata_cls(
+        seq_lens=torch.tensor([input_ids.numel()], dtype=torch.int),
+        num_contexts=int(num_cached_tokens == 0),
+        kv_cache_params=KVCacheParams(
+            use_cache=True, num_cached_tokens_per_seq=[num_cached_tokens]),
+        kv_cache_manager=cache,
+        request_ids=[request_id],
+        prompt_lens=[prompt_len],
+        max_num_requests=1,
+        max_num_tokens=128,
+    )
+    position_ids = torch.arange(num_cached_tokens,
+                                num_cached_tokens + input_ids.numel(),
+                                device=input_ids.device).unsqueeze(0)
+    metadata.prepare()
+    return model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        attn_metadata=metadata,
+        return_context_logits=True,
+    )
 
-    def test_nemotron_nas_sanity(self):
-        config_dict = deepcopy(NEMOTRON_NAS_MINI_CONFIG)
-        # 8B * sizeof(float16) plus some extra for activations
-        mem_for_full_model = (2 + 1) * 8 * 2**(30)
-        reduce_nemotron_nas_config(mem_for_full_model, config_dict)
-        if config_dict["num_hidden_layers"] <= 0:
-            self.skipTest("Insufficient memory for a single NemotronNAS layer")
-        nemotron_nas_config = AutoConfig.from_pretrained(
-            llm_models_root() / "nemotron-nas/Llama-3_1-Nemotron-51B-Instruct",
-            trust_remote_code=True,
-        )
-        nemotron_nas_config = nemotron_nas_config.from_dict(config_dict)
 
-        dtype = nemotron_nas_config.torch_dtype
-        device = torch.device('cuda')
+class TestDeciLMForCausalLM:
 
-        model_config = ModelConfig(pretrained_config=nemotron_nas_config)
-        nemotron_nas = NemotronNASForCausalLM(model_config).to(dtype).to(device)
+    def test_construction(self, decilm_model: NemotronNASForCausalLM) -> None:
+        config = decilm_model.config
+        layers = decilm_model.model.layers
+        assert config.architectures == ["DeciLMForCausalLM"]
+        assert len(layers) == 4
+        assert config.num_key_value_heads == [4, 0, 2, 1]
+        assert decilm_model.model.embed_tokens.weight.shape == (128, 256)
+        assert decilm_model.lm_head.weight.shape == (128, 256)
 
-        input_ids = torch.tensor([100, 200, 300, 100, 200, 100, 400, 500],
+        assert layers[0].self_attn.num_key_value_heads == 4
+        assert layers[0].mlp.gate_up_proj.weight.shape == (512, 256)
+        assert not hasattr(layers[1], "self_attn")
+        assert not hasattr(layers[1], "input_layernorm")
+        assert layers[1].mlp.gate_up_proj.weight.shape == (1024, 256)
+        assert layers[2].self_attn.num_key_value_heads == 2
+        assert not hasattr(layers[2], "mlp")
+        assert not hasattr(layers[2], "post_attention_layernorm")
+        assert layers[3].self_attn.num_key_value_heads == 1
+        assert hasattr(layers[3], "mlp")
+
+    def test_forward(self, decilm_model: NemotronNASForCausalLM,
+                     decilm_cache: KVCacheManager) -> None:
+        input_ids = torch.tensor([3, 5, 7, 11, 13, 17, 19, 23],
                                  dtype=torch.int,
-                                 device=device)
+                                 device="cuda")
+        full_logits = _forward(decilm_model,
+                               decilm_cache,
+                               input_ids,
+                               request_id=0)
+        assert full_logits.shape == (8, decilm_model.config.vocab_size)
+        assert full_logits.dtype == torch.float32
+        assert torch.isfinite(full_logits).all()
 
-        num_blocks = 1000
-        tokens_per_block = 128
-
-        if dtype == torch.half:
-            kv_cache_dtype = tensorrt_llm.bindings.DataType.HALF
-        elif dtype == torch.bfloat16:
-            kv_cache_dtype = tensorrt_llm.bindings.DataType.BF16
-        else:
-            raise ValueError("Invalid dtype")
-
-        mapping = Mapping(world_size=1, tp_size=1, rank=0)
-        kv_cache_config = KvCacheConfig(max_tokens=num_blocks *
-                                        tokens_per_block)
-
-        num_layers = nemotron_nas.config.num_hidden_layers
-        num_kv_heads = nemotron_nas.config.num_key_value_heads
-        num_heads = nemotron_nas.config.num_attention_heads
-        head_dim = nemotron_nas.config.hidden_size // num_heads
-        max_seq_len = num_blocks * tokens_per_block
-
-        context_sequence_lengths = [3, 2, 1]
-        sequence_lengths = context_sequence_lengths + [1, 1]
-        batch_size = len(sequence_lengths)
-        past_seen_tokens = [0, 0, 0, 62, 75]
-        request_ids = list(range(len(sequence_lengths)))
-        token_nums = (torch.tensor(past_seen_tokens) +
-                      torch.tensor(sequence_lengths)).tolist()
-        prompt_lens = token_nums[:3] + past_seen_tokens[3:]
-
-        kv_cache_manager = KVCacheManager(
-            kv_cache_config,
-            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-            num_layers=num_layers,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            tokens_per_block=tokens_per_block,
-            max_seq_len=max_seq_len,
-            max_batch_size=batch_size,
-            mapping=mapping,
-            dtype=kv_cache_dtype,
+        prefix_len = 5
+        prefix_logits = _forward(
+            decilm_model,
+            decilm_cache,
+            input_ids[:prefix_len],
+            request_id=1,
+            prompt_len=prefix_len,
         )
-        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+        torch.testing.assert_close(prefix_logits,
+                                   full_logits[:prefix_len],
+                                   atol=5e-3,
+                                   rtol=5e-3)
 
-        metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
-        attn_metadata = metadata_cls(
-            seq_lens=torch.tensor(sequence_lengths, dtype=torch.int),
-            num_contexts=len(context_sequence_lengths),
-            kv_cache_params=KVCacheParams(
-                use_cache=True,
-                num_cached_tokens_per_seq=past_seen_tokens,
-            ),
-            kv_cache_manager=kv_cache_manager,
-            request_ids=request_ids,
-            prompt_lens=prompt_lens,
-            max_num_requests=len(context_sequence_lengths) + 2,
-            max_num_tokens=8192,
-        )
+        # Decode through the real paged cache, including layers with different KV-head counts.
+        for position in range(prefix_len, input_ids.numel()):
+            decode_logits = _forward(
+                decilm_model,
+                decilm_cache,
+                input_ids[position:position + 1],
+                request_id=1,
+                num_cached_tokens=position,
+                prompt_len=prefix_len,
+            )
+            torch.testing.assert_close(decode_logits,
+                                       full_logits[position:position + 1],
+                                       atol=5e-3,
+                                       rtol=5e-3)
 
-        position_ids = []
-        for i, tokens in enumerate(past_seen_tokens):
-            seq_len = context_sequence_lengths[i] if i < len(
-                context_sequence_lengths) else 1
-            position_id = torch.arange(tokens,
-                                       tokens + seq_len,
-                                       device=input_ids.device)
-            position_ids.append(position_id)
-
-        position_ids = torch.cat(position_ids).unsqueeze(0)
-
-        with torch.inference_mode():
-            attn_metadata.prepare()
-            logits = nemotron_nas.forward(input_ids=input_ids,
-                                          position_ids=position_ids,
-                                          attn_metadata=attn_metadata)
-
-        self.assertEqual(len(past_seen_tokens), logits.shape[0])
-
-        with torch.inference_mode():
-            attn_metadata.prepare()
-            logits = nemotron_nas.forward(input_ids=input_ids,
-                                          position_ids=position_ids,
-                                          attn_metadata=attn_metadata,
-                                          return_context_logits=True)
-        self.assertEqual(input_ids.shape, logits.shape[:-1])
-
-        kv_cache_manager.shutdown()
-
-    @parameterized.expand([
-        Scenario(backend="VANILLA"),
-        Scenario(backend="FLASHINFER"),
-        Scenario(backend="TRTLLM"),
-    ], lambda testcase_func, param_num, param:
-                          f"{testcase_func.__name__}[{param.args[0]}]")
-    @torch.no_grad()
-    @unittest.skip("https://nvbugspro.nvidia.com/bug/5439817")
-    def test_nemotron_nas_allclose_to_hf(self, scenario: Scenario) -> None:
-        """
-        Compare output to HF
-        """
-        backend = scenario.backend
-        metadata_cls = get_attention_backend(backend).Metadata
-
-        torch.random.manual_seed(0)
-        config_dict = deepcopy(NEMOTRON_NAS_MINI_CONFIG)
-        # 8B * sizeof(float16) plus some extra for activations
-        # times 2, since we'll need 2 of these
-        mem_for_full_model = (2 + 1) * 8 * 2**(30) * 4
-        reduce_nemotron_nas_config(mem_for_full_model, config_dict)
-        if config_dict["num_hidden_layers"] <= 0:
-            self.skipTest("Insufficient memory for a single NemotronNAS layer")
-
-        nemotron_nas_ckpt = llm_models_root(
-        ) / "nemotron-nas/Llama-3_1-Nemotron-51B-Instruct"
-        nemotron_nas_config = AutoConfig.from_pretrained(
-            nemotron_nas_ckpt,
-            trust_remote_code=True,
-        )
-        class_ref = nemotron_nas_config.auto_map["AutoModelForCausalLM"]
-        nemotron_nas_config = nemotron_nas_config.from_dict(config_dict)
-        dtype = nemotron_nas_config.torch_dtype
-        device = torch.device('cuda')
-
-        model_class = get_class_from_dynamic_module(class_ref,
-                                                    nemotron_nas_ckpt)
-        hf_nemotron_nas = model_class(nemotron_nas_config).to(dtype).to(
-            device).eval()
-        # This line populates the "variable" field in the NEED_SETUP_CACHE_CLASSES_MAPPING dict
-        hf_nemotron_nas._prepare_generation_config(None)
-        # And this line is the only way to access the only concrete Cache class DeciLMForCausalLM accepts
-        VariableCache = transformers.generation.utils.NEED_SETUP_CACHE_CLASSES_MAPPING[
-            "variable"]
-
-        model_config = ModelConfig(pretrained_config=nemotron_nas_config,
-                                   attn_backend=backend)
-        nemotron_nas = NemotronNASForCausalLM(model_config).to(dtype).to(device)
-        nemotron_nas.load_weights(hf_nemotron_nas.state_dict())
-
-        num_blocks = 1
-        tokens_per_block = 128
-
-        kv_cache_config = KvCacheConfig(max_tokens=num_blocks *
-                                        tokens_per_block)
-
-        num_layers = nemotron_nas.config.num_hidden_layers
-        num_kv_heads = nemotron_nas.config.num_key_value_heads
-        num_heads = nemotron_nas.config.num_attention_heads
-        head_dim = nemotron_nas.config.hidden_size // num_heads
-        max_seq_len = num_blocks * tokens_per_block
-        batch_size = 1
-
-        mapping = Mapping(world_size=1, tp_size=1, rank=0)
-        if dtype == torch.half:
-            kv_cache_dtype = tensorrt_llm.bindings.DataType.HALF
-        elif dtype == torch.bfloat16:
-            kv_cache_dtype = tensorrt_llm.bindings.DataType.BF16
-        else:
-            raise ValueError("Invalid dtype")
-
-        kv_cache_manager = KVCacheManager(
-            kv_cache_config,
-            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-            num_layers=num_layers,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            tokens_per_block=tokens_per_block,
-            max_seq_len=max_seq_len,
-            max_batch_size=batch_size,
-            mapping=mapping,
-            dtype=kv_cache_dtype,
-        )
-
-        # context
-        input_ids = torch.tensor([100, 200, 300, 100, 200, 100, 400, 500],
-                                 dtype=torch.int,
-                                 device=device)
-
-        num_cached_tokens_per_seq = [0]
-        request_ids = [1]
-        token_nums = [input_ids.size(-1)]
-        prompt_lens = [input_ids.size(-1)]
-        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
-
-        attn_metadata = metadata_cls(
-            seq_lens=torch.tensor([input_ids.size(-1)], dtype=torch.int),
-            num_contexts=1,
-            kv_cache_params=KVCacheParams(
-                use_cache=True,
-                num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-            ),
-            kv_cache_manager=kv_cache_manager,
-            request_ids=request_ids,
-            prompt_lens=prompt_lens,
-            max_num_requests=1,
-            max_num_tokens=8192,
-        )
-
-        position_ids = [torch.arange(0, input_ids.size(-1))]
-        position_ids = torch.cat(position_ids).unsqueeze(0).cuda()
-        # And, lastly, this is the simplest way of creating a Cache that `hf_nemotron_nas` will accept
-        past_key_values = VariableCache(config=nemotron_nas_config,
-                                        dtype=dtype,
-                                        batch_size=1)
-        with torch.inference_mode():
-            attn_metadata.prepare()
-            logits = nemotron_nas.forward(input_ids=input_ids,
-                                          position_ids=position_ids,
-                                          attn_metadata=attn_metadata)
-            ref = hf_nemotron_nas.forward(input_ids=input_ids.unsqueeze(0),
-                                          position_ids=position_ids,
-                                          past_key_values=past_key_values,
-                                          use_cache=True)
-
-        torch.testing.assert_close(logits,
-                                   ref.logits[:, -1].float(),
-                                   atol=0.1,
-                                   rtol=0.1)
-
-        # gen
-        gen_input_ids = torch.tensor([600], dtype=torch.int, device=device)
-
-        num_cached_tokens_per_seq = [input_ids.size(-1)]
-
-        attn_metadata = metadata_cls(
-            seq_lens=torch.tensor([gen_input_ids.size(-1)], dtype=torch.int),
-            num_contexts=0,
-            kv_cache_params=KVCacheParams(
-                use_cache=True,
-                num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-            ),
-            kv_cache_manager=kv_cache_manager,
-            request_ids=request_ids,
-            prompt_lens=prompt_lens,
-            max_num_requests=1,
-            max_num_tokens=8192,
-        )
-
-        gen_position_ids = [
-            torch.arange(input_ids.size(-1),
-                         input_ids.size(-1) + gen_input_ids.size(-1))
-        ]
-        gen_position_ids = torch.cat(gen_position_ids).unsqueeze(0).cuda()
-        with torch.inference_mode():
-            attn_metadata.prepare()
-            logits = nemotron_nas.forward(input_ids=gen_input_ids,
-                                          position_ids=gen_position_ids,
-                                          attn_metadata=attn_metadata)
-            ref = hf_nemotron_nas.forward(input_ids=gen_input_ids.unsqueeze(0),
-                                          position_ids=gen_position_ids,
-                                          past_key_values=ref.past_key_values,
-                                          use_cache=True)
-
-        torch.testing.assert_close(logits,
-                                   ref.logits[:, -1].float(),
-                                   atol=0.1,
-                                   rtol=0.1)
-
-        kv_cache_manager.shutdown()
+        # Future tokens must not alter prefix logits, and the model must react to changed inputs.
+        changed_ids = input_ids.clone()
+        changed_ids[prefix_len:] = torch.tensor([29, 31, 37],
+                                                dtype=torch.int,
+                                                device="cuda")
+        changed_logits = _forward(decilm_model,
+                                  decilm_cache,
+                                  changed_ids,
+                                  request_id=2)
+        torch.testing.assert_close(changed_logits[:prefix_len],
+                                   full_logits[:prefix_len],
+                                   atol=5e-3,
+                                   rtol=5e-3)
+        assert not torch.allclose(changed_logits[prefix_len:],
+                                  full_logits[prefix_len:],
+                                  atol=5e-3,
+                                  rtol=5e-3)

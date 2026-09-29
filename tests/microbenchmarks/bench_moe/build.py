@@ -29,7 +29,16 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
-from tensorrt_llm._torch.modules.fused_moe.interface import MoESchedulerKind, MoEWeightLoadingMode
+from tensorrt_llm._torch.moe.fused_moe.activation import (
+    ACTIVATION_PAYLOAD,
+    MoEActivation,
+    SimpleActivation,
+    SiTuActivation,
+    SwigluBiasActivation,
+)
+from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEEnvFlag, collect_moe_environment
+from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind, MoEWeightLoadingMode
+from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -39,29 +48,22 @@ from .quantize import get_test_quant_params
 from .specs import ConfigSpec, ModelSpec
 from .utils import _ensure_dist_for_megamoe
 
-# Map concrete MoE module class names to short backend identifiers used in
-# results and the dashboard. Anything not in this table falls back to the
-# upper-case class name.
-_BACKEND_CLASS_TO_NAME: Dict[str, str] = {
-    "CutlassFusedMoE": "CUTLASS",
-    "TRTLLMGenFusedMoE": "TRTLLM",
-    "CuteDslFusedMoE": "CUTEDSL",
-    "DeepGemmFusedMoE": "DEEPGEMM",
-    "DenseGEMMFusedMoE": "DENSEGEMM",
-    "MegaMoEDeepGemm": "MEGAMOE_DEEPGEMM",
-    "MegaMoECuteDsl": "MEGAMOE_CUTEDSL",
-    "VanillaMoE": "VANILLA",
-}
-
 
 def _backend_name_from_module(moe) -> str:
-    """Resolve ``actual_backend`` for both ConfigurableMoE and legacy modules."""
+    """Resolve ``actual_backend`` for both ConfigurableMoE and legacy modules.
+
+    Read off ``BACKEND_FAMILY``, which is the table resolution itself uses, so
+    a backend that gains or splits classes stays labelled without an edit
+    here. A hand-written class-name table used to do this and went stale the
+    moment TRTLLM-Gen split into one class per identity.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.moe_resolution import backend_family_of
+
     backend_attr = getattr(moe, "backend", None)
-    if backend_attr is not None and backend_attr is not moe:
-        backend_cls = type(backend_attr).__name__
-    else:
-        backend_cls = type(moe).__name__
-    return _BACKEND_CLASS_TO_NAME.get(backend_cls, backend_cls.upper())
+    backend_cls = (
+        type(backend_attr) if backend_attr is not None and backend_attr is not moe else type(moe)
+    )
+    return backend_family_of(backend_cls) or backend_cls.__name__.upper()
 
 
 def _scheduler_kind_name(moe) -> Optional[str]:
@@ -83,6 +85,24 @@ def _comm_method_name(moe) -> str:
     return type(comm).__name__
 
 
+def _epilogue_activation_name(moe) -> str:
+    """Return the epilogue the built module actually runs: ``"situ"`` or ``"swiglu"``.
+
+    The SiTU request can be dropped for reasons the spec cannot see (wrong
+    backend, wrong quant, upstream fallback), so read it back rather than
+    reporting what was asked for. Every impl records the resolved kind in
+    ``activation_type``; TRTLLM-Gen additionally exposes a predicate, which is
+    checked first because SiTU shares its constant slots with SwiGLU there.
+    """
+    backend = getattr(moe, "backend", None) or moe
+    if getattr(backend, "is_situ_activation", False):
+        return "situ"
+    activation_type = getattr(backend, "activation_type", None)
+    if activation_type is not None and ActivationType(activation_type) == ActivationType.SiTu:
+        return "situ"
+    return "swiglu"
+
+
 def _calculate_num_chunks_safe(moe, all_rank_num_tokens: List[int]) -> Optional[int]:
     """Best-effort lookup of ``num_chunks`` for the case we are about to time."""
     scheduler = getattr(moe, "scheduler", None)
@@ -97,9 +117,61 @@ def _calculate_num_chunks_safe(moe, all_rank_num_tokens: List[int]) -> Optional[
         return None
 
 
+#: Backends whose kernels implement the SiTU epilogue, with the quant they
+#: implement it on. Not a capability check -- ``create_moe`` does that, and
+#: rejects rather than degrades; this is the bench choosing which cases are
+#: worth asking for.
+_SITU_PATHS = frozenset(
+    {
+        ("MEGAMOE_DEEPGEMM", QuantAlgo.W4A8_MXFP4_MXFP8),
+        ("MEGAMOE_CUTEDSL", QuantAlgo.NVFP4),
+        ("TRTLLM", QuantAlgo.W4A8_MXFP4_MXFP8),
+        ("CUTLASS", QuantAlgo.NVFP4),
+    }
+)
+
+
+def _situ_kwargs(
+    model: ModelSpec,
+    moe_backend: str,
+    quant_algo: Optional[QuantAlgo],
+) -> Dict:
+    """``create_moe`` kwargs that switch the epilogue to SiTU, or ``{}``.
+
+    A spec carrying SiTU constants falls back to the SwiGLU proxy on any other
+    backend/quant pair rather than failing the case -- SiTU is gated, so the
+    GEMM shapes and comm volume are the same either way.
+
+    The constants go out as scalars for every backend: each one's
+    ``activation_support`` decides whether its kernels read them as a baked
+    scalar or a per-expert ``float32`` buffer, so the bench no longer sizes
+    tensors against the EP partition to match a particular kernel ABI.
+    """
+    if model.situ_beta is None:
+        return {}
+    if (moe_backend.upper(), quant_algo) not in _SITU_PATHS:
+        return {}
+    return {
+        "activation": SiTuActivation(
+            gate_softcap=float(model.situ_beta),
+            linear_softcap=float(model.situ_linear_beta),
+        )
+    }
+
+
+def _plain_activation(kind: ActivationType) -> MoEActivation:
+    """The spec's ``activation_type`` as a carrier, for the no-constants case.
+
+    Reads ``ACTIVATION_PAYLOAD`` rather than naming the two kinds ``specs.py``
+    currently allows, so a third one added there needs no change here.
+    """
+    payload = ACTIVATION_PAYLOAD[ActivationType(kind)]
+    return SimpleActivation(kind) if payload is SimpleActivation else payload()
+
+
 def _create_moe_for_benchmark(**kwargs):
     ensure_cute_dsl_importable_for_benchmark()
-    from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe
+    from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe
 
     return create_moe(**kwargs)
 
@@ -213,13 +285,18 @@ def _build_moe_module(
 
     # Shared-expert fusion is opt-in in TRTLLMGenFusedMoE; "fused" cases must
     # enable it explicitly or they would silently benchmark the unfused path.
+    # The flag is read through the cached selection environment, which
+    # ``expand_and_prune`` already collected, so the write has to be followed
+    # by a re-collect or it lands behind the snapshot and is read by nothing.
     if model.n_shared_experts > 0 and model.shared_expert_mode != "unfused":
-        os.environ["TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION"] = "1"
+        os.environ[MoEEnvFlag.SHARED_EXPERT_FUSION.value] = "1"
     else:
-        os.environ.pop("TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION", None)
+        os.environ.pop(MoEEnvFlag.SHARED_EXPERT_FUSION.value, None)
+    collect_moe_environment(force=True)
 
     mc = model.to_moe_model_config()
     swiglu_gptoss_style = model.swiglu_gptoss_style
+    activation_type = model.activation_type_enum
 
     routing_method = _create_routing_method(
         model.routing_method_cls,
@@ -264,6 +341,7 @@ def _build_moe_module(
         swiglu_beta=model.swiglu_beta if swiglu_gptoss_style else None,
         swiglu_limit=model.swiglu_limit if swiglu_gptoss_style else None,
         num_local_experts=num_local_experts,
+        activation_type=activation_type,
     )
 
     weight_loading_mode = getattr(
@@ -272,7 +350,8 @@ def _build_moe_module(
 
     swiglu_tensors = quantize_util.get_swiglu_tensors()
 
-    moe = _create_moe_for_benchmark(
+    # Merge then unpack so SiTU can override activation_type / swiglu_alpha-beta.
+    moe_kwargs = dict(
         routing_method=routing_method,
         num_experts=mc.num_experts,
         hidden_size=mc.hidden_size,
@@ -282,10 +361,18 @@ def _build_moe_module(
         model_config=model_config,
         weight_loading_mode=weight_loading_mode,
         bias=swiglu_gptoss_style,
-        swiglu_alpha=swiglu_tensors["swiglu_alpha"] if swiglu_tensors else None,
-        swiglu_beta=swiglu_tensors["swiglu_beta"] if swiglu_tensors else None,
-        swiglu_limit=swiglu_tensors["swiglu_limit"] if swiglu_tensors else None,
+        activation=(
+            SwigluBiasActivation(
+                gate_sigmoid_scale=swiglu_tensors["swiglu_alpha"],
+                linear_offset=swiglu_tensors["swiglu_beta"],
+                clamp=swiglu_tensors["swiglu_limit"],
+            )
+            if swiglu_tensors
+            else _plain_activation(activation_type)
+        ),
     )
+    moe_kwargs.update(_situ_kwargs(model, moe_backend, quant_algo))
+    moe = _create_moe_for_benchmark(**moe_kwargs)
 
     if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
         weights, _ref_weights, _ref_kwargs = quantize_util.prepare_weights_from_backend(

@@ -22,6 +22,10 @@ from typing import NamedTuple, Optional, Union
 
 _BACKEND = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower()
 
+#: Name of the active backend ("cpp" or "python"). Exposed so callers can gate
+#: Python-only extension points, such as duck-typed event sinks, on the selection.
+BACKEND = _BACKEND
+
 if _BACKEND == "python":
     from . import rawref  # noqa: F401
     from ._block_radix_tree import (  # noqa: F401
@@ -86,18 +90,41 @@ if _BACKEND == "python":
         KVCacheUpdatedData,
         UniqueToken,
     )
-    from ._exceptions import CuError, OutOfMemoryError, OutOfPagesError  # noqa: F401
+    from ._exceptions import (  # noqa: F401
+        CorruptedError,
+        CuError,
+        OutOfMemoryError,
+        OutOfPagesError,
+    )
     from ._life_cycle_registry import AttnLifeCycle, LayerGroupId, LifeCycleId  # noqa: F401
     from ._stats import (  # noqa: F401
         _KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
+        CountsByLevel,
         KVCacheIterationStatsDelta,
         KVCacheStatsDelta,
+        ReusedBlocksByLevel,
         SsmSnapshotIterationStatsDelta,
     )
     from ._storage import BufferId  # noqa: F401
     from ._storage._config import CoalescedBuffer, SlotDesc, SlotDescVariant  # noqa: F401
     from ._storage._core import PoolGroupIndex, PoolIndex  # noqa: F401
+    from ._storage_manager import StorageStatistics  # noqa: F401
     from ._utils import HalfOpenRange, exact_div, typed_range  # noqa: F401
+
+    def poison_reason() -> str | None:
+        """First recorded KVCM2 invariant violation, or None.
+
+        The pure-Python backend has no poison latch, so this is always None.
+        """
+        return None
+
+    def take_poison() -> str | None:
+        """Report the recorded violation and clear it. Always None on this backend."""
+        return None
+
+    def num_live_managers() -> int:
+        """Number of constructed, not-yet-destroyed managers. Not tracked on this backend."""
+        return 0
 
     _cpp_introspection = None
 else:
@@ -169,6 +196,8 @@ else:
     KVCacheIterationStatsDelta = _cpp.KVCacheIterationStatsDelta
     KVCacheManager = _cpp.KVCacheManager
     KVCacheManagerConfig = _cpp.KVCacheManagerConfig
+    IKvCacheColdPageCodec = _cpp.IKvCacheColdPageCodec
+    create_default_kv_cache_cold_page_codec = _cpp.create_default_kv_cache_cold_page_codec
     # The C++ KVCacheManagerConfig binding replaces the Python @dataclass, but
     # callers (the DeepSeek-V4 cache manager's _build_cache_config and our own
     # host-tier fallback) use dataclasses.replace() on it. dataclasses.replace()
@@ -188,6 +217,7 @@ else:
         layers: object = None
         max_util_for_resume: float = 0.97
         enable_partial_reuse: bool = True
+        reuse_match_backoff: int = 0
         constraints: object = None
         typical_step: object = None
         initial_pool_ratio: object = None
@@ -212,11 +242,16 @@ else:
     SlotDesc = _cpp.SlotDesc
     SlotDescVariant = _cpp.SlotDescVariant
     SsmLayerConfig = _cpp.SsmLayerConfig
+    StorageStatistics = _cpp.StorageStatistics
     _KVCache = _cpp._KVCache
+    poison_reason = _cpp.poison_reason
+    take_poison = _cpp.take_poison
+    num_live_managers = _cpp.num_live_managers
     _cpp_introspection = getattr(_cpp, "_introspection", None)
     _KV_CACHE_ITERATION_STATS_DELTA_FIELDS = tuple(KVCacheIterationStatsDelta._field_names)
     PlannedDropHandle = _cpp.PlannedDropHandle
     CuError = _cpp.CuError
+    CorruptedError = _cpp.CorruptedError
 
     # Symbols added on main that are not yet ported to the C++ backend.
     # TODO(kvCacheManagerV2-cpp): port these and replace the fallbacks.
@@ -226,6 +261,7 @@ else:
     ReuseScope = getattr(_cpp, "ReuseScope", ReuseScope)
     ScratchDesc = getattr(_cpp, "ScratchDesc", None)
     SsmSnapshotIterationStatsDelta = _cpp.SsmSnapshotIterationStatsDelta
+    ReusedBlocksByLevel = _cpp.ReusedBlocksByLevel
     SwaScratchReuseConfig = getattr(_cpp, "SwaScratchReuseConfig", None)
     UniqueToken = _cpp.UniqueToken
 
@@ -290,6 +326,7 @@ else:
 __all__ = [
     "AggregatedPageDesc",
     "AttentionLayerConfig",
+    "BACKEND",
     "BAD_PAGE_INDEX",
     "CACHE_LEVEL1",
     "BatchDesc",
@@ -340,6 +377,7 @@ __all__ = [
     "ReuseScope",
     "ScratchDesc",
     "KVCacheIterationStatsDelta",
+    "ReusedBlocksByLevel",
     "KVCacheStatsDelta",
     "SsmSnapshotIterationStatsDelta",
     "SlidingWindowSize",
@@ -351,6 +389,7 @@ __all__ = [
     "TokenIdExt",
     "UniqueToken",
     "AttnLifeCycle",
+    "CorruptedError",
     "CuError",
     "OutOfMemoryError",
     "_KVCache",
@@ -359,4 +398,10 @@ __all__ = [
     "sequence_to_blockchain_keys",
     "rawref",
     "typed_range",
+    "poison_reason",
+    "take_poison",
+    "num_live_managers",
 ]
+
+if _BACKEND != "python":
+    __all__.extend(["IKvCacheColdPageCodec", "create_default_kv_cache_cold_page_codec"])

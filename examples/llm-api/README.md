@@ -15,8 +15,8 @@ python3 quickstart_advanced.py --model_dir nvidia/Llama-3.1-8B-Instruct-FP8 --kv
 # BF16 + TP=8
 python3 quickstart_advanced.py --model_dir nvidia/Llama-3_1-Nemotron-Ultra-253B-v1 --tp_size 8
 
-# Nemotron-H requires disabling cache reuse in kv cache
-python3 quickstart_advanced.py --model_dir nvidia/Nemotron-H-8B-Base-8K --disable_kv_cache_reuse --max_batch_size 8
+# Nemotron Nano hybrid (SSM) models require disabling cache reuse in kv cache
+python3 quickstart_advanced.py --model_dir nvidia/NVIDIA-Nemotron-Nano-9B-v2 --disable_kv_cache_reuse --max_batch_size 8
 ```
 
 ## Run the multimodal example script:

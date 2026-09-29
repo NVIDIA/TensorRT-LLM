@@ -21,16 +21,12 @@ import socket
 import tempfile
 import time
 from difflib import SequenceMatcher
-from typing import Any
+from typing import Any, Optional
 
 import yaml
 from packaging import version
 
-from tensorrt_llm import LLM as LLM_torch
 from tensorrt_llm._utils import get_free_port
-from tensorrt_llm.executor.request import LoRARequest
-from tensorrt_llm.lora_manager import LoraConfig
-from tensorrt_llm.sampling_params import SamplingParams
 
 from .trt_test_alternative import (check_call, check_output, print_info,
                                    print_warning)
@@ -216,339 +212,6 @@ def run_and_check(llm_venv, run_cmd, valid_outputs, streaming=False):
         ]), f"output is: {output}"
 
 
-def generate_dummy_loras(
-        hf_model_dir,
-        lora_output_dir,
-        num_loras=1,
-        lora_rank=8,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        zero_weights=False):
-
-    import torch
-    from peft import LoraConfig, get_peft_model
-    from transformers import AutoModelForCausalLM
-
-    print("Creating pseudo LoRAs...")
-
-    # Avoid meta tensors by loading model to CPU first (ensures all parameters are materialized)
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            hf_model_dir,
-            dtype=torch.float16,
-            device_map=None,  # Load everything to CPU first
-            trust_remote_code=True,
-            low_cpu_mem_usage=False,
-        )
-    except Exception:
-        # Fallback to auto device mapping if CPU loading fails
-        print(
-            "Warning: Loading model to CPU failed, falling back to auto device mapping"
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            hf_model_dir,
-            dtype=torch.float16,
-            device_map="auto",
-            trust_remote_code=True,
-        )
-
-    lora_config = LoraConfig(r=lora_rank,
-                             target_modules=target_modules,
-                             bias="none",
-                             task_type="CAUSAL_LM")
-    lora_output_paths = []
-    for lora_idx in range(num_loras):
-        lora_model = get_peft_model(model, lora_config)
-        if zero_weights:
-            for param in lora_model.parameters():
-                param.data.zero_()
-
-        pseudo_lora_dir = f"{lora_output_dir}/pseudo_lora_{lora_idx}"
-        lora_model.save_pretrained(pseudo_lora_dir)
-        lora_output_paths.append(pseudo_lora_dir)
-    return lora_output_paths
-
-
-def get_test_prompts(use_code_prompts: bool = False) -> list[str]:
-    """Get test prompts for LoRA testing.
-
-    Args:
-        use_code_prompts: If True, return code-related prompts. If False, return general prompts.
-
-    Returns:
-        List of test prompts.
-    """
-    if use_code_prompts:
-        return [
-            "Write a function that outputs the fibonacci sequence.",
-            "Convert the following C++ code to Python:  x = 0;x++;",
-            "Find the largest prime factor of 42.",
-            "write a unit test for this function: $(cat fib.py)",
-            "# A simple python function to remove whitespace from a string:",
-            "How to load CodeLlama from HuggingFace?",
-        ]
-    else:
-        return [
-            "Hey how are you doing today?",
-            "How is the weather in Seattle, WA?",
-            "Is it ok to fill diesel in a petrol car?",
-            "Can you check the top 5 trending songs on spotify?",
-            "What is the capital of France?",
-            "How to load CodeLlama from HuggingFace?",
-        ]
-
-
-def get_test_prompts_for_torch() -> list[str]:
-    """Get test prompts for LoRA Torch testing.
-
-    Returns:
-        List of test prompts.
-    """
-    return [
-        "Hey how are you doing today?",
-        "How is the weather in Seattle, WA?",
-        "Is it ok to fill diesel in a petrol car?",
-        "Can you check the top 5 trending songs on spotify?",
-        "What is the capital of France?",
-    ]
-
-
-def test_multi_lora_support(
-    hf_model_dir,
-    tllm_ckpt_dir,
-    engine_dir,
-    llm_venv,
-    example_root,
-    num_loras=2,
-    lora_rank=8,
-    target_hf_modules=["q_proj", "k_proj", "v_proj"],
-    target_trtllm_modules=["attn_q", "attn_k", "attn_v"],
-    zero_lora_weights=True,
-    use_code_prompts=False,
-):
-    start_time = time.time()
-    print("Creating dummy LoRAs...")
-    lora_start = time.time()
-    lora_paths = generate_dummy_loras(
-        hf_model_dir=hf_model_dir,
-        lora_output_dir=llm_venv.get_working_directory(),
-        num_loras=num_loras,
-        lora_rank=lora_rank,
-        target_modules=target_hf_modules,
-        zero_weights=zero_lora_weights)
-    lora_end = time.time()
-    print(
-        f"Creating dummy LoRAs completed in {(lora_end - lora_start):.2f} seconds."
-    )
-
-    print("Build engines...")
-    build_start = time.time()
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={tllm_ckpt_dir}",
-        f"--output_dir={engine_dir}",
-        "--remove_input_padding=enable",
-        "--context_fmha=enable",
-        "--gemm_plugin=auto",
-        "--lora_plugin=auto",
-        "--max_batch_size=8",
-        "--max_input_len=512",
-        "--max_seq_len=562",
-        "--lora_dir",
-        f"{lora_paths[0]}",
-        f"{lora_paths[1]}",
-        "--max_lora_rank=8",
-        "--lora_target_modules",
-        *target_trtllm_modules,
-        "--max_beam_width=1",
-    ]
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-    build_end = time.time()
-    print(
-        f"Build engines completed in {(build_end - build_start):.2f} seconds.")
-
-    input_prompts = get_test_prompts(use_code_prompts)
-
-    print("Run inference with C++ runtime with pybind...")
-    inference_start = time.time()
-    run_script = f"{example_root}/../../../run.py" if "core" in example_root else f"{example_root}/../run.py"
-    run_cmd = [
-        run_script,
-        f"--tokenizer_dir={hf_model_dir}",
-        f"--engine_dir={engine_dir}",
-        "--input_text",
-        *input_prompts,
-        "--lora_task_uids",
-        "-1",
-        "0",
-        "1",
-        "-1",
-        "0",
-        "1",
-        "--top_p=0.5",
-        "--top_k=0",
-        "--random_seed=0",
-        "--max_output_len=30",
-    ]
-    venv_check_call(llm_venv, run_cmd)
-    inference_end = time.time()
-    print(
-        f"Inference completed in {(inference_end - inference_start):.2f} seconds."
-    )
-
-    total_time = time.time() - start_time
-    print(
-        f"Total test_multi_lora_support execution time: {total_time:.2f} seconds"
-    )
-
-
-def test_llm_torch_multi_lora_support(
-        hf_model_dir,
-        llm_venv,
-        num_loras=2,
-        lora_rank=8,
-        target_hf_modules=["q_proj", "k_proj", "v_proj"],
-        target_trtllm_modules=["attn_q", "attn_k", "attn_v"],
-        zero_lora_weights=True,
-        tensor_parallel_size=1,
-        pipeline_parallel_size=1):
-    """Test multi-LoRA support with LLM-API Torch backend.
-
-    When zero_lora_weights=True, validates that LoRA outputs match base model
-    outputs (since zero-weight LoRAs should not alter behavior).
-    """
-
-    assert zero_lora_weights, (
-        "This test compares LoRA outputs against base model outputs, "
-        "which is only valid when zero_lora_weights=True.")
-
-    start_time = time.time()
-    print("Creating dummy LoRAs...")
-    lora_start = time.time()
-
-    lora_paths = generate_dummy_loras(
-        hf_model_dir=hf_model_dir,
-        lora_output_dir=llm_venv.get_working_directory(),
-        num_loras=num_loras,
-        lora_rank=lora_rank,
-        target_modules=target_hf_modules,
-        zero_weights=zero_lora_weights)
-    lora_end = time.time()
-    print(
-        f"Creating dummy LoRAs completed in {(lora_end - lora_start):.2f} seconds."
-    )
-
-    lora_config = LoraConfig(lora_dir=lora_paths,
-                             max_lora_rank=lora_rank,
-                             max_loras=num_loras,
-                             max_cpu_loras=num_loras,
-                             lora_target_modules=target_trtllm_modules)
-
-    input_prompts = get_test_prompts_for_torch()
-
-    sampling_params = SamplingParams(max_tokens=30,
-                                     top_p=0.5,
-                                     top_k=0,
-                                     temperature=0.0)
-
-    # Step 1: Get base model outputs (no LoRA) as the ground truth.
-    print("Initializing LLM_torch without LoRA for base model outputs...")
-    init_start = time.time()
-
-    with LLM_torch(model=hf_model_dir,
-                   tensor_parallel_size=tensor_parallel_size,
-                   pipeline_parallel_size=pipeline_parallel_size,
-                   dtype="bfloat16",
-                   max_batch_size=8,
-                   max_input_len=512,
-                   max_seq_len=562,
-                   max_beam_width=1) as base_llm:
-
-        init_end = time.time()
-        print(
-            f"Base LLM_torch initialization completed in {(init_end - init_start):.2f} seconds."
-        )
-
-        print("Running base model inference (no LoRA)...")
-        base_inference_start = time.time()
-
-        base_outputs = base_llm.generate(input_prompts,
-                                         sampling_params=sampling_params)
-
-        base_inference_end = time.time()
-        print(
-            f"Base inference completed in {(base_inference_end - base_inference_start):.2f} seconds."
-        )
-
-    expected_outputs = [o.outputs[0].text for o in base_outputs]
-    for i, text in enumerate(expected_outputs):
-        print(f"Base output {i+1}: {text!r}")
-
-    # Step 2: Run with LoRA adapters and compare against base outputs.
-    print("Initializing LLM_torch with LoRA support...")
-    init_start = time.time()
-
-    with LLM_torch(model=hf_model_dir,
-                   lora_config=lora_config,
-                   tensor_parallel_size=tensor_parallel_size,
-                   pipeline_parallel_size=pipeline_parallel_size,
-                   dtype="bfloat16",
-                   max_batch_size=8,
-                   max_input_len=512,
-                   max_seq_len=562,
-                   max_beam_width=1) as llm:
-
-        init_end = time.time()
-        print(
-            f"LLM_torch initialization completed in {(init_end - init_start):.2f} seconds."
-        )
-
-        print("Running inference with LLM-API Torch backend...")
-        inference_start = time.time()
-
-        # Create LoRA requests cycling through available adapters.
-        lora_requests = []
-        lora_counter = 0
-        for i in range(len(input_prompts)):
-            if i % 2 == 1:
-                lora_requests.append(None)
-            else:
-                lora_idx = lora_counter % num_loras
-                lora_counter += 1
-                lora_requests.append(
-                    LoRARequest(f"lora-{lora_idx}", lora_idx,
-                                lora_paths[lora_idx]))
-
-        outputs = llm.generate(input_prompts,
-                               sampling_params=sampling_params,
-                               lora_request=lora_requests)
-
-        inference_end = time.time()
-        print(
-            f"Inference completed in {(inference_end - inference_start):.2f} seconds."
-        )
-
-        # Validate that LoRA outputs match base model outputs.
-        print("Validating outputs against base model...")
-        assert len(outputs) == len(expected_outputs), \
-            f"Expected {len(expected_outputs)} outputs, got {len(outputs)}"
-
-        for i, (output, expected) in enumerate(zip(outputs, expected_outputs)):
-            actual_text = output.outputs[0].text
-            print(f"Prompt {i+1}: {input_prompts[i]}")
-            print(
-                f"LoRA: {lora_requests[i].lora_int_id if lora_requests[i] else 'None'}"
-            )
-            print(f"Expected (base): {expected!r}")
-            print(f"Actual (LoRA):   {actual_text!r}")
-            print("-" * 50)
-
-            assert actual_text == expected, \
-                f"Output {i+1} mismatch:\nExpected (base): {expected!r}\nActual (LoRA):   {actual_text!r}"
-
-    total_time = time.time() - start_time
-    print(f"Total test execution time: {total_time:.2f} seconds")
-
-
 def get_dummy_spec_decoding_heads(hf_model_dir,
                                   save_dir,
                                   mode='medusa',
@@ -671,13 +334,145 @@ def wait_for_server(host, port, timeout_seconds=180):
     return False
 
 
+def wait_for_reported_addr(addr_path: str,
+                           timeout: float,
+                           process=None) -> tuple[str, int]:
+    """Read the address a server reported to its --report_addr file.
+
+    The file only appears once trtllm-serve has bound its socket, and that
+    socket stays bound from then on, so the address cannot be stolen between
+    this read and its use -- unlike a port reserved before the server starts.
+
+    Args:
+        addr_path: Path passed to the server's --report_addr.
+        timeout: Seconds to wait for the file to appear.
+        process: Optional Popen of the server, polled so that a crash fails
+            fast instead of burning the whole timeout.
+
+    Returns:
+        tuple[str, int]: The host and port the server bound.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(
+                f"server exited with code {process.returncode} before "
+                f"reporting its address to {addr_path}")
+        try:
+            with open(addr_path) as f:
+                reported = f.read().strip()
+        except FileNotFoundError:
+            reported = ""
+        if reported:
+            host, _, port = reported.rpartition(":")
+            return host, int(port)
+        time.sleep(0.5)
+    raise TimeoutError(f"server did not report its address to {addr_path} "
+                       f"within {timeout}s")
+
+
 PORTS_IN_USE = set()
 
+# Size of the window carved out just below the kernel's ephemeral range, used
+# when CONTAINER_PORT_START is unset (e.g. the SLURM multi-node path).
+STATIC_PORT_RANGE_SIZE = 4096
 
-def get_free_port_in_ci(max_attempts=100):
+
+def get_ephemeral_port_range() -> Optional[tuple[int, int]]:
+    """Return the kernel's ephemeral port range as (low, high), or None.
+
+    These are the ports bind(('', 0)) hands out. None means the range could
+    not be read.
     """
-    Get a free port in the range [CONTAINER_PORT_START, CONTAINER_PORT_START + CONTAINER_PORT_NUM - 1]
-    If CONTAINER_PORT_START and CONTAINER_PORT_NUM are not set or all ports are already in use, fallback to get_free_port
+    try:
+        with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
+            low, high = (int(value) for value in f.read().split())
+    except (OSError, ValueError) as e:
+        print_info(f"[get_free_port_in_ci] could not read the ephemeral port "
+                   f"range ({e}); assuming none is reserved.")
+        return None
+    # Nonsense bounds would make get_static_port_range() hand out ports outside
+    # 1-65535, and bind() raises OverflowError (not OSError) for those, so
+    # reserve_port_from_range would propagate it instead of trying another port.
+    if not 1 <= low <= high <= 65535:
+        print_warning(f"[get_free_port_in_ci] ignoring implausible ephemeral "
+                      f"port range ({low}, {high}).")
+        return None
+    return low, high
+
+
+def get_static_port_range() -> Optional[tuple[int, int]]:
+    """Return a (low, high) window just below the kernel's ephemeral range.
+
+    None is returned if the ephemeral range cannot be determined.
+
+    Ports here are never handed out by bind(('', 0)), so a port reserved from
+    this window cannot be stolen by a sibling process launched with --port 0 --
+    which is how a reserved disaggregated server port was lost to the test's
+    own worker.
+    """
+    ephemeral_range = get_ephemeral_port_range()
+    if ephemeral_range is None:
+        return None
+    high = ephemeral_range[0] - 1
+    low = max(1024, high - STATIC_PORT_RANGE_SIZE + 1)
+    if low > high:
+        return None
+    return low, high
+
+
+def reserve_port_from_range(port_range: tuple[int, int],
+                            source: str) -> Optional[int]:
+    """Probe-bind random ports from an inclusive (low, high) window.
+
+    The first port found free is recorded in PORTS_IN_USE and returned;
+    None is returned once every candidate in the window is taken.
+    """
+    global PORTS_IN_USE
+
+    pid = os.getpid()
+    low, high = port_range
+    available_ports = [
+        port for port in range(low, high + 1) if port not in PORTS_IN_USE
+    ]
+    num_candidates = len(available_ports)
+
+    for attempt in range(1, num_candidates + 1):
+        # Get a random port from the available ports
+        port = random.choice(available_ports)
+
+        # Check if the port is free
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("localhost", port))
+                PORTS_IN_USE.add(port)
+                print_info(
+                    f"[get_free_port_in_ci] pid={pid} allocated port={port} "
+                    f"from {source} range {port_range} after {attempt} "
+                    f"attempt(s); {len(PORTS_IN_USE)} reserved in-process. The "
+                    f"probe socket is now closed, so another process may take "
+                    f"the port before the caller rebinds it (TOCTOU).")
+                return port
+            except OSError as e:
+                print_info(
+                    f"[get_free_port_in_ci] pid={pid} candidate port={port} "
+                    f"in {source} range {port_range} is busy ({e}); trying "
+                    f"another.")
+                available_ports.remove(port)
+                continue
+
+    print_warning(
+        f"[get_free_port_in_ci] pid={pid} exhausted all {num_candidates} "
+        f"candidate ports in {source} range {port_range}.")
+    return None
+
+
+def get_free_port_in_ci(max_attempts: int = 100) -> int:
+    """Get a free port from the CI-assigned container port range.
+
+    The range is [CONTAINER_PORT_START, CONTAINER_PORT_START + CONTAINER_PORT_NUM - 1].
+    If those are unset, or every port in the range is already in use, fall back to
+    a port just below the kernel's ephemeral range, and only then to get_free_port.
     """
     global PORTS_IN_USE
 
@@ -685,45 +480,23 @@ def get_free_port_in_ci(max_attempts=100):
     container_port_start = int(os.environ.get("CONTAINER_PORT_START", -1))
     container_port_num = int(os.environ.get("CONTAINER_PORT_NUM", -1))
     if container_port_start != -1 and container_port_num != -1:
-        port_range = (container_port_start,
-                      container_port_start + container_port_num - 1)
-        available_ports = [
-            port for port in range(container_port_start, container_port_start +
-                                   container_port_num)
-            if port not in PORTS_IN_USE
-        ]
-        num_candidates = len(available_ports)
+        port = reserve_port_from_range(
+            (container_port_start,
+             container_port_start + container_port_num - 1), "CI")
+        if port is not None:
+            return port
 
-        for attempt in range(1, num_candidates + 1):
-            # Get a random port from the available ports
-            port = random.choice(available_ports)
+    # No CI range configured, or every port in it is taken. Prefer a port below
+    # the ephemeral range over a system-assigned one: the latter is drawn from
+    # the same pool that trtllm-serve's own --port 0 workers bind from, so a
+    # sibling worker can take it before the caller rebinds it.
+    static_port_range = get_static_port_range()
+    if static_port_range is not None:
+        port = reserve_port_from_range(static_port_range, "static")
+        if port is not None:
+            return port
 
-            # Check if the port is free
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                try:
-                    s.bind(("localhost", port))
-                    PORTS_IN_USE.add(port)
-                    print_info(
-                        f"[get_free_port_in_ci] pid={pid} allocated port={port} "
-                        f"from CI range {port_range} after {attempt} attempt(s); "
-                        f"{len(PORTS_IN_USE)} reserved in-process. The probe "
-                        f"socket is now closed, so another process may take the "
-                        f"port before the caller rebinds it (TOCTOU).")
-                    return port
-                except OSError as e:
-                    print_info(
-                        f"[get_free_port_in_ci] pid={pid} candidate port={port} "
-                        f"in CI range {port_range} is busy ({e}); trying another."
-                    )
-                    available_ports.remove(port)
-                    continue
-
-        print_warning(
-            f"[get_free_port_in_ci] pid={pid} exhausted all {num_candidates} "
-            f"candidate ports in CI range {port_range}; falling back to a "
-            f"system-assigned ephemeral port.")
-
-    # No port found in the range, try to get a random free port from the system
+    # Last resort: a system-assigned ephemeral port.
     for _ in range(max_attempts):
         port = get_free_port()
         if port not in PORTS_IN_USE:

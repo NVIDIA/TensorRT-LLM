@@ -42,9 +42,13 @@ The following examples demonstrate how to use TensorRT LLM's multimodal support 
 
 ### Quick start
 
-Quickly try out TensorRT LLM's multimodal support using our `LLM-API` and a ready-to-run [example](source:examples/llm-api/quickstart_multimodal.py):
+Quickly try out TensorRT LLM's multimodal support using our `LLM-API` and a ready-to-run [example](source:examples/llm-api/quickstart_multimodal.py). The script imports helpers from its sibling file [`quickstart_advanced.py`](source:examples/llm-api/quickstart_advanced.py), so run it from a checkout of the `examples/llm-api/` directory rather than as a single downloaded file:
 
 ```bash
+# Get the examples directory first; quickstart_multimodal.py imports from
+# quickstart_advanced.py next to it.
+git clone --depth 1 https://github.com/NVIDIA/TensorRT-LLM.git
+cd TensorRT-LLM/examples/llm-api
 python3 quickstart_multimodal.py --model_dir Efficient-Large-Model/NVILA-8B --modality image --disable_kv_cache_reuse
 ```
 

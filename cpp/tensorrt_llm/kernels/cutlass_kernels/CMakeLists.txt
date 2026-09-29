@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -17,6 +17,9 @@
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+# Common CUDA architectures for FP8/FP16/BF16 GEMM kernels
+set(CUTLASS_COMMON_ARCHS 89 90 100f 120f)
 
 # The Python executable will only be defined if building with Torch support. If
 # not, we need to find it here.
@@ -76,15 +79,17 @@ function(process_target target_name enable_hopper enable_blackwell)
   if(${enable_blackwell}
      AND ("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
           OR "103" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+          OR "107" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
           OR "120" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
           OR "121" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
          ))
 
     target_compile_options(${target_name}
                            PRIVATE "-DCUTLASS_ENABLE_GDC_FOR_SM100=1")
-    # Both 100 and 103 support these kernels
+    # SM100 family (100, 103, 107) support these kernels
     if("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
-       OR "103" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+       OR "103" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+       OR "107" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
       # No kernels should be parsed, unless blackwell is specified. This is a
       # build time improvement
       target_compile_definitions(${target_name}
@@ -155,9 +160,12 @@ endfunction()
 file(GLOB_RECURSE MIXED_SRC_CPP fpA_intB_gemm/*.cpp)
 file(GLOB_RECURSE MIXED_SRC_CU fpA_intB_gemm/*.cu)
 
-# Get the sources for MOE Grouped GEMM launchers
-file(GLOB_RECURSE GROUPED_SRC_CPP moe_gemm/*.cpp)
-file(GLOB_RECURSE GROUPED_SRC_CU moe_gemm/*.cu)
+# Get the sources for MOE Grouped GEMM launchers. They live in the MoE domain
+# directory; the targets stay here, next to the CUTLASS instantiation generator
+# and the helpers (process_target, add_instantiations) they use.
+set(MOE_CUTLASS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../moe/cutlass)
+file(GLOB_RECURSE GROUPED_SRC_CPP ${MOE_CUTLASS_DIR}/*.cpp)
+file(GLOB_RECURSE GROUPED_SRC_CU ${MOE_CUTLASS_DIR}/*.cu)
 
 # Get the sources for FP8 Rowwise GEMM launchers
 file(GLOB_RECURSE FBGEMM_SRC_CU fp8_rowwise_gemm/*.cu)
@@ -176,7 +184,6 @@ file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 set(ALL_SRCS ${SRC_CPP};${SRC_CU})
 list(FILTER ALL_SRCS EXCLUDE REGEX "fpA_intB_gemm/.*")
-list(FILTER ALL_SRCS EXCLUDE REGEX "moe_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "fp8_rowwise_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "fp8_blockscale_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "fp4_gemm/.*")
@@ -205,12 +212,12 @@ add_cuda_architectures(fpA_intB_gemm_src 89)
 add_instantiations(fpA_intB_gemm_src ${INSTANTIATION_GENERATION_DIR}/gemm)
 
 add_library(fb_gemm_src STATIC ${FBGEMM_SRC_CU} ${FBGEMM_CU_INSTANTIATIONS})
-set_cuda_architectures(fb_gemm_src 89 90 100f 120f)
+set_cuda_architectures(fb_gemm_src ${CUTLASS_COMMON_ARCHS})
 # add_instantiations(fb_gemm_src
 # ${INSTANTIATION_GENERATION_DIR}/fp8_rowwise_gemm)
 
 add_library(fp8_blockscale_gemm_src STATIC ${FP8_BLOCKSCALE_GEMM_SRC_CU})
-set_cuda_architectures(fp8_blockscale_gemm_src 89 90 100f 120f)
+set_cuda_architectures(fp8_blockscale_gemm_src ${CUTLASS_COMMON_ARCHS})
 
 set(GEMM_SWIGLU_SM90_SRC_CU
     ${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu)
@@ -234,7 +241,7 @@ if(USING_OSS_CUTLASS_FP4_GEMM)
 endif()
 
 if(USING_OSS_CUTLASS_MOE_GEMM)
-  file(GLOB MOE_GEMM_SRC_CU "${CMAKE_CURRENT_SOURCE_DIR}/moe_gemm/*.cu")
+  file(GLOB MOE_GEMM_SRC_CU "${MOE_CUTLASS_DIR}/*.cu")
   set(MOE_GEMM_SRC_CU_LAUNCHER ${MOE_GEMM_SRC_CU})
   list(FILTER MOE_GEMM_SRC_CU_LAUNCHER EXCLUDE REGEX ".*moe_gemm_kernels_.*")
   list(FILTER MOE_GEMM_SRC_CU INCLUDE REGEX ".*moe_gemm_kernels_.*")
@@ -264,7 +271,7 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
   process_target(_moe_gemm_fp4 false true)
 
   add_library(_moe_gemm_fp8 OBJECT ${MOE_GEMM_SRC_CU_FP8})
-  set_cuda_architectures(_moe_gemm_fp8 89 90 100f 120f)
+  set_cuda_architectures(_moe_gemm_fp8 ${CUTLASS_COMMON_ARCHS})
   process_target(_moe_gemm_fp8 true true)
 
   add_instantiations(moe_gemm_src ${INSTANTIATION_GENERATION_DIR}/gemm_grouped)

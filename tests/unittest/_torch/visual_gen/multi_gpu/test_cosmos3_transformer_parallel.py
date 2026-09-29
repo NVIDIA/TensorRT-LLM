@@ -23,39 +23,23 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-try:
-    import sys
-    from pathlib import Path
-
-    from tensorrt_llm._torch.visual_gen.config import (
-        AttentionConfig,
-        DiffusionModelConfig,
-        TorchCompileConfig,
-    )
-    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-    from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
-        COSMOS3_EDGE_BACKBONE_TYPE,
-        Cosmos3VFMTransformer,
-    )
-
-    # Spawn distributed workers via a helper that retries with a fresh master
-    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _visual_gen_dist_utils import spawn_with_retry
-
-    from tensorrt_llm.models.modeling_utils import QuantConfig
-
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
-    # Module-level configs below reference this; every test skips in this
-    # branch, but the definitions still have to import cleanly.
-    COSMOS3_EDGE_BACKBONE_TYPE = "cosmos3_edge_nemotron_dense"
+from tensorrt_llm._torch.visual_gen.config import (
+    AttentionConfig,
+    DiffusionModelConfig,
+    TorchCompileConfig,
+)
+from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
+    COSMOS3_EDGE_BACKBONE_TYPE,
+    Cosmos3VFMTransformer,
+)
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 # Attention2D (attn2d) wraps the compute backend in Attention2DAttention, which
 # requires (a) an LSE-capable inner backend — only FA4, VANILLA does not support
 # LSE — and (b) the ``flash_attn_combine`` JIT kernel.  Detect both up front so the
-# attn2d tests skip cleanly when the kernels are not built (e.g. non-Blackwell CI).
+# attn2d tests fail loudly when the kernels are missing on their Blackwell runner —
+# a build/dependency problem, not a reason to skip.
 try:
     from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
         _flash_attn_fwd as _fa4_fwd,
@@ -64,7 +48,7 @@ try:
         _flash_attn_combine as _fa_combine,
     )
 
-    _ATTN2D_AVAILABLE = MODULES_AVAILABLE and _fa4_fwd is not None and _fa_combine is not None
+    _ATTN2D_AVAILABLE = _fa4_fwd is not None and _fa_combine is not None
 except ImportError:
     _ATTN2D_AVAILABLE = False
 
@@ -157,6 +141,15 @@ _COSMOS3_AUDIO_CONFIG = dict(
     temporal_compression_factor_sound=1,
 )
 
+_ACTION_DIM = 64
+_T_ACTION = 4
+_COSMOS3_ACTION_CONFIG = dict(
+    **_COSMOS3_TEST_CONFIG,
+    action_gen=True,
+    action_dim=_ACTION_DIM,
+    num_embodiment_domains=32,
+)
+
 SEED_WEIGHTS = 123
 SEED_INPUT = 456
 SEED_COND_TEXT = 42
@@ -212,11 +205,13 @@ def _distributed_worker(rank, world_size, backend, test_fn, port):
 
 
 def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool = True):
-    if not MODULES_AVAILABLE:
-        pytest.skip("Required modules not available")
     if use_cuda and torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
     backend = "nccl" if use_cuda else "gloo"
+    # Spawn distributed workers via a helper that retries with a fresh master
+    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
+    from ._visual_gen_dist_utils import spawn_with_retry
+
     spawn_with_retry(
         lambda port: mp.spawn(
             _distributed_worker,
@@ -462,6 +457,34 @@ def _forward_with_audio(
     return out.video, out.audio
 
 
+def _forward_with_action(
+    model: Cosmos3VFMTransformer, device: torch.device, text_seed: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    channels = _COSMOS3_TEST_CONFIG["latent_channel"]
+    hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
+        device, channels=channels, text_seed=text_seed
+    )
+    torch.manual_seed(SEED_INPUT + 2)
+    action_latents = (
+        torch.randn(hs.shape[0], _T_ACTION, _ACTION_DIM, device=device, dtype=hs.dtype) * 0.1
+    )
+    domain_ids = torch.tensor([7], dtype=torch.long, device=device)
+    model.reset_cache()
+    with torch.inference_mode():
+        out = model(
+            hidden_states=hs,
+            timestep=ts / _NUM_TRAIN_TIMESTEPS,
+            raw_timestep=ts,
+            text_ids=text_ids,
+            text_mask=text_mask,
+            video_shape=video_shape,
+            fps=_FPS,
+            action_latents=action_latents,
+            action_domain_ids=domain_ids,
+        )
+    return out.video, out.action
+
+
 def _build_ref_and_parallel(
     *,
     tp_size: int = 1,
@@ -628,6 +651,37 @@ def _logic_cosmos3_ulysses_audio_vs_single_gpu(rank, world_size):
     )
 
 
+def _logic_cosmos3_ulysses_action_vs_single_gpu(rank, world_size):
+    ref_model, ulysses_model, _, device = _build_ref_and_parallel(
+        ulysses_size=world_size, pretrained_dict=_COSMOS3_ACTION_CONFIG
+    )
+    text_seed = _cfg_text_seed(rank, tp_size=1, ulysses_size=world_size, cfg_size=1)
+
+    ref_video, ref_action = _forward_with_action(ref_model, device, text_seed)
+    ulysses_video, ulysses_action = _forward_with_action(ulysses_model, device, text_seed)
+
+    if rank == 0:
+        vdiff = (ulysses_video.float() - ref_video.float()).abs()
+        adiff = (ulysses_action.float() - ref_action.float()).abs()
+        print(
+            f"[ulysses={world_size}+action] "
+            f"video max_abs_diff={vdiff.max().item():.6e}, "
+            f"action max_abs_diff={adiff.max().item():.6e}",
+            flush=True,
+        )
+
+    _assert_parity(
+        ulysses_video,
+        ref_video,
+        msg=f"Rank {rank}: Ulysses+action VIDEO differs from single-GPU reference",
+    )
+    _assert_parity(
+        ulysses_action,
+        ref_action,
+        msg=f"Rank {rank}: Ulysses+action ACTION differs from single-GPU reference",
+    )
+
+
 def _logic_cosmos3_tp_ulysses_vs_single_gpu(rank, world_size):
     tp_size = 2
     ulysses_size = 2
@@ -759,57 +813,50 @@ def _logic_cosmos3_attn2d_ulysses_vs_single_gpu(rank, world_size):
 class TestCosmos3TransformerParallel:
     """Cosmos3 TP / Ulysses / CFG parity vs single-GPU (synthetic weights, no checkpoint)."""
 
-    def _skip_if_unavailable(self):
-        if not MODULES_AVAILABLE:
-            pytest.skip("Required modules not available")
-
     def test_tp2_vs_single_gpu(self):
-        self._skip_if_unavailable()
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_tp_vs_single_gpu)
 
     def test_ulysses2_vs_single_gpu(self):
-        self._skip_if_unavailable()
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_ulysses_vs_single_gpu)
 
     def test_edge_tp2_vs_single_gpu(self):
         """Edge's non-gated relu² MLP shards without the gate_up fusion the
         Qwen recipe uses, so column/row splitting takes a different path."""
-        self._skip_if_unavailable()
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_edge_tp_vs_single_gpu)
 
     def test_edge_ulysses2_vs_single_gpu(self):
         """Edge under sequence sharding: no und Q/K norm, and the reasoner's
         keys are normed only where the generator consumes them."""
-        self._skip_if_unavailable()
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_edge_ulysses_vs_single_gpu)
 
     def test_ulysses2_audio_vs_single_gpu(self):
         """Ulysses parity with the audio modality on: video + audio tokens are
         sharded together across the sequence dimension."""
-        self._skip_if_unavailable()
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_ulysses_audio_vs_single_gpu)
+
+    def test_ulysses2_action_vs_single_gpu(self):
+        """Ulysses parity with action tokens appended to the GEN sequence."""
+        run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_ulysses_action_vs_single_gpu)
 
     @pytest.mark.gpu4
     def test_tp2_ulysses2_vs_single_gpu(self):
-        self._skip_if_unavailable()
         run_test_in_distributed(world_size=4, test_fn=_logic_cosmos3_tp_ulysses_vs_single_gpu)
 
     @pytest.mark.gpu4
     def test_cfg2_ulysses2_vs_single_gpu(self):
-        self._skip_if_unavailable()
         run_test_in_distributed(world_size=4, test_fn=_logic_cosmos3_cfg_ulysses_vs_single_gpu)
 
     def test_attn2d_2x1_vs_single_gpu(self):
-        self._skip_if_unavailable()
-        if not _ATTN2D_AVAILABLE:
-            pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
+        assert _ATTN2D_AVAILABLE, (
+            "FA4 / flash_attn_combine JIT kernels not available; expected on the Blackwell CI runner"
+        )
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_attn2d_vs_single_gpu)
 
     @pytest.mark.gpu4
     def test_attn2d_2x1_ulysses2_vs_single_gpu(self):
-        self._skip_if_unavailable()
-        if not _ATTN2D_AVAILABLE:
-            pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
+        assert _ATTN2D_AVAILABLE, (
+            "FA4 / flash_attn_combine JIT kernels not available; expected on the Blackwell CI runner"
+        )
         run_test_in_distributed(world_size=4, test_fn=_logic_cosmos3_attn2d_ulysses_vs_single_gpu)
 
 

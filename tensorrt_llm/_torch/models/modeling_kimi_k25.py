@@ -63,11 +63,11 @@ from ...inputs import (
     register_input_processor,
 )
 from ...sampling_params import SamplingParams
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PredefinedAttentionMask
-from ..attention_backend.utils import get_attention_backend
+from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PredefinedAttentionMask
+from ..attention.backends.utils import get_attention_backend
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mlp import MLP
@@ -372,6 +372,11 @@ def _vision_requires_replication(model_config: ModelConfig, num_heads: int) -> b
     mapping = model_config.mapping
     if mapping.enable_attention_dp:
         return True
+    # Helix carries its parallelism in cp with tp_size=1, so a tp-only test
+    # never trips; the tower has no context-parallel form, so any cp > 1
+    # must replicate.
+    if mapping.cp_size > 1:
+        return True
     return (num_heads % mapping.tp_size) != 0
 
 
@@ -379,12 +384,18 @@ def _get_vision_tp_mapping(model_config: ModelConfig, num_heads: int) -> Mapping
     if not _vision_requires_replication(model_config, num_heads):
         return model_config.mapping
 
+    # Fold every parallel dimension (incl. helix cp) into pp so each rank
+    # runs the tower replicated; without cp the world size collapses below
+    # the rank range under helix.
+    attn_ranks = (
+        model_config.mapping.pp_size * model_config.mapping.tp_size * model_config.mapping.cp_size
+    )
     return Mapping(
-        world_size=model_config.mapping.pp_size * model_config.mapping.tp_size,
+        world_size=attn_ranks,
         rank=model_config.mapping.rank,
         gpus_per_node=model_config.mapping.gpus_per_node,
         tp_size=1,
-        pp_size=model_config.mapping.pp_size * model_config.mapping.tp_size,
+        pp_size=attn_ranks,
     )
 
 
@@ -1705,7 +1716,7 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
     @property
     def mm_token_ids(self) -> torch.Tensor:
         """Surface the in-vocab media placeholder to the model engine so
-        ``_prepare_multimodal_indices`` selects the ``torch.isin`` predicate
+        ``runners.prepare_multimodal_indices`` selects the ``torch.isin`` predicate
         instead of the OOV (``>= vocab_size``) fallback (which would miss
         Kimi's placeholder and force ``fuse_input_embeds`` through the
         ``torch.where`` host-sync path on GPU input_ids).
@@ -1733,6 +1744,10 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         if any(k.startswith(self._LANG_PREFIX) for k in weights):
             lm_weights = filter_weights("language_model", weights)
             lm_weights = ConsumableWeightsDict(lm_weights)
+            checkpoint_dir = getattr(weights, "checkpoint_dir", None)
+            if checkpoint_dir is not None:
+                lm_weights.checkpoint_dir = checkpoint_dir
+            lm_weights.checkpoint_prefix = self._LANG_PREFIX
         else:
             lm_weights = weights
         self.llm.load_weights(lm_weights)
@@ -1765,7 +1780,7 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
             )
             mm_embeds = find_input_mm_embeds(mm_embeds, mm_ctx_params)
 
-            # The executor's ``_prepare_multimodal_indices`` now sees Kimi's
+            # ``runners.prepare_multimodal_indices`` now sees Kimi's
             # in-vocab placeholder via ``self.mm_token_ids`` and emits indices
             # that match ``find_input_mm_embeds``'s active-chunk slice. The
             # previous ``(input_ids == placeholder).sum().item()`` guard was a

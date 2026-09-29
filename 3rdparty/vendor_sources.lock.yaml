@@ -1,0 +1,29 @@
+schema_version: 1
+vendors:
+  flashinfer-prims-ts:
+    url: https://github.com/yuxianq/flashinfer.git
+    branch: trtllm-prims-ts-dev
+    commit: 6e0d64e79f2a87eeb539e2f40ea12d009679a8f5
+    source: flashinfer/attention/prims_ts
+    destination: tensorrt_llm/_torch/attention/backends/prims_ts
+    include:
+    - '**/*.py'
+    patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
+    patch_digest: sha256:ba917f330d8281781ce30ddb89f1772ee8f9017264d948b588b881a92f511e45
+    digest: sha256-tree-v1:fa65b674a9ec6121b4158069d5585cc56df28243d1ac1199eb97003d81135d76
+  sana-sol-attn:
+    url: https://github.com/NVlabs/Sana.git
+    branch: sol-engine
+    commit: 5fe5febdf0f59fee1c0b44a5ce6665df0dabd247
+    source: techniques/sparse_backends
+    destination: tensorrt_llm/_torch/visual_gen/cute_dsl_kernels/blackwell
+    include:
+    - sol_attn/THIRD_PARTY_NOTICES.md
+    - sol_attn/__init__.py
+    - sol_attn/common/*
+    - sol_attn/interface.py
+    - sol_attn/preprocess.py
+    - sol_attn/sm100/*
+    patch: 3rdparty/vendor_patches/sana-sol-attn.patch
+    patch_digest: sha256:0d66669021683773aff34533abaf8f200abd09e3af93d19eed0e2a2e04f2f980
+    digest: sha256-tree-v1:383f6085ca1bc2438e8d7d4796036af3a816dbfd396313704f7f4be2c06ac55b

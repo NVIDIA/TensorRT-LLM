@@ -44,6 +44,24 @@ def _cpp_introspection_module() -> Any | None:
     return getattr(package, "_cpp_introspection", None)
 
 
+def poison_for_testing(reason: str) -> None:
+    """Set the poison latch directly, to exercise the refusal paths."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is None:
+        raise RuntimeError("the poison latch requires the C++ backend")
+    cpp_introspection.poison_for_testing(reason)
+
+
+def create_test_padding_cold_page_codec(
+    cold_page_bytes_by_layer: dict[int, int],
+) -> Any:
+    """Create the private native padding codec used by cold-tier end-to-end tests."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is None:
+        raise RuntimeError("the test padding cold-page codec requires the C++ backend")
+    return cpp_introspection.create_test_padding_cold_page_codec(cold_page_bytes_by_layer)
+
+
 def make_test_block(
     manager: Any,
     tokens: Any,
@@ -109,6 +127,23 @@ def close_test_block(block: Any) -> None:
         block.close()
         return
     block.close()
+
+
+def set_test_block_page_cache_level(block: Any, life_cycle_id: int, cache_level: int) -> None:
+    """Set synthetic page residency for attribution tests."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        cpp_introspection.set_test_block_page_cache_level(block, life_cycle_id, cache_level)
+        return
+
+    from ._common import CacheLevel
+
+    page = next((page for page in block.pages if page.life_cycle == life_cycle_id), None)
+    if page is None:
+        raise ValueError(f"test block has no page for life cycle {life_cycle_id}")
+    if page.scheduled_for_eviction:
+        page.manager.exclude_from_eviction(page)
+    page.cache_level = CacheLevel(cache_level)
 
 
 def test_block_key(block: Any) -> bytes:
@@ -269,14 +304,6 @@ def force_rebalance_precondition(manager: Any, skew: float = 2.0) -> None:
     set_target_ratio_list_gpu(manager, [x / total for x in skewed])
 
 
-def storage_statistics(manager: Any, cache_level: int = 0) -> list[Any]:
-    """Return storage statistics by pool group for a cache level."""
-    cpp_introspection = _cpp_introspection_module()
-    if cpp_introspection is not None:
-        return list(cpp_introspection.storage_statistics(manager, cache_level))
-    return list(manager._storage.get_statistics(cache_level))
-
-
 def storage_utilization(manager: Any, cache_level: int = 0) -> list[float]:
     """Return storage utilization by pool group for a cache level."""
     cpp_introspection = _cpp_introspection_module()
@@ -427,14 +454,6 @@ def reuse_match_planned_drop_counts(
     return match.num_tokens, counts
 
 
-def pool_group_index(manager: Any, lc_id: int) -> int:
-    """Return the storage pool-group index for lifecycle ``lc_id``."""
-    cpp_introspection = _cpp_introspection_module()
-    if cpp_introspection is not None:
-        return cpp_introspection.pool_group_index(manager, lc_id)
-    return manager._storage.get_pool_group_index(lc_id)
-
-
 def compute_slots_for_batch(
     manager: Any,
     batch: Any,
@@ -450,5 +469,7 @@ def compute_slots_for_batch(
             )
         )
     return list(
-        manager._storage._compute_slots_for_batch(batch, tokens_per_block, swa_scratch_reuse)
+        manager._storage._compute_pool_group_slots_for_batch(
+            batch, tokens_per_block, swa_scratch_reuse
+        )
     )

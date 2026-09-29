@@ -21,7 +21,7 @@ from ...inputs import (
     register_input_processor,
 )
 from ...sampling_params import SamplingParams
-from ..attention_backend import AttentionMetadata
+from ..attention.backends import AttentionMetadata
 from .checkpoints.hf.exaone4_5_weight_mapper import Exaone4_5HfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (

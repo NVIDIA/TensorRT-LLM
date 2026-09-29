@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from collections.abc import Sequence
+from typing import Optional
 
 import numpy as np
 
@@ -25,7 +26,8 @@ from tensorrt_llm._torch.disaggregation.base.region import (
     SpecRegionPair,
 )
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable, MapperKind
+from tensorrt_llm._torch.disaggregation.resource.utils import find_replicated_role_mismatch
 from tensorrt_llm._utils import nvtx_range
 
 
@@ -481,6 +483,22 @@ class AttentionPolicy:
     def __init__(self, self_rank_info: RankInfo):
         self._ri = self_rank_info
 
+    def should_send(
+        self, peer_overlap, peer_rank_info, *, mapper_kind: Optional[MapperKind] = None
+    ) -> "bool | None":
+        """Attention uses head-duplication routing.
+
+        REPLICATED views (index-key side caches) hold identical bytes on every
+        TP rank, so they return None to defer to fan-in election instead.
+        """
+        if mapper_kind == MapperKind.REPLICATED:
+            return None
+        dup = peer_overlap.duplicate_head_factor
+        if dup <= 1:
+            return True
+        tp_rank = self._ri.tp_rank % self._ri.tp_size_per_dp_group
+        return (peer_rank_info.dp_rank % dup) == (tp_rank % dup)
+
     def _tp_per_dp(self, ri: RankInfo) -> int:
         if getattr(ri.attention, "enable_attention_dp", False):
             return ri.tp_size // ri.dp_size
@@ -538,6 +556,24 @@ class AttentionPolicy:
         )
         return False
 
+    @staticmethod
+    def validate_peer_compatible(
+        self_page_table: Optional[KVCachePageTable],
+        peer_page_table: Optional[KVCachePageTable],
+    ) -> None:
+        """Reject a peer whose PAGED groups declare different replicated roles.
+
+        Pool matching drops a view with no counterpart silently, so an
+        index-key side cache the peer never declares would leave the receiver
+        holding zeroed state instead of raising. Raises ``ValueError``.
+        """
+        differing = find_replicated_role_mismatch(self_page_table, peer_page_table, CacheKind.PAGED)
+        if differing:
+            raise ValueError(
+                "AttentionPolicy.validate_peer_compatible: replicated roles differ on "
+                f"overlapping layers: {differing}"
+            )
+
     def check_peer_compatible(self, peer_ri: RankInfo) -> bool:
         a = self._ri.attention
         b = peer_ri.attention
@@ -545,10 +581,20 @@ class AttentionPolicy:
         return not (
             self._mismatch("is_mla", a.is_mla, b.is_mla)
             or self._fail_if(
-                self._ri.cp_size != 1 or peer_ri.cp_size != 1,
-                "cp_size must be 1 for both ranks",
+                self._ri.cp_size != 1 and peer_ri.cp_size != 1,
+                "cp_size must be 1 on at least one side (helix pairs a cp=1 "
+                "context instance with a cp=N generation instance)",
                 local=self._ri.cp_size,
                 peer=peer_ri.cp_size,
+            )
+            or self._fail_if(
+                (self._ri.cp_size != 1 or peer_ri.cp_size != 1)
+                and a.tokens_per_block != b.tokens_per_block,
+                "helix block-interleaved transfer requires equal "
+                "tokens_per_block on both sides (block boundaries must "
+                "coincide for [cp_rank::cp_size] ownership)",
+                local=a.tokens_per_block,
+                peer=b.tokens_per_block,
             )
             or self._mismatch("element_bytes", a.element_bytes, b.element_bytes)
             or self._fail_if(
@@ -597,7 +643,7 @@ class AttentionPolicy:
         peer_dup_head = max(1, factor_peer // factor_self)
         return dup_head, peer_dup_head
 
-    def build_kv_mapper(
+    def build_mapper(
         self,
         *,
         peer_ri: RankInfo,
@@ -608,6 +654,10 @@ class AttentionPolicy:
         peer_bytes_per_layer: int,
         self_buffers_per_layer: int = 1,
         peer_buffers_per_layer: int = 1,
+        self_lg=None,
+        peer_lg=None,
+        self_pv=None,
+        peer_pv=None,
     ) -> RegionMapperBase:
         """Pick the mapper for one view pair.
 
@@ -617,7 +667,7 @@ class AttentionPolicy:
         The kind only decides the two irreducible semantic differences:
 
         - REPLICATED skips head matching entirely (bytes are identical on
-          every TP rank; fan-in ownership is decided upstream).
+          every TP rank; fan-in ownership is decided by ``should_send``).
         - Under head mismatch, HND (INDEXED) slices one contiguous head
           range per K/V buffer, while NHD must slice inside every token.
 

@@ -197,13 +197,23 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.indexer_extra_warp_id = tuple(
             range(self.tma_warp_id + 1, self.tma_warp_id + 1 +
                   indexer_transform_warps - 4)) if self.indexer_q_fusion else ()
-        self.threads_per_cta = 32 * len(
+        self.threads_per_warp = 32
+        self.threads_per_cta = self.threads_per_warp * len(
             (self.mma_warp_id, self.tma_warp_id, *self.epilog_warp_id,
              *self.indexer_extra_warp_id))
         # Set barrier id for cta sync, epilogue sync and tmem ptr sync
         self.cta_sync_bar_id = 0
         self.epilog_sync_bar_id = 1
         self.tmem_ptr_sync_bar_id = 2
+        self.epilog_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=self.epilog_sync_bar_id,
+            num_threads=self.threads_per_warp * len(self.epilog_warp_id),
+        )
+        self.tmem_alloc_barrier = pipeline.NamedBarrier(
+            barrier_id=self.tmem_ptr_sync_bar_id,
+            num_threads=self.threads_per_warp * len(
+                (self.mma_warp_id, *self.epilog_warp_id)),
+        )
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
@@ -1394,7 +1404,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 self.epilog_tmem_copy_and_partition(epi_tidx, tCtAcc_base, tCgC,
                                                     epi_tile, use_2cta_instrs))
 
-            tTR_rC = cute.make_fragment(tTR_rAcc.shape, self.c_dtype)
+            tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
             tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
                 tiled_copy_t2r, tTR_rC, epi_tidx, sC)
             tma_atom_c, bSG_sC, bSG_gC_partitioned = (
@@ -1414,7 +1424,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             # Threads/warps participating in tma store pipeline
             c_producer_group = pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
-                32 * len(self.epilog_warp_id),
                 32 * len(self.epilog_warp_id),
             )
             c_pipeline = pipeline.PipelineTmaStore.create(
@@ -1862,7 +1871,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN, RestL)
         tTR_gC = thr_copy_t2r.partition_D(gC_mnl_epi)
         # (T2R, T2R_M, T2R_N)
-        tTR_rAcc = cute.make_fragment(
+        tTR_rAcc = cute.make_rmem_tensor(
             tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype)
         return tiled_copy_t2r, tTR_tAcc, tTR_rAcc
 
@@ -2088,14 +2097,27 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         cluster_shape_mnl = (*cluster_shape_mn, 1)
 
         tile_sched_params = utils.PersistentTileSchedulerParams(
-            num_ctas_mnl,
-            cluster_shape_mnl,
-            swizzle_size=swizzle_size,
-            raster_along_m=raster_along_m)
+            num_ctas_mnl, cluster_shape_mnl, swizzle_size, raster_along_m)
         grid = utils.StaticPersistentTileScheduler.get_grid_shape(
             tile_sched_params, max_active_clusters)
 
         return tile_sched_params, grid
+
+    @staticmethod
+    def needs_unpack_tma(
+        a_dtype: Type[cutlass.Numeric],
+        b_dtype: Type[cutlass.Numeric],
+    ) -> bool:
+        """Decide whether TMA must use the UNPACK_U8 variant for operands.
+
+        Unpack is required when operand widths differ or either operand is
+        6-bit. Otherwise TMA can use the natural packed format.
+        """
+        if a_dtype.width != b_dtype.width:
+            return True
+        if a_dtype.width == 6 or b_dtype.width == 6:
+            return True
+        return False
 
     @staticmethod
     def is_valid_dtypes_and_scale_factor_vec_size(

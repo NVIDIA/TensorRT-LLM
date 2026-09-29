@@ -61,9 +61,6 @@ def _run_llmapi_example(llm_root, engine_dir, llm_venv, script_name: str,
         # medusa-vicuna-7b-v1.3
         f"{llm_models_root()}/medusa-vicuna-7b-v1.3":
         f"{llm_venv.get_working_directory()}/FasterDecoding/medusa-vicuna-7b-v1.3",
-        # llama3.1-medusa-8b-hf_v0.1
-        f"{llm_models_root()}/llama3.1-medusa-8b-hf_v0.1":
-        f"{llm_venv.get_working_directory()}/nvidia/Llama-3.1-8B-Medusa-FP8",
         # Llama-3.1-8B-Instruct
         f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct":
         f"{llm_venv.get_working_directory()}/meta-llama/Llama-3.1-8B-Instruct",
@@ -176,7 +173,7 @@ def test_llmapi_runtime(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_runtime.py")
 
 
-@pytest.mark.parametrize("model", ["Qwen2-0.5B"])
+@pytest.mark.parametrize("model", ["Qwen3/Qwen3-0.6B"])
 def test_llmapi_kv_cache_connector(llm_root, llm_venv, model):
     script_path = Path(
         llm_root) / "examples" / "llm-api" / "llm_kv_cache_connector.py"

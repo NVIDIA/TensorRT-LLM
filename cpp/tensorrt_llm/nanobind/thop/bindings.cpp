@@ -20,9 +20,12 @@
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 #include <tensorrt_llm/common/attentionOp.h>
+#include <tensorrt_llm/common/cudaUtils.h>
+#include <tensorrt_llm/common/tllmDataType.h>
+#include <tensorrt_llm/kernels/fmhaDispatcher.h>
 #include <tensorrt_llm/kernels/helixAllToAll.h>
 #include <tensorrt_llm/thop/attentionOp.h>
-#include <tensorrt_llm/thop/moeAlltoAllMeta.h>
+#include <tensorrt_llm/thop/moe/communication/moeAlltoAllMeta.h>
 #include <tensorrt_llm/thop/outputTensor.h>
 #include <tensorrt_llm/thop/trtllmGenFusedOps.h>
 #include <torch/extension.h>
@@ -58,7 +61,8 @@ nb::tuple trtllmGenContextPreprocessBinding(torch::Tensor qkv_input, torch::Tens
     double rotary_embedding_scale, int64_t rotary_embedding_max_positions, int64_t position_embedding_type,
     double bmm1_scale, double bmm2_scale, int64_t attention_chunk_size, bool fp8_context_fmha, bool paged_context_fmha,
     bool is_mla_enable, int64_t multi_processor_count, int64_t total_num_blocks, int64_t kv_factor,
-    bool need_build_kv_cache_metadata, std::optional<torch::Tensor> cross_kv, bool cross_attention)
+    bool need_build_kv_cache_metadata, std::optional<torch::Tensor> cross_kv, bool cross_attention,
+    bool skip_fmha_workspace)
 {
     auto result = [&]()
     {
@@ -71,7 +75,7 @@ nb::tuple trtllmGenContextPreprocessBinding(torch::Tensor qkv_input, torch::Tens
             max_past_kv_length, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale_type,
             rotary_embedding_scale, rotary_embedding_max_positions, position_embedding_type, bmm1_scale, bmm2_scale,
             attention_chunk_size, fp8_context_fmha, paged_context_fmha, is_mla_enable, multi_processor_count,
-            total_num_blocks, kv_factor, need_build_kv_cache_metadata, cross_kv, cross_attention);
+            total_num_blocks, kv_factor, need_build_kv_cache_metadata, cross_kv, cross_attention, skip_fmha_workspace);
     }();
 
     return nb::make_tuple(std::get<0>(result), optionalToObject(std::get<1>(result)),
@@ -94,7 +98,7 @@ nb::tuple trtllmGenGenerationPreprocessBinding(torch::Tensor qkv_input, torch::T
     double rotary_embedding_scale, int64_t rotary_embedding_max_positions, int64_t position_embedding_type,
     double bmm1_scale, double bmm2_scale, bool fp8_context_fmha, int64_t predicted_tokens_per_seq,
     int64_t attention_chunk_size, int64_t multi_processor_count, int64_t total_num_blocks, int64_t kv_factor,
-    bool need_build_kv_cache_metadata, bool cross_attention)
+    bool need_build_kv_cache_metadata, bool cross_attention, bool skip_fmha_workspace)
 {
     auto result = [&]()
     {
@@ -108,13 +112,90 @@ nb::tuple trtllmGenGenerationPreprocessBinding(torch::Tensor qkv_input, torch::T
             rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale_type, rotary_embedding_scale,
             rotary_embedding_max_positions, position_embedding_type, bmm1_scale, bmm2_scale, fp8_context_fmha,
             predicted_tokens_per_seq, attention_chunk_size, multi_processor_count, total_num_blocks, kv_factor,
-            need_build_kv_cache_metadata, cross_attention);
+            need_build_kv_cache_metadata, cross_attention, skip_fmha_workspace);
     }();
 
     return nb::make_tuple(std::get<0>(result), optionalToObject(std::get<1>(result)),
         optionalToObject(std::get<2>(result)), optionalToObject(std::get<3>(result)), std::get<4>(result),
         std::get<5>(result), std::get<6>(result), optionalToObject(std::get<7>(result)), std::get<8>(result),
         std::get<9>(result), std::get<10>(result), std::get<11>(result));
+}
+
+bool fusedContextFmhaKernelExists(
+    int headSize, tensorrt_llm::DataType kvCacheDtype, int tokensPerBlock, tensorrt_llm::DataType outputDtype)
+{
+    using tensorrt_llm::kernels::Data_type;
+
+    // A fused kernel exists only for a power-of-two page size; the kernel
+    // lookup asserts on other values, so reject them here rather than let that
+    // assertion escape this diagnostic query. tokensPerBlock > 0 is guaranteed
+    // before the bit test.
+    if (headSize <= 0 || tokensPerBlock <= 0 || (tokensPerBlock & (tokensPerBlock - 1)) != 0)
+    {
+        return false;
+    }
+
+    // Probe ordinary dense, causal paged context with Q at the KV precision,
+    // except for an NVFP4 KV cache, which is read by an FP8 Q kernel. thop
+    // enables FP8 context computation for FP8 paged KV and attentionOp requires
+    // it for FP4 KV. Output precision is independent and must be supplied
+    // explicitly by the caller.
+    Data_type dataType{};
+    Data_type dataTypeKv{};
+    Data_type dataTypeOut{};
+    switch (kvCacheDtype)
+    {
+    case tensorrt_llm::DataType::kFP8: dataType = dataTypeKv = Data_type::DATA_TYPE_E4M3; break;
+    case tensorrt_llm::DataType::kBF16: dataType = dataTypeKv = Data_type::DATA_TYPE_BF16; break;
+    case tensorrt_llm::DataType::kHALF: dataType = dataTypeKv = Data_type::DATA_TYPE_FP16; break;
+    case tensorrt_llm::DataType::kFP4:
+        // Only the trtllm-gen kernel set has E2M1-KV context kernels. The
+        // FMHA-v2 runner used everywhere else asserts that Q and KV precision
+        // match, so answer "no" wherever FmhaDispatcher would pick FMHA-v2
+        // instead of tripping that assertion inside a diagnostic query. This
+        // mirrors the dispatcher's trtllm-gen selection: SM100 family, and
+        // head size 72 excluded (trtllm-gen has no kernel for it).
+        if (!tensorrt_llm::common::isSM100Family() || headSize == 72)
+        {
+            return false;
+        }
+        dataType = Data_type::DATA_TYPE_E4M3;
+        dataTypeKv = Data_type::DATA_TYPE_E2M1;
+        break;
+    default: return false;
+    }
+
+    switch (outputDtype)
+    {
+    case tensorrt_llm::DataType::kBF16: dataTypeOut = Data_type::DATA_TYPE_BF16; break;
+    case tensorrt_llm::DataType::kHALF: dataTypeOut = Data_type::DATA_TYPE_FP16; break;
+    case tensorrt_llm::DataType::kFP8: dataTypeOut = Data_type::DATA_TYPE_E4M3; break;
+    case tensorrt_llm::DataType::kFP4: dataTypeOut = Data_type::DATA_TYPE_E2M1; break;
+    default: return false;
+    }
+
+    tensorrt_llm::kernels::MHARunnerFixedParams params{};
+    params.dataType = dataType;
+    params.dataTypeKv = dataTypeKv;
+    params.dataTypeOut = dataTypeOut;
+    params.forceFp32Acc = false;
+    params.attentionMaskType = tensorrt_llm::kernels::ContextAttentionMaskType::CAUSAL;
+    // The paged-context FMHA path: Q plus a paged KV cache, i.e. the layout
+    // attentionOp selects when mPagedKVCache && mPagedContextFMHA.
+    params.attentionInputLayout = tensorrt_llm::kernels::AttentionInputLayout::Q_PAGED_KV;
+    params.isSPadded = false;
+    params.numQHeads = 1;
+    params.numKvHeads = 1;
+    params.numTokensPerBlock = tokensPerBlock;
+    params.headSize = headSize;
+    params.headSizeV = headSize;
+    params.qScaling = 1.f;
+    params.attnLogitSoftcappingScale = 0.f;
+    params.hasAlibi = false;
+    params.scaleAlibi = false;
+    params.saveSoftmax = false;
+
+    return tensorrt_llm::kernels::FmhaDispatcher(params).isSupported();
 }
 
 } // namespace
@@ -181,6 +262,8 @@ void initBindings(nb::module_& m)
         nb::arg("spec_decoding_target_max_draft_tokens") = std::nullopt, nb::arg("quant_scale_qkv") = std::nullopt,
         nb::arg("dsv4_inv_rope_cos_sin_cache") = std::nullopt, nb::arg("enable_dsv4_epilogue_fusion") = false,
         nb::arg("force_prepare_spec_dec_tree_mask") = false, nb::arg("max_num_sequences") = std::nullopt,
+        nb::arg("kv_norm_weight") = std::nullopt, nb::arg("kv_norm_eps") = 1e-6,
+        nb::arg("skip_correction_threshold") = 0.0, nb::arg("uses_spcompress") = std::nullopt,
         "Multi-head attention operation", nb::call_guard<nb::gil_scoped_release>());
 
     m.def(
@@ -196,6 +279,16 @@ void initBindings(nb::module_& m)
         "length). Returns 0 outside the fp8 context-MLA separate-Q/KV path. Used by the KV-cache estimator to "
         "reserve workspace headroom before sizing the KV pool.");
 
+    m.def("fused_context_fmha_kernel_exists", &fusedContextFmhaKernelExists, nb::arg("head_size"),
+        nb::arg("kv_cache_dtype"), nb::arg("tokens_per_block"), nb::arg("output_dtype"),
+        "Whether this build has a fused paged-context FMHA kernel for (this device's SM, head_size, KV cache dtype, "
+        "tokens per block, output dtype), with Q at the KV precision (FP8 Q for an NVFP4 KV cache, which only the "
+        "SM100-family kernel set carries), causal masking, and equal Q/KV heads. "
+        "This is a diagnostic for a fixed probe configuration and does not describe what a given model will run; "
+        "AttentionOp checks its own exact initialized configuration before allowing paged-context attention. "
+        "A build whose --cuda_architectures omits this device's SM carries no kernels for it and reports false.",
+        nb::call_guard<nb::gil_scoped_release>());
+
     m.def("compute_flash_mla_metadata", &tensorrt_llm::computeFlashMlaMetadata, nb::arg("seqlens_k"),
         nb::arg("tile_scheduler_metadata"), nb::arg("num_splits"), nb::arg("batch_size"), nb::arg("s_q"),
         nb::arg("num_q_heads"), nb::arg("num_kv_heads"), nb::arg("head_size_v"),
@@ -205,10 +298,11 @@ void initBindings(nb::module_& m)
     m.def(
         "get_trtllm_gen_context_workspace_layout",
         [](at::ScalarType dtype, int64_t batch_size, int64_t num_tokens, int64_t num_heads, int64_t head_size,
-            int64_t rotary_embedding_dim, bool separate_q_kv_input, bool fp8_context_fmha)
+            int64_t rotary_embedding_dim, bool separate_q_kv_input, bool fp8_context_fmha, bool skip_fmha_workspace)
         {
             auto const layout = torch_ext::TrtllmAttentionWorkspaceManager::buildContextLayout(dtype, batch_size,
-                num_tokens, num_heads, head_size, rotary_embedding_dim, separate_q_kv_input, fp8_context_fmha);
+                num_tokens, num_heads, head_size, rotary_embedding_dim, separate_q_kv_input, fp8_context_fmha,
+                skip_fmha_workspace);
             nb::dict result;
             result["trtllm_gen_workspace_offset"] = layout.trtllmGenWorkspaceOffset;
             result["cu_q_seqlens_offset"] = layout.cuQSeqlensOffset;
@@ -233,17 +327,17 @@ void initBindings(nb::module_& m)
         },
         nb::arg("dtype"), nb::arg("batch_size"), nb::arg("num_tokens"), nb::arg("num_heads"), nb::arg("head_size"),
         nb::arg("rotary_embedding_dim"), nb::arg("separate_q_kv_input"), nb::arg("fp8_context_fmha"),
-        "Return the C++ trtllm-gen context workspace layout.");
+        nb::arg("skip_fmha_workspace") = false, "Return the C++ trtllm-gen context workspace layout.");
 
     m.def(
         "get_trtllm_gen_generation_workspace_layout",
         [](at::ScalarType dtype, int64_t batch_beam, int64_t num_tokens, int64_t num_heads, int64_t head_size,
             int64_t rotary_embedding_dim, int64_t num_kv_heads, int64_t max_blocks_per_sequence,
-            bool use_sparse_attention)
+            bool use_sparse_attention, bool skip_fmha_workspace)
         {
             auto const layout = torch_ext::TrtllmAttentionWorkspaceManager::buildGenerationLayout(dtype, batch_beam,
                 num_tokens, num_heads, head_size, rotary_embedding_dim, num_kv_heads, max_blocks_per_sequence,
-                use_sparse_attention);
+                use_sparse_attention, skip_fmha_workspace);
             nb::dict result;
             result["trtllm_gen_workspace_offset"] = layout.trtllmGenWorkspaceOffset;
             result["cu_seqlens_offset"] = layout.cuSeqlensOffset;
@@ -268,7 +362,8 @@ void initBindings(nb::module_& m)
         },
         nb::arg("dtype"), nb::arg("batch_beam"), nb::arg("num_tokens"), nb::arg("num_heads"), nb::arg("head_size"),
         nb::arg("rotary_embedding_dim"), nb::arg("num_kv_heads"), nb::arg("max_blocks_per_sequence") = 0,
-        nb::arg("use_sparse_attention") = false, "Return the C++ trtllm-gen generation workspace layout.");
+        nb::arg("use_sparse_attention") = false, nb::arg("skip_fmha_workspace") = false,
+        "Return the C++ trtllm-gen generation workspace layout.");
 
     m.def("trtllm_gen_context_preprocess", &trtllmGenContextPreprocessBinding, nb::arg("qkv_input"),
         nb::arg("workspace"), nb::arg("sequence_lengths"), nb::arg("context_lengths"),
@@ -286,7 +381,8 @@ void initBindings(nb::module_& m)
         nb::arg("attention_chunk_size"), nb::arg("fp8_context_fmha"), nb::arg("paged_context_fmha"),
         nb::arg("is_mla_enable"), nb::arg("multi_processor_count"), nb::arg("total_num_blocks"), nb::arg("kv_factor"),
         nb::arg("need_build_kv_cache_metadata") = true, nb::arg("cross_kv").none() = nb::none(),
-        nb::arg("cross_attention") = false, "Fused nanobind context preprocess for trtllm-gen attention.");
+        nb::arg("cross_attention") = false, nb::arg("skip_fmha_workspace") = false,
+        "Fused nanobind context preprocess for trtllm-gen attention.");
 
     m.def("trtllm_gen_context_postprocess", &torch_ext::trtllmGenContextPostprocess, nb::arg("qkv_input"),
         nb::arg("workspace"), nb::arg("sequence_lengths"), nb::arg("context_lengths"),
@@ -301,7 +397,7 @@ void initBindings(nb::module_& m)
         nb::arg("rotary_embedding_base"), nb::arg("rotary_embedding_scale_type"), nb::arg("rotary_embedding_scale"),
         nb::arg("rotary_embedding_max_positions"), nb::arg("position_embedding_type"), nb::arg("bmm1_scale"),
         nb::arg("fp8_context_fmha"), nb::arg("paged_context_fmha"), nb::arg("is_mla_enable"),
-        nb::arg("attention_chunk_size"), nb::arg("multi_processor_count"),
+        nb::arg("attention_chunk_size"), nb::arg("multi_processor_count"), nb::arg("skip_fmha_workspace") = false,
         "Fused nanobind context postprocess for trtllm-gen attention.", nb::call_guard<nb::gil_scoped_release>());
 
     m.def(
@@ -346,6 +442,6 @@ void initBindings(nb::module_& m)
         nb::arg("bmm2_scale"), nb::arg("fp8_context_fmha"), nb::arg("predicted_tokens_per_seq"),
         nb::arg("attention_chunk_size"), nb::arg("multi_processor_count"), nb::arg("total_num_blocks"),
         nb::arg("kv_factor"), nb::arg("need_build_kv_cache_metadata") = true, nb::arg("cross_attention") = false,
-        "Fused nanobind generation preprocess for trtllm-gen attention.");
+        nb::arg("skip_fmha_workspace") = false, "Fused nanobind generation preprocess for trtllm-gen attention.");
 }
 } // namespace tensorrt_llm::nanobind::thop

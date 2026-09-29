@@ -1,0 +1,82 @@
+--- a/csrc/jit/compiler.hpp
++++ b/csrc/jit/compiler.hpp
+@@ -56,12 +56,18 @@ public:
+                             "--ptxas-options=--register-usage-level=10",
+                             get_env<int>("DG_JIT_CPP_STANDARD", 20));
+         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PTXAS_VERBOSE", 0) or get_env("DG_JIT_PTXAS_CHECK", 0))
+             flags += " --ptxas-options=--verbose,--warn-on-local-memory-usage";
+         if (get_env("DG_JIT_WITH_LINEINFO", 0))
+             flags += " -Xcompiler -rdynamic -lineinfo";
++
++        // Allow overriding the in-kernel barrier timeout, see `comm/barrier.cuh`
++        // NOTES: `flags` is part of the kernel signature, so changing this value
++        // naturally invalidates the JIT cache
++        if (const auto barrier_timeout_seconds = get_env("DG_JIT_BARRIER_TIMEOUT_SECONDS", 0); barrier_timeout_seconds > 0)
++            flags += fmt::format(" -DDG_BARRIER_TIMEOUT_SECONDS={}", barrier_timeout_seconds);
+     }
+ 
+     virtual ~Compiler() = default;
+ 
+     std::filesystem::path make_tmp_dir() const {
+         return make_dirs(cache_dir_path / "tmp");
+--- a/deep_gemm/include/deep_gemm/comm/barrier.cuh
++++ b/deep_gemm/include/deep_gemm/comm/barrier.cuh
+@@ -5,14 +5,22 @@
+ #include <deep_gemm/ptx/ld_st.cuh>
+ #include <deep_gemm/layout/sym_buffer.cuh>
+ #include <deep_gemm/layout/mega_moe.cuh>
+ 
+ namespace deep_gemm::comm {
+ 
+-// 60s timeout, at 2 GHz
+-constexpr int64_t kNumTimeoutCycles = 60ll * 2000000000ll;
++// Barrier timeout in seconds, overridable at JIT compile time. The host-side compiler
++// turns the `DG_JIT_BARRIER_TIMEOUT_SECONDS` environment variable into this definition,
++// so slow-but-healthy rendezvous (e.g. large expert-parallel groups whose first
++// collective follows a long warm-up) can be distinguished from a genuine hang.
++#ifndef DG_BARRIER_TIMEOUT_SECONDS
++#define DG_BARRIER_TIMEOUT_SECONDS 60
++#endif
++
++// Timeout in cycles, at 2 GHz
++constexpr int64_t kNumTimeoutCycles = static_cast<int64_t>(DG_BARRIER_TIMEOUT_SECONDS) * 2000000000ll;
+ 
+ CUTLASS_DEVICE void cluster_sync_with_relaxed_arrive() {
+     // Perform cluster_sync with `barrier.cluster.arrive.relaxed`
+     // This is slightly faster than `cute::cluster_sync` but has weaker memory ordering guarantee
+     cute::cluster_arrive_relaxed();
+     cute::cluster_wait();
+@@ -31,14 +39,14 @@ CUTLASS_DEVICE void grid_sync(const layout::Workspace& workspace,
+             count_ptr, sm_idx == 0 ? (kFinishSumTag - (kNumSMs - 1)) : 1);
+         uint32_t new_value;
+         const auto start_clock = clock64();
+         do {
+             new_value = ptx::ld_acq(count_ptr);
+             if (clock64() - start_clock >= kNumTimeoutCycles) {
+-                printf("DeepGEMM grid sync timeout: sm=%u, thread=%u, grid_sync_idx=%u, old=%u, current=%u, expected_tag=%u\n",
+-                       sm_idx, thread_idx, kGridSyncIndex, old_value, new_value, old_value ^ kFinishSumTag);
++                printf("DeepGEMM grid sync timeout (%ds): sm=%u, thread=%u, grid_sync_idx=%u, old=%u, current=%u, expected_tag=%u\n",
++                       DG_BARRIER_TIMEOUT_SECONDS, sm_idx, thread_idx, kGridSyncIndex, old_value, new_value, old_value ^ kFinishSumTag);
+                 DG_DEVICE_ASSERT(false and "Grid sync timeout");
+             }
+         } while (((new_value ^ old_value) & kFinishSumTag) == 0);
+     }
+     sync_scope();
+ }
+@@ -72,14 +80,14 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
+         if (thread_idx == 0) {
+             ptx::red_add(counter_ptr, 1);
+             const int target = signal_sign ? 0 : static_cast<int>(kNumRanks);
+             const auto start_clock = clock64();
+             while (ptx::ld_acq_sys(signal_ptr) != target) {
+                 if (clock64() - start_clock >= kNumTimeoutCycles) {
+-                    printf("DeepGEMM NVLink barrier timeout: rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
+-                           sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
++                    printf("DeepGEMM NVLink barrier timeout (%ds): rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
++                           DG_BARRIER_TIMEOUT_SECONDS, sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
+                     DG_DEVICE_ASSERT(false and "NVLink barrier timeout");
+                 }
+             }
+         }
+     }
+ 

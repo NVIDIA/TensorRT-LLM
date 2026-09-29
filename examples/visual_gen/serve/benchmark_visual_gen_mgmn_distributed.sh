@@ -42,7 +42,7 @@
 #    - MASTER_PORT:     NCCL rendezvous port (default: 29500)
 #    - RESULT_DIR:      directory to save benchmark results (default: ./benchmark_results)
 #
-# 3. Benchmark parameters (SIZE, NUM_FRAMES, FPS, NUM_INFERENCE_STEPS, etc.):
+# 3. Benchmark parameters (WIDTH, HEIGHT, NUM_FRAMES, FPS, NUM_INFERENCE_STEPS, etc.):
 #    Override via environment variables or edit defaults in the section below.
 #
 # EXAMPLE USAGE:
@@ -69,7 +69,8 @@ export BACKEND="${BACKEND:-openai-videos}"
 export SERVER_PORT="${SERVER_PORT:-8000}"
 
 # Generation defaults
-export SIZE="${SIZE:-1280x720}"
+export WIDTH="${WIDTH:-1280}"
+export HEIGHT="${HEIGHT:-720}"
 export NUM_FRAMES="${NUM_FRAMES:-81}"
 export FPS="${FPS:-16}"
 export NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-50}"
@@ -139,7 +140,7 @@ echo "Server:              http://${MASTER_ADDR}:${SERVER_PORT}"
 echo "Nodes:               ${SLURM_NNODES}"
 echo "GPUs per node:       ${SLURM_GPUS_PER_NODE}"
 echo "Backend:             ${BACKEND}"
-echo "Size:                ${SIZE}"
+echo "Size:                ${WIDTH}x${HEIGHT}"
 if [ "$BACKEND" = "openai-videos" ]; then
 echo "Num frames:          ${NUM_FRAMES}"
 echo "FPS:                 ${FPS}"
@@ -166,6 +167,7 @@ echo "  Command: ${SERVER_CMD}"
 echo ""
 
 srun -l \
+    --kill-on-bad-exit=1 \
     --export=ALL \
     --container-image "${CONTAINER_IMAGE}" \
     --container-workdir "${PROJECT_ROOT}" \
@@ -182,26 +184,38 @@ wait_for_server
 # Step 2: Run benchmark (rank-0 node only)
 # ---------------------------------------------------------------------------
 
+WORKLOAD_FILE="${RESULT_DIR}/workload.yaml"
+mkdir -p "${RESULT_DIR}"
+{
+  echo "backend: ${BACKEND}"
+  echo "common_params:"
+  echo "  width: ${WIDTH}"
+  echo "  height: ${HEIGHT}"
+  echo "  num_inference_steps: ${NUM_INFERENCE_STEPS}"
+  echo "  guidance_scale: ${GUIDANCE_SCALE}"
+  echo "  seed: ${SEED}"
+  if [ "$BACKEND" = "openai-videos" ]; then
+    echo "  num_frames: ${NUM_FRAMES}"
+    echo "  frame_rate: ${FPS}"
+  fi
+  echo "requests:"
+  # YAML single-quoted: ' is the only character needing an escape, by doubling.
+  for _ in $(seq 1 "${NUM_PROMPTS}"); do
+    echo "  - prompt: '${PROMPT//\'/\'\'}'"
+  done
+} > "${WORKLOAD_FILE}"
+
 export BENCHMARK_CMD="python -m tensorrt_llm.serve.scripts.benchmark_visual_gen \
     --model ${MODEL} \
     --backend ${BACKEND} \
     --host ${MASTER_ADDR} \
     --port ${SERVER_PORT} \
-    --prompt \"${PROMPT}\" \
-    --num-prompts ${NUM_PROMPTS} \
-    --size ${SIZE} \
-    --num-inference-steps ${NUM_INFERENCE_STEPS} \
-    --guidance-scale ${GUIDANCE_SCALE} \
-    --seed ${SEED} \
+    --workload ${WORKLOAD_FILE} \
     --max-concurrency ${MAX_CONCURRENCY} \
     --save-result \
     --save-detailed \
     --result-dir ${RESULT_DIR} \
     --metric-percentiles 50,90,99"
-
-if [ "$BACKEND" = "openai-videos" ]; then
-    BENCHMARK_CMD="${BENCHMARK_CMD} --num-frames ${NUM_FRAMES} --fps ${FPS}"
-fi
 
 echo ""
 echo "Step 2: Running benchmark..."

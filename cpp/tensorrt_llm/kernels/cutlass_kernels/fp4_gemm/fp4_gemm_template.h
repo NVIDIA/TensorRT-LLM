@@ -436,7 +436,7 @@ size_t CutlassFp4GemmRunner<T, fp4GemmType>::dispatchToArch(T* D, void const* A,
 {
     if constexpr (fp4GemmType == FP4GemmType::W4A8_MXFP4_MXFP8)
     {
-        if (mSm == 100 || mSm == 103)
+        if (tk::isSM100Family(mSm))
         {
             return dispatchMXFP8xMXFP4GemmCTAShapeSm100<T>(D, A, B, input_sf, weight_sf, global_sf, m, n, k,
                 batch_count, gemmConfig, workspace, workspaceBytes, stream, occupancy, bias);
@@ -449,7 +449,7 @@ size_t CutlassFp4GemmRunner<T, fp4GemmType>::dispatchToArch(T* D, void const* A,
     }
     else if constexpr (fp4GemmType == FP4GemmType::W8A8_MXFP8_MXFP8)
     {
-        if (mSm == 100 || mSm == 103)
+        if (tk::isSM100Family(mSm))
         {
             return dispatchMXFP8xMXFP8GemmCTAShapeSm100<T>(D, A, B, input_sf, weight_sf, global_sf, m, n, k,
                 batch_count, gemmConfig, workspace, workspaceBytes, stream, occupancy);
@@ -462,20 +462,25 @@ size_t CutlassFp4GemmRunner<T, fp4GemmType>::dispatchToArch(T* D, void const* A,
     }
     else if constexpr (fp4GemmType == FP4GemmType::W4A4_NVFP4_NVFP4)
     {
-        if (mSm == 103)
+        if (tk::isSM100Family(mSm))
         {
 #ifdef COMPILE_BLACKWELL_SM103_TMA_GEMMS
-            return dispatchNVFP4xNVFP4GemmCTAShapeSm10x<cutlass::arch::Sm103, T>(D, A, B, input_sf, weight_sf,
-                global_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes, stream, occupancy, bias);
+            if (mSm == 103)
+            {
+                return dispatchNVFP4xNVFP4GemmCTAShapeSm10x<cutlass::arch::Sm103, T>(D, A, B, input_sf, weight_sf,
+                    global_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes, stream, occupancy, bias);
+            }
+            else
+            {
+                return dispatchNVFP4xNVFP4GemmCTAShapeSm10x<cutlass::arch::Sm100, T>(D, A, B, input_sf, weight_sf,
+                    global_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes, stream, occupancy, bias);
+            }
 #else
+            // SM107, SM100, and other SM100 family members all use the same cutlass::arch::Sm100 kernels (compiled with
+            // 100f)
             return dispatchNVFP4xNVFP4GemmCTAShapeSm10x<cutlass::arch::Sm100, T>(D, A, B, input_sf, weight_sf,
                 global_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes, stream, occupancy, bias);
 #endif
-        }
-        else if (mSm == 100)
-        {
-            return dispatchNVFP4xNVFP4GemmCTAShapeSm10x<cutlass::arch::Sm100, T>(D, A, B, input_sf, weight_sf,
-                global_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes, stream, occupancy, bias);
         }
         else if (mSm == 120 || mSm == 121)
         {
@@ -514,7 +519,7 @@ std::vector<tkc::CutlassGemmConfig> CutlassFp4GemmRunner<T, fp4GemmType>::getCon
 
     std::vector<CutlassGemmConfig> candidateConfigs;
 
-    if (mSm == 100 || mSm == 103)
+    if (tk::isSM100Family(mSm))
     {
         std::vector<tkc::CutlassTileConfigSM100> tilesSm10x = {
             tkc::CutlassTileConfigSM100::CtaShape128x128x256B,

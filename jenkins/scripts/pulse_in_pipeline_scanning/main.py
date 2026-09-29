@@ -104,7 +104,7 @@ def _license_docs_to_entries(docs: list, scan_type: str, license_info: dict | No
                 "dependency_name": pkg,
                 "license": doc.get("s_license_ids") or "Unknown",
                 "corrected_license": doc.get("s_corrected_license") or "",
-                "is_permissive": doc.get("is_permissive", False),
+                "is_permissive": info.get("is_permissive", False),
                 "is_nvidia_proprietary": info.get("is_nvidia_proprietary"),
                 "scan_type": scan_type,
             }

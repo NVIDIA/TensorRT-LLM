@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from unittest.mock import patch
 
 import anyio
+import pytest
 
 from agent_flow import (
     AgentLayer,
@@ -130,6 +132,34 @@ def test_layer_started_panel_includes_backend_version(capsys):
     assert "version" in captured.out
     assert "cli 9.9.9" in captured.out
     assert "sdk 0.0.1" in captured.out
+
+
+def test_fetch_available_skills_reads_the_client_without_sending_a_turn():
+    """The skill list is an inspection, not a conversation.
+
+    Both backends can answer from a connected session, so this must cost
+    a client and nothing else — a turn here would bill a model call on
+    every workflow launch that checks what is installed.
+    """
+    backend = FakeBackend([{"skills": ["trtllm-agent-toolkit:perf-analysis"]}])
+    layer = AgentLayer(_config())
+
+    with patch("agent_flow.layers.create_backend", return_value=backend):
+        skills = layer.fetch_available_skills()
+
+    assert skills == ["trtllm-agent-toolkit:perf-analysis"]
+    assert backend.create_client_calls == 1
+    assert backend.clients[0].send_count == 0
+    assert backend.clients[0].closed
+
+
+def test_fetch_available_skills_passes_through_a_backend_that_cannot_say():
+    """``None`` stays ``None`` — callers must not see it as "no skills"."""
+    backend = FakeBackend([{"text": "ok"}])
+    layer = AgentLayer(_config())
+
+    with patch("agent_flow.layers.create_backend", return_value=backend):
+        assert layer.fetch_available_skills() is None
 
 
 def test_codex_layer_started_panel_includes_version_and_reasoning_effort(capsys):
@@ -583,3 +613,260 @@ def test_prompt_builder_can_replace_content():
     assert result == "rewritten"
     assert backend.clients[0].messages == ["normalized prompt"]
     assert backend.clients[0].system_prompt == "custom"
+
+
+def test_on_activity_sees_every_event_and_cannot_fail_the_run():
+    """The observer hook, driven through a real turn.
+
+    Two properties, and they are really one: a caller can watch what the agent is
+    doing, and watching cannot change it. The second is what makes the hook safe
+    to point at a filesystem — the conversion service writes progress to disk from
+    here, and a full or read-only disk must not take down the turn it describes.
+    """
+    seen = []
+
+    def observer(kind, event):
+        seen.append((kind, getattr(event, "name", "")))
+        raise RuntimeError("observer exploded")
+
+    backend = FakeBackend(
+        [{"text": "done", "tool_calls": [ToolCallEvent(name="Read", input={"file_path": "x"})]}]
+    )
+    layer = AgentLayer(replace(_config(print_activity=False), on_activity=observer))
+
+    with patch("agent_flow.layers.create_backend", return_value=backend):
+        result = layer("go")
+
+    assert result == "done", "a raising observer must not change the result"
+    assert ("tool", "Read") in seen, "the observer must actually see the events"
+
+
+def test_no_observer_by_default():
+    """Every existing layer keeps the behaviour it had."""
+    assert _config().on_activity is None
+
+
+@pytest.mark.parametrize("backend_kind", ["claude-code", "codex"])
+@pytest.mark.parametrize("session_mode", ["stateless", "persistent"])
+async def test_required_tools_correct_on_same_client_and_keep_satisfied_calls(
+    backend_kind,
+    session_mode,
+):
+    """One logical invocation can finish remaining calls in a second SDK turn."""
+    backend = FakeBackend(
+        [
+            {
+                "turns": [
+                    {"text": "initial", "tool_calls": [ToolCallEvent("append_progress", {})]},
+                    {
+                        "text": "corrected",
+                        "tool_calls": [ToolCallEvent("mcp__agent-tools__update_status", {})],
+                    },
+                ]
+            }
+        ]
+    )
+    observed = []
+    config = replace(
+        _config(session_mode=session_mode, print_activity=False),
+        backend=BackendConfig(kind=backend_kind, model="test-model"),
+        required_tools=("append_progress", "update_status"),
+        on_activity=lambda kind, event: observed.append((kind, event)),
+    )
+    with patch("agent_flow.layers.create_backend", return_value=backend):
+        async with AgentLayer(config) as layer:
+            assert await layer.aforward("do the work") == "corrected"
+    assert backend.create_client_calls == 1
+    client = backend.clients[0]
+    assert client.closed
+    assert client.messages[0] == "do the work"
+    assert len(client.messages) == 2
+    assert "`update_status`" in client.messages[1]
+    assert "append_progress" not in client.messages[1]
+    assert [event.name for kind, event in observed if kind == "tool"] == [
+        "append_progress",
+        "mcp__agent-tools__update_status",
+    ]
+
+
+async def test_required_tools_do_not_retry_a_satisfied_turn():
+    backend = FakeBackend([{"tool_calls": [ToolCallEvent("append_progress", {})]}])
+    config = replace(_config(print_activity=False), required_tools=("append_progress",))
+    with patch("agent_flow.layers.create_backend", return_value=backend):
+        async with AgentLayer(config) as layer:
+            assert await layer.aforward("record progress") == "ok"
+    assert backend.clients[0].send_count == 1
+
+
+async def test_required_tools_raise_after_one_correction_and_close_client():
+    from agent_flow.hooks import RequiredToolCallError
+
+    backend = FakeBackend([{"tool_calls": [ToolCallEvent("append_progress", {})]}])
+    config = replace(
+        _config(print_activity=False),
+        required_tools=("append_progress", "update_status"),
+    )
+    with patch("agent_flow.layers.create_backend", return_value=backend):
+        async with AgentLayer(config) as layer:
+            with pytest.raises(RequiredToolCallError, match="one corrective turn: update_status"):
+                await layer.aforward("record progress and status")
+    assert backend.clients[0].send_count == 2
+    assert backend.clients[0].closed
+
+
+@pytest.mark.parametrize(
+    "child_fields",
+    [
+        {"parent_tool_use_id": "spawn-1"},
+        {"agent_label": "Reviewer"},
+    ],
+)
+async def test_required_tools_exclude_subagent_calls(child_fields):
+    from agent_flow.hooks import RequiredToolCallError
+
+    backend = FakeBackend(
+        [
+            {
+                "tool_calls": [ToolCallEvent("append_progress", {}, **child_fields)],
+            }
+        ]
+    )
+    config = replace(_config(print_activity=False), required_tools=("append_progress",))
+    with patch("agent_flow.layers.create_backend", return_value=backend):
+        async with AgentLayer(config) as layer:
+            with pytest.raises(RequiredToolCallError, match="append_progress"):
+                await layer.aforward("record your own progress")
+    assert backend.clients[0].send_count == 2
+
+
+@pytest.mark.parametrize(
+    "turn",
+    [
+        {"error": RuntimeError("backend failed")},
+        {"is_error": True, "errors": ["backend failed"]},
+    ],
+)
+async def test_required_tools_propagate_backend_errors_without_correction(turn):
+    backend = FakeBackend([{"turns": [turn]}])
+    config = replace(_config(print_activity=False), required_tools=("append_progress",))
+    with patch("agent_flow.layers.create_backend", return_value=backend):
+        async with AgentLayer(config) as layer:
+            with pytest.raises(RuntimeError, match="backend failed"):
+                await layer.aforward("record progress")
+    assert backend.clients[0].send_count == 1
+    assert backend.clients[0].closed
+
+
+async def test_required_tools_aggregate_turn_expense_but_keep_last_context():
+    from agent_flow.logger import get_logger
+
+    from .helpers import FakeClient
+
+    client = FakeClient(
+        turns=[
+            {
+                "text": "initial",
+                "usage": UsageInfo(
+                    input_tokens=100,
+                    output_tokens=20,
+                    cache_creation_tokens=30,
+                    cache_read_tokens=40,
+                    total_tokens=120,
+                    cost_usd=0.1,
+                    num_turns=2,
+                    duration_ms=1000,
+                    context_tokens=120,
+                    context_window=1000,
+                    context_percentage=12,
+                ),
+            },
+            {
+                "text": "corrected",
+                "tool_calls": [ToolCallEvent("append_progress", {})],
+                "usage": UsageInfo(
+                    input_tokens=150,
+                    output_tokens=10,
+                    cache_creation_tokens=5,
+                    cache_read_tokens=50,
+                    total_tokens=160,
+                    cost_usd=0.2,
+                    num_turns=1,
+                    duration_ms=200,
+                    context_tokens=280,
+                    context_window=1000,
+                    context_percentage=28,
+                ),
+            },
+        ]
+    )
+    config = replace(_config(print_activity=False), required_tools=("append_progress",))
+    async with AgentLayer(config) as layer:
+        response = await layer._execute(
+            client, AgentRequest("work", metadata={"task": 1}), get_logger()
+        )
+    assert response.content == "corrected"
+    assert response.metadata == {"task": 1}
+    assert response.usage == UsageInfo(
+        input_tokens=250,
+        output_tokens=30,
+        cache_creation_tokens=35,
+        cache_read_tokens=90,
+        total_tokens=280,
+        cost_usd=pytest.approx(0.3),
+        num_turns=3,
+        duration_ms=1200,
+        context_tokens=280,
+        context_window=1000,
+        context_percentage=28,
+    )
+
+
+@pytest.mark.parametrize("known_usage", [None, UsageInfo(context_tokens=25, context_window=100)])
+def test_fetch_baseline_never_sends_a_model_turn(known_usage):
+    backend = FakeBackend([{"context_usage": known_usage}])
+    with patch("agent_flow.layers.create_backend", return_value=backend):
+        with AgentLayer(_config()) as layer:
+            assert layer.fetch_baseline_context_usage() is known_usage
+    assert backend.clients[0].send_count == 0
+    assert backend.clients[0].closed
+
+
+@pytest.mark.parametrize("session_mode", ["stateless", "persistent"])
+async def test_session_modes_resolve_the_same_client_options(session_mode, tmp_path):
+    backend = FakeBackend()
+    config = replace(
+        _config(session_mode=session_mode, print_activity=False, human_input_enabled=True),
+        backend=BackendConfig(
+            kind="claude-code",
+            model="test-model",
+            tools=["sentinel-tool"],
+            hooks={"Stop": []},
+            extra_mcp_servers={"test": {"command": "test"}},
+            cwd=tmp_path,
+        ),
+        disallowed_tools=("Write",),
+    )
+    with patch("agent_flow.layers.create_backend", return_value=backend):
+        async with AgentLayer(config) as layer:
+            await layer.aforward("work")
+    client = backend.clients[0]
+    assert client.system_prompt == "You are helpful."
+    assert client.model == "test-model"
+    assert client.tools[0].name == "ask_human"
+    assert client.tools[1:] == ["sentinel-tool"]
+    assert client.hooks == {"Stop": []}
+    assert client.disallowed_tools == ["Write", "AskUserQuestion"]
+    assert client.extra_mcp_servers == {"test": {"command": "test"}}
+    assert client.cwd == tmp_path
+
+
+@pytest.mark.parametrize("final_estimate, expected", [(0.3, 0.3), (None, 0.2), (0.0, 0.0)])
+def test_usage_carries_latest_available_thread_cost_estimate(final_estimate, expected):
+    from agent_flow.layers import _merge_turn_usage
+
+    usage = _merge_turn_usage(
+        UsageInfo(input_tokens=10, estimated_thread_cost_usd=0.2),
+        UsageInfo(input_tokens=20, estimated_thread_cost_usd=final_estimate),
+    )
+    assert usage.input_tokens == 30
+    assert usage.estimated_thread_cost_usd == expected

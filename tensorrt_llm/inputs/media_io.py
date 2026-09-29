@@ -14,6 +14,7 @@ from abc import ABC, abstractmethod
 from concurrent.futures import Executor
 from io import BytesIO
 from pathlib import Path
+from stat import S_ISREG
 from types import MappingProxyType
 from typing import (
     Any,
@@ -107,12 +108,40 @@ _MAX_REDIRECTS = 5
 
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 
+# Opt-in switch relaxing the requirement that media URLs resolve to global
+# (public) IP addresses. Set TRTLLM_MEDIA_ALLOW_PRIVATE_URLS=1 to allow
+# http(s) media URLs that resolve to private, loopback, or link-local
+# addresses — needed for airgapped / intranet deployments where media is
+# served from hosts that have no public address. Default OFF: with the
+# switch unset, non-global addresses are rejected as SSRF protection.
+# Enabling it lets clients steer server-side fetches at internal services
+# (including cloud metadata endpoints), so only set it when every client
+# of the server is trusted or egress is filtered at the network level.
+# Multicast addresses are rejected either way. Read per call so tests and
+# long-lived processes observe changes without re-import.
+_ALLOW_PRIVATE_URLS_ENV = "TRTLLM_MEDIA_ALLOW_PRIVATE_URLS"
+
+
+def _allow_private_urls() -> bool:
+    if os.environ.get(_ALLOW_PRIVATE_URLS_ENV, "0") != "1":
+        return False
+    logger.warning_once(
+        f"{_ALLOW_PRIVATE_URLS_ENV}=1: media URLs resolving to private/loopback "
+        "addresses are allowed; server-side SSRF protection for media fetches "
+        "is relaxed.",
+        key="media_allow_private_urls",
+    )
+    return True
+
 
 def _validate_url(url: str) -> None:
     """Validate that *url* points to a public, non-internal HTTP(S) resource.
 
     Raises ``RuntimeError`` for URLs that target non-global addresses or that
-    use a scheme other than http / https.
+    use a scheme other than http / https. Setting
+    ``TRTLLM_MEDIA_ALLOW_PRIVATE_URLS=1`` skips the non-global-address
+    rejection (scheme, hostname, and multicast checks still apply); see
+    ``_ALLOW_PRIVATE_URLS_ENV`` above for the security tradeoff.
 
     Note: validation is performed at DNS-resolution time. A DNS-rebinding
     attack (TTL=0, resolves to a public IP during validation then a private IP
@@ -134,10 +163,17 @@ def _validate_url(url: str) -> None:
     except socket.gaierror as exc:
         raise RuntimeError(f"Could not resolve hostname {hostname!r}") from exc
 
+    allow_private = _allow_private_urls()
     for _family, _type, _proto, _canon, sockaddr in infos:
         ip = ipaddress.ip_address(sockaddr[0])
-        if not ip.is_global or ip.is_multicast:
-            raise RuntimeError(f"URL resolves to a non-public address ({ip})")
+        if ip.is_multicast:
+            raise RuntimeError(f"URL resolves to a multicast address ({ip})")
+        if not ip.is_global and not allow_private:
+            raise RuntimeError(
+                f"URL resolves to a non-public address ({ip}); set "
+                f"{_ALLOW_PRIVATE_URLS_ENV}=1 to allow private media URLs "
+                f"in trusted network environments"
+            )
 
 
 def _buffer_requests_response(resp: "requests.Response") -> "requests.Response":
@@ -386,6 +422,18 @@ _ISOBMFF_IMAGE_BRANDS = frozenset(
     }
 )
 
+# ISO-BMFF audio: an `.m4a` is an MP4 whose brand says audio-only. Without
+# these it falls through to the video default, which is how an audio file ends
+# up classified as video.
+_ISOBMFF_AUDIO_BRANDS = frozenset(
+    {
+        b"M4A ",
+        b"M4B ",  # iTunes audio / audiobook
+        b"F4A ",
+        b"F4B ",  # Flash audio / audiobook
+    }
+)
+
 # Work bound, not a format rule. The declared box size is client-controlled,
 # so without a ceiling the scan below costs O(payload): 1.6 s of interpreter
 # time for a 64 MB buffer, on the serving event loop. This admits 1020
@@ -470,10 +518,31 @@ def sniff_media_kind(data) -> Optional[str]:
         # major brand alone is not sufficient to identify still images.
         if brands & _ISOBMFF_IMAGE_BRANDS:
             return "image"
+        if brands & _ISOBMFF_AUDIO_BRANDS:
+            return "audio"
         return "video"
-    if header.startswith(b"RIFF") and header[8:12] == b"AVI ":
-        return "video"
+    if header.startswith(b"RIFF"):
+        # RIFF carries both; the form type at [8:12] is what separates them.
+        if header[8:12] == b"AVI ":
+            return "video"
+        if header[8:12] == b"WAVE":
+            return "audio"
+        return None
+    if header.startswith(b"OggS") or header.startswith(b"fLaC") or header.startswith(b"ID3"):
+        return "audio"
+    if _is_mpeg_audio_sync(header):
+        return "audio"
     return None
+
+
+def _is_mpeg_audio_sync(header: bytes) -> bool:
+    """True for a bare MPEG audio / ADTS AAC frame — an MP3 with no ID3 tag.
+
+    The sync word is eleven set bits, so the second byte carries three bits of
+    version/layer alongside it; matching the mask rather than a byte list keeps
+    every MPEG-1/2/2.5 layer and ADTS variant in scope.
+    """
+    return len(header) >= 2 and header[0] == 0xFF and (header[1] & 0xE0) == 0xE0
 
 
 def _select_cv2_stream_buffered_backend() -> Optional[int]:
@@ -716,6 +785,39 @@ def _normalize_file_uri(uri: str) -> str:
     return uri
 
 
+def _safe_read_local_file(location: str) -> bytes:
+    """Read a local file, refusing anything that has no end.
+
+    Takes a bare path or a ``file://`` URI.
+
+    The counterpart of :func:`_safe_request_get` for the local branch, and it
+    guards the one case that is unbounded rather than merely large: reading a
+    character device never reaches EOF and reading a FIFO blocks, so either
+    turns a caller into a denial of service. A regular file is finite, which is
+    the property required here.
+
+    Size is deliberately not capped: naming a large file of one's own is the
+    normal case for a local caller, and no threshold separates that from an
+    abusive one. This bounds the shape of what may be read, then, not its size
+    or its reach — any regular file the process can read is still readable.
+    """
+    path = Path(_normalize_file_uri(location))
+    try:
+        stat = path.stat()  # follows symlinks, so a link to a device is caught
+    except OSError as exc:
+        raise ValueError(f"file could not be read: {exc}") from exc
+
+    if not S_ISREG(stat.st_mode):
+        raise ValueError(
+            f"path is not a regular file: {location!r}. Character devices, "
+            "FIFOs and directories cannot be read as media."
+        )
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"file could not be read: {exc}") from exc
+
+
 _MediaT = TypeVar("_MediaT")
 
 
@@ -733,6 +835,12 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
     # Servers can publish a dedicated pool via `set_executor` so
     # media decoding does not contend with unrelated `to_thread` callers.
     _executor: ClassVar[Optional[Executor]] = None
+
+    # Required MIME type prefix for `data:` URIs handled by this modality
+    # (e.g. `"image/"`). A data URI whose declared media type falls outside
+    # this prefix is rejected rather than decoded. URIs that omit the media
+    # type are accepted for backward compatibility. `None` disables the check.
+    _data_uri_mime_prefix: ClassVar[Optional[str]] = None
 
     @classmethod
     def set_executor(cls, executor: Executor) -> None:
@@ -807,6 +915,12 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
             encoding = parts[1] if len(parts) > 1 else ""
             if encoding != "base64":
                 raise NotImplementedError("Only base64 data URLs are supported for now.")
+            prefix = self._data_uri_mime_prefix
+            if prefix and media_type and not media_type.lower().startswith(prefix):
+                raise ValueError(
+                    f"data URI declares media type {media_type!r}, which does not "
+                    f"match the expected {prefix}* type for this content part"
+                )
             return await self._run_in_executor(self.load_base64, media_type, b64_data)
         elif parsed.scheme in ("", "file"):
             return await self._run_in_executor(self.load_file, url)
@@ -824,6 +938,8 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
 
 class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):
     """I/O for the image modality."""
+
+    _data_uri_mime_prefix: ClassVar[Optional[str]] = "image/"
 
     def __init__(self, format: str = "pt", device: str = "cpu") -> None:
         if format not in _SUPPORTED_IMAGE_FORMATS:
@@ -856,6 +972,8 @@ class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):
 class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
     """I/O for the audio modality."""
 
+    _data_uri_mime_prefix: ClassVar[Optional[str]] = "audio/"
+
     def __init__(self, **kwargs) -> None:
         # AudioMediaIO has no configurable parameters. An explicit __init__
         # is needed so that BaseMediaIO.create() does not crash when kwargs
@@ -883,6 +1001,8 @@ class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
 
 class VideoMediaIO(BaseMediaIO[VideoData]):
     """I/O for the video modality; customizes merge for `fps`/`num_frames` coupling."""
+
+    _data_uri_mime_prefix: ClassVar[Optional[str]] = "video/"
 
     def __init__(
         self,

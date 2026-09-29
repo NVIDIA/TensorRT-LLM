@@ -200,6 +200,29 @@ async def test_coordinator_select_does_not_retry_error_status():
 
 
 @pytest.mark.asyncio
+async def test_coordinator_renew_posts_existing_request_id():
+    router = _delegating_router()
+    session = mock.MagicMock()
+    session.post = mock.MagicMock(return_value=_msgpack_response(200, {}))
+    session.close = mock.AsyncMock()
+    router._session = session
+    request = CompletionRequest(
+        model="m",
+        prompt="hi",
+        disaggregated_params=DisaggregatedParams(request_type="generation_only",
+                                                 ctx_request_id=123),
+    )
+
+    await router.renew_request(request)
+
+    assert msgpack.unpackb(session.post.call_args.kwargs["data"],
+                           raw=False) == {
+                               "role": "generation",
+                               "req_id": 123,
+                           }
+
+
+@pytest.mark.asyncio
 async def test_coordinator_finish_queue_is_bounded():
     local_router = RoundRobinRouter(server_role=None, servers=["server1"])
     router = CoordinatorDelegatingRouter("http://coordinator", local_router,

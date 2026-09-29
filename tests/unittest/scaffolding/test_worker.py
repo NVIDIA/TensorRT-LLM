@@ -14,19 +14,15 @@
 # limitations under the License.
 
 import asyncio
-import os
-import sys
 
 import pytest
 from llmapi.apps.openai_server import RemoteOpenAIServer
+from llmapi.test_llm import get_model_path
+from utils.llm_data import llm_models_root
 
 from tensorrt_llm.scaffolding import (ChatTask, GenerationTask, TaskStatus,
                                       TRTLLMWorker, TRTOpenaiWorker,
                                       UserMessage)
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from llmapi.test_llm import get_model_path
-from utils.llm_data import llm_models_root
 
 
 @pytest.fixture(scope="module")

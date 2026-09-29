@@ -45,8 +45,8 @@ Prepare the dataset:
 trtllm-bench \
   --model ./model_ckpt  \
   prepare-dataset \
-  --output mm_data.jsonl
-  real-dataset
+  --output mm_data.jsonl \
+  real-dataset \
   --dataset-name lmms-lab/MMMU \
   --dataset-split test \
   --dataset-image-key image \

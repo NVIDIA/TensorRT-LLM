@@ -147,7 +147,7 @@ class DirectTopKKernel:
     ):
         per = cutlass.const_expr(nbins // self.num_threads)
         num_warps = cutlass.const_expr(self.num_warps)
-        h = cute.make_fragment((per,), cutlass.Int32)
+        h = cute.make_rmem_tensor((per,), cutlass.Int32)
         s_sum = cutlass.Int32(0)
         for q in cutlass.range_constexpr(per):
             h[q] = smem_hist[tidx * cutlass.Int32(per) + cutlass.Int32(q)]
@@ -349,7 +349,7 @@ class DirectTopKKernel:
             # ~1.03 cold-kernel gap at npad 8256. Keep the flat batch.
             n_batch = cutlass.const_expr((DKCMAX // 4 + num_threads - 1) // num_threads)
             frags = [
-                cute.make_fragment((4,), cutlass.Float32) for _ in range(n_batch)
+                cute.make_rmem_tensor((4,), cutlass.Float32) for _ in range(n_batch)
             ]  # Python-unrolled register batch
             for u in cutlass.range_constexpr(n_batch):
                 i_vec = tidx + cutlass.Int32(u * num_threads)

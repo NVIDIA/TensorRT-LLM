@@ -5,8 +5,15 @@ start and configuration for GSM8K evaluation.
 
 ## Hardware support
 
-Only NVIDIA Blackwell GPUs are currently supported and tested. Support for
-other GPU architectures may be added in a future release.
+Only NVIDIA Blackwell GPUs (`SM100` family) are supported. The performance
+results in this example were measured on GB300 NVL (`SM103`). Per-GPU memory
+requirements differ per recipe, and are set by the attention layout rather
+than by the GPU count: DEP16 needs 210 GB per rank and TEP8 needs 213 GB per
+rank, so both require GB300-class per-GPU memory, while TEP16 needs 115 GB
+per rank and is validated end-to-end on GB200 (`SM100`) at 16 GPUs. B200
+(`SM100`) is functionally supported at the kernel and module level and
+covered by unit tests in CI. See Current limitations. Support for other GPU
+architectures may be added in a future release.
 
 ## Prerequisites
 
@@ -27,12 +34,14 @@ other GPU architectures may be added in a future release.
   for `.venv-3.12` in every command below and export
   `TRTLLM_VENV=/path/to/repo/.venv-<major>.<minor>` when submitting the
   Slurm jobs (they default to the repository-root `.venv-3.12`). Adjust
-  `--cuda_architectures` to the target GPUs (`103-real` for GB300).
+  `--cuda_architectures` to the target GPUs (`103-real` for GB300,
+  `100-real` for B200).
 - A complete Hugging Face-format Kimi K3 checkpoint and tokenizer, e.g.
   [moonshotai/Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3) downloaded
   from the Hugging Face Hub (the example scripts take a local filesystem
   path).
-- A Slurm cluster with 16 NVIDIA Blackwell GPUs and a TensorRT-LLM container
+- A Slurm cluster with 16 NVIDIA Blackwell GPUs (GB300-class per-GPU memory
+  for DEP16 and TEP8; see Hardware support) and a TensorRT-LLM container
   image. The image passed as `--image` below must already provide
   TensorRT-LLM's runtime dependencies, that is, a release-style TensorRT-LLM
   container; a build or devel image without them does not work. The Slurm
@@ -57,23 +66,6 @@ other GPU architectures may be added in a future release.
   ```bash
   .venv-3.12/bin/python -m pip install fla-core einops
   ```
-- To use the optimized CuTeDSL MLA kernel, install the following FlashInfer
-  revision into the same in-place environment after installing TensorRT-LLM:
-
-  ```bash
-  .venv-3.12/bin/python -u -m pip install --force-reinstall --no-deps \
-      --no-build-isolation \
-      "flashinfer-python[cu13] @ git+https://github.com/PerkzZheng/flashinfer-k3.git@b6cc594918baf76c40c3a6236fd53f0f8fb9d2dc"
-  ```
-
-  The `packaging>=24.2` requirement of this source build is already
-  satisfied by `requirements.txt`. The TensorRT-LLM environment already
-  provides FlashInfer's runtime
-  dependencies; `--no-deps` prevents pip from replacing its pinned PyTorch,
-  Triton, CUDA, and CuTeDSL packages. Install FlashInfer last: TensorRT-LLM
-  currently pins `flashinfer-python==0.6.14`, so a later
-  dependency-resolving TensorRT-LLM install can replace this source revision.
-
 ## Run the model
 
 Kimi K3 requires a multi-node launch. From the repository root, submit the
@@ -214,6 +206,17 @@ decoding requires the default cache manager, which cannot reuse blocks.
 ## Current limitations
 
 - Pipeline parallelism is not supported.
+- **DEP16 and TEP8 require GB300-class per-GPU memory.** Under attention-DP
+  the BF16 non-expert weights are replicated on every rank (114 GB per rank),
+  which together with the MXFP4 routed experts at 16-way expert parallelism
+  (90 GB per rank) needs 210 GB per rank for DEP16; TEP8 needs 213 GB per
+  rank because its 8-way expert share alone is 181 GB. Neither fits `SM100`
+  per-GPU memory. Use TEP16, which shards the non-expert weights and needs
+  115 GB per rank — validated end-to-end on GB200 (16 GPUs, 4 nodes), see the
+  deployment guide. Note that the FP8 weight-read path (TRTLLM-14765) does
+  not lift the DEP16 requirement: the conversion runs after the weights are
+  already resident in BF16, so it lowers the steady-state footprint but
+  leaves the load-time peak unchanged.
 - **Known performance limitation at DEP16 saturation** (attention-DP +
   EP16 throughput recipe): the 8K/1K serving sweep loses several percent
   of output throughput at concurrency ≥ 128 (up to ~15% at concurrency
@@ -221,4 +224,4 @@ decoding requires the default cache manager, which cannot reuse blocks.
   and the TEP16/TEP8 latency recipes are unaffected. Tracked as
   TRTLLM-14904.
 - FP8 KV cache (`kv_cache_config.dtype: fp8`) is not yet supported.
-- Speculative decoding: suffix-automaton speculation is supported for aggregated serving (`speculative_config: {decoding_type: SA}` in the extra LLM API options). For evaluation, use `eval_extra_llm_options_sa.yaml` (the `--sa` flag of the GSM8K job): that configuration runs with the overlap scheduler off, `max_batch_size` 8, and a matching CUDA-graph `max_batch_size`. Combining speculation with disaggregated serving is not yet supported.
+- Speculative decoding: suffix-automaton speculation is supported for aggregated serving (`speculative_config: {decoding_type: SA}` in the extra LLM API options). For evaluation, use `eval_extra_llm_options_sa.yaml` (the `--sa` flag of the GSM8K job): that configuration runs with the overlap scheduler off, `max_batch_size` 8, and a matching CUDA-graph `max_batch_size`. Suffix-automaton speculation also works under disaggregated serving; enable it on the generation server with `examples/kimi_k3/disagg/gen_config.yaml` (SA runs eager with `max_batch_size` ≤ 8; see `examples/kimi_k3/disagg/README.md`).

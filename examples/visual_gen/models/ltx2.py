@@ -17,7 +17,10 @@
 
 Usage:
     python ltx2.py
-    python ltx2.py --visual_gen_args ../configs/ltx2.yaml
+    python ltx2.py --visual_gen_args ../configs/ltx2-1gpu.yaml
+    # Force two-stage on a checkpoint lacking the aux files:
+    python ltx2.py --spatial_upsampler_path <upsampler.safetensors> \
+        --distilled_lora_path <distilled-lora.safetensors>
 """
 
 import argparse
@@ -50,6 +53,26 @@ def main():
         ),
     )
     parser.add_argument(
+        "--spatial_upsampler_path",
+        type=str,
+        default=None,
+        help=(
+            "Spatial upsampler safetensors path. Setting both this and "
+            "--distilled_lora_path forces two-stage inference. "
+            "Auto-discovered from the checkpoint dir when unset."
+        ),
+    )
+    parser.add_argument(
+        "--distilled_lora_path",
+        type=str,
+        default=None,
+        help=(
+            "Distilled-LoRA safetensors path. Setting both this and "
+            "--spatial_upsampler_path forces two-stage inference. "
+            "Auto-discovered from the checkpoint dir when unset."
+        ),
+    )
+    parser.add_argument(
         "--output_path",
         type=str,
         default="ltx2_t2v_output.mp4",
@@ -71,6 +94,15 @@ def main():
             **extra_args.pipeline_config,
             "text_encoder_path": text_encoder_path,
         }
+    # Two-stage auto-enables when both aux paths resolve (explicit here, or
+    # auto-discovered from the checkpoint dir); pass both to force it on a
+    # checkpoint that does not bundle them.
+    for key, value in (
+        ("spatial_upsampler_path", args.spatial_upsampler_path),
+        ("distilled_lora_path", args.distilled_lora_path),
+    ):
+        if value is not None:
+            extra_args.pipeline_config = {**extra_args.pipeline_config, key: value}
     visual_gen = VisualGen(model=args.model, args=extra_args)
 
     # --- Model-specific: T2V request construction ---

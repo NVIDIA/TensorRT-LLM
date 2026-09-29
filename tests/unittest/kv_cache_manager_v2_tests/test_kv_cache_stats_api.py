@@ -107,6 +107,33 @@ def test_cpp_stats_types_are_native() -> None:
         peak.available = 6
 
 
+def test_native_cold_page_codec_is_consumed_after_failure() -> None:
+    if os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() != "cpp":
+        pytest.skip("C++ backend only")
+
+    from tensorrt_llm.bindings.internal.batch_manager import kv_cache_manager_v2 as cpp
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import create_default_kv_cache_cold_page_codec
+
+    assert create_default_kv_cache_cold_page_codec is cpp.create_default_kv_cache_cold_page_codec
+    codec = create_default_kv_cache_cold_page_codec()
+
+    invalid_config = _make_config()
+    invalid_config.cache_tiers = []
+    with pytest.raises(AssertionError):
+        KVCacheManager(invalid_config, cold_page_codec=codec)
+
+    with pytest.raises(TypeError):
+        KVCacheManager(_make_config(), cold_page_codec=codec)
+
+
+def test_native_cold_page_codec_rejects_wrong_type() -> None:
+    if os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() != "cpp":
+        pytest.skip("C++ backend only")
+
+    with pytest.raises(TypeError, match="IKvCacheColdPageCodec instance or None"):
+        KVCacheManager(_make_config(), cold_page_codec=5)
+
+
 def test_manager_accepts_uint64_max_request_id() -> None:
     manager = KVCacheManager(_make_config())
     cache = None

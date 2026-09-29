@@ -41,6 +41,7 @@ def cluster_env_module() -> ModuleType:
         ("DGX_B200-8_GPUs-PyTorch-PerfSanity-1", "B200"),
         ("DGX_GB200-4_GPUs-PyTorch-PerfSanity-1", "GB200"),
         ("dgx_gb300-4_gpus-pytorch-perfsanity-1", "GB300"),
+        ("VR200-HECATE-4_GPUs-PyTorch-PerfSanity-1", "VR200"),
         ("unknown-stage", ""),
         ("", ""),
     ),
@@ -57,6 +58,7 @@ def test_gpu_type_from_stage_name(
         (["B200"], "B200"),
         (["b200", "gb200"], "GB200"),
         (["GB300", "B300"], "GB300"),
+        (["VR200"], "VR200"),
         (["L40S"], ""),
         ([], ""),
     ),
@@ -82,13 +84,23 @@ def test_gpu_type_from_supported_gpus(
             "mlx5_4:1,mlx5_5:1,mlx5_10:1,mlx5_11:1",
         ),
         (
-            "oci-aga-cs-001",
-            "export UCX_TLS=^tcp,rc_gda,gga UCX_IB_MLX5_DEVX=n "
-            "UCX_NET_DEVICES="
-            "rdma_vf_rail0:1,rdma_vf_rail1:1,rdma_vf_rail2:1,rdma_vf_rail3:1 "
-            "UCX_IB_TRAFFIC_CLASS=96 TRTLLM_NIXL_NUM_THREADS=1",
+            "oci-hsg-cs-001",
+            "export UCX_NET_DEVICES=mlx5_0:1,mlx5_1:1,mlx5_3:1,mlx5_4:1,eth0",
         ),
-        ("aws-cmh", "export UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp"),
+        (
+            "oci-aga-cs-001",
+            "export UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp UCX_TCP_AF_PRIO=inet",
+        ),
+        (
+            "oci-jhb-slurm-1",
+            "export UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp UCX_TCP_AF_PRIO=inet",
+        ),
+        (
+            "aws-cmh",
+            "export UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp "
+            "UCX_NET_DEVICES=eth0,mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,"
+            "mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1",
+        ),
         ("aws-dfw-prod", "export UCX_TLS=^gdr_copy"),
     ),
 )

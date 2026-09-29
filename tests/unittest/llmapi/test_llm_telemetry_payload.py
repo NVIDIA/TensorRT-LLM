@@ -22,18 +22,15 @@ JSON parameter against ground truth values from torch.cuda, platform, etc.
 import json
 import os
 import platform
-import sys
 import threading
 from unittest.mock import patch
 
 import pytest
+from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM as LLM_torch
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.usage import schemas
-
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
-from utils.llm_data import llm_models_root  # noqa: E402
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
@@ -66,11 +63,13 @@ class TestPayloadVerification:
     def _setup(self):
         self.model_path = _get_model_path()
 
-    def test_payload_parameters_match_ground_truth(self):
+    def test_payload_parameters_match_ground_truth(self, monkeypatch):
         """Load real model, build payload, verify every parameter is accurate."""
         import torch
 
         import tensorrt_llm.usage.usage_lib as usage_lib
+
+        monkeypatch.setenv("TRTLLM_USAGE_FORCE_ENABLED", "1")
 
         # Step 1: Load real model, capture report_usage kwargs
         captured, spy = _make_spy()
@@ -85,6 +84,7 @@ class TestPayloadVerification:
 
         assert llm_args is not None, "report_usage was not called with llm_args"
         assert pretrained_config is not None, "report_usage was not called with pretrained_config"
+        assert usage_lib.apply_usage_session_config(telemetry_config)
 
         # Extract usage_context the same way report_usage does
         usage_context = ""

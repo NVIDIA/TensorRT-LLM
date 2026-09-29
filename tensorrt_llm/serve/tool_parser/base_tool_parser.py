@@ -1,7 +1,7 @@
 # Adapted from https://github.com/sgl-project/sglang/blob/083629c23564e1a64deaa052f1df5c5d914358d8/python/sglang/srt/function_call/base_format_detector.py
 import json
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
@@ -13,10 +13,52 @@ from .core_types import StreamingParseResult, ToolCallItem, _GetInfoFunc
 from .utils import find_common_prefix, is_complete_json, partial_json_loads
 
 
+def warn_if_tool_call_unparsed(parser_name: str, tool_parser: "BaseToolParser",
+                               text: str, calls: List[ToolCallItem]) -> None:
+    """Warn when tool-call markup was detected but no tool call was extracted.
+
+    Without this, a tool call the parser could not extract is indistinguishable
+    from a model that chose not to call a tool: the request returns 200 and the
+    response simply carries no tool call, so the call is silently lost (GitHub
+    issue #17917).
+
+    Only the non-streaming path calls this, because the check needs the whole
+    model output and ``has_tool_call`` on a partial increment is not meaningful.
+    The streaming path could run an equivalent check at ``finished=True``, when
+    the parser's ``_buffer`` still holds the unparsed remainder; that is left
+    for a follow-up.
+
+    The warning is emitted once per parser name: the condition reflects a
+    persistent misconfiguration (wrong ``--tool_parser`` or a changed chat
+    template), so repeating it for every request would only scale with traffic.
+    """
+    if calls:
+        return
+    try:
+        detected = tool_parser.has_tool_call(text)
+    except NotImplementedError:
+        return
+    if not detected:
+        return
+    logger.warning_once(
+        f"Tool parser '{parser_name}' detected tool-call markup but extracted "
+        "no tool calls from the model output; the response will not carry "
+        "any tool call. "
+        "Likely causes: the parser does not match the model's chat template "
+        "(check --tool_parser), the output is malformed or truncated, the tool "
+        "block is empty, or the parser rejected the arguments.",
+        key=parser_name)
+
+
 class BaseToolParser(ABC):
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
 
     needs_raw_special_tokens: bool = False
+    # Parsers whose forced/named ``tool_choice`` output still carries the
+    # model's native tool-call markup (rather than grammar-constrained bare
+    # JSON arguments) set this to True so the serving layer runs extraction
+    # on the named-choice path instead of passing raw text through.
+    extracts_forced_tool_calls: bool = False
 
     def __init__(self):
         # Streaming state management
@@ -80,7 +122,7 @@ class BaseToolParser(ABC):
                         -1,  # Caller should update this based on the actual tools array called
                         name=name,
                         parameters=json.dumps(
-                            act.get("parameters") or act.get("arguments", {}),
+                            act.get("parameters") or act.get("arguments") or {},
                             ensure_ascii=False,
                         ),
                     ))
@@ -109,6 +151,17 @@ class BaseToolParser(ABC):
             if bot_token.startswith(buffer[-i:]):
                 return i
         return 0
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Finalize a stream that ended before the format's closing markers.
+
+        Called once by the serving layer when generation finishes, after the
+        last ``parse_streaming_increment`` call, so parsers that buffer whole
+        sections can emit whatever the truncated stream still holds. The
+        default is a no-op to preserve the existing behavior of parsers that
+        manage ``self._buffer`` incrementally.
+        """
+        return StreamingParseResult()
 
     def parse_streaming_increment(self, new_text: str,
                                   tools: List[Tool]) -> StreamingParseResult:
@@ -223,7 +276,19 @@ class BaseToolParser(ABC):
                 cur_arguments = current_tool_call.get("arguments")
                 res = StreamingParseResult()
 
-                if cur_arguments:
+                # A finished call may carry no "arguments" key at all, or an
+                # explicit null. Both mean "no arguments" and are normalized to
+                # {} so the call still completes, matching what parse_base_json
+                # returns on the non-streaming path. While the JSON is still
+                # partial a missing key only means "not streamed yet", so it is
+                # left alone and the elif prev_arguments branch keeps handling it.
+                if is_current_complete and cur_arguments is None:
+                    cur_arguments = {}
+
+                # An empty argument object is falsy but still has to be streamed and
+                # completed, otherwise a zero-argument tool call never finishes and its
+                # text stays in the buffer forever.
+                if cur_arguments is not None:
                     # Calculate how much of the arguments we've already streamed
                     sent = len(
                         self.streamed_args_for_tool[self.current_tool_id])
@@ -300,6 +365,17 @@ class BaseToolParser(ABC):
     def supports_structural_tag(self) -> bool:
         """Return True if this detector supports structural tag format."""
         return True
+
+    def build_strict_structural_tag_format(
+            self, tools: List[Tool]) -> Optional[Dict[str, Any]]:
+        """Build a complete structural-tag format for strict-tool decoding.
+
+        Override on parsers whose wire format cannot be expressed through
+        the `structure_info` begin/end/trigger triples (e.g. kimi_k3's
+        XTML call tags). Returns the xgrammar structural-tag format dict,
+        or None to fall back to the `structure_info` path.
+        """
+        return None
 
     @abstractmethod
     def structure_info(self) -> _GetInfoFunc:

@@ -136,6 +136,10 @@ def kda_decode_mtp_kernel(
         bos = cu_seqlens[i_n]
         eos = cu_seqlens[i_n + 1]
         slot = ssm_state_indices[i_n]
+    # V2 can interleave many layers between state slots. Promote the index
+    # before multiplying by static strides: the element offset can exceed
+    # INT32_MAX even when each individual stride fits in int32.
+    slot = Int64(slot)
     h0_idx = slot * HV + i_hv
     hk_off = i_h * K
     hv_off = i_hv * V
@@ -192,6 +196,7 @@ def kda_decode_mtp_kernel(
             cute.make_layout((KERNEL_WIDTH * vec_size,), stride=(1,)), cutlass.Float32
         )
     r_exp_A = cutlass.Float32(0.0)
+    run_precompute = False
     if cutlass.const_expr(USE_REGULAR_METADATA) or eos > bos:
         if cutlass.const_expr(FUSE_PRECOMPUTE or RUNTIME_PRECOMPUTE_FLAG):
             if cutlass.const_expr(RUNTIME_PRECOMPUTE_FLAG):

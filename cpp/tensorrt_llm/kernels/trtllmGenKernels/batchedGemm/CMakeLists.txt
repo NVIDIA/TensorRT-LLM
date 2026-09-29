@@ -19,7 +19,7 @@ file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 
 add_library(trtllm_gen_batched_gemm OBJECT)
-filter_source_cuda_architectures(SOURCE_LIST SRC_CPP ARCHS 100 103 100f)
+filter_source_cuda_architectures(SOURCE_LIST SRC_CPP ARCHS 100 103 107 100f)
 
 target_sources(trtllm_gen_batched_gemm PRIVATE ${SRC_CPP} ${SRC_CU})
 target_compile_definitions(trtllm_gen_batched_gemm
@@ -36,4 +36,4 @@ tllm_add_cubin_archive_sources(
   trtllm_gen_batched_gemm
   "${CMAKE_CURRENT_SOURCE_DIR}/trtllmGen_bmm_export/cubins"
   NAMESPACE batchedGemm tensorrt_llm ${TRTLLM_ABI_NAMESPACE} kernels
-  ARCHS 100 103 100f)
+  ARCHS 100 103 107 100f)

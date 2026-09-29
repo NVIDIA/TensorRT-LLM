@@ -35,6 +35,8 @@ struct PendingAllocationSegment
     int beamWidth;
     bool countAsMissed;
     bool countAsGeneration;
+    bool recordManagerStats;
+    bool recordRequestStats;
 };
 
 struct PendingStatsDelta
@@ -56,7 +58,7 @@ public:
     [[nodiscard]] bool empty() const noexcept
     {
         return mRequestStats.empty() && mGlobalStats.empty() && mIterationStatsByLifeCycle.empty()
-            && mSsmSnapshotIterationStatsByLifeCycle.empty();
+            && mSsmSnapshotIterationStatsByLifeCycle.empty() && countsByLevelEmpty(mCachedTokensByLevel);
     }
 
     void clear() noexcept
@@ -65,17 +67,21 @@ public:
         mGlobalStats.clear();
         mIterationStatsByLifeCycle.clear();
         mSsmSnapshotIterationStatsByLifeCycle.clear();
+        mReusedBlocksByLevelByLifeCycle.clear();
+        mCachedTokensByLevel.clear();
         mAllocationSegments.clear();
     }
 
     bool recordAllocationRange(LifeCycleId lifeCycle, BlockOrdinal blockBegin, BlockOrdinal blockEnd, int beamWidth,
-        bool countAsMissed, bool countAsGeneration = false)
+        bool countAsMissed, bool countAsGeneration = false, bool recordManagerStats = true,
+        bool recordRequestStats = true)
     {
         if (blockBegin >= blockEnd)
         {
             return false;
         }
-        PendingAllocationSegment segment{lifeCycle, blockBegin, blockEnd, beamWidth, countAsMissed, countAsGeneration};
+        PendingAllocationSegment segment{lifeCycle, blockBegin, blockEnd, beamWidth, countAsMissed, countAsGeneration,
+            recordManagerStats, recordRequestStats};
         if (!add(allocationDelta(segment, blockBegin, blockEnd)))
         {
             return false;
@@ -84,21 +90,32 @@ public:
         return true;
     }
 
-    bool recordReuse(LifeCycleId lifeCycle, int fullReusedBlocks, int partialReusedBlocks)
+    // `byLevel` splits the same full/partial counts across the cache levels the reused pages were
+    // resident on. It rides along with the scalar counters so both are committed or discarded
+    // together; reuse is never rolled back (only allocation ranges are), so add-only is enough.
+    bool recordReuse(LifeCycleId lifeCycle, int fullReusedBlocks, int partialReusedBlocks,
+        ReusedBlocksByLevel const& byLevel = {}, bool recordManagerStats = true, bool recordRequestStats = true)
     {
         int const reusedBlocks = fullReusedBlocks + partialReusedBlocks;
-        if (reusedBlocks == 0)
+        if (reusedBlocks == 0 || (!recordManagerStats && !recordRequestStats))
         {
             return false;
         }
 
         PendingStatsDelta delta;
-        delta.globalStats.reusedBlocks = reusedBlocks;
-        delta.requestStats.reusedBlocks = reusedBlocks;
-        delta.iterationStats.iterReusedBlocks = reusedBlocks;
-        delta.iterationStats.iterFullReusedBlocks = fullReusedBlocks;
-        delta.iterationStats.iterPartialReusedBlocks = partialReusedBlocks;
-        delta.lifeCycle = lifeCycle;
+        if (recordManagerStats)
+        {
+            delta.globalStats.reusedBlocks = reusedBlocks;
+            delta.iterationStats.iterReusedBlocks = reusedBlocks;
+            delta.iterationStats.iterFullReusedBlocks = fullReusedBlocks;
+            delta.iterationStats.iterPartialReusedBlocks = partialReusedBlocks;
+            delta.lifeCycle = lifeCycle;
+            mReusedBlocksByLevelByLifeCycle[lifeCycle].add(byLevel);
+        }
+        if (recordRequestStats)
+        {
+            delta.requestStats.reusedBlocks = reusedBlocks;
+        }
         return add(delta);
     }
 
@@ -187,21 +204,80 @@ public:
         return mSsmSnapshotIterationStatsByLifeCycle;
     }
 
+    ReusedBlocksByLevelByLifeCycle const& reusedBlocksByLevelByLifeCycle() const noexcept
+    {
+        return mReusedBlocksByLevelByLifeCycle;
+    }
+
+    // Cached-token attribution for the sequence's reuse match, indexed by cache level.
+    //
+    // Unlike the reuse counters this is a manager-global quantity rather than a per-lifecycle one:
+    // a match spans every lifecycle at once (the final SSM checkpoint summarizes the whole
+    // recurrent prefix, so its tier applies to every matched token), leaving no single lifecycle to
+    // attribute it to. It still rides the pending-stats lifecycle so it is committed or discarded
+    // together with the counters it was derived from -- in particular, a dummy sequence's
+    // attribution is dropped by the same discardPendingStats() that drops its reuse counters.
+    bool recordCachedTokensByLevel(CountsByLevel const& counts)
+    {
+        if (countsByLevelEmpty(counts))
+        {
+            return false;
+        }
+        addCountsByLevel(mCachedTokensByLevel, counts);
+        return true;
+    }
+
+    void clearCachedTokensByLevel() noexcept
+    {
+        mCachedTokensByLevel.clear();
+    }
+
+    //! Limit a level's staged attribution without restoring counts already dropped or committed.
+    void limitCachedTokensByLevel(CacheLevel level, int64_t maxTokens)
+    {
+        // No attribution is staged when stats are disabled, discarded, or already committed.
+        if (mCachedTokensByLevel.empty())
+        {
+            return;
+        }
+        TLLM_CHECK_DEBUG(level < mCachedTokensByLevel.size());
+        if (level >= mCachedTokensByLevel.size())
+        {
+            return;
+        }
+        auto& count = mCachedTokensByLevel.at(level);
+        TLLM_CHECK_DEBUG(maxTokens >= 0);
+        count = std::min(count, std::max(int64_t{0}, maxTokens));
+    }
+
+    [[nodiscard]] CountsByLevel const& cachedTokensByLevel() const noexcept
+    {
+        return mCachedTokensByLevel;
+    }
+
 private:
     static PendingStatsDelta allocationDelta(
         PendingAllocationSegment const& segment, BlockOrdinal blockBegin, BlockOrdinal blockEnd)
     {
         int64_t const numBlocks = static_cast<int64_t>(std::max(0, blockEnd - blockBegin)) * segment.beamWidth;
         PendingStatsDelta delta;
-        delta.globalStats.allocTotalBlocks = numBlocks;
-        delta.globalStats.allocNewBlocks = numBlocks;
-        delta.globalStats.missedBlocks = segment.countAsMissed ? numBlocks : 0;
-        delta.requestStats = delta.globalStats.copy();
-        delta.iterationStats.iterAllocTotalBlocks = numBlocks;
-        delta.iterationStats.iterAllocNewBlocks = numBlocks;
-        delta.iterationStats.iterMissedBlocks = segment.countAsMissed ? numBlocks : 0;
-        delta.iterationStats.iterGenAllocBlocks = segment.countAsGeneration ? numBlocks : 0;
-        delta.lifeCycle = segment.lifeCycle;
+        if (segment.recordManagerStats)
+        {
+            delta.globalStats.allocTotalBlocks = numBlocks;
+            delta.globalStats.allocNewBlocks = numBlocks;
+            delta.globalStats.missedBlocks = segment.countAsMissed ? numBlocks : 0;
+            delta.iterationStats.iterAllocTotalBlocks = numBlocks;
+            delta.iterationStats.iterAllocNewBlocks = numBlocks;
+            delta.iterationStats.iterMissedBlocks = segment.countAsMissed ? numBlocks : 0;
+            delta.iterationStats.iterGenAllocBlocks = segment.countAsGeneration ? numBlocks : 0;
+            delta.lifeCycle = segment.lifeCycle;
+        }
+        if (segment.recordRequestStats)
+        {
+            delta.requestStats.allocTotalBlocks = numBlocks;
+            delta.requestStats.allocNewBlocks = numBlocks;
+            delta.requestStats.missedBlocks = segment.countAsMissed ? numBlocks : 0;
+        }
         return delta;
     }
 
@@ -249,6 +325,8 @@ private:
     KVCacheStatsDelta mGlobalStats;
     IterationStatsByLifeCycle mIterationStatsByLifeCycle;
     SsmSnapshotIterationStatsByLifeCycle mSsmSnapshotIterationStatsByLifeCycle;
+    ReusedBlocksByLevelByLifeCycle mReusedBlocksByLevelByLifeCycle;
+    CountsByLevel mCachedTokensByLevel;
     std::vector<PendingAllocationSegment> mAllocationSegments;
 };
 
