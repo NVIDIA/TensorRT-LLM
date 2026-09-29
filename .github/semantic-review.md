@@ -174,12 +174,13 @@ not establish the semantic correctness of those citations or the AI's findings.
 
 Publication logs and job summaries explain why a result was not accepted and
 link the observed comment. A known CodeRabbit service-error message, a missing
-or malformed result record, mismatched identities or revisions, and missing
+or malformed result record, mismatched request IDs or revisions, and missing
 source citations have distinct diagnostics. A comment without the request's
 identity is an unverified observation, not proof that it answers that request.
 These diagnostics do not complete requests, change verdicts or request retries.
-They remain visible when no status update is needed; ordinary unrelated bot
-comments do not create an analysis result.
+Diagnostic publication does not depend on a status write. Scheduled scans do
+not create repair jobs solely to emit diagnostics for unchanged PRs. Ordinary
+unrelated bot comments do not create an analysis result.
 
 Publication uses only the latest request and its matching replies. A new request
 updates the same PR context on its requested head commit; an old request's late
