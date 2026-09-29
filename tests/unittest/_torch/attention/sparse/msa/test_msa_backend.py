@@ -76,6 +76,9 @@ def test_msa_metadata_clears_padded_cache_slot_tail(
         metadata._msa_qo_lens_cpu = torch.tensor([count], dtype=torch.int32)
         metadata._msa_kv_lens_cpu = metadata._msa_qo_lens_cpu.clone()
         metadata._msa_qo_offset_cpu = torch.zeros(1, dtype=torch.int32)
+        # What the base seq_lens setter would derive; the cache writers read the
+        # live count off it.
+        metadata._num_tokens = count
         metadata._build_msa_fields()
         assert metadata.msa_out_cache_loc.tolist() == list(range(12, 12 + count)) + [-1] * (
             4 - count
@@ -685,6 +688,8 @@ def test_msa_index_k_uses_hnd_cache_view_and_writer():
     metadata.kv_cache_manager = manager
     metadata.msa_out_cache_loc = torch.tensor([2, page_size + 5], dtype=torch.int32)
     values = torch.arange(2 * head_dim, dtype=torch.float32).reshape(2, 1, head_dim)
+    metadata._msa_fields_ready = True
+    metadata._num_tokens = 2
 
     returned = metadata.msa_idx_k_cache(3)
     metadata.msa_write_idx_k(3, values)
@@ -809,6 +814,7 @@ def test_msa_indexer_enforces_real_fp8_and_bf16_handoff_states() -> None:
                 self.cache,
                 self.msa_out_cache_loc,
                 idx_k,
+                int(idx_k.shape[0]),
                 layout="HND",
             )
 
@@ -1224,6 +1230,97 @@ def test_the_decode_span_of_a_mixed_step_is_its_generation_suffix():
     # The trtllm-gen scheduling bound must come from the span's own rows: the
     # 4096-token context row here would inflate a whole-batch maximum by 100x.
     assert metadata.msa_max_kv_len == 40
+
+
+def test_the_triton_sparse_decode_rejects_a_q_that_outruns_the_batch():
+    """The guard has to be reached, not merely available.
+
+    Eleven speculative decode requests of 4 query tokens each, padded by a
+    piecewise CUDA graph out to 512: the kernel would read 512 page table rows
+    out of a batch that has 11. It reads its shapes before touching a device,
+    so the refusal happens at the call and needs no GPU.
+    """
+    batch, query_len, total_q, num_heads, head_dim = 11, 4, 512, 4, 128
+    q = torch.empty(total_q, num_heads, head_dim)
+    paged = torch.empty(1, 1, 128, head_dim)
+    with pytest.raises(
+        ValueError, match=r"Triton sparse decode: total_q \(512\) must be batch \(11\)"
+    ):
+        minimax_m3_sparse_attn_decode(
+            q,
+            paged,
+            paged,
+            torch.zeros(1, total_q, 64, dtype=torch.int64),
+            torch.zeros(batch, 4, dtype=torch.int32),
+            torch.zeros(batch, dtype=torch.int32),
+            sm_scale=head_dim**-0.5,
+            output=torch.empty_like(q),
+            decode_query_len=query_len,
+        )
+
+
+def test_the_trtllm_gen_dense_decode_rejects_a_q_that_outruns_the_batch():
+    """The same padded q against the dense kernel, which had no such guard.
+
+    It is handed no cache manager: its multi-CTA counters are sized off the
+    batch, so it has to decline before consulting one.
+    """
+    pytest.importorskip("flashinfer")
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.trtllm_gen_dense_decode import (
+        minimax_m3_trtllm_gen_dense_decode,
+    )
+
+    batch, query_len, total_q, num_heads, head_dim = 11, 4, 512, 4, 128
+    q = torch.empty(total_q, num_heads, head_dim)
+    with pytest.raises(
+        ValueError, match=r"trtllm-gen dense decode: total_q \(512\) must be batch \(11\)"
+    ):
+        minimax_m3_trtllm_gen_dense_decode(
+            q,
+            None,
+            0,
+            torch.zeros(batch, 4, dtype=torch.int32),
+            torch.zeros(batch, dtype=torch.int32),
+            sm_scale=head_dim**-0.5,
+            output=torch.empty_like(q),
+            decode_query_len=query_len,
+            max_seq_len=1024,
+            max_num_requests=batch,
+        )
+
+
+def test_the_eager_writer_drops_the_sentinel_tail_it_is_handed():
+    """The padded rows of a step must reach no page at all, the wrap target of a
+    surviving -1 included."""
+    num_pages, page_size, head_dim = 4, 8, 16
+    cache = torch.zeros(num_pages, 1, page_size, head_dim, dtype=torch.bfloat16)
+    # Two live tokens, then the -1 tail a capture bucket pads the step out to.
+    out_cache_loc = torch.tensor([2, page_size + 5, -1, -1], dtype=torch.int32)
+    values = torch.arange(4 * head_dim, dtype=torch.float32).reshape(4, 1, head_dim)
+
+    write_kv_slots(cache, out_cache_loc, values, 2, layout="HND")
+
+    torch.testing.assert_close(cache[0, 0, 2], values[0, 0].to(torch.bfloat16))
+    torch.testing.assert_close(cache[1, 0, 5], values[1, 0].to(torch.bfloat16))
+    # The page a wrapped -1 would have hit.
+    assert not cache[num_pages - 1].any()
+
+
+def test_the_eager_writer_refuses_a_live_count_it_has_no_rows_for():
+    """A count past the rows supplied is a caller bug, not a short write."""
+    cache = torch.zeros(4, 1, 8, 16, dtype=torch.bfloat16)
+    out_cache_loc = torch.tensor([2, 5], dtype=torch.int32)
+    values = torch.zeros(2, 1, 16)
+
+    with pytest.raises(ValueError, match=r"num_live_tokens=3 exceeds the rows supplied"):
+        write_kv_slots(cache, out_cache_loc, values, 3, layout="HND")
+
+    with pytest.raises(ValueError, match="must be non-negative"):
+        write_kv_slots(cache, out_cache_loc, values, -1, layout="HND")
+
+    # A step that scheduled nothing writes nothing rather than erroring.
+    write_kv_slots(cache, out_cache_loc, values, 0, layout="HND")
+    assert not cache.any()
 
 
 def test_a_pure_prefill_step_has_no_decode_span():
@@ -1864,16 +1961,21 @@ def test_fused_scatter_matches_reference(src_dtype, cache_dtype, with_idx):
 
     ref_pool = pool.clone()
     ref_idx_pool = idx_pool.clone()
+    # The sentinel sits at the head here rather than in a tail, so the
+    # reference masks it out and states the surviving row count.
+    num_live_slots = int(valid.sum())
     write_kv_slots(
         ref_pool[1:-1, 0],
         slots[valid],
         k.reshape(num_tokens, num_kv_heads, head_dim)[valid],
+        num_live_slots,
         layout="HND",
     )
     write_kv_slots(
         ref_pool[1:-1, 1],
         slots[valid],
         v.reshape(num_tokens, num_kv_heads, head_dim)[valid],
+        num_live_slots,
         layout="HND",
     )
     if with_idx:
@@ -1881,6 +1983,7 @@ def test_fused_scatter_matches_reference(src_dtype, cache_dtype, with_idx):
             ref_idx_pool[1:-1, 0],
             slots[valid],
             idx_k.reshape(num_tokens, 1, head_dim)[valid],
+            num_live_slots,
             layout="HND",
         )
 
